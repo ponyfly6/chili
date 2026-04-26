@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import type {
   ApprovalRow,
+  AgentTaskRow,
   EventPublisher,
   EventQuery,
   EventStore,
@@ -21,7 +22,7 @@ import type {
   TimestampMs,
 } from "@chili/protocol";
 import type { RuntimeAgentsSnapshot } from "./agent-projection.js";
-import type { RuntimeHttpService } from "./runtime-http.js";
+import type { RuntimeHttpService, RuntimeTaskControlService } from "./runtime-http.js";
 import { createRuntimeHttpHandler } from "./runtime-http.js";
 
 test("serves sessions and event backlog over the runtime HTTP handler", async () => {
@@ -126,6 +127,57 @@ test("serves subagent runs and tasks through an event replay projection", async 
   expect(body.agents[1]?.mailboxMessageIds).toEqual(["event_mailbox"]);
   expect(body.tasks[0]?.status).toBe("completed");
   expect(body.mailbox[0]?.triggerTurn).toBe(true);
+});
+
+test("serves task control routes", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const tasks = new FakeTaskControlService();
+  const handler = createRuntimeHttpHandler({ service, store, tasks });
+
+  const listResponse = await handler(new Request("http://chili.test/tasks?status=running"));
+  expect(listResponse.status).toBe(200);
+  expect(await listResponse.json()).toMatchObject([{ id: "task_http", status: "running" }]);
+  expect(tasks.lastListStatus).toBe("running");
+
+  const taskResponse = await handler(new Request("http://chili.test/tasks/task_http"));
+  expect(taskResponse.status).toBe(200);
+  expect(await taskResponse.json()).toMatchObject({ id: "task_http", status: "running" });
+
+  const followupResponse = await handler(
+    new Request("http://chili.test/tasks/task_http/followup", {
+      method: "POST",
+      body: JSON.stringify({ text: "continue", maxTurns: 2 }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  expect(followupResponse.status).toBe(200);
+  expect(await followupResponse.json()).toMatchObject({
+    task: { id: "task_http", status: "completed", summary: "done" },
+    result: { status: "completed", finishReason: "stop" },
+  });
+  expect(tasks.lastFollowupText).toBe("continue");
+
+  const waitResponse = await handler(
+    new Request("http://chili.test/tasks/task_http/wait", {
+      method: "POST",
+      body: JSON.stringify({ timeoutMs: 10 }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  expect(waitResponse.status).toBe(200);
+  expect(await waitResponse.json()).toMatchObject({ id: "task_http" });
+
+  const closeResponse = await handler(
+    new Request("http://chili.test/tasks/task_http/close", {
+      method: "POST",
+      body: JSON.stringify({ status: "cancelled", summary: "stopped" }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  expect(closeResponse.status).toBe(200);
+  expect(await closeResponse.json()).toMatchObject({ id: "task_http", status: "cancelled", summary: "stopped" });
 });
 
 test("resolves approvals through the runtime HTTP handler", async () => {
@@ -244,6 +296,57 @@ class BusyRuntimeService extends FakeRuntimeService {
     error.name = "RuntimeBusyError";
     throw error;
   }
+}
+
+class FakeTaskControlService implements RuntimeTaskControlService {
+  lastListStatus: string | undefined;
+  lastFollowupText: string | undefined;
+
+  async listTasks(query: { status?: string } = {}): Promise<AgentTaskRow[]> {
+    this.lastListStatus = query.status;
+    return [taskRow({ status: "running" })];
+  }
+
+  async getTask(): Promise<AgentTaskRow> {
+    return taskRow({ status: "running" });
+  }
+
+  async followupTask(input: { text: string }): Promise<Awaited<ReturnType<RuntimeTaskControlService["followupTask"]>>> {
+    this.lastFollowupText = input.text;
+    return {
+      task: taskRow({ status: "completed", summary: "done" }),
+      result: {
+        status: "completed",
+        turns: [],
+        finishReason: "stop",
+      },
+    };
+  }
+
+  async waitForTask(): Promise<AgentTaskRow> {
+    return taskRow({ status: "completed", summary: "done" });
+  }
+
+  async closeTask(input: { status?: "completed" | "failed" | "cancelled"; summary?: string }): Promise<AgentTaskRow> {
+    const rowInput: { status: AgentTaskRow["status"]; summary?: string } = { status: input.status ?? "cancelled" };
+    if (input.summary) rowInput.summary = input.summary;
+    return taskRow(rowInput);
+  }
+}
+
+function taskRow(input: { status: AgentTaskRow["status"]; summary?: string }): AgentTaskRow {
+  const row: AgentTaskRow = {
+    id: "task_http" as TaskId,
+    path: "/root/task_http" as AgentPath,
+    taskName: "review",
+    status: input.status,
+    childSessionId: "session_child" as SessionId,
+    childThreadId: "thread_child" as ThreadId,
+    createdAt: 1,
+    updatedAt: 2,
+  };
+  if (input.summary) row.summary = input.summary;
+  return row;
 }
 
 class MemoryEventStore implements EventStore {

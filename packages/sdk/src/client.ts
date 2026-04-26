@@ -1,5 +1,8 @@
 import type {
   ChiliEvent,
+  AgentPath,
+  AgentTaskMode,
+  AgentTaskStatus,
   Message,
   ApprovalId,
   RuntimeApprovalResolveResult,
@@ -8,6 +11,7 @@ import type {
   RuntimePromptResult,
   RuntimeSessionRef,
   SessionId,
+  TaskId,
   ThreadId,
 } from "@chili/protocol";
 import type { RuntimeAgentsSnapshot } from "./projection.js";
@@ -21,6 +25,11 @@ export interface RuntimeClient {
   archiveSession(sessionId: SessionId): Promise<void>;
   listSessions(): Promise<RuntimeSessionSummary[]>;
   listAgents(input?: ListAgentsRequest): Promise<RuntimeAgentsSnapshot>;
+  listTasks(input?: ListTasksRequest): Promise<RuntimeAgentTaskRecord[]>;
+  task(taskId: TaskId): Promise<RuntimeAgentTaskRecord>;
+  followupTask(input: FollowupTaskRequest): Promise<RuntimeTaskFollowupResult>;
+  waitTask(input: WaitTaskRequest): Promise<RuntimeAgentTaskRecord>;
+  closeTask(input: CloseTaskRequest): Promise<RuntimeAgentTaskRecord>;
   messages(sessionId: SessionId): Promise<Message[]>;
   streamEvents(input?: StreamEventsRequest): AsyncIterable<ChiliEvent>;
 }
@@ -62,6 +71,60 @@ export interface RuntimeSessionSummary {
 
 export interface ListAgentsRequest {
   sessionId?: SessionId;
+}
+
+export interface ListTasksRequest {
+  status?: AgentTaskStatus;
+  parentSessionId?: SessionId;
+  childSessionId?: SessionId;
+  limit?: number;
+}
+
+export interface RuntimeAgentTaskRecord {
+  id: TaskId;
+  path: AgentPath;
+  status: AgentTaskStatus;
+  taskName: string;
+  parentPath?: AgentPath;
+  parentSessionId?: SessionId;
+  parentThreadId?: ThreadId;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  cwd?: string;
+  prompt?: string;
+  mode?: AgentTaskMode;
+  currentRunId?: string;
+  summary?: string;
+  error?: string;
+  completion?: Record<string, unknown>;
+  createdAt: number;
+  updatedAt: number;
+  completedAt?: number;
+}
+
+export interface FollowupTaskRequest {
+  taskId: TaskId;
+  text: string;
+  maxTurns?: number;
+  system?: string[];
+}
+
+export interface RuntimeTaskFollowupResult {
+  task: RuntimeAgentTaskRecord;
+  result: RuntimePromptResult;
+}
+
+export interface WaitTaskRequest {
+  taskId: TaskId;
+  timeoutMs?: number;
+}
+
+export interface CloseTaskRequest {
+  taskId: TaskId;
+  status?: Extract<AgentTaskStatus, "completed" | "failed" | "cancelled">;
+  summary?: string;
+  error?: string;
+  interrupt?: boolean;
 }
 
 export interface StreamEventsRequest {
@@ -119,6 +182,43 @@ export class HttpRuntimeClient implements RuntimeClient {
   listAgents(input: ListAgentsRequest = {}): Promise<RuntimeAgentsSnapshot> {
     if (input.sessionId) return this.get(`sessions/${encodeURIComponent(input.sessionId)}/agents`);
     return this.get("agents");
+  }
+
+  listTasks(input: ListTasksRequest = {}): Promise<RuntimeAgentTaskRecord[]> {
+    const params = new URLSearchParams();
+    if (input.status) params.set("status", input.status);
+    if (input.parentSessionId) params.set("parentSessionId", input.parentSessionId);
+    if (input.childSessionId) params.set("childSessionId", input.childSessionId);
+    if (input.limit !== undefined) params.set("limit", String(input.limit));
+    const query = params.toString();
+    return this.get(`tasks${query ? `?${query}` : ""}`);
+  }
+
+  task(taskId: TaskId): Promise<RuntimeAgentTaskRecord> {
+    return this.get(`tasks/${encodeURIComponent(taskId)}`);
+  }
+
+  followupTask(input: FollowupTaskRequest): Promise<RuntimeTaskFollowupResult> {
+    return this.post(`tasks/${encodeURIComponent(input.taskId)}/followup`, {
+      text: input.text,
+      maxTurns: input.maxTurns,
+      system: input.system,
+    });
+  }
+
+  waitTask(input: WaitTaskRequest): Promise<RuntimeAgentTaskRecord> {
+    return this.post(`tasks/${encodeURIComponent(input.taskId)}/wait`, {
+      timeoutMs: input.timeoutMs,
+    });
+  }
+
+  closeTask(input: CloseTaskRequest): Promise<RuntimeAgentTaskRecord> {
+    return this.post(`tasks/${encodeURIComponent(input.taskId)}/close`, {
+      status: input.status,
+      summary: input.summary,
+      error: input.error,
+      interrupt: input.interrupt,
+    });
   }
 
   messages(sessionId: SessionId): Promise<Message[]> {

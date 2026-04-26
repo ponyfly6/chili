@@ -1,13 +1,27 @@
 import type { CliModelName } from "./model.js";
+import type { AgentTaskStatus } from "@chili/protocol";
 
 export interface CliArgs {
-  command: "run" | "serve" | "sessions" | "revert" | "help";
+  command:
+    | "run"
+    | "serve"
+    | "sessions"
+    | "revert"
+    | "tasks"
+    | "task"
+    | "task-followup"
+    | "task-wait"
+    | "task-close"
+    | "help";
   prompt?: string;
   cwd: string;
   host: string;
   port: number;
   resume?: string;
   snapshotId?: string;
+  taskId?: string;
+  taskStatus?: Extract<AgentTaskStatus, "completed" | "failed" | "cancelled">;
+  timeoutMs?: number;
   model: CliModelName;
   yes: boolean;
   maxTurns: number;
@@ -32,6 +46,32 @@ export function parseArgs(argv: readonly string[]): CliArgs {
 
     if (arg === "sessions" || arg === "ls") {
       result.command = "sessions";
+      continue;
+    }
+    if (arg === "tasks") {
+      result.command = "tasks";
+      continue;
+    }
+    if (arg === "task") {
+      result.command = "task";
+      result.taskId = requireValue(arg, args);
+      continue;
+    }
+    if (arg === "followup") {
+      result.command = "task-followup";
+      result.taskId = requireValue(arg, args);
+      prompt.push(...args.splice(0));
+      continue;
+    }
+    if (arg === "wait") {
+      result.command = "task-wait";
+      result.taskId = requireValue(arg, args);
+      continue;
+    }
+    if (arg === "close") {
+      result.command = "task-close";
+      result.taskId = requireValue(arg, args);
+      prompt.push(...args.splice(0));
       continue;
     }
     if (arg === "serve") {
@@ -81,6 +121,19 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       if (!Number.isInteger(result.maxTurns) || result.maxTurns <= 0) throw new Error("--max-turns must be a positive integer");
       continue;
     }
+    if (arg === "--status") {
+      const status = requireValue(arg, args);
+      if (status !== "completed" && status !== "failed" && status !== "cancelled") {
+        throw new Error("--status must be completed, failed, or cancelled");
+      }
+      result.taskStatus = status;
+      continue;
+    }
+    if (arg === "--timeout-ms") {
+      result.timeoutMs = Number.parseInt(requireValue(arg, args), 10);
+      if (!Number.isInteger(result.timeoutMs) || result.timeoutMs <= 0) throw new Error("--timeout-ms must be a positive integer");
+      continue;
+    }
     if (arg.startsWith("-")) throw new Error(`Unknown option: ${arg}`);
     prompt.push(arg, ...args.splice(0));
   }
@@ -97,6 +150,11 @@ export function usage(): string {
     "  bun run chili -- \"fix the failing test\"",
     "  bun run chili -- --resume <session-id> \"continue\"",
     "  bun run chili -- sessions",
+    "  bun run chili -- tasks",
+    "  bun run chili -- task <task-id>",
+    "  bun run chili -- followup <task-id> \"continue this task\"",
+    "  bun run chili -- wait <task-id> --timeout-ms 30000",
+    "  bun run chili -- --status cancelled close <task-id> \"stopped\"",
     "  bun run chili -- serve --port 4777",
     "  bun run chili -- revert <snapshot-id> --resume <session-id>",
     "  bun run chili -- --model fake \"hello\"",
@@ -110,6 +168,8 @@ export function usage(): string {
     "  --model <name>      minimax | fake | legacy-minimax, default minimax",
     "  --yes, -y           Auto-approve tool permissions",
     "  --max-turns <n>     Max automatic tool-use continuation turns, default 12",
+    "  --status <status>   Task close status: completed | failed | cancelled",
+    "  --timeout-ms <n>    Task wait timeout in milliseconds",
   ].join("\n");
 }
 

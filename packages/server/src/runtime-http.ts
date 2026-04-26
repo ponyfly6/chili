@@ -1,5 +1,6 @@
 import type {
   ChiliEvent,
+  AgentTaskStatus,
   RuntimeInterruptResult,
   RuntimeApprovalResolveResult,
   RuntimePromptAccepted,
@@ -8,9 +9,20 @@ import type {
   RuntimeTurnResult,
   SessionId,
   ThreadId,
+  TaskId,
 } from "@chili/protocol";
-import type { RuntimeBackgroundErrorHandler, SubmitPromptInput, SubmitPromptResult } from "@chili/core";
+import type {
+  AgentTaskCloseInput,
+  AgentTaskFinalStatus,
+  AgentTaskFollowupInput,
+  AgentTaskFollowupResult,
+  AgentTaskWaitInput,
+  RuntimeBackgroundErrorHandler,
+  SubmitPromptInput,
+  SubmitPromptResult,
+} from "@chili/core";
 import type { EventPublisher, EventStore } from "@chili/store";
+import type { AgentTaskQuery, AgentTaskRow } from "@chili/store";
 import { projectRuntimeAgents } from "./agent-projection.js";
 
 export interface RuntimeHttpService {
@@ -21,9 +33,18 @@ export interface RuntimeHttpService {
   archiveSession(sessionId: SessionId): Promise<void>;
 }
 
+export interface RuntimeTaskControlService {
+  listTasks(query?: AgentTaskQuery): Promise<AgentTaskRow[]>;
+  getTask(taskId: TaskId): Promise<AgentTaskRow>;
+  followupTask(input: AgentTaskFollowupInput): Promise<AgentTaskFollowupResult>;
+  waitForTask(input: AgentTaskWaitInput): Promise<AgentTaskRow>;
+  closeTask(input: AgentTaskCloseInput): Promise<AgentTaskRow>;
+}
+
 export interface RuntimeHttpHandlerOptions {
   service: RuntimeHttpService;
   store: EventStore & EventPublisher;
+  tasks?: RuntimeTaskControlService;
   approvals?: ApprovalResolver;
   maxBacklogEvents?: number;
   onBackgroundError?: (error: unknown) => void;
@@ -61,6 +82,50 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "listSessions") {
         return json(await options.store.sessions());
+      }
+
+      if (route.name === "listTasks") {
+        const tasks = requireTaskControl(options);
+        return json(await tasks.listTasks(taskQueryFromUrl(url)));
+      }
+
+      if (route.name === "task") {
+        const tasks = requireTaskControl(options);
+        return json(await tasks.getTask(route.taskId));
+      }
+
+      if (route.name === "taskFollowup") {
+        const tasks = requireTaskControl(options);
+        const body = await readJson<TaskFollowupBody>(request);
+        if (!body.text) throw badRequest("text is required");
+        const input: AgentTaskFollowupInput = {
+          taskId: route.taskId,
+          text: body.text,
+        };
+        if (body.maxTurns !== undefined) input.maxTurns = body.maxTurns;
+        if (body.system) input.system = body.system;
+        return json(serializeTaskFollowupResult(await tasks.followupTask(input)));
+      }
+
+      if (route.name === "taskWait") {
+        const tasks = requireTaskControl(options);
+        const body = await readJson<TaskWaitBody>(request);
+        const input: AgentTaskWaitInput = { taskId: route.taskId };
+        if (body.timeoutMs !== undefined) input.timeoutMs = body.timeoutMs;
+        return json(await tasks.waitForTask(input));
+      }
+
+      if (route.name === "taskClose") {
+        const tasks = requireTaskControl(options);
+        const body = await readJson<TaskCloseBody>(request);
+        const input: AgentTaskCloseInput = {
+          taskId: route.taskId,
+          status: closeStatus(body.status),
+        };
+        if (body.summary) input.summary = body.summary;
+        if (body.error) input.error = body.error;
+        if (body.interrupt !== undefined) input.interrupt = body.interrupt;
+        return json(await tasks.closeTask(input));
       }
 
       if (route.name === "agents") {
@@ -182,6 +247,11 @@ type Route =
   | { name: "events" }
   | { name: "agents"; sessionId?: SessionId }
   | { name: "listSessions" }
+  | { name: "listTasks" }
+  | { name: "task"; taskId: TaskId }
+  | { name: "taskFollowup"; taskId: TaskId }
+  | { name: "taskWait"; taskId: TaskId }
+  | { name: "taskClose"; taskId: TaskId }
   | { name: "createSession" }
   | { name: "messages"; sessionId: SessionId }
   | { name: "prompt"; sessionId: SessionId }
@@ -203,6 +273,23 @@ interface PromptBody {
   cwd?: string;
   maxTurns?: number;
   system?: string[];
+}
+
+interface TaskFollowupBody {
+  text?: string;
+  maxTurns?: number;
+  system?: string[];
+}
+
+interface TaskWaitBody {
+  timeoutMs?: number;
+}
+
+interface TaskCloseBody {
+  status?: unknown;
+  summary?: string;
+  error?: string;
+  interrupt?: boolean;
 }
 
 interface InterruptBody {
@@ -234,6 +321,7 @@ function routeRequest(method: string, pathname: string): Route {
   if (method === "GET" && path === "/events") return { name: "events" };
   if (method === "GET" && path === "/agents") return { name: "agents" };
   if (method === "GET" && path === "/sessions") return { name: "listSessions" };
+  if (method === "GET" && path === "/tasks") return { name: "listTasks" };
   if (method === "POST" && path === "/sessions") return { name: "createSession" };
 
   const approvalRoute = /^\/approvals\/([^/]+)\/resolve$/.exec(path);
@@ -242,6 +330,17 @@ function routeRequest(method: string, pathname: string): Route {
       name: "resolveApproval",
       approvalId: decodeURIComponent(approvalRoute[1] ?? "") as import("@chili/protocol").ApprovalId,
     };
+  }
+
+  const taskRoute = /^\/tasks\/([^/]+)(?:\/([^/]+))?$/.exec(path);
+  if (taskRoute) {
+    const taskId = decodeURIComponent(taskRoute[1] ?? "") as TaskId;
+    const action = taskRoute[2];
+    if (method === "GET" && !action) return { name: "task", taskId };
+    if (method === "POST" && action === "followup") return { name: "taskFollowup", taskId };
+    if (method === "POST" && action === "wait") return { name: "taskWait", taskId };
+    if (method === "POST" && action === "close") return { name: "taskClose", taskId };
+    return { name: "notFound" };
   }
 
   const sessionRoute = /^\/sessions\/([^/]+)\/([^/]+)$/.exec(path);
@@ -377,6 +476,13 @@ function serializeSubmitPromptResult(result: SubmitPromptResult): RuntimePromptR
   return failed;
 }
 
+function serializeTaskFollowupResult(result: AgentTaskFollowupResult): { task: AgentTaskRow; result: RuntimePromptResult } {
+  return {
+    task: result.task,
+    result: serializeSubmitPromptResult(result.result),
+  };
+}
+
 function serializeTurnResult(result: SubmitPromptResult["turns"][number]): RuntimeTurnResult {
   if (result.status === "completed") {
     const completed: Extract<RuntimeTurnResult, { status: "completed" }> = {
@@ -442,6 +548,15 @@ function notFound(message: string): HttpError {
 function toHttpError(error: unknown): HttpError {
   if (isHttpError(error)) return error;
   const err = error instanceof Error ? error : new Error(String(error));
+  if (err.name === "AgentTaskNotFoundError") {
+    return { status: 404, message: err.message };
+  }
+  if (err.name === "AgentTaskNotRunnableError") {
+    return { status: 409, message: err.message };
+  }
+  if (err.name === "AgentTaskWaitTimeoutError") {
+    return { status: 408, message: err.message };
+  }
   if (err.name === "RuntimeBusyError") {
     return { status: 409, message: err.message };
   }
@@ -465,4 +580,47 @@ function asSessionId(value: string | null): SessionId | undefined {
 
 function asThreadId(value: string | null): ThreadId | undefined {
   return value ? (value as ThreadId) : undefined;
+}
+
+function requireTaskControl(options: RuntimeHttpHandlerOptions): RuntimeTaskControlService {
+  if (!options.tasks) throw { status: 501, message: "No task control service is configured" } satisfies HttpError;
+  return options.tasks;
+}
+
+function taskQueryFromUrl(url: URL): AgentTaskQuery {
+  const query: AgentTaskQuery = {};
+  const status = taskStatus(url.searchParams.get("status"));
+  const parentSessionId = asSessionId(url.searchParams.get("parentSessionId"));
+  const childSessionId = asSessionId(url.searchParams.get("childSessionId"));
+  const limit = numberParam(url.searchParams.get("limit"));
+  if (status) query.status = status;
+  if (parentSessionId) query.parentSessionId = parentSessionId;
+  if (childSessionId) query.childSessionId = childSessionId;
+  if (limit !== undefined) query.limit = limit;
+  return query;
+}
+
+function taskStatus(value: string | null): AgentTaskStatus | undefined {
+  if (
+    value === "pending" ||
+    value === "running" ||
+    value === "completed" ||
+    value === "failed" ||
+    value === "cancelled"
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function closeStatus(value: unknown): AgentTaskFinalStatus {
+  if (value === undefined) return "cancelled";
+  if (value === "completed" || value === "failed" || value === "cancelled") return value;
+  throw badRequest("status must be completed, failed, or cancelled");
+}
+
+function numberParam(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }

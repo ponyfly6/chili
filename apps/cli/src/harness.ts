@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   AgentRunnerSubagentRunner,
+  AgentTaskControlService,
   LocalSubagentManager,
   RuntimeService,
   SingleAgentRuntime,
@@ -43,6 +44,7 @@ export interface CliHarness {
   events: ObservableEventStore;
   runtime: SingleAgentRuntime;
   service: RuntimeService;
+  tasks: AgentTaskControlService;
   recovery: SnapshotRecoveryService;
   close(): void;
 }
@@ -60,6 +62,9 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const model = await createCliModel(options.model);
   const registry = createToolRegistry();
   const childRegistry = createChildToolRegistry();
+  const childSystem = [
+    "You are a local Chili subagent. Work in the assigned repository scope, keep results concise, and return a clear final summary.",
+  ];
   const snapshotProvider = new FileSystemSnapshotProvider({
     rootDir: join(stateDir, "snapshots"),
     createId,
@@ -92,15 +97,21 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
       maxToolCallsPerTurn: 20,
     },
   });
+  const childService = new RuntimeService({
+    runtime: childRuntime,
+    store: eventStore,
+    cwd,
+    createId,
+    maxTurns: 8,
+    system: childSystem,
+  });
   const subagents = new LocalSubagentManager({
     store: eventStore,
     runner: new AgentRunnerSubagentRunner({
       runner: childRuntime,
       store: eventStore,
       maxTurns: 8,
-      system: [
-        "You are a local Chili subagent. Work in the assigned repository scope, keep results concise, and return a clear final summary.",
-      ],
+      system: childSystem,
     }),
     createId,
   });
@@ -145,6 +156,12 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     cwd,
     createId,
   });
+  const tasks = new AgentTaskControlService({
+    store: eventStore,
+    runtime: childService,
+    createId,
+    system: childSystem,
+  });
 
   return {
     cwd,
@@ -152,6 +169,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     events: eventStore,
     runtime,
     service,
+    tasks,
     recovery,
     close: () => sqliteStore.close(),
   };

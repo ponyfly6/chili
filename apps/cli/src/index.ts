@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { createInterface } from "node:readline/promises";
-import type { SessionId } from "@chili/protocol";
+import type { SessionId, TaskId } from "@chili/protocol";
 import { startRuntimeHttpServer } from "@chili/server";
 import { DeferredApprovalQueue } from "@chili/tools";
 import { parseArgs, usage } from "./args.js";
@@ -33,6 +33,52 @@ async function main(): Promise<void> {
 
     if (args.command === "sessions") {
       await printSessions(harness.store);
+      return;
+    }
+
+    if (args.command === "tasks") {
+      await printTasks(harness);
+      return;
+    }
+
+    if (args.command === "task") {
+      if (!args.taskId) throw new Error("task requires a task id");
+      await printTask(harness, args.taskId as TaskId);
+      return;
+    }
+
+    if (args.command === "task-followup") {
+      if (!args.taskId) throw new Error("followup requires a task id");
+      if (!args.prompt) throw new Error("followup requires prompt text");
+      const controller = installInterruptHandler();
+      const result = await harness.tasks.followupTask({
+        taskId: args.taskId as TaskId,
+        text: args.prompt,
+        maxTurns: args.maxTurns,
+        signal: controller.signal,
+      });
+      console.log(`[task] ${result.task.id}\t${result.task.status}\t${result.task.summary ?? ""}`);
+      return;
+    }
+
+    if (args.command === "task-wait") {
+      if (!args.taskId) throw new Error("wait requires a task id");
+      const input: { taskId: TaskId; timeoutMs?: number } = { taskId: args.taskId as TaskId };
+      if (args.timeoutMs !== undefined) input.timeoutMs = args.timeoutMs;
+      const task = await harness.tasks.waitForTask(input);
+      console.log(`[task] ${task.id}\t${task.status}\t${task.summary ?? ""}`);
+      return;
+    }
+
+    if (args.command === "task-close") {
+      if (!args.taskId) throw new Error("close requires a task id");
+      const input: { taskId: TaskId; status?: "completed" | "failed" | "cancelled"; summary?: string } = {
+        taskId: args.taskId as TaskId,
+      };
+      if (args.taskStatus) input.status = args.taskStatus;
+      if (args.prompt) input.summary = args.prompt;
+      const task = await harness.tasks.closeTask(input);
+      console.log(`[task] ${task.id}\t${task.status}\t${task.summary ?? ""}`);
       return;
     }
 
@@ -86,6 +132,7 @@ async function serve(input: {
   const server = startRuntimeHttpServer({
     service: input.harness.service,
     store: input.harness.events,
+    tasks: input.harness.tasks,
     approvals: input.approvalQueue,
     hostname: input.host,
     port: input.port,
@@ -117,6 +164,31 @@ async function printSessions(store: Awaited<ReturnType<typeof createCliHarness>>
   }
 }
 
+async function printTasks(harness: Awaited<ReturnType<typeof createCliHarness>>): Promise<void> {
+  const tasks = await harness.tasks.listTasks();
+  if (tasks.length === 0) {
+    console.log("No tasks yet.");
+    return;
+  }
+  for (const task of tasks) {
+    console.log(
+      [
+        task.id,
+        task.status,
+        task.childSessionId ?? "",
+        task.updatedAt ? new Date(task.updatedAt).toISOString() : "",
+        task.taskName,
+        task.summary ?? "",
+      ].join("\t"),
+    );
+  }
+}
+
+async function printTask(harness: Awaited<ReturnType<typeof createCliHarness>>, taskId: TaskId): Promise<void> {
+  const task = await harness.tasks.getTask(taskId);
+  console.log(JSON.stringify(task, null, 2));
+}
+
 async function repl(input: {
   harness: Awaited<ReturnType<typeof createCliHarness>>;
   sessionId: SessionId;
@@ -131,11 +203,28 @@ async function repl(input: {
       if (!line) continue;
       if (line === "/exit" || line === "/quit") return;
       if (line === "/help") {
-        console.log(["/help                 Show commands", "/sessions             List sessions", "/revert <snapshotId>  Revert a snapshot in this session", "/exit                 Quit"].join("\n"));
+        console.log(
+          [
+            "/help                 Show commands",
+            "/sessions             List sessions",
+            "/tasks                List subagent tasks",
+            "/task <taskId>        Show a subagent task",
+            "/revert <snapshotId>  Revert a snapshot in this session",
+            "/exit                 Quit",
+          ].join("\n"),
+        );
         continue;
       }
       if (line === "/sessions") {
         await printSessions(input.harness.store);
+        continue;
+      }
+      if (line === "/tasks") {
+        await printTasks(input.harness);
+        continue;
+      }
+      if (line.startsWith("/task ")) {
+        await printTask(input.harness, line.slice("/task ".length).trim() as TaskId);
         continue;
       }
       if (line.startsWith("/revert ")) {

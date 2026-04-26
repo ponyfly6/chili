@@ -1,7 +1,19 @@
-import type { ChiliEvent, EventEnvelope, Message, MessagePart, MessageRole, SessionId } from "@chili/protocol";
-import type { ApprovalRow, EventQuery, EventStore, SessionRow } from "@chili/store";
+import type { ChiliEvent, EventEnvelope, Message, MessagePart, MessageRole, SessionId, TaskId } from "@chili/protocol";
+import type {
+  AgentMailboxQuery,
+  AgentMailboxRow,
+  AgentRunQuery,
+  AgentRunRow,
+  AgentTaskQuery,
+  AgentTaskRow,
+  ApprovalRow,
+  EventQuery,
+  EventStore,
+  SessionRow,
+  SubagentProjectionStore,
+} from "@chili/store";
 
-export class PrintingEventStore implements EventStore {
+export class PrintingEventStore implements EventStore, SubagentProjectionStore {
   constructor(private readonly inner: EventStore, private readonly printer: CliPrinter) {}
 
   async append(event: ChiliEvent): Promise<void> {
@@ -28,6 +40,30 @@ export class PrintingEventStore implements EventStore {
 
   pendingApprovals(sessionId?: SessionId): Promise<ApprovalRow[]> {
     return this.inner.pendingApprovals(sessionId);
+  }
+
+  agentTasks(query?: AgentTaskQuery): Promise<AgentTaskRow[]> {
+    return this.subagentStore()?.agentTasks(query) ?? Promise.resolve([]);
+  }
+
+  agentTask(taskId: TaskId): Promise<AgentTaskRow | undefined> {
+    return this.subagentStore()?.agentTask(taskId) ?? Promise.resolve(undefined);
+  }
+
+  agentRuns(query?: AgentRunQuery): Promise<AgentRunRow[]> {
+    return this.subagentStore()?.agentRuns(query) ?? Promise.resolve([]);
+  }
+
+  agentMailbox(query?: AgentMailboxQuery): Promise<AgentMailboxRow[]> {
+    return this.subagentStore()?.agentMailbox(query) ?? Promise.resolve([]);
+  }
+
+  private subagentStore(): SubagentProjectionStore | undefined {
+    const inner = this.inner as EventStore & Partial<SubagentProjectionStore>;
+    if (inner.agentTasks && inner.agentTask && inner.agentRuns && inner.agentMailbox) {
+      return inner as SubagentProjectionStore;
+    }
+    return undefined;
   }
 }
 

@@ -15,6 +15,7 @@
     "smoke:cli": "bun run scripts/smoke-cli.ts",
     "smoke:p0p1": "bun run scripts/smoke-p0-p1.ts",
     "smoke:p2": "bun run scripts/smoke-p2-subagent.ts",
+    "smoke:p2-control": "bun run scripts/smoke-p2-task-control.ts",
     "typecheck": "tsc -b"
   },
   "devDependencies": {
