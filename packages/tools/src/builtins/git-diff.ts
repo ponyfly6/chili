@@ -12,8 +12,12 @@ export interface GitDiffInput {
 export function createGitDiffTool(): ChiliToolDefinition<GitDiffInput> {
   return {
     name: "git_diff",
+    searchHint: "Inspect git diff output, staged changes, stats, or path-specific diffs.",
     description: "Read git diff output for the current workspace.",
     risk: "read",
+    isReadOnly: true,
+    isConcurrencySafe: true,
+    maxResultOutputBytes: 100_000,
     inputSchema: {
       type: "object",
       properties: {

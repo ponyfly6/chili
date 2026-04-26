@@ -31,6 +31,7 @@ export interface SingleAgentRuntimeOptions {
   contextBuilder?: ContextWindowBuilder;
   retryPolicy?: RetryPolicy;
   doomLoopGuard?: DoomLoopGuardOptions;
+  maxConcurrentToolCalls?: number;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
 }
@@ -403,18 +404,48 @@ export class SingleAgentRuntime implements AgentRunner {
     assistantMessageId: MessageId,
     toolCalls: readonly PendingToolCall[],
   ): Promise<void> {
+    const concurrentLimit = this.options.maxConcurrentToolCalls ?? 10;
+    let batch: PendingToolCall[] = [];
+
+    const flush = async (): Promise<void> => {
+      if (batch.length === 0) return;
+      const current = batch;
+      batch = [];
+      const results = await Promise.all(
+        current.map((toolCall) => this.runToolCall(input, turnId, assistantMessageId, toolCall)),
+      );
+      let cancelled: Error | undefined;
+      for (const result of results) {
+        await this.appendPart(input, assistantMessageId, result.part);
+        if (result.cancelledError && !cancelled) cancelled = result.cancelledError;
+      }
+      if (cancelled) throw cancelled;
+    };
+
     for (const toolCall of toolCalls) {
       if (input.signal?.aborted) throw abortError("Turn aborted");
-      await this.executeToolCall(input, turnId, assistantMessageId, toolCall);
+      const safe = await this.options.toolExecutor.canRunConcurrently(toolCall.toolName, toolCall.input);
+      if (safe) {
+        batch.push(toolCall);
+        if (batch.length >= concurrentLimit) await flush();
+        continue;
+      }
+
+      await flush();
+      const result = await this.runToolCall(input, turnId, assistantMessageId, toolCall);
+      await this.appendPart(input, assistantMessageId, result.part);
+      if (result.cancelledError) throw result.cancelledError;
     }
+
+    await flush();
   }
 
-  private async executeToolCall(
+  private async runToolCall(
     input: RunTurnInput,
     turnId: TurnId,
     assistantMessageId: MessageId,
     toolCall: PendingToolCall,
-  ): Promise<void> {
+  ): Promise<{ part: MessagePart; cancelledError?: Error }> {
     const executeInput = {
       sessionId: input.sessionId,
       threadId: input.threadId,
@@ -442,11 +473,10 @@ export class SingleAgentRuntime implements AgentRunner {
       if (result.result.artifactIds) {
         part.artifactIds = result.result.artifactIds;
       }
-      await this.appendPart(input, assistantMessageId, part);
-      return;
+      return { part };
     }
 
-    await this.appendPart(input, assistantMessageId, {
+    const part: MessagePart = {
       id: this.id<PartId>("part"),
       messageId: assistantMessageId,
       sessionId: input.sessionId,
@@ -455,10 +485,11 @@ export class SingleAgentRuntime implements AgentRunner {
       output: "",
       error: result.error.message,
       synthetic: true,
-    });
+    };
     if (result.status === "cancelled") {
-      throw result.error;
+      return { part, cancelledError: result.error };
     }
+    return { part };
   }
 
   private async appendPart(input: EventContext, messageId: MessageId, part: MessagePart): Promise<void> {

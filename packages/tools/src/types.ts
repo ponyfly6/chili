@@ -13,22 +13,38 @@ import type {
   ToolResult,
   TurnId,
 } from "@chili/protocol";
+import type { FileReadStateStore } from "./file-read-state.js";
 
 export type ValidationResult<Input> =
   | { ok: true; value: Input }
   | { ok: false; message: string };
 
-export interface ChiliToolDefinition<Input = unknown, Output extends ToolResult = ToolResult>
-  extends ToolDefinition<Input, Output> {
+export interface ChiliToolDefinition<Input = any, Output extends ToolResult = ToolResult>
+  extends Omit<ToolDefinition<Input, Output>, "execute"> {
   aliases?: string[];
+  searchHint?: string;
+  alwaysLoad?: boolean;
+  shouldDefer?: boolean;
+  interruptBehavior?: "cancel" | "block";
+  maxResultOutputBytes?: number;
+  isReadOnly?: ToolBooleanPredicate<Input>;
+  isConcurrencySafe?: ToolBooleanPredicate<Input>;
+  isDestructive?: ToolBooleanPredicate<Input>;
   validate?(input: unknown): Promise<ValidationResult<Input>> | ValidationResult<Input>;
   approval?(input: Input): false | ToolApprovalSpec;
+  execute(input: Input, context: ChiliToolExecutionContext): Promise<Output>;
 }
 
 export interface ToolApprovalSpec {
   permission?: string;
   patterns: string[];
   metadata?: Record<string, unknown>;
+}
+
+export type ToolBooleanPredicate<Input = any> = boolean | ((input: Input) => boolean | Promise<boolean>);
+
+export interface ChiliToolExecutionContext extends ToolExecutionContext {
+  fileReads?: FileReadStateStore;
 }
 
 export interface ToolRegistry {
@@ -63,6 +79,7 @@ export interface ToolExecutorOptions {
   approvals: ApprovalBroker;
   snapshotProvider?: SnapshotProvider;
   snapshotPolicy?: SnapshotPolicy;
+  fileReadState?: FileReadStateStore;
   maxResultOutputBytes?: number;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;

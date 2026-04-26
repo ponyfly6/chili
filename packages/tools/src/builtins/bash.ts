@@ -12,8 +12,14 @@ export function createBashTool(): ChiliToolDefinition<BashInput> {
   return {
     name: "bash",
     aliases: ["run_shell_command"],
+    searchHint: "Run shell commands; read-only commands can be scheduled concurrently.",
     description: "Run a non-interactive shell command in the workspace.",
     risk: "execute",
+    isReadOnly: (input) => isReadOnlyShellCommand(input.command),
+    isConcurrencySafe: (input) => isReadOnlyShellCommand(input.command),
+    isDestructive: (input) => !isReadOnlyShellCommand(input.command),
+    interruptBehavior: "cancel",
+    maxResultOutputBytes: 30_000,
     inputSchema: {
       type: "object",
       required: ["command"],
@@ -57,6 +63,8 @@ export function createBashTool(): ChiliToolDefinition<BashInput> {
         patterns: [input.command],
         metadata: {
           command: input.command,
+          commandPrefix: commandPrefix(input.command),
+          readOnly: isReadOnlyShellCommand(input.command),
         },
       };
     },
@@ -90,6 +98,56 @@ export function createBashTool(): ChiliToolDefinition<BashInput> {
       };
     },
   };
+}
+
+function isReadOnlyShellCommand(command: string): boolean {
+  const normalized = command.trim();
+  if (!normalized) return false;
+  if (/(^|[;&|]\s*)(rm|mv|cp|touch|mkdir|rmdir|chmod|chown|sudo|tee|python|node|bun|npm|pnpm|yarn|make)\b/.test(normalized)) {
+    return false;
+  }
+  if (/(^|\s)(>|>>|2>|&>)/.test(normalized)) return false;
+
+  const segments = normalized
+    .split(/\s*(?:&&|\|\|)\s*/)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  if (segments.length === 0) return false;
+  return segments.every(isReadOnlySegment);
+}
+
+function isReadOnlySegment(command: string): boolean {
+  const tokens = command.split(/\s+/);
+  const first = tokens[0] ?? "";
+  const second = tokens[1] ?? "";
+  const prefix = second ? `${first} ${second}` : first;
+  const readOnlyPrefixes = [
+    "pwd",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "grep",
+    "rg",
+    "find",
+    "sed",
+    "awk",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git branch",
+    "git rev-parse",
+    "git ls-files",
+    "git grep",
+  ];
+  return readOnlyPrefixes.some((allowed) => prefix === allowed || command.startsWith(`${allowed} `));
+}
+
+function commandPrefix(command: string): string {
+  const tokens = command.trim().split(/\s+/).filter(Boolean);
+  return tokens.slice(0, Math.min(tokens.length, 2)).join(" ");
 }
 
 function formatCommandOutput(stdout: string, stderr: string): string {

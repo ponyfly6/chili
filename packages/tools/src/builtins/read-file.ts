@@ -13,8 +13,12 @@ export function createReadFileTool(): ChiliToolDefinition<ReadFileInput> {
   return {
     name: "read",
     aliases: ["read_file"],
+    searchHint: "Read text files with optional line offsets and byte limits.",
     description: "Read a UTF-8 text file within the current workspace.",
     risk: "read",
+    isReadOnly: true,
+    isConcurrencySafe: true,
+    maxResultOutputBytes: Infinity,
     inputSchema: {
       type: "object",
       required: ["filePath"],
@@ -78,6 +82,10 @@ export function createReadFileTool(): ChiliToolDefinition<ReadFileInput> {
       const truncated = buffer.byteLength > maxBytes;
       const rawContent = buffer.subarray(0, maxBytes).toString("utf8");
       const content = sliceLines(rawContent, input.offset, input.limit);
+      const fullRead = !truncated && input.offset === undefined && input.limit === undefined;
+      if (fullRead) {
+        await context.fileReads?.recordTextRead(workspace, target, rawContent);
+      }
 
       return {
         title: rel,

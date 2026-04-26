@@ -14,8 +14,14 @@ export function createEditTool(): ChiliToolDefinition<EditInput> {
   return {
     name: "edit",
     aliases: ["replace"],
+    searchHint: "Replace exact literal text in a workspace file after reading it.",
     description: "Replace exact literal text in a workspace file.",
     risk: "write",
+    isReadOnly: false,
+    isConcurrencySafe: false,
+    isDestructive: false,
+    interruptBehavior: "block",
+    maxResultOutputBytes: 100_000,
     inputSchema: {
       type: "object",
       required: ["filePath", "oldString", "newString"],
@@ -81,10 +87,14 @@ export function createEditTool(): ChiliToolDefinition<EditInput> {
       const workspace = resolve(context.cwd);
       const target = resolveWorkspacePath(workspace, input.filePath);
       const existing = await readTextIfExists(target.absolutePath);
+      if (existing !== undefined) {
+        await context.fileReads?.assertFresh(workspace, target.absolutePath);
+      }
 
       if (input.oldString === "") {
         await mkdir(dirname(target.absolutePath), { recursive: true });
         await writeFile(target.absolutePath, input.newString, "utf8");
+        await context.fileReads?.recordTextRead(workspace, target.absolutePath, input.newString);
         return {
           title: target.relativePath,
           output: existing === undefined ? "Created file successfully." : "Replaced file contents successfully.",
@@ -114,6 +124,7 @@ export function createEditTool(): ChiliToolDefinition<EditInput> {
 
       const next = input.replaceAll ? existing.split(oldString).join(newString) : existing.replace(oldString, newString);
       await writeFile(target.absolutePath, next, "utf8");
+      await context.fileReads?.recordTextRead(workspace, target.absolutePath, next);
 
       return {
         title: target.relativePath,

@@ -151,6 +151,59 @@ test("consumes rich model streams and executes tool calls after the stream finis
   expect(toolStartedIndex).toBeGreaterThan(toolCallPartIndex);
 });
 
+test("runs concurrency-safe tool calls in parallel and preserves result order", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  let running = 0;
+  let maxRunning = 0;
+  registry.register({
+    name: "parallel",
+    description: "Parallel read tool.",
+    risk: "read",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    isReadOnly: true,
+    isConcurrencySafe: true,
+    execute: async (input) => {
+      running++;
+      maxRunning = Math.max(maxRunning, running);
+      const value = isRecord(input) && typeof input.value === "string" ? input.value : "";
+      await sleepMs(value === "first" ? 30 : 1);
+      running--;
+      return { title: value, output: value };
+    },
+  });
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "tool_call", name: "parallel", input: { value: "first" } };
+      yield { type: "tool_call", name: "parallel", input: { value: "second" } };
+      yield { type: "finish", reason: "tool_use" };
+    },
+  };
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+    }),
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const result = await runtime.runTurn({
+    sessionId: "session_parallel_tools" as SessionId,
+    threadId: "thread_parallel_tools" as ThreadId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(maxRunning).toBe(2);
+  expect(toolResultParts(store).map((part) => part.output)).toEqual(["first", "second"]);
+});
+
 test("clears the reserved runtime when the initial running status write fails", async () => {
   const store = new ThrowingStatusStore();
   const service = new RuntimeService({
@@ -268,4 +321,12 @@ function abortError(message: string): Error {
   const error = new Error(message);
   error.name = "AbortError";
   return error;
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

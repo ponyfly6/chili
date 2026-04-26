@@ -1,6 +1,6 @@
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
-import type { ChiliToolDefinition, ValidationResult } from "../types.js";
+import type { ChiliToolDefinition, ChiliToolExecutionContext, ValidationResult } from "../types.js";
 
 export interface ApplyPatchInput {
   patchText?: string;
@@ -51,8 +51,14 @@ interface AppliedOperation {
 export function createApplyPatchTool(): ChiliToolDefinition<ApplyPatchInput> {
   return {
     name: "apply_patch",
+    searchHint: "Apply structured create, replace, delete, or raw patch operations to workspace files.",
     description: "Apply Codex/OpenCode-style patch text to files inside the workspace.",
     risk: "write",
+    isReadOnly: false,
+    isConcurrencySafe: false,
+    isDestructive: (input) => input.operations.some((operation) => operation.type === "delete"),
+    interruptBehavior: "block",
+    maxResultOutputBytes: 100_000,
     inputSchema: {
       type: "object",
       properties: {
@@ -114,6 +120,7 @@ export function createApplyPatchTool(): ChiliToolDefinition<ApplyPatchInput> {
 
       for (const operation of input.operations) {
         const target = resolveWorkspacePath(workspace, operation.path);
+        await assertPatchReadState(workspace, target, operation, context.fileReads);
         if (operation.type === "create") {
           applied.push(await createFile(target, operation));
         } else if (operation.type === "replace") {
@@ -123,6 +130,7 @@ export function createApplyPatchTool(): ChiliToolDefinition<ApplyPatchInput> {
         } else {
           applied.push(await applyRawUpdate(workspace, target, operation));
         }
+        await updatePatchReadState(workspace, operation, context.fileReads);
       }
 
       const changed = applied.filter((operation) => operation.changed);
@@ -319,6 +327,53 @@ async function createFile(target: WorkspacePath, operation: CreateFileOperation)
     changed: existing !== operation.content,
     detail: existing === undefined ? "created" : "overwritten",
   };
+}
+
+async function assertPatchReadState(
+  workspace: string,
+  target: WorkspacePath,
+  operation: ApplyPatchOperation,
+  fileReads: ChiliToolExecutionContext["fileReads"],
+): Promise<void> {
+  if (!fileReads) return;
+
+  if (operation.type === "create") {
+    const existing = await readTextIfExists(target.absolutePath);
+    if (existing !== undefined) await fileReads.assertFresh(workspace, target.absolutePath);
+    return;
+  }
+
+  await fileReads.assertFresh(workspace, target.absolutePath);
+  if (operation.type === "raw_update" && operation.movePath) {
+    const outputPath = resolveWorkspacePath(workspace, operation.movePath);
+    if (outputPath.absolutePath !== target.absolutePath) {
+      const existingOutput = await readTextIfExists(outputPath.absolutePath);
+      if (existingOutput !== undefined) await fileReads.assertFresh(workspace, outputPath.absolutePath);
+    }
+  }
+}
+
+async function updatePatchReadState(
+  workspace: string,
+  operation: ApplyPatchOperation,
+  fileReads: ChiliToolExecutionContext["fileReads"],
+): Promise<void> {
+  if (!fileReads) return;
+
+  if (operation.type === "delete") {
+    const target = resolveWorkspacePath(workspace, operation.path);
+    fileReads.forget(workspace, target.absolutePath);
+    return;
+  }
+
+  const outputPath = operation.type === "raw_update" && operation.movePath ? operation.movePath : operation.path;
+  const target = resolveWorkspacePath(workspace, outputPath);
+  const content = await readTextIfExists(target.absolutePath);
+  if (content !== undefined) await fileReads.recordTextRead(workspace, target.absolutePath, content);
+  if (operation.type === "raw_update" && operation.movePath) {
+    const source = resolveWorkspacePath(workspace, operation.path);
+    if (source.absolutePath !== target.absolutePath) fileReads.forget(workspace, source.absolutePath);
+  }
 }
 
 async function deleteFile(target: WorkspacePath, operation: DeleteFileOperation): Promise<AppliedOperation> {
