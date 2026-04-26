@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { expect, test } from "bun:test";
 import type {
   ChiliEvent,
@@ -11,6 +14,7 @@ import type {
   TurnId,
 } from "@chili/protocol";
 import type { ApprovalRow, EventQuery, EventStore, SessionRow } from "@chili/store";
+import { SqliteEventStore } from "@chili/store";
 import type { AgentRunner, AppendUserMessageInput, CreateSessionInput, RunTurnInput, RunTurnResult } from "./runner.js";
 import {
   AgentRunnerSubagentRunner,
@@ -212,6 +216,271 @@ test("tracks background subagent tasks until they complete", async () => {
     type: "agent.completed",
     payload: { taskId: "task_1", status: "completed", summary: "background done" },
   });
+});
+
+test("background subagents run under a durable task lease", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-subagent-lease-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  let runGeneration: number | undefined;
+  let leaseOwner: string | undefined;
+  const manager = new LocalSubagentManager({
+    store,
+    createId: createSequentialId(),
+    now: () => 100 as TimestampMs,
+    leaseTtlMs: 90,
+    leaseHeartbeatIntervalMs: 20,
+    runner: {
+      async run(input) {
+        runGeneration = input.generation;
+        leaseOwner = (await store.agentTask(input.taskId))?.leaseOwner;
+        return { status: "completed", summary: "background done" };
+      },
+    },
+  });
+
+  try {
+    const task = await manager.spawnTask({
+      parentSessionId: "session_parent" as SessionId,
+      parentThreadId: "thread_parent" as ThreadId,
+      cwd: "/repo",
+      taskName: "background reader",
+      prompt: "Read README",
+      mode: "background",
+    });
+
+    await manager.waitForBackgroundTasks();
+
+    expect(runGeneration).toBe(2);
+    expect(leaseOwner).toBe("local:agent_2");
+    expect(await store.agentTask(task.taskId)).toMatchObject({
+      id: task.taskId,
+      status: "completed",
+      generation: 2,
+      summary: "background done",
+    });
+    expect((await store.agentTask(task.taskId))?.leaseOwner).toBeUndefined();
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("background subagents abort when an external close invalidates the lease", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-subagent-lease-close-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  let started!: () => void;
+  let abortSeen = false;
+  const startedPromise = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const manager = new LocalSubagentManager({
+    store,
+    createId: createSequentialId(),
+    now: () => 100 as TimestampMs,
+    leaseTtlMs: 90,
+    leaseHeartbeatIntervalMs: 2,
+    runner: {
+      async run(input) {
+        started();
+        await new Promise<void>((resolve) => {
+          input.signal?.addEventListener(
+            "abort",
+            () => {
+              abortSeen = true;
+              resolve();
+            },
+            { once: true },
+          );
+        });
+        return { status: "completed", summary: "late completion" };
+      },
+    },
+  });
+
+  try {
+    const task = await manager.spawnTask({
+      parentSessionId: "session_parent" as SessionId,
+      parentThreadId: "thread_parent" as ThreadId,
+      cwd: "/repo",
+      taskName: "background reader",
+      prompt: "Read README",
+      mode: "background",
+    });
+    await startedPromise;
+    const leasedTask = await store.agentTask(task.taskId);
+    expect(leasedTask).toMatchObject({
+      status: "running",
+      generation: 2,
+      leaseOwner: "local:agent_2",
+    });
+
+    await store.append({
+      id: "event_external_close",
+      type: "agent.task_completed",
+      time: 101 as TimestampMs,
+      sessionId: "session_parent" as SessionId,
+      threadId: "thread_parent" as ThreadId,
+      payload: {
+        taskId: task.taskId,
+        path: task.path,
+        runId: task.runId,
+        generation: (leasedTask?.generation ?? 0) + 1,
+        status: "cancelled",
+        summary: "external close",
+      },
+    });
+
+    await waitUntil(() => abortSeen);
+    await manager.waitForBackgroundTasks();
+
+    expect(await store.agentTask(task.taskId)).toMatchObject({
+      id: task.taskId,
+      status: "cancelled",
+      generation: 3,
+      summary: "external close",
+    });
+    expect((await store.events({ type: "agent.task_completed", limit: 10 })).map((event) => event.id)).toEqual([
+      "event_external_close",
+    ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("background subagents suppress completion when external close wins before heartbeat", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-subagent-lease-race-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  let started!: () => void;
+  let finish!: () => void;
+  const startedPromise = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const finishPromise = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  const manager = new LocalSubagentManager({
+    store,
+    createId: createSequentialId(),
+    now: () => 100 as TimestampMs,
+    leaseTtlMs: 90,
+    leaseHeartbeatIntervalMs: 1_000,
+    runner: {
+      async run() {
+        started();
+        await finishPromise;
+        return { status: "completed", summary: "late completion" };
+      },
+    },
+  });
+
+  try {
+    const task = await manager.spawnTask({
+      parentSessionId: "session_parent" as SessionId,
+      parentThreadId: "thread_parent" as ThreadId,
+      cwd: "/repo",
+      taskName: "background reader",
+      prompt: "Read README",
+      mode: "background",
+    });
+    await startedPromise;
+    const leasedTask = await store.agentTask(task.taskId);
+
+    await store.append({
+      id: "event_external_close_before_finish",
+      type: "agent.task_completed",
+      time: 101 as TimestampMs,
+      sessionId: "session_parent" as SessionId,
+      threadId: "thread_parent" as ThreadId,
+      payload: {
+        taskId: task.taskId,
+        path: task.path,
+        runId: task.runId,
+        generation: (leasedTask?.generation ?? 0) + 1,
+        status: "cancelled",
+        summary: "external close",
+      },
+    });
+
+    finish();
+    await manager.waitForBackgroundTasks();
+
+    expect(await store.agentTask(task.taskId)).toMatchObject({
+      id: task.taskId,
+      status: "cancelled",
+      generation: 3,
+      summary: "external close",
+    });
+    expect((await store.events({ type: "agent.task_completed", limit: 10 })).map((event) => event.id)).toEqual([
+      "event_external_close_before_finish",
+    ]);
+    expect(await store.events({ type: "agent.completed", limit: 10 })).toEqual([]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("complete_task completes a leased local background task without leaking the lease", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-subagent-lease-complete-tool-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const manager = new LocalSubagentManager({
+    store,
+    createId: createSequentialId(),
+    now: () => 100 as TimestampMs,
+    leaseTtlMs: 90,
+    leaseHeartbeatIntervalMs: 20,
+    runner: {
+      async run(input) {
+        await new Promise<void>((_resolve, reject) => {
+          input.signal?.addEventListener(
+            "abort",
+            () => {
+              const error = new Error("aborted");
+              error.name = "AbortError";
+              reject(error);
+            },
+            { once: true },
+          );
+        });
+        return { status: "completed", summary: "late completion" };
+      },
+    },
+  });
+
+  try {
+    const task = await manager.spawnTask({
+      parentSessionId: "session_parent" as SessionId,
+      parentThreadId: "thread_parent" as ThreadId,
+      cwd: "/repo",
+      taskName: "background reader",
+      prompt: "Read README",
+      mode: "background",
+    });
+
+    await waitUntil(async () => Boolean((await store.agentTask(task.taskId))?.leaseOwner));
+    await manager.completeTask({ taskId: task.taskId, summary: "tool summary" });
+    await manager.waitForBackgroundTasks();
+
+    expect(await store.agentTask(task.taskId)).toMatchObject({
+      id: task.taskId,
+      status: "completed",
+      generation: 2,
+      summary: "tool summary",
+    });
+    expect((await store.agentTask(task.taskId))?.leaseOwner).toBeUndefined();
+    expect((await store.events({ type: "agent.completed", limit: 10 })).at(-1)).toMatchObject({
+      payload: {
+        taskId: task.taskId,
+        status: "completed",
+        generation: 2,
+        summary: "tool summary",
+      },
+    });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("complete_task fails for unknown local subagent tasks", async () => {
@@ -435,4 +704,13 @@ class FakeChildRunner implements AgentRunner {
 function createSequentialId(): (prefix: string) => string {
   let index = 0;
   return (prefix) => `${prefix}_${++index}`;
+}
+
+async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("Timed out waiting for condition");
 }

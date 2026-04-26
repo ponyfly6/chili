@@ -9,7 +9,7 @@ import type {
   TimestampMs,
 } from "@chili/protocol";
 import { joinAgentPath, ROOT_AGENT_PATH, timestampNow } from "@chili/protocol";
-import type { EventStore } from "@chili/store";
+import type { AgentTaskLeaseStore, EventStore } from "@chili/store";
 import type {
   CompleteTaskToolInput,
   SubagentController,
@@ -75,18 +75,31 @@ export interface LocalSubagentRunner {
 export type LocalSubagentBackgroundErrorHandler = (error: unknown, task: LocalSubagentTaskResult) => void;
 
 export interface LocalSubagentManagerOptions {
-  store: EventStore;
+  store: EventStore & Partial<AgentTaskLeaseStore>;
   runner: LocalSubagentRunner;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
   onBackgroundError?: LocalSubagentBackgroundErrorHandler;
+  leaseTtlMs?: number;
+  leaseHeartbeatIntervalMs?: number;
 }
 
 interface LocalSubagentTaskState {
   task: LocalSubagentTaskResult;
   runInput: LocalSubagentRunInput;
   controller: AbortController;
+  lease?: LocalSubagentTaskLease;
   externallyClosed?: boolean;
+}
+
+interface LocalSubagentTaskLease {
+  owner: string;
+  generation: number;
+  ttlMs: number;
+  heartbeatIntervalMs: number;
+  timer?: ReturnType<typeof setInterval>;
+  renewing?: boolean;
+  stopped?: boolean;
 }
 
 export interface AgentRunnerSubagentRunnerOptions {
@@ -127,8 +140,12 @@ export class LocalSubagentManager implements SubagentController {
     if (state.externallyClosed || state.task.status !== "running") {
       throw new Error(`Local subagent task already completed: ${input.taskId}`);
     }
+    if (!(await this.ensureTaskLease(state))) {
+      throw new Error(`Local subagent task lease lost: ${input.taskId}`);
+    }
     state.task.status = input.status ?? "completed";
     state.task.summary = input.summary;
+    this.stopLeaseHeartbeat(state);
     await this.appendTaskCompletion(state.runInput, state.task);
     state.controller.abort();
     return {
@@ -147,6 +164,8 @@ export class LocalSubagentManager implements SubagentController {
     if (!state) return false;
     state.externallyClosed = true;
     state.task.status = "cancelled";
+    this.stopLeaseHeartbeat(state);
+    await this.releaseTaskLease(state);
     state.controller.abort();
     return true;
   }
@@ -224,7 +243,16 @@ export class LocalSubagentManager implements SubagentController {
     };
     if (input.parentThreadId) runInput.parentThreadId = input.parentThreadId;
     runInput.signal = controller.signal;
+
+    const lease = await this.claimTaskLease(runInput);
+    if (lease) {
+      runInput.generation = lease.generation;
+    }
     const state: LocalSubagentTaskState = { task, runInput, controller };
+    if (lease) {
+      state.lease = lease;
+      this.startLeaseHeartbeat(state);
+    }
     this.tasks.set(taskId, state);
 
     if (mode === "background") {
@@ -251,28 +279,159 @@ export class LocalSubagentManager implements SubagentController {
       const result = await this.options.runner.run(input);
       if (state.externallyClosed) return task;
       if (task.status !== "running") {
+        this.stopLeaseHeartbeat(state);
         await this.appendAgentCompletion(input, task);
         return task;
       }
+      if (!(await this.ensureTaskLease(state))) return task;
       task.status = result.status;
       if (result.summary) task.summary = result.summary;
       if (result.error) task.error = result.error;
+      this.stopLeaseHeartbeat(state);
       await this.appendTaskCompletion(input, task);
       await this.appendAgentCompletion(input, task);
       return task;
     } catch (error) {
       if (state.externallyClosed) return task;
       if (task.status !== "running") {
+        this.stopLeaseHeartbeat(state);
         await this.appendAgentCompletion(input, task);
         return task;
       }
+      if (!(await this.ensureTaskLease(state))) return task;
       const err = toError(error);
       task.status = isAbortError(err) ? "cancelled" : "failed";
       task.error = err;
+      this.stopLeaseHeartbeat(state);
       await this.appendTaskCompletion(input, task);
       await this.appendAgentCompletion(input, task);
       return task;
+    } finally {
+      this.stopLeaseHeartbeat(state);
     }
+  }
+
+  private async claimTaskLease(input: LocalSubagentRunInput): Promise<LocalSubagentTaskLease | undefined> {
+    const store = this.leaseStore();
+    if (!store) return undefined;
+
+    const ttlMs = this.options.leaseTtlMs ?? 30_000;
+    const result = await store.claimAgentTaskLease({
+      taskId: input.taskId,
+      runId: input.runId,
+      generation: input.generation,
+      owner: leaseOwner(input.runId),
+      ttlMs,
+      now: Number(this.now()),
+    });
+    if (!result.acquired || !result.task) {
+      throw new Error(`Could not acquire local subagent task lease: ${input.taskId}`);
+    }
+
+    return {
+      owner: leaseOwner(input.runId),
+      generation: result.task.generation,
+      ttlMs,
+      heartbeatIntervalMs: this.leaseHeartbeatIntervalMs(ttlMs),
+    };
+  }
+
+  private startLeaseHeartbeat(state: LocalSubagentTaskState): void {
+    const lease = state.lease;
+    if (!lease || lease.timer) return;
+    lease.timer = setInterval(() => {
+      void this.renewTaskLease(state).catch((error) => this.cancelForLeaseLoss(state, error));
+    }, lease.heartbeatIntervalMs);
+    unrefTimer(lease.timer);
+  }
+
+  private stopLeaseHeartbeat(state: LocalSubagentTaskState): void {
+    const lease = state.lease;
+    if (!lease || lease.stopped) return;
+    lease.stopped = true;
+    if (lease.timer) {
+      clearInterval(lease.timer);
+      delete lease.timer;
+    }
+  }
+
+  private async renewTaskLease(state: LocalSubagentTaskState): Promise<void> {
+    const lease = state.lease;
+    const store = this.leaseStore();
+    if (!lease || lease.stopped || lease.renewing || !store) return;
+
+    lease.renewing = true;
+    try {
+      const result = await store.renewAgentTaskLease({
+        taskId: state.runInput.taskId,
+        owner: lease.owner,
+        generation: lease.generation,
+        ttlMs: lease.ttlMs,
+        now: Number(this.now()),
+      });
+      if (result.acquired) return;
+      this.cancelForLeaseLoss(state);
+    } finally {
+      lease.renewing = false;
+    }
+  }
+
+  private async ensureTaskLease(state: LocalSubagentTaskState): Promise<boolean> {
+    const lease = state.lease;
+    const store = this.leaseStore();
+    if (!lease || !store) return true;
+    if (lease.stopped) return true;
+
+    let result: Awaited<ReturnType<AgentTaskLeaseStore["renewAgentTaskLease"]>>;
+    try {
+      result = await store.renewAgentTaskLease({
+        taskId: state.runInput.taskId,
+        owner: lease.owner,
+        generation: lease.generation,
+        ttlMs: lease.ttlMs,
+        now: Number(this.now()),
+      });
+    } catch (error) {
+      this.cancelForLeaseLoss(state, error);
+      return false;
+    }
+    if (result.acquired) return true;
+    this.cancelForLeaseLoss(state);
+    return false;
+  }
+
+  private cancelForLeaseLoss(state: LocalSubagentTaskState, error?: unknown): void {
+    state.externallyClosed = true;
+    state.task.status = "cancelled";
+    this.stopLeaseHeartbeat(state);
+    state.controller.abort();
+    if (error) this.options.onBackgroundError?.(error, state.task);
+  }
+
+  private async releaseTaskLease(state: LocalSubagentTaskState): Promise<void> {
+    const lease = state.lease;
+    const store = this.leaseStore();
+    if (!lease || !store) return;
+    await store.releaseAgentTaskLease({
+      taskId: state.runInput.taskId,
+      owner: lease.owner,
+      generation: lease.generation,
+      now: Number(this.now()),
+    });
+  }
+
+  private leaseStore(): AgentTaskLeaseStore | undefined {
+    const store = this.options.store;
+    if (store.claimAgentTaskLease && store.renewAgentTaskLease && store.releaseAgentTaskLease) {
+      return store as EventStore & AgentTaskLeaseStore;
+    }
+    return undefined;
+  }
+
+  private leaseHeartbeatIntervalMs(ttlMs: number): number {
+    const configured = this.options.leaseHeartbeatIntervalMs;
+    if (configured !== undefined) return Math.max(1, configured);
+    return Math.max(1, Math.floor(ttlMs / 3));
   }
 
   private async appendTaskCompletion(input: LocalSubagentRunInput, task: LocalSubagentTaskResult): Promise<void> {
@@ -412,6 +571,15 @@ function toError(error: unknown): Error {
 
 function isAbortError(error: Error): boolean {
   return error.name === "AbortError" || error.message.toLowerCase().includes("aborted");
+}
+
+function leaseOwner(runId: AgentRunId): string {
+  return `local:${runId}`;
+}
+
+function unrefTimer(timer: ReturnType<typeof setInterval>): void {
+  const maybeTimer = timer as ReturnType<typeof setInterval> & { unref?: () => void };
+  maybeTimer.unref?.();
 }
 
 function eventContext(sessionId: SessionId, threadId: ThreadId | undefined): { sessionId: SessionId; threadId?: ThreadId } {
