@@ -11,6 +11,7 @@ export interface RuntimeAgentView {
   mailboxMessageIds: string[];
   childRunIds: AgentRunId[];
   taskIds: TaskId[];
+  generation: number;
   createdAt: number;
   updatedAt: number;
   parentPath?: AgentPath;
@@ -34,6 +35,7 @@ export interface RuntimeAgentMailboxMessageView {
 export interface RuntimeTaskView {
   id: TaskId;
   status: RuntimeTaskStatus;
+  generation: number;
   createdAt: number;
   updatedAt: number;
   teamId?: TeamId;
@@ -112,20 +114,26 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
     const path = stringValue(payload.path) as AgentPath | undefined;
     const taskName = stringValue(payload.taskName);
     if (!runId || !path || !taskName) return;
+    const generation = generationValue(payload.generation);
+    const taskId = stringValue(payload.taskId) as TaskId | undefined;
+    const existingTask = taskId ? view.tasks[taskId] : undefined;
+    if (existingTask && isStaleTaskSpawn(existingTask, generation)) return;
 
     const agent = upsertAgentRun(view, runId, path, event.time);
+    if (agent.completedAt !== undefined && (generation === undefined || generation <= agent.generation)) return;
     agent.path = path;
     agent.taskName = taskName;
     agent.status = "running";
+    agent.generation = generation ?? agent.generation;
     agent.updatedAt = event.time;
     assignOptional(agent, "parentPath", stringValue(payload.parentPath) as AgentPath | undefined);
     assignOptional(agent, "sessionId", event.sessionId);
     assignOptional(agent, "threadId", event.threadId);
-    const taskId = stringValue(payload.taskId) as TaskId | undefined;
     if (taskId) {
       if (!agent.taskIds.includes(taskId)) agent.taskIds.push(taskId);
       const task = upsertTask(view, taskId, event.time);
       task.status = "running";
+      task.generation = generation ?? task.generation;
       delete task.completedAt;
       task.updatedAt = event.time;
       task.path = path;
@@ -146,10 +154,14 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
     const path = stringValue(payload.path) as AgentPath | undefined;
     const status = agentStatusValue(payload.status);
     if (!runId || !path || !status) return;
+    const generation = generationValue(payload.generation);
 
     const agent = upsertAgentRun(view, runId, path, event.time);
+    if (agent.completedAt !== undefined) return;
+    if (generation !== undefined && generation < agent.generation) return;
     agent.path = path;
     agent.status = status;
+    agent.generation = generation ?? agent.generation;
     agent.completedAt = event.time;
     agent.updatedAt = event.time;
     assignOptional(agent, "sessionId", event.sessionId);
@@ -204,6 +216,7 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
 
     const task = upsertTask(view, taskId, event.time);
     task.status = "pending";
+    task.generation = 0;
     task.updatedAt = event.time;
     task.path = path;
     task.ownerPath = path;
@@ -242,8 +255,14 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
 
     const existing = view.tasks[taskId];
     const task = existing ?? upsertTask(view, taskId, event.time);
+    const generation = generationValue(payload.generation);
+    if (event.type === "agent.task_completed") {
+      if (existing && isFinalTaskStatus(existing.status)) return;
+      if (existing && generation !== undefined && generation < existing.generation) return;
+    }
     if (teamId) task.teamId = teamId;
     task.status = status;
+    if (generation !== undefined) task.generation = Math.max(task.generation, generation);
     task.updatedAt = event.time;
     if (status === "completed" || status === "failed" || status === "cancelled") task.completedAt = event.time;
     assignOptional(task, "sessionId", event.sessionId);
@@ -265,6 +284,7 @@ function upsertAgentRun(view: MutableAgentsView, runId: AgentRunId, path: AgentP
     mailboxMessageIds: [],
     childRunIds: [],
     taskIds: [],
+    generation: 0,
     createdAt: time,
     updatedAt: time,
   };
@@ -281,6 +301,7 @@ function upsertTask(view: MutableAgentsView, taskId: TaskId, time: number): Runt
   const task: RuntimeTaskView = {
     id: taskId,
     status: "pending",
+    generation: 0,
     createdAt: time,
     updatedAt: time,
   };
@@ -333,6 +354,11 @@ function booleanValue(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
+function generationValue(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return Math.max(0, Math.trunc(value));
+}
+
 function agentStatusValue(value: unknown): RuntimeAgentStatus | undefined {
   return value === "running" || value === "completed" || value === "failed" || value === "cancelled" ? value : undefined;
 }
@@ -341,4 +367,13 @@ function taskStatusValue(value: unknown): RuntimeTaskStatus | undefined {
   return value === "pending" || value === "running" || value === "in_progress" || value === "blocked" || value === "completed" || value === "failed" || value === "cancelled"
     ? value
     : undefined;
+}
+
+function isStaleTaskSpawn(task: RuntimeTaskView, generation: number | undefined): boolean {
+  if (generation !== undefined && generation < task.generation) return true;
+  return isFinalTaskStatus(task.status) && (generation === undefined || generation <= task.generation);
+}
+
+function isFinalTaskStatus(status: RuntimeTaskStatus): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
 }

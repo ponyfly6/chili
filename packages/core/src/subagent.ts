@@ -46,6 +46,7 @@ export interface LocalSubagentRunInput {
   cwd: string;
   taskName: string;
   prompt: string;
+  generation: number;
   signal?: AbortSignal;
 }
 
@@ -158,6 +159,7 @@ export class LocalSubagentManager implements SubagentController {
     const childSessionId = this.id<SessionId>("session");
     const childThreadId = this.id<ThreadId>("thread");
     const mode = input.mode ?? "one_shot";
+    const generation = 1;
     const controller = linkedAbortController(input.signal);
 
     const task: LocalSubagentTaskResult = {
@@ -201,6 +203,7 @@ export class LocalSubagentManager implements SubagentController {
         childThreadId,
         taskName: input.taskName,
         cwd: input.cwd,
+        generation,
         ...(input.parentThreadId ? { parentThreadId: input.parentThreadId } : {}),
         ...(mode ? { mode } : {}),
       },
@@ -217,6 +220,7 @@ export class LocalSubagentManager implements SubagentController {
       cwd: input.cwd,
       taskName: input.taskName,
       prompt: input.prompt,
+      generation,
     };
     if (input.parentThreadId) runInput.parentThreadId = input.parentThreadId;
     runInput.signal = controller.signal;
@@ -281,6 +285,7 @@ export class LocalSubagentManager implements SubagentController {
         path: input.path,
         runId: input.runId,
         status: task.status,
+        generation: input.generation,
         ...(task.summary ? { summary: task.summary } : {}),
         ...(task.error ? { error: task.error.message } : {}),
       },
@@ -297,6 +302,7 @@ export class LocalSubagentManager implements SubagentController {
         path: input.path,
         taskId: input.taskId,
         status: task.status,
+        generation: input.generation,
         ...(task.summary ? { summary: task.summary } : {}),
         ...(task.error ? { error: task.error.message } : {}),
       },

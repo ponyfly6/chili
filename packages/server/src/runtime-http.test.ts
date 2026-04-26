@@ -152,6 +152,7 @@ test("serves subagent runs and tasks through an event replay projection", async 
         taskId: localTaskId,
         path: localPath,
         status: "completed",
+        generation: 1,
         summary: "done",
       },
     },
@@ -171,6 +172,7 @@ test("serves subagent runs and tasks through an event replay projection", async 
         childSessionId: "session_child_http" as SessionId,
         childThreadId: "thread_child_http" as ThreadId,
         taskName: "local reader",
+        generation: 2,
       },
     },
   ]);
@@ -519,6 +521,7 @@ function taskRow(input: { status: AgentTaskRow["status"]; summary?: string }): A
     path: "/root/task_http" as AgentPath,
     taskName: "review",
     status: input.status,
+    generation: 0,
     childSessionId: "session_child" as SessionId,
     childThreadId: "thread_child" as ThreadId,
     createdAt: 1,

@@ -23,6 +23,11 @@ import { SQLITE_SCHEMA } from "./schema.js";
 import type {
   AgentMailboxQuery,
   AgentMailboxRow,
+  AgentTaskLeaseClaimInput,
+  AgentTaskLeaseReleaseInput,
+  AgentTaskLeaseRenewInput,
+  AgentTaskLeaseResult,
+  AgentTaskLeaseStore,
   AgentRunRow,
   AgentRunQuery,
   AgentTaskQuery,
@@ -75,9 +80,19 @@ interface AgentTaskProjectionRow {
   summary: string | null;
   error: string | null;
   completion_json: string | null;
+  generation: number;
+  lease_owner: string | null;
+  lease_expires_at: number | null;
+  lease_heartbeat_at: number | null;
   created_at: number;
   updated_at: number;
   completed_at: number | null;
+}
+
+interface AgentTaskStateRow {
+  status: string;
+  generation: number;
+  current_run_id: string | null;
 }
 
 interface AgentRunProjectionRow {
@@ -94,6 +109,7 @@ interface AgentRunProjectionRow {
   task_name: string;
   cwd: string | null;
   mode: string | null;
+  generation: number;
   status: AgentRunRow["status"];
   created_at: number;
   completed_at: number | null;
@@ -118,7 +134,7 @@ export interface SqliteEventStoreOptions {
   onMirrorError?: (error: unknown, event: ChiliEvent) => void;
 }
 
-export class SqliteEventStore implements EventStore, SubagentProjectionStore {
+export class SqliteEventStore implements EventStore, SubagentProjectionStore, AgentTaskLeaseStore {
   private readonly db: Database;
 
   constructor(path = ".chili/chili.sqlite", private readonly options: SqliteEventStoreOptions = {}) {
@@ -297,7 +313,7 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore {
       .query<AgentTaskProjectionRow, any>(
         `select id, path, parent_path, parent_session_id, parent_thread_id, child_session_id, child_thread_id,
                 task_name, cwd, prompt, mode, status, current_run_id, summary, error, completion_json,
-                created_at, updated_at, completed_at
+                generation, lease_owner, lease_expires_at, lease_heartbeat_at, created_at, updated_at, completed_at
          from agent_tasks
          ${where}
          order by created_at asc, id asc
@@ -337,7 +353,7 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore {
     return this.db
       .query<AgentRunProjectionRow, any>(
         `select id, session_id, thread_id, task_id, path, parent_path, parent_session_id, parent_thread_id,
-                child_session_id, child_thread_id, task_name, cwd, mode, status, created_at, completed_at
+                child_session_id, child_thread_id, task_name, cwd, mode, status, generation, created_at, completed_at
          from agent_runs
          ${where}
          order by created_at asc, id asc
@@ -385,6 +401,87 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore {
       )
       .all(params)
       .map((row) => agentMailboxFromRow(row));
+  }
+
+  async claimAgentTaskLease(input: AgentTaskLeaseClaimInput): Promise<AgentTaskLeaseResult> {
+    const now = input.now ?? Date.now();
+    const expiresAt = now + input.ttlMs;
+    const result = this.db
+      .query(
+        `update agent_tasks
+         set lease_owner = $owner,
+             lease_expires_at = $expiresAt,
+             lease_heartbeat_at = $now,
+             generation = generation + 1,
+             updated_at = $now
+         where id = $taskId
+           and status = 'running'
+           and ($runId is null or current_run_id is null or current_run_id = $runId)
+           and ($generation is null or generation = $generation)
+           and (
+             lease_owner is null
+             or lease_expires_at is null
+             or lease_expires_at <= $now
+             or lease_owner = $owner
+           )`,
+      )
+      .run({
+        taskId: input.taskId,
+        owner: input.owner,
+        runId: input.runId ?? null,
+        generation: input.generation ?? null,
+        now,
+        expiresAt,
+      });
+    const task = await this.agentTask(input.taskId);
+    return result.changes > 0 && task ? { acquired: true, task } : { acquired: false, ...(task ? { task } : {}) };
+  }
+
+  async renewAgentTaskLease(input: AgentTaskLeaseRenewInput): Promise<AgentTaskLeaseResult> {
+    const now = input.now ?? Date.now();
+    const expiresAt = now + input.ttlMs;
+    const result = this.db
+      .query(
+        `update agent_tasks
+         set lease_expires_at = $expiresAt,
+             lease_heartbeat_at = $now,
+             updated_at = $now
+         where id = $taskId
+           and status = 'running'
+           and lease_owner = $owner
+           and generation = $generation`,
+      )
+      .run({
+        taskId: input.taskId,
+        owner: input.owner,
+        generation: input.generation,
+        now,
+        expiresAt,
+      });
+    const task = await this.agentTask(input.taskId);
+    return result.changes > 0 && task ? { acquired: true, task } : { acquired: false, ...(task ? { task } : {}) };
+  }
+
+  async releaseAgentTaskLease(input: AgentTaskLeaseReleaseInput): Promise<boolean> {
+    const now = input.now ?? Date.now();
+    const result = this.db
+      .query(
+        `update agent_tasks
+         set lease_owner = null,
+             lease_expires_at = null,
+             lease_heartbeat_at = null,
+             updated_at = $now
+         where id = $taskId
+           and lease_owner = $owner
+           and generation = $generation`,
+      )
+      .run({
+        taskId: input.taskId,
+        owner: input.owner,
+        generation: input.generation,
+        now,
+      });
+    return result.changes > 0;
   }
 
   private writeTransaction(events: readonly ChiliEvent[]): void {
@@ -444,10 +541,17 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore {
     this.addColumnIfMissing("agent_runs", "child_thread_id", "text");
     this.addColumnIfMissing("agent_runs", "cwd", "text");
     this.addColumnIfMissing("agent_runs", "mode", "text");
+    this.addColumnIfMissing("agent_runs", "generation", "integer not null default 0");
+    this.addColumnIfMissing("agent_tasks", "generation", "integer not null default 0");
+    this.addColumnIfMissing("agent_tasks", "lease_owner", "text");
+    this.addColumnIfMissing("agent_tasks", "lease_expires_at", "integer");
+    this.addColumnIfMissing("agent_tasks", "lease_heartbeat_at", "integer");
     this.addColumnIfMissing("agent_mailbox", "consumed_at", "integer");
     this.db.exec(`create index if not exists agent_runs_task_idx on agent_runs(task_id)`);
     this.db.exec(`create index if not exists agent_runs_child_session_idx on agent_runs(child_session_id)`);
     this.db.exec(`create index if not exists agent_mailbox_status_idx on agent_mailbox(status, created_at)`);
+    this.db.exec(`create index if not exists agent_tasks_lease_idx on agent_tasks(status, lease_expires_at)`);
+    this.db.exec(`create index if not exists agent_tasks_lease_owner_idx on agent_tasks(lease_owner, status)`);
   }
 
   private addColumnIfMissing(table: string, column: string, definition: string): void {
@@ -678,12 +782,17 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore {
     if (event.type === "agent.spawned") {
       const parentSessionId = event.payload.parentSessionId ?? event.sessionId ?? null;
       const parentThreadId = event.payload.parentThreadId ?? event.threadId ?? null;
+      const payloadGeneration = normalizedGeneration(event.payload.generation);
+      if (event.payload.taskId) {
+        const current = this.agentTaskState(event.payload.taskId);
+        if (current && !shouldApplySpawnToTask(current, payloadGeneration)) return;
+      }
       this.db
         .query(
           `insert into agent_runs
              (id, session_id, thread_id, task_id, path, parent_path, parent_session_id, parent_thread_id,
-              child_session_id, child_thread_id, task_name, cwd, mode, status, created_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
+              child_session_id, child_thread_id, task_name, cwd, mode, status, generation, created_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)
            on conflict(id) do update set
              status = 'running',
              session_id = coalesce(excluded.session_id, agent_runs.session_id),
@@ -698,7 +807,9 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore {
              task_name = excluded.task_name,
              cwd = coalesce(excluded.cwd, agent_runs.cwd),
              mode = coalesce(excluded.mode, agent_runs.mode),
-             completed_at = null`,
+             generation = max(agent_runs.generation, excluded.generation),
+             completed_at = null
+           where agent_runs.completed_at is null`,
         )
         .run(
           event.payload.runId,
@@ -714,48 +825,11 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore {
           event.payload.taskName,
           event.payload.cwd ?? null,
           event.payload.mode ?? null,
+          payloadGeneration ?? 0,
           event.time,
         );
       if (event.payload.taskId) {
-        this.db
-          .query(
-            `insert into agent_tasks
-               (id, path, parent_path, parent_session_id, parent_thread_id, child_session_id, child_thread_id,
-                task_name, cwd, mode, status, current_run_id, created_at, updated_at)
-             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
-             on conflict(id) do update set
-               status = 'running',
-               current_run_id = excluded.current_run_id,
-               path = excluded.path,
-               parent_path = coalesce(excluded.parent_path, agent_tasks.parent_path),
-               parent_session_id = coalesce(excluded.parent_session_id, agent_tasks.parent_session_id),
-               parent_thread_id = coalesce(excluded.parent_thread_id, agent_tasks.parent_thread_id),
-               child_session_id = coalesce(excluded.child_session_id, agent_tasks.child_session_id),
-               child_thread_id = coalesce(excluded.child_thread_id, agent_tasks.child_thread_id),
-               task_name = excluded.task_name,
-               cwd = coalesce(excluded.cwd, agent_tasks.cwd),
-               mode = coalesce(excluded.mode, agent_tasks.mode),
-               summary = null,
-               error = null,
-               completion_json = null,
-               completed_at = null,
-               updated_at = excluded.updated_at`,
-          )
-          .run(
-            event.payload.taskId,
-            event.payload.path,
-            event.payload.parentPath ?? null,
-            parentSessionId,
-            parentThreadId,
-            event.payload.childSessionId ?? null,
-            event.payload.childThreadId ?? null,
-            event.payload.taskName,
-            event.payload.cwd ?? null,
-            event.payload.mode ?? null,
-            event.payload.runId,
-            event.time,
-            event.time,
-          );
+        this.applyAgentSpawnToTask(event, parentSessionId, parentThreadId, payloadGeneration);
       }
       return;
     }
@@ -811,16 +885,24 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore {
       this.db
         .query(
           `update agent_runs
-           set status = ?, completed_at = ?, task_id = coalesce(?, task_id)
-           where id = ?`,
+           set status = ?, completed_at = ?, task_id = coalesce(?, task_id),
+               generation = max(generation, ?)
+           where id = ? and completed_at is null`,
         )
-        .run(event.payload.status, event.time, event.payload.taskId ?? null, event.payload.runId);
+        .run(
+          event.payload.status,
+          event.time,
+          event.payload.taskId ?? null,
+          normalizedGeneration(event.payload.generation) ?? 0,
+          event.payload.runId,
+        );
       if (event.payload.taskId) {
         this.applyAgentTaskCompletion(
           {
             taskId: event.payload.taskId,
             path: event.payload.path,
             runId: event.payload.runId,
+            ...(event.payload.generation !== undefined ? { generation: event.payload.generation } : {}),
             status: event.payload.status,
             ...(event.payload.summary ? { summary: event.payload.summary } : {}),
             ...(event.payload.error ? { error: event.payload.error } : {}),
@@ -831,19 +913,89 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore {
     }
   }
 
-  private applyAgentTaskCompletion(payload: AgentCompleteTaskPayload, time: number): void {
+  private applyAgentSpawnToTask(
+    event: Extract<AgentEvent, { type: "agent.spawned" }>,
+    parentSessionId: string | null,
+    parentThreadId: string | null,
+    payloadGeneration: number | undefined,
+  ): void {
+    const taskId = event.payload.taskId;
+    if (!taskId) return;
+    const current = this.agentTaskState(taskId);
+    if (current && !shouldApplySpawnToTask(current, payloadGeneration)) return;
+    const generation = payloadGeneration ?? current?.generation ?? 0;
+
     this.db
       .query(
         `insert into agent_tasks
-           (id, path, task_name, status, current_run_id, summary, error, completion_json, created_at, updated_at, completed_at)
-         values (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?)
+           (id, path, parent_path, parent_session_id, parent_thread_id, child_session_id, child_thread_id,
+            task_name, cwd, mode, status, generation, current_run_id, lease_owner, lease_expires_at,
+            lease_heartbeat_at, created_at, updated_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, null, null, null, ?, ?)
+         on conflict(id) do update set
+           status = 'running',
+           generation = excluded.generation,
+           current_run_id = excluded.current_run_id,
+           path = excluded.path,
+           parent_path = coalesce(excluded.parent_path, agent_tasks.parent_path),
+           parent_session_id = coalesce(excluded.parent_session_id, agent_tasks.parent_session_id),
+           parent_thread_id = coalesce(excluded.parent_thread_id, agent_tasks.parent_thread_id),
+           child_session_id = coalesce(excluded.child_session_id, agent_tasks.child_session_id),
+           child_thread_id = coalesce(excluded.child_thread_id, agent_tasks.child_thread_id),
+           task_name = excluded.task_name,
+           cwd = coalesce(excluded.cwd, agent_tasks.cwd),
+           mode = coalesce(excluded.mode, agent_tasks.mode),
+           summary = null,
+           error = null,
+           completion_json = null,
+           lease_owner = null,
+           lease_expires_at = null,
+           lease_heartbeat_at = null,
+           completed_at = null,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        taskId,
+        event.payload.path,
+        event.payload.parentPath ?? null,
+        parentSessionId,
+        parentThreadId,
+        event.payload.childSessionId ?? null,
+        event.payload.childThreadId ?? null,
+        event.payload.taskName,
+        event.payload.cwd ?? null,
+        event.payload.mode ?? null,
+        generation,
+        event.payload.runId,
+        event.time,
+        event.time,
+      );
+  }
+
+  private applyAgentTaskCompletion(payload: AgentCompleteTaskPayload, time: number): void {
+    const generation = normalizedGeneration(payload.generation);
+    const current = this.agentTaskState(payload.taskId);
+    if (current && !shouldApplyTaskCompletion(current, payload.runId, generation)) {
+      return;
+    }
+
+    this.db
+      .query(
+        `insert into agent_tasks
+           (id, path, task_name, status, generation, current_run_id, summary, error, completion_json,
+            lease_owner, lease_expires_at, lease_heartbeat_at, created_at, updated_at, completed_at)
+         values (?, ?, '', ?, ?, ?, ?, ?, ?, null, null, null, ?, ?, ?)
          on conflict(id) do update set
            path = excluded.path,
            status = excluded.status,
+           generation = max(agent_tasks.generation, excluded.generation),
            current_run_id = coalesce(excluded.current_run_id, agent_tasks.current_run_id),
            summary = excluded.summary,
            error = excluded.error,
            completion_json = excluded.completion_json,
+           lease_owner = null,
+           lease_expires_at = null,
+           lease_heartbeat_at = null,
            updated_at = excluded.updated_at,
            completed_at = excluded.completed_at`,
       )
@@ -851,6 +1003,7 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore {
         payload.taskId,
         payload.path,
         payload.status,
+        generation ?? current?.generation ?? 0,
         payload.runId ?? null,
         payload.summary ?? null,
         payload.error ?? null,
@@ -862,9 +1015,24 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore {
 
     if (payload.runId) {
       this.db
-        .query(`update agent_runs set status = ?, completed_at = ?, task_id = coalesce(task_id, ?) where id = ?`)
-        .run(payload.status, time, payload.taskId, payload.runId);
+        .query(
+          `update agent_runs
+           set status = ?, completed_at = ?, task_id = coalesce(task_id, ?), generation = max(generation, ?)
+           where id = ? and completed_at is null`,
+        )
+        .run(payload.status, time, payload.taskId, generation ?? current?.generation ?? 0, payload.runId);
     }
+  }
+
+  private agentTaskState(taskId: TaskId): AgentTaskStateRow | undefined {
+    const row = this.db
+      .query<AgentTaskStateRow, [string]>(
+        `select status, generation, current_run_id
+         from agent_tasks
+         where id = ?`,
+      )
+      .get(taskId);
+    return row ?? undefined;
   }
 
   private applyTeamEvent(event: TeamEvent): void {
@@ -951,6 +1119,7 @@ function agentTaskFromRow(row: AgentTaskProjectionRow): AgentTaskRow {
     path: row.path as AgentPath,
     status: row.status as AgentTaskRow["status"],
     taskName: row.task_name,
+    generation: row.generation ?? 0,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -966,6 +1135,9 @@ function agentTaskFromRow(row: AgentTaskProjectionRow): AgentTaskRow {
   if (row.summary) task.summary = row.summary;
   if (row.error) task.error = row.error;
   if (row.completion_json) task.completion = decodeJson<Record<string, unknown>>(row.completion_json, {});
+  if (row.lease_owner) task.leaseOwner = row.lease_owner;
+  if (row.lease_expires_at !== null) task.leaseExpiresAt = row.lease_expires_at;
+  if (row.lease_heartbeat_at !== null) task.leaseHeartbeatAt = row.lease_heartbeat_at;
   if (row.completed_at) task.completedAt = row.completed_at;
   return task;
 }
@@ -1019,6 +1191,34 @@ function applyPartDelta(part: MessagePart, field: string, delta: string): Messag
     return { ...part, output: part.output + delta };
   }
   return part;
+}
+
+function normalizedGeneration(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return Math.max(0, Math.trunc(value));
+}
+
+function shouldApplySpawnToTask(current: AgentTaskStateRow, generation: number | undefined): boolean {
+  if (generation !== undefined && generation < current.generation) return false;
+  if (isFinalTaskStatus(current.status)) {
+    return generation !== undefined && generation > current.generation;
+  }
+  return generation === undefined || generation >= current.generation;
+}
+
+function shouldApplyTaskCompletion(
+  current: AgentTaskStateRow,
+  runId: string | undefined,
+  generation: number | undefined,
+): boolean {
+  if (isFinalTaskStatus(current.status)) return false;
+  if (runId && current.current_run_id && current.current_run_id !== runId) return false;
+  if (generation !== undefined && generation < current.generation) return false;
+  return true;
+}
+
+function isFinalTaskStatus(status: string): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
 }
 
 export type { AgentMailboxRow, AgentRunRow, AgentTaskRow };

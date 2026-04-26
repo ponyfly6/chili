@@ -212,7 +212,7 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
   expect(snapshot.mailbox[0]?.consumedAt).toBe(6);
 });
 
-test("replays completed local subagent tasks as running on spawn without completedAt", () => {
+test("replays completed local subagent tasks as running on newer-generation spawn without completedAt", () => {
   const sessionId = "session_local_agents" as SessionId;
   const threadId = "thread_local_agents" as ThreadId;
   const taskId = "task_local" as TaskId;
@@ -251,6 +251,7 @@ test("replays completed local subagent tasks as running on spawn without complet
           taskId,
           path,
           status: "completed",
+          generation: 1,
           summary: "done",
         },
       },
@@ -270,6 +271,7 @@ test("replays completed local subagent tasks as running on spawn without complet
           childSessionId,
           childThreadId,
           taskName: "reader",
+          generation: 2,
         },
       },
     ],
@@ -279,6 +281,7 @@ test("replays completed local subagent tasks as running on spawn without complet
   expect(view.tasks[taskId]).toMatchObject({
     id: taskId,
     status: "running",
+    generation: 2,
     path,
     sessionId,
     childSessionId,

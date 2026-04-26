@@ -97,6 +97,7 @@ export const SQLITE_SCHEMA = [
     cwd text,
     mode text,
     status text not null,
+    generation integer not null default 0,
     created_at integer not null,
     completed_at integer
   )`,
@@ -116,10 +117,14 @@ export const SQLITE_SCHEMA = [
     prompt text,
     mode text,
     status text not null,
+    generation integer not null default 0,
     current_run_id text,
     summary text,
     error text,
     completion_json text,
+    lease_owner text,
+    lease_expires_at integer,
+    lease_heartbeat_at integer,
     created_at integer not null,
     updated_at integer not null,
     completed_at integer

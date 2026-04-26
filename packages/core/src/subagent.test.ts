@@ -62,6 +62,7 @@ test("spawns a local subagent and records lifecycle events", async () => {
     cwd: "/repo",
     taskName: "reader",
     prompt: "Read README",
+    generation: 1,
   });
   expect(store.items.map((event) => event.type)).toEqual([
     "agent.task_created",
@@ -95,6 +96,7 @@ test("spawns a local subagent and records lifecycle events", async () => {
       path: "/root/task_1",
       parentPath: "/root",
       taskName: "reader",
+      generation: 1,
     },
   });
   expect(store.items[2]).toMatchObject({
@@ -103,6 +105,7 @@ test("spawns a local subagent and records lifecycle events", async () => {
       runId: "agent_2",
       path: "/root/task_1",
       status: "completed",
+      generation: 1,
       summary: "read it",
     },
   });
@@ -114,6 +117,7 @@ test("spawns a local subagent and records lifecycle events", async () => {
       taskId: "task_1",
       path: "/root/task_1",
       status: "completed",
+      generation: 1,
       summary: "read it",
     },
   });
@@ -140,6 +144,7 @@ test("runs a child task through an AgentRunner", async () => {
     cwd: "/repo",
     taskName: "reader",
     prompt: "Read README",
+    generation: 1,
   });
 
   expect(result).toEqual({

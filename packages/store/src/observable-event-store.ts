@@ -4,6 +4,11 @@ import type {
   AgentMailboxRow,
   AgentRunQuery,
   AgentRunRow,
+  AgentTaskLeaseClaimInput,
+  AgentTaskLeaseReleaseInput,
+  AgentTaskLeaseRenewInput,
+  AgentTaskLeaseResult,
+  AgentTaskLeaseStore,
   AgentTaskQuery,
   AgentTaskRow,
   ApprovalRow,
@@ -17,7 +22,7 @@ export interface EventPublisher {
   subscribe(listener: (event: ChiliEvent) => void): () => void;
 }
 
-export class ObservableEventStore implements EventStore, EventPublisher, SubagentProjectionStore {
+export class ObservableEventStore implements EventStore, EventPublisher, SubagentProjectionStore, AgentTaskLeaseStore {
   private readonly listeners = new Set<(event: ChiliEvent) => void>();
 
   constructor(private readonly inner: EventStore) {}
@@ -64,6 +69,18 @@ export class ObservableEventStore implements EventStore, EventPublisher, Subagen
     return this.subagentStore()?.agentMailbox(query) ?? Promise.resolve([]);
   }
 
+  claimAgentTaskLease(input: AgentTaskLeaseClaimInput): Promise<AgentTaskLeaseResult> {
+    return this.leaseStore()?.claimAgentTaskLease(input) ?? Promise.resolve({ acquired: false });
+  }
+
+  renewAgentTaskLease(input: AgentTaskLeaseRenewInput): Promise<AgentTaskLeaseResult> {
+    return this.leaseStore()?.renewAgentTaskLease(input) ?? Promise.resolve({ acquired: false });
+  }
+
+  releaseAgentTaskLease(input: AgentTaskLeaseReleaseInput): Promise<boolean> {
+    return this.leaseStore()?.releaseAgentTaskLease(input) ?? Promise.resolve(false);
+  }
+
   subscribe(listener: (event: ChiliEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -77,6 +94,14 @@ export class ObservableEventStore implements EventStore, EventPublisher, Subagen
     const inner = this.inner as EventStore & Partial<SubagentProjectionStore>;
     if (inner.agentTasks && inner.agentTask && inner.agentRuns && inner.agentMailbox) {
       return inner as SubagentProjectionStore;
+    }
+    return undefined;
+  }
+
+  private leaseStore(): AgentTaskLeaseStore | undefined {
+    const inner = this.inner as EventStore & Partial<AgentTaskLeaseStore>;
+    if (inner.claimAgentTaskLease && inner.renewAgentTaskLease && inner.releaseAgentTaskLease) {
+      return inner as EventStore & AgentTaskLeaseStore;
     }
     return undefined;
   }

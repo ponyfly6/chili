@@ -84,6 +84,7 @@ export interface AgentTaskRow {
   path: AgentPath;
   status: AgentTaskStatus;
   taskName: string;
+  generation: number;
   parentPath?: AgentPath;
   parentSessionId?: SessionId;
   parentThreadId?: ThreadId;
@@ -96,6 +97,9 @@ export interface AgentTaskRow {
   summary?: string;
   error?: string;
   completion?: Record<string, unknown>;
+  leaseOwner?: string;
+  leaseExpiresAt?: number;
+  leaseHeartbeatAt?: number;
   createdAt: number;
   updatedAt: number;
   completedAt?: number;
@@ -142,6 +146,35 @@ export interface AgentMailboxQuery {
   limit?: number;
 }
 
+export interface AgentTaskLeaseClaimInput {
+  taskId: TaskId;
+  owner: string;
+  ttlMs: number;
+  now?: number;
+  runId?: string;
+  generation?: number;
+}
+
+export interface AgentTaskLeaseRenewInput {
+  taskId: TaskId;
+  owner: string;
+  generation: number;
+  ttlMs: number;
+  now?: number;
+}
+
+export interface AgentTaskLeaseReleaseInput {
+  taskId: TaskId;
+  owner: string;
+  generation: number;
+  now?: number;
+}
+
+export interface AgentTaskLeaseResult {
+  acquired: boolean;
+  task?: AgentTaskRow;
+}
+
 export interface EventStore {
   append(event: ChiliEvent): Promise<void>;
   appendMany(events: readonly ChiliEvent[]): Promise<void>;
@@ -156,6 +189,12 @@ export interface SubagentProjectionStore {
   agentTask(taskId: TaskId): Promise<AgentTaskRow | undefined>;
   agentRuns(query?: AgentRunQuery): Promise<AgentRunRow[]>;
   agentMailbox(query?: AgentMailboxQuery): Promise<AgentMailboxRow[]>;
+}
+
+export interface AgentTaskLeaseStore {
+  claimAgentTaskLease(input: AgentTaskLeaseClaimInput): Promise<AgentTaskLeaseResult>;
+  renewAgentTaskLease(input: AgentTaskLeaseRenewInput): Promise<AgentTaskLeaseResult>;
+  releaseAgentTaskLease(input: AgentTaskLeaseReleaseInput): Promise<boolean>;
 }
 
 export interface EventMirror {

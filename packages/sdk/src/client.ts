@@ -170,6 +170,7 @@ export interface RuntimeAgentTaskRecord {
   path: AgentPath;
   status: AgentTaskStatus;
   taskName: string;
+  generation: number;
   parentPath?: AgentPath;
   parentSessionId?: SessionId;
   parentThreadId?: ThreadId;
@@ -182,6 +183,9 @@ export interface RuntimeAgentTaskRecord {
   summary?: string;
   error?: string;
   completion?: Record<string, unknown>;
+  leaseOwner?: string;
+  leaseExpiresAt?: number;
+  leaseHeartbeatAt?: number;
   createdAt: number;
   updatedAt: number;
   completedAt?: number;

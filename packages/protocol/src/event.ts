@@ -88,6 +88,7 @@ export interface AgentSpawnedPayload {
   runId: AgentRunId;
   path: AgentPath;
   taskName: string;
+  generation?: number;
   parentPath?: AgentPath;
   taskId?: TaskId;
   parentSessionId?: SessionId;
@@ -124,6 +125,7 @@ export interface AgentCompleteTaskPayload {
   path: AgentPath;
   status: Exclude<AgentTaskStatus, "pending" | "running">;
   runId?: AgentRunId;
+  generation?: number;
   summary?: string;
   error?: string;
   metadata?: Record<string, unknown>;
@@ -134,6 +136,7 @@ export interface AgentCompletedPayload {
   path: AgentPath;
   status: Exclude<AgentTaskStatus, "pending" | "running">;
   taskId?: TaskId;
+  generation?: number;
   summary?: string;
   error?: string;
 }

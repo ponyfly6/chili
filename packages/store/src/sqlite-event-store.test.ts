@@ -68,6 +68,68 @@ test("migrates older event tables without seq and uses row insertion order", asy
   }
 });
 
+test("migrates older agent task tables with generation and lease columns", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-task-lease-migration-"));
+  const dbPath = join(dir, "events.sqlite");
+  const db = new Database(dbPath, { create: true, strict: true });
+  db.exec(`
+    create table agent_tasks (
+      id text primary key,
+      path text not null,
+      parent_path text,
+      parent_session_id text,
+      parent_thread_id text,
+      child_session_id text,
+      child_thread_id text,
+      task_name text not null,
+      cwd text,
+      prompt text,
+      mode text,
+      status text not null,
+      current_run_id text,
+      summary text,
+      error text,
+      completion_json text,
+      created_at integer not null,
+      updated_at integer not null,
+      completed_at integer
+    )
+  `);
+  db.query(
+    `insert into agent_tasks
+       (id, path, task_name, status, current_run_id, created_at, updated_at)
+     values (?, ?, ?, 'running', ?, 1, 1)`,
+  ).run("task_old", "/root/task_old", "old task", "agent_old");
+  db.close();
+
+  const store = new SqliteEventStore(dbPath);
+  try {
+    expect(await store.agentTask("task_old" as TaskId)).toMatchObject({
+      id: "task_old",
+      status: "running",
+      generation: 0,
+    });
+
+    const claim = await store.claimAgentTaskLease({
+      taskId: "task_old" as TaskId,
+      owner: "worker_migrated",
+      ttlMs: 100,
+      now: 10,
+    });
+    expect(claim).toMatchObject({
+      acquired: true,
+      task: {
+        generation: 1,
+        leaseOwner: "worker_migrated",
+        leaseExpiresAt: 110,
+      },
+    });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("replays message part deltas into stored messages", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-part-delta-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -256,6 +318,7 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
         prompt: "Review this",
         mode: "one_shot",
         status: "completed",
+        generation: 0,
         currentRunId: runId,
         summary: "done",
         completion: {
@@ -329,6 +392,7 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
         taskName: "review",
         cwd: "/repo",
         mode: "one_shot",
+        generation: 1,
       },
     });
 
@@ -337,6 +401,7 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
       id: taskId,
       status: "running",
       currentRunId: "agent_review_followup",
+      generation: 1,
     });
     expect(resumed?.completedAt).toBeUndefined();
     expect(resumed?.summary).toBeUndefined();
@@ -346,6 +411,237 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("claims, renews, expires, and releases task leases with generation CAS", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-task-lease-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const taskId = "task_lease" as TaskId;
+  const runId = "agent_lease" as AgentRunId;
+
+  try {
+    await appendRunningTask(store, { taskId, runId, generation: 1, time: 1 as TimestampMs });
+
+    const first = await store.claimAgentTaskLease({ taskId, owner: "worker_a", ttlMs: 50, now: 100 });
+    expect(first).toMatchObject({
+      acquired: true,
+      task: {
+        id: taskId,
+        generation: 2,
+        leaseOwner: "worker_a",
+        leaseExpiresAt: 150,
+        leaseHeartbeatAt: 100,
+      },
+    });
+
+    const blocked = await store.claimAgentTaskLease({ taskId, owner: "worker_b", ttlMs: 50, now: 110 });
+    expect(blocked.acquired).toBe(false);
+    expect(blocked.task).toMatchObject({ leaseOwner: "worker_a", generation: 2 });
+
+    const wrongOwnerRenew = await store.renewAgentTaskLease({
+      taskId,
+      owner: "worker_b",
+      generation: 2,
+      ttlMs: 50,
+      now: 120,
+    });
+    expect(wrongOwnerRenew.acquired).toBe(false);
+
+    const renewed = await store.renewAgentTaskLease({
+      taskId,
+      owner: "worker_a",
+      generation: 2,
+      ttlMs: 50,
+      now: 120,
+    });
+    expect(renewed).toMatchObject({
+      acquired: true,
+      task: {
+        generation: 2,
+        leaseOwner: "worker_a",
+        leaseExpiresAt: 170,
+        leaseHeartbeatAt: 120,
+      },
+    });
+
+    const expiredClaim = await store.claimAgentTaskLease({ taskId, owner: "worker_b", ttlMs: 50, now: 171 });
+    expect(expiredClaim).toMatchObject({
+      acquired: true,
+      task: {
+        generation: 3,
+        leaseOwner: "worker_b",
+        leaseExpiresAt: 221,
+        leaseHeartbeatAt: 171,
+      },
+    });
+
+    expect(await store.releaseAgentTaskLease({ taskId, owner: "worker_a", generation: 2, now: 172 })).toBe(false);
+    expect(await store.releaseAgentTaskLease({ taskId, owner: "worker_b", generation: 3, now: 173 })).toBe(true);
+    expect(await store.agentTask(taskId)).toMatchObject({ generation: 3 });
+    expect((await store.agentTask(taskId))?.leaseOwner).toBeUndefined();
+    expect((await store.agentTask(taskId))?.leaseExpiresAt).toBeUndefined();
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("final task projection wins over late completion and stale spawn", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-task-generation-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const taskId = "task_generation" as TaskId;
+  const runId = "agent_generation" as AgentRunId;
+  const path = "/root/task_generation" as AgentPath;
+
+  try {
+    await appendRunningTask(store, { taskId, runId, path, generation: 1, time: 1 as TimestampMs });
+    await store.claimAgentTaskLease({ taskId, owner: "worker_a", ttlMs: 50, now: 10 });
+
+    await store.append({
+      id: "event_close_task",
+      type: "agent.task_completed",
+      time: 20 as TimestampMs,
+      payload: {
+        taskId,
+        path,
+        runId,
+        generation: 3,
+        status: "cancelled",
+        summary: "stopped by user",
+      },
+    });
+    await store.append({
+      id: "event_late_task_completed",
+      type: "agent.task_completed",
+      time: 21 as TimestampMs,
+      payload: {
+        taskId,
+        path,
+        runId,
+        generation: 2,
+        status: "completed",
+        summary: "late success",
+      },
+    });
+    await store.append({
+      id: "event_late_agent_completed",
+      type: "agent.completed",
+      time: 22 as TimestampMs,
+      payload: {
+        taskId,
+        path,
+        runId,
+        generation: 2,
+        status: "completed",
+        summary: "late success",
+      },
+    });
+    await store.append({
+      id: "event_stale_spawn",
+      type: "agent.spawned",
+      time: 23 as TimestampMs,
+      payload: {
+        runId: "agent_generation_stale" as AgentRunId,
+        taskId,
+        path,
+        taskName: "review",
+      },
+    });
+
+    expect(await store.agentTask(taskId)).toMatchObject({
+      id: taskId,
+      status: "cancelled",
+      generation: 3,
+      summary: "stopped by user",
+    });
+    expect((await store.agentTask(taskId))?.leaseOwner).toBeUndefined();
+    expect(await store.agentRuns({ taskId })).toMatchObject([{ id: runId, status: "cancelled" }]);
+
+    await store.append({
+      id: "event_new_spawn",
+      type: "agent.spawned",
+      time: 24 as TimestampMs,
+      payload: {
+        runId: "agent_generation_followup" as AgentRunId,
+        taskId,
+        path,
+        taskName: "review",
+        generation: 4,
+      },
+    });
+
+    expect(await store.agentTask(taskId)).toMatchObject({
+      id: taskId,
+      status: "running",
+      currentRunId: "agent_generation_followup",
+      generation: 4,
+    });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+async function appendRunningTask(
+  store: SqliteEventStore,
+  input: {
+    taskId: TaskId;
+    runId: AgentRunId;
+    path?: AgentPath;
+    generation?: number;
+    time: TimestampMs;
+  },
+): Promise<void> {
+  const parentSessionId = "session_parent" as SessionId;
+  const parentThreadId = "thread_parent" as ThreadId;
+  const childSessionId = "session_child" as SessionId;
+  const childThreadId = "thread_child" as ThreadId;
+  const path = input.path ?? (`/root/${input.taskId}` as AgentPath);
+  const parentPath = "/root" as AgentPath;
+
+  await store.appendMany([
+    {
+      id: `event_task_created_${input.taskId}`,
+      type: "agent.task_created",
+      time: input.time,
+      sessionId: parentSessionId,
+      threadId: parentThreadId,
+      payload: {
+        taskId: input.taskId,
+        path,
+        parentPath,
+        parentSessionId,
+        parentThreadId,
+        childSessionId,
+        childThreadId,
+        taskName: "review",
+        cwd: "/repo",
+        prompt: "Review this",
+        mode: "background",
+      },
+    },
+    {
+      id: `event_spawned_${input.taskId}`,
+      type: "agent.spawned",
+      time: input.time,
+      sessionId: parentSessionId,
+      threadId: parentThreadId,
+      payload: {
+        runId: input.runId,
+        taskId: input.taskId,
+        path,
+        parentPath,
+        parentSessionId,
+        parentThreadId,
+        childSessionId,
+        childThreadId,
+        taskName: "review",
+        cwd: "/repo",
+        mode: "background",
+        ...(input.generation !== undefined ? { generation: input.generation } : {}),
+      },
+    },
+  ]);
+}
 
 function sessionEvent(id: string, sessionId: SessionId, threadId: ThreadId, time: TimestampMs): ChiliEvent {
   return {

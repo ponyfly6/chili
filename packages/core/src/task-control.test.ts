@@ -313,6 +313,44 @@ test("reconciles stale running background tasks without touching live task ids",
   }
 });
 
+test("reconcile skips stale background tasks with an active durable lease", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-task-control-reconcile-lease-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const runtime = new FakeTaskRuntime(store);
+  const leasedTaskId = "task_leased" as TaskId;
+
+  try {
+    await seedTask(store, { taskId: leasedTaskId, status: "running", mode: "background", time: 10 as TimestampMs });
+    const lease = await store.claimAgentTaskLease({
+      taskId: leasedTaskId,
+      owner: "worker_a",
+      ttlMs: 1_000,
+      now: 90,
+    });
+    expect(lease.acquired).toBe(true);
+
+    const service = new AgentTaskControlService({
+      store,
+      runtime,
+      createId: createSequentialId(),
+      now: () => 100 as TimestampMs,
+    });
+
+    const result = await service.reconcileStaleTasks({ staleAfterMs: 30 });
+
+    expect(result.scanned).toBe(1);
+    expect(result.closed).toEqual([]);
+    expect(await store.agentTask(leasedTaskId)).toMatchObject({
+      id: leasedTaskId,
+      status: "running",
+      leaseOwner: "worker_a",
+    });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 async function seedTask(
   store: SqliteEventStore,
   input: { taskId: TaskId; status: "running" | "completed"; mode?: "one_shot" | "resumable" | "background"; time?: TimestampMs },

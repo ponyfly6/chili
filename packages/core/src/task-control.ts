@@ -99,6 +99,7 @@ export class AgentTaskWaitTimeoutError extends Error {
 interface ActiveTaskRun {
   task: AgentTaskRow;
   runId: AgentRunId;
+  generation: number;
   controller: AbortController;
   completed: boolean;
 }
@@ -119,21 +120,23 @@ export class AgentTaskControlService {
   async followupTask(input: AgentTaskFollowupInput): Promise<AgentTaskFollowupResult> {
     const task = await this.requireRunnableTask(input.taskId);
     const runId = this.id<AgentRunId>("agent");
+    const generation = task.generation + 1;
     const activeRun: ActiveTaskRun = {
       task,
       runId,
+      generation,
       controller: linkedAbortController(input.signal),
       completed: false,
     };
 
-    const messageId = await this.appendTaskFollowup(task, input.text, runId);
+    const messageId = await this.appendTaskFollowup(task, input.text, runId, generation);
     this.activeRuns.set(task.id, activeRun);
     try {
       const result = await this.options.runtime.submitPrompt(this.submitPromptInput(task, input, activeRun.controller.signal));
       await this.consumeTaskFollowup(task, messageId);
       if (await this.shouldCompleteRun(task.id, runId, activeRun)) {
         activeRun.completed = true;
-        await this.completeFollowupRun(task, runId, result);
+        await this.completeFollowupRun(task, runId, generation, result);
       }
 
       return {
@@ -145,8 +148,8 @@ export class AgentTaskControlService {
         const err = toError(error);
         const status: AgentTaskFinalStatus = isAbortError(err) ? "cancelled" : "failed";
         activeRun.completed = true;
-        await this.appendTaskCompletion(task, status, runId, undefined, err.message);
-        await this.appendAgentCompletion(task, status, runId, undefined, err.message);
+        await this.appendTaskCompletion(task, status, runId, activeRun.generation, undefined, err.message);
+        await this.appendAgentCompletion(task, status, runId, activeRun.generation, undefined, err.message);
       }
       throw error;
     } finally {
@@ -165,8 +168,8 @@ export class AgentTaskControlService {
 
     const status = input.status ?? "completed";
     activeRun.completed = true;
-    await this.appendTaskCompletion(activeRun.task, status, activeRun.runId, input.summary);
-    await this.appendAgentCompletion(activeRun.task, status, activeRun.runId, input.summary);
+    await this.appendTaskCompletion(activeRun.task, status, activeRun.runId, activeRun.generation, input.summary);
+    await this.appendAgentCompletion(activeRun.task, status, activeRun.runId, activeRun.generation, input.summary);
     activeRun.controller.abort();
     return {
       taskId: input.taskId,
@@ -208,8 +211,23 @@ export class AgentTaskControlService {
       }
     }
 
-    await this.appendTaskCompletion(task, status, task.currentRunId as AgentRunId | undefined, input.summary, input.error);
-    await this.appendAgentCompletion(task, status, task.currentRunId as AgentRunId | undefined, input.summary, input.error);
+    const closeGeneration = task.generation + 1;
+    await this.appendTaskCompletion(
+      task,
+      status,
+      task.currentRunId as AgentRunId | undefined,
+      closeGeneration,
+      input.summary,
+      input.error,
+    );
+    await this.appendAgentCompletion(
+      task,
+      status,
+      task.currentRunId as AgentRunId | undefined,
+      closeGeneration,
+      input.summary,
+      input.error,
+    );
     return this.requireTask(input.taskId);
   }
 
@@ -225,6 +243,7 @@ export class AgentTaskControlService {
     for (const task of candidates) {
       if (liveTaskIds.has(task.id)) continue;
       if (modes.length > 0 && (!task.mode || !modes.includes(task.mode))) continue;
+      if (task.leaseOwner && task.leaseExpiresAt && task.leaseExpiresAt > Number(this.now())) continue;
       if (task.updatedAt > cutoff) continue;
       closed.push(
         await this.closeTask({
@@ -278,7 +297,12 @@ export class AgentTaskControlService {
     return promptInput;
   }
 
-  private async appendTaskFollowup(task: AgentTaskRow, text: string, runId: AgentRunId): Promise<string> {
+  private async appendTaskFollowup(
+    task: AgentTaskRow,
+    text: string,
+    runId: AgentRunId,
+    generation: number,
+  ): Promise<string> {
     const messageId = await this.append(task, "agent.message_queued", {
       taskId: task.id,
       path: task.path,
@@ -301,6 +325,7 @@ export class AgentTaskControlService {
       taskName: task.taskName,
       cwd: task.cwd,
       mode: task.mode,
+      generation,
     });
     return messageId;
   }
@@ -317,13 +342,14 @@ export class AgentTaskControlService {
   private async completeFollowupRun(
     task: AgentTaskRow,
     runId: AgentRunId,
+    generation: number,
     result: SubmitPromptResult,
   ): Promise<void> {
     const status = promptResultToTaskStatus(result);
     const summary = result.status === "completed" ? await this.latestAssistantText(task.childSessionId) : undefined;
     const error = result.status === "completed" ? undefined : result.error?.message ?? result.finishReason;
-    await this.appendTaskCompletion(task, status, runId, summary, error);
-    await this.appendAgentCompletion(task, status, runId, summary, error);
+    await this.appendTaskCompletion(task, status, runId, generation, summary, error);
+    await this.appendAgentCompletion(task, status, runId, generation, summary, error);
   }
 
   private async shouldCompleteRun(taskId: TaskId, runId: AgentRunId, activeRun: ActiveTaskRun): Promise<boolean> {
@@ -331,6 +357,7 @@ export class AgentTaskControlService {
     const current = await this.options.store.agentTask(taskId);
     if (!current) return false;
     if (current.currentRunId && current.currentRunId !== runId) return false;
+    if (current.generation !== activeRun.generation) return false;
     return !isFinalTaskStatus(current.status);
   }
 
@@ -338,6 +365,7 @@ export class AgentTaskControlService {
     task: AgentTaskRow,
     status: AgentTaskFinalStatus,
     runId?: AgentRunId,
+    generation?: number,
     summary?: string,
     error?: string,
   ): Promise<void> {
@@ -346,6 +374,7 @@ export class AgentTaskControlService {
       path: task.path,
       status,
       runId,
+      generation,
       summary,
       error,
     });
@@ -355,6 +384,7 @@ export class AgentTaskControlService {
     task: AgentTaskRow,
     status: AgentTaskFinalStatus,
     runId?: AgentRunId,
+    generation?: number,
     summary?: string,
     error?: string,
   ): Promise<void> {
@@ -364,6 +394,7 @@ export class AgentTaskControlService {
       taskId: task.id,
       path: task.path,
       status,
+      generation,
       summary,
       error,
     });
