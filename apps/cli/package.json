@@ -1,0 +1,21 @@
+{
+  "name": "@chili/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "chili": "./dist/index.js"
+  },
+  "dependencies": {
+    "@chili/core": "workspace:*",
+    "@chili/policy": "workspace:*",
+    "@chili/protocol": "workspace:*",
+    "@chili/providers": "workspace:*",
+    "@chili/server": "workspace:*",
+    "@chili/store": "workspace:*",
+    "@chili/tools": "workspace:*"
+  },
+  "scripts": {
+    "typecheck": "tsc -b"
+  }
+}

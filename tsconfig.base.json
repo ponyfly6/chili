@@ -1,0 +1,52 @@
+{
+  "compilerOptions": {
+    "allowSyntheticDefaultImports": true,
+    "baseUrl": ".",
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "lib": [
+      "DOM",
+      "ES2023"
+    ],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmitOnError": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "noUncheckedIndexedAccess": true,
+    "paths": {
+      "@chili/core": [
+        "packages/core/src/index.ts"
+      ],
+      "@chili/policy": [
+        "packages/policy/src/index.ts"
+      ],
+      "@chili/protocol": [
+        "packages/protocol/src/index.ts"
+      ],
+      "@chili/providers": [
+        "packages/providers/src/index.ts"
+      ],
+      "@chili/sdk": [
+        "packages/sdk/src/index.ts"
+      ],
+      "@chili/server": [
+        "packages/server/src/index.ts"
+      ],
+      "@chili/store": [
+        "packages/store/src/index.ts"
+      ],
+      "@chili/tools": [
+        "packages/tools/src/index.ts"
+      ]
+    },
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ES2023",
+    "verbatimModuleSyntax": true
+  }
+}

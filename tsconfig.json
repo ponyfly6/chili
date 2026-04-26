@@ -1,0 +1,32 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "./packages/protocol"
+    },
+    {
+      "path": "./packages/providers"
+    },
+    {
+      "path": "./packages/sdk"
+    },
+    {
+      "path": "./packages/policy"
+    },
+    {
+      "path": "./packages/store"
+    },
+    {
+      "path": "./packages/tools"
+    },
+    {
+      "path": "./packages/core"
+    },
+    {
+      "path": "./packages/server"
+    },
+    {
+      "path": "./apps/cli"
+    }
+  ]
+}

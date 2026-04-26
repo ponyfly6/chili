@@ -4,7 +4,19 @@
 # Logs
 *.log
 
+# Dependencies
+node_modules/
+
 # Env
 .env
 .env.*
 
+# Chili local state
+.chili/
+
+# Build outputs
+dist/
+packages/*/dist/
+apps/*/dist/
+
+/docs/
