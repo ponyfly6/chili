@@ -1,6 +1,7 @@
 import type {
   ChiliEvent,
   AgentPath,
+  AgentTaskMode,
   AgentTaskStatus,
   RuntimeInterruptResult,
   RuntimeApprovalResolveResult,
@@ -20,6 +21,8 @@ import type {
   AgentTaskFinalStatus,
   AgentTaskFollowupInput,
   AgentTaskFollowupResult,
+  AgentTaskReconcileStaleInput,
+  AgentTaskReconcileStaleResult,
   AgentTaskWaitInput,
   RuntimeBackgroundErrorHandler,
   SubmitPromptInput,
@@ -43,6 +46,7 @@ export interface RuntimeTaskControlService {
   followupTask(input: AgentTaskFollowupInput): Promise<AgentTaskFollowupResult>;
   waitForTask(input: AgentTaskWaitInput): Promise<AgentTaskRow>;
   closeTask(input: AgentTaskCloseInput): Promise<AgentTaskRow>;
+  reconcileStaleTasks(input?: AgentTaskReconcileStaleInput): Promise<AgentTaskReconcileStaleResult>;
 }
 
 export interface RuntimeAgentTreeService {
@@ -99,6 +103,12 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "listTasks") {
         const tasks = requireTaskControl(options);
         return json(await tasks.listTasks(taskQueryFromUrl(url)));
+      }
+
+      if (route.name === "tasksReconcileStale") {
+        const tasks = requireTaskControl(options);
+        const body = await readJson<TaskReconcileStaleBody>(request);
+        return json(await tasks.reconcileStaleTasks(reconcileStaleInput(body)));
       }
 
       if (route.name === "task") {
@@ -280,6 +290,7 @@ type Route =
   | { name: "agents"; sessionId?: SessionId }
   | { name: "listSessions" }
   | { name: "listTasks" }
+  | { name: "tasksReconcileStale" }
   | { name: "agentTree" }
   | { name: "agentRuns" }
   | { name: "mailbox" }
@@ -328,6 +339,14 @@ interface TaskCloseBody {
   interrupt?: boolean;
 }
 
+interface TaskReconcileStaleBody {
+  staleAfterMs?: number;
+  modes?: unknown;
+  limit?: number;
+  summary?: string;
+  error?: string;
+}
+
 interface InterruptBody {
   reason?: string;
 }
@@ -361,6 +380,7 @@ function routeRequest(method: string, pathname: string): Route {
   if (method === "GET" && path === "/mailbox") return { name: "mailbox" };
   if (method === "GET" && path === "/sessions") return { name: "listSessions" };
   if (method === "GET" && path === "/tasks") return { name: "listTasks" };
+  if (method === "POST" && path === "/tasks/reconcile_stale") return { name: "tasksReconcileStale" };
   if (method === "POST" && path === "/sessions") return { name: "createSession" };
 
   const mailboxRoute = /^\/mailbox\/([^/]+)\/consume$/.exec(path);
@@ -672,11 +692,13 @@ function agentRunQueryFromUrl(url: URL): AgentRunQuery {
 function mailboxQueryFromUrl(url: URL): AgentMailboxQuery {
   const query: AgentMailboxQuery = {};
   const messageId = url.searchParams.get("messageId");
+  const taskId = url.searchParams.get("taskId");
   const status = url.searchParams.get("status");
   const path = url.searchParams.get("path");
   const childSessionId = asSessionId(url.searchParams.get("childSessionId"));
   const limit = numberParam(url.searchParams.get("limit"));
   if (messageId) query.messageId = messageId;
+  if (taskId) query.taskId = taskId as TaskId;
   if (status === "queued" || status === "consumed") query.status = status;
   if (path) query.path = path as AgentPath;
   if (childSessionId) query.childSessionId = childSessionId;
@@ -714,6 +736,34 @@ function closeStatus(value: unknown): AgentTaskFinalStatus {
   if (value === undefined) return "cancelled";
   if (value === "completed" || value === "failed" || value === "cancelled") return value;
   throw badRequest("status must be completed, failed, or cancelled");
+}
+
+function reconcileStaleInput(body: TaskReconcileStaleBody): AgentTaskReconcileStaleInput {
+  const input: AgentTaskReconcileStaleInput = {};
+  if (body.staleAfterMs !== undefined) {
+    if (!Number.isInteger(body.staleAfterMs) || body.staleAfterMs < 0) {
+      throw badRequest("staleAfterMs must be a non-negative integer");
+    }
+    input.staleAfterMs = body.staleAfterMs;
+  }
+  if (body.limit !== undefined) {
+    if (!Number.isInteger(body.limit) || body.limit <= 0) {
+      throw badRequest("limit must be a positive integer");
+    }
+    input.limit = body.limit;
+  }
+  if (body.summary) input.summary = body.summary;
+  if (body.error) input.error = body.error;
+  if (body.modes !== undefined) {
+    if (!Array.isArray(body.modes)) throw badRequest("modes must be an array");
+    input.modes = body.modes.map((mode) => {
+      if (mode !== "one_shot" && mode !== "resumable" && mode !== "background") {
+        throw badRequest("modes must contain one_shot, resumable, or background");
+      }
+      return mode as AgentTaskMode;
+    });
+  }
+  return input;
 }
 
 function numberParam(value: string | null): number | undefined {

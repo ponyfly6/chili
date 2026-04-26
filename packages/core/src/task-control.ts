@@ -1,6 +1,7 @@
 import type {
   AgentPath,
   AgentRunId,
+  AgentTaskMode,
   AgentTaskStatus,
   ChiliEvent,
   EventEnvelope,
@@ -58,6 +59,20 @@ export interface AgentTaskCloseInput {
   summary?: string;
   error?: string;
   interrupt?: boolean;
+}
+
+export interface AgentTaskReconcileStaleInput {
+  staleAfterMs?: number;
+  modes?: AgentTaskMode[];
+  liveTaskIds?: Iterable<TaskId | string>;
+  limit?: number;
+  summary?: string;
+  error?: string;
+}
+
+export interface AgentTaskReconcileStaleResult {
+  scanned: number;
+  closed: AgentTaskRow[];
 }
 
 export class AgentTaskNotFoundError extends Error {
@@ -196,6 +211,36 @@ export class AgentTaskControlService {
     await this.appendTaskCompletion(task, status, task.currentRunId as AgentRunId | undefined, input.summary, input.error);
     await this.appendAgentCompletion(task, status, task.currentRunId as AgentRunId | undefined, input.summary, input.error);
     return this.requireTask(input.taskId);
+  }
+
+  async reconcileStaleTasks(input: AgentTaskReconcileStaleInput = {}): Promise<AgentTaskReconcileStaleResult> {
+    const limit = input.limit ?? 500;
+    const staleAfterMs = input.staleAfterMs ?? 30_000;
+    const cutoff = Number(this.now()) - staleAfterMs;
+    const liveTaskIds = new Set([...(input.liveTaskIds ?? [])].map(String));
+    const modes = input.modes ?? ["background"];
+    const candidates = await this.options.store.agentTasks({ status: "running", limit });
+    const closed: AgentTaskRow[] = [];
+
+    for (const task of candidates) {
+      if (liveTaskIds.has(task.id)) continue;
+      if (modes.length > 0 && (!task.mode || !modes.includes(task.mode))) continue;
+      if (task.updatedAt > cutoff) continue;
+      closed.push(
+        await this.closeTask({
+          taskId: task.id,
+          status: "cancelled",
+          summary: input.summary ?? "Marked stale: background worker is no longer running",
+          error: input.error ?? "stale_background_worker",
+          interrupt: false,
+        }),
+      );
+    }
+
+    return {
+      scanned: candidates.length,
+      closed,
+    };
   }
 
   private async requireTask(taskId: TaskId): Promise<AgentTaskRow> {

@@ -144,6 +144,55 @@ test("builds an agent path tree and consumes mailbox messages", async () => {
   }
 });
 
+test("synthesizes missing root and ancestor nodes from agent paths", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-agent-tree-ancestors-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const rootPath = "/root" as AgentPath;
+  const reviewerPath = "/root/reviewer" as AgentPath;
+  const childPath = "/root/reviewer/reader" as AgentPath;
+
+  try {
+    await store.append(
+      agentSpawned(
+        "event_reader",
+        "agent_reader" as AgentRunId,
+        childPath,
+        reviewerPath,
+        "reader",
+        5,
+      ),
+    );
+    const service = new AgentTreeControlService({ store });
+
+    const snapshot = await service.snapshot({ rootPath });
+
+    expect(snapshot.nodes).toHaveLength(1);
+    expect(snapshot.nodes[0]).toMatchObject({
+      path: rootPath,
+      taskName: "",
+      status: "empty",
+      children: [
+        {
+          path: reviewerPath,
+          taskName: "",
+          status: "empty",
+          children: [
+            {
+              path: childPath,
+              parentPath: reviewerPath,
+              taskName: "reader",
+              runIds: ["agent_reader"],
+            },
+          ],
+        },
+      ],
+    });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 function agentSpawned(
   id: string,
   runId: AgentRunId,

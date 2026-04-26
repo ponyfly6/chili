@@ -196,6 +196,13 @@ function buildTreeNodes(input: {
     node.updatedAt = Math.max(node.updatedAt, message.consumedAt ?? message.createdAt);
   }
 
+  for (const node of [...nodes.values()]) {
+    synthesizeAncestors(nodes, node.path, node.createdAt, input.rootPath);
+  }
+  if (input.rootPath && !nodes.has(input.rootPath)) {
+    upsertNode(nodes, input.rootPath, 0);
+  }
+
   const roots: AgentTreeNode[] = [];
   for (const node of nodes.values()) {
     if (node.parentPath && nodes.has(node.parentPath)) {
@@ -207,7 +214,8 @@ function buildTreeNodes(input: {
 
   const sortedRoots = sortTree(roots);
   if (!input.rootPath) return sortedRoots;
-  return sortedRoots.filter((node) => isPathWithin(node.path, input.rootPath as AgentPath));
+  const explicitRoot = nodes.get(input.rootPath);
+  return explicitRoot ? [explicitRoot] : sortedRoots.filter((node) => isPathWithin(node.path, input.rootPath as AgentPath));
 }
 
 function upsertNode(nodes: Map<string, AgentTreeNode>, path: AgentPath, time: number): AgentTreeNode {
@@ -228,6 +236,28 @@ function upsertNode(nodes: Map<string, AgentTreeNode>, path: AgentPath, time: nu
   };
   nodes.set(path, node);
   return node;
+}
+
+function synthesizeAncestors(
+  nodes: Map<string, AgentTreeNode>,
+  path: AgentPath,
+  time: number,
+  rootPath: AgentPath | undefined,
+): void {
+  let childPath: AgentPath | undefined = path;
+  while (childPath) {
+    if (rootPath && childPath === rootPath) return;
+    const parentPath = parentAgentPath(childPath);
+    if (!parentPath) return;
+    if (rootPath && !isPathWithin(childPath, rootPath)) return;
+
+    const child = nodes.get(childPath);
+    if (child && !child.parentPath) child.parentPath = parentPath;
+    const parent = upsertNode(nodes, parentPath, time);
+    parent.createdAt = Math.min(parent.createdAt, time);
+    parent.updatedAt = Math.max(parent.updatedAt, child?.updatedAt ?? time);
+    childPath = parentPath;
+  }
 }
 
 function sortTree(nodes: AgentTreeNode[]): AgentTreeNode[] {

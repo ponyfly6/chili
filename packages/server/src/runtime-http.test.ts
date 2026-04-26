@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import type { AgentTreeSnapshot } from "@chili/core";
 import type {
   ApprovalRow,
+  AgentMailboxQuery,
   AgentTaskRow,
   AgentMailboxRow,
   AgentRunRow,
@@ -237,6 +238,20 @@ test("serves task control routes", async () => {
   );
   expect(closeResponse.status).toBe(200);
   expect(await closeResponse.json()).toMatchObject({ id: "task_http", status: "cancelled", summary: "stopped" });
+
+  const reconcileResponse = await handler(
+    new Request("http://chili.test/tasks/reconcile_stale", {
+      method: "POST",
+      body: JSON.stringify({ staleAfterMs: 0, modes: ["background"], limit: 25 }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  expect(reconcileResponse.status).toBe(200);
+  expect(await reconcileResponse.json()).toMatchObject({
+    scanned: 1,
+    closed: [{ id: "task_http", status: "cancelled" }],
+  });
+  expect(tasks.lastReconcile).toMatchObject({ staleAfterMs: 0, modes: ["background"], limit: 25 });
 });
 
 test("serves agent tree and mailbox control routes", async () => {
@@ -260,6 +275,12 @@ test("serves agent tree and mailbox control routes", async () => {
   const mailboxResponse = await handler(new Request("http://chili.test/mailbox?status=queued"));
   expect(mailboxResponse.status).toBe(200);
   expect(await mailboxResponse.json()).toMatchObject([{ id: "event_mailbox", status: "queued" }]);
+  expect(agents.mailboxQueries.at(-1)).toMatchObject({ status: "queued" });
+
+  const taskMailboxResponse = await handler(new Request("http://chili.test/mailbox?taskId=task_http&status=queued"));
+  expect(taskMailboxResponse.status).toBe(200);
+  expect(await taskMailboxResponse.json()).toMatchObject([{ id: "event_mailbox", status: "queued" }]);
+  expect(agents.mailboxQueries.at(-1)).toMatchObject({ taskId: "task_http", status: "queued" });
 
   const consumeResponse = await handler(
     new Request("http://chili.test/mailbox/event_mailbox/consume", {
@@ -394,6 +415,7 @@ class BusyRuntimeService extends FakeRuntimeService {
 class FakeTaskControlService implements RuntimeTaskControlService {
   lastListStatus: string | undefined;
   lastFollowupText: string | undefined;
+  lastReconcile: unknown;
 
   async listTasks(query: { status?: string } = {}): Promise<AgentTaskRow[]> {
     this.lastListStatus = query.status;
@@ -425,10 +447,16 @@ class FakeTaskControlService implements RuntimeTaskControlService {
     if (input.summary) rowInput.summary = input.summary;
     return taskRow(rowInput);
   }
+
+  async reconcileStaleTasks(input = {}): Promise<{ scanned: number; closed: AgentTaskRow[] }> {
+    this.lastReconcile = input;
+    return { scanned: 1, closed: [taskRow({ status: "cancelled" })] };
+  }
 }
 
 class FakeAgentTreeService implements RuntimeAgentTreeService {
   consumedIds: string[] = [];
+  mailboxQueries: AgentMailboxQuery[] = [];
 
   async snapshot(): Promise<AgentTreeSnapshot> {
     const root = agentRunRow({ id: "agent_http_root", path: "/root", taskName: "lead" });
@@ -474,7 +502,8 @@ class FakeAgentTreeService implements RuntimeAgentTreeService {
     return [agentRunRow({ id: "agent_http_child", path: "/root/task_http", parentPath: "/root", taskName: "review" })];
   }
 
-  async mailbox(): Promise<AgentMailboxRow[]> {
+  async mailbox(query: AgentMailboxQuery = {}): Promise<AgentMailboxRow[]> {
+    this.mailboxQueries.push(query);
     return [mailboxRow({ status: "queued" })];
   }
 

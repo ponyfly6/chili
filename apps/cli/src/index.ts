@@ -43,6 +43,17 @@ async function main(): Promise<void> {
       return;
     }
 
+    if (args.command === "tasks-reconcile-stale") {
+      const input: { staleAfterMs?: number } = {};
+      if (args.staleAfterMs !== undefined) input.staleAfterMs = args.staleAfterMs;
+      const result = await harness.tasks.reconcileStaleTasks(input);
+      console.log(`[tasks] scanned=${result.scanned} closed=${result.closed.length}`);
+      for (const task of result.closed) {
+        console.log(`[task] ${task.id}\t${task.status}\t${task.summary ?? ""}`);
+      }
+      return;
+    }
+
     if (args.command === "agents") {
       await printAgentTree(harness);
       return;
@@ -253,6 +264,7 @@ async function repl(input: {
             "/agents               Show agent tree",
             "/mailbox              List queued mailbox messages",
             "/tasks                List subagent tasks",
+            "/recover-tasks        Mark stale background tasks cancelled",
             "/task <taskId>        Show a subagent task",
             "/revert <snapshotId>  Revert a snapshot in this session",
             "/exit                 Quit",
@@ -274,6 +286,11 @@ async function repl(input: {
       }
       if (line === "/tasks") {
         await printTasks(input.harness);
+        continue;
+      }
+      if (line === "/recover-tasks") {
+        const result = await input.harness.tasks.reconcileStaleTasks();
+        console.log(`[tasks] scanned=${result.scanned} closed=${result.closed.length}`);
         continue;
       }
       if (line.startsWith("/task ")) {

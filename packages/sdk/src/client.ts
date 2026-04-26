@@ -35,6 +35,7 @@ export interface RuntimeClient {
   followupTask(input: FollowupTaskRequest): Promise<RuntimeTaskFollowupResult>;
   waitTask(input: WaitTaskRequest): Promise<RuntimeAgentTaskRecord>;
   closeTask(input: CloseTaskRequest): Promise<RuntimeAgentTaskRecord>;
+  reconcileStaleTasks(input?: ReconcileStaleTasksRequest): Promise<RuntimeTaskReconcileStaleResult>;
   messages(sessionId: SessionId): Promise<Message[]>;
   streamEvents(input?: StreamEventsRequest): AsyncIterable<ChiliEvent>;
 }
@@ -97,7 +98,7 @@ export interface RuntimeAgentTreeNode {
   path: AgentPath;
   parentPath?: AgentPath;
   taskName: string;
-  status: RuntimeAgentRunRecord["status"] | AgentMailboxStatus | "empty";
+  status: RuntimeAgentRunRecord["status"] | AgentTaskStatus | AgentMailboxStatus | "empty";
   runIds: string[];
   runs: RuntimeAgentRunRecord[];
   tasks: RuntimeAgentTaskRecord[];
@@ -209,6 +210,19 @@ export interface CloseTaskRequest {
   summary?: string;
   error?: string;
   interrupt?: boolean;
+}
+
+export interface ReconcileStaleTasksRequest {
+  staleAfterMs?: number;
+  modes?: AgentTaskMode[];
+  limit?: number;
+  summary?: string;
+  error?: string;
+}
+
+export interface RuntimeTaskReconcileStaleResult {
+  scanned: number;
+  closed: RuntimeAgentTaskRecord[];
 }
 
 export interface StreamEventsRequest {
@@ -342,6 +356,10 @@ export class HttpRuntimeClient implements RuntimeClient {
       error: input.error,
       interrupt: input.interrupt,
     });
+  }
+
+  reconcileStaleTasks(input: ReconcileStaleTasksRequest = {}): Promise<RuntimeTaskReconcileStaleResult> {
+    return this.post("tasks/reconcile_stale", input);
   }
 
   messages(sessionId: SessionId): Promise<Message[]> {

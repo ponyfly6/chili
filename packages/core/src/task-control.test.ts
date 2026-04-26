@@ -272,22 +272,64 @@ test("closes a running task and interrupts the child session", async () => {
   }
 });
 
+test("reconciles stale running background tasks without touching live task ids", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-task-control-reconcile-stale-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const runtime = new FakeTaskRuntime(store);
+  const staleTaskId = "task_stale" as TaskId;
+  const liveTaskId = "task_live" as TaskId;
+
+  try {
+    await seedTask(store, { taskId: staleTaskId, status: "running", mode: "background", time: 10 as TimestampMs });
+    await seedTask(store, { taskId: liveTaskId, status: "running", mode: "background", time: 20 as TimestampMs });
+    const service = new AgentTaskControlService({
+      store,
+      runtime,
+      createId: createSequentialId(),
+      now: () => 100 as TimestampMs,
+    });
+
+    const result = await service.reconcileStaleTasks({
+      staleAfterMs: 30,
+      liveTaskIds: [liveTaskId],
+    });
+
+    expect(result.scanned).toBe(2);
+    expect(result.closed.map((task) => task.id)).toEqual([staleTaskId]);
+    expect(await store.agentTask(staleTaskId)).toMatchObject({
+      id: staleTaskId,
+      status: "cancelled",
+      currentRunId: "agent_initial_task_stale",
+      summary: "Marked stale: background worker is no longer running",
+      error: "stale_background_worker",
+    });
+    expect(await store.agentTask(liveTaskId)).toMatchObject({
+      id: liveTaskId,
+      status: "running",
+    });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 async function seedTask(
   store: SqliteEventStore,
-  input: { taskId: TaskId; status: "running" | "completed" },
+  input: { taskId: TaskId; status: "running" | "completed"; mode?: "one_shot" | "resumable" | "background"; time?: TimestampMs },
 ): Promise<void> {
   const parentSessionId = "session_parent" as SessionId;
   const parentThreadId = "thread_parent" as ThreadId;
   const childSessionId = "session_child" as SessionId;
   const childThreadId = "thread_child" as ThreadId;
-  const runId = "agent_initial" as AgentRunId;
+  const runId = `agent_initial_${input.taskId}` as AgentRunId;
   const path = `/root/${input.taskId}` as AgentPath;
   const parentPath = "/root" as AgentPath;
-  const time = 1 as TimestampMs;
+  const time = input.time ?? (1 as TimestampMs);
+  const mode = input.mode ?? "one_shot";
 
   const events: ChiliEvent[] = [
     {
-      id: "event_task_created",
+      id: `event_task_created_${input.taskId}`,
       type: "agent.task_created",
       time,
       sessionId: parentSessionId,
@@ -303,11 +345,11 @@ async function seedTask(
         taskName: "reader",
         cwd: "/repo",
         prompt: "read package",
-        mode: "one_shot",
+        mode,
       },
     },
     {
-      id: "event_spawned",
+      id: `event_spawned_${input.taskId}`,
       type: "agent.spawned",
       time,
       sessionId: parentSessionId,
@@ -323,14 +365,14 @@ async function seedTask(
         childThreadId,
         taskName: "reader",
         cwd: "/repo",
-        mode: "one_shot",
+        mode,
       },
     },
   ];
 
   if (input.status === "completed") {
     events.push({
-      id: "event_completed",
+      id: `event_completed_${input.taskId}`,
       type: "agent.completed",
       time,
       sessionId: parentSessionId,

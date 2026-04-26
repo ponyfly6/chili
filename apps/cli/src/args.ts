@@ -13,6 +13,7 @@ export interface CliArgs {
     | "task-followup"
     | "task-wait"
     | "task-close"
+    | "tasks-reconcile-stale"
     | "mailbox"
     | "mailbox-consume"
     | "help";
@@ -26,6 +27,7 @@ export interface CliArgs {
   messageId?: string;
   taskStatus?: Extract<AgentTaskStatus, "completed" | "failed" | "cancelled">;
   timeoutMs?: number;
+  staleAfterMs?: number;
   model: CliModelName;
   yes: boolean;
   maxTurns: number;
@@ -54,6 +56,10 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     }
     if (arg === "tasks") {
       result.command = "tasks";
+      continue;
+    }
+    if (arg === "recover-tasks") {
+      result.command = "tasks-reconcile-stale";
       continue;
     }
     if (arg === "agents" || arg === "tree") {
@@ -151,6 +157,13 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       if (!Number.isInteger(result.timeoutMs) || result.timeoutMs <= 0) throw new Error("--timeout-ms must be a positive integer");
       continue;
     }
+    if (arg === "--stale-after-ms") {
+      result.staleAfterMs = Number.parseInt(requireValue(arg, args), 10);
+      if (!Number.isInteger(result.staleAfterMs) || result.staleAfterMs < 0) {
+        throw new Error("--stale-after-ms must be a non-negative integer");
+      }
+      continue;
+    }
     if (arg.startsWith("-")) throw new Error(`Unknown option: ${arg}`);
     prompt.push(arg, ...args.splice(0));
   }
@@ -168,6 +181,7 @@ export function usage(): string {
     "  bun run chili -- --resume <session-id> \"continue\"",
     "  bun run chili -- sessions",
     "  bun run chili -- tasks",
+    "  bun run chili -- recover-tasks --stale-after-ms 30000",
     "  bun run chili -- agents",
     "  bun run chili -- mailbox",
     "  bun run chili -- consume <mailbox-message-id>",
@@ -190,6 +204,7 @@ export function usage(): string {
     "  --max-turns <n>     Max automatic tool-use continuation turns, default 12",
     "  --status <status>   Task close status: completed | failed | cancelled",
     "  --timeout-ms <n>    Task wait timeout in milliseconds",
+    "  --stale-after-ms <n> Recover running background tasks older than this many milliseconds",
   ].join("\n");
 }
 
