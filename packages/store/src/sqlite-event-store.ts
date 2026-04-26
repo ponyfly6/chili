@@ -735,6 +735,10 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore {
                task_name = excluded.task_name,
                cwd = coalesce(excluded.cwd, agent_tasks.cwd),
                mode = coalesce(excluded.mode, agent_tasks.mode),
+               summary = null,
+               error = null,
+               completion_json = null,
+               completed_at = null,
                updated_at = excluded.updated_at`,
           )
           .run(

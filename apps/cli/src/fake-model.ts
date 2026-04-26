@@ -21,6 +21,20 @@ export class FakeModelRouter implements ModelRouter {
       return;
     }
 
+    if (text.includes("delegate background read")) {
+      yield {
+        type: "tool_call",
+        name: "task",
+        input: {
+          description: "Read package through a background subagent",
+          prompt: "read package",
+          mode: "background",
+        },
+      };
+      yield { type: "finish", reason: "tool_use" };
+      return;
+    }
+
     if (text.includes("delegate read")) {
       yield {
         type: "tool_call",

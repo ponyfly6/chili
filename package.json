@@ -17,6 +17,7 @@
     "smoke:p2": "bun run scripts/smoke-p2-subagent.ts",
     "smoke:p2-control": "bun run scripts/smoke-p2-task-control.ts",
     "smoke:p3": "bun run scripts/smoke-p3-agent-tree.ts",
+    "smoke:p3-background": "bun run scripts/smoke-p3-background.ts",
     "typecheck": "tsc -b"
   },
   "devDependencies": {

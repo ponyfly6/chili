@@ -310,6 +310,37 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
       },
     ]);
     expect(await store.agentTask(taskId)).toMatchObject({ id: taskId, status: "completed" });
+
+    await store.append({
+      id: "event_spawned_followup",
+      type: "agent.spawned",
+      time: (time + 1) as TimestampMs,
+      sessionId: parentSessionId,
+      threadId: parentThreadId,
+      payload: {
+        runId: "agent_review_followup" as AgentRunId,
+        taskId,
+        path,
+        parentPath,
+        parentSessionId,
+        parentThreadId,
+        childSessionId,
+        childThreadId,
+        taskName: "review",
+        cwd: "/repo",
+        mode: "one_shot",
+      },
+    });
+
+    const resumed = await store.agentTask(taskId);
+    expect(resumed).toMatchObject({
+      id: taskId,
+      status: "running",
+      currentRunId: "agent_review_followup",
+    });
+    expect(resumed?.completedAt).toBeUndefined();
+    expect(resumed?.summary).toBeUndefined();
+    expect(resumed?.completion).toBeUndefined();
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });

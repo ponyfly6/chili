@@ -16,6 +16,7 @@ import {
   FileSystemSnapshotProvider,
   InMemoryToolRegistry,
   PolicyApprovalBroker,
+  type SubagentController,
   ToolExecutor,
   createApplyPatchTool,
   createBashTool,
@@ -48,7 +49,7 @@ export interface CliHarness {
   tasks: AgentTaskControlService;
   agents: AgentTreeControlService;
   recovery: SnapshotRecoveryService;
-  close(): void;
+  close(): Promise<void>;
 }
 
 export async function createCliHarness(options: CliHarnessOptions): Promise<CliHarness> {
@@ -117,8 +118,30 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     }),
     createId,
   });
+  const tasks = new AgentTaskControlService({
+    store: eventStore,
+    runtime: childService,
+    interruptTask: (taskId) => subagents.interruptTask(taskId),
+    createId,
+    system: childSystem,
+  });
+  const completeTaskController: SubagentController = {
+    spawnTask(input, context) {
+      return subagents.spawnTask(input, context);
+    },
+    async completeTask(input) {
+      try {
+        return await tasks.completeTask(input);
+      } catch (error) {
+        if (error instanceof Error && error.name === "AgentTaskNotRunnableError") {
+          return subagents.completeTask(input);
+        }
+        throw error;
+      }
+    },
+  };
   registry.register(createTaskTool(subagents));
-  childRegistry.register(createCompleteTaskTool(subagents));
+  childRegistry.register(createCompleteTaskTool(completeTaskController));
   const toolExecutor = new ToolExecutor({
     registry,
     events: { publish: (event) => eventStore.append(event) },
@@ -158,12 +181,6 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     cwd,
     createId,
   });
-  const tasks = new AgentTaskControlService({
-    store: eventStore,
-    runtime: childService,
-    createId,
-    system: childSystem,
-  });
   const agents = new AgentTreeControlService({
     store: eventStore,
     createId,
@@ -178,7 +195,10 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     tasks,
     agents,
     recovery,
-    close: () => sqliteStore.close(),
+    close: async () => {
+      await subagents.waitForBackgroundTasks();
+      sqliteStore.close();
+    },
   };
 }
 

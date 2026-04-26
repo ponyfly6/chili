@@ -132,6 +132,10 @@ export class RuntimeService {
       });
 
       for (let index = 0; index < maxTurns; index++) {
+        if (controller.signal.aborted) {
+          return await this.cancelledPrompt(input, turns, "Prompt aborted");
+        }
+
         const result = await this.options.runtime.runTurn({
           sessionId: input.sessionId,
           threadId: input.threadId,
@@ -163,6 +167,10 @@ export class RuntimeService {
             turns,
             error: result.error,
           };
+        }
+
+        if (controller.signal.aborted) {
+          return await this.cancelledPrompt(input, turns, "Prompt aborted");
         }
 
         if (result.finishReason !== "tool_use") {
@@ -232,6 +240,25 @@ export class RuntimeService {
     await this.append({ sessionId }, "session.archived", { sessionId });
   }
 
+  private async cancelledPrompt(
+    input: SubmitPromptInput,
+    turns: RunTurnResult[],
+    reason: string,
+  ): Promise<SubmitPromptResult> {
+    const error = abortError(reason);
+    await this.publishStatus({
+      sessionId: input.sessionId,
+      threadId: input.threadId,
+      status: "cancelled",
+      reason,
+    });
+    return {
+      status: "cancelled",
+      turns,
+      error,
+    };
+  }
+
   private createRunController(input: SubmitPromptInput): AbortController {
     const controller = new AbortController();
     if (input.signal) {
@@ -298,6 +325,12 @@ function defaultCreateId(prefix: string): string {
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function abortError(message: string): Error {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
 }
 
 function isAbortError(error: Error): boolean {

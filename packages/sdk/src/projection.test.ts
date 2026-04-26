@@ -211,3 +211,79 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
   expect(snapshot.mailbox[0]?.status).toBe("consumed");
   expect(snapshot.mailbox[0]?.consumedAt).toBe(6);
 });
+
+test("replays completed local subagent tasks as running on spawn without completedAt", () => {
+  const sessionId = "session_local_agents" as SessionId;
+  const threadId = "thread_local_agents" as ThreadId;
+  const taskId = "task_local" as TaskId;
+  const childSessionId = "session_child_local" as SessionId;
+  const childThreadId = "thread_child_local" as ThreadId;
+  const path = "/root/task_local" as AgentPath;
+
+  const view = reduceRuntimeEvents(
+    [
+      {
+        id: "event_task_created",
+        type: "agent.task_created",
+        time: 1 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          taskId,
+          path,
+          parentPath: "/root" as AgentPath,
+          parentSessionId: sessionId,
+          parentThreadId: threadId,
+          childSessionId,
+          childThreadId,
+          taskName: "reader",
+          cwd: "/repo",
+          prompt: "read",
+        },
+      },
+      {
+        id: "event_task_completed",
+        type: "agent.task_completed",
+        time: 2 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          taskId,
+          path,
+          status: "completed",
+          summary: "done",
+        },
+      },
+      {
+        id: "event_agent_spawned",
+        type: "agent.spawned",
+        time: 3 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          runId: "agent_local" as AgentRunId,
+          taskId,
+          path,
+          parentPath: "/root" as AgentPath,
+          parentSessionId: sessionId,
+          parentThreadId: threadId,
+          childSessionId,
+          childThreadId,
+          taskName: "reader",
+        },
+      },
+    ],
+    createRuntimeView(),
+  );
+
+  expect(view.tasks[taskId]).toMatchObject({
+    id: taskId,
+    status: "running",
+    path,
+    sessionId,
+    childSessionId,
+    childThreadId,
+  });
+  expect(view.tasks[taskId]?.completedAt).toBeUndefined();
+  expect(view.sessions[sessionId]?.taskIds).toEqual([taskId]);
+});

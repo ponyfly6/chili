@@ -121,7 +121,7 @@ export interface RuntimeAgentMailboxMessageView {
   consumedAt?: number;
 }
 
-export type RuntimeTaskStatus = "pending" | "in_progress" | "blocked" | "completed" | "failed" | "cancelled";
+export type RuntimeTaskStatus = "pending" | "running" | "in_progress" | "blocked" | "completed" | "failed" | "cancelled";
 
 export interface RuntimeTaskView {
   id: TaskId;
@@ -389,7 +389,20 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     assignOptional(agent, "sessionId", event.sessionId);
     assignOptional(agent, "threadId", event.threadId);
     const taskId = stringValue(payload.taskId) as TaskId | undefined;
-    if (taskId && !agent.taskIds.includes(taskId)) agent.taskIds.push(taskId);
+    if (taskId) {
+      if (!agent.taskIds.includes(taskId)) agent.taskIds.push(taskId);
+      const task = upsertTask(view, taskId, event.time);
+      task.status = "running";
+      delete task.completedAt;
+      task.updatedAt = event.time;
+      task.path = path;
+      task.ownerPath = path;
+      assignOptional(task, "sessionId", (stringValue(payload.parentSessionId) as SessionId | undefined) ?? event.sessionId);
+      assignOptional(task, "childSessionId", stringValue(payload.childSessionId) as SessionId | undefined);
+      assignOptional(task, "childThreadId", stringValue(payload.childThreadId) as ThreadId | undefined);
+      linkTaskToSession(view, task, event.time);
+      linkTaskToOwnerAgent(view, task, event.time);
+    }
     view.agentRunIdsByPath[path] = runId;
     linkAgentToSession(view, agent, event.time);
     linkAgentToParent(view, agent, event.time);
@@ -706,7 +719,7 @@ function agentStatusValue(value: unknown): RuntimeAgentStatus | undefined {
 }
 
 function taskStatusValue(value: unknown): RuntimeTaskStatus | undefined {
-  return value === "pending" || value === "in_progress" || value === "blocked" || value === "completed" || value === "failed" || value === "cancelled"
+  return value === "pending" || value === "running" || value === "in_progress" || value === "blocked" || value === "completed" || value === "failed" || value === "cancelled"
     ? value
     : undefined;
 }

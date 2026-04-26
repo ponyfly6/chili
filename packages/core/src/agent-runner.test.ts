@@ -128,6 +128,40 @@ test("RuntimeService reserves busy sessions before the runner reaches runTurn", 
   expect(runner.userMessages).toHaveLength(1);
 });
 
+test("RuntimeService stops before another tool-use turn when interrupted", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const sessionId = "session_interrupt_loop" as SessionId;
+  const threadId = "thread_interrupt_loop" as ThreadId;
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+  runner.runTurnResult = {
+    status: "completed",
+    turnId: "turn_tool_use" as TurnId,
+    assistantMessageId: "message_assistant_tool_use" as MessageId,
+    finishReason: "tool_use",
+  };
+  runner.onRunTurn = async () => {
+    await service.interrupt(sessionId, "complete_task");
+  };
+
+  const result = await service.submitPrompt({
+    sessionId,
+    threadId,
+    text: "finish by tool",
+    maxTurns: 3,
+  });
+
+  expect(result.status).toBe("cancelled");
+  expect(runner.turnInputs).toHaveLength(1);
+  expect(statuses(store)).toEqual(["running", "cancelling", "running", "cancelled"]);
+});
+
 test("SingleAgentRuntime satisfies AgentRunner without changing aborted turn behavior", async () => {
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();
@@ -173,6 +207,7 @@ class FakeAgentRunner implements AgentRunner {
   readonly userMessages: AppendUserMessageInput[] = [];
   readonly turnInputs: RunTurnInput[] = [];
   runTurnWait?: Promise<void>;
+  onRunTurn?: (input: RunTurnInput) => Promise<void>;
   runTurnResult: RunTurnResult = {
     status: "completed",
     turnId: "turn_fake" as TurnId,
@@ -193,6 +228,7 @@ class FakeAgentRunner implements AgentRunner {
   async runTurn(input: RunTurnInput): Promise<RunTurnResult> {
     this.turnInputs.push(input);
     await this.runTurnWait;
+    await this.onRunTurn?.(input);
     return this.runTurnResult;
   }
 }

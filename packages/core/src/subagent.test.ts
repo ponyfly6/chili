@@ -171,6 +171,154 @@ test("runs a child task through an AgentRunner", async () => {
   });
 });
 
+test("tracks background subagent tasks until they complete", async () => {
+  const store = new MemoryEventStore();
+  const manager = new LocalSubagentManager({
+    store,
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+    runner: {
+      async run() {
+        await Promise.resolve();
+        return { status: "completed", summary: "background done" };
+      },
+    },
+  });
+
+  const task = await manager.spawnTask({
+    parentSessionId: "session_parent" as SessionId,
+    parentThreadId: "thread_parent" as ThreadId,
+    cwd: "/repo",
+    taskName: "background reader",
+    prompt: "Read README",
+    mode: "background",
+  });
+
+  expect(task).toMatchObject({
+    taskId: "task_1",
+    status: "running",
+  });
+  await manager.waitForBackgroundTasks();
+  expect(store.items.at(-2)).toMatchObject({
+    type: "agent.task_completed",
+    payload: { taskId: "task_1", status: "completed", summary: "background done" },
+  });
+  expect(store.items.at(-1)).toMatchObject({
+    type: "agent.completed",
+    payload: { taskId: "task_1", status: "completed", summary: "background done" },
+  });
+});
+
+test("complete_task fails for unknown local subagent tasks", async () => {
+  const store = new MemoryEventStore();
+  const manager = new LocalSubagentManager({
+    store,
+    createId: createSequentialId(),
+    runner: {
+      async run() {
+        return { status: "completed", summary: "done" };
+      },
+    },
+  });
+
+  await expect(
+    manager.completeTask({
+      taskId: "task_missing",
+      summary: "done",
+    }),
+  ).rejects.toThrow("No active local subagent task: task_missing");
+});
+
+test("complete_task completes a local background task without abort overriding it", async () => {
+  const store = new MemoryEventStore();
+  const manager = new LocalSubagentManager({
+    store,
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+    runner: {
+      async run(input) {
+        await new Promise<void>((_resolve, reject) => {
+          input.signal?.addEventListener(
+            "abort",
+            () => {
+              const error = new Error("aborted");
+              error.name = "AbortError";
+              reject(error);
+            },
+            { once: true },
+          );
+        });
+        return { status: "completed", summary: "late completion" };
+      },
+    },
+  });
+
+  const task = await manager.spawnTask({
+    parentSessionId: "session_parent" as SessionId,
+    parentThreadId: "thread_parent" as ThreadId,
+    cwd: "/repo",
+    taskName: "background reader",
+    prompt: "Read README",
+    mode: "background",
+  });
+
+  await Promise.resolve();
+  const completion = await manager.completeTask({
+    taskId: task.taskId,
+    summary: "tool summary",
+  });
+  await manager.waitForBackgroundTasks();
+
+  expect(completion).toEqual({
+    taskId: "task_1",
+    summary: "tool summary",
+    status: "completed",
+  });
+  expect(store.items.map((event) => event.type)).toEqual([
+    "agent.task_created",
+    "agent.spawned",
+    "agent.task_completed",
+    "agent.completed",
+  ]);
+  expect(store.items.at(-1)).toMatchObject({
+    type: "agent.completed",
+    payload: { taskId: "task_1", status: "completed", summary: "tool summary" },
+  });
+});
+
+test("external interrupt prevents a late background subagent completion", async () => {
+  const store = new MemoryEventStore();
+  let finish!: () => void;
+  const manager = new LocalSubagentManager({
+    store,
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+    runner: {
+      async run() {
+        await new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        return { status: "completed", summary: "late completion" };
+      },
+    },
+  });
+
+  const task = await manager.spawnTask({
+    parentSessionId: "session_parent" as SessionId,
+    parentThreadId: "thread_parent" as ThreadId,
+    cwd: "/repo",
+    taskName: "background reader",
+    prompt: "Read README",
+    mode: "background",
+  });
+
+  await Promise.resolve();
+  expect(await manager.interruptTask(task.taskId)).toBe(true);
+  finish();
+  await manager.waitForBackgroundTasks();
+  expect(store.items.map((event) => event.type)).toEqual(["agent.task_created", "agent.spawned"]);
+});
+
 class MemoryEventStore implements EventStore {
   readonly items: ChiliEvent[] = [];
 

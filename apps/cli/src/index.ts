@@ -138,7 +138,7 @@ async function main(): Promise<void> {
       maxTurns: args.maxTurns,
     });
   } finally {
-    harness.close();
+    await harness.close();
   }
 }
 

@@ -12,6 +12,7 @@ import type {
 } from "@chili/protocol";
 import { ROOT_AGENT_PATH, timestampNow } from "@chili/protocol";
 import type { AgentTaskQuery, AgentTaskRow, EventStore, SubagentProjectionStore } from "@chili/store";
+import type { CompleteTaskToolInput, SubagentTaskCompletion } from "@chili/tools";
 import type { SubmitPromptInput, SubmitPromptResult } from "./runtime-service.js";
 
 export type AgentTaskFinalStatus = Exclude<AgentTaskStatus, "pending" | "running">;
@@ -24,6 +25,7 @@ export interface AgentTaskPromptRuntime {
 export interface AgentTaskControlServiceOptions {
   store: EventStore & SubagentProjectionStore;
   runtime: AgentTaskPromptRuntime;
+  interruptTask?: (taskId: TaskId) => boolean | Promise<boolean>;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
   defaultWaitTimeoutMs?: number;
@@ -79,7 +81,16 @@ export class AgentTaskWaitTimeoutError extends Error {
   }
 }
 
+interface ActiveTaskRun {
+  task: AgentTaskRow;
+  runId: AgentRunId;
+  controller: AbortController;
+  completed: boolean;
+}
+
 export class AgentTaskControlService {
+  private readonly activeRuns = new Map<string, ActiveTaskRun>();
+
   constructor(private readonly options: AgentTaskControlServiceOptions) {}
 
   listTasks(query: AgentTaskQuery = {}): Promise<AgentTaskRow[]> {
@@ -93,14 +104,59 @@ export class AgentTaskControlService {
   async followupTask(input: AgentTaskFollowupInput): Promise<AgentTaskFollowupResult> {
     const task = await this.requireRunnableTask(input.taskId);
     const runId = this.id<AgentRunId>("agent");
+    const activeRun: ActiveTaskRun = {
+      task,
+      runId,
+      controller: linkedAbortController(input.signal),
+      completed: false,
+    };
 
-    await this.appendTaskFollowup(task, input.text, runId);
-    const result = await this.options.runtime.submitPrompt(this.submitPromptInput(task, input));
-    await this.completeFollowupRun(task, runId, result);
+    const messageId = await this.appendTaskFollowup(task, input.text, runId);
+    this.activeRuns.set(task.id, activeRun);
+    try {
+      const result = await this.options.runtime.submitPrompt(this.submitPromptInput(task, input, activeRun.controller.signal));
+      await this.consumeTaskFollowup(task, messageId);
+      if (await this.shouldCompleteRun(task.id, runId, activeRun)) {
+        activeRun.completed = true;
+        await this.completeFollowupRun(task, runId, result);
+      }
 
+      return {
+        task: await this.requireTask(input.taskId),
+        result,
+      };
+    } catch (error) {
+      if (await this.shouldCompleteRun(task.id, runId, activeRun)) {
+        const err = toError(error);
+        const status: AgentTaskFinalStatus = isAbortError(err) ? "cancelled" : "failed";
+        activeRun.completed = true;
+        await this.appendTaskCompletion(task, status, runId, undefined, err.message);
+        await this.appendAgentCompletion(task, status, runId, undefined, err.message);
+      }
+      throw error;
+    } finally {
+      this.activeRuns.delete(task.id);
+    }
+  }
+
+  async completeTask(input: CompleteTaskToolInput): Promise<SubagentTaskCompletion> {
+    const activeRun = this.activeRuns.get(input.taskId);
+    if (!activeRun) {
+      throw new AgentTaskNotRunnableError(input.taskId as TaskId, `No active follow-up run for task: ${input.taskId}`);
+    }
+    if (activeRun.completed) {
+      throw new AgentTaskNotRunnableError(input.taskId as TaskId, `Active follow-up run already completed: ${input.taskId}`);
+    }
+
+    const status = input.status ?? "completed";
+    activeRun.completed = true;
+    await this.appendTaskCompletion(activeRun.task, status, activeRun.runId, input.summary);
+    await this.appendAgentCompletion(activeRun.task, status, activeRun.runId, input.summary);
+    activeRun.controller.abort();
     return {
-      task: await this.requireTask(input.taskId),
-      result,
+      taskId: input.taskId,
+      summary: input.summary,
+      status,
     };
   }
 
@@ -125,8 +181,16 @@ export class AgentTaskControlService {
     if (isFinalTaskStatus(task.status)) return task;
 
     const status = input.status ?? "cancelled";
-    if (input.interrupt !== false && task.childSessionId) {
-      await this.options.runtime.interrupt(task.childSessionId, "task_closed");
+    const activeRun = this.activeRuns.get(task.id);
+    if (activeRun && (!task.currentRunId || task.currentRunId === activeRun.runId)) {
+      activeRun.completed = true;
+      activeRun.controller.abort();
+    }
+    if (input.interrupt !== false) {
+      await this.options.interruptTask?.(task.id);
+      if (task.childSessionId) {
+        await this.options.runtime.interrupt(task.childSessionId, "task_closed");
+      }
     }
 
     await this.appendTaskCompletion(task, status, task.currentRunId as AgentRunId | undefined, input.summary, input.error);
@@ -148,7 +212,7 @@ export class AgentTaskControlService {
     return task;
   }
 
-  private submitPromptInput(task: AgentTaskRow, input: AgentTaskFollowupInput): SubmitPromptInput {
+  private submitPromptInput(task: AgentTaskRow, input: AgentTaskFollowupInput, signal: AbortSignal): SubmitPromptInput {
     if (!task.childSessionId || !task.childThreadId) {
       throw new AgentTaskNotRunnableError(task.id, `Agent task is missing child session metadata: ${task.id}`);
     }
@@ -165,12 +229,12 @@ export class AgentTaskControlService {
     };
     if (task.cwd) promptInput.cwd = task.cwd;
     if (input.maxTurns !== undefined) promptInput.maxTurns = input.maxTurns;
-    if (input.signal) promptInput.signal = input.signal;
+    promptInput.signal = signal;
     return promptInput;
   }
 
-  private async appendTaskFollowup(task: AgentTaskRow, text: string, runId: AgentRunId): Promise<void> {
-    await this.append(task, "agent.message_queued", {
+  private async appendTaskFollowup(task: AgentTaskRow, text: string, runId: AgentRunId): Promise<string> {
+    const messageId = await this.append(task, "agent.message_queued", {
       taskId: task.id,
       path: task.path,
       from: task.parentPath ?? ROOT_AGENT_PATH,
@@ -193,6 +257,16 @@ export class AgentTaskControlService {
       cwd: task.cwd,
       mode: task.mode,
     });
+    return messageId;
+  }
+
+  private async consumeTaskFollowup(task: AgentTaskRow, messageId: string): Promise<void> {
+    await this.append(task, "agent.message_consumed", {
+      messageId,
+      taskId: task.id,
+      path: task.path,
+      consumedBy: task.path,
+    });
   }
 
   private async completeFollowupRun(
@@ -205,6 +279,14 @@ export class AgentTaskControlService {
     const error = result.status === "completed" ? undefined : result.error?.message ?? result.finishReason;
     await this.appendTaskCompletion(task, status, runId, summary, error);
     await this.appendAgentCompletion(task, status, runId, summary, error);
+  }
+
+  private async shouldCompleteRun(taskId: TaskId, runId: AgentRunId, activeRun: ActiveTaskRun): Promise<boolean> {
+    if (activeRun.completed) return false;
+    const current = await this.options.store.agentTask(taskId);
+    if (!current) return false;
+    if (current.currentRunId && current.currentRunId !== runId) return false;
+    return !isFinalTaskStatus(current.status);
   }
 
   private async appendTaskCompletion(
@@ -258,9 +340,10 @@ export class AgentTaskControlService {
     task: AgentTaskRow,
     type: TType,
     payload: TPayload,
-  ): Promise<void> {
+  ): Promise<string> {
+    const id = this.id("event");
     const event: EventEnvelope<TType, TPayload> = {
-      id: this.id("event"),
+      id,
       type,
       time: this.now(),
       payload: pruneUndefined(payload),
@@ -269,6 +352,7 @@ export class AgentTaskControlService {
     if (sessionId) event.sessionId = sessionId;
     if (task.parentThreadId) event.threadId = task.parentThreadId;
     await this.options.store.append(event as ChiliEvent);
+    return id;
   }
 
   private id<T extends string>(prefix: string): T {
@@ -328,8 +412,27 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+function linkedAbortController(signal: AbortSignal | undefined): AbortController {
+  const controller = new AbortController();
+  if (!signal) return controller;
+  if (signal.aborted) {
+    controller.abort();
+    return controller;
+  }
+  signal.addEventListener("abort", () => controller.abort(), { once: true });
+  return controller;
+}
+
 function abortError(message: string): Error {
   const error = new Error(message);
   error.name = "AbortError";
   return error;
+}
+
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function isAbortError(error: Error): boolean {
+  return error.name === "AbortError" || error.message.toLowerCase().includes("aborted");
 }

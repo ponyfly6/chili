@@ -77,6 +77,9 @@ test("serves subagent runs and tasks through an event replay projection", async 
   const childPath = "/root/reviewer" as AgentPath;
   const teamId = "team_http" as TeamId;
   const taskId = "task_http" as TaskId;
+  const localTaskId = "task_local_http" as TaskId;
+  const localRunId = "agentrun_local_http" as AgentRunId;
+  const localPath = "/root/local_reader" as AgentPath;
 
   await store.appendMany([
     {
@@ -119,16 +122,69 @@ test("serves subagent runs and tasks through an event replay projection", async 
       threadId: session.threadId,
       payload: { teamId, taskId, status: "completed" },
     },
+    {
+      id: "event_local_task",
+      type: "agent.task_created",
+      time: 7 as TimestampMs,
+      sessionId: session.sessionId,
+      threadId: session.threadId,
+      payload: {
+        taskId: localTaskId,
+        path: localPath,
+        parentPath: rootPath,
+        parentSessionId: session.sessionId,
+        parentThreadId: session.threadId,
+        childSessionId: "session_child_http" as SessionId,
+        childThreadId: "thread_child_http" as ThreadId,
+        taskName: "local reader",
+        cwd: "/repo",
+        prompt: "read",
+      },
+    },
+    {
+      id: "event_local_task_completed",
+      type: "agent.task_completed",
+      time: 8 as TimestampMs,
+      sessionId: session.sessionId,
+      threadId: session.threadId,
+      payload: {
+        taskId: localTaskId,
+        path: localPath,
+        status: "completed",
+        summary: "done",
+      },
+    },
+    {
+      id: "event_local_agent",
+      type: "agent.spawned",
+      time: 9 as TimestampMs,
+      sessionId: session.sessionId,
+      threadId: session.threadId,
+      payload: {
+        runId: localRunId,
+        taskId: localTaskId,
+        path: localPath,
+        parentPath: rootPath,
+        parentSessionId: session.sessionId,
+        parentThreadId: session.threadId,
+        childSessionId: "session_child_http" as SessionId,
+        childThreadId: "thread_child_http" as ThreadId,
+        taskName: "local reader",
+      },
+    },
   ]);
 
   const response = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/agents`));
   expect(response.status).toBe(200);
   const body = (await response.json()) as RuntimeAgentsSnapshot;
 
-  expect(body.agents.map((agent) => agent.id)).toEqual([rootRunId, childRunId]);
-  expect(body.agents[0]?.childRunIds).toEqual([childRunId]);
+  expect(body.agents.map((agent) => agent.id)).toEqual([rootRunId, childRunId, localRunId]);
+  expect(body.agents[0]?.childRunIds).toEqual([childRunId, localRunId]);
   expect(body.agents[1]?.mailboxMessageIds).toEqual(["event_mailbox"]);
   expect(body.tasks[0]?.status).toBe("completed");
+  const localTask = body.tasks.find((task) => task.id === localTaskId);
+  expect(localTask?.status).toBe("running");
+  expect(localTask?.completedAt).toBeUndefined();
   expect(body.mailbox[0]?.triggerTurn).toBe(true);
 });
 

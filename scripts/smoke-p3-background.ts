@@ -3,23 +3,22 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const workspace = await mkdtemp(join(tmpdir(), "chili-p3-agent-tree-"));
+const workspace = await mkdtemp(join(tmpdir(), "chili-p3-background-"));
 
 try {
-  await writeFile(join(workspace, "package.json"), JSON.stringify({ name: "p3-agent-tree-smoke" }, null, 2), "utf8");
+  await writeFile(join(workspace, "package.json"), JSON.stringify({ name: "p3-background-smoke" }, null, 2), "utf8");
 
-  const initial = await runCli(["--model", "fake", "--yes", "--cwd", workspace, "delegate read"]);
+  const initial = await runCli(["--model", "fake", "--yes", "--cwd", workspace, "delegate background read"]);
   const taskId = /\[task\]\s+(task_[^\s]+)/.exec(initial.stdout)?.[1];
   assert.ok(taskId, initial.stdout);
+  assert.match(initial.stdout, new RegExp(`\\[task\\] ${taskId}: completed`));
 
-  const agents = await runCli(["--model", "fake", "--cwd", workspace, "agents"]);
-  assert.match(agents.stdout, new RegExp(`/root/${taskId}\\tcompleted`));
+  const listed = await runCli(["--model", "fake", "--cwd", workspace, "tasks"]);
+  assert.match(listed.stdout, new RegExp(`${taskId}\\tcompleted`));
 
-  await runCli(["--model", "fake", "--yes", "--cwd", workspace, "followup", taskId, "continue the task"]);
-
-  const mailbox = await runCli(["--model", "fake", "--cwd", workspace, "mailbox"]);
-  assert.match(mailbox.stdout, /No mailbox messages/);
-  console.log("P3 agent tree smoke ok");
+  const waited = await runCli(["--model", "fake", "--cwd", workspace, "wait", taskId, "--timeout-ms", "5000"]);
+  assert.match(waited.stdout, new RegExp(`\\[task\\] ${taskId}\\tcompleted`));
+  console.log("P3 background smoke ok");
 } finally {
   await rm(workspace, { recursive: true, force: true });
 }

@@ -84,6 +84,8 @@ export interface LocalSubagentManagerOptions {
 interface LocalSubagentTaskState {
   task: LocalSubagentTaskResult;
   runInput: LocalSubagentRunInput;
+  controller: AbortController;
+  externallyClosed?: boolean;
 }
 
 export interface AgentRunnerSubagentRunnerOptions {
@@ -95,6 +97,7 @@ export interface AgentRunnerSubagentRunnerOptions {
 
 export class LocalSubagentManager implements SubagentController {
   private readonly tasks = new Map<string, LocalSubagentTaskState>();
+  private readonly backgroundTasks = new Set<Promise<void>>();
 
   constructor(private readonly options: LocalSubagentManagerOptions) {}
 
@@ -117,16 +120,34 @@ export class LocalSubagentManager implements SubagentController {
 
   async completeTask(input: CompleteTaskToolInput): Promise<SubagentTaskCompletion> {
     const state = this.tasks.get(input.taskId);
-    if (state) {
-      state.task.status = input.status ?? "completed";
-      state.task.summary = input.summary;
-      await this.appendTaskCompletion(state.runInput, state.task);
+    if (!state) {
+      throw new Error(`No active local subagent task: ${input.taskId}`);
     }
+    if (state.externallyClosed || state.task.status !== "running") {
+      throw new Error(`Local subagent task already completed: ${input.taskId}`);
+    }
+    state.task.status = input.status ?? "completed";
+    state.task.summary = input.summary;
+    await this.appendTaskCompletion(state.runInput, state.task);
+    state.controller.abort();
     return {
       taskId: input.taskId,
       summary: input.summary,
       status: input.status ?? "completed",
     };
+  }
+
+  async waitForBackgroundTasks(): Promise<void> {
+    await Promise.allSettled([...this.backgroundTasks]);
+  }
+
+  async interruptTask(taskId: TaskId | string): Promise<boolean> {
+    const state = this.tasks.get(taskId);
+    if (!state) return false;
+    state.externallyClosed = true;
+    state.task.status = "cancelled";
+    state.controller.abort();
+    return true;
   }
 
   private async spawnLocalTask(input: LocalSubagentTaskInput): Promise<LocalSubagentTaskResult> {
@@ -137,6 +158,7 @@ export class LocalSubagentManager implements SubagentController {
     const childSessionId = this.id<SessionId>("session");
     const childThreadId = this.id<ThreadId>("thread");
     const mode = input.mode ?? "one_shot";
+    const controller = linkedAbortController(input.signal);
 
     const task: LocalSubagentTaskResult = {
       taskId,
@@ -197,27 +219,33 @@ export class LocalSubagentManager implements SubagentController {
       prompt: input.prompt,
     };
     if (input.parentThreadId) runInput.parentThreadId = input.parentThreadId;
-    if (input.signal) runInput.signal = input.signal;
-    this.tasks.set(taskId, { task, runInput });
+    runInput.signal = controller.signal;
+    const state: LocalSubagentTaskState = { task, runInput, controller };
+    this.tasks.set(taskId, state);
 
     if (mode === "background") {
-      queueMicrotask(() => {
-        void this.completeFromRunner(task, runInput).catch((error: unknown) => {
+      let promise: Promise<void>;
+      promise = Promise.resolve().then(async () => {
+        try {
+          await this.completeFromRunner(state);
+        } catch (error: unknown) {
           this.options.onBackgroundError?.(error, task);
-        });
+        } finally {
+          this.backgroundTasks.delete(promise);
+        }
       });
+      this.backgroundTasks.add(promise);
       return task;
     }
 
-    return this.completeFromRunner(task, runInput);
+    return this.completeFromRunner(state);
   }
 
-  private async completeFromRunner(
-    task: LocalSubagentTaskResult,
-    input: LocalSubagentRunInput,
-  ): Promise<LocalSubagentTaskResult> {
+  private async completeFromRunner(state: LocalSubagentTaskState): Promise<LocalSubagentTaskResult> {
+    const { task, runInput: input } = state;
     try {
       const result = await this.options.runner.run(input);
+      if (state.externallyClosed) return task;
       if (task.status !== "running") {
         await this.appendAgentCompletion(input, task);
         return task;
@@ -229,6 +257,11 @@ export class LocalSubagentManager implements SubagentController {
       await this.appendAgentCompletion(input, task);
       return task;
     } catch (error) {
+      if (state.externallyClosed) return task;
+      if (task.status !== "running") {
+        await this.appendAgentCompletion(input, task);
+        return task;
+      }
       const err = toError(error);
       task.status = isAbortError(err) ? "cancelled" : "failed";
       task.error = err;
@@ -379,6 +412,17 @@ function eventContext(sessionId: SessionId, threadId: ThreadId | undefined): { s
   const context: { sessionId: SessionId; threadId?: ThreadId } = { sessionId };
   if (threadId) context.threadId = threadId;
   return context;
+}
+
+function linkedAbortController(signal: AbortSignal | undefined): AbortController {
+  const controller = new AbortController();
+  if (!signal) return controller;
+  if (signal.aborted) {
+    controller.abort();
+    return controller;
+  }
+  signal.addEventListener("abort", () => controller.abort(), { once: true });
+  return controller;
 }
 
 function fromToolTaskInput(input: TaskToolInput, context: SubagentToolContext): LocalSubagentTaskInput {
