@@ -152,6 +152,65 @@ export interface TeamTaskUpdateToolInput {
   metadata?: Record<string, unknown>;
 }
 
+export type TeamTaskDispatchMode = "one_shot" | "resumable" | "background";
+export type TeamTaskDispatchStatus = "running" | "completed" | "failed" | "cancelled" | "skipped";
+
+export interface TeamTaskDispatchToolInput {
+  teamId: string;
+  taskId: string;
+  ownerPath?: string;
+  mode?: TeamTaskDispatchMode;
+  prompt?: string;
+}
+
+export interface TeamTaskSyncToolInput {
+  teamId: string;
+  taskId: string;
+}
+
+export interface TeamTaskReconcileToolInput {
+  teamId?: string;
+  limit?: number;
+}
+
+export interface TeamDispatchAgentTaskRecord {
+  taskId: TaskId | string;
+  path?: AgentPath | string;
+  runId?: string;
+  childSessionId?: SessionId | string;
+  childThreadId?: ThreadId | string;
+  status: string;
+  summary?: string;
+  error?: string;
+}
+
+export interface TeamTaskDispatchRecord {
+  status: TeamTaskDispatchStatus;
+  teamTask: TeamTaskRecord;
+  agentTask?: TeamDispatchAgentTaskRecord;
+  reason?: string;
+}
+
+export interface TeamTaskSyncRecord {
+  applied: boolean;
+  teamTask: TeamTaskRecord;
+  agentTask?: TeamDispatchAgentTaskRecord;
+  reason?: string;
+}
+
+export interface TeamTaskReconcileErrorRecord {
+  teamId: TeamId | string;
+  taskId: TaskId | string;
+  error: string;
+}
+
+export interface TeamTaskReconcileRecord {
+  scanned: number;
+  synced: TeamTaskSyncRecord[];
+  skipped: TeamTaskSyncRecord[];
+  errors: TeamTaskReconcileErrorRecord[];
+}
+
 export interface TeamMessageSendToolInput {
   teamId: string;
   messageId?: string;
@@ -185,4 +244,10 @@ export interface TeamToolController {
   updateTask(input: TeamTaskUpdateToolInput, context: TeamToolContext): Promise<TeamTaskRecord>;
   sendMessage(input: TeamMessageSendToolInput, context: TeamToolContext): Promise<TeamMessageRecord>;
   listMessages(input: TeamMessageListToolInput, context: TeamToolContext): Promise<TeamMessageRecord[]>;
+}
+
+export interface TeamTaskDispatchToolController {
+  dispatchTask(input: TeamTaskDispatchToolInput, context: TeamToolContext): Promise<TeamTaskDispatchRecord>;
+  syncTask(input: TeamTaskSyncToolInput, context: TeamToolContext): Promise<TeamTaskSyncRecord>;
+  reconcileTasks(input: TeamTaskReconcileToolInput, context: TeamToolContext): Promise<TeamTaskReconcileRecord>;
 }

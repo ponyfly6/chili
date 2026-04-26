@@ -178,7 +178,7 @@ export class RuntimeService {
           return await this.cancelledPrompt(input, turns, "Prompt aborted");
         }
 
-        if (result.finishReason !== "tool_use") {
+        if (!isToolUseFinishReason(result.finishReason)) {
           const idleStatus: {
             sessionId: SessionId;
             threadId: ThreadId;
@@ -340,4 +340,8 @@ function abortError(message: string): Error {
 
 function isAbortError(error: Error): boolean {
   return error.name === "AbortError" || error.message.toLowerCase().includes("aborted");
+}
+
+function isToolUseFinishReason(reason: string | undefined): boolean {
+  return reason === "tool_use" || reason === "tool_calls" || reason === "function_call";
 }

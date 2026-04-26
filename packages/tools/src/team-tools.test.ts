@@ -22,10 +22,14 @@ import {
   createTeamTaskAssignTool,
   createTeamTaskClaimTool,
   createTeamTaskCreateTool,
+  createTeamTaskDispatchTool,
   createTeamTaskListTool,
+  createTeamTaskReconcileTool,
+  createTeamTaskSyncTool,
   createTeamTaskUpdateTool,
 } from "./builtins/team.js";
 import type {
+  TeamDispatchAgentTaskRecord,
   TeamCreateToolInput,
   TeamListToolInput,
   TeamMemberAddToolInput,
@@ -39,8 +43,15 @@ import type {
   TeamTaskClaimRecord,
   TeamTaskClaimToolInput,
   TeamTaskCreateToolInput,
+  TeamTaskDispatchRecord,
+  TeamTaskDispatchToolController,
+  TeamTaskDispatchToolInput,
   TeamTaskListToolInput,
+  TeamTaskReconcileRecord,
+  TeamTaskReconcileToolInput,
   TeamTaskRecord,
+  TeamTaskSyncRecord,
+  TeamTaskSyncToolInput,
   TeamTaskUpdateToolInput,
   TeamToolController,
   TeamToolContext,
@@ -253,6 +264,67 @@ test("team read tools forward filters and emit list-shaped JSON", async () => {
   expect(approvals).toEqual([]);
 });
 
+test("team dispatch tools expose subagent dispatch, sync, and reconcile", async () => {
+  const controller = new FakeTeamToolController();
+  const approvals: ApprovalBrokerRequest[] = [];
+  const executor = createExecutor(registryWithTeamTools(controller), approvals);
+
+  const dispatched = await executor.execute(
+    toolInput("team_dispatch", {
+      team_id: "team_core",
+      task_id: "task_team",
+      owner_path: "/worker",
+      mode: "one-shot",
+      prompt: "Implement this slice.",
+    }),
+  );
+  expect(dispatched.status).toBe("completed");
+  if (dispatched.status === "completed") {
+    expect(JSON.parse(dispatched.result.output)).toMatchObject({
+      status: "completed",
+      team_task: { task_id: "task_team", owner_path: "/worker" },
+      agent_task: { task_id: "agent_task", status: "completed", summary: "done" },
+    });
+  }
+  expect(controller.taskDispatchInputs).toEqual([
+    {
+      teamId: "team_core",
+      taskId: "task_team",
+      ownerPath: "/worker",
+      mode: "one_shot",
+      prompt: "Implement this slice.",
+    },
+  ]);
+  expect(approvals).toHaveLength(1);
+  expect(approvals[0]).toMatchObject({
+    permission: "team_task_dispatch",
+    patterns: ["team_core", "task_team", "one_shot"],
+  });
+
+  const synced = await executor.execute(toolInput("sync_team_task", { team_id: "team_core", task_id: "task_team" }));
+  expect(synced.status).toBe("completed");
+  if (synced.status === "completed") {
+    expect(JSON.parse(synced.result.output)).toMatchObject({
+      applied: true,
+      team_task: { task_id: "task_team", status: "completed", summary: "done" },
+      agent_task: { task_id: "agent_task", status: "completed" },
+    });
+  }
+  expect(controller.taskSyncInputs).toEqual([{ teamId: "team_core", taskId: "task_team" }]);
+
+  const reconciled = await executor.execute(toolInput("team_reconcile", { team_id: "team_core", limit: 10 }));
+  expect(reconciled.status).toBe("completed");
+  if (reconciled.status === "completed") {
+    expect(JSON.parse(reconciled.result.output)).toMatchObject({
+      scanned: 2,
+      synced: [{ applied: true, team_task: { task_id: "task_team" } }],
+      skipped: [{ applied: false, reason: "agent_running" }],
+      errors: [],
+    });
+  }
+  expect(controller.taskReconcileInputs).toEqual([{ teamId: "team_core", limit: 10 }]);
+});
+
 test("team tools reject non-absolute agent paths", async () => {
   const controller = new FakeTeamToolController();
   const executor = createExecutor(registryWithTeamTools(controller), []);
@@ -268,7 +340,7 @@ test("team tools reject non-absolute agent paths", async () => {
   expect(controller.memberAddInputs).toEqual([]);
 });
 
-function registryWithTeamTools(controller: TeamToolController): InMemoryToolRegistry {
+function registryWithTeamTools(controller: TeamToolController & TeamTaskDispatchToolController): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createTeamCreateTool(controller));
   registry.register(createTeamListTool(controller));
@@ -279,6 +351,9 @@ function registryWithTeamTools(controller: TeamToolController): InMemoryToolRegi
   registry.register(createTeamTaskAssignTool(controller));
   registry.register(createTeamTaskClaimTool(controller));
   registry.register(createTeamTaskUpdateTool(controller));
+  registry.register(createTeamTaskDispatchTool(controller));
+  registry.register(createTeamTaskSyncTool(controller));
+  registry.register(createTeamTaskReconcileTool(controller));
   registry.register(createTeamMessageSendTool(controller));
   registry.register(createTeamMessageListTool(controller));
   return registry;
@@ -311,7 +386,7 @@ function toolInput(toolName: string, input: unknown, callId?: ToolCallId): Execu
   return value;
 }
 
-class FakeTeamToolController implements TeamToolController {
+class FakeTeamToolController implements TeamToolController, TeamTaskDispatchToolController {
   createTeamInputs: TeamCreateToolInput[] = [];
   teamListInputs: TeamListToolInput[] = [];
   memberAddInputs: TeamMemberAddToolInput[] = [];
@@ -321,6 +396,9 @@ class FakeTeamToolController implements TeamToolController {
   taskAssignInputs: TeamTaskAssignToolInput[] = [];
   taskClaimInputs: TeamTaskClaimToolInput[] = [];
   taskUpdateInputs: TeamTaskUpdateToolInput[] = [];
+  taskDispatchInputs: TeamTaskDispatchToolInput[] = [];
+  taskSyncInputs: TeamTaskSyncToolInput[] = [];
+  taskReconcileInputs: TeamTaskReconcileToolInput[] = [];
   messageSendInputs: TeamMessageSendToolInput[] = [];
   messageListInputs: TeamMessageListToolInput[] = [];
 
@@ -367,6 +445,69 @@ class FakeTeamToolController implements TeamToolController {
   async updateTask(input: TeamTaskUpdateToolInput): Promise<TeamTaskRecord> {
     this.taskUpdateInputs.push(input);
     return taskRecord(input);
+  }
+
+  async dispatchTask(input: TeamTaskDispatchToolInput): Promise<TeamTaskDispatchRecord> {
+    this.taskDispatchInputs.push(input);
+    const status = input.mode === "one_shot" ? "completed" : "running";
+    const teamTaskInput: Partial<TeamTaskCreateToolInput & TeamTaskAssignToolInput & TeamTaskClaimToolInput & TeamTaskUpdateToolInput> = {
+      teamId: input.teamId,
+      taskId: input.taskId,
+      status: "in_progress",
+    };
+    if (input.ownerPath) teamTaskInput.ownerPath = input.ownerPath;
+    const agentTask: TeamDispatchAgentTaskRecord = {
+      taskId: "agent_task",
+      path: input.ownerPath ?? "/worker",
+      runId: "run_team",
+      childSessionId: "session_child",
+      childThreadId: "thread_child",
+      status,
+    };
+    if (status === "completed") agentTask.summary = "done";
+    return {
+      status,
+      teamTask: taskRecord(teamTaskInput),
+      agentTask,
+    };
+  }
+
+  async syncTask(input: TeamTaskSyncToolInput): Promise<TeamTaskSyncRecord> {
+    this.taskSyncInputs.push(input);
+    return {
+      applied: true,
+      teamTask: taskRecord({ teamId: input.teamId, taskId: input.taskId, status: "completed", summary: "done" }),
+      agentTask: {
+        taskId: "agent_task",
+        path: "/worker",
+        runId: "run_team",
+        status: "completed",
+        summary: "done",
+      },
+    };
+  }
+
+  async reconcileTasks(input: TeamTaskReconcileToolInput): Promise<TeamTaskReconcileRecord> {
+    this.taskReconcileInputs.push(input);
+    return {
+      scanned: 2,
+      synced: [
+        {
+          applied: true,
+          teamTask: taskRecord({ teamId: input.teamId ?? "team_core", taskId: "task_team", status: "completed" }),
+          agentTask: { taskId: "agent_task", status: "completed", summary: "done" },
+        },
+      ],
+      skipped: [
+        {
+          applied: false,
+          reason: "agent_running",
+          teamTask: taskRecord({ teamId: input.teamId ?? "team_core", taskId: "task_running", status: "in_progress" }),
+          agentTask: { taskId: "agent_running", status: "running" },
+        },
+      ],
+      errors: [],
+    };
   }
 
   async sendMessage(input: TeamMessageSendToolInput): Promise<TeamMessageRecord> {

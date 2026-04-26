@@ -13,6 +13,15 @@ import type {
   ToolCallId,
   TurnId,
 } from "@chili/protocol";
+import {
+  HttpRuntimeClient,
+  type RuntimeAgentTaskRecord,
+  type RuntimeLocalSubagentTaskRecord,
+  type RuntimeTeamTaskDispatchResult,
+  type RuntimeTeamTaskReconcileResult,
+  type RuntimeTeamTaskRecord,
+  type RuntimeTeamTaskSyncResult,
+} from "./client.js";
 import { createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, sessionMessages } from "./projection.js";
 
 test("replays session, message, tool, and approval events into a runtime view", () => {
@@ -364,3 +373,157 @@ test("replays completed local subagent tasks as running on newer-generation spaw
   expect(view.tasks[taskId]?.completedAt).toBeUndefined();
   expect(view.sessions[sessionId]?.taskIds).toEqual([taskId]);
 });
+
+test("client preserves team dispatcher JSON shapes for dispatch, sync, and reconcile", async () => {
+  const teamId = "team_sdk" as TeamId;
+  const taskId = "task_sdk" as TaskId;
+  const sessionId = "session_sdk" as SessionId;
+  const threadId = "thread_sdk" as ThreadId;
+  const ownerPath = "/root/reviewer" as AgentPath;
+  const teamTask = sdkTeamTaskJson({ teamId, taskId, status: "in_progress", ownerPath });
+  const skippedTeamTask = sdkTeamTaskJson({ teamId, taskId, status: "pending", ownerPath, includeMetadata: false });
+  const agentTask = sdkAgentTaskJson({ status: "running", ownerPath });
+  const syncResult: RuntimeTeamTaskSyncResult = {
+    applied: false,
+    reason: "agent_running",
+    teamTask,
+    agentTask: sdkAgentTaskRecord({ status: "running" }),
+  };
+  const dispatchJson: RuntimeTeamTaskDispatchResult = {
+    status: "running",
+    teamTask,
+    team_task: teamTask,
+    agentTask,
+    agent_task: agentTask,
+  };
+  const skippedDispatchJson: RuntimeTeamTaskDispatchResult = {
+    status: "skipped",
+    reason: "missing_owner",
+    teamTask: skippedTeamTask,
+    team_task: skippedTeamTask,
+  };
+  const reconcileJson: RuntimeTeamTaskReconcileResult = {
+    scanned: 1,
+    synced: [],
+    skipped: [syncResult],
+    errors: [],
+  };
+  const responses: unknown[] = [dispatchJson, skippedDispatchJson, syncResult, reconcileJson];
+  const requests: Array<{ url: string; method: string | undefined; body: unknown }> = [];
+  const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const responseBody = responses.shift();
+    if (!responseBody) throw new Error("unexpected request");
+    requests.push({
+      url: input instanceof Request ? input.url : String(input),
+      method: init?.method,
+      body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
+    });
+    return new Response(JSON.stringify(responseBody), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+  const client = new HttpRuntimeClient({ baseUrl: "http://runtime.test/api", fetch: fetchImpl });
+
+  expect(
+    await client.dispatchTeamTask({
+      teamId,
+      taskId,
+      ownerPath,
+      sessionId,
+      threadId,
+      mode: "background",
+      cwd: "/repo",
+      prompt: "verify",
+    }),
+  ).toEqual(dispatchJson);
+  expect(await client.dispatchTeamTask({ teamId, taskId, sessionId, threadId })).toEqual(skippedDispatchJson);
+  expect(await client.syncTeamTask({ teamId, taskId, sessionId, threadId })).toEqual(syncResult);
+  expect(await client.reconcileTeamTasks({ teamId, sessionId, threadId, limit: 5 })).toEqual(reconcileJson);
+  expect(requests).toEqual([
+    {
+      url: "http://runtime.test/api/teams/team_sdk/tasks/task_sdk/dispatch",
+      method: "POST",
+      body: { teamId, taskId, ownerPath, sessionId, threadId, mode: "background", cwd: "/repo", prompt: "verify" },
+    },
+    {
+      url: "http://runtime.test/api/teams/team_sdk/tasks/task_sdk/dispatch",
+      method: "POST",
+      body: { teamId, taskId, sessionId, threadId },
+    },
+    {
+      url: "http://runtime.test/api/teams/team_sdk/tasks/task_sdk/sync",
+      method: "POST",
+      body: { teamId, taskId, sessionId, threadId },
+    },
+    {
+      url: "http://runtime.test/api/teams/team_sdk/reconcile_dispatches",
+      method: "POST",
+      body: { teamId, sessionId, threadId, limit: 5 },
+    },
+  ]);
+});
+
+function sdkTeamTaskJson(input: {
+  teamId: TeamId;
+  taskId: TaskId;
+  status: "pending" | "in_progress" | "blocked" | "completed" | "failed" | "cancelled";
+  ownerPath: AgentPath;
+  includeMetadata?: boolean;
+}): RuntimeTeamTaskRecord {
+  return {
+    id: input.taskId,
+    teamId: input.teamId,
+    title: "SDK team task",
+    status: input.status,
+    ownerPath: input.ownerPath,
+    dependsOn: [],
+    ...(input.includeMetadata === false
+      ? {}
+      : {
+          metadata: {
+            chiliTeamDispatch: {
+              agentTaskId: "task_agent_sdk",
+              agentPath: "/root/reviewer/task_agent_sdk",
+              runId: "agentrun_agent_sdk",
+              childSessionId: "session_child_sdk",
+              childThreadId: "thread_child_sdk",
+              mode: "background",
+              dispatchedAt: 101,
+              agentStatus: "running",
+            },
+          },
+        }),
+    createdAt: 1,
+    updatedAt: 2,
+  };
+}
+
+function sdkAgentTaskJson(input: {
+  status: "running" | "completed" | "failed" | "cancelled";
+  ownerPath: AgentPath;
+}): RuntimeLocalSubagentTaskRecord {
+  return {
+    taskId: "task_agent_sdk" as TaskId,
+    runId: "agentrun_agent_sdk",
+    path: "/root/reviewer/task_agent_sdk" as AgentPath,
+    parentPath: input.ownerPath,
+    childSessionId: "session_child_sdk" as SessionId,
+    childThreadId: "thread_child_sdk" as ThreadId,
+    status: input.status,
+  };
+}
+
+function sdkAgentTaskRecord(input: { status: "running" | "completed" | "failed" | "cancelled" }): RuntimeAgentTaskRecord {
+  return {
+    id: "task_agent_sdk" as TaskId,
+    path: "/root/reviewer/task_agent_sdk" as AgentPath,
+    taskName: "SDK team task",
+    status: input.status,
+    generation: 0,
+    childSessionId: "session_child_sdk" as SessionId,
+    childThreadId: "thread_child_sdk" as ThreadId,
+    createdAt: 1,
+    updatedAt: 2,
+  };
+}

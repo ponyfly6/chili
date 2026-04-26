@@ -378,14 +378,44 @@ test("serves team control routes", async () => {
       }),
     );
     expect(dispatchResponse.status).toBe(200);
-    expect(await dispatchResponse.json()).toMatchObject({
+    const runningTeamTask = teamTaskRow({
+      teamId: team.id,
+      taskId: task.id,
+      status: "in_progress",
+      metadata: teamDispatchMetadata("running"),
+    });
+    const runningAgentTask = localSubagentTaskRow({ status: "running" });
+    expect(await dispatchResponse.json()).toEqual({
       status: "running",
-      team_task: { id: task.id, teamId: team.id, status: "in_progress" },
-      agent_task: { taskId: "task_agent_http", status: "running" },
+      teamTask: runningTeamTask,
+      team_task: runningTeamTask,
+      agentTask: runningAgentTask,
+      agent_task: runningAgentTask,
     });
     expect(teamDispatcher.dispatchInputs).toMatchObject([
       { teamId: team.id, taskId: task.id, mode: "background", sessionId: "session_dispatch", threadId: "thread_dispatch" },
     ]);
+
+    teamDispatcher.nextDispatchResult = {
+      status: "skipped",
+      reason: "missing_owner",
+      teamTask: teamTaskRow({ teamId: team.id, taskId: task.id, status: "pending" }),
+    };
+    const skippedDispatchResponse = await handler(
+      new Request(`http://chili.test/teams/${team.id}/tasks/${task.id}/dispatch`, {
+        method: "POST",
+        body: JSON.stringify({ sessionId: "session_dispatch" }),
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    expect(skippedDispatchResponse.status).toBe(200);
+    const skippedTeamTask = teamTaskRow({ teamId: team.id, taskId: task.id, status: "pending" });
+    expect(await skippedDispatchResponse.json()).toEqual({
+      status: "skipped",
+      teamTask: skippedTeamTask,
+      team_task: skippedTeamTask,
+      reason: "missing_owner",
+    });
 
     const syncResponse = await handler(
       new Request(`http://chili.test/teams/${team.id}/tasks/${task.id}/sync`, {
@@ -395,9 +425,15 @@ test("serves team control routes", async () => {
       }),
     );
     expect(syncResponse.status).toBe(200);
-    expect(await syncResponse.json()).toMatchObject({
+    expect(await syncResponse.json()).toEqual({
       applied: true,
-      teamTask: { id: task.id, teamId: team.id, status: "completed" },
+      teamTask: teamTaskRow({
+        teamId: team.id,
+        taskId: task.id,
+        status: "completed",
+        metadata: teamDispatchMetadata("completed", 102),
+      }),
+      agentTask: taskRow({ status: "completed", summary: "done" }),
     });
     expect(teamDispatcher.syncInputs).toMatchObject([{ teamId: team.id, taskId: task.id, sessionId: "session_dispatch" }]);
 
@@ -409,7 +445,7 @@ test("serves team control routes", async () => {
       }),
     );
     expect(teamReconcileResponse.status).toBe(200);
-    expect(await teamReconcileResponse.json()).toMatchObject({ scanned: 1, synced: [{ applied: true }] });
+    expect(await teamReconcileResponse.json()).toEqual(reconcileResultJson(team.id));
     expect(teamDispatcher.reconcileInputs.at(-1)).toMatchObject({ teamId: team.id, sessionId: "session_dispatch", limit: 5 });
 
     const globalReconcileResponse = await handler(
@@ -420,7 +456,7 @@ test("serves team control routes", async () => {
       }),
     );
     expect(globalReconcileResponse.status).toBe(200);
-    expect(await globalReconcileResponse.json()).toMatchObject({ scanned: 1, synced: [{ applied: true }] });
+    expect(await globalReconcileResponse.json()).toEqual(reconcileResultJson("team_http" as TeamId));
     expect(teamDispatcher.reconcileInputs.at(-1)).toMatchObject({ limit: 10 });
 
     const updateResponse = await handler(
@@ -669,23 +705,26 @@ class FakeTeamDispatcherService implements RuntimeTeamDispatcherService {
   dispatchInputs: Array<Parameters<RuntimeTeamDispatcherService["dispatchTask"]>[0]> = [];
   syncInputs: Array<Parameters<RuntimeTeamDispatcherService["syncTask"]>[0]> = [];
   reconcileInputs: Array<NonNullable<Parameters<RuntimeTeamDispatcherService["reconcileTasks"]>[0]>> = [];
+  nextDispatchResult: Awaited<ReturnType<RuntimeTeamDispatcherService["dispatchTask"]>> | undefined;
 
   async dispatchTask(
     input: Parameters<RuntimeTeamDispatcherService["dispatchTask"]>[0],
   ): Promise<Awaited<ReturnType<RuntimeTeamDispatcherService["dispatchTask"]>>> {
     this.dispatchInputs.push(input);
+    if (this.nextDispatchResult) {
+      const result = this.nextDispatchResult;
+      this.nextDispatchResult = undefined;
+      return result;
+    }
     return {
       status: "running",
-      teamTask: teamTaskRow({ teamId: input.teamId, taskId: input.taskId, status: "in_progress" }),
-      agentTask: {
-        taskId: "task_agent_http" as TaskId,
-        runId: "agent_http_dispatch" as AgentRunId,
-        path: "/root/reviewer/task_agent_http" as AgentPath,
-        parentPath: "/root/reviewer" as AgentPath,
-        childSessionId: "session_child_dispatch" as SessionId,
-        childThreadId: "thread_child_dispatch" as ThreadId,
-        status: "running",
-      },
+      teamTask: teamTaskRow({
+        teamId: input.teamId,
+        taskId: input.taskId,
+        status: "in_progress",
+        metadata: teamDispatchMetadata("running"),
+      }),
+      agentTask: localSubagentTaskRow({ status: "running" }),
     };
   }
 
@@ -695,7 +734,12 @@ class FakeTeamDispatcherService implements RuntimeTeamDispatcherService {
     this.syncInputs.push(input);
     return {
       applied: true,
-      teamTask: teamTaskRow({ teamId: input.teamId, taskId: input.taskId, status: "completed" }),
+      teamTask: teamTaskRow({
+        teamId: input.teamId,
+        taskId: input.taskId,
+        status: "completed",
+        metadata: teamDispatchMetadata("completed", 102),
+      }),
       agentTask: taskRow({ status: "completed", summary: "done" }),
     };
   }
@@ -704,27 +748,85 @@ class FakeTeamDispatcherService implements RuntimeTeamDispatcherService {
     input: NonNullable<Parameters<RuntimeTeamDispatcherService["reconcileTasks"]>[0]> = {},
   ): Promise<Awaited<ReturnType<RuntimeTeamDispatcherService["reconcileTasks"]>>> {
     this.reconcileInputs.push(input);
-    return {
-      scanned: 1,
-      synced: [
-        {
-          applied: true,
-          teamTask: teamTaskRow({
-            teamId: input.teamId ?? ("team_http" as TeamId),
-            taskId: "task_http" as TaskId,
-            status: "completed",
-          }),
-          agentTask: taskRow({ status: "completed", summary: "done" }),
-        },
-      ],
-      skipped: [],
-      errors: [],
-    };
+    return reconcileResultJson(input.teamId ?? ("team_http" as TeamId));
   }
 }
 
-function teamTaskRow(input: { teamId: TeamId; taskId: TaskId; status: TeamTaskRow["status"] }): TeamTaskRow {
+function reconcileResultJson(teamId: TeamId): Awaited<ReturnType<RuntimeTeamDispatcherService["reconcileTasks"]>> {
   return {
+    scanned: 2,
+    synced: [
+      {
+        applied: true,
+        teamTask: teamTaskRow({
+          teamId,
+          taskId: "task_http" as TaskId,
+          status: "completed",
+          metadata: teamDispatchMetadata("completed", 102),
+        }),
+        agentTask: taskRow({ status: "completed", summary: "done" }),
+      },
+    ],
+    skipped: [
+      {
+        applied: false,
+        reason: "agent_running",
+        teamTask: teamTaskRow({
+          teamId,
+          taskId: "task_skip_http" as TaskId,
+          status: "in_progress",
+          metadata: teamDispatchMetadata("running"),
+        }),
+        agentTask: taskRow({ status: "running" }),
+      },
+    ],
+    errors: [],
+  };
+}
+
+function teamDispatchMetadata(agentStatus: "running" | "completed", syncedAt?: number): Record<string, unknown> {
+  return {
+    chiliTeamDispatch: {
+      agentTaskId: "task_agent_http",
+      agentPath: "/root/reviewer/task_agent_http",
+      runId: "agent_http_dispatch",
+      childSessionId: "session_child_dispatch",
+      childThreadId: "thread_child_dispatch",
+      mode: "background",
+      dispatchedAt: 101,
+      agentStatus,
+      ...(syncedAt === undefined ? {} : { syncedAt }),
+    },
+  };
+}
+
+function localSubagentTaskRow(input: { status: "running" | "completed" | "failed" | "cancelled" }): {
+  taskId: TaskId;
+  runId: AgentRunId;
+  path: AgentPath;
+  parentPath: AgentPath;
+  childSessionId: SessionId;
+  childThreadId: ThreadId;
+  status: "running" | "completed" | "failed" | "cancelled";
+} {
+  return {
+    taskId: "task_agent_http" as TaskId,
+    runId: "agent_http_dispatch" as AgentRunId,
+    path: "/root/reviewer/task_agent_http" as AgentPath,
+    parentPath: "/root/reviewer" as AgentPath,
+    childSessionId: "session_child_dispatch" as SessionId,
+    childThreadId: "thread_child_dispatch" as ThreadId,
+    status: input.status,
+  };
+}
+
+function teamTaskRow(input: {
+  teamId: TeamId;
+  taskId: TaskId;
+  status: TeamTaskRow["status"];
+  metadata?: Record<string, unknown>;
+}): TeamTaskRow {
+  const row: TeamTaskRow = {
     id: input.taskId,
     teamId: input.teamId,
     title: "HTTP team task",
@@ -734,6 +836,8 @@ function teamTaskRow(input: { teamId: TeamId; taskId: TaskId; status: TeamTaskRo
     createdAt: 1,
     updatedAt: 2,
   };
+  if (input.metadata) row.metadata = input.metadata;
+  return row;
 }
 
 function taskRow(input: { status: AgentTaskRow["status"]; summary?: string }): AgentTaskRow {

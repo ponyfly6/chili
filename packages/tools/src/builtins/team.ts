@@ -15,8 +15,15 @@ import type {
   TeamTaskClaimRecord,
   TeamTaskClaimToolInput,
   TeamTaskCreateToolInput,
+  TeamTaskDispatchRecord,
+  TeamTaskDispatchToolController,
+  TeamTaskDispatchToolInput,
   TeamTaskListToolInput,
+  TeamTaskReconcileRecord,
+  TeamTaskReconcileToolInput,
   TeamTaskRecord,
+  TeamTaskSyncRecord,
+  TeamTaskSyncToolInput,
   TeamTaskUpdateToolInput,
   TeamToolController,
   TeamMemberStatus,
@@ -321,6 +328,115 @@ export function createTeamTaskUpdateTool(
   };
 }
 
+export function createTeamTaskDispatchTool(
+  controller: TeamTaskDispatchToolController,
+): ChiliToolDefinition<TeamTaskDispatchToolInput, TeamToolResult> {
+  return {
+    name: "team_task_dispatch",
+    aliases: ["dispatch_team_task", "team_dispatch"],
+    description: "Dispatch a persistent team task to its assigned local subagent.",
+    risk: "execute",
+    inputSchema: {
+      type: "object",
+      required: ["teamId", "taskId"],
+      properties: {
+        teamId: { type: "string" },
+        team_id: { type: "string" },
+        taskId: { type: "string" },
+        task_id: { type: "string" },
+        ownerPath: { type: "string" },
+        owner_path: { type: "string" },
+        mode: { type: "string", enum: ["one_shot", "resumable", "background"] },
+        prompt: { type: "string" },
+      },
+    },
+    validate: validateTeamTaskDispatchInput,
+    approval(input) {
+      return {
+        permission: "team_task_dispatch",
+        patterns: [input.teamId, input.taskId, input.mode ?? "background"],
+        metadata: {
+          teamId: input.teamId,
+          team_id: input.teamId,
+          taskId: input.taskId,
+          task_id: input.taskId,
+          ownerPath: input.ownerPath,
+          owner_path: input.ownerPath,
+          mode: input.mode ?? "background",
+          promptPreview: input.prompt ? preview(input.prompt) : undefined,
+        },
+      };
+    },
+    async execute(input, context) {
+      await context.metadata({
+        metadata: {
+          teamId: input.teamId,
+          team_id: input.teamId,
+          taskId: input.taskId,
+          task_id: input.taskId,
+          ownerPath: input.ownerPath,
+          owner_path: input.ownerPath,
+          mode: input.mode ?? "background",
+        },
+      });
+      return teamTaskDispatchToolResult(await controller.dispatchTask(input, context));
+    },
+  };
+}
+
+export function createTeamTaskSyncTool(
+  controller: TeamTaskDispatchToolController,
+): ChiliToolDefinition<TeamTaskSyncToolInput, TeamToolResult> {
+  return {
+    name: "team_task_sync",
+    aliases: ["sync_team_task"],
+    description: "Sync a dispatched team task from its bound local subagent result.",
+    risk: "write",
+    inputSchema: {
+      type: "object",
+      required: ["teamId", "taskId"],
+      properties: {
+        teamId: { type: "string" },
+        team_id: { type: "string" },
+        taskId: { type: "string" },
+        task_id: { type: "string" },
+      },
+    },
+    validate: validateTeamTaskSyncInput,
+    approval: () => false,
+    async execute(input, context) {
+      await context.metadata({ metadata: { teamId: input.teamId, team_id: input.teamId, taskId: input.taskId, task_id: input.taskId } });
+      return teamTaskSyncToolResult(await controller.syncTask(input, context));
+    },
+  };
+}
+
+export function createTeamTaskReconcileTool(
+  controller: TeamTaskDispatchToolController,
+): ChiliToolDefinition<TeamTaskReconcileToolInput, TeamToolResult> {
+  return {
+    name: "team_task_reconcile",
+    aliases: ["reconcile_team_tasks", "team_reconcile"],
+    description: "Reconcile dispatched in-progress team tasks with their local subagent task state.",
+    risk: "write",
+    isConcurrencySafe: false,
+    inputSchema: {
+      type: "object",
+      properties: {
+        teamId: { type: "string" },
+        team_id: { type: "string" },
+        limit: { type: "number" },
+      },
+    },
+    validate: validateTeamTaskReconcileInput,
+    approval: () => false,
+    async execute(input, context) {
+      await context.metadata({ metadata: { teamId: input.teamId, team_id: input.teamId, limit: input.limit } });
+      return teamTaskReconcileToolResult(await controller.reconcileTasks(input, context));
+    },
+  };
+}
+
 export function createTeamMessageSendTool(
   controller: TeamToolController,
 ): ChiliToolDefinition<TeamMessageSendToolInput, TeamToolResult> {
@@ -559,6 +675,43 @@ function validateTeamTaskUpdateInput(input: unknown): ValidationResult<TeamTaskU
   return { ok: true, value };
 }
 
+function validateTeamTaskDispatchInput(input: unknown): ValidationResult<TeamTaskDispatchToolInput> {
+  if (!isRecord(input)) return { ok: false, message: "expected an object" };
+  const teamId = requiredString(input, ["teamId", "team_id"], "teamId");
+  if (!teamId.ok) return teamId;
+  const taskId = requiredString(input, ["taskId", "task_id", "id"], "taskId");
+  if (!taskId.ok) return taskId;
+  const ownerPath = optionalPath(input, ["ownerPath", "owner_path"], "ownerPath");
+  if (!ownerPath.ok) return ownerPath;
+  const mode = normalizeDispatchMode(input.mode);
+  if (!mode.ok) return mode;
+  const value: TeamTaskDispatchToolInput = { teamId: teamId.value, taskId: taskId.value };
+  if (ownerPath.value) value.ownerPath = ownerPath.value;
+  if (mode.value) value.mode = mode.value;
+  assignString(value, "prompt", pickString(input, ["prompt", "message"]));
+  return { ok: true, value };
+}
+
+function validateTeamTaskSyncInput(input: unknown): ValidationResult<TeamTaskSyncToolInput> {
+  if (!isRecord(input)) return { ok: false, message: "expected an object" };
+  const teamId = requiredString(input, ["teamId", "team_id"], "teamId");
+  if (!teamId.ok) return teamId;
+  const taskId = requiredString(input, ["taskId", "task_id", "id"], "taskId");
+  if (!taskId.ok) return taskId;
+  return { ok: true, value: { teamId: teamId.value, taskId: taskId.value } };
+}
+
+function validateTeamTaskReconcileInput(input: unknown): ValidationResult<TeamTaskReconcileToolInput> {
+  const record = optionalRecord(input);
+  if (!record.ok) return record;
+  const limit = optionalPositiveInteger(record.value.limit, "limit");
+  if (!limit.ok) return limit;
+  const value: TeamTaskReconcileToolInput = {};
+  assignString(value, "teamId", pickString(record.value, ["teamId", "team_id"]));
+  if (limit.value !== undefined) value.limit = limit.value;
+  return { ok: true, value };
+}
+
 function validateTeamMessageSendInput(input: unknown): ValidationResult<TeamMessageSendToolInput> {
   if (!isRecord(input)) return { ok: false, message: "expected an object" };
   const teamId = requiredString(input, ["teamId", "team_id"], "teamId");
@@ -673,6 +826,67 @@ function teamTaskClaimToolResult(claim: TeamTaskClaimRecord): TeamToolResult {
   };
 }
 
+function teamTaskDispatchToolResult(result: TeamTaskDispatchRecord): TeamToolResult {
+  const output = teamTaskDispatchOutput(result);
+  return {
+    title: `team_task_dispatch ${result.teamTask.taskId} ${result.status}`,
+    output: JSON.stringify(output),
+    metadata: {
+      team_id: result.teamTask.teamId,
+      teamId: result.teamTask.teamId,
+      task_id: result.teamTask.taskId,
+      taskId: result.teamTask.taskId,
+      status: result.status,
+      reason: result.reason ?? "",
+      agent_task_id: result.agentTask?.taskId ?? "",
+      agentTaskId: result.agentTask?.taskId ?? "",
+    },
+  };
+}
+
+function teamTaskSyncToolResult(result: TeamTaskSyncRecord): TeamToolResult {
+  const output = teamTaskSyncOutput(result);
+  return {
+    title: result.applied ? `team_task_sync ${result.teamTask.taskId}` : `team_task_sync ${result.reason ?? "skipped"}`,
+    output: JSON.stringify(output),
+    metadata: {
+      applied: result.applied,
+      reason: result.reason ?? "",
+      team_id: result.teamTask.teamId,
+      teamId: result.teamTask.teamId,
+      task_id: result.teamTask.taskId,
+      taskId: result.teamTask.taskId,
+      agent_task_id: result.agentTask?.taskId ?? "",
+      agentTaskId: result.agentTask?.taskId ?? "",
+    },
+  };
+}
+
+function teamTaskReconcileToolResult(result: TeamTaskReconcileRecord): TeamToolResult {
+  const output = {
+    scanned: result.scanned,
+    synced: result.synced.map(teamTaskSyncOutput),
+    skipped: result.skipped.map(teamTaskSyncOutput),
+    errors: result.errors.map((error) => ({
+      team_id: error.teamId,
+      teamId: error.teamId,
+      task_id: error.taskId,
+      taskId: error.taskId,
+      error: error.error,
+    })),
+  };
+  return {
+    title: `team_task_reconcile scanned=${result.scanned} synced=${result.synced.length} skipped=${result.skipped.length} errors=${result.errors.length}`,
+    output: JSON.stringify(output),
+    metadata: {
+      scanned: result.scanned,
+      synced: result.synced.length,
+      skipped: result.skipped.length,
+      errors: result.errors.length,
+    },
+  };
+}
+
 function teamMessageRecordToolResult(title: string, message: TeamMessageRecord): TeamToolResult {
   return {
     title: `${title} ${message.messageId}`,
@@ -759,6 +973,45 @@ function teamTaskRecordOutput(task: TeamTaskRecord): Record<string, unknown> {
     updatedAt: task.updatedAt,
     completed_at: task.completedAt,
     completedAt: task.completedAt,
+  });
+}
+
+function teamTaskDispatchOutput(result: TeamTaskDispatchRecord): Record<string, unknown> {
+  return pruneUndefined({
+    status: result.status,
+    reason: result.reason,
+    team_task: teamTaskRecordOutput(result.teamTask),
+    teamTask: teamTaskRecordOutput(result.teamTask),
+    agent_task: result.agentTask ? agentTaskRecordOutput(result.agentTask) : undefined,
+    agentTask: result.agentTask ? agentTaskRecordOutput(result.agentTask) : undefined,
+  });
+}
+
+function teamTaskSyncOutput(result: TeamTaskSyncRecord): Record<string, unknown> {
+  return pruneUndefined({
+    applied: result.applied,
+    reason: result.reason,
+    team_task: teamTaskRecordOutput(result.teamTask),
+    teamTask: teamTaskRecordOutput(result.teamTask),
+    agent_task: result.agentTask ? agentTaskRecordOutput(result.agentTask) : undefined,
+    agentTask: result.agentTask ? agentTaskRecordOutput(result.agentTask) : undefined,
+  });
+}
+
+function agentTaskRecordOutput(task: NonNullable<TeamTaskDispatchRecord["agentTask"]>): Record<string, unknown> {
+  return pruneUndefined({
+    task_id: task.taskId,
+    taskId: task.taskId,
+    path: task.path,
+    run_id: task.runId,
+    runId: task.runId,
+    child_session_id: task.childSessionId,
+    childSessionId: task.childSessionId,
+    child_thread_id: task.childThreadId,
+    childThreadId: task.childThreadId,
+    status: task.status,
+    summary: task.summary,
+    error: task.error,
   });
 }
 
@@ -883,6 +1136,21 @@ function normalizeTeamTaskStatus(value: unknown): ValidationResult<TeamTaskStatu
   }
 }
 
+function normalizeDispatchMode(value: unknown): ValidationResult<TeamTaskDispatchToolInput["mode"] | undefined> {
+  if (value === undefined) return { ok: true, value: undefined };
+  if (typeof value !== "string") return { ok: false, message: "mode must be a string" };
+  switch (value.trim().toLowerCase()) {
+    case "one_shot":
+    case "resumable":
+    case "background":
+      return { ok: true, value: value.trim().toLowerCase() as TeamTaskDispatchToolInput["mode"] };
+    case "one-shot":
+      return { ok: true, value: "one_shot" };
+    default:
+      return { ok: false, message: "mode must be one_shot, resumable, or background" };
+  }
+}
+
 function normalizeMessageKind(value: unknown): ValidationResult<TeamMessageKind | undefined> {
   if (value === undefined) return { ok: true, value: undefined };
   if (typeof value !== "string") return { ok: false, message: "message kind must be a string" };
@@ -938,4 +1206,8 @@ function pruneUndefined<T>(value: T): T {
     if (item !== undefined) output[key] = item;
   }
   return output as T;
+}
+
+function preview(value: string, max = 200): string {
+  return value.length <= max ? value : `${value.slice(0, max)}...`;
 }

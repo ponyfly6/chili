@@ -46,18 +46,26 @@ import {
   createTeamTaskAssignTool,
   createTeamTaskClaimTool,
   createTeamTaskCreateTool,
+  createTeamTaskDispatchTool,
   createTeamTaskListTool,
+  createTeamTaskReconcileTool,
+  createTeamTaskSyncTool,
   createTeamTaskUpdateTool,
   createToolSearchTool,
   createWriteFileTool,
   type MailboxListToolInput,
   type SubagentMailboxRecord,
   type SubagentTaskRecord,
+  type TeamDispatchAgentTaskRecord,
   type TeamMemberRecord,
   type TeamMessageRecord,
   type TeamRecord,
   type TeamTaskClaimRecord,
+  type TeamTaskDispatchRecord,
+  type TeamTaskDispatchToolController,
   type TeamTaskRecord,
+  type TeamTaskReconcileRecord,
+  type TeamTaskSyncRecord,
   type TeamToolController,
 } from "@chili/tools";
 import { createCliApprovalBroker, createCliPermissionRules } from "./approval.js";
@@ -242,6 +250,8 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const teamController = createTeamToolController(teams);
   registerTeamTools(registry, teamController);
   registerTeamTools(childRegistry, teamController);
+  const teamDispatchController = createTeamTaskDispatchToolController(teamDispatcher);
+  registerTeamDispatchTools(registry, teamDispatchController);
 
   return {
     cwd,
@@ -310,6 +320,12 @@ function registerTeamTools(registry: InMemoryToolRegistry, controller: TeamToolC
   registry.register(createTeamTaskUpdateTool(controller));
   registry.register(createTeamMessageSendTool(controller));
   registry.register(createTeamMessageListTool(controller));
+}
+
+function registerTeamDispatchTools(registry: InMemoryToolRegistry, controller: TeamTaskDispatchToolController): void {
+  registry.register(createTeamTaskDispatchTool(controller));
+  registry.register(createTeamTaskSyncTool(controller));
+  registry.register(createTeamTaskReconcileTool(controller));
 }
 
 function createApprovalBroker(options: CliHarnessOptions): PolicyApprovalBroker {
@@ -535,6 +551,43 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
   };
 }
 
+function createTeamTaskDispatchToolController(dispatcher: TeamTaskDispatchService): TeamTaskDispatchToolController {
+  return {
+    async dispatchTask(input, context) {
+      const dispatchInput: Parameters<TeamTaskDispatchService["dispatchTask"]>[0] = {
+        teamId: input.teamId as TeamId,
+        taskId: input.taskId as TaskId,
+        sessionId: context.sessionId,
+        cwd: context.cwd,
+        signal: context.signal,
+      };
+      if (context.threadId) dispatchInput.threadId = context.threadId;
+      if (input.ownerPath) dispatchInput.ownerPath = input.ownerPath as AgentPath;
+      if (input.mode) dispatchInput.mode = input.mode;
+      if (input.prompt) dispatchInput.prompt = input.prompt;
+      return toTeamTaskDispatchRecord(await dispatcher.dispatchTask(dispatchInput));
+    },
+    async syncTask(input, context) {
+      const syncInput: Parameters<TeamTaskDispatchService["syncTask"]>[0] = {
+        teamId: input.teamId as TeamId,
+        taskId: input.taskId as TaskId,
+        sessionId: context.sessionId,
+      };
+      if (context.threadId) syncInput.threadId = context.threadId;
+      return toTeamTaskSyncRecord(await dispatcher.syncTask(syncInput));
+    },
+    async reconcileTasks(input, context) {
+      const reconcileInput: Parameters<TeamTaskDispatchService["reconcileTasks"]>[0] = {
+        sessionId: context.sessionId,
+      };
+      if (context.threadId) reconcileInput.threadId = context.threadId;
+      if (input.teamId) reconcileInput.teamId = input.teamId as TeamId;
+      if (input.limit !== undefined) reconcileInput.limit = input.limit;
+      return toTeamTaskReconcileRecord(await dispatcher.reconcileTasks(reconcileInput));
+    },
+  };
+}
+
 function mailboxTaskLimit(input: MailboxListToolInput): number {
   return Math.max(input.limit ?? 500, 500);
 }
@@ -626,6 +679,57 @@ function toTeamTaskRecord(task: TeamTaskRow): TeamTaskRecord {
   };
 }
 
+function toTeamTaskDispatchRecord(
+  result: Awaited<ReturnType<TeamTaskDispatchService["dispatchTask"]>>,
+): TeamTaskDispatchRecord {
+  return {
+    status: result.status,
+    teamTask: toTeamTaskRecord(result.teamTask),
+    ...(result.agentTask ? { agentTask: toTeamDispatchAgentTaskRecord(result.agentTask) } : {}),
+    ...(result.reason ? { reason: result.reason } : {}),
+  };
+}
+
+function toTeamTaskSyncRecord(result: Awaited<ReturnType<TeamTaskDispatchService["syncTask"]>>): TeamTaskSyncRecord {
+  return {
+    applied: result.applied,
+    teamTask: toTeamTaskRecord(result.teamTask),
+    ...(result.agentTask ? { agentTask: toTeamDispatchAgentTaskRecord(result.agentTask) } : {}),
+    ...(result.reason ? { reason: result.reason } : {}),
+  };
+}
+
+function toTeamTaskReconcileRecord(
+  result: Awaited<ReturnType<TeamTaskDispatchService["reconcileTasks"]>>,
+): TeamTaskReconcileRecord {
+  return {
+    scanned: result.scanned,
+    synced: result.synced.map(toTeamTaskSyncRecord),
+    skipped: result.skipped.map(toTeamTaskSyncRecord),
+    errors: result.errors.map((error) => ({
+      teamId: error.teamId,
+      taskId: error.taskId,
+      error: error.error,
+    })),
+  };
+}
+
+function toTeamDispatchAgentTaskRecord(task: TeamDispatchAgentTaskLike): TeamDispatchAgentTaskRecord {
+  const record: TeamDispatchAgentTaskRecord = {
+    taskId: (task.taskId ?? task.id) as TaskId,
+    status: task.status,
+  };
+  if (task.path) record.path = task.path;
+  const runId = task.runId ?? task.currentRunId;
+  if (runId) record.runId = runId;
+  if (task.childSessionId) record.childSessionId = task.childSessionId;
+  if (task.childThreadId) record.childThreadId = task.childThreadId;
+  if (task.summary) record.summary = task.summary;
+  const error = task.error;
+  if (error) record.error = error instanceof Error ? error.message : error;
+  return record;
+}
+
 function toTeamMessageRecord(message: TeamMessageRow): TeamMessageRecord {
   return {
     messageId: message.id,
@@ -644,3 +748,23 @@ function toTeamMessageRecord(message: TeamMessageRow): TeamMessageRecord {
 function limitItems<T>(items: T[], limit: number | undefined): T[] {
   return limit === undefined ? items : items.slice(0, limit);
 }
+
+type TeamDispatchAgentTaskLike = (
+  | {
+      taskId: TaskId;
+      id?: TaskId;
+    }
+  | {
+      taskId?: TaskId;
+      id: TaskId;
+    }
+) & {
+  path?: AgentPath;
+  runId?: string;
+  currentRunId?: string;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  status: string;
+  summary?: string;
+  error?: string | Error;
+};

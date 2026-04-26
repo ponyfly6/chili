@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { AgentPath, SessionId, TaskId, ThreadId, TimestampMs } from "@chili/protocol";
+import type { AgentPath, AgentRunId, SessionId, TaskId, ThreadId, TimestampMs } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import { LocalSubagentManager, type LocalSubagentRunInput, type LocalSubagentRunResult, type LocalSubagentRunner } from "./subagent.js";
 import { TeamTaskDispatchService } from "./team-dispatcher.js";
@@ -113,14 +113,21 @@ test("syncs a background team task after the subagent finishes", async () => {
       cwd: dir,
     });
     expect(dispatched.status).toBe("running");
+    const dispatchedAgentTask = dispatched.agentTask;
+    if (!dispatchedAgentTask) throw new Error("expected dispatched agent task");
     expect(dispatched.teamTask).toMatchObject({
       status: "in_progress",
-      metadata: {
-        chiliTeamDispatch: {
-          agentTaskId: dispatched.agentTask?.taskId,
-          mode: "background",
-          agentStatus: "running",
-        },
+    });
+    expect(dispatched.teamTask.metadata).toEqual({
+      chiliTeamDispatch: {
+        agentTaskId: dispatchedAgentTask.taskId,
+        agentPath: dispatchedAgentTask.path,
+        runId: dispatchedAgentTask.runId,
+        childSessionId: dispatchedAgentTask.childSessionId,
+        childThreadId: dispatchedAgentTask.childThreadId,
+        mode: "background",
+        dispatchedAt: 200,
+        agentStatus: "running",
       },
     });
 
@@ -135,18 +142,104 @@ test("syncs a background team task after the subagent finishes", async () => {
         id: task.id,
         status: "completed",
         summary: "Verified independently",
-        metadata: {
-          chiliTeamDispatch: {
-            agentTaskId: dispatched.agentTask?.taskId,
-            agentStatus: "completed",
-            syncedAt: 200,
-          },
-        },
       },
       agentTask: {
         status: "completed",
         summary: "Verified independently",
       },
+    });
+    expect(synced.teamTask.metadata).toEqual({
+      chiliTeamDispatch: {
+        agentTaskId: dispatchedAgentTask.taskId,
+        agentPath: dispatchedAgentTask.path,
+        runId: dispatchedAgentTask.runId,
+        childSessionId: dispatchedAgentTask.childSessionId,
+        childThreadId: dispatchedAgentTask.childThreadId,
+        mode: "background",
+        dispatchedAt: 200,
+        agentStatus: "completed",
+        syncedAt: 200,
+      },
+    });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reports skipped reasons for dispatch, sync, and reconcile", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-dispatch-skips-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 225 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const sessionId = "session_team_skips" as SessionId;
+  const threadId = "thread_team_skips" as ThreadId;
+  const runner = new FakeLocalSubagentRunner({ status: "completed", summary: "should not run" });
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
+
+    const team = await teams.createTeam({ sessionId, threadId, name: "skips", leadPath });
+    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const unownedTask = await teams.createTask({
+      sessionId,
+      threadId,
+      teamId: team.id,
+      title: "Missing owner",
+    });
+
+    const dispatchSkipped = await dispatcher.dispatchTask({ teamId: team.id, taskId: unownedTask.id, sessionId, threadId });
+    expect(dispatchSkipped).toMatchObject({
+      status: "skipped",
+      reason: "missing_owner",
+      teamTask: { id: unownedTask.id, status: "pending" },
+    });
+    expect(runner.runs).toEqual([]);
+
+    const syncSkipped = await dispatcher.syncTask({ teamId: team.id, taskId: unownedTask.id, sessionId, threadId });
+    expect(syncSkipped).toMatchObject({
+      applied: false,
+      reason: "not_dispatched",
+      teamTask: { id: unownedTask.id, status: "pending" },
+    });
+
+    const missingAgentTask = await teams.createTask({
+      sessionId,
+      threadId,
+      teamId: team.id,
+      title: "Missing agent task",
+      ownerPath: workerPath,
+      status: "in_progress",
+      metadata: {
+        chiliTeamDispatch: {
+          agentTaskId: "task_missing_agent" as TaskId,
+          agentPath: workerPath,
+          runId: "agentrun_missing_agent" as AgentRunId,
+          childSessionId: "session_missing_agent" as SessionId,
+          childThreadId: "thread_missing_agent" as ThreadId,
+          mode: "background",
+          dispatchedAt: 100,
+          agentStatus: "running",
+        },
+      },
+    });
+
+    const reconciled = await dispatcher.reconcileTasks({ teamId: team.id, sessionId, threadId });
+    expect(reconciled).toMatchObject({
+      scanned: 1,
+      synced: [],
+      skipped: [
+        {
+          applied: false,
+          reason: "agent_task_not_found",
+          teamTask: { id: missingAgentTask.id, status: "in_progress" },
+        },
+      ],
+      errors: [],
     });
   } finally {
     store.close();

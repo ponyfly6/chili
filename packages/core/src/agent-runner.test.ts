@@ -128,6 +128,69 @@ test("RuntimeService reserves busy sessions before the runner reaches runTurn", 
   expect(runner.userMessages).toHaveLength(1);
 });
 
+test("RuntimeService continues after OpenAI-compatible tool_calls finish reason", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+  runner.onRunTurn = async () => {
+    const turnNumber = runner.turnInputs.length;
+    runner.runTurnResult = {
+      status: "completed",
+      turnId: `turn_${turnNumber}` as TurnId,
+      assistantMessageId: `message_assistant_${turnNumber}` as MessageId,
+      finishReason: turnNumber === 1 ? "tool_calls" : "stop",
+    };
+  };
+
+  const result = await service.submitPrompt({
+    sessionId: "session_tool_calls" as SessionId,
+    threadId: "thread_tool_calls" as ThreadId,
+    text: "use a tool",
+    maxTurns: 3,
+  });
+
+  expect(result.status).toBe("completed");
+  expect(result.finishReason).toBe("stop");
+  expect(runner.turnInputs).toHaveLength(2);
+  expect(statuses(store)).toEqual(["running", "running", "running", "idle"]);
+});
+
+test("RuntimeService still stops on Anthropic-style end_turn finish reason", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+  runner.runTurnResult = {
+    status: "completed",
+    turnId: "turn_end_turn" as TurnId,
+    assistantMessageId: "message_assistant_end_turn" as MessageId,
+    finishReason: "end_turn",
+  };
+
+  const result = await service.submitPrompt({
+    sessionId: "session_end_turn" as SessionId,
+    threadId: "thread_end_turn" as ThreadId,
+    text: "answer directly",
+    maxTurns: 3,
+  });
+
+  expect(result.status).toBe("completed");
+  expect(result.finishReason).toBe("end_turn");
+  expect(runner.turnInputs).toHaveLength(1);
+  expect(statuses(store)).toEqual(["running", "running", "idle"]);
+});
+
 test("RuntimeService stops before another tool-use turn when interrupted", async () => {
   const store = new MemoryEventStore();
   const runner = new FakeAgentRunner();
