@@ -156,12 +156,44 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
       payload: { runId: childRunId, path: childPath, parentPath: rootPath, taskName: "review" },
     },
     {
+      id: "event_team_created",
+      type: "team.created",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { teamId, name: "agents", leadPath: rootPath, description: "projection team" },
+    },
+    {
+      id: "event_team_member_lead",
+      type: "team.member_added",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { teamId, path: rootPath, name: "team-lead", role: "leader", status: "running" },
+    },
+    {
+      id: "event_team_member_child",
+      type: "team.member_added",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { teamId, path: childPath, name: "reviewer", role: "reviewer", status: "idle", toolScope: ["read"] },
+    },
+    {
       id: "event_4",
       type: "team.task_created",
       time: 4 as TimestampMs,
       sessionId,
       threadId,
-      payload: { teamId, taskId, ownerPath: childPath },
+      payload: { teamId, taskId, title: "Review projection", ownerPath: childPath },
+    },
+    {
+      id: "event_team_task_claimed",
+      type: "team.task_claimed",
+      time: 4 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { teamId, taskId, ownerPath: childPath, claimedBy: childPath },
     },
     {
       id: "event_5",
@@ -178,6 +210,22 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
       sessionId,
       threadId,
       payload: { messageId: "event_5", path: childPath },
+    },
+    {
+      id: "event_team_message",
+      type: "team.message_sent",
+      time: 6 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        teamId,
+        messageId: "teammsg_projection",
+        from: rootPath,
+        to: childPath,
+        content: "Please review projection",
+        kind: "task_assignment",
+        taskId,
+      },
     },
     {
       id: "event_7",
@@ -204,7 +252,33 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
   expect(view.agents[rootRunId]?.childRunIds).toEqual([childRunId]);
   expect(view.agents[childRunId]?.mailboxMessageIds).toEqual(["event_5"]);
   expect(view.agents[childRunId]?.taskIds).toEqual([taskId]);
+  expect(view.teams[teamId]).toMatchObject({
+    id: teamId,
+    name: "agents",
+    leadPath: rootPath,
+    description: "projection team",
+    memberIds: [`${teamId}:${rootPath}`, `${teamId}:${childPath}`],
+    taskIds: [taskId],
+    messageIds: ["teammsg_projection"],
+  });
+  expect(view.teamMembers[`${teamId}:${childPath}`]).toMatchObject({
+    teamId,
+    path: childPath,
+    name: "reviewer",
+    role: "reviewer",
+    status: "running",
+    currentTaskId: taskId,
+    toolScope: ["read"],
+  });
+  expect(view.teamMessages.teammsg_projection).toMatchObject({
+    teamId,
+    from: rootPath,
+    to: childPath,
+    kind: "task_assignment",
+    taskId,
+  });
   expect(view.tasks[taskId]?.status).toBe("completed");
+  expect(view.tasks[taskId]?.title).toBe("Review projection");
   expect(view.tasks[taskId]?.completedAt).toBe(7);
   expect(snapshot.agents.map((agent) => agent.id)).toEqual([rootRunId, childRunId]);
   expect(snapshot.mailbox[0]?.triggerTurn).toBe(true);

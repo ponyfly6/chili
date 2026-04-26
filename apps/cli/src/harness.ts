@@ -8,10 +8,12 @@ import {
   RuntimeService,
   SingleAgentRuntime,
   SnapshotRecoveryService,
+  TeamControlService,
+  TeamTaskDispatchService,
 } from "@chili/core";
-import type { AgentPath, SessionId, TaskId, ThreadId } from "@chili/protocol";
+import type { AgentPath, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
 import { ObservableEventStore, SqliteEventStore } from "@chili/store";
-import type { AgentMailboxRow, AgentTaskQuery, AgentTaskRow } from "@chili/store";
+import type { AgentMailboxRow, AgentTaskQuery, AgentTaskRow, TeamMemberRow, TeamMessageRow, TeamRow, TeamTaskRow } from "@chili/store";
 import {
   DeferredApprovalQueue,
   FileSystemSnapshotProvider,
@@ -35,11 +37,28 @@ import {
   createTaskListTool,
   createTaskTool,
   createTaskWaitTool,
+  createTeamCreateTool,
+  createTeamListTool,
+  createTeamMemberAddTool,
+  createTeamMemberListTool,
+  createTeamMessageListTool,
+  createTeamMessageSendTool,
+  createTeamTaskAssignTool,
+  createTeamTaskClaimTool,
+  createTeamTaskCreateTool,
+  createTeamTaskListTool,
+  createTeamTaskUpdateTool,
   createToolSearchTool,
   createWriteFileTool,
   type MailboxListToolInput,
   type SubagentMailboxRecord,
   type SubagentTaskRecord,
+  type TeamMemberRecord,
+  type TeamMessageRecord,
+  type TeamRecord,
+  type TeamTaskClaimRecord,
+  type TeamTaskRecord,
+  type TeamToolController,
 } from "@chili/tools";
 import { createCliApprovalBroker, createCliPermissionRules } from "./approval.js";
 import { createIdFactory } from "./id.js";
@@ -63,6 +82,8 @@ export interface CliHarness {
   service: RuntimeService;
   tasks: AgentTaskControlService;
   agents: AgentTreeControlService;
+  teams: TeamControlService;
+  teamDispatcher: TeamTaskDispatchService;
   recovery: SnapshotRecoveryService;
   close(): Promise<void>;
 }
@@ -140,6 +161,16 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     createId,
     system: childSystem,
   });
+  const teams = new TeamControlService({
+    store: eventStore,
+    createId,
+  });
+  const teamDispatcher = new TeamTaskDispatchService({
+    teams,
+    subagents,
+    store: eventStore,
+    cwd,
+  });
   const completeTaskController: SubagentController = {
     spawnTask(input, context) {
       return subagents.spawnTask(input, context);
@@ -208,6 +239,9 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   registry.register(createTaskCloseTool(controlController));
   registry.register(createMailboxListTool(controlController));
   registry.register(createMailboxConsumeTool(controlController));
+  const teamController = createTeamToolController(teams);
+  registerTeamTools(registry, teamController);
+  registerTeamTools(childRegistry, teamController);
 
   return {
     cwd,
@@ -217,6 +251,8 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     service,
     tasks,
     agents,
+    teams,
+    teamDispatcher,
     recovery,
     close: async () => {
       await subagents.waitForBackgroundTasks();
@@ -260,6 +296,20 @@ function createChildToolRegistry(): InMemoryToolRegistry {
   registry.register(createGitDiffTool());
   registry.register(createToolSearchTool(registry));
   return registry;
+}
+
+function registerTeamTools(registry: InMemoryToolRegistry, controller: TeamToolController): void {
+  registry.register(createTeamCreateTool(controller));
+  registry.register(createTeamListTool(controller));
+  registry.register(createTeamMemberAddTool(controller));
+  registry.register(createTeamMemberListTool(controller));
+  registry.register(createTeamTaskCreateTool(controller));
+  registry.register(createTeamTaskListTool(controller));
+  registry.register(createTeamTaskAssignTool(controller));
+  registry.register(createTeamTaskClaimTool(controller));
+  registry.register(createTeamTaskUpdateTool(controller));
+  registry.register(createTeamMessageSendTool(controller));
+  registry.register(createTeamMessageListTool(controller));
 }
 
 function createApprovalBroker(options: CliHarnessOptions): PolicyApprovalBroker {
@@ -339,6 +389,152 @@ function createSubagentControlController(
   };
 }
 
+function createTeamToolController(teams: TeamControlService): TeamToolController {
+  return {
+    async createTeam(input, context) {
+      const createInput: Parameters<TeamControlService["createTeam"]>[0] = {
+        name: input.name,
+        leadPath: input.leadPath as AgentPath,
+        sessionId: context.sessionId,
+      };
+      if (context.threadId) createInput.threadId = context.threadId;
+      if (input.teamId) createInput.teamId = input.teamId as TeamId;
+      if (input.description) createInput.description = input.description;
+      if (input.leadName) createInput.leadName = input.leadName;
+      if (input.leadRole) createInput.leadRole = input.leadRole;
+      if (input.leadStatus) createInput.leadStatus = input.leadStatus;
+      if (input.leadWriteScope) createInput.leadWriteScope = input.leadWriteScope;
+      return toTeamRecord(await teams.createTeam(createInput));
+    },
+    async listTeams(input) {
+      return limitItems(
+        (await teams.listTeams()).filter((team) => (input.status ? team.status === input.status : true)).map(toTeamRecord),
+        input.limit,
+      );
+    },
+    async addMember(input, context) {
+      const addInput: Parameters<TeamControlService["addMember"]>[0] = {
+        teamId: input.teamId as TeamId,
+        path: input.path as AgentPath,
+        name: input.name,
+        role: input.role,
+        sessionId: context.sessionId,
+      };
+      if (context.threadId) addInput.threadId = context.threadId;
+      if (input.status) addInput.status = input.status;
+      if (input.childSessionId) addInput.childSessionId = input.childSessionId as SessionId;
+      if (input.childThreadId) addInput.childThreadId = input.childThreadId as ThreadId;
+      if (input.model) addInput.model = input.model;
+      if (input.toolScope) addInput.toolScope = input.toolScope;
+      if (input.writeScope) addInput.writeScope = input.writeScope;
+      return toTeamMemberRecord(await teams.addMember(addInput));
+    },
+    async listMembers(input) {
+      return limitItems(
+        (await teams.members(input.teamId as TeamId))
+          .filter((member) => (input.status ? member.status === input.status : true))
+          .map(toTeamMemberRecord),
+        input.limit,
+      );
+    },
+    async createTask(input, context) {
+      const createInput: Parameters<TeamControlService["createTask"]>[0] = {
+        teamId: input.teamId as TeamId,
+        title: input.title,
+        sessionId: context.sessionId,
+      };
+      if (context.threadId) createInput.threadId = context.threadId;
+      if (input.taskId) createInput.taskId = input.taskId as TaskId;
+      if (input.description) createInput.description = input.description;
+      if (input.createdBy) createInput.createdBy = input.createdBy as AgentPath;
+      if (input.ownerPath) createInput.ownerPath = input.ownerPath as AgentPath;
+      if (input.dependsOn) createInput.dependsOn = input.dependsOn as TaskId[];
+      if (input.status) createInput.status = input.status;
+      if (input.metadata) createInput.metadata = input.metadata;
+      return toTeamTaskRecord(await teams.createTask(createInput));
+    },
+    async listTasks(input) {
+      return limitItems(
+        (await teams.tasks(input.teamId as TeamId))
+          .filter((task) => (input.status ? task.status === input.status : true))
+          .filter((task) => (input.ownerPath ? task.ownerPath === input.ownerPath : true))
+          .map(toTeamTaskRecord),
+        input.limit,
+      );
+    },
+    async assignTask(input, context) {
+      const assignInput: Parameters<TeamControlService["assignTask"]>[0] = {
+        teamId: input.teamId as TeamId,
+        taskId: input.taskId as TaskId,
+        ownerPath: input.ownerPath as AgentPath,
+        sessionId: context.sessionId,
+      };
+      if (context.threadId) assignInput.threadId = context.threadId;
+      if (input.assignedBy) assignInput.assignedBy = input.assignedBy as AgentPath;
+      if (input.message) assignInput.message = input.message;
+      if (input.messageSummary) assignInput.messageSummary = input.messageSummary;
+      return toTeamTaskRecord(await teams.assignTask(assignInput));
+    },
+    async claimTask(input, context) {
+      const claimInput: Parameters<TeamControlService["claimTask"]>[0] = {
+        teamId: input.teamId as TeamId,
+        taskId: input.taskId as TaskId,
+        ownerPath: input.ownerPath as AgentPath,
+        sessionId: context.sessionId,
+      };
+      if (context.threadId) claimInput.threadId = context.threadId;
+      if (input.claimedBy) claimInput.claimedBy = input.claimedBy as AgentPath;
+      const claim = await teams.claimTask(claimInput);
+      const result: TeamTaskClaimRecord = { applied: claim.applied };
+      if (claim.reason) result.reason = claim.reason;
+      if (claim.task) result.task = toTeamTaskRecord(claim.task);
+      return result;
+    },
+    async updateTask(input, context) {
+      const updateInput: Parameters<TeamControlService["updateTask"]>[0] = {
+        teamId: input.teamId as TeamId,
+        taskId: input.taskId as TaskId,
+        sessionId: context.sessionId,
+      };
+      if (context.threadId) updateInput.threadId = context.threadId;
+      if (input.status) updateInput.status = input.status;
+      if (input.ownerPath) updateInput.ownerPath = input.ownerPath as AgentPath;
+      if (input.title) updateInput.title = input.title;
+      if (input.description) updateInput.description = input.description;
+      if (input.dependsOn) updateInput.dependsOn = input.dependsOn as TaskId[];
+      if (input.summary) updateInput.summary = input.summary;
+      if (input.error) updateInput.error = input.error;
+      if (input.metadata) updateInput.metadata = input.metadata;
+      return toTeamTaskRecord(await teams.updateTask(updateInput));
+    },
+    async sendMessage(input, context) {
+      const messageInput: Parameters<TeamControlService["sendMessage"]>[0] = {
+        teamId: input.teamId as TeamId,
+        from: input.from as AgentPath,
+        to: input.to as AgentPath | "*",
+        content: input.content,
+        sessionId: context.sessionId,
+      };
+      if (context.threadId) messageInput.threadId = context.threadId;
+      if (input.messageId) messageInput.messageId = input.messageId;
+      if (input.kind) messageInput.kind = input.kind;
+      if (input.taskId) messageInput.taskId = input.taskId as TaskId;
+      if (input.summary) messageInput.summary = input.summary;
+      if (input.metadata) messageInput.metadata = input.metadata;
+      return toTeamMessageRecord(await teams.sendMessage(messageInput));
+    },
+    async listMessages(input) {
+      return limitItems(
+        (await teams.messages(input.teamId as TeamId))
+          .filter((message) => (input.path ? message.fromPath === input.path || message.toPath === input.path || message.toPath === "*" : true))
+          .filter((message) => (input.taskId ? message.taskId === input.taskId : true))
+          .map(toTeamMessageRecord),
+        input.limit,
+      );
+    },
+  };
+}
+
 function mailboxTaskLimit(input: MailboxListToolInput): number {
   return Math.max(input.limit ?? 500, 500);
 }
@@ -376,4 +572,75 @@ function toSubagentMailboxRecord(message: AgentMailboxRow): SubagentMailboxRecor
     createdAt: message.createdAt,
     ...(message.consumedAt ? { consumedAt: message.consumedAt } : {}),
   };
+}
+
+function toTeamRecord(team: TeamRow): TeamRecord {
+  return {
+    teamId: team.id,
+    name: team.name,
+    leadPath: team.leadPath,
+    status: team.status,
+    ...(team.sessionId ? { sessionId: team.sessionId } : {}),
+    ...(team.description ? { description: team.description } : {}),
+    createdAt: team.createdAt,
+    updatedAt: team.updatedAt,
+  };
+}
+
+function toTeamMemberRecord(member: TeamMemberRow): TeamMemberRecord {
+  return {
+    teamId: member.teamId,
+    path: member.path,
+    name: member.name,
+    role: member.role,
+    status: member.status,
+    ...(member.childSessionId ? { childSessionId: member.childSessionId } : {}),
+    ...(member.childThreadId ? { childThreadId: member.childThreadId } : {}),
+    ...(member.model ? { model: member.model } : {}),
+    ...(member.toolScope ? { toolScope: member.toolScope } : {}),
+    ...(member.writeScope ? { writeScope: member.writeScope } : {}),
+    ...(member.currentTaskId ? { currentTaskId: member.currentTaskId } : {}),
+    createdAt: member.createdAt,
+    updatedAt: member.updatedAt,
+    ...(member.closedAt ? { closedAt: member.closedAt } : {}),
+  };
+}
+
+function toTeamTaskRecord(task: TeamTaskRow): TeamTaskRecord {
+  return {
+    taskId: task.id,
+    teamId: task.teamId,
+    title: task.title,
+    status: task.status,
+    ...(task.sessionId ? { sessionId: task.sessionId } : {}),
+    ...(task.description ? { description: task.description } : {}),
+    ...(task.ownerPath ? { ownerPath: task.ownerPath } : {}),
+    ...(task.createdBy ? { createdBy: task.createdBy } : {}),
+    dependsOn: task.dependsOn,
+    ...(task.summary ? { summary: task.summary } : {}),
+    ...(task.error ? { error: task.error } : {}),
+    ...(task.metadata ? { metadata: task.metadata } : {}),
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    ...(task.completedAt ? { completedAt: task.completedAt } : {}),
+  };
+}
+
+function toTeamMessageRecord(message: TeamMessageRow): TeamMessageRecord {
+  return {
+    messageId: message.id,
+    teamId: message.teamId,
+    fromPath: message.fromPath,
+    toPath: message.toPath,
+    content: message.content,
+    kind: message.kind,
+    ...(message.taskId ? { taskId: message.taskId } : {}),
+    ...(message.summary ? { summary: message.summary } : {}),
+    ...(message.metadata ? { metadata: message.metadata } : {}),
+    createdAt: message.createdAt,
+  };
+}
+
+function limitItems<T>(items: T[], limit: number | undefined): T[] {
+  return limit === undefined ? items : items.slice(0, limit);
 }

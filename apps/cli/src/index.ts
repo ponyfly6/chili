@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { createInterface } from "node:readline/promises";
 import type { AgentTreeNode } from "@chili/core";
-import type { SessionId, TaskId } from "@chili/protocol";
+import type { SessionId, TaskId, TeamId } from "@chili/protocol";
 import { ROOT_AGENT_PATH } from "@chili/protocol";
 import { startRuntimeHttpServer } from "@chili/server";
 import { DeferredApprovalQueue } from "@chili/tools";
@@ -56,6 +56,65 @@ async function main(): Promise<void> {
 
     if (args.command === "agents") {
       await printAgentTree(harness);
+      return;
+    }
+
+    if (args.command === "teams") {
+      await printTeams(harness);
+      return;
+    }
+
+    if (args.command === "team") {
+      if (!args.teamId) throw new Error("team requires a team id");
+      await printTeam(harness, args.teamId as TeamId);
+      return;
+    }
+
+    if (args.command === "team-members") {
+      if (!args.teamId) throw new Error("team-members requires a team id");
+      await printTeamMembers(harness, args.teamId as TeamId);
+      return;
+    }
+
+    if (args.command === "team-tasks") {
+      if (!args.teamId) throw new Error("team-tasks requires a team id");
+      await printTeamTasks(harness, args.teamId as TeamId);
+      return;
+    }
+
+    if (args.command === "team-messages") {
+      if (!args.teamId) throw new Error("team-messages requires a team id");
+      await printTeamMessages(harness, args.teamId as TeamId);
+      return;
+    }
+
+    if (args.command === "team-dispatch") {
+      if (!args.teamId || !args.taskId) throw new Error("team-dispatch requires a team id and task id");
+      await dispatchTeamTask(harness, args.teamId as TeamId, args.taskId as TaskId, "background");
+      return;
+    }
+
+    if (args.command === "team-run") {
+      if (!args.teamId || !args.taskId) throw new Error("team-run requires a team id and task id");
+      await dispatchTeamTask(harness, args.teamId as TeamId, args.taskId as TaskId, "one_shot");
+      return;
+    }
+
+    if (args.command === "team-sync") {
+      if (!args.teamId || !args.taskId) throw new Error("team-sync requires a team id and task id");
+      const result = await harness.teamDispatcher.syncTask({
+        teamId: args.teamId as TeamId,
+        taskId: args.taskId as TaskId,
+      });
+      console.log(jsonStringify(result));
+      return;
+    }
+
+    if (args.command === "team-reconcile") {
+      const input: Parameters<typeof harness.teamDispatcher.reconcileTasks>[0] = {};
+      if (args.teamId) input.teamId = args.teamId as TeamId;
+      const result = await harness.teamDispatcher.reconcileTasks(input);
+      console.log(jsonStringify(result));
       return;
     }
 
@@ -164,6 +223,8 @@ async function serve(input: {
     store: input.harness.events,
     tasks: input.harness.tasks,
     agents: input.harness.agents,
+    teams: input.harness.teams,
+    teamDispatcher: input.harness.teamDispatcher,
     approvals: input.approvalQueue,
     hostname: input.host,
     port: input.port,
@@ -231,6 +292,129 @@ async function printAgentTree(harness: Awaited<ReturnType<typeof createCliHarnes
   }
 }
 
+async function printTeams(harness: Awaited<ReturnType<typeof createCliHarness>>): Promise<void> {
+  const teams = await harness.teams.listTeams();
+  if (teams.length === 0) {
+    console.log("No teams yet.");
+    return;
+  }
+  for (const team of teams) {
+    console.log(
+      [
+        team.id,
+        team.status,
+        team.leadPath,
+        team.updatedAt ? new Date(team.updatedAt).toISOString() : "",
+        team.name,
+        team.description ?? "",
+      ].join("\t"),
+    );
+  }
+}
+
+async function printTeam(harness: Awaited<ReturnType<typeof createCliHarness>>, teamId: TeamId): Promise<void> {
+  const team = (await harness.teams.listTeams()).find((item) => item.id === teamId);
+  if (!team) throw new Error(`Team not found: ${teamId}`);
+  const [members, tasks, messages] = await Promise.all([
+    harness.teams.members(teamId),
+    harness.teams.tasks(teamId),
+    harness.teams.messages(teamId),
+  ]);
+  console.log(JSON.stringify({ team, members, tasks, messages }, null, 2));
+}
+
+async function printTeamMembers(harness: Awaited<ReturnType<typeof createCliHarness>>, teamId: TeamId): Promise<void> {
+  const members = await harness.teams.members(teamId);
+  if (members.length === 0) {
+    console.log("No team members.");
+    return;
+  }
+  for (const member of members) {
+    console.log(
+      [
+        member.path,
+        member.status,
+        member.currentTaskId ?? "",
+        member.childSessionId ?? "",
+        member.name,
+        member.role,
+      ].join("\t"),
+    );
+  }
+}
+
+async function printTeamTasks(harness: Awaited<ReturnType<typeof createCliHarness>>, teamId: TeamId): Promise<void> {
+  const tasks = await harness.teams.tasks(teamId);
+  if (tasks.length === 0) {
+    console.log("No team tasks.");
+    return;
+  }
+  for (const task of tasks) {
+    console.log(
+      [
+        task.id,
+        task.status,
+        task.ownerPath ?? "",
+        task.dependsOn.length > 0 ? task.dependsOn.join(",") : "",
+        task.updatedAt ? new Date(task.updatedAt).toISOString() : "",
+        task.title,
+        task.summary ?? "",
+      ].join("\t"),
+    );
+  }
+}
+
+async function printTeamMessages(harness: Awaited<ReturnType<typeof createCliHarness>>, teamId: TeamId): Promise<void> {
+  const messages = await harness.teams.messages(teamId);
+  if (messages.length === 0) {
+    console.log("No team messages.");
+    return;
+  }
+  for (const message of messages) {
+    console.log(
+      [
+        message.id,
+        message.kind,
+        message.fromPath,
+        message.toPath,
+        message.taskId ?? "",
+        message.createdAt ? new Date(message.createdAt).toISOString() : "",
+        message.summary ?? message.content,
+      ].join("\t"),
+    );
+  }
+}
+
+async function dispatchTeamTask(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  teamId: TeamId,
+  taskId: TaskId,
+  mode: "background" | "one_shot",
+): Promise<void> {
+  const team = (await harness.teams.listTeams()).find((item) => item.id === teamId);
+  if (!team) throw new Error(`Team not found: ${teamId}`);
+  const task = (await harness.teams.tasks(teamId)).find((item) => item.id === taskId);
+  if (!task) throw new Error(`Team task not found: ${taskId}`);
+
+  let sessionId = task.sessionId ?? team.sessionId;
+  let threadId: import("@chili/protocol").ThreadId | undefined;
+  if (!sessionId) {
+    const session = await harness.service.createSession({ cwd: harness.cwd });
+    sessionId = session.sessionId;
+    threadId = session.threadId;
+  }
+
+  const result = await harness.teamDispatcher.dispatchTask({
+    teamId,
+    taskId,
+    mode,
+    cwd: harness.cwd,
+    sessionId,
+    ...(threadId ? { threadId } : {}),
+  });
+  console.log(jsonStringify(result));
+}
+
 async function printMailbox(harness: Awaited<ReturnType<typeof createCliHarness>>): Promise<void> {
   const messages = await harness.agents.mailbox({ status: "queued" });
   if (messages.length === 0) {
@@ -241,6 +425,17 @@ async function printMailbox(harness: Awaited<ReturnType<typeof createCliHarness>
     const content = message.message && "content" in message.message ? message.message.content : "";
     console.log([message.id, message.status, message.fromPath, message.path, content].join("\t"));
   }
+}
+
+function jsonStringify(value: unknown): string {
+  return JSON.stringify(
+    value,
+    (_key, item) => {
+      if (item instanceof Error) return item.message;
+      return item;
+    },
+    2,
+  );
 }
 
 async function repl(input: {

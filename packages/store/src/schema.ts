@@ -157,10 +157,31 @@ export const SQLITE_SCHEMA = [
     name text not null,
     lead_path text not null,
     status text not null,
+    description text,
     created_at integer not null,
     updated_at integer not null
   )`,
   `create index if not exists teams_session_idx on teams(session_id)`,
+
+  `create table if not exists team_members (
+    team_id text not null,
+    path text not null,
+    name text not null,
+    role text not null,
+    status text not null,
+    child_session_id text,
+    child_thread_id text,
+    model text,
+    tool_scope_json text,
+    write_scope_json text,
+    current_task_id text,
+    created_at integer not null,
+    updated_at integer not null,
+    closed_at integer,
+    primary key (team_id, path)
+  )`,
+  `create index if not exists team_members_team_status_idx on team_members(team_id, status)`,
+  `create index if not exists team_members_path_idx on team_members(path)`,
 
   `create table if not exists team_tasks (
     id text primary key,
@@ -169,8 +190,32 @@ export const SQLITE_SCHEMA = [
     owner_path text,
     status text not null,
     title text,
+    description text,
+    created_by text,
+    depends_on_json text,
+    summary text,
+    error text,
+    metadata_json text,
     created_at integer not null,
-    updated_at integer not null
+    updated_at integer not null,
+    completed_at integer
   )`,
   `create index if not exists team_tasks_team_status_idx on team_tasks(team_id, status)`,
+  `create index if not exists team_tasks_owner_status_idx on team_tasks(owner_path, status)`,
+
+  `create table if not exists team_messages (
+    id text primary key,
+    team_id text not null,
+    from_path text not null,
+    to_path text not null,
+    task_id text,
+    kind text not null,
+    content text not null,
+    summary text,
+    metadata_json text,
+    created_at integer not null
+  )`,
+  `create index if not exists team_messages_team_time_idx on team_messages(team_id, created_at)`,
+  `create index if not exists team_messages_to_time_idx on team_messages(to_path, created_at)`,
+  `create index if not exists team_messages_task_idx on team_messages(task_id, created_at)`,
 ];

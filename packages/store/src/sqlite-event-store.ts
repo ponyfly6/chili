@@ -19,6 +19,8 @@ import type {
   TaskId,
   SessionEvent,
   TeamEvent,
+  TeamId,
+  TeamTaskClaimedPayload,
   ThreadId,
   ToolEvent,
 } from "@chili/protocol";
@@ -51,6 +53,18 @@ import type {
   EventStore,
   SessionRow,
   SubagentProjectionStore,
+  TeamMemberQuery,
+  TeamMemberRow,
+  TeamMessageQuery,
+  TeamMessageRow,
+  TeamProjectionStore,
+  TeamQuery,
+  TeamRow,
+  TeamTaskClaimInput,
+  TeamTaskClaimStore,
+  TeamTaskMutationResult,
+  TeamTaskQuery,
+  TeamTaskRow,
 } from "./types.js";
 
 interface StoredEventRow {
@@ -147,13 +161,87 @@ interface AgentMailboxProjectionRow {
   consumed_at: number | null;
 }
 
+interface TeamProjectionRow {
+  id: string;
+  session_id: string | null;
+  name: string;
+  lead_path: string;
+  status: TeamRow["status"];
+  description: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+interface TeamMemberProjectionRow {
+  team_id: string;
+  path: string;
+  name: string;
+  role: string;
+  status: TeamMemberRow["status"];
+  child_session_id: string | null;
+  child_thread_id: string | null;
+  model: string | null;
+  tool_scope_json: string | null;
+  write_scope_json: string | null;
+  current_task_id: string | null;
+  created_at: number;
+  updated_at: number;
+  closed_at: number | null;
+}
+
+interface TeamTaskProjectionRow {
+  id: string;
+  team_id: string;
+  session_id: string | null;
+  owner_path: string | null;
+  status: TeamTaskRow["status"];
+  title: string | null;
+  description: string | null;
+  created_by: string | null;
+  depends_on_json: string | null;
+  summary: string | null;
+  error: string | null;
+  metadata_json: string | null;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
+}
+
+interface TeamTaskStateRow {
+  id: string;
+  team_id: string;
+  status: TeamTaskRow["status"];
+  owner_path: string | null;
+  depends_on_json: string | null;
+}
+
+interface TeamMessageProjectionRow {
+  id: string;
+  team_id: string;
+  from_path: string;
+  to_path: string;
+  task_id: string | null;
+  kind: TeamMessageRow["kind"];
+  content: string;
+  summary: string | null;
+  metadata_json: string | null;
+  created_at: number;
+}
+
 export interface SqliteEventStoreOptions {
   mirror?: EventMirror;
   onMirrorError?: (error: unknown, event: ChiliEvent) => void;
 }
 
 export class SqliteEventStore
-  implements EventStore, SubagentProjectionStore, AgentTaskLeaseStore, AgentTaskFinalizationStore, AgentMailboxDeliveryStore
+  implements
+    EventStore,
+    SubagentProjectionStore,
+    AgentTaskLeaseStore,
+    AgentTaskFinalizationStore,
+    AgentMailboxDeliveryStore,
+    TeamProjectionStore,
+    TeamTaskClaimStore
 {
   private readonly db: Database;
 
@@ -170,6 +258,7 @@ export class SqliteEventStore
       this.db.exec(statement);
     }
     this.migrateSubagentSchema();
+    this.migrateTeamSchema();
   }
 
   close(): void {
@@ -421,6 +510,179 @@ export class SqliteEventStore
       )
       .all(params)
       .map((row) => agentMailboxFromRow(row));
+  }
+
+  async teams(query: TeamQuery = {}): Promise<TeamRow[]> {
+    const clauses: string[] = [];
+    const params: Record<string, unknown> = {};
+
+    if (query.teamId) {
+      clauses.push("id = $teamId");
+      params.teamId = query.teamId;
+    }
+    if (query.sessionId) {
+      clauses.push("session_id = $sessionId");
+      params.sessionId = query.sessionId;
+    }
+    if (query.status) {
+      clauses.push("status = $status");
+      params.status = query.status;
+    }
+
+    params.limit = query.limit ?? 500;
+    const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
+    return this.db
+      .query<TeamProjectionRow, any>(
+        `select id, session_id, name, lead_path, status, description, created_at, updated_at
+         from teams
+         ${where}
+         order by updated_at desc, id asc
+         limit $limit`,
+      )
+      .all(params)
+      .map((row) => teamFromRow(row));
+  }
+
+  async teamMembers(query: TeamMemberQuery = {}): Promise<TeamMemberRow[]> {
+    const clauses: string[] = [];
+    const params: Record<string, unknown> = {};
+
+    if (query.teamId) {
+      clauses.push("team_id = $teamId");
+      params.teamId = query.teamId;
+    }
+    if (query.path) {
+      clauses.push("path = $path");
+      params.path = query.path;
+    }
+    if (query.status) {
+      clauses.push("status = $status");
+      params.status = query.status;
+    }
+
+    params.limit = query.limit ?? 500;
+    const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
+    return this.db
+      .query<TeamMemberProjectionRow, any>(
+        `select team_id, path, name, role, status, child_session_id, child_thread_id, model,
+                tool_scope_json, write_scope_json, current_task_id, created_at, updated_at, closed_at
+         from team_members
+         ${where}
+         order by created_at asc, path asc
+         limit $limit`,
+      )
+      .all(params)
+      .map((row) => teamMemberFromRow(row));
+  }
+
+  async teamTasks(query: TeamTaskQuery = {}): Promise<TeamTaskRow[]> {
+    const clauses: string[] = [];
+    const params: Record<string, unknown> = {};
+
+    if (query.teamId) {
+      clauses.push("team_id = $teamId");
+      params.teamId = query.teamId;
+    }
+    if (query.taskId) {
+      clauses.push("id = $taskId");
+      params.taskId = query.taskId;
+    }
+    if (query.ownerPath) {
+      clauses.push("owner_path = $ownerPath");
+      params.ownerPath = query.ownerPath;
+    }
+    if (query.status) {
+      clauses.push("status = $status");
+      params.status = query.status;
+    }
+
+    params.limit = query.limit ?? 500;
+    const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
+    return this.db
+      .query<TeamTaskProjectionRow, any>(
+        `select id, team_id, session_id, owner_path, status, title, description, created_by,
+                depends_on_json, summary, error, metadata_json, created_at, updated_at, completed_at
+         from team_tasks
+         ${where}
+         order by created_at asc, id asc
+         limit $limit`,
+      )
+      .all(params)
+      .map((row) => teamTaskFromRow(row));
+  }
+
+  async teamMessages(query: TeamMessageQuery = {}): Promise<TeamMessageRow[]> {
+    const clauses: string[] = [];
+    const params: Record<string, unknown> = {};
+
+    if (query.teamId) {
+      clauses.push("team_id = $teamId");
+      params.teamId = query.teamId;
+    }
+    if (query.path) {
+      clauses.push("(from_path = $path or to_path = $path or to_path = '*')");
+      params.path = query.path;
+    }
+    if (query.taskId) {
+      clauses.push("task_id = $taskId");
+      params.taskId = query.taskId;
+    }
+
+    params.limit = query.limit ?? 500;
+    const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
+    return this.db
+      .query<TeamMessageProjectionRow, any>(
+        `select id, team_id, from_path, to_path, task_id, kind, content, summary, metadata_json, created_at
+         from team_messages
+         ${where}
+         order by created_at asc, id asc
+         limit $limit`,
+      )
+      .all(params)
+      .map((row) => teamMessageFromRow(row));
+  }
+
+  async claimTeamTask(input: TeamTaskClaimInput): Promise<TeamTaskMutationResult> {
+    const result = this.db.transaction((item: TeamTaskClaimInput) => {
+      const current = this.teamTaskState(item.teamId, item.taskId);
+      if (!current) return { applied: false, reason: "not_found" as const, events: [] as ChiliEvent[] };
+      if (isFinalTeamTaskStatus(current.status)) {
+        return { applied: false, reason: "already_resolved" as const, events: [] as ChiliEvent[] };
+      }
+      if (current.status === "blocked" || !this.teamTaskDependenciesComplete(current)) {
+        return { applied: false, reason: "blocked" as const, events: [] as ChiliEvent[] };
+      }
+      if (current.status !== "pending" || (current.owner_path && current.owner_path !== item.ownerPath)) {
+        return { applied: false, reason: "already_claimed" as const, events: [] as ChiliEvent[] };
+      }
+
+      const event = this.teamTaskClaimedEvent(item, current);
+      const cas = this.db
+        .query(
+          `update team_tasks
+           set owner_path = $ownerPath,
+               status = 'in_progress',
+               updated_at = $time,
+               completed_at = null
+           where id = $taskId
+             and team_id = $teamId
+             and status = 'pending'
+             and (owner_path is null or owner_path = $ownerPath)`,
+        )
+        .run({
+          teamId: item.teamId,
+          taskId: item.taskId,
+          ownerPath: item.ownerPath,
+          time: event.time,
+        });
+      if (cas.changes === 0) return { applied: false, reason: "already_claimed" as const, events: [] as ChiliEvent[] };
+      this.writeTransactionEvents([event]);
+      return { applied: true, events: [event] };
+    })(input);
+
+    await this.writeMirrors(result.events);
+    const task = (await this.teamTasks({ teamId: input.teamId, taskId: input.taskId, limit: 1 }))[0];
+    return { ...result, ...(task ? { task } : {}) };
   }
 
   async claimAgentMailboxMessage(input: AgentMailboxClaimInput): Promise<AgentMailboxMutationResult> {
@@ -867,6 +1129,23 @@ export class SqliteEventStore
     this.db.exec(`create index if not exists agent_mailbox_status_idx on agent_mailbox(status, created_at)`);
     this.db.exec(`create index if not exists agent_tasks_lease_idx on agent_tasks(status, lease_expires_at)`);
     this.db.exec(`create index if not exists agent_tasks_lease_owner_idx on agent_tasks(lease_owner, status)`);
+  }
+
+  private migrateTeamSchema(): void {
+    this.addColumnIfMissing("teams", "description", "text");
+    this.addColumnIfMissing("team_tasks", "description", "text");
+    this.addColumnIfMissing("team_tasks", "created_by", "text");
+    this.addColumnIfMissing("team_tasks", "depends_on_json", "text");
+    this.addColumnIfMissing("team_tasks", "summary", "text");
+    this.addColumnIfMissing("team_tasks", "error", "text");
+    this.addColumnIfMissing("team_tasks", "metadata_json", "text");
+    this.addColumnIfMissing("team_tasks", "completed_at", "integer");
+    this.db.exec(`create index if not exists team_tasks_owner_status_idx on team_tasks(owner_path, status)`);
+    this.db.exec(`create index if not exists team_members_team_status_idx on team_members(team_id, status)`);
+    this.db.exec(`create index if not exists team_members_path_idx on team_members(path)`);
+    this.db.exec(`create index if not exists team_messages_team_time_idx on team_messages(team_id, created_at)`);
+    this.db.exec(`create index if not exists team_messages_to_time_idx on team_messages(to_path, created_at)`);
+    this.db.exec(`create index if not exists team_messages_task_idx on team_messages(task_id, created_at)`);
   }
 
   private addColumnIfMissing(table: string, column: string, definition: string): void {
@@ -1404,40 +1683,302 @@ export class SqliteEventStore
       .get(taskId)?.parent_thread_id ?? undefined;
   }
 
+  private teamTaskState(teamId: TeamId, taskId: TaskId): TeamTaskStateRow | undefined {
+    const row = this.db
+      .query<TeamTaskStateRow, [string, string]>(
+        `select id, team_id, status, owner_path, depends_on_json
+         from team_tasks
+         where team_id = ? and id = ?`,
+      )
+      .get(teamId, taskId);
+    return row ?? undefined;
+  }
+
+  private teamTaskDependenciesComplete(task: TeamTaskStateRow): boolean {
+    const dependencies = decodeJson<TaskId[]>(task.depends_on_json ?? "[]", []);
+    if (dependencies.length === 0) return true;
+
+    const completed = this.db
+      .query<{ count: number }, any>(
+        `select count(*) as count
+         from team_tasks
+         where team_id = $teamId
+           and status = 'completed'
+           and id in (${dependencies.map((_, index) => `$dep${index}`).join(", ")})`,
+      )
+      .get(Object.fromEntries([["teamId", task.team_id], ...dependencies.map((id, index) => [`dep${index}`, id])]));
+    return (completed?.count ?? 0) === dependencies.length;
+  }
+
+  private teamTaskClaimedEvent(
+    input: TeamTaskClaimInput,
+    current: TeamTaskStateRow,
+  ): Extract<ChiliEvent, { type: "team.task_claimed" }> {
+    const payload: TeamTaskClaimedPayload = {
+      teamId: input.teamId,
+      taskId: input.taskId,
+      ownerPath: input.ownerPath,
+    };
+    if (input.claimedBy) payload.claimedBy = input.claimedBy;
+
+    const event: EventEnvelope<"team.task_claimed", TeamTaskClaimedPayload> = {
+      id: input.eventId,
+      type: "team.task_claimed",
+      time: (input.time ?? Date.now()) as EventEnvelope["time"],
+      payload,
+    };
+    const sessionId = input.sessionId ?? this.sessionIdForTeamTask(current.id);
+    if (sessionId) event.sessionId = sessionId as SessionId;
+    if (input.threadId) event.threadId = input.threadId;
+    return event;
+  }
+
+  private sessionIdForTeamTask(taskId: string): string | undefined {
+    return this.db
+      .query<{ session_id: string | null }, [string]>(`select session_id from team_tasks where id = ?`)
+      .get(taskId)?.session_id ?? undefined;
+  }
+
+  private touchTeam(teamId: TeamId, time: number): void {
+    this.db.query(`update teams set updated_at = ? where id = ?`).run(time, teamId);
+  }
+
   private applyTeamEvent(event: TeamEvent): void {
     if (event.type === "team.created") {
       this.db
         .query(
-          `insert into teams (id, session_id, name, lead_path, status, created_at, updated_at)
-           values (?, ?, ?, ?, 'active', ?, ?)
-           on conflict(id) do update set updated_at = excluded.updated_at`,
-        )
-        .run(event.payload.teamId, event.sessionId ?? null, event.payload.name, event.payload.leadPath, event.time, event.time);
-      return;
-    }
-
-    if (event.type === "team.task_created") {
-      this.db
-        .query(
-          `insert into team_tasks (id, team_id, session_id, owner_path, status, created_at, updated_at)
-           values (?, ?, ?, ?, 'pending', ?, ?)
-           on conflict(id) do nothing`,
+          `insert into teams (id, session_id, name, lead_path, status, description, created_at, updated_at)
+           values (?, ?, ?, ?, 'active', ?, ?, ?)
+           on conflict(id) do update set
+             name = excluded.name,
+             lead_path = excluded.lead_path,
+             description = excluded.description,
+             updated_at = excluded.updated_at`,
         )
         .run(
-          event.payload.taskId,
           event.payload.teamId,
           event.sessionId ?? null,
-          event.payload.ownerPath ?? null,
+          event.payload.name,
+          event.payload.leadPath,
+          event.payload.description ?? null,
           event.time,
           event.time,
         );
       return;
     }
 
-    if (event.type === "team.task_updated") {
+    if (event.type === "team.member_added") {
       this.db
-        .query(`update team_tasks set status = ?, updated_at = ? where id = ?`)
-        .run(event.payload.status, event.time, event.payload.taskId);
+        .query(
+          `insert into team_members
+             (team_id, path, name, role, status, child_session_id, child_thread_id, model,
+              tool_scope_json, write_scope_json, created_at, updated_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           on conflict(team_id, path) do update set
+             name = excluded.name,
+             role = excluded.role,
+             status = excluded.status,
+             child_session_id = coalesce(excluded.child_session_id, team_members.child_session_id),
+             child_thread_id = coalesce(excluded.child_thread_id, team_members.child_thread_id),
+             model = coalesce(excluded.model, team_members.model),
+             tool_scope_json = coalesce(excluded.tool_scope_json, team_members.tool_scope_json),
+             write_scope_json = coalesce(excluded.write_scope_json, team_members.write_scope_json),
+             closed_at = null,
+             updated_at = excluded.updated_at`,
+        )
+        .run(
+          event.payload.teamId,
+          event.payload.path,
+          event.payload.name,
+          event.payload.role,
+          event.payload.status ?? "idle",
+          event.payload.childSessionId ?? null,
+          event.payload.childThreadId ?? null,
+          event.payload.model ?? null,
+          event.payload.toolScope ? encodeJson(event.payload.toolScope) : null,
+          event.payload.writeScope ? encodeJson(event.payload.writeScope) : null,
+          event.time,
+          event.time,
+        );
+      this.touchTeam(event.payload.teamId, event.time);
+      return;
+    }
+
+    if (event.type === "team.member_status_changed") {
+      this.db
+        .query(
+          `update team_members
+           set status = ?,
+               current_task_id = ?,
+               closed_at = case when ? = 'closed' then ? else closed_at end,
+               updated_at = ?
+           where team_id = ? and path = ?`,
+        )
+        .run(
+          event.payload.status,
+          event.payload.taskId ?? null,
+          event.payload.status,
+          event.time,
+          event.time,
+          event.payload.teamId,
+          event.payload.path,
+        );
+      this.touchTeam(event.payload.teamId, event.time);
+      return;
+    }
+
+    if (event.type === "team.task_created") {
+      this.db
+        .query(
+          `insert into team_tasks
+             (id, team_id, session_id, owner_path, status, title, description, created_by,
+              depends_on_json, metadata_json, created_at, updated_at, completed_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           on conflict(id) do update set
+             team_id = excluded.team_id,
+             session_id = coalesce(excluded.session_id, team_tasks.session_id),
+             owner_path = excluded.owner_path,
+             status = excluded.status,
+             title = excluded.title,
+             description = excluded.description,
+             created_by = excluded.created_by,
+             depends_on_json = excluded.depends_on_json,
+             metadata_json = excluded.metadata_json,
+             completed_at = excluded.completed_at,
+             updated_at = excluded.updated_at`,
+        )
+        .run(
+          event.payload.taskId,
+          event.payload.teamId,
+          event.sessionId ?? null,
+          event.payload.ownerPath ?? null,
+          event.payload.status ?? "pending",
+          event.payload.title ?? String(event.payload.taskId),
+          event.payload.description ?? null,
+          event.payload.createdBy ?? null,
+          encodeJson(event.payload.dependsOn ?? []),
+          event.payload.metadata ? encodeJson(event.payload.metadata) : null,
+          event.time,
+          event.time,
+          isFinalTeamTaskStatus(event.payload.status ?? "pending") ? event.time : null,
+        );
+      this.touchTeam(event.payload.teamId, event.time);
+      return;
+    }
+
+    if (event.type === "team.task_assigned") {
+      this.db
+        .query(
+          `update team_tasks
+           set owner_path = ?,
+               updated_at = ?
+           where id = ? and team_id = ?`,
+        )
+        .run(event.payload.ownerPath, event.time, event.payload.taskId, event.payload.teamId);
+      this.db
+        .query(
+          `update team_members
+           set current_task_id = ?,
+               updated_at = ?
+           where team_id = ? and path = ?`,
+        )
+        .run(event.payload.taskId, event.time, event.payload.teamId, event.payload.ownerPath);
+      this.touchTeam(event.payload.teamId, event.time);
+      return;
+    }
+
+    if (event.type === "team.task_claimed") {
+      this.db
+        .query(
+          `update team_tasks
+           set owner_path = ?,
+               status = 'in_progress',
+               completed_at = null,
+               updated_at = ?
+           where id = ? and team_id = ?`,
+        )
+        .run(event.payload.ownerPath, event.time, event.payload.taskId, event.payload.teamId);
+      this.db
+        .query(
+          `update team_members
+           set status = 'running',
+               current_task_id = ?,
+               updated_at = ?
+           where team_id = ? and path = ?`,
+        )
+        .run(event.payload.taskId, event.time, event.payload.teamId, event.payload.ownerPath);
+      this.touchTeam(event.payload.teamId, event.time);
+      return;
+    }
+
+    if (event.type === "team.task_updated") {
+      const current = this.teamTaskState(event.payload.teamId, event.payload.taskId);
+      const status = event.payload.status ?? current?.status ?? "pending";
+      this.db
+        .query(
+          `update team_tasks
+           set status = coalesce(?, status),
+               owner_path = coalesce(?, owner_path),
+               title = coalesce(?, title),
+               description = coalesce(?, description),
+               depends_on_json = coalesce(?, depends_on_json),
+               summary = coalesce(?, summary),
+               error = coalesce(?, error),
+               metadata_json = coalesce(?, metadata_json),
+               completed_at = case when ? in ('completed', 'failed', 'cancelled') then ? else completed_at end,
+               updated_at = ?
+           where id = ? and team_id = ?`,
+        )
+        .run(
+          event.payload.status ?? null,
+          event.payload.ownerPath ?? null,
+          event.payload.title ?? null,
+          event.payload.description ?? null,
+          event.payload.dependsOn ? encodeJson(event.payload.dependsOn) : null,
+          event.payload.summary ?? null,
+          event.payload.error ?? null,
+          event.payload.metadata ? encodeJson(event.payload.metadata) : null,
+          status,
+          event.time,
+          event.time,
+          event.payload.taskId,
+          event.payload.teamId,
+        );
+      if (event.payload.ownerPath) {
+        this.db
+          .query(
+            `update team_members
+             set current_task_id = ?,
+                 updated_at = ?
+             where team_id = ? and path = ?`,
+          )
+          .run(event.payload.taskId, event.time, event.payload.teamId, event.payload.ownerPath);
+      }
+      this.touchTeam(event.payload.teamId, event.time);
+      return;
+    }
+
+    if (event.type === "team.message_sent") {
+      this.db
+        .query(
+          `insert into team_messages
+             (id, team_id, from_path, to_path, task_id, kind, content, summary, metadata_json, created_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           on conflict(id) do nothing`,
+        )
+        .run(
+          event.payload.messageId,
+          event.payload.teamId,
+          event.payload.from,
+          event.payload.to,
+          event.payload.taskId ?? null,
+          event.payload.kind ?? "text",
+          event.payload.content,
+          event.payload.summary ?? null,
+          event.payload.metadata ? encodeJson(event.payload.metadata) : null,
+          event.time,
+        );
+      this.touchTeam(event.payload.teamId, event.time);
     }
   }
 
@@ -1552,6 +2093,77 @@ function agentMailboxFromRow(row: AgentMailboxProjectionRow): AgentMailboxRow {
   return message;
 }
 
+function teamFromRow(row: TeamProjectionRow): TeamRow {
+  const team: TeamRow = {
+    id: row.id as TeamId,
+    name: row.name,
+    leadPath: row.lead_path as AgentPath,
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+  if (row.session_id) team.sessionId = row.session_id as SessionId;
+  if (row.description) team.description = row.description;
+  return team;
+}
+
+function teamMemberFromRow(row: TeamMemberProjectionRow): TeamMemberRow {
+  const member: TeamMemberRow = {
+    teamId: row.team_id as TeamId,
+    path: row.path as AgentPath,
+    name: row.name,
+    role: row.role,
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+  if (row.child_session_id) member.childSessionId = row.child_session_id as SessionId;
+  if (row.child_thread_id) member.childThreadId = row.child_thread_id as ThreadId;
+  if (row.model) member.model = row.model;
+  if (row.tool_scope_json) member.toolScope = decodeJson<string[]>(row.tool_scope_json, []);
+  if (row.write_scope_json) member.writeScope = decodeJson<string[]>(row.write_scope_json, []);
+  if (row.current_task_id) member.currentTaskId = row.current_task_id as TaskId;
+  if (row.closed_at) member.closedAt = row.closed_at;
+  return member;
+}
+
+function teamTaskFromRow(row: TeamTaskProjectionRow): TeamTaskRow {
+  const task: TeamTaskRow = {
+    id: row.id as TaskId,
+    teamId: row.team_id as TeamId,
+    title: row.title ?? row.id,
+    status: row.status,
+    dependsOn: decodeJson<TaskId[]>(row.depends_on_json ?? "[]", []),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+  if (row.session_id) task.sessionId = row.session_id as SessionId;
+  if (row.description) task.description = row.description;
+  if (row.owner_path) task.ownerPath = row.owner_path as AgentPath;
+  if (row.created_by) task.createdBy = row.created_by as AgentPath;
+  if (row.summary) task.summary = row.summary;
+  if (row.error) task.error = row.error;
+  if (row.metadata_json) task.metadata = decodeJson<Record<string, unknown>>(row.metadata_json, {});
+  if (row.completed_at) task.completedAt = row.completed_at;
+  return task;
+}
+
+function teamMessageFromRow(row: TeamMessageProjectionRow): TeamMessageRow {
+  const message: TeamMessageRow = {
+    id: row.id,
+    teamId: row.team_id as TeamId,
+    fromPath: row.from_path as AgentPath,
+    toPath: row.to_path as AgentPath | "*",
+    content: row.content,
+    kind: row.kind,
+    createdAt: row.created_at,
+  };
+  if (row.task_id) message.taskId = row.task_id as TaskId;
+  if (row.summary) message.summary = row.summary;
+  if (row.metadata_json) message.metadata = decodeJson<Record<string, unknown>>(row.metadata_json, {});
+  return message;
+}
+
 function applyPartDelta(part: MessagePart, field: string, delta: string): MessagePart {
   if (field === "text" && (part.type === "text" || part.type === "reasoning")) {
     return { ...part, text: part.text + delta };
@@ -1587,6 +2199,10 @@ function shouldApplyTaskCompletion(
 }
 
 function isFinalTaskStatus(status: string): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+function isFinalTeamTaskStatus(status: string): boolean {
   return status === "completed" || status === "failed" || status === "cancelled";
 }
 

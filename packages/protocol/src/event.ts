@@ -165,7 +165,97 @@ export type AgentEvent =
   | EventEnvelope<"agent.task_completed", AgentCompleteTaskPayload>
   | EventEnvelope<"agent.completed", AgentCompletedPayload>;
 
+export type TeamMemberStatus = "idle" | "running" | "waiting" | "blocked" | "closed";
+export type TeamTaskStatus = "pending" | "in_progress" | "blocked" | "completed" | "failed" | "cancelled";
+export type TeamMessageKind = "text" | "task_assignment" | "system";
+
+export interface TeamCreatedPayload {
+  teamId: TeamId;
+  name: string;
+  leadPath: AgentPath;
+  description?: string;
+}
+
+export interface TeamMemberAddedPayload {
+  teamId: TeamId;
+  path: AgentPath;
+  name: string;
+  role: string;
+  status?: TeamMemberStatus;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  model?: string;
+  toolScope?: string[];
+  writeScope?: string[];
+}
+
+export interface TeamMemberStatusChangedPayload {
+  teamId: TeamId;
+  path: AgentPath;
+  status: TeamMemberStatus;
+  taskId?: TaskId;
+  reason?: string;
+}
+
+export interface TeamTaskCreatedPayload {
+  teamId: TeamId;
+  taskId: TaskId;
+  title?: string;
+  description?: string;
+  createdBy?: AgentPath;
+  ownerPath?: AgentPath;
+  dependsOn?: TaskId[];
+  status?: TeamTaskStatus;
+  metadata?: Record<string, unknown>;
+}
+
+export interface TeamTaskAssignedPayload {
+  teamId: TeamId;
+  taskId: TaskId;
+  ownerPath: AgentPath;
+  assignedBy?: AgentPath;
+  previousOwnerPath?: AgentPath;
+  messageId?: string;
+}
+
+export interface TeamTaskClaimedPayload {
+  teamId: TeamId;
+  taskId: TaskId;
+  ownerPath: AgentPath;
+  claimedBy?: AgentPath;
+}
+
+export interface TeamTaskUpdatedPayload {
+  teamId: TeamId;
+  taskId: TaskId;
+  status?: TeamTaskStatus;
+  ownerPath?: AgentPath;
+  title?: string;
+  description?: string;
+  dependsOn?: TaskId[];
+  summary?: string;
+  error?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface TeamMessageSentPayload {
+  teamId: TeamId;
+  messageId: string;
+  from: AgentPath;
+  to: AgentPath | "*";
+  content: string;
+  kind?: TeamMessageKind;
+  taskId?: TaskId;
+  summary?: string;
+  metadata?: Record<string, unknown>;
+}
+
 export type TeamEvent =
-  | EventEnvelope<"team.created", { teamId: TeamId; name: string; leadPath: AgentPath }>
-  | EventEnvelope<"team.task_created", { teamId: TeamId; taskId: TaskId; ownerPath?: AgentPath }>
-  | EventEnvelope<"team.task_updated", { teamId: TeamId; taskId: TaskId; status: "pending" | "in_progress" | "blocked" | "completed" | "cancelled" }>;
+  | EventEnvelope<"team.created", TeamCreatedPayload>
+  | EventEnvelope<"team.member_added", TeamMemberAddedPayload>
+  | EventEnvelope<"team.member_status_changed", TeamMemberStatusChangedPayload>
+  | EventEnvelope<"team.task_created", TeamTaskCreatedPayload>
+  | EventEnvelope<"team.task_assigned", TeamTaskAssignedPayload>
+  | EventEnvelope<"team.task_claimed", TeamTaskClaimedPayload>
+  | EventEnvelope<"team.task_updated", TeamTaskUpdatedPayload>
+  | EventEnvelope<"team.message_sent", TeamMessageSentPayload>;

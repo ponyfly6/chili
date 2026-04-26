@@ -256,8 +256,27 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
 
     const task = upsertTask(view, taskId, event.time);
     task.teamId = teamId;
-    task.status = "pending";
+    task.status = taskStatusValue(payload.status) ?? "pending";
     task.updatedAt = event.time;
+    assignOptional(task, "sessionId", event.sessionId);
+    assignOptional(task, "ownerPath", stringValue(payload.ownerPath) as AgentPath | undefined);
+    if (task.status === "completed" || task.status === "failed" || task.status === "cancelled") task.completedAt = event.time;
+    linkTaskToOwnerAgent(view, task, event.time);
+    return;
+  }
+
+  if (event.type === "team.task_assigned" || event.type === "team.task_claimed") {
+    const teamId = stringValue(payload.teamId) as TeamId | undefined;
+    const taskId = stringValue(payload.taskId) as TaskId | undefined;
+    if (!teamId || !taskId) return;
+
+    const task = upsertTask(view, taskId, event.time);
+    task.teamId = teamId;
+    task.updatedAt = event.time;
+    if (event.type === "team.task_claimed") {
+      task.status = "in_progress";
+      delete task.completedAt;
+    }
     assignOptional(task, "sessionId", event.sessionId);
     assignOptional(task, "ownerPath", stringValue(payload.ownerPath) as AgentPath | undefined);
     linkTaskToOwnerAgent(view, task, event.time);

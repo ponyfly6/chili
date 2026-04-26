@@ -11,6 +11,10 @@ import type {
   MessageId,
   SessionId,
   TaskId,
+  TeamId,
+  TeamMemberStatus,
+  TeamMessageKind,
+  TeamTaskStatus,
   ThreadId,
   ToolCallStatus,
 } from "@chili/protocol";
@@ -245,6 +249,112 @@ export interface AgentMailboxMutationResult {
   events: ChiliEvent[];
 }
 
+export interface TeamRow {
+  id: TeamId;
+  sessionId?: SessionId;
+  name: string;
+  leadPath: AgentPath;
+  status: "active" | "archived";
+  description?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface TeamMemberRow {
+  teamId: TeamId;
+  path: AgentPath;
+  name: string;
+  role: string;
+  status: TeamMemberStatus;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  model?: string;
+  toolScope?: string[];
+  writeScope?: string[];
+  currentTaskId?: TaskId;
+  createdAt: number;
+  updatedAt: number;
+  closedAt?: number;
+}
+
+export interface TeamTaskRow {
+  id: TaskId;
+  teamId: TeamId;
+  sessionId?: SessionId;
+  title: string;
+  description?: string;
+  status: TeamTaskStatus;
+  ownerPath?: AgentPath;
+  createdBy?: AgentPath;
+  dependsOn: TaskId[];
+  summary?: string;
+  error?: string;
+  metadata?: Record<string, unknown>;
+  createdAt: number;
+  updatedAt: number;
+  completedAt?: number;
+}
+
+export interface TeamMessageRow {
+  id: string;
+  teamId: TeamId;
+  fromPath: AgentPath;
+  toPath: AgentPath | "*";
+  content: string;
+  kind: TeamMessageKind;
+  taskId?: TaskId;
+  summary?: string;
+  metadata?: Record<string, unknown>;
+  createdAt: number;
+}
+
+export interface TeamQuery {
+  teamId?: TeamId;
+  sessionId?: SessionId;
+  status?: TeamRow["status"];
+  limit?: number;
+}
+
+export interface TeamMemberQuery {
+  teamId?: TeamId;
+  path?: AgentPath;
+  status?: TeamMemberStatus;
+  limit?: number;
+}
+
+export interface TeamTaskQuery {
+  teamId?: TeamId;
+  taskId?: TaskId;
+  ownerPath?: AgentPath;
+  status?: TeamTaskStatus;
+  limit?: number;
+}
+
+export interface TeamMessageQuery {
+  teamId?: TeamId;
+  path?: AgentPath;
+  taskId?: TaskId;
+  limit?: number;
+}
+
+export interface TeamTaskClaimInput {
+  teamId: TeamId;
+  taskId: TaskId;
+  ownerPath: AgentPath;
+  eventId: string;
+  claimedBy?: AgentPath;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  time?: number;
+}
+
+export interface TeamTaskMutationResult {
+  applied: boolean;
+  task?: TeamTaskRow;
+  events: ChiliEvent[];
+  reason?: "not_found" | "already_claimed" | "already_resolved" | "blocked";
+}
+
 export interface EventStore {
   append(event: ChiliEvent): Promise<void>;
   appendMany(events: readonly ChiliEvent[]): Promise<void>;
@@ -276,6 +386,17 @@ export interface AgentMailboxDeliveryStore {
   claimAgentMailboxMessage(input: AgentMailboxClaimInput): Promise<AgentMailboxMutationResult>;
   consumeAgentMailboxMessage(input: AgentMailboxConsumeInput): Promise<AgentMailboxMutationResult>;
   requeueAgentMailboxMessage(input: AgentMailboxRequeueInput): Promise<AgentMailboxMutationResult>;
+}
+
+export interface TeamProjectionStore {
+  teams(query?: TeamQuery): Promise<TeamRow[]>;
+  teamMembers(query?: TeamMemberQuery): Promise<TeamMemberRow[]>;
+  teamTasks(query?: TeamTaskQuery): Promise<TeamTaskRow[]>;
+  teamMessages(query?: TeamMessageQuery): Promise<TeamMessageRow[]>;
+}
+
+export interface TeamTaskClaimStore {
+  claimTeamTask(input: TeamTaskClaimInput): Promise<TeamTaskMutationResult>;
 }
 
 export interface EventMirror {

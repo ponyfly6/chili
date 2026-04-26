@@ -12,6 +12,8 @@ import type {
   SessionId,
   TaskId,
   TeamId,
+  TeamMemberStatus,
+  TeamMessageKind,
   ThreadId,
   ToolCallId,
   ToolCallStatus,
@@ -33,6 +35,12 @@ export interface ChiliRuntimeView {
   mailboxMessages: Record<string, RuntimeAgentMailboxMessageView>;
   taskIds: TaskId[];
   tasks: Record<string, RuntimeTaskView>;
+  teamIds: TeamId[];
+  teams: Record<string, RuntimeTeamView>;
+  teamMemberIds: string[];
+  teamMembers: Record<string, RuntimeTeamMemberView>;
+  teamMessageIds: string[];
+  teamMessages: Record<string, RuntimeTeamMessageView>;
   partIndex: Record<string, RuntimePartIndexEntry>;
   lastEventId?: string;
 }
@@ -132,12 +140,63 @@ export interface RuntimeTaskView {
   createdAt: number;
   updatedAt: number;
   teamId?: TeamId;
+  title?: string;
+  description?: string;
+  dependsOn?: TaskId[];
+  summary?: string;
+  error?: string;
   sessionId?: SessionId;
   ownerPath?: AgentPath;
   path?: AgentPath;
   childSessionId?: SessionId;
   childThreadId?: ThreadId;
   completedAt?: number;
+}
+
+export interface RuntimeTeamView {
+  id: TeamId;
+  name: string;
+  leadPath: AgentPath;
+  status: "active" | "archived";
+  memberIds: string[];
+  taskIds: TaskId[];
+  messageIds: string[];
+  createdAt: number;
+  updatedAt: number;
+  sessionId?: SessionId;
+  description?: string;
+}
+
+export interface RuntimeTeamMemberView {
+  id: string;
+  teamId: TeamId;
+  path: AgentPath;
+  name: string;
+  role: string;
+  status: TeamMemberStatus;
+  createdAt: number;
+  updatedAt: number;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  model?: string;
+  toolScope?: string[];
+  writeScope?: string[];
+  currentTaskId?: TaskId;
+  closedAt?: number;
+}
+
+export interface RuntimeTeamMessageView {
+  id: string;
+  teamId: TeamId;
+  from: AgentPath;
+  to: AgentPath | "*";
+  content: string;
+  kind: TeamMessageKind;
+  createdAt: number;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  taskId?: TaskId;
+  summary?: string;
 }
 
 export interface RuntimeAgentsSnapshot {
@@ -166,6 +225,12 @@ export function createRuntimeView(): ChiliRuntimeView {
     mailboxMessages: {},
     taskIds: [],
     tasks: {},
+    teamIds: [],
+    teams: {},
+    teamMemberIds: [],
+    teamMembers: {},
+    teamMessageIds: [],
+    teamMessages: {},
     partIndex: {},
   };
 }
@@ -182,6 +247,7 @@ export function reduceRuntimeEvents(
 
 export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvelope): ChiliRuntimeView {
   view.lastEventId = inputEvent.id;
+  applyTeamProjectionEvent(view, inputEvent);
   applySubagentProjectionEvent(view, inputEvent);
 
   const event = inputEvent as ChiliEvent;
@@ -373,6 +439,130 @@ export function runtimeAgentsSnapshot(view: ChiliRuntimeView, sessionId?: Sessio
   return snapshot;
 }
 
+function applyTeamProjectionEvent(view: ChiliRuntimeView, event: EventEnvelope): void {
+  const payload = recordPayload(event);
+  if (!payload) return;
+
+  if (event.type === "team.created") {
+    const teamId = stringValue(payload.teamId) as TeamId | undefined;
+    const name = stringValue(payload.name);
+    const leadPath = stringValue(payload.leadPath) as AgentPath | undefined;
+    if (!teamId || !name || !leadPath) return;
+
+    const team = upsertTeam(view, teamId, event.time);
+    team.name = name;
+    team.leadPath = leadPath;
+    team.status = "active";
+    team.updatedAt = event.time;
+    assignOptional(team, "sessionId", event.sessionId);
+    assignOptional(team, "description", stringValue(payload.description));
+    return;
+  }
+
+  if (event.type === "team.member_added") {
+    const teamId = stringValue(payload.teamId) as TeamId | undefined;
+    const path = stringValue(payload.path) as AgentPath | undefined;
+    const name = stringValue(payload.name);
+    const role = stringValue(payload.role);
+    if (!teamId || !path || !name || !role) return;
+
+    const member = upsertTeamMember(view, teamId, path, event.time);
+    member.name = name;
+    member.role = role;
+    member.status = teamMemberStatusValue(payload.status) ?? "idle";
+    member.updatedAt = event.time;
+    assignOptional(member, "childSessionId", stringValue(payload.childSessionId) as SessionId | undefined);
+    assignOptional(member, "childThreadId", stringValue(payload.childThreadId) as ThreadId | undefined);
+    assignOptional(member, "model", stringValue(payload.model));
+    assignOptional(member, "toolScope", stringArrayValue(payload.toolScope));
+    assignOptional(member, "writeScope", stringArrayValue(payload.writeScope));
+    linkMemberToTeam(view, member, event.time);
+    return;
+  }
+
+  if (event.type === "team.member_status_changed") {
+    const teamId = stringValue(payload.teamId) as TeamId | undefined;
+    const path = stringValue(payload.path) as AgentPath | undefined;
+    const status = teamMemberStatusValue(payload.status);
+    if (!teamId || !path || !status) return;
+
+    const member = upsertTeamMember(view, teamId, path, event.time);
+    member.status = status;
+    member.updatedAt = event.time;
+    assignOptional(member, "currentTaskId", stringValue(payload.taskId) as TaskId | undefined);
+    if (!payload.taskId) delete member.currentTaskId;
+    if (status === "closed") member.closedAt = event.time;
+    linkMemberToTeam(view, member, event.time);
+    return;
+  }
+
+  if (
+    event.type === "team.task_created" ||
+    event.type === "team.task_assigned" ||
+    event.type === "team.task_claimed" ||
+    event.type === "team.task_updated"
+  ) {
+    const teamId = stringValue(payload.teamId) as TeamId | undefined;
+    const taskId = stringValue(payload.taskId) as TaskId | undefined;
+    if (!teamId || !taskId) return;
+
+    const team = upsertTeam(view, teamId, event.time);
+    if (!team.taskIds.includes(taskId)) team.taskIds.push(taskId);
+    team.updatedAt = event.time;
+
+    const task = upsertTask(view, taskId, event.time);
+    task.teamId = teamId;
+    task.updatedAt = event.time;
+    assignOptional(task, "sessionId", event.sessionId);
+    assignOptional(task, "title", stringValue(payload.title));
+    assignOptional(task, "description", stringValue(payload.description));
+    assignOptional(task, "dependsOn", taskIdArrayValue(payload.dependsOn));
+    assignOptional(task, "summary", stringValue(payload.summary));
+    assignOptional(task, "error", stringValue(payload.error));
+
+    const ownerPath = stringValue(payload.ownerPath) as AgentPath | undefined;
+    if (ownerPath) {
+      task.ownerPath = ownerPath;
+      const member = view.teamMembers[teamMemberKey(teamId, ownerPath)];
+      if (member && (event.type === "team.task_assigned" || event.type === "team.task_claimed")) {
+        member.currentTaskId = taskId;
+        member.status = event.type === "team.task_claimed" ? "running" : member.status;
+        member.updatedAt = event.time;
+      }
+    }
+    return;
+  }
+
+  if (event.type === "team.message_sent") {
+    const teamId = stringValue(payload.teamId) as TeamId | undefined;
+    const messageId = stringValue(payload.messageId);
+    const from = stringValue(payload.from) as AgentPath | undefined;
+    const to = stringValue(payload.to) as AgentPath | "*" | undefined;
+    const content = stringValue(payload.content);
+    if (!teamId || !messageId || !from || !to || !content) return;
+
+    const message: RuntimeTeamMessageView = {
+      id: messageId,
+      teamId,
+      from,
+      to,
+      content,
+      kind: teamMessageKindValue(payload.kind) ?? "text",
+      createdAt: event.time,
+    };
+    assignOptional(message, "sessionId", event.sessionId);
+    assignOptional(message, "threadId", event.threadId);
+    assignOptional(message, "taskId", stringValue(payload.taskId) as TaskId | undefined);
+    assignOptional(message, "summary", stringValue(payload.summary));
+    view.teamMessages[messageId] = message;
+    if (!view.teamMessageIds.includes(messageId)) view.teamMessageIds.push(messageId);
+
+    const team = upsertTeam(view, teamId, event.time);
+    if (!team.messageIds.includes(messageId)) team.messageIds.push(messageId);
+    team.updatedAt = event.time;
+  }
+}
+
 function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelope): void {
   const payload = recordPayload(event);
   if (!payload) return;
@@ -527,8 +717,31 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
 
     const task = upsertTask(view, taskId, event.time);
     task.teamId = teamId;
-    task.status = "pending";
+    task.status = taskStatusValue(payload.status) ?? "pending";
     task.updatedAt = event.time;
+    assignOptional(task, "sessionId", event.sessionId);
+    assignOptional(task, "ownerPath", stringValue(payload.ownerPath) as AgentPath | undefined);
+    assignOptional(task, "title", stringValue(payload.title));
+    assignOptional(task, "description", stringValue(payload.description));
+    assignOptional(task, "dependsOn", taskIdArrayValue(payload.dependsOn));
+    if (task.status === "completed" || task.status === "failed" || task.status === "cancelled") task.completedAt = event.time;
+    linkTaskToSession(view, task, event.time);
+    linkTaskToOwnerAgent(view, task, event.time);
+    return;
+  }
+
+  if (event.type === "team.task_assigned" || event.type === "team.task_claimed") {
+    const teamId = stringValue(payload.teamId) as TeamId | undefined;
+    const taskId = stringValue(payload.taskId) as TaskId | undefined;
+    if (!teamId || !taskId) return;
+
+    const task = upsertTask(view, taskId, event.time);
+    task.teamId = teamId;
+    task.updatedAt = event.time;
+    if (event.type === "team.task_claimed") {
+      task.status = "in_progress";
+      delete task.completedAt;
+    }
     assignOptional(task, "sessionId", event.sessionId);
     assignOptional(task, "ownerPath", stringValue(payload.ownerPath) as AgentPath | undefined);
     linkTaskToSession(view, task, event.time);
@@ -562,6 +775,11 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     assignOptional(task, "sessionId", event.sessionId);
     assignOptional(task, "ownerPath", stringValue(payload.ownerPath) as AgentPath | undefined);
     assignOptional(task, "path", stringValue(payload.path) as AgentPath | undefined);
+    assignOptional(task, "title", stringValue(payload.title));
+    assignOptional(task, "description", stringValue(payload.description));
+    assignOptional(task, "dependsOn", taskIdArrayValue(payload.dependsOn));
+    assignOptional(task, "summary", stringValue(payload.summary));
+    assignOptional(task, "error", stringValue(payload.error));
     linkTaskToSession(view, task, event.time);
     linkTaskToOwnerAgent(view, task, event.time);
   }
@@ -624,6 +842,51 @@ function upsertTask(view: ChiliRuntimeView, taskId: TaskId, time: number): Runti
   view.tasks[taskId] = task;
   view.taskIds.push(taskId);
   return task;
+}
+
+function upsertTeam(view: ChiliRuntimeView, teamId: TeamId, time: number): RuntimeTeamView {
+  const existing = view.teams[teamId];
+  if (existing) return existing;
+
+  const team: RuntimeTeamView = {
+    id: teamId,
+    name: "",
+    leadPath: "" as AgentPath,
+    status: "active",
+    memberIds: [],
+    taskIds: [],
+    messageIds: [],
+    createdAt: time,
+    updatedAt: time,
+  };
+  view.teams[teamId] = team;
+  view.teamIds.push(teamId);
+  return team;
+}
+
+function upsertTeamMember(
+  view: ChiliRuntimeView,
+  teamId: TeamId,
+  path: AgentPath,
+  time: number,
+): RuntimeTeamMemberView {
+  const id = teamMemberKey(teamId, path);
+  const existing = view.teamMembers[id];
+  if (existing) return existing;
+
+  const member: RuntimeTeamMemberView = {
+    id,
+    teamId,
+    path,
+    name: "",
+    role: "",
+    status: "idle",
+    createdAt: time,
+    updatedAt: time,
+  };
+  view.teamMembers[id] = member;
+  view.teamMemberIds.push(id);
+  return member;
 }
 
 function upsertToolCall(view: ChiliRuntimeView, callId: ToolCallId, time: number): RuntimeToolCallView {
@@ -704,6 +967,12 @@ function linkOwnedTasksToAgent(view: ChiliRuntimeView, agent: RuntimeAgentView, 
   }
 }
 
+function linkMemberToTeam(view: ChiliRuntimeView, member: RuntimeTeamMemberView, time: number): void {
+  const team = upsertTeam(view, member.teamId, time);
+  if (!team.memberIds.includes(member.id)) team.memberIds.push(member.id);
+  team.updatedAt = time;
+}
+
 function applyPartDelta(view: ChiliRuntimeView, partId: PartId, field: string, delta: string): void {
   const entry = view.partIndex[partId];
   if (!entry) return;
@@ -753,6 +1022,17 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+function stringArrayValue(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const items = value.filter((item): item is string => typeof item === "string" && item.length > 0);
+  return items.length > 0 ? items : undefined;
+}
+
+function taskIdArrayValue(value: unknown): TaskId[] | undefined {
+  const items = stringArrayValue(value);
+  return items ? (items as TaskId[]) : undefined;
+}
+
 function booleanValue(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
@@ -770,6 +1050,18 @@ function taskStatusValue(value: unknown): RuntimeTaskStatus | undefined {
   return value === "pending" || value === "running" || value === "in_progress" || value === "blocked" || value === "completed" || value === "failed" || value === "cancelled"
     ? value
     : undefined;
+}
+
+function teamMemberStatusValue(value: unknown): TeamMemberStatus | undefined {
+  return value === "idle" || value === "running" || value === "waiting" || value === "blocked" || value === "closed" ? value : undefined;
+}
+
+function teamMessageKindValue(value: unknown): TeamMessageKind | undefined {
+  return value === "text" || value === "task_assignment" || value === "system" ? value : undefined;
+}
+
+function teamMemberKey(teamId: TeamId, path: AgentPath): string {
+  return `${teamId}:${path}`;
 }
 
 function isStaleTaskSpawn(task: RuntimeTaskView, generation: number | undefined): boolean {

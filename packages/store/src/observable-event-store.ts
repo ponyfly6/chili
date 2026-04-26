@@ -25,6 +25,18 @@ import type {
   EventStore,
   SessionRow,
   SubagentProjectionStore,
+  TeamMemberQuery,
+  TeamMemberRow,
+  TeamMessageQuery,
+  TeamMessageRow,
+  TeamProjectionStore,
+  TeamQuery,
+  TeamRow,
+  TeamTaskClaimInput,
+  TeamTaskClaimStore,
+  TeamTaskMutationResult,
+  TeamTaskQuery,
+  TeamTaskRow,
 } from "./types.js";
 
 export interface EventPublisher {
@@ -38,7 +50,9 @@ export class ObservableEventStore
     SubagentProjectionStore,
     AgentTaskLeaseStore,
     AgentTaskFinalizationStore,
-    AgentMailboxDeliveryStore
+    AgentMailboxDeliveryStore,
+    TeamProjectionStore,
+    TeamTaskClaimStore
 {
   private readonly listeners = new Set<(event: ChiliEvent) => void>();
 
@@ -84,6 +98,22 @@ export class ObservableEventStore
 
   agentMailbox(query?: AgentMailboxQuery): Promise<AgentMailboxRow[]> {
     return this.subagentStore()?.agentMailbox(query) ?? Promise.resolve([]);
+  }
+
+  teams(query?: TeamQuery): Promise<TeamRow[]> {
+    return this.teamProjectionStore()?.teams(query) ?? Promise.resolve([]);
+  }
+
+  teamMembers(query?: TeamMemberQuery): Promise<TeamMemberRow[]> {
+    return this.teamProjectionStore()?.teamMembers(query) ?? Promise.resolve([]);
+  }
+
+  teamTasks(query?: TeamTaskQuery): Promise<TeamTaskRow[]> {
+    return this.teamProjectionStore()?.teamTasks(query) ?? Promise.resolve([]);
+  }
+
+  teamMessages(query?: TeamMessageQuery): Promise<TeamMessageRow[]> {
+    return this.teamProjectionStore()?.teamMessages(query) ?? Promise.resolve([]);
   }
 
   claimAgentTaskLease(input: AgentTaskLeaseClaimInput): Promise<AgentTaskLeaseResult> {
@@ -133,6 +163,13 @@ export class ObservableEventStore
     return result;
   }
 
+  async claimTeamTask(input: TeamTaskClaimInput): Promise<TeamTaskMutationResult> {
+    const result = await (this.teamTaskClaimStore()?.claimTeamTask(input) ??
+      Promise.resolve({ applied: false, reason: "not_found" as const, events: [] }));
+    for (const event of result.events) this.emit(event);
+    return result;
+  }
+
   subscribe(listener: (event: ChiliEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -170,6 +207,22 @@ export class ObservableEventStore
     const inner = this.inner as EventStore & Partial<AgentMailboxDeliveryStore>;
     if (inner.claimAgentMailboxMessage && inner.consumeAgentMailboxMessage && inner.requeueAgentMailboxMessage) {
       return inner as EventStore & AgentMailboxDeliveryStore;
+    }
+    return undefined;
+  }
+
+  private teamProjectionStore(): TeamProjectionStore | undefined {
+    const inner = this.inner as EventStore & Partial<TeamProjectionStore>;
+    if (inner.teams && inner.teamMembers && inner.teamTasks && inner.teamMessages) {
+      return inner as EventStore & TeamProjectionStore;
+    }
+    return undefined;
+  }
+
+  private teamTaskClaimStore(): TeamTaskClaimStore | undefined {
+    const inner = this.inner as EventStore & Partial<TeamTaskClaimStore>;
+    if (inner.claimTeamTask) {
+      return inner as EventStore & TeamTaskClaimStore;
     }
     return undefined;
   }

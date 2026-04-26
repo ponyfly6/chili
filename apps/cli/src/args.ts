@@ -8,6 +8,15 @@ export interface CliArgs {
     | "sessions"
     | "revert"
     | "agents"
+    | "teams"
+    | "team"
+    | "team-members"
+    | "team-tasks"
+    | "team-messages"
+    | "team-dispatch"
+    | "team-run"
+    | "team-sync"
+    | "team-reconcile"
     | "tasks"
     | "task"
     | "task-followup"
@@ -24,6 +33,7 @@ export interface CliArgs {
   resume?: string;
   snapshotId?: string;
   taskId?: string;
+  teamId?: string;
   messageId?: string;
   taskStatus?: Extract<AgentTaskStatus, "completed" | "failed" | "cancelled">;
   timeoutMs?: number;
@@ -64,6 +74,57 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     }
     if (arg === "agents" || arg === "tree") {
       result.command = "agents";
+      continue;
+    }
+    if (arg === "teams") {
+      result.command = "teams";
+      continue;
+    }
+    if (arg === "team") {
+      result.command = "team";
+      result.teamId = requireValue(arg, args);
+      continue;
+    }
+    if (arg === "team-members") {
+      result.command = "team-members";
+      result.teamId = requireValue(arg, args);
+      continue;
+    }
+    if (arg === "team-tasks") {
+      result.command = "team-tasks";
+      result.teamId = requireValue(arg, args);
+      continue;
+    }
+    if (arg === "team-messages") {
+      result.command = "team-messages";
+      result.teamId = requireValue(arg, args);
+      continue;
+    }
+    if (arg === "team-dispatch") {
+      result.command = "team-dispatch";
+      result.teamId = requireValue(arg, args);
+      result.taskId = requireValue(arg, args);
+      continue;
+    }
+    if (arg === "team-run") {
+      result.command = "team-run";
+      result.teamId = requireValue(arg, args);
+      result.taskId = requireValue(arg, args);
+      continue;
+    }
+    if (arg === "team-sync") {
+      result.command = "team-sync";
+      result.teamId = requireValue(arg, args);
+      result.taskId = requireValue(arg, args);
+      continue;
+    }
+    if (arg === "team-reconcile") {
+      result.command = "team-reconcile";
+      const teamId = args[0];
+      if (teamId && !teamId.startsWith("-")) {
+        result.teamId = teamId;
+        args.shift();
+      }
       continue;
     }
     if (arg === "mailbox") {
@@ -183,6 +244,15 @@ export function usage(): string {
     "  bun run chili -- tasks",
     "  bun run chili -- recover-tasks --stale-after-ms 30000",
     "  bun run chili -- agents",
+    "  bun run chili -- teams",
+    "  bun run chili -- team <team-id>",
+    "  bun run chili -- team-members <team-id>",
+    "  bun run chili -- team-tasks <team-id>",
+    "  bun run chili -- team-messages <team-id>",
+    "  bun run chili -- team-dispatch <team-id> <task-id>",
+    "  bun run chili -- team-run <team-id> <task-id>",
+    "  bun run chili -- team-sync <team-id> <task-id>",
+    "  bun run chili -- team-reconcile [team-id]",
     "  bun run chili -- mailbox",
     "  bun run chili -- consume <mailbox-message-id>",
     "  bun run chili -- task <task-id>",

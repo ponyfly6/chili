@@ -11,6 +11,7 @@ import type {
   PartId,
   SessionId,
   TaskId,
+  TeamId,
   ThreadId,
   TimestampMs,
 } from "@chili/protocol";
@@ -819,6 +820,351 @@ test("final task projection wins over late completion and stale spawn", async ()
       currentRunId: "agent_generation_followup",
       generation: 4,
     });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("projects team members, task board, and messages", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-team-projection-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const sessionId = "session_team" as SessionId;
+  const threadId = "thread_team" as ThreadId;
+  const teamId = "team_alpha" as TeamId;
+  const leadPath = "/root" as AgentPath;
+  const reviewerPath = "/root/reviewer" as AgentPath;
+  const setupTaskId = "task_setup" as TaskId;
+  const reviewTaskId = "task_review" as TaskId;
+
+  try {
+    await store.appendMany([
+      sessionEvent("event_session_team", sessionId, threadId, 1 as TimestampMs),
+      {
+        id: "event_team_created",
+        type: "team.created",
+        time: 2 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          name: "alpha",
+          leadPath,
+          description: "parallel review team",
+        },
+      },
+      {
+        id: "event_team_lead",
+        type: "team.member_added",
+        time: 3 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          path: leadPath,
+          name: "team-lead",
+          role: "leader",
+          status: "running",
+          writeScope: ["/repo"],
+        },
+      },
+      {
+        id: "event_team_reviewer",
+        type: "team.member_added",
+        time: 4 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          path: reviewerPath,
+          name: "reviewer",
+          role: "code-reviewer",
+          childSessionId: "session_reviewer" as SessionId,
+          childThreadId: "thread_reviewer" as ThreadId,
+          model: "test-model",
+          toolScope: ["read", "git_diff"],
+          writeScope: ["packages/core"],
+        },
+      },
+      {
+        id: "event_setup_task",
+        type: "team.task_created",
+        time: 5 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          taskId: setupTaskId,
+          title: "Prepare context",
+          createdBy: leadPath,
+          status: "completed",
+          metadata: { phase: "setup" },
+        },
+      },
+      {
+        id: "event_review_task",
+        type: "team.task_created",
+        time: 6 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          taskId: reviewTaskId,
+          title: "Review team runtime",
+          description: "Check projection behavior",
+          createdBy: leadPath,
+          dependsOn: [setupTaskId],
+        },
+      },
+      {
+        id: "event_review_assigned",
+        type: "team.task_assigned",
+        time: 7 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          taskId: reviewTaskId,
+          ownerPath: reviewerPath,
+          assignedBy: leadPath,
+        },
+      },
+      {
+        id: "event_review_message",
+        type: "team.message_sent",
+        time: 8 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          messageId: "message_review_assignment",
+          from: leadPath,
+          to: reviewerPath,
+          kind: "task_assignment",
+          taskId: reviewTaskId,
+          content: "Please review team runtime.",
+          summary: "assignment",
+        },
+      },
+      {
+        id: "event_review_done",
+        type: "team.task_updated",
+        time: 9 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          taskId: reviewTaskId,
+          status: "completed",
+          summary: "Projection looks consistent",
+        },
+      },
+      {
+        id: "event_reviewer_idle",
+        type: "team.member_status_changed",
+        time: 10 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          path: reviewerPath,
+          status: "idle",
+        },
+      },
+    ]);
+
+    expect(await store.teams({ teamId })).toEqual([
+      {
+        id: teamId,
+        sessionId,
+        name: "alpha",
+        leadPath,
+        status: "active",
+        description: "parallel review team",
+        createdAt: 2,
+        updatedAt: 10,
+      },
+    ]);
+    expect(await store.teamMembers({ teamId })).toMatchObject([
+      {
+        teamId,
+        path: leadPath,
+        name: "team-lead",
+        role: "leader",
+        status: "running",
+        writeScope: ["/repo"],
+      },
+      {
+        teamId,
+        path: reviewerPath,
+        name: "reviewer",
+        role: "code-reviewer",
+        status: "idle",
+        childSessionId: "session_reviewer",
+        childThreadId: "thread_reviewer",
+        model: "test-model",
+        toolScope: ["read", "git_diff"],
+        writeScope: ["packages/core"],
+      },
+    ]);
+    expect(await store.teamTasks({ teamId })).toMatchObject([
+      {
+        id: setupTaskId,
+        status: "completed",
+        title: "Prepare context",
+        createdBy: leadPath,
+        metadata: { phase: "setup" },
+        completedAt: 5,
+      },
+      {
+        id: reviewTaskId,
+        status: "completed",
+        title: "Review team runtime",
+        description: "Check projection behavior",
+        ownerPath: reviewerPath,
+        dependsOn: [setupTaskId],
+        summary: "Projection looks consistent",
+        completedAt: 9,
+      },
+    ]);
+    expect(await store.teamMessages({ teamId, path: reviewerPath })).toMatchObject([
+      {
+        id: "message_review_assignment",
+        teamId,
+        fromPath: leadPath,
+        toPath: reviewerPath,
+        kind: "task_assignment",
+        taskId: reviewTaskId,
+        content: "Please review team runtime.",
+      },
+    ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("claims team tasks with dependency-aware CAS", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-team-claim-"));
+  const mirrored: ChiliEvent[] = [];
+  const store = new SqliteEventStore(join(dir, "events.sqlite"), {
+    mirror: {
+      async write(event) {
+        mirrored.push(event);
+      },
+    },
+  });
+  const sessionId = "session_team_claim" as SessionId;
+  const threadId = "thread_team_claim" as ThreadId;
+  const teamId = "team_claim" as TeamId;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const otherPath = "/root/other" as AgentPath;
+  const setupTaskId = "task_claim_setup" as TaskId;
+  const readyTaskId = "task_claim_ready" as TaskId;
+  const blockedTaskId = "task_claim_blocked" as TaskId;
+
+  try {
+    await store.appendMany([
+      sessionEvent("event_team_claim_session", sessionId, threadId, 1 as TimestampMs),
+      {
+        id: "event_team_claim_created",
+        type: "team.created",
+        time: 2 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { teamId, name: "claimers", leadPath },
+      },
+      {
+        id: "event_team_claim_worker",
+        type: "team.member_added",
+        time: 3 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { teamId, path: workerPath, name: "worker", role: "implementer" },
+      },
+      {
+        id: "event_team_claim_setup",
+        type: "team.task_created",
+        time: 4 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { teamId, taskId: setupTaskId, title: "setup", status: "completed" },
+      },
+      {
+        id: "event_team_claim_ready",
+        type: "team.task_created",
+        time: 5 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { teamId, taskId: readyTaskId, title: "ready", dependsOn: [setupTaskId] },
+      },
+      {
+        id: "event_team_claim_blocked",
+        type: "team.task_created",
+        time: 6 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { teamId, taskId: blockedTaskId, title: "blocked", dependsOn: ["task_missing" as TaskId] },
+      },
+    ]);
+
+    const claimed = await store.claimTeamTask({
+      teamId,
+      taskId: readyTaskId,
+      ownerPath: workerPath,
+      claimedBy: workerPath,
+      eventId: "event_team_claim_ready_cas",
+      sessionId,
+      threadId,
+      time: 7,
+    });
+    expect(claimed).toMatchObject({
+      applied: true,
+      task: {
+        id: readyTaskId,
+        status: "in_progress",
+        ownerPath: workerPath,
+      },
+    });
+    expect(claimed.events.map((event) => event.type)).toEqual(["team.task_claimed"]);
+    expect(mirrored.map((event) => event.id)).toContain("event_team_claim_ready_cas");
+
+    const duplicate = await store.claimTeamTask({
+      teamId,
+      taskId: readyTaskId,
+      ownerPath: otherPath,
+      eventId: "event_team_claim_duplicate",
+      time: 8,
+    });
+    expect(duplicate).toMatchObject({
+      applied: false,
+      reason: "already_claimed",
+      task: {
+        id: readyTaskId,
+        status: "in_progress",
+        ownerPath: workerPath,
+      },
+    });
+
+    const blocked = await store.claimTeamTask({
+      teamId,
+      taskId: blockedTaskId,
+      ownerPath: workerPath,
+      eventId: "event_team_claim_blocked_cas",
+      time: 9,
+    });
+    expect(blocked).toMatchObject({
+      applied: false,
+      reason: "blocked",
+      task: {
+        id: blockedTaskId,
+        status: "pending",
+      },
+    });
+    expect((await store.events({ type: "team.task_claimed", limit: 10 })).map((event) => event.id)).toEqual([
+      "event_team_claim_ready_cas",
+    ]);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });

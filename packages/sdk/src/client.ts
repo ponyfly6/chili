@@ -13,6 +13,10 @@ import type {
   RuntimeSessionRef,
   SessionId,
   TaskId,
+  TeamId,
+  TeamMemberStatus,
+  TeamMessageKind,
+  TeamTaskStatus,
   ThreadId,
 } from "@chili/protocol";
 import type { RuntimeAgentsSnapshot } from "./projection.js";
@@ -30,6 +34,20 @@ export interface RuntimeClient {
   listAgentRuns(input?: ListAgentRunsRequest): Promise<RuntimeAgentRunRecord[]>;
   mailbox(input?: ListMailboxRequest): Promise<RuntimeAgentMailboxRecord[]>;
   consumeMailbox(messageId: string): Promise<RuntimeAgentMailboxRecord>;
+  listTeams(): Promise<RuntimeTeamRecord[]>;
+  createTeam(input: CreateTeamRequest): Promise<RuntimeTeamRecord>;
+  listTeamMembers(teamId: TeamId): Promise<RuntimeTeamMemberRecord[]>;
+  addTeamMember(input: AddTeamMemberRequest): Promise<RuntimeTeamMemberRecord>;
+  listTeamTasks(teamId: TeamId): Promise<RuntimeTeamTaskRecord[]>;
+  createTeamTask(input: CreateTeamTaskRequest): Promise<RuntimeTeamTaskRecord>;
+  assignTeamTask(input: AssignTeamTaskRequest): Promise<RuntimeTeamTaskRecord>;
+  claimTeamTask(input: ClaimTeamTaskRequest): Promise<RuntimeTeamTaskClaimResult>;
+  dispatchTeamTask(input: DispatchTeamTaskRequest): Promise<RuntimeTeamTaskDispatchResult>;
+  syncTeamTask(input: SyncTeamTaskRequest): Promise<RuntimeTeamTaskSyncResult>;
+  reconcileTeamTasks(input?: ReconcileTeamTasksRequest): Promise<RuntimeTeamTaskReconcileResult>;
+  updateTeamTask(input: UpdateTeamTaskRequest): Promise<RuntimeTeamTaskRecord>;
+  listTeamMessages(teamId: TeamId): Promise<RuntimeTeamMessageRecord[]>;
+  sendTeamMessage(input: SendTeamMessageRequest): Promise<RuntimeTeamMessageRecord>;
   listTasks(input?: ListTasksRequest): Promise<RuntimeAgentTaskRecord[]>;
   task(taskId: TaskId): Promise<RuntimeAgentTaskRecord>;
   followupTask(input: FollowupTaskRequest): Promise<RuntimeTaskFollowupResult>;
@@ -156,6 +174,214 @@ export interface RuntimeAgentMailboxRecord {
   message?: unknown;
   createdAt: number;
   consumedAt?: number;
+}
+
+export interface RuntimeTeamRecord {
+  id: TeamId;
+  sessionId?: SessionId;
+  name: string;
+  leadPath: AgentPath;
+  status: "active" | "archived";
+  description?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface RuntimeTeamMemberRecord {
+  teamId: TeamId;
+  path: AgentPath;
+  name: string;
+  role: string;
+  status: TeamMemberStatus;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  model?: string;
+  toolScope?: string[];
+  writeScope?: string[];
+  currentTaskId?: TaskId;
+  createdAt: number;
+  updatedAt: number;
+  closedAt?: number;
+}
+
+export interface RuntimeTeamTaskRecord {
+  id: TaskId;
+  teamId: TeamId;
+  sessionId?: SessionId;
+  title: string;
+  description?: string;
+  status: TeamTaskStatus;
+  ownerPath?: AgentPath;
+  createdBy?: AgentPath;
+  dependsOn: TaskId[];
+  summary?: string;
+  error?: string;
+  metadata?: Record<string, unknown>;
+  createdAt: number;
+  updatedAt: number;
+  completedAt?: number;
+}
+
+export interface RuntimeTeamMessageRecord {
+  id: string;
+  teamId: TeamId;
+  fromPath: AgentPath;
+  toPath: AgentPath | "*";
+  content: string;
+  kind: TeamMessageKind;
+  taskId?: TaskId;
+  summary?: string;
+  metadata?: Record<string, unknown>;
+  createdAt: number;
+}
+
+export interface TeamRequestContext {
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+}
+
+export interface CreateTeamRequest extends TeamRequestContext {
+  teamId?: TeamId;
+  name: string;
+  leadPath: AgentPath;
+  description?: string;
+  leadName?: string;
+  leadRole?: string;
+  leadStatus?: TeamMemberStatus;
+  leadWriteScope?: string[];
+}
+
+export interface AddTeamMemberRequest extends TeamRequestContext {
+  teamId: TeamId;
+  path: AgentPath;
+  name: string;
+  role: string;
+  status?: TeamMemberStatus;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  model?: string;
+  toolScope?: string[];
+  writeScope?: string[];
+}
+
+export interface CreateTeamTaskRequest extends TeamRequestContext {
+  teamId: TeamId;
+  taskId?: TaskId;
+  title: string;
+  description?: string;
+  createdBy?: AgentPath;
+  ownerPath?: AgentPath;
+  dependsOn?: TaskId[];
+  status?: TeamTaskStatus;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AssignTeamTaskRequest extends TeamRequestContext {
+  teamId: TeamId;
+  taskId: TaskId;
+  ownerPath: AgentPath;
+  assignedBy?: AgentPath;
+  message?: string;
+  messageSummary?: string;
+}
+
+export interface ClaimTeamTaskRequest extends TeamRequestContext {
+  teamId: TeamId;
+  taskId: TaskId;
+  ownerPath: AgentPath;
+  claimedBy?: AgentPath;
+}
+
+export interface RuntimeTeamTaskClaimResult {
+  applied: boolean;
+  task?: RuntimeTeamTaskRecord;
+  events: ChiliEvent[];
+  reason?: "not_found" | "already_claimed" | "already_resolved" | "blocked";
+}
+
+export interface RuntimeLocalSubagentTaskRecord {
+  taskId: TaskId;
+  runId: string;
+  path: AgentPath;
+  parentPath: AgentPath;
+  childSessionId: SessionId;
+  childThreadId: ThreadId;
+  status: AgentTaskStatus;
+  summary?: string;
+  error?: string;
+}
+
+export interface RuntimeTeamTaskDispatchResult {
+  status: "running" | "completed" | "failed" | "cancelled" | "skipped";
+  teamTask: RuntimeTeamTaskRecord;
+  team_task: RuntimeTeamTaskRecord;
+  agentTask?: RuntimeLocalSubagentTaskRecord;
+  agent_task?: RuntimeLocalSubagentTaskRecord;
+  reason?: RuntimeTeamTaskClaimResult["reason"] | "missing_owner" | "missing_session";
+}
+
+export interface RuntimeTeamTaskSyncResult {
+  applied: boolean;
+  teamTask: RuntimeTeamTaskRecord;
+  agentTask?: RuntimeAgentTaskRecord;
+  reason?: "not_dispatched" | "agent_task_not_found" | "agent_running" | "team_already_final";
+}
+
+export interface RuntimeTeamTaskReconcileError {
+  teamId: TeamId;
+  taskId: TaskId;
+  error: string;
+}
+
+export interface RuntimeTeamTaskReconcileResult {
+  scanned: number;
+  synced: RuntimeTeamTaskSyncResult[];
+  skipped: RuntimeTeamTaskSyncResult[];
+  errors: RuntimeTeamTaskReconcileError[];
+}
+
+export interface DispatchTeamTaskRequest extends TeamRequestContext {
+  teamId: TeamId;
+  taskId: TaskId;
+  ownerPath?: AgentPath;
+  cwd?: string;
+  mode?: AgentTaskMode;
+  prompt?: string;
+}
+
+export interface SyncTeamTaskRequest extends TeamRequestContext {
+  teamId: TeamId;
+  taskId: TaskId;
+}
+
+export interface ReconcileTeamTasksRequest extends TeamRequestContext {
+  teamId?: TeamId;
+  limit?: number;
+}
+
+export interface UpdateTeamTaskRequest extends TeamRequestContext {
+  teamId: TeamId;
+  taskId: TaskId;
+  status?: TeamTaskStatus;
+  ownerPath?: AgentPath;
+  title?: string;
+  description?: string;
+  dependsOn?: TaskId[];
+  summary?: string;
+  error?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface SendTeamMessageRequest extends TeamRequestContext {
+  teamId: TeamId;
+  messageId?: string;
+  from: AgentPath;
+  to: AgentPath | "*";
+  content: string;
+  kind?: TeamMessageKind;
+  taskId?: TaskId;
+  summary?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface ListTasksRequest {
@@ -323,6 +549,65 @@ export class HttpRuntimeClient implements RuntimeClient {
 
   consumeMailbox(messageId: string): Promise<RuntimeAgentMailboxRecord> {
     return this.post(`mailbox/${encodeURIComponent(messageId)}/consume`, {});
+  }
+
+  listTeams(): Promise<RuntimeTeamRecord[]> {
+    return this.get("teams");
+  }
+
+  createTeam(input: CreateTeamRequest): Promise<RuntimeTeamRecord> {
+    return this.post("teams", input);
+  }
+
+  listTeamMembers(teamId: TeamId): Promise<RuntimeTeamMemberRecord[]> {
+    return this.get(`teams/${encodeURIComponent(teamId)}/members`);
+  }
+
+  addTeamMember(input: AddTeamMemberRequest): Promise<RuntimeTeamMemberRecord> {
+    return this.post(`teams/${encodeURIComponent(input.teamId)}/members`, input);
+  }
+
+  listTeamTasks(teamId: TeamId): Promise<RuntimeTeamTaskRecord[]> {
+    return this.get(`teams/${encodeURIComponent(teamId)}/tasks`);
+  }
+
+  createTeamTask(input: CreateTeamTaskRequest): Promise<RuntimeTeamTaskRecord> {
+    return this.post(`teams/${encodeURIComponent(input.teamId)}/tasks`, input);
+  }
+
+  assignTeamTask(input: AssignTeamTaskRequest): Promise<RuntimeTeamTaskRecord> {
+    return this.post(`teams/${encodeURIComponent(input.teamId)}/tasks/${encodeURIComponent(input.taskId)}/assign`, input);
+  }
+
+  claimTeamTask(input: ClaimTeamTaskRequest): Promise<RuntimeTeamTaskClaimResult> {
+    return this.post(`teams/${encodeURIComponent(input.teamId)}/tasks/${encodeURIComponent(input.taskId)}/claim`, input);
+  }
+
+  dispatchTeamTask(input: DispatchTeamTaskRequest): Promise<RuntimeTeamTaskDispatchResult> {
+    return this.post(`teams/${encodeURIComponent(input.teamId)}/tasks/${encodeURIComponent(input.taskId)}/dispatch`, input);
+  }
+
+  syncTeamTask(input: SyncTeamTaskRequest): Promise<RuntimeTeamTaskSyncResult> {
+    return this.post(`teams/${encodeURIComponent(input.teamId)}/tasks/${encodeURIComponent(input.taskId)}/sync`, input);
+  }
+
+  reconcileTeamTasks(input: ReconcileTeamTasksRequest = {}): Promise<RuntimeTeamTaskReconcileResult> {
+    const path = input.teamId
+      ? `teams/${encodeURIComponent(input.teamId)}/reconcile_dispatches`
+      : "teams/reconcile_dispatches";
+    return this.post(path, input);
+  }
+
+  updateTeamTask(input: UpdateTeamTaskRequest): Promise<RuntimeTeamTaskRecord> {
+    return this.post(`teams/${encodeURIComponent(input.teamId)}/tasks/${encodeURIComponent(input.taskId)}/update`, input);
+  }
+
+  listTeamMessages(teamId: TeamId): Promise<RuntimeTeamMessageRecord[]> {
+    return this.get(`teams/${encodeURIComponent(teamId)}/messages`);
+  }
+
+  sendTeamMessage(input: SendTeamMessageRequest): Promise<RuntimeTeamMessageRecord> {
+    return this.post(`teams/${encodeURIComponent(input.teamId)}/messages`, input);
   }
 
   listTasks(input: ListTasksRequest = {}): Promise<RuntimeAgentTaskRecord[]> {
