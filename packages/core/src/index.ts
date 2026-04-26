@@ -1,3 +1,4 @@
+export * from "./agent-tree.js";
 export * from "./anthropic-compatible-model.js";
 export * from "./context.js";
 export * from "./doom-loop-guard.js";

@@ -173,16 +173,24 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
     },
     {
       id: "event_6",
-      type: "team.task_updated",
+      type: "agent.message_consumed",
       time: 6 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "event_5", path: childPath },
+    },
+    {
+      id: "event_7",
+      type: "team.task_updated",
+      time: 7 as TimestampMs,
       sessionId,
       threadId,
       payload: { teamId, taskId, status: "completed" },
     },
     {
-      id: "event_7",
+      id: "event_8",
       type: "agent.completed",
-      time: 7 as TimestampMs,
+      time: 8 as TimestampMs,
       sessionId,
       threadId,
       payload: { runId: childRunId, path: childPath, status: "completed" },
@@ -197,7 +205,9 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
   expect(view.agents[childRunId]?.mailboxMessageIds).toEqual(["event_5"]);
   expect(view.agents[childRunId]?.taskIds).toEqual([taskId]);
   expect(view.tasks[taskId]?.status).toBe("completed");
-  expect(view.tasks[taskId]?.completedAt).toBe(6);
+  expect(view.tasks[taskId]?.completedAt).toBe(7);
   expect(snapshot.agents.map((agent) => agent.id)).toEqual([rootRunId, childRunId]);
   expect(snapshot.mailbox[0]?.triggerTurn).toBe(true);
+  expect(snapshot.mailbox[0]?.status).toBe("consumed");
+  expect(snapshot.mailbox[0]?.consumedAt).toBe(6);
 });

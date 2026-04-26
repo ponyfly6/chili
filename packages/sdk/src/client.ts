@@ -1,6 +1,7 @@
 import type {
   ChiliEvent,
   AgentPath,
+  AgentMailboxStatus,
   AgentTaskMode,
   AgentTaskStatus,
   Message,
@@ -25,6 +26,10 @@ export interface RuntimeClient {
   archiveSession(sessionId: SessionId): Promise<void>;
   listSessions(): Promise<RuntimeSessionSummary[]>;
   listAgents(input?: ListAgentsRequest): Promise<RuntimeAgentsSnapshot>;
+  agentTree(input?: AgentTreeRequest): Promise<RuntimeAgentTreeSnapshot>;
+  listAgentRuns(input?: ListAgentRunsRequest): Promise<RuntimeAgentRunRecord[]>;
+  mailbox(input?: ListMailboxRequest): Promise<RuntimeAgentMailboxRecord[]>;
+  consumeMailbox(messageId: string): Promise<RuntimeAgentMailboxRecord>;
   listTasks(input?: ListTasksRequest): Promise<RuntimeAgentTaskRecord[]>;
   task(taskId: TaskId): Promise<RuntimeAgentTaskRecord>;
   followupTask(input: FollowupTaskRequest): Promise<RuntimeTaskFollowupResult>;
@@ -71,6 +76,85 @@ export interface RuntimeSessionSummary {
 
 export interface ListAgentsRequest {
   sessionId?: SessionId;
+}
+
+export interface AgentTreeRequest {
+  rootPath?: AgentPath;
+  sessionId?: SessionId;
+  includeConsumedMailbox?: boolean;
+  limit?: number;
+}
+
+export interface RuntimeAgentTreeSnapshot {
+  rootPath?: AgentPath;
+  nodes: RuntimeAgentTreeNode[];
+  agents: RuntimeAgentRunRecord[];
+  tasks: RuntimeAgentTaskRecord[];
+  mailbox: RuntimeAgentMailboxRecord[];
+}
+
+export interface RuntimeAgentTreeNode {
+  path: AgentPath;
+  parentPath?: AgentPath;
+  taskName: string;
+  status: RuntimeAgentRunRecord["status"] | AgentMailboxStatus | "empty";
+  runIds: string[];
+  runs: RuntimeAgentRunRecord[];
+  tasks: RuntimeAgentTaskRecord[];
+  mailbox: RuntimeAgentMailboxRecord[];
+  children: RuntimeAgentTreeNode[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ListAgentRunsRequest {
+  path?: AgentPath;
+  sessionId?: SessionId;
+  childSessionId?: SessionId;
+  status?: RuntimeAgentRunRecord["status"];
+  limit?: number;
+}
+
+export interface RuntimeAgentRunRecord {
+  id: string;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  taskId?: TaskId;
+  path: AgentPath;
+  parentPath?: AgentPath;
+  parentSessionId?: SessionId;
+  parentThreadId?: ThreadId;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  taskName: string;
+  cwd?: string;
+  mode?: AgentTaskMode;
+  status: "running" | "completed" | "failed" | "cancelled";
+  createdAt: number;
+  completedAt?: number;
+}
+
+export interface ListMailboxRequest {
+  messageId?: string;
+  taskId?: TaskId;
+  path?: AgentPath;
+  childSessionId?: SessionId;
+  status?: AgentMailboxStatus;
+  limit?: number;
+}
+
+export interface RuntimeAgentMailboxRecord {
+  id: string;
+  path: AgentPath;
+  fromPath: AgentPath;
+  triggerTurn: boolean;
+  status: AgentMailboxStatus;
+  taskId?: TaskId;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  message?: unknown;
+  createdAt: number;
+  consumedAt?: number;
 }
 
 export interface ListTasksRequest {
@@ -182,6 +266,45 @@ export class HttpRuntimeClient implements RuntimeClient {
   listAgents(input: ListAgentsRequest = {}): Promise<RuntimeAgentsSnapshot> {
     if (input.sessionId) return this.get(`sessions/${encodeURIComponent(input.sessionId)}/agents`);
     return this.get("agents");
+  }
+
+  agentTree(input: AgentTreeRequest = {}): Promise<RuntimeAgentTreeSnapshot> {
+    const params = new URLSearchParams();
+    if (input.rootPath) params.set("rootPath", input.rootPath);
+    if (input.sessionId) params.set("sessionId", input.sessionId);
+    if (input.includeConsumedMailbox !== undefined) {
+      params.set("includeConsumedMailbox", String(input.includeConsumedMailbox));
+    }
+    if (input.limit !== undefined) params.set("limit", String(input.limit));
+    const query = params.toString();
+    return this.get(`agents/tree${query ? `?${query}` : ""}`);
+  }
+
+  listAgentRuns(input: ListAgentRunsRequest = {}): Promise<RuntimeAgentRunRecord[]> {
+    const params = new URLSearchParams();
+    if (input.path) params.set("path", input.path);
+    if (input.sessionId) params.set("sessionId", input.sessionId);
+    if (input.childSessionId) params.set("childSessionId", input.childSessionId);
+    if (input.status) params.set("status", input.status);
+    if (input.limit !== undefined) params.set("limit", String(input.limit));
+    const query = params.toString();
+    return this.get(`agent_runs${query ? `?${query}` : ""}`);
+  }
+
+  mailbox(input: ListMailboxRequest = {}): Promise<RuntimeAgentMailboxRecord[]> {
+    const params = new URLSearchParams();
+    if (input.messageId) params.set("messageId", input.messageId);
+    if (input.taskId) params.set("taskId", input.taskId);
+    if (input.path) params.set("path", input.path);
+    if (input.childSessionId) params.set("childSessionId", input.childSessionId);
+    if (input.status) params.set("status", input.status);
+    if (input.limit !== undefined) params.set("limit", String(input.limit));
+    const query = params.toString();
+    return this.get(`mailbox${query ? `?${query}` : ""}`);
+  }
+
+  consumeMailbox(messageId: string): Promise<RuntimeAgentMailboxRecord> {
+    return this.post(`mailbox/${encodeURIComponent(messageId)}/consume`, {});
   }
 
   listTasks(input: ListTasksRequest = {}): Promise<RuntimeAgentTaskRecord[]> {

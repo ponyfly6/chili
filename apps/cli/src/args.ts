@@ -7,11 +7,14 @@ export interface CliArgs {
     | "serve"
     | "sessions"
     | "revert"
+    | "agents"
     | "tasks"
     | "task"
     | "task-followup"
     | "task-wait"
     | "task-close"
+    | "mailbox"
+    | "mailbox-consume"
     | "help";
   prompt?: string;
   cwd: string;
@@ -20,6 +23,7 @@ export interface CliArgs {
   resume?: string;
   snapshotId?: string;
   taskId?: string;
+  messageId?: string;
   taskStatus?: Extract<AgentTaskStatus, "completed" | "failed" | "cancelled">;
   timeoutMs?: number;
   model: CliModelName;
@@ -50,6 +54,19 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     }
     if (arg === "tasks") {
       result.command = "tasks";
+      continue;
+    }
+    if (arg === "agents" || arg === "tree") {
+      result.command = "agents";
+      continue;
+    }
+    if (arg === "mailbox") {
+      result.command = "mailbox";
+      continue;
+    }
+    if (arg === "consume") {
+      result.command = "mailbox-consume";
+      result.messageId = requireValue(arg, args);
       continue;
     }
     if (arg === "task") {
@@ -151,6 +168,9 @@ export function usage(): string {
     "  bun run chili -- --resume <session-id> \"continue\"",
     "  bun run chili -- sessions",
     "  bun run chili -- tasks",
+    "  bun run chili -- agents",
+    "  bun run chili -- mailbox",
+    "  bun run chili -- consume <mailbox-message-id>",
     "  bun run chili -- task <task-id>",
     "  bun run chili -- followup <task-id> \"continue this task\"",
     "  bun run chili -- wait <task-id> --timeout-ms 30000",

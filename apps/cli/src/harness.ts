@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   AgentRunnerSubagentRunner,
+  AgentTreeControlService,
   AgentTaskControlService,
   LocalSubagentManager,
   RuntimeService,
@@ -45,6 +46,7 @@ export interface CliHarness {
   runtime: SingleAgentRuntime;
   service: RuntimeService;
   tasks: AgentTaskControlService;
+  agents: AgentTreeControlService;
   recovery: SnapshotRecoveryService;
   close(): void;
 }
@@ -162,6 +164,10 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     createId,
     system: childSystem,
   });
+  const agents = new AgentTreeControlService({
+    store: eventStore,
+    createId,
+  });
 
   return {
     cwd,
@@ -170,6 +176,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     runtime,
     service,
     tasks,
+    agents,
     recovery,
     close: () => sqliteStore.close(),
   };

@@ -1,6 +1,7 @@
 import type {
   AgentPath,
   AgentMailboxPayload,
+  AgentMailboxStatus,
   AgentTaskMode,
   AgentTaskStatus,
   ChiliEvent,
@@ -105,12 +106,13 @@ export interface AgentMailboxRow {
   path: AgentPath;
   fromPath: AgentPath;
   triggerTurn: boolean;
-  status: "queued";
+  status: AgentMailboxStatus;
   taskId?: TaskId;
   childSessionId?: SessionId;
   childThreadId?: ThreadId;
   message?: AgentMailboxPayload;
   createdAt: number;
+  consumedAt?: number;
 }
 
 export interface AgentTaskQuery {
@@ -132,9 +134,11 @@ export interface AgentRunQuery {
 }
 
 export interface AgentMailboxQuery {
+  messageId?: string;
   taskId?: TaskId;
   path?: AgentPath;
   childSessionId?: SessionId;
+  status?: AgentMailboxStatus;
   limit?: number;
 }
 

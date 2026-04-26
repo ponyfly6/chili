@@ -24,9 +24,11 @@ export interface RuntimeAgentMailboxMessageView {
   path: AgentPath;
   from: AgentPath;
   triggerTurn: boolean;
+  status: "queued" | "consumed";
   queuedAt: number;
   sessionId?: SessionId;
   threadId?: ThreadId;
+  consumedAt?: number;
 }
 
 export interface RuntimeTaskView {
@@ -156,6 +158,7 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
       path,
       from,
       triggerTurn: booleanValue(payload.triggerTurn) ?? false,
+      status: "queued",
       queuedAt: event.time,
     };
     assignOptional(message, "sessionId", event.sessionId);
@@ -169,6 +172,16 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
       agent.mailboxMessageIds.push(message.id);
       agent.updatedAt = event.time;
     }
+    return;
+  }
+
+  if (event.type === "agent.message_consumed") {
+    const messageId = stringValue(payload.messageId);
+    if (!messageId) return;
+    const message = view.mailboxMessages[messageId];
+    if (!message) return;
+    message.status = "consumed";
+    message.consumedAt = event.time;
     return;
   }
 

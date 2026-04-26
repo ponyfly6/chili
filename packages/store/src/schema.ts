@@ -138,11 +138,13 @@ export const SQLITE_SCHEMA = [
     trigger_turn integer not null,
     status text not null,
     message_json text,
-    created_at integer not null
+    created_at integer not null,
+    consumed_at integer
   )`,
   `create index if not exists agent_mailbox_task_idx on agent_mailbox(task_id, created_at)`,
   `create index if not exists agent_mailbox_path_idx on agent_mailbox(path, created_at)`,
   `create index if not exists agent_mailbox_child_session_idx on agent_mailbox(child_session_id, created_at)`,
+  `create index if not exists agent_mailbox_status_idx on agent_mailbox(status, created_at)`,
 
   `create table if not exists teams (
     id text primary key,

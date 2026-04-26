@@ -1,6 +1,8 @@
 #!/usr/bin/env bun
 import { createInterface } from "node:readline/promises";
+import type { AgentTreeNode } from "@chili/core";
 import type { SessionId, TaskId } from "@chili/protocol";
+import { ROOT_AGENT_PATH } from "@chili/protocol";
 import { startRuntimeHttpServer } from "@chili/server";
 import { DeferredApprovalQueue } from "@chili/tools";
 import { parseArgs, usage } from "./args.js";
@@ -38,6 +40,23 @@ async function main(): Promise<void> {
 
     if (args.command === "tasks") {
       await printTasks(harness);
+      return;
+    }
+
+    if (args.command === "agents") {
+      await printAgentTree(harness);
+      return;
+    }
+
+    if (args.command === "mailbox") {
+      await printMailbox(harness);
+      return;
+    }
+
+    if (args.command === "mailbox-consume") {
+      if (!args.messageId) throw new Error("consume requires a mailbox message id");
+      const message = await harness.agents.consumeMailbox({ messageId: args.messageId });
+      console.log(`[mailbox] ${message.id}\t${message.status}`);
       return;
     }
 
@@ -133,6 +152,7 @@ async function serve(input: {
     service: input.harness.service,
     store: input.harness.events,
     tasks: input.harness.tasks,
+    agents: input.harness.agents,
     approvals: input.approvalQueue,
     hostname: input.host,
     port: input.port,
@@ -189,6 +209,29 @@ async function printTask(harness: Awaited<ReturnType<typeof createCliHarness>>, 
   console.log(JSON.stringify(task, null, 2));
 }
 
+async function printAgentTree(harness: Awaited<ReturnType<typeof createCliHarness>>): Promise<void> {
+  const snapshot = await harness.agents.snapshot({ rootPath: ROOT_AGENT_PATH });
+  if (snapshot.nodes.length === 0) {
+    console.log("No agents yet.");
+    return;
+  }
+  for (const node of snapshot.nodes) {
+    printAgentTreeNode(node, 0);
+  }
+}
+
+async function printMailbox(harness: Awaited<ReturnType<typeof createCliHarness>>): Promise<void> {
+  const messages = await harness.agents.mailbox({ status: "queued" });
+  if (messages.length === 0) {
+    console.log("No mailbox messages.");
+    return;
+  }
+  for (const message of messages) {
+    const content = message.message && "content" in message.message ? message.message.content : "";
+    console.log([message.id, message.status, message.fromPath, message.path, content].join("\t"));
+  }
+}
+
 async function repl(input: {
   harness: Awaited<ReturnType<typeof createCliHarness>>;
   sessionId: SessionId;
@@ -207,6 +250,8 @@ async function repl(input: {
           [
             "/help                 Show commands",
             "/sessions             List sessions",
+            "/agents               Show agent tree",
+            "/mailbox              List queued mailbox messages",
             "/tasks                List subagent tasks",
             "/task <taskId>        Show a subagent task",
             "/revert <snapshotId>  Revert a snapshot in this session",
@@ -217,6 +262,14 @@ async function repl(input: {
       }
       if (line === "/sessions") {
         await printSessions(input.harness.store);
+        continue;
+      }
+      if (line === "/agents") {
+        await printAgentTree(input.harness);
+        continue;
+      }
+      if (line === "/mailbox") {
+        await printMailbox(input.harness);
         continue;
       }
       if (line === "/tasks") {
@@ -246,6 +299,16 @@ async function repl(input: {
     }
   } finally {
     rl.close();
+  }
+}
+
+function printAgentTreeNode(node: AgentTreeNode, depth: number): void {
+  const indent = "  ".repeat(depth);
+  const runs = node.runIds.length > 0 ? ` runs=${node.runIds.length}` : "";
+  const mailbox = node.mailbox.length > 0 ? ` mailbox=${node.mailbox.length}` : "";
+  console.log(`${indent}${node.path}\t${node.status}\t${node.taskName || "(agent)"}${runs}${mailbox}`);
+  for (const child of node.children) {
+    printAgentTreeNode(child, depth + 1);
   }
 }
 

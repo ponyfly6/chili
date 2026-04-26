@@ -1,5 +1,6 @@
 import type {
   ChiliEvent,
+  AgentPath,
   AgentTaskStatus,
   RuntimeInterruptResult,
   RuntimeApprovalResolveResult,
@@ -12,6 +13,9 @@ import type {
   TaskId,
 } from "@chili/protocol";
 import type {
+  AgentTreeSnapshot,
+  AgentTreeSnapshotQuery,
+  ConsumeAgentMailboxInput,
   AgentTaskCloseInput,
   AgentTaskFinalStatus,
   AgentTaskFollowupInput,
@@ -22,7 +26,7 @@ import type {
   SubmitPromptResult,
 } from "@chili/core";
 import type { EventPublisher, EventStore } from "@chili/store";
-import type { AgentTaskQuery, AgentTaskRow } from "@chili/store";
+import type { AgentMailboxQuery, AgentMailboxRow, AgentRunQuery, AgentRunRow, AgentTaskQuery, AgentTaskRow } from "@chili/store";
 import { projectRuntimeAgents } from "./agent-projection.js";
 
 export interface RuntimeHttpService {
@@ -41,10 +45,18 @@ export interface RuntimeTaskControlService {
   closeTask(input: AgentTaskCloseInput): Promise<AgentTaskRow>;
 }
 
+export interface RuntimeAgentTreeService {
+  snapshot(query?: AgentTreeSnapshotQuery): Promise<AgentTreeSnapshot>;
+  agentRuns(query?: AgentRunQuery): Promise<AgentRunRow[]>;
+  mailbox(query?: AgentMailboxQuery): Promise<AgentMailboxRow[]>;
+  consumeMailbox(input: ConsumeAgentMailboxInput): Promise<AgentMailboxRow>;
+}
+
 export interface RuntimeHttpHandlerOptions {
   service: RuntimeHttpService;
   store: EventStore & EventPublisher;
   tasks?: RuntimeTaskControlService;
+  agents?: RuntimeAgentTreeService;
   approvals?: ApprovalResolver;
   maxBacklogEvents?: number;
   onBackgroundError?: (error: unknown) => void;
@@ -126,6 +138,26 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         if (body.error) input.error = body.error;
         if (body.interrupt !== undefined) input.interrupt = body.interrupt;
         return json(await tasks.closeTask(input));
+      }
+
+      if (route.name === "agentTree") {
+        const agents = requireAgentTree(options);
+        return json(await agents.snapshot(agentTreeQueryFromUrl(url)));
+      }
+
+      if (route.name === "agentRuns") {
+        const agents = requireAgentTree(options);
+        return json(await agents.agentRuns(agentRunQueryFromUrl(url)));
+      }
+
+      if (route.name === "mailbox") {
+        const agents = requireAgentTree(options);
+        return json(await agents.mailbox(mailboxQueryFromUrl(url)));
+      }
+
+      if (route.name === "consumeMailbox") {
+        const agents = requireAgentTree(options);
+        return json(await agents.consumeMailbox({ messageId: route.messageId }));
       }
 
       if (route.name === "agents") {
@@ -248,6 +280,10 @@ type Route =
   | { name: "agents"; sessionId?: SessionId }
   | { name: "listSessions" }
   | { name: "listTasks" }
+  | { name: "agentTree" }
+  | { name: "agentRuns" }
+  | { name: "mailbox" }
+  | { name: "consumeMailbox"; messageId: string }
   | { name: "task"; taskId: TaskId }
   | { name: "taskFollowup"; taskId: TaskId }
   | { name: "taskWait"; taskId: TaskId }
@@ -320,9 +356,17 @@ function routeRequest(method: string, pathname: string): Route {
   if (method === "GET" && path === "/health") return { name: "health" };
   if (method === "GET" && path === "/events") return { name: "events" };
   if (method === "GET" && path === "/agents") return { name: "agents" };
+  if (method === "GET" && path === "/agents/tree") return { name: "agentTree" };
+  if (method === "GET" && path === "/agent_runs") return { name: "agentRuns" };
+  if (method === "GET" && path === "/mailbox") return { name: "mailbox" };
   if (method === "GET" && path === "/sessions") return { name: "listSessions" };
   if (method === "GET" && path === "/tasks") return { name: "listTasks" };
   if (method === "POST" && path === "/sessions") return { name: "createSession" };
+
+  const mailboxRoute = /^\/mailbox\/([^/]+)\/consume$/.exec(path);
+  if (method === "POST" && mailboxRoute) {
+    return { name: "consumeMailbox", messageId: decodeURIComponent(mailboxRoute[1] ?? "") };
+  }
 
   const approvalRoute = /^\/approvals\/([^/]+)\/resolve$/.exec(path);
   if (method === "POST" && approvalRoute) {
@@ -557,6 +601,9 @@ function toHttpError(error: unknown): HttpError {
   if (err.name === "AgentTaskWaitTimeoutError") {
     return { status: 408, message: err.message };
   }
+  if (err.name === "AgentMailboxNotFoundError") {
+    return { status: 404, message: err.message };
+  }
   if (err.name === "RuntimeBusyError") {
     return { status: 409, message: err.message };
   }
@@ -585,6 +632,56 @@ function asThreadId(value: string | null): ThreadId | undefined {
 function requireTaskControl(options: RuntimeHttpHandlerOptions): RuntimeTaskControlService {
   if (!options.tasks) throw { status: 501, message: "No task control service is configured" } satisfies HttpError;
   return options.tasks;
+}
+
+function requireAgentTree(options: RuntimeHttpHandlerOptions): RuntimeAgentTreeService {
+  if (!options.agents) throw { status: 501, message: "No agent tree service is configured" } satisfies HttpError;
+  return options.agents;
+}
+
+function agentTreeQueryFromUrl(url: URL): AgentTreeSnapshotQuery {
+  const query: AgentTreeSnapshotQuery = {};
+  const rootPath = url.searchParams.get("rootPath");
+  const sessionId = asSessionId(url.searchParams.get("sessionId"));
+  const includeConsumedMailbox = booleanParam(url.searchParams.get("includeConsumedMailbox"));
+  const limit = numberParam(url.searchParams.get("limit"));
+  if (rootPath) query.rootPath = rootPath as AgentPath;
+  if (sessionId) query.sessionId = sessionId;
+  if (includeConsumedMailbox !== undefined) query.includeConsumedMailbox = includeConsumedMailbox;
+  if (limit !== undefined) query.limit = limit;
+  return query;
+}
+
+function agentRunQueryFromUrl(url: URL): AgentRunQuery {
+  const query: AgentRunQuery = {};
+  const sessionId = asSessionId(url.searchParams.get("sessionId"));
+  const childSessionId = asSessionId(url.searchParams.get("childSessionId"));
+  const path = url.searchParams.get("path");
+  const status = url.searchParams.get("status");
+  const limit = numberParam(url.searchParams.get("limit"));
+  if (sessionId) query.sessionId = sessionId;
+  if (childSessionId) query.childSessionId = childSessionId;
+  if (path) query.path = path as AgentPath;
+  if (status === "running" || status === "completed" || status === "failed" || status === "cancelled") {
+    query.status = status;
+  }
+  if (limit !== undefined) query.limit = limit;
+  return query;
+}
+
+function mailboxQueryFromUrl(url: URL): AgentMailboxQuery {
+  const query: AgentMailboxQuery = {};
+  const messageId = url.searchParams.get("messageId");
+  const status = url.searchParams.get("status");
+  const path = url.searchParams.get("path");
+  const childSessionId = asSessionId(url.searchParams.get("childSessionId"));
+  const limit = numberParam(url.searchParams.get("limit"));
+  if (messageId) query.messageId = messageId;
+  if (status === "queued" || status === "consumed") query.status = status;
+  if (path) query.path = path as AgentPath;
+  if (childSessionId) query.childSessionId = childSessionId;
+  if (limit !== undefined) query.limit = limit;
+  return query;
 }
 
 function taskQueryFromUrl(url: URL): AgentTaskQuery {
@@ -623,4 +720,10 @@ function numberParam(value: string | null): number | undefined {
   if (!value) return undefined;
   const parsed = Number.parseInt(value, 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function booleanParam(value: string | null): boolean | undefined {
+  if (value === "true" || value === "1") return true;
+  if (value === "false" || value === "0") return false;
+  return undefined;
 }

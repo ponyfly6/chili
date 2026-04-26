@@ -129,6 +129,11 @@ export class CliPrinter {
       return;
     }
 
+    if (event.type === "agent.message_consumed") {
+      this.line(`\n[agent] message consumed ${event.payload.messageId}`);
+      return;
+    }
+
     if (event.type === "agent.completed") {
       this.line(`\n[agent] completed ${event.payload.path}: ${event.payload.status}`);
       return;

@@ -107,9 +107,10 @@ interface AgentMailboxProjectionRow {
   child_session_id: string | null;
   child_thread_id: string | null;
   trigger_turn: number;
-  status: "queued";
+  status: AgentMailboxRow["status"];
   message_json: string | null;
   created_at: number;
+  consumed_at: number | null;
 }
 
 export interface SqliteEventStoreOptions {
@@ -350,6 +351,10 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore {
     const clauses: string[] = [];
     const params: Record<string, unknown> = {};
 
+    if (query.messageId) {
+      clauses.push("id = $messageId");
+      params.messageId = query.messageId;
+    }
     if (query.taskId) {
       clauses.push("task_id = $taskId");
       params.taskId = query.taskId;
@@ -362,13 +367,17 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore {
       clauses.push("child_session_id = $childSessionId");
       params.childSessionId = query.childSessionId;
     }
+    if (query.status) {
+      clauses.push("status = $status");
+      params.status = query.status;
+    }
 
     params.limit = query.limit ?? 500;
     const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
     return this.db
       .query<AgentMailboxProjectionRow, any>(
         `select id, task_id, path, from_path, child_session_id, child_thread_id, trigger_turn, status,
-                message_json, created_at
+                message_json, created_at, consumed_at
          from agent_mailbox
          ${where}
          order by created_at asc, id asc
@@ -435,8 +444,10 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore {
     this.addColumnIfMissing("agent_runs", "child_thread_id", "text");
     this.addColumnIfMissing("agent_runs", "cwd", "text");
     this.addColumnIfMissing("agent_runs", "mode", "text");
+    this.addColumnIfMissing("agent_mailbox", "consumed_at", "integer");
     this.db.exec(`create index if not exists agent_runs_task_idx on agent_runs(task_id)`);
     this.db.exec(`create index if not exists agent_runs_child_session_idx on agent_runs(child_session_id)`);
+    this.db.exec(`create index if not exists agent_mailbox_status_idx on agent_mailbox(status, created_at)`);
   }
 
   private addColumnIfMissing(table: string, column: string, definition: string): void {
@@ -777,6 +788,16 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore {
       return;
     }
 
+    if (event.type === "agent.message_consumed") {
+      this.db
+        .query(`update agent_mailbox set status = 'consumed', consumed_at = ? where id = ?`)
+        .run(event.time, event.payload.messageId);
+      if (event.payload.taskId) {
+        this.db.query(`update agent_tasks set updated_at = ? where id = ?`).run(event.time, event.payload.taskId);
+      }
+      return;
+    }
+
     if (event.type === "agent.task_completed") {
       this.applyAgentTaskCompletion(event.payload, event.time);
       return;
@@ -982,6 +1003,7 @@ function agentMailboxFromRow(row: AgentMailboxProjectionRow): AgentMailboxRow {
   if (row.message_json) {
     message.message = decodeJson<AgentMailboxPayload>(row.message_json, { content: "" });
   }
+  if (row.consumed_at) message.consumedAt = row.consumed_at;
   return message;
 }
 

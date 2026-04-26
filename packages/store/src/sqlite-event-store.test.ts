@@ -201,6 +201,19 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
       },
     });
     await store.append({
+      id: "event_mailbox_consumed",
+      type: "agent.message_consumed",
+      time,
+      sessionId: parentSessionId,
+      threadId: parentThreadId,
+      payload: {
+        messageId: "event_mailbox",
+        taskId,
+        path,
+        consumedBy: path,
+      },
+    });
+    await store.append({
       id: "event_task_completed",
       type: "agent.task_completed",
       time,
@@ -284,8 +297,16 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
         childSessionId,
         childThreadId,
         triggerTurn: true,
-        status: "queued",
+        status: "consumed",
         message: { role: "user", content: "go" },
+        consumedAt: time,
+      },
+    ]);
+    expect(await store.agentMailbox({ status: "queued" })).toEqual([]);
+    expect(await store.agentMailbox({ messageId: "event_mailbox", status: "consumed" })).toMatchObject([
+      {
+        id: "event_mailbox",
+        status: "consumed",
       },
     ]);
     expect(await store.agentTask(taskId)).toMatchObject({ id: taskId, status: "completed" });

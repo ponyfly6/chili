@@ -1,7 +1,10 @@
 import { expect, test } from "bun:test";
+import type { AgentTreeSnapshot } from "@chili/core";
 import type {
   ApprovalRow,
   AgentTaskRow,
+  AgentMailboxRow,
+  AgentRunRow,
   EventPublisher,
   EventQuery,
   EventStore,
@@ -22,7 +25,7 @@ import type {
   TimestampMs,
 } from "@chili/protocol";
 import type { RuntimeAgentsSnapshot } from "./agent-projection.js";
-import type { RuntimeHttpService, RuntimeTaskControlService } from "./runtime-http.js";
+import type { RuntimeAgentTreeService, RuntimeHttpService, RuntimeTaskControlService } from "./runtime-http.js";
 import { createRuntimeHttpHandler } from "./runtime-http.js";
 
 test("serves sessions and event backlog over the runtime HTTP handler", async () => {
@@ -180,6 +183,40 @@ test("serves task control routes", async () => {
   expect(await closeResponse.json()).toMatchObject({ id: "task_http", status: "cancelled", summary: "stopped" });
 });
 
+test("serves agent tree and mailbox control routes", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const agents = new FakeAgentTreeService();
+  const handler = createRuntimeHttpHandler({ service, store, agents });
+
+  const treeResponse = await handler(new Request("http://chili.test/agents/tree?rootPath=/root&includeConsumedMailbox=true"));
+  expect(treeResponse.status).toBe(200);
+  expect(await treeResponse.json()).toMatchObject({
+    rootPath: "/root",
+    nodes: [{ path: "/root", children: [{ path: "/root/task_http" }] }],
+  });
+
+  const runsResponse = await handler(new Request("http://chili.test/agent_runs?path=/root/task_http"));
+  expect(runsResponse.status).toBe(200);
+  expect(await runsResponse.json()).toMatchObject([{ id: "agent_http_child", path: "/root/task_http" }]);
+
+  const mailboxResponse = await handler(new Request("http://chili.test/mailbox?status=queued"));
+  expect(mailboxResponse.status).toBe(200);
+  expect(await mailboxResponse.json()).toMatchObject([{ id: "event_mailbox", status: "queued" }]);
+
+  const consumeResponse = await handler(
+    new Request("http://chili.test/mailbox/event_mailbox/consume", {
+      method: "POST",
+      body: JSON.stringify({}),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  expect(consumeResponse.status).toBe(200);
+  expect(await consumeResponse.json()).toMatchObject({ id: "event_mailbox", status: "consumed" });
+  expect(agents.consumedIds).toEqual(["event_mailbox"]);
+});
+
 test("resolves approvals through the runtime HTTP handler", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
@@ -334,6 +371,63 @@ class FakeTaskControlService implements RuntimeTaskControlService {
   }
 }
 
+class FakeAgentTreeService implements RuntimeAgentTreeService {
+  consumedIds: string[] = [];
+
+  async snapshot(): Promise<AgentTreeSnapshot> {
+    const root = agentRunRow({ id: "agent_http_root", path: "/root", taskName: "lead" });
+    const child = agentRunRow({ id: "agent_http_child", path: "/root/task_http", parentPath: "/root", taskName: "review" });
+    const mailbox = mailboxRow({ status: "queued" });
+    return {
+      rootPath: "/root" as AgentPath,
+      agents: [root, child],
+      tasks: [taskRow({ status: "running" })],
+      mailbox: [mailbox],
+      nodes: [
+        {
+          path: "/root" as AgentPath,
+          taskName: "lead",
+          status: "running",
+          runIds: [root.id],
+          runs: [root],
+          tasks: [],
+          mailbox: [],
+          createdAt: 1,
+          updatedAt: 1,
+          children: [
+            {
+              path: "/root/task_http" as AgentPath,
+              parentPath: "/root" as AgentPath,
+              taskName: "review",
+              status: "running",
+              runIds: [child.id],
+              runs: [child],
+              tasks: [taskRow({ status: "running" })],
+              mailbox: [mailbox],
+              children: [],
+              createdAt: 2,
+              updatedAt: 2,
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  async agentRuns(): Promise<AgentRunRow[]> {
+    return [agentRunRow({ id: "agent_http_child", path: "/root/task_http", parentPath: "/root", taskName: "review" })];
+  }
+
+  async mailbox(): Promise<AgentMailboxRow[]> {
+    return [mailboxRow({ status: "queued" })];
+  }
+
+  async consumeMailbox(input: { messageId: string }): Promise<AgentMailboxRow> {
+    this.consumedIds.push(input.messageId);
+    return mailboxRow({ status: "consumed" });
+  }
+}
+
 function taskRow(input: { status: AgentTaskRow["status"]; summary?: string }): AgentTaskRow {
   const row: AgentTaskRow = {
     id: "task_http" as TaskId,
@@ -346,6 +440,32 @@ function taskRow(input: { status: AgentTaskRow["status"]; summary?: string }): A
     updatedAt: 2,
   };
   if (input.summary) row.summary = input.summary;
+  return row;
+}
+
+function agentRunRow(input: { id: string; path: string; parentPath?: string; taskName: string }): AgentRunRow {
+  const row: AgentRunRow = {
+    id: input.id,
+    path: input.path as AgentPath,
+    taskName: input.taskName,
+    status: "running",
+    createdAt: 1,
+  };
+  if (input.parentPath) row.parentPath = input.parentPath as AgentPath;
+  return row;
+}
+
+function mailboxRow(input: { status: AgentMailboxRow["status"] }): AgentMailboxRow {
+  const row: AgentMailboxRow = {
+    id: "event_mailbox",
+    path: "/root/task_http" as AgentPath,
+    fromPath: "/root" as AgentPath,
+    triggerTurn: true,
+    status: input.status,
+    taskId: "task_http" as TaskId,
+    createdAt: 3,
+  };
+  if (input.status === "consumed") row.consumedAt = 4;
   return row;
 }
 
