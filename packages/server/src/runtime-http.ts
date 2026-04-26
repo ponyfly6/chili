@@ -624,6 +624,9 @@ function toHttpError(error: unknown): HttpError {
   if (err.name === "AgentMailboxNotFoundError") {
     return { status: 404, message: err.message };
   }
+  if (err.name === "AgentMailboxNotDeliverableError") {
+    return { status: 409, message: err.message };
+  }
   if (err.name === "RuntimeBusyError") {
     return { status: 409, message: err.message };
   }

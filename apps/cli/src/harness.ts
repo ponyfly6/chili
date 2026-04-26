@@ -183,6 +183,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   });
   const agents = new AgentTreeControlService({
     store: eventStore,
+    runtime: childService,
     createId,
   });
 

@@ -1,6 +1,7 @@
 import type {
   ChiliEvent,
   EventEnvelope,
+  MessageId,
   RuntimeSessionStatus,
   SessionId,
   ThreadId,
@@ -83,6 +84,10 @@ export class RuntimeService {
     const sessionId = await this.options.runtime.createSession(createInput);
     await this.publishStatus({ sessionId, threadId, status: "idle", reason: "session_created" });
     return { sessionId, threadId };
+  }
+
+  appendUserMessage(input: { sessionId: SessionId; threadId: ThreadId; text: string }): Promise<MessageId> {
+    return this.options.runtime.appendUserMessage(input);
   }
 
   async submitPrompt(input: SubmitPromptInput): Promise<SubmitPromptResult> {

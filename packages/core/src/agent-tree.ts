@@ -1,10 +1,12 @@
 import type {
   AgentMailboxStatus,
+  AgentMailboxPayload,
   AgentMessageConsumedPayload,
   AgentPath,
   AgentTaskStatus,
   ChiliEvent,
   EventEnvelope,
+  MessagePart,
   SessionId,
   TaskId,
   ThreadId,
@@ -20,11 +22,18 @@ import type {
   EventStore,
   SubagentProjectionStore,
 } from "@chili/store";
+import type { SubmitPromptInput, SubmitPromptResult } from "./runtime-service.js";
 
 export interface AgentTreeControlServiceOptions {
   store: EventStore & SubagentProjectionStore;
+  runtime?: AgentMailboxRuntime;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
+}
+
+export interface AgentMailboxRuntime {
+  appendUserMessage(input: { sessionId: SessionId; threadId: ThreadId; text: string }): Promise<unknown>;
+  submitPrompt(input: SubmitPromptInput): Promise<SubmitPromptResult>;
 }
 
 export interface AgentTreeSnapshotQuery {
@@ -65,6 +74,13 @@ export class AgentMailboxNotFoundError extends Error {
   constructor(readonly messageId: string) {
     super(`Agent mailbox message not found: ${messageId}`);
     this.name = "AgentMailboxNotFoundError";
+  }
+}
+
+export class AgentMailboxNotDeliverableError extends Error {
+  constructor(readonly messageId: string, message: string) {
+    super(message);
+    this.name = "AgentMailboxNotDeliverableError";
   }
 }
 
@@ -119,6 +135,7 @@ export class AgentTreeControlService {
     if (message.status === "consumed") return message;
 
     const task = message.taskId ? await this.options.store.agentTask(message.taskId) : undefined;
+    await this.deliverMailbox(message, task);
     const consumedBy = input.consumedBy ?? message.path;
     const payload: AgentMessageConsumedPayload = {
       messageId: input.messageId,
@@ -139,6 +156,35 @@ export class AgentTreeControlService {
     await this.options.store.append(event as ChiliEvent);
 
     return this.requireMailbox(input.messageId);
+  }
+
+  private async deliverMailbox(message: AgentMailboxRow, task: AgentTaskRow | undefined): Promise<void> {
+    const runtime = this.options.runtime;
+    if (!runtime || !message.message) return;
+
+    const sessionId = task?.childSessionId ?? message.childSessionId;
+    const threadId = task?.childThreadId ?? message.childThreadId;
+    if (!sessionId || !threadId) {
+      throw new AgentMailboxNotDeliverableError(message.id, `Mailbox message is missing child session metadata: ${message.id}`);
+    }
+
+    const text = textFromMailboxPayload(message.message);
+    if (!text) {
+      throw new AgentMailboxNotDeliverableError(message.id, `Mailbox message has no deliverable text: ${message.id}`);
+    }
+
+    if (message.triggerTurn) {
+      const input: SubmitPromptInput = {
+        sessionId,
+        threadId,
+        text,
+      };
+      if (task?.cwd) input.cwd = task.cwd;
+      await runtime.submitPrompt(input);
+      return;
+    }
+
+    await runtime.appendUserMessage({ sessionId, threadId, text });
   }
 
   private async requireMailbox(messageId: string): Promise<AgentMailboxRow> {
@@ -266,6 +312,25 @@ function sortTree(nodes: AgentTreeNode[]): AgentTreeNode[] {
     sortTree(node.children);
   }
   return nodes;
+}
+
+function textFromMailboxPayload(payload: AgentMailboxPayload): string | undefined {
+  const text =
+    "content" in payload
+      ? payload.content
+      : payload.parts
+          .map(textFromPart)
+          .filter(Boolean)
+          .join("\n");
+  const trimmed = text.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function textFromPart(part: MessagePart): string {
+  if (part.type === "text" || part.type === "reasoning") return part.text;
+  if (part.type === "tool_result") return part.error ? part.error : part.output;
+  if (part.type === "agent_handoff") return part.summary;
+  return "";
 }
 
 function isPathWithin(path: AgentPath, rootPath: AgentPath): boolean {
