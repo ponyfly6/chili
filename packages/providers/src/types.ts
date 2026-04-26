@@ -1,4 +1,9 @@
 import type { Message } from "@chili/protocol";
+import type { ModelCompatibilityOverrides } from "./compat.js";
+
+export type ModelApiFamily = "anthropic-messages" | "openai-completions" | "openai-responses" | (string & {});
+
+export type ModelInputCapability = "text" | "image";
 
 export interface ModelCapabilities {
   streaming: boolean;
@@ -12,8 +17,15 @@ export interface ModelCapabilities {
 export interface ModelDescriptor {
   provider: string;
   model: string;
+  apiFamily?: ModelApiFamily;
+  baseUrl?: string;
   displayName?: string;
   capabilities?: ModelCapabilities;
+  compatibility?: ModelCompatibilityOverrides;
+  inputCapabilities?: readonly ModelInputCapability[];
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
+  default?: boolean;
 }
 
 export interface ChiliModelProvider {

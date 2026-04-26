@@ -6,6 +6,7 @@ import {
   createMiniMaxM27HighspeedModel,
   MINIMAX_ANTHROPIC_BASE_URL,
   MINIMAX_M27_HIGHSPEED_MODEL,
+  normalizeAnthropicToolCallId,
 } from "./index.js";
 import type { ModelStreamEvent, ModelTool } from "./types.js";
 
@@ -78,6 +79,49 @@ test("converts Chili messages and tools into an Anthropic request body", () => {
       },
     ],
   });
+});
+
+test("normalizes Anthropic tool ids and synthesizes missing tool results in request bodies", () => {
+  const invalidToolCallId = "responses|tool call with spaces!" as ToolCallId;
+  const normalizedToolCallId = normalizeAnthropicToolCallId(invalidToolCallId);
+  const messages = [
+    message("assistant", [
+      { type: "reasoning", text: "opaque", redacted: true },
+      { type: "tool_call", callId: invalidToolCallId, toolName: "bash", input: { cmd: "pwd" }, status: "pending" },
+    ]),
+    message("user", [{ type: "text", text: "new request" }]),
+  ];
+
+  const body = buildAnthropicRequestBody(
+    {
+      messages,
+      tools: [],
+      system: [],
+    },
+    {
+      model: "test-model",
+      stream: true,
+    },
+  );
+
+  expect(body.messages).toEqual([
+    {
+      role: "assistant",
+      content: [{ type: "tool_use", id: normalizedToolCallId, name: "bash", input: { cmd: "pwd" } }],
+    },
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: normalizedToolCallId,
+          content: "No result provided\n\nError: No result provided",
+          is_error: true,
+        },
+        { type: "text", text: "new request" },
+      ],
+    },
+  ]);
 });
 
 test("passes AbortSignal through to fetch and requests streaming", async () => {

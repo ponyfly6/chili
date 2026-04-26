@@ -110,7 +110,11 @@ function toModelRouter(modelOrProvider: ProviderModelOrProvider, modelName?: str
 function readMiniMaxOptionsFromEnv(input: CliModelOptions): MiniMaxRouterOptions {
   const options: MiniMaxRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_MAX_TOKENS };
   const apiKey = process.env.MINIMAX_API_KEY ?? process.env.ANTHROPIC_API_KEY;
-  const baseUrl = process.env.MINIMAX_BASE_URL ?? process.env.ANTHROPIC_BASE_URL ?? DEFAULT_MINIMAX_BASE_URL;
+  const baseUrl =
+    process.env.MINIMAX_BASE_URL ??
+    process.env.MINIMAX_ANTHROPIC_BASE_URL ??
+    process.env.ANTHROPIC_BASE_URL ??
+    DEFAULT_MINIMAX_BASE_URL;
   const model = process.env.MINIMAX_MODEL ?? process.env.ANTHROPIC_MODEL ?? DEFAULT_MINIMAX_MODEL;
   const resolvedApiKey = input.apiKey ?? apiKey;
   const resolvedBaseUrl = input.baseUrl ?? baseUrl;

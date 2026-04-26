@@ -19,6 +19,7 @@
         "@chili/core": "workspace:*",
         "@chili/policy": "workspace:*",
         "@chili/protocol": "workspace:*",
+        "@chili/providers": "workspace:*",
         "@chili/server": "workspace:*",
         "@chili/store": "workspace:*",
         "@chili/tools": "workspace:*",
@@ -41,6 +42,13 @@
     "packages/protocol": {
       "name": "@chili/protocol",
       "version": "0.0.0",
+    },
+    "packages/providers": {
+      "name": "@chili/providers",
+      "version": "0.0.0",
+      "dependencies": {
+        "@chili/protocol": "workspace:*",
+      },
     },
     "packages/sdk": {
       "name": "@chili/sdk",
@@ -82,6 +90,8 @@
     "@chili/policy": ["@chili/policy@workspace:packages/policy"],
 
     "@chili/protocol": ["@chili/protocol@workspace:packages/protocol"],
+
+    "@chili/providers": ["@chili/providers@workspace:packages/providers"],
 
     "@chili/sdk": ["@chili/sdk@workspace:packages/sdk"],
 

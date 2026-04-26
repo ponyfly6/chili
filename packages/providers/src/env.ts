@@ -1,0 +1,89 @@
+import { MINIMAX_PROVIDER_ID } from "./models.js";
+
+export type EnvironmentSource = Record<string, string | undefined>;
+
+export interface ProviderEnvironmentSpec {
+  apiKey?: readonly string[];
+  baseUrl?: readonly string[];
+  model?: readonly string[];
+}
+
+export interface ProviderEnvironment {
+  apiKey?: string;
+  apiKeyEnv?: string;
+  baseUrl?: string;
+  baseUrlEnv?: string;
+  model?: string;
+  modelEnv?: string;
+}
+
+export const MINIMAX_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
+  apiKey: ["MINIMAX_API_KEY", "ANTHROPIC_API_KEY"],
+  baseUrl: ["MINIMAX_BASE_URL", "MINIMAX_ANTHROPIC_BASE_URL", "ANTHROPIC_BASE_URL"],
+  model: ["MINIMAX_MODEL", "ANTHROPIC_MODEL"],
+};
+
+const PROVIDER_ENVIRONMENT: Record<string, ProviderEnvironmentSpec> = {
+  [MINIMAX_PROVIDER_ID]: MINIMAX_ENVIRONMENT,
+};
+
+export function readProviderEnvironment(
+  provider: string,
+  env: EnvironmentSource = currentEnvironment(),
+): ProviderEnvironment {
+  const spec = PROVIDER_ENVIRONMENT[provider];
+  if (!spec) return {};
+  return readEnvironmentSpec(spec, env);
+}
+
+export function readMiniMaxEnvironment(env: EnvironmentSource = currentEnvironment()): ProviderEnvironment {
+  return readEnvironmentSpec(MINIMAX_ENVIRONMENT, env);
+}
+
+export function findConfiguredEnvironmentNames(
+  provider: string,
+  env: EnvironmentSource = currentEnvironment(),
+): readonly string[] {
+  const spec = PROVIDER_ENVIRONMENT[provider];
+  if (!spec) return [];
+  return [...configuredNames(spec.apiKey, env), ...configuredNames(spec.baseUrl, env), ...configuredNames(spec.model, env)];
+}
+
+function readEnvironmentSpec(spec: ProviderEnvironmentSpec, env: EnvironmentSource): ProviderEnvironment {
+  const apiKey = firstEnvironmentValue(spec.apiKey, env);
+  const baseUrl = firstEnvironmentValue(spec.baseUrl, env);
+  const model = firstEnvironmentValue(spec.model, env);
+  const result: ProviderEnvironment = {};
+  if (apiKey) {
+    result.apiKey = apiKey.value;
+    result.apiKeyEnv = apiKey.name;
+  }
+  if (baseUrl) {
+    result.baseUrl = baseUrl.value;
+    result.baseUrlEnv = baseUrl.name;
+  }
+  if (model) {
+    result.model = model.value;
+    result.modelEnv = model.name;
+  }
+  return result;
+}
+
+function firstEnvironmentValue(
+  names: readonly string[] | undefined,
+  env: EnvironmentSource,
+): { name: string; value: string } | undefined {
+  for (const name of names ?? []) {
+    const value = env[name];
+    if (value) return { name, value };
+  }
+  return undefined;
+}
+
+function configuredNames(names: readonly string[] | undefined, env: EnvironmentSource): string[] {
+  return (names ?? []).filter((name) => !!env[name]);
+}
+
+function currentEnvironment(): EnvironmentSource {
+  return typeof process === "undefined" ? {} : process.env;
+}
