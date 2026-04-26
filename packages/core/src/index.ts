@@ -7,4 +7,5 @@ export * from "./runner.js";
 export * from "./runtime.js";
 export * from "./runtime-service.js";
 export * from "./single-agent-runtime.js";
+export * from "./subagent.js";
 export * from "./team.js";

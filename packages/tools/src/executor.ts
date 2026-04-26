@@ -164,6 +164,7 @@ export class ToolExecutor {
   private context(tool: ChiliToolDefinition, input: ExecuteToolInput, callId: ToolCallId): ToolExecutionContext {
     return {
       sessionId: input.sessionId,
+      ...(input.threadId ? { threadId: input.threadId } : {}),
       turnId: input.turnId,
       callId,
       signal: input.signal ?? new AbortController().signal,

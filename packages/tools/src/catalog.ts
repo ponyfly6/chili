@@ -16,8 +16,8 @@ export const CHILI_TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: "glob", aliases: [], source: "opencode", phase: "p1", status: "planned" },
   { name: "grep", aliases: ["grep_search"], source: "opencode", phase: "p1", status: "planned" },
   { name: "todowrite", aliases: ["write_todos"], source: "opencode", phase: "p1", status: "planned" },
-  { name: "task", aliases: ["agent"], source: "opencode", phase: "p2", status: "planned" },
-  { name: "complete_task", aliases: [], source: "gemini-cli", phase: "p2", status: "planned" },
+  { name: "task", aliases: ["agent"], source: "opencode", phase: "p2", status: "implemented" },
+  { name: "complete_task", aliases: [], source: "gemini-cli", phase: "p2", status: "implemented" },
   { name: "webfetch", aliases: ["web_fetch"], source: "opencode", phase: "later", status: "planned" },
   { name: "websearch", aliases: ["web_search"], source: "opencode", phase: "later", status: "planned" },
 ];
