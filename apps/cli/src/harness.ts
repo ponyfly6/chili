@@ -9,26 +9,37 @@ import {
   SingleAgentRuntime,
   SnapshotRecoveryService,
 } from "@chili/core";
-import type { SessionId, ThreadId } from "@chili/protocol";
+import type { AgentPath, SessionId, TaskId, ThreadId } from "@chili/protocol";
 import { ObservableEventStore, SqliteEventStore } from "@chili/store";
+import type { AgentMailboxRow, AgentTaskQuery, AgentTaskRow } from "@chili/store";
 import {
   DeferredApprovalQueue,
   FileSystemSnapshotProvider,
   InMemoryToolRegistry,
   PolicyApprovalBroker,
   type SubagentController,
+  type SubagentControlController,
   ToolExecutor,
   createApplyPatchTool,
   createBashTool,
+  createMailboxConsumeTool,
+  createMailboxListTool,
   createCompleteTaskTool,
   createEditTool,
   createGitDiffTool,
   createGlobTool,
   createGrepTool,
   createReadFileTool,
+  createTaskCloseTool,
+  createTaskFollowupTool,
+  createTaskListTool,
   createTaskTool,
+  createTaskWaitTool,
   createToolSearchTool,
   createWriteFileTool,
+  type MailboxListToolInput,
+  type SubagentMailboxRecord,
+  type SubagentTaskRecord,
 } from "@chili/tools";
 import { createCliApprovalBroker, createCliPermissionRules } from "./approval.js";
 import { createIdFactory } from "./id.js";
@@ -190,6 +201,13 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     runtime: childService,
     createId,
   });
+  const controlController = createSubagentControlController(tasks, agents);
+  registry.register(createTaskListTool(controlController));
+  registry.register(createTaskWaitTool(controlController));
+  registry.register(createTaskFollowupTool(controlController));
+  registry.register(createTaskCloseTool(controlController));
+  registry.register(createMailboxListTool(controlController));
+  registry.register(createMailboxConsumeTool(controlController));
 
   return {
     cwd,
@@ -254,4 +272,108 @@ function createApprovalBroker(options: CliHarnessOptions): PolicyApprovalBroker 
     ask: async (request) =>
       options.approvalQueue?.ask(request) ?? { action: "deny", feedback: "Approval queue is unavailable." },
   });
+}
+
+function createSubagentControlController(
+  tasks: AgentTaskControlService,
+  agents: AgentTreeControlService,
+): SubagentControlController {
+  return {
+    async listTasks(input, context) {
+      const query: AgentTaskQuery = {};
+      if (input.status) query.status = input.status;
+      if (input.limit !== undefined) query.limit = input.limit;
+      if (!input.all) query.parentSessionId = context.sessionId;
+      return (await tasks.listTasks(query)).map(toSubagentTaskRecord);
+    },
+    async waitTask(input) {
+      return toSubagentTaskRecord(
+        await tasks.waitForTask({
+          taskId: input.taskId as TaskId,
+          ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+        }),
+      );
+    },
+    async followupTask(input) {
+      const result = await tasks.followupTask({
+        taskId: input.taskId as TaskId,
+        text: input.prompt,
+        ...(input.maxTurns !== undefined ? { maxTurns: input.maxTurns } : {}),
+      });
+      return toSubagentTaskRecord(result.task);
+    },
+    async closeTask(input) {
+      return toSubagentTaskRecord(
+        await tasks.closeTask({
+          taskId: input.taskId as TaskId,
+          ...(input.status ? { status: input.status } : {}),
+          ...(input.summary ? { summary: input.summary } : {}),
+          ...(input.error ? { error: input.error } : {}),
+          ...(input.interrupt !== undefined ? { interrupt: input.interrupt } : {}),
+        }),
+      );
+    },
+    async listMailbox(input, context) {
+      const messages = await agents.mailbox({
+        status: input.status ?? "queued",
+        ...(input.taskId ? { taskId: input.taskId as TaskId } : {}),
+        ...(input.path ? { path: input.path as AgentPath } : {}),
+        ...(input.limit !== undefined ? { limit: input.limit } : {}),
+      });
+      if (input.all || input.taskId || input.path) return messages.map(toSubagentMailboxRecord);
+
+      const visibleTaskIds = new Set(
+        (await tasks.listTasks({ parentSessionId: context.sessionId, limit: mailboxTaskLimit(input) })).map((task) => task.id),
+      );
+      return messages.filter((message) => message.taskId && visibleTaskIds.has(message.taskId)).map(toSubagentMailboxRecord);
+    },
+    async consumeMailbox(input, context) {
+      const message = (await agents.mailbox({ messageId: input.messageId, limit: 1 }))[0];
+      if (!message?.taskId) throw new Error(`Mailbox message is not visible to this session: ${input.messageId}`);
+      const task = await tasks.getTask(message.taskId);
+      if (task.parentSessionId !== context.sessionId) {
+        throw new Error(`Mailbox message is not visible to this session: ${input.messageId}`);
+      }
+      return toSubagentMailboxRecord(await agents.consumeMailbox({ messageId: input.messageId }));
+    },
+  };
+}
+
+function mailboxTaskLimit(input: MailboxListToolInput): number {
+  return Math.max(input.limit ?? 500, 500);
+}
+
+function toSubagentTaskRecord(task: AgentTaskRow): SubagentTaskRecord {
+  return {
+    taskId: task.id,
+    path: task.path,
+    taskName: task.taskName,
+    status: task.status,
+    ...(task.mode ? { mode: task.mode } : {}),
+    generation: task.generation,
+    ...(task.currentRunId ? { currentRunId: task.currentRunId } : {}),
+    ...(task.childSessionId ? { childSessionId: task.childSessionId } : {}),
+    ...(task.childThreadId ? { childThreadId: task.childThreadId } : {}),
+    ...(task.summary ? { summary: task.summary } : {}),
+    ...(task.error ? { error: task.error } : {}),
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    ...(task.completedAt ? { completedAt: task.completedAt } : {}),
+  };
+}
+
+function toSubagentMailboxRecord(message: AgentMailboxRow): SubagentMailboxRecord {
+  return {
+    messageId: message.id,
+    path: message.path,
+    fromPath: message.fromPath,
+    status: message.status,
+    triggerTurn: message.triggerTurn,
+    ...(message.taskId ? { taskId: message.taskId } : {}),
+    ...(message.childSessionId ? { childSessionId: message.childSessionId } : {}),
+    ...(message.childThreadId ? { childThreadId: message.childThreadId } : {}),
+    ...(message.message ? { message: message.message } : {}),
+    createdAt: message.createdAt,
+    ...(message.consumedAt ? { consumedAt: message.consumedAt } : {}),
+  };
 }
