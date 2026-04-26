@@ -1,0 +1,141 @@
+import { mkdir } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { RuntimeService, SingleAgentRuntime, SnapshotRecoveryService } from "@chili/core";
+import type { SessionId, ThreadId } from "@chili/protocol";
+import { ObservableEventStore, SqliteEventStore } from "@chili/store";
+import {
+  DeferredApprovalQueue,
+  FileSystemSnapshotProvider,
+  InMemoryToolRegistry,
+  PolicyApprovalBroker,
+  ToolExecutor,
+  createApplyPatchTool,
+  createBashTool,
+  createEditTool,
+  createGitDiffTool,
+  createReadFileTool,
+} from "@chili/tools";
+import { createCliApprovalBroker, createCliPermissionRules } from "./approval.js";
+import { createIdFactory } from "./id.js";
+import type { CliModelName } from "./model.js";
+import { createCliModel } from "./model.js";
+import { CliPrinter, PrintingEventStore } from "./printing-store.js";
+
+export interface CliHarnessOptions {
+  cwd: string;
+  model: CliModelName;
+  yes?: boolean;
+  quiet?: boolean;
+  approvalQueue?: DeferredApprovalQueue;
+}
+
+export interface CliHarness {
+  cwd: string;
+  store: SqliteEventStore;
+  events: ObservableEventStore;
+  runtime: SingleAgentRuntime;
+  service: RuntimeService;
+  recovery: SnapshotRecoveryService;
+  close(): void;
+}
+
+export async function createCliHarness(options: CliHarnessOptions): Promise<CliHarness> {
+  const cwd = resolve(options.cwd);
+  const stateDir = join(cwd, ".chili");
+  await mkdir(stateDir, { recursive: true });
+
+  const createId = createIdFactory();
+  const sqliteStore = new SqliteEventStore(join(stateDir, "chili.sqlite"));
+  const printer = new CliPrinter();
+  const printableStore = options.quiet ? sqliteStore : new PrintingEventStore(sqliteStore, printer);
+  const eventStore = new ObservableEventStore(printableStore);
+  const registry = createToolRegistry();
+  const snapshotProvider = new FileSystemSnapshotProvider({
+    rootDir: join(stateDir, "snapshots"),
+    createId,
+  });
+  const toolExecutor = new ToolExecutor({
+    registry,
+    events: { publish: (event) => eventStore.append(event) },
+    approvals: createApprovalBroker(options),
+    snapshotProvider,
+    createId,
+    maxResultOutputBytes: 256_000,
+  });
+  const runtime = new SingleAgentRuntime({
+    store: eventStore,
+    model: await createCliModel(options.model),
+    toolRegistry: registry,
+    toolExecutor,
+    createId,
+    contextBudget: {
+      maxInputChars: 160_000,
+      maxToolResultChars: 24_000,
+      preserveRecentMessages: 6,
+    },
+    retryPolicy: {
+      maxAttempts: 2,
+      initialDelayMs: 500,
+    },
+    doomLoopGuard: {
+      maxRepeatedToolCalls: 3,
+      maxToolCallsPerTurn: 40,
+    },
+  });
+  const recovery = new SnapshotRecoveryService({
+    store: eventStore,
+    snapshotProvider,
+    createId,
+  });
+  const service = new RuntimeService({
+    runtime,
+    store: eventStore,
+    cwd,
+    createId,
+  });
+
+  return {
+    cwd,
+    store: sqliteStore,
+    events: eventStore,
+    runtime,
+    service,
+    recovery,
+    close: () => sqliteStore.close(),
+  };
+}
+
+export async function latestThreadId(store: SqliteEventStore, sessionId: SessionId): Promise<ThreadId | undefined> {
+  const events = await store.events({ sessionId, limit: 5000 });
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index];
+    if (event?.threadId) return event.threadId;
+  }
+  return undefined;
+}
+
+export function newThreadId(): ThreadId {
+  return createIdFactory()("thread") as ThreadId;
+}
+
+function createToolRegistry(): InMemoryToolRegistry {
+  const registry = new InMemoryToolRegistry();
+  registry.register(createReadFileTool());
+  registry.register(createEditTool());
+  registry.register(createApplyPatchTool());
+  registry.register(createBashTool());
+  registry.register(createGitDiffTool());
+  return registry;
+}
+
+function createApprovalBroker(options: CliHarnessOptions): PolicyApprovalBroker {
+  if (!options.approvalQueue) {
+    return createCliApprovalBroker(options.yes === undefined ? {} : { yes: options.yes });
+  }
+
+  return new PolicyApprovalBroker({
+    rulesets: [createCliPermissionRules(options.yes ?? false)],
+    ask: async (request) =>
+      options.approvalQueue?.ask(request) ?? { action: "deny", feedback: "Approval queue is unavailable." },
+  });
+}

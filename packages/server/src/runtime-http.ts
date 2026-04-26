@@ -1,0 +1,452 @@
+import type {
+  ChiliEvent,
+  RuntimeInterruptResult,
+  RuntimeApprovalResolveResult,
+  RuntimePromptAccepted,
+  RuntimePromptResult,
+  RuntimeSessionRef,
+  RuntimeTurnResult,
+  SessionId,
+  ThreadId,
+} from "@chili/protocol";
+import type { RuntimeBackgroundErrorHandler, SubmitPromptInput, SubmitPromptResult } from "@chili/core";
+import type { EventPublisher, EventStore } from "@chili/store";
+
+export interface RuntimeHttpService {
+  createSession(input?: { sessionId?: SessionId; threadId?: ThreadId; cwd?: string }): Promise<RuntimeSessionRef>;
+  submitPrompt(input: SubmitPromptInput): Promise<SubmitPromptResult>;
+  submitPromptAsync(input: SubmitPromptInput, onError?: RuntimeBackgroundErrorHandler): void;
+  interrupt(sessionId: SessionId, reason?: string): Promise<boolean>;
+  archiveSession(sessionId: SessionId): Promise<void>;
+}
+
+export interface RuntimeHttpHandlerOptions {
+  service: RuntimeHttpService;
+  store: EventStore & EventPublisher;
+  approvals?: ApprovalResolver;
+  maxBacklogEvents?: number;
+  onBackgroundError?: (error: unknown) => void;
+}
+
+export interface ApprovalResolver {
+  resolve(input: {
+    approvalId: import("@chili/protocol").ApprovalId;
+    decision: "allow_once" | "allow_always" | "deny";
+    feedback?: string;
+  }): boolean | Promise<boolean>;
+}
+
+export interface StartRuntimeHttpServerOptions extends RuntimeHttpHandlerOptions {
+  hostname?: string;
+  port?: number;
+}
+
+export interface RuntimeHttpServer {
+  url: string;
+  close(): void;
+}
+
+export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (request: Request) => Promise<Response> {
+  const maxBacklogEvents = options.maxBacklogEvents ?? 5000;
+
+  return async function runtimeHttpHandler(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const route = routeRequest(request.method, url.pathname);
+
+    try {
+      if (route.name === "health") {
+        return json({ ok: true });
+      }
+
+      if (route.name === "listSessions") {
+        return json(await options.store.sessions());
+      }
+
+      if (route.name === "createSession") {
+        const body = await readJson<CreateSessionBody>(request);
+        const input: { sessionId?: SessionId; threadId?: ThreadId; cwd?: string } = {};
+        if (body.sessionId) input.sessionId = body.sessionId;
+        if (body.threadId) input.threadId = body.threadId;
+        if (body.cwd) input.cwd = body.cwd;
+        return json(await options.service.createSession(input), 201);
+      }
+
+      if (route.name === "messages") {
+        return json(await options.store.messages(route.sessionId));
+      }
+
+      if (route.name === "prompt" || route.name === "promptAsync") {
+        const body = await readJson<PromptBody>(request);
+        if (!body.threadId) throw badRequest("threadId is required");
+        if (!body.text) throw badRequest("text is required");
+        await requireSession(options.store, route.sessionId);
+
+        const input = buildSubmitPromptInput(route.sessionId, body);
+
+        if (route.name === "prompt") {
+          return json(serializeSubmitPromptResult(await options.service.submitPrompt(input)));
+        }
+
+        options.service.submitPromptAsync(input, options.onBackgroundError);
+        const accepted: RuntimePromptAccepted = {
+          status: "accepted",
+          sessionId: route.sessionId,
+          threadId: body.threadId,
+        };
+        return json(accepted, 202);
+      }
+
+      if (route.name === "interrupt") {
+        const body = await readJson<InterruptBody>(request);
+        const result: RuntimeInterruptResult = {
+          interrupted: await options.service.interrupt(route.sessionId, body.reason),
+        };
+        return json(result);
+      }
+
+      if (route.name === "archive") {
+        await options.service.archiveSession(route.sessionId);
+        return new Response(null, { status: 204 });
+      }
+
+      if (route.name === "resolveApproval") {
+        if (!options.approvals) return jsonError(501, "No approval resolver is configured");
+        const body = await readJson<ResolveApprovalBody>(request);
+        if (!body.decision) throw badRequest("decision is required");
+        const resolveInput: {
+          approvalId: import("@chili/protocol").ApprovalId;
+          decision: "allow_once" | "allow_always" | "deny";
+          feedback?: string;
+        } = {
+          approvalId: route.approvalId,
+          decision: body.decision,
+        };
+        if (body.feedback) resolveInput.feedback = body.feedback;
+        const result: RuntimeApprovalResolveResult = {
+          resolved: await options.approvals.resolve(resolveInput),
+        };
+        return json(result);
+      }
+
+      if (route.name === "events") {
+        const streamOptions: EventStreamOptions = {
+          store: options.store,
+          request,
+          maxBacklogEvents,
+        };
+        const sessionId = asSessionId(url.searchParams.get("sessionId"));
+        const threadId = asThreadId(url.searchParams.get("threadId"));
+        const afterEventId = url.searchParams.get("afterEventId");
+        if (sessionId) streamOptions.sessionId = sessionId;
+        if (threadId) streamOptions.threadId = threadId;
+        if (afterEventId) streamOptions.afterEventId = afterEventId;
+        return eventStream(streamOptions);
+      }
+
+      return jsonError(404, "Not found");
+    } catch (error) {
+      const err = toHttpError(error);
+      return jsonError(err.status, err.message);
+    }
+  };
+}
+
+export function startRuntimeHttpServer(options: StartRuntimeHttpServerOptions): RuntimeHttpServer {
+  const server = Bun.serve({
+    hostname: options.hostname ?? "127.0.0.1",
+    port: options.port ?? 0,
+    fetch: createRuntimeHttpHandler(options),
+  });
+
+  return {
+    url: server.url.href,
+    close: () => server.stop(true),
+  };
+}
+
+type Route =
+  | { name: "health" }
+  | { name: "events" }
+  | { name: "listSessions" }
+  | { name: "createSession" }
+  | { name: "messages"; sessionId: SessionId }
+  | { name: "prompt"; sessionId: SessionId }
+  | { name: "promptAsync"; sessionId: SessionId }
+  | { name: "interrupt"; sessionId: SessionId }
+  | { name: "archive"; sessionId: SessionId }
+  | { name: "resolveApproval"; approvalId: import("@chili/protocol").ApprovalId }
+  | { name: "notFound" };
+
+interface CreateSessionBody {
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  cwd?: string;
+}
+
+interface PromptBody {
+  threadId?: ThreadId;
+  text?: string;
+  cwd?: string;
+  maxTurns?: number;
+  system?: string[];
+}
+
+interface InterruptBody {
+  reason?: string;
+}
+
+interface ResolveApprovalBody {
+  decision?: "allow_once" | "allow_always" | "deny";
+  feedback?: string;
+}
+
+interface EventStreamOptions {
+  store: EventStore & EventPublisher;
+  request: Request;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  afterEventId?: string;
+  maxBacklogEvents: number;
+}
+
+interface HttpError {
+  status: number;
+  message: string;
+}
+
+function routeRequest(method: string, pathname: string): Route {
+  const path = pathname.replace(/\/+$/, "") || "/";
+  if (method === "GET" && path === "/health") return { name: "health" };
+  if (method === "GET" && path === "/events") return { name: "events" };
+  if (method === "GET" && path === "/sessions") return { name: "listSessions" };
+  if (method === "POST" && path === "/sessions") return { name: "createSession" };
+
+  const approvalRoute = /^\/approvals\/([^/]+)\/resolve$/.exec(path);
+  if (method === "POST" && approvalRoute) {
+    return {
+      name: "resolveApproval",
+      approvalId: decodeURIComponent(approvalRoute[1] ?? "") as import("@chili/protocol").ApprovalId,
+    };
+  }
+
+  const sessionRoute = /^\/sessions\/([^/]+)\/([^/]+)$/.exec(path);
+  if (!sessionRoute) return { name: "notFound" };
+
+  const sessionId = decodeURIComponent(sessionRoute[1] ?? "") as SessionId;
+  const action = sessionRoute[2];
+  if (method === "GET" && action === "messages") return { name: "messages", sessionId };
+  if (method === "POST" && action === "prompt") return { name: "prompt", sessionId };
+  if (method === "POST" && action === "prompt_async") return { name: "promptAsync", sessionId };
+  if (method === "POST" && action === "interrupt") return { name: "interrupt", sessionId };
+  if (method === "POST" && action === "archive") return { name: "archive", sessionId };
+  return { name: "notFound" };
+}
+
+function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody): SubmitPromptInput {
+  const input: SubmitPromptInput = {
+    sessionId,
+    threadId: body.threadId as ThreadId,
+    text: body.text ?? "",
+  };
+  if (body.cwd) input.cwd = body.cwd;
+  if (body.maxTurns !== undefined) input.maxTurns = body.maxTurns;
+  if (body.system) input.system = body.system;
+  return input;
+}
+
+async function eventStream(options: EventStreamOptions): Promise<Response> {
+  const encoder = new TextEncoder();
+  const sentIds = new Set<string>();
+  const pending: ChiliEvent[] = [];
+  let backlogDone = false;
+  let closed = false;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let unsubscribe: (() => void) | undefined;
+  let closeController: (() => void) | undefined;
+
+  const cleanup = (): void => {
+    if (closed) return;
+    closed = true;
+    unsubscribe?.();
+    unsubscribe = undefined;
+    if (heartbeat) clearInterval(heartbeat);
+    heartbeat = undefined;
+    closeController?.();
+  };
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (event: ChiliEvent): void => {
+        if (closed || sentIds.has(event.id) || !matchesEvent(event, options)) return;
+        sentIds.add(event.id);
+        controller.enqueue(encoder.encode(formatSse(event)));
+      };
+
+      unsubscribe = options.store.subscribe((event) => {
+        if (backlogDone) {
+          send(event);
+        } else {
+          pending.push(event);
+        }
+      });
+
+      closeController = (): void => {
+        try {
+          controller.close();
+        } catch {
+          // The client may have closed first.
+        }
+      };
+
+      options.request.signal.addEventListener("abort", cleanup, { once: true });
+      heartbeat = setInterval(() => {
+        if (!closed) controller.enqueue(encoder.encode(": heartbeat\n\n"));
+      }, 15_000);
+
+      const query = {
+        limit: options.maxBacklogEvents,
+      } as {
+        sessionId?: SessionId;
+        threadId?: ThreadId;
+        afterEventId?: string;
+        limit: number;
+      };
+      if (options.sessionId) query.sessionId = options.sessionId;
+      if (options.threadId) query.threadId = options.threadId;
+      if (options.afterEventId) query.afterEventId = options.afterEventId;
+      const backlog = await options.store.events(query);
+      for (const event of backlog) send(event as ChiliEvent);
+      backlogDone = true;
+      for (const event of pending.splice(0)) send(event);
+    },
+    cancel() {
+      cleanup();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+      "content-type": "text/event-stream; charset=utf-8",
+      "x-accel-buffering": "no",
+    },
+  });
+}
+
+function matchesEvent(event: ChiliEvent, options: EventStreamOptions): boolean {
+  if (options.sessionId && event.sessionId !== options.sessionId) return false;
+  if (options.threadId && event.threadId !== options.threadId) return false;
+  return true;
+}
+
+function formatSse(event: ChiliEvent): string {
+  return [`id: ${event.id}`, "event: chili.event", `data: ${JSON.stringify(event)}`, "", ""].join("\n");
+}
+
+function serializeSubmitPromptResult(result: SubmitPromptResult): RuntimePromptResult {
+  const turns = result.turns.map(serializeTurnResult);
+  if (result.status === "completed") {
+    const completed: Extract<RuntimePromptResult, { status: "completed" }> = { status: "completed", turns };
+    if (result.finishReason) completed.finishReason = result.finishReason;
+    return completed;
+  }
+
+  const failed: Extract<RuntimePromptResult, { status: "failed" | "cancelled" | "max_turns" }> = {
+    status: result.status,
+    turns,
+  };
+  if (result.error) failed.error = serializeError(result.error);
+  if (result.finishReason) failed.finishReason = result.finishReason;
+  return failed;
+}
+
+function serializeTurnResult(result: SubmitPromptResult["turns"][number]): RuntimeTurnResult {
+  if (result.status === "completed") {
+    const completed: Extract<RuntimeTurnResult, { status: "completed" }> = {
+      status: "completed",
+      turnId: result.turnId,
+      assistantMessageId: result.assistantMessageId,
+    };
+    if (result.finishReason) completed.finishReason = result.finishReason;
+    return completed;
+  }
+
+  const failed: Extract<RuntimeTurnResult, { status: "failed" | "cancelled" }> = {
+    status: result.status,
+    turnId: result.turnId,
+    error: serializeError(result.error),
+  };
+  if (result.assistantMessageId) failed.assistantMessageId = result.assistantMessageId;
+  return failed;
+}
+
+function serializeError(error: Error): { name: string; message: string } {
+  return {
+    name: error.name || "Error",
+    message: error.message,
+  };
+}
+
+async function requireSession(store: EventStore, sessionId: SessionId): Promise<void> {
+  const sessions = await store.sessions();
+  if (!sessions.some((session) => session.id === sessionId)) {
+    throw notFound(`Session not found: ${sessionId}`);
+  }
+}
+
+async function readJson<T>(request: Request): Promise<T> {
+  if (request.headers.get("content-length") === "0") return {} as T;
+  try {
+    return (await request.json()) as T;
+  } catch {
+    return {} as T;
+  }
+}
+
+function json(value: unknown, status = 200): Response {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+function jsonError(status: number, message: string): Response {
+  return json({ error: { message } }, status);
+}
+
+function badRequest(message: string): HttpError {
+  return { status: 400, message };
+}
+
+function notFound(message: string): HttpError {
+  return { status: 404, message };
+}
+
+function toHttpError(error: unknown): HttpError {
+  if (isHttpError(error)) return error;
+  const err = error instanceof Error ? error : new Error(String(error));
+  if (err.name === "RuntimeBusyError") {
+    return { status: 409, message: err.message };
+  }
+  return { status: 500, message: err.message };
+}
+
+function isHttpError(error: unknown): error is HttpError {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "status" in error &&
+    typeof (error as { status: unknown }).status === "number" &&
+    "message" in error &&
+    typeof (error as { message: unknown }).message === "string"
+  );
+}
+
+function asSessionId(value: string | null): SessionId | undefined {
+  return value ? (value as SessionId) : undefined;
+}
+
+function asThreadId(value: string | null): ThreadId | undefined {
+  return value ? (value as ThreadId) : undefined;
+}
