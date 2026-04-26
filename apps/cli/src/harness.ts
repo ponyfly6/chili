@@ -23,8 +23,12 @@ import {
   createCompleteTaskTool,
   createEditTool,
   createGitDiffTool,
+  createGlobTool,
+  createGrepTool,
   createReadFileTool,
   createTaskTool,
+  createToolSearchTool,
+  createWriteFileTool,
 } from "@chili/tools";
 import { createCliApprovalBroker, createCliPermissionRules } from "./approval.js";
 import { createIdFactory } from "./id.js";
@@ -219,17 +223,24 @@ export function newThreadId(): ThreadId {
 function createToolRegistry(): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool());
+  registry.register(createGlobTool());
+  registry.register(createGrepTool());
   registry.register(createEditTool());
+  registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());
   registry.register(createBashTool());
   registry.register(createGitDiffTool());
+  registry.register(createToolSearchTool(registry));
   return registry;
 }
 
 function createChildToolRegistry(): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool());
+  registry.register(createGlobTool());
+  registry.register(createGrepTool());
   registry.register(createGitDiffTool());
+  registry.register(createToolSearchTool(registry));
   return registry;
 }
 

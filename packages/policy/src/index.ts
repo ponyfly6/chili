@@ -4,6 +4,7 @@ export interface PermissionRule {
   permission: string;
   pattern: string;
   action: PermissionAction;
+  source?: string;
 }
 
 export interface PolicyDecision {
@@ -21,8 +22,7 @@ export function evaluatePolicy(
   for (let index = rules.length - 1; index >= 0; index -= 1) {
     const rule = rules[index];
     if (!rule) continue;
-    if (!matches(rule.permission, permission)) continue;
-    if (!matches(rule.pattern, pattern)) continue;
+    if (!matchesRule(rule, permission, pattern)) continue;
     return { action: rule.action, matchedRule: rule };
   }
 
@@ -49,4 +49,29 @@ export function matches(pattern: string, value: string): boolean {
     .map((part) => part.replace(/[|\\{}()[\]^$+?.]/g, "\\$&"))
     .join(".*");
   return new RegExp(`^${escaped}$`).test(value);
+}
+
+export function parsePermissionSpec(spec: string): { permission: string; content?: string } {
+  const trimmed = spec.trim();
+  const open = trimmed.indexOf("(");
+  if (open < 0 || !trimmed.endsWith(")")) return { permission: trimmed };
+  const permission = trimmed.slice(0, open).trim();
+  const content = trimmed.slice(open + 1, -1);
+  if (!permission) return { permission: trimmed };
+  return { permission, content: unescapePermissionContent(content) };
+}
+
+function matchesRule(rule: PermissionRule, permission: string, pattern: string): boolean {
+  const parsed = parsePermissionSpec(rule.permission);
+  if (!matchesPermission(parsed.permission, permission)) return false;
+  if (parsed.content !== undefined && !matches(parsed.content, pattern)) return false;
+  return matches(rule.pattern, pattern);
+}
+
+function matchesPermission(pattern: string, value: string): boolean {
+  return matches(pattern.toLowerCase(), value.toLowerCase());
+}
+
+function unescapePermissionContent(content: string): string {
+  return content.replaceAll("\\(", "(").replaceAll("\\)", ")");
 }

@@ -7,15 +7,18 @@ import type {
   ThreadId,
   TimestampMs,
   ToolCallId,
-  ToolExecutionContext,
   ToolMetadataUpdate,
   ToolResult,
   TurnId,
 } from "@chili/protocol";
 import { timestampNow } from "@chili/protocol";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { ToolDeniedError, ToolValidationError, UnknownToolError, isAbortError, toError } from "./errors.js";
+import { FileReadStateStore } from "./file-read-state.js";
 import type {
   ChiliToolDefinition,
+  ChiliToolExecutionContext,
   ExecuteToolInput,
   ExecuteToolResult,
   SnapshotRecord,
@@ -24,7 +27,11 @@ import type {
 } from "./types.js";
 
 export class ToolExecutor {
-  constructor(private readonly options: ToolExecutorOptions) {}
+  private readonly fileReads: FileReadStateStore;
+
+  constructor(private readonly options: ToolExecutorOptions) {
+    this.fileReads = options.fileReadState ?? new FileReadStateStore();
+  }
 
   async execute(input: ExecuteToolInput): Promise<ExecuteToolResult> {
     const callId = input.callId ?? this.id<ToolCallId>("toolcall");
@@ -54,7 +61,7 @@ export class ToolExecutor {
 
       await this.update(input, callId, "running");
       const rawResult = await tool.execute(validated, this.context(tool, input, callId));
-      const result = this.truncateResult(rawResult);
+      const result = await this.processResult(tool, input, callId, rawResult);
 
       await this.publish("tool.call_finished", input, {
         callId,
@@ -69,6 +76,14 @@ export class ToolExecutor {
       }
       return this.fail(input, callId, toError(error));
     }
+  }
+
+  async canRunConcurrently(toolName: string, input: unknown): Promise<boolean> {
+    const tool = this.options.registry.get(toolName);
+    if (!tool) return false;
+    const explicit = await this.resolvePredicate(tool.isConcurrencySafe, input);
+    if (explicit !== undefined) return explicit;
+    return (await this.resolvePredicate(tool.isReadOnly, input)) ?? false;
   }
 
   private async validate<Input>(tool: ChiliToolDefinition<Input>, input: unknown): Promise<Input> {
@@ -144,24 +159,33 @@ export class ToolExecutor {
     return snapshot;
   }
 
-  private truncateResult(result: ToolResult): ToolResult {
-    const maxBytes = this.options.maxResultOutputBytes ?? 256_000;
+  private async processResult(
+    tool: ChiliToolDefinition,
+    input: ExecuteToolInput,
+    callId: ToolCallId,
+    result: ToolResult,
+  ): Promise<ToolResult> {
+    const maxBytes = tool.maxResultOutputBytes ?? this.options.maxResultOutputBytes ?? 256_000;
+    if (maxBytes === Infinity) return result;
     const truncated = truncateUtf8(result.output, maxBytes);
     if (!truncated.truncated) return result;
 
+    const persisted = await this.persistLargeOutput(input.cwd, callId, result.output);
+
     return {
       ...result,
-      output: `${truncated.text}\n[tool output truncated after ${maxBytes} bytes]`,
+      output: `${truncated.text}\n[tool output truncated after ${maxBytes} bytes; full output saved to ${persisted.relativePath}]`,
       metadata: {
         ...result.metadata,
         outputTruncated: true,
         outputBytes: truncated.bytes,
         outputLimitBytes: maxBytes,
+        outputPath: persisted.relativePath,
       },
     };
   }
 
-  private context(tool: ChiliToolDefinition, input: ExecuteToolInput, callId: ToolCallId): ToolExecutionContext {
+  private context(tool: ChiliToolDefinition, input: ExecuteToolInput, callId: ToolCallId): ChiliToolExecutionContext {
     return {
       sessionId: input.sessionId,
       ...(input.threadId ? { threadId: input.threadId } : {}),
@@ -169,6 +193,7 @@ export class ToolExecutor {
       callId,
       signal: input.signal ?? new AbortController().signal,
       cwd: input.cwd,
+      fileReads: this.fileReads,
       metadata: (update) => this.metadata(input, callId, update),
       requestApproval: (request) =>
         this.requestApproval(input, callId, tool, {
@@ -276,6 +301,27 @@ export class ToolExecutor {
 
   private now(): TimestampMs {
     return this.options.now ? this.options.now() : timestampNow();
+  }
+
+  private async resolvePredicate<Input>(
+    predicate: ChiliToolDefinition<Input>["isConcurrencySafe"],
+    input: unknown,
+  ): Promise<boolean | undefined> {
+    if (predicate === undefined) return undefined;
+    if (typeof predicate === "boolean") return predicate;
+    return predicate(input as Input);
+  }
+
+  private async persistLargeOutput(
+    cwd: string,
+    callId: ToolCallId,
+    output: string,
+  ): Promise<{ relativePath: string; absolutePath: string }> {
+    const relativePath = join(".chili", "tool-results", `${callId}.txt`);
+    const absolutePath = join(cwd, relativePath);
+    await mkdir(join(cwd, ".chili", "tool-results"), { recursive: true });
+    await writeFile(absolutePath, output, "utf8");
+    return { relativePath, absolutePath };
   }
 }
 

@@ -12,7 +12,11 @@ import {
   createBashTool,
   createEditTool,
   createGitDiffTool,
+  createGlobTool,
+  createGrepTool,
   createReadFileTool,
+  createToolSearchTool,
+  createWriteFileTool,
 } from "../packages/tools/src/index.js";
 
 function idFactory(): (prefix: string) => string {
@@ -23,10 +27,14 @@ function idFactory(): (prefix: string) => string {
 function registerTools(): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool());
+  registry.register(createGlobTool());
+  registry.register(createGrepTool());
   registry.register(createEditTool());
+  registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());
   registry.register(createBashTool());
   registry.register(createGitDiffTool());
+  registry.register(createToolSearchTool(registry));
   return registry;
 }
 
@@ -81,6 +89,7 @@ async function smokeSingleAgentToolLoop(workspace: string): Promise<void> {
   const harness = createHarness(workspace, {
     stream: async function* () {
       yield { type: "text_delta", text: "editing" } as const;
+      yield { type: "tool_call", name: "read", input: { filePath: "a.txt" } } as const;
       yield {
         type: "tool_call",
         name: "replace",
@@ -189,6 +198,11 @@ async function smokeSnapshotRevert(workspace: string): Promise<void> {
     stream: async function* () {
       yield {
         type: "tool_call",
+        name: "read",
+        input: { filePath: "snap.txt" },
+      } as const;
+      yield {
+        type: "tool_call",
         name: "edit",
         input: { filePath: "snap.txt", oldString: "before", newString: "after" },
       } as const;
@@ -244,7 +258,14 @@ async function smokeContextAndOutputTruncation(workspace: string): Promise<void>
   const createId = idFactory();
   const store = new SqliteEventStore(join(workspace, `${globalThis.crypto.randomUUID()}.sqlite`));
   const registry = new InMemoryToolRegistry();
-  registry.register(createReadFileTool());
+  registry.register({
+    name: "large_output",
+    description: "Emit a large output.",
+    risk: "read",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => ({ title: "large", output: "12345678901234567890" }),
+  });
   const executor = new ToolExecutor({
     registry,
     events: { publish: (event) => store.append(event) },
@@ -273,13 +294,12 @@ async function smokeContextAndOutputTruncation(workspace: string): Promise<void>
   assert.equal(result.status, "completed");
   assert.ok((await store.events({ sessionId, type: "turn.compaction_requested", limit: 10 })).length >= 1);
 
-  await writeFile(join(workspace, "big.txt"), "12345678901234567890", "utf8");
   const toolResult = await executor.execute({
     sessionId,
     threadId: "thread_6" as never,
     turnId: "turn_tool" as never,
-    toolName: "read",
-    input: { filePath: "big.txt" },
+    toolName: "large_output",
+    input: {},
     cwd: workspace,
   });
   assert.equal(toolResult.status, "completed");
