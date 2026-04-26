@@ -4,6 +4,10 @@ import type {
   AgentMailboxRow,
   AgentRunQuery,
   AgentRunRow,
+  AgentTaskCloseCasInput,
+  AgentTaskCompleteCasInput,
+  AgentTaskFinalizationResult,
+  AgentTaskFinalizationStore,
   AgentTaskLeaseClaimInput,
   AgentTaskLeaseReleaseInput,
   AgentTaskLeaseRenewInput,
@@ -18,7 +22,7 @@ import type {
   SubagentProjectionStore,
 } from "@chili/store";
 
-export class PrintingEventStore implements EventStore, SubagentProjectionStore, AgentTaskLeaseStore {
+export class PrintingEventStore implements EventStore, SubagentProjectionStore, AgentTaskLeaseStore, AgentTaskFinalizationStore {
   constructor(private readonly inner: EventStore, private readonly printer: CliPrinter) {}
 
   async append(event: ChiliEvent): Promise<void> {
@@ -75,6 +79,20 @@ export class PrintingEventStore implements EventStore, SubagentProjectionStore, 
     return this.leaseStore()?.releaseAgentTaskLease(input) ?? Promise.resolve(false);
   }
 
+  async completeAgentTaskCas(input: AgentTaskCompleteCasInput): Promise<AgentTaskFinalizationResult> {
+    const result = await (this.finalizationStore()?.completeAgentTaskCas(input) ??
+      Promise.resolve({ applied: false, events: [] }));
+    for (const event of result.events) this.printer.event(event);
+    return result;
+  }
+
+  async closeAgentTaskCas(input: AgentTaskCloseCasInput): Promise<AgentTaskFinalizationResult> {
+    const result = await (this.finalizationStore()?.closeAgentTaskCas(input) ??
+      Promise.resolve({ applied: false, events: [] }));
+    for (const event of result.events) this.printer.event(event);
+    return result;
+  }
+
   private subagentStore(): SubagentProjectionStore | undefined {
     const inner = this.inner as EventStore & Partial<SubagentProjectionStore>;
     if (inner.agentTasks && inner.agentTask && inner.agentRuns && inner.agentMailbox) {
@@ -87,6 +105,14 @@ export class PrintingEventStore implements EventStore, SubagentProjectionStore, 
     const inner = this.inner as EventStore & Partial<AgentTaskLeaseStore>;
     if (inner.claimAgentTaskLease && inner.renewAgentTaskLease && inner.releaseAgentTaskLease) {
       return inner as EventStore & AgentTaskLeaseStore;
+    }
+    return undefined;
+  }
+
+  private finalizationStore(): AgentTaskFinalizationStore | undefined {
+    const inner = this.inner as EventStore & Partial<AgentTaskFinalizationStore>;
+    if (inner.completeAgentTaskCas && inner.closeAgentTaskCas) {
+      return inner as EventStore & AgentTaskFinalizationStore;
     }
     return undefined;
   }

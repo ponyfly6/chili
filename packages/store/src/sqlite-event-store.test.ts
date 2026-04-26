@@ -14,6 +14,7 @@ import type {
   ThreadId,
   TimestampMs,
 } from "@chili/protocol";
+import { ObservableEventStore } from "./observable-event-store.js";
 import { SqliteEventStore } from "./sqlite-event-store.js";
 
 test("orders event replay and afterEventId cursors by insertion sequence", async () => {
@@ -481,6 +482,134 @@ test("claims, renews, expires, and releases task leases with generation CAS", as
     expect((await store.agentTask(taskId))?.leaseExpiresAt).toBeUndefined();
   } finally {
     store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("finalizes agent tasks through SQLite CAS without leaking stale events", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-task-final-cas-"));
+  const mirrored: ChiliEvent[] = [];
+  const store = new SqliteEventStore(join(dir, "events.sqlite"), {
+    mirror: {
+      async write(event) {
+        mirrored.push(event);
+      },
+    },
+  });
+  const taskId = "task_final_cas" as TaskId;
+  const runId = "agent_final_cas" as AgentRunId;
+  const path = "/root/task_final_cas" as AgentPath;
+
+  try {
+    await appendRunningTask(store, { taskId, runId, path, generation: 1, time: 1 as TimestampMs });
+    await store.claimAgentTaskLease({ taskId, owner: "worker_a", ttlMs: 100, now: 10 });
+
+    const completed = await store.completeAgentTaskCas({
+      taskId,
+      path,
+      runId,
+      generation: 2,
+      owner: "worker_a",
+      status: "completed",
+      summary: "done",
+      eventId: "event_cas_task_completed",
+      agentEventId: "event_cas_agent_completed",
+      sessionId: "session_parent" as SessionId,
+      threadId: "thread_parent" as ThreadId,
+      time: 20,
+    });
+
+    expect(completed.applied).toBe(true);
+    expect(completed.events.map((event) => event.id)).toEqual(["event_cas_task_completed", "event_cas_agent_completed"]);
+    expect(mirrored.map((event) => event.id)).toEqual([
+      "event_task_created_task_final_cas",
+      "event_spawned_task_final_cas",
+      "event_cas_task_completed",
+      "event_cas_agent_completed",
+    ]);
+    expect(await store.agentTask(taskId)).toMatchObject({
+      id: taskId,
+      status: "completed",
+      generation: 2,
+      summary: "done",
+    });
+    expect((await store.agentTask(taskId))?.leaseOwner).toBeUndefined();
+
+    const stale = await store.completeAgentTaskCas({
+      taskId,
+      path,
+      runId,
+      generation: 2,
+      owner: "worker_a",
+      status: "failed",
+      error: "late failure",
+      eventId: "event_late_cas_task_completed",
+      agentEventId: "event_late_cas_agent_completed",
+      time: 21,
+    });
+    expect(stale.applied).toBe(false);
+    expect(stale.events).toEqual([]);
+    expect((await store.events({ type: "agent.task_completed", limit: 10 })).map((event) => event.id)).toEqual([
+      "event_cas_task_completed",
+    ]);
+    expect(mirrored.map((event) => event.id)).not.toContain("event_late_cas_task_completed");
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("close task CAS wins over runner completion CAS and Observable only emits committed events", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-task-close-cas-"));
+  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
+  const store = new ObservableEventStore(baseStore);
+  const emitted: ChiliEvent[] = [];
+  const unsubscribe = store.subscribe((event) => emitted.push(event));
+  const taskId = "task_close_cas" as TaskId;
+  const runId = "agent_close_cas" as AgentRunId;
+  const path = "/root/task_close_cas" as AgentPath;
+
+  try {
+    await appendRunningTask(baseStore, { taskId, runId, path, generation: 1, time: 1 as TimestampMs });
+    await baseStore.claimAgentTaskLease({ taskId, owner: "worker_a", ttlMs: 100, now: 10 });
+
+    const closed = await store.closeAgentTaskCas({
+      taskId,
+      status: "cancelled",
+      summary: "stopped",
+      eventId: "event_close_cas_task",
+      agentEventId: "event_close_cas_agent",
+      time: 20,
+    });
+    expect(closed.applied).toBe(true);
+    expect(emitted.map((event) => event.id)).toEqual(["event_close_cas_task", "event_close_cas_agent"]);
+    expect(await baseStore.agentTask(taskId)).toMatchObject({
+      id: taskId,
+      status: "cancelled",
+      generation: 3,
+      summary: "stopped",
+    });
+
+    const late = await store.completeAgentTaskCas({
+      taskId,
+      path,
+      runId,
+      generation: 2,
+      owner: "worker_a",
+      status: "completed",
+      summary: "late",
+      eventId: "event_late_complete_cas_task",
+      agentEventId: "event_late_complete_cas_agent",
+      time: 21,
+    });
+    expect(late.applied).toBe(false);
+    expect(emitted.map((event) => event.id)).toEqual(["event_close_cas_task", "event_close_cas_agent"]);
+    expect((await baseStore.events({ type: "agent.task_completed", limit: 10 })).map((event) => event.id)).toEqual([
+      "event_close_cas_task",
+    ]);
+  } finally {
+    unsubscribe();
+    baseStore.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

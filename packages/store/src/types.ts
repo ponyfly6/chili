@@ -1,5 +1,6 @@
 import type {
   AgentPath,
+  AgentRunId,
   AgentMailboxPayload,
   AgentMailboxStatus,
   AgentTaskMode,
@@ -175,6 +176,42 @@ export interface AgentTaskLeaseResult {
   task?: AgentTaskRow;
 }
 
+export type AgentTaskFinalStatus = Exclude<AgentTaskStatus, "pending" | "running">;
+
+export interface AgentTaskCompleteCasInput {
+  taskId: TaskId;
+  path: AgentPath;
+  status: AgentTaskFinalStatus;
+  eventId: string;
+  runId?: AgentRunId;
+  generation?: number;
+  owner?: string;
+  summary?: string;
+  error?: string;
+  agentEventId?: string;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  time?: number;
+}
+
+export interface AgentTaskCloseCasInput {
+  taskId: TaskId;
+  status: AgentTaskFinalStatus;
+  eventId: string;
+  summary?: string;
+  error?: string;
+  agentEventId?: string;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  time?: number;
+}
+
+export interface AgentTaskFinalizationResult {
+  applied: boolean;
+  task?: AgentTaskRow;
+  events: ChiliEvent[];
+}
+
 export interface EventStore {
   append(event: ChiliEvent): Promise<void>;
   appendMany(events: readonly ChiliEvent[]): Promise<void>;
@@ -195,6 +232,11 @@ export interface AgentTaskLeaseStore {
   claimAgentTaskLease(input: AgentTaskLeaseClaimInput): Promise<AgentTaskLeaseResult>;
   renewAgentTaskLease(input: AgentTaskLeaseRenewInput): Promise<AgentTaskLeaseResult>;
   releaseAgentTaskLease(input: AgentTaskLeaseReleaseInput): Promise<boolean>;
+}
+
+export interface AgentTaskFinalizationStore {
+  completeAgentTaskCas(input: AgentTaskCompleteCasInput): Promise<AgentTaskFinalizationResult>;
+  closeAgentTaskCas(input: AgentTaskCloseCasInput): Promise<AgentTaskFinalizationResult>;
 }
 
 export interface EventMirror {

@@ -12,7 +12,13 @@ import type {
   TimestampMs,
 } from "@chili/protocol";
 import { ROOT_AGENT_PATH, timestampNow } from "@chili/protocol";
-import type { AgentTaskQuery, AgentTaskRow, EventStore, SubagentProjectionStore } from "@chili/store";
+import type {
+  AgentTaskFinalizationStore,
+  AgentTaskQuery,
+  AgentTaskRow,
+  EventStore,
+  SubagentProjectionStore,
+} from "@chili/store";
 import type { CompleteTaskToolInput, SubagentTaskCompletion } from "@chili/tools";
 import type { SubmitPromptInput, SubmitPromptResult } from "./runtime-service.js";
 
@@ -24,7 +30,7 @@ export interface AgentTaskPromptRuntime {
 }
 
 export interface AgentTaskControlServiceOptions {
-  store: EventStore & SubagentProjectionStore;
+  store: EventStore & SubagentProjectionStore & Partial<AgentTaskFinalizationStore>;
   runtime: AgentTaskPromptRuntime;
   interruptTask?: (taskId: TaskId) => boolean | Promise<boolean>;
   createId?: (prefix: string) => string;
@@ -135,8 +141,7 @@ export class AgentTaskControlService {
       const result = await this.options.runtime.submitPrompt(this.submitPromptInput(task, input, activeRun.controller.signal));
       await this.consumeTaskFollowup(task, messageId);
       if (await this.shouldCompleteRun(task.id, runId, activeRun)) {
-        activeRun.completed = true;
-        await this.completeFollowupRun(task, runId, generation, result);
+        activeRun.completed = await this.completeFollowupRun(task, runId, generation, result);
       }
 
       return {
@@ -147,9 +152,7 @@ export class AgentTaskControlService {
       if (await this.shouldCompleteRun(task.id, runId, activeRun)) {
         const err = toError(error);
         const status: AgentTaskFinalStatus = isAbortError(err) ? "cancelled" : "failed";
-        activeRun.completed = true;
-        await this.appendTaskCompletion(task, status, runId, activeRun.generation, undefined, err.message);
-        await this.appendAgentCompletion(task, status, runId, activeRun.generation, undefined, err.message);
+        activeRun.completed = await this.completeTaskFinal(task, status, runId, activeRun.generation, undefined, err.message);
       }
       throw error;
     } finally {
@@ -167,9 +170,11 @@ export class AgentTaskControlService {
     }
 
     const status = input.status ?? "completed";
+    const applied = await this.completeTaskFinal(activeRun.task, status, activeRun.runId, activeRun.generation, input.summary);
+    if (!applied) {
+      throw new AgentTaskNotRunnableError(input.taskId as TaskId, `Active follow-up run lost task ownership: ${input.taskId}`);
+    }
     activeRun.completed = true;
-    await this.appendTaskCompletion(activeRun.task, status, activeRun.runId, activeRun.generation, input.summary);
-    await this.appendAgentCompletion(activeRun.task, status, activeRun.runId, activeRun.generation, input.summary);
     activeRun.controller.abort();
     return {
       taskId: input.taskId,
@@ -211,24 +216,7 @@ export class AgentTaskControlService {
       }
     }
 
-    const closeGeneration = task.generation + 1;
-    await this.appendTaskCompletion(
-      task,
-      status,
-      task.currentRunId as AgentRunId | undefined,
-      closeGeneration,
-      input.summary,
-      input.error,
-    );
-    await this.appendAgentCompletion(
-      task,
-      status,
-      task.currentRunId as AgentRunId | undefined,
-      closeGeneration,
-      input.summary,
-      input.error,
-    );
-    return this.requireTask(input.taskId);
+    return (await this.closeTaskFinal(task, status, input.summary, input.error)) ?? this.requireTask(input.taskId);
   }
 
   async reconcileStaleTasks(input: AgentTaskReconcileStaleInput = {}): Promise<AgentTaskReconcileStaleResult> {
@@ -344,12 +332,11 @@ export class AgentTaskControlService {
     runId: AgentRunId,
     generation: number,
     result: SubmitPromptResult,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const status = promptResultToTaskStatus(result);
     const summary = result.status === "completed" ? await this.latestAssistantText(task.childSessionId) : undefined;
     const error = result.status === "completed" ? undefined : result.error?.message ?? result.finishReason;
-    await this.appendTaskCompletion(task, status, runId, generation, summary, error);
-    await this.appendAgentCompletion(task, status, runId, generation, summary, error);
+    return this.completeTaskFinal(task, status, runId, generation, summary, error);
   }
 
   private async shouldCompleteRun(taskId: TaskId, runId: AgentRunId, activeRun: ActiveTaskRun): Promise<boolean> {
@@ -378,6 +365,78 @@ export class AgentTaskControlService {
       summary,
       error,
     });
+  }
+
+  private async completeTaskFinal(
+    task: AgentTaskRow,
+    status: AgentTaskFinalStatus,
+    runId?: AgentRunId,
+    generation?: number,
+    summary?: string,
+    error?: string,
+  ): Promise<boolean> {
+    const store = this.finalizationStore();
+    if (store) {
+      const input: Parameters<AgentTaskFinalizationStore["completeAgentTaskCas"]>[0] = {
+        taskId: task.id,
+        path: task.path,
+        status,
+        eventId: this.id("event"),
+      };
+      if (runId) input.runId = runId;
+      if (generation !== undefined) input.generation = generation;
+      if (summary) input.summary = summary;
+      if (error) input.error = error;
+      if (runId) input.agentEventId = this.id("event");
+      const sessionId = task.parentSessionId ?? task.childSessionId;
+      if (sessionId) input.sessionId = sessionId;
+      if (task.parentThreadId) input.threadId = task.parentThreadId;
+      input.time = this.now();
+      const result = await store.completeAgentTaskCas(input);
+      return result.applied;
+    }
+
+    await this.appendTaskCompletion(task, status, runId, generation, summary, error);
+    await this.appendAgentCompletion(task, status, runId, generation, summary, error);
+    return true;
+  }
+
+  private async closeTaskFinal(
+    task: AgentTaskRow,
+    status: AgentTaskFinalStatus,
+    summary?: string,
+    error?: string,
+  ): Promise<AgentTaskRow | undefined> {
+    const store = this.finalizationStore();
+    if (store) {
+      const input: Parameters<AgentTaskFinalizationStore["closeAgentTaskCas"]>[0] = {
+        taskId: task.id,
+        status,
+        eventId: this.id("event"),
+      };
+      if (summary) input.summary = summary;
+      if (error) input.error = error;
+      if (task.currentRunId) input.agentEventId = this.id("event");
+      const sessionId = task.parentSessionId ?? task.childSessionId;
+      if (sessionId) input.sessionId = sessionId;
+      if (task.parentThreadId) input.threadId = task.parentThreadId;
+      input.time = this.now();
+      const result = await store.closeAgentTaskCas(input);
+      return result.task;
+    }
+
+    const closeGeneration = task.generation + 1;
+    await this.appendTaskCompletion(task, status, task.currentRunId as AgentRunId | undefined, closeGeneration, summary, error);
+    await this.appendAgentCompletion(task, status, task.currentRunId as AgentRunId | undefined, closeGeneration, summary, error);
+    return this.requireTask(task.id);
+  }
+
+  private finalizationStore(): AgentTaskFinalizationStore | undefined {
+    const store = this.options.store;
+    if (store.completeAgentTaskCas && store.closeAgentTaskCas) {
+      return store as EventStore & SubagentProjectionStore & AgentTaskFinalizationStore;
+    }
+    return undefined;
   }
 
   private async appendAgentCompletion(

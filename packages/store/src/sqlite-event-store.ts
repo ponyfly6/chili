@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import type {
   AgentCompleteTaskPayload,
+  AgentCompletedPayload,
   AgentEvent,
   ApprovalEvent,
   ChiliEvent,
@@ -23,6 +24,10 @@ import { SQLITE_SCHEMA } from "./schema.js";
 import type {
   AgentMailboxQuery,
   AgentMailboxRow,
+  AgentTaskCloseCasInput,
+  AgentTaskCompleteCasInput,
+  AgentTaskFinalizationResult,
+  AgentTaskFinalizationStore,
   AgentTaskLeaseClaimInput,
   AgentTaskLeaseReleaseInput,
   AgentTaskLeaseRenewInput,
@@ -93,6 +98,11 @@ interface AgentTaskStateRow {
   status: string;
   generation: number;
   current_run_id: string | null;
+  lease_owner: string | null;
+  path: string;
+  parent_session_id: string | null;
+  parent_thread_id: string | null;
+  child_session_id: string | null;
 }
 
 interface AgentRunProjectionRow {
@@ -134,7 +144,7 @@ export interface SqliteEventStoreOptions {
   onMirrorError?: (error: unknown, event: ChiliEvent) => void;
 }
 
-export class SqliteEventStore implements EventStore, SubagentProjectionStore, AgentTaskLeaseStore {
+export class SqliteEventStore implements EventStore, SubagentProjectionStore, AgentTaskLeaseStore, AgentTaskFinalizationStore {
   private readonly db: Database;
 
   constructor(path = ".chili/chili.sqlite", private readonly options: SqliteEventStoreOptions = {}) {
@@ -484,14 +494,102 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore, Ag
     return result.changes > 0;
   }
 
+  async completeAgentTaskCas(input: AgentTaskCompleteCasInput): Promise<AgentTaskFinalizationResult> {
+    const result = this.db.transaction((item: AgentTaskCompleteCasInput) => {
+      const current = this.agentTaskState(item.taskId);
+      if (!current || isFinalTaskStatus(current.status)) return { applied: false, events: [] as ChiliEvent[] };
+
+      const generation = normalizedGeneration(item.generation) ?? current.generation;
+      const now = item.time ?? Date.now();
+      const cas = this.db
+        .query(
+          `update agent_tasks
+           set updated_at = updated_at
+           where id = $taskId
+             and status = 'running'
+             and ($runId is null or current_run_id is null or current_run_id = $runId)
+             and generation = $generation
+             and ($owner is null or (lease_owner = $owner and lease_expires_at > $now))`,
+        )
+        .run({
+          taskId: item.taskId,
+          runId: item.runId ?? null,
+          generation,
+          owner: item.owner ?? null,
+          now,
+        });
+      if (cas.changes === 0) return { applied: false, events: [] as ChiliEvent[] };
+
+      const event = this.taskCompletedEvent(item, current, generation);
+      const events: ChiliEvent[] = [event];
+      if (item.runId && item.agentEventId) events.push(this.agentCompletedEvent(item, current, generation));
+      this.writeTransactionEvents(events);
+      return { applied: true, events };
+    })(input);
+
+    await this.writeMirrors(result.events);
+    const task = await this.agentTask(input.taskId);
+    return { ...result, ...(task ? { task } : {}) };
+  }
+
+  async closeAgentTaskCas(input: AgentTaskCloseCasInput): Promise<AgentTaskFinalizationResult> {
+    const result = this.db.transaction((item: AgentTaskCloseCasInput) => {
+      const current = this.agentTaskState(item.taskId);
+      if (!current) return { applied: false, events: [] as ChiliEvent[] };
+      if (isFinalTaskStatus(current.status)) return { applied: false, events: [] as ChiliEvent[] };
+
+      const cas = this.db
+        .query(
+          `update agent_tasks
+           set updated_at = updated_at
+           where id = $taskId
+             and status not in ('completed', 'failed', 'cancelled')`,
+        )
+        .run({ taskId: item.taskId });
+      if (cas.changes === 0) return { applied: false, events: [] as ChiliEvent[] };
+
+      const generation = current.generation + 1;
+      const completionInput: AgentTaskCompleteCasInput = {
+        taskId: item.taskId,
+        path: current.path as AgentPath,
+        status: item.status,
+        eventId: item.eventId,
+        generation,
+      };
+      if (current.current_run_id) completionInput.runId = current.current_run_id as NonNullable<AgentTaskCompleteCasInput["runId"]>;
+      if (item.summary) completionInput.summary = item.summary;
+      if (item.error) completionInput.error = item.error;
+      if (item.agentEventId) completionInput.agentEventId = item.agentEventId;
+      if (item.sessionId) completionInput.sessionId = item.sessionId;
+      if (item.threadId) completionInput.threadId = item.threadId;
+      if (item.time !== undefined) completionInput.time = item.time;
+
+      const event = this.taskCompletedEvent(completionInput, current, generation);
+      const events: ChiliEvent[] = [event];
+      if (current.current_run_id && item.agentEventId) {
+        events.push(this.agentCompletedEvent(completionInput, current, generation));
+      }
+      this.writeTransactionEvents(events);
+      return { applied: true, events };
+    })(input);
+
+    await this.writeMirrors(result.events);
+    const task = await this.agentTask(input.taskId);
+    return { ...result, ...(task ? { task } : {}) };
+  }
+
   private writeTransaction(events: readonly ChiliEvent[]): void {
     const run = this.db.transaction((items: readonly ChiliEvent[]) => {
-      for (const event of items) {
-        this.insertEvent(event);
-        this.applyProjection(event);
-      }
+      this.writeTransactionEvents(items);
     });
     run(events);
+  }
+
+  private writeTransactionEvents(events: readonly ChiliEvent[]): void {
+    for (const event of events) {
+      this.insertEvent(event);
+      this.applyProjection(event);
+    }
   }
 
   private async writeMirror(event: ChiliEvent): Promise<void> {
@@ -501,6 +599,71 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore, Ag
     } catch (error) {
       this.options.onMirrorError?.(error, event);
     }
+  }
+
+  private async writeMirrors(events: readonly ChiliEvent[]): Promise<void> {
+    for (const event of events) {
+      await this.writeMirror(event);
+    }
+  }
+
+  private taskCompletedEvent(
+    input: AgentTaskCompleteCasInput,
+    current: AgentTaskStateRow,
+    generation: number,
+  ): Extract<ChiliEvent, { type: "agent.task_completed" }> {
+    const payload: AgentCompleteTaskPayload = {
+      taskId: input.taskId,
+      path: input.path,
+      status: input.status,
+      generation,
+    };
+    if (input.runId) payload.runId = input.runId;
+    if (input.summary) payload.summary = input.summary;
+    if (input.error) payload.error = input.error;
+
+    const event: EventEnvelope<"agent.task_completed", AgentCompleteTaskPayload> = {
+      id: input.eventId,
+      type: "agent.task_completed",
+      time: (input.time ?? Date.now()) as EventEnvelope["time"],
+      payload,
+    };
+    const sessionId = input.sessionId ?? current.parent_session_id ?? current.child_session_id;
+    if (sessionId) event.sessionId = sessionId as SessionId;
+    const threadId = input.threadId ?? current.parent_thread_id;
+    if (threadId) event.threadId = threadId as ThreadId;
+    return event;
+  }
+
+  private agentCompletedEvent(
+    input: AgentTaskCompleteCasInput,
+    current: AgentTaskStateRow,
+    generation: number,
+  ): Extract<ChiliEvent, { type: "agent.completed" }> {
+    if (!input.runId || !input.agentEventId) {
+      throw new Error("agent.completed CAS event requires runId and agentEventId");
+    }
+    const payload: AgentCompletedPayload = {
+      runId: input.runId,
+      taskId: input.taskId,
+      path: input.path,
+      status: input.status,
+      generation,
+    };
+    if (input.summary) payload.summary = input.summary;
+    if (input.error) payload.error = input.error;
+
+    const event: EventEnvelope<"agent.completed", AgentCompletedPayload> = {
+      id: input.agentEventId,
+      type: "agent.completed",
+      time: (input.time ?? Date.now()) as EventEnvelope["time"],
+      payload,
+    };
+    const sessionId = input.sessionId ?? current.parent_session_id ?? current.child_session_id;
+    if (sessionId) event.sessionId = sessionId as SessionId;
+    const threadId = input.threadId ?? current.parent_thread_id;
+    if (threadId) event.threadId = threadId as ThreadId;
+    return event;
   }
 
   private insertEvent(event: ChiliEvent): void {
@@ -1027,7 +1190,7 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore, Ag
   private agentTaskState(taskId: TaskId): AgentTaskStateRow | undefined {
     const row = this.db
       .query<AgentTaskStateRow, [string]>(
-        `select status, generation, current_run_id
+        `select status, generation, current_run_id, lease_owner, path, parent_session_id, parent_thread_id, child_session_id
          from agent_tasks
          where id = ?`,
       )

@@ -9,7 +9,7 @@ import type {
   TimestampMs,
 } from "@chili/protocol";
 import { joinAgentPath, ROOT_AGENT_PATH, timestampNow } from "@chili/protocol";
-import type { AgentTaskLeaseStore, EventStore } from "@chili/store";
+import type { AgentTaskFinalizationStore, AgentTaskLeaseStore, EventStore } from "@chili/store";
 import type {
   CompleteTaskToolInput,
   SubagentController,
@@ -75,7 +75,7 @@ export interface LocalSubagentRunner {
 export type LocalSubagentBackgroundErrorHandler = (error: unknown, task: LocalSubagentTaskResult) => void;
 
 export interface LocalSubagentManagerOptions {
-  store: EventStore & Partial<AgentTaskLeaseStore>;
+  store: EventStore & Partial<AgentTaskLeaseStore> & Partial<AgentTaskFinalizationStore>;
   runner: LocalSubagentRunner;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
@@ -146,7 +146,9 @@ export class LocalSubagentManager implements SubagentController {
     state.task.status = input.status ?? "completed";
     state.task.summary = input.summary;
     this.stopLeaseHeartbeat(state);
-    await this.appendTaskCompletion(state.runInput, state.task);
+    if (!(await this.completeTaskFinal(state, false))) {
+      throw new Error(`Local subagent task finalization lost CAS: ${input.taskId}`);
+    }
     state.controller.abort();
     return {
       taskId: input.taskId,
@@ -288,8 +290,10 @@ export class LocalSubagentManager implements SubagentController {
       if (result.summary) task.summary = result.summary;
       if (result.error) task.error = result.error;
       this.stopLeaseHeartbeat(state);
-      await this.appendTaskCompletion(input, task);
-      await this.appendAgentCompletion(input, task);
+      if (!(await this.completeTaskFinal(state, true))) {
+        state.externallyClosed = true;
+        task.status = "cancelled";
+      }
       return task;
     } catch (error) {
       if (state.externallyClosed) return task;
@@ -303,8 +307,10 @@ export class LocalSubagentManager implements SubagentController {
       task.status = isAbortError(err) ? "cancelled" : "failed";
       task.error = err;
       this.stopLeaseHeartbeat(state);
-      await this.appendTaskCompletion(input, task);
-      await this.appendAgentCompletion(input, task);
+      if (!(await this.completeTaskFinal(state, true))) {
+        state.externallyClosed = true;
+        task.status = "cancelled";
+      }
       return task;
     } finally {
       this.stopLeaseHeartbeat(state);
@@ -420,10 +426,48 @@ export class LocalSubagentManager implements SubagentController {
     });
   }
 
+  private async completeTaskFinal(state: LocalSubagentTaskState, includeAgentEvent: boolean): Promise<boolean> {
+    const { task, runInput: input } = state;
+    if (task.status === "running") return false;
+
+    const store = this.finalizationStore();
+    if (store) {
+      const casInput: Parameters<AgentTaskFinalizationStore["completeAgentTaskCas"]>[0] = {
+        taskId: input.taskId,
+        path: input.path,
+        runId: input.runId,
+        status: task.status,
+        generation: input.generation,
+        eventId: this.id("event"),
+        sessionId: input.parentSessionId,
+        time: this.now(),
+      };
+      if (state.lease?.owner) casInput.owner = state.lease.owner;
+      if (input.parentThreadId) casInput.threadId = input.parentThreadId;
+      if (task.summary) casInput.summary = task.summary;
+      if (task.error) casInput.error = task.error.message;
+      if (includeAgentEvent) casInput.agentEventId = this.id("event");
+      const result = await store.completeAgentTaskCas(casInput);
+      return result.applied;
+    }
+
+    await this.appendTaskCompletion(input, task);
+    if (includeAgentEvent) await this.appendAgentCompletion(input, task);
+    return true;
+  }
+
   private leaseStore(): AgentTaskLeaseStore | undefined {
     const store = this.options.store;
     if (store.claimAgentTaskLease && store.renewAgentTaskLease && store.releaseAgentTaskLease) {
       return store as EventStore & AgentTaskLeaseStore;
+    }
+    return undefined;
+  }
+
+  private finalizationStore(): AgentTaskFinalizationStore | undefined {
+    const store = this.options.store;
+    if (store.completeAgentTaskCas && store.closeAgentTaskCas) {
+      return store as EventStore & AgentTaskFinalizationStore;
     }
     return undefined;
   }
