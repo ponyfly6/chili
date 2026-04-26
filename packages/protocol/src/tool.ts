@@ -1,0 +1,55 @@
+import type { ApprovalId, ArtifactId, SessionId, ToolCallId, TurnId } from "./ids.js";
+
+export type ToolRisk = "read" | "write" | "execute" | "network" | "dangerous";
+
+export type ToolCallStatus =
+  | "pending"
+  | "validating"
+  | "waiting_for_approval"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface ToolDefinition<Input = unknown, Output extends ToolResult = ToolResult> {
+  name: string;
+  description: string;
+  risk: ToolRisk;
+  inputSchema: unknown;
+  execute(input: Input, context: ToolExecutionContext): Promise<Output>;
+}
+
+export interface ToolExecutionContext {
+  sessionId: SessionId;
+  turnId: TurnId;
+  callId: ToolCallId;
+  signal: AbortSignal;
+  cwd: string;
+  metadata(update: ToolMetadataUpdate): Promise<void>;
+  requestApproval(request: ApprovalRequest): Promise<ApprovalDecision>;
+}
+
+export interface ToolMetadataUpdate {
+  title?: string;
+  status?: ToolCallStatus;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ToolResult {
+  title: string;
+  output: string;
+  metadata?: Record<string, unknown>;
+  artifactIds?: ArtifactId[];
+}
+
+export interface ApprovalRequest {
+  id?: ApprovalId;
+  permission: string;
+  patterns: string[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface ApprovalDecision {
+  action: "allow_once" | "allow_always" | "deny";
+  feedback?: string;
+}

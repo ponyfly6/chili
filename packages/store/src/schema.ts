@@ -1,0 +1,121 @@
+export const SQLITE_SCHEMA = [
+  `create table if not exists events (
+    seq integer primary key autoincrement,
+    id text not null unique,
+    type text not null,
+    time integer not null,
+    session_id text,
+    thread_id text,
+    payload_json text not null
+  )`,
+  `create unique index if not exists events_id_idx on events(id)`,
+  `create index if not exists events_seq_idx on events(seq)`,
+  `create index if not exists events_session_seq_idx on events(session_id, seq)`,
+  `create index if not exists events_thread_seq_idx on events(thread_id, seq)`,
+  `create index if not exists events_type_seq_idx on events(type, seq)`,
+  `create index if not exists events_session_time_idx on events(session_id, time, id)`,
+  `create index if not exists events_thread_time_idx on events(thread_id, time, id)`,
+  `create index if not exists events_type_time_idx on events(type, time, id)`,
+
+  `create table if not exists sessions (
+    id text primary key,
+    cwd text not null,
+    title text,
+    status text not null,
+    created_at integer not null,
+    updated_at integer not null
+  )`,
+  `create index if not exists sessions_updated_idx on sessions(updated_at)`,
+
+  `create table if not exists messages (
+    id text primary key,
+    session_id text not null,
+    thread_id text,
+    role text not null,
+    parent_id text,
+    created_at integer not null
+  )`,
+  `create index if not exists messages_session_time_idx on messages(session_id, created_at, id)`,
+
+  `create table if not exists message_parts (
+    id text primary key,
+    message_id text not null,
+    session_id text not null,
+    type text not null,
+    ordinal integer not null,
+    data_json text not null,
+    created_at integer not null
+  )`,
+  `create index if not exists message_parts_message_ordinal_idx on message_parts(message_id, ordinal)`,
+  `create index if not exists message_parts_session_idx on message_parts(session_id)`,
+
+  `create table if not exists tool_calls (
+    id text primary key,
+    session_id text,
+    thread_id text,
+    turn_id text,
+    tool_name text not null,
+    status text not null,
+    input_json text,
+    output text,
+    error text,
+    synthetic integer not null default 0,
+    started_at integer not null,
+    updated_at integer not null
+  )`,
+  `create index if not exists tool_calls_session_status_idx on tool_calls(session_id, status)`,
+  `create index if not exists tool_calls_turn_idx on tool_calls(turn_id)`,
+
+  `create table if not exists approvals (
+    id text primary key,
+    session_id text,
+    thread_id text,
+    call_id text,
+    permission text not null,
+    patterns_json text not null,
+    status text not null,
+    decision text,
+    feedback text,
+    created_at integer not null,
+    resolved_at integer
+  )`,
+  `create index if not exists approvals_session_status_idx on approvals(session_id, status)`,
+  `create index if not exists approvals_call_idx on approvals(call_id)`,
+
+  `create table if not exists agent_runs (
+    id text primary key,
+    session_id text,
+    thread_id text,
+    path text not null,
+    parent_path text,
+    task_name text not null,
+    status text not null,
+    created_at integer not null,
+    completed_at integer
+  )`,
+  `create index if not exists agent_runs_session_status_idx on agent_runs(session_id, status)`,
+  `create index if not exists agent_runs_path_idx on agent_runs(path)`,
+
+  `create table if not exists teams (
+    id text primary key,
+    session_id text,
+    name text not null,
+    lead_path text not null,
+    status text not null,
+    created_at integer not null,
+    updated_at integer not null
+  )`,
+  `create index if not exists teams_session_idx on teams(session_id)`,
+
+  `create table if not exists team_tasks (
+    id text primary key,
+    team_id text not null,
+    session_id text,
+    owner_path text,
+    status text not null,
+    title text,
+    created_at integer not null,
+    updated_at integer not null
+  )`,
+  `create index if not exists team_tasks_team_status_idx on team_tasks(team_id, status)`,
+];

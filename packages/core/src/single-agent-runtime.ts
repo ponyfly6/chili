@@ -1,0 +1,556 @@
+import type {
+  ChiliEvent,
+  EventEnvelope,
+  MessageId,
+  MessagePart,
+  PartId,
+  SessionId,
+  ThreadId,
+  TimestampMs,
+  ToolCallId,
+  TurnId,
+} from "@chili/protocol";
+import { timestampNow } from "@chili/protocol";
+import type { EventStore } from "@chili/store";
+import type { ToolRegistry } from "@chili/tools";
+import { ToolExecutor } from "@chili/tools";
+import { ContextWindowBuilder, type ContextBudgetOptions, type ContextUsage } from "./context.js";
+import { DoomLoopError, DoomLoopGuard, type DoomLoopGuardOptions } from "./doom-loop-guard.js";
+import { normalizeRetryPolicy, retryDelay, sleep, type RetryPolicy } from "./retry.js";
+import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.js";
+import type { AgentRunner, AppendUserMessageInput, CreateSessionInput, RunTurnInput, RunTurnResult } from "./runner.js";
+
+export type { AppendUserMessageInput, CreateSessionInput, RunTurnInput, RunTurnResult } from "./runner.js";
+
+export interface SingleAgentRuntimeOptions {
+  store: EventStore;
+  model: ModelRouter;
+  toolRegistry: ToolRegistry;
+  toolExecutor: ToolExecutor;
+  contextBudget?: ContextBudgetOptions;
+  contextBuilder?: ContextWindowBuilder;
+  retryPolicy?: RetryPolicy;
+  doomLoopGuard?: DoomLoopGuardOptions;
+  createId?: (prefix: string) => string;
+  now?: () => TimestampMs;
+}
+
+interface EventContext {
+  sessionId: SessionId;
+  threadId?: ThreadId;
+}
+
+interface PendingToolCall {
+  callId: ToolCallId;
+  toolName: string;
+  input: unknown;
+}
+
+interface StreamingToolCall {
+  callId: ToolCallId;
+  toolName: string;
+  input: unknown;
+}
+
+interface AssistantStreamState {
+  textPartId?: PartId;
+  reasoningPartId?: PartId;
+  toolCalls: PendingToolCall[];
+  streamingToolCalls: Map<string, StreamingToolCall>;
+}
+
+interface AssistantStreamResult {
+  finishReason?: string;
+  toolCalls: PendingToolCall[];
+}
+
+export class SingleAgentRuntime implements AgentRunner {
+  constructor(private readonly options: SingleAgentRuntimeOptions) {}
+
+  async createSession(input: CreateSessionInput): Promise<SessionId> {
+    const sessionId = input.sessionId ?? this.id<SessionId>("session");
+    await this.append(
+      {
+        sessionId,
+        threadId: input.threadId,
+      },
+      "session.created",
+      { sessionId, cwd: input.cwd },
+    );
+    return sessionId;
+  }
+
+  async appendUserMessage(input: AppendUserMessageInput): Promise<MessageId> {
+    const messageId = this.id<MessageId>("msg");
+    await this.append(input, "message.created", {
+      messageId,
+      role: "user",
+    });
+    await this.appendPart(input, messageId, {
+      id: this.id<PartId>("part"),
+      messageId,
+      sessionId: input.sessionId,
+      type: "text",
+      text: input.text,
+    });
+    return messageId;
+  }
+
+  async runTurn(input: RunTurnInput): Promise<RunTurnResult> {
+    const turnId = input.turnId ?? this.id<TurnId>("turn");
+    let assistantMessageId: MessageId | undefined;
+    let contextUsage: ContextUsage | undefined;
+
+    try {
+      await this.append(input, "turn.started", { turnId });
+
+      assistantMessageId = this.id<MessageId>("msg");
+      await this.append(input, "message.created", {
+        messageId: assistantMessageId,
+        role: "assistant",
+      });
+
+      const rawMessages = await this.options.store.messages(input.sessionId);
+      const context = this.contextBuilder().build(rawMessages);
+      contextUsage = context.usage;
+      if (context.compactionBoundary) {
+        await this.append(input, "turn.compaction_requested", {
+          turnId,
+          reason: context.compactionBoundary.reason,
+          boundaryMessageId: context.compactionBoundary.boundaryMessageId,
+          estimatedChars: context.compactionBoundary.estimatedChars,
+          budgetChars: context.compactionBoundary.budgetChars,
+        });
+      }
+
+      const modelInput: ModelStreamInput = {
+        sessionId: input.sessionId,
+        threadId: input.threadId,
+        turnId,
+        messages: context.messages,
+        tools: this.options.toolRegistry.list(),
+        system: input.system ?? [],
+      };
+      if (input.signal) modelInput.signal = input.signal;
+
+      const guard = new DoomLoopGuard(this.options.doomLoopGuard);
+      const streamResult = await this.consumeModelStream(input, turnId, assistantMessageId, modelInput, guard);
+      await this.executeToolCalls(input, turnId, assistantMessageId, streamResult.toolCalls);
+
+      await this.append(input, "turn.completed", {
+        turnId,
+        status: "completed",
+      });
+
+      const result: Extract<RunTurnResult, { status: "completed" }> = {
+        status: "completed",
+        turnId,
+        assistantMessageId,
+      };
+      if (contextUsage) result.contextUsage = contextUsage;
+      if (streamResult.finishReason) result.finishReason = streamResult.finishReason;
+      return result;
+    } catch (error) {
+      const err = toError(error);
+      const status = isAbortError(err) ? "cancelled" : "failed";
+      await this.append(input, "turn.completed", {
+        turnId,
+        status,
+      });
+      const result: Extract<RunTurnResult, { status: "failed" | "cancelled" }> = {
+        status,
+        turnId,
+        error: err,
+      };
+      if (assistantMessageId) result.assistantMessageId = assistantMessageId;
+      if (contextUsage) result.contextUsage = contextUsage;
+      return result;
+    }
+  }
+
+  private async consumeModelStream(
+    input: RunTurnInput,
+    turnId: TurnId,
+    assistantMessageId: MessageId,
+    modelInput: ModelStreamInput,
+    guard: DoomLoopGuard,
+  ): Promise<AssistantStreamResult> {
+    const retryPolicy = normalizeRetryPolicy(this.options.retryPolicy);
+    let attempt = 1;
+
+    while (true) {
+      let emitted = false;
+      try {
+        const state: AssistantStreamState = {
+          toolCalls: [],
+          streamingToolCalls: new Map(),
+        };
+        for await (const event of this.options.model.stream(modelInput)) {
+          if (input.signal?.aborted) throw abortError("Turn aborted");
+          if (event.type === "text_delta") {
+            emitted = true;
+            await this.appendTextDelta(input, assistantMessageId, state, event.text);
+            continue;
+          }
+
+          if (event.type === "reasoning_delta") {
+            emitted = true;
+            await this.appendReasoningDelta(input, assistantMessageId, state, event.text, event.redacted);
+            continue;
+          }
+
+          if (event.type === "tool_call") {
+            emitted = true;
+            await this.queueToolCall(
+              input,
+              turnId,
+              assistantMessageId,
+              {
+                callId: this.id<ToolCallId>("toolcall"),
+                toolName: event.name,
+                input: event.input,
+              },
+              guard,
+              state,
+            );
+            continue;
+          }
+
+          if (event.type === "tool_call_start") {
+            emitted = true;
+            state.streamingToolCalls.set(toolCallKey(event.toolCallId, event.index), {
+              callId: event.toolCallId as ToolCallId,
+              toolName: event.name,
+              input: {},
+            });
+            continue;
+          }
+
+          if (event.type === "tool_call_delta") {
+            emitted = true;
+            const toolCall = state.streamingToolCalls.get(toolCallKey(event.toolCallId, event.index));
+            if (toolCall && event.partialInput !== undefined) {
+              toolCall.input = event.partialInput;
+            }
+            continue;
+          }
+
+          if (event.type === "tool_call_end") {
+            emitted = true;
+            const key = toolCallKey(event.toolCallId, event.index);
+            const existing = state.streamingToolCalls.get(key);
+            state.streamingToolCalls.delete(key);
+            await this.queueToolCall(
+              input,
+              turnId,
+              assistantMessageId,
+              {
+                callId: (existing?.callId ?? event.toolCallId) as ToolCallId,
+                toolName: event.name || existing?.toolName || "",
+                input: event.input,
+              },
+              guard,
+              state,
+            );
+            continue;
+          }
+
+          if (event.type === "finish") {
+            if (event.responseId || event.usage) {
+              await this.appendModelMetadata(input, turnId, event);
+            }
+            return { finishReason: event.reason, toolCalls: state.toolCalls };
+          }
+
+          if (event.type === "metadata") {
+            emitted = true;
+            await this.appendModelMetadata(input, turnId, event);
+            continue;
+          }
+
+          throw toError(event.error);
+        }
+        return { toolCalls: state.toolCalls };
+      } catch (error) {
+        const err = toError(error);
+        if (input.signal?.aborted || isAbortError(err)) {
+          throw err;
+        }
+        if (!emitted && attempt < retryPolicy.maxAttempts && retryPolicy.retryable(err)) {
+          const delayMs = retryDelay(retryPolicy, attempt);
+          await this.append(input, "turn.retry_scheduled", {
+            turnId,
+            attempt: attempt + 1,
+            delayMs,
+            reason: err.message,
+          });
+          await sleep(delayMs);
+          attempt++;
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
+  private async appendTextDelta(
+    input: RunTurnInput,
+    assistantMessageId: MessageId,
+    state: AssistantStreamState,
+    text: string,
+  ): Promise<void> {
+    if (!state.textPartId) {
+      state.textPartId = this.id<PartId>("part");
+      await this.appendPart(input, assistantMessageId, {
+        id: state.textPartId,
+        messageId: assistantMessageId,
+        sessionId: input.sessionId,
+        type: "text",
+        text,
+      });
+      return;
+    }
+
+    await this.appendPartDelta(input, assistantMessageId, state.textPartId, "text", text);
+  }
+
+  private async appendReasoningDelta(
+    input: RunTurnInput,
+    assistantMessageId: MessageId,
+    state: AssistantStreamState,
+    text: string,
+    redacted?: boolean,
+  ): Promise<void> {
+    if (!state.reasoningPartId) {
+      state.reasoningPartId = this.id<PartId>("part");
+      await this.appendPart(input, assistantMessageId, {
+        id: state.reasoningPartId,
+        messageId: assistantMessageId,
+        sessionId: input.sessionId,
+        type: "reasoning",
+        text,
+        ...(redacted ? { redacted } : {}),
+      });
+      return;
+    }
+
+    await this.appendPartDelta(input, assistantMessageId, state.reasoningPartId, "text", text);
+  }
+
+  private async queueToolCall(
+    input: RunTurnInput,
+    turnId: TurnId,
+    assistantMessageId: MessageId,
+    toolCall: PendingToolCall,
+    guard: DoomLoopGuard,
+    state: AssistantStreamState,
+  ): Promise<void> {
+    await this.appendPart(input, assistantMessageId, {
+      id: this.id<PartId>("part"),
+      messageId: assistantMessageId,
+      sessionId: input.sessionId,
+      type: "tool_call",
+      callId: toolCall.callId,
+      toolName: toolCall.toolName,
+      input: toolCall.input,
+      status: "pending",
+    });
+
+    const guardResult = guard.check({ toolName: toolCall.toolName, input: toolCall.input });
+    if (!guardResult.ok) {
+      const error = new DoomLoopError(
+        guardResult.reason === "repeated_tool_call"
+          ? `Repeated tool call blocked: ${toolCall.toolName}`
+          : `Tool call limit exceeded: ${guardResult.total}`,
+      );
+      await this.append(input, "turn.guard_triggered", {
+        turnId,
+        reason: guardResult.reason,
+        toolName: toolCall.toolName,
+        count: guardResult.count,
+      });
+      await this.append(input, "tool.call_started", {
+        turnId,
+        callId: toolCall.callId,
+        toolName: toolCall.toolName,
+        input: toolCall.input,
+      });
+      await this.append(input, "tool.call_finished", {
+        callId: toolCall.callId,
+        status: "failed",
+        error: error.message,
+        synthetic: true,
+      });
+      await this.appendPart(input, assistantMessageId, {
+        id: this.id<PartId>("part"),
+        messageId: assistantMessageId,
+        sessionId: input.sessionId,
+        type: "tool_result",
+        callId: toolCall.callId,
+        output: "",
+        error: error.message,
+        synthetic: true,
+      });
+      throw error;
+    }
+
+    state.toolCalls.push(toolCall);
+  }
+
+  private async executeToolCalls(
+    input: RunTurnInput,
+    turnId: TurnId,
+    assistantMessageId: MessageId,
+    toolCalls: readonly PendingToolCall[],
+  ): Promise<void> {
+    for (const toolCall of toolCalls) {
+      if (input.signal?.aborted) throw abortError("Turn aborted");
+      await this.executeToolCall(input, turnId, assistantMessageId, toolCall);
+    }
+  }
+
+  private async executeToolCall(
+    input: RunTurnInput,
+    turnId: TurnId,
+    assistantMessageId: MessageId,
+    toolCall: PendingToolCall,
+  ): Promise<void> {
+    const executeInput = {
+      sessionId: input.sessionId,
+      threadId: input.threadId,
+      turnId,
+      callId: toolCall.callId,
+      toolName: toolCall.toolName,
+      input: toolCall.input,
+      cwd: input.cwd,
+    };
+    if (input.signal) {
+      Object.assign(executeInput, { signal: input.signal });
+    }
+
+    const result = await this.options.toolExecutor.execute(executeInput);
+
+    if (result.status === "completed") {
+      const part: MessagePart = {
+        id: this.id<PartId>("part"),
+        messageId: assistantMessageId,
+        sessionId: input.sessionId,
+        type: "tool_result",
+        callId: toolCall.callId,
+        output: result.result.output,
+      };
+      if (result.result.artifactIds) {
+        part.artifactIds = result.result.artifactIds;
+      }
+      await this.appendPart(input, assistantMessageId, part);
+      return;
+    }
+
+    await this.appendPart(input, assistantMessageId, {
+      id: this.id<PartId>("part"),
+      messageId: assistantMessageId,
+      sessionId: input.sessionId,
+      type: "tool_result",
+      callId: toolCall.callId,
+      output: "",
+      error: result.error.message,
+      synthetic: true,
+    });
+    if (result.status === "cancelled") {
+      throw result.error;
+    }
+  }
+
+  private async appendPart(input: EventContext, messageId: MessageId, part: MessagePart): Promise<void> {
+    await this.append(input, "message.part_added", {
+      messageId,
+      part,
+    });
+  }
+
+  private async appendPartDelta(
+    input: EventContext,
+    messageId: MessageId,
+    partId: PartId,
+    field: string,
+    delta: string,
+  ): Promise<void> {
+    await this.append(input, "message.part_delta", {
+      messageId,
+      partId,
+      field,
+      delta,
+    });
+  }
+
+  private async appendModelMetadata(
+    input: EventContext,
+    turnId: TurnId,
+    metadata: Extract<ModelStreamEvent, { type: "metadata" | "finish" }>,
+  ): Promise<void> {
+    await this.append(input, "turn.model_metadata", {
+      turnId,
+      ...(isModelMetadataEvent(metadata) && metadata.provider ? { provider: metadata.provider } : {}),
+      ...(isModelMetadataEvent(metadata) && metadata.model ? { model: metadata.model } : {}),
+      ...(metadata.responseId ? { responseId: metadata.responseId } : {}),
+      ...(metadata.usage ? { usage: metadata.usage } : {}),
+    });
+  }
+
+  private async append<TType extends ChiliEvent["type"], TPayload>(
+    input: EventContext,
+    type: TType,
+    payload: TPayload,
+  ): Promise<void> {
+    const event: EventEnvelope<TType, TPayload> = {
+      id: this.id("event"),
+      type,
+      time: this.now(),
+      sessionId: input.sessionId,
+      payload,
+    };
+    if (input.threadId) event.threadId = input.threadId;
+    await this.options.store.append(event as ChiliEvent);
+  }
+
+  private id<T extends string>(prefix: string): T {
+    const create = this.options.createId ?? defaultCreateId;
+    return create(prefix) as T;
+  }
+
+  private now(): TimestampMs {
+    return this.options.now ? this.options.now() : timestampNow();
+  }
+
+  private contextBuilder(): ContextWindowBuilder {
+    return this.options.contextBuilder ?? new ContextWindowBuilder(this.options.contextBudget);
+  }
+}
+
+function defaultCreateId(prefix: string): string {
+  return `${prefix}_${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function isAbortError(error: Error): boolean {
+  return error.name === "AbortError" || error.message.toLowerCase().includes("aborted");
+}
+
+function abortError(message: string): Error {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
+function toolCallKey(toolCallId: string, index: number | undefined): string {
+  return `${toolCallId}:${index ?? ""}`;
+}
+
+function isModelMetadataEvent(
+  event: Extract<ModelStreamEvent, { type: "metadata" | "finish" }>,
+): event is Extract<ModelStreamEvent, { type: "metadata" }> {
+  return "type" in event && event.type === "metadata";
+}
