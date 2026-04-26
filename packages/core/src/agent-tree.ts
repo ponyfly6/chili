@@ -14,6 +14,7 @@ import type {
 } from "@chili/protocol";
 import { normalizeAgentPath, parentAgentPath, timestampNow } from "@chili/protocol";
 import type {
+  AgentMailboxDeliveryStore,
   AgentMailboxQuery,
   AgentMailboxRow,
   AgentRunQuery,
@@ -25,7 +26,7 @@ import type {
 import type { SubmitPromptInput, SubmitPromptResult } from "./runtime-service.js";
 
 export interface AgentTreeControlServiceOptions {
-  store: EventStore & SubagentProjectionStore;
+  store: EventStore & SubagentProjectionStore & Partial<AgentMailboxDeliveryStore>;
   runtime?: AgentMailboxRuntime;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
@@ -133,14 +134,66 @@ export class AgentTreeControlService {
   async consumeMailbox(input: ConsumeAgentMailboxInput): Promise<AgentMailboxRow> {
     const message = await this.requireMailbox(input.messageId);
     if (message.status === "consumed") return message;
-
     const task = message.taskId ? await this.options.store.agentTask(message.taskId) : undefined;
-    await this.deliverMailbox(message, task);
-    const consumedBy = input.consumedBy ?? message.path;
-    const payload: AgentMessageConsumedPayload = {
+
+    const deliveryStore = this.mailboxDeliveryStore();
+    if (!deliveryStore) {
+      await this.deliverMailbox(message, task);
+      await this.appendMailboxConsumed(message, task, input.consumedBy);
+      return this.requireMailbox(input.messageId);
+    }
+
+    const context = mailboxEventContext(message, task);
+    const claim = await deliveryStore.claimAgentMailboxMessage({
       messageId: input.messageId,
+      eventId: this.id("event"),
+      claimedBy: input.consumedBy ?? message.path,
+      ...(context.sessionId ? { sessionId: context.sessionId } : {}),
+      ...(context.threadId ? { threadId: context.threadId } : {}),
+      time: this.now(),
+    });
+    if (!claim.applied) {
+      const current = claim.message ?? (await this.requireMailbox(input.messageId));
+      if (current.status === "consumed") return current;
+      throw new AgentMailboxNotDeliverableError(input.messageId, `Mailbox message is already being delivered: ${input.messageId}`);
+    }
+
+    const claimedMessage = claim.message ?? (await this.requireMailbox(input.messageId));
+    try {
+      await this.deliverMailbox(claimedMessage, task);
+    } catch (error) {
+      await deliveryStore.requeueAgentMailboxMessage({
+        messageId: input.messageId,
+        eventId: this.id("event"),
+        error: toError(error).message,
+        ...(context.sessionId ? { sessionId: context.sessionId } : {}),
+        ...(context.threadId ? { threadId: context.threadId } : {}),
+        time: this.now(),
+      });
+      throw error;
+    }
+
+    const consumed = await deliveryStore.consumeAgentMailboxMessage({
+      messageId: input.messageId,
+      eventId: this.id("event"),
+      consumedBy: input.consumedBy ?? claimedMessage.path,
+      ...(context.sessionId ? { sessionId: context.sessionId } : {}),
+      ...(context.threadId ? { threadId: context.threadId } : {}),
+      time: this.now(),
+    });
+    if (consumed.message) return consumed.message;
+    return this.requireMailbox(input.messageId);
+  }
+
+  private async appendMailboxConsumed(
+    message: AgentMailboxRow,
+    task: AgentTaskRow | undefined,
+    consumedBy: AgentPath | undefined,
+  ): Promise<void> {
+    const payload: AgentMessageConsumedPayload = {
+      messageId: message.id,
       path: message.path,
-      consumedBy,
+      consumedBy: consumedBy ?? message.path,
     };
     if (message.taskId) payload.taskId = message.taskId;
     const event: EventEnvelope<"agent.message_consumed", AgentMessageConsumedPayload> = {
@@ -154,8 +207,6 @@ export class AgentTreeControlService {
     const threadId = task?.parentThreadId ?? message.childThreadId;
     if (threadId) event.threadId = threadId;
     await this.options.store.append(event as ChiliEvent);
-
-    return this.requireMailbox(input.messageId);
   }
 
   private async deliverMailbox(message: AgentMailboxRow, task: AgentTaskRow | undefined): Promise<void> {
@@ -201,6 +252,26 @@ export class AgentTreeControlService {
   private now(): TimestampMs {
     return this.options.now ? this.options.now() : timestampNow();
   }
+
+  private mailboxDeliveryStore(): AgentMailboxDeliveryStore | undefined {
+    const store = this.options.store;
+    if (store.claimAgentMailboxMessage && store.consumeAgentMailboxMessage && store.requeueAgentMailboxMessage) {
+      return store as EventStore & SubagentProjectionStore & AgentMailboxDeliveryStore;
+    }
+    return undefined;
+  }
+}
+
+function mailboxEventContext(
+  message: AgentMailboxRow,
+  task: AgentTaskRow | undefined,
+): { sessionId?: SessionId; threadId?: ThreadId } {
+  const context: { sessionId?: SessionId; threadId?: ThreadId } = {};
+  const sessionId = task?.parentSessionId ?? message.childSessionId;
+  if (sessionId) context.sessionId = sessionId;
+  const threadId = task?.parentThreadId ?? message.childThreadId;
+  if (threadId) context.threadId = threadId;
+  return context;
 }
 
 function buildTreeNodes(input: {
@@ -339,4 +410,8 @@ function isPathWithin(path: AgentPath, rootPath: AgentPath): boolean {
 
 function defaultCreateId(prefix: string): string {
   return `${prefix}_${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
 }

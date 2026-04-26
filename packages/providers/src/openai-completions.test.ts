@@ -228,7 +228,7 @@ test("parses OpenAI-compatible SSE text, reasoning, tool deltas, and usage", asy
   });
   expect(events.at(-1)).toMatchObject({
     type: "finish",
-    reason: "tool_calls",
+    reason: "tool_use",
     responseId: "chatcmpl_1",
     usage: { inputTokens: 3, outputTokens: 4, cacheReadInputTokens: 1, totalTokens: 7 },
   });
@@ -285,7 +285,7 @@ test("falls back to non-streaming OpenAI-compatible JSON responses", async () =>
     input: { filePath: "README.md" },
     index: 0,
   });
-  expect(events[4]).toMatchObject({ type: "finish", reason: "tool_calls", responseId: "chatcmpl_json" });
+  expect(events[4]).toMatchObject({ type: "finish", reason: "tool_use", responseId: "chatcmpl_json" });
 });
 
 async function collect(stream: AsyncIterable<ModelStreamEvent>): Promise<ModelStreamEvent[]> {

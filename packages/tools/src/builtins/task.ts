@@ -285,7 +285,7 @@ export function createMailboxListTool(
     inputSchema: {
       type: "object",
       properties: {
-        status: { type: "string", enum: ["queued", "consumed"] },
+        status: { type: "string", enum: ["queued", "delivering", "consumed"] },
         taskId: { type: "string" },
         task_id: { type: "string" },
         path: { type: "string" },
@@ -685,18 +685,21 @@ function normalizeTaskStatus(value: unknown): ValidationResult<SubagentTaskStatu
   }
 }
 
-function normalizeMailboxStatus(value: unknown): ValidationResult<"queued" | "consumed" | undefined> {
+function normalizeMailboxStatus(value: unknown): ValidationResult<"queued" | "delivering" | "consumed" | undefined> {
   if (value === undefined) return { ok: true, value: undefined };
   if (typeof value !== "string") return { ok: false, message: "status must be a string" };
   switch (value.trim().toLowerCase()) {
     case "queued":
     case "pending":
       return { ok: true, value: "queued" };
+    case "delivering":
+    case "running":
+      return { ok: true, value: "delivering" };
     case "consumed":
     case "done":
       return { ok: true, value: "consumed" };
     default:
-      return { ok: false, message: "status must be queued or consumed" };
+      return { ok: false, message: "status must be queued, delivering, or consumed" };
   }
 }
 

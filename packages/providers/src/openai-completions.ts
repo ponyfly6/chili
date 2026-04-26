@@ -532,10 +532,15 @@ function metadataEvent(
 }
 
 function finishEvent(reason: string, responseId: string | undefined, usage: ModelUsage | undefined): ModelStreamEvent {
-  const event: ModelStreamEvent = { type: "finish", reason };
+  const event: ModelStreamEvent = { type: "finish", reason: normalizeFinishReason(reason) };
   if (responseId) event.responseId = responseId;
   if (usage) event.usage = usage;
   return event;
+}
+
+function normalizeFinishReason(reason: string): string {
+  if (reason === "tool_calls" || reason === "function_call") return "tool_use";
+  return reason;
 }
 
 function errorEvent(error: unknown, responseId: string | undefined, usage: ModelUsage | undefined): ModelStreamEvent {

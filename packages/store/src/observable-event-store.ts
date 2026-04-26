@@ -2,6 +2,11 @@ import type { ChiliEvent, EventEnvelope, Message, SessionId, TaskId } from "@chi
 import type {
   AgentMailboxQuery,
   AgentMailboxRow,
+  AgentMailboxClaimInput,
+  AgentMailboxConsumeInput,
+  AgentMailboxDeliveryStore,
+  AgentMailboxMutationResult,
+  AgentMailboxRequeueInput,
   AgentRunQuery,
   AgentRunRow,
   AgentTaskCloseCasInput,
@@ -27,7 +32,13 @@ export interface EventPublisher {
 }
 
 export class ObservableEventStore
-  implements EventStore, EventPublisher, SubagentProjectionStore, AgentTaskLeaseStore, AgentTaskFinalizationStore
+  implements
+    EventStore,
+    EventPublisher,
+    SubagentProjectionStore,
+    AgentTaskLeaseStore,
+    AgentTaskFinalizationStore,
+    AgentMailboxDeliveryStore
 {
   private readonly listeners = new Set<(event: ChiliEvent) => void>();
 
@@ -101,6 +112,27 @@ export class ObservableEventStore
     return result;
   }
 
+  async claimAgentMailboxMessage(input: AgentMailboxClaimInput): Promise<AgentMailboxMutationResult> {
+    const result = await (this.mailboxDeliveryStore()?.claimAgentMailboxMessage(input) ??
+      Promise.resolve({ applied: false, events: [] }));
+    for (const event of result.events) this.emit(event);
+    return result;
+  }
+
+  async consumeAgentMailboxMessage(input: AgentMailboxConsumeInput): Promise<AgentMailboxMutationResult> {
+    const result = await (this.mailboxDeliveryStore()?.consumeAgentMailboxMessage(input) ??
+      Promise.resolve({ applied: false, events: [] }));
+    for (const event of result.events) this.emit(event);
+    return result;
+  }
+
+  async requeueAgentMailboxMessage(input: AgentMailboxRequeueInput): Promise<AgentMailboxMutationResult> {
+    const result = await (this.mailboxDeliveryStore()?.requeueAgentMailboxMessage(input) ??
+      Promise.resolve({ applied: false, events: [] }));
+    for (const event of result.events) this.emit(event);
+    return result;
+  }
+
   subscribe(listener: (event: ChiliEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -130,6 +162,14 @@ export class ObservableEventStore
     const inner = this.inner as EventStore & Partial<AgentTaskFinalizationStore>;
     if (inner.completeAgentTaskCas && inner.closeAgentTaskCas) {
       return inner as EventStore & AgentTaskFinalizationStore;
+    }
+    return undefined;
+  }
+
+  private mailboxDeliveryStore(): AgentMailboxDeliveryStore | undefined {
+    const inner = this.inner as EventStore & Partial<AgentMailboxDeliveryStore>;
+    if (inner.claimAgentMailboxMessage && inner.consumeAgentMailboxMessage && inner.requeueAgentMailboxMessage) {
+      return inner as EventStore & AgentMailboxDeliveryStore;
     }
     return undefined;
   }

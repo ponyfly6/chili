@@ -2,6 +2,11 @@ import type { ChiliEvent, EventEnvelope, Message, MessagePart, MessageRole, Sess
 import type {
   AgentMailboxQuery,
   AgentMailboxRow,
+  AgentMailboxClaimInput,
+  AgentMailboxConsumeInput,
+  AgentMailboxDeliveryStore,
+  AgentMailboxMutationResult,
+  AgentMailboxRequeueInput,
   AgentRunQuery,
   AgentRunRow,
   AgentTaskCloseCasInput,
@@ -22,7 +27,9 @@ import type {
   SubagentProjectionStore,
 } from "@chili/store";
 
-export class PrintingEventStore implements EventStore, SubagentProjectionStore, AgentTaskLeaseStore, AgentTaskFinalizationStore {
+export class PrintingEventStore
+  implements EventStore, SubagentProjectionStore, AgentTaskLeaseStore, AgentTaskFinalizationStore, AgentMailboxDeliveryStore
+{
   constructor(private readonly inner: EventStore, private readonly printer: CliPrinter) {}
 
   async append(event: ChiliEvent): Promise<void> {
@@ -93,6 +100,27 @@ export class PrintingEventStore implements EventStore, SubagentProjectionStore, 
     return result;
   }
 
+  async claimAgentMailboxMessage(input: AgentMailboxClaimInput): Promise<AgentMailboxMutationResult> {
+    const result = await (this.mailboxDeliveryStore()?.claimAgentMailboxMessage(input) ??
+      Promise.resolve({ applied: false, events: [] }));
+    for (const event of result.events) this.printer.event(event);
+    return result;
+  }
+
+  async consumeAgentMailboxMessage(input: AgentMailboxConsumeInput): Promise<AgentMailboxMutationResult> {
+    const result = await (this.mailboxDeliveryStore()?.consumeAgentMailboxMessage(input) ??
+      Promise.resolve({ applied: false, events: [] }));
+    for (const event of result.events) this.printer.event(event);
+    return result;
+  }
+
+  async requeueAgentMailboxMessage(input: AgentMailboxRequeueInput): Promise<AgentMailboxMutationResult> {
+    const result = await (this.mailboxDeliveryStore()?.requeueAgentMailboxMessage(input) ??
+      Promise.resolve({ applied: false, events: [] }));
+    for (const event of result.events) this.printer.event(event);
+    return result;
+  }
+
   private subagentStore(): SubagentProjectionStore | undefined {
     const inner = this.inner as EventStore & Partial<SubagentProjectionStore>;
     if (inner.agentTasks && inner.agentTask && inner.agentRuns && inner.agentMailbox) {
@@ -113,6 +141,14 @@ export class PrintingEventStore implements EventStore, SubagentProjectionStore, 
     const inner = this.inner as EventStore & Partial<AgentTaskFinalizationStore>;
     if (inner.completeAgentTaskCas && inner.closeAgentTaskCas) {
       return inner as EventStore & AgentTaskFinalizationStore;
+    }
+    return undefined;
+  }
+
+  private mailboxDeliveryStore(): AgentMailboxDeliveryStore | undefined {
+    const inner = this.inner as EventStore & Partial<AgentMailboxDeliveryStore>;
+    if (inner.claimAgentMailboxMessage && inner.consumeAgentMailboxMessage && inner.requeueAgentMailboxMessage) {
+      return inner as EventStore & AgentMailboxDeliveryStore;
     }
     return undefined;
   }
@@ -177,6 +213,17 @@ export class CliPrinter {
     if (event.type === "agent.message_queued") {
       const trigger = event.payload.triggerTurn ? " trigger=turn" : "";
       this.line(`\n[agent] message queued ${event.payload.from} -> ${event.payload.path}${trigger}`);
+      return;
+    }
+
+    if (event.type === "agent.message_claimed") {
+      this.line(`\n[agent] message claimed ${event.payload.messageId}`);
+      return;
+    }
+
+    if (event.type === "agent.message_requeued") {
+      const error = event.payload.error ? ` error=${event.payload.error}` : "";
+      this.line(`\n[agent] message requeued ${event.payload.messageId}${error}`);
       return;
     }
 

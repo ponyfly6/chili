@@ -2,6 +2,9 @@ import { Database } from "bun:sqlite";
 import type {
   AgentCompleteTaskPayload,
   AgentCompletedPayload,
+  AgentMessageClaimedPayload,
+  AgentMessageConsumedPayload,
+  AgentMessageRequeuedPayload,
   AgentEvent,
   ApprovalEvent,
   ChiliEvent,
@@ -24,6 +27,11 @@ import { SQLITE_SCHEMA } from "./schema.js";
 import type {
   AgentMailboxQuery,
   AgentMailboxRow,
+  AgentMailboxClaimInput,
+  AgentMailboxConsumeInput,
+  AgentMailboxDeliveryStore,
+  AgentMailboxMutationResult,
+  AgentMailboxRequeueInput,
   AgentTaskCloseCasInput,
   AgentTaskCompleteCasInput,
   AgentTaskFinalizationResult,
@@ -144,7 +152,9 @@ export interface SqliteEventStoreOptions {
   onMirrorError?: (error: unknown, event: ChiliEvent) => void;
 }
 
-export class SqliteEventStore implements EventStore, SubagentProjectionStore, AgentTaskLeaseStore, AgentTaskFinalizationStore {
+export class SqliteEventStore
+  implements EventStore, SubagentProjectionStore, AgentTaskLeaseStore, AgentTaskFinalizationStore, AgentMailboxDeliveryStore
+{
   private readonly db: Database;
 
   constructor(path = ".chili/chili.sqlite", private readonly options: SqliteEventStoreOptions = {}) {
@@ -413,6 +423,76 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore, Ag
       .map((row) => agentMailboxFromRow(row));
   }
 
+  async claimAgentMailboxMessage(input: AgentMailboxClaimInput): Promise<AgentMailboxMutationResult> {
+    const result = this.db.transaction((item: AgentMailboxClaimInput) => {
+      const current = this.agentMailboxState(item.messageId);
+      if (!current || current.status !== "queued") return { applied: false, events: [] as ChiliEvent[] };
+
+      const event = this.agentMailboxClaimedEvent(item, current);
+      const cas = this.db
+        .query(`update agent_mailbox set status = 'delivering' where id = $messageId and status = 'queued'`)
+        .run({ messageId: item.messageId });
+      if (cas.changes === 0) return { applied: false, events: [] as ChiliEvent[] };
+      this.writeTransactionEvents([event]);
+      return { applied: true, events: [event] };
+    })(input);
+
+    await this.writeMirrors(result.events);
+    const message = await this.agentMailboxMessage(input.messageId);
+    return { ...result, ...(message ? { message } : {}) };
+  }
+
+  async consumeAgentMailboxMessage(input: AgentMailboxConsumeInput): Promise<AgentMailboxMutationResult> {
+    const result = this.db.transaction((item: AgentMailboxConsumeInput) => {
+      const current = this.agentMailboxState(item.messageId);
+      if (!current || current.status === "consumed") return { applied: false, events: [] as ChiliEvent[] };
+      if (current.status !== "delivering") return { applied: false, events: [] as ChiliEvent[] };
+
+      const event = this.agentMailboxConsumedEvent(item, current);
+      const cas = this.db
+        .query(
+          `update agent_mailbox
+           set status = 'consumed',
+               consumed_at = $time
+           where id = $messageId
+             and status = 'delivering'`,
+        )
+        .run({ messageId: item.messageId, time: event.time });
+      if (cas.changes === 0) return { applied: false, events: [] as ChiliEvent[] };
+      this.writeTransactionEvents([event]);
+      return { applied: true, events: [event] };
+    })(input);
+
+    await this.writeMirrors(result.events);
+    const message = await this.agentMailboxMessage(input.messageId);
+    return { ...result, ...(message ? { message } : {}) };
+  }
+
+  async requeueAgentMailboxMessage(input: AgentMailboxRequeueInput): Promise<AgentMailboxMutationResult> {
+    const result = this.db.transaction((item: AgentMailboxRequeueInput) => {
+      const current = this.agentMailboxState(item.messageId);
+      if (!current || current.status !== "delivering") return { applied: false, events: [] as ChiliEvent[] };
+
+      const event = this.agentMailboxRequeuedEvent(item, current);
+      const cas = this.db
+        .query(
+          `update agent_mailbox
+           set status = 'queued',
+               consumed_at = null
+           where id = $messageId
+             and status = 'delivering'`,
+        )
+        .run({ messageId: item.messageId });
+      if (cas.changes === 0) return { applied: false, events: [] as ChiliEvent[] };
+      this.writeTransactionEvents([event]);
+      return { applied: true, events: [event] };
+    })(input);
+
+    await this.writeMirrors(result.events);
+    const message = await this.agentMailboxMessage(input.messageId);
+    return { ...result, ...(message ? { message } : {}) };
+  }
+
   async claimAgentTaskLease(input: AgentTaskLeaseClaimInput): Promise<AgentTaskLeaseResult> {
     const now = input.now ?? Date.now();
     const expiresAt = now + input.ttlMs;
@@ -662,6 +742,78 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore, Ag
     const sessionId = input.sessionId ?? current.parent_session_id ?? current.child_session_id;
     if (sessionId) event.sessionId = sessionId as SessionId;
     const threadId = input.threadId ?? current.parent_thread_id;
+    if (threadId) event.threadId = threadId as ThreadId;
+    return event;
+  }
+
+  private agentMailboxClaimedEvent(
+    input: AgentMailboxClaimInput,
+    current: AgentMailboxProjectionRow,
+  ): Extract<ChiliEvent, { type: "agent.message_claimed" }> {
+    const payload: AgentMessageClaimedPayload = {
+      messageId: input.messageId,
+      path: current.path as AgentPath,
+    };
+    if (current.task_id) payload.taskId = current.task_id as TaskId;
+    if (input.claimedBy) payload.claimedBy = input.claimedBy;
+
+    const event: EventEnvelope<"agent.message_claimed", AgentMessageClaimedPayload> = {
+      id: input.eventId,
+      type: "agent.message_claimed",
+      time: (input.time ?? Date.now()) as EventEnvelope["time"],
+      payload,
+    };
+    const sessionId = input.sessionId ?? this.parentSessionIdForTask(current.task_id) ?? current.child_session_id;
+    if (sessionId) event.sessionId = sessionId as SessionId;
+    const threadId = input.threadId ?? this.parentThreadIdForTask(current.task_id) ?? current.child_thread_id;
+    if (threadId) event.threadId = threadId as ThreadId;
+    return event;
+  }
+
+  private agentMailboxConsumedEvent(
+    input: AgentMailboxConsumeInput,
+    current: AgentMailboxProjectionRow,
+  ): Extract<ChiliEvent, { type: "agent.message_consumed" }> {
+    const payload: AgentMessageConsumedPayload = {
+      messageId: input.messageId,
+      path: current.path as AgentPath,
+      consumedBy: input.consumedBy ?? (current.path as AgentPath),
+    };
+    if (current.task_id) payload.taskId = current.task_id as TaskId;
+
+    const event: EventEnvelope<"agent.message_consumed", AgentMessageConsumedPayload> = {
+      id: input.eventId,
+      type: "agent.message_consumed",
+      time: (input.time ?? Date.now()) as EventEnvelope["time"],
+      payload,
+    };
+    const sessionId = input.sessionId ?? this.parentSessionIdForTask(current.task_id) ?? current.child_session_id;
+    if (sessionId) event.sessionId = sessionId as SessionId;
+    const threadId = input.threadId ?? this.parentThreadIdForTask(current.task_id) ?? current.child_thread_id;
+    if (threadId) event.threadId = threadId as ThreadId;
+    return event;
+  }
+
+  private agentMailboxRequeuedEvent(
+    input: AgentMailboxRequeueInput,
+    current: AgentMailboxProjectionRow,
+  ): Extract<ChiliEvent, { type: "agent.message_requeued" }> {
+    const payload: AgentMessageRequeuedPayload = {
+      messageId: input.messageId,
+      path: current.path as AgentPath,
+    };
+    if (current.task_id) payload.taskId = current.task_id as TaskId;
+    if (input.error) payload.error = input.error;
+
+    const event: EventEnvelope<"agent.message_requeued", AgentMessageRequeuedPayload> = {
+      id: input.eventId,
+      type: "agent.message_requeued",
+      time: (input.time ?? Date.now()) as EventEnvelope["time"],
+      payload,
+    };
+    const sessionId = input.sessionId ?? this.parentSessionIdForTask(current.task_id) ?? current.child_session_id;
+    if (sessionId) event.sessionId = sessionId as SessionId;
+    const threadId = input.threadId ?? this.parentThreadIdForTask(current.task_id) ?? current.child_thread_id;
     if (threadId) event.threadId = threadId as ThreadId;
     return event;
   }
@@ -1029,6 +1181,26 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore, Ag
       return;
     }
 
+    if (event.type === "agent.message_claimed") {
+      this.db
+        .query(`update agent_mailbox set status = 'delivering' where id = ? and status = 'queued'`)
+        .run(event.payload.messageId);
+      if (event.payload.taskId) {
+        this.db.query(`update agent_tasks set updated_at = ? where id = ?`).run(event.time, event.payload.taskId);
+      }
+      return;
+    }
+
+    if (event.type === "agent.message_requeued") {
+      this.db
+        .query(`update agent_mailbox set status = 'queued', consumed_at = null where id = ? and status = 'delivering'`)
+        .run(event.payload.messageId);
+      if (event.payload.taskId) {
+        this.db.query(`update agent_tasks set updated_at = ? where id = ?`).run(event.time, event.payload.taskId);
+      }
+      return;
+    }
+
     if (event.type === "agent.message_consumed") {
       this.db
         .query(`update agent_mailbox set status = 'consumed', consumed_at = ? where id = ?`)
@@ -1196,6 +1368,40 @@ export class SqliteEventStore implements EventStore, SubagentProjectionStore, Ag
       )
       .get(taskId);
     return row ?? undefined;
+  }
+
+  private agentMailboxState(messageId: string): AgentMailboxProjectionRow | undefined {
+    const row = this.db
+      .query<AgentMailboxProjectionRow, [string]>(
+        `select id, task_id, path, from_path, child_session_id, child_thread_id, trigger_turn, status,
+                message_json, created_at, consumed_at
+         from agent_mailbox
+         where id = ?`,
+      )
+      .get(messageId);
+    return row ?? undefined;
+  }
+
+  private async agentMailboxMessage(messageId: string): Promise<AgentMailboxRow | undefined> {
+    return (await this.agentMailbox({ messageId, limit: 1 }))[0];
+  }
+
+  private parentSessionIdForTask(taskId: string | null): string | undefined {
+    if (!taskId) return undefined;
+    return this.db
+      .query<{ parent_session_id: string | null }, [string]>(
+        `select parent_session_id from agent_tasks where id = ?`,
+      )
+      .get(taskId)?.parent_session_id ?? undefined;
+  }
+
+  private parentThreadIdForTask(taskId: string | null): string | undefined {
+    if (!taskId) return undefined;
+    return this.db
+      .query<{ parent_thread_id: string | null }, [string]>(
+        `select parent_thread_id from agent_tasks where id = ?`,
+      )
+      .get(taskId)?.parent_thread_id ?? undefined;
   }
 
   private applyTeamEvent(event: TeamEvent): void {

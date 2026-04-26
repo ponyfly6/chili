@@ -4,7 +4,7 @@ export type SubagentTaskStatus = "pending" | "running" | "completed" | "failed" 
 
 export type CompleteTaskStatus = "completed" | "failed" | "cancelled";
 
-export type SubagentMailboxStatus = "queued" | "consumed";
+export type SubagentMailboxStatus = "queued" | "delivering" | "consumed";
 
 export interface TaskToolInput {
   description: string;

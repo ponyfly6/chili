@@ -276,6 +276,94 @@ test("delivers mailbox messages to child sessions before consuming them", async 
   }
 });
 
+test("claims mailbox before delivery so concurrent consumers only deliver once", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-agent-tree-mailbox-claim-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const runtime = new BlockingMailboxRuntime();
+  const parentSessionId = "session_parent" as SessionId;
+  const parentThreadId = "thread_parent" as ThreadId;
+  const childSessionId = "session_child" as SessionId;
+  const childThreadId = "thread_child" as ThreadId;
+  const taskId = "task_child" as TaskId;
+  const rootPath = "/root" as AgentPath;
+  const childPath = "/root/task_child" as AgentPath;
+  let now = 2;
+
+  try {
+    await store.appendMany([
+      {
+        id: "event_task_created",
+        type: "agent.task_created",
+        time: 1 as TimestampMs,
+        sessionId: parentSessionId,
+        threadId: parentThreadId,
+        payload: {
+          taskId,
+          path: childPath,
+          parentPath: rootPath,
+          parentSessionId,
+          parentThreadId,
+          childSessionId,
+          childThreadId,
+          taskName: "reader",
+          cwd: "/repo",
+          prompt: "read",
+          mode: "resumable",
+        },
+      },
+      {
+        id: "event_mailbox",
+        type: "agent.message_queued",
+        time: 2 as TimestampMs,
+        sessionId: parentSessionId,
+        threadId: parentThreadId,
+        payload: {
+          taskId,
+          path: childPath,
+          from: rootPath,
+          childSessionId,
+          childThreadId,
+          triggerTurn: true,
+          message: { role: "user", content: "continue from mailbox" },
+        },
+      },
+    ]);
+
+    const service = new AgentTreeControlService({
+      store,
+      runtime,
+      createId: createSequentialId(),
+      now: () => (++now) as TimestampMs,
+    });
+
+    const first = service.consumeMailbox({ messageId: "event_mailbox" });
+    await runtime.started;
+
+    await expect(service.consumeMailbox({ messageId: "event_mailbox" })).rejects.toThrow(
+      "Mailbox message is already being delivered",
+    );
+
+    runtime.release();
+    await expect(first).resolves.toMatchObject({
+      id: "event_mailbox",
+      status: "consumed",
+    });
+
+    expect(runtime.prompts).toHaveLength(1);
+    expect((await store.events({ type: "agent.message_claimed", limit: 10 })).map((event) => event.id)).toEqual([
+      "event_1",
+    ]);
+    expect((await store.events({ type: "agent.message_consumed", limit: 10 })).map((event) => event.id)).toEqual([
+      "event_3",
+    ]);
+    expect((await store.events({ type: "agent.message_requeued", limit: 10 }))).toEqual([]);
+  } finally {
+    runtime.release();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("keeps mailbox queued when delivery fails", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-agent-tree-delivery-failure-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -314,6 +402,12 @@ test("keeps mailbox queued when delivery fails", async () => {
       },
     ]);
     expect((await store.events({ type: "agent.message_consumed", limit: 10 }))).toEqual([]);
+    expect((await store.events({ type: "agent.message_claimed", limit: 10 })).map((event) => event.id)).toEqual([
+      "event_1",
+    ]);
+    expect((await store.events({ type: "agent.message_requeued", limit: 10 })).map((event) => event.id)).toEqual([
+      "event_2",
+    ]);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -373,5 +467,53 @@ class FakeMailboxRuntime {
       ],
       finishReason: "stop",
     };
+  }
+}
+
+class BlockingMailboxRuntime {
+  readonly messages: Array<{ sessionId: SessionId; threadId: ThreadId; text: string }> = [];
+  readonly prompts: SubmitPromptInput[] = [];
+  readonly started: Promise<void>;
+  private readonly released: Promise<void>;
+  private markStarted: () => void = () => {};
+  private markReleased: () => void = () => {};
+  private isReleased = false;
+
+  constructor() {
+    this.started = new Promise((resolve) => {
+      this.markStarted = resolve;
+    });
+    this.released = new Promise((resolve) => {
+      this.markReleased = resolve;
+    });
+  }
+
+  async appendUserMessage(input: { sessionId: SessionId; threadId: ThreadId; text: string }): Promise<MessageId> {
+    this.messages.push(input);
+    return "message_mailbox" as MessageId;
+  }
+
+  async submitPrompt(input: SubmitPromptInput): Promise<SubmitPromptResult> {
+    this.prompts.push(input);
+    this.markStarted();
+    await this.released;
+    return {
+      status: "completed",
+      turns: [
+        {
+          status: "completed",
+          turnId: "turn_mailbox" as TurnId,
+          assistantMessageId: "message_assistant" as MessageId,
+          finishReason: "stop",
+        },
+      ],
+      finishReason: "stop",
+    };
+  }
+
+  release(): void {
+    if (this.isReleased) return;
+    this.isReleased = true;
+    this.markReleased();
   }
 }

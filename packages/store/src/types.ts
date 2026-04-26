@@ -212,6 +212,39 @@ export interface AgentTaskFinalizationResult {
   events: ChiliEvent[];
 }
 
+export interface AgentMailboxClaimInput {
+  messageId: string;
+  eventId: string;
+  claimedBy?: AgentPath;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  time?: number;
+}
+
+export interface AgentMailboxConsumeInput {
+  messageId: string;
+  eventId: string;
+  consumedBy?: AgentPath;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  time?: number;
+}
+
+export interface AgentMailboxRequeueInput {
+  messageId: string;
+  eventId: string;
+  error?: string;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  time?: number;
+}
+
+export interface AgentMailboxMutationResult {
+  applied: boolean;
+  message?: AgentMailboxRow;
+  events: ChiliEvent[];
+}
+
 export interface EventStore {
   append(event: ChiliEvent): Promise<void>;
   appendMany(events: readonly ChiliEvent[]): Promise<void>;
@@ -237,6 +270,12 @@ export interface AgentTaskLeaseStore {
 export interface AgentTaskFinalizationStore {
   completeAgentTaskCas(input: AgentTaskCompleteCasInput): Promise<AgentTaskFinalizationResult>;
   closeAgentTaskCas(input: AgentTaskCloseCasInput): Promise<AgentTaskFinalizationResult>;
+}
+
+export interface AgentMailboxDeliveryStore {
+  claimAgentMailboxMessage(input: AgentMailboxClaimInput): Promise<AgentMailboxMutationResult>;
+  consumeAgentMailboxMessage(input: AgentMailboxConsumeInput): Promise<AgentMailboxMutationResult>;
+  requeueAgentMailboxMessage(input: AgentMailboxRequeueInput): Promise<AgentMailboxMutationResult>;
 }
 
 export interface EventMirror {

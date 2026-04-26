@@ -614,6 +614,121 @@ test("close task CAS wins over runner completion CAS and Observable only emits c
   }
 });
 
+test("claims, requeues, and consumes mailbox messages through SQLite CAS", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-mailbox-cas-"));
+  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
+  const store = new ObservableEventStore(baseStore);
+  const emitted: ChiliEvent[] = [];
+  const unsubscribe = store.subscribe((event) => emitted.push(event));
+  const taskId = "task_mailbox_cas" as TaskId;
+  const path = "/root/task_mailbox_cas" as AgentPath;
+  const parentPath = "/root" as AgentPath;
+  const childSessionId = "session_child" as SessionId;
+  const childThreadId = "thread_child" as ThreadId;
+
+  try {
+    await baseStore.append({
+      id: "event_mailbox",
+      type: "agent.message_queued",
+      time: 1 as TimestampMs,
+      payload: {
+        taskId,
+        path,
+        from: parentPath,
+        childSessionId,
+        childThreadId,
+        triggerTurn: true,
+        message: { role: "user", content: "continue" },
+      },
+    });
+
+    const firstClaim = await store.claimAgentMailboxMessage({
+      messageId: "event_mailbox",
+      eventId: "event_claim_a",
+      claimedBy: path,
+      time: 2,
+    });
+    expect(firstClaim).toMatchObject({
+      applied: true,
+      message: { id: "event_mailbox", status: "delivering" },
+    });
+
+    const blockedClaim = await store.claimAgentMailboxMessage({
+      messageId: "event_mailbox",
+      eventId: "event_claim_blocked",
+      claimedBy: path,
+      time: 3,
+    });
+    expect(blockedClaim.applied).toBe(false);
+    expect(blockedClaim.events).toEqual([]);
+    expect(blockedClaim.message).toMatchObject({ id: "event_mailbox", status: "delivering" });
+
+    const requeued = await store.requeueAgentMailboxMessage({
+      messageId: "event_mailbox",
+      eventId: "event_requeue",
+      error: "delivery failed",
+      time: 4,
+    });
+    expect(requeued).toMatchObject({
+      applied: true,
+      message: { id: "event_mailbox", status: "queued" },
+    });
+
+    const secondClaim = await store.claimAgentMailboxMessage({
+      messageId: "event_mailbox",
+      eventId: "event_claim_b",
+      claimedBy: path,
+      time: 5,
+    });
+    expect(secondClaim).toMatchObject({
+      applied: true,
+      message: { id: "event_mailbox", status: "delivering" },
+    });
+
+    const consumed = await store.consumeAgentMailboxMessage({
+      messageId: "event_mailbox",
+      eventId: "event_consumed",
+      consumedBy: path,
+      time: 6,
+    });
+    expect(consumed).toMatchObject({
+      applied: true,
+      message: { id: "event_mailbox", status: "consumed", consumedAt: 6 },
+    });
+
+    const lateConsume = await store.consumeAgentMailboxMessage({
+      messageId: "event_mailbox",
+      eventId: "event_consumed_late",
+      consumedBy: path,
+      time: 7,
+    });
+    expect(lateConsume.applied).toBe(false);
+    expect(lateConsume.events).toEqual([]);
+    expect(lateConsume.message).toMatchObject({ id: "event_mailbox", status: "consumed", consumedAt: 6 });
+
+    expect(emitted.map((event) => event.id)).toEqual([
+      "event_claim_a",
+      "event_requeue",
+      "event_claim_b",
+      "event_consumed",
+    ]);
+    expect((await baseStore.events({ type: "agent.message_claimed", limit: 10 })).map((event) => event.id)).toEqual([
+      "event_claim_a",
+      "event_claim_b",
+    ]);
+    expect((await baseStore.events({ type: "agent.message_requeued", limit: 10 })).map((event) => event.id)).toEqual([
+      "event_requeue",
+    ]);
+    expect((await baseStore.events({ type: "agent.message_consumed", limit: 10 })).map((event) => event.id)).toEqual([
+      "event_consumed",
+    ]);
+  } finally {
+    unsubscribe();
+    baseStore.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("final task projection wins over late completion and stale spawn", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-task-generation-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));

@@ -68,7 +68,7 @@ export type RecoveryEvent =
 
 export type AgentTaskStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
 export type AgentTaskMode = "one_shot" | "resumable" | "background";
-export type AgentMailboxStatus = "queued" | "consumed";
+export type AgentMailboxStatus = "queued" | "delivering" | "consumed";
 
 export interface AgentTaskCreatedPayload {
   taskId: TaskId;
@@ -120,6 +120,20 @@ export interface AgentMessageConsumedPayload {
   consumedBy?: AgentPath;
 }
 
+export interface AgentMessageClaimedPayload {
+  messageId: string;
+  path?: AgentPath;
+  taskId?: TaskId;
+  claimedBy?: AgentPath;
+}
+
+export interface AgentMessageRequeuedPayload {
+  messageId: string;
+  path?: AgentPath;
+  taskId?: TaskId;
+  error?: string;
+}
+
 export interface AgentCompleteTaskPayload {
   taskId: TaskId;
   path: AgentPath;
@@ -145,6 +159,8 @@ export type AgentEvent =
   | EventEnvelope<"agent.task_created", AgentTaskCreatedPayload>
   | EventEnvelope<"agent.spawned", AgentSpawnedPayload>
   | EventEnvelope<"agent.message_queued", AgentMessageQueuedPayload>
+  | EventEnvelope<"agent.message_claimed", AgentMessageClaimedPayload>
+  | EventEnvelope<"agent.message_requeued", AgentMessageRequeuedPayload>
   | EventEnvelope<"agent.message_consumed", AgentMessageConsumedPayload>
   | EventEnvelope<"agent.task_completed", AgentCompleteTaskPayload>
   | EventEnvelope<"agent.completed", AgentCompletedPayload>;

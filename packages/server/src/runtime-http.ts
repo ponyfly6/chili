@@ -702,7 +702,7 @@ function mailboxQueryFromUrl(url: URL): AgentMailboxQuery {
   const limit = numberParam(url.searchParams.get("limit"));
   if (messageId) query.messageId = messageId;
   if (taskId) query.taskId = taskId as TaskId;
-  if (status === "queued" || status === "consumed") query.status = status;
+  if (status === "queued" || status === "delivering" || status === "consumed") query.status = status;
   if (path) query.path = path as AgentPath;
   if (childSessionId) query.childSessionId = childSessionId;
   if (limit !== undefined) query.limit = limit;

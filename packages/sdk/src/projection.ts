@@ -115,10 +115,11 @@ export interface RuntimeAgentMailboxMessageView {
   path: AgentPath;
   from: AgentPath;
   triggerTurn: boolean;
-  status: "queued" | "consumed";
+  status: "queued" | "delivering" | "consumed";
   queuedAt: number;
   sessionId?: SessionId;
   threadId?: ThreadId;
+  claimedAt?: number;
   consumedAt?: number;
 }
 
@@ -476,6 +477,27 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     if (!message) return;
     message.status = "consumed";
     message.consumedAt = event.time;
+    return;
+  }
+
+  if (event.type === "agent.message_claimed") {
+    const messageId = stringValue(payload.messageId);
+    if (!messageId) return;
+    const message = view.mailboxMessages[messageId];
+    if (!message) return;
+    message.status = "delivering";
+    message.claimedAt = event.time;
+    return;
+  }
+
+  if (event.type === "agent.message_requeued") {
+    const messageId = stringValue(payload.messageId);
+    if (!messageId) return;
+    const message = view.mailboxMessages[messageId];
+    if (!message) return;
+    message.status = "queued";
+    delete message.claimedAt;
+    delete message.consumedAt;
     return;
   }
 
