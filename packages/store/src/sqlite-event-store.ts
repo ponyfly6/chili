@@ -1,14 +1,18 @@
 import { Database } from "bun:sqlite";
 import type {
+  AgentCompleteTaskPayload,
   AgentEvent,
   ApprovalEvent,
   ChiliEvent,
   EventEnvelope,
+  AgentPath,
+  AgentMailboxPayload,
   Message,
   MessageId,
   MessageEvent,
   MessagePart,
   SessionId,
+  TaskId,
   SessionEvent,
   TeamEvent,
   ThreadId,
@@ -17,12 +21,18 @@ import type {
 import { decodeJson, encodeJson } from "./json.js";
 import { SQLITE_SCHEMA } from "./schema.js";
 import type {
+  AgentMailboxQuery,
+  AgentMailboxRow,
   AgentRunRow,
+  AgentRunQuery,
+  AgentTaskQuery,
+  AgentTaskRow,
   ApprovalRow,
   EventMirror,
   EventQuery,
   EventStore,
   SessionRow,
+  SubagentProjectionStore,
 } from "./types.js";
 
 interface StoredEventRow {
@@ -48,12 +58,66 @@ interface PartRow {
   data_json: string;
 }
 
+interface AgentTaskProjectionRow {
+  id: string;
+  path: string;
+  parent_path: string | null;
+  parent_session_id: string | null;
+  parent_thread_id: string | null;
+  child_session_id: string | null;
+  child_thread_id: string | null;
+  task_name: string;
+  cwd: string | null;
+  prompt: string | null;
+  mode: string | null;
+  status: string;
+  current_run_id: string | null;
+  summary: string | null;
+  error: string | null;
+  completion_json: string | null;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
+}
+
+interface AgentRunProjectionRow {
+  id: string;
+  session_id: string | null;
+  thread_id: string | null;
+  task_id: string | null;
+  path: string;
+  parent_path: string | null;
+  parent_session_id: string | null;
+  parent_thread_id: string | null;
+  child_session_id: string | null;
+  child_thread_id: string | null;
+  task_name: string;
+  cwd: string | null;
+  mode: string | null;
+  status: AgentRunRow["status"];
+  created_at: number;
+  completed_at: number | null;
+}
+
+interface AgentMailboxProjectionRow {
+  id: string;
+  task_id: string | null;
+  path: string;
+  from_path: string;
+  child_session_id: string | null;
+  child_thread_id: string | null;
+  trigger_turn: number;
+  status: "queued";
+  message_json: string | null;
+  created_at: number;
+}
+
 export interface SqliteEventStoreOptions {
   mirror?: EventMirror;
   onMirrorError?: (error: unknown, event: ChiliEvent) => void;
 }
 
-export class SqliteEventStore implements EventStore {
+export class SqliteEventStore implements EventStore, SubagentProjectionStore {
   private readonly db: Database;
 
   constructor(path = ".chili/chili.sqlite", private readonly options: SqliteEventStoreOptions = {}) {
@@ -68,6 +132,7 @@ export class SqliteEventStore implements EventStore {
     for (const statement of remainingStatements) {
       this.db.exec(statement);
     }
+    this.migrateSubagentSchema();
   }
 
   close(): void {
@@ -196,6 +261,123 @@ export class SqliteEventStore implements EventStore {
     return rows.map((row) => approvalFromRow(row));
   }
 
+  async agentTask(taskId: TaskId): Promise<AgentTaskRow | undefined> {
+    return (await this.agentTasks({ taskId, limit: 1 }))[0];
+  }
+
+  async agentTasks(query: AgentTaskQuery = {}): Promise<AgentTaskRow[]> {
+    const clauses: string[] = [];
+    const params: Record<string, unknown> = {};
+
+    if (query.taskId) {
+      clauses.push("id = $taskId");
+      params.taskId = query.taskId;
+    }
+    if (query.path) {
+      clauses.push("path = $path");
+      params.path = query.path;
+    }
+    if (query.parentSessionId) {
+      clauses.push("parent_session_id = $parentSessionId");
+      params.parentSessionId = query.parentSessionId;
+    }
+    if (query.childSessionId) {
+      clauses.push("child_session_id = $childSessionId");
+      params.childSessionId = query.childSessionId;
+    }
+    if (query.status) {
+      clauses.push("status = $status");
+      params.status = query.status;
+    }
+
+    params.limit = query.limit ?? 500;
+    const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
+    return this.db
+      .query<AgentTaskProjectionRow, any>(
+        `select id, path, parent_path, parent_session_id, parent_thread_id, child_session_id, child_thread_id,
+                task_name, cwd, prompt, mode, status, current_run_id, summary, error, completion_json,
+                created_at, updated_at, completed_at
+         from agent_tasks
+         ${where}
+         order by created_at asc, id asc
+         limit $limit`,
+      )
+      .all(params)
+      .map((row) => agentTaskFromRow(row));
+  }
+
+  async agentRuns(query: AgentRunQuery = {}): Promise<AgentRunRow[]> {
+    const clauses: string[] = [];
+    const params: Record<string, unknown> = {};
+
+    if (query.taskId) {
+      clauses.push("task_id = $taskId");
+      params.taskId = query.taskId;
+    }
+    if (query.path) {
+      clauses.push("path = $path");
+      params.path = query.path;
+    }
+    if (query.sessionId) {
+      clauses.push("session_id = $sessionId");
+      params.sessionId = query.sessionId;
+    }
+    if (query.childSessionId) {
+      clauses.push("child_session_id = $childSessionId");
+      params.childSessionId = query.childSessionId;
+    }
+    if (query.status) {
+      clauses.push("status = $status");
+      params.status = query.status;
+    }
+
+    params.limit = query.limit ?? 500;
+    const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
+    return this.db
+      .query<AgentRunProjectionRow, any>(
+        `select id, session_id, thread_id, task_id, path, parent_path, parent_session_id, parent_thread_id,
+                child_session_id, child_thread_id, task_name, cwd, mode, status, created_at, completed_at
+         from agent_runs
+         ${where}
+         order by created_at asc, id asc
+         limit $limit`,
+      )
+      .all(params)
+      .map((row) => agentRunFromRow(row));
+  }
+
+  async agentMailbox(query: AgentMailboxQuery = {}): Promise<AgentMailboxRow[]> {
+    const clauses: string[] = [];
+    const params: Record<string, unknown> = {};
+
+    if (query.taskId) {
+      clauses.push("task_id = $taskId");
+      params.taskId = query.taskId;
+    }
+    if (query.path) {
+      clauses.push("path = $path");
+      params.path = query.path;
+    }
+    if (query.childSessionId) {
+      clauses.push("child_session_id = $childSessionId");
+      params.childSessionId = query.childSessionId;
+    }
+
+    params.limit = query.limit ?? 500;
+    const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
+    return this.db
+      .query<AgentMailboxProjectionRow, any>(
+        `select id, task_id, path, from_path, child_session_id, child_thread_id, trigger_turn, status,
+                message_json, created_at
+         from agent_mailbox
+         ${where}
+         order by created_at asc, id asc
+         limit $limit`,
+      )
+      .all(params)
+      .map((row) => agentMailboxFromRow(row));
+  }
+
   private writeTransaction(events: readonly ChiliEvent[]): void {
     const run = this.db.transaction((items: readonly ChiliEvent[]) => {
       for (const event of items) {
@@ -243,6 +425,25 @@ export class SqliteEventStore implements EventStore {
     this.db.exec(`create index if not exists events_session_seq_idx on events(session_id, seq)`);
     this.db.exec(`create index if not exists events_thread_seq_idx on events(thread_id, seq)`);
     this.db.exec(`create index if not exists events_type_seq_idx on events(type, seq)`);
+  }
+
+  private migrateSubagentSchema(): void {
+    this.addColumnIfMissing("agent_runs", "task_id", "text");
+    this.addColumnIfMissing("agent_runs", "parent_session_id", "text");
+    this.addColumnIfMissing("agent_runs", "parent_thread_id", "text");
+    this.addColumnIfMissing("agent_runs", "child_session_id", "text");
+    this.addColumnIfMissing("agent_runs", "child_thread_id", "text");
+    this.addColumnIfMissing("agent_runs", "cwd", "text");
+    this.addColumnIfMissing("agent_runs", "mode", "text");
+    this.db.exec(`create index if not exists agent_runs_task_idx on agent_runs(task_id)`);
+    this.db.exec(`create index if not exists agent_runs_child_session_idx on agent_runs(child_session_id)`);
+  }
+
+  private addColumnIfMissing(table: string, column: string, definition: string): void {
+    const columns = this.db.query<{ name: string }, []>(`pragma table_info(${table})`).all();
+    if (!columns.some((item) => item.name === column)) {
+      this.db.exec(`alter table ${table} add column ${column} ${definition}`);
+    }
   }
 
   private nextEventSeq(): number {
@@ -425,30 +626,219 @@ export class SqliteEventStore implements EventStore {
   }
 
   private applyAgentEvent(event: AgentEvent): void {
-    if (event.type === "agent.spawned") {
+    if (event.type === "agent.task_created") {
       this.db
         .query(
-          `insert into agent_runs
-             (id, session_id, thread_id, path, parent_path, task_name, status, created_at)
-           values (?, ?, ?, ?, ?, ?, 'running', ?)
-           on conflict(id) do update set status = 'running'`,
+          `insert into agent_tasks
+             (id, path, parent_path, parent_session_id, parent_thread_id, child_session_id, child_thread_id,
+              task_name, cwd, prompt, mode, status, created_at, updated_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+           on conflict(id) do update set
+             path = excluded.path,
+             parent_path = excluded.parent_path,
+             parent_session_id = excluded.parent_session_id,
+             parent_thread_id = excluded.parent_thread_id,
+             child_session_id = excluded.child_session_id,
+             child_thread_id = excluded.child_thread_id,
+             task_name = excluded.task_name,
+             cwd = excluded.cwd,
+             prompt = excluded.prompt,
+             mode = excluded.mode,
+             updated_at = excluded.updated_at`,
         )
         .run(
-          event.payload.runId,
-          event.sessionId ?? null,
-          event.threadId ?? null,
+          event.payload.taskId,
           event.payload.path,
-          event.payload.parentPath ?? null,
+          event.payload.parentPath,
+          event.payload.parentSessionId,
+          event.payload.parentThreadId ?? null,
+          event.payload.childSessionId,
+          event.payload.childThreadId,
           event.payload.taskName,
+          event.payload.cwd,
+          event.payload.prompt,
+          event.payload.mode ?? null,
+          event.time,
           event.time,
         );
       return;
     }
 
+    if (event.type === "agent.spawned") {
+      const parentSessionId = event.payload.parentSessionId ?? event.sessionId ?? null;
+      const parentThreadId = event.payload.parentThreadId ?? event.threadId ?? null;
+      this.db
+        .query(
+          `insert into agent_runs
+             (id, session_id, thread_id, task_id, path, parent_path, parent_session_id, parent_thread_id,
+              child_session_id, child_thread_id, task_name, cwd, mode, status, created_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
+           on conflict(id) do update set
+             status = 'running',
+             session_id = coalesce(excluded.session_id, agent_runs.session_id),
+             thread_id = coalesce(excluded.thread_id, agent_runs.thread_id),
+             task_id = coalesce(excluded.task_id, agent_runs.task_id),
+             path = excluded.path,
+             parent_path = coalesce(excluded.parent_path, agent_runs.parent_path),
+             parent_session_id = coalesce(excluded.parent_session_id, agent_runs.parent_session_id),
+             parent_thread_id = coalesce(excluded.parent_thread_id, agent_runs.parent_thread_id),
+             child_session_id = coalesce(excluded.child_session_id, agent_runs.child_session_id),
+             child_thread_id = coalesce(excluded.child_thread_id, agent_runs.child_thread_id),
+             task_name = excluded.task_name,
+             cwd = coalesce(excluded.cwd, agent_runs.cwd),
+             mode = coalesce(excluded.mode, agent_runs.mode),
+             completed_at = null`,
+        )
+        .run(
+          event.payload.runId,
+          event.sessionId ?? null,
+          event.threadId ?? null,
+          event.payload.taskId ?? null,
+          event.payload.path,
+          event.payload.parentPath ?? null,
+          parentSessionId,
+          parentThreadId,
+          event.payload.childSessionId ?? null,
+          event.payload.childThreadId ?? null,
+          event.payload.taskName,
+          event.payload.cwd ?? null,
+          event.payload.mode ?? null,
+          event.time,
+        );
+      if (event.payload.taskId) {
+        this.db
+          .query(
+            `insert into agent_tasks
+               (id, path, parent_path, parent_session_id, parent_thread_id, child_session_id, child_thread_id,
+                task_name, cwd, mode, status, current_run_id, created_at, updated_at)
+             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+             on conflict(id) do update set
+               status = 'running',
+               current_run_id = excluded.current_run_id,
+               path = excluded.path,
+               parent_path = coalesce(excluded.parent_path, agent_tasks.parent_path),
+               parent_session_id = coalesce(excluded.parent_session_id, agent_tasks.parent_session_id),
+               parent_thread_id = coalesce(excluded.parent_thread_id, agent_tasks.parent_thread_id),
+               child_session_id = coalesce(excluded.child_session_id, agent_tasks.child_session_id),
+               child_thread_id = coalesce(excluded.child_thread_id, agent_tasks.child_thread_id),
+               task_name = excluded.task_name,
+               cwd = coalesce(excluded.cwd, agent_tasks.cwd),
+               mode = coalesce(excluded.mode, agent_tasks.mode),
+               updated_at = excluded.updated_at`,
+          )
+          .run(
+            event.payload.taskId,
+            event.payload.path,
+            event.payload.parentPath ?? null,
+            parentSessionId,
+            parentThreadId,
+            event.payload.childSessionId ?? null,
+            event.payload.childThreadId ?? null,
+            event.payload.taskName,
+            event.payload.cwd ?? null,
+            event.payload.mode ?? null,
+            event.payload.runId,
+            event.time,
+            event.time,
+          );
+      }
+      return;
+    }
+
+    if (event.type === "agent.message_queued") {
+      this.db
+        .query(
+          `insert into agent_mailbox
+             (id, task_id, path, from_path, child_session_id, child_thread_id, trigger_turn, status, message_json, created_at)
+           values (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+           on conflict(id) do update set
+             task_id = excluded.task_id,
+             path = excluded.path,
+             from_path = excluded.from_path,
+             child_session_id = excluded.child_session_id,
+             child_thread_id = excluded.child_thread_id,
+             trigger_turn = excluded.trigger_turn,
+             message_json = excluded.message_json`,
+        )
+        .run(
+          event.id,
+          event.payload.taskId ?? null,
+          event.payload.path,
+          event.payload.from,
+          event.payload.childSessionId ?? null,
+          event.payload.childThreadId ?? null,
+          event.payload.triggerTurn ? 1 : 0,
+          event.payload.message ? encodeJson(event.payload.message) : null,
+          event.time,
+        );
+      if (event.payload.taskId) {
+        this.db.query(`update agent_tasks set updated_at = ? where id = ?`).run(event.time, event.payload.taskId);
+      }
+      return;
+    }
+
+    if (event.type === "agent.task_completed") {
+      this.applyAgentTaskCompletion(event.payload, event.time);
+      return;
+    }
+
     if (event.type === "agent.completed") {
       this.db
-        .query(`update agent_runs set status = ?, completed_at = ? where id = ?`)
-        .run(event.payload.status, event.time, event.payload.runId);
+        .query(
+          `update agent_runs
+           set status = ?, completed_at = ?, task_id = coalesce(?, task_id)
+           where id = ?`,
+        )
+        .run(event.payload.status, event.time, event.payload.taskId ?? null, event.payload.runId);
+      if (event.payload.taskId) {
+        this.applyAgentTaskCompletion(
+          {
+            taskId: event.payload.taskId,
+            path: event.payload.path,
+            runId: event.payload.runId,
+            status: event.payload.status,
+            ...(event.payload.summary ? { summary: event.payload.summary } : {}),
+            ...(event.payload.error ? { error: event.payload.error } : {}),
+          },
+          event.time,
+        );
+      }
+    }
+  }
+
+  private applyAgentTaskCompletion(payload: AgentCompleteTaskPayload, time: number): void {
+    this.db
+      .query(
+        `insert into agent_tasks
+           (id, path, task_name, status, current_run_id, summary, error, completion_json, created_at, updated_at, completed_at)
+         values (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?)
+         on conflict(id) do update set
+           path = excluded.path,
+           status = excluded.status,
+           current_run_id = coalesce(excluded.current_run_id, agent_tasks.current_run_id),
+           summary = excluded.summary,
+           error = excluded.error,
+           completion_json = excluded.completion_json,
+           updated_at = excluded.updated_at,
+           completed_at = excluded.completed_at`,
+      )
+      .run(
+        payload.taskId,
+        payload.path,
+        payload.status,
+        payload.runId ?? null,
+        payload.summary ?? null,
+        payload.error ?? null,
+        encodeJson(payload),
+        time,
+        time,
+        time,
+      );
+
+    if (payload.runId) {
+      this.db
+        .query(`update agent_runs set status = ?, completed_at = ?, task_id = coalesce(task_id, ?) where id = ?`)
+        .run(payload.status, time, payload.taskId, payload.runId);
     }
   }
 
@@ -530,6 +920,71 @@ function approvalFromRow(row: Record<string, unknown>): ApprovalRow {
   return approval;
 }
 
+function agentTaskFromRow(row: AgentTaskProjectionRow): AgentTaskRow {
+  const task: AgentTaskRow = {
+    id: row.id as TaskId,
+    path: row.path as AgentPath,
+    status: row.status as AgentTaskRow["status"],
+    taskName: row.task_name,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+  if (row.parent_path) task.parentPath = row.parent_path as AgentPath;
+  if (row.parent_session_id) task.parentSessionId = row.parent_session_id as SessionId;
+  if (row.parent_thread_id) task.parentThreadId = row.parent_thread_id as ThreadId;
+  if (row.child_session_id) task.childSessionId = row.child_session_id as SessionId;
+  if (row.child_thread_id) task.childThreadId = row.child_thread_id as ThreadId;
+  if (row.cwd) task.cwd = row.cwd;
+  if (row.prompt) task.prompt = row.prompt;
+  if (row.mode) task.mode = row.mode as NonNullable<AgentTaskRow["mode"]>;
+  if (row.current_run_id) task.currentRunId = row.current_run_id;
+  if (row.summary) task.summary = row.summary;
+  if (row.error) task.error = row.error;
+  if (row.completion_json) task.completion = decodeJson<Record<string, unknown>>(row.completion_json, {});
+  if (row.completed_at) task.completedAt = row.completed_at;
+  return task;
+}
+
+function agentRunFromRow(row: AgentRunProjectionRow): AgentRunRow {
+  const run: AgentRunRow = {
+    id: row.id,
+    path: row.path as AgentPath,
+    taskName: row.task_name,
+    status: row.status,
+    createdAt: row.created_at,
+  };
+  if (row.session_id) run.sessionId = row.session_id as SessionId;
+  if (row.thread_id) run.threadId = row.thread_id as ThreadId;
+  if (row.task_id) run.taskId = row.task_id as TaskId;
+  if (row.parent_path) run.parentPath = row.parent_path as AgentPath;
+  if (row.parent_session_id) run.parentSessionId = row.parent_session_id as SessionId;
+  if (row.parent_thread_id) run.parentThreadId = row.parent_thread_id as ThreadId;
+  if (row.child_session_id) run.childSessionId = row.child_session_id as SessionId;
+  if (row.child_thread_id) run.childThreadId = row.child_thread_id as ThreadId;
+  if (row.cwd) run.cwd = row.cwd;
+  if (row.mode) run.mode = row.mode as NonNullable<AgentRunRow["mode"]>;
+  if (row.completed_at) run.completedAt = row.completed_at;
+  return run;
+}
+
+function agentMailboxFromRow(row: AgentMailboxProjectionRow): AgentMailboxRow {
+  const message: AgentMailboxRow = {
+    id: row.id,
+    path: row.path as AgentPath,
+    fromPath: row.from_path as AgentPath,
+    triggerTurn: row.trigger_turn === 1,
+    status: row.status,
+    createdAt: row.created_at,
+  };
+  if (row.task_id) message.taskId = row.task_id as TaskId;
+  if (row.child_session_id) message.childSessionId = row.child_session_id as SessionId;
+  if (row.child_thread_id) message.childThreadId = row.child_thread_id as ThreadId;
+  if (row.message_json) {
+    message.message = decodeJson<AgentMailboxPayload>(row.message_json, { content: "" });
+  }
+  return message;
+}
+
 function applyPartDelta(part: MessagePart, field: string, delta: string): MessagePart {
   if (field === "text" && (part.type === "text" || part.type === "reasoning")) {
     return { ...part, text: part.text + delta };
@@ -540,4 +995,4 @@ function applyPartDelta(part: MessagePart, field: string, delta: string): Messag
   return part;
 }
 
-export type { AgentRunRow };
+export type { AgentMailboxRow, AgentRunRow, AgentTaskRow };

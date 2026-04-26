@@ -66,10 +66,76 @@ export type RecoveryEvent =
   | EventEnvelope<"snapshot.created", { snapshotId: SnapshotId; callId?: ToolCallId; toolName?: string; paths: string[]; reason: string }>
   | EventEnvelope<"snapshot.reverted", { snapshotId: SnapshotId; status: "completed" | "failed"; paths: string[]; error?: string }>;
 
+export type AgentTaskStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
+export type AgentTaskMode = "one_shot" | "resumable" | "background";
+
+export interface AgentTaskCreatedPayload {
+  taskId: TaskId;
+  path: AgentPath;
+  parentPath: AgentPath;
+  parentSessionId: SessionId;
+  childSessionId: SessionId;
+  childThreadId: ThreadId;
+  taskName: string;
+  cwd: string;
+  prompt: string;
+  parentThreadId?: ThreadId;
+  mode?: AgentTaskMode;
+}
+
+export interface AgentSpawnedPayload {
+  runId: AgentRunId;
+  path: AgentPath;
+  taskName: string;
+  parentPath?: AgentPath;
+  taskId?: TaskId;
+  parentSessionId?: SessionId;
+  parentThreadId?: ThreadId;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  cwd?: string;
+  mode?: AgentTaskMode;
+}
+
+export type AgentMailboxPayload =
+  | { role?: "system" | "user" | "assistant" | "tool"; content: string; metadata?: Record<string, unknown> }
+  | { role?: "system" | "user" | "assistant" | "tool"; parts: MessagePart[]; metadata?: Record<string, unknown> };
+
+export interface AgentMessageQueuedPayload {
+  path: AgentPath;
+  from: AgentPath;
+  triggerTurn: boolean;
+  taskId?: TaskId;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  message?: AgentMailboxPayload;
+}
+
+export interface AgentCompleteTaskPayload {
+  taskId: TaskId;
+  path: AgentPath;
+  status: Exclude<AgentTaskStatus, "pending" | "running">;
+  runId?: AgentRunId;
+  summary?: string;
+  error?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AgentCompletedPayload {
+  runId: AgentRunId;
+  path: AgentPath;
+  status: Exclude<AgentTaskStatus, "pending" | "running">;
+  taskId?: TaskId;
+  summary?: string;
+  error?: string;
+}
+
 export type AgentEvent =
-  | EventEnvelope<"agent.spawned", { runId: AgentRunId; path: AgentPath; parentPath?: AgentPath; taskName: string }>
-  | EventEnvelope<"agent.message_queued", { path: AgentPath; from: AgentPath; triggerTurn: boolean }>
-  | EventEnvelope<"agent.completed", { runId: AgentRunId; path: AgentPath; status: "completed" | "failed" | "cancelled" }>;
+  | EventEnvelope<"agent.task_created", AgentTaskCreatedPayload>
+  | EventEnvelope<"agent.spawned", AgentSpawnedPayload>
+  | EventEnvelope<"agent.message_queued", AgentMessageQueuedPayload>
+  | EventEnvelope<"agent.task_completed", AgentCompleteTaskPayload>
+  | EventEnvelope<"agent.completed", AgentCompletedPayload>;
 
 export type TeamEvent =
   | EventEnvelope<"team.created", { teamId: TeamId; name: string; leadPath: AgentPath }>

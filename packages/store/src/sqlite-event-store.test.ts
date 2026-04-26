@@ -3,7 +3,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import type { ChiliEvent, MessageId, PartId, SessionId, ThreadId, TimestampMs } from "@chili/protocol";
+import type {
+  AgentPath,
+  AgentRunId,
+  ChiliEvent,
+  MessageId,
+  PartId,
+  SessionId,
+  TaskId,
+  ThreadId,
+  TimestampMs,
+} from "@chili/protocol";
 import { SqliteEventStore } from "./sqlite-event-store.js";
 
 test("orders event replay and afterEventId cursors by insertion sequence", async () => {
@@ -113,6 +123,172 @@ test("replays message part deltas into stored messages", async () => {
         text: "hello",
       },
     ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("projects local subagent tasks, runs, mailbox, and completion", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-subagent-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const parentSessionId = "session_parent" as SessionId;
+  const parentThreadId = "thread_parent" as ThreadId;
+  const childSessionId = "session_child" as SessionId;
+  const childThreadId = "thread_child" as ThreadId;
+  const taskId = "task_review" as TaskId;
+  const runId = "agent_review" as AgentRunId;
+  const path = "/root/task_review" as AgentPath;
+  const parentPath = "/root" as AgentPath;
+  const time = 1 as TimestampMs;
+
+  try {
+    await store.append(sessionEvent("event_session", parentSessionId, parentThreadId, time));
+    await store.append({
+      id: "event_task_created",
+      type: "agent.task_created",
+      time,
+      sessionId: parentSessionId,
+      threadId: parentThreadId,
+      payload: {
+        taskId,
+        path,
+        parentPath,
+        parentSessionId,
+        parentThreadId,
+        childSessionId,
+        childThreadId,
+        taskName: "review",
+        cwd: "/repo",
+        prompt: "Review this",
+        mode: "one_shot",
+      },
+    });
+    await store.append({
+      id: "event_spawned",
+      type: "agent.spawned",
+      time,
+      sessionId: parentSessionId,
+      threadId: parentThreadId,
+      payload: {
+        runId,
+        taskId,
+        path,
+        parentPath,
+        parentSessionId,
+        parentThreadId,
+        childSessionId,
+        childThreadId,
+        taskName: "review",
+        cwd: "/repo",
+        mode: "one_shot",
+      },
+    });
+    await store.append({
+      id: "event_mailbox",
+      type: "agent.message_queued",
+      time,
+      sessionId: parentSessionId,
+      threadId: parentThreadId,
+      payload: {
+        taskId,
+        path,
+        from: parentPath,
+        childSessionId,
+        childThreadId,
+        triggerTurn: true,
+        message: { role: "user", content: "go" },
+      },
+    });
+    await store.append({
+      id: "event_task_completed",
+      type: "agent.task_completed",
+      time,
+      sessionId: parentSessionId,
+      threadId: parentThreadId,
+      payload: {
+        taskId,
+        runId,
+        path,
+        status: "completed",
+        summary: "done",
+      },
+    });
+    await store.append({
+      id: "event_completed",
+      type: "agent.completed",
+      time,
+      sessionId: parentSessionId,
+      threadId: parentThreadId,
+      payload: {
+        runId,
+        taskId,
+        path,
+        status: "completed",
+        summary: "done",
+      },
+    });
+
+    expect(await store.agentTasks({ taskId })).toEqual([
+      {
+        id: taskId,
+        path,
+        parentPath,
+        parentSessionId,
+        parentThreadId,
+        childSessionId,
+        childThreadId,
+        taskName: "review",
+        cwd: "/repo",
+        prompt: "Review this",
+        mode: "one_shot",
+        status: "completed",
+        currentRunId: runId,
+        summary: "done",
+        completion: {
+          taskId,
+          runId,
+          path,
+          status: "completed",
+          summary: "done",
+        },
+        createdAt: time,
+        updatedAt: time,
+        completedAt: time,
+      },
+    ]);
+    expect(await store.agentRuns({ taskId })).toMatchObject([
+      {
+        id: runId,
+        sessionId: parentSessionId,
+        threadId: parentThreadId,
+        taskId,
+        path,
+        parentPath,
+        parentSessionId,
+        parentThreadId,
+        childSessionId,
+        childThreadId,
+        taskName: "review",
+        cwd: "/repo",
+        mode: "one_shot",
+        status: "completed",
+      },
+    ]);
+    expect(await store.agentMailbox({ taskId })).toMatchObject([
+      {
+        id: "event_mailbox",
+        taskId,
+        path,
+        fromPath: parentPath,
+        childSessionId,
+        childThreadId,
+        triggerTurn: true,
+        status: "queued",
+        message: { role: "user", content: "go" },
+      },
+    ]);
+    expect(await store.agentTask(taskId)).toMatchObject({ id: taskId, status: "completed" });
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
