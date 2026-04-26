@@ -76,6 +76,44 @@ export class CliPrinter {
       return;
     }
 
+    if (event.type === "agent.task_created") {
+      this.line(`\n[task] ${event.payload.taskId} -> ${event.payload.path} (${event.payload.taskName})`);
+      return;
+    }
+
+    if (event.type === "agent.spawned") {
+      const parent = event.payload.parentPath ? ` parent=${event.payload.parentPath}` : "";
+      this.line(`\n[agent] spawned ${event.payload.path} (${event.payload.taskName})${parent}`);
+      return;
+    }
+
+    if (event.type === "agent.message_queued") {
+      const trigger = event.payload.triggerTurn ? " trigger=turn" : "";
+      this.line(`\n[agent] message queued ${event.payload.from} -> ${event.payload.path}${trigger}`);
+      return;
+    }
+
+    if (event.type === "agent.completed") {
+      this.line(`\n[agent] completed ${event.payload.path}: ${event.payload.status}`);
+      return;
+    }
+
+    if (event.type === "agent.task_completed") {
+      this.line(`\n[task] ${event.payload.taskId}: ${event.payload.status}`);
+      return;
+    }
+
+    if (event.type === "team.task_created") {
+      const owner = event.payload.ownerPath ? ` owner=${event.payload.ownerPath}` : "";
+      this.line(`\n[task] created ${event.payload.taskId} team=${event.payload.teamId}${owner}`);
+      return;
+    }
+
+    if (event.type === "team.task_updated") {
+      this.line(`\n[task] ${event.payload.taskId}: ${event.payload.status}`);
+      return;
+    }
+
     if (event.type === "snapshot.created") {
       this.line(`\n[snapshot] ${event.payload.snapshotId} ${event.payload.paths.join(", ")}`);
     }

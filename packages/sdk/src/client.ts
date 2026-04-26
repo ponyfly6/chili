@@ -10,6 +10,7 @@ import type {
   SessionId,
   ThreadId,
 } from "@chili/protocol";
+import type { RuntimeAgentsSnapshot } from "./projection.js";
 
 export interface RuntimeClient {
   createSession(input?: CreateSessionRequest): Promise<RuntimeSessionRef>;
@@ -19,6 +20,7 @@ export interface RuntimeClient {
   resolveApproval(input: ResolveApprovalRequest): Promise<RuntimeApprovalResolveResult>;
   archiveSession(sessionId: SessionId): Promise<void>;
   listSessions(): Promise<RuntimeSessionSummary[]>;
+  listAgents(input?: ListAgentsRequest): Promise<RuntimeAgentsSnapshot>;
   messages(sessionId: SessionId): Promise<Message[]>;
   streamEvents(input?: StreamEventsRequest): AsyncIterable<ChiliEvent>;
 }
@@ -56,6 +58,10 @@ export interface RuntimeSessionSummary {
   status: "active" | "archived";
   createdAt: number;
   updatedAt: number;
+}
+
+export interface ListAgentsRequest {
+  sessionId?: SessionId;
 }
 
 export interface StreamEventsRequest {
@@ -108,6 +114,11 @@ export class HttpRuntimeClient implements RuntimeClient {
 
   listSessions(): Promise<RuntimeSessionSummary[]> {
     return this.get("sessions");
+  }
+
+  listAgents(input: ListAgentsRequest = {}): Promise<RuntimeAgentsSnapshot> {
+    if (input.sessionId) return this.get(`sessions/${encodeURIComponent(input.sessionId)}/agents`);
+    return this.get("agents");
   }
 
   messages(sessionId: SessionId): Promise<Message[]> {

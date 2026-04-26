@@ -1,6 +1,12 @@
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { RuntimeService, SingleAgentRuntime, SnapshotRecoveryService } from "@chili/core";
+import {
+  AgentRunnerSubagentRunner,
+  LocalSubagentManager,
+  RuntimeService,
+  SingleAgentRuntime,
+  SnapshotRecoveryService,
+} from "@chili/core";
 import type { SessionId, ThreadId } from "@chili/protocol";
 import { ObservableEventStore, SqliteEventStore } from "@chili/store";
 import {
@@ -11,9 +17,11 @@ import {
   ToolExecutor,
   createApplyPatchTool,
   createBashTool,
+  createCompleteTaskTool,
   createEditTool,
   createGitDiffTool,
   createReadFileTool,
+  createTaskTool,
 } from "@chili/tools";
 import { createCliApprovalBroker, createCliPermissionRules } from "./approval.js";
 import { createIdFactory } from "./id.js";
@@ -49,11 +57,55 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const printer = new CliPrinter();
   const printableStore = options.quiet ? sqliteStore : new PrintingEventStore(sqliteStore, printer);
   const eventStore = new ObservableEventStore(printableStore);
+  const model = await createCliModel(options.model);
   const registry = createToolRegistry();
+  const childRegistry = createChildToolRegistry();
   const snapshotProvider = new FileSystemSnapshotProvider({
     rootDir: join(stateDir, "snapshots"),
     createId,
   });
+  const childToolExecutor = new ToolExecutor({
+    registry: childRegistry,
+    events: { publish: (event) => eventStore.append(event) },
+    approvals: createApprovalBroker(options),
+    snapshotProvider,
+    createId,
+    maxResultOutputBytes: 128_000,
+  });
+  const childRuntime = new SingleAgentRuntime({
+    store: eventStore,
+    model,
+    toolRegistry: childRegistry,
+    toolExecutor: childToolExecutor,
+    createId,
+    contextBudget: {
+      maxInputChars: 120_000,
+      maxToolResultChars: 16_000,
+      preserveRecentMessages: 4,
+    },
+    retryPolicy: {
+      maxAttempts: 2,
+      initialDelayMs: 500,
+    },
+    doomLoopGuard: {
+      maxRepeatedToolCalls: 3,
+      maxToolCallsPerTurn: 20,
+    },
+  });
+  const subagents = new LocalSubagentManager({
+    store: eventStore,
+    runner: new AgentRunnerSubagentRunner({
+      runner: childRuntime,
+      store: eventStore,
+      maxTurns: 8,
+      system: [
+        "You are a local Chili subagent. Work in the assigned repository scope, keep results concise, and return a clear final summary.",
+      ],
+    }),
+    createId,
+  });
+  registry.register(createTaskTool(subagents));
+  childRegistry.register(createCompleteTaskTool(subagents));
   const toolExecutor = new ToolExecutor({
     registry,
     events: { publish: (event) => eventStore.append(event) },
@@ -64,7 +116,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   });
   const runtime = new SingleAgentRuntime({
     store: eventStore,
-    model: await createCliModel(options.model),
+    model,
     toolRegistry: registry,
     toolExecutor,
     createId,
@@ -124,6 +176,13 @@ function createToolRegistry(): InMemoryToolRegistry {
   registry.register(createEditTool());
   registry.register(createApplyPatchTool());
   registry.register(createBashTool());
+  registry.register(createGitDiffTool());
+  return registry;
+}
+
+function createChildToolRegistry(): InMemoryToolRegistry {
+  const registry = new InMemoryToolRegistry();
+  registry.register(createReadFileTool());
   registry.register(createGitDiffTool());
   return registry;
 }

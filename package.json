@@ -14,6 +14,7 @@
     "probe:minimax": "bun run scripts/probe-minimax.ts",
     "smoke:cli": "bun run scripts/smoke-cli.ts",
     "smoke:p0p1": "bun run scripts/smoke-p0-p1.ts",
+    "smoke:p2": "bun run scripts/smoke-p2-subagent.ts",
     "typecheck": "tsc -b"
   },
   "devDependencies": {

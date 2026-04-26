@@ -21,6 +21,20 @@ export class FakeModelRouter implements ModelRouter {
       return;
     }
 
+    if (text.includes("delegate read")) {
+      yield {
+        type: "tool_call",
+        name: "task",
+        input: {
+          description: "Read package through a subagent",
+          prompt: "read package",
+          mode: "one_shot",
+        },
+      };
+      yield { type: "finish", reason: "tool_use" };
+      return;
+    }
+
     yield { type: "text_delta", text: text ? `Echo: ${text}` : "Chili fake model is ready." };
     yield { type: "finish", reason: "stop" };
   }

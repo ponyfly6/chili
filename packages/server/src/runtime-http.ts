@@ -11,6 +11,7 @@ import type {
 } from "@chili/protocol";
 import type { RuntimeBackgroundErrorHandler, SubmitPromptInput, SubmitPromptResult } from "@chili/core";
 import type { EventPublisher, EventStore } from "@chili/store";
+import { projectRuntimeAgents } from "./agent-projection.js";
 
 export interface RuntimeHttpService {
   createSession(input?: { sessionId?: SessionId; threadId?: ThreadId; cwd?: string }): Promise<RuntimeSessionRef>;
@@ -60,6 +61,18 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "listSessions") {
         return json(await options.store.sessions());
+      }
+
+      if (route.name === "agents") {
+        const query = {
+          limit: maxBacklogEvents,
+        } as {
+          sessionId?: SessionId;
+          limit: number;
+        };
+        if (route.sessionId) query.sessionId = route.sessionId;
+        const events = await options.store.events(query);
+        return json(projectRuntimeAgents(events, route.sessionId));
       }
 
       if (route.name === "createSession") {
@@ -167,6 +180,7 @@ export function startRuntimeHttpServer(options: StartRuntimeHttpServerOptions): 
 type Route =
   | { name: "health" }
   | { name: "events" }
+  | { name: "agents"; sessionId?: SessionId }
   | { name: "listSessions" }
   | { name: "createSession" }
   | { name: "messages"; sessionId: SessionId }
@@ -218,6 +232,7 @@ function routeRequest(method: string, pathname: string): Route {
   const path = pathname.replace(/\/+$/, "") || "/";
   if (method === "GET" && path === "/health") return { name: "health" };
   if (method === "GET" && path === "/events") return { name: "events" };
+  if (method === "GET" && path === "/agents") return { name: "agents" };
   if (method === "GET" && path === "/sessions") return { name: "listSessions" };
   if (method === "POST" && path === "/sessions") return { name: "createSession" };
 
@@ -234,6 +249,7 @@ function routeRequest(method: string, pathname: string): Route {
 
   const sessionId = decodeURIComponent(sessionRoute[1] ?? "") as SessionId;
   const action = sessionRoute[2];
+  if (method === "GET" && action === "agents") return { name: "agents", sessionId };
   if (method === "GET" && action === "messages") return { name: "messages", sessionId };
   if (method === "POST" && action === "prompt") return { name: "prompt", sessionId };
   if (method === "POST" && action === "prompt_async") return { name: "promptAsync", sessionId };

@@ -8,14 +8,19 @@ import type {
 } from "@chili/store";
 import { ObservableEventStore } from "@chili/store";
 import type {
+  AgentPath,
+  AgentRunId,
   ChiliEvent,
   EventEnvelope,
   Message,
   RuntimeSessionRef,
   SessionId,
+  TaskId,
+  TeamId,
   ThreadId,
   TimestampMs,
 } from "@chili/protocol";
+import type { RuntimeAgentsSnapshot } from "./agent-projection.js";
 import type { RuntimeHttpService } from "./runtime-http.js";
 import { createRuntimeHttpHandler } from "./runtime-http.js";
 
@@ -54,6 +59,73 @@ test("serves sessions and event backlog over the runtime HTTP handler", async ()
   reader.releaseLock();
 
   expect(new TextDecoder().decode(chunk.value)).toContain("session.created");
+});
+
+test("serves subagent runs and tasks through an event replay projection", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const handler = createRuntimeHttpHandler({ service, store });
+  const session = await service.createSession({ cwd: "/repo" });
+  const rootRunId = "agentrun_http_root" as AgentRunId;
+  const childRunId = "agentrun_http_child" as AgentRunId;
+  const rootPath = "/root" as AgentPath;
+  const childPath = "/root/reviewer" as AgentPath;
+  const teamId = "team_http" as TeamId;
+  const taskId = "task_http" as TaskId;
+
+  await store.appendMany([
+    {
+      id: "event_agent_root",
+      type: "agent.spawned",
+      time: 2 as TimestampMs,
+      sessionId: session.sessionId,
+      threadId: session.threadId,
+      payload: { runId: rootRunId, path: rootPath, taskName: "lead" },
+    },
+    {
+      id: "event_agent_child",
+      type: "agent.spawned",
+      time: 3 as TimestampMs,
+      sessionId: session.sessionId,
+      threadId: session.threadId,
+      payload: { runId: childRunId, path: childPath, parentPath: rootPath, taskName: "review" },
+    },
+    {
+      id: "event_task_created",
+      type: "team.task_created",
+      time: 4 as TimestampMs,
+      sessionId: session.sessionId,
+      threadId: session.threadId,
+      payload: { teamId, taskId, ownerPath: childPath },
+    },
+    {
+      id: "event_mailbox",
+      type: "agent.message_queued",
+      time: 5 as TimestampMs,
+      sessionId: session.sessionId,
+      threadId: session.threadId,
+      payload: { path: childPath, from: rootPath, triggerTurn: true },
+    },
+    {
+      id: "event_task_done",
+      type: "team.task_updated",
+      time: 6 as TimestampMs,
+      sessionId: session.sessionId,
+      threadId: session.threadId,
+      payload: { teamId, taskId, status: "completed" },
+    },
+  ]);
+
+  const response = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/agents`));
+  expect(response.status).toBe(200);
+  const body = (await response.json()) as RuntimeAgentsSnapshot;
+
+  expect(body.agents.map((agent) => agent.id)).toEqual([rootRunId, childRunId]);
+  expect(body.agents[0]?.childRunIds).toEqual([childRunId]);
+  expect(body.agents[1]?.mailboxMessageIds).toEqual(["event_mailbox"]);
+  expect(body.tasks[0]?.status).toBe("completed");
+  expect(body.mailbox[0]?.triggerTurn).toBe(true);
 });
 
 test("resolves approvals through the runtime HTTP handler", async () => {

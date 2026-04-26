@@ -1,6 +1,19 @@
 import { expect, test } from "bun:test";
-import type { ChiliEvent, MessageId, PartId, SessionId, ThreadId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
-import { createRuntimeView, pendingApprovals, reduceRuntimeEvents, sessionMessages } from "./projection.js";
+import type {
+  AgentPath,
+  AgentRunId,
+  ChiliEvent,
+  MessageId,
+  PartId,
+  SessionId,
+  TaskId,
+  TeamId,
+  ThreadId,
+  TimestampMs,
+  ToolCallId,
+  TurnId,
+} from "@chili/protocol";
+import { createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, sessionMessages } from "./projection.js";
 
 test("replays session, message, tool, and approval events into a runtime view", () => {
   const sessionId = "session_test" as SessionId;
@@ -105,4 +118,86 @@ test("replays session, message, tool, and approval events into a runtime view", 
   expect(message?.parts[0]?.type === "text" ? message.parts[0].text : "").toBe("hello world");
   expect(view.toolCalls[callId]?.status).toBe("completed");
   expect(pendingApprovals(view, sessionId)).toHaveLength(0);
+});
+
+test("projects subagent runs, mailbox messages, and team tasks", () => {
+  const sessionId = "session_agents" as SessionId;
+  const threadId = "thread_agents" as ThreadId;
+  const rootRunId = "agentrun_root" as AgentRunId;
+  const childRunId = "agentrun_child" as AgentRunId;
+  const teamId = "team_agents" as TeamId;
+  const taskId = "task_review" as TaskId;
+  const rootPath = "/root" as AgentPath;
+  const childPath = "/root/reviewer" as AgentPath;
+
+  const events: ChiliEvent[] = [
+    {
+      id: "event_1",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_2",
+      type: "agent.spawned",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { runId: rootRunId, path: rootPath, taskName: "lead" },
+    },
+    {
+      id: "event_3",
+      type: "agent.spawned",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { runId: childRunId, path: childPath, parentPath: rootPath, taskName: "review" },
+    },
+    {
+      id: "event_4",
+      type: "team.task_created",
+      time: 4 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { teamId, taskId, ownerPath: childPath },
+    },
+    {
+      id: "event_5",
+      type: "agent.message_queued",
+      time: 5 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { path: childPath, from: rootPath, triggerTurn: true },
+    },
+    {
+      id: "event_6",
+      type: "team.task_updated",
+      time: 6 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { teamId, taskId, status: "completed" },
+    },
+    {
+      id: "event_7",
+      type: "agent.completed",
+      time: 7 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { runId: childRunId, path: childPath, status: "completed" },
+    },
+  ];
+
+  const view = reduceRuntimeEvents(events, createRuntimeView());
+  const snapshot = runtimeAgentsSnapshot(view, sessionId);
+
+  expect(view.sessions[sessionId]?.agentRunIds).toEqual([rootRunId, childRunId]);
+  expect(view.agents[rootRunId]?.childRunIds).toEqual([childRunId]);
+  expect(view.agents[childRunId]?.mailboxMessageIds).toEqual(["event_5"]);
+  expect(view.agents[childRunId]?.taskIds).toEqual([taskId]);
+  expect(view.tasks[taskId]?.status).toBe("completed");
+  expect(view.tasks[taskId]?.completedAt).toBe(6);
+  expect(snapshot.agents.map((agent) => agent.id)).toEqual([rootRunId, childRunId]);
+  expect(snapshot.mailbox[0]?.triggerTurn).toBe(true);
 });
