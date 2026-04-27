@@ -239,6 +239,23 @@ export class CliPrinter {
       return;
     }
 
+    if (event.type === "turn.compaction_started") {
+      this.line(`\n[context] compacting ${event.payload.reason}`);
+      return;
+    }
+
+    if (event.type === "turn.compaction_completed") {
+      this.line(
+        `\n[context] compacted ${event.payload.sourceMessageCount} messages (${event.payload.estimatedCharsBefore} -> ${event.payload.estimatedCharsAfter} chars)`,
+      );
+      return;
+    }
+
+    if (event.type === "turn.compaction_failed") {
+      this.line(`\n[context] compaction failed: ${event.payload.error}`);
+      return;
+    }
+
     if (event.type === "turn.guard_triggered") {
       this.line(`\n[guard] ${event.payload.reason} (${event.payload.count})`);
       return;

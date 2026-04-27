@@ -514,6 +514,7 @@ async function repl(input: {
             "/tasks                List subagent tasks",
             "/recover-tasks        Mark stale background tasks cancelled",
             "/task <taskId>        Show a subagent task",
+            "/compact [focus]      Compress conversation context",
             "/revert <snapshotId>  Revert a snapshot in this session",
             "/exit                 Quit",
           ].join("\n"),
@@ -543,6 +544,28 @@ async function repl(input: {
       }
       if (line.startsWith("/task ")) {
         await printTask(input.harness, line.slice("/task ".length).trim() as TaskId);
+        continue;
+      }
+      if (line === "/compact" || line.startsWith("/compact ")) {
+        const instructions = line.slice("/compact".length).trim();
+        const controller = installInterruptHandler();
+        const compactInput: {
+          sessionId: SessionId;
+          threadId: import("@chili/protocol").ThreadId;
+          instructions?: string;
+          signal: AbortSignal;
+        } = {
+          sessionId: input.sessionId,
+          threadId: input.threadId,
+          signal: controller.signal,
+        };
+        if (instructions) compactInput.instructions = instructions;
+        const result = await input.harness.service.compactSession(compactInput);
+        if (result.status === "skipped") {
+          console.log(`[context] compact skipped: ${result.reason}`);
+        } else if (result.status === "failed" || result.status === "cancelled") {
+          console.error(`[context] compact ${result.status}: ${result.error.message}`);
+        }
         continue;
       }
       if (line.startsWith("/revert ")) {

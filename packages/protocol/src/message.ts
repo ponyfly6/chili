@@ -78,6 +78,10 @@ export interface CompactionPart extends BasePart {
   type: "compaction";
   boundaryMessageId: MessageId;
   reason: "manual" | "token_budget" | "recovery";
+  summary?: string;
+  sourceMessageIds?: MessageId[];
+  estimatedCharsBefore?: number;
+  estimatedCharsAfter?: number;
 }
 
 export interface AgentHandoffPart extends BasePart {

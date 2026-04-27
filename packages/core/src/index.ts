@@ -1,6 +1,7 @@
 export * from "./agent-mailbox-delivery-pump.js";
 export * from "./agent-tree.js";
 export * from "./anthropic-compatible-model.js";
+export * from "./compaction.js";
 export * from "./context.js";
 export * from "./doom-loop-guard.js";
 export * from "./recovery.js";

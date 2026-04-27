@@ -1,6 +1,7 @@
 import type {
   ChiliEvent,
   EventEnvelope,
+  Message,
   MessageId,
   MessagePart,
   PartId,
@@ -14,7 +15,8 @@ import { timestampNow } from "@chili/protocol";
 import type { EventStore } from "@chili/store";
 import type { ToolAccessPolicyResolver, ToolRegistry } from "@chili/tools";
 import { ToolExecutor, filterToolsByPolicy } from "@chili/tools";
-import { ContextWindowBuilder, type ContextBudgetOptions, type ContextUsage } from "./context.js";
+import { ContextCompactionService, type ContextCompactionOptions, type ContextCompactionResult } from "./compaction.js";
+import { ContextWindowBuilder, type CompactionBoundary, type ContextBudgetOptions, type ContextUsage } from "./context.js";
 import { DoomLoopError, DoomLoopGuard, type DoomLoopGuardOptions } from "./doom-loop-guard.js";
 import { normalizeRetryPolicy, retryDelay, sleep, type RetryPolicy } from "./retry.js";
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.js";
@@ -30,6 +32,8 @@ export interface SingleAgentRuntimeOptions {
   toolPolicyResolver?: ToolAccessPolicyResolver;
   contextBudget?: ContextBudgetOptions;
   contextBuilder?: ContextWindowBuilder;
+  contextCompaction?: Omit<ContextCompactionOptions, "model" | "now">;
+  contextCompactor?: ContextCompactionService;
   retryPolicy?: RetryPolicy;
   doomLoopGuard?: DoomLoopGuardOptions;
   maxConcurrentToolCalls?: number;
@@ -66,6 +70,34 @@ interface AssistantStreamResult {
   toolCalls: PendingToolCall[];
 }
 
+export interface CompactContextInput {
+  sessionId: SessionId;
+  threadId: ThreadId;
+  turnId?: TurnId;
+  reason?: "manual" | "token_budget" | "recovery";
+  instructions?: string;
+  signal?: AbortSignal;
+}
+
+export type CompactContextResult =
+  | {
+      status: "completed";
+      turnId: TurnId;
+      messageId: MessageId;
+      boundaryMessageId: MessageId;
+      summaryChars: number;
+    }
+  | {
+      status: "skipped";
+      turnId: TurnId;
+      reason: string;
+    }
+  | {
+      status: "failed" | "cancelled";
+      turnId: TurnId;
+      error: Error;
+    };
+
 export class SingleAgentRuntime implements AgentRunner {
   constructor(private readonly options: SingleAgentRuntimeOptions) {}
 
@@ -98,6 +130,49 @@ export class SingleAgentRuntime implements AgentRunner {
     return messageId;
   }
 
+  async compactContext(input: CompactContextInput): Promise<CompactContextResult> {
+    const turnId = input.turnId ?? this.id<TurnId>("turn");
+    const reason = input.reason ?? "manual";
+    let boundary: CompactionBoundary | undefined;
+    try {
+      await this.append(input, "turn.started", { turnId });
+      const rawMessages = await this.options.store.messages(input.sessionId);
+      boundary = this.contextBuilder().compactionBoundary(rawMessages, reason);
+      if (!boundary) {
+        await this.append(input, "turn.completed", { turnId, status: "completed" });
+        return { status: "skipped", turnId, reason: "No messages available to compact" };
+      }
+
+      await this.append(input, "turn.compaction_requested", {
+        turnId,
+        reason,
+        boundaryMessageId: boundary.boundaryMessageId,
+        estimatedChars: boundary.estimatedChars,
+        budgetChars: boundary.budgetChars,
+      });
+      const result = await this.compactMessages(input, turnId, rawMessages, boundary);
+      await this.append(input, "turn.completed", { turnId, status: "completed" });
+      return {
+        status: "completed",
+        turnId,
+        messageId: result.messageId,
+        boundaryMessageId: result.boundaryMessageId,
+        summaryChars: result.summaryChars,
+      };
+    } catch (error) {
+      const err = toError(error);
+      const status = isAbortError(err) ? "cancelled" : "failed";
+      await this.append(input, "turn.compaction_failed", {
+        turnId,
+        reason,
+        ...(boundary ? { boundaryMessageId: boundary.boundaryMessageId } : {}),
+        error: err.message,
+      });
+      await this.append(input, "turn.completed", { turnId, status });
+      return { status, turnId, error: err };
+    }
+  }
+
   async runTurn(input: RunTurnInput): Promise<RunTurnResult> {
     const turnId = input.turnId ?? this.id<TurnId>("turn");
     let assistantMessageId: MessageId | undefined;
@@ -106,14 +181,8 @@ export class SingleAgentRuntime implements AgentRunner {
     try {
       await this.append(input, "turn.started", { turnId });
 
-      assistantMessageId = this.id<MessageId>("msg");
-      await this.append(input, "message.created", {
-        messageId: assistantMessageId,
-        role: "assistant",
-      });
-
       const rawMessages = await this.options.store.messages(input.sessionId);
-      const context = this.contextBuilder().build(rawMessages);
+      let context = this.contextBuilder().build(rawMessages);
       contextUsage = context.usage;
       if (context.compactionBoundary) {
         await this.append(input, "turn.compaction_requested", {
@@ -123,9 +192,20 @@ export class SingleAgentRuntime implements AgentRunner {
           estimatedChars: context.compactionBoundary.estimatedChars,
           budgetChars: context.compactionBoundary.budgetChars,
         });
+        const compacted = await this.tryCompactMessages(input, turnId, rawMessages, context.compactionBoundary);
+        if (compacted) {
+          context = this.contextBuilder().build(await this.options.store.messages(input.sessionId));
+          contextUsage = context.usage;
+        }
       }
 
-      const modelInput: ModelStreamInput = {
+      assistantMessageId = this.id<MessageId>("msg");
+      await this.append(input, "message.created", {
+        messageId: assistantMessageId,
+        role: "assistant",
+      });
+
+      let modelInput: ModelStreamInput = {
         sessionId: input.sessionId,
         threadId: input.threadId,
         turnId,
@@ -136,7 +216,32 @@ export class SingleAgentRuntime implements AgentRunner {
       if (input.signal) modelInput.signal = input.signal;
 
       const guard = new DoomLoopGuard(this.options.doomLoopGuard);
-      const streamResult = await this.consumeModelStream(input, turnId, assistantMessageId, modelInput, guard);
+      let streamResult: AssistantStreamResult;
+      try {
+        streamResult = await this.consumeModelStream(input, turnId, assistantMessageId, modelInput, guard);
+      } catch (error) {
+        const err = toError(error);
+        if (!this.canRecoverWithCompaction(err)) throw err;
+        const recoveryMessages = await this.options.store.messages(input.sessionId);
+        const recoveryBoundary = this.contextBuilder().compactionBoundary(recoveryMessages, "recovery");
+        if (!recoveryBoundary) throw err;
+        await this.append(input, "turn.compaction_requested", {
+          turnId,
+          reason: "recovery",
+          boundaryMessageId: recoveryBoundary.boundaryMessageId,
+          estimatedChars: recoveryBoundary.estimatedChars,
+          budgetChars: recoveryBoundary.budgetChars,
+        });
+        const recovered = await this.tryCompactMessages(input, turnId, recoveryMessages, recoveryBoundary);
+        if (!recovered) throw err;
+        const recoveredContext = this.contextBuilder().build(await this.options.store.messages(input.sessionId));
+        contextUsage = recoveredContext.usage;
+        modelInput = {
+          ...modelInput,
+          messages: recoveredContext.messages,
+        };
+        streamResult = await this.consumeModelStream(input, turnId, assistantMessageId, modelInput, guard);
+      }
       await this.executeToolCalls(input, turnId, assistantMessageId, streamResult.toolCalls);
 
       await this.append(input, "turn.completed", {
@@ -191,7 +296,7 @@ export class SingleAgentRuntime implements AgentRunner {
     let attempt = 1;
 
     while (true) {
-      let emitted = false;
+      let assistantMutated = false;
       try {
         const state: AssistantStreamState = {
           toolCalls: [],
@@ -200,19 +305,19 @@ export class SingleAgentRuntime implements AgentRunner {
         for await (const event of this.options.model.stream(modelInput)) {
           if (input.signal?.aborted) throw abortError("Turn aborted");
           if (event.type === "text_delta") {
-            emitted = true;
+            assistantMutated = true;
             await this.appendTextDelta(input, assistantMessageId, state, event.text);
             continue;
           }
 
           if (event.type === "reasoning_delta") {
-            emitted = true;
+            assistantMutated = true;
             await this.appendReasoningDelta(input, assistantMessageId, state, event.text, event.redacted);
             continue;
           }
 
           if (event.type === "tool_call") {
-            emitted = true;
+            assistantMutated = true;
             await this.queueToolCall(
               input,
               turnId,
@@ -229,7 +334,6 @@ export class SingleAgentRuntime implements AgentRunner {
           }
 
           if (event.type === "tool_call_start") {
-            emitted = true;
             state.streamingToolCalls.set(toolCallKey(event.toolCallId, event.index), {
               callId: event.toolCallId as ToolCallId,
               toolName: event.name,
@@ -239,7 +343,6 @@ export class SingleAgentRuntime implements AgentRunner {
           }
 
           if (event.type === "tool_call_delta") {
-            emitted = true;
             const toolCall = state.streamingToolCalls.get(toolCallKey(event.toolCallId, event.index));
             if (toolCall && event.partialInput !== undefined) {
               toolCall.input = event.partialInput;
@@ -248,7 +351,7 @@ export class SingleAgentRuntime implements AgentRunner {
           }
 
           if (event.type === "tool_call_end") {
-            emitted = true;
+            assistantMutated = true;
             const key = toolCallKey(event.toolCallId, event.index);
             const existing = state.streamingToolCalls.get(key);
             state.streamingToolCalls.delete(key);
@@ -275,7 +378,6 @@ export class SingleAgentRuntime implements AgentRunner {
           }
 
           if (event.type === "metadata") {
-            emitted = true;
             await this.appendModelMetadata(input, turnId, event);
             continue;
           }
@@ -288,7 +390,7 @@ export class SingleAgentRuntime implements AgentRunner {
         if (input.signal?.aborted || isAbortError(err)) {
           throw err;
         }
-        if (!emitted && attempt < retryPolicy.maxAttempts && retryPolicy.retryable(err)) {
+        if (!assistantMutated && attempt < retryPolicy.maxAttempts && retryPolicy.retryable(err)) {
           const delayMs = retryDelay(retryPolicy, attempt);
           await this.append(input, "turn.retry_scheduled", {
             turnId,
@@ -300,9 +402,111 @@ export class SingleAgentRuntime implements AgentRunner {
           attempt++;
           continue;
         }
+        markAssistantMutation(err, assistantMutated);
         throw err;
       }
     }
+  }
+
+  private canRecoverWithCompaction(error: Error): boolean {
+    if (didAssistantMutate(error)) return false;
+    if (isAbortError(error)) return false;
+    return isContextLimitError(error);
+  }
+
+  private async tryCompactMessages(
+    input: RunTurnInput,
+    turnId: TurnId,
+    messages: readonly Message[],
+    boundary: CompactionBoundary,
+  ): Promise<boolean> {
+    try {
+      await this.compactMessages(input, turnId, messages, boundary);
+      return true;
+    } catch (error) {
+      await this.append(input, "turn.compaction_failed", {
+        turnId,
+        reason: boundary.reason,
+        boundaryMessageId: boundary.boundaryMessageId,
+        error: toError(error).message,
+      });
+      return false;
+    }
+  }
+
+  private async compactMessages(
+    input: CompactContextInput,
+    turnId: TurnId,
+    messages: readonly Message[],
+    boundary: CompactionBoundary,
+  ): Promise<{ messageId: MessageId; boundaryMessageId: MessageId; summaryChars: number }> {
+    await this.append(input, "turn.compaction_started", {
+      turnId,
+      reason: boundary.reason,
+      boundaryMessageId: boundary.boundaryMessageId,
+      estimatedChars: boundary.estimatedChars,
+      budgetChars: boundary.budgetChars,
+    });
+    const compactInput: {
+      sessionId: SessionId;
+      threadId: ThreadId;
+      turnId: TurnId;
+      messages: readonly Message[];
+      boundary: CompactionBoundary;
+      instructions?: string;
+      signal?: AbortSignal;
+    } = {
+      sessionId: input.sessionId,
+      threadId: input.threadId,
+      turnId,
+      messages,
+      boundary,
+    };
+    if (input.instructions !== undefined) compactInput.instructions = input.instructions;
+    if (input.signal !== undefined) compactInput.signal = input.signal;
+    const result = await this.compactor().compact(compactInput);
+    const messageId = await this.appendCompactionMessage(input, result);
+    await this.append(input, "turn.compaction_completed", {
+      turnId,
+      messageId,
+      boundaryMessageId: result.boundary.boundaryMessageId,
+      summaryChars: result.summary.length,
+      sourceMessageCount: result.sourceMessageCount,
+      estimatedCharsBefore: result.estimatedCharsBefore,
+      estimatedCharsAfter: result.estimatedCharsAfter,
+    });
+    return { messageId, boundaryMessageId: result.boundary.boundaryMessageId, summaryChars: result.summary.length };
+  }
+
+  private async appendCompactionMessage(input: EventContext, result: ContextCompactionResult): Promise<MessageId> {
+    const messageId = this.id<MessageId>("msg");
+    await this.append(input, "message.created", {
+      messageId,
+      role: "system",
+    });
+
+    const summaryText = renderContextSummary(result);
+    await this.appendPart(input, messageId, {
+      id: this.id<PartId>("part"),
+      messageId,
+      sessionId: input.sessionId,
+      type: "text",
+      text: summaryText,
+      synthetic: true,
+    });
+    await this.appendPart(input, messageId, {
+      id: this.id<PartId>("part"),
+      messageId,
+      sessionId: input.sessionId,
+      type: "compaction",
+      boundaryMessageId: result.boundary.boundaryMessageId,
+      reason: result.boundary.reason,
+      summary: result.summary,
+      sourceMessageIds: result.sourceMessageIds,
+      estimatedCharsBefore: result.estimatedCharsBefore,
+      estimatedCharsAfter: result.estimatedCharsAfter,
+    });
+    return messageId;
   }
 
   private async appendTextDelta(
@@ -567,6 +771,17 @@ export class SingleAgentRuntime implements AgentRunner {
   private contextBuilder(): ContextWindowBuilder {
     return this.options.contextBuilder ?? new ContextWindowBuilder(this.options.contextBudget);
   }
+
+  private compactor(): ContextCompactionService {
+    return (
+      this.options.contextCompactor ??
+      new ContextCompactionService({
+        model: this.options.model,
+        now: () => this.now(),
+        ...this.options.contextCompaction,
+      })
+    );
+  }
 }
 
 function defaultCreateId(prefix: string): string {
@@ -575,6 +790,33 @@ function defaultCreateId(prefix: string): string {
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+interface AssistantMutationError extends Error {
+  assistantMutated?: boolean;
+}
+
+function markAssistantMutation(error: Error, assistantMutated: boolean): void {
+  (error as AssistantMutationError).assistantMutated = assistantMutated;
+}
+
+function didAssistantMutate(error: Error): boolean {
+  return (error as AssistantMutationError).assistantMutated === true;
+}
+
+function isContextLimitError(error: Error): boolean {
+  const message = error.message.toLowerCase();
+  return (
+    message.includes("context window") ||
+    message.includes("context length") ||
+    message.includes("maximum context") ||
+    message.includes("prompt is too long") ||
+    message.includes("input is too long") ||
+    message.includes("too many tokens") ||
+    message.includes("request too large") ||
+    message.includes("http 413") ||
+    /\b413\b/.test(message)
+  );
 }
 
 function isAbortError(error: Error): boolean {
@@ -595,4 +837,17 @@ function isModelMetadataEvent(
   event: Extract<ModelStreamEvent, { type: "metadata" | "finish" }>,
 ): event is Extract<ModelStreamEvent, { type: "metadata" }> {
   return "type" in event && event.type === "metadata";
+}
+
+function renderContextSummary(result: ContextCompactionResult): string {
+  return [
+    `<context_summary boundary_message_id="${result.boundary.boundaryMessageId}" reason="${result.boundary.reason}">`,
+    stripContextSummary(result.summary),
+    "</context_summary>",
+  ].join("\n");
+}
+
+function stripContextSummary(summary: string): string {
+  const match = /<context_summary\b[^>]*>([\s\S]*?)<\/context_summary>/i.exec(summary.trim());
+  return (match?.[1] ?? summary).trim();
 }

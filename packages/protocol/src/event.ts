@@ -45,6 +45,9 @@ export type TurnEvent =
   | EventEnvelope<"turn.model_metadata", ModelMetadataPayload>
   | EventEnvelope<"turn.completed", { turnId: TurnId; status: "completed" | "failed" | "cancelled" }>
   | EventEnvelope<"turn.compaction_requested", { turnId: TurnId; reason: "manual" | "token_budget" | "recovery"; boundaryMessageId?: MessageId; estimatedChars?: number; budgetChars?: number }>
+  | EventEnvelope<"turn.compaction_started", { turnId: TurnId; reason: "manual" | "token_budget" | "recovery"; boundaryMessageId?: MessageId; sourceMessageCount?: number; estimatedChars?: number; budgetChars?: number }>
+  | EventEnvelope<"turn.compaction_completed", { turnId: TurnId; messageId: MessageId; boundaryMessageId: MessageId; summaryChars: number; sourceMessageCount: number; estimatedCharsBefore: number; estimatedCharsAfter: number }>
+  | EventEnvelope<"turn.compaction_failed", { turnId: TurnId; reason: "manual" | "token_budget" | "recovery"; boundaryMessageId?: MessageId; error: string }>
   | EventEnvelope<"turn.retry_scheduled", { turnId: TurnId; attempt: number; delayMs: number; reason: string }>
   | EventEnvelope<"turn.guard_triggered", { turnId: TurnId; reason: "repeated_tool_call" | "tool_call_limit"; toolName?: string; count: number }>;
 

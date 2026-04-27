@@ -11,6 +11,7 @@ import type {
 import { timestampNow } from "@chili/protocol";
 import type { EventStore } from "@chili/store";
 import type { AgentRunner, RunTurnResult } from "./runner.js";
+import type { CompactContextResult } from "./single-agent-runtime.js";
 
 export interface RuntimeServiceOptions {
   runtime: AgentRunner;
@@ -40,6 +41,13 @@ export interface SubmitPromptInput {
   cwd?: string;
   maxTurns?: number;
   system?: string[];
+  signal?: AbortSignal;
+}
+
+export interface CompactSessionInput {
+  sessionId: SessionId;
+  threadId: ThreadId;
+  instructions?: string;
   signal?: AbortSignal;
 }
 
@@ -88,6 +96,57 @@ export class RuntimeService {
 
   appendUserMessage(input: { sessionId: SessionId; threadId: ThreadId; text: string }): Promise<MessageId> {
     return this.options.runtime.appendUserMessage(input);
+  }
+
+  async compactSession(input: CompactSessionInput): Promise<CompactContextResult> {
+    if (this.running.has(input.sessionId)) {
+      throw new RuntimeBusyError(input.sessionId);
+    }
+    const runtime = this.options.runtime as AgentRunner & {
+      compactContext?: (compactInput: {
+        sessionId: SessionId;
+        threadId: ThreadId;
+        reason: "manual";
+        instructions?: string;
+        signal?: AbortSignal;
+      }) => Promise<CompactContextResult>;
+    };
+    if (!runtime.compactContext) {
+      throw new Error("Runtime does not support context compaction");
+    }
+
+    const controller = this.createRunController({ ...input, text: "" });
+    try {
+      await this.publishStatus({
+        sessionId: input.sessionId,
+        threadId: input.threadId,
+        status: "running",
+        reason: "manual_compaction",
+      });
+      const compactInput: {
+        sessionId: SessionId;
+        threadId: ThreadId;
+        reason: "manual";
+        instructions?: string;
+        signal?: AbortSignal;
+      } = {
+        sessionId: input.sessionId,
+        threadId: input.threadId,
+        reason: "manual",
+        signal: controller.signal,
+      };
+      if (input.instructions) compactInput.instructions = input.instructions;
+      const result = await runtime.compactContext(compactInput);
+      await this.publishStatus({
+        sessionId: input.sessionId,
+        threadId: input.threadId,
+        status: result.status === "failed" || result.status === "cancelled" ? result.status : "idle",
+        ...(result.status === "failed" || result.status === "cancelled" ? { reason: result.error.message } : {}),
+      });
+      return result;
+    } finally {
+      this.running.delete(input.sessionId);
+    }
   }
 
   async submitPrompt(input: SubmitPromptInput): Promise<SubmitPromptResult> {
