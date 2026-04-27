@@ -142,16 +142,7 @@ export class ToolExecutor {
       : tool.risk === "write" || tool.risk === "dangerous";
     if (!shouldSnapshot) return undefined;
 
-    const snapshot = await this.options.snapshotProvider.create({
-      cwd: input.cwd,
-      sessionId: input.sessionId,
-      ...(input.threadId ? { threadId: input.threadId } : {}),
-      callId,
-      toolName: tool.name,
-      patterns: spec.patterns,
-      reason: `before ${tool.name}`,
-      metadata: spec.metadata,
-    });
+    const snapshot = await this.createSnapshot(tool, input, callId, spec);
     if (!snapshot) return undefined;
 
     await this.publish("snapshot.created", input, {
@@ -168,6 +159,34 @@ export class ToolExecutor {
       },
     });
     return snapshot;
+  }
+
+  private async createSnapshot<Input>(
+    tool: ChiliToolDefinition<Input>,
+    input: ExecuteToolInput,
+    callId: ToolCallId,
+    spec: Required<ToolApprovalSpec>,
+  ): Promise<SnapshotRecord | undefined> {
+    try {
+      return await this.options.snapshotProvider?.create({
+        cwd: input.cwd,
+        sessionId: input.sessionId,
+        ...(input.threadId ? { threadId: input.threadId } : {}),
+        callId,
+        toolName: tool.name,
+        patterns: spec.patterns,
+        reason: `before ${tool.name}`,
+        metadata: spec.metadata,
+      });
+    } catch (error) {
+      const err = toError(error);
+      await this.metadata(input, callId, {
+        metadata: {
+          snapshotError: err.message,
+        },
+      });
+      throw new Error(`Snapshot failed before ${tool.name}; refusing to run tool: ${err.message}`);
+    }
   }
 
   private async processResult(

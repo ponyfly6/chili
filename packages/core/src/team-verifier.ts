@@ -269,16 +269,21 @@ export class TeamTaskVerificationService {
       const runGit = (args: readonly string[]) =>
         runProcess("git", args, input.signal ? { ...processInput, signal: input.signal } : processInput);
       const tracked = await runGit(["diff", "--no-ext-diff", "--no-color", "HEAD", "--"]);
+      if (tracked.timedOut) return "(git diff failed: timed out after 15000ms)";
       if (tracked.exitCode !== 0) return `(git diff failed: ${tracked.stderr || `exit ${tracked.exitCode}`})`;
 
       const parts = tracked.stdout.trim().length > 0 ? [tracked.stdout.trimEnd()] : [];
       const untracked = await runGit(["ls-files", "--others", "--exclude-standard", "-z"]);
-      if (untracked.exitCode !== 0) {
+      if (untracked.timedOut) {
+        parts.push("(git untracked file scan failed: timed out after 15000ms)");
+      } else if (untracked.exitCode !== 0) {
         parts.push(`(git untracked file scan failed: ${untracked.stderr || `exit ${untracked.exitCode}`})`);
       } else {
         for (const path of splitNul(untracked.stdout)) {
           const fileDiff = await runGit(["diff", "--no-ext-diff", "--no-color", "--no-index", "--", "/dev/null", path]);
-          if (fileDiff.exitCode !== 0 && fileDiff.exitCode !== 1) {
+          if (fileDiff.timedOut) {
+            parts.push(`(git diff for untracked file failed: ${path}: timed out after 15000ms)`);
+          } else if (fileDiff.exitCode !== 0 && fileDiff.exitCode !== 1) {
             parts.push(`(git diff for untracked file failed: ${path}: ${fileDiff.stderr || `exit ${fileDiff.exitCode}`})`);
           } else if (fileDiff.stdout.trim().length > 0) {
             parts.push(fileDiff.stdout.trimEnd());

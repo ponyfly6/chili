@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChiliEvent, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
@@ -14,6 +14,7 @@ import { createWriteFileTool } from "./builtins/write-file.js";
 import { InMemoryToolRegistry } from "./registry.js";
 import { ToolExecutor } from "./executor.js";
 import type { ExecuteToolInput, ToolAccessPolicyResolver } from "./types.js";
+import type { SnapshotProvider, SnapshotRecord, SnapshotRevertResult } from "./types.js";
 
 test("write tools require a fresh full read before modifying existing files", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-tools-read-state-"));
@@ -170,9 +171,69 @@ test("scoped worker policy allows only read-only bash without execute scope", as
     const readOnly = await executor.execute(toolInput("bash", { command: "pwd" }, workspace));
     expect(readOnly.status).toBe("completed");
 
+    for (const command of ["git branch", "git branch --list", "git status", "git diff"]) {
+      const result = await executor.execute(toolInput("bash", { command }, workspace));
+      expect(result.status).toBe("completed");
+    }
+
     const build = await executor.execute(toolInput("bash", { command: "bun test" }, workspace));
     expect(build.status).toBe("failed");
     if (build.status === "failed") expect(build.error.message).toContain("does not have execute scope");
+
+    const findDelete = await executor.execute(toolInput("bash", { command: "find . -delete" }, workspace));
+    expect(findDelete.status).toBe("failed");
+    if (findDelete.status === "failed") expect(findDelete.error.message).toContain("does not have execute scope");
+
+    for (const command of ["sed -i 's/a/b/' file", "awk -i inplace '{print}' file", "git branch -D foo"]) {
+      const result = await executor.execute(toolInput("bash", { command }, workspace));
+      expect(result.status).toBe("failed");
+      if (result.status === "failed") expect(result.error.message).toContain("does not have execute scope");
+    }
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("bash supports workspace-scoped cwd and env overrides", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-bash-cwd-"));
+  try {
+    await mkdir(join(workspace, "subdir"), { recursive: true });
+    const registry = new InMemoryToolRegistry();
+    registry.register(createBashTool());
+    const executor = createExecutor(registry);
+
+    const result = await executor.execute(
+      toolInput("bash", { command: "printf \"$CHILI_TEST_ENV:$(basename \"$PWD\")\"", cwd: "subdir", env: { CHILI_TEST_ENV: "ok" } }, workspace),
+    );
+    expect(result.status).toBe("completed");
+    if (result.status === "completed") {
+      expect(result.result.output).toBe("ok:subdir");
+      expect(result.result.metadata).toMatchObject({
+        timedOut: false,
+        stdoutBytes: 9,
+        outputLimitBytes: 256_000,
+      });
+    }
+
+    const outside = await executor.execute(toolInput("bash", { command: "pwd", cwd: ".." }, workspace));
+    expect(outside.status).toBe("failed");
+    if (outside.status === "failed") expect(outside.error.message).toContain("cwd must stay inside the workspace");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("snapshot creation failure fails closed before write tools mutate files", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-snapshot-fail-"));
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register(createWriteFileTool());
+    const executor = createExecutor(registry, undefined, failingSnapshotProvider());
+
+    const result = await executor.execute(toolInput("write", { filePath: "new.txt", content: "next\n" }, workspace));
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") expect(result.error.message).toContain("Snapshot failed before write");
+    await expect(stat(join(workspace, "new.txt"))).rejects.toThrow();
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
@@ -296,12 +357,17 @@ function fakeTeamMessageSendTool() {
   };
 }
 
-function createExecutor(registry: InMemoryToolRegistry, policyResolver?: ToolAccessPolicyResolver): ToolExecutor {
+function createExecutor(
+  registry: InMemoryToolRegistry,
+  policyResolver?: ToolAccessPolicyResolver,
+  snapshotProvider?: SnapshotProvider,
+): ToolExecutor {
   return new ToolExecutor({
     registry,
     events: { publish: async (_event: ChiliEvent) => undefined },
     approvals: { decide: async () => ({ action: "allow_once" }) },
     ...(policyResolver ? { policyResolver } : {}),
+    ...(snapshotProvider ? { snapshotProvider } : {}),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
   });
@@ -322,4 +388,15 @@ function toolInput(toolName: string, input: unknown, cwd: string, callId?: ToolC
 function createSequentialId(): (prefix: string) => string {
   let index = 0;
   return (prefix) => `${prefix}_${++index}`;
+}
+
+function failingSnapshotProvider(): SnapshotProvider {
+  return {
+    async create(): Promise<SnapshotRecord | undefined> {
+      throw new Error("snapshot store unavailable");
+    },
+    async revert(): Promise<SnapshotRevertResult> {
+      throw new Error("not used");
+    },
+  };
 }

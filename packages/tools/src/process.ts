@@ -5,6 +5,7 @@ export interface RunProcessOptions {
   env?: Record<string, string | undefined>;
   signal?: AbortSignal;
   timeoutMs?: number;
+  killGraceMs?: number;
   maxOutputBytes?: number;
 }
 
@@ -15,7 +16,12 @@ export interface RunProcessResult {
   stderr: string;
   stdoutTruncated: boolean;
   stderrTruncated: boolean;
+  stdoutBytes: number;
+  stderrBytes: number;
+  outputLimitBytes: number;
   durationMs: number;
+  timedOut: boolean;
+  aborted: boolean;
 }
 
 export async function runProcess(
@@ -23,27 +29,39 @@ export async function runProcess(
   args: readonly string[],
   options: RunProcessOptions,
 ): Promise<RunProcessResult> {
+  if (options.signal?.aborted) throw abortError("Process aborted");
+
   const started = Date.now();
   const child = spawn(command, [...args], {
     cwd: options.cwd,
     env: normalizeEnv(options.env),
+    detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
   });
 
   let timedOut = false;
   let aborted = false;
+  let exited = false;
+  let escalation: NodeJS.Timeout | undefined;
   const maxOutputBytes = options.maxOutputBytes ?? 256_000;
+  const killGraceMs = options.killGraceMs ?? 1_000;
 
   const timeout = options.timeoutMs
     ? setTimeout(() => {
         timedOut = true;
-        child.kill("SIGTERM");
+        terminateProcessGroup(child, "SIGTERM");
+        escalation = setTimeout(() => {
+          if (!exited) terminateProcessGroup(child, "SIGKILL");
+        }, killGraceMs);
       }, options.timeoutMs)
     : undefined;
 
   const abort = () => {
     aborted = true;
-    child.kill("SIGTERM");
+    terminateProcessGroup(child, "SIGTERM");
+    escalation = setTimeout(() => {
+      if (!exited) terminateProcessGroup(child, "SIGKILL");
+    }, killGraceMs);
   };
 
   if (options.signal) {
@@ -57,10 +75,8 @@ export async function runProcess(
       collect(child.stderr, maxOutputBytes),
       waitForExit(child),
     ]);
+    exited = true;
 
-    if (timedOut) {
-      throw abortError(`Process timed out after ${options.timeoutMs}ms`);
-    }
     if (aborted) {
       throw abortError("Process aborted");
     }
@@ -72,10 +88,16 @@ export async function runProcess(
       stderr: stderr.text,
       stdoutTruncated: stdout.truncated,
       stderrTruncated: stderr.truncated,
+      stdoutBytes: stdout.bytes,
+      stderrBytes: stderr.bytes,
+      outputLimitBytes: maxOutputBytes,
       durationMs: Date.now() - started,
+      timedOut,
+      aborted,
     };
   } finally {
     if (timeout) clearTimeout(timeout);
+    if (escalation) clearTimeout(escalation);
     options.signal?.removeEventListener("abort", abort);
   }
 }
@@ -98,26 +120,29 @@ function normalizeEnv(env: Record<string, string | undefined> | undefined): Node
   return base;
 }
 
-async function collect(stream: AsyncIterable<Buffer>, maxBytes: number): Promise<{ text: string; truncated: boolean }> {
+async function collect(stream: AsyncIterable<Buffer>, maxBytes: number): Promise<{ text: string; bytes: number; truncated: boolean }> {
   const chunks: Buffer[] = [];
+  let storedBytes = 0;
   let bytes = 0;
   let truncated = false;
 
   for await (const chunk of stream) {
-    if (bytes >= maxBytes) {
+    bytes += chunk.byteLength;
+    if (storedBytes >= maxBytes) {
       truncated = true;
       continue;
     }
 
-    const remaining = maxBytes - bytes;
+    const remaining = maxBytes - storedBytes;
     const next = chunk.byteLength > remaining ? chunk.subarray(0, remaining) : chunk;
     chunks.push(next);
-    bytes += next.byteLength;
+    storedBytes += next.byteLength;
     if (chunk.byteLength > remaining) truncated = true;
   }
 
   return {
     text: Buffer.concat(chunks).toString("utf8"),
+    bytes,
     truncated,
   };
 }
@@ -133,4 +158,26 @@ function abortError(message: string): Error {
   const error = new Error(message);
   error.name = "AbortError";
   return error;
+}
+
+function terminateProcessGroup(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+
+  if (process.platform !== "win32" && child.pid !== undefined) {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch (error) {
+      if (!isNoSuchProcess(error)) {
+        // Fall through to killing the direct child; this can happen when the OS
+        // refuses process-group signaling for a process that is already exiting.
+      }
+    }
+  }
+
+  child.kill(signal);
+}
+
+function isNoSuchProcess(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH";
 }

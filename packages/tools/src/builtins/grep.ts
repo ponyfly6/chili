@@ -145,6 +145,9 @@ export function createGrepTool(): ChiliToolDefinition<GrepInput> {
         maxOutputBytes: input.maxOutputBytes ?? 512_000,
       });
 
+      if (result.timedOut) {
+        throw new Error(`rg timed out after 15000ms`);
+      }
       if (result.exitCode !== 0 && result.exitCode !== 1) {
         throw new Error(result.stderr || `rg exited with code ${result.exitCode}`);
       }
@@ -166,6 +169,7 @@ export function createGrepTool(): ChiliToolDefinition<GrepInput> {
           totalLines: lines.length,
           truncated,
           durationMs: result.durationMs,
+          outputLimitBytes: result.outputLimitBytes,
         },
       };
     },

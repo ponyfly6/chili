@@ -94,6 +94,9 @@ export function createGitDiffTool(): ChiliToolDefinition<GitDiffInput> {
         maxOutputBytes: input.maxOutputBytes ?? 512_000,
       });
 
+      if (result.timedOut) {
+        throw new Error(`git diff timed out after 15000ms`);
+      }
       if (result.exitCode !== 0) {
         throw new Error(result.stderr || `git diff exited with code ${result.exitCode}`);
       }
@@ -109,6 +112,7 @@ export function createGitDiffTool(): ChiliToolDefinition<GitDiffInput> {
           paths: input.paths ?? [],
           durationMs: result.durationMs,
           truncated: result.stdoutTruncated || result.stderrTruncated,
+          outputLimitBytes: result.outputLimitBytes,
         },
       };
     },
