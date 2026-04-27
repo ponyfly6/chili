@@ -478,6 +478,15 @@ export interface RuntimeTeamExecutionFinalTask {
   agentTaskId?: TaskId;
 }
 
+export interface RuntimeTeamExecutionVerificationTask {
+  teamId: TeamId;
+  taskId: TaskId;
+  ownerPath?: AgentPath;
+  status: "passed" | "failed";
+  feedback?: string;
+  verifierTaskId?: TaskId;
+}
+
 export interface RuntimeTeamExecutionSkippedTask {
   teamId: TeamId;
   taskId: TaskId;
@@ -508,6 +517,8 @@ export interface RuntimeTeamExecutionRunSummary {
   endedAt: number;
   dispatched: RuntimeTeamExecutionDispatchedTask[];
   completed: RuntimeTeamExecutionFinalTask[];
+  accepted: RuntimeTeamExecutionFinalTask[];
+  reopened: RuntimeTeamExecutionVerificationTask[];
   failed: RuntimeTeamExecutionFinalTask[];
   blocked: RuntimeTeamExecutionSkippedTask[];
   skipped: RuntimeTeamExecutionSkippedTask[];

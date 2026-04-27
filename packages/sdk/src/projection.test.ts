@@ -431,6 +431,8 @@ test("client preserves team dispatcher JSON shapes for dispatch, sync, and recon
     endedAt: 110,
     dispatched: [{ teamId, taskId, ownerPath, agentTaskId: agentTask.taskId, status: "running" }],
     completed: [],
+    accepted: [],
+    reopened: [],
     failed: [],
     blocked: [],
     skipped: [],

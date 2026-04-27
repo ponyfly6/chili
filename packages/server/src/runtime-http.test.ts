@@ -939,6 +939,8 @@ function teamRunLoopResultJson(teamId: TeamId): Awaited<ReturnType<RuntimeTeamEx
       },
     ],
     completed: [],
+    accepted: [],
+    reopened: [],
     failed: [],
     blocked: [],
     skipped: [],

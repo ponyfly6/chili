@@ -12,6 +12,7 @@ import {
   TeamControlService,
   TeamExecutionRunner,
   TeamTaskDispatchService,
+  TeamTaskVerificationService,
   defaultScopedWorkerPolicy,
   type WorkerToolPolicy,
 } from "@chili/core";
@@ -191,6 +192,11 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     store: eventStore,
     cwd,
   });
+  const teamVerifier = new TeamTaskVerificationService({
+    teams,
+    subagents,
+    cwd,
+  });
   const completeTaskController: SubagentController = {
     spawnTask(input, context) {
       return subagents.spawnTask(input, context);
@@ -250,6 +256,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const teamRunner = new TeamExecutionRunner({
     teams,
     dispatcher: teamDispatcher,
+    verifier: teamVerifier,
     cwd,
     createSession: async (input) => service.createSession({ cwd: input.cwd }),
   });

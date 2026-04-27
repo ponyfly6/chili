@@ -8,15 +8,27 @@ import type {
   TeamTaskReconcileResult,
   TeamTaskSyncResult,
 } from "./team-dispatcher.js";
+import type {
+  TeamTaskVerifierSkipReason,
+  TeamTaskVerifierSweepInput,
+  TeamTaskVerifierSweepResult,
+  TeamTaskVerifierVerifiedResult,
+} from "./team-verifier.js";
+import { isAcceptedTeamTask, isCompletedButUnverifiedTeamTask, isReopenedAfterFailedVerification } from "./team-verifier.js";
 import type { TeamControlService } from "./team.js";
 
 export interface TeamExecutionRunnerOptions {
   teams: TeamControlService;
   dispatcher: TeamTaskDispatchService;
+  verifier?: TeamTaskVerifier;
   cwd: string;
   now?: () => TimestampMs;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   createSession?: (input: TeamExecutionSessionRequest) => Promise<TeamExecutionSession>;
+}
+
+export interface TeamTaskVerifier {
+  verifyCompletedTasks(input: TeamTaskVerifierSweepInput): Promise<TeamTaskVerifierSweepResult>;
 }
 
 export interface TeamExecutionSessionRequest {
@@ -51,6 +63,8 @@ export interface TeamExecutionRunSummary {
   endedAt: number;
   dispatched: TeamExecutionDispatchedTask[];
   completed: TeamExecutionFinalTask[];
+  accepted: TeamExecutionFinalTask[];
+  reopened: TeamExecutionVerificationTask[];
   failed: TeamExecutionFinalTask[];
   blocked: TeamExecutionSkippedTask[];
   skipped: TeamExecutionSkippedTask[];
@@ -76,6 +90,15 @@ export interface TeamExecutionFinalTask {
   summary?: string;
   error?: string;
   agentTaskId?: TaskId;
+}
+
+export interface TeamExecutionVerificationTask {
+  teamId: TeamId;
+  taskId: TaskId;
+  ownerPath?: AgentPath;
+  status: "passed" | "failed";
+  feedback?: string;
+  verifierTaskId?: TaskId;
 }
 
 export interface TeamExecutionSkippedTask {
@@ -150,6 +173,8 @@ export class TeamExecutionRunner {
       endedAt: startedAt,
       dispatched: [],
       completed: [],
+      accepted: [],
+      reopened: [],
       failed: [],
       blocked: [],
       skipped: [],
@@ -184,7 +209,7 @@ export class TeamExecutionRunner {
         break;
       }
 
-      const state = await this.loadState(input.teamId);
+      let state = await this.loadState(input.teamId);
       if (state.team.status !== "active") {
         summary.stopReason = "team_inactive";
         break;
@@ -195,11 +220,22 @@ export class TeamExecutionRunner {
         break;
       }
 
+      const verified = await this.verifyCompletedTasks(input, summary, sessionState);
+      this.collectVerification(verified, summary);
+      const postVerifyStop = controlStopReason(input, startedMonotonic, timeoutMs);
+      if (postVerifyStop) {
+        summary.stopReason = postVerifyStop;
+        break;
+      }
+      if (verified && (verified.verified.length > 0 || verified.skipped.length > 0)) {
+        state = await this.loadState(input.teamId);
+      }
+
       for (const task of state.tasks) {
         if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
         if (task.status !== "pending") continue;
 
-        const blockedBy = incompleteDependencies(task, state.tasks);
+        const blockedBy = incompleteDependencies(task, state.tasks, Boolean(this.options.verifier));
         if (blockedBy.length > 0) {
           const skipped: TeamExecutionSkippedTask = {
             teamId: input.teamId,
@@ -290,8 +326,16 @@ export class TeamExecutionRunner {
         break;
       }
       const stillRunning = runningTasks(postCycle.tasks);
-      const runnable = runnablePendingTasks(postCycle, input, sessionState, Boolean(this.options.createSession));
-      if (stillRunning.length === 0 && runnable.length === 0) {
+      const runnable = runnablePendingTasks(
+        postCycle,
+        input,
+        sessionState,
+        Boolean(this.options.createSession),
+        Boolean(this.options.verifier),
+      );
+      const unverified = this.unverifiedTasks(postCycle.tasks);
+      const reopened = this.reopenedTasks(postCycle.tasks);
+      if (stillRunning.length === 0 && runnable.length === 0 && unverified.length === 0 && reopened.length === 0) {
         summary.stopReason = "drained";
         break;
       }
@@ -303,6 +347,7 @@ export class TeamExecutionRunner {
 
     const finalState = await this.loadState(input.teamId);
     summary.stillRunning = runningTasks(finalState.tasks).map((task) => runningTaskSummary(task));
+    summary.accepted = this.acceptedTasks(finalState.tasks).map((task) => finalTaskSummary(task, undefined)).filter(isDefined);
     summary.endedAt = Number(this.now());
     return summary;
   }
@@ -361,6 +406,61 @@ export class TeamExecutionRunner {
     if (!final) return;
     if (final.status === "completed") pushUniqueFinal(summary.completed, final);
     else pushUniqueFinal(summary.failed, final);
+  }
+
+  private async verifyCompletedTasks(
+    input: TeamExecutionRunInput,
+    summary: TeamExecutionRunSummary,
+    sessionState: SessionState,
+  ): Promise<TeamTaskVerifierSweepResult | undefined> {
+    if (!this.options.verifier) return undefined;
+    try {
+      const verifierInput: TeamTaskVerifierSweepInput = {
+        teamId: input.teamId,
+        cwd: input.cwd ?? this.options.cwd,
+      };
+      const sessionId = sessionState.sessionId ?? input.sessionId;
+      const threadId = sessionState.threadId ?? input.threadId;
+      if (sessionId) verifierInput.sessionId = sessionId;
+      if (threadId) verifierInput.threadId = threadId;
+      if (input.signal) verifierInput.signal = input.signal;
+      return await this.options.verifier.verifyCompletedTasks(verifierInput);
+    } catch (error) {
+      summary.errors.push({
+        teamId: input.teamId,
+        error: toError(error).message,
+      });
+      return undefined;
+    }
+  }
+
+  private collectVerification(result: TeamTaskVerifierSweepResult | undefined, summary: TeamExecutionRunSummary): void {
+    if (!result) return;
+    for (const verified of result.verified) {
+      removeSkipped(summary, verified.teamTask.id);
+      if (verified.status === "passed") {
+        const final = finalTaskSummary(verified.teamTask, undefined);
+        if (final) pushUniqueFinal(summary.accepted, final);
+        continue;
+      }
+      pushUniqueVerification(summary.reopened, verificationSummary(verified));
+    }
+    for (const skipped of result.skipped) {
+      const item: TeamExecutionSkippedTask = {
+        teamId: skipped.teamTask.teamId,
+        taskId: skipped.teamTask.id,
+        reason: verifierSkipReason(skipped.reason),
+      };
+      if (skipped.teamTask.ownerPath) item.ownerPath = skipped.teamTask.ownerPath;
+      pushUniqueSkipped(summary.skipped, item);
+    }
+    for (const error of result.errors) {
+      summary.errors.push({
+        teamId: error.teamId,
+        taskId: error.taskId,
+        error: error.error,
+      });
+    }
   }
 
   private collectDispatch(result: TeamTaskDispatchResult, summary: TeamExecutionRunSummary): void {
@@ -425,6 +525,21 @@ export class TeamExecutionRunner {
     return { team, tasks, members };
   }
 
+  private acceptedTasks(tasks: readonly TeamTaskRow[]): TeamTaskRow[] {
+    if (!this.options.verifier) return [];
+    return tasks.filter(isAcceptedTeamTask);
+  }
+
+  private unverifiedTasks(tasks: readonly TeamTaskRow[]): TeamTaskRow[] {
+    if (!this.options.verifier) return [];
+    return tasks.filter(isCompletedButUnverifiedTeamTask);
+  }
+
+  private reopenedTasks(tasks: readonly TeamTaskRow[]): TeamTaskRow[] {
+    if (!this.options.verifier) return [];
+    return tasks.filter(isReopenedAfterFailedVerification);
+  }
+
   private now(): TimestampMs {
     return this.options.now ? this.options.now() : timestampNow();
   }
@@ -447,10 +562,14 @@ export class TeamExecutionRunner {
   }
 }
 
-function incompleteDependencies(task: TeamTaskRow, tasks: readonly TeamTaskRow[]): TaskId[] {
+function incompleteDependencies(task: TeamTaskRow, tasks: readonly TeamTaskRow[], requireAccepted = false): TaskId[] {
   if (task.dependsOn.length === 0) return [];
   const byId = new Map(tasks.map((item) => [item.id, item]));
-  return task.dependsOn.filter((taskId) => byId.get(taskId)?.status !== "completed");
+  return task.dependsOn.filter((taskId) => {
+    const dependency = byId.get(taskId);
+    if (!dependency || dependency.status !== "completed") return true;
+    return requireAccepted && !isAcceptedTeamTask(dependency);
+  });
 }
 
 function runnablePendingTasks(
@@ -458,11 +577,12 @@ function runnablePendingTasks(
   input: TeamExecutionRunInput,
   sessionState: SessionState,
   canCreateSession: boolean,
+  requireAcceptedDependencies = false,
 ): TeamTaskRow[] {
   return state.tasks.filter((task) => {
     if (task.status !== "pending") return false;
     if (!task.ownerPath) return false;
-    if (incompleteDependencies(task, state.tasks).length > 0) return false;
+    if (incompleteDependencies(task, state.tasks, requireAcceptedDependencies).length > 0) return false;
     if (!Boolean(sessionState.sessionId ?? input.sessionId ?? task.sessionId ?? state.team.sessionId ?? canCreateSession)) return false;
     const member = state.members.find((item) => item.path === task.ownerPath);
     if (!member) return true;
@@ -499,6 +619,18 @@ function finalTaskSummary(task: TeamTaskRow, agentTaskId: TaskId | undefined): T
   const resolvedAgentTaskId = agentTaskId ?? dispatchAgentTaskId(task.metadata);
   if (resolvedAgentTaskId) summary.agentTaskId = resolvedAgentTaskId;
   return summary;
+}
+
+function verificationSummary(result: TeamTaskVerifierVerifiedResult): TeamExecutionVerificationTask {
+  const item: TeamExecutionVerificationTask = {
+    teamId: result.teamTask.teamId,
+    taskId: result.teamTask.id,
+    status: result.status === "passed" ? "passed" : "failed",
+  };
+  if (result.teamTask.ownerPath) item.ownerPath = result.teamTask.ownerPath;
+  if (result.feedback) item.feedback = result.feedback;
+  if (result.verifierTask?.taskId) item.verifierTaskId = result.verifierTask.taskId;
+  return item;
 }
 
 function isFinalStatus(status: TeamTaskStatus): status is Extract<TeamTaskStatus, "completed" | "failed" | "cancelled"> {
@@ -540,6 +672,12 @@ function syncSkipReason(reason: TeamTaskSyncResult["reason"]): TeamExecutionSkip
   return undefined;
 }
 
+function verifierSkipReason(reason: TeamTaskVerifierSkipReason): TeamExecutionSkipReason {
+  if (reason === "missing_owner" || reason === "missing_session") return reason;
+  if (reason === "already_passed") return "already_resolved";
+  return "blocked";
+}
+
 function pushUniqueDispatch(items: TeamExecutionDispatchedTask[], item: TeamExecutionDispatchedTask): void {
   const index = items.findIndex((existing) => existing.taskId === item.taskId);
   if (index >= 0) items[index] = item;
@@ -554,6 +692,12 @@ function pushUniqueFinal(items: TeamExecutionFinalTask[], item: TeamExecutionFin
 
 function pushUniqueSkipped(items: TeamExecutionSkippedTask[], item: TeamExecutionSkippedTask): void {
   const index = items.findIndex((existing) => existing.taskId === item.taskId && existing.reason === item.reason);
+  if (index >= 0) items[index] = item;
+  else items.push(item);
+}
+
+function pushUniqueVerification(items: TeamExecutionVerificationTask[], item: TeamExecutionVerificationTask): void {
+  const index = items.findIndex((existing) => existing.taskId === item.taskId);
   if (index >= 0) items[index] = item;
   else items.push(item);
 }
@@ -583,4 +727,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function isDefined<T>(value: T | undefined): value is T {
+  return value !== undefined;
 }

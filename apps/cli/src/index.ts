@@ -494,6 +494,8 @@ function printTeamRunLoopSummary(summary: TeamExecutionRunSummary): void {
       `cycles=${summary.cycles}`,
       `dispatched=${summary.dispatched.length}`,
       `completed=${summary.completed.length}`,
+      `accepted=${summary.accepted.length}`,
+      `reopened=${summary.reopened.length}`,
       `failed=${summary.failed.length}`,
       `blocked=${summary.blocked.length}`,
       `skipped=${summary.skipped.length}`,
@@ -506,6 +508,12 @@ function printTeamRunLoopSummary(summary: TeamExecutionRunSummary): void {
   }
   for (const item of summary.completed) {
     console.log(["[complete]", item.taskId, item.status, item.ownerPath ?? "-", item.summary ?? ""].join("\t"));
+  }
+  for (const item of summary.accepted) {
+    console.log(["[accepted]", item.taskId, item.status, item.ownerPath ?? "-", item.summary ?? ""].join("\t"));
+  }
+  for (const item of summary.reopened) {
+    console.log(["[reopened]", item.taskId, item.status, item.ownerPath ?? "-", item.feedback ?? ""].join("\t"));
   }
   for (const item of summary.failed) {
     console.log(["[failed]", item.taskId, item.status, item.ownerPath ?? "-", item.error ?? item.summary ?? ""].join("\t"));
