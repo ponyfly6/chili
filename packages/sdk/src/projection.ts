@@ -13,6 +13,8 @@ import type {
   TaskId,
   TeamId,
   TeamMemberStatus,
+  TeamMessageDelivery,
+  TeamMessageDeliveryStatus,
   TeamMessageKind,
   ThreadId,
   ToolCallId,
@@ -127,6 +129,8 @@ export interface RuntimeAgentMailboxMessageView {
   queuedAt: number;
   sessionId?: SessionId;
   threadId?: ThreadId;
+  teamId?: TeamId;
+  teamMessageId?: string;
   claimedAt?: number;
   consumedAt?: number;
 }
@@ -192,6 +196,11 @@ export interface RuntimeTeamMessageView {
   to: AgentPath | "*";
   content: string;
   kind: TeamMessageKind;
+  delivery?: TeamMessageDelivery;
+  deliveryStatus?: TeamMessageDeliveryStatus;
+  deliveryError?: string;
+  deliveryUpdatedAt?: number;
+  deliveredAt?: number;
   createdAt: number;
   sessionId?: SessionId;
   threadId?: ThreadId;
@@ -550,11 +559,13 @@ function applyTeamProjectionEvent(view: ChiliRuntimeView, event: EventEnvelope):
       kind: teamMessageKindValue(payload.kind) ?? "text",
       createdAt: event.time,
     };
+    assignOptional(message, "delivery", teamMessageDeliveryValue(payload.delivery));
     assignOptional(message, "sessionId", event.sessionId);
     assignOptional(message, "threadId", event.threadId);
     assignOptional(message, "taskId", stringValue(payload.taskId) as TaskId | undefined);
     assignOptional(message, "summary", stringValue(payload.summary));
     view.teamMessages[messageId] = message;
+    refreshTeamMessageDeliveryStatus(view, messageId, event.time);
     if (!view.teamMessageIds.includes(messageId)) view.teamMessageIds.push(messageId);
 
     const team = upsertTeam(view, teamId, event.time);
@@ -648,6 +659,12 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     };
     assignOptional(message, "sessionId", event.sessionId);
     assignOptional(message, "threadId", event.threadId);
+    const teamMetadata = teamMailboxMetadata(payload.message);
+    if (teamMetadata) {
+      message.teamId = teamMetadata.teamId;
+      message.teamMessageId = teamMetadata.teamMessageId;
+      applyTeamMessageDeliveryStatus(view, teamMetadata.teamMessageId, "queued", event.time);
+    }
     view.mailboxMessages[message.id] = message;
     if (!view.mailboxMessageIds.includes(message.id)) view.mailboxMessageIds.push(message.id);
 
@@ -667,6 +684,7 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     if (!message) return;
     message.status = "consumed";
     message.consumedAt = event.time;
+    if (message.teamMessageId) applyTeamMessageDeliveryStatus(view, message.teamMessageId, "delivered", event.time);
     return;
   }
 
@@ -677,6 +695,7 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     if (!message) return;
     message.status = "delivering";
     message.claimedAt = event.time;
+    if (message.teamMessageId) applyTeamMessageDeliveryStatus(view, message.teamMessageId, "delivering", event.time);
     return;
   }
 
@@ -688,6 +707,7 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     message.status = "queued";
     delete message.claimedAt;
     delete message.consumedAt;
+    if (message.teamMessageId) applyTeamMessageDeliveryStatus(view, message.teamMessageId, "failed", event.time, stringValue(payload.error));
     return;
   }
 
@@ -1058,6 +1078,61 @@ function teamMemberStatusValue(value: unknown): TeamMemberStatus | undefined {
 
 function teamMessageKindValue(value: unknown): TeamMessageKind | undefined {
   return value === "text" || value === "task_assignment" || value === "system" ? value : undefined;
+}
+
+function teamMessageDeliveryValue(value: unknown): TeamMessageDelivery | undefined {
+  return value === "queueOnly" || value === "triggerTurn" ? value : undefined;
+}
+
+function applyTeamMessageDeliveryStatus(
+  view: ChiliRuntimeView,
+  teamMessageId: string,
+  status: TeamMessageDeliveryStatus,
+  time: number,
+  error?: string,
+): void {
+  const message = view.teamMessages[teamMessageId];
+  if (!message) return;
+  message.deliveryStatus = status;
+  message.deliveryUpdatedAt = time;
+  if (status === "delivered") {
+    message.deliveredAt = time;
+    delete message.deliveryError;
+    return;
+  }
+  if (status === "failed" && error) {
+    message.deliveryError = error;
+    return;
+  }
+  if (status === "queued" || status === "delivering") {
+    delete message.deliveryError;
+  }
+}
+
+function refreshTeamMessageDeliveryStatus(view: ChiliRuntimeView, teamMessageId: string, time: number): void {
+  const deliveries = Object.values(view.mailboxMessages).filter((message) => message.teamMessageId === teamMessageId);
+  if (deliveries.length === 0) return;
+  if (deliveries.some((message) => message.status === "delivering")) {
+    applyTeamMessageDeliveryStatus(view, teamMessageId, "delivering", time);
+    return;
+  }
+  if (deliveries.some((message) => message.status === "queued")) {
+    applyTeamMessageDeliveryStatus(view, teamMessageId, "queued", time);
+    return;
+  }
+  applyTeamMessageDeliveryStatus(view, teamMessageId, "delivered", time);
+}
+
+function teamMailboxMetadata(value: unknown): { teamId: TeamId; teamMessageId: string } | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const message = value as Record<string, unknown>;
+  const metadata = message.metadata;
+  if (!metadata || typeof metadata !== "object") return undefined;
+  const record = metadata as Record<string, unknown>;
+  const teamId = stringValue(record.teamId) as TeamId | undefined;
+  const teamMessageId = stringValue(record.teamMessageId);
+  if (!teamId || !teamMessageId) return undefined;
+  return { teamId, teamMessageId };
 }
 
 function teamMemberKey(teamId: TeamId, path: AgentPath): string {

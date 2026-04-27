@@ -20,6 +20,8 @@ import type {
   SessionEvent,
   TeamEvent,
   TeamId,
+  TeamMessageDelivery,
+  TeamMessageDeliveryStatus,
   TeamTaskClaimedPayload,
   ThreadId,
   ToolEvent,
@@ -55,6 +57,8 @@ import type {
   SubagentProjectionStore,
   TeamMemberQuery,
   TeamMemberRow,
+  TeamMessageDeliveryQuery,
+  TeamMessageDeliveryRow,
   TeamMessageQuery,
   TeamMessageRow,
   TeamProjectionStore,
@@ -222,10 +226,30 @@ interface TeamMessageProjectionRow {
   to_path: string;
   task_id: string | null;
   kind: TeamMessageRow["kind"];
+  delivery: TeamMessageDelivery | null;
+  delivery_status: TeamMessageDeliveryStatus | null;
+  delivery_error: string | null;
+  delivery_updated_at: number | null;
+  delivered_at: number | null;
   content: string;
   summary: string | null;
   metadata_json: string | null;
   created_at: number;
+}
+
+interface TeamMessageDeliveryProjectionRow {
+  mailbox_message_id: string;
+  team_id: string;
+  team_message_id: string;
+  path: string;
+  child_session_id: string | null;
+  child_thread_id: string | null;
+  trigger_turn: number;
+  status: TeamMessageDeliveryStatus;
+  error: string | null;
+  queued_at: number;
+  updated_at: number;
+  delivered_at: number | null;
 }
 
 export interface SqliteEventStoreOptions {
@@ -616,15 +640,15 @@ export class SqliteEventStore
     const params: Record<string, unknown> = {};
 
     if (query.teamId) {
-      clauses.push("team_id = $teamId");
+      clauses.push("m.team_id = $teamId");
       params.teamId = query.teamId;
     }
     if (query.path) {
-      clauses.push("(from_path = $path or to_path = $path or to_path = '*')");
+      clauses.push("(m.from_path = $path or m.to_path = $path or m.to_path = '*')");
       params.path = query.path;
     }
     if (query.taskId) {
-      clauses.push("task_id = $taskId");
+      clauses.push("m.task_id = $taskId");
       params.taskId = query.taskId;
     }
 
@@ -632,14 +656,83 @@ export class SqliteEventStore
     const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
     return this.db
       .query<TeamMessageProjectionRow, any>(
-        `select id, team_id, from_path, to_path, task_id, kind, content, summary, metadata_json, created_at
-         from team_messages
+        `select m.id, m.team_id, m.from_path, m.to_path, m.task_id, m.kind, m.delivery, m.content,
+                m.summary, m.metadata_json, m.created_at,
+                (
+                  select case
+                    when count(*) = 0 then null
+                    when sum(case when d.status = 'failed' then 1 else 0 end) > 0 then 'failed'
+                    when sum(case when d.status = 'delivering' then 1 else 0 end) > 0 then 'delivering'
+                    when sum(case when d.status = 'queued' then 1 else 0 end) > 0 then 'queued'
+                    else 'delivered'
+                  end
+                  from team_message_deliveries d
+                  where d.team_message_id = m.id
+                ) as delivery_status,
+                (
+                  select d.error
+                  from team_message_deliveries d
+                  where d.team_message_id = m.id and d.error is not null
+                  order by d.updated_at desc, d.mailbox_message_id asc
+                  limit 1
+                ) as delivery_error,
+                (
+                  select max(d.updated_at)
+                  from team_message_deliveries d
+                  where d.team_message_id = m.id
+                ) as delivery_updated_at,
+                (
+                  select max(d.delivered_at)
+                  from team_message_deliveries d
+                  where d.team_message_id = m.id
+                ) as delivered_at
+         from team_messages m
          ${where}
-         order by created_at asc, id asc
+         order by m.created_at asc, m.id asc
          limit $limit`,
       )
       .all(params)
       .map((row) => teamMessageFromRow(row));
+  }
+
+  async teamMessageDeliveries(query: TeamMessageDeliveryQuery = {}): Promise<TeamMessageDeliveryRow[]> {
+    const clauses: string[] = [];
+    const params: Record<string, unknown> = {};
+
+    if (query.teamId) {
+      clauses.push("team_id = $teamId");
+      params.teamId = query.teamId;
+    }
+    if (query.teamMessageId) {
+      clauses.push("team_message_id = $teamMessageId");
+      params.teamMessageId = query.teamMessageId;
+    }
+    if (query.mailboxMessageId) {
+      clauses.push("mailbox_message_id = $mailboxMessageId");
+      params.mailboxMessageId = query.mailboxMessageId;
+    }
+    if (query.path) {
+      clauses.push("path = $path");
+      params.path = query.path;
+    }
+    if (query.status) {
+      clauses.push("status = $status");
+      params.status = query.status;
+    }
+
+    params.limit = query.limit ?? 500;
+    const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
+    return this.db
+      .query<TeamMessageDeliveryProjectionRow, any>(
+        `select mailbox_message_id, team_id, team_message_id, path, child_session_id, child_thread_id,
+                trigger_turn, status, error, queued_at, updated_at, delivered_at
+         from team_message_deliveries
+         ${where}
+         order by updated_at asc, mailbox_message_id asc
+         limit $limit`,
+      )
+      .all(params)
+      .map((row) => teamMessageDeliveryFromRow(row));
   }
 
   async claimTeamTask(input: TeamTaskClaimInput): Promise<TeamTaskMutationResult> {
@@ -1140,12 +1233,32 @@ export class SqliteEventStore
     this.addColumnIfMissing("team_tasks", "error", "text");
     this.addColumnIfMissing("team_tasks", "metadata_json", "text");
     this.addColumnIfMissing("team_tasks", "completed_at", "integer");
+    this.addColumnIfMissing("team_messages", "delivery", "text");
+    this.db.exec(`
+      create table if not exists team_message_deliveries (
+        mailbox_message_id text primary key,
+        team_id text not null,
+        team_message_id text not null,
+        path text not null,
+        child_session_id text,
+        child_thread_id text,
+        trigger_turn integer not null,
+        status text not null,
+        error text,
+        queued_at integer not null,
+        updated_at integer not null,
+        delivered_at integer
+      )
+    `);
     this.db.exec(`create index if not exists team_tasks_owner_status_idx on team_tasks(owner_path, status)`);
     this.db.exec(`create index if not exists team_members_team_status_idx on team_members(team_id, status)`);
     this.db.exec(`create index if not exists team_members_path_idx on team_members(path)`);
     this.db.exec(`create index if not exists team_messages_team_time_idx on team_messages(team_id, created_at)`);
     this.db.exec(`create index if not exists team_messages_to_time_idx on team_messages(to_path, created_at)`);
     this.db.exec(`create index if not exists team_messages_task_idx on team_messages(task_id, created_at)`);
+    this.db.exec(`create index if not exists team_message_deliveries_team_idx on team_message_deliveries(team_id, updated_at)`);
+    this.db.exec(`create index if not exists team_message_deliveries_message_idx on team_message_deliveries(team_message_id, updated_at)`);
+    this.db.exec(`create index if not exists team_message_deliveries_status_idx on team_message_deliveries(status, updated_at)`);
   }
 
   private addColumnIfMissing(table: string, column: string, definition: string): void {
@@ -1457,6 +1570,7 @@ export class SqliteEventStore
       if (event.payload.taskId) {
         this.db.query(`update agent_tasks set updated_at = ? where id = ?`).run(event.time, event.payload.taskId);
       }
+      this.applyTeamMessageDeliveryQueued(event);
       return;
     }
 
@@ -1464,6 +1578,7 @@ export class SqliteEventStore
       this.db
         .query(`update agent_mailbox set status = 'delivering' where id = ? and status = 'queued'`)
         .run(event.payload.messageId);
+      this.applyTeamMessageDeliveryStatus(event.payload.messageId, "delivering", event.time);
       if (event.payload.taskId) {
         this.db.query(`update agent_tasks set updated_at = ? where id = ?`).run(event.time, event.payload.taskId);
       }
@@ -1474,6 +1589,7 @@ export class SqliteEventStore
       this.db
         .query(`update agent_mailbox set status = 'queued', consumed_at = null where id = ? and status = 'delivering'`)
         .run(event.payload.messageId);
+      this.applyTeamMessageDeliveryStatus(event.payload.messageId, "failed", event.time, event.payload.error);
       if (event.payload.taskId) {
         this.db.query(`update agent_tasks set updated_at = ? where id = ?`).run(event.time, event.payload.taskId);
       }
@@ -1484,6 +1600,7 @@ export class SqliteEventStore
       this.db
         .query(`update agent_mailbox set status = 'consumed', consumed_at = ? where id = ?`)
         .run(event.time, event.payload.messageId);
+      this.applyTeamMessageDeliveryStatus(event.payload.messageId, "delivered", event.time);
       if (event.payload.taskId) {
         this.db.query(`update agent_tasks set updated_at = ? where id = ?`).run(event.time, event.payload.taskId);
       }
@@ -1525,6 +1642,58 @@ export class SqliteEventStore
         );
       }
     }
+  }
+
+  private applyTeamMessageDeliveryQueued(event: Extract<AgentEvent, { type: "agent.message_queued" }>): void {
+    const metadata = teamMailboxMetadata(event.payload.message);
+    if (!metadata) return;
+    this.db
+      .query(
+        `insert into team_message_deliveries
+           (mailbox_message_id, team_id, team_message_id, path, child_session_id, child_thread_id,
+            trigger_turn, status, error, queued_at, updated_at, delivered_at)
+         values (?, ?, ?, ?, ?, ?, ?, 'queued', null, ?, ?, null)
+         on conflict(mailbox_message_id) do update set
+           team_id = excluded.team_id,
+           team_message_id = excluded.team_message_id,
+           path = excluded.path,
+           child_session_id = excluded.child_session_id,
+           child_thread_id = excluded.child_thread_id,
+           trigger_turn = excluded.trigger_turn,
+           status = 'queued',
+           error = null,
+           updated_at = excluded.updated_at,
+           delivered_at = null`,
+      )
+      .run(
+        event.id,
+        metadata.teamId,
+        metadata.teamMessageId,
+        event.payload.path,
+        event.payload.childSessionId ?? null,
+        event.payload.childThreadId ?? null,
+        event.payload.triggerTurn ? 1 : 0,
+        event.time,
+        event.time,
+      );
+  }
+
+  private applyTeamMessageDeliveryStatus(
+    mailboxMessageId: string,
+    status: TeamMessageDeliveryStatus,
+    time: number,
+    error?: string,
+  ): void {
+    this.db
+      .query(
+        `update team_message_deliveries
+         set status = ?,
+             error = ?,
+             updated_at = ?,
+             delivered_at = case when ? = 'delivered' then ? else delivered_at end
+         where mailbox_message_id = ?`,
+      )
+      .run(status, error ?? null, time, status, time, mailboxMessageId);
   }
 
   private applyAgentSpawnToTask(
@@ -1962,8 +2131,8 @@ export class SqliteEventStore
       this.db
         .query(
           `insert into team_messages
-             (id, team_id, from_path, to_path, task_id, kind, content, summary, metadata_json, created_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             (id, team_id, from_path, to_path, task_id, kind, delivery, content, summary, metadata_json, created_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            on conflict(id) do nothing`,
         )
         .run(
@@ -1973,6 +2142,7 @@ export class SqliteEventStore
           event.payload.to,
           event.payload.taskId ?? null,
           event.payload.kind ?? "text",
+          event.payload.delivery ?? null,
           event.payload.content,
           event.payload.summary ?? null,
           event.payload.metadata ? encodeJson(event.payload.metadata) : null,
@@ -2158,10 +2328,43 @@ function teamMessageFromRow(row: TeamMessageProjectionRow): TeamMessageRow {
     kind: row.kind,
     createdAt: row.created_at,
   };
+  if (row.delivery) message.delivery = row.delivery;
+  if (row.delivery_status) message.deliveryStatus = row.delivery_status;
+  if (row.delivery_error) message.deliveryError = row.delivery_error;
+  if (row.delivery_updated_at) message.deliveryUpdatedAt = row.delivery_updated_at;
+  if (row.delivered_at) message.deliveredAt = row.delivered_at;
   if (row.task_id) message.taskId = row.task_id as TaskId;
   if (row.summary) message.summary = row.summary;
   if (row.metadata_json) message.metadata = decodeJson<Record<string, unknown>>(row.metadata_json, {});
   return message;
+}
+
+function teamMessageDeliveryFromRow(row: TeamMessageDeliveryProjectionRow): TeamMessageDeliveryRow {
+  const delivery: TeamMessageDeliveryRow = {
+    mailboxMessageId: row.mailbox_message_id,
+    teamId: row.team_id as TeamId,
+    teamMessageId: row.team_message_id,
+    path: row.path as AgentPath,
+    status: row.status,
+    triggerTurn: row.trigger_turn === 1,
+    queuedAt: row.queued_at,
+    updatedAt: row.updated_at,
+  };
+  if (row.child_session_id) delivery.childSessionId = row.child_session_id as SessionId;
+  if (row.child_thread_id) delivery.childThreadId = row.child_thread_id as ThreadId;
+  if (row.error) delivery.error = row.error;
+  if (row.delivered_at) delivery.deliveredAt = row.delivered_at;
+  return delivery;
+}
+
+function teamMailboxMetadata(payload: AgentMailboxPayload | undefined): { teamId: TeamId; teamMessageId: string } | undefined {
+  const metadata = payload?.metadata;
+  if (!metadata || typeof metadata !== "object") return undefined;
+  const teamId = metadata.teamId;
+  const teamMessageId = metadata.teamMessageId;
+  if (typeof teamId !== "string" || teamId.length === 0) return undefined;
+  if (typeof teamMessageId !== "string" || teamMessageId.length === 0) return undefined;
+  return { teamId: teamId as TeamId, teamMessageId };
 }
 
 function applyPartDelta(part: MessagePart, field: string, delta: string): MessagePart {

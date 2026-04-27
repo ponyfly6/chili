@@ -3,6 +3,8 @@ import type { AgentPath, TaskId, TeamId, ThreadId, SessionId, ToolExecutionConte
 export type TeamMemberStatus = "idle" | "running" | "waiting" | "blocked" | "closed";
 export type TeamTaskStatus = "pending" | "in_progress" | "blocked" | "completed" | "failed" | "cancelled";
 export type TeamMessageKind = "text" | "task_assignment" | "system";
+export type TeamMessageDelivery = "queueOnly" | "triggerTurn";
+export type TeamMessageDeliveryStatus = "queued" | "delivering" | "delivered" | "failed";
 
 export interface TeamRecord {
   teamId: TeamId | string;
@@ -57,6 +59,11 @@ export interface TeamMessageRecord {
   toPath: AgentPath | string | "*";
   content: string;
   kind: TeamMessageKind;
+  delivery?: TeamMessageDelivery;
+  deliveryStatus?: TeamMessageDeliveryStatus;
+  deliveryError?: string;
+  deliveryUpdatedAt?: number;
+  deliveredAt?: number;
   taskId?: TaskId | string;
   summary?: string;
   metadata?: Record<string, unknown>;
@@ -129,6 +136,7 @@ export interface TeamTaskAssignToolInput {
   ownerPath: string;
   assignedBy?: string;
   message?: string;
+  messageDelivery?: TeamMessageDelivery;
   messageSummary?: string;
 }
 
@@ -218,6 +226,7 @@ export interface TeamMessageSendToolInput {
   to: string | "*";
   content: string;
   kind?: TeamMessageKind;
+  delivery?: TeamMessageDelivery;
   taskId?: string;
   summary?: string;
   metadata?: Record<string, unknown>;

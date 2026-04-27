@@ -132,6 +132,47 @@ test("migrates older agent task tables with generation and lease columns", async
   }
 });
 
+test("migrates older team message tables without delivery", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-team-message-migration-"));
+  const dbPath = join(dir, "events.sqlite");
+  const db = new Database(dbPath, { create: true, strict: true });
+  db.exec(`
+    create table team_messages (
+      id text primary key,
+      team_id text not null,
+      from_path text not null,
+      to_path text not null,
+      task_id text,
+      kind text not null,
+      content text not null,
+      summary text,
+      metadata_json text,
+      created_at integer not null
+    )
+  `);
+  db.query(
+    `insert into team_messages
+       (id, team_id, from_path, to_path, kind, content, created_at)
+     values (?, ?, ?, ?, 'text', ?, 1)`,
+  ).run("teammsg_old", "team_old", "/root", "/root/worker", "old message");
+  db.close();
+
+  const store = new SqliteEventStore(dbPath);
+  try {
+    expect(await store.teamMessages({ teamId: "team_old" as TeamId })).toMatchObject([
+      {
+        id: "teammsg_old",
+        teamId: "team_old",
+        kind: "text",
+        content: "old message",
+      },
+    ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("replays message part deltas into stored messages", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-part-delta-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -941,6 +982,7 @@ test("projects team members, task board, and messages", async () => {
           from: leadPath,
           to: reviewerPath,
           kind: "task_assignment",
+          delivery: "queueOnly",
           taskId: reviewTaskId,
           content: "Please review team runtime.",
           summary: "assignment",
@@ -1034,10 +1076,121 @@ test("projects team members, task board, and messages", async () => {
         fromPath: leadPath,
         toPath: reviewerPath,
         kind: "task_assignment",
+        delivery: "queueOnly",
         taskId: reviewTaskId,
         content: "Please review team runtime.",
       },
     ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("projects team message delivery status from agent mailbox lifecycle", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-team-message-delivery-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const teamId = "team_delivery" as TeamId;
+  const teamMessageId = "teammsg_delivery";
+  const mailboxMessageId = "agentmsg_delivery";
+  const workerPath = "/root/worker" as AgentPath;
+  const childSessionId = "session_worker" as SessionId;
+  const childThreadId = "thread_worker" as ThreadId;
+
+  try {
+    await store.append({
+      id: "event_team_message",
+      type: "team.message_sent",
+      time: 1 as TimestampMs,
+      payload: {
+        teamId,
+        messageId: teamMessageId,
+        from: "/root" as AgentPath,
+        to: workerPath,
+        content: "Run delivery test",
+        kind: "text",
+        delivery: "triggerTurn",
+      },
+    });
+    await store.append({
+      id: mailboxMessageId,
+      type: "agent.message_queued",
+      time: 2 as TimestampMs,
+      payload: {
+        path: workerPath,
+        from: "/root" as AgentPath,
+        childSessionId,
+        childThreadId,
+        triggerTurn: true,
+        message: {
+          role: "user",
+          content: "Run delivery test",
+          metadata: { teamId, teamMessageId },
+        },
+      },
+    });
+
+    expect(await store.teamMessages({ teamId })).toMatchObject([
+      {
+        id: teamMessageId,
+        delivery: "triggerTurn",
+        deliveryStatus: "queued",
+        deliveryUpdatedAt: 2,
+      },
+    ]);
+    expect(await store.teamMessageDeliveries({ teamMessageId })).toMatchObject([
+      {
+        mailboxMessageId,
+        teamId,
+        teamMessageId,
+        path: workerPath,
+        status: "queued",
+        triggerTurn: true,
+        childSessionId,
+        childThreadId,
+      },
+    ]);
+
+    await store.append({
+      id: "event_delivery_claimed",
+      type: "agent.message_claimed",
+      time: 3 as TimestampMs,
+      payload: { messageId: mailboxMessageId, path: workerPath },
+    });
+    expect((await store.teamMessages({ teamId }))[0]).toMatchObject({
+      deliveryStatus: "delivering",
+      deliveryUpdatedAt: 3,
+    });
+
+    await store.append({
+      id: "event_delivery_requeued",
+      type: "agent.message_requeued",
+      time: 4 as TimestampMs,
+      payload: { messageId: mailboxMessageId, path: workerPath, error: "child busy" },
+    });
+    expect((await store.teamMessages({ teamId }))[0]).toMatchObject({
+      deliveryStatus: "failed",
+      deliveryError: "child busy",
+      deliveryUpdatedAt: 4,
+    });
+
+    await store.append({
+      id: "event_delivery_claimed_again",
+      type: "agent.message_claimed",
+      time: 5 as TimestampMs,
+      payload: { messageId: mailboxMessageId, path: workerPath },
+    });
+    await store.append({
+      id: "event_delivery_consumed",
+      type: "agent.message_consumed",
+      time: 6 as TimestampMs,
+      payload: { messageId: mailboxMessageId, path: workerPath },
+    });
+    expect((await store.teamMessages({ teamId }))[0]).toMatchObject({
+      deliveryStatus: "delivered",
+      deliveredAt: 6,
+      deliveryUpdatedAt: 6,
+    });
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });

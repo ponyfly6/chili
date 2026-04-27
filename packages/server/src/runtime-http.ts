@@ -13,6 +13,7 @@ import type {
   ThreadId,
   TaskId,
   TeamId,
+  TeamMessageDelivery,
 } from "@chili/protocol";
 import type {
   AgentTreeSnapshot,
@@ -545,6 +546,7 @@ interface TeamTaskAssignBody extends TeamContextBody {
   ownerPath?: AgentPath;
   assignedBy?: AgentPath;
   message?: string;
+  messageDelivery?: unknown;
   messageSummary?: string;
 }
 
@@ -581,6 +583,7 @@ interface TeamMessageBody extends TeamContextBody {
   to?: AgentPath | "*";
   content?: string;
   kind?: unknown;
+  delivery?: unknown;
   taskId?: TaskId;
   summary?: string;
   metadata?: Record<string, unknown>;
@@ -905,6 +908,9 @@ function toHttpError(error: unknown): HttpError {
   if (err.name === "TeamTaskClaimError") {
     return { status: 409, message: err.message };
   }
+  if (err.name === "TeamMessageDeliveryError") {
+    return { status: 409, message: err.message };
+  }
   if (err.name === "RuntimeBusyError") {
     return { status: 409, message: err.message };
   }
@@ -1019,6 +1025,8 @@ function teamTaskAssignInput(teamId: TeamId, taskId: TaskId, body: TeamTaskAssig
   };
   if (body.assignedBy) input.assignedBy = body.assignedBy;
   if (body.message) input.message = body.message;
+  const delivery = teamMessageDelivery(body.messageDelivery);
+  if (delivery) input.messageDelivery = delivery;
   if (body.messageSummary) input.messageSummary = body.messageSummary;
   return input;
 }
@@ -1097,6 +1105,8 @@ function teamMessageInput(teamId: TeamId, body: TeamMessageBody): SendTeamMessag
   if (body.messageId) input.messageId = body.messageId;
   const kind = teamMessageKind(body.kind);
   if (kind) input.kind = kind;
+  const delivery = teamMessageDelivery(body.delivery);
+  if (delivery) input.delivery = delivery;
   if (body.taskId) input.taskId = body.taskId;
   if (body.summary) input.summary = body.summary;
   if (body.metadata) input.metadata = body.metadata;
@@ -1203,6 +1213,12 @@ function teamMessageKind(value: unknown): SendTeamMessageInput["kind"] | undefin
   if (value === undefined) return undefined;
   if (value === "text" || value === "task_assignment" || value === "system") return value;
   throw badRequest("message kind must be text, task_assignment, or system");
+}
+
+function teamMessageDelivery(value: unknown): TeamMessageDelivery | undefined {
+  if (value === undefined) return undefined;
+  if (value === "queueOnly" || value === "triggerTurn") return value;
+  throw badRequest("message delivery must be queueOnly or triggerTurn");
 }
 
 function localSubagentMode(value: unknown): TeamTaskDispatchInput["mode"] | undefined {

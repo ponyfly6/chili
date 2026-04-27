@@ -1,4 +1,5 @@
 import type {
+  AgentMessageQueuedPayload,
   AgentPath,
   ChiliEvent,
   EventEnvelope,
@@ -7,6 +8,7 @@ import type {
   TeamEvent,
   TeamId,
   TeamMemberStatus as ProtocolTeamMemberStatus,
+  TeamMessageDelivery,
   TeamMessageKind,
   TeamTaskStatus as ProtocolTeamTaskStatus,
   ThreadId,
@@ -90,6 +92,7 @@ export interface AssignTeamTaskInput extends TeamEventContext {
   ownerPath: AgentPath;
   assignedBy?: AgentPath;
   message?: string;
+  messageDelivery?: TeamMessageDelivery;
   messageSummary?: string;
 }
 
@@ -120,6 +123,7 @@ export interface SendTeamMessageInput extends TeamEventContext {
   to: AgentPath | "*";
   content: string;
   kind?: TeamMessageKind;
+  delivery?: TeamMessageDelivery;
   taskId?: TaskId;
   summary?: string;
   metadata?: Record<string, unknown>;
@@ -154,6 +158,13 @@ export class TeamTaskClaimError extends Error {
   ) {
     super(`Team task claim failed: ${taskId} in ${teamId} (${reason})`);
     this.name = "TeamTaskClaimError";
+  }
+}
+
+export class TeamMessageDeliveryError extends Error {
+  constructor(readonly teamId: TeamId, readonly target: AgentPath | "*", readonly reason: string) {
+    super(`Team message delivery failed for ${target} in ${teamId}: ${reason}`);
+    this.name = "TeamMessageDeliveryError";
   }
 }
 
@@ -240,6 +251,8 @@ export class TeamControlService implements TeamRuntime {
     await this.requireMember(input.teamId, input.ownerPath);
 
     const messageId = input.message ? this.id("teammsg") : undefined;
+    const messageFrom = input.assignedBy ?? task.createdBy ?? input.ownerPath;
+    const messageDelivery = input.messageDelivery ?? "queueOnly";
     const events: ChiliEvent[] = [
       this.teamEvent(
         input,
@@ -262,14 +275,29 @@ export class TeamControlService implements TeamRuntime {
           pruneUndefined({
             teamId: input.teamId,
             messageId,
-            from: input.assignedBy ?? task.createdBy ?? input.ownerPath,
+            from: messageFrom,
             to: input.ownerPath,
             content: input.message,
             kind: "task_assignment" as const,
+            delivery: messageDelivery,
             taskId: input.taskId,
             summary: input.messageSummary,
           }),
         ),
+      );
+      events.push(
+        ...(await this.teamMessageDeliveryEvents(input, {
+          teamId: input.teamId,
+          messageId,
+          from: messageFrom,
+          to: input.ownerPath,
+          content: input.message,
+          kind: "task_assignment",
+          delivery: messageDelivery,
+          taskId: input.taskId,
+          summary: input.messageSummary,
+          strict: false,
+        })),
       );
     }
 
@@ -343,7 +371,7 @@ export class TeamControlService implements TeamRuntime {
   async sendMessage(input: SendTeamMessageInput): Promise<TeamMessageRow> {
     await this.requireTeam(input.teamId);
     const messageId = input.messageId ?? this.id("teammsg");
-    await this.options.store.append(
+    const events: ChiliEvent[] = [
       this.teamEvent(
         input,
         "team.message_sent",
@@ -354,12 +382,31 @@ export class TeamControlService implements TeamRuntime {
           to: input.to,
           content: input.content,
           kind: input.kind,
+          delivery: input.delivery,
           taskId: input.taskId,
           summary: input.summary,
           metadata: input.metadata,
         }),
       ),
-    );
+    ];
+    if (input.delivery) {
+      events.push(
+        ...(await this.teamMessageDeliveryEvents(input, {
+          teamId: input.teamId,
+          messageId,
+          from: input.from,
+          to: input.to,
+          content: input.content,
+          kind: input.kind ?? "text",
+          delivery: input.delivery,
+          taskId: input.taskId,
+          summary: input.summary,
+          metadata: input.metadata,
+          strict: true,
+        })),
+      );
+    }
+    await this.options.store.appendMany(events);
     const message = (await this.options.store.teamMessages({ teamId: input.teamId, limit: 500 })).find(
       (item) => item.id === messageId,
     );
@@ -401,6 +448,46 @@ export class TeamControlService implements TeamRuntime {
     return task;
   }
 
+  private async teamMessageDeliveryEvents(
+    context: TeamEventContext,
+    input: TeamMessageDeliveryEventInput,
+  ): Promise<ChiliEvent[]> {
+    const members =
+      input.to === "*"
+        ? (await this.options.store.teamMembers({ teamId: input.teamId })).filter((member) => member.path !== input.from)
+        : [await this.requireMember(input.teamId, input.to)];
+    const events: ChiliEvent[] = [];
+    for (const member of members) {
+      if (!isDeliverableTeamMember(member)) {
+        if (input.strict && input.to !== "*") {
+          const reason = member.status === "closed" ? "target member is closed" : "target member has no child session/thread";
+          throw new TeamMessageDeliveryError(input.teamId, input.to, reason);
+        }
+        continue;
+      }
+      events.push(
+        this.agentMessageQueuedEvent(
+          context,
+          teamMessageToAgentMailboxPayload(member, {
+            from: input.from,
+            content: input.content,
+            delivery: input.delivery,
+            teamId: input.teamId,
+            messageId: input.messageId,
+            kind: input.kind,
+            taskId: input.taskId,
+            summary: input.summary,
+            metadata: input.metadata,
+          }),
+        ),
+      );
+    }
+    if (input.strict && events.length === 0) {
+      throw new TeamMessageDeliveryError(input.teamId, input.to, "no deliverable members");
+    }
+    return events;
+  }
+
   private teamEvent<TType extends TeamEvent["type"], TPayload>(
     context: TeamEventContext,
     type: TType,
@@ -417,6 +504,18 @@ export class TeamControlService implements TeamRuntime {
     return event as ChiliEvent;
   }
 
+  private agentMessageQueuedEvent(context: TeamEventContext, payload: AgentMessageQueuedPayload): ChiliEvent {
+    const event: EventEnvelope<"agent.message_queued", AgentMessageQueuedPayload> = {
+      id: this.id("agentmsg"),
+      type: "agent.message_queued",
+      time: this.now(),
+      payload,
+    };
+    if (context.sessionId) event.sessionId = context.sessionId;
+    if (context.threadId) event.threadId = context.threadId;
+    return event;
+  }
+
   private id<T extends string>(prefix: string): T {
     const create = this.options.createId ?? defaultCreateId;
     return create(prefix) as T;
@@ -425,6 +524,68 @@ export class TeamControlService implements TeamRuntime {
   private now(): TimestampMs {
     return this.options.now ? this.options.now() : timestampNow();
   }
+}
+
+interface TeamMessageDeliveryEventInput {
+  teamId: TeamId;
+  messageId: string;
+  from: AgentPath;
+  to: AgentPath | "*";
+  content: string;
+  kind: TeamMessageKind;
+  delivery: TeamMessageDelivery;
+  taskId?: TaskId | undefined;
+  summary?: string | undefined;
+  metadata?: Record<string, unknown> | undefined;
+  strict: boolean;
+}
+
+interface TeamMessageMailboxInput {
+  from: AgentPath;
+  content: string;
+  delivery: TeamMessageDelivery;
+  teamId: TeamId;
+  messageId: string;
+  kind: TeamMessageKind;
+  taskId?: TaskId | undefined;
+  summary?: string | undefined;
+  metadata?: Record<string, unknown> | undefined;
+}
+
+type DeliverableTeamMember = TeamMemberRow & {
+  childSessionId: SessionId;
+  childThreadId: ThreadId;
+};
+
+function isDeliverableTeamMember(member: TeamMemberRow): member is DeliverableTeamMember {
+  return member.status !== "closed" && Boolean(member.childSessionId) && Boolean(member.childThreadId);
+}
+
+function teamMessageToAgentMailboxPayload(
+  member: DeliverableTeamMember,
+  input: TeamMessageMailboxInput,
+): AgentMessageQueuedPayload {
+  const payload: AgentMessageQueuedPayload = {
+    path: member.path,
+    from: input.from,
+    triggerTurn: input.delivery === "triggerTurn",
+    childSessionId: member.childSessionId,
+    childThreadId: member.childThreadId,
+    message: {
+      role: "user",
+      content: input.content,
+      metadata: pruneUndefined({
+        teamId: input.teamId,
+        teamMessageId: input.messageId,
+        teamMessageKind: input.kind,
+        taskId: input.taskId,
+        summary: input.summary,
+        teamMessageMetadata: input.metadata,
+      }),
+    },
+  };
+  if (input.taskId) payload.taskId = input.taskId;
+  return payload;
 }
 
 function isFinalTeamTaskStatus(status: TeamTaskStatus): boolean {

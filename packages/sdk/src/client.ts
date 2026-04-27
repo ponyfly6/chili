@@ -15,6 +15,8 @@ import type {
   TaskId,
   TeamId,
   TeamMemberStatus,
+  TeamMessageDelivery,
+  TeamMessageDeliveryStatus,
   TeamMessageKind,
   TeamTaskStatus,
   ThreadId,
@@ -229,6 +231,11 @@ export interface RuntimeTeamMessageRecord {
   toPath: AgentPath | "*";
   content: string;
   kind: TeamMessageKind;
+  delivery?: TeamMessageDelivery;
+  deliveryStatus?: TeamMessageDeliveryStatus;
+  deliveryError?: string;
+  deliveryUpdatedAt?: number;
+  deliveredAt?: number;
   taskId?: TaskId;
   summary?: string;
   metadata?: Record<string, unknown>;
@@ -282,6 +289,7 @@ export interface AssignTeamTaskRequest extends TeamRequestContext {
   ownerPath: AgentPath;
   assignedBy?: AgentPath;
   message?: string;
+  messageDelivery?: TeamMessageDelivery;
   messageSummary?: string;
 }
 
@@ -385,6 +393,7 @@ export interface SendTeamMessageRequest extends TeamRequestContext {
   to: AgentPath | "*";
   content: string;
   kind?: TeamMessageKind;
+  delivery?: TeamMessageDelivery;
   taskId?: TaskId;
   summary?: string;
   metadata?: Record<string, unknown>;

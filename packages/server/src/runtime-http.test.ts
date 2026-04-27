@@ -333,7 +333,14 @@ test("serves team control routes", async () => {
     const addMemberResponse = await handler(
       new Request(`http://chili.test/teams/${team.id}/members`, {
         method: "POST",
-        body: JSON.stringify({ path: "/root/reviewer", name: "reviewer", role: "reviewer", toolScope: ["read"] }),
+        body: JSON.stringify({
+          path: "/root/reviewer",
+          name: "reviewer",
+          role: "reviewer",
+          childSessionId: "session_reviewer",
+          childThreadId: "thread_reviewer",
+          toolScope: ["read"],
+        }),
         headers: { "content-type": "application/json" },
       }),
     );
@@ -353,7 +360,12 @@ test("serves team control routes", async () => {
     const assignResponse = await handler(
       new Request(`http://chili.test/teams/${team.id}/tasks/${task.id}/assign`, {
         method: "POST",
-        body: JSON.stringify({ ownerPath: "/root/reviewer", assignedBy: "/root", message: "please review" }),
+        body: JSON.stringify({
+          ownerPath: "/root/reviewer",
+          assignedBy: "/root",
+          message: "please review",
+          messageDelivery: "triggerTurn",
+        }),
         headers: { "content-type": "application/json" },
       }),
     );
@@ -475,7 +487,19 @@ test("serves team control routes", async () => {
 
     const messagesResponse = await handler(new Request(`http://chili.test/teams/${team.id}/messages`));
     expect(messagesResponse.status).toBe(200);
-    expect(await messagesResponse.json()).toMatchObject([{ kind: "task_assignment", content: "please review" }]);
+    expect(await messagesResponse.json()).toMatchObject([
+      { kind: "task_assignment", delivery: "triggerTurn", deliveryStatus: "queued", content: "please review" },
+    ]);
+    expect(await store.agentMailbox({ path: "/root/reviewer" as AgentPath, status: "queued" })).toMatchObject([
+      {
+        path: "/root/reviewer",
+        fromPath: "/root",
+        triggerTurn: true,
+        childSessionId: "session_reviewer",
+        childThreadId: "thread_reviewer",
+        taskId: task.id,
+      },
+    ]);
   } finally {
     baseStore.close();
     await rm(dir, { recursive: true, force: true });

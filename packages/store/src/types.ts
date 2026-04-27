@@ -12,6 +12,8 @@ import type {
   SessionId,
   TaskId,
   TeamId,
+  TeamMessageDelivery,
+  TeamMessageDeliveryStatus,
   TeamMemberStatus,
   TeamMessageKind,
   TeamTaskStatus,
@@ -302,6 +304,11 @@ export interface TeamMessageRow {
   toPath: AgentPath | "*";
   content: string;
   kind: TeamMessageKind;
+  delivery?: TeamMessageDelivery;
+  deliveryStatus?: TeamMessageDeliveryStatus;
+  deliveryError?: string;
+  deliveryUpdatedAt?: number;
+  deliveredAt?: number;
   taskId?: TaskId;
   summary?: string;
   metadata?: Record<string, unknown>;
@@ -334,6 +341,30 @@ export interface TeamMessageQuery {
   teamId?: TeamId;
   path?: AgentPath;
   taskId?: TaskId;
+  limit?: number;
+}
+
+export interface TeamMessageDeliveryRow {
+  mailboxMessageId: string;
+  teamId: TeamId;
+  teamMessageId: string;
+  path: AgentPath;
+  status: TeamMessageDeliveryStatus;
+  triggerTurn: boolean;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  error?: string;
+  queuedAt: number;
+  updatedAt: number;
+  deliveredAt?: number;
+}
+
+export interface TeamMessageDeliveryQuery {
+  teamId?: TeamId;
+  teamMessageId?: string;
+  mailboxMessageId?: string;
+  path?: AgentPath;
+  status?: TeamMessageDeliveryStatus;
   limit?: number;
 }
 
@@ -393,6 +424,7 @@ export interface TeamProjectionStore {
   teamMembers(query?: TeamMemberQuery): Promise<TeamMemberRow[]>;
   teamTasks(query?: TeamTaskQuery): Promise<TeamTaskRow[]>;
   teamMessages(query?: TeamMessageQuery): Promise<TeamMessageRow[]>;
+  teamMessageDeliveries(query?: TeamMessageDeliveryQuery): Promise<TeamMessageDeliveryRow[]>;
 }
 
 export interface TeamTaskClaimStore {

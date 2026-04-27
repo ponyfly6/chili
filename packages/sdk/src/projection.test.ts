@@ -210,7 +210,16 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
       time: 5 as TimestampMs,
       sessionId,
       threadId,
-      payload: { path: childPath, from: rootPath, triggerTurn: true },
+      payload: {
+        path: childPath,
+        from: rootPath,
+        triggerTurn: true,
+        message: {
+          role: "user",
+          content: "Please review projection",
+          metadata: { teamId, teamMessageId: "teammsg_projection", teamMessageKind: "task_assignment" },
+        },
+      },
     },
     {
       id: "event_6",
@@ -233,6 +242,7 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
         to: childPath,
         content: "Please review projection",
         kind: "task_assignment",
+        delivery: "queueOnly",
         taskId,
       },
     },
@@ -284,6 +294,9 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
     from: rootPath,
     to: childPath,
     kind: "task_assignment",
+    delivery: "queueOnly",
+    deliveryStatus: "delivered",
+    deliveredAt: 6,
     taskId,
   });
   expect(view.tasks[taskId]?.status).toBe("completed");

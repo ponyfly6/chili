@@ -139,6 +139,7 @@ test("team write tools normalize inputs and return durable board records", async
       owner_path: "/worker",
       assigned_by: "/lead",
       text: "Please take this slice.",
+      message_delivery: "trigger-turn",
       message_summary: "assign tools",
     }),
   );
@@ -150,6 +151,7 @@ test("team write tools normalize inputs and return durable board records", async
       ownerPath: "/worker",
       assignedBy: "/lead",
       message: "Please take this slice.",
+      messageDelivery: "triggerTurn",
       messageSummary: "assign tools",
     },
   ]);
@@ -201,6 +203,7 @@ test("team write tools normalize inputs and return durable board records", async
       to: "*",
       text: "Status check",
       kind: "assignment",
+      delivery: "queue-only",
       task_id: "task_team",
     }),
   );
@@ -213,9 +216,16 @@ test("team write tools normalize inputs and return durable board records", async
       to: "*",
       content: "Status check",
       kind: "task_assignment",
+      delivery: "queueOnly",
       taskId: "task_team",
     },
   ]);
+  if (message.status === "completed") {
+    expect(JSON.parse(message.result.output)).toMatchObject({
+      message_id: "message_team",
+      delivery: "queueOnly",
+    });
+  }
 
   expect(approvals).toEqual([]);
 });
@@ -573,6 +583,7 @@ function messageRecord(input: TeamMessageSendToolInput): TeamMessageRecord {
     toPath: input.to as AgentPath | "*",
     content: input.content,
     kind: input.kind ?? "text",
+    ...(input.delivery ? { delivery: input.delivery } : {}),
     ...(input.taskId ? { taskId: input.taskId } : {}),
     createdAt: 1,
   };

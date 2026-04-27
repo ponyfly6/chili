@@ -210,6 +210,7 @@ export const SQLITE_SCHEMA = [
     to_path text not null,
     task_id text,
     kind text not null,
+    delivery text,
     content text not null,
     summary text,
     metadata_json text,
@@ -218,4 +219,22 @@ export const SQLITE_SCHEMA = [
   `create index if not exists team_messages_team_time_idx on team_messages(team_id, created_at)`,
   `create index if not exists team_messages_to_time_idx on team_messages(to_path, created_at)`,
   `create index if not exists team_messages_task_idx on team_messages(task_id, created_at)`,
+
+  `create table if not exists team_message_deliveries (
+    mailbox_message_id text primary key,
+    team_id text not null,
+    team_message_id text not null,
+    path text not null,
+    child_session_id text,
+    child_thread_id text,
+    trigger_turn integer not null,
+    status text not null,
+    error text,
+    queued_at integer not null,
+    updated_at integer not null,
+    delivered_at integer
+  )`,
+  `create index if not exists team_message_deliveries_team_idx on team_message_deliveries(team_id, updated_at)`,
+  `create index if not exists team_message_deliveries_message_idx on team_message_deliveries(team_message_id, updated_at)`,
+  `create index if not exists team_message_deliveries_status_idx on team_message_deliveries(status, updated_at)`,
 ];

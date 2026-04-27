@@ -168,6 +168,8 @@ export type AgentEvent =
 export type TeamMemberStatus = "idle" | "running" | "waiting" | "blocked" | "closed";
 export type TeamTaskStatus = "pending" | "in_progress" | "blocked" | "completed" | "failed" | "cancelled";
 export type TeamMessageKind = "text" | "task_assignment" | "system";
+export type TeamMessageDelivery = "queueOnly" | "triggerTurn";
+export type TeamMessageDeliveryStatus = "queued" | "delivering" | "delivered" | "failed";
 
 export interface TeamCreatedPayload {
   teamId: TeamId;
@@ -245,6 +247,7 @@ export interface TeamMessageSentPayload {
   to: AgentPath | "*";
   content: string;
   kind?: TeamMessageKind;
+  delivery?: TeamMessageDelivery;
   taskId?: TaskId;
   summary?: string;
   metadata?: Record<string, unknown>;

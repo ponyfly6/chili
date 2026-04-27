@@ -27,6 +27,7 @@ import type {
   TeamTaskUpdateToolInput,
   TeamToolController,
   TeamMemberStatus,
+  TeamMessageDelivery,
   TeamMessageKind,
   TeamTaskStatus,
 } from "../team.js";
@@ -247,6 +248,9 @@ export function createTeamTaskAssignTool(
         assignedBy: { type: "string" },
         assigned_by: { type: "string" },
         message: { type: "string" },
+        messageDelivery: { type: "string", enum: ["queueOnly", "triggerTurn"] },
+        message_delivery: { type: "string", enum: ["queueOnly", "triggerTurn"] },
+        delivery: { type: "string", enum: ["queueOnly", "triggerTurn"] },
         messageSummary: { type: "string" },
         message_summary: { type: "string" },
       },
@@ -458,6 +462,9 @@ export function createTeamMessageSendTool(
         content: { type: "string" },
         text: { type: "string" },
         kind: { type: "string" },
+        delivery: { type: "string", enum: ["queueOnly", "triggerTurn"] },
+        messageDelivery: { type: "string", enum: ["queueOnly", "triggerTurn"] },
+        message_delivery: { type: "string", enum: ["queueOnly", "triggerTurn"] },
         taskId: { type: "string" },
         task_id: { type: "string" },
         summary: { type: "string" },
@@ -631,9 +638,12 @@ function validateTeamTaskAssignInput(input: unknown): ValidationResult<TeamTaskA
   if (!base.ok) return base;
   const assignedBy = optionalPath(input, ["assignedBy", "assigned_by"], "assignedBy");
   if (!assignedBy.ok) return assignedBy;
+  const delivery = normalizeMessageDelivery(input.messageDelivery ?? input.message_delivery ?? input.delivery);
+  if (!delivery.ok) return delivery;
   const value: TeamTaskAssignToolInput = { ...base.value };
   if (assignedBy.value) value.assignedBy = assignedBy.value;
   assignString(value, "message", pickString(input, ["message", "content", "text"]));
+  if (delivery.value) value.messageDelivery = delivery.value;
   assignString(value, "messageSummary", pickString(input, ["messageSummary", "message_summary", "summary"]));
   return { ok: true, value };
 }
@@ -724,11 +734,14 @@ function validateTeamMessageSendInput(input: unknown): ValidationResult<TeamMess
   if (!content.ok) return content;
   const kind = normalizeMessageKind(input.kind);
   if (!kind.ok) return kind;
+  const delivery = normalizeMessageDelivery(input.delivery ?? input.messageDelivery ?? input.message_delivery);
+  if (!delivery.ok) return delivery;
   const metadata = optionalPlainObject(input.metadata, "metadata");
   if (!metadata.ok) return metadata;
   const value: TeamMessageSendToolInput = { teamId: teamId.value, from: from.value, to: to.value, content: content.value };
   assignString(value, "messageId", pickString(input, ["messageId", "message_id"]));
   if (kind.value) value.kind = kind.value;
+  if (delivery.value) value.delivery = delivery.value;
   assignString(value, "taskId", pickString(input, ["taskId", "task_id"]));
   assignString(value, "summary", pickString(input, ["summary"]));
   if (metadata.value) value.metadata = metadata.value;
@@ -1027,6 +1040,15 @@ function teamMessageRecordOutput(message: TeamMessageRecord): Record<string, unk
     toPath: message.toPath,
     content: message.content,
     kind: message.kind,
+    delivery: message.delivery,
+    delivery_status: message.deliveryStatus,
+    deliveryStatus: message.deliveryStatus,
+    delivery_error: message.deliveryError,
+    deliveryError: message.deliveryError,
+    delivery_updated_at: message.deliveryUpdatedAt,
+    deliveryUpdatedAt: message.deliveryUpdatedAt,
+    delivered_at: message.deliveredAt,
+    deliveredAt: message.deliveredAt,
     task_id: message.taskId,
     taskId: message.taskId,
     summary: message.summary,
@@ -1164,6 +1186,31 @@ function normalizeMessageKind(value: unknown): ValidationResult<TeamMessageKind 
       return { ok: true, value: "task_assignment" };
     default:
       return { ok: false, message: "message kind must be text, task_assignment, or system" };
+  }
+}
+
+function normalizeMessageDelivery(value: unknown): ValidationResult<TeamMessageDelivery | undefined> {
+  if (value === undefined) return { ok: true, value: undefined };
+  if (typeof value !== "string") return { ok: false, message: "message delivery must be a string" };
+  switch (value.trim().toLowerCase()) {
+    case "queueonly":
+    case "queue_only":
+    case "queue-only":
+    case "queue":
+    case "mailbox":
+    case "mailbox_only":
+    case "mailbox-only":
+      return { ok: true, value: "queueOnly" };
+    case "triggerturn":
+    case "trigger_turn":
+    case "trigger-turn":
+    case "wake":
+    case "run":
+    case "start_turn":
+    case "start-turn":
+      return { ok: true, value: "triggerTurn" };
+    default:
+      return { ok: false, message: "message delivery must be queueOnly or triggerTurn" };
   }
 }
 

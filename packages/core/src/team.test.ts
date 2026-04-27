@@ -93,8 +93,30 @@ test("creates a persistent team with leader, members, task assignment, claim, an
         fromPath: leadPath,
         toPath: reviewerPath,
         kind: "task_assignment",
+        delivery: "queueOnly",
+        deliveryStatus: "queued",
         taskId: task.id,
         content: "Please review the team control service.",
+      },
+    ]);
+    expect(await store.agentMailbox({ path: reviewerPath, status: "queued" })).toMatchObject([
+      {
+        path: reviewerPath,
+        fromPath: leadPath,
+        triggerTurn: false,
+        taskId: task.id,
+        childSessionId: "session_reviewer",
+        childThreadId: "thread_reviewer",
+        message: {
+          role: "user",
+          content: "Please review the team control service.",
+          metadata: {
+            teamId: team.id,
+            teamMessageKind: "task_assignment",
+            taskId: task.id,
+            summary: "review assignment",
+          },
+        },
       },
     ]);
 
@@ -148,9 +170,76 @@ test("creates a persistent team with leader, members, task assignment, claim, an
       "team.task_created",
       "team.task_assigned",
       "team.message_sent",
+      "agent.message_queued",
       "team.task_claimed",
       "team.task_updated",
       "team.member_status_changed",
+    ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("delivers explicit team messages to agent mailbox when requested", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-control-delivery-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+
+  try {
+    const service = new TeamControlService({
+      store,
+      createId: createSequentialId(),
+      now: () => 30 as TimestampMs,
+    });
+
+    const team = await service.createTeam({ name: "delivery-team", leadPath });
+    await service.addMember({
+      teamId: team.id,
+      path: workerPath,
+      name: "worker",
+      role: "implementer",
+      childSessionId: "session_worker" as SessionId,
+      childThreadId: "thread_worker" as ThreadId,
+    });
+
+    const message = await service.sendMessage({
+      teamId: team.id,
+      from: leadPath,
+      to: workerPath,
+      content: "Please pick up the next step.",
+      delivery: "triggerTurn",
+      summary: "wake worker",
+      metadata: { priority: "high" },
+    });
+
+    expect(message).toMatchObject({
+      teamId: team.id,
+      fromPath: leadPath,
+      toPath: workerPath,
+      delivery: "triggerTurn",
+      deliveryStatus: "queued",
+      content: "Please pick up the next step.",
+    });
+    expect(await store.agentMailbox({ path: workerPath, status: "queued" })).toMatchObject([
+      {
+        path: workerPath,
+        fromPath: leadPath,
+        triggerTurn: true,
+        childSessionId: "session_worker",
+        childThreadId: "thread_worker",
+        message: {
+          role: "user",
+          content: "Please pick up the next step.",
+          metadata: {
+            teamId: team.id,
+            teamMessageKind: "text",
+            summary: "wake worker",
+            teamMessageMetadata: { priority: "high" },
+          },
+        },
+      },
     ]);
   } finally {
     store.close();

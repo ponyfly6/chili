@@ -27,6 +27,8 @@ import type {
   SubagentProjectionStore,
   TeamMemberQuery,
   TeamMemberRow,
+  TeamMessageDeliveryQuery,
+  TeamMessageDeliveryRow,
   TeamMessageQuery,
   TeamMessageRow,
   TeamProjectionStore,
@@ -114,6 +116,10 @@ export class ObservableEventStore
 
   teamMessages(query?: TeamMessageQuery): Promise<TeamMessageRow[]> {
     return this.teamProjectionStore()?.teamMessages(query) ?? Promise.resolve([]);
+  }
+
+  teamMessageDeliveries(query?: TeamMessageDeliveryQuery): Promise<TeamMessageDeliveryRow[]> {
+    return this.teamProjectionStore()?.teamMessageDeliveries(query) ?? Promise.resolve([]);
   }
 
   claimAgentTaskLease(input: AgentTaskLeaseClaimInput): Promise<AgentTaskLeaseResult> {
@@ -213,7 +219,7 @@ export class ObservableEventStore
 
   private teamProjectionStore(): TeamProjectionStore | undefined {
     const inner = this.inner as EventStore & Partial<TeamProjectionStore>;
-    if (inner.teams && inner.teamMembers && inner.teamTasks && inner.teamMessages) {
+    if (inner.teams && inner.teamMembers && inner.teamTasks && inner.teamMessages && inner.teamMessageDeliveries) {
       return inner as EventStore & TeamProjectionStore;
     }
     return undefined;
