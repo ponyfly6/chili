@@ -1,5 +1,10 @@
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "@chili/core";
 import { createMiniMaxM27HighspeedRouter } from "@chili/core";
+import {
+  MINIMAX_ANTHROPIC_BASE_URL,
+  MINIMAX_M27_HIGHSPEED_MODEL,
+  readMiniMaxEnvironment,
+} from "@chili/providers";
 import { FakeModelRouter } from "./fake-model.js";
 
 export type CliModelName = "fake" | "minimax" | "legacy-minimax";
@@ -44,8 +49,6 @@ type ProviderModelStreamEvent =
   | { type: "tool_call_end"; name: string; input: unknown; [key: string]: unknown };
 
 const PROVIDERS_PACKAGE_NAME = "@chili/providers";
-const DEFAULT_MINIMAX_BASE_URL = "https://api.minimaxi.com/anthropic";
-const DEFAULT_MINIMAX_MODEL = "MiniMax-M2.7-highspeed";
 const DEFAULT_MAX_TOKENS = 4096;
 
 export async function createCliModel(name: CliModelName, options: CliModelOptions = {}): Promise<ModelRouter> {
@@ -109,16 +112,10 @@ function toModelRouter(modelOrProvider: ProviderModelOrProvider, modelName?: str
 
 function readMiniMaxOptionsFromEnv(input: CliModelOptions): MiniMaxRouterOptions {
   const options: MiniMaxRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_MAX_TOKENS };
-  const apiKey = process.env.MINIMAX_API_KEY ?? process.env.ANTHROPIC_API_KEY;
-  const baseUrl =
-    process.env.MINIMAX_BASE_URL ??
-    process.env.MINIMAX_ANTHROPIC_BASE_URL ??
-    process.env.ANTHROPIC_BASE_URL ??
-    DEFAULT_MINIMAX_BASE_URL;
-  const model = process.env.MINIMAX_MODEL ?? process.env.ANTHROPIC_MODEL ?? DEFAULT_MINIMAX_MODEL;
-  const resolvedApiKey = input.apiKey ?? apiKey;
-  const resolvedBaseUrl = input.baseUrl ?? baseUrl;
-  const resolvedModel = input.model ?? model;
+  const env = readMiniMaxEnvironment();
+  const resolvedApiKey = input.apiKey ?? env.apiKey;
+  const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? MINIMAX_ANTHROPIC_BASE_URL;
+  const resolvedModel = input.model ?? env.model ?? MINIMAX_M27_HIGHSPEED_MODEL;
 
   if (resolvedApiKey) options.apiKey = resolvedApiKey;
   if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;

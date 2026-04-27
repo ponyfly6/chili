@@ -45,6 +45,7 @@ test("MiniMax env resolution prefers provider-specific variables before Anthropi
       MINIMAX_API_KEY: "minimax-key",
       ANTHROPIC_BASE_URL: "https://anthropic.test",
       MINIMAX_ANTHROPIC_BASE_URL: "https://minimax-anthropic.test",
+      MINIMAX_BASE_URL: "https://minimax-generic.test/v1",
       ANTHROPIC_MODEL: "anthropic-model",
       MINIMAX_MODEL: "minimax-model",
     }),
@@ -55,5 +56,17 @@ test("MiniMax env resolution prefers provider-specific variables before Anthropi
     baseUrlEnv: "MINIMAX_ANTHROPIC_BASE_URL",
     model: "minimax-model",
     modelEnv: "MINIMAX_MODEL",
+  });
+});
+
+test("MiniMax env resolution uses Anthropic base URL before generic MiniMax base URL", () => {
+  expect(
+    readMiniMaxEnvironment({
+      ANTHROPIC_BASE_URL: "https://anthropic.test",
+      MINIMAX_BASE_URL: "https://minimax-generic.test/v1",
+    }),
+  ).toEqual({
+    baseUrl: "https://anthropic.test",
+    baseUrlEnv: "ANTHROPIC_BASE_URL",
   });
 });

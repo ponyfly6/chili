@@ -19,7 +19,7 @@ export interface ProviderEnvironment {
 
 export const MINIMAX_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
   apiKey: ["MINIMAX_API_KEY", "ANTHROPIC_API_KEY"],
-  baseUrl: ["MINIMAX_BASE_URL", "MINIMAX_ANTHROPIC_BASE_URL", "ANTHROPIC_BASE_URL"],
+  baseUrl: ["MINIMAX_ANTHROPIC_BASE_URL", "ANTHROPIC_BASE_URL", "MINIMAX_BASE_URL"],
   model: ["MINIMAX_MODEL", "ANTHROPIC_MODEL"],
 };
 

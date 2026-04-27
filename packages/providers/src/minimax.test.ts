@@ -33,6 +33,30 @@ test("MiniMax model factory resolves model, baseUrl, and API key from env", asyn
   expect(events.at(-1)).toMatchObject({ type: "finish", reason: "end_turn", responseId: "msg_env" });
 });
 
+test("MiniMax Anthropic base URL env wins over generic MiniMax base URL", async () => {
+  let url = "";
+  const fetchImpl = (async (input) => {
+    url = String(input);
+    return new Response(JSON.stringify({ id: "msg_url", content: [], stop_reason: "end_turn" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  const model = createMiniMaxM27HighspeedModel({
+    env: {
+      MINIMAX_API_KEY: "env-key",
+      MINIMAX_BASE_URL: "https://api.minimaxi.com/v1",
+      MINIMAX_ANTHROPIC_BASE_URL: "https://api.minimaxi.com/anthropic",
+    },
+    fetch: fetchImpl,
+  });
+
+  await collect(model.stream({ messages: [], tools: [], system: [] }));
+
+  expect(url).toBe("https://api.minimaxi.com/anthropic/v1/messages");
+});
+
 test("MiniMax provider lists a configured custom default model without dropping catalog models", () => {
   const provider = createMiniMaxProvider({
     env: {
