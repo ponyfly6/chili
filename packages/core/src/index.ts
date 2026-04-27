@@ -13,5 +13,6 @@ export * from "./single-agent-runtime.js";
 export * from "./subagent.js";
 export * from "./task-control.js";
 export * from "./team-dispatcher.js";
+export * from "./team-execution-runner.js";
 export * from "./worker-policy.js";
 export * from "./team.js";

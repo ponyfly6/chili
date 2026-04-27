@@ -37,6 +37,8 @@ import type {
   SubmitPromptResult,
   TeamTaskDispatchInput,
   TeamTaskDispatchResult,
+  TeamExecutionRunInput,
+  TeamExecutionRunSummary,
   TeamTaskReconcileInput,
   TeamTaskReconcileResult,
   TeamTaskSyncInput,
@@ -105,6 +107,10 @@ export interface RuntimeTeamDispatcherService {
   reconcileTasks(input?: TeamTaskReconcileInput): Promise<TeamTaskReconcileResult>;
 }
 
+export interface RuntimeTeamExecutionRunnerService {
+  run(input: TeamExecutionRunInput): Promise<TeamExecutionRunSummary>;
+}
+
 export interface RuntimeHttpHandlerOptions {
   service: RuntimeHttpService;
   store: EventStore & EventPublisher;
@@ -112,6 +118,7 @@ export interface RuntimeHttpHandlerOptions {
   agents?: RuntimeAgentTreeService;
   teams?: RuntimeTeamService;
   teamDispatcher?: RuntimeTeamDispatcherService;
+  teamRunner?: RuntimeTeamExecutionRunnerService;
   approvals?: ApprovalResolver;
   maxBacklogEvents?: number;
   onBackgroundError?: (error: unknown) => void;
@@ -250,6 +257,14 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         const dispatcher = requireTeamDispatcher(options);
         const body = await readJson<TeamTaskReconcileBody>(request);
         return json(await dispatcher.reconcileTasks(teamTaskReconcileInput(route.teamId, body)));
+      }
+
+      if (route.name === "teamRunLoop") {
+        const runner = requireTeamRunner(options);
+        const body = await readJson<TeamRunLoopBody>(request);
+        const input = teamRunLoopInput(route.teamId, body);
+        input.signal = request.signal;
+        return json(await runner.run(input));
       }
 
       if (route.name === "teamMembers") {
@@ -447,6 +462,7 @@ type Route =
   | { name: "listTeams" }
   | { name: "createTeam" }
   | { name: "teamReconcileDispatches"; teamId?: TeamId }
+  | { name: "teamRunLoop"; teamId: TeamId }
   | { name: "teamSnapshot"; teamId: TeamId }
   | { name: "teamMembers"; teamId: TeamId }
   | { name: "teamAddMember"; teamId: TeamId }
@@ -574,6 +590,15 @@ interface TeamTaskReconcileBody extends TeamContextBody {
   limit?: number;
 }
 
+interface TeamRunLoopBody extends TeamContextBody {
+  cwd?: string;
+  mode?: string;
+  once?: boolean;
+  maxCycles?: number;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+}
+
 interface TeamTaskUpdateBody extends TeamContextBody {
   status?: unknown;
   ownerPath?: AgentPath;
@@ -662,6 +687,9 @@ function routeRequest(method: string, pathname: string): Route {
     }
     if (resource === "reconcile_dispatches" && method === "POST" && !resourceId) {
       return { name: "teamReconcileDispatches", teamId };
+    }
+    if ((resource === "run_loop" || resource === "run-loop") && method === "POST" && !resourceId) {
+      return { name: "teamRunLoop", teamId };
     }
     if (resource === "tasks") {
       if (method === "GET" && !resourceId) return { name: "teamTasks", teamId };
@@ -965,6 +993,11 @@ function requireTeamDispatcher(options: RuntimeHttpHandlerOptions): RuntimeTeamD
   return options.teamDispatcher;
 }
 
+function requireTeamRunner(options: RuntimeHttpHandlerOptions): RuntimeTeamExecutionRunnerService {
+  if (!options.teamRunner) throw { status: 501, message: "No team execution runner is configured" } satisfies HttpError;
+  return options.teamRunner;
+}
+
 function teamContext(body: TeamContextBody): TeamEventContextInput {
   const input: TeamEventContextInput = {};
   if (body.sessionId) input.sessionId = body.sessionId;
@@ -1081,6 +1114,30 @@ function teamTaskReconcileInput(teamId: TeamId | undefined, body: TeamTaskReconc
   if (body.limit !== undefined) {
     if (!Number.isInteger(body.limit) || body.limit <= 0) throw badRequest("limit must be a positive integer");
     input.limit = body.limit;
+  }
+  return input;
+}
+
+function teamRunLoopInput(teamId: TeamId, body: TeamRunLoopBody): TeamExecutionRunInput {
+  const input: TeamExecutionRunInput = {
+    ...teamContext(body),
+    teamId,
+  };
+  if (body.cwd) input.cwd = body.cwd;
+  const mode = localSubagentMode(body.mode);
+  if (mode) input.mode = mode;
+  if (body.once !== undefined) input.once = body.once;
+  if (body.maxCycles !== undefined) {
+    if (!Number.isInteger(body.maxCycles) || body.maxCycles <= 0) throw badRequest("maxCycles must be a positive integer");
+    input.maxCycles = body.maxCycles;
+  }
+  if (body.timeoutMs !== undefined) {
+    if (!Number.isInteger(body.timeoutMs) || body.timeoutMs <= 0) throw badRequest("timeoutMs must be a positive integer");
+    input.timeoutMs = body.timeoutMs;
+  }
+  if (body.pollIntervalMs !== undefined) {
+    if (!Number.isInteger(body.pollIntervalMs) || body.pollIntervalMs < 0) throw badRequest("pollIntervalMs must be a non-negative integer");
+    input.pollIntervalMs = body.pollIntervalMs;
   }
   return input;
 }

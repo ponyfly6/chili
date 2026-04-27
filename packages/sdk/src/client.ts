@@ -48,6 +48,7 @@ export interface RuntimeClient {
   dispatchTeamTask(input: DispatchTeamTaskRequest): Promise<RuntimeTeamTaskDispatchResult>;
   syncTeamTask(input: SyncTeamTaskRequest): Promise<RuntimeTeamTaskSyncResult>;
   reconcileTeamTasks(input?: ReconcileTeamTasksRequest): Promise<RuntimeTeamTaskReconcileResult>;
+  runTeamLoop(input: RunTeamLoopRequest): Promise<RuntimeTeamExecutionRunSummary>;
   updateTeamTask(input: UpdateTeamTaskRequest): Promise<RuntimeTeamTaskRecord>;
   listTeamMessages(teamId: TeamId): Promise<RuntimeTeamMessageRecord[]>;
   sendTeamMessage(input: SendTeamMessageRequest): Promise<RuntimeTeamMessageRecord>;
@@ -389,7 +390,8 @@ export interface RuntimeTeamTaskDispatchResult {
     | "missing_session"
     | "missing_member"
     | "member_unavailable"
-    | "scope_mismatch";
+    | "scope_mismatch"
+    | "write_conflict";
 }
 
 export interface RuntimeTeamTaskSyncResult {
@@ -429,6 +431,88 @@ export interface SyncTeamTaskRequest extends TeamRequestContext {
 export interface ReconcileTeamTasksRequest extends TeamRequestContext {
   teamId?: TeamId;
   limit?: number;
+}
+
+export interface RunTeamLoopRequest extends TeamRequestContext {
+  teamId: TeamId;
+  cwd?: string;
+  mode?: AgentTaskMode;
+  once?: boolean;
+  maxCycles?: number;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+}
+
+export type RuntimeTeamExecutionStopReason = "drained" | "once" | "max_cycles" | "timeout" | "aborted" | "team_inactive";
+
+export type RuntimeTeamExecutionSkipReason =
+  | "dependency_incomplete"
+  | "missing_owner"
+  | "missing_session"
+  | "missing_member"
+  | "member_unavailable"
+  | "scope_mismatch"
+  | "write_conflict"
+  | "blocked"
+  | "already_claimed"
+  | "already_resolved"
+  | "not_dispatched"
+  | "agent_task_not_found"
+  | "team_already_final";
+
+export interface RuntimeTeamExecutionDispatchedTask {
+  teamId: TeamId;
+  taskId: TaskId;
+  ownerPath?: AgentPath;
+  agentTaskId?: TaskId;
+  status: RuntimeTeamTaskDispatchResult["status"];
+}
+
+export interface RuntimeTeamExecutionFinalTask {
+  teamId: TeamId;
+  taskId: TaskId;
+  ownerPath?: AgentPath;
+  status: Extract<TeamTaskStatus, "completed" | "failed" | "cancelled">;
+  summary?: string;
+  error?: string;
+  agentTaskId?: TaskId;
+}
+
+export interface RuntimeTeamExecutionSkippedTask {
+  teamId: TeamId;
+  taskId: TaskId;
+  ownerPath?: AgentPath;
+  reason: RuntimeTeamExecutionSkipReason;
+  blockedBy?: TaskId[];
+}
+
+export interface RuntimeTeamExecutionRunningTask {
+  teamId: TeamId;
+  taskId: TaskId;
+  ownerPath?: AgentPath;
+  title: string;
+  agentTaskId?: TaskId;
+}
+
+export interface RuntimeTeamExecutionError {
+  teamId: TeamId;
+  taskId?: TaskId;
+  error: string;
+}
+
+export interface RuntimeTeamExecutionRunSummary {
+  teamId: TeamId;
+  cycles: number;
+  stopReason: RuntimeTeamExecutionStopReason;
+  startedAt: number;
+  endedAt: number;
+  dispatched: RuntimeTeamExecutionDispatchedTask[];
+  completed: RuntimeTeamExecutionFinalTask[];
+  failed: RuntimeTeamExecutionFinalTask[];
+  blocked: RuntimeTeamExecutionSkippedTask[];
+  skipped: RuntimeTeamExecutionSkippedTask[];
+  stillRunning: RuntimeTeamExecutionRunningTask[];
+  errors: RuntimeTeamExecutionError[];
 }
 
 export interface UpdateTeamTaskRequest extends TeamRequestContext {
@@ -673,6 +757,10 @@ export class HttpRuntimeClient implements RuntimeClient {
       ? `teams/${encodeURIComponent(input.teamId)}/reconcile_dispatches`
       : "teams/reconcile_dispatches";
     return this.post(path, input);
+  }
+
+  runTeamLoop(input: RunTeamLoopRequest): Promise<RuntimeTeamExecutionRunSummary> {
+    return this.post(`teams/${encodeURIComponent(input.teamId)}/run_loop`, input);
   }
 
   updateTeamTask(input: UpdateTeamTaskRequest): Promise<RuntimeTeamTaskRecord> {

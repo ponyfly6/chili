@@ -17,6 +17,7 @@ import {
   HttpRuntimeClient,
   type RuntimeAgentTaskRecord,
   type RuntimeLocalSubagentTaskRecord,
+  type RuntimeTeamExecutionRunSummary,
   type RuntimeTeamTaskDispatchResult,
   type RuntimeTeamTaskReconcileResult,
   type RuntimeTeamTaskRecord,
@@ -422,7 +423,21 @@ test("client preserves team dispatcher JSON shapes for dispatch, sync, and recon
     skipped: [syncResult],
     errors: [],
   };
-  const responses: unknown[] = [dispatchJson, skippedDispatchJson, syncResult, reconcileJson];
+  const runLoopJson: RuntimeTeamExecutionRunSummary = {
+    teamId,
+    cycles: 1,
+    stopReason: "once",
+    startedAt: 100,
+    endedAt: 110,
+    dispatched: [{ teamId, taskId, ownerPath, agentTaskId: agentTask.taskId, status: "running" }],
+    completed: [],
+    failed: [],
+    blocked: [],
+    skipped: [],
+    stillRunning: [{ teamId, taskId, ownerPath, agentTaskId: agentTask.taskId, title: "SDK team task" }],
+    errors: [],
+  };
+  const responses: unknown[] = [dispatchJson, skippedDispatchJson, syncResult, reconcileJson, runLoopJson];
   const requests: Array<{ url: string; method: string | undefined; body: unknown }> = [];
   const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     const responseBody = responses.shift();
@@ -454,6 +469,19 @@ test("client preserves team dispatcher JSON shapes for dispatch, sync, and recon
   expect(await client.dispatchTeamTask({ teamId, taskId, sessionId, threadId })).toEqual(skippedDispatchJson);
   expect(await client.syncTeamTask({ teamId, taskId, sessionId, threadId })).toEqual(syncResult);
   expect(await client.reconcileTeamTasks({ teamId, sessionId, threadId, limit: 5 })).toEqual(reconcileJson);
+  expect(
+    await client.runTeamLoop({
+      teamId,
+      sessionId,
+      threadId,
+      mode: "background",
+      cwd: "/repo",
+      once: true,
+      maxCycles: 2,
+      timeoutMs: 1000,
+      pollIntervalMs: 10,
+    }),
+  ).toEqual(runLoopJson);
   expect(requests).toEqual([
     {
       url: "http://runtime.test/api/teams/team_sdk/tasks/task_sdk/dispatch",
@@ -474,6 +502,21 @@ test("client preserves team dispatcher JSON shapes for dispatch, sync, and recon
       url: "http://runtime.test/api/teams/team_sdk/reconcile_dispatches",
       method: "POST",
       body: { teamId, sessionId, threadId, limit: 5 },
+    },
+    {
+      url: "http://runtime.test/api/teams/team_sdk/run_loop",
+      method: "POST",
+      body: {
+        teamId,
+        sessionId,
+        threadId,
+        mode: "background",
+        cwd: "/repo",
+        once: true,
+        maxCycles: 2,
+        timeoutMs: 1000,
+        pollIntervalMs: 10,
+      },
     },
   ]);
 });

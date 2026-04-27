@@ -15,6 +15,7 @@ export interface CliArgs {
     | "team-messages"
     | "team-dispatch"
     | "team-run"
+    | "team-run-loop"
     | "team-sync"
     | "team-reconcile"
     | "tasks"
@@ -38,9 +39,11 @@ export interface CliArgs {
   taskStatus?: Extract<AgentTaskStatus, "completed" | "failed" | "cancelled">;
   timeoutMs?: number;
   staleAfterMs?: number;
+  maxCycles?: number;
   model: CliModelName;
   yes: boolean;
   json: boolean;
+  once: boolean;
   maxTurns: number;
 }
 
@@ -54,6 +57,7 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     model: "minimax",
     yes: false,
     json: false,
+    once: false,
     maxTurns: 12,
   };
   const prompt: string[] = [];
@@ -104,6 +108,11 @@ export function parseArgs(argv: readonly string[]): CliArgs {
         result.teamId = requireValue(next, args);
         continue;
       }
+      if (next === "run-loop") {
+        result.command = "team-run-loop";
+        result.teamId = requireValue(next, args);
+        continue;
+      }
       result.command = "team";
       result.teamId = next;
       continue;
@@ -138,6 +147,11 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       result.command = "team-run";
       result.teamId = requireValue(arg, args);
       result.taskId = requireValue(arg, args);
+      continue;
+    }
+    if (arg === "team-run-loop") {
+      result.command = "team-run-loop";
+      result.teamId = requireValue(arg, args);
       continue;
     }
     if (arg === "team-sync") {
@@ -232,9 +246,18 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       result.json = true;
       continue;
     }
+    if (arg === "--once") {
+      result.once = true;
+      continue;
+    }
     if (arg === "--max-turns") {
       result.maxTurns = Number.parseInt(requireValue(arg, args), 10);
       if (!Number.isInteger(result.maxTurns) || result.maxTurns <= 0) throw new Error("--max-turns must be a positive integer");
+      continue;
+    }
+    if (arg === "--max-cycles") {
+      result.maxCycles = Number.parseInt(requireValue(arg, args), 10);
+      if (!Number.isInteger(result.maxCycles) || result.maxCycles <= 0) throw new Error("--max-cycles must be a positive integer");
       continue;
     }
     if (arg === "--status") {
@@ -285,6 +308,7 @@ export function usage(): string {
     "  bun run chili -- team-messages <team-id>",
     "  bun run chili -- team-dispatch <team-id> <task-id>",
     "  bun run chili -- team-run <team-id> <task-id>",
+    "  bun run chili -- team-run-loop <team-id> --once --max-cycles 10 --timeout-ms 30000",
     "  bun run chili -- team-sync <team-id> <task-id>",
     "  bun run chili -- team-reconcile [team-id]",
     "  bun run chili -- mailbox",
@@ -307,7 +331,9 @@ export function usage(): string {
     "  --model <name>      minimax | deepseek | fake | legacy-minimax, default minimax",
     "  --yes, -y           Auto-approve tool permissions",
     "  --json              Print machine-readable JSON for supported read commands",
+    "  --once              Run one team execution cycle",
     "  --max-turns <n>     Max automatic tool-use continuation turns, default 12",
+    "  --max-cycles <n>    Max team execution runner cycles",
     "  --status <status>   Task close status: completed | failed | cancelled",
     "  --timeout-ms <n>    Task wait timeout in milliseconds",
     "  --stale-after-ms <n> Recover running background tasks older than this many milliseconds",

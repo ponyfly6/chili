@@ -35,6 +35,7 @@ import type {
   RuntimeHttpService,
   RuntimeTaskControlService,
   RuntimeTeamDispatcherService,
+  RuntimeTeamExecutionRunnerService,
 } from "./runtime-http.js";
 import { createRuntimeHttpHandler } from "./runtime-http.js";
 
@@ -316,7 +317,8 @@ test("serves team control routes", async () => {
     now: () => 10 as TimestampMs,
   });
   const teamDispatcher = new FakeTeamDispatcherService();
-  const handler = createRuntimeHttpHandler({ service, store, teams, teamDispatcher });
+  const teamRunner = new FakeTeamExecutionRunnerService();
+  const handler = createRuntimeHttpHandler({ service, store, teams, teamDispatcher, teamRunner });
 
   try {
     const createTeamResponse = await handler(
@@ -471,6 +473,38 @@ test("serves team control routes", async () => {
     expect(await globalReconcileResponse.json()).toEqual(reconcileResultJson("team_http" as TeamId));
     expect(teamDispatcher.reconcileInputs.at(-1)).toMatchObject({ limit: 10 });
 
+    const runLoopResponse = await handler(
+      new Request(`http://chili.test/teams/${team.id}/run_loop`, {
+        method: "POST",
+        body: JSON.stringify({
+          sessionId: "session_dispatch",
+          threadId: "thread_dispatch",
+          cwd: "/repo",
+          mode: "background",
+          once: true,
+          maxCycles: 2,
+          timeoutMs: 1000,
+          pollIntervalMs: 10,
+        }),
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    expect(runLoopResponse.status).toBe(200);
+    expect(await runLoopResponse.json()).toEqual(teamRunLoopResultJson(team.id));
+    expect(teamRunner.runInputs).toMatchObject([
+      {
+        teamId: team.id,
+        sessionId: "session_dispatch",
+        threadId: "thread_dispatch",
+        cwd: "/repo",
+        mode: "background",
+        once: true,
+        maxCycles: 2,
+        timeoutMs: 1000,
+        pollIntervalMs: 10,
+      },
+    ]);
+
     const updateResponse = await handler(
       new Request(`http://chili.test/teams/${team.id}/tasks/${task.id}/update`, {
         method: "POST",
@@ -561,6 +595,29 @@ test("resolves approvals through the runtime HTTP handler", async () => {
   expect(response.status).toBe(200);
   expect(await response.json()).toEqual({ resolved: true });
   expect(approvals.resolved).toBe(true);
+});
+
+test("passes request cancellation through team run loop HTTP route", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const controller = new AbortController();
+  const teamRunner = new AbortObservingTeamExecutionRunnerService(() => controller.abort());
+  const handler = createRuntimeHttpHandler({ service, store, teamRunner });
+
+  const response = await handler(
+    new Request("http://chili.test/teams/team_abort/run_loop", {
+      method: "POST",
+      body: JSON.stringify({ once: true }),
+      headers: { "content-type": "application/json" },
+      signal: controller.signal,
+    }),
+  );
+
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({ teamId: "team_abort", stopReason: "aborted" });
+  expect(teamRunner.seenSignal).toBeInstanceOf(AbortSignal);
+  expect(teamRunner.signalAbortedAfterAbort).toBe(true);
 });
 
 test("does not accept async prompts for missing or busy sessions", async () => {
@@ -807,6 +864,32 @@ class FakeTeamDispatcherService implements RuntimeTeamDispatcherService {
   }
 }
 
+class FakeTeamExecutionRunnerService implements RuntimeTeamExecutionRunnerService {
+  runInputs: Array<Parameters<RuntimeTeamExecutionRunnerService["run"]>[0]> = [];
+
+  async run(input: Parameters<RuntimeTeamExecutionRunnerService["run"]>[0]): Promise<Awaited<ReturnType<RuntimeTeamExecutionRunnerService["run"]>>> {
+    this.runInputs.push(input);
+    return teamRunLoopResultJson(input.teamId);
+  }
+}
+
+class AbortObservingTeamExecutionRunnerService implements RuntimeTeamExecutionRunnerService {
+  seenSignal: AbortSignal | undefined;
+  signalAbortedAfterAbort = false;
+
+  constructor(private readonly abortRequest: () => void) {}
+
+  async run(input: Parameters<RuntimeTeamExecutionRunnerService["run"]>[0]): Promise<Awaited<ReturnType<RuntimeTeamExecutionRunnerService["run"]>>> {
+    this.seenSignal = input.signal;
+    this.abortRequest();
+    this.signalAbortedAfterAbort = input.signal?.aborted ?? false;
+    return {
+      ...teamRunLoopResultJson(input.teamId),
+      stopReason: this.signalAbortedAfterAbort ? "aborted" : "once",
+    };
+  }
+}
+
 function reconcileResultJson(teamId: TeamId): Awaited<ReturnType<RuntimeTeamDispatcherService["reconcileTasks"]>> {
   return {
     scanned: 2,
@@ -833,6 +916,39 @@ function reconcileResultJson(teamId: TeamId): Awaited<ReturnType<RuntimeTeamDisp
           metadata: teamDispatchMetadata("running"),
         }),
         agentTask: taskRow({ status: "running" }),
+      },
+    ],
+    errors: [],
+  };
+}
+
+function teamRunLoopResultJson(teamId: TeamId): Awaited<ReturnType<RuntimeTeamExecutionRunnerService["run"]>> {
+  return {
+    teamId,
+    cycles: 1,
+    stopReason: "once",
+    startedAt: 100,
+    endedAt: 110,
+    dispatched: [
+      {
+        teamId,
+        taskId: "task_http" as TaskId,
+        ownerPath: "/root/reviewer" as AgentPath,
+        agentTaskId: "task_agent_http" as TaskId,
+        status: "running",
+      },
+    ],
+    completed: [],
+    failed: [],
+    blocked: [],
+    skipped: [],
+    stillRunning: [
+      {
+        teamId,
+        taskId: "task_http" as TaskId,
+        ownerPath: "/root/reviewer" as AgentPath,
+        agentTaskId: "task_agent_http" as TaskId,
+        title: "HTTP team task",
       },
     ],
     errors: [],

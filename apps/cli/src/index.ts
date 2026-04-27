@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { createInterface } from "node:readline/promises";
-import type { AgentTreeNode, TeamSnapshot } from "@chili/core";
+import type { AgentTreeNode, TeamExecutionRunSummary, TeamSnapshot } from "@chili/core";
 import type { SessionId, TaskId, TeamId } from "@chili/protocol";
 import { ROOT_AGENT_PATH } from "@chili/protocol";
 import { startRuntimeHttpServer } from "@chili/server";
@@ -97,6 +97,23 @@ async function main(): Promise<void> {
     if (args.command === "team-run") {
       if (!args.teamId || !args.taskId) throw new Error("team-run requires a team id and task id");
       await dispatchTeamTask(harness, args.teamId as TeamId, args.taskId as TaskId, "one_shot");
+      return;
+    }
+
+    if (args.command === "team-run-loop") {
+      if (!args.teamId) throw new Error("team-run-loop requires a team id");
+      const controller = installInterruptHandler();
+      const input: Parameters<typeof harness.teamRunner.run>[0] = {
+        teamId: args.teamId as TeamId,
+        cwd: harness.cwd,
+        once: args.once,
+        signal: controller.signal,
+      };
+      if (args.maxCycles !== undefined) input.maxCycles = args.maxCycles;
+      if (args.timeoutMs !== undefined) input.timeoutMs = args.timeoutMs;
+      const result = await harness.teamRunner.run(input);
+      if (args.json) console.log(jsonStringify(result));
+      else printTeamRunLoopSummary(result);
       return;
     }
 
@@ -225,6 +242,7 @@ async function serve(input: {
     agents: input.harness.agents,
     teams: input.harness.teams,
     teamDispatcher: input.harness.teamDispatcher,
+    teamRunner: input.harness.teamRunner,
     approvals: input.approvalQueue,
     hostname: input.host,
     port: input.port,
@@ -466,6 +484,44 @@ async function dispatchTeamTask(
     ...(threadId ? { threadId } : {}),
   });
   console.log(jsonStringify(result));
+}
+
+function printTeamRunLoopSummary(summary: TeamExecutionRunSummary): void {
+  console.log(
+    [
+      `[team-run-loop] ${summary.teamId}`,
+      `stop=${summary.stopReason}`,
+      `cycles=${summary.cycles}`,
+      `dispatched=${summary.dispatched.length}`,
+      `completed=${summary.completed.length}`,
+      `failed=${summary.failed.length}`,
+      `blocked=${summary.blocked.length}`,
+      `skipped=${summary.skipped.length}`,
+      `running=${summary.stillRunning.length}`,
+      `errors=${summary.errors.length}`,
+    ].join("\t"),
+  );
+  for (const item of summary.dispatched) {
+    console.log(["[dispatch]", item.taskId, item.status, item.ownerPath ?? "-", item.agentTaskId ?? "-"].join("\t"));
+  }
+  for (const item of summary.completed) {
+    console.log(["[complete]", item.taskId, item.status, item.ownerPath ?? "-", item.summary ?? ""].join("\t"));
+  }
+  for (const item of summary.failed) {
+    console.log(["[failed]", item.taskId, item.status, item.ownerPath ?? "-", item.error ?? item.summary ?? ""].join("\t"));
+  }
+  for (const item of summary.blocked) {
+    console.log(["[blocked]", item.taskId, item.reason, item.ownerPath ?? "-", item.blockedBy ? `blocked_by=${item.blockedBy.join(",")}` : ""].join("\t"));
+  }
+  for (const item of summary.skipped) {
+    console.log(["[skipped]", item.taskId, item.reason, item.ownerPath ?? "-"].join("\t"));
+  }
+  for (const item of summary.stillRunning) {
+    console.log(["[running]", item.taskId, item.ownerPath ?? "-", item.agentTaskId ?? "-", item.title].join("\t"));
+  }
+  for (const item of summary.errors) {
+    console.log(["[error]", item.taskId ?? "-", item.error].join("\t"));
+  }
 }
 
 async function printMailbox(harness: Awaited<ReturnType<typeof createCliHarness>>): Promise<void> {

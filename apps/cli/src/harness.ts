@@ -10,6 +10,7 @@ import {
   SingleAgentRuntime,
   SnapshotRecoveryService,
   TeamControlService,
+  TeamExecutionRunner,
   TeamTaskDispatchService,
   defaultScopedWorkerPolicy,
   type WorkerToolPolicy,
@@ -99,6 +100,7 @@ export interface CliHarness {
   mailboxPump: AgentMailboxDeliveryPump;
   teams: TeamControlService;
   teamDispatcher: TeamTaskDispatchService;
+  teamRunner: TeamExecutionRunner;
   recovery: SnapshotRecoveryService;
   close(): Promise<void>;
 }
@@ -245,6 +247,12 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     cwd,
     createId,
   });
+  const teamRunner = new TeamExecutionRunner({
+    teams,
+    dispatcher: teamDispatcher,
+    cwd,
+    createSession: async (input) => service.createSession({ cwd: input.cwd }),
+  });
   const agents = new AgentTreeControlService({
     store: eventStore,
     runtime: childService,
@@ -279,6 +287,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     mailboxPump,
     teams,
     teamDispatcher,
+    teamRunner,
     recovery,
     close: async () => {
       await mailboxPump.stop();
