@@ -20,7 +20,7 @@
 - 权限审批和恢复流程
 - 可恢复的 coding session
 
-产品方向更接近 Codex 或 Claude Code，而不是泛用型 autonomous agent。
+产品方向是一个终端优先、面向真实代码库执行的本地 coding agent。
 
 ---
 

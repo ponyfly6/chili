@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { evaluatePolicy, parsePermissionSpec } from "./index.js";
 
-test("parses Claude Code style Tool(content) permission specs", () => {
+test("parses Tool(content) permission specs", () => {
   expect(parsePermissionSpec("Bash(git status *)")).toEqual({
     permission: "Bash",
     content: "git status *",

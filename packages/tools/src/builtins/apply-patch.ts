@@ -52,7 +52,7 @@ export function createApplyPatchTool(): ChiliToolDefinition<ApplyPatchInput> {
   return {
     name: "apply_patch",
     searchHint: "Apply structured create, replace, delete, or raw patch operations to workspace files.",
-    description: "Apply Codex/OpenCode-style patch text to files inside the workspace.",
+    description: "Apply structured patch text to files inside the workspace.",
     risk: "write",
     isReadOnly: false,
     isConcurrencySafe: false,

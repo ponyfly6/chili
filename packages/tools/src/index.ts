@@ -10,7 +10,6 @@ export * from "./builtins/task.js";
 export * from "./builtins/team.js";
 export * from "./builtins/tool-search.js";
 export * from "./builtins/write-file.js";
-export * from "./catalog.js";
 export * from "./deferred-approval.js";
 export * from "./errors.js";
 export * from "./executor.js";

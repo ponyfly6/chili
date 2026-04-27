@@ -110,9 +110,8 @@ function detectChatCompletionsCompatibility(input: CompatibilityResolutionInput)
   const isGroq = provider === "groq" || baseUrl.includes("groq.com");
   const isDeepSeek = provider === "deepseek" || baseUrl.includes("deepseek.com");
   const isCerebras = provider === "cerebras" || baseUrl.includes("cerebras.ai");
-  const isOpenCode = provider === "opencode" || baseUrl.includes("opencode.ai");
   const isChutes = baseUrl.includes("chutes.ai");
-  const isNonStandard = isZai || isXai || isDeepSeek || isCerebras || isOpenCode || isChutes;
+  const isNonStandard = isZai || isXai || isDeepSeek || isCerebras || isChutes;
 
   return {
     supportsStore: !isNonStandard,
