@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { createInterface } from "node:readline/promises";
-import type { AgentTreeNode } from "@chili/core";
+import type { AgentTreeNode, TeamSnapshot } from "@chili/core";
 import type { SessionId, TaskId, TeamId } from "@chili/protocol";
 import { ROOT_AGENT_PATH } from "@chili/protocol";
 import { startRuntimeHttpServer } from "@chili/server";
@@ -22,7 +22,7 @@ async function main(): Promise<void> {
     cwd: args.cwd,
     model: args.model,
     yes: args.yes,
-    quiet: args.command === "sessions",
+    quiet: args.command === "sessions" || args.json,
     ...(approvalQueue ? { approvalQueue } : {}),
   });
 
@@ -60,31 +60,31 @@ async function main(): Promise<void> {
     }
 
     if (args.command === "teams") {
-      await printTeams(harness);
+      await printTeams(harness, args.json);
       return;
     }
 
     if (args.command === "team") {
       if (!args.teamId) throw new Error("team requires a team id");
-      await printTeam(harness, args.teamId as TeamId);
+      await printTeam(harness, args.teamId as TeamId, args.json);
       return;
     }
 
     if (args.command === "team-members") {
       if (!args.teamId) throw new Error("team-members requires a team id");
-      await printTeamMembers(harness, args.teamId as TeamId);
+      await printTeamMembers(harness, args.teamId as TeamId, args.json);
       return;
     }
 
     if (args.command === "team-tasks") {
       if (!args.teamId) throw new Error("team-tasks requires a team id");
-      await printTeamTasks(harness, args.teamId as TeamId);
+      await printTeamTasks(harness, args.teamId as TeamId, args.json);
       return;
     }
 
     if (args.command === "team-messages") {
       if (!args.teamId) throw new Error("team-messages requires a team id");
-      await printTeamMessages(harness, args.teamId as TeamId);
+      await printTeamMessages(harness, args.teamId as TeamId, args.json);
       return;
     }
 
@@ -292,18 +292,28 @@ async function printAgentTree(harness: Awaited<ReturnType<typeof createCliHarnes
   }
 }
 
-async function printTeams(harness: Awaited<ReturnType<typeof createCliHarness>>): Promise<void> {
+async function printTeams(harness: Awaited<ReturnType<typeof createCliHarness>>, asJson: boolean): Promise<void> {
   const teams = await harness.teams.listTeams();
   if (teams.length === 0) {
-    console.log("No teams yet.");
+    console.log(asJson ? "[]" : "No teams yet.");
+    return;
+  }
+  const snapshots = await Promise.all(teams.map((team) => harness.teams.snapshot(team.id)));
+  if (asJson) {
+    console.log(jsonStringify(snapshots));
     return;
   }
   for (const team of teams) {
+    const snapshot = snapshots.find((item) => item.team.id === team.id);
     console.log(
       [
         team.id,
         team.status,
         team.leadPath,
+        snapshot ? `members=${snapshot.stats.memberCount}` : "members=?",
+        snapshot ? `tasks=${snapshot.stats.taskCount}` : "tasks=?",
+        snapshot ? `ready=${snapshot.stats.readyTaskIds.length}` : "ready=?",
+        snapshot ? `blocked=${snapshot.stats.blockedTaskIds.length}` : "blocked=?",
         team.updatedAt ? new Date(team.updatedAt).toISOString() : "",
         team.name,
         team.description ?? "",
@@ -312,30 +322,68 @@ async function printTeams(harness: Awaited<ReturnType<typeof createCliHarness>>)
   }
 }
 
-async function printTeam(harness: Awaited<ReturnType<typeof createCliHarness>>, teamId: TeamId): Promise<void> {
-  const team = (await harness.teams.listTeams()).find((item) => item.id === teamId);
-  if (!team) throw new Error(`Team not found: ${teamId}`);
-  const [members, tasks, messages] = await Promise.all([
-    harness.teams.members(teamId),
-    harness.teams.tasks(teamId),
-    harness.teams.messages(teamId),
-  ]);
-  console.log(JSON.stringify({ team, members, tasks, messages }, null, 2));
-}
-
-async function printTeamMembers(harness: Awaited<ReturnType<typeof createCliHarness>>, teamId: TeamId): Promise<void> {
-  const members = await harness.teams.members(teamId);
-  if (members.length === 0) {
-    console.log("No team members.");
+async function printTeam(harness: Awaited<ReturnType<typeof createCliHarness>>, teamId: TeamId, asJson: boolean): Promise<void> {
+  const snapshot = await harness.teams.snapshot(teamId);
+  if (asJson) {
+    console.log(jsonStringify(snapshot));
     return;
   }
-  for (const member of members) {
+
+  const stats = snapshot.stats;
+  console.log(
+    `[team] ${snapshot.team.name} ${snapshot.team.id} ${snapshot.team.status} lead=${snapshot.team.leadPath} updated=${formatTime(
+      snapshot.team.updatedAt,
+    )}`,
+  );
+  console.log(
+    `[stats] members=${stats.memberCount} tasks=${stats.taskCount} ready=${stats.readyTaskIds.length} blocked=${stats.blockedTaskIds.length} messages=${stats.messageCount} deliveries=${stats.deliveryCount}`,
+  );
+  printTeamMembersFromSnapshot(snapshot);
+  printTeamTasksFromSnapshot(snapshot);
+  printTeamMessagesFromSnapshot(snapshot, 8);
+}
+
+async function printTeamMembers(harness: Awaited<ReturnType<typeof createCliHarness>>, teamId: TeamId, asJson: boolean): Promise<void> {
+  const snapshot = await harness.teams.snapshot(teamId);
+  if (asJson) {
+    console.log(jsonStringify(snapshot.members));
+    return;
+  }
+  printTeamMembersFromSnapshot(snapshot);
+}
+
+async function printTeamTasks(harness: Awaited<ReturnType<typeof createCliHarness>>, teamId: TeamId, asJson: boolean): Promise<void> {
+  const snapshot = await harness.teams.snapshot(teamId);
+  if (asJson) {
+    console.log(jsonStringify(snapshot.tasks));
+    return;
+  }
+  printTeamTasksFromSnapshot(snapshot);
+}
+
+async function printTeamMessages(harness: Awaited<ReturnType<typeof createCliHarness>>, teamId: TeamId, asJson: boolean): Promise<void> {
+  const snapshot = await harness.teams.snapshot(teamId);
+  if (asJson) {
+    console.log(jsonStringify(snapshot.messages));
+    return;
+  }
+  printTeamMessagesFromSnapshot(snapshot);
+}
+
+function printTeamMembersFromSnapshot(snapshot: TeamSnapshot): void {
+  if (snapshot.members.length === 0) {
+    console.log("[members] none");
+    return;
+  }
+  console.log("[members]");
+  for (const member of snapshot.members) {
     console.log(
       [
-        member.path,
+        `  ${member.path}`,
         member.status,
-        member.currentTaskId ?? "",
-        member.childSessionId ?? "",
+        `task=${member.currentTaskId ?? "-"}`,
+        `queued=${member.deliveryIds.length}`,
+        member.childSessionId ? `session=${member.childSessionId}` : "session=-",
         member.name,
         member.role,
       ].join("\t"),
@@ -343,20 +391,22 @@ async function printTeamMembers(harness: Awaited<ReturnType<typeof createCliHarn
   }
 }
 
-async function printTeamTasks(harness: Awaited<ReturnType<typeof createCliHarness>>, teamId: TeamId): Promise<void> {
-  const tasks = await harness.teams.tasks(teamId);
-  if (tasks.length === 0) {
-    console.log("No team tasks.");
+function printTeamTasksFromSnapshot(snapshot: TeamSnapshot): void {
+  if (snapshot.tasks.length === 0) {
+    console.log("[tasks] none");
     return;
   }
-  for (const task of tasks) {
+  console.log("[tasks]");
+  for (const task of snapshot.tasks) {
     console.log(
       [
-        task.id,
-        task.status,
-        task.ownerPath ?? "",
-        task.dependsOn.length > 0 ? task.dependsOn.join(",") : "",
-        task.updatedAt ? new Date(task.updatedAt).toISOString() : "",
+        `  ${task.id}`,
+        taskStatusLabel(task),
+        `owner=${task.ownerPath ?? "-"}`,
+        `depends=${formatList(task.dependsOn)}`,
+        `blocks=${formatList(task.blocks)}`,
+        `messages=${task.messageIds.length}`,
+        task.dispatch ? "dispatched" : "not_dispatched",
         task.title,
         task.summary ?? "",
       ].join("\t"),
@@ -364,22 +414,25 @@ async function printTeamTasks(harness: Awaited<ReturnType<typeof createCliHarnes
   }
 }
 
-async function printTeamMessages(harness: Awaited<ReturnType<typeof createCliHarness>>, teamId: TeamId): Promise<void> {
-  const messages = await harness.teams.messages(teamId);
+function printTeamMessagesFromSnapshot(snapshot: TeamSnapshot, limit?: number): void {
+  const messages = limit === undefined ? snapshot.messages : snapshot.messages.slice(-limit);
   if (messages.length === 0) {
-    console.log("No team messages.");
+    console.log("[messages] none");
     return;
   }
+  console.log(limit === undefined || snapshot.messages.length <= limit ? "[messages]" : `[messages] latest ${messages.length}/${snapshot.messages.length}`);
   for (const message of messages) {
     console.log(
       [
-        message.id,
+        `  ${message.id}`,
         message.kind,
-        message.fromPath,
-        message.toPath,
-        message.taskId ?? "",
-        message.createdAt ? new Date(message.createdAt).toISOString() : "",
-        message.summary ?? message.content,
+        `delivery=${message.deliveryStatus ?? "none"}`,
+        `deliveries=${message.deliveries.length}`,
+        `from=${message.fromPath}`,
+        `to=${message.toPath}`,
+        message.taskId ? `task=${message.taskId}` : "task=-",
+        formatTime(message.createdAt),
+        message.summary ?? preview(message.content),
       ].join("\t"),
     );
   }
@@ -522,6 +575,25 @@ function printAgentTreeNode(node: AgentTreeNode, depth: number): void {
   for (const child of node.children) {
     printAgentTreeNode(child, depth + 1);
   }
+}
+
+function taskStatusLabel(task: TeamSnapshot["tasks"][number]): string {
+  if (task.blockedBy.length > 0) return `${task.status}:blocked_by=${task.blockedBy.join(",")}`;
+  if (task.ready) return `${task.status}:ready`;
+  return task.status;
+}
+
+function formatList(values: readonly string[]): string {
+  return values.length === 0 ? "-" : values.join(",");
+}
+
+function formatTime(value: number | undefined): string {
+  return value === undefined ? "-" : new Date(value).toISOString();
+}
+
+function preview(value: string, max = 96): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1)}...`;
 }
 
 function installInterruptHandler(): AbortController {

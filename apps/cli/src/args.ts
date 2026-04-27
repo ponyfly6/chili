@@ -40,6 +40,7 @@ export interface CliArgs {
   staleAfterMs?: number;
   model: CliModelName;
   yes: boolean;
+  json: boolean;
   maxTurns: number;
 }
 
@@ -52,6 +53,7 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     port: 4777,
     model: "minimax",
     yes: false,
+    json: false,
     maxTurns: 12,
   };
   const prompt: string[] = [];
@@ -81,6 +83,32 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       continue;
     }
     if (arg === "team") {
+      const next = requireValue(arg, args);
+      if (next === "status") {
+        result.command = "team";
+        result.teamId = requireValue(next, args);
+        continue;
+      }
+      if (next === "members") {
+        result.command = "team-members";
+        result.teamId = requireValue(next, args);
+        continue;
+      }
+      if (next === "tasks") {
+        result.command = "team-tasks";
+        result.teamId = requireValue(next, args);
+        continue;
+      }
+      if (next === "messages") {
+        result.command = "team-messages";
+        result.teamId = requireValue(next, args);
+        continue;
+      }
+      result.command = "team";
+      result.teamId = next;
+      continue;
+    }
+    if (arg === "team-status") {
       result.command = "team";
       result.teamId = requireValue(arg, args);
       continue;
@@ -200,6 +228,10 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       result.yes = true;
       continue;
     }
+    if (arg === "--json") {
+      result.json = true;
+      continue;
+    }
     if (arg === "--max-turns") {
       result.maxTurns = Number.parseInt(requireValue(arg, args), 10);
       if (!Number.isInteger(result.maxTurns) || result.maxTurns <= 0) throw new Error("--max-turns must be a positive integer");
@@ -246,6 +278,8 @@ export function usage(): string {
     "  bun run chili -- agents",
     "  bun run chili -- teams",
     "  bun run chili -- team <team-id>",
+    "  bun run chili -- team status <team-id> --json",
+    "  bun run chili -- team tasks <team-id>",
     "  bun run chili -- team-members <team-id>",
     "  bun run chili -- team-tasks <team-id>",
     "  bun run chili -- team-messages <team-id>",
@@ -271,6 +305,7 @@ export function usage(): string {
     "  --resume, -r <id>   Resume a session",
     "  --model <name>      minimax | fake | legacy-minimax, default minimax",
     "  --yes, -y           Auto-approve tool permissions",
+    "  --json              Print machine-readable JSON for supported read commands",
     "  --max-turns <n>     Max automatic tool-use continuation turns, default 12",
     "  --status <status>   Task close status: completed | failed | cancelled",
     "  --timeout-ms <n>    Task wait timeout in milliseconds",
