@@ -11,8 +11,10 @@ import {
   SnapshotRecoveryService,
   TeamControlService,
   TeamTaskDispatchService,
+  defaultScopedWorkerPolicy,
+  type WorkerToolPolicy,
 } from "@chili/core";
-import type { AgentPath, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
+import type { AgentPath, EventEnvelope, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
 import { ObservableEventStore, SqliteEventStore } from "@chili/store";
 import type { AgentMailboxRow, AgentTaskQuery, AgentTaskRow, TeamMemberRow, TeamMessageRow, TeamRow, TeamTaskRow } from "@chili/store";
 import {
@@ -70,6 +72,7 @@ import {
   type TeamTaskReconcileRecord,
   type TeamTaskSyncRecord,
   type TeamToolController,
+  type ToolAccessPolicyResolver,
 } from "@chili/tools";
 import { createCliApprovalBroker, createCliPermissionRules } from "./approval.js";
 import { createIdFactory } from "./id.js";
@@ -110,6 +113,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const printer = new CliPrinter();
   const printableStore = options.quiet ? sqliteStore : new PrintingEventStore(sqliteStore, printer);
   const eventStore = new ObservableEventStore(printableStore);
+  const childToolPolicyResolver = createWorkerToolPolicyResolver(eventStore);
   const model = await createCliModel(options.model);
   const registry = createToolRegistry();
   const childRegistry = createChildToolRegistry();
@@ -124,6 +128,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     registry: childRegistry,
     events: { publish: (event) => eventStore.append(event) },
     approvals: createApprovalBroker(options),
+    policyResolver: childToolPolicyResolver,
     snapshotProvider,
     createId,
     maxResultOutputBytes: 128_000,
@@ -133,6 +138,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     model,
     toolRegistry: childRegistry,
     toolExecutor: childToolExecutor,
+    toolPolicyResolver: childToolPolicyResolver,
     createId,
     contextBudget: {
       maxInputChars: 120_000,
@@ -295,6 +301,57 @@ export function newThreadId(): ThreadId {
   return createIdFactory()("thread") as ThreadId;
 }
 
+function createWorkerToolPolicyResolver(store: ObservableEventStore): ToolAccessPolicyResolver {
+  return {
+    async resolve(context) {
+      const policy = await findWorkerToolPolicy(store, context.sessionId, context.threadId);
+      return policy ?? defaultScopedWorkerPolicy();
+    },
+  };
+}
+
+async function findWorkerToolPolicy(
+  store: ObservableEventStore,
+  sessionId: SessionId,
+  threadId: ThreadId | undefined,
+): Promise<WorkerToolPolicy | undefined> {
+  let afterEventId: string | undefined;
+  let found: WorkerToolPolicy | undefined;
+
+  while (true) {
+    const query: { type: string; limit: number; afterEventId?: string } = { type: "agent.spawned", limit: 500 };
+    if (afterEventId) query.afterEventId = afterEventId;
+    const events = await store.events(query);
+    for (const event of events) {
+      const policy = workerToolPolicyFromEvent(event, sessionId, threadId);
+      if (policy) found = policy;
+    }
+    if (events.length < query.limit) return found;
+    const lastEvent = events.at(-1);
+    if (!lastEvent) return found;
+    afterEventId = lastEvent.id;
+  }
+}
+
+function workerToolPolicyFromEvent(
+  event: EventEnvelope | undefined,
+  sessionId: SessionId,
+  threadId: ThreadId | undefined,
+): WorkerToolPolicy | undefined {
+  const payload = event?.payload;
+  if (!isRecord(payload)) return undefined;
+  if (payload.childSessionId !== sessionId) return undefined;
+  if (threadId && payload.childThreadId !== threadId) return undefined;
+  const policy = payload.workerPolicy;
+  if (!isRecord(policy)) return undefined;
+  return {
+    ...policy,
+    allowedTools: stringArray(policy.allowedTools),
+    writeScope: stringArray(policy.writeScope),
+    executeScope: stringArray(policy.executeScope),
+  } as WorkerToolPolicy;
+}
+
 function createToolRegistry(): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool());
@@ -309,11 +366,25 @@ function createToolRegistry(): InMemoryToolRegistry {
   return registry;
 }
 
+function stringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const items = value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
+  return items.length > 0 ? items : [];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function createChildToolRegistry(): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
+  registry.register(createEditTool());
+  registry.register(createWriteFileTool());
+  registry.register(createApplyPatchTool());
+  registry.register(createBashTool());
   registry.register(createGitDiffTool());
   registry.register(createToolSearchTool(registry));
   return registry;

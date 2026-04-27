@@ -20,4 +20,5 @@ export * from "./registry.js";
 export * from "./snapshot.js";
 export * from "./subagent.js";
 export * from "./team.js";
+export * from "./tool-policy.js";
 export * from "./types.js";

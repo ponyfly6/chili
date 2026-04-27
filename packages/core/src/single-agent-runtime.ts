@@ -12,8 +12,8 @@ import type {
 } from "@chili/protocol";
 import { timestampNow } from "@chili/protocol";
 import type { EventStore } from "@chili/store";
-import type { ToolRegistry } from "@chili/tools";
-import { ToolExecutor } from "@chili/tools";
+import type { ToolAccessPolicyResolver, ToolRegistry } from "@chili/tools";
+import { ToolExecutor, filterToolsByPolicy } from "@chili/tools";
 import { ContextWindowBuilder, type ContextBudgetOptions, type ContextUsage } from "./context.js";
 import { DoomLoopError, DoomLoopGuard, type DoomLoopGuardOptions } from "./doom-loop-guard.js";
 import { normalizeRetryPolicy, retryDelay, sleep, type RetryPolicy } from "./retry.js";
@@ -27,6 +27,7 @@ export interface SingleAgentRuntimeOptions {
   model: ModelRouter;
   toolRegistry: ToolRegistry;
   toolExecutor: ToolExecutor;
+  toolPolicyResolver?: ToolAccessPolicyResolver;
   contextBudget?: ContextBudgetOptions;
   contextBuilder?: ContextWindowBuilder;
   retryPolicy?: RetryPolicy;
@@ -129,7 +130,7 @@ export class SingleAgentRuntime implements AgentRunner {
         threadId: input.threadId,
         turnId,
         messages: context.messages,
-        tools: this.options.toolRegistry.list(),
+        tools: await this.visibleTools(input, turnId),
         system: input.system ?? [],
       };
       if (input.signal) modelInput.signal = input.signal;
@@ -167,6 +168,16 @@ export class SingleAgentRuntime implements AgentRunner {
       if (contextUsage) result.contextUsage = contextUsage;
       return result;
     }
+  }
+
+  private async visibleTools(input: RunTurnInput, turnId: TurnId) {
+    const policy = await this.options.toolPolicyResolver?.resolve({
+      sessionId: input.sessionId,
+      threadId: input.threadId,
+      turnId,
+      cwd: input.cwd,
+    });
+    return filterToolsByPolicy(this.options.toolRegistry.list(), policy);
   }
 
   private async consumeModelStream(

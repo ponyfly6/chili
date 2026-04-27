@@ -16,6 +16,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ToolDeniedError, ToolValidationError, UnknownToolError, isAbortError, toError } from "./errors.js";
 import { FileReadStateStore } from "./file-read-state.js";
+import { authorizeToolByPolicy, filterToolsByPolicy, toolPolicyContext } from "./tool-policy.js";
 import type {
   ChiliToolDefinition,
   ChiliToolExecutionContext,
@@ -51,13 +52,23 @@ export class ToolExecutor {
     try {
       await this.update(input, callId, "validating");
       const validated = await this.validate(tool, input.input);
+      const spec = this.approvalSpec(tool, validated);
+      const policy = await this.policy(input);
+      await authorizeToolByPolicy({
+        tool,
+        executeInput: input,
+        validatedInput: validated,
+        approvalSpec: spec === false ? { permission: tool.name, patterns: ["*"], metadata: {} } : spec,
+        policy,
+        isReadOnly: (definition, toolInput) => this.resolvePredicate(definition.isReadOnly, toolInput),
+      });
 
-      const approval = await this.requestLifecycleApproval(tool, input, callId, validated);
+      const approval = await this.requestLifecycleApproval(tool, input, callId, validated, spec);
       if (approval.action === "deny") {
         throw new ToolDeniedError(tool.name, approval.feedback);
       }
 
-      await this.createSnapshotIfNeeded(tool, input, callId, validated);
+      await this.createSnapshotIfNeeded(tool, input, callId, validated, spec);
 
       await this.update(input, callId, "running");
       const rawResult = await tool.execute(validated, this.context(tool, input, callId));
@@ -98,8 +109,8 @@ export class ToolExecutor {
     input: ExecuteToolInput,
     callId: ToolCallId,
     validated: Input,
+    spec: false | Required<ToolApprovalSpec>,
   ): Promise<ApprovalDecision> {
-    const spec = this.approvalSpec(tool, validated);
     if (spec === false) return { action: "allow_once" };
 
     await this.update(input, callId, "waiting_for_approval");
@@ -121,8 +132,8 @@ export class ToolExecutor {
     input: ExecuteToolInput,
     callId: ToolCallId,
     validated: Input,
+    spec: false | Required<ToolApprovalSpec>,
   ): Promise<SnapshotRecord | undefined> {
-    const spec = this.approvalSpec(tool, validated);
     if (spec === false) return undefined;
     if (!this.options.snapshotProvider) return undefined;
 
@@ -194,6 +205,7 @@ export class ToolExecutor {
       signal: input.signal ?? new AbortController().signal,
       cwd: input.cwd,
       fileReads: this.fileReads,
+      visibleTools: () => this.visibleTools(input),
       metadata: (update) => this.metadata(input, callId, update),
       requestApproval: (request) =>
         this.requestApproval(input, callId, tool, {
@@ -246,6 +258,14 @@ export class ToolExecutor {
       status: update.status ?? "running",
       ...(update.metadata ? { metadata: update.metadata } : {}),
     });
+  }
+
+  private async visibleTools(input: ExecuteToolInput): Promise<ChiliToolDefinition[]> {
+    return filterToolsByPolicy(this.options.registry.list(), await this.policy(input));
+  }
+
+  private async policy(input: ExecuteToolInput) {
+    return this.options.policyResolver?.resolve(toolPolicyContext(input));
   }
 
   private async update(

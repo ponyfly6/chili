@@ -19,6 +19,12 @@ import type {
   TaskToolInput,
 } from "@chili/tools";
 import type { AgentRunner } from "./runner.js";
+import {
+  completeWorkerToolPolicy,
+  workerPolicySystemSummary,
+  type WorkerToolPolicy,
+  type WorkerToolPolicyTemplate,
+} from "./worker-policy.js";
 
 export type LocalSubagentMode = "one_shot" | "resumable" | "background";
 export type LocalSubagentStatus = "running" | "completed" | "failed" | "cancelled";
@@ -31,6 +37,7 @@ export interface LocalSubagentTaskInput {
   taskName: string;
   prompt: string;
   mode?: LocalSubagentMode;
+  workerPolicy?: WorkerToolPolicyTemplate;
   signal?: AbortSignal;
 }
 
@@ -47,6 +54,7 @@ export interface LocalSubagentRunInput {
   taskName: string;
   prompt: string;
   generation: number;
+  workerPolicy?: WorkerToolPolicy;
   signal?: AbortSignal;
 }
 
@@ -64,6 +72,7 @@ export interface LocalSubagentTaskResult {
   childSessionId: SessionId;
   childThreadId: ThreadId;
   status: LocalSubagentStatus;
+  workerPolicy?: WorkerToolPolicy;
   summary?: string;
   error?: Error;
 }
@@ -182,6 +191,9 @@ export class LocalSubagentManager implements SubagentController {
     const mode = input.mode ?? "one_shot";
     const generation = 1;
     const controller = linkedAbortController(input.signal);
+    const workerPolicy = input.workerPolicy
+      ? completeWorkerToolPolicy(input.workerPolicy, childSessionId, childThreadId)
+      : undefined;
 
     const task: LocalSubagentTaskResult = {
       taskId,
@@ -192,6 +204,7 @@ export class LocalSubagentManager implements SubagentController {
       childThreadId,
       status: "running",
     };
+    if (workerPolicy) task.workerPolicy = workerPolicy;
 
     await this.append(
       eventContext(input.parentSessionId, input.parentThreadId),
@@ -208,6 +221,7 @@ export class LocalSubagentManager implements SubagentController {
         prompt: input.prompt,
         ...(input.parentThreadId ? { parentThreadId: input.parentThreadId } : {}),
         ...(mode ? { mode } : {}),
+        ...(workerPolicy ? { workerPolicy } : {}),
       },
     );
 
@@ -227,6 +241,7 @@ export class LocalSubagentManager implements SubagentController {
         generation,
         ...(input.parentThreadId ? { parentThreadId: input.parentThreadId } : {}),
         ...(mode ? { mode } : {}),
+        ...(workerPolicy ? { workerPolicy } : {}),
       },
     );
 
@@ -244,6 +259,7 @@ export class LocalSubagentManager implements SubagentController {
       generation,
     };
     if (input.parentThreadId) runInput.parentThreadId = input.parentThreadId;
+    if (workerPolicy) runInput.workerPolicy = workerPolicy;
     runInput.signal = controller.signal;
 
     const lease = await this.claimTaskLease(runInput);
@@ -562,6 +578,7 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
         system: [
           ...(this.options.system ?? []),
           `Subagent task id: ${input.taskId}. Agent path: ${input.path}. When the task is complete, either provide a final concise answer or call complete_task with this task id and a clear summary.`,
+          ...(input.workerPolicy ? [workerPolicySystemSummary(input.workerPolicy)] : []),
         ],
       };
       if (input.signal) Object.assign(runInput, { signal: input.signal });

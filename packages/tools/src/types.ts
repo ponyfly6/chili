@@ -45,6 +45,7 @@ export type ToolBooleanPredicate<Input = any> = boolean | ((input: Input) => boo
 
 export interface ChiliToolExecutionContext extends ToolExecutionContext {
   fileReads?: FileReadStateStore;
+  visibleTools?: () => Promise<ChiliToolDefinition[]> | ChiliToolDefinition[];
 }
 
 export interface ToolRegistry {
@@ -77,6 +78,7 @@ export interface ToolExecutorOptions {
   registry: ToolRegistry;
   events: ToolEventSink;
   approvals: ApprovalBroker;
+  policyResolver?: ToolAccessPolicyResolver;
   snapshotProvider?: SnapshotProvider;
   snapshotPolicy?: SnapshotPolicy;
   fileReadState?: FileReadStateStore;
@@ -94,6 +96,27 @@ export interface ExecuteToolInput {
   input: unknown;
   cwd: string;
   signal?: AbortSignal;
+}
+
+export interface ToolPolicyContext {
+  sessionId: SessionId;
+  threadId?: ThreadId;
+  turnId?: TurnId;
+  cwd: string;
+}
+
+export interface ToolAccessPolicy {
+  allowedTools?: readonly string[];
+  writeScope?: readonly string[];
+  executeScope?: readonly string[];
+  teamId?: string;
+  taskId?: string;
+  memberPath?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ToolAccessPolicyResolver {
+  resolve(context: ToolPolicyContext): Promise<ToolAccessPolicy | undefined> | ToolAccessPolicy | undefined;
 }
 
 export type ExecuteToolResult =

@@ -37,8 +37,9 @@ export function createToolSearchTool(registry: ToolRegistry): ChiliToolDefinitio
       return { ok: true, value };
     },
     approval: () => false,
-    async execute(input) {
-      const results = searchTools(registry.list(), input.query, input.maxResults ?? 8);
+    async execute(input, context) {
+      const tools = context.visibleTools ? await context.visibleTools() : registry.list();
+      const results = searchTools(tools, input.query, input.maxResults ?? 8);
       const output = results.length
         ? results.map((tool) => `${tool.name}: ${tool.description}`).join("\n")
         : "(no matching tools)";

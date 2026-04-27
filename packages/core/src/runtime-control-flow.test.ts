@@ -151,6 +151,63 @@ test("consumes rich model streams and executes tool calls after the stream finis
   expect(toolStartedIndex).toBeGreaterThan(toolCallPartIndex);
 });
 
+test("runtime hides unauthorized tools from model input", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  registry.register({
+    name: "read",
+    description: "Read",
+    risk: "read",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => ({ title: "read", output: "ok" }),
+  });
+  registry.register({
+    name: "write",
+    description: "Write",
+    risk: "write",
+    inputSchema: { type: "object" },
+    approval: () => ({ permission: "write", patterns: ["src/a.ts"] }),
+    execute: async () => ({ title: "write", output: "ok" }),
+  });
+  const seenTools: string[][] = [];
+  const policyResolver = {
+    resolve: () => ({
+      allowedTools: ["read"],
+      writeScope: [],
+    }),
+  };
+  const model: ModelRouter = {
+    async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+      seenTools.push(input.tools.map((tool) => tool.name));
+      yield { type: "finish", reason: "end_turn" };
+    },
+  };
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+      policyResolver,
+    }),
+    toolPolicyResolver: policyResolver,
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const result = await runtime.runTurn({
+    sessionId: "session_scoped_tools" as SessionId,
+    threadId: "thread_scoped_tools" as ThreadId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(seenTools).toEqual([["read"]]);
+});
+
 test("runs concurrency-safe tool calls in parallel and preserves result order", async () => {
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();

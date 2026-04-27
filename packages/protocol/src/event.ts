@@ -82,6 +82,7 @@ export interface AgentTaskCreatedPayload {
   prompt: string;
   parentThreadId?: ThreadId;
   mode?: AgentTaskMode;
+  workerPolicy?: Record<string, unknown>;
 }
 
 export interface AgentSpawnedPayload {
@@ -97,6 +98,7 @@ export interface AgentSpawnedPayload {
   childThreadId?: ThreadId;
   cwd?: string;
   mode?: AgentTaskMode;
+  workerPolicy?: Record<string, unknown>;
 }
 
 export type AgentMailboxPayload =
