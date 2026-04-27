@@ -25,10 +25,27 @@ import type {
   EventStore,
   SessionRow,
   SubagentProjectionStore,
+  TeamMemberQuery,
+  TeamMemberRow,
+  TeamMessageDeliveryQuery,
+  TeamMessageDeliveryRow,
+  TeamMessageQuery,
+  TeamMessageRow,
+  TeamProjectionStore,
+  TeamQuery,
+  TeamRow,
+  TeamTaskQuery,
+  TeamTaskRow,
 } from "@chili/store";
 
 export class PrintingEventStore
-  implements EventStore, SubagentProjectionStore, AgentTaskLeaseStore, AgentTaskFinalizationStore, AgentMailboxDeliveryStore
+  implements
+    EventStore,
+    SubagentProjectionStore,
+    AgentTaskLeaseStore,
+    AgentTaskFinalizationStore,
+    AgentMailboxDeliveryStore,
+    TeamProjectionStore
 {
   constructor(private readonly inner: EventStore, private readonly printer: CliPrinter) {}
 
@@ -72,6 +89,26 @@ export class PrintingEventStore
 
   agentMailbox(query?: AgentMailboxQuery): Promise<AgentMailboxRow[]> {
     return this.subagentStore()?.agentMailbox(query) ?? Promise.resolve([]);
+  }
+
+  teams(query?: TeamQuery): Promise<TeamRow[]> {
+    return this.teamProjectionStore()?.teams(query) ?? Promise.resolve([]);
+  }
+
+  teamMembers(query?: TeamMemberQuery): Promise<TeamMemberRow[]> {
+    return this.teamProjectionStore()?.teamMembers(query) ?? Promise.resolve([]);
+  }
+
+  teamTasks(query?: TeamTaskQuery): Promise<TeamTaskRow[]> {
+    return this.teamProjectionStore()?.teamTasks(query) ?? Promise.resolve([]);
+  }
+
+  teamMessages(query?: TeamMessageQuery): Promise<TeamMessageRow[]> {
+    return this.teamProjectionStore()?.teamMessages(query) ?? Promise.resolve([]);
+  }
+
+  teamMessageDeliveries(query?: TeamMessageDeliveryQuery): Promise<TeamMessageDeliveryRow[]> {
+    return this.teamProjectionStore()?.teamMessageDeliveries(query) ?? Promise.resolve([]);
   }
 
   claimAgentTaskLease(input: AgentTaskLeaseClaimInput): Promise<AgentTaskLeaseResult> {
@@ -149,6 +186,14 @@ export class PrintingEventStore
     const inner = this.inner as EventStore & Partial<AgentMailboxDeliveryStore>;
     if (inner.claimAgentMailboxMessage && inner.consumeAgentMailboxMessage && inner.requeueAgentMailboxMessage) {
       return inner as EventStore & AgentMailboxDeliveryStore;
+    }
+    return undefined;
+  }
+
+  private teamProjectionStore(): TeamProjectionStore | undefined {
+    const inner = this.inner as EventStore & Partial<TeamProjectionStore>;
+    if (inner.teams && inner.teamMembers && inner.teamTasks && inner.teamMessages && inner.teamMessageDeliveries) {
+      return inner as EventStore & TeamProjectionStore;
     }
     return undefined;
   }
