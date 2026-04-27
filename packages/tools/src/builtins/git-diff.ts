@@ -601,6 +601,9 @@ async function assertGitRepository(cwd: string, signal: AbortSignal): Promise<vo
     timeoutMs: 10_000,
     maxOutputBytes: 64_000,
   });
+  if (result.timedOut) {
+    throw new Error("git repository check timed out after 10000ms");
+  }
   if (result.exitCode !== 0 || result.stdout.trim() !== "true") {
     throw new Error("Not a git repository. Run this tool from inside a git worktree.");
   }
@@ -629,6 +632,9 @@ async function runGit(
 }
 
 function assertGitSuccess(result: Awaited<ReturnType<typeof runGit>>, command: string): void {
+  if (result.timedOut) {
+    throw new Error(`${command} timed out`);
+  }
   if (result.exitCode !== 0) {
     throw new Error(result.stderr || `${command} exited with code ${result.exitCode}`);
   }
