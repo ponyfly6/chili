@@ -490,6 +490,37 @@ test("serves team control routes", async () => {
     expect(await messagesResponse.json()).toMatchObject([
       { kind: "task_assignment", delivery: "triggerTurn", deliveryStatus: "queued", content: "please review" },
     ]);
+    const snapshotResponse = await handler(new Request(`http://chili.test/teams/${team.id}/snapshot`));
+    expect(snapshotResponse.status).toBe(200);
+    const snapshot = (await snapshotResponse.json()) as {
+      stats: {
+        memberCount: number;
+        taskCount: number;
+        messageCount: number;
+        deliveryCount: number;
+      };
+      members: Array<{ path: string; taskIds: string[]; deliveryIds: string[] }>;
+      tasks: Array<{ id: string; owner?: { path: string }; messageIds: string[] }>;
+      messages: Array<{ deliveries: Array<{ path: string; status: string }> }>;
+    };
+    expect(snapshot.stats).toMatchObject({
+      memberCount: 2,
+      taskCount: 1,
+      messageCount: 1,
+      deliveryCount: 1,
+    });
+    expect(snapshot.members.find((member) => member.path === "/root/reviewer")).toMatchObject({
+      taskIds: [task.id],
+    });
+    expect(snapshot.members.find((member) => member.path === "/root/reviewer")?.deliveryIds).toHaveLength(1);
+    expect(snapshot.tasks[0]).toMatchObject({
+      id: task.id,
+      owner: { path: "/root/reviewer" },
+    });
+    expect(snapshot.tasks[0]?.messageIds).toHaveLength(1);
+    expect(snapshot.messages[0]).toMatchObject({
+      deliveries: [{ path: "/root/reviewer", status: "queued" }],
+    });
     expect(await store.agentMailbox({ path: "/root/reviewer" as AgentPath, status: "queued" })).toMatchObject([
       {
         path: "/root/reviewer",

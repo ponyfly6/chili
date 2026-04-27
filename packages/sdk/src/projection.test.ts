@@ -21,6 +21,7 @@ import {
   type RuntimeTeamTaskReconcileResult,
   type RuntimeTeamTaskRecord,
   type RuntimeTeamTaskSyncResult,
+  type RuntimeTeamSnapshot,
 } from "./client.js";
 import { createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, sessionMessages } from "./projection.js";
 
@@ -475,6 +476,108 @@ test("client preserves team dispatcher JSON shapes for dispatch, sync, and recon
       body: { teamId, sessionId, threadId, limit: 5 },
     },
   ]);
+});
+
+test("client fetches team snapshots through the runtime HTTP API", async () => {
+  const teamId = "team_sdk_snapshot" as TeamId;
+  const taskId = "task_sdk_snapshot" as TaskId;
+  const ownerPath = "/root/reviewer" as AgentPath;
+  const teamTask = sdkTeamTaskJson({ teamId, taskId, status: "pending", ownerPath, includeMetadata: false });
+  const snapshot: RuntimeTeamSnapshot = {
+    team: {
+      id: teamId,
+      name: "SDK snapshot",
+      leadPath: "/root" as AgentPath,
+      status: "active",
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    members: [
+      {
+        teamId,
+        path: ownerPath,
+        name: "reviewer",
+        role: "reviewer",
+        status: "idle",
+        taskIds: [taskId],
+        deliveryIds: ["mailbox_sdk_snapshot"],
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ],
+    tasks: [
+      {
+        ...teamTask,
+        blockedBy: [],
+        blocks: [],
+        ready: true,
+        messageIds: ["teammsg_sdk_snapshot"],
+      },
+    ],
+    messages: [
+      {
+        id: "teammsg_sdk_snapshot",
+        teamId,
+        fromPath: "/root" as AgentPath,
+        toPath: ownerPath,
+        content: "review",
+        kind: "task_assignment",
+        delivery: "triggerTurn",
+        deliveryStatus: "queued",
+        taskId,
+        deliveries: [
+          {
+            mailboxMessageId: "mailbox_sdk_snapshot",
+            teamId,
+            teamMessageId: "teammsg_sdk_snapshot",
+            path: ownerPath,
+            status: "queued",
+            triggerTurn: true,
+            queuedAt: 2,
+            updatedAt: 2,
+          },
+        ],
+        createdAt: 2,
+      },
+    ],
+    messageDeliveries: [
+      {
+        mailboxMessageId: "mailbox_sdk_snapshot",
+        teamId,
+        teamMessageId: "teammsg_sdk_snapshot",
+        path: ownerPath,
+        status: "queued",
+        triggerTurn: true,
+        queuedAt: 2,
+        updatedAt: 2,
+      },
+    ],
+    stats: {
+      memberCount: 1,
+      taskCount: 1,
+      messageCount: 1,
+      deliveryCount: 1,
+      membersByStatus: { idle: 1, running: 0, waiting: 0, blocked: 0, closed: 0 },
+      tasksByStatus: { pending: 1, in_progress: 0, blocked: 0, completed: 0, failed: 0, cancelled: 0 },
+      messagesByDeliveryStatus: { queued: 1 },
+      deliveriesByStatus: { queued: 1 },
+      readyTaskIds: [taskId],
+      blockedTaskIds: [],
+    },
+    generatedAt: 3,
+  };
+  const requests: Array<{ url: string; method: string | undefined }> = [];
+  const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    requests.push({ url: input instanceof Request ? input.url : String(input), method: init?.method });
+    return new Response(JSON.stringify(snapshot), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+  const client = new HttpRuntimeClient({ baseUrl: "http://runtime.test/api", fetch: fetchImpl });
+
+  expect(await client.teamSnapshot(teamId)).toEqual(snapshot);
+  expect(requests).toEqual([{ url: "http://runtime.test/api/teams/team_sdk_snapshot/snapshot", method: "GET" }]);
 });
 
 function sdkTeamTaskJson(input: {

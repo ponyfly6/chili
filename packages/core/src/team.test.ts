@@ -142,6 +142,37 @@ test("creates a persistent team with leader, members, task assignment, claim, an
         currentTaskId: task.id,
       },
     ]);
+    const snapshot = await service.snapshot(team.id);
+    const reviewerSnapshot = snapshot.members.find((member) => member.path === reviewerPath);
+    expect(snapshot.stats).toMatchObject({
+      memberCount: 2,
+      taskCount: 1,
+      messageCount: 1,
+      deliveryCount: 1,
+      membersByStatus: { running: 2 },
+      tasksByStatus: { in_progress: 1 },
+      messagesByDeliveryStatus: { queued: 1 },
+      deliveriesByStatus: { queued: 1 },
+      readyTaskIds: [],
+      blockedTaskIds: [],
+    });
+    expect(reviewerSnapshot).toMatchObject({
+      taskIds: [task.id],
+      currentTask: { id: task.id, status: "in_progress" },
+    });
+    expect(reviewerSnapshot?.deliveryIds).toHaveLength(1);
+    expect(snapshot.tasks[0]).toMatchObject({
+      id: task.id,
+      owner: { path: reviewerPath },
+      blockedBy: [],
+      blocks: [],
+      ready: false,
+    });
+    expect(snapshot.tasks[0]?.messageIds).toHaveLength(1);
+    expect(snapshot.messages[0]).toMatchObject({
+      taskId: task.id,
+      deliveries: [{ path: reviewerPath, status: "queued" }],
+    });
 
     const completed = await service.updateTask({
       sessionId,

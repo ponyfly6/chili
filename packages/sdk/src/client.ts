@@ -38,6 +38,7 @@ export interface RuntimeClient {
   consumeMailbox(messageId: string): Promise<RuntimeAgentMailboxRecord>;
   listTeams(): Promise<RuntimeTeamRecord[]>;
   createTeam(input: CreateTeamRequest): Promise<RuntimeTeamRecord>;
+  teamSnapshot(teamId: TeamId): Promise<RuntimeTeamSnapshot>;
   listTeamMembers(teamId: TeamId): Promise<RuntimeTeamMemberRecord[]>;
   addTeamMember(input: AddTeamMemberRequest): Promise<RuntimeTeamMemberRecord>;
   listTeamTasks(teamId: TeamId): Promise<RuntimeTeamTaskRecord[]>;
@@ -240,6 +241,63 @@ export interface RuntimeTeamMessageRecord {
   summary?: string;
   metadata?: Record<string, unknown>;
   createdAt: number;
+}
+
+export interface RuntimeTeamMessageDeliveryRecord {
+  mailboxMessageId: string;
+  teamId: TeamId;
+  teamMessageId: string;
+  path: AgentPath;
+  status: TeamMessageDeliveryStatus;
+  triggerTurn: boolean;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  error?: string;
+  queuedAt: number;
+  updatedAt: number;
+  deliveredAt?: number;
+}
+
+export interface RuntimeTeamSnapshot {
+  team: RuntimeTeamRecord;
+  members: RuntimeTeamSnapshotMember[];
+  tasks: RuntimeTeamSnapshotTask[];
+  messages: RuntimeTeamSnapshotMessage[];
+  messageDeliveries: RuntimeTeamMessageDeliveryRecord[];
+  stats: RuntimeTeamSnapshotStats;
+  generatedAt: number;
+}
+
+export interface RuntimeTeamSnapshotMember extends RuntimeTeamMemberRecord {
+  taskIds: TaskId[];
+  deliveryIds: string[];
+  currentTask?: RuntimeTeamTaskRecord;
+}
+
+export interface RuntimeTeamSnapshotTask extends RuntimeTeamTaskRecord {
+  blockedBy: TaskId[];
+  blocks: TaskId[];
+  ready: boolean;
+  messageIds: string[];
+  owner?: RuntimeTeamMemberRecord;
+  dispatch?: unknown;
+}
+
+export interface RuntimeTeamSnapshotMessage extends RuntimeTeamMessageRecord {
+  deliveries: RuntimeTeamMessageDeliveryRecord[];
+}
+
+export interface RuntimeTeamSnapshotStats {
+  memberCount: number;
+  taskCount: number;
+  messageCount: number;
+  deliveryCount: number;
+  membersByStatus: Record<TeamMemberStatus, number>;
+  tasksByStatus: Record<TeamTaskStatus, number>;
+  messagesByDeliveryStatus: Record<string, number>;
+  deliveriesByStatus: Record<string, number>;
+  readyTaskIds: TaskId[];
+  blockedTaskIds: TaskId[];
 }
 
 export interface TeamRequestContext {
@@ -572,6 +630,10 @@ export class HttpRuntimeClient implements RuntimeClient {
 
   createTeam(input: CreateTeamRequest): Promise<RuntimeTeamRecord> {
     return this.post("teams", input);
+  }
+
+  teamSnapshot(teamId: TeamId): Promise<RuntimeTeamSnapshot> {
+    return this.get(`teams/${encodeURIComponent(teamId)}/snapshot`);
   }
 
   listTeamMembers(teamId: TeamId): Promise<RuntimeTeamMemberRecord[]> {

@@ -18,6 +18,7 @@ import { timestampNow } from "@chili/protocol";
 import type {
   EventStore,
   TeamMemberRow,
+  TeamMessageDeliveryRow,
   TeamMessageRow,
   TeamProjectionStore,
   TeamRow,
@@ -37,6 +38,7 @@ export interface TeamRuntime {
   claimTask(input: ClaimTeamTaskInput): Promise<TeamTaskMutationResult>;
   updateTask(input: UpdateTeamTaskInput): Promise<TeamTaskRow>;
   sendMessage(input: SendTeamMessageInput): Promise<TeamMessageRow>;
+  snapshot(teamId: TeamId): Promise<TeamSnapshot>;
 }
 
 export interface TeamControlServiceOptions {
@@ -127,6 +129,48 @@ export interface SendTeamMessageInput extends TeamEventContext {
   taskId?: TaskId;
   summary?: string;
   metadata?: Record<string, unknown>;
+}
+
+export interface TeamSnapshot {
+  team: TeamRow;
+  members: TeamSnapshotMember[];
+  tasks: TeamSnapshotTask[];
+  messages: TeamSnapshotMessage[];
+  messageDeliveries: TeamMessageDeliveryRow[];
+  stats: TeamSnapshotStats;
+  generatedAt: number;
+}
+
+export interface TeamSnapshotMember extends TeamMemberRow {
+  taskIds: TaskId[];
+  deliveryIds: string[];
+  currentTask?: TeamTaskRow;
+}
+
+export interface TeamSnapshotTask extends TeamTaskRow {
+  blockedBy: TaskId[];
+  blocks: TaskId[];
+  ready: boolean;
+  messageIds: string[];
+  owner?: TeamMemberRow;
+  dispatch?: unknown;
+}
+
+export interface TeamSnapshotMessage extends TeamMessageRow {
+  deliveries: TeamMessageDeliveryRow[];
+}
+
+export interface TeamSnapshotStats {
+  memberCount: number;
+  taskCount: number;
+  messageCount: number;
+  deliveryCount: number;
+  membersByStatus: Record<TeamMemberStatus, number>;
+  tasksByStatus: Record<TeamTaskStatus, number>;
+  messagesByDeliveryStatus: Record<string, number>;
+  deliveriesByStatus: Record<string, number>;
+  readyTaskIds: TaskId[];
+  blockedTaskIds: TaskId[];
 }
 
 export class TeamNotFoundError extends Error {
@@ -430,6 +474,24 @@ export class TeamControlService implements TeamRuntime {
     return this.options.store.teamMessages({ teamId });
   }
 
+  async snapshot(teamId: TeamId): Promise<TeamSnapshot> {
+    const team = await this.requireTeam(teamId);
+    const [members, tasks, messages, messageDeliveries] = await Promise.all([
+      this.options.store.teamMembers({ teamId }),
+      this.options.store.teamTasks({ teamId }),
+      this.options.store.teamMessages({ teamId }),
+      this.options.store.teamMessageDeliveries({ teamId }),
+    ]);
+    return buildTeamSnapshot({
+      team,
+      members,
+      tasks,
+      messages,
+      messageDeliveries,
+      generatedAt: Number(this.now()),
+    });
+  }
+
   private async requireTeam(teamId: TeamId): Promise<TeamRow> {
     const team = (await this.options.store.teams({ teamId, limit: 1 }))[0];
     if (!team) throw new TeamNotFoundError(teamId);
@@ -587,6 +649,152 @@ function teamMessageToAgentMailboxPayload(
   if (input.taskId) payload.taskId = input.taskId;
   return payload;
 }
+
+function buildTeamSnapshot(input: {
+  team: TeamRow;
+  members: TeamMemberRow[];
+  tasks: TeamTaskRow[];
+  messages: TeamMessageRow[];
+  messageDeliveries: TeamMessageDeliveryRow[];
+  generatedAt: number;
+}): TeamSnapshot {
+  const membersByPath = new Map(input.members.map((member) => [member.path, member]));
+  const tasksById = new Map(input.tasks.map((task) => [task.id, task]));
+  const taskIdsByOwner = new Map<AgentPath, TaskId[]>();
+  const deliveryIdsByPath = new Map<AgentPath, string[]>();
+  const messageIdsByTask = new Map<TaskId, string[]>();
+  const deliveriesByMessageId = new Map<string, TeamMessageDeliveryRow[]>();
+
+  for (const task of input.tasks) {
+    if (!task.ownerPath) continue;
+    const ids = taskIdsByOwner.get(task.ownerPath) ?? [];
+    ids.push(task.id);
+    taskIdsByOwner.set(task.ownerPath, ids);
+  }
+  for (const message of input.messages) {
+    if (!message.taskId) continue;
+    const ids = messageIdsByTask.get(message.taskId) ?? [];
+    ids.push(message.id);
+    messageIdsByTask.set(message.taskId, ids);
+  }
+  for (const delivery of input.messageDeliveries) {
+    const deliveryIds = deliveryIdsByPath.get(delivery.path) ?? [];
+    deliveryIds.push(delivery.mailboxMessageId);
+    deliveryIdsByPath.set(delivery.path, deliveryIds);
+    const messageDeliveries = deliveriesByMessageId.get(delivery.teamMessageId) ?? [];
+    messageDeliveries.push(delivery);
+    deliveriesByMessageId.set(delivery.teamMessageId, messageDeliveries);
+  }
+
+  const tasks: TeamSnapshotTask[] = input.tasks.map((task) => {
+    const blockedBy = task.dependsOn.filter((dependency) => !isCompletedDependency(tasksById.get(dependency)));
+    const blocks = input.tasks.filter((candidate) => candidate.dependsOn.includes(task.id)).map((candidate) => candidate.id);
+    const snapshotTask: TeamSnapshotTask = {
+      ...task,
+      blockedBy,
+      blocks,
+      ready: task.status === "pending" && blockedBy.length === 0,
+      messageIds: messageIdsByTask.get(task.id) ?? [],
+    };
+    if (task.ownerPath) {
+      const owner = membersByPath.get(task.ownerPath);
+      if (owner) snapshotTask.owner = owner;
+    }
+    const dispatch = dispatchMetadata(task.metadata);
+    if (dispatch !== undefined) snapshotTask.dispatch = dispatch;
+    return snapshotTask;
+  });
+
+  const members: TeamSnapshotMember[] = input.members.map((member) => {
+    const snapshotMember: TeamSnapshotMember = {
+      ...member,
+      taskIds: taskIdsByOwner.get(member.path) ?? [],
+      deliveryIds: deliveryIdsByPath.get(member.path) ?? [],
+    };
+    if (member.currentTaskId) {
+      const currentTask = tasksById.get(member.currentTaskId);
+      if (currentTask) snapshotMember.currentTask = currentTask;
+    }
+    return snapshotMember;
+  });
+
+  const messages = input.messages.map((message): TeamSnapshotMessage => ({
+    ...message,
+    deliveries: deliveriesByMessageId.get(message.id) ?? [],
+  }));
+
+  const stats = teamSnapshotStats({ members, tasks, messages, deliveries: input.messageDeliveries });
+  return {
+    team: input.team,
+    members,
+    tasks,
+    messages,
+    messageDeliveries: input.messageDeliveries,
+    stats,
+    generatedAt: input.generatedAt,
+  };
+}
+
+function isCompletedDependency(task: TeamTaskRow | undefined): boolean {
+  return Boolean(task && task.status === "completed");
+}
+
+function dispatchMetadata(metadata: Record<string, unknown> | undefined): unknown {
+  return metadata ? metadata.chiliTeamDispatch : undefined;
+}
+
+function teamSnapshotStats(input: {
+  members: TeamSnapshotMember[];
+  tasks: TeamSnapshotTask[];
+  messages: TeamSnapshotMessage[];
+  deliveries: TeamMessageDeliveryRow[];
+}): TeamSnapshotStats {
+  const membersByStatus = countByStatus(TEAM_MEMBER_STATUSES);
+  for (const member of input.members) membersByStatus[member.status] += 1;
+
+  const tasksByStatus = countByStatus(TEAM_TASK_STATUSES);
+  for (const task of input.tasks) tasksByStatus[task.status] += 1;
+
+  const messagesByDeliveryStatus: Record<string, number> = {};
+  for (const message of input.messages) {
+    const status = message.deliveryStatus ?? "none";
+    messagesByDeliveryStatus[status] = (messagesByDeliveryStatus[status] ?? 0) + 1;
+  }
+
+  const deliveriesByStatus: Record<string, number> = {};
+  for (const delivery of input.deliveries) {
+    deliveriesByStatus[delivery.status] = (deliveriesByStatus[delivery.status] ?? 0) + 1;
+  }
+
+  return {
+    memberCount: input.members.length,
+    taskCount: input.tasks.length,
+    messageCount: input.messages.length,
+    deliveryCount: input.deliveries.length,
+    membersByStatus,
+    tasksByStatus,
+    messagesByDeliveryStatus,
+    deliveriesByStatus,
+    readyTaskIds: input.tasks.filter((task) => task.ready).map((task) => task.id),
+    blockedTaskIds: input.tasks.filter((task) => task.blockedBy.length > 0 || task.status === "blocked").map((task) => task.id),
+  };
+}
+
+function countByStatus<T extends string>(statuses: readonly T[]): Record<T, number> {
+  const counts = {} as Record<T, number>;
+  for (const status of statuses) counts[status] = 0;
+  return counts;
+}
+
+const TEAM_MEMBER_STATUSES = ["idle", "running", "waiting", "blocked", "closed"] as const satisfies readonly TeamMemberStatus[];
+const TEAM_TASK_STATUSES = [
+  "pending",
+  "in_progress",
+  "blocked",
+  "completed",
+  "failed",
+  "cancelled",
+] as const satisfies readonly TeamTaskStatus[];
 
 function isFinalTeamTaskStatus(status: TeamTaskStatus): boolean {
   return status === "completed" || status === "failed" || status === "cancelled";

@@ -70,10 +70,67 @@ export interface TeamMessageRecord {
   createdAt?: number;
 }
 
+export interface TeamMessageDeliveryRecord {
+  mailboxMessageId: string;
+  teamId: TeamId | string;
+  teamMessageId: string;
+  path: AgentPath | string;
+  status: TeamMessageDeliveryStatus;
+  triggerTurn: boolean;
+  childSessionId?: SessionId | string;
+  childThreadId?: ThreadId | string;
+  error?: string;
+  queuedAt?: number;
+  updatedAt?: number;
+  deliveredAt?: number;
+}
+
 export interface TeamTaskClaimRecord {
   applied: boolean;
   task?: TeamTaskRecord;
   reason?: "not_found" | "already_claimed" | "already_resolved" | "blocked";
+}
+
+export interface TeamSnapshotMemberRecord extends TeamMemberRecord {
+  taskIds: (TaskId | string)[];
+  deliveryIds: string[];
+  currentTask?: TeamTaskRecord;
+}
+
+export interface TeamSnapshotTaskRecord extends TeamTaskRecord {
+  blockedBy: (TaskId | string)[];
+  blocks: (TaskId | string)[];
+  ready: boolean;
+  messageIds: string[];
+  owner?: TeamMemberRecord;
+  dispatch?: unknown;
+}
+
+export interface TeamSnapshotMessageRecord extends TeamMessageRecord {
+  deliveries: TeamMessageDeliveryRecord[];
+}
+
+export interface TeamSnapshotStatsRecord {
+  memberCount: number;
+  taskCount: number;
+  messageCount: number;
+  deliveryCount: number;
+  membersByStatus: Record<string, number>;
+  tasksByStatus: Record<string, number>;
+  messagesByDeliveryStatus: Record<string, number>;
+  deliveriesByStatus: Record<string, number>;
+  readyTaskIds: (TaskId | string)[];
+  blockedTaskIds: (TaskId | string)[];
+}
+
+export interface TeamSnapshotRecord {
+  team: TeamRecord;
+  members: TeamSnapshotMemberRecord[];
+  tasks: TeamSnapshotTaskRecord[];
+  messages: TeamSnapshotMessageRecord[];
+  messageDeliveries: TeamMessageDeliveryRecord[];
+  stats: TeamSnapshotStatsRecord;
+  generatedAt?: number;
 }
 
 export interface TeamCreateToolInput {
@@ -90,6 +147,10 @@ export interface TeamCreateToolInput {
 export interface TeamListToolInput {
   status?: "active" | "archived";
   limit?: number;
+}
+
+export interface TeamSnapshotToolInput {
+  teamId: string;
 }
 
 export interface TeamMemberAddToolInput {
@@ -244,6 +305,7 @@ export type TeamToolContext = ToolExecutionContext;
 export interface TeamToolController {
   createTeam(input: TeamCreateToolInput, context: TeamToolContext): Promise<TeamRecord>;
   listTeams(input: TeamListToolInput, context: TeamToolContext): Promise<TeamRecord[]>;
+  snapshotTeam(input: TeamSnapshotToolInput, context: TeamToolContext): Promise<TeamSnapshotRecord>;
   addMember(input: TeamMemberAddToolInput, context: TeamToolContext): Promise<TeamMemberRecord>;
   listMembers(input: TeamMemberListToolInput, context: TeamToolContext): Promise<TeamMemberRecord[]>;
   createTask(input: TeamTaskCreateToolInput, context: TeamToolContext): Promise<TeamTaskRecord>;

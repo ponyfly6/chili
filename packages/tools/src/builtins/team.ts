@@ -11,6 +11,8 @@ import type {
   TeamMessageRecord,
   TeamMessageSendToolInput,
   TeamRecord,
+  TeamSnapshotRecord,
+  TeamSnapshotToolInput,
   TeamTaskAssignToolInput,
   TeamTaskClaimRecord,
   TeamTaskClaimToolInput,
@@ -90,6 +92,30 @@ export function createTeamListTool(controller: TeamToolController): ChiliToolDef
     approval: () => false,
     async execute(input, context) {
       return teamListToolResult(await controller.listTeams(input, context));
+    },
+  };
+}
+
+export function createTeamSnapshotTool(controller: TeamToolController): ChiliToolDefinition<TeamSnapshotToolInput, TeamToolResult> {
+  return {
+    name: "team_snapshot",
+    aliases: ["snapshot_team", "team_status"],
+    description: "Read a joined snapshot of a team, including members, tasks, messages, deliveries, and board stats.",
+    risk: "read",
+    isReadOnly: true,
+    isConcurrencySafe: true,
+    inputSchema: {
+      type: "object",
+      required: ["teamId"],
+      properties: {
+        teamId: { type: "string" },
+        team_id: { type: "string" },
+      },
+    },
+    validate: validateTeamSnapshotInput,
+    approval: () => false,
+    async execute(input, context) {
+      return teamSnapshotToolResult(await controller.snapshotTeam(input, context));
     },
   };
 }
@@ -546,6 +572,13 @@ function validateTeamListInput(input: unknown): ValidationResult<TeamListToolInp
   return { ok: true, value };
 }
 
+function validateTeamSnapshotInput(input: unknown): ValidationResult<TeamSnapshotToolInput> {
+  if (!isRecord(input)) return { ok: false, message: "expected an object" };
+  const teamId = requiredString(input, ["teamId", "team_id"], "teamId");
+  if (!teamId.ok) return teamId;
+  return { ok: true, value: { teamId: teamId.value } };
+}
+
 function validateTeamMemberAddInput(input: unknown): ValidationResult<TeamMemberAddToolInput> {
   if (!isRecord(input)) return { ok: false, message: "expected an object" };
   const teamId = requiredString(input, ["teamId", "team_id"], "teamId");
@@ -789,6 +822,25 @@ function teamListToolResult(teams: readonly TeamRecord[]): TeamToolResult {
   };
 }
 
+function teamSnapshotToolResult(snapshot: TeamSnapshotRecord): TeamToolResult {
+  return {
+    title: `team_snapshot ${snapshot.team.teamId}`,
+    output: JSON.stringify(teamSnapshotRecordOutput(snapshot)),
+    metadata: {
+      team_id: snapshot.team.teamId,
+      teamId: snapshot.team.teamId,
+      members: snapshot.members.length,
+      tasks: snapshot.tasks.length,
+      messages: snapshot.messages.length,
+      deliveries: snapshot.messageDeliveries.length,
+      ready_tasks: snapshot.stats.readyTaskIds.length,
+      readyTasks: snapshot.stats.readyTaskIds.length,
+      blocked_tasks: snapshot.stats.blockedTaskIds.length,
+      blockedTasks: snapshot.stats.blockedTaskIds.length,
+    },
+  };
+}
+
 function teamMemberRecordToolResult(title: string, member: TeamMemberRecord): TeamToolResult {
   return {
     title: `${title} ${member.path}`,
@@ -934,6 +986,54 @@ function teamRecordOutput(team: TeamRecord): Record<string, unknown> {
   });
 }
 
+function teamSnapshotRecordOutput(snapshot: TeamSnapshotRecord): Record<string, unknown> {
+  const messageDeliveries = snapshot.messageDeliveries.map(teamMessageDeliveryRecordOutput);
+  return pruneUndefined({
+    team: teamRecordOutput(snapshot.team),
+    members: snapshot.members.map(teamSnapshotMemberRecordOutput),
+    tasks: snapshot.tasks.map(teamSnapshotTaskRecordOutput),
+    messages: snapshot.messages.map(teamSnapshotMessageRecordOutput),
+    message_deliveries: messageDeliveries,
+    messageDeliveries,
+    stats: snapshot.stats,
+    generated_at: snapshot.generatedAt,
+    generatedAt: snapshot.generatedAt,
+  });
+}
+
+function teamSnapshotMemberRecordOutput(member: TeamSnapshotRecord["members"][number]): Record<string, unknown> {
+  return pruneUndefined({
+    ...teamMemberRecordOutput(member),
+    task_ids: member.taskIds,
+    taskIds: member.taskIds,
+    delivery_ids: member.deliveryIds,
+    deliveryIds: member.deliveryIds,
+    current_task: member.currentTask ? teamTaskRecordOutput(member.currentTask) : undefined,
+    currentTask: member.currentTask ? teamTaskRecordOutput(member.currentTask) : undefined,
+  });
+}
+
+function teamSnapshotTaskRecordOutput(task: TeamSnapshotRecord["tasks"][number]): Record<string, unknown> {
+  return pruneUndefined({
+    ...teamTaskRecordOutput(task),
+    blocked_by: task.blockedBy,
+    blockedBy: task.blockedBy,
+    blocks: task.blocks,
+    ready: task.ready,
+    message_ids: task.messageIds,
+    messageIds: task.messageIds,
+    owner: task.owner ? teamMemberRecordOutput(task.owner) : undefined,
+    dispatch: task.dispatch,
+  });
+}
+
+function teamSnapshotMessageRecordOutput(message: TeamSnapshotRecord["messages"][number]): Record<string, unknown> {
+  return pruneUndefined({
+    ...teamMessageRecordOutput(message),
+    deliveries: message.deliveries.map(teamMessageDeliveryRecordOutput),
+  });
+}
+
 function teamMemberRecordOutput(member: TeamMemberRecord): Record<string, unknown> {
   return pruneUndefined({
     team_id: member.teamId,
@@ -1055,6 +1155,32 @@ function teamMessageRecordOutput(message: TeamMessageRecord): Record<string, unk
     metadata: message.metadata,
     created_at: message.createdAt,
     createdAt: message.createdAt,
+  });
+}
+
+function teamMessageDeliveryRecordOutput(delivery: TeamSnapshotRecord["messageDeliveries"][number]): Record<string, unknown> {
+  return pruneUndefined({
+    mailbox_message_id: delivery.mailboxMessageId,
+    mailboxMessageId: delivery.mailboxMessageId,
+    team_id: delivery.teamId,
+    teamId: delivery.teamId,
+    team_message_id: delivery.teamMessageId,
+    teamMessageId: delivery.teamMessageId,
+    path: delivery.path,
+    status: delivery.status,
+    trigger_turn: delivery.triggerTurn,
+    triggerTurn: delivery.triggerTurn,
+    child_session_id: delivery.childSessionId,
+    childSessionId: delivery.childSessionId,
+    child_thread_id: delivery.childThreadId,
+    childThreadId: delivery.childThreadId,
+    error: delivery.error,
+    queued_at: delivery.queuedAt,
+    queuedAt: delivery.queuedAt,
+    updated_at: delivery.updatedAt,
+    updatedAt: delivery.updatedAt,
+    delivered_at: delivery.deliveredAt,
+    deliveredAt: delivery.deliveredAt,
   });
 }
 

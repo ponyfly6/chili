@@ -41,6 +41,7 @@ import type {
   TeamTaskReconcileResult,
   TeamTaskSyncInput,
   TeamTaskSyncResult,
+  TeamSnapshot,
   UpdateTeamTaskInput,
 } from "@chili/core";
 import type { EventPublisher, EventStore } from "@chili/store";
@@ -85,6 +86,7 @@ export interface RuntimeAgentTreeService {
 
 export interface RuntimeTeamService {
   listTeams(): Promise<TeamRow[]>;
+  snapshot(teamId: TeamId): Promise<TeamSnapshot>;
   members(teamId: TeamId): Promise<TeamMemberRow[]>;
   tasks(teamId: TeamId): Promise<TeamTaskRow[]>;
   messages(teamId: TeamId): Promise<TeamMessageRow[]>;
@@ -253,6 +255,11 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "teamMembers") {
         const teams = requireTeams(options);
         return json(await teams.members(route.teamId));
+      }
+
+      if (route.name === "teamSnapshot") {
+        const teams = requireTeams(options);
+        return json(await teams.snapshot(route.teamId));
       }
 
       if (route.name === "teamAddMember") {
@@ -440,6 +447,7 @@ type Route =
   | { name: "listTeams" }
   | { name: "createTeam" }
   | { name: "teamReconcileDispatches"; teamId?: TeamId }
+  | { name: "teamSnapshot"; teamId: TeamId }
   | { name: "teamMembers"; teamId: TeamId }
   | { name: "teamAddMember"; teamId: TeamId }
   | { name: "teamTasks"; teamId: TeamId }
@@ -647,6 +655,7 @@ function routeRequest(method: string, pathname: string): Route {
     const resource = teamRoute[2];
     const resourceId = teamRoute[3];
     const action = teamRoute[4];
+    if (resource === "snapshot" && method === "GET" && !resourceId) return { name: "teamSnapshot", teamId };
     if (resource === "members") {
       if (method === "GET" && !resourceId) return { name: "teamMembers", teamId };
       if (method === "POST" && !resourceId) return { name: "teamAddMember", teamId };

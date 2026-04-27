@@ -44,6 +44,7 @@ import {
   createTeamMemberListTool,
   createTeamMessageListTool,
   createTeamMessageSendTool,
+  createTeamSnapshotTool,
   createTeamTaskAssignTool,
   createTeamTaskClaimTool,
   createTeamTaskCreateTool,
@@ -61,6 +62,7 @@ import {
   type TeamMemberRecord,
   type TeamMessageRecord,
   type TeamRecord,
+  type TeamSnapshotRecord,
   type TeamTaskClaimRecord,
   type TeamTaskDispatchRecord,
   type TeamTaskDispatchToolController,
@@ -320,6 +322,7 @@ function createChildToolRegistry(): InMemoryToolRegistry {
 function registerTeamTools(registry: InMemoryToolRegistry, controller: TeamToolController): void {
   registry.register(createTeamCreateTool(controller));
   registry.register(createTeamListTool(controller));
+  registry.register(createTeamSnapshotTool(controller));
   registry.register(createTeamMemberAddTool(controller));
   registry.register(createTeamMemberListTool(controller));
   registry.register(createTeamTaskCreateTool(controller));
@@ -436,6 +439,9 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
         (await teams.listTeams()).filter((team) => (input.status ? team.status === input.status : true)).map(toTeamRecord),
         input.limit,
       );
+    },
+    async snapshotTeam(input) {
+      return toTeamSnapshotRecord(await teams.snapshot(input.teamId as TeamId));
     },
     async addMember(input, context) {
       const addInput: Parameters<TeamControlService["addMember"]>[0] = {
@@ -651,6 +657,41 @@ function toTeamRecord(team: TeamRow): TeamRecord {
   };
 }
 
+function toTeamSnapshotRecord(snapshot: Awaited<ReturnType<TeamControlService["snapshot"]>>): TeamSnapshotRecord {
+  return {
+    team: toTeamRecord(snapshot.team),
+    members: snapshot.members.map((member) => {
+      const record = {
+        ...toTeamMemberRecord(member),
+        taskIds: member.taskIds,
+        deliveryIds: member.deliveryIds,
+      };
+      return member.currentTask ? { ...record, currentTask: toTeamTaskRecord(member.currentTask) } : record;
+    }),
+    tasks: snapshot.tasks.map((task) => {
+      const record = {
+        ...toTeamTaskRecord(task),
+        blockedBy: task.blockedBy,
+        blocks: task.blocks,
+        ready: task.ready,
+        messageIds: task.messageIds,
+      };
+      return {
+        ...record,
+        ...(task.owner ? { owner: toTeamMemberRecord(task.owner) } : {}),
+        ...(task.dispatch !== undefined ? { dispatch: task.dispatch } : {}),
+      };
+    }),
+    messages: snapshot.messages.map((message) => ({
+      ...toTeamMessageRecord(message),
+      deliveries: message.deliveries.map(toTeamMessageDeliveryRecord),
+    })),
+    messageDeliveries: snapshot.messageDeliveries.map(toTeamMessageDeliveryRecord),
+    stats: snapshot.stats,
+    generatedAt: snapshot.generatedAt,
+  };
+}
+
 function toTeamMemberRecord(member: TeamMemberRow): TeamMemberRecord {
   return {
     teamId: member.teamId,
@@ -758,6 +799,25 @@ function toTeamMessageRecord(message: TeamMessageRow): TeamMessageRecord {
     ...(message.summary ? { summary: message.summary } : {}),
     ...(message.metadata ? { metadata: message.metadata } : {}),
     createdAt: message.createdAt,
+  };
+}
+
+function toTeamMessageDeliveryRecord(
+  delivery: Awaited<ReturnType<TeamControlService["snapshot"]>>["messageDeliveries"][number],
+): TeamSnapshotRecord["messageDeliveries"][number] {
+  return {
+    mailboxMessageId: delivery.mailboxMessageId,
+    teamId: delivery.teamId,
+    teamMessageId: delivery.teamMessageId,
+    path: delivery.path,
+    status: delivery.status,
+    triggerTurn: delivery.triggerTurn,
+    ...(delivery.childSessionId ? { childSessionId: delivery.childSessionId } : {}),
+    ...(delivery.childThreadId ? { childThreadId: delivery.childThreadId } : {}),
+    ...(delivery.error ? { error: delivery.error } : {}),
+    queuedAt: delivery.queuedAt,
+    updatedAt: delivery.updatedAt,
+    ...(delivery.deliveredAt ? { deliveredAt: delivery.deliveredAt } : {}),
   };
 }
 

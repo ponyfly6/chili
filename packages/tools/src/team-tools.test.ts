@@ -19,6 +19,7 @@ import {
   createTeamMemberListTool,
   createTeamMessageListTool,
   createTeamMessageSendTool,
+  createTeamSnapshotTool,
   createTeamTaskAssignTool,
   createTeamTaskClaimTool,
   createTeamTaskCreateTool,
@@ -39,6 +40,8 @@ import type {
   TeamMessageRecord,
   TeamMessageSendToolInput,
   TeamRecord,
+  TeamSnapshotRecord,
+  TeamSnapshotToolInput,
   TeamTaskAssignToolInput,
   TeamTaskClaimRecord,
   TeamTaskClaimToolInput,
@@ -271,6 +274,19 @@ test("team read tools forward filters and emit list-shaped JSON", async () => {
     { teamId: "team_core", path: "/worker", taskId: "task_team", limit: 4 },
   ]);
 
+  const snapshot = await executor.execute(toolInput("team_status", { team_id: "team_core" }));
+  expect(snapshot.status).toBe("completed");
+  if (snapshot.status === "completed") {
+    expect(JSON.parse(snapshot.result.output)).toMatchObject({
+      team: { team_id: "team_core" },
+      stats: { memberCount: 1, taskCount: 1, messageCount: 1, deliveryCount: 1 },
+      members: [{ path: "/worker", task_ids: ["task_team"], delivery_ids: ["mailbox_team"] }],
+      tasks: [{ task_id: "task_team", ready: true, message_ids: ["message_team"] }],
+      messages: [{ message_id: "message_team", deliveries: [{ mailbox_message_id: "mailbox_team", status: "queued" }] }],
+    });
+  }
+  expect(controller.snapshotInputs).toEqual([{ teamId: "team_core" }]);
+
   expect(approvals).toEqual([]);
 });
 
@@ -354,6 +370,7 @@ function registryWithTeamTools(controller: TeamToolController & TeamTaskDispatch
   const registry = new InMemoryToolRegistry();
   registry.register(createTeamCreateTool(controller));
   registry.register(createTeamListTool(controller));
+  registry.register(createTeamSnapshotTool(controller));
   registry.register(createTeamMemberAddTool(controller));
   registry.register(createTeamMemberListTool(controller));
   registry.register(createTeamTaskCreateTool(controller));
@@ -399,6 +416,7 @@ function toolInput(toolName: string, input: unknown, callId?: ToolCallId): Execu
 class FakeTeamToolController implements TeamToolController, TeamTaskDispatchToolController {
   createTeamInputs: TeamCreateToolInput[] = [];
   teamListInputs: TeamListToolInput[] = [];
+  snapshotInputs: TeamSnapshotToolInput[] = [];
   memberAddInputs: TeamMemberAddToolInput[] = [];
   memberListInputs: TeamMemberListToolInput[] = [];
   taskCreateInputs: TeamTaskCreateToolInput[] = [];
@@ -420,6 +438,11 @@ class FakeTeamToolController implements TeamToolController, TeamTaskDispatchTool
   async listTeams(input: TeamListToolInput): Promise<TeamRecord[]> {
     this.teamListInputs.push(input);
     return [teamRecord({ name: "Core team", leadPath: "/lead" })];
+  }
+
+  async snapshotTeam(input: TeamSnapshotToolInput): Promise<TeamSnapshotRecord> {
+    this.snapshotInputs.push(input);
+    return snapshotRecord(input.teamId);
   }
 
   async addMember(input: TeamMemberAddToolInput): Promise<TeamMemberRecord> {
@@ -586,6 +609,69 @@ function messageRecord(input: TeamMessageSendToolInput): TeamMessageRecord {
     ...(input.delivery ? { delivery: input.delivery } : {}),
     ...(input.taskId ? { taskId: input.taskId } : {}),
     createdAt: 1,
+  };
+}
+
+function snapshotRecord(teamId: string): TeamSnapshotRecord {
+  const member = memberRecord({ teamId, path: "/worker", name: "Worker", role: "implementation" });
+  const task = taskRecord({ teamId, taskId: "task_team", ownerPath: "/worker", title: "Implement team tools", status: "pending" });
+  const delivery = {
+    mailboxMessageId: "mailbox_team",
+    teamId,
+    teamMessageId: "message_team",
+    path: "/worker" as AgentPath,
+    status: "queued" as const,
+    triggerTurn: true,
+    queuedAt: 1,
+    updatedAt: 1,
+  };
+  return {
+    team: teamRecord({ teamId, name: "Core team", leadPath: "/lead" }),
+    members: [
+      {
+        ...member,
+        taskIds: [task.taskId],
+        deliveryIds: [delivery.mailboxMessageId],
+      },
+    ],
+    tasks: [
+      {
+        ...task,
+        blockedBy: [],
+        blocks: [],
+        ready: true,
+        messageIds: ["message_team"],
+        owner: member,
+      },
+    ],
+    messages: [
+      {
+        ...messageRecord({
+          teamId,
+          messageId: "message_team",
+          from: "/lead",
+          to: "/worker",
+          content: "Status check",
+          delivery: "triggerTurn",
+          taskId: task.taskId,
+        }),
+        deliveries: [delivery],
+      },
+    ],
+    messageDeliveries: [delivery],
+    stats: {
+      memberCount: 1,
+      taskCount: 1,
+      messageCount: 1,
+      deliveryCount: 1,
+      membersByStatus: { idle: 1 },
+      tasksByStatus: { pending: 1 },
+      messagesByDeliveryStatus: { queued: 1 },
+      deliveriesByStatus: { queued: 1 },
+      readyTaskIds: [task.taskId],
+      blockedTaskIds: [],
+    },
+    generatedAt: 1,
   };
 }
 
