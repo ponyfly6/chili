@@ -94,6 +94,8 @@ interface OpenAIUsage {
   prompt_tokens?: number | null;
   completion_tokens?: number | null;
   total_tokens?: number | null;
+  prompt_cache_hit_tokens?: number | null;
+  prompt_cache_miss_tokens?: number | null;
   prompt_tokens_details?: {
     cached_tokens?: number | null;
   };
@@ -282,10 +284,23 @@ export function buildOpenAICompletionsRequestBody(
   if ((options.stream ?? true) && compatibility.supportsUsageInStreaming) {
     body.stream_options = { include_usage: true };
   }
+  if (options.reasoning !== undefined) applyReasoningOptions(body, compatibility, options.reasoning);
 
   const tools = toOpenAITools(input.tools ?? []);
   if (tools.length > 0) body.tools = tools;
   return body;
+}
+
+function applyReasoningOptions(
+  body: Record<string, unknown>,
+  compatibility: ChatCompletionsCompatibility,
+  reasoning: boolean,
+): void {
+  if (compatibility.reasoningParameterStyle !== "deepseek") return;
+  body.thinking = { type: reasoning ? "enabled" : "disabled" };
+  if (reasoning && compatibility.supportsReasoningEffort) {
+    body.reasoning_effort = compatibility.reasoningEffortMap.high ?? "high";
+  }
 }
 
 export function resolveChatCompletionsUrl(baseUrl: string): string {
@@ -512,6 +527,7 @@ function toModelUsage(usage: OpenAIUsage | undefined): ModelUsage | undefined {
   if (usage.prompt_tokens_details?.cached_tokens != null) {
     modelUsage.cacheReadInputTokens = usage.prompt_tokens_details.cached_tokens;
   }
+  if (usage.prompt_cache_hit_tokens != null) modelUsage.cacheReadInputTokens = usage.prompt_cache_hit_tokens;
   modelUsage.totalTokens =
     usage.total_tokens ??
     (modelUsage.inputTokens ?? 0) + (modelUsage.outputTokens ?? 0) + (modelUsage.cacheReadInputTokens ?? 0);

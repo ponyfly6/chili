@@ -120,7 +120,7 @@ function detectChatCompletionsCompatibility(input: CompatibilityResolutionInput)
     supportsReasoningEffort: !isXai && !isZai,
     reasoningEffortMap: detectReasoningEffortMap(model, isDeepSeek, isGroq),
     supportsUsageInStreaming: true,
-    maxTokensField: isChutes ? "max_tokens" : "max_completion_tokens",
+    maxTokensField: isDeepSeek || isChutes ? "max_tokens" : "max_completion_tokens",
     requiresReasoningContentOnAssistantMessages: isDeepSeek,
     reasoningParameterStyle: detectReasoningParameterStyle(provider, baseUrl, isDeepSeek, isZai),
     toolCallDeltaMode: isZai ? "zai-tool-stream" : "standard",

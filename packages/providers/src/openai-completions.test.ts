@@ -116,6 +116,8 @@ test("uses compatibility settings when shaping OpenAI-compatible requests", () =
     model: "deepseek-reasoner",
     max_tokens: 64,
     stream: true,
+    thinking: { type: "enabled" },
+    reasoning_effort: "high",
     messages: [{ role: "developer", content: "runtime\n\nsystem" }],
   });
   expect(body).not.toHaveProperty("store");

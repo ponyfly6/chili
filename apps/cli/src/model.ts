@@ -1,15 +1,18 @@
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "@chili/core";
 import { createMiniMaxM27HighspeedRouter } from "@chili/core";
 import {
+  DEEPSEEK_OPENAI_BASE_URL,
+  DEEPSEEK_V4_PRO_MODEL,
   MINIMAX_ANTHROPIC_BASE_URL,
   MINIMAX_M27_HIGHSPEED_MODEL,
+  readDeepSeekEnvironment,
   readMiniMaxEnvironment,
 } from "@chili/providers";
 import { FakeModelRouter } from "./fake-model.js";
 
-export type CliModelName = "fake" | "minimax" | "legacy-minimax";
+export type CliModelName = "fake" | "minimax" | "deepseek" | "legacy-minimax";
 
-interface MiniMaxRouterOptions {
+interface ProviderRouterOptions {
   apiKey?: string;
   baseUrl?: string;
   model?: string;
@@ -17,10 +20,9 @@ interface MiniMaxRouterOptions {
   fetch?: typeof fetch;
 }
 
-type CliModelOptions = MiniMaxRouterOptions;
+type CliModelOptions = ProviderRouterOptions;
 
-type MiniMaxRouterFactory = (options?: MiniMaxRouterOptions) => ModelRouter | Promise<ModelRouter>;
-type ProviderMiniMaxFactory = (options?: MiniMaxRouterOptions) => ProviderModelOrProvider | Promise<ProviderModelOrProvider>;
+type ProviderRouterFactory = (options?: ProviderRouterOptions) => ProviderModelOrProvider | Promise<ProviderModelOrProvider>;
 
 interface ProviderModel {
   stream(input: ProviderModelStreamInput): AsyncIterable<ProviderModelStreamEvent>;
@@ -53,34 +55,45 @@ const DEFAULT_MAX_TOKENS = 4096;
 
 export async function createCliModel(name: CliModelName, options: CliModelOptions = {}): Promise<ModelRouter> {
   if (name === "fake") return new FakeModelRouter();
+  if (name === "deepseek") return createProvidersDeepSeekRouter(readDeepSeekOptionsFromEnv(options));
   const miniMaxOptions = readMiniMaxOptionsFromEnv(options);
   if (name === "legacy-minimax") return createMiniMaxM27HighspeedRouter(miniMaxOptions);
   return createProvidersMiniMaxRouter(miniMaxOptions);
 }
 
-async function createProvidersMiniMaxRouter(options: MiniMaxRouterOptions): Promise<ModelRouter> {
-  const providers = await loadProvidersModule();
+async function createProvidersMiniMaxRouter(options: ProviderRouterOptions): Promise<ModelRouter> {
+  const providers = await loadProvidersModule("minimax");
   const createRouter = resolveMiniMaxFactory(providers);
   const modelOrProvider = await createRouter(options);
-  return toModelRouter(modelOrProvider, options.model);
+  return toModelRouter(modelOrProvider, options.model, "MiniMax");
 }
 
-async function loadProvidersModule(): Promise<Record<string, unknown>> {
+async function createProvidersDeepSeekRouter(options: ProviderRouterOptions): Promise<ModelRouter> {
+  const providers = await loadProvidersModule("deepseek");
+  const createRouter = resolveDeepSeekFactory(providers);
+  const modelOrProvider = await createRouter(options);
+  return toModelRouter(modelOrProvider, options.model, "DeepSeek");
+}
+
+async function loadProvidersModule(providerName: "minimax" | "deepseek"): Promise<Record<string, unknown>> {
   try {
     return (await import(PROVIDERS_PACKAGE_NAME)) as Record<string, unknown>;
   } catch (error) {
+    const fallback = providerName === "minimax" ? " Use --model legacy-minimax to temporarily use the old @chili/core router," : "";
     throw new Error(
       [
-        "Unable to load @chili/providers for --model minimax.",
-        "Use --model legacy-minimax to temporarily use the old @chili/core router,",
+        `Unable to load @chili/providers for --model ${providerName}.`,
+        fallback,
         "or --model fake for local smoke tests until the providers package is merged.",
-      ].join(" "),
+      ]
+        .filter(Boolean)
+        .join(" "),
       { cause: error },
     );
   }
 }
 
-function resolveMiniMaxFactory(providers: Record<string, unknown>): ProviderMiniMaxFactory {
+function resolveMiniMaxFactory(providers: Record<string, unknown>): ProviderRouterFactory {
   const defaultExport = providers.default;
   const defaultObject = isRecord(defaultExport) ? defaultExport : {};
   const candidates = [
@@ -99,23 +112,56 @@ function resolveMiniMaxFactory(providers: Record<string, unknown>): ProviderMini
       "@chili/providers must export createMiniMaxRouter(options) or another compatible MiniMax router factory",
     );
   }
-  return factory as ProviderMiniMaxFactory;
+  return factory as ProviderRouterFactory;
 }
 
-function toModelRouter(modelOrProvider: ProviderModelOrProvider, modelName?: string): ModelRouter {
+function resolveDeepSeekFactory(providers: Record<string, unknown>): ProviderRouterFactory {
+  const defaultExport = providers.default;
+  const defaultObject = isRecord(defaultExport) ? defaultExport : {};
+  const candidates = [
+    providers.createDeepSeekRouter,
+    providers.createDeepSeekV4Model,
+    providers.createDeepSeekProvider,
+    defaultObject.createDeepSeekRouter,
+    defaultObject.createDeepSeekV4Model,
+    defaultObject.createDeepSeekProvider,
+    typeof defaultExport === "function" ? defaultExport : undefined,
+  ];
+  const factory = candidates.find((candidate) => typeof candidate === "function");
+  if (!factory) {
+    throw new Error("@chili/providers must export createDeepSeekRouter(options) or another compatible DeepSeek factory");
+  }
+  return factory as ProviderRouterFactory;
+}
+
+function toModelRouter(modelOrProvider: ProviderModelOrProvider, modelName: string | undefined, providerName: string): ModelRouter {
   if (isProviderModelProvider(modelOrProvider)) {
     return new ProviderModelRouterAdapter(modelOrProvider.getModel(modelName));
   }
   if (isProviderModel(modelOrProvider)) return new ProviderModelRouterAdapter(modelOrProvider);
-  throw new Error("@chili/providers MiniMax factory did not return a model or provider-compatible object");
+  throw new Error(`@chili/providers ${providerName} factory did not return a model or provider-compatible object`);
 }
 
-function readMiniMaxOptionsFromEnv(input: CliModelOptions): MiniMaxRouterOptions {
-  const options: MiniMaxRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_MAX_TOKENS };
+function readMiniMaxOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
+  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_MAX_TOKENS };
   const env = readMiniMaxEnvironment();
   const resolvedApiKey = input.apiKey ?? env.apiKey;
   const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? MINIMAX_ANTHROPIC_BASE_URL;
   const resolvedModel = input.model ?? env.model ?? MINIMAX_M27_HIGHSPEED_MODEL;
+
+  if (resolvedApiKey) options.apiKey = resolvedApiKey;
+  if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
+  if (resolvedModel) options.model = resolvedModel;
+  if (input.fetch) options.fetch = input.fetch;
+  return options;
+}
+
+function readDeepSeekOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
+  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_MAX_TOKENS };
+  const env = readDeepSeekEnvironment();
+  const resolvedApiKey = input.apiKey ?? env.apiKey;
+  const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? DEEPSEEK_OPENAI_BASE_URL;
+  const resolvedModel = input.model ?? env.model ?? DEEPSEEK_V4_PRO_MODEL;
 
   if (resolvedApiKey) options.apiKey = resolvedApiKey;
   if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;

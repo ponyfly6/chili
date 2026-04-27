@@ -1,6 +1,14 @@
 import { expect, test } from "bun:test";
 import { parseArgs } from "./args.js";
 
+test("parses DeepSeek as a CLI model", () => {
+  expect(parseArgs(["--model", "deepseek", "hello"])).toMatchObject({
+    command: "run",
+    model: "deepseek",
+    prompt: "hello",
+  });
+});
+
 test("parses team status and nested team view commands", () => {
   expect(parseArgs(["team", "status", "team_1", "--json"])).toMatchObject({
     command: "team",

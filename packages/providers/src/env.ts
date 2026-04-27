@@ -1,4 +1,4 @@
-import { MINIMAX_PROVIDER_ID } from "./models.js";
+import { DEEPSEEK_PROVIDER_ID, MINIMAX_PROVIDER_ID } from "./models.js";
 
 export type EnvironmentSource = Record<string, string | undefined>;
 
@@ -23,7 +23,14 @@ export const MINIMAX_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
   model: ["MINIMAX_MODEL", "ANTHROPIC_MODEL"],
 };
 
+export const DEEPSEEK_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
+  apiKey: ["DEEPSEEK_API_KEY"],
+  baseUrl: ["DEEPSEEK_BASE_URL"],
+  model: ["DEEPSEEK_MODEL"],
+};
+
 const PROVIDER_ENVIRONMENT: Record<string, ProviderEnvironmentSpec> = {
+  [DEEPSEEK_PROVIDER_ID]: DEEPSEEK_ENVIRONMENT,
   [MINIMAX_PROVIDER_ID]: MINIMAX_ENVIRONMENT,
 };
 
@@ -38,6 +45,10 @@ export function readProviderEnvironment(
 
 export function readMiniMaxEnvironment(env: EnvironmentSource = currentEnvironment()): ProviderEnvironment {
   return readEnvironmentSpec(MINIMAX_ENVIRONMENT, env);
+}
+
+export function readDeepSeekEnvironment(env: EnvironmentSource = currentEnvironment()): ProviderEnvironment {
+  return readEnvironmentSpec(DEEPSEEK_ENVIRONMENT, env);
 }
 
 export function findConfiguredEnvironmentNames(

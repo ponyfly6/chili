@@ -4,8 +4,88 @@ export const MINIMAX_PROVIDER_ID = "minimax";
 export const MINIMAX_M27_MODEL = "MiniMax-M2.7";
 export const MINIMAX_M27_HIGHSPEED_MODEL = "MiniMax-M2.7-highspeed";
 export const MINIMAX_ANTHROPIC_BASE_URL = "https://api.minimaxi.com/anthropic";
+export const DEEPSEEK_PROVIDER_ID = "deepseek";
+export const DEEPSEEK_V4_PRO_MODEL = "deepseek-v4-pro";
+export const DEEPSEEK_V4_FLASH_MODEL = "deepseek-v4-flash";
+export const DEEPSEEK_OPENAI_BASE_URL = "https://api.deepseek.com";
+export const DEEPSEEK_ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic";
 
 const BUILTIN_MODELS = [
+  {
+    provider: DEEPSEEK_PROVIDER_ID,
+    model: DEEPSEEK_V4_PRO_MODEL,
+    displayName: "DeepSeek V4 Pro",
+    apiFamily: "openai-completions",
+    baseUrl: DEEPSEEK_OPENAI_BASE_URL,
+    default: true,
+    inputCapabilities: ["text"],
+    contextWindowTokens: 1048576,
+    maxOutputTokens: 393216,
+    capabilities: {
+      streaming: true,
+      reasoning: true,
+      toolCalls: true,
+      toolCallDeltas: true,
+      usage: true,
+      responseId: true,
+    },
+    compatibility: {
+      chatCompletions: {
+        supportsStore: false,
+        supportsDeveloperRole: false,
+        supportsReasoningEffort: true,
+        reasoningEffortMap: {
+          minimal: "high",
+          low: "high",
+          medium: "high",
+          high: "high",
+          xhigh: "max",
+        },
+        supportsUsageInStreaming: true,
+        maxTokensField: "max_tokens",
+        requiresReasoningContentOnAssistantMessages: true,
+        reasoningParameterStyle: "deepseek",
+        toolCallDeltaMode: "standard",
+      },
+    },
+  },
+  {
+    provider: DEEPSEEK_PROVIDER_ID,
+    model: DEEPSEEK_V4_FLASH_MODEL,
+    displayName: "DeepSeek V4 Flash",
+    apiFamily: "openai-completions",
+    baseUrl: DEEPSEEK_OPENAI_BASE_URL,
+    inputCapabilities: ["text"],
+    contextWindowTokens: 1048576,
+    maxOutputTokens: 393216,
+    capabilities: {
+      streaming: true,
+      reasoning: true,
+      toolCalls: true,
+      toolCallDeltas: true,
+      usage: true,
+      responseId: true,
+    },
+    compatibility: {
+      chatCompletions: {
+        supportsStore: false,
+        supportsDeveloperRole: false,
+        supportsReasoningEffort: true,
+        reasoningEffortMap: {
+          minimal: "high",
+          low: "high",
+          medium: "high",
+          high: "high",
+          xhigh: "max",
+        },
+        supportsUsageInStreaming: true,
+        maxTokensField: "max_tokens",
+        requiresReasoningContentOnAssistantMessages: true,
+        reasoningParameterStyle: "deepseek",
+        toolCallDeltaMode: "standard",
+      },
+    },
+  },
   {
     provider: MINIMAX_PROVIDER_ID,
     model: MINIMAX_M27_HIGHSPEED_MODEL,

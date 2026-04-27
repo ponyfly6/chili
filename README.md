@@ -86,6 +86,22 @@ MINIMAX_MODEL=MiniMax-M2.7-highspeed
 bun run chili -- --model legacy-minimax "hello"
 ```
 
+DeepSeek V4 使用 OpenAI-compatible 接入：
+
+```bash
+DEEPSEEK_API_KEY=... bun run chili -- --model deepseek "总结这个仓库"
+```
+
+DeepSeek 配置优先使用这些环境变量：
+
+```bash
+DEEPSEEK_API_KEY=
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-v4-pro
+```
+
+可选模型为 `deepseek-v4-pro` 和 `deepseek-v4-flash`。官方 Anthropic 格式端点为 `https://api.deepseek.com/anthropic`，当前 CLI 默认使用 OpenAI 格式端点。
+
 ---
 
 ## 开发

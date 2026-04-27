@@ -57,6 +57,7 @@ test("detects chat completions differences from provider and baseUrl", () => {
     supportsStore: false,
     supportsDeveloperRole: false,
     requiresReasoningContentOnAssistantMessages: true,
+    maxTokensField: "max_tokens",
     reasoningParameterStyle: "deepseek",
     reasoningEffortMap: {
       minimal: "high",
