@@ -5,6 +5,7 @@ import { runProcess } from "@chili/tools";
 import type { LocalSubagentTaskResult } from "./subagent.js";
 import type { TeamTaskSubagentRunner } from "./team-dispatcher.js";
 import { TeamTaskNotFoundError, type TeamControlService } from "./team.js";
+import { mergeMergeMetadata, worktreeMetadata } from "./team-worktree.js";
 import type { WorkerToolPolicyTemplate } from "./worker-policy.js";
 
 const VERIFICATION_METADATA_KEY = "verification";
@@ -153,7 +154,8 @@ export class TeamTaskVerificationService {
       return { status: "skipped", reason: "missing_session", teamTask: task };
     }
 
-    const cwd = input.cwd ?? this.options.cwd;
+    const worktree = worktreeMetadata(task.metadata);
+    const cwd = worktree?.path ?? input.cwd ?? this.options.cwd;
     const member = members.find((item) => item.path === task.ownerPath);
     throwIfAborted(input.signal);
     const gitDiffInput: TeamTaskVerifierGitDiffInput = { team, task, cwd };
@@ -183,7 +185,7 @@ export class TeamTaskVerificationService {
       parentPath: task.ownerPath,
       cwd,
       taskName: `Verify ${task.title}`,
-      prompt: verifierPrompt(verifierPromptInput({ team, task: pendingTask, member, gitDiff, testCommands })),
+      prompt: verifierPrompt(verifierPromptInput({ team, task: pendingTask, member, gitDiff, testCommands, worktreePath: worktree?.path })),
       mode: "one_shot" as const,
       workerPolicy: verifierWorkerPolicy({
         teamId: task.teamId,
@@ -200,19 +202,29 @@ export class TeamTaskVerificationService {
     const feedback = verdict.feedback;
 
     if (verdict.status === "passed") {
+      const verificationMetadata = mergeVerificationMetadata(pendingTask.metadata, verificationFields({
+        status: "passed",
+        verifierTaskId: verifierTask.taskId,
+        verifierRunId: verifierTask.runId,
+        verifierPath: verifierTask.path,
+        checkedAt,
+        feedback,
+        workerSummary: task.summary,
+        gitDiff,
+      }));
+      const metadata = worktree
+        ? mergeMergeMetadata(verificationMetadata, {
+            status: "pending",
+            createdAt: checkedAt,
+            worktreePath: worktree.path,
+            baseRef: worktree.baseRef,
+            diff: gitDiff,
+          })
+        : verificationMetadata;
       const acceptedTask = await this.options.teams.updateTask({
         teamId: task.teamId,
         taskId: task.id,
-        metadata: mergeVerificationMetadata(pendingTask.metadata, verificationFields({
-          status: "passed",
-          verifierTaskId: verifierTask.taskId,
-          verifierRunId: verifierTask.runId,
-          verifierPath: verifierTask.path,
-          checkedAt,
-          feedback,
-          workerSummary: task.summary,
-          gitDiff,
-        })),
+        metadata,
         sessionId: parentSessionId,
         ...(input.threadId ? { threadId: input.threadId } : {}),
       });
@@ -314,6 +326,7 @@ function verifierPrompt(input: {
   member?: TeamMemberRow;
   gitDiff: string;
   testCommands: string[];
+  worktreePath?: string;
 }): string {
   const writeScope = metadataStringArray(input.task.metadata, ["writeScope", "write_scope", "writeScopes", "write_scopes"]);
   return [
@@ -321,6 +334,7 @@ function verifierPrompt(input: {
     `Task title: ${input.task.title}`,
     input.task.description ? `Task description:\n${input.task.description}` : undefined,
     `Member: ${input.member?.path ?? input.task.ownerPath ?? "(unknown)"}`,
+    input.worktreePath ? `Isolated worktree: ${input.worktreePath}` : undefined,
     `Write scope: ${formatList(writeScope)}`,
     `Worker summary: ${input.task.summary ?? "(none)"}`,
     `Allowed test commands: ${formatList(input.testCommands)}`,
@@ -343,14 +357,16 @@ function verifierPromptInput(input: {
   member: TeamMemberRow | undefined;
   gitDiff: string;
   testCommands: string[];
-}): { team: TeamRow; task: TeamTaskRow; member?: TeamMemberRow; gitDiff: string; testCommands: string[] } {
-  const output: { team: TeamRow; task: TeamTaskRow; member?: TeamMemberRow; gitDiff: string; testCommands: string[] } = {
+  worktreePath: string | undefined;
+}): { team: TeamRow; task: TeamTaskRow; member?: TeamMemberRow; gitDiff: string; testCommands: string[]; worktreePath?: string } {
+  const output: { team: TeamRow; task: TeamTaskRow; member?: TeamMemberRow; gitDiff: string; testCommands: string[]; worktreePath?: string } = {
     team: input.team,
     task: input.task,
     gitDiff: input.gitDiff,
     testCommands: input.testCommands,
   };
   if (input.member) output.member = input.member;
+  if (input.worktreePath) output.worktreePath = input.worktreePath;
   return output;
 }
 

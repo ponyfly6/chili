@@ -13,6 +13,7 @@ import {
   TeamExecutionRunner,
   TeamTaskDispatchService,
   TeamTaskVerificationService,
+  TeamWorktreeService,
   defaultScopedWorkerPolicy,
   type WorkerToolPolicy,
 } from "@chili/core";
@@ -186,10 +187,15 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     store: eventStore,
     createId,
   });
+  const teamWorktrees = new TeamWorktreeService({
+    teams,
+    cwd,
+  });
   const teamDispatcher = new TeamTaskDispatchService({
     teams,
     subagents,
     store: eventStore,
+    worktrees: teamWorktrees,
     cwd,
   });
   const teamVerifier = new TeamTaskVerificationService({

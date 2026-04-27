@@ -18,6 +18,7 @@ import type {
 } from "@chili/store";
 import type { LocalSubagentMode, LocalSubagentTaskInput, LocalSubagentTaskResult } from "./subagent.js";
 import { TeamTaskNotFoundError, type TeamControlService } from "./team.js";
+import type { TeamWorktreeEnsureInput, TeamWorktreeEnsureResult } from "./team-worktree.js";
 import {
   SCOPED_WORKER_BASE_TOOLS,
   SCOPED_WORKER_EXECUTE_TOOLS,
@@ -31,12 +32,17 @@ export interface TeamTaskDispatchServiceOptions {
   teams: TeamControlService;
   subagents: TeamTaskSubagentRunner;
   store: SubagentProjectionStore;
+  worktrees?: TeamTaskWorktreeManager;
   cwd: string;
   now?: () => TimestampMs;
 }
 
 export interface TeamTaskSubagentRunner {
   spawnTask(input: LocalSubagentTaskInput): Promise<LocalSubagentTaskResult>;
+}
+
+export interface TeamTaskWorktreeManager {
+  ensureTaskWorktree(input: TeamWorktreeEnsureInput): Promise<TeamWorktreeEnsureResult>;
 }
 
 export interface TeamTaskDispatchInput {
@@ -162,6 +168,34 @@ export class TeamTaskDispatchService {
       return { status: "skipped", reason: dispatchPolicy.reason, teamTask: blockedTask };
     }
 
+    let dispatchTask = task;
+    let worktree: TeamWorktreeEnsureResult | undefined;
+    if (this.options.worktrees && taskNeedsWorktree(task)) {
+      try {
+        worktree = await this.ensureWorktree({
+          teamId: input.teamId,
+          taskId: input.taskId,
+          cwd: input.cwd ?? this.options.cwd,
+          sessionId: parentSessionId,
+          ...(input.threadId ? { threadId: input.threadId } : {}),
+          ...(input.signal ? { signal: input.signal } : {}),
+        });
+        dispatchTask = worktree.task;
+      } catch (error) {
+        const err = toError(error);
+        const blockedTask = await this.options.teams.updateTask({
+          teamId: input.teamId,
+          taskId: input.taskId,
+          status: "blocked",
+          error: `worktree_failed: ${err.message}`,
+          metadata: mergeDispatchMetadata(task.metadata, { policy: dispatchPolicy }),
+          sessionId: parentSessionId,
+          ...(input.threadId ? { threadId: input.threadId } : {}),
+        });
+        return { status: "skipped", reason: "blocked", teamTask: blockedTask };
+      }
+    }
+
     const claim = await this.options.teams.claimTask({
       teamId: input.teamId,
       taskId: input.taskId,
@@ -179,15 +213,20 @@ export class TeamTaskDispatchService {
     }
 
     const claimedTask = claim.task ?? (await this.requireTeamTask(input.teamId, input.taskId));
+    const claimedMetadata = claimedTask.metadata ?? {};
+    const taskForPrompt: TeamTaskRow = worktree && !claimedMetadata.worktree
+      ? { ...claimedTask, metadata: dispatchTask.metadata ?? {} }
+      : claimedTask;
     try {
       const mode = input.mode ?? "background";
+      const taskCwd = worktree?.path ?? input.cwd ?? this.options.cwd;
       const spawnInput: LocalSubagentTaskInput = {
         parentSessionId,
         ...(input.threadId ? { parentThreadId: input.threadId } : {}),
         parentPath: ownerPath,
-        cwd: input.cwd ?? this.options.cwd,
-        taskName: claimedTask.title,
-        prompt: input.prompt ?? teamTaskPrompt(claimedTask, ownerPath, dispatchPolicy),
+        cwd: taskCwd,
+        taskName: taskForPrompt.title,
+        prompt: input.prompt ?? teamTaskPrompt(taskForPrompt, ownerPath, dispatchPolicy, worktree?.path),
         mode,
         workerPolicy: workerPolicyForDispatch({
           teamId: input.teamId,
@@ -202,7 +241,7 @@ export class TeamTaskDispatchService {
       const policyMetadata = dispatchPolicyForMetadata(dispatchPolicy);
 
       const updateInput = {
-        task: claimedTask,
+        task: taskForPrompt,
         agentTask,
         mode,
         sessionId: parentSessionId,
@@ -228,6 +267,13 @@ export class TeamTaskDispatchService {
       });
       return { status: isAbortError(err) ? "cancelled" : "failed", teamTask };
     }
+  }
+
+  private async ensureWorktree(input: TeamWorktreeEnsureInput): Promise<TeamWorktreeEnsureResult> {
+    if (!this.options.worktrees) {
+      throw new Error("Team worktree service is not configured");
+    }
+    return this.options.worktrees.ensureTaskWorktree(input);
   }
 
   async syncTask(input: TeamTaskSyncInput): Promise<TeamTaskSyncResult> {
@@ -421,13 +467,20 @@ export class TeamTaskDispatchService {
   }
 }
 
-function teamTaskPrompt(task: TeamTaskRow, ownerPath: AgentPath, policy?: TeamTaskDispatchPolicyMetadata): string {
+function teamTaskPrompt(
+  task: TeamTaskRow,
+  ownerPath: AgentPath,
+  policy?: TeamTaskDispatchPolicyMetadata,
+  worktreePath?: string,
+): string {
   const verificationFeedback = failedVerificationFeedback(task.metadata);
   return [
     `Team task: ${task.teamId}/${task.id}`,
     `Assigned member path: ${ownerPath}`,
     `Title: ${task.title}`,
     task.description ? `Description:\n${task.description}` : undefined,
+    worktreePath ? `Isolated worktree: ${worktreePath}` : undefined,
+    worktreePath ? "Implement changes in this task worktree. Do not assume the main workspace has been modified." : undefined,
     verificationFeedback ? `Previous verifier feedback:\n${verificationFeedback}` : undefined,
     task.dependsOn.length > 0 ? `Dependencies: ${task.dependsOn.join(", ")}` : undefined,
     policy ? `Allowed tools: ${formatList(policy.allowedTools)}` : undefined,
@@ -438,6 +491,13 @@ function teamTaskPrompt(task: TeamTaskRow, ownerPath: AgentPath, policy?: TeamTa
   ]
     .filter((line): line is string => line !== undefined)
     .join("\n");
+}
+
+function taskNeedsWorktree(task: TeamTaskRow): boolean {
+  const writeScope = metadataStringArray(task.metadata, ["writeScope", "write_scope", "writeScopes", "write_scopes"]);
+  if ((writeScope?.length ?? 0) > 0) return true;
+  const requiredTools = normalizedToolNames(metadataStringArray(task.metadata, ["requiredTools", "required_tools", "toolScope", "tool_scope"]));
+  return requiredTools.some((tool) => tool === "edit" || tool === "write" || tool === "apply_patch" || tool === "bash");
 }
 
 function failedVerificationFeedback(metadata: Record<string, unknown> | undefined): string | undefined {

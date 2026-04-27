@@ -15,5 +15,6 @@ export * from "./task-control.js";
 export * from "./team-dispatcher.js";
 export * from "./team-execution-runner.js";
 export * from "./team-verifier.js";
+export * from "./team-worktree.js";
 export * from "./worker-policy.js";
 export * from "./team.js";
