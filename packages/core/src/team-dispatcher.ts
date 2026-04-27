@@ -331,6 +331,7 @@ export class TeamTaskDispatchService {
     };
     if (input.threadId) update.threadId = input.threadId;
     if (input.agentTask.summary) update.summary = input.agentTask.summary;
+    if (status === "completed" && input.task.error) update.error = "";
     if (input.agentTask.error) update.error = input.agentTask.error.message;
     return this.options.teams.updateTask(update);
   }
@@ -421,11 +422,13 @@ export class TeamTaskDispatchService {
 }
 
 function teamTaskPrompt(task: TeamTaskRow, ownerPath: AgentPath, policy?: TeamTaskDispatchPolicyMetadata): string {
+  const verificationFeedback = failedVerificationFeedback(task.metadata);
   return [
     `Team task: ${task.teamId}/${task.id}`,
     `Assigned member path: ${ownerPath}`,
     `Title: ${task.title}`,
     task.description ? `Description:\n${task.description}` : undefined,
+    verificationFeedback ? `Previous verifier feedback:\n${verificationFeedback}` : undefined,
     task.dependsOn.length > 0 ? `Dependencies: ${task.dependsOn.join(", ")}` : undefined,
     policy ? `Allowed tools: ${formatList(policy.allowedTools)}` : undefined,
     policy ? `Write scope: ${formatList(policy.writeScope)}` : undefined,
@@ -435,6 +438,15 @@ function teamTaskPrompt(task: TeamTaskRow, ownerPath: AgentPath, policy?: TeamTa
   ]
     .filter((line): line is string => line !== undefined)
     .join("\n");
+}
+
+function failedVerificationFeedback(metadata: Record<string, unknown> | undefined): string | undefined {
+  const verification = metadata?.verification;
+  if (!isRecord(verification)) return undefined;
+  if (verification.status !== "failed") return undefined;
+  return typeof verification.feedback === "string" && verification.feedback.trim().length > 0
+    ? verification.feedback.trim()
+    : undefined;
 }
 
 function dispatchBinding(metadata: Record<string, unknown> | undefined): TeamTaskAgentBinding | undefined {

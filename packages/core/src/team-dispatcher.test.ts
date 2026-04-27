@@ -78,6 +78,67 @@ test("dispatches a one-shot team task to a local subagent and syncs the final re
   }
 });
 
+test("includes failed verifier feedback in retry prompts and clears stale task errors on success", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-dispatch-verifier-feedback-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 150 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const sessionId = "session_team_dispatch_verifier_feedback" as SessionId;
+  const threadId = "thread_team_dispatch_verifier_feedback" as ThreadId;
+  const runner = new FakeLocalSubagentRunner({ status: "completed", summary: "Fixed verifier feedback" });
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
+
+    const team = await teams.createTeam({ sessionId, threadId, name: "feedback", leadPath });
+    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const task = await teams.createTask({
+      sessionId,
+      threadId,
+      teamId: team.id,
+      title: "Retry after verifier failure",
+      ownerPath: workerPath,
+      metadata: {
+        verification: {
+          status: "failed",
+          feedback: "VERDICT: failed\nAdd retry timeout coverage.",
+        },
+      },
+    });
+    await teams.updateTask({
+      sessionId,
+      threadId,
+      teamId: team.id,
+      taskId: task.id,
+      error: "verification_failed",
+    });
+
+    const result = await dispatcher.dispatchTask({
+      teamId: team.id,
+      taskId: task.id,
+      mode: "one_shot",
+      sessionId,
+      threadId,
+      cwd: dir,
+    });
+
+    expect(runner.runs[0]?.prompt).toContain("Previous verifier feedback:\nVERDICT: failed\nAdd retry timeout coverage.");
+    expect(result.teamTask).toMatchObject({
+      id: task.id,
+      status: "completed",
+      summary: "Fixed verifier feedback",
+    });
+    expect(result.teamTask.error).toBeUndefined();
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("syncs a background team task after the subagent finishes", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-dispatch-background-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
