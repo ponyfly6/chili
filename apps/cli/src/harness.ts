@@ -34,7 +34,11 @@ import {
   createMailboxListTool,
   createCompleteTaskTool,
   createEditTool,
+  createGitBranchTool,
+  createGitCommitTool,
   createGitDiffTool,
+  createGitStageTool,
+  createGitStatusTool,
   createGlobTool,
   createGrepTool,
   createReadFileTool,
@@ -383,7 +387,7 @@ function createToolRegistry(): InMemoryToolRegistry {
   registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());
   registry.register(createBashTool());
-  registry.register(createGitDiffTool());
+  registerGitTools(registry);
   registry.register(createToolSearchTool(registry));
   return registry;
 }
@@ -407,9 +411,17 @@ function createChildToolRegistry(): InMemoryToolRegistry {
   registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());
   registry.register(createBashTool());
-  registry.register(createGitDiffTool());
+  registerGitTools(registry);
   registry.register(createToolSearchTool(registry));
   return registry;
+}
+
+function registerGitTools(registry: InMemoryToolRegistry): void {
+  registry.register(createGitStatusTool());
+  registry.register(createGitDiffTool());
+  registry.register(createGitStageTool());
+  registry.register(createGitCommitTool());
+  registry.register(createGitBranchTool());
 }
 
 function registerTeamTools(registry: InMemoryToolRegistry, controller: TeamToolController): void {

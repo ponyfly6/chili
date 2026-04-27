@@ -22,6 +22,7 @@ export function createCliPermissionRules(yes: boolean): PermissionRule[] {
         { permission: "read", pattern: "*", action: "allow" },
         { permission: "glob", pattern: "*", action: "allow" },
         { permission: "grep", pattern: "*", action: "allow" },
+        { permission: "git_status", pattern: "*", action: "allow" },
         { permission: "git_diff", pattern: "*", action: "allow" },
       ];
 }
