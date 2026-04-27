@@ -300,6 +300,7 @@ export class TeamExecutionRunner {
           this.collectDispatch(dispatched, summary);
           if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
         } catch (error) {
+          if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
           summary.errors.push({
             teamId: input.teamId,
             taskId: task.id,

@@ -182,6 +182,7 @@ export class TeamTaskDispatchService {
         });
         dispatchTask = worktree.task;
       } catch (error) {
+        if (isSignalAbort(error, input.signal)) throw error;
         const err = toError(error);
         const blockedTask = await this.options.teams.updateTask({
           teamId: input.teamId,
@@ -194,6 +195,7 @@ export class TeamTaskDispatchService {
         });
         return { status: "skipped", reason: "blocked", teamTask: blockedTask };
       }
+      throwIfAborted(input.signal);
     }
 
     const claim = await this.options.teams.claimTask({
@@ -708,6 +710,21 @@ function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-function isAbortError(error: Error): boolean {
-  return error.name === "AbortError" || error.message.toLowerCase().includes("aborted");
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  const reason = signal.reason;
+  if (reason instanceof Error) throw reason;
+  const error = new Error("Team task dispatch aborted");
+  error.name = "AbortError";
+  throw error;
+}
+
+function isSignalAbort(error: unknown, signal: AbortSignal | undefined): boolean {
+  if (signal?.aborted) return true;
+  return isAbortError(error);
+}
+
+function isAbortError(error: unknown): boolean {
+  const err = toError(error);
+  return err.name === "AbortError" || err.message.toLowerCase().includes("aborted");
 }

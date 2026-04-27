@@ -196,7 +196,12 @@ test("verifier policy is read-only and denies write tools", async () => {
     taskId: "task_policy" as TaskId,
     memberPath: "/root/worker" as AgentPath,
     parentSessionId: "session_policy" as SessionId,
-    testCommands: ["bun test packages/core/src/team-verifier.test.ts", "rm -rf ."],
+    testCommands: [
+      "bun test packages/core/src/team-verifier.test.ts",
+      "bun test packages/core/src/team-verifier.test.ts; rm -rf .",
+      "npm run test > out.txt",
+      "rm -rf .",
+    ],
   });
   const read = createReadFileTool();
   const gitDiff = createGitDiffTool();
@@ -243,6 +248,23 @@ test("verifier policy is read-only and denies write tools", async () => {
       },
       validatedInput: { command: "bun test packages/core/src/other.test.ts" },
       approvalSpec: { permission: "bash", patterns: ["bun test packages/core/src/other.test.ts"], metadata: {} },
+      policy,
+      isReadOnly: actualReadOnly,
+    }),
+  ).rejects.toThrow("execute scope");
+  await expect(
+    authorizeToolByPolicy({
+      tool: bash,
+      executeInput: {
+        sessionId: "session_policy" as SessionId,
+        threadId: "thread_policy" as ThreadId,
+        turnId: "turn_policy" as TurnId,
+        toolName: "bash",
+        input: { command: "bun test packages/core/src/team-verifier.test.ts; rm -rf ." },
+        cwd: "/tmp",
+      },
+      validatedInput: { command: "bun test packages/core/src/team-verifier.test.ts; rm -rf ." },
+      approvalSpec: { permission: "bash", patterns: ["bun test packages/core/src/team-verifier.test.ts; rm -rf ."], metadata: {} },
       policy,
       isReadOnly: actualReadOnly,
     }),

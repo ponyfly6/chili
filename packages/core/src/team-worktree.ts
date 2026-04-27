@@ -94,6 +94,7 @@ export class TeamWorktreeService {
       args: ["worktree", "add", "--detach", path, baseRef],
       ...(input.signal ? { signal: input.signal } : {}),
     });
+    throwIfAborted(input.signal);
 
     const createdAt = Number(this.now());
     const metadata = mergeWorktreeMetadata(task.metadata, {
@@ -201,4 +202,13 @@ function pruneUndefined<T>(value: T): T {
     if (item !== undefined) output[key] = item;
   }
   return output as T;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  const reason = signal.reason;
+  if (reason instanceof Error) throw reason;
+  const error = new Error("Team worktree creation aborted");
+  error.name = "AbortError";
+  throw error;
 }

@@ -7,6 +7,7 @@ import { SqliteEventStore } from "@chili/store";
 import { runProcess } from "@chili/tools";
 import { LocalSubagentManager, type LocalSubagentRunInput, type LocalSubagentRunResult, type LocalSubagentRunner } from "./subagent.js";
 import { TeamTaskDispatchService, type TeamTaskWorktreeManager } from "./team-dispatcher.js";
+import { TeamExecutionRunner } from "./team-execution-runner.js";
 import { TeamControlService } from "./team.js";
 import { TeamTaskVerificationService } from "./team-verifier.js";
 import { TeamWorktreeService, taskMergeMetadata, worktreeMetadata } from "./team-worktree.js";
@@ -162,6 +163,52 @@ test("worktree creation failure blocks the task with a clear error", async () =>
   }
 });
 
+test("abort during worktree creation does not block the task", async () => {
+  const dir = await mkGitRepo("chili-team-worktree-abort-");
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 1335 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const sessionId = "session_team_worktree_abort" as SessionId;
+  const controller = new AbortController();
+  const runner = new CapturingRunner();
+  const worktrees: TeamTaskWorktreeManager = {
+    async ensureTaskWorktree() {
+      const error = new Error("git worktree add aborted");
+      error.name = "AbortError";
+      controller.abort(error);
+      throw error;
+    },
+  };
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, worktrees, cwd: dir, now });
+    const execution = new TeamExecutionRunner({ teams, dispatcher, cwd: dir, now });
+    const team = await teams.createTeam({ sessionId, name: "worktree-abort", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer", writeScope: ["packages/core"] });
+    const task = await teams.createTask({ sessionId, teamId: team.id, title: "Abort isolation", ownerPath: workerPath, metadata: { writeScope: ["packages/core"] } });
+
+    const summary = await execution.run({ teamId: team.id, sessionId, cwd: dir, signal: controller.signal });
+
+    expect(summary).toMatchObject({
+      stopReason: "aborted",
+      dispatched: [],
+      errors: [],
+    });
+    expect(runner.runs).toEqual([]);
+    const [storedTask] = await teams.tasks(team.id);
+    expect(storedTask).toMatchObject({ id: task.id, status: "pending" });
+    expect(storedTask?.error ?? "").toBe("");
+    expect(worktreeMetadata(storedTask?.metadata)).toBeUndefined();
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("verifier uses the task worktree and records pending merge diff without touching main workspace", async () => {
   const dir = await mkGitRepo("chili-team-worktree-verifier-");
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -222,6 +269,60 @@ test("verifier uses the task worktree and records pending merge diff without tou
   }
 });
 
+test("verifier merge diff includes staged and untracked worktree changes", async () => {
+  const dir = await mkGitRepo("chili-team-worktree-merge-diff-");
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 1350 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const sessionId = "session_team_worktree_merge_diff" as SessionId;
+  const threadId = "thread_team_worktree_merge_diff" as ThreadId;
+  const runner = new MixedChangeRunner();
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+    const worktrees = new TeamWorktreeService({ teams, cwd: dir, now });
+    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, worktrees, cwd: dir, now });
+    const verifier = new TeamTaskVerificationService({ teams, subagents, cwd: dir, now });
+    const team = await teams.createTeam({ sessionId, threadId, name: "worktree-merge-diff", leadPath });
+    await teams.addMember({
+      sessionId,
+      threadId,
+      teamId: team.id,
+      path: workerPath,
+      name: "worker",
+      role: "implementer",
+      writeScope: ["packages/core", "docs"],
+    });
+    const task = await teams.createTask({
+      sessionId,
+      threadId,
+      teamId: team.id,
+      title: "Create mixed worktree changes",
+      ownerPath: workerPath,
+      metadata: { writeScope: ["packages/core", "docs"] },
+    });
+
+    const dispatched = await dispatcher.dispatchTask({ teamId: team.id, taskId: task.id, mode: "one_shot", sessionId, threadId, cwd: dir });
+    const worktree = worktreeMetadata(dispatched.teamTask.metadata);
+    if (!worktree) throw new Error("expected task worktree metadata");
+    const verified = await verifier.verifyCompletedTasks({ teamId: team.id, sessionId, threadId, cwd: dir });
+
+    expect(verified.verified).toMatchObject([{ status: "passed" }]);
+    const [storedTask] = await teams.tasks(team.id);
+    const diff = taskMergeMetadata(storedTask?.metadata)?.diff ?? "";
+    expect(diff).toContain("docs staged by worker");
+    expect(diff).toContain("packages/core/src/new-feature.ts");
+    expect(diff).toContain("export const created = true;");
+    expect(await readFile(join(dir, "docs/readme.md"), "utf8")).toBe("# docs\n");
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 class WritingRunner implements LocalSubagentRunner {
   readonly runs: LocalSubagentRunInput[] = [];
 
@@ -250,6 +351,24 @@ class WritingThenVerifyingRunner implements LocalSubagentRunner {
     if (input.taskName.startsWith("Verify ")) return { status: "completed", summary: "VERDICT: passed\nDiff looks good." };
     await writeFile(join(input.cwd, this.path), this.content);
     return { status: "completed", summary: `Wrote ${this.path}` };
+  }
+}
+
+class MixedChangeRunner implements LocalSubagentRunner {
+  readonly runs: LocalSubagentRunInput[] = [];
+
+  async run(input: LocalSubagentRunInput): Promise<LocalSubagentRunResult> {
+    this.runs.push(input);
+    if (input.taskName.startsWith("Verify ")) return { status: "completed", summary: "VERDICT: passed\nPatch is complete." };
+    await writeFile(join(input.cwd, "docs/readme.md"), "# docs\n\ndocs staged by worker\n");
+    const staged = await runProcess("git", ["add", "docs/readme.md"], {
+      cwd: input.cwd,
+      timeoutMs: 30_000,
+      maxOutputBytes: 128_000,
+    });
+    if (staged.exitCode !== 0) throw new Error(staged.stderr || `git add failed with exit ${staged.exitCode}`);
+    await writeFile(join(input.cwd, "packages/core/src/new-feature.ts"), "export const created = true;\n");
+    return { status: "completed", summary: "Created staged and untracked worktree changes" };
   }
 }
 

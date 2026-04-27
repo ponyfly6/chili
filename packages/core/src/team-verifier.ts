@@ -266,9 +266,27 @@ export class TeamTaskVerificationService {
         timeoutMs: 15_000,
         maxOutputBytes: DEFAULT_GIT_DIFF_MAX_BYTES,
       };
-      const result = await runProcess("git", ["diff", "--no-ext-diff", "--no-color"], input.signal ? { ...processInput, signal: input.signal } : processInput);
-      if (result.exitCode !== 0) return `(git diff failed: ${result.stderr || `exit ${result.exitCode}`})`;
-      return result.stdout || "(no diff)";
+      const runGit = (args: readonly string[]) =>
+        runProcess("git", args, input.signal ? { ...processInput, signal: input.signal } : processInput);
+      const tracked = await runGit(["diff", "--no-ext-diff", "--no-color", "HEAD", "--"]);
+      if (tracked.exitCode !== 0) return `(git diff failed: ${tracked.stderr || `exit ${tracked.exitCode}`})`;
+
+      const parts = tracked.stdout.trim().length > 0 ? [tracked.stdout.trimEnd()] : [];
+      const untracked = await runGit(["ls-files", "--others", "--exclude-standard", "-z"]);
+      if (untracked.exitCode !== 0) {
+        parts.push(`(git untracked file scan failed: ${untracked.stderr || `exit ${untracked.exitCode}`})`);
+      } else {
+        for (const path of splitNul(untracked.stdout)) {
+          const fileDiff = await runGit(["diff", "--no-ext-diff", "--no-color", "--no-index", "--", "/dev/null", path]);
+          if (fileDiff.exitCode !== 0 && fileDiff.exitCode !== 1) {
+            parts.push(`(git diff for untracked file failed: ${path}: ${fileDiff.stderr || `exit ${fileDiff.exitCode}`})`);
+          } else if (fileDiff.stdout.trim().length > 0) {
+            parts.push(fileDiff.stdout.trimEnd());
+          }
+        }
+      }
+
+      return parts.length > 0 ? truncateDiff(parts.join("\n")) : "(no diff)";
     } catch (error) {
       if (isSignalAbort(error, input.signal)) throw error;
       return `(git diff unavailable: ${toError(error).message})`;
@@ -450,14 +468,24 @@ function normalizedVerifierTestCommands(commands: readonly string[] | undefined)
 }
 
 function isVerifierTestCommand(command: string): boolean {
-  return (
-    /^bun\s+test\b/.test(command) ||
-    /^bun\s+run\s+(test|typecheck|lint)\b/.test(command) ||
-    /^npm\s+(test|run\s+(test|typecheck|lint))\b/.test(command) ||
-    /^pnpm\s+(test|run\s+(test|typecheck|lint))\b/.test(command) ||
-    /^yarn\s+(test|run\s+(test|typecheck|lint))\b/.test(command) ||
-    /^tsc\b/.test(command)
-  );
+  const argv = simpleCommandArgv(command);
+  if (!argv) return false;
+  const [program, first, second] = argv;
+  if (program === "bun") return first === "test" || (first === "run" && isAllowedScriptName(second));
+  if (program === "npm" || program === "pnpm" || program === "yarn") {
+    return first === "test" || (first === "run" && isAllowedScriptName(second));
+  }
+  return program === "tsc";
+}
+
+function simpleCommandArgv(command: string): string[] | undefined {
+  const argv = command.trim().split(/\s+/).filter(Boolean);
+  if (argv.length === 0) return undefined;
+  return argv.every((part) => /^[A-Za-z0-9@%_+=:,./-]+$/.test(part)) ? argv : undefined;
+}
+
+function isAllowedScriptName(value: string | undefined): boolean {
+  return value === "test" || value === "typecheck" || value === "lint";
 }
 
 function formatList(items: readonly string[] | undefined): string {
@@ -475,6 +503,15 @@ function pruneUndefined<T>(value: T): T {
     if (item !== undefined) output[key] = item;
   }
   return output as T;
+}
+
+function splitNul(value: string): string[] {
+  return value.split("\0").filter((item) => item.length > 0);
+}
+
+function truncateDiff(value: string): string {
+  if (value.length <= DEFAULT_GIT_DIFF_MAX_BYTES) return value;
+  return `${value.slice(0, DEFAULT_GIT_DIFF_MAX_BYTES)}\n(diff truncated at ${DEFAULT_GIT_DIFF_MAX_BYTES} characters)`;
 }
 
 function toError(error: unknown): Error {
