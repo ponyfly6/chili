@@ -118,7 +118,7 @@ test("syncs a background team task after the subagent finishes", async () => {
     expect(dispatched.teamTask).toMatchObject({
       status: "in_progress",
     });
-    expect(dispatched.teamTask.metadata).toEqual({
+    expect(dispatched.teamTask.metadata).toMatchObject({
       chiliTeamDispatch: {
         agentTaskId: dispatchedAgentTask.taskId,
         agentPath: dispatchedAgentTask.path,
@@ -128,7 +128,21 @@ test("syncs a background team task after the subagent finishes", async () => {
         mode: "background",
         dispatchedAt: 200,
         agentStatus: "running",
+        policy: {
+          allowed: true,
+          allowedTools: expect.arrayContaining(["read", "complete_task", "team_task_update"]),
+          checkedAt: 200,
+        },
       },
+    });
+    expect(dispatchedAgentTask.workerPolicy).toMatchObject({
+      teamId: team.id,
+      taskId: task.id,
+      memberPath: workerPath,
+      childSessionId: dispatchedAgentTask.childSessionId,
+      allowedTools: expect.arrayContaining(["read", "complete_task", "team_task_update"]),
+      writeScope: [],
+      executeScope: [],
     });
 
     await runner.started;
@@ -148,7 +162,7 @@ test("syncs a background team task after the subagent finishes", async () => {
         summary: "Verified independently",
       },
     });
-    expect(synced.teamTask.metadata).toEqual({
+    expect(synced.teamTask.metadata).toMatchObject({
       chiliTeamDispatch: {
         agentTaskId: dispatchedAgentTask.taskId,
         agentPath: dispatchedAgentTask.path,
@@ -159,6 +173,11 @@ test("syncs a background team task after the subagent finishes", async () => {
         dispatchedAt: 200,
         agentStatus: "completed",
         syncedAt: 200,
+        policy: {
+          allowed: true,
+          allowedTools: expect.arrayContaining(["read", "complete_task", "team_task_update"]),
+          checkedAt: 200,
+        },
       },
     });
   } finally {
@@ -247,7 +266,7 @@ test("reports skipped reasons for dispatch, sync, and reconcile", async () => {
   }
 });
 
-test("gates dispatch by dependencies and member scopes while recording write conflicts", async () => {
+test("gates dispatch by dependencies, member scopes, and write conflicts", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-dispatch-policy-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const ids = createSequentialId();
@@ -371,6 +390,48 @@ test("gates dispatch by dependencies and member scopes while recording write con
       },
     });
 
+    const scopedWriteTask = await teams.createTask({
+      sessionId,
+      threadId,
+      teamId: team.id,
+      title: "Scoped writer",
+      ownerPath: workerPath,
+      metadata: { writeScope: ["packages/core/src"], requiredTools: ["edit"] },
+    });
+    const scopedWrite = await dispatcher.dispatchTask({
+      teamId: team.id,
+      taskId: scopedWriteTask.id,
+      mode: "one_shot",
+      sessionId,
+      threadId,
+      cwd: dir,
+    });
+    expect(scopedWrite).toMatchObject({
+      status: "completed",
+      teamTask: {
+        id: scopedWriteTask.id,
+        status: "completed",
+        metadata: {
+          chiliTeamDispatch: {
+            policy: {
+              allowed: true,
+              writeScope: ["packages/core/src"],
+              requiredTools: ["edit"],
+              allowedTools: expect.arrayContaining(["read", "edit", "complete_task", "team_task_update"]),
+              checkedAt: 240,
+            },
+          },
+        },
+      },
+    });
+    expect(scopedWrite.agentTask?.workerPolicy).toMatchObject({
+      teamId: team.id,
+      taskId: scopedWriteTask.id,
+      memberPath: workerPath,
+      writeScope: ["packages/core/src"],
+      allowedTools: expect.arrayContaining(["read", "edit", "complete_task", "team_task_update"]),
+    });
+
     const existingWriter = await teams.createTask({
       sessionId,
       threadId,
@@ -409,16 +470,19 @@ test("gates dispatch by dependencies and member scopes while recording write con
       cwd: dir,
     });
     expect(conflictDispatch).toMatchObject({
-      status: "completed",
+      status: "skipped",
+      reason: "write_conflict",
       teamTask: {
         id: conflictTask.id,
-        status: "completed",
+        status: "blocked",
+        error: "write_conflict",
         metadata: {
           writeScope: ["packages/core/src"],
           requiredTools: ["edit"],
           chiliTeamDispatch: {
             policy: {
-              allowed: true,
+              allowed: false,
+              reason: "write_conflict",
               writeScope: ["packages/core/src"],
               requiredTools: ["edit"],
               conflicts: [{ taskId: existingWriter.id, ownerPath: reviewerPath, writeScope: ["packages/core"] }],
@@ -664,6 +728,95 @@ test("blocks dispatch when member writeScope or toolScope cannot satisfy task me
   }
 });
 
+test("blocks dispatch when required write or execute tools lack explicit scopes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-dispatch-required-scope-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 355 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const sessionId = "session_team_required_scope" as SessionId;
+  const threadId = "thread_team_required_scope" as ThreadId;
+  const runner = new FakeLocalSubagentRunner({ status: "completed", summary: "should not run" });
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
+
+    const team = await teams.createTeam({ sessionId, threadId, name: "required-scope", leadPath });
+    await teams.addMember({
+      sessionId,
+      threadId,
+      teamId: team.id,
+      path: workerPath,
+      name: "worker",
+      role: "implementer",
+      toolScope: ["read", "edit", "bash"],
+      writeScope: ["packages/core"],
+    });
+
+    const editTask = await teams.createTask({
+      sessionId,
+      threadId,
+      teamId: team.id,
+      title: "Edit without write scope",
+      ownerPath: workerPath,
+      metadata: { requiredTools: ["edit"] },
+    });
+    const editDispatch = await dispatcher.dispatchTask({
+      teamId: team.id,
+      taskId: editTask.id,
+      mode: "one_shot",
+      sessionId,
+      threadId,
+      cwd: dir,
+    });
+    expect(editDispatch).toMatchObject({
+      status: "skipped",
+      reason: "scope_mismatch",
+      teamTask: {
+        id: editTask.id,
+        status: "blocked",
+        error: "scope_mismatch",
+        metadata: { chiliTeamDispatch: { policy: { allowed: false, requiredTools: ["edit"] } } },
+      },
+    });
+
+    const bashTask = await teams.createTask({
+      sessionId,
+      threadId,
+      teamId: team.id,
+      title: "Shell without execute scope",
+      ownerPath: workerPath,
+      metadata: { requiredTools: ["bash"] },
+    });
+    const bashDispatch = await dispatcher.dispatchTask({
+      teamId: team.id,
+      taskId: bashTask.id,
+      mode: "one_shot",
+      sessionId,
+      threadId,
+      cwd: dir,
+    });
+    expect(bashDispatch).toMatchObject({
+      status: "skipped",
+      reason: "scope_mismatch",
+      teamTask: {
+        id: bashTask.id,
+        status: "blocked",
+        error: "scope_mismatch",
+        metadata: { chiliTeamDispatch: { policy: { allowed: false, requiredTools: ["bash"] } } },
+      },
+    });
+
+    expect(runner.runs).toEqual([]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("skips unavailable members without permanently blocking the task", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-dispatch-member-unavailable-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -744,7 +897,7 @@ test("skips unavailable members without permanently blocking the task", async ()
   }
 });
 
-test("records overlapping write scopes as dispatch conflict suggestions", async () => {
+test("blocks dispatch for overlapping running write scopes", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-dispatch-conflicts-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const ids = createSequentialId();
@@ -800,15 +953,18 @@ test("records overlapping write scopes as dispatch conflict suggestions", async 
     });
 
     expect(result).toMatchObject({
-      status: "completed",
+      status: "skipped",
+      reason: "write_conflict",
       teamTask: {
         id: task.id,
-        status: "completed",
+        status: "blocked",
+        error: "write_conflict",
         metadata: {
           writeScope: ["packages/core/src"],
           chiliTeamDispatch: {
             policy: {
-              allowed: true,
+              allowed: false,
+              reason: "write_conflict",
               writeScope: ["packages/core/src"],
               memberWriteScope: ["packages/core"],
               checkedAt: 375,
@@ -824,7 +980,7 @@ test("records overlapping write scopes as dispatch conflict suggestions", async 
         },
       },
     });
-    expect(runner.runs).toHaveLength(1);
+    expect(runner.runs).toHaveLength(0);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });

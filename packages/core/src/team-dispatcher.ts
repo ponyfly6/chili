@@ -18,6 +18,12 @@ import type {
 } from "@chili/store";
 import type { LocalSubagentMode, LocalSubagentTaskInput, LocalSubagentTaskResult } from "./subagent.js";
 import { TeamTaskNotFoundError, type TeamControlService } from "./team.js";
+import {
+  SCOPED_WORKER_BASE_TOOLS,
+  SCOPED_WORKER_EXECUTE_TOOLS,
+  SCOPED_WORKER_WRITE_TOOLS,
+  type WorkerToolPolicyTemplate,
+} from "./worker-policy.js";
 
 const DISPATCH_METADATA_KEY = "chiliTeamDispatch";
 
@@ -82,7 +88,9 @@ export interface TeamTaskDispatchPolicyMetadata {
   allowed: boolean;
   reason?: TeamTaskDispatchPolicyReason;
   writeScope?: string[];
+  executeScope?: string[];
   requiredTools?: string[];
+  allowedTools?: string[];
   memberWriteScope?: string[];
   memberToolScope?: string[];
   conflicts?: TeamTaskDispatchConflict[];
@@ -90,7 +98,7 @@ export interface TeamTaskDispatchPolicyMetadata {
 }
 
 export type TeamTaskDispatchStatus = "running" | "completed" | "failed" | "cancelled" | "skipped";
-export type TeamTaskDispatchPolicyReason = "missing_member" | "member_unavailable" | "scope_mismatch";
+export type TeamTaskDispatchPolicyReason = "missing_member" | "member_unavailable" | "scope_mismatch" | "write_conflict";
 
 export interface TeamTaskDispatchResult {
   status: TeamTaskDispatchStatus;
@@ -179,8 +187,15 @@ export class TeamTaskDispatchService {
         parentPath: ownerPath,
         cwd: input.cwd ?? this.options.cwd,
         taskName: claimedTask.title,
-        prompt: input.prompt ?? teamTaskPrompt(claimedTask, ownerPath),
+        prompt: input.prompt ?? teamTaskPrompt(claimedTask, ownerPath, dispatchPolicy),
         mode,
+        workerPolicy: workerPolicyForDispatch({
+          teamId: input.teamId,
+          taskId: input.taskId,
+          memberPath: ownerPath,
+          parentSessionId,
+          dispatchPolicy,
+        }),
       };
       if (input.signal) spawnInput.signal = input.signal;
       const agentTask = await this.options.subagents.spawnTask(spawnInput);
@@ -341,18 +356,27 @@ export class TeamTaskDispatchService {
     const members = await this.options.teams.members(input.teamId);
     const member = members.find((item) => item.path === input.ownerPath);
     const taskWriteScope = metadataStringArray(input.task.metadata, ["writeScope", "write_scope", "writeScopes", "write_scopes"]);
+    const executeScope = metadataStringArray(input.task.metadata, ["executeScope", "execute_scope", "executionScope", "execution_scope"]);
     const requiredTools = metadataStringArray(input.task.metadata, ["requiredTools", "required_tools", "toolScope", "tool_scope"]);
+    const requiredToolNames = normalizedToolNames(requiredTools);
     const policyBase: TeamTaskDispatchPolicyMetadata = {
       allowed: true,
       checkedAt,
     };
     if (taskWriteScope) policyBase.writeScope = taskWriteScope;
+    if (executeScope) policyBase.executeScope = executeScope;
     if (requiredTools) policyBase.requiredTools = requiredTools;
     if (member?.writeScope) policyBase.memberWriteScope = member.writeScope;
     if (member?.toolScope) policyBase.memberToolScope = member.toolScope;
 
     if (!member) {
       return { ...policyBase, allowed: false, reason: "missing_member" };
+    }
+    if (requiresExplicitScope(requiredToolNames, SCOPED_WORKER_WRITE_TOOLS, taskWriteScope)) {
+      return { ...policyBase, allowed: false, reason: "scope_mismatch" };
+    }
+    if (requiresExplicitScope(requiredToolNames, SCOPED_WORKER_EXECUTE_TOOLS, executeScope)) {
+      return { ...policyBase, allowed: false, reason: "scope_mismatch" };
     }
     if (member.status === "closed" || member.status === "blocked" || (member.status === "running" && member.currentTaskId !== input.task.id)) {
       return { ...policyBase, allowed: false, reason: "member_unavailable" };
@@ -362,8 +386,11 @@ export class TeamTaskDispatchService {
     }
 
     const conflicts = await this.writeConflicts(input.teamId, input.task, taskWriteScope);
-    if (conflicts.length > 0) policyBase.conflicts = conflicts;
-    return policyBase;
+    if (conflicts.length > 0) {
+      return { ...policyBase, allowed: false, reason: "write_conflict", conflicts };
+    }
+
+    return { ...policyBase, allowedTools: scopedWorkerAllowedTools(policyBase) };
   }
 
   private async writeConflicts(
@@ -393,13 +420,16 @@ export class TeamTaskDispatchService {
   }
 }
 
-function teamTaskPrompt(task: TeamTaskRow, ownerPath: AgentPath): string {
+function teamTaskPrompt(task: TeamTaskRow, ownerPath: AgentPath, policy?: TeamTaskDispatchPolicyMetadata): string {
   return [
     `Team task: ${task.teamId}/${task.id}`,
     `Assigned member path: ${ownerPath}`,
     `Title: ${task.title}`,
     task.description ? `Description:\n${task.description}` : undefined,
     task.dependsOn.length > 0 ? `Dependencies: ${task.dependsOn.join(", ")}` : undefined,
+    policy ? `Allowed tools: ${formatList(policy.allowedTools)}` : undefined,
+    policy ? `Write scope: ${formatList(policy.writeScope)}` : undefined,
+    policy ? `Execute scope: ${formatList(policy.executeScope)}` : undefined,
     "",
     "Work the task to completion. Use team tools for progress notes when helpful. When complete, call complete_task for your local subagent task with a concise summary.",
   ]
@@ -449,8 +479,84 @@ function metadataStringArray(metadata: Record<string, unknown> | undefined, keys
 }
 
 function dispatchPolicyForMetadata(policy: TeamTaskDispatchPolicyMetadata): TeamTaskDispatchPolicyMetadata | undefined {
-  if (!policy.allowed || policy.writeScope || policy.requiredTools || policy.conflicts) return policy;
+  if (!policy.allowed || policy.writeScope || policy.executeScope || policy.requiredTools || policy.conflicts || policy.allowedTools) return policy;
   return undefined;
+}
+
+function workerPolicyForDispatch(input: {
+  teamId: TeamId;
+  taskId: TaskId;
+  memberPath: AgentPath;
+  parentSessionId: SessionId;
+  dispatchPolicy: TeamTaskDispatchPolicyMetadata;
+}): WorkerToolPolicyTemplate {
+  const policy: WorkerToolPolicyTemplate = {
+    teamId: input.teamId,
+    taskId: input.taskId,
+    memberPath: input.memberPath,
+    parentSessionId: input.parentSessionId,
+    allowedTools: input.dispatchPolicy.allowedTools ?? scopedWorkerAllowedTools(input.dispatchPolicy),
+    writeScope: input.dispatchPolicy.writeScope ?? [],
+    executeScope: input.dispatchPolicy.executeScope ?? [],
+  };
+  return policy;
+}
+
+function scopedWorkerAllowedTools(policy: TeamTaskDispatchPolicyMetadata): string[] {
+  const allowed = new Set<string>(SCOPED_WORKER_BASE_TOOLS);
+  const requiredTools = normalizedToolNames(policy.requiredTools);
+  const requiredWriteTools = requiredTools.filter((tool) => SCOPED_WORKER_WRITE_TOOLS.includes(tool as never));
+
+  if ((policy.writeScope?.length ?? 0) > 0) {
+    const writeTools = requiredWriteTools.length > 0 ? requiredWriteTools : [...SCOPED_WORKER_WRITE_TOOLS];
+    for (const tool of writeTools) allowed.add(tool);
+  }
+
+  if ((policy.executeScope?.length ?? 0) > 0 || requiredTools.some((tool) => SCOPED_WORKER_EXECUTE_TOOLS.includes(tool as never))) {
+    for (const tool of SCOPED_WORKER_EXECUTE_TOOLS) allowed.add(tool);
+  }
+
+  for (const tool of requiredTools) {
+    if (!SCOPED_WORKER_WRITE_TOOLS.includes(tool as never) && !SCOPED_WORKER_EXECUTE_TOOLS.includes(tool as never)) {
+      allowed.add(tool);
+    }
+  }
+
+  if (!policy.memberToolScope || policy.memberToolScope.length === 0) return [...allowed].sort();
+
+  const memberTools = new Set(normalizedToolNames(policy.memberToolScope));
+  return [...allowed]
+    .filter((tool) => isEssentialWorkerTool(tool) || memberTools.has("*") || memberTools.has(tool))
+    .sort();
+}
+
+function normalizedToolNames(tools: readonly string[] | undefined): string[] {
+  return (tools ?? []).map(normalizeToolName).filter(Boolean);
+}
+
+function normalizeToolName(tool: string): string {
+  const normalized = tool.trim().toLowerCase();
+  if (normalized === "shell" || normalized === "run_shell_command") return "bash";
+  if (normalized === "read_file") return "read";
+  if (normalized === "write_file") return "write";
+  if (normalized === "patch") return "apply_patch";
+  return normalized;
+}
+
+function isEssentialWorkerTool(tool: string): boolean {
+  return (
+    tool === "complete_task" ||
+    tool === "tool_search" ||
+    tool === "team_snapshot" ||
+    tool === "team_task_list" ||
+    tool === "team_task_update" ||
+    tool === "team_message_send" ||
+    tool === "team_message_list"
+  );
+}
+
+function formatList(items: readonly string[] | undefined): string {
+  return items && items.length > 0 ? items.join(", ") : "(none)";
 }
 
 function scopeAllowsAll(allowed: readonly string[] | undefined, required: readonly string[] | undefined): boolean {
@@ -464,8 +570,16 @@ function toolScopeAllowsAll(allowed: readonly string[] | undefined, required: re
   if (!required || required.length === 0) return true;
   if (!allowed) return true;
   if (allowed.length === 0) return false;
-  const normalizedAllowed = allowed.map((item) => item.trim().toLowerCase());
-  return required.every((item) => normalizedAllowed.includes("*") || normalizedAllowed.includes(item.trim().toLowerCase()));
+  const normalizedAllowed = allowed.map(normalizeToolName);
+  return required.every((item) => normalizedAllowed.includes("*") || normalizedAllowed.includes(normalizeToolName(item)));
+}
+
+function requiresExplicitScope(
+  requiredTools: readonly string[],
+  scopedTools: readonly string[],
+  scope: readonly string[] | undefined,
+): boolean {
+  return requiredTools.some((tool) => scopedTools.includes(tool as never)) && (!scope || scope.length === 0);
 }
 
 function scopesOverlap(left: readonly string[], right: readonly string[]): boolean {
