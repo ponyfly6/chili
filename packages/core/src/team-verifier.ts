@@ -109,6 +109,7 @@ export class TeamTaskVerificationService {
         if (verified.status === "skipped") result.skipped.push(verified);
         else result.verified.push(verified);
       } catch (error) {
+        if (isSignalAbort(error, input.signal)) throw error;
         result.errors.push({
           teamId: input.teamId,
           taskId: task.id,
@@ -154,10 +155,13 @@ export class TeamTaskVerificationService {
 
     const cwd = input.cwd ?? this.options.cwd;
     const member = members.find((item) => item.path === task.ownerPath);
+    throwIfAborted(input.signal);
     const gitDiffInput: TeamTaskVerifierGitDiffInput = { team, task, cwd };
     if (member) gitDiffInput.member = member;
     if (input.signal) gitDiffInput.signal = input.signal;
     const gitDiff = await this.gitDiff(gitDiffInput);
+    throwIfAborted(input.signal);
+    const testCommands = verifierTestCommands(task.metadata);
     const startedAt = Number(this.now());
     const pendingTask = await this.options.teams.updateTask({
       teamId: task.teamId,
@@ -171,6 +175,7 @@ export class TeamTaskVerificationService {
       sessionId: parentSessionId,
       ...(input.threadId ? { threadId: input.threadId } : {}),
     });
+    throwIfAborted(input.signal);
 
     const verifierInput = {
       parentSessionId,
@@ -178,13 +183,14 @@ export class TeamTaskVerificationService {
       parentPath: task.ownerPath,
       cwd,
       taskName: `Verify ${task.title}`,
-      prompt: verifierPrompt(verifierPromptInput({ team, task: pendingTask, member, gitDiff })),
+      prompt: verifierPrompt(verifierPromptInput({ team, task: pendingTask, member, gitDiff, testCommands })),
       mode: "one_shot" as const,
       workerPolicy: verifierWorkerPolicy({
         teamId: task.teamId,
         taskId: task.id,
         memberPath: task.ownerPath,
         parentSessionId,
+        testCommands,
       }),
       ...(input.signal ? { signal: input.signal } : {}),
     };
@@ -252,6 +258,7 @@ export class TeamTaskVerificationService {
       if (result.exitCode !== 0) return `(git diff failed: ${result.stderr || `exit ${result.exitCode}`})`;
       return result.stdout || "(no diff)";
     } catch (error) {
+      if (isSignalAbort(error, input.signal)) throw error;
       return `(git diff unavailable: ${toError(error).message})`;
     }
   }
@@ -266,6 +273,7 @@ export function verifierWorkerPolicy(input: {
   taskId: TaskId;
   memberPath: AgentPath;
   parentSessionId: SessionId;
+  testCommands?: readonly string[];
 }): WorkerToolPolicyTemplate {
   return {
     teamId: input.teamId,
@@ -274,7 +282,7 @@ export function verifierWorkerPolicy(input: {
     parentSessionId: input.parentSessionId,
     allowedTools: ["read", "glob", "grep", "git_diff", "bash", "complete_task"],
     writeScope: [],
-    executeScope: [],
+    executeScope: normalizedVerifierTestCommands(input.testCommands),
   };
 }
 
@@ -305,14 +313,9 @@ function verifierPrompt(input: {
   task: TeamTaskRow;
   member?: TeamMemberRow;
   gitDiff: string;
+  testCommands: string[];
 }): string {
   const writeScope = metadataStringArray(input.task.metadata, ["writeScope", "write_scope", "writeScopes", "write_scopes"]);
-  const suggestedTests = metadataStringArray(input.task.metadata, [
-    "suggestedTestCommands",
-    "suggested_test_commands",
-    "testCommands",
-    "test_commands",
-  ]);
   return [
     `Verifier for team task: ${input.team.id}/${input.task.id}`,
     `Task title: ${input.task.title}`,
@@ -320,9 +323,9 @@ function verifierPrompt(input: {
     `Member: ${input.member?.path ?? input.task.ownerPath ?? "(unknown)"}`,
     `Write scope: ${formatList(writeScope)}`,
     `Worker summary: ${input.task.summary ?? "(none)"}`,
-    `Suggested test commands: ${formatList(suggestedTests)}`,
+    `Allowed test commands: ${formatList(input.testCommands)}`,
     "",
-    "You are a read-only verifier. Do not edit, write, or apply patches. Inspect the implementation, run read-only test commands when useful, and judge whether the task is acceptable.",
+    "You are a verifier with no file write scope. Do not edit, write, or apply patches. Inspect the implementation, run only the allowed test commands listed above plus commands the runtime classifies as read-only, and judge whether the task is acceptable.",
     "Use complete_task with a concise summary that starts with exactly one of:",
     "VERDICT: passed",
     "VERDICT: failed",
@@ -339,11 +342,13 @@ function verifierPromptInput(input: {
   task: TeamTaskRow;
   member: TeamMemberRow | undefined;
   gitDiff: string;
-}): { team: TeamRow; task: TeamTaskRow; member?: TeamMemberRow; gitDiff: string } {
-  const output: { team: TeamRow; task: TeamTaskRow; member?: TeamMemberRow; gitDiff: string } = {
+  testCommands: string[];
+}): { team: TeamRow; task: TeamTaskRow; member?: TeamMemberRow; gitDiff: string; testCommands: string[] } {
+  const output: { team: TeamRow; task: TeamTaskRow; member?: TeamMemberRow; gitDiff: string; testCommands: string[] } = {
     team: input.team,
     task: input.task,
     gitDiff: input.gitDiff,
+    testCommands: input.testCommands,
   };
   if (input.member) output.member = input.member;
   return output;
@@ -414,6 +419,31 @@ function metadataStringArray(metadata: Record<string, unknown> | undefined, keys
   return undefined;
 }
 
+function verifierTestCommands(metadata: Record<string, unknown> | undefined): string[] {
+  const commands = metadataStringArray(metadata, [
+    "suggestedTestCommands",
+    "suggested_test_commands",
+    "testCommands",
+    "test_commands",
+  ]);
+  return normalizedVerifierTestCommands(commands);
+}
+
+function normalizedVerifierTestCommands(commands: readonly string[] | undefined): string[] {
+  return [...new Set((commands ?? []).map((command) => command.trim()).filter(isVerifierTestCommand))];
+}
+
+function isVerifierTestCommand(command: string): boolean {
+  return (
+    /^bun\s+test\b/.test(command) ||
+    /^bun\s+run\s+(test|typecheck|lint)\b/.test(command) ||
+    /^npm\s+(test|run\s+(test|typecheck|lint))\b/.test(command) ||
+    /^pnpm\s+(test|run\s+(test|typecheck|lint))\b/.test(command) ||
+    /^yarn\s+(test|run\s+(test|typecheck|lint))\b/.test(command) ||
+    /^tsc\b/.test(command)
+  );
+}
+
 function formatList(items: readonly string[] | undefined): string {
   return items && items.length > 0 ? items.join(", ") : "(none)";
 }
@@ -433,4 +463,19 @@ function pruneUndefined<T>(value: T): T {
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  const reason = signal.reason;
+  if (reason instanceof Error) throw reason;
+  const error = new Error("Verification aborted");
+  error.name = "AbortError";
+  throw error;
+}
+
+function isSignalAbort(error: unknown, signal: AbortSignal | undefined): boolean {
+  if (signal?.aborted) return true;
+  const err = toError(error);
+  return err.name === "AbortError" && err.message.toLowerCase().includes("aborted");
 }

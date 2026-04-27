@@ -426,6 +426,7 @@ export class TeamExecutionRunner {
       if (input.signal) verifierInput.signal = input.signal;
       return await this.options.verifier.verifyCompletedTasks(verifierInput);
     } catch (error) {
+      if (isAbortError(error)) return undefined;
       summary.errors.push({
         teamId: input.teamId,
         error: toError(error).message,
@@ -727,6 +728,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function isAbortError(error: unknown): boolean {
+  const err = toError(error);
+  return err.name === "AbortError" || err.message.toLowerCase().includes("aborted");
 }
 
 function isDefined<T>(value: T | undefined): value is T {
