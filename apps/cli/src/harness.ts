@@ -14,6 +14,8 @@ import {
   TeamTaskDispatchService,
   TeamTaskVerificationService,
   TeamWorktreeService,
+  buildChiliMemorySystemContext,
+  createMemoryTool,
   defaultScopedWorkerPolicy,
   type WorkerToolPolicy,
 } from "@chili/core";
@@ -169,6 +171,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     createId,
     maxTurns: 8,
     system: childSystem,
+    systemContext: (context) => buildChiliMemorySystemContext({ cwd: context.cwd }),
   });
   const subagents = new LocalSubagentManager({
     store: eventStore,
@@ -262,6 +265,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     store: eventStore,
     cwd,
     createId,
+    systemContext: (context) => buildChiliMemorySystemContext({ cwd: context.cwd }),
   });
   const teamRunner = new TeamExecutionRunner({
     teams,
@@ -383,6 +387,7 @@ function createToolRegistry(): InMemoryToolRegistry {
   registry.register(createReadFileTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
+  registry.register(createMemoryTool());
   registry.register(createEditTool());
   registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());
@@ -407,6 +412,7 @@ function createChildToolRegistry(): InMemoryToolRegistry {
   registry.register(createReadFileTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
+  registry.register(createMemoryTool());
   registry.register(createEditTool());
   registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());

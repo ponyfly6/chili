@@ -19,9 +19,16 @@ export interface RuntimeServiceOptions {
   cwd: string;
   maxTurns?: number;
   system?: string[];
+  systemContext?: RuntimeSystemContextProvider;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
 }
+
+export type RuntimeSystemContextProvider = (input: {
+  sessionId: SessionId;
+  threadId: ThreadId;
+  cwd: string;
+}) => Promise<string[]> | string[];
 
 export interface CreateRuntimeSessionInput {
   sessionId?: SessionId;
@@ -178,10 +185,16 @@ export class RuntimeService {
   private async runReservedPrompt(input: SubmitPromptInput, controller: AbortController): Promise<SubmitPromptResult> {
     const turns: RunTurnResult[] = [];
     const maxTurns = input.maxTurns ?? this.options.maxTurns ?? 12;
-    const system = input.system ?? this.options.system ?? [];
     const cwd = input.cwd ?? this.options.cwd;
 
     try {
+      const system = await this.resolveSystem({
+        base: input.system ?? this.options.system ?? [],
+        sessionId: input.sessionId,
+        threadId: input.threadId,
+        cwd,
+      });
+
       await this.publishStatus({
         sessionId: input.sessionId,
         threadId: input.threadId,
@@ -290,6 +303,20 @@ export class RuntimeService {
     } finally {
       this.running.delete(input.sessionId);
     }
+  }
+
+  private async resolveSystem(input: {
+    base: readonly string[];
+    sessionId: SessionId;
+    threadId: ThreadId;
+    cwd: string;
+  }): Promise<string[]> {
+    const dynamic = await this.options.systemContext?.({
+      sessionId: input.sessionId,
+      threadId: input.threadId,
+      cwd: input.cwd,
+    });
+    return [...input.base, ...(dynamic ?? [])];
   }
 
   async interrupt(sessionId: SessionId, reason = "user_interrupt"): Promise<boolean> {

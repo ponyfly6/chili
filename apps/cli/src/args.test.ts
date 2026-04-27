@@ -59,3 +59,18 @@ test("parses team run loop command and runner flags", () => {
     teamId: "team_1",
   });
 });
+
+test("parses memory commands", () => {
+  expect(parseArgs(["memory", "show"])).toMatchObject({
+    command: "memory-show",
+  });
+  expect(parseArgs(["memory", "add", "--user", "prefer", "small", "patches"])).toMatchObject({
+    command: "memory-add",
+    memoryScope: "user",
+    prompt: "prefer small patches",
+  });
+  expect(parseArgs(["memory", "reload", "--project"])).toMatchObject({
+    command: "memory-reload",
+    memoryScope: "project",
+  });
+});

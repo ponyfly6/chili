@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { createInterface } from "node:readline/promises";
+import { addChiliMemoryEntry, loadChiliMemoryContext } from "@chili/core";
 import type { AgentTreeNode, TeamExecutionRunSummary, TeamSnapshot } from "@chili/core";
 import type { SessionId, TaskId, TeamId } from "@chili/protocol";
 import { ROOT_AGENT_PATH } from "@chili/protocol";
@@ -137,6 +138,22 @@ async function main(): Promise<void> {
 
     if (args.command === "mailbox") {
       await printMailbox(harness);
+      return;
+    }
+
+    if (args.command === "memory-show") {
+      await printMemory(harness, args.memoryScope);
+      return;
+    }
+
+    if (args.command === "memory-add") {
+      if (!args.prompt) throw new Error("memory add requires text");
+      await addMemory(harness, args.prompt, args.memoryScope);
+      return;
+    }
+
+    if (args.command === "memory-reload") {
+      await reloadMemory(harness, args.memoryScope);
       return;
     }
 
@@ -544,6 +561,65 @@ async function printMailbox(harness: Awaited<ReturnType<typeof createCliHarness>
   }
 }
 
+type MemoryScopeArg = "user" | "project" | "all" | undefined;
+
+async function printMemory(harness: Awaited<ReturnType<typeof createCliHarness>>, scope: MemoryScopeArg): Promise<void> {
+  const snapshot = await loadChiliMemoryContext({ cwd: harness.cwd });
+  const documents = filterMemoryDocuments(snapshot.documents, scope);
+  if (documents.length === 0) {
+    console.log("No Chili memory or project instructions loaded.");
+    return;
+  }
+
+  for (const document of documents) {
+    console.log(`[memory] ${document.label}\t${document.path}`);
+    console.log(document.content);
+    if (document.truncated) console.log("[memory] document truncated in context");
+    console.log("");
+  }
+}
+
+async function addMemory(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  text: string,
+  scope: MemoryScopeArg,
+): Promise<void> {
+  const result = await addChiliMemoryEntry({
+    cwd: harness.cwd,
+    text,
+    scope: memoryWriteScope(scope),
+  });
+  console.log(`[memory] saved ${result.scope}: ${result.path}`);
+  console.log(`- ${result.text}`);
+}
+
+async function reloadMemory(harness: Awaited<ReturnType<typeof createCliHarness>>, scope: MemoryScopeArg): Promise<void> {
+  const snapshot = await loadChiliMemoryContext({ cwd: harness.cwd });
+  const documents = filterMemoryDocuments(snapshot.documents, scope);
+  console.log(`[memory] reloaded ${documents.length} source(s)`);
+  if (documents.length > 0) {
+    console.log("");
+    for (const document of documents) {
+      console.log(`[memory] ${document.label}\t${document.path}`);
+    }
+  }
+}
+
+function filterMemoryDocuments(
+  documents: Awaited<ReturnType<typeof loadChiliMemoryContext>>["documents"],
+  scope: MemoryScopeArg,
+): Awaited<ReturnType<typeof loadChiliMemoryContext>>["documents"] {
+  if (!scope || scope === "all") return documents;
+  if (scope === "user") return documents.filter((document) => document.kind === "user_memory");
+  return documents.filter((document) => document.kind === "project_memory" || document.kind === "project_instruction");
+}
+
+function memoryWriteScope(scope: MemoryScopeArg): "user" | "project" {
+  if (!scope) return "project";
+  if (scope === "user" || scope === "project") return scope;
+  throw new Error("memory add requires --user or --project, not --all");
+}
+
 function jsonStringify(value: unknown): string {
   return JSON.stringify(
     value,
@@ -575,6 +651,9 @@ async function repl(input: {
             "/sessions             List sessions",
             "/agents               Show agent tree",
             "/mailbox              List queued mailbox messages",
+            "/memory show          Show loaded memory and project instructions",
+            "/memory add <text>    Save a project memory entry",
+            "/memory reload        Refresh and show loaded memory sources",
             "/tasks                List subagent tasks",
             "/recover-tasks        Mark stale background tasks cancelled",
             "/task <taskId>        Show a subagent task",
@@ -595,6 +674,10 @@ async function repl(input: {
       }
       if (line === "/mailbox") {
         await printMailbox(input.harness);
+        continue;
+      }
+      if (line === "/memory" || line.startsWith("/memory ")) {
+        await handleMemoryReplCommand(input.harness, line.slice("/memory".length).trim());
         continue;
       }
       if (line === "/tasks") {
@@ -652,6 +735,47 @@ async function repl(input: {
   } finally {
     rl.close();
   }
+}
+
+async function handleMemoryReplCommand(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  command: string,
+): Promise<void> {
+  const action = command.split(/\s+/, 1)[0] || "show";
+  const rest = command.slice(action.length).trim();
+  if (action === "show" || action === "list") {
+    await printMemory(harness, parseReplMemoryScope(rest));
+    return;
+  }
+  if (action === "reload" || action === "refresh") {
+    await reloadMemory(harness, parseReplMemoryScope(rest));
+    return;
+  }
+  if (action === "add") {
+    const parsed = parseReplMemoryAdd(rest);
+    if (!parsed.text) throw new Error("/memory add requires text");
+    await addMemory(harness, parsed.text, parsed.scope);
+    return;
+  }
+  throw new Error(`Unknown /memory command: ${action}`);
+}
+
+function parseReplMemoryScope(input: string): MemoryScopeArg {
+  if (!input) return undefined;
+  if (input === "--user" || input === "user") return "user";
+  if (input === "--project" || input === "project") return "project";
+  if (input === "--all" || input === "all") return "all";
+  throw new Error("memory scope must be user, project, or all");
+}
+
+function parseReplMemoryAdd(input: string): { scope: MemoryScopeArg; text: string } {
+  if (input.startsWith("--user ")) {
+    return { scope: "user", text: input.slice("--user ".length).trim() };
+  }
+  if (input.startsWith("--project ")) {
+    return { scope: "project", text: input.slice("--project ".length).trim() };
+  }
+  return { scope: "project", text: input.trim() };
 }
 
 function printAgentTreeNode(node: AgentTreeNode, depth: number): void {

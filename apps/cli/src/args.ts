@@ -26,6 +26,9 @@ export interface CliArgs {
     | "tasks-reconcile-stale"
     | "mailbox"
     | "mailbox-consume"
+    | "memory-show"
+    | "memory-add"
+    | "memory-reload"
     | "help";
   prompt?: string;
   cwd: string;
@@ -36,6 +39,7 @@ export interface CliArgs {
   taskId?: string;
   teamId?: string;
   messageId?: string;
+  memoryScope?: "user" | "project" | "all";
   taskStatus?: Extract<AgentTaskStatus, "completed" | "failed" | "cancelled">;
   timeoutMs?: number;
   staleAfterMs?: number;
@@ -171,6 +175,10 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     }
     if (arg === "mailbox") {
       result.command = "mailbox";
+      continue;
+    }
+    if (arg === "memory") {
+      parseMemoryCommand(result, args, prompt);
       continue;
     }
     if (arg === "consume") {
@@ -312,6 +320,9 @@ export function usage(): string {
     "  bun run chili -- team-sync <team-id> <task-id>",
     "  bun run chili -- team-reconcile [team-id]",
     "  bun run chili -- mailbox",
+    "  bun run chili -- memory show",
+    "  bun run chili -- memory add [--user|--project] \"remember this\"",
+    "  bun run chili -- memory reload",
     "  bun run chili -- consume <mailbox-message-id>",
     "  bun run chili -- task <task-id>",
     "  bun run chili -- followup <task-id> \"continue this task\"",
@@ -342,6 +353,65 @@ export function usage(): string {
 
 function isCliModelName(value: string): value is CliModelName {
   return value === "minimax" || value === "deepseek" || value === "fake" || value === "legacy-minimax";
+}
+
+function parseMemoryCommand(result: CliArgs, args: string[], prompt: string[]): void {
+  const action = args[0] && !args[0].startsWith("-") ? args.shift() : "show";
+  if (action === "show" || action === "list") {
+    result.command = "memory-show";
+    parseMemoryFlags(result, args, false);
+    return;
+  }
+  if (action === "reload" || action === "refresh") {
+    result.command = "memory-reload";
+    parseMemoryFlags(result, args, false);
+    return;
+  }
+  if (action === "add") {
+    result.command = "memory-add";
+    const text: string[] = [];
+    parseMemoryFlags(result, args, true, text);
+    if (result.memoryScope === "all") throw new Error("memory add scope must be user or project");
+    prompt.push(...text);
+    return;
+  }
+  throw new Error(`Unknown memory command: ${action}`);
+}
+
+function parseMemoryFlags(
+  result: CliArgs,
+  args: string[],
+  textAllowed: boolean,
+  text: string[] = [],
+): void {
+  while (args.length > 0) {
+    const arg = args.shift();
+    if (!arg) continue;
+    if (arg === "--user") {
+      result.memoryScope = "user";
+      continue;
+    }
+    if (arg === "--project") {
+      result.memoryScope = "project";
+      continue;
+    }
+    if (arg === "--all") {
+      result.memoryScope = "all";
+      continue;
+    }
+    if (arg === "--scope") {
+      result.memoryScope = parseMemoryScope(requireValue(arg, args));
+      continue;
+    }
+    if (arg.startsWith("-")) throw new Error(`Unknown memory option: ${arg}`);
+    if (!textAllowed) throw new Error(`Unexpected memory argument: ${arg}`);
+    text.push(arg);
+  }
+}
+
+function parseMemoryScope(value: string): "user" | "project" | "all" {
+  if (value === "user" || value === "project" || value === "all") return value;
+  throw new Error("--scope must be user, project, or all");
 }
 
 function requireValue(flag: string, args: string[]): string {
