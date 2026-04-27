@@ -125,6 +125,49 @@ test("uses compatibility settings when shaping OpenAI-compatible requests", () =
   expect(body).not.toHaveProperty("max_completion_tokens");
 });
 
+test("converts assistant-attached tool results into OpenAI tool messages", () => {
+  const callId = "call_attached" as ToolCallId;
+  const body = buildOpenAICompletionsRequestBody(
+    {
+      messages: [
+        message("user", [{ type: "text", text: "read file" }]),
+        message("assistant", [
+          { type: "tool_call", callId, toolName: "read", input: { filePath: "README.md" }, status: "pending" },
+          { type: "tool_result", callId, output: "contents" },
+        ]),
+        message("assistant", [{ type: "text", text: "contents summarized" }]),
+      ],
+      tools: [],
+      system: [],
+    },
+    {
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      baseUrl: "https://api.deepseek.com",
+      maxTokens: 64,
+      stream: true,
+    },
+  );
+
+  expect(body.messages).toEqual([
+    { role: "user", content: "read file" },
+    {
+      role: "assistant",
+      content: null,
+      reasoning_content: "",
+      tool_calls: [
+        {
+          id: callId,
+          type: "function",
+          function: { name: "read", arguments: "{\"filePath\":\"README.md\"}" },
+        },
+      ],
+    },
+    { role: "tool", tool_call_id: callId, content: "contents" },
+    { role: "assistant", content: "contents summarized", reasoning_content: "" },
+  ]);
+});
+
 test("resolves chat completions URL variants", () => {
   expect(resolveChatCompletionsUrl("https://api.test")).toBe("https://api.test/v1/chat/completions");
   expect(resolveChatCompletionsUrl("https://api.test/v1")).toBe("https://api.test/v1/chat/completions");

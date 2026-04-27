@@ -69,6 +69,25 @@ test("does not synthesize tool results when a following result satisfies the cal
   expect("synthetic" in (transformed[1]?.parts[0] ?? {})).toBe(false);
 });
 
+test("hoists assistant-attached tool results before missing-result synthesis", () => {
+  const callId = "toolu_attached" as ToolCallId;
+  const messages = [
+    message("assistant", [
+      { type: "tool_call", callId, toolName: "read_file", input: { path: "README.md" }, status: "pending" },
+      { type: "tool_result", callId, output: "contents" },
+    ]),
+    message("assistant", [{ type: "text", text: "I read it." }]),
+  ];
+
+  const transformed = transformModelMessages(messages, { now: () => 123 });
+
+  expect(transformed.map((item) => item.role)).toEqual(["assistant", "user", "assistant"]);
+  expect(transformed[0]?.parts).toEqual([expect.objectContaining({ type: "tool_call", callId })]);
+  expect(transformed[1]?.parts).toEqual([expect.objectContaining({ type: "tool_result", callId, output: "contents" })]);
+  expect(transformed[1]?.parts[0]).toMatchObject({ messageId: transformed[1]?.id });
+  expect(JSON.stringify(transformed)).not.toContain("No result provided");
+});
+
 test("drops redacted reasoning blocks before provider replay", () => {
   const messages = [
     message("assistant", [

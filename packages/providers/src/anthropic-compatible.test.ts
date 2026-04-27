@@ -124,6 +124,51 @@ test("normalizes Anthropic tool ids and synthesizes missing tool results in requ
   ]);
 });
 
+test("converts assistant-attached tool results into Anthropic user tool results", () => {
+  const firstCallId = "toolcall_ls" as ToolCallId;
+  const secondCallId = "toolcall_glob" as ToolCallId;
+  const messages = [
+    message("user", [{ type: "text", text: "总结这个仓库" }]),
+    message("assistant", [
+      { type: "tool_call", callId: firstCallId, toolName: "bash", input: { command: "ls -la" }, status: "pending" },
+      { type: "tool_call", callId: secondCallId, toolName: "glob", input: { pattern: "*" }, status: "pending" },
+      { type: "tool_result", callId: firstCallId, output: "package.json\nREADME.md" },
+      { type: "tool_result", callId: secondCallId, output: "apps\npackages" },
+    ]),
+  ];
+
+  const body = buildAnthropicRequestBody(
+    {
+      messages,
+      tools: [],
+      system: [],
+    },
+    {
+      model: "test-model",
+      stream: true,
+    },
+  );
+
+  expect(body.messages).toEqual([
+    { role: "user", content: [{ type: "text", text: "总结这个仓库" }] },
+    {
+      role: "assistant",
+      content: [
+        { type: "tool_use", id: firstCallId, name: "bash", input: { command: "ls -la" } },
+        { type: "tool_use", id: secondCallId, name: "glob", input: { pattern: "*" } },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        { type: "tool_result", tool_use_id: firstCallId, content: "package.json\nREADME.md" },
+        { type: "tool_result", tool_use_id: secondCallId, content: "apps\npackages" },
+      ],
+    },
+  ]);
+  expect(JSON.stringify(body.messages)).not.toContain("No result provided");
+});
+
 test("passes AbortSignal through to fetch and requests streaming", async () => {
   const controller = new AbortController();
   let signal: AbortSignal | null | undefined;

@@ -21,7 +21,7 @@ export function transformModelMessages(
   messages: readonly Message[],
   options: MessageTransformOptions = {},
 ): Message[] {
-  const normalized = normalizeMessageParts(messages, options);
+  const normalized = hoistAssistantToolResults(normalizeMessageParts(messages, options));
   if (options.insertMissingToolResults === false) return normalized;
   return insertMissingToolResults(normalized, options);
 }
@@ -89,6 +89,43 @@ function normalizeToolCallId(
   normalize: ((id: string) => string) | undefined,
 ): ToolCallId {
   return (normalize ? normalize(String(callId)) : String(callId)) as ToolCallId;
+}
+
+function hoistAssistantToolResults(messages: readonly Message[]): Message[] {
+  const result: Message[] = [];
+
+  for (const message of messages) {
+    if (message.role !== "assistant") {
+      result.push(message);
+      continue;
+    }
+
+    const toolResults = message.parts.filter(
+      (part): part is Extract<MessagePart, { type: "tool_result" }> => part.type === "tool_result",
+    );
+    if (toolResults.length === 0) {
+      result.push(message);
+      continue;
+    }
+
+    const assistantParts = message.parts.filter((part) => part.type !== "tool_result");
+    if (assistantParts.length > 0) {
+      result.push({ ...message, parts: assistantParts });
+    }
+
+    const messageId = `msg_tool_result_${stableHash(
+      toolResults.map((part) => `${String(part.id)}:${String(part.callId)}`).join("|"),
+    )}` as MessageId;
+    result.push({
+      id: messageId,
+      sessionId: message.sessionId,
+      role: "user",
+      parts: toolResults.map((part) => ({ ...part, messageId })),
+      createdAt: message.createdAt,
+    });
+  }
+
+  return result;
 }
 
 function insertMissingToolResults(messages: readonly Message[], options: MessageTransformOptions): Message[] {
