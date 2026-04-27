@@ -1063,6 +1063,8 @@ test("claims team tasks with dependency-aware CAS", async () => {
   const setupTaskId = "task_claim_setup" as TaskId;
   const readyTaskId = "task_claim_ready" as TaskId;
   const blockedTaskId = "task_claim_blocked" as TaskId;
+  const failedDependencyTaskId = "task_claim_failed_dependency" as TaskId;
+  const waitsOnFailedTaskId = "task_claim_waits_on_failed" as TaskId;
 
   try {
     await store.appendMany([
@@ -1107,6 +1109,22 @@ test("claims team tasks with dependency-aware CAS", async () => {
         threadId,
         payload: { teamId, taskId: blockedTaskId, title: "blocked", dependsOn: ["task_missing" as TaskId] },
       },
+      {
+        id: "event_team_claim_failed_dependency",
+        type: "team.task_created",
+        time: 7 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { teamId, taskId: failedDependencyTaskId, title: "failed dependency", status: "failed" },
+      },
+      {
+        id: "event_team_claim_waits_on_failed",
+        type: "team.task_created",
+        time: 8 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { teamId, taskId: waitsOnFailedTaskId, title: "waits on failed", dependsOn: [failedDependencyTaskId] },
+      },
     ]);
 
     const claimed = await store.claimTeamTask({
@@ -1117,7 +1135,7 @@ test("claims team tasks with dependency-aware CAS", async () => {
       eventId: "event_team_claim_ready_cas",
       sessionId,
       threadId,
-      time: 7,
+      time: 9,
     });
     expect(claimed).toMatchObject({
       applied: true,
@@ -1135,7 +1153,7 @@ test("claims team tasks with dependency-aware CAS", async () => {
       taskId: readyTaskId,
       ownerPath: otherPath,
       eventId: "event_team_claim_duplicate",
-      time: 8,
+      time: 10,
     });
     expect(duplicate).toMatchObject({
       applied: false,
@@ -1152,13 +1170,28 @@ test("claims team tasks with dependency-aware CAS", async () => {
       taskId: blockedTaskId,
       ownerPath: workerPath,
       eventId: "event_team_claim_blocked_cas",
-      time: 9,
+      time: 11,
     });
     expect(blocked).toMatchObject({
       applied: false,
       reason: "blocked",
       task: {
         id: blockedTaskId,
+        status: "pending",
+      },
+    });
+    const blockedByFailedDependency = await store.claimTeamTask({
+      teamId,
+      taskId: waitsOnFailedTaskId,
+      ownerPath: workerPath,
+      eventId: "event_team_claim_failed_dependency_cas",
+      time: 12,
+    });
+    expect(blockedByFailedDependency).toMatchObject({
+      applied: false,
+      reason: "blocked",
+      task: {
+        id: waitsOnFailedTaskId,
         status: "pending",
       },
     });

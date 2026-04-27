@@ -47,7 +47,7 @@ test("creates a persistent team with leader, members, task assignment, claim, an
       },
     ]);
 
-    await service.addMember({
+    const reviewer = await service.addMember({
       sessionId,
       threadId,
       teamId: team.id,
@@ -57,6 +57,13 @@ test("creates a persistent team with leader, members, task assignment, claim, an
       childSessionId: "session_reviewer" as SessionId,
       childThreadId: "thread_reviewer" as ThreadId,
       toolScope: ["read", "git_diff"],
+      writeScope: ["packages/core"],
+    });
+    expect(reviewer).toMatchObject({
+      teamId: team.id,
+      path: reviewerPath,
+      toolScope: ["read", "git_diff"],
+      writeScope: ["packages/core"],
     });
     const task = await service.createTask({
       sessionId,

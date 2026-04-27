@@ -317,7 +317,13 @@ export interface RuntimeTeamTaskDispatchResult {
   team_task: RuntimeTeamTaskRecord;
   agentTask?: RuntimeLocalSubagentTaskRecord;
   agent_task?: RuntimeLocalSubagentTaskRecord;
-  reason?: RuntimeTeamTaskClaimResult["reason"] | "missing_owner" | "missing_session";
+  reason?:
+    | RuntimeTeamTaskClaimResult["reason"]
+    | "missing_owner"
+    | "missing_session"
+    | "missing_member"
+    | "member_unavailable"
+    | "scope_mismatch";
 }
 
 export interface RuntimeTeamTaskSyncResult {

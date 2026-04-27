@@ -9,7 +9,13 @@ import type {
   TimestampMs,
 } from "@chili/protocol";
 import { timestampNow } from "@chili/protocol";
-import type { AgentTaskRow, SubagentProjectionStore, TeamTaskMutationResult, TeamTaskRow } from "@chili/store";
+import type {
+  AgentTaskRow,
+  SubagentProjectionStore,
+  TeamMemberRow,
+  TeamTaskMutationResult,
+  TeamTaskRow,
+} from "@chili/store";
 import type { LocalSubagentMode, LocalSubagentTaskInput, LocalSubagentTaskResult } from "./subagent.js";
 import { TeamTaskNotFoundError, type TeamControlService } from "./team.js";
 
@@ -63,15 +69,34 @@ export interface TeamTaskAgentBinding {
   dispatchedAt: number;
   agentStatus: LocalSubagentTaskResult["status"] | AgentTaskRow["status"];
   syncedAt?: number;
+  policy?: TeamTaskDispatchPolicyMetadata;
+}
+
+export interface TeamTaskDispatchConflict {
+  taskId: TaskId;
+  ownerPath?: AgentPath;
+  writeScope: string[];
+}
+
+export interface TeamTaskDispatchPolicyMetadata {
+  allowed: boolean;
+  reason?: TeamTaskDispatchPolicyReason;
+  writeScope?: string[];
+  requiredTools?: string[];
+  memberWriteScope?: string[];
+  memberToolScope?: string[];
+  conflicts?: TeamTaskDispatchConflict[];
+  checkedAt: number;
 }
 
 export type TeamTaskDispatchStatus = "running" | "completed" | "failed" | "cancelled" | "skipped";
+export type TeamTaskDispatchPolicyReason = "missing_member" | "member_unavailable" | "scope_mismatch";
 
 export interface TeamTaskDispatchResult {
   status: TeamTaskDispatchStatus;
   teamTask: TeamTaskRow;
   agentTask?: LocalSubagentTaskResult;
-  reason?: TeamTaskMutationResult["reason"] | "missing_owner" | "missing_session";
+  reason?: TeamTaskMutationResult["reason"] | "missing_owner" | "missing_session" | TeamTaskDispatchPolicyReason;
 }
 
 export interface TeamTaskSyncResult {
@@ -109,6 +134,26 @@ export class TeamTaskDispatchService {
     const parentSessionId = input.sessionId ?? task.sessionId ?? team.sessionId;
     if (!parentSessionId) return { status: "skipped", reason: "missing_session", teamTask: task };
 
+    const dispatchPolicy = await this.dispatchPolicy({
+      teamId: input.teamId,
+      task,
+      ownerPath,
+    });
+    if (!dispatchPolicy.allowed) {
+      const shouldBlockTask = dispatchPolicy.reason !== "member_unavailable";
+      const updateInput: Parameters<TeamControlService["updateTask"]>[0] = {
+        teamId: input.teamId,
+        taskId: input.taskId,
+        metadata: mergeDispatchMetadata(task.metadata, { policy: dispatchPolicy }),
+        sessionId: parentSessionId,
+      };
+      if (shouldBlockTask) updateInput.status = "blocked";
+      if (shouldBlockTask && dispatchPolicy.reason) updateInput.error = dispatchPolicy.reason;
+      if (input.threadId) updateInput.threadId = input.threadId;
+      const blockedTask = await this.options.teams.updateTask(updateInput);
+      return { status: "skipped", reason: dispatchPolicy.reason, teamTask: blockedTask };
+    }
+
     const claim = await this.options.teams.claimTask({
       teamId: input.teamId,
       taskId: input.taskId,
@@ -139,12 +184,14 @@ export class TeamTaskDispatchService {
       };
       if (input.signal) spawnInput.signal = input.signal;
       const agentTask = await this.options.subagents.spawnTask(spawnInput);
+      const policyMetadata = dispatchPolicyForMetadata(dispatchPolicy);
 
       const updateInput = {
         task: claimedTask,
         agentTask,
         mode,
         sessionId: parentSessionId,
+        ...(policyMetadata ? { policy: policyMetadata } : {}),
       };
       const teamTask = await this.updateTeamTaskFromAgentResult(
         input.threadId ? { ...updateInput, threadId: input.threadId } : updateInput,
@@ -246,6 +293,7 @@ export class TeamTaskDispatchService {
     mode: LocalSubagentMode;
     sessionId: SessionId;
     threadId?: ThreadId;
+    policy?: TeamTaskDispatchPolicyMetadata;
   }): Promise<TeamTaskRow> {
     const status = teamStatusFromAgentStatus(input.agentTask.status);
     const update: Parameters<TeamControlService["updateTask"]>[0] = {
@@ -261,6 +309,7 @@ export class TeamTaskDispatchService {
         mode: input.mode,
         dispatchedAt: Number(this.now()),
         agentStatus: input.agentTask.status,
+        ...(input.policy ? { policy: input.policy } : {}),
         ...(isFinalLocalSubagentStatus(input.agentTask.status) ? { syncedAt: Number(this.now()) } : {}),
       }),
       sessionId: input.sessionId,
@@ -281,6 +330,62 @@ export class TeamTaskDispatchService {
     const task = (await this.options.teams.tasks(teamId)).find((item) => item.id === taskId);
     if (!task) throw new TeamTaskNotFoundError(teamId, taskId);
     return task;
+  }
+
+  private async dispatchPolicy(input: {
+    teamId: TeamId;
+    task: TeamTaskRow;
+    ownerPath: AgentPath;
+  }): Promise<TeamTaskDispatchPolicyMetadata> {
+    const checkedAt = Number(this.now());
+    const members = await this.options.teams.members(input.teamId);
+    const member = members.find((item) => item.path === input.ownerPath);
+    const taskWriteScope = metadataStringArray(input.task.metadata, ["writeScope", "write_scope", "writeScopes", "write_scopes"]);
+    const requiredTools = metadataStringArray(input.task.metadata, ["requiredTools", "required_tools", "toolScope", "tool_scope"]);
+    const policyBase: TeamTaskDispatchPolicyMetadata = {
+      allowed: true,
+      checkedAt,
+    };
+    if (taskWriteScope) policyBase.writeScope = taskWriteScope;
+    if (requiredTools) policyBase.requiredTools = requiredTools;
+    if (member?.writeScope) policyBase.memberWriteScope = member.writeScope;
+    if (member?.toolScope) policyBase.memberToolScope = member.toolScope;
+
+    if (!member) {
+      return { ...policyBase, allowed: false, reason: "missing_member" };
+    }
+    if (member.status === "closed" || member.status === "blocked" || (member.status === "running" && member.currentTaskId !== input.task.id)) {
+      return { ...policyBase, allowed: false, reason: "member_unavailable" };
+    }
+    if (!scopeAllowsAll(member.writeScope, taskWriteScope) || !toolScopeAllowsAll(member.toolScope, requiredTools)) {
+      return { ...policyBase, allowed: false, reason: "scope_mismatch" };
+    }
+
+    const conflicts = await this.writeConflicts(input.teamId, input.task, taskWriteScope);
+    if (conflicts.length > 0) policyBase.conflicts = conflicts;
+    return policyBase;
+  }
+
+  private async writeConflicts(
+    teamId: TeamId,
+    task: TeamTaskRow,
+    writeScope: string[] | undefined,
+  ): Promise<TeamTaskDispatchConflict[]> {
+    if (!writeScope || writeScope.length === 0) return [];
+    const tasks = await this.options.teams.tasks(teamId);
+    const conflicts: TeamTaskDispatchConflict[] = [];
+    for (const candidate of tasks) {
+      if (candidate.id === task.id || candidate.status !== "in_progress") continue;
+      const candidateWriteScope = metadataStringArray(candidate.metadata, ["writeScope", "write_scope", "writeScopes", "write_scopes"]);
+      if (!candidateWriteScope || !scopesOverlap(writeScope, candidateWriteScope)) continue;
+      const conflict: TeamTaskDispatchConflict = {
+        taskId: candidate.id,
+        writeScope: candidateWriteScope,
+      };
+      if (candidate.ownerPath) conflict.ownerPath = candidate.ownerPath;
+      conflicts.push(conflict);
+    }
+    return conflicts;
   }
 
   private now(): TimestampMs {
@@ -330,6 +435,55 @@ function mergeDispatchMetadata(
       ...binding,
     }),
   };
+}
+
+function metadataStringArray(metadata: Record<string, unknown> | undefined, keys: readonly string[]): string[] | undefined {
+  if (!metadata) return undefined;
+  for (const key of keys) {
+    const value = metadata[key];
+    if (!Array.isArray(value)) continue;
+    const items = value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
+    return items.length > 0 ? items : [];
+  }
+  return undefined;
+}
+
+function dispatchPolicyForMetadata(policy: TeamTaskDispatchPolicyMetadata): TeamTaskDispatchPolicyMetadata | undefined {
+  if (!policy.allowed || policy.writeScope || policy.requiredTools || policy.conflicts) return policy;
+  return undefined;
+}
+
+function scopeAllowsAll(allowed: readonly string[] | undefined, required: readonly string[] | undefined): boolean {
+  if (!required || required.length === 0) return true;
+  if (!allowed) return true;
+  if (allowed.length === 0) return false;
+  return required.every((item) => allowed.some((scope) => pathScopeContains(scope, item)));
+}
+
+function toolScopeAllowsAll(allowed: readonly string[] | undefined, required: readonly string[] | undefined): boolean {
+  if (!required || required.length === 0) return true;
+  if (!allowed) return true;
+  if (allowed.length === 0) return false;
+  const normalizedAllowed = allowed.map((item) => item.trim().toLowerCase());
+  return required.every((item) => normalizedAllowed.includes("*") || normalizedAllowed.includes(item.trim().toLowerCase()));
+}
+
+function scopesOverlap(left: readonly string[], right: readonly string[]): boolean {
+  return left.some((leftItem) => right.some((rightItem) => pathScopeContains(leftItem, rightItem) || pathScopeContains(rightItem, leftItem)));
+}
+
+function pathScopeContains(scope: string, item: string): boolean {
+  const normalizedScope = normalizePathScope(scope);
+  const normalizedItem = normalizePathScope(item);
+  if (normalizedScope === "*" || normalizedScope === "." || normalizedScope === "/") return true;
+  return normalizedItem === normalizedScope || normalizedItem.startsWith(`${normalizedScope}/`);
+}
+
+function normalizePathScope(value: string): string {
+  let normalized = value.trim().replaceAll("\\", "/");
+  while (normalized.startsWith("./")) normalized = normalized.slice(2);
+  while (normalized.length > 1 && normalized.endsWith("/")) normalized = normalized.slice(0, -1);
+  return normalized || ".";
 }
 
 function teamStatusFromAgentStatus(status: LocalSubagentTaskResult["status"] | AgentTaskRow["status"]): TeamTaskStatus {
