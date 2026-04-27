@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   AgentRunnerSubagentRunner,
+  AgentMailboxDeliveryPump,
   AgentTreeControlService,
   AgentTaskControlService,
   LocalSubagentManager,
@@ -90,6 +91,7 @@ export interface CliHarness {
   service: RuntimeService;
   tasks: AgentTaskControlService;
   agents: AgentTreeControlService;
+  mailboxPump: AgentMailboxDeliveryPump;
   teams: TeamControlService;
   teamDispatcher: TeamTaskDispatchService;
   recovery: SnapshotRecoveryService;
@@ -240,6 +242,11 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     runtime: childService,
     createId,
   });
+  const mailboxPump = new AgentMailboxDeliveryPump({
+    agents,
+    events: eventStore,
+  });
+  mailboxPump.start();
   const controlController = createSubagentControlController(tasks, agents);
   registry.register(createTaskListTool(controlController));
   registry.register(createTaskWaitTool(controlController));
@@ -261,10 +268,12 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     service,
     tasks,
     agents,
+    mailboxPump,
     teams,
     teamDispatcher,
     recovery,
     close: async () => {
+      await mailboxPump.stop();
       await subagents.waitForBackgroundTasks();
       sqliteStore.close();
     },
@@ -488,6 +497,7 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       if (context.threadId) assignInput.threadId = context.threadId;
       if (input.assignedBy) assignInput.assignedBy = input.assignedBy as AgentPath;
       if (input.message) assignInput.message = input.message;
+      if (input.messageDelivery) assignInput.messageDelivery = input.messageDelivery;
       if (input.messageSummary) assignInput.messageSummary = input.messageSummary;
       return toTeamTaskRecord(await teams.assignTask(assignInput));
     },
@@ -534,6 +544,7 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       if (context.threadId) messageInput.threadId = context.threadId;
       if (input.messageId) messageInput.messageId = input.messageId;
       if (input.kind) messageInput.kind = input.kind;
+      if (input.delivery) messageInput.delivery = input.delivery;
       if (input.taskId) messageInput.taskId = input.taskId as TaskId;
       if (input.summary) messageInput.summary = input.summary;
       if (input.metadata) messageInput.metadata = input.metadata;
@@ -738,6 +749,11 @@ function toTeamMessageRecord(message: TeamMessageRow): TeamMessageRecord {
     toPath: message.toPath,
     content: message.content,
     kind: message.kind,
+    ...(message.delivery ? { delivery: message.delivery } : {}),
+    ...(message.deliveryStatus ? { deliveryStatus: message.deliveryStatus } : {}),
+    ...(message.deliveryError ? { deliveryError: message.deliveryError } : {}),
+    ...(message.deliveryUpdatedAt ? { deliveryUpdatedAt: message.deliveryUpdatedAt } : {}),
+    ...(message.deliveredAt ? { deliveredAt: message.deliveredAt } : {}),
     ...(message.taskId ? { taskId: message.taskId } : {}),
     ...(message.summary ? { summary: message.summary } : {}),
     ...(message.metadata ? { metadata: message.metadata } : {}),

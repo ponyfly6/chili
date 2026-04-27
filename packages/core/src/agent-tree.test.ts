@@ -13,9 +13,10 @@ import type {
   TimestampMs,
   TurnId,
 } from "@chili/protocol";
-import { SqliteEventStore } from "@chili/store";
+import { ObservableEventStore, SqliteEventStore } from "@chili/store";
 import type { SubmitPromptInput, SubmitPromptResult } from "./runtime-service.js";
 import { AgentTreeControlService } from "./agent-tree.js";
+import { AgentMailboxDeliveryPump } from "./agent-mailbox-delivery-pump.js";
 
 test("builds an agent path tree and consumes mailbox messages", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-agent-tree-"));
@@ -272,6 +273,177 @@ test("delivers mailbox messages to child sessions before consuming them", async 
     });
   } finally {
     store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("mailbox delivery pump drains trigger-turn messages without consuming queue-only messages", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-agent-mailbox-pump-drain-"));
+  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
+  const store = new ObservableEventStore(baseStore);
+  const runtime = new FakeMailboxRuntime();
+  const childSessionId = "session_child" as SessionId;
+  const childThreadId = "thread_child" as ThreadId;
+  const childPath = "/root/worker" as AgentPath;
+
+  try {
+    await store.appendMany([
+      {
+        id: "event_trigger_mailbox",
+        type: "agent.message_queued",
+        time: 1 as TimestampMs,
+        payload: {
+          path: childPath,
+          from: "/root" as AgentPath,
+          childSessionId,
+          childThreadId,
+          triggerTurn: true,
+          message: { role: "user", content: "wake up" },
+        },
+      },
+      {
+        id: "event_queue_only_mailbox",
+        type: "agent.message_queued",
+        time: 2 as TimestampMs,
+        payload: {
+          path: childPath,
+          from: "/root" as AgentPath,
+          childSessionId,
+          childThreadId,
+          triggerTurn: false,
+          message: { role: "user", content: "remember this" },
+        },
+      },
+    ]);
+
+    const service = new AgentTreeControlService({
+      store,
+      runtime,
+      createId: createSequentialId(),
+      now: () => 3 as TimestampMs,
+    });
+    const pump = new AgentMailboxDeliveryPump({ agents: service, events: store });
+
+    pump.start();
+    await pump.waitForIdle();
+    await pump.stop();
+
+    expect(runtime.prompts).toMatchObject([
+      {
+        sessionId: childSessionId,
+        threadId: childThreadId,
+        text: "wake up",
+      },
+    ]);
+    expect(runtime.messages).toEqual([]);
+    expect(await service.mailbox({ messageId: "event_trigger_mailbox" })).toMatchObject([{ status: "consumed" }]);
+    expect(await service.mailbox({ messageId: "event_queue_only_mailbox" })).toMatchObject([{ status: "queued" }]);
+  } finally {
+    baseStore.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("mailbox delivery pump subscribes to live trigger-turn messages", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-agent-mailbox-pump-live-"));
+  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
+  const store = new ObservableEventStore(baseStore);
+  const runtime = new FakeMailboxRuntime();
+  const childSessionId = "session_child" as SessionId;
+  const childThreadId = "thread_child" as ThreadId;
+  const childPath = "/root/worker" as AgentPath;
+
+  try {
+    const service = new AgentTreeControlService({
+      store,
+      runtime,
+      createId: createSequentialId(),
+      now: () => 4 as TimestampMs,
+    });
+    const pump = new AgentMailboxDeliveryPump({ agents: service, events: store, includeExisting: false });
+    pump.start();
+
+    await store.append({
+      id: "event_live_mailbox",
+      type: "agent.message_queued",
+      time: 1 as TimestampMs,
+      payload: {
+        path: childPath,
+        from: "/root" as AgentPath,
+        childSessionId,
+        childThreadId,
+        triggerTurn: true,
+        message: { role: "user", content: "run now" },
+      },
+    });
+    await pump.waitForIdle();
+    await pump.stop();
+
+    expect(runtime.prompts).toMatchObject([
+      {
+        sessionId: childSessionId,
+        threadId: childThreadId,
+        text: "run now",
+      },
+    ]);
+    expect(await service.mailbox({ messageId: "event_live_mailbox" })).toMatchObject([{ status: "consumed" }]);
+  } finally {
+    baseStore.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("mailbox delivery pump reports failures and leaves messages queued", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-agent-mailbox-pump-failure-"));
+  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
+  const store = new ObservableEventStore(baseStore);
+  const runtime = new FakeMailboxRuntime(new Error("child session is busy"));
+  const childSessionId = "session_child" as SessionId;
+  const childThreadId = "thread_child" as ThreadId;
+  const childPath = "/root/worker" as AgentPath;
+  const failures: Array<{ messageId: string | undefined; error: unknown }> = [];
+
+  try {
+    const service = new AgentTreeControlService({
+      store,
+      runtime,
+      createId: createSequentialId(),
+      now: () => 5 as TimestampMs,
+    });
+    const pump = new AgentMailboxDeliveryPump({
+      agents: service,
+      events: store,
+      includeExisting: false,
+      onError: (error, messageId) => {
+        failures.push({ error, messageId });
+      },
+    });
+    pump.start();
+
+    await store.append({
+      id: "event_failed_mailbox",
+      type: "agent.message_queued",
+      time: 1 as TimestampMs,
+      payload: {
+        path: childPath,
+        from: "/root" as AgentPath,
+        childSessionId,
+        childThreadId,
+        triggerTurn: true,
+        message: { role: "user", content: "try run" },
+      },
+    });
+    await pump.waitForIdle();
+    await pump.stop();
+
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.messageId).toBe("event_failed_mailbox");
+    expect(await service.mailbox({ messageId: "event_failed_mailbox" })).toMatchObject([{ status: "queued" }]);
+    expect((await store.events({ type: "agent.message_requeued", limit: 10 })).map((event) => event.id)).toEqual([
+      "event_2",
+    ]);
+  } finally {
+    baseStore.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
