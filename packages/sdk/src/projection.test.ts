@@ -433,13 +433,25 @@ test("client preserves team dispatcher JSON shapes for dispatch, sync, and recon
     completed: [],
     accepted: [],
     reopened: [],
+    merged: [],
+    mergeFailed: [],
+    mergeConflicted: [],
+    mergeSkipped: [],
     failed: [],
     blocked: [],
     skipped: [],
     stillRunning: [{ teamId, taskId, ownerPath, agentTaskId: agentTask.taskId, title: "SDK team task" }],
     errors: [],
   };
-  const responses: unknown[] = [dispatchJson, skippedDispatchJson, syncResult, reconcileJson, runLoopJson];
+  const mergeJson = {
+    scanned: 1,
+    applied: [],
+    failed: [],
+    conflicted: [],
+    skipped: [],
+    errors: [],
+  };
+  const responses: unknown[] = [dispatchJson, skippedDispatchJson, syncResult, reconcileJson, mergeJson, runLoopJson];
   const requests: Array<{ url: string; method: string | undefined; body: unknown }> = [];
   const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     const responseBody = responses.shift();
@@ -471,6 +483,7 @@ test("client preserves team dispatcher JSON shapes for dispatch, sync, and recon
   expect(await client.dispatchTeamTask({ teamId, taskId, sessionId, threadId })).toEqual(skippedDispatchJson);
   expect(await client.syncTeamTask({ teamId, taskId, sessionId, threadId })).toEqual(syncResult);
   expect(await client.reconcileTeamTasks({ teamId, sessionId, threadId, limit: 5 })).toEqual(reconcileJson);
+  expect(await client.mergeTeamTasks({ teamId, taskId, sessionId, threadId, cwd: "/repo" })).toEqual(mergeJson);
   expect(
     await client.runTeamLoop({
       teamId,
@@ -504,6 +517,11 @@ test("client preserves team dispatcher JSON shapes for dispatch, sync, and recon
       url: "http://runtime.test/api/teams/team_sdk/reconcile_dispatches",
       method: "POST",
       body: { teamId, sessionId, threadId, limit: 5 },
+    },
+    {
+      url: "http://runtime.test/api/teams/team_sdk/merge",
+      method: "POST",
+      body: { teamId, taskId, sessionId, threadId, cwd: "/repo" },
     },
     {
       url: "http://runtime.test/api/teams/team_sdk/run_loop",

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { createInterface } from "node:readline/promises";
 import { addChiliMemoryEntry, loadChiliMemoryContext } from "@chili/core";
-import type { AgentTreeNode, TeamExecutionRunSummary, TeamSnapshot } from "@chili/core";
+import type { AgentTreeNode, TeamExecutionRunSummary, TeamMergeSweepResult, TeamSnapshot } from "@chili/core";
 import type { SessionId, TaskId, TeamId } from "@chili/protocol";
 import { ROOT_AGENT_PATH } from "@chili/protocol";
 import { startRuntimeHttpServer } from "@chili/server";
@@ -115,6 +115,19 @@ async function main(): Promise<void> {
       const result = await harness.teamRunner.run(input);
       if (args.json) console.log(jsonStringify(result));
       else printTeamRunLoopSummary(result);
+      return;
+    }
+
+    if (args.command === "team-merge") {
+      if (!args.teamId) throw new Error("team-merge requires a team id");
+      const input: Parameters<typeof harness.teamMerger.mergeTeamTasks>[0] = {
+        teamId: args.teamId as TeamId,
+        cwd: harness.cwd,
+      };
+      if (args.taskId) input.taskId = args.taskId as TaskId;
+      const result = await harness.teamMerger.mergeTeamTasks(input);
+      if (args.json) console.log(jsonStringify(result));
+      else printTeamMergeSummary(result);
       return;
     }
 
@@ -259,6 +272,7 @@ async function serve(input: {
     agents: input.harness.agents,
     teams: input.harness.teams,
     teamDispatcher: input.harness.teamDispatcher,
+    teamMerger: input.harness.teamMerger,
     teamRunner: input.harness.teamRunner,
     approvals: input.approvalQueue,
     hostname: input.host,
@@ -513,6 +527,10 @@ function printTeamRunLoopSummary(summary: TeamExecutionRunSummary): void {
       `completed=${summary.completed.length}`,
       `accepted=${summary.accepted.length}`,
       `reopened=${summary.reopened.length}`,
+      `merged=${summary.merged.length}`,
+      `mergeFailed=${summary.mergeFailed.length}`,
+      `mergeConflicted=${summary.mergeConflicted.length}`,
+      `mergeSkipped=${summary.mergeSkipped.length}`,
       `failed=${summary.failed.length}`,
       `blocked=${summary.blocked.length}`,
       `skipped=${summary.skipped.length}`,
@@ -532,6 +550,18 @@ function printTeamRunLoopSummary(summary: TeamExecutionRunSummary): void {
   for (const item of summary.reopened) {
     console.log(["[reopened]", item.taskId, item.status, item.ownerPath ?? "-", item.feedback ?? ""].join("\t"));
   }
+  for (const item of summary.merged) {
+    console.log(["[merged]", item.taskId, item.status, item.ownerPath ?? "-", mergeFilesChanged(item.diffSummary)].join("\t"));
+  }
+  for (const item of summary.mergeConflicted) {
+    console.log(["[merge-conflicted]", item.taskId, item.status, item.ownerPath ?? "-", item.error ?? item.conflicts?.join("; ") ?? ""].join("\t"));
+  }
+  for (const item of summary.mergeFailed) {
+    console.log(["[merge-failed]", item.taskId, item.status, item.ownerPath ?? "-", item.error ?? ""].join("\t"));
+  }
+  for (const item of summary.mergeSkipped) {
+    console.log(["[merge-skipped]", item.taskId, item.reason, item.ownerPath ?? "-", item.error ?? ""].join("\t"));
+  }
   for (const item of summary.failed) {
     console.log(["[failed]", item.taskId, item.status, item.ownerPath ?? "-", item.error ?? item.summary ?? ""].join("\t"));
   }
@@ -547,6 +577,31 @@ function printTeamRunLoopSummary(summary: TeamExecutionRunSummary): void {
   for (const item of summary.errors) {
     console.log(["[error]", item.taskId ?? "-", item.error].join("\t"));
   }
+}
+
+function printTeamMergeSummary(result: TeamMergeSweepResult): void {
+  console.log(
+    [
+      "[team-merge]",
+      `scanned=${result.scanned}`,
+      `applied=${result.applied.length}`,
+      `failed=${result.failed.length}`,
+      `conflicted=${result.conflicted.length}`,
+      `skipped=${result.skipped.length}`,
+      `errors=${result.errors.length}`,
+    ].join("\t"),
+  );
+  for (const item of result.applied) console.log(["[merged]", item.teamTask.id, mergeFilesChanged(item.diffSummary)].join("\t"));
+  for (const item of result.conflicted) console.log(["[conflicted]", item.teamTask.id, item.error ?? item.conflicts?.join("; ") ?? ""].join("\t"));
+  for (const item of result.failed) console.log(["[merge-failed]", item.teamTask.id, item.error ?? ""].join("\t"));
+  for (const item of result.skipped) console.log(["[merge-skipped]", item.teamTask.id, item.reason, item.error ?? ""].join("\t"));
+  for (const item of result.errors) console.log(["[error]", item.taskId, item.error].join("\t"));
+}
+
+function mergeFilesChanged(summary: unknown): string {
+  if (!summary || typeof summary !== "object" || !("filesChanged" in summary)) return "files=0";
+  const filesChanged = (summary as { filesChanged?: unknown }).filesChanged;
+  return `files=${typeof filesChanged === "number" ? filesChanged : 0}`;
 }
 
 async function printMailbox(harness: Awaited<ReturnType<typeof createCliHarness>>): Promise<void> {

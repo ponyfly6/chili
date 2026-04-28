@@ -258,6 +258,54 @@ export interface TeamMessageSentPayload {
   metadata?: Record<string, unknown>;
 }
 
+export type TeamRunStopReason = "drained" | "once" | "max_cycles" | "timeout" | "aborted" | "team_inactive";
+export type TeamRunLifecyclePhase = "reconcile" | "load" | "verify" | "merge" | "dispatch" | "wait" | "drain";
+
+export interface TeamRunSummaryCounts {
+  dispatched: number;
+  completed: number;
+  accepted: number;
+  reopened: number;
+  merged: number;
+  mergeFailed: number;
+  mergeConflicted: number;
+  mergeSkipped: number;
+  failed: number;
+  blocked: number;
+  skipped: number;
+  stillRunning: number;
+  errors: number;
+}
+
+export interface TeamRunStartedPayload {
+  teamId: TeamId;
+  runId: string;
+  mode: AgentTaskMode;
+  once: boolean;
+  maxCycles: number;
+  timeoutMs: number;
+  pollIntervalMs: number;
+}
+
+export interface TeamRunProgressPayload {
+  teamId: TeamId;
+  runId: string;
+  cycle: number;
+  phase: TeamRunLifecyclePhase;
+  counts: TeamRunSummaryCounts;
+  stopReason?: TeamRunStopReason;
+}
+
+export interface TeamRunCompletedPayload {
+  teamId: TeamId;
+  runId: string;
+  cycles: number;
+  stopReason: TeamRunStopReason;
+  startedAt: number;
+  endedAt: number;
+  counts: TeamRunSummaryCounts;
+}
+
 export type TeamEvent =
   | EventEnvelope<"team.created", TeamCreatedPayload>
   | EventEnvelope<"team.member_added", TeamMemberAddedPayload>
@@ -266,4 +314,7 @@ export type TeamEvent =
   | EventEnvelope<"team.task_assigned", TeamTaskAssignedPayload>
   | EventEnvelope<"team.task_claimed", TeamTaskClaimedPayload>
   | EventEnvelope<"team.task_updated", TeamTaskUpdatedPayload>
-  | EventEnvelope<"team.message_sent", TeamMessageSentPayload>;
+  | EventEnvelope<"team.message_sent", TeamMessageSentPayload>
+  | EventEnvelope<"team.run_started", TeamRunStartedPayload>
+  | EventEnvelope<"team.run_progress", TeamRunProgressPayload>
+  | EventEnvelope<"team.run_completed", TeamRunCompletedPayload>;

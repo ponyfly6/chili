@@ -60,6 +60,15 @@ test("parses team run loop command and runner flags", () => {
   });
 });
 
+test("parses team merge command", () => {
+  expect(parseArgs(["team-merge", "team_1", "--task", "task_1", "--json"])).toMatchObject({
+    command: "team-merge",
+    teamId: "team_1",
+    taskId: "task_1",
+    json: true,
+  });
+});
+
 test("parses memory commands", () => {
   expect(parseArgs(["memory", "show"])).toMatchObject({
     command: "memory-show",

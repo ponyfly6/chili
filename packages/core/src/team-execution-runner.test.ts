@@ -2,12 +2,14 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { AgentPath, SessionId, TimestampMs, ThreadId } from "@chili/protocol";
+import type { AgentPath, AgentRunId, SessionId, TaskId, TeamId, TimestampMs, ThreadId } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import { LocalSubagentManager, type LocalSubagentRunInput, type LocalSubagentRunResult, type LocalSubagentRunner } from "./subagent.js";
 import { TeamTaskDispatchService } from "./team-dispatcher.js";
-import { TeamExecutionRunner } from "./team-execution-runner.js";
+import { TeamExecutionRunner, type TeamTaskMerger, type TeamTaskVerifier } from "./team-execution-runner.js";
+import type { TeamMergeResultStatus, TeamMergeSweepResult } from "./team-merge.js";
 import { TeamControlService } from "./team.js";
+import { taskMergeMetadata } from "./team-worktree.js";
 
 test("runs team tasks through dependencies until the board is drained", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-drained-"));
@@ -130,6 +132,88 @@ test("runs one cycle and reports still-running background tasks", async () => {
     await subagents.waitForBackgroundTasks();
   } finally {
     runner.completeAll();
+    await subagents?.waitForBackgroundTasks();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("emits team run lifecycle events", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-lifecycle-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 650 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const sessionId = "session_team_runner_lifecycle" as SessionId;
+  const threadId = "thread_team_runner_lifecycle" as ThreadId;
+  const runner = new ImmediateLocalSubagentRunner();
+  let subagents: LocalSubagentManager | undefined;
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
+    const execution = new TeamExecutionRunner({ teams, dispatcher, events: store, cwd: dir, now, createId: ids });
+
+    const team = await teams.createTeam({ sessionId, threadId, name: "runner-lifecycle", leadPath });
+    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const task = await teams.createTask({ sessionId, threadId, teamId: team.id, title: "Emit events", ownerPath: workerPath });
+
+    const summary = await execution.run({ teamId: team.id, sessionId, threadId, mode: "one_shot", maxCycles: 3 });
+
+    expect(summary).toMatchObject({
+      stopReason: "drained",
+      dispatched: [{ taskId: task.id, status: "completed" }],
+      completed: [{ taskId: task.id, status: "completed" }],
+      errors: [],
+    });
+    const lifecycleEvents = (await store.events({ limit: 100 })).filter((event) => event.type.startsWith("team.run_"));
+    expect(lifecycleEvents.map((event) => event.type)).toEqual([
+      "team.run_started",
+      "team.run_progress",
+      "team.run_progress",
+      "team.run_progress",
+      "team.run_progress",
+      "team.run_progress",
+      "team.run_progress",
+      "team.run_completed",
+    ]);
+    expect(lifecycleEvents[0]).toMatchObject({
+      type: "team.run_started",
+      sessionId,
+      threadId,
+      payload: {
+        teamId: team.id,
+        mode: "one_shot",
+        once: false,
+        maxCycles: 3,
+      },
+    });
+    const runIds = new Set(lifecycleEvents.map((event) => (isRecord(event.payload) ? event.payload.runId : undefined)));
+    expect(runIds.size).toBe(1);
+    expect([...runIds][0]).toEqual(expect.stringContaining("teamrun_"));
+    expect(
+      lifecycleEvents
+        .filter((event) => event.type === "team.run_progress")
+        .map((event) => (isRecord(event.payload) ? event.payload.phase : undefined)),
+    ).toEqual(["reconcile", "load", "verify", "merge", "dispatch", "drain"]);
+    expect(lifecycleEvents.at(-1)).toMatchObject({
+      type: "team.run_completed",
+      sessionId,
+      threadId,
+      payload: {
+        teamId: team.id,
+        cycles: 1,
+        stopReason: "drained",
+        counts: {
+          dispatched: 1,
+          completed: 1,
+          errors: 0,
+        },
+      },
+    });
+  } finally {
     await subagents?.waitForBackgroundTasks();
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -598,6 +682,150 @@ test("reports abort when the signal is aborted during task dispatch", async () =
   }
 });
 
+test("merges verifier-passed tasks and drains after merge is applied", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-merge-applied-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 980 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const sessionId = "session_team_runner_merge" as SessionId;
+  const runner = new ImmediateLocalSubagentRunner();
+  let subagents: LocalSubagentManager | undefined;
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
+    const verifier = new PendingMergeVerifier(teams, now);
+    const merger = new MetadataMergeService(teams, "applied", now);
+    const execution = new TeamExecutionRunner({ teams, dispatcher, verifier, merger, cwd: dir, now });
+    const team = await teams.createTeam({ sessionId, name: "runner-merge", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const task = await teams.createTask({ sessionId, teamId: team.id, title: "Complete and merge", ownerPath: workerPath });
+
+    const summary = await execution.run({ teamId: team.id, sessionId, mode: "one_shot", maxCycles: 3 });
+
+    expect(summary).toMatchObject({
+      stopReason: "drained",
+      completed: [{ taskId: task.id, status: "completed" }],
+      accepted: [{ taskId: task.id, status: "completed" }],
+      merged: [{ taskId: task.id, status: "applied" }],
+      mergeFailed: [],
+      mergeConflicted: [],
+      mergeSkipped: [],
+      errors: [],
+    });
+    const [storedTask] = await teams.tasks(team.id);
+    expect(taskMergeMetadata(storedTask?.metadata)?.status).toBe("applied");
+  } finally {
+    await subagents?.waitForBackgroundTasks();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reports merge conflicts from verifier-passed tasks", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-merge-conflict-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 985 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const sessionId = "session_team_runner_merge_conflict" as SessionId;
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const team = await teams.createTeam({ sessionId, name: "runner-merge-conflict", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const task = await teams.createTask({
+      sessionId,
+      teamId: team.id,
+      title: "Already verified",
+      ownerPath: workerPath,
+      status: "completed",
+      metadata: pendingMergeMetadata(),
+    });
+    const dispatcher = {
+      async reconcileTasks() {
+        return emptyReconcileResult();
+      },
+      async dispatchTask() {
+        throw new Error("not expected");
+      },
+      async syncTask() {
+        throw new Error("not expected");
+      },
+    } as unknown as TeamTaskDispatchService;
+    const merger = new MetadataMergeService(teams, "conflicted", now);
+    const execution = new TeamExecutionRunner({ teams, dispatcher, merger, cwd: dir, now });
+
+    const summary = await execution.run({ teamId: team.id, sessionId, maxCycles: 2 });
+
+    expect(summary).toMatchObject({
+      stopReason: "drained",
+      merged: [],
+      mergeConflicted: [{ taskId: task.id, status: "conflicted", error: "merge_conflicted" }],
+      errors: [],
+    });
+    const [storedTask] = await teams.tasks(team.id);
+    expect(taskMergeMetadata(storedTask?.metadata)?.status).toBe("conflicted");
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("does not report drained while a pending merge has not been processed", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-merge-pending-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 990 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const sessionId = "session_team_runner_merge_pending" as SessionId;
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const team = await teams.createTeam({ sessionId, name: "runner-merge-pending", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    await teams.createTask({
+      sessionId,
+      teamId: team.id,
+      title: "Pending merge",
+      ownerPath: workerPath,
+      status: "completed",
+      metadata: pendingMergeMetadata(),
+    });
+    const dispatcher = {
+      async reconcileTasks() {
+        return emptyReconcileResult();
+      },
+      async dispatchTask() {
+        throw new Error("not expected");
+      },
+      async syncTask() {
+        throw new Error("not expected");
+      },
+    } as unknown as TeamTaskDispatchService;
+    const execution = new TeamExecutionRunner({ teams, dispatcher, cwd: dir, now });
+
+    const summary = await execution.run({ teamId: team.id, sessionId, maxCycles: 1 });
+
+    expect(summary).toMatchObject({
+      stopReason: "max_cycles",
+      cycles: 1,
+      stillRunning: [],
+      merged: [],
+      mergeConflicted: [],
+      errors: [],
+    });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 class DeferredLocalSubagentRunner implements LocalSubagentRunner {
   readonly runs: LocalSubagentRunInput[] = [];
   private readonly completions: Array<() => void> = [];
@@ -626,6 +854,117 @@ class ImmediateLocalSubagentRunner implements LocalSubagentRunner {
     this.runs.push(input);
     return { status: "completed", summary: `Done ${input.taskName}` };
   }
+}
+
+class PendingMergeVerifier implements TeamTaskVerifier {
+  constructor(
+    private readonly teams: TeamControlService,
+    private readonly now: () => TimestampMs,
+  ) {}
+
+  async verifyCompletedTasks(input: Parameters<TeamTaskVerifier["verifyCompletedTasks"]>[0]): Promise<Awaited<ReturnType<TeamTaskVerifier["verifyCompletedTasks"]>>> {
+    const tasks = await this.teams.tasks(input.teamId);
+    const result: Awaited<ReturnType<TeamTaskVerifier["verifyCompletedTasks"]>> = {
+      scanned: 0,
+      verified: [],
+      skipped: [],
+      errors: [],
+    };
+    for (const task of tasks) {
+      if (task.status !== "completed" || taskMergeMetadata(task.metadata)) continue;
+      result.scanned++;
+      const updated = await this.teams.updateTask({
+        teamId: task.teamId,
+        taskId: task.id,
+        metadata: pendingMergeMetadata(Number(this.now())),
+        ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+        ...(input.threadId ? { threadId: input.threadId } : {}),
+      });
+      result.verified.push({
+        status: "passed",
+        teamTask: updated,
+        verifierTask: {
+          taskId: "task_verifier" as TaskId,
+          runId: "run_verifier" as AgentRunId,
+          path: "/root/worker/verifier" as AgentPath,
+          parentPath: "/root/worker" as AgentPath,
+          childSessionId: "session_verifier" as SessionId,
+          childThreadId: "thread_verifier" as ThreadId,
+          status: "completed",
+          summary: "VERDICT: passed",
+        },
+        feedback: "VERDICT: passed",
+      });
+    }
+    return result;
+  }
+}
+
+class MetadataMergeService implements TeamTaskMerger {
+  constructor(
+    private readonly teams: TeamControlService,
+    private readonly status: TeamMergeResultStatus,
+    private readonly now: () => TimestampMs,
+  ) {}
+
+  async mergeTeamTasks(input: Parameters<TeamTaskMerger["mergeTeamTasks"]>[0]): Promise<TeamMergeSweepResult> {
+    const result: TeamMergeSweepResult = {
+      scanned: 0,
+      applied: [],
+      failed: [],
+      conflicted: [],
+      skipped: [],
+      errors: [],
+    };
+    const tasks = await this.teams.tasks(input.teamId);
+    for (const task of tasks) {
+      const merge = taskMergeMetadata(task.metadata);
+      if (!merge || merge.status !== "pending") continue;
+      result.scanned++;
+      const metadata = {
+        ...(task.metadata ?? {}),
+        merge: {
+          ...merge,
+          status: this.status,
+          mergedAt: Number(this.now()),
+          diffSummary: { filesChanged: 1, paths: ["packages/core/src/team.ts"], truncatedPaths: false, diffBytes: 10 },
+          ...(this.status === "conflicted" ? { error: "merge_conflicted", conflicts: ["packages/core/src/team.ts"] } : {}),
+          ...(this.status === "failed" ? { error: "merge_failed" } : {}),
+        },
+      };
+      const updated = await this.teams.updateTask({
+        teamId: task.teamId,
+        taskId: task.id,
+        metadata,
+        ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+        ...(input.threadId ? { threadId: input.threadId } : {}),
+      });
+      const item = {
+        status: this.status,
+        teamTask: updated,
+        diffSummary: { filesChanged: 1, paths: ["packages/core/src/team.ts"], truncatedPaths: false, diffBytes: 10 },
+        ...(this.status === "conflicted" ? { error: "merge_conflicted", conflicts: ["packages/core/src/team.ts"] } : {}),
+        ...(this.status === "failed" ? { error: "merge_failed" } : {}),
+      };
+      if (this.status === "applied") result.applied.push(item as TeamMergeSweepResult["applied"][number]);
+      else if (this.status === "failed") result.failed.push(item as TeamMergeSweepResult["failed"][number]);
+      else if (this.status === "conflicted") result.conflicted.push(item as TeamMergeSweepResult["conflicted"][number]);
+    }
+    return result;
+  }
+}
+
+function pendingMergeMetadata(createdAt = 900): Record<string, unknown> {
+  return {
+    verification: { status: "passed", gitDiff: "diff" },
+    merge: {
+      status: "pending",
+      createdAt,
+      worktreePath: "/tmp/chili-runner-test-worktree",
+      baseRef: "HEAD",
+      diff: "diff",
+    },
+  };
 }
 
 function createSequentialId(): (prefix: string) => string {

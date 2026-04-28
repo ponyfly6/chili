@@ -11,7 +11,7 @@ const MERGE_METADATA_KEY = "merge";
 const DEFAULT_BASE_REF = "HEAD";
 
 export type TeamTaskWorktreeStatus = "active";
-export type TeamTaskMergeStatus = "pending";
+export type TeamTaskMergeStatus = "pending" | "applied" | "failed" | "conflicted" | "skipped";
 
 export interface TeamWorktreeServiceOptions {
   teams: TeamControlService;
@@ -66,6 +66,13 @@ export interface TeamTaskMergeMetadata {
   worktreePath?: string;
   baseRef?: string;
   diff?: string;
+  diffSummary?: Record<string, unknown>;
+  mergedAt?: number;
+  error?: string;
+  conflicts?: string[];
+  reason?: string;
+  mainHead?: string;
+  worktreeHead?: string;
 }
 
 export class TeamWorktreeService {
@@ -163,7 +170,7 @@ export function worktreeMetadata(metadata: Record<string, unknown> | undefined):
 export function taskMergeMetadata(metadata: Record<string, unknown> | undefined): TeamTaskMergeMetadata | undefined {
   const value = metadata?.[MERGE_METADATA_KEY];
   if (!isRecord(value)) return undefined;
-  if (value.status !== "pending" || typeof value.createdAt !== "number") return undefined;
+  if (!isMergeStatus(value.status) || typeof value.createdAt !== "number") return undefined;
   return value as unknown as TeamTaskMergeMetadata;
 }
 
@@ -193,6 +200,10 @@ function safePathSegment(value: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isMergeStatus(value: unknown): value is TeamTaskMergeStatus {
+  return value === "pending" || value === "applied" || value === "failed" || value === "conflicted" || value === "skipped";
 }
 
 function pruneUndefined<T>(value: T): T {

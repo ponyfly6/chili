@@ -36,6 +36,7 @@ import type {
   RuntimeTaskControlService,
   RuntimeTeamDispatcherService,
   RuntimeTeamExecutionRunnerService,
+  RuntimeTeamMergeService,
 } from "./runtime-http.js";
 import { createRuntimeHttpHandler } from "./runtime-http.js";
 
@@ -317,8 +318,9 @@ test("serves team control routes", async () => {
     now: () => 10 as TimestampMs,
   });
   const teamDispatcher = new FakeTeamDispatcherService();
+  const teamMerger = new FakeTeamMergeService();
   const teamRunner = new FakeTeamExecutionRunnerService();
-  const handler = createRuntimeHttpHandler({ service, store, teams, teamDispatcher, teamRunner });
+  const handler = createRuntimeHttpHandler({ service, store, teams, teamDispatcher, teamMerger, teamRunner });
 
   try {
     const createTeamResponse = await handler(
@@ -472,6 +474,19 @@ test("serves team control routes", async () => {
     expect(globalReconcileResponse.status).toBe(200);
     expect(await globalReconcileResponse.json()).toEqual(reconcileResultJson("team_http" as TeamId));
     expect(teamDispatcher.reconcileInputs.at(-1)).toMatchObject({ limit: 10 });
+
+    const mergeResponse = await handler(
+      new Request(`http://chili.test/teams/${team.id}/merge`, {
+        method: "POST",
+        body: JSON.stringify({ sessionId: "session_dispatch", threadId: "thread_dispatch", taskId: task.id, cwd: "/repo" }),
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    expect(mergeResponse.status).toBe(200);
+    expect(await mergeResponse.json()).toEqual(teamMergeResultJson(team.id, task.id));
+    expect(teamMerger.mergeInputs).toMatchObject([
+      { teamId: team.id, taskId: task.id, sessionId: "session_dispatch", threadId: "thread_dispatch", cwd: "/repo" },
+    ]);
 
     const runLoopResponse = await handler(
       new Request(`http://chili.test/teams/${team.id}/run_loop`, {
@@ -873,6 +888,17 @@ class FakeTeamExecutionRunnerService implements RuntimeTeamExecutionRunnerServic
   }
 }
 
+class FakeTeamMergeService implements RuntimeTeamMergeService {
+  mergeInputs: Array<Parameters<RuntimeTeamMergeService["mergeTeamTasks"]>[0]> = [];
+
+  async mergeTeamTasks(
+    input: Parameters<RuntimeTeamMergeService["mergeTeamTasks"]>[0],
+  ): Promise<Awaited<ReturnType<RuntimeTeamMergeService["mergeTeamTasks"]>>> {
+    this.mergeInputs.push(input);
+    return teamMergeResultJson(input.teamId, input.taskId ?? ("task_http" as TaskId));
+  }
+}
+
 class AbortObservingTeamExecutionRunnerService implements RuntimeTeamExecutionRunnerService {
   seenSignal: AbortSignal | undefined;
   signalAbortedAfterAbort = false;
@@ -941,6 +967,10 @@ function teamRunLoopResultJson(teamId: TeamId): Awaited<ReturnType<RuntimeTeamEx
     completed: [],
     accepted: [],
     reopened: [],
+    merged: [],
+    mergeFailed: [],
+    mergeConflicted: [],
+    mergeSkipped: [],
     failed: [],
     blocked: [],
     skipped: [],
@@ -953,6 +983,23 @@ function teamRunLoopResultJson(teamId: TeamId): Awaited<ReturnType<RuntimeTeamEx
         title: "HTTP team task",
       },
     ],
+    errors: [],
+  };
+}
+
+function teamMergeResultJson(teamId: TeamId, taskId: TaskId): Awaited<ReturnType<RuntimeTeamMergeService["mergeTeamTasks"]>> {
+  return {
+    scanned: 1,
+    applied: [
+      {
+        status: "applied",
+        teamTask: teamTaskRow({ teamId, taskId, status: "completed" }),
+        diffSummary: { filesChanged: 1, paths: ["packages/core/src/team.ts"], truncatedPaths: false, diffBytes: 120 },
+      },
+    ],
+    failed: [],
+    conflicted: [],
+    skipped: [],
     errors: [],
   };
 }

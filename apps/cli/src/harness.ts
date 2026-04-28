@@ -11,6 +11,7 @@ import {
   SnapshotRecoveryService,
   TeamControlService,
   TeamExecutionRunner,
+  TeamMergeService,
   TeamTaskDispatchService,
   TeamTaskVerificationService,
   TeamWorktreeService,
@@ -108,6 +109,7 @@ export interface CliHarness {
   mailboxPump: AgentMailboxDeliveryPump;
   teams: TeamControlService;
   teamDispatcher: TeamTaskDispatchService;
+  teamMerger: TeamMergeService;
   teamRunner: TeamExecutionRunner;
   recovery: SnapshotRecoveryService;
   close(): Promise<void>;
@@ -210,6 +212,10 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     subagents,
     cwd,
   });
+  const teamMerger = new TeamMergeService({
+    teams,
+    cwd,
+  });
   const completeTaskController: SubagentController = {
     spawnTask(input, context) {
       return subagents.spawnTask(input, context);
@@ -271,6 +277,8 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     teams,
     dispatcher: teamDispatcher,
     verifier: teamVerifier,
+    merger: teamMerger,
+    events: eventStore,
     cwd,
     createSession: async (input) => service.createSession({ cwd: input.cwd }),
   });
@@ -308,6 +316,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     mailboxPump,
     teams,
     teamDispatcher,
+    teamMerger,
     teamRunner,
     recovery,
     close: async () => {

@@ -39,6 +39,8 @@ import type {
   TeamTaskDispatchResult,
   TeamExecutionRunInput,
   TeamExecutionRunSummary,
+  TeamMergeInput,
+  TeamMergeSweepResult,
   TeamTaskReconcileInput,
   TeamTaskReconcileResult,
   TeamTaskSyncInput,
@@ -111,6 +113,10 @@ export interface RuntimeTeamExecutionRunnerService {
   run(input: TeamExecutionRunInput): Promise<TeamExecutionRunSummary>;
 }
 
+export interface RuntimeTeamMergeService {
+  mergeTeamTasks(input: TeamMergeInput): Promise<TeamMergeSweepResult>;
+}
+
 export interface RuntimeHttpHandlerOptions {
   service: RuntimeHttpService;
   store: EventStore & EventPublisher;
@@ -118,6 +124,7 @@ export interface RuntimeHttpHandlerOptions {
   agents?: RuntimeAgentTreeService;
   teams?: RuntimeTeamService;
   teamDispatcher?: RuntimeTeamDispatcherService;
+  teamMerger?: RuntimeTeamMergeService;
   teamRunner?: RuntimeTeamExecutionRunnerService;
   approvals?: ApprovalResolver;
   maxBacklogEvents?: number;
@@ -265,6 +272,14 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         const input = teamRunLoopInput(route.teamId, body);
         input.signal = request.signal;
         return json(await runner.run(input));
+      }
+
+      if (route.name === "teamMerge") {
+        const merger = requireTeamMerger(options);
+        const body = await readJson<TeamMergeBody>(request);
+        const input = teamMergeInput(route.teamId, body);
+        input.signal = request.signal;
+        return json(await merger.mergeTeamTasks(input));
       }
 
       if (route.name === "teamMembers") {
@@ -463,6 +478,7 @@ type Route =
   | { name: "createTeam" }
   | { name: "teamReconcileDispatches"; teamId?: TeamId }
   | { name: "teamRunLoop"; teamId: TeamId }
+  | { name: "teamMerge"; teamId: TeamId }
   | { name: "teamSnapshot"; teamId: TeamId }
   | { name: "teamMembers"; teamId: TeamId }
   | { name: "teamAddMember"; teamId: TeamId }
@@ -599,6 +615,11 @@ interface TeamRunLoopBody extends TeamContextBody {
   pollIntervalMs?: number;
 }
 
+interface TeamMergeBody extends TeamContextBody {
+  taskId?: TaskId;
+  cwd?: string;
+}
+
 interface TeamTaskUpdateBody extends TeamContextBody {
   status?: unknown;
   ownerPath?: AgentPath;
@@ -690,6 +711,9 @@ function routeRequest(method: string, pathname: string): Route {
     }
     if ((resource === "run_loop" || resource === "run-loop") && method === "POST" && !resourceId) {
       return { name: "teamRunLoop", teamId };
+    }
+    if (resource === "merge" && method === "POST" && !resourceId) {
+      return { name: "teamMerge", teamId };
     }
     if (resource === "tasks") {
       if (method === "GET" && !resourceId) return { name: "teamTasks", teamId };
@@ -998,6 +1022,11 @@ function requireTeamRunner(options: RuntimeHttpHandlerOptions): RuntimeTeamExecu
   return options.teamRunner;
 }
 
+function requireTeamMerger(options: RuntimeHttpHandlerOptions): RuntimeTeamMergeService {
+  if (!options.teamMerger) throw { status: 501, message: "No team merge service is configured" } satisfies HttpError;
+  return options.teamMerger;
+}
+
 function teamContext(body: TeamContextBody): TeamEventContextInput {
   const input: TeamEventContextInput = {};
   if (body.sessionId) input.sessionId = body.sessionId;
@@ -1139,6 +1168,16 @@ function teamRunLoopInput(teamId: TeamId, body: TeamRunLoopBody): TeamExecutionR
     if (!Number.isInteger(body.pollIntervalMs) || body.pollIntervalMs < 0) throw badRequest("pollIntervalMs must be a non-negative integer");
     input.pollIntervalMs = body.pollIntervalMs;
   }
+  return input;
+}
+
+function teamMergeInput(teamId: TeamId, body: TeamMergeBody): TeamMergeInput {
+  const input: TeamMergeInput = {
+    ...teamContext(body),
+    teamId,
+  };
+  if (body.taskId) input.taskId = body.taskId;
+  if (body.cwd) input.cwd = body.cwd;
   return input;
 }
 

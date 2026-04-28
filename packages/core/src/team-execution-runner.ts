@@ -1,4 +1,17 @@
-import type { AgentPath, SessionId, TaskId, TeamId, TeamTaskStatus, ThreadId, TimestampMs } from "@chili/protocol";
+import type {
+  AgentPath,
+  ChiliEvent,
+  EventEnvelope,
+  SessionId,
+  TaskId,
+  TeamId,
+  TeamRunLifecyclePhase,
+  TeamRunStopReason,
+  TeamRunSummaryCounts,
+  TeamTaskStatus,
+  ThreadId,
+  TimestampMs,
+} from "@chili/protocol";
 import { timestampNow } from "@chili/protocol";
 import type { TeamMemberRow, TeamRow, TeamTaskRow } from "@chili/store";
 import type { LocalSubagentMode } from "./subagent.js";
@@ -9,26 +22,45 @@ import type {
   TeamTaskSyncResult,
 } from "./team-dispatcher.js";
 import type {
+  TeamMergeInput,
+  TeamMergeSkippedReason,
+  TeamMergeSweepResult,
+  TeamMergeTaskResult,
+  TeamMergeTaskSkipped,
+} from "./team-merge.js";
+import type {
   TeamTaskVerifierSkipReason,
   TeamTaskVerifierSweepInput,
   TeamTaskVerifierSweepResult,
   TeamTaskVerifierVerifiedResult,
 } from "./team-verifier.js";
 import { isAcceptedTeamTask, isCompletedButUnverifiedTeamTask, isReopenedAfterFailedVerification } from "./team-verifier.js";
+import { taskMergeMetadata } from "./team-worktree.js";
 import type { TeamControlService } from "./team.js";
 
 export interface TeamExecutionRunnerOptions {
   teams: TeamControlService;
   dispatcher: TeamTaskDispatchService;
   verifier?: TeamTaskVerifier;
+  merger?: TeamTaskMerger;
+  events?: TeamRunEventStore;
   cwd: string;
   now?: () => TimestampMs;
+  createId?: (prefix: string) => string;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   createSession?: (input: TeamExecutionSessionRequest) => Promise<TeamExecutionSession>;
 }
 
+export interface TeamRunEventStore {
+  append(event: ChiliEvent): Promise<void>;
+}
+
 export interface TeamTaskVerifier {
   verifyCompletedTasks(input: TeamTaskVerifierSweepInput): Promise<TeamTaskVerifierSweepResult>;
+}
+
+export interface TeamTaskMerger {
+  mergeTeamTasks(input: TeamMergeInput): Promise<TeamMergeSweepResult>;
 }
 
 export interface TeamExecutionSessionRequest {
@@ -65,6 +97,10 @@ export interface TeamExecutionRunSummary {
   completed: TeamExecutionFinalTask[];
   accepted: TeamExecutionFinalTask[];
   reopened: TeamExecutionVerificationTask[];
+  merged: TeamExecutionMergeTask[];
+  mergeFailed: TeamExecutionMergeTask[];
+  mergeConflicted: TeamExecutionMergeTask[];
+  mergeSkipped: TeamExecutionMergeSkippedTask[];
   failed: TeamExecutionFinalTask[];
   blocked: TeamExecutionSkippedTask[];
   skipped: TeamExecutionSkippedTask[];
@@ -72,7 +108,7 @@ export interface TeamExecutionRunSummary {
   errors: TeamExecutionError[];
 }
 
-export type TeamExecutionStopReason = "drained" | "once" | "max_cycles" | "timeout" | "aborted" | "team_inactive";
+export type TeamExecutionStopReason = TeamRunStopReason;
 
 export interface TeamExecutionDispatchedTask {
   teamId: TeamId;
@@ -99,6 +135,24 @@ export interface TeamExecutionVerificationTask {
   status: "passed" | "failed";
   feedback?: string;
   verifierTaskId?: TaskId;
+}
+
+export interface TeamExecutionMergeTask {
+  teamId: TeamId;
+  taskId: TaskId;
+  ownerPath?: AgentPath;
+  status: "applied" | "failed" | "conflicted";
+  diffSummary?: unknown;
+  error?: string;
+  conflicts?: string[];
+}
+
+export interface TeamExecutionMergeSkippedTask {
+  teamId: TeamId;
+  taskId: TaskId;
+  ownerPath?: AgentPath;
+  reason: TeamMergeSkippedReason;
+  error?: string;
 }
 
 export interface TeamExecutionSkippedTask {
@@ -158,6 +212,7 @@ export class TeamExecutionRunner {
 
   async run(input: TeamExecutionRunInput): Promise<TeamExecutionRunSummary> {
     const startedAt = Number(this.now());
+    const runId = this.id("teamrun");
     const maxCycles = input.once ? 1 : input.maxCycles ?? DEFAULT_MAX_CYCLES;
     const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const pollIntervalMs = input.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
@@ -175,6 +230,10 @@ export class TeamExecutionRunner {
       completed: [],
       accepted: [],
       reopened: [],
+      merged: [],
+      mergeFailed: [],
+      mergeConflicted: [],
+      mergeSkipped: [],
       failed: [],
       blocked: [],
       skipped: [],
@@ -183,9 +242,15 @@ export class TeamExecutionRunner {
     };
 
     const initialState = await this.loadState(input.teamId);
+    await this.publishRunStarted(input, sessionState, initialState.team, runId, {
+      maxCycles,
+      timeoutMs,
+      pollIntervalMs,
+    });
     if (initialState.team.status !== "active") {
       summary.stopReason = "team_inactive";
       summary.endedAt = Number(this.now());
+      await this.publishRunCompleted(input, sessionState, initialState.team, runId, summary);
       return summary;
     }
 
@@ -204,6 +269,7 @@ export class TeamExecutionRunner {
       const reconciled = await this.reconcile(input, summary, sessionState);
       this.collectReconcile(reconciled, summary);
       const postReconcileStop = controlStopReason(input, startedMonotonic, timeoutMs);
+      await this.publishRunProgress(input, sessionState, initialState.team, runId, summary, "reconcile", postReconcileStop);
       if (postReconcileStop) {
         summary.stopReason = postReconcileStop;
         break;
@@ -212,9 +278,11 @@ export class TeamExecutionRunner {
       let state = await this.loadState(input.teamId);
       if (state.team.status !== "active") {
         summary.stopReason = "team_inactive";
+        await this.publishRunProgress(input, sessionState, state.team, runId, summary, "load", "team_inactive");
         break;
       }
       const postLoadStop = controlStopReason(input, startedMonotonic, timeoutMs);
+      await this.publishRunProgress(input, sessionState, state.team, runId, summary, "load", postLoadStop);
       if (postLoadStop) {
         summary.stopReason = postLoadStop;
         break;
@@ -223,11 +291,23 @@ export class TeamExecutionRunner {
       const verified = await this.verifyCompletedTasks(input, summary, sessionState);
       this.collectVerification(verified, summary);
       const postVerifyStop = controlStopReason(input, startedMonotonic, timeoutMs);
+      await this.publishRunProgress(input, sessionState, state.team, runId, summary, "verify", postVerifyStop);
       if (postVerifyStop) {
         summary.stopReason = postVerifyStop;
         break;
       }
-      if (verified && (verified.verified.length > 0 || verified.skipped.length > 0)) {
+      const merged = await this.mergeVerifiedTasks(input, summary, sessionState);
+      this.collectMerge(merged, summary);
+      const postMergeStop = controlStopReason(input, startedMonotonic, timeoutMs);
+      await this.publishRunProgress(input, sessionState, state.team, runId, summary, "merge", postMergeStop);
+      if (postMergeStop) {
+        summary.stopReason = postMergeStop;
+        break;
+      }
+      if (
+        (verified && (verified.verified.length > 0 || verified.skipped.length > 0)) ||
+        (merged && (merged.applied.length > 0 || merged.failed.length > 0 || merged.conflicted.length > 0 || merged.skipped.length > 0))
+      ) {
         state = await this.loadState(input.teamId);
       }
 
@@ -310,6 +390,7 @@ export class TeamExecutionRunner {
       }
 
       const postScanStop = controlStopReason(input, startedMonotonic, timeoutMs);
+      await this.publishRunProgress(input, sessionState, state.team, runId, summary, "dispatch", postScanStop);
       if (postScanStop) {
         summary.stopReason = postScanStop;
         break;
@@ -324,6 +405,7 @@ export class TeamExecutionRunner {
       const postCycleStop = controlStopReason(input, startedMonotonic, timeoutMs);
       if (postCycleStop) {
         summary.stopReason = postCycleStop;
+        await this.publishRunProgress(input, sessionState, postCycle.team, runId, summary, "wait", postCycleStop);
         break;
       }
       const stillRunning = runningTasks(postCycle.tasks);
@@ -336,12 +418,21 @@ export class TeamExecutionRunner {
       );
       const unverified = this.unverifiedTasks(postCycle.tasks);
       const reopened = this.reopenedTasks(postCycle.tasks);
-      if (stillRunning.length === 0 && runnable.length === 0 && unverified.length === 0 && reopened.length === 0) {
+      const pendingMerge = this.pendingMergeTasks(postCycle.tasks);
+      if (
+        stillRunning.length === 0 &&
+        runnable.length === 0 &&
+        unverified.length === 0 &&
+        reopened.length === 0 &&
+        pendingMerge.length === 0
+      ) {
         summary.stopReason = "drained";
+        await this.publishRunProgress(input, sessionState, postCycle.team, runId, summary, "drain", "drained");
         break;
       }
 
       if (stillRunning.length > 0 && !input.signal?.aborted) {
+        await this.publishRunProgress(input, sessionState, postCycle.team, runId, summary, "wait");
         await this.sleep(Math.min(pollIntervalMs, remainingDelay(timeoutMs, startedMonotonic)), input.signal);
       }
     }
@@ -350,6 +441,7 @@ export class TeamExecutionRunner {
     summary.stillRunning = runningTasks(finalState.tasks).map((task) => runningTaskSummary(task));
     summary.accepted = this.acceptedTasks(finalState.tasks).map((task) => finalTaskSummary(task, undefined)).filter(isDefined);
     summary.endedAt = Number(this.now());
+    await this.publishRunCompleted(input, sessionState, finalState.team, runId, summary);
     return summary;
   }
 
@@ -465,6 +557,48 @@ export class TeamExecutionRunner {
     }
   }
 
+  private async mergeVerifiedTasks(
+    input: TeamExecutionRunInput,
+    summary: TeamExecutionRunSummary,
+    sessionState: SessionState,
+  ): Promise<TeamMergeSweepResult | undefined> {
+    if (!this.options.merger) return undefined;
+    try {
+      const mergeInput: TeamMergeInput = {
+        teamId: input.teamId,
+        cwd: input.cwd ?? this.options.cwd,
+      };
+      const sessionId = sessionState.sessionId ?? input.sessionId;
+      const threadId = sessionState.threadId ?? input.threadId;
+      if (sessionId) mergeInput.sessionId = sessionId;
+      if (threadId) mergeInput.threadId = threadId;
+      if (input.signal) mergeInput.signal = input.signal;
+      return await this.options.merger.mergeTeamTasks(mergeInput);
+    } catch (error) {
+      if (isAbortError(error)) return undefined;
+      summary.errors.push({
+        teamId: input.teamId,
+        error: toError(error).message,
+      });
+      return undefined;
+    }
+  }
+
+  private collectMerge(result: TeamMergeSweepResult | undefined, summary: TeamExecutionRunSummary): void {
+    if (!result) return;
+    for (const item of result.applied) pushUniqueMerge(summary.merged, mergeSummary(item));
+    for (const item of result.failed) pushUniqueMerge(summary.mergeFailed, mergeSummary(item));
+    for (const item of result.conflicted) pushUniqueMerge(summary.mergeConflicted, mergeSummary(item));
+    for (const item of result.skipped) pushUniqueMergeSkipped(summary.mergeSkipped, mergeSkippedSummary(item));
+    for (const error of result.errors) {
+      summary.errors.push({
+        teamId: error.teamId,
+        taskId: error.taskId,
+        error: error.error,
+      });
+    }
+  }
+
   private collectDispatch(result: TeamTaskDispatchResult, summary: TeamExecutionRunSummary): void {
     if (result.status === "skipped") {
       const reason = dispatchSkipReason(result.reason);
@@ -542,8 +676,101 @@ export class TeamExecutionRunner {
     return tasks.filter(isReopenedAfterFailedVerification);
   }
 
+  private pendingMergeTasks(tasks: readonly TeamTaskRow[]): TeamTaskRow[] {
+    return tasks.filter((task) => verificationAcceptedPendingMerge(task));
+  }
+
   private now(): TimestampMs {
     return this.options.now ? this.options.now() : timestampNow();
+  }
+
+  private id(prefix: string): string {
+    const create = this.options.createId ?? defaultCreateId;
+    return create(prefix);
+  }
+
+  private async publishRunStarted(
+    input: TeamExecutionRunInput,
+    sessionState: SessionState,
+    team: TeamRow,
+    runId: string,
+    options: { maxCycles: number; timeoutMs: number; pollIntervalMs: number },
+  ): Promise<void> {
+    await this.appendRunEvent(input, sessionState, team, "team.run_started", {
+      teamId: input.teamId,
+      runId,
+      mode: input.mode ?? "background",
+      once: input.once === true,
+      maxCycles: options.maxCycles,
+      timeoutMs: options.timeoutMs,
+      pollIntervalMs: options.pollIntervalMs,
+    });
+  }
+
+  private async publishRunProgress(
+    input: TeamExecutionRunInput,
+    sessionState: SessionState,
+    team: TeamRow,
+    runId: string,
+    summary: TeamExecutionRunSummary,
+    phase: TeamRunLifecyclePhase,
+    stopReason?: TeamRunStopReason,
+  ): Promise<void> {
+    const payload: {
+      teamId: TeamId;
+      runId: string;
+      cycle: number;
+      phase: TeamRunLifecyclePhase;
+      counts: TeamRunSummaryCounts;
+      stopReason?: TeamRunStopReason;
+    } = {
+      teamId: input.teamId,
+      runId,
+      cycle: summary.cycles,
+      phase,
+      counts: runSummaryCounts(summary),
+    };
+    if (stopReason) payload.stopReason = stopReason;
+    await this.appendRunEvent(input, sessionState, team, "team.run_progress", payload);
+  }
+
+  private async publishRunCompleted(
+    input: TeamExecutionRunInput,
+    sessionState: SessionState,
+    team: TeamRow,
+    runId: string,
+    summary: TeamExecutionRunSummary,
+  ): Promise<void> {
+    await this.appendRunEvent(input, sessionState, team, "team.run_completed", {
+      teamId: input.teamId,
+      runId,
+      cycles: summary.cycles,
+      stopReason: summary.stopReason,
+      startedAt: summary.startedAt,
+      endedAt: summary.endedAt,
+      counts: runSummaryCounts(summary),
+    });
+  }
+
+  private async appendRunEvent<TType extends ChiliEvent["type"], TPayload>(
+    input: TeamExecutionRunInput,
+    sessionState: SessionState,
+    team: TeamRow,
+    type: TType,
+    payload: TPayload,
+  ): Promise<void> {
+    if (!this.options.events) return;
+    const event: EventEnvelope<TType, TPayload> = {
+      id: this.id("event"),
+      type,
+      time: this.now(),
+      payload,
+    };
+    const sessionId = sessionState.sessionId ?? input.sessionId ?? team.sessionId;
+    if (sessionId) event.sessionId = sessionId;
+    const threadId = sessionState.threadId ?? input.threadId;
+    if (threadId) event.threadId = threadId;
+    await this.options.events.append(event as ChiliEvent);
   }
 
   private sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
@@ -635,6 +862,34 @@ function verificationSummary(result: TeamTaskVerifierVerifiedResult): TeamExecut
   return item;
 }
 
+function mergeSummary(result: TeamMergeTaskResult): TeamExecutionMergeTask {
+  const item: TeamExecutionMergeTask = {
+    teamId: result.teamTask.teamId,
+    taskId: result.teamTask.id,
+    status: result.status,
+  };
+  if (result.teamTask.ownerPath) item.ownerPath = result.teamTask.ownerPath;
+  if (result.diffSummary) item.diffSummary = result.diffSummary;
+  if (result.error) item.error = result.error;
+  if (result.conflicts) item.conflicts = result.conflicts;
+  return item;
+}
+
+function mergeSkippedSummary(result: TeamMergeTaskSkipped): TeamExecutionMergeSkippedTask {
+  const item: TeamExecutionMergeSkippedTask = {
+    teamId: result.teamTask.teamId,
+    taskId: result.teamTask.id,
+    reason: result.reason,
+  };
+  if (result.teamTask.ownerPath) item.ownerPath = result.teamTask.ownerPath;
+  if (result.error) item.error = result.error;
+  return item;
+}
+
+function verificationAcceptedPendingMerge(task: TeamTaskRow): boolean {
+  return isAcceptedTeamTask(task) && taskMergeMetadata(task.metadata)?.status === "pending";
+}
+
 function isFinalStatus(status: TeamTaskStatus): status is Extract<TeamTaskStatus, "completed" | "failed" | "cancelled"> {
   return status === "completed" || status === "failed" || status === "cancelled";
 }
@@ -704,6 +959,18 @@ function pushUniqueVerification(items: TeamExecutionVerificationTask[], item: Te
   else items.push(item);
 }
 
+function pushUniqueMerge(items: TeamExecutionMergeTask[], item: TeamExecutionMergeTask): void {
+  const index = items.findIndex((existing) => existing.taskId === item.taskId);
+  if (index >= 0) items[index] = item;
+  else items.push(item);
+}
+
+function pushUniqueMergeSkipped(items: TeamExecutionMergeSkippedTask[], item: TeamExecutionMergeSkippedTask): void {
+  const index = items.findIndex((existing) => existing.taskId === item.taskId && existing.reason === item.reason);
+  if (index >= 0) items[index] = item;
+  else items.push(item);
+}
+
 function removeSkipped(summary: TeamExecutionRunSummary, taskId: TaskId): void {
   summary.blocked = summary.blocked.filter((item) => item.taskId !== taskId);
   summary.skipped = summary.skipped.filter((item) => item.taskId !== taskId);
@@ -711,6 +978,24 @@ function removeSkipped(summary: TeamExecutionRunSummary, taskId: TaskId): void {
 
 function remainingDelay(timeoutMs: number, startedMonotonic: number): number {
   return Math.max(0, timeoutMs - (Date.now() - startedMonotonic));
+}
+
+function runSummaryCounts(summary: TeamExecutionRunSummary): TeamRunSummaryCounts {
+  return {
+    dispatched: summary.dispatched.length,
+    completed: summary.completed.length,
+    accepted: summary.accepted.length,
+    reopened: summary.reopened.length,
+    merged: summary.merged.length,
+    mergeFailed: summary.mergeFailed.length,
+    mergeConflicted: summary.mergeConflicted.length,
+    mergeSkipped: summary.mergeSkipped.length,
+    failed: summary.failed.length,
+    blocked: summary.blocked.length,
+    skipped: summary.skipped.length,
+    stillRunning: summary.stillRunning.length,
+    errors: summary.errors.length,
+  };
 }
 
 function controlStopReason(
@@ -738,4 +1023,8 @@ function isAbortError(error: unknown): boolean {
 
 function isDefined<T>(value: T | undefined): value is T {
   return value !== undefined;
+}
+
+function defaultCreateId(prefix: string): string {
+  return `${prefix}_${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
 }

@@ -48,6 +48,7 @@ export interface RuntimeClient {
   dispatchTeamTask(input: DispatchTeamTaskRequest): Promise<RuntimeTeamTaskDispatchResult>;
   syncTeamTask(input: SyncTeamTaskRequest): Promise<RuntimeTeamTaskSyncResult>;
   reconcileTeamTasks(input?: ReconcileTeamTasksRequest): Promise<RuntimeTeamTaskReconcileResult>;
+  mergeTeamTasks(input: MergeTeamTasksRequest): Promise<RuntimeTeamMergeResult>;
   runTeamLoop(input: RunTeamLoopRequest): Promise<RuntimeTeamExecutionRunSummary>;
   updateTeamTask(input: UpdateTeamTaskRequest): Promise<RuntimeTeamTaskRecord>;
   listTeamMessages(teamId: TeamId): Promise<RuntimeTeamMessageRecord[]>;
@@ -433,6 +434,12 @@ export interface ReconcileTeamTasksRequest extends TeamRequestContext {
   limit?: number;
 }
 
+export interface MergeTeamTasksRequest extends TeamRequestContext {
+  teamId: TeamId;
+  taskId?: TaskId;
+  cwd?: string;
+}
+
 export interface RunTeamLoopRequest extends TeamRequestContext {
   teamId: TeamId;
   cwd?: string;
@@ -487,6 +494,33 @@ export interface RuntimeTeamExecutionVerificationTask {
   verifierTaskId?: TaskId;
 }
 
+export interface RuntimeTeamMergeDiffSummary {
+  filesChanged: number;
+  paths: string[];
+  truncatedPaths: boolean;
+  diffBytes: number;
+}
+
+export interface RuntimeTeamMergeTask {
+  teamId: TeamId;
+  taskId: TaskId;
+  ownerPath?: AgentPath;
+  status: "applied" | "failed" | "conflicted";
+  diffSummary?: RuntimeTeamMergeDiffSummary | unknown;
+  error?: string;
+  conflicts?: string[];
+}
+
+export type RuntimeTeamMergeSkippedReason = "not_passed" | "missing_merge_metadata" | "not_pending" | "missing_worktree";
+
+export interface RuntimeTeamMergeSkippedTask {
+  teamId: TeamId;
+  taskId: TaskId;
+  ownerPath?: AgentPath;
+  reason: RuntimeTeamMergeSkippedReason;
+  error?: string;
+}
+
 export interface RuntimeTeamExecutionSkippedTask {
   teamId: TeamId;
   taskId: TaskId;
@@ -519,11 +553,45 @@ export interface RuntimeTeamExecutionRunSummary {
   completed: RuntimeTeamExecutionFinalTask[];
   accepted: RuntimeTeamExecutionFinalTask[];
   reopened: RuntimeTeamExecutionVerificationTask[];
+  merged: RuntimeTeamMergeTask[];
+  mergeFailed: RuntimeTeamMergeTask[];
+  mergeConflicted: RuntimeTeamMergeTask[];
+  mergeSkipped: RuntimeTeamMergeSkippedTask[];
   failed: RuntimeTeamExecutionFinalTask[];
   blocked: RuntimeTeamExecutionSkippedTask[];
   skipped: RuntimeTeamExecutionSkippedTask[];
   stillRunning: RuntimeTeamExecutionRunningTask[];
   errors: RuntimeTeamExecutionError[];
+}
+
+export interface RuntimeTeamMergeTaskResult {
+  status: "applied" | "failed" | "conflicted";
+  teamTask: RuntimeTeamTaskRecord;
+  diffSummary?: RuntimeTeamMergeDiffSummary;
+  error?: string;
+  conflicts?: string[];
+}
+
+export interface RuntimeTeamMergeTaskSkipped {
+  status: "skipped";
+  teamTask: RuntimeTeamTaskRecord;
+  reason: RuntimeTeamMergeSkippedReason;
+  error?: string;
+}
+
+export interface RuntimeTeamMergeError {
+  teamId: TeamId;
+  taskId: TaskId;
+  error: string;
+}
+
+export interface RuntimeTeamMergeResult {
+  scanned: number;
+  applied: RuntimeTeamMergeTaskResult[];
+  failed: RuntimeTeamMergeTaskResult[];
+  conflicted: RuntimeTeamMergeTaskResult[];
+  skipped: RuntimeTeamMergeTaskSkipped[];
+  errors: RuntimeTeamMergeError[];
 }
 
 export interface UpdateTeamTaskRequest extends TeamRequestContext {
@@ -768,6 +836,10 @@ export class HttpRuntimeClient implements RuntimeClient {
       ? `teams/${encodeURIComponent(input.teamId)}/reconcile_dispatches`
       : "teams/reconcile_dispatches";
     return this.post(path, input);
+  }
+
+  mergeTeamTasks(input: MergeTeamTasksRequest): Promise<RuntimeTeamMergeResult> {
+    return this.post(`teams/${encodeURIComponent(input.teamId)}/merge`, input);
   }
 
   runTeamLoop(input: RunTeamLoopRequest): Promise<RuntimeTeamExecutionRunSummary> {

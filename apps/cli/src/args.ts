@@ -16,6 +16,7 @@ export interface CliArgs {
     | "team-dispatch"
     | "team-run"
     | "team-run-loop"
+    | "team-merge"
     | "team-sync"
     | "team-reconcile"
     | "tasks"
@@ -158,6 +159,11 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       result.teamId = requireValue(arg, args);
       continue;
     }
+    if (arg === "team-merge") {
+      result.command = "team-merge";
+      result.teamId = requireValue(arg, args);
+      continue;
+    }
     if (arg === "team-sync") {
       result.command = "team-sync";
       result.teamId = requireValue(arg, args);
@@ -276,6 +282,10 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       result.taskStatus = status;
       continue;
     }
+    if (arg === "--task") {
+      result.taskId = requireValue(arg, args);
+      continue;
+    }
     if (arg === "--timeout-ms") {
       result.timeoutMs = Number.parseInt(requireValue(arg, args), 10);
       if (!Number.isInteger(result.timeoutMs) || result.timeoutMs <= 0) throw new Error("--timeout-ms must be a positive integer");
@@ -317,6 +327,7 @@ export function usage(): string {
     "  bun run chili -- team-dispatch <team-id> <task-id>",
     "  bun run chili -- team-run <team-id> <task-id>",
     "  bun run chili -- team-run-loop <team-id> --once --max-cycles 10 --timeout-ms 30000",
+    "  bun run chili -- team-merge <team-id> [--task <task-id>] [--json]",
     "  bun run chili -- team-sync <team-id> <task-id>",
     "  bun run chili -- team-reconcile [team-id]",
     "  bun run chili -- mailbox",
@@ -346,6 +357,7 @@ export function usage(): string {
     "  --max-turns <n>     Max automatic tool-use continuation turns, default 12",
     "  --max-cycles <n>    Max team execution runner cycles",
     "  --status <status>   Task close status: completed | failed | cancelled",
+    "  --task <task-id>     Limit team merge to one task",
     "  --timeout-ms <n>    Task wait timeout in milliseconds",
     "  --stale-after-ms <n> Recover running background tasks older than this many milliseconds",
   ].join("\n");
