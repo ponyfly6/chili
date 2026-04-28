@@ -11,6 +11,7 @@
     "check": "bun run typecheck",
     "cli": "bun run apps/cli/src/index.ts",
     "chili": "bun run apps/cli/src/index.ts",
+    "tui": "bun run apps/tui/src/index.ts",
     "probe:minimax": "bun run scripts/probe-minimax.ts",
     "smoke": "bun run scripts/smoke.ts",
     "smoke:p0": "bun run scripts/smoke.ts",

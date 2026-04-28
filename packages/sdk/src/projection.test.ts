@@ -2,12 +2,14 @@ import { expect, test } from "bun:test";
 import type {
   AgentPath,
   AgentRunId,
+  ApprovalId,
   ChiliEvent,
   MessageId,
   PartId,
   SessionId,
   TaskId,
   TeamId,
+  TeamRunSummaryCounts,
   ThreadId,
   TimestampMs,
   ToolCallId,
@@ -24,7 +26,7 @@ import {
   type RuntimeTeamTaskSyncResult,
   type RuntimeTeamSnapshot,
 } from "./client.js";
-import { createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, sessionMessages } from "./projection.js";
+import { createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, sessionMessages, teamLiveCockpit } from "./projection.js";
 
 test("replays session, message, tool, and approval events into a runtime view", () => {
   const sessionId = "session_test" as SessionId;
@@ -310,6 +312,309 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
   expect(snapshot.mailbox[0]?.consumedAt).toBe(6);
 });
 
+test("projects team run lifecycle events into run view models", () => {
+  const sessionId = "session_team_run" as SessionId;
+  const threadId = "thread_team_run" as ThreadId;
+  const teamId = "team_run_projection" as TeamId;
+  const leadPath = "/root" as AgentPath;
+  const runCounts = teamRunCounts({ dispatched: 2, completed: 1, stillRunning: 1 });
+
+  const view = reduceRuntimeEvents(
+    [
+      {
+        id: "event_team",
+        type: "team.created",
+        time: 1 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { teamId, name: "runner", leadPath },
+      },
+      {
+        id: "event_run_start",
+        type: "team.run_started",
+        time: 2 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          runId: "teamrun_test",
+          mode: "background",
+          once: false,
+          maxCycles: 5,
+          timeoutMs: 1000,
+          pollIntervalMs: 50,
+        },
+      },
+      {
+        id: "event_run_progress",
+        type: "team.run_progress",
+        time: 3 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { teamId, runId: "teamrun_test", cycle: 1, phase: "dispatch", counts: runCounts },
+      },
+      {
+        id: "event_run_complete",
+        type: "team.run_completed",
+        time: 4 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          runId: "teamrun_test",
+          cycles: 1,
+          stopReason: "once",
+          startedAt: 2,
+          endedAt: 4,
+          counts: teamRunCounts({ dispatched: 2, completed: 2 }),
+        },
+      },
+    ],
+    createRuntimeView(),
+  );
+
+  expect(view.teams[teamId]?.runIds).toEqual(["teamrun_test"]);
+  expect(view.teams[teamId]?.activeRunId).toBeUndefined();
+  expect(view.teams[teamId]?.lastCompletedRunId).toBe("teamrun_test");
+  expect(view.teamRuns.teamrun_test).toMatchObject({
+    teamId,
+    status: "completed",
+    cycle: 1,
+    phase: "dispatch",
+    stopReason: "once",
+    startedAt: 2,
+    endedAt: 4,
+    counts: { dispatched: 2, completed: 2 },
+  });
+});
+
+test("derives Team Live cockpit view from team projection state", () => {
+  const sessionId = "session_team_live" as SessionId;
+  const threadId = "thread_team_live" as ThreadId;
+  const otherSessionId = "session_team_live_other" as SessionId;
+  const otherThreadId = "thread_team_live_other" as ThreadId;
+  const childSessionId = "session_team_live_child" as SessionId;
+  const childThreadId = "thread_team_live_child" as ThreadId;
+  const teamId = "team_live" as TeamId;
+  const otherTeamId = "team_live_other" as TeamId;
+  const taskId = "task_live" as TaskId;
+  const leadPath = "/root" as AgentPath;
+  const memberPath = "/root/worker" as AgentPath;
+  const callId = "toolcall_live" as ToolCallId;
+  const approvalId = "approval_live" as ApprovalId;
+  const childApprovalId = "approval_live_child" as ApprovalId;
+
+  const view = reduceRuntimeEvents(
+    [
+      {
+        id: "event_session",
+        type: "session.created",
+        time: 1 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { sessionId, cwd: "/repo" },
+      },
+      {
+        id: "event_other_team",
+        type: "team.created",
+        time: 2 as TimestampMs,
+        sessionId: otherSessionId,
+        threadId: otherThreadId,
+        payload: { teamId: otherTeamId, name: "other", leadPath },
+      },
+      {
+        id: "event_team",
+        type: "team.created",
+        time: 3 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { teamId, name: "live", leadPath },
+      },
+      {
+        id: "event_lead",
+        type: "team.member_added",
+        time: 3 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { teamId, path: leadPath, name: "lead", role: "leader", status: "running" },
+      },
+      {
+        id: "event_member",
+        type: "team.member_added",
+        time: 4 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          path: memberPath,
+          name: "worker",
+          role: "builder",
+          status: "idle",
+          childSessionId,
+          childThreadId,
+          toolScope: ["read_file"],
+          writeScope: ["packages/sdk"],
+        },
+      },
+      {
+        id: "event_task",
+        type: "team.task_created",
+        time: 5 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          taskId,
+          title: "Build live cockpit",
+          ownerPath: memberPath,
+          metadata: {
+            chiliTeamDispatch: { agentTaskId: "task_agent_live", agentStatus: "running" },
+            verification: { status: "pending", verifierTaskId: "task_verify_live" },
+            worktree: { path: "/repo/.chili/worktrees/live", baseRef: "HEAD", createdAt: 5, status: "active" },
+            merge: { status: "pending", createdAt: 6, worktreePath: "/repo/.chili/worktrees/live" },
+          },
+        },
+      },
+      {
+        id: "event_claim",
+        type: "team.task_claimed",
+        time: 6 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { teamId, taskId, ownerPath: memberPath, claimedBy: memberPath },
+      },
+      {
+        id: "event_message",
+        type: "team.message_sent",
+        time: 7 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          messageId: "teammsg_live",
+          from: leadPath,
+          to: memberPath,
+          content: "Build the cockpit",
+          kind: "task_assignment",
+          delivery: "triggerTurn",
+          taskId,
+        },
+      },
+      {
+        id: "event_mailbox",
+        type: "agent.message_queued",
+        time: 8 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          path: memberPath,
+          from: leadPath,
+          triggerTurn: true,
+          taskId,
+          childSessionId,
+          childThreadId,
+          message: {
+            role: "user",
+            content: "Build the cockpit",
+            metadata: { teamId, teamMessageId: "teammsg_live" },
+          },
+        },
+      },
+      {
+        id: "event_run_start",
+        type: "team.run_started",
+        time: 9 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          runId: "teamrun_live",
+          mode: "background",
+          once: false,
+          maxCycles: 4,
+          timeoutMs: 1000,
+          pollIntervalMs: 100,
+        },
+      },
+      {
+        id: "event_run_progress",
+        type: "team.run_progress",
+        time: 10 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { teamId, runId: "teamrun_live", cycle: 1, phase: "dispatch", counts: teamRunCounts({ dispatched: 1 }) },
+      },
+      {
+        id: "event_tool",
+        type: "tool.call_started",
+        time: 11 as TimestampMs,
+        sessionId: childSessionId,
+        threadId: childThreadId,
+        payload: { turnId: "turn_live" as TurnId, callId, toolName: "read_file", input: { path: "README.md" } },
+      },
+      {
+        id: "event_approval",
+        type: "approval.requested",
+        time: 12 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { approvalId, callId, permission: "tool.edit", patterns: ["packages/sdk/*"] },
+      },
+      {
+        id: "event_child_approval",
+        type: "approval.requested",
+        time: 13 as TimestampMs,
+        sessionId: childSessionId,
+        threadId: childThreadId,
+        payload: { approvalId: childApprovalId, callId, permission: "tool.bash", patterns: ["bun test"] },
+      },
+    ],
+    createRuntimeView(),
+  );
+
+  const cockpit = teamLiveCockpit(view, { teamId, sessionId, limit: 10 });
+
+  expect(cockpit.teamIds).toEqual([teamId]);
+  expect(cockpit.team?.name).toBe("live");
+  expect(cockpit.lead?.path).toBe(leadPath);
+  expect(cockpit.members.map((member) => member.path)).toEqual([leadPath, memberPath]);
+  expect(cockpit.members.find((member) => member.path === memberPath)).toMatchObject({
+    status: "running",
+    currentTaskId: taskId,
+    currentTaskTitle: "Build live cockpit",
+    deliveryIds: ["event_mailbox"],
+  });
+  expect(cockpit.activeRun).toMatchObject({
+    id: "teamrun_live",
+    phase: "dispatch",
+    counts: { dispatched: 1 },
+  });
+  expect(cockpit.tasks[0]).toMatchObject({
+    id: taskId,
+    status: "in_progress",
+    ownerName: "worker",
+    metadata: {
+      dispatch: { agentTaskId: "task_agent_live" },
+      verification: { status: "pending" },
+      worktree: { status: "active" },
+      merge: { status: "pending" },
+    },
+  });
+  expect(cockpit.pendingApprovals.map((approval) => approval.id)).toEqual([approvalId, childApprovalId]);
+  expect(cockpit.mailbox[0]).toMatchObject({
+    id: "event_mailbox",
+    status: "queued",
+    deliveryStatus: "queued",
+    taskId,
+  });
+  expect(cockpit.toolCounts).toEqual([{ toolName: "read_file", total: 1, running: 1, completed: 0, failed: 0 }]);
+  expect(cockpit.metadata.worktrees).toHaveLength(1);
+  expect(cockpit.recentActivity.map((item) => item.kind)).toContain("run");
+  expect(cockpit.recentActivity.map((item) => item.kind)).toContain("tool");
+  expect(cockpit.recentActivity.map((item) => item.id)).toContain(childApprovalId);
+  expect(teamLiveCockpit(view, { teamId: otherTeamId, sessionId }).team).toBeUndefined();
+});
+
 test("replays completed local subagent tasks as running on newer-generation spawn without completedAt", () => {
   const sessionId = "session_local_agents" as SessionId;
   const threadId = "thread_local_agents" as ThreadId;
@@ -541,6 +846,52 @@ test("client preserves team dispatcher JSON shapes for dispatch, sync, and recon
   ]);
 });
 
+test("client can cancel team run loop requests without serializing AbortSignal", async () => {
+  const teamId = "team_sdk_abort" as TeamId;
+  const controller = new AbortController();
+  let recorded: { body: unknown; signalled: boolean } | undefined;
+  const fetchImpl = (async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    recorded = {
+      body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
+      signalled: init?.signal === controller.signal,
+    };
+    return new Response(
+      JSON.stringify({
+        teamId,
+        cycles: 0,
+        stopReason: "aborted",
+        startedAt: 1,
+        endedAt: 1,
+        dispatched: [],
+        completed: [],
+        accepted: [],
+        reopened: [],
+        merged: [],
+        mergeFailed: [],
+        mergeConflicted: [],
+        mergeSkipped: [],
+        failed: [],
+        blocked: [],
+        skipped: [],
+        stillRunning: [],
+        errors: [],
+      } satisfies RuntimeTeamExecutionRunSummary),
+      {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      },
+    );
+  }) as unknown as typeof fetch;
+  const client = new HttpRuntimeClient({ baseUrl: "http://runtime.test/api", fetch: fetchImpl });
+
+  await client.runTeamLoop({ teamId, once: true, signal: controller.signal });
+
+  expect(recorded).toEqual({
+    body: { teamId, once: true },
+    signalled: true,
+  });
+});
+
 test("client fetches team snapshots through the runtime HTTP API", async () => {
   const teamId = "team_sdk_snapshot" as TeamId;
   const taskId = "task_sdk_snapshot" as TaskId;
@@ -704,5 +1055,24 @@ function sdkAgentTaskRecord(input: { status: "running" | "completed" | "failed" 
     childThreadId: "thread_child_sdk" as ThreadId,
     createdAt: 1,
     updatedAt: 2,
+  };
+}
+
+function teamRunCounts(input: Partial<TeamRunSummaryCounts>): TeamRunSummaryCounts {
+  return {
+    dispatched: 0,
+    completed: 0,
+    accepted: 0,
+    reopened: 0,
+    merged: 0,
+    mergeFailed: 0,
+    mergeConflicted: 0,
+    mergeSkipped: 0,
+    failed: 0,
+    blocked: 0,
+    skipped: 0,
+    stillRunning: 0,
+    errors: 0,
+    ...input,
   };
 }

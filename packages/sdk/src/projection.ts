@@ -1,6 +1,7 @@
 import type {
   AgentPath,
   AgentRunId,
+  AgentTaskMode,
   ApprovalId,
   ChiliEvent,
   EventEnvelope,
@@ -16,6 +17,9 @@ import type {
   TeamMessageDelivery,
   TeamMessageDeliveryStatus,
   TeamMessageKind,
+  TeamRunLifecyclePhase,
+  TeamRunStopReason,
+  TeamRunSummaryCounts,
   ThreadId,
   ToolCallId,
   ToolCallStatus,
@@ -43,6 +47,9 @@ export interface ChiliRuntimeView {
   teamMembers: Record<string, RuntimeTeamMemberView>;
   teamMessageIds: string[];
   teamMessages: Record<string, RuntimeTeamMessageView>;
+  teamRunIds: string[];
+  teamRuns: Record<string, RuntimeTeamRunView>;
+  teamRunIdsByTeam: Record<string, string[]>;
   partIndex: Record<string, RuntimePartIndexEntry>;
   lastEventId?: string;
 }
@@ -131,6 +138,10 @@ export interface RuntimeAgentMailboxMessageView {
   threadId?: ThreadId;
   teamId?: TeamId;
   teamMessageId?: string;
+  taskId?: TaskId;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  error?: string;
   claimedAt?: number;
   consumedAt?: number;
 }
@@ -147,9 +158,11 @@ export interface RuntimeTaskView {
   title?: string;
   description?: string;
   dependsOn?: TaskId[];
+  metadata?: Record<string, unknown>;
   summary?: string;
   error?: string;
   sessionId?: SessionId;
+  createdBy?: AgentPath;
   ownerPath?: AgentPath;
   path?: AgentPath;
   childSessionId?: SessionId;
@@ -165,10 +178,13 @@ export interface RuntimeTeamView {
   memberIds: string[];
   taskIds: TaskId[];
   messageIds: string[];
+  runIds: string[];
   createdAt: number;
   updatedAt: number;
   sessionId?: SessionId;
   description?: string;
+  activeRunId?: string;
+  lastCompletedRunId?: string;
 }
 
 export interface RuntimeTeamMemberView {
@@ -206,6 +222,7 @@ export interface RuntimeTeamMessageView {
   threadId?: ThreadId;
   taskId?: TaskId;
   summary?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface RuntimeAgentsSnapshot {
@@ -218,6 +235,163 @@ export interface RuntimeAgentsSnapshot {
 export interface RuntimePartIndexEntry {
   messageId: MessageId;
   index: number;
+}
+
+export type RuntimeTeamRunStatus = "running" | "completed";
+
+export interface RuntimeTeamRunView {
+  id: string;
+  teamId: TeamId;
+  status: RuntimeTeamRunStatus;
+  cycle: number;
+  counts: TeamRunSummaryCounts;
+  createdAt: number;
+  updatedAt: number;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  mode?: AgentTaskMode;
+  once?: boolean;
+  maxCycles?: number;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+  phase?: TeamRunLifecyclePhase;
+  stopReason?: TeamRunStopReason;
+  startedAt?: number;
+  endedAt?: number;
+}
+
+export interface TeamLiveCockpitInput {
+  teamId?: TeamId;
+  sessionId?: SessionId;
+  limit?: number;
+}
+
+export interface TeamLiveCockpitView {
+  teamIds: TeamId[];
+  teams: TeamLiveTeamSummary[];
+  team?: RuntimeTeamView;
+  lead?: TeamLiveMemberRow;
+  members: TeamLiveMemberRow[];
+  tasks: TeamLiveTaskRow[];
+  runs: RuntimeTeamRunView[];
+  activeRun?: RuntimeTeamRunView;
+  pendingApprovals: RuntimeApprovalView[];
+  mailbox: TeamLiveMailboxDeliveryView[];
+  metadata: TeamLiveMetadataSummary;
+  toolCounts: TeamLiveToolCount[];
+  recentActivity: TeamLiveActivityItem[];
+  lastEventId?: string;
+}
+
+export interface TeamLiveTeamSummary {
+  id: TeamId;
+  name: string;
+  status: RuntimeTeamView["status"];
+  leadPath: AgentPath;
+  memberCount: number;
+  taskCount: number;
+  runningTaskCount: number;
+  pendingTaskCount: number;
+  pendingApprovalCount: number;
+  updatedAt: number;
+  activeRunId?: string;
+}
+
+export interface TeamLiveMemberRow {
+  id: string;
+  teamId: TeamId;
+  path: AgentPath;
+  name: string;
+  role: string;
+  status: TeamMemberStatus;
+  isLead: boolean;
+  depth: number;
+  taskIds: TaskId[];
+  deliveryIds: string[];
+  updatedAt: number;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  model?: string;
+  toolScope?: string[];
+  writeScope?: string[];
+  currentTaskId?: TaskId;
+  currentTaskTitle?: string;
+}
+
+export interface TeamLiveTaskMetadata {
+  dispatch?: Record<string, unknown>;
+  verification?: Record<string, unknown>;
+  worktree?: Record<string, unknown>;
+  merge?: Record<string, unknown>;
+}
+
+export interface TeamLiveTaskRow {
+  id: TaskId;
+  teamId?: TeamId;
+  title: string;
+  description?: string;
+  status: RuntimeTaskStatus;
+  ownerPath?: AgentPath;
+  ownerName?: string;
+  dependsOn?: TaskId[];
+  summary?: string;
+  error?: string;
+  metadata: TeamLiveTaskMetadata;
+  updatedAt: number;
+  completedAt?: number;
+}
+
+export interface TeamLiveMailboxDeliveryView {
+  id: string;
+  path: AgentPath;
+  from: AgentPath;
+  status: RuntimeAgentMailboxMessageView["status"];
+  triggerTurn: boolean;
+  queuedAt: number;
+  teamId?: TeamId;
+  teamMessageId?: string;
+  taskId?: TaskId;
+  deliveryStatus?: TeamMessageDeliveryStatus;
+  deliveryError?: string;
+  claimedAt?: number;
+  consumedAt?: number;
+}
+
+export interface TeamLiveMetadataSummary {
+  dispatches: TeamLiveMetadataEntry[];
+  verifications: TeamLiveMetadataEntry[];
+  worktrees: TeamLiveMetadataEntry[];
+  merges: TeamLiveMetadataEntry[];
+}
+
+export interface TeamLiveMetadataEntry {
+  taskId: TaskId;
+  title: string;
+  status: RuntimeTaskStatus;
+  ownerPath?: AgentPath;
+  value: Record<string, unknown>;
+}
+
+export interface TeamLiveToolCount {
+  toolName: string;
+  total: number;
+  running: number;
+  completed: number;
+  failed: number;
+}
+
+export type TeamLiveActivityKind = "run" | "message" | "mailbox" | "tool" | "approval" | "task";
+
+export interface TeamLiveActivityItem {
+  id: string;
+  kind: TeamLiveActivityKind;
+  time: number;
+  label: string;
+  status?: string;
+  detail?: string;
+  toolName?: string;
+  taskId?: TaskId;
+  teamId?: TeamId;
 }
 
 export function createRuntimeView(): ChiliRuntimeView {
@@ -240,6 +414,9 @@ export function createRuntimeView(): ChiliRuntimeView {
     teamMembers: {},
     teamMessageIds: [],
     teamMessages: {},
+    teamRunIds: [],
+    teamRuns: {},
+    teamRunIdsByTeam: {},
     partIndex: {},
   };
 }
@@ -448,6 +625,302 @@ export function runtimeAgentsSnapshot(view: ChiliRuntimeView, sessionId?: Sessio
   return snapshot;
 }
 
+export function teamLiveCockpit(view: ChiliRuntimeView, input: TeamLiveCockpitInput = {}): TeamLiveCockpitView {
+  const limit = Math.max(1, input.limit ?? 16);
+  const teams = view.teamIds.flatMap((teamId) => {
+    const team = view.teams[teamId];
+    if (!team || !teamInSessionScope(view, team, input.sessionId)) return [];
+    return team ? [teamLiveTeamSummary(view, team, input.sessionId)] : [];
+  });
+  const selectedTeamSummary = input.teamId ? teams.find((team) => team.id === input.teamId) : teams[0];
+  const selectedTeam = selectedTeamSummary ? view.teams[selectedTeamSummary.id] : undefined;
+  const team = selectedTeam;
+  const runs = team ? teamRunsForTeam(view, team.id) : [];
+  const activeRun = team ? activeTeamRun(view, team) : undefined;
+  const tasks = team ? teamTaskRows(view, team) : [];
+  const members = team ? teamMemberRows(view, team, tasks) : [];
+  const lead = members.find((member) => member.isLead);
+  const sessionScope = team ? scopedSessionIdsForTeam(view, team, input.sessionId) : input.sessionId ? new Set([input.sessionId]) : new Set<SessionId>();
+  const approvals = pendingApprovalsForScope(view, sessionScope);
+  const mailbox = team ? teamMailboxRows(view, team.id) : [];
+  const metadata = teamLiveMetadata(tasks);
+  const toolCounts = toolCountsForScope(view, sessionScope);
+  const recentActivity = team ? teamRecentActivity(view, team, sessionScope, limit) : [];
+
+  const output: TeamLiveCockpitView = {
+    teamIds: teams.map((item) => item.id),
+    teams,
+    members,
+    tasks,
+    runs,
+    pendingApprovals: approvals,
+    mailbox,
+    metadata,
+    toolCounts,
+    recentActivity,
+  };
+  assignOptional(output, "team", team);
+  assignOptional(output, "lead", lead);
+  assignOptional(output, "activeRun", activeRun);
+  assignOptional(output, "lastEventId", view.lastEventId);
+  return output;
+}
+
+function teamLiveTeamSummary(
+  view: ChiliRuntimeView,
+  team: RuntimeTeamView,
+  sessionId: SessionId | undefined,
+): TeamLiveTeamSummary {
+  const tasks = team.taskIds.flatMap((taskId) => {
+    const task = view.tasks[taskId];
+    return task ? [task] : [];
+  });
+  const pendingApprovalCount = pendingApprovalsForScope(view, scopedSessionIdsForTeam(view, team, sessionId)).length;
+  const summary: TeamLiveTeamSummary = {
+    id: team.id,
+    name: team.name,
+    status: team.status,
+    leadPath: team.leadPath,
+    memberCount: team.memberIds.length,
+    taskCount: tasks.length,
+    runningTaskCount: tasks.filter((task) => task.status === "running" || task.status === "in_progress").length,
+    pendingTaskCount: tasks.filter((task) => task.status === "pending" || task.status === "blocked").length,
+    pendingApprovalCount,
+    updatedAt: team.updatedAt,
+  };
+  assignOptional(summary, "activeRunId", team.activeRunId);
+  return summary;
+}
+
+function teamMemberRows(view: ChiliRuntimeView, team: RuntimeTeamView, tasks: readonly TeamLiveTaskRow[]): TeamLiveMemberRow[] {
+  const leadDepth = pathDepth(team.leadPath);
+  return team.memberIds
+    .flatMap((memberId) => {
+      const member = view.teamMembers[memberId];
+      return member ? [member] : [];
+    })
+    .map((member) => {
+      const ownedTasks = tasks.filter((task) => task.ownerPath === member.path);
+      const deliveries = Object.values(view.mailboxMessages).filter((message) => message.teamId === team.id && message.path === member.path);
+      const currentTask = currentTaskForMember(member, ownedTasks);
+      const row: TeamLiveMemberRow = {
+        id: member.id,
+        teamId: member.teamId,
+        path: member.path,
+        name: member.name,
+        role: member.role,
+        status: member.status,
+        isLead: member.path === team.leadPath,
+        depth: Math.max(0, pathDepth(member.path) - leadDepth),
+        taskIds: ownedTasks.map((task) => task.id),
+        deliveryIds: deliveries.map((delivery) => delivery.id),
+        updatedAt: member.updatedAt,
+      };
+      assignOptional(row, "childSessionId", member.childSessionId);
+      assignOptional(row, "childThreadId", member.childThreadId);
+      assignOptional(row, "model", member.model);
+      assignOptional(row, "toolScope", member.toolScope);
+      assignOptional(row, "writeScope", member.writeScope);
+      assignOptional(row, "currentTaskId", currentTask?.id ?? member.currentTaskId);
+      assignOptional(row, "currentTaskTitle", currentTask?.title);
+      return row;
+    });
+}
+
+function teamTaskRows(view: ChiliRuntimeView, team: RuntimeTeamView): TeamLiveTaskRow[] {
+  return team.taskIds
+    .flatMap((taskId) => {
+      const task = view.tasks[taskId];
+      return task ? [task] : [];
+    })
+    .map((task) => {
+      const owner = task.ownerPath ? view.teamMembers[teamMemberKey(team.id, task.ownerPath)] : undefined;
+      const row: TeamLiveTaskRow = {
+        id: task.id,
+        title: task.title ?? task.id,
+        status: task.status,
+        metadata: teamLiveTaskMetadata(task.metadata),
+        updatedAt: task.updatedAt,
+      };
+      assignOptional(row, "teamId", task.teamId);
+      assignOptional(row, "description", task.description);
+      assignOptional(row, "ownerPath", task.ownerPath);
+      assignOptional(row, "ownerName", owner?.name);
+      assignOptional(row, "dependsOn", task.dependsOn);
+      assignOptional(row, "summary", task.summary);
+      assignOptional(row, "error", task.error);
+      assignOptional(row, "completedAt", task.completedAt);
+      return row;
+    })
+    .sort((left, right) => taskSortRank(left.status) - taskSortRank(right.status) || right.updatedAt - left.updatedAt);
+}
+
+function teamRunsForTeam(view: ChiliRuntimeView, teamId: TeamId): RuntimeTeamRunView[] {
+  return (view.teamRunIdsByTeam[teamId] ?? [])
+    .flatMap((runId) => {
+      const run = view.teamRuns[runId];
+      return run ? [run] : [];
+    })
+    .sort((left, right) => right.updatedAt - left.updatedAt);
+}
+
+function activeTeamRun(view: ChiliRuntimeView, team: RuntimeTeamView): RuntimeTeamRunView | undefined {
+  if (team.activeRunId) {
+    const run = view.teamRuns[team.activeRunId];
+    if (run) return run;
+  }
+  return teamRunsForTeam(view, team.id).find((run) => run.status === "running") ?? teamRunsForTeam(view, team.id)[0];
+}
+
+function teamMailboxRows(view: ChiliRuntimeView, teamId: TeamId): TeamLiveMailboxDeliveryView[] {
+  return Object.values(view.mailboxMessages)
+    .filter((message) => message.teamId === teamId)
+    .map((message) => {
+      const teamMessage = message.teamMessageId ? view.teamMessages[message.teamMessageId] : undefined;
+      const row: TeamLiveMailboxDeliveryView = {
+        id: message.id,
+        path: message.path,
+        from: message.from,
+        status: message.status,
+        triggerTurn: message.triggerTurn,
+        queuedAt: message.queuedAt,
+      };
+      assignOptional(row, "teamId", message.teamId);
+      assignOptional(row, "teamMessageId", message.teamMessageId);
+      assignOptional(row, "taskId", message.taskId ?? teamMessage?.taskId);
+      assignOptional(row, "deliveryStatus", teamMessage?.deliveryStatus);
+      assignOptional(row, "deliveryError", teamMessage?.deliveryError ?? message.error);
+      assignOptional(row, "claimedAt", message.claimedAt);
+      assignOptional(row, "consumedAt", message.consumedAt);
+      return row;
+    })
+    .sort((left, right) => right.queuedAt - left.queuedAt);
+}
+
+function teamLiveMetadata(tasks: readonly TeamLiveTaskRow[]): TeamLiveMetadataSummary {
+  const summary: TeamLiveMetadataSummary = {
+    dispatches: [],
+    verifications: [],
+    worktrees: [],
+    merges: [],
+  };
+  for (const task of tasks) {
+    if (task.metadata.dispatch) summary.dispatches.push(metadataEntry(task, task.metadata.dispatch));
+    if (task.metadata.verification) summary.verifications.push(metadataEntry(task, task.metadata.verification));
+    if (task.metadata.worktree) summary.worktrees.push(metadataEntry(task, task.metadata.worktree));
+    if (task.metadata.merge) summary.merges.push(metadataEntry(task, task.metadata.merge));
+  }
+  return summary;
+}
+
+function teamLiveTaskMetadata(metadata: Record<string, unknown> | undefined): TeamLiveTaskMetadata {
+  const output: TeamLiveTaskMetadata = {};
+  assignOptional(output, "dispatch", metadataRecord(metadata, "chiliTeamDispatch"));
+  assignOptional(output, "verification", metadataRecord(metadata, "verification"));
+  assignOptional(output, "worktree", metadataRecord(metadata, "worktree"));
+  assignOptional(output, "merge", metadataRecord(metadata, "merge"));
+  return output;
+}
+
+function metadataEntry(task: TeamLiveTaskRow, value: Record<string, unknown>): TeamLiveMetadataEntry {
+  const entry: TeamLiveMetadataEntry = {
+    taskId: task.id,
+    title: task.title,
+    status: task.status,
+    value,
+  };
+  assignOptional(entry, "ownerPath", task.ownerPath);
+  return entry;
+}
+
+function toolCountsForScope(view: ChiliRuntimeView, sessionScope: ReadonlySet<SessionId>): TeamLiveToolCount[] {
+  const counts = new Map<string, TeamLiveToolCount>();
+  for (const toolCall of Object.values(view.toolCalls)) {
+    if (sessionScope.size > 0 && (!toolCall.sessionId || !sessionScope.has(toolCall.sessionId))) continue;
+    const toolName = toolCall.toolName || "(unknown)";
+    const current = counts.get(toolName) ?? { toolName, total: 0, running: 0, completed: 0, failed: 0 };
+    current.total++;
+    if (toolCall.status === "completed") current.completed++;
+    else if (toolCall.status === "failed" || toolCall.status === "cancelled") current.failed++;
+    else current.running++;
+    counts.set(toolName, current);
+  }
+  return [...counts.values()].sort((left, right) => right.total - left.total || left.toolName.localeCompare(right.toolName));
+}
+
+function teamRecentActivity(
+  view: ChiliRuntimeView,
+  team: RuntimeTeamView,
+  sessionScope: ReadonlySet<SessionId>,
+  limit: number,
+): TeamLiveActivityItem[] {
+  const items: TeamLiveActivityItem[] = [];
+  for (const run of teamRunsForTeam(view, team.id)) {
+    const label = run.phase ? `run ${run.phase}` : `run ${run.status}`;
+    items.push(activityItem({ id: run.id, kind: "run", time: run.updatedAt, label, status: run.stopReason ?? run.status, teamId: team.id }));
+  }
+  for (const messageId of team.messageIds) {
+    const message = view.teamMessages[messageId];
+    if (!message) continue;
+    items.push(activityItem({
+      id: message.id,
+      kind: "message",
+      time: message.createdAt,
+      label: `${message.kind}: ${message.from} -> ${message.to}`,
+      status: message.deliveryStatus ?? message.delivery,
+      detail: message.summary ?? message.content,
+      taskId: message.taskId,
+      teamId: message.teamId,
+    }));
+  }
+  for (const mailbox of teamMailboxRows(view, team.id)) {
+    items.push(activityItem({
+      id: mailbox.id,
+      kind: "mailbox",
+      time: mailbox.consumedAt ?? mailbox.claimedAt ?? mailbox.queuedAt,
+      label: `mailbox ${mailbox.from} -> ${mailbox.path}`,
+      status: mailbox.status,
+      taskId: mailbox.taskId,
+      teamId: mailbox.teamId,
+    }));
+  }
+  for (const task of team.taskIds.flatMap((taskId) => (view.tasks[taskId] ? [view.tasks[taskId]] : []))) {
+    items.push(activityItem({
+      id: task.id,
+      kind: "task",
+      time: task.updatedAt,
+      label: task.title ?? task.id,
+      status: task.status,
+      detail: task.error ?? task.summary,
+      taskId: task.id,
+      teamId: task.teamId,
+    }));
+  }
+  for (const toolCall of Object.values(view.toolCalls)) {
+    if (sessionScope.size > 0 && (!toolCall.sessionId || !sessionScope.has(toolCall.sessionId))) continue;
+    items.push(activityItem({
+      id: toolCall.id,
+      kind: "tool",
+      time: toolCall.updatedAt,
+      label: toolCall.toolName || "(unknown tool)",
+      status: toolCall.status,
+      detail: toolCall.error ?? toolCall.output,
+      toolName: toolCall.toolName,
+    }));
+  }
+  for (const approval of pendingApprovalsForScope(view, sessionScope)) {
+    items.push(activityItem({
+      id: approval.id,
+      kind: "approval",
+      time: approval.resolvedAt ?? approval.createdAt,
+      label: approval.permission,
+      status: approval.status,
+      detail: approval.patterns.join(", "),
+    }));
+  }
+  return items.sort((left, right) => right.time - left.time).slice(0, limit);
+}
+
 function applyTeamProjectionEvent(view: ChiliRuntimeView, event: EventEnvelope): void {
   const payload = recordPayload(event);
   if (!payload) return;
@@ -525,7 +998,9 @@ function applyTeamProjectionEvent(view: ChiliRuntimeView, event: EventEnvelope):
     assignOptional(task, "sessionId", event.sessionId);
     assignOptional(task, "title", stringValue(payload.title));
     assignOptional(task, "description", stringValue(payload.description));
+    assignOptional(task, "createdBy", stringValue(payload.createdBy) as AgentPath | undefined);
     assignOptional(task, "dependsOn", taskIdArrayValue(payload.dependsOn));
+    assignOptional(task, "metadata", recordObjectValue(payload.metadata));
     assignOptional(task, "summary", stringValue(payload.summary));
     assignOptional(task, "error", stringValue(payload.error));
 
@@ -564,12 +1039,84 @@ function applyTeamProjectionEvent(view: ChiliRuntimeView, event: EventEnvelope):
     assignOptional(message, "threadId", event.threadId);
     assignOptional(message, "taskId", stringValue(payload.taskId) as TaskId | undefined);
     assignOptional(message, "summary", stringValue(payload.summary));
+    assignOptional(message, "metadata", recordObjectValue(payload.metadata));
     view.teamMessages[messageId] = message;
     refreshTeamMessageDeliveryStatus(view, messageId, event.time);
     if (!view.teamMessageIds.includes(messageId)) view.teamMessageIds.push(messageId);
 
     const team = upsertTeam(view, teamId, event.time);
     if (!team.messageIds.includes(messageId)) team.messageIds.push(messageId);
+    team.updatedAt = event.time;
+    return;
+  }
+
+  if (event.type === "team.run_started") {
+    const teamId = stringValue(payload.teamId) as TeamId | undefined;
+    const runId = stringValue(payload.runId);
+    if (!teamId || !runId) return;
+
+    const run = upsertTeamRun(view, teamId, runId, event.time);
+    run.status = "running";
+    run.cycle = 0;
+    run.counts = emptyTeamRunCounts();
+    run.updatedAt = event.time;
+    assignOptional(run, "sessionId", event.sessionId);
+    assignOptional(run, "threadId", event.threadId);
+    assignOptional(run, "mode", agentTaskModeValue(payload.mode));
+    assignOptional(run, "once", booleanValue(payload.once));
+    assignOptional(run, "maxCycles", finiteNumberValue(payload.maxCycles));
+    assignOptional(run, "timeoutMs", finiteNumberValue(payload.timeoutMs));
+    assignOptional(run, "pollIntervalMs", finiteNumberValue(payload.pollIntervalMs));
+    delete run.phase;
+    delete run.stopReason;
+    delete run.endedAt;
+    linkTeamRunToTeam(view, run, event.time);
+    const team = upsertTeam(view, teamId, event.time);
+    team.activeRunId = runId;
+    team.updatedAt = event.time;
+    return;
+  }
+
+  if (event.type === "team.run_progress") {
+    const teamId = stringValue(payload.teamId) as TeamId | undefined;
+    const runId = stringValue(payload.runId);
+    if (!teamId || !runId) return;
+
+    const run = upsertTeamRun(view, teamId, runId, event.time);
+    run.status = "running";
+    run.cycle = finiteNumberValue(payload.cycle) ?? run.cycle;
+    run.counts = teamRunSummaryCountsValue(payload.counts) ?? run.counts;
+    run.updatedAt = event.time;
+    assignOptional(run, "sessionId", event.sessionId);
+    assignOptional(run, "threadId", event.threadId);
+    assignOptional(run, "phase", teamRunLifecyclePhaseValue(payload.phase));
+    assignOptional(run, "stopReason", teamRunStopReasonValue(payload.stopReason));
+    linkTeamRunToTeam(view, run, event.time);
+    const team = upsertTeam(view, teamId, event.time);
+    team.activeRunId = runId;
+    team.updatedAt = event.time;
+    return;
+  }
+
+  if (event.type === "team.run_completed") {
+    const teamId = stringValue(payload.teamId) as TeamId | undefined;
+    const runId = stringValue(payload.runId);
+    if (!teamId || !runId) return;
+
+    const run = upsertTeamRun(view, teamId, runId, event.time);
+    run.status = "completed";
+    run.cycle = finiteNumberValue(payload.cycles) ?? run.cycle;
+    run.counts = teamRunSummaryCountsValue(payload.counts) ?? run.counts;
+    run.updatedAt = event.time;
+    assignOptional(run, "sessionId", event.sessionId);
+    assignOptional(run, "threadId", event.threadId);
+    assignOptional(run, "stopReason", teamRunStopReasonValue(payload.stopReason));
+    assignOptional(run, "startedAt", finiteNumberValue(payload.startedAt));
+    assignOptional(run, "endedAt", finiteNumberValue(payload.endedAt));
+    linkTeamRunToTeam(view, run, event.time);
+    const team = upsertTeam(view, teamId, event.time);
+    if (team.activeRunId === runId) delete team.activeRunId;
+    team.lastCompletedRunId = runId;
     team.updatedAt = event.time;
   }
 }
@@ -659,6 +1206,9 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     };
     assignOptional(message, "sessionId", event.sessionId);
     assignOptional(message, "threadId", event.threadId);
+    assignOptional(message, "taskId", stringValue(payload.taskId) as TaskId | undefined);
+    assignOptional(message, "childSessionId", stringValue(payload.childSessionId) as SessionId | undefined);
+    assignOptional(message, "childThreadId", stringValue(payload.childThreadId) as ThreadId | undefined);
     const teamMetadata = teamMailboxMetadata(payload.message);
     if (teamMetadata) {
       message.teamId = teamMetadata.teamId;
@@ -707,6 +1257,7 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     message.status = "queued";
     delete message.claimedAt;
     delete message.consumedAt;
+    assignOptional(message, "error", stringValue(payload.error));
     if (message.teamMessageId) applyTeamMessageDeliveryStatus(view, message.teamMessageId, "failed", event.time, stringValue(payload.error));
     return;
   }
@@ -744,6 +1295,7 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     assignOptional(task, "title", stringValue(payload.title));
     assignOptional(task, "description", stringValue(payload.description));
     assignOptional(task, "dependsOn", taskIdArrayValue(payload.dependsOn));
+    assignOptional(task, "metadata", recordObjectValue(payload.metadata));
     if (task.status === "completed" || task.status === "failed" || task.status === "cancelled") task.completedAt = event.time;
     linkTaskToSession(view, task, event.time);
     linkTaskToOwnerAgent(view, task, event.time);
@@ -798,6 +1350,7 @@ function applySubagentProjectionEvent(view: ChiliRuntimeView, event: EventEnvelo
     assignOptional(task, "title", stringValue(payload.title));
     assignOptional(task, "description", stringValue(payload.description));
     assignOptional(task, "dependsOn", taskIdArrayValue(payload.dependsOn));
+    assignOptional(task, "metadata", recordObjectValue(payload.metadata));
     assignOptional(task, "summary", stringValue(payload.summary));
     assignOptional(task, "error", stringValue(payload.error));
     linkTaskToSession(view, task, event.time);
@@ -876,12 +1429,31 @@ function upsertTeam(view: ChiliRuntimeView, teamId: TeamId, time: number): Runti
     memberIds: [],
     taskIds: [],
     messageIds: [],
+    runIds: [],
     createdAt: time,
     updatedAt: time,
   };
   view.teams[teamId] = team;
   view.teamIds.push(teamId);
   return team;
+}
+
+function upsertTeamRun(view: ChiliRuntimeView, teamId: TeamId, runId: string, time: number): RuntimeTeamRunView {
+  const existing = view.teamRuns[runId];
+  if (existing) return existing;
+
+  const run: RuntimeTeamRunView = {
+    id: runId,
+    teamId,
+    status: "running",
+    cycle: 0,
+    counts: emptyTeamRunCounts(),
+    createdAt: time,
+    updatedAt: time,
+  };
+  view.teamRuns[runId] = run;
+  view.teamRunIds.push(runId);
+  return run;
 }
 
 function upsertTeamMember(
@@ -993,6 +1565,15 @@ function linkMemberToTeam(view: ChiliRuntimeView, member: RuntimeTeamMemberView,
   team.updatedAt = time;
 }
 
+function linkTeamRunToTeam(view: ChiliRuntimeView, run: RuntimeTeamRunView, time: number): void {
+  const team = upsertTeam(view, run.teamId, time);
+  if (!team.runIds.includes(run.id)) team.runIds.push(run.id);
+  const teamRunIds = view.teamRunIdsByTeam[run.teamId] ?? [];
+  if (!teamRunIds.includes(run.id)) teamRunIds.push(run.id);
+  view.teamRunIdsByTeam[run.teamId] = teamRunIds;
+  team.updatedAt = time;
+}
+
 function applyPartDelta(view: ChiliRuntimeView, partId: PartId, field: string, delta: string): void {
   const entry = view.partIndex[partId];
   if (!entry) return;
@@ -1057,9 +1638,25 @@ function booleanValue(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
+function finiteNumberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? Math.trunc(value) : undefined;
+}
+
 function generationValue(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
   return Math.max(0, Math.trunc(value));
+}
+
+function recordObjectValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function metadataRecord(metadata: Record<string, unknown> | undefined, key: string): Record<string, unknown> | undefined {
+  return metadata ? recordObjectValue(metadata[key]) : undefined;
+}
+
+function agentTaskModeValue(value: unknown): AgentTaskMode | undefined {
+  return value === "one_shot" || value === "resumable" || value === "background" ? value : undefined;
 }
 
 function agentStatusValue(value: unknown): RuntimeAgentStatus | undefined {
@@ -1082,6 +1679,175 @@ function teamMessageKindValue(value: unknown): TeamMessageKind | undefined {
 
 function teamMessageDeliveryValue(value: unknown): TeamMessageDelivery | undefined {
   return value === "queueOnly" || value === "triggerTurn" ? value : undefined;
+}
+
+function teamRunLifecyclePhaseValue(value: unknown): TeamRunLifecyclePhase | undefined {
+  return value === "reconcile" || value === "load" || value === "verify" || value === "merge" || value === "dispatch" || value === "wait" || value === "drain"
+    ? value
+    : undefined;
+}
+
+function teamRunStopReasonValue(value: unknown): TeamRunStopReason | undefined {
+  return value === "drained" ||
+    value === "once" ||
+    value === "max_cycles" ||
+    value === "timeout" ||
+    value === "aborted" ||
+    value === "team_inactive"
+    ? value
+    : undefined;
+}
+
+function teamRunSummaryCountsValue(value: unknown): TeamRunSummaryCounts | undefined {
+  const record = recordObjectValue(value);
+  if (!record) return undefined;
+  const counts = emptyTeamRunCounts();
+  for (const key of teamRunCountKeys) {
+    const item = finiteNumberValue(record[key]);
+    if (item !== undefined) counts[key] = item;
+  }
+  return counts;
+}
+
+const teamRunCountKeys = [
+  "dispatched",
+  "completed",
+  "accepted",
+  "reopened",
+  "merged",
+  "mergeFailed",
+  "mergeConflicted",
+  "mergeSkipped",
+  "failed",
+  "blocked",
+  "skipped",
+  "stillRunning",
+  "errors",
+] as const;
+
+function emptyTeamRunCounts(): TeamRunSummaryCounts {
+  return {
+    dispatched: 0,
+    completed: 0,
+    accepted: 0,
+    reopened: 0,
+    merged: 0,
+    mergeFailed: 0,
+    mergeConflicted: 0,
+    mergeSkipped: 0,
+    failed: 0,
+    blocked: 0,
+    skipped: 0,
+    stillRunning: 0,
+    errors: 0,
+  };
+}
+
+function taskSortRank(status: RuntimeTaskStatus): number {
+  if (status === "running" || status === "in_progress") return 0;
+  if (status === "blocked") return 1;
+  if (status === "pending") return 2;
+  if (status === "failed" || status === "cancelled") return 3;
+  return 4;
+}
+
+function pathDepth(path: AgentPath): number {
+  return path.split("/").filter(Boolean).length;
+}
+
+function currentTaskForMember(
+  member: RuntimeTeamMemberView,
+  ownedTasks: readonly TeamLiveTaskRow[],
+): TeamLiveTaskRow | undefined {
+  if (member.currentTaskId) {
+    const current = ownedTasks.find((task) => task.id === member.currentTaskId);
+    if (current) return current;
+  }
+  return [...ownedTasks]
+    .filter((task) => task.status === "running" || task.status === "in_progress" || task.status === "pending")
+    .sort((left, right) => taskSortRank(left.status) - taskSortRank(right.status) || right.updatedAt - left.updatedAt)[0];
+}
+
+function scopedSessionIdsForTeam(
+  view: ChiliRuntimeView,
+  team: RuntimeTeamView,
+  inputSessionId: SessionId | undefined,
+): Set<SessionId> {
+  const ids = new Set<SessionId>();
+  if (inputSessionId) ids.add(inputSessionId);
+  if (team.sessionId) ids.add(team.sessionId);
+  for (const memberId of team.memberIds) {
+    const member = view.teamMembers[memberId];
+    if (member?.childSessionId) ids.add(member.childSessionId);
+  }
+  for (const taskId of team.taskIds) {
+    const task = view.tasks[taskId];
+    if (task?.sessionId) ids.add(task.sessionId);
+    if (task?.childSessionId) ids.add(task.childSessionId);
+  }
+  for (const messageId of team.messageIds) {
+    const message = view.teamMessages[messageId];
+    if (message?.sessionId) ids.add(message.sessionId);
+  }
+  return ids;
+}
+
+function pendingApprovalsForScope(view: ChiliRuntimeView, sessionScope: ReadonlySet<SessionId>): RuntimeApprovalView[] {
+  return Object.values(view.approvals).filter((approval) => {
+    if (approval.status !== "pending") return false;
+    return sessionScope.size === 0 ? true : Boolean(approval.sessionId && sessionScope.has(approval.sessionId));
+  });
+}
+
+function teamInSessionScope(
+  view: ChiliRuntimeView,
+  team: RuntimeTeamView,
+  sessionId: SessionId | undefined,
+): boolean {
+  if (!sessionId) return true;
+  if (team.sessionId === sessionId) return true;
+  for (const memberId of team.memberIds) {
+    const member = view.teamMembers[memberId];
+    if (member?.childSessionId === sessionId) return true;
+  }
+  for (const taskId of team.taskIds) {
+    const task = view.tasks[taskId];
+    if (task?.sessionId === sessionId || task?.childSessionId === sessionId) return true;
+  }
+  for (const messageId of team.messageIds) {
+    const message = view.teamMessages[messageId];
+    if (message?.sessionId === sessionId) return true;
+  }
+  for (const runId of team.runIds) {
+    const run = view.teamRuns[runId];
+    if (run?.sessionId === sessionId) return true;
+  }
+  return false;
+}
+
+function activityItem(input: {
+  id: string;
+  kind: TeamLiveActivityKind;
+  time: number;
+  label: string;
+  status?: string | undefined;
+  detail?: string | undefined;
+  toolName?: string | undefined;
+  taskId?: TaskId | undefined;
+  teamId?: TeamId | undefined;
+}): TeamLiveActivityItem {
+  const item: TeamLiveActivityItem = {
+    id: input.id,
+    kind: input.kind,
+    time: input.time,
+    label: input.label,
+  };
+  assignOptional(item, "status", input.status);
+  assignOptional(item, "detail", input.detail);
+  assignOptional(item, "toolName", input.toolName);
+  assignOptional(item, "taskId", input.taskId);
+  assignOptional(item, "teamId", input.teamId);
+  return item;
 }
 
 function applyTeamMessageDeliveryStatus(

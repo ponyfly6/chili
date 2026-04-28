@@ -448,6 +448,7 @@ export interface RunTeamLoopRequest extends TeamRequestContext {
   maxCycles?: number;
   timeoutMs?: number;
   pollIntervalMs?: number;
+  signal?: AbortSignal;
 }
 
 export type RuntimeTeamExecutionStopReason = "drained" | "once" | "max_cycles" | "timeout" | "aborted" | "team_inactive";
@@ -843,7 +844,8 @@ export class HttpRuntimeClient implements RuntimeClient {
   }
 
   runTeamLoop(input: RunTeamLoopRequest): Promise<RuntimeTeamExecutionRunSummary> {
-    return this.post(`teams/${encodeURIComponent(input.teamId)}/run_loop`, input);
+    const { signal, ...body } = input;
+    return this.post(`teams/${encodeURIComponent(input.teamId)}/run_loop`, body, signal);
   }
 
   updateTeamTask(input: UpdateTeamTaskRequest): Promise<RuntimeTeamTaskRecord> {
@@ -946,12 +948,14 @@ export class HttpRuntimeClient implements RuntimeClient {
     return this.request(path, { method: "GET" });
   }
 
-  private post<T>(path: string, body: unknown): Promise<T> {
-    return this.request(path, {
+  private post<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
+    const init: RequestInit = {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
-    });
+    };
+    if (signal) init.signal = signal;
+    return this.request(path, init);
   }
 
   private async request<T>(path: string, init: RequestInit): Promise<T> {
