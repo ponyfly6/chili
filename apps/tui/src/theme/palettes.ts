@@ -102,7 +102,111 @@ export const terminalDarkTheme: TuiTheme = {
   },
 };
 
+export const chiliLightTheme: TuiTheme = {
+  id: "chili-light",
+  name: "Chili Light",
+  colors: {
+    background: "#fbfbf8",
+    panel: "#f2f4f7",
+    overlay: "#ffffff",
+    text: {
+      primary: "#1f2328",
+      secondary: "#3f4652",
+      muted: "#6b7280",
+      disabled: "#9ca3af",
+      inverse: "#ffffff",
+    },
+    border: {
+      subtle: "#e5e7eb",
+      default: "#d0d7de",
+      focus: "#0f766e",
+      warning: "#d8b76a",
+      danger: "#e2a09b",
+    },
+    accent: {
+      primary: "#0f766e",
+      secondary: "#2563eb",
+      muted: "#99c7c0",
+    },
+    status: {
+      success: "#2f855a",
+      warning: "#b7791f",
+      error: "#b42318",
+      info: "#2563eb",
+      pending: "#b7791f",
+    },
+    input: {
+      background: "#ffffff",
+      text: "#1f2328",
+      placeholder: "#9ca3af",
+      cursor: "#1f2328",
+      disabledText: "#6b7280",
+      disabledBorder: "#e5e7eb",
+    },
+    menu: {
+      background: "#ffffff",
+      selectedBackground: "#dff5f1",
+      selectedText: "#1f2328",
+      text: "#3f4652",
+      muted: "#9ca3af",
+    },
+  },
+};
+
+export const warmLightTheme: TuiTheme = {
+  id: "warm-light",
+  name: "Warm Light",
+  colors: {
+    background: "#faf6ee",
+    panel: "#f1eadf",
+    overlay: "#fffaf2",
+    text: {
+      primary: "#292524",
+      secondary: "#57534e",
+      muted: "#78716c",
+      disabled: "#a8a29e",
+      inverse: "#fffaf2",
+    },
+    border: {
+      subtle: "#e7ded2",
+      default: "#d6cabc",
+      focus: "#0f766e",
+      warning: "#c6a35a",
+      danger: "#dfa199",
+    },
+    accent: {
+      primary: "#0f766e",
+      secondary: "#3b6f9d",
+      muted: "#9fc4ba",
+    },
+    status: {
+      success: "#3f7f4c",
+      warning: "#a16207",
+      error: "#b91c1c",
+      info: "#3b6f9d",
+      pending: "#a16207",
+    },
+    input: {
+      background: "#fffaf2",
+      text: "#292524",
+      placeholder: "#a8a29e",
+      cursor: "#292524",
+      disabledText: "#78716c",
+      disabledBorder: "#e7ded2",
+    },
+    menu: {
+      background: "#fffaf2",
+      selectedBackground: "#deeee8",
+      selectedText: "#292524",
+      text: "#57534e",
+      muted: "#a8a29e",
+    },
+  },
+};
+
 export const tuiThemes = [
   chiliDarkTheme,
   terminalDarkTheme,
+  chiliLightTheme,
+  warmLightTheme,
 ] as const satisfies readonly TuiTheme[];

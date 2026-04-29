@@ -9,6 +9,7 @@ export type SlashCommandCategory =
 
 export type SlashCommandResult =
   | { type: "open_view"; view: "team" | "help" | "agents" | "status" }
+  | { type: "open_theme_picker" }
   | { type: "close_view" }
   | { type: "clear_transcript" }
   | { type: "insert_prompt"; text: string }
@@ -38,4 +39,3 @@ export type SlashCommand = {
   complete?: (ctx: SlashCommandContext, input: string) => SlashCompletion[];
   run: (ctx: SlashCommandContext, args: string) => SlashCommandResult | Promise<SlashCommandResult>;
 };
-

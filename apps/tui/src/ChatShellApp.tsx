@@ -16,7 +16,15 @@ import type { LocalTranscriptItem, PromptPart } from "./chat/types.js";
 import { usePromptHistory } from "./chat/usePromptHistory.js";
 import { createDefaultSlashCommands, resolveSlashCommand, slashCompletions } from "./slash/registry.js";
 import type { SlashCommand, SlashCommandContext, SlashCommandResult, SlashCompletion } from "./slash/types.js";
-import { resolveTuiTheme, type TuiTheme } from "./theme/index.js";
+import {
+  DEFAULT_TUI_THEME_ID,
+  initialTuiThemeId,
+  resolveTuiTheme,
+  selectableTuiThemeOptions,
+  SYSTEM_TUI_THEME_ID,
+  type TuiTheme,
+  type TuiThemeOption,
+} from "./theme/index.js";
 
 type ShellView = "chat" | "team" | "help" | "agents" | "status";
 
@@ -25,6 +33,7 @@ export interface ChatShellOptions extends TeamLiveTuiOptions {
   providerName?: string;
   modeName?: string;
   themeId?: string;
+  systemTheme?: TuiTheme;
 }
 
 export function ChatShellApp(props: {
@@ -88,10 +97,15 @@ export function ChatShellSurface(props: {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteIndex, setPaletteIndex] = useState(0);
   const [completionIndex, setCompletionIndex] = useState(0);
+  const [themeId, setThemeId] = useState(() => initialTuiThemeId(props.options?.themeId));
+  const [themePicker, setThemePicker] = useState<ThemePickerNavigation | undefined>(undefined);
   const [messageScrollOffset, setMessageScrollOffset] = useState(0);
   const prompt = promptText(promptParts);
   const history = usePromptHistory();
-  const theme = resolveTuiTheme(props.options?.themeId);
+  const systemTheme = props.options?.systemTheme;
+  const theme = resolveTuiTheme(themeId, undefined, { systemTheme });
+  const themeOptions = selectableTuiThemeOptions;
+  const systemThemeAvailable = Boolean(systemTheme);
   const slashContext = useMemo<SlashCommandContext>(() => ({
     model: props.model,
     ...(props.options?.cwd ? { cwd: props.options.cwd } : {}),
@@ -118,6 +132,28 @@ export function ChatShellSurface(props: {
     historyPromptValueRef.current = value;
     setPrompt(value);
   }, [setPrompt]);
+  const openThemePicker = useCallback(() => {
+    const index = themeOptionIndex(themeOptions, themeId);
+    setThemePicker({
+      previousThemeId: themeId,
+      index,
+    });
+    setThemeId(themeOptions[index]?.id ?? DEFAULT_TUI_THEME_ID);
+  }, [themeId, themeOptions]);
+  const previewTheme = useCallback((index: number) => {
+    const nextIndex = clampIndex(index, themeOptions.length);
+    setThemePicker((current) => current ? { ...current, index: nextIndex } : current);
+    setThemeId(themeOptions[nextIndex]?.id ?? DEFAULT_TUI_THEME_ID);
+  }, [themeOptions]);
+  const confirmThemePicker = useCallback(() => {
+    setThemePicker(undefined);
+  }, []);
+  const cancelThemePicker = useCallback(() => {
+    setThemePicker((current) => {
+      if (current) setThemeId(current.previousThemeId);
+      return undefined;
+    });
+  }, []);
   const bottomAnchor = useMemo(() => {
     const lastItem = props.runtime.chatView.items.at(-1);
     const lastStatus = lastItem?.kind === "tool"
@@ -175,8 +211,24 @@ export function ChatShellSurface(props: {
     if (paletteOpen) {
       handlePaletteKey(key, paletteItems, paletteIndex, setPaletteIndex, (completion) => {
         setPaletteOpen(false);
-        void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, setView, setLocalItems, setPrompt);
+        void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, setView, setLocalItems, setPrompt, openThemePicker);
       }, () => setPaletteOpen(false));
+      return;
+    }
+    if (themePicker) {
+      if (isEscape(key)) {
+        cancelThemePicker();
+        return;
+      }
+      if (isArrowUp(key) || isArrowDown(key)) {
+        const delta = isArrowUp(key) ? -1 : 1;
+        previewTheme(themePicker.index + delta);
+        return;
+      }
+      if (isEnter(key)) {
+        confirmThemePicker();
+        return;
+      }
       return;
     }
     if (slashCompletionOpen && !key.shift && (isArrowUp(key) || isArrowDown(key))) {
@@ -263,9 +315,9 @@ export function ChatShellSurface(props: {
           width={dimensions.width}
           height={dimensions.height}
           prompt={prompt}
-          focused={view === "chat" && !paletteOpen && !disabledReason}
+          focused={view === "chat" && !paletteOpen && !themePicker && !disabledReason}
           onPromptChange={handlePromptChange}
-          onSubmit={() => void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, setLocalItems, setPrompt, history.record)}
+          onSubmit={() => void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, setLocalItems, setPrompt, openThemePicker, history.record)}
           completions={completions}
           completionIndex={selectedCompletionIndex}
           paletteOpen={paletteOpen}
@@ -276,6 +328,11 @@ export function ChatShellSurface(props: {
           runtime={props.runtime}
           disabledReason={disabledReason}
           theme={theme}
+          themePicker={themePicker ? {
+            items: themeOptions,
+            selectedIndex: themePicker.index,
+            systemThemeAvailable,
+          } : undefined}
         />
       ) : (
         <SessionScreen
@@ -283,11 +340,11 @@ export function ChatShellSurface(props: {
           height={dimensions.height}
           view={view}
           prompt={prompt}
-          focused={view === "chat" && !paletteOpen && !disabledReason}
+          focused={view === "chat" && !paletteOpen && !themePicker && !disabledReason}
           onPromptChange={handlePromptChange}
           onSubmit={() => {
             setMessageScrollOffset(0);
-            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, setLocalItems, setPrompt, history.record);
+            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, setLocalItems, setPrompt, openThemePicker, history.record);
           }}
           onMessageScroll={(event) => {
             const direction = event.scroll?.direction;
@@ -315,6 +372,11 @@ export function ChatShellSurface(props: {
           commands={commands}
           disabledReason={disabledReason}
           theme={theme}
+          themePicker={themePicker ? {
+            items: themeOptions,
+            selectedIndex: themePicker.index,
+            systemThemeAvailable,
+          } : undefined}
         />
       )}
     </box>
@@ -338,6 +400,7 @@ function HomeScreen(props: {
   options: { modeName: string; modelName: string; providerName: string; cwd: string };
   disabledReason?: string | undefined;
   theme: TuiTheme;
+  themePicker?: ThemePickerModel | undefined;
 }) {
   const promptWidth = Math.min(76, Math.max(42, props.width - 12));
   const compactBrand = props.width < 92 || props.height < 32;
@@ -349,6 +412,7 @@ function HomeScreen(props: {
         <box height={1} />
         <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Chili"}</text>
         <box height={1} />
+        {props.themePicker ? <ThemePicker model={props.themePicker} theme={props.theme} /> : null}
         <PromptComposer
           width={promptWidth}
           prompt={props.prompt}
@@ -396,6 +460,7 @@ function SessionScreen(props: {
   commands: readonly SlashCommand[];
   disabledReason?: string | undefined;
   theme: TuiTheme;
+  themePicker?: ThemePickerModel | undefined;
 }) {
   const promptWidth = Math.min(96, Math.max(42, props.width - 8));
   const messageWidth = Math.max(24, props.width - 8);
@@ -437,6 +502,7 @@ function SessionScreen(props: {
       />
       <TeamStatusRow model={props.model} theme={props.theme} />
       <box width="100%" alignItems="center" flexDirection="column">
+        {props.themePicker ? <ThemePicker model={props.themePicker} theme={props.theme} /> : null}
         <PromptComposer
           width={promptWidth}
           prompt={props.prompt}
@@ -455,6 +521,40 @@ function SessionScreen(props: {
         />
       </box>
       <StatusFooter options={props.options} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} theme={props.theme} />
+    </box>
+  );
+}
+
+interface ThemePickerNavigation {
+  previousThemeId: string;
+  index: number;
+}
+
+interface ThemePickerModel {
+  items: readonly TuiThemeOption[];
+  selectedIndex: number;
+  systemThemeAvailable: boolean;
+}
+
+function ThemePicker(props: { model: ThemePickerModel; theme: TuiTheme }) {
+  return (
+    <box width="100%" flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.focus} paddingX={1}>
+      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Theme"}</text>
+      {props.model.items.map((item, index) => {
+        const selected = index === props.model.selectedIndex;
+        const suffix = item.id === SYSTEM_TUI_THEME_ID && !props.model.systemThemeAvailable ? " (fallback)" : "";
+        return (
+          <text
+            key={item.id}
+            fg={selected ? props.theme.colors.menu.selectedText : props.theme.colors.menu.text}
+            bg={selected ? props.theme.colors.menu.selectedBackground : props.theme.colors.menu.background}
+            wrapMode="none"
+            truncate
+          >
+            {`${selected ? ">" : " "} ${item.name}${suffix}`}
+          </text>
+        );
+      })}
     </box>
   );
 }
@@ -526,13 +626,14 @@ async function submitPrompt(
   setView: (view: ShellView) => void,
   setLocalItems: (update: (current: LocalTranscriptItem[]) => LocalTranscriptItem[]) => void,
   setPrompt: (value: string | ((current: string) => string)) => void,
+  openThemePicker: () => void,
   onAccepted?: (text: string) => void,
 ): Promise<void> {
   const trimmed = prompt.trim();
   if (!trimmed) return;
   if (trimmed.startsWith("/")) {
     setPrompt("");
-    await runSlashInput(trimmed, commands, ctx, model, runtime, setView, setLocalItems, setPrompt);
+    await runSlashInput(trimmed, commands, ctx, model, runtime, setView, setLocalItems, setPrompt, openThemePicker);
     return;
   }
   if (!runtime.canSubmit) {
@@ -555,6 +656,7 @@ async function runSlashInput(
   setView: (view: ShellView) => void,
   setLocalItems: (update: (current: LocalTranscriptItem[]) => LocalTranscriptItem[]) => void,
   setPrompt: (value: string | ((current: string) => string)) => void,
+  openThemePicker: () => void,
 ): Promise<void> {
   const match = resolveSlashCommand(commands, input);
   if (!match) {
@@ -562,7 +664,7 @@ async function runSlashInput(
     return;
   }
   const result = await match.command.run(ctx, match.args);
-  applySlashResult(result, model, runtime, setView, setLocalItems, setPrompt);
+  applySlashResult(result, model, runtime, setView, setLocalItems, setPrompt, openThemePicker);
 }
 
 function applySlashResult(
@@ -572,6 +674,7 @@ function applySlashResult(
   setView: (view: ShellView) => void,
   setLocalItems: (update: (current: LocalTranscriptItem[]) => LocalTranscriptItem[]) => void,
   setPrompt: (value: string | ((current: string) => string)) => void,
+  openThemePicker: () => void,
 ): void {
   if (result.type === "open_view") {
     setView(result.view);
@@ -579,6 +682,10 @@ function applySlashResult(
   }
   if (result.type === "close_view") {
     setView("chat");
+    return;
+  }
+  if (result.type === "open_theme_picker") {
+    openThemePicker();
     return;
   }
   if (result.type === "clear_transcript") {
@@ -661,6 +768,11 @@ function localItem(level: "info" | "error", text: string): LocalTranscriptItem {
 function validSelectedTeamId(model: TeamLiveView, selectedTeamId: TeamId | undefined): TeamId | undefined {
   if (selectedTeamId && model.teams.some((team) => team.id === selectedTeamId)) return selectedTeamId;
   return model.selectedTeamId ?? model.teams[0]?.id;
+}
+
+function themeOptionIndex(options: readonly TuiThemeOption[], themeId: string): number {
+  const index = options.findIndex((option) => option.id === themeId);
+  return index < 0 ? 0 : index;
 }
 
 function printableKey(key: KeyEvent): string | undefined {

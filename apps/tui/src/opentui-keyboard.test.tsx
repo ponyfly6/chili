@@ -483,6 +483,7 @@ test("Ctrl+P opens the command palette", async () => {
     await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
     expect(app.captureCharFrame()).toContain("Command Palette");
     expect(app.captureCharFrame()).toContain("/team");
+    expect(app.captureCharFrame()).toContain("/theme - Switch theme");
   } finally {
     app.renderer.destroy();
   }
@@ -495,6 +496,108 @@ test("slash completion includes team command", async () => {
     await typeText(app, "/");
     expect(app.captureCharFrame()).toContain("Commands");
     expect(app.captureCharFrame()).toContain("/team");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/theme opens the theme picker", async () => {
+  const app = await mountShell(teamLiveFixture());
+
+  try {
+    await typeText(app, "/theme");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("Theme");
+    expect(frame).toContain("> Chili Dark");
+    expect(frame).toContain("  Terminal Dark");
+    expect(frame).toContain("  System (fallback)");
+    expect(frame).toContain("  Chili Light");
+    expect(frame).toContain("  Warm Light");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("theme picker Up and Down preview the selected theme", async () => {
+  const app = await mountShell(teamLiveFixture());
+
+  try {
+    await typeText(app, "/theme");
+    await press(app, () => app.mockInput.pressEnter());
+
+    await press(app, () => app.mockInput.pressArrow("down"));
+    expect(app.captureCharFrame()).toContain("> Terminal Dark");
+
+    await press(app, () => app.mockInput.pressArrow("down"));
+    expect(app.captureCharFrame()).toContain("> System (fallback)");
+
+    await press(app, () => app.mockInput.pressArrow("up"));
+    expect(app.captureCharFrame()).toContain("> Terminal Dark");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("theme picker Escape rolls back the previewed theme", async () => {
+  const app = await mountShell(teamLiveFixture());
+
+  try {
+    await typeText(app, "/theme");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressArrow("down"));
+    expect(app.captureCharFrame()).toContain("> Terminal Dark");
+
+    await press(app, () => app.mockInput.pressEscape());
+    expect(app.captureCharFrame()).not.toContain("> Terminal Dark");
+
+    await typeText(app, "/theme");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(app.captureCharFrame()).toContain("> Chili Dark");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("theme picker preserves an in-progress draft opened from the command palette", async () => {
+  const app = await mountShell(teamLiveFixture());
+
+  try {
+    await typeText(app, "draft before theme");
+    await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
+    await press(app, () => app.mockInput.pressArrow("down"));
+    await press(app, () => app.mockInput.pressArrow("down"));
+    await press(app, () => app.mockInput.pressArrow("down"));
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(app.captureCharFrame()).toContain("Theme");
+    expect(app.captureCharFrame()).toContain("draft before theme");
+
+    await press(app, () => app.mockInput.pressArrow("down"));
+    expect(app.captureCharFrame()).toContain("> Terminal Dark");
+
+    await press(app, () => app.mockInput.pressEscape());
+    expect(app.captureCharFrame()).toContain("draft before theme");
+    expect(app.captureCharFrame()).not.toContain("Theme");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("theme picker Enter confirms the previewed theme", async () => {
+  const app = await mountShell(teamLiveFixture());
+
+  try {
+    await typeText(app, "/theme");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressArrow("down"));
+    await press(app, () => app.mockInput.pressEnter());
+    expect(app.captureCharFrame()).not.toContain("> Terminal Dark");
+
+    await typeText(app, "/theme");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(app.captureCharFrame()).toContain("> Terminal Dark");
   } finally {
     app.renderer.destroy();
   }

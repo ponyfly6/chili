@@ -5,6 +5,7 @@ import { HttpRuntimeClient } from "@chili/sdk";
 import type { SessionId, TeamId, ThreadId } from "@chili/protocol";
 import { ChatShellApp, type ChatShellOptions } from "./ChatShellApp.js";
 import { TeamLiveApp } from "./TeamLiveApp.js";
+import { generateSystemTheme, type SystemPaletteInput, type TuiTheme } from "./theme/index.js";
 export { teamLiveStreamInput, type TeamLiveStreamScopeInput } from "./useTeamLiveRuntime.js";
 
 export interface TuiOptions extends ChatShellOptions {
@@ -44,6 +45,10 @@ export function parseArgs(argv: readonly string[]): TuiOptions | "help" {
     }
     if (arg === "--cwd") {
       options.cwd = requireValue(argv, ++index, arg);
+      continue;
+    }
+    if (arg === "--theme") {
+      options.themeId = requireValue(argv, ++index, arg);
       continue;
     }
     if (arg === "--run-loop") {
@@ -97,6 +102,7 @@ function usage(): string {
     "  --run-loop             Trigger SDK runTeamLoop for --team.",
     "  --once                 Pass once=true to runTeamLoop.",
     "  --cwd <path>           CWD passed to runTeamLoop.",
+    "  --theme <theme-id>     Initial TUI theme.",
     "  --max-cycles <n>       Max cycles passed to runTeamLoop.",
     "  --timeout-ms <n>       Timeout passed to runTeamLoop.",
     "  --poll-interval-ms <n> Poll interval passed to runTeamLoop.",
@@ -128,6 +134,8 @@ async function main(): Promise<void> {
 
   const client = new HttpRuntimeClient({ baseUrl: options.baseUrl });
   const renderer = await createCliRenderer(rendererConfig());
+  const systemTheme = await detectSystemTheme(renderer);
+  if (systemTheme) options.systemTheme = systemTheme;
   const root = createRoot(renderer);
 
   await new Promise<void>((resolve) => {
@@ -145,6 +153,15 @@ async function main(): Promise<void> {
       : <ChatShellApp client={client} options={options} onExit={close} />);
     renderer.start();
   });
+}
+
+async function detectSystemTheme(renderer: { getPalette?: (options?: { size?: number; timeout?: number }) => Promise<SystemPaletteInput> }): Promise<TuiTheme | undefined> {
+  try {
+    const palette = await renderer.getPalette?.({ size: 16, timeout: 300 });
+    return generateSystemTheme(palette);
+  } catch {
+    return undefined;
+  }
 }
 
 if (import.meta.main) {

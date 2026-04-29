@@ -23,6 +23,13 @@ export function createDefaultSlashCommands(): SlashCommand[] {
       run: () => ({ type: "sdk_action", action: "team_merge" }),
     },
     {
+      name: "theme",
+      description: "Switch theme",
+      category: "view",
+      isSafeConcurrent: true,
+      run: () => ({ type: "open_theme_picker" }),
+    },
+    {
       name: "clear",
       description: "Clear the local transcript",
       category: "session",
@@ -127,4 +134,3 @@ function uniqueCompletions(completions: readonly SlashCompletion[]): SlashComple
   }
   return output;
 }
-

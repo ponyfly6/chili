@@ -3,7 +3,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import type { SessionId, ThreadId } from "@chili/protocol";
 import { parseArgs, teamLiveStreamInput } from "./index.js";
-import { resolveTuiTheme } from "./theme/index.js";
+import { generateSystemTheme, resolveTuiTheme } from "./theme/index.js";
 
 test("parses runtime flags and keeps Team Live stream unscoped for child-session events", () => {
   const controller = new AbortController();
@@ -14,12 +14,13 @@ test("parses runtime flags and keeps Team Live stream unscoped for child-session
     once: false,
     teamLive: false,
   });
-  expect(parseArgs(["--url", "http://runtime.test", "--team", "team_live", "--team-live", "--run-loop", "--once", "--max-cycles", "2"])).toMatchObject({
+  expect(parseArgs(["--url", "http://runtime.test", "--team", "team_live", "--team-live", "--run-loop", "--once", "--theme", "chili-light", "--max-cycles", "2"])).toMatchObject({
     baseUrl: "http://runtime.test",
     teamId: "team_live",
     teamLive: true,
     runLoop: true,
     once: true,
+    themeId: "chili-light",
     maxCycles: 2,
   });
 
@@ -62,6 +63,89 @@ test("resolves TUI theme from CHILI_TUI_THEME", () => {
   expect(resolveTuiTheme(undefined, { CHILI_TUI_THEME: "terminal-dark" })).toMatchObject({
     id: "terminal-dark",
     name: "Terminal Dark",
+  });
+});
+
+test("resolves light TUI themes", () => {
+  expect(resolveTuiTheme("chili-light", {})).toMatchObject({
+    id: "chili-light",
+    name: "Chili Light",
+    colors: {
+      background: "#fbfbf8",
+      text: { primary: "#1f2328" },
+    },
+  });
+  expect(resolveTuiTheme("warm-light", {})).toMatchObject({
+    id: "warm-light",
+    name: "Warm Light",
+    colors: {
+      background: "#faf6ee",
+      text: { primary: "#292524" },
+    },
+  });
+});
+
+test("system TUI theme falls back to the default when unavailable", () => {
+  expect(resolveTuiTheme("system", {})).toMatchObject({
+    id: "chili-dark",
+    name: "Chili Dark",
+  });
+});
+
+test("system TUI theme resolves from a generated palette theme when available", () => {
+  const systemTheme = generateSystemTheme({
+    defaultBackground: "#101820",
+    defaultForeground: "#f8f8f2",
+    palette: ["#000000", "#ff5555", "#50fa7b", "#f1fa8c", "#8be9fd", "#ff79c6", "#7ee7c8", "#bbbbbb"],
+  });
+
+  expect(resolveTuiTheme("system", {}, { systemTheme })).toMatchObject({
+    id: "system",
+    colors: {
+      background: "#101820",
+    },
+  });
+});
+
+test("generates a system TUI theme from a terminal palette", () => {
+  const theme = generateSystemTheme({
+    defaultBackground: "#101820",
+    defaultForeground: "#f8f8f2",
+    palette: ["#000000", "#ff5555", "#50fa7b", "#f1fa8c", "#8be9fd", "#ff79c6", "#7ee7c8", "#bbbbbb"],
+  });
+
+  expect(theme).toMatchObject({
+    id: "system",
+    name: "System",
+    colors: {
+      background: "#101820",
+      text: { primary: "#f8f8f2" },
+      accent: { primary: "#7ee7c8" },
+      status: {
+        error: "#ff5555",
+        success: "#50fa7b",
+        warning: "#f1fa8c",
+      },
+    },
+  });
+});
+
+test("system TUI theme generation tolerates invalid palette colors", () => {
+  expect(() => generateSystemTheme({
+    defaultBackground: "not-a-color",
+    defaultForeground: "#12",
+    palette: ["black", "red", undefined, null, "#12345678", "rgb(0 0 0)", "#abc"],
+  })).not.toThrow();
+  expect(generateSystemTheme({
+    defaultBackground: "not-a-color",
+    defaultForeground: "#12",
+    palette: ["black", "red", undefined, null, "#12345678", "rgb(0 0 0)", "#abc"],
+  })).toMatchObject({
+    id: "system",
+    colors: {
+      background: "#050505",
+      accent: { primary: "#aabbcc" },
+    },
   });
 });
 
