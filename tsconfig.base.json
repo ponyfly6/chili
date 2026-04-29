@@ -19,6 +19,9 @@
     "noImplicitOverride": true,
     "noUncheckedIndexedAccess": true,
     "paths": {
+      "@chili/commands": [
+        "packages/commands/src/index.ts"
+      ],
       "@chili/core": [
         "packages/core/src/index.ts"
       ],

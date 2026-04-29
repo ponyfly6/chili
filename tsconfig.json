@@ -20,6 +20,9 @@
       "path": "./packages/tools"
     },
     {
+      "path": "./packages/commands"
+    },
+    {
       "path": "./packages/core"
     },
     {
