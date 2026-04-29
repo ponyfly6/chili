@@ -421,9 +421,11 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
           decision: body.decision,
         };
         if (body.feedback) resolveInput.feedback = body.feedback;
-        const result: RuntimeApprovalResolveResult = {
-          resolved: await options.approvals.resolve(resolveInput),
-        };
+        const resolved = await options.approvals.resolve(resolveInput);
+        if (!resolved) {
+          return jsonError(409, "Approval is not pending in this runtime. It may have been handled already or orphaned by a server restart.");
+        }
+        const result: RuntimeApprovalResolveResult = { resolved };
         return json(result);
       }
 

@@ -612,6 +612,33 @@ test("resolves approvals through the runtime HTTP handler", async () => {
   expect(approvals.resolved).toBe(true);
 });
 
+test("returns conflict when approval is not pending in the runtime queue", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const approvals = {
+    resolve() {
+      return false;
+    },
+  };
+  const handler = createRuntimeHttpHandler({ service, store, approvals });
+
+  const response = await handler(
+    new Request("http://chili.test/approvals/approval_orphan/resolve", {
+      method: "POST",
+      body: JSON.stringify({ decision: "allow_once" }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({
+    error: {
+      message: "Approval is not pending in this runtime. It may have been handled already or orphaned by a server restart.",
+    },
+  });
+});
+
 test("passes request cancellation through team run loop HTTP route", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
