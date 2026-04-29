@@ -65,6 +65,7 @@ export interface RuntimeSessionView {
   agentRunIds: AgentRunId[];
   taskIds: TaskId[];
   updatedAt: number;
+  threadId?: ThreadId;
   currentTurnId?: TurnId;
   statusReason?: string;
 }
@@ -577,6 +578,76 @@ export type TeamLiveAction =
   | { type: "reject"; approvalId?: ApprovalId; sessionId?: SessionId; enabled: boolean; reason?: string }
   | { type: "interrupt"; sessionId?: SessionId; enabled: boolean; reason?: string };
 
+export interface ChatSessionInput {
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  limit?: number;
+  generatedAt?: string;
+  requireSession?: boolean;
+}
+
+export interface ChatSessionView {
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  status: RuntimeSessionStatus | "unknown";
+  items: ChatTranscriptItem[];
+  pendingApprovals: ChatApprovalRow[];
+  activeTools: ChatToolCallRow[];
+  generatedAt: string;
+  lastEventId?: string;
+}
+
+export type ChatTranscriptItem =
+  | ChatMessageRow
+  | ChatToolCallRow
+  | ChatApprovalRow;
+
+export interface ChatMessageRow {
+  id: MessageId;
+  kind: "message";
+  role: MessageRole;
+  parts: ChatMessagePart[];
+  createdAt: number;
+  threadId?: ThreadId;
+  completedAt?: number;
+}
+
+export type ChatMessagePart =
+  | { type: "text"; id: PartId; text: string; synthetic?: boolean }
+  | { type: "reasoning"; id: PartId; text: string; redacted?: boolean }
+  | { type: "tool_call"; id: PartId; callId: ToolCallId; toolName: string; status: ToolPartStatus; input?: unknown }
+  | { type: "tool_result"; id: PartId; callId: ToolCallId; output: string; error?: string; synthetic?: boolean }
+  | { type: "summary"; id: PartId; text: string };
+
+export interface ChatToolCallRow {
+  id: ToolCallId;
+  kind: "tool";
+  toolName: string;
+  status: RuntimeToolCallView["status"];
+  updatedAt: number;
+  input?: unknown;
+  output?: string;
+  error?: string;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+}
+
+export interface ChatApprovalRow {
+  id: ApprovalId;
+  kind: "approval";
+  permission: string;
+  patterns: string[];
+  status: RuntimeApprovalView["status"];
+  createdAt: number;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  callId?: ToolCallId;
+  toolName?: string;
+  decision?: RuntimeApprovalView["decision"];
+  feedback?: string;
+  resolvedAt?: number;
+}
+
 export function createRuntimeView(): ChiliRuntimeView {
   return {
     sessionIds: [],
@@ -626,6 +697,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       session.cwd = event.payload.cwd;
       session.lifecycle = "active";
       session.updatedAt = event.time;
+      assignOptional(session, "threadId", event.threadId);
       break;
     }
     case "session.status_changed": {
@@ -806,6 +878,147 @@ export function runtimeAgentsSnapshot(view: ChiliRuntimeView, sessionId?: Sessio
   };
   assignOptional(snapshot, "lastEventId", view.lastEventId);
   return snapshot;
+}
+
+export function chatSessionView(view: ChiliRuntimeView, input: ChatSessionInput = {}): ChatSessionView {
+  const limit = Math.max(1, input.limit ?? 80);
+  const session = input.sessionId ? view.sessions[input.sessionId] : input.requireSession ? undefined : latestSession(view);
+  const sessionId = input.sessionId ?? session?.id;
+  const messages = session
+    ? session.messageIds.flatMap((messageId) => {
+      const message = view.messages[messageId];
+      if (!message || !matchesThread(message.threadId, input.threadId)) return [];
+      return [chatMessageRow(message)];
+    })
+    : [];
+  const tools = session
+    ? session.toolCallIds.flatMap((callId) => {
+      const toolCall = view.toolCalls[callId];
+      if (!toolCall || !matchesThread(toolCall.threadId, input.threadId)) return [];
+      return [chatToolCallRow(toolCall)];
+    })
+    : [];
+  const approvals = session
+    ? session.approvalIds.flatMap((approvalId) => {
+      const approval = view.approvals[approvalId];
+      if (!approval || !matchesThread(approval.threadId, input.threadId)) return [];
+      return [chatApprovalRow(view, approval)];
+    })
+    : [];
+  const items = [...messages, ...tools, ...approvals]
+    .sort((left, right) => chatItemTime(left) - chatItemTime(right))
+    .slice(-limit);
+  const output: ChatSessionView = {
+    status: session?.status ?? "unknown",
+    items,
+    pendingApprovals: approvals.filter((approval) => approval.status === "pending"),
+    activeTools: tools.filter((tool) => tool.status === "running" || tool.status === "waiting_for_approval" || tool.status === "validating"),
+    generatedAt: input.generatedAt ?? new Date().toISOString(),
+  };
+  assignOptional(output, "sessionId", sessionId);
+  assignOptional(output, "threadId", input.threadId ?? session?.threadId);
+  assignOptional(output, "lastEventId", view.lastEventId);
+  return output;
+}
+
+function latestSession(view: ChiliRuntimeView): RuntimeSessionView | undefined {
+  for (let index = view.sessionIds.length - 1; index >= 0; index -= 1) {
+    const session = view.sessions[view.sessionIds[index] ?? ""];
+    if (session) return session;
+  }
+  return undefined;
+}
+
+function matchesThread(value: ThreadId | undefined, requested: ThreadId | undefined): boolean {
+  return requested ? !value || value === requested : true;
+}
+
+function chatMessageRow(message: RuntimeMessageView): ChatMessageRow {
+  const row: ChatMessageRow = {
+    id: message.id,
+    kind: "message",
+    role: message.role,
+    parts: message.parts.map((part) => chatMessagePart(part)),
+    createdAt: message.createdAt,
+  };
+  assignOptional(row, "threadId", message.threadId);
+  assignOptional(row, "completedAt", message.completedAt);
+  return row;
+}
+
+function chatMessagePart(part: MessagePart): ChatMessagePart {
+  if (part.type === "text") {
+    const output: ChatMessagePart = { type: "text", id: part.id, text: part.text };
+    assignOptional(output, "synthetic", part.synthetic);
+    return output;
+  }
+  if (part.type === "reasoning") {
+    const output: ChatMessagePart = { type: "reasoning", id: part.id, text: part.text };
+    assignOptional(output, "redacted", part.redacted);
+    return output;
+  }
+  if (part.type === "tool_call") {
+    return {
+      type: "tool_call",
+      id: part.id,
+      callId: part.callId,
+      toolName: part.toolName,
+      status: part.status,
+      input: part.input,
+    };
+  }
+  if (part.type === "tool_result") {
+    const output: ChatMessagePart = { type: "tool_result", id: part.id, callId: part.callId, output: part.output };
+    assignOptional(output, "error", part.error);
+    assignOptional(output, "synthetic", part.synthetic);
+    return output;
+  }
+  if (part.type === "patch") return { type: "summary", id: part.id, text: `patch: ${part.files.join(", ")}` };
+  if (part.type === "artifact") return { type: "summary", id: part.id, text: `artifact: ${part.artifactId}` };
+  if (part.type === "compaction") return { type: "summary", id: part.id, text: part.summary ?? `compaction: ${part.reason}` };
+  return { type: "summary", id: part.id, text: `agent handoff: ${part.agentPath}` };
+}
+
+function chatToolCallRow(toolCall: RuntimeToolCallView): ChatToolCallRow {
+  const row: ChatToolCallRow = {
+    id: toolCall.id,
+    kind: "tool",
+    toolName: toolCall.toolName,
+    status: toolCall.status,
+    updatedAt: toolCall.updatedAt,
+  };
+  assignOptional(row, "input", toolCall.input);
+  assignOptional(row, "output", toolCall.output);
+  assignOptional(row, "error", toolCall.error);
+  assignOptional(row, "sessionId", toolCall.sessionId);
+  assignOptional(row, "threadId", toolCall.threadId);
+  return row;
+}
+
+function chatApprovalRow(view: ChiliRuntimeView, approval: RuntimeApprovalView): ChatApprovalRow {
+  const toolCall = approval.callId ? view.toolCalls[approval.callId] : undefined;
+  const row: ChatApprovalRow = {
+    id: approval.id,
+    kind: "approval",
+    permission: approval.permission,
+    patterns: approval.patterns,
+    status: approval.status,
+    createdAt: approval.createdAt,
+  };
+  assignOptional(row, "sessionId", approval.sessionId);
+  assignOptional(row, "threadId", approval.threadId);
+  assignOptional(row, "callId", approval.callId);
+  assignOptional(row, "toolName", toolCall?.toolName);
+  assignOptional(row, "decision", approval.decision);
+  assignOptional(row, "feedback", approval.feedback);
+  assignOptional(row, "resolvedAt", approval.resolvedAt);
+  return row;
+}
+
+function chatItemTime(item: ChatTranscriptItem): number {
+  if (item.kind === "message") return item.createdAt;
+  if (item.kind === "tool") return item.updatedAt;
+  return item.resolvedAt ?? item.createdAt;
 }
 
 export function teamLiveView(view: ChiliRuntimeView, input: TeamLiveCockpitInput = {}): TeamLiveView {

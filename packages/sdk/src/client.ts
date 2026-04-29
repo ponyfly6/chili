@@ -69,6 +69,7 @@ export interface CreateSessionRequest {
   sessionId?: SessionId;
   threadId?: ThreadId;
   cwd?: string;
+  signal?: AbortSignal;
 }
 
 export interface SubmitPromptRequest {
@@ -78,28 +79,33 @@ export interface SubmitPromptRequest {
   cwd?: string;
   maxTurns?: number;
   system?: string[];
+  signal?: AbortSignal;
 }
 
 export interface InterruptSessionRequest {
   sessionId: SessionId;
   reason?: string;
+  signal?: AbortSignal;
 }
 
 export interface ResolveApprovalRequest {
   approvalId: ApprovalId;
   decision: "allow_once" | "allow_always" | "deny";
   feedback?: string;
+  signal?: AbortSignal;
 }
 
 export interface ApproveApprovalRequest {
   approvalId: ApprovalId;
   always?: boolean;
   feedback?: string;
+  signal?: AbortSignal;
 }
 
 export interface RejectApprovalRequest {
   approvalId: ApprovalId;
   feedback?: string;
+  signal?: AbortSignal;
 }
 
 export interface RuntimeSessionSummary {
@@ -728,26 +734,29 @@ export class HttpRuntimeClient implements RuntimeClient {
   }
 
   createSession(input: CreateSessionRequest = {}): Promise<RuntimeSessionRef> {
-    return this.post("sessions", input);
+    const { signal, ...body } = input;
+    return this.post("sessions", body, signal);
   }
 
   submitPrompt(input: SubmitPromptRequest): Promise<RuntimePromptResult> {
-    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/prompt`, input);
+    const { signal, ...body } = input;
+    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/prompt`, body, signal);
   }
 
   submitPromptAsync(input: SubmitPromptRequest): Promise<RuntimePromptAccepted> {
-    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/prompt_async`, input);
+    const { signal, ...body } = input;
+    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/prompt_async`, body, signal);
   }
 
   interruptSession(input: InterruptSessionRequest): Promise<RuntimeInterruptResult> {
-    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/interrupt`, { reason: input.reason });
+    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/interrupt`, { reason: input.reason }, input.signal);
   }
 
   resolveApproval(input: ResolveApprovalRequest): Promise<RuntimeApprovalResolveResult> {
     return this.post(`approvals/${encodeURIComponent(input.approvalId)}/resolve`, {
       decision: input.decision,
       feedback: input.feedback,
-    });
+    }, input.signal);
   }
 
   approveApproval(input: ApproveApprovalRequest): Promise<RuntimeApprovalResolveResult> {
@@ -756,6 +765,7 @@ export class HttpRuntimeClient implements RuntimeClient {
       decision: input.always ? "allow_always" : "allow_once",
     };
     if (input.feedback !== undefined) request.feedback = input.feedback;
+    if (input.signal) request.signal = input.signal;
     return this.resolveApproval(request);
   }
 
@@ -765,6 +775,7 @@ export class HttpRuntimeClient implements RuntimeClient {
       decision: "deny",
     };
     if (input.feedback !== undefined) request.feedback = input.feedback;
+    if (input.signal) request.signal = input.signal;
     return this.resolveApproval(request);
   }
 

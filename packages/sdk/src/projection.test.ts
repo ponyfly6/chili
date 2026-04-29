@@ -27,7 +27,7 @@ import {
   type RuntimeTeamTaskSyncResult,
   type RuntimeTeamSnapshot,
 } from "./client.js";
-import { createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, sessionMessages, teamLiveCockpit, teamLiveView } from "./projection.js";
+import { chatSessionView, createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, sessionMessages, teamLiveCockpit, teamLiveView } from "./projection.js";
 
 test("replays session, message, tool, and approval events into a runtime view", () => {
   const sessionId = "session_test" as SessionId;
@@ -132,6 +132,206 @@ test("replays session, message, tool, and approval events into a runtime view", 
   expect(message?.parts[0]?.type === "text" ? message.parts[0].text : "").toBe("hello world");
   expect(view.toolCalls[callId]?.status).toBe("completed");
   expect(pendingApprovals(view, sessionId)).toHaveLength(0);
+});
+
+test("projects chat session transcript rows from message, tool, and approval events", () => {
+  const sessionId = "session_chat_view" as SessionId;
+  const threadId = "thread_chat_view" as ThreadId;
+  const turnId = "turn_chat_view" as TurnId;
+  const userMessageId = "msg_chat_user" as MessageId;
+  const assistantMessageId = "msg_chat_assistant" as MessageId;
+  const userPartId = "part_chat_user" as PartId;
+  const reasoningPartId = "part_chat_reasoning" as PartId;
+  const textPartId = "part_chat_text" as PartId;
+  const callPartId = "part_chat_tool_call" as PartId;
+  const callId = "toolcall_chat_view" as ToolCallId;
+  const approvalId = "approval_chat_view" as ApprovalId;
+
+  const pendingView = reduceRuntimeEvents(
+    [
+      {
+        id: "event_chat_session",
+        type: "session.created",
+        time: 1 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { sessionId, cwd: "/repo" },
+      },
+      {
+        id: "event_chat_turn",
+        type: "turn.started",
+        time: 2 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { turnId },
+      },
+      {
+        id: "event_chat_user",
+        type: "message.created",
+        time: 3 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { messageId: userMessageId, role: "user" },
+      },
+      {
+        id: "event_chat_user_text",
+        type: "message.part_added",
+        time: 4 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          messageId: userMessageId,
+          part: { id: userPartId, messageId: userMessageId, sessionId, type: "text", text: "please test" },
+        },
+      },
+      {
+        id: "event_chat_assistant",
+        type: "message.created",
+        time: 5 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { messageId: assistantMessageId, role: "assistant" },
+      },
+      {
+        id: "event_chat_reasoning",
+        type: "message.part_added",
+        time: 6 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          messageId: assistantMessageId,
+          part: { id: reasoningPartId, messageId: assistantMessageId, sessionId, type: "reasoning", text: "thinking" },
+        },
+      },
+      {
+        id: "event_chat_reasoning_delta",
+        type: "message.part_delta",
+        time: 7 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { messageId: assistantMessageId, partId: reasoningPartId, field: "text", delta: " through" },
+      },
+      {
+        id: "event_chat_text",
+        type: "message.part_added",
+        time: 8 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          messageId: assistantMessageId,
+          part: { id: textPartId, messageId: assistantMessageId, sessionId, type: "text", text: "hello" },
+        },
+      },
+      {
+        id: "event_chat_text_delta",
+        type: "message.part_delta",
+        time: 9 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { messageId: assistantMessageId, partId: textPartId, field: "text", delta: " world" },
+      },
+      {
+        id: "event_chat_tool_part",
+        type: "message.part_added",
+        time: 10 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          messageId: assistantMessageId,
+          part: {
+            id: callPartId,
+            messageId: assistantMessageId,
+            sessionId,
+            type: "tool_call",
+            callId,
+            toolName: "bash",
+            input: { command: "bun test" },
+            status: "pending",
+          },
+        },
+      },
+      {
+        id: "event_chat_tool_started",
+        type: "tool.call_started",
+        time: 11 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { turnId, callId, toolName: "bash", input: { command: "bun test" } },
+      },
+      {
+        id: "event_chat_tool_waiting",
+        type: "tool.call_updated",
+        time: 12 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { callId, status: "waiting_for_approval" },
+      },
+      {
+        id: "event_chat_approval",
+        type: "approval.requested",
+        time: 13 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { approvalId, callId, permission: "tool.bash", patterns: ["bun test"] },
+      },
+    ],
+    createRuntimeView(),
+  );
+
+  const pending = chatSessionView(pendingView, { sessionId, threadId, generatedAt: "now" });
+  const blank = chatSessionView(pendingView, { requireSession: true, generatedAt: "now" });
+  const assistant = pending.items.find((item) => item.kind === "message" && item.role === "assistant");
+  const tool = pending.items.find((item) => item.kind === "tool");
+
+  expect(blank.sessionId).toBeUndefined();
+  expect(blank.items).toEqual([]);
+  expect(pending.sessionId).toBe(sessionId);
+  expect(pending.threadId).toBe(threadId);
+  expect(pending.status).toBe("waiting_for_approval");
+  expect(assistant?.kind === "message" ? assistant.parts : []).toContainEqual({ type: "reasoning", id: reasoningPartId, text: "thinking through" });
+  expect(assistant?.kind === "message" ? assistant.parts : []).toContainEqual({ type: "text", id: textPartId, text: "hello world" });
+  expect(tool).toMatchObject({ kind: "tool", id: callId, toolName: "bash", status: "waiting_for_approval" });
+  expect(pending.pendingApprovals).toEqual([
+    expect.objectContaining({ id: approvalId, status: "pending", permission: "tool.bash", toolName: "bash" }),
+  ]);
+
+  const resolvedView = reduceRuntimeEvents(
+    [
+      {
+        id: "event_chat_approval_done",
+        type: "approval.resolved",
+        time: 14 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { approvalId, decision: "allow_once" },
+      },
+      {
+        id: "event_chat_tool_finished",
+        type: "tool.call_finished",
+        time: 15 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { callId, status: "completed", output: "ok" },
+      },
+      {
+        id: "event_chat_done",
+        type: "turn.completed",
+        time: 16 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { turnId, status: "completed" },
+      },
+    ],
+    pendingView,
+  );
+  const resolved = chatSessionView(resolvedView, { sessionId, threadId });
+  const resolvedApproval = resolved.items.find((item) => item.kind === "approval");
+  const completedTool = resolved.items.find((item) => item.kind === "tool");
+
+  expect(resolved.status).toBe("idle");
+  expect(resolved.pendingApprovals).toHaveLength(0);
+  expect(resolvedApproval).toMatchObject({ kind: "approval", id: approvalId, status: "resolved", decision: "allow_once" });
+  expect(completedTool).toMatchObject({ kind: "tool", id: callId, status: "completed", output: "ok" });
 });
 
 test("projects subagent runs, mailbox messages, and team tasks", () => {
@@ -1146,6 +1346,67 @@ test("client can cancel team run and merge commands without serializing AbortSig
     {
       url: "http://runtime.test/api/teams/team_sdk_abort/merge",
       body: { teamId },
+      signalled: true,
+    },
+  ]);
+});
+
+test("client can cancel chat commands without serializing AbortSignal", async () => {
+  const sessionId = "session_sdk_abort" as SessionId;
+  const threadId = "thread_sdk_abort" as ThreadId;
+  const controller = new AbortController();
+  const records: { url: string; body: unknown; signalled: boolean }[] = [];
+  const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url = String(input);
+    records.push({
+      url,
+      body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
+      signalled: init?.signal === controller.signal,
+    });
+    const body = url.endsWith("/sessions")
+      ? ({ sessionId, threadId })
+      : url.endsWith("/prompt_async")
+        ? ({ status: "accepted", sessionId, threadId })
+        : url.endsWith("/interrupt")
+          ? ({ interrupted: true })
+          : ({ resolved: true });
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+  const client = new HttpRuntimeClient({ baseUrl: "http://runtime.test/api", fetch: fetchImpl });
+
+  await client.createSession({ cwd: "/repo", signal: controller.signal });
+  await client.submitPromptAsync({ sessionId, threadId, text: "hello", cwd: "/repo", signal: controller.signal });
+  await client.interruptSession({ sessionId, reason: "stop", signal: controller.signal });
+  await client.approveApproval({ approvalId: "approval_sdk_abort" as ApprovalId, signal: controller.signal });
+  await client.rejectApproval({ approvalId: "approval_sdk_abort" as ApprovalId, feedback: "no", signal: controller.signal });
+
+  expect(records).toEqual([
+    {
+      url: "http://runtime.test/api/sessions",
+      body: { cwd: "/repo" },
+      signalled: true,
+    },
+    {
+      url: "http://runtime.test/api/sessions/session_sdk_abort/prompt_async",
+      body: { sessionId, threadId, text: "hello", cwd: "/repo" },
+      signalled: true,
+    },
+    {
+      url: "http://runtime.test/api/sessions/session_sdk_abort/interrupt",
+      body: { reason: "stop" },
+      signalled: true,
+    },
+    {
+      url: "http://runtime.test/api/approvals/approval_sdk_abort/resolve",
+      body: { decision: "allow_once" },
+      signalled: true,
+    },
+    {
+      url: "http://runtime.test/api/approvals/approval_sdk_abort/resolve",
+      body: { decision: "deny", feedback: "no" },
       signalled: true,
     },
   ]);
