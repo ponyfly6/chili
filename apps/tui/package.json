@@ -8,7 +8,10 @@
   },
   "dependencies": {
     "@chili/protocol": "workspace:*",
-    "@chili/sdk": "workspace:*"
+    "@chili/sdk": "workspace:*",
+    "@opentui/core": "0.1.106",
+    "@opentui/react": "0.1.106",
+    "react": "19.2.5"
   },
   "scripts": {
     "typecheck": "tsc -b"

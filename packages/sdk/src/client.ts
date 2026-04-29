@@ -29,6 +29,8 @@ export interface RuntimeClient {
   submitPromptAsync(input: SubmitPromptRequest): Promise<RuntimePromptAccepted>;
   interruptSession(input: InterruptSessionRequest): Promise<RuntimeInterruptResult>;
   resolveApproval(input: ResolveApprovalRequest): Promise<RuntimeApprovalResolveResult>;
+  approveApproval(input: ApproveApprovalRequest): Promise<RuntimeApprovalResolveResult>;
+  rejectApproval(input: RejectApprovalRequest): Promise<RuntimeApprovalResolveResult>;
   archiveSession(sessionId: SessionId): Promise<void>;
   listSessions(): Promise<RuntimeSessionSummary[]>;
   listAgents(input?: ListAgentsRequest): Promise<RuntimeAgentsSnapshot>;
@@ -86,6 +88,17 @@ export interface InterruptSessionRequest {
 export interface ResolveApprovalRequest {
   approvalId: ApprovalId;
   decision: "allow_once" | "allow_always" | "deny";
+  feedback?: string;
+}
+
+export interface ApproveApprovalRequest {
+  approvalId: ApprovalId;
+  always?: boolean;
+  feedback?: string;
+}
+
+export interface RejectApprovalRequest {
+  approvalId: ApprovalId;
   feedback?: string;
 }
 
@@ -438,6 +451,7 @@ export interface MergeTeamTasksRequest extends TeamRequestContext {
   teamId: TeamId;
   taskId?: TaskId;
   cwd?: string;
+  signal?: AbortSignal;
 }
 
 export interface RunTeamLoopRequest extends TeamRequestContext {
@@ -736,6 +750,24 @@ export class HttpRuntimeClient implements RuntimeClient {
     });
   }
 
+  approveApproval(input: ApproveApprovalRequest): Promise<RuntimeApprovalResolveResult> {
+    const request: ResolveApprovalRequest = {
+      approvalId: input.approvalId,
+      decision: input.always ? "allow_always" : "allow_once",
+    };
+    if (input.feedback !== undefined) request.feedback = input.feedback;
+    return this.resolveApproval(request);
+  }
+
+  rejectApproval(input: RejectApprovalRequest): Promise<RuntimeApprovalResolveResult> {
+    const request: ResolveApprovalRequest = {
+      approvalId: input.approvalId,
+      decision: "deny",
+    };
+    if (input.feedback !== undefined) request.feedback = input.feedback;
+    return this.resolveApproval(request);
+  }
+
   async archiveSession(sessionId: SessionId): Promise<void> {
     await this.post(`sessions/${encodeURIComponent(sessionId)}/archive`, {});
   }
@@ -840,7 +872,8 @@ export class HttpRuntimeClient implements RuntimeClient {
   }
 
   mergeTeamTasks(input: MergeTeamTasksRequest): Promise<RuntimeTeamMergeResult> {
-    return this.post(`teams/${encodeURIComponent(input.teamId)}/merge`, input);
+    const { signal, ...body } = input;
+    return this.post(`teams/${encodeURIComponent(input.teamId)}/merge`, body, signal);
   }
 
   runTeamLoop(input: RunTeamLoopRequest): Promise<RuntimeTeamExecutionRunSummary> {

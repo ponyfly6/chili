@@ -264,6 +264,8 @@ export interface TeamLiveCockpitInput {
   teamId?: TeamId;
   sessionId?: SessionId;
   limit?: number;
+  connection?: TeamLiveConnectionState;
+  generatedAt?: string;
 }
 
 export interface TeamLiveCockpitView {
@@ -380,7 +382,16 @@ export interface TeamLiveToolCount {
   failed: number;
 }
 
-export type TeamLiveActivityKind = "run" | "message" | "mailbox" | "tool" | "approval" | "task";
+export type TeamLiveActivityKind =
+  | "run"
+  | "message"
+  | "mailbox"
+  | "tool"
+  | "approval"
+  | "task"
+  | "member"
+  | "verifier"
+  | "merge";
 
 export interface TeamLiveActivityItem {
   id: string;
@@ -393,6 +404,178 @@ export interface TeamLiveActivityItem {
   taskId?: TaskId;
   teamId?: TeamId;
 }
+
+export type TeamLiveConnectionStatus = "unknown" | "connecting" | "streaming" | "reconnecting" | "offline" | "error";
+
+export interface TeamLiveConnectionState {
+  status: TeamLiveConnectionStatus;
+  lastEventId?: string;
+  error?: string;
+}
+
+export interface TeamLiveScope {
+  teamId?: TeamId;
+  sessionId?: SessionId;
+  teamIds: TeamId[];
+  sessionIds: SessionId[];
+}
+
+export interface TeamLiveView {
+  connection: TeamLiveConnectionState;
+  scope: TeamLiveScope;
+  selectedTeamId?: TeamId;
+  teams: TeamLiveTeamSummary[];
+  selected?: TeamLiveSelectedTeam;
+  globalActivity: TeamLiveActivityItem[];
+  availableActions: TeamLiveAction[];
+  generatedAt: string;
+  lastEventId?: string;
+}
+
+export interface TeamLiveSelectedTeam {
+  team: TeamLiveTeamSummary;
+  members: TeamLiveMemberSummary[];
+  tasks: TeamLiveTaskSummary[];
+  runs: TeamLiveRunSummary[];
+  activeTools: TeamLiveToolSummary[];
+  pendingApprovals: TeamLiveApprovalSummary[];
+  mergeQueue: TeamLiveMergeSummary[];
+  recentActivity: TeamLiveActivityItem[];
+  availableActions: TeamLiveAction[];
+  health: TeamLiveHealth;
+}
+
+export interface TeamLiveMemberSummary extends TeamLiveMemberRow {
+  sessionId?: SessionId;
+  currentTaskStatus?: RuntimeTaskStatus;
+}
+
+export interface TeamLiveTaskSummary extends Omit<TeamLiveTaskRow, "metadata"> {
+  metadata: TeamLiveTaskMetadata;
+  verifier?: TeamLiveVerifierSummary;
+  merge?: TeamLiveMergeSummary;
+  worktree?: TeamLiveWorktreeSummary;
+  dispatch?: TeamLiveDispatchSummary;
+  blocked: boolean;
+  final: boolean;
+}
+
+export type TeamLiveVerifierStatus = "none" | "pending" | "passed" | "failed";
+
+export interface TeamLiveVerifierSummary {
+  status: TeamLiveVerifierStatus;
+  verifierTaskId?: TaskId;
+  verifierRunId?: AgentRunId;
+  verifierPath?: AgentPath;
+  checkedAt?: number;
+  startedAt?: number;
+  feedback?: string;
+}
+
+export type TeamLiveMergeStatus = "none" | "pending" | "applied" | "failed" | "conflicted" | "skipped";
+
+export interface TeamLiveMergeSummary {
+  teamId?: TeamId;
+  taskId: TaskId;
+  title: string;
+  ownerPath?: AgentPath;
+  status: TeamLiveMergeStatus;
+  worktreePath?: string;
+  baseRef?: string;
+  diffSummary?: Record<string, unknown>;
+  error?: string;
+  conflicts?: string[];
+  reason?: string;
+  createdAt?: number;
+  mergedAt?: number;
+}
+
+export interface TeamLiveWorktreeSummary {
+  path: string;
+  baseRef?: string;
+  status?: string;
+  createdAt?: number;
+}
+
+export interface TeamLiveDispatchSummary {
+  agentTaskId?: TaskId;
+  agentPath?: AgentPath;
+  runId?: AgentRunId;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  mode?: string;
+  agentStatus?: string;
+  dispatchedAt?: number;
+  syncedAt?: number;
+  policy?: Record<string, unknown>;
+}
+
+export interface TeamLiveToolSummary {
+  id: ToolCallId;
+  toolName: string;
+  status: RuntimeToolCallView["status"];
+  updatedAt: number;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  turnId?: TurnId;
+  waitingForApproval: boolean;
+  error?: string;
+}
+
+export interface TeamLiveApprovalSummary {
+  id: ApprovalId;
+  permission: string;
+  patterns: string[];
+  status: RuntimeApprovalView["status"];
+  createdAt: number;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  callId?: ToolCallId;
+  toolName?: string;
+  decision?: RuntimeApprovalView["decision"];
+  feedback?: string;
+  resolvedAt?: number;
+}
+
+export interface TeamLiveRunSummary {
+  id: string;
+  teamId: TeamId;
+  status: RuntimeTeamRunStatus;
+  cycle: number;
+  phase?: TeamRunLifecyclePhase;
+  stopReason?: TeamRunStopReason;
+  counts: TeamRunSummaryCounts;
+  startedAt?: number;
+  endedAt?: number;
+  updatedAt: number;
+  mode?: AgentTaskMode;
+  once?: boolean;
+}
+
+export type TeamLiveHealthStatus = "ok" | "attention" | "blocked" | "error";
+
+export interface TeamLiveHealth {
+  status: TeamLiveHealthStatus;
+  reasons: string[];
+  counts: {
+    runningTasks: number;
+    pendingTasks: number;
+    blockedTasks: number;
+    failedTasks: number;
+    pendingApprovals: number;
+    activeTools: number;
+    pendingMerges: number;
+    conflictedMerges: number;
+    errors: number;
+  };
+}
+
+export type TeamLiveAction =
+  | { type: "run_loop"; teamId?: TeamId; enabled: boolean; reason?: string }
+  | { type: "merge"; teamId?: TeamId; taskId?: TaskId; enabled: boolean; reason?: string }
+  | { type: "approve"; approvalId?: ApprovalId; sessionId?: SessionId; enabled: boolean; reason?: string }
+  | { type: "reject"; approvalId?: ApprovalId; sessionId?: SessionId; enabled: boolean; reason?: string }
+  | { type: "interrupt"; sessionId?: SessionId; enabled: boolean; reason?: string };
 
 export function createRuntimeView(): ChiliRuntimeView {
   return {
@@ -625,13 +808,42 @@ export function runtimeAgentsSnapshot(view: ChiliRuntimeView, sessionId?: Sessio
   return snapshot;
 }
 
+export function teamLiveView(view: ChiliRuntimeView, input: TeamLiveCockpitInput = {}): TeamLiveView {
+  const limit = Math.max(1, input.limit ?? 24);
+  const teams = visibleTeamSummaries(view, input.sessionId);
+  const selectedTeamSummary = input.teamId ? teams.find((team) => team.id === input.teamId) : teams[0];
+  const team = selectedTeamSummary ? view.teams[selectedTeamSummary.id] : undefined;
+  const selected = team && selectedTeamSummary
+    ? teamLiveSelectedTeam(view, team, selectedTeamSummary, input.sessionId, limit)
+    : undefined;
+  const scope = teamLiveScope(view, input.sessionId, team, teams);
+  const globalActivity = teams
+    .flatMap((summary) => {
+      const item = view.teams[summary.id];
+      return item ? teamLiveRecentActivity(view, item, scopedSessionIdsForTeam(view, item, input.sessionId), Math.max(4, Math.ceil(limit / 2))) : [];
+    })
+    .sort((left, right) => right.time - left.time)
+    .slice(0, limit);
+
+  const connection: TeamLiveConnectionState = input.connection ? { ...input.connection } : { status: "unknown" };
+  if (!connection.lastEventId && view.lastEventId) connection.lastEventId = view.lastEventId;
+  const output: TeamLiveView = {
+    connection,
+    scope,
+    teams,
+    globalActivity,
+    availableActions: selected?.availableActions ?? teamLiveActions(view, undefined, new Set(), [], []),
+    generatedAt: input.generatedAt ?? new Date().toISOString(),
+  };
+  assignOptional(output, "selectedTeamId", team?.id);
+  assignOptional(output, "selected", selected);
+  assignOptional(output, "lastEventId", view.lastEventId);
+  return output;
+}
+
 export function teamLiveCockpit(view: ChiliRuntimeView, input: TeamLiveCockpitInput = {}): TeamLiveCockpitView {
   const limit = Math.max(1, input.limit ?? 16);
-  const teams = view.teamIds.flatMap((teamId) => {
-    const team = view.teams[teamId];
-    if (!team || !teamInSessionScope(view, team, input.sessionId)) return [];
-    return team ? [teamLiveTeamSummary(view, team, input.sessionId)] : [];
-  });
+  const teams = visibleTeamSummaries(view, input.sessionId);
   const selectedTeamSummary = input.teamId ? teams.find((team) => team.id === input.teamId) : teams[0];
   const selectedTeam = selectedTeamSummary ? view.teams[selectedTeamSummary.id] : undefined;
   const team = selectedTeam;
@@ -664,6 +876,64 @@ export function teamLiveCockpit(view: ChiliRuntimeView, input: TeamLiveCockpitIn
   assignOptional(output, "activeRun", activeRun);
   assignOptional(output, "lastEventId", view.lastEventId);
   return output;
+}
+
+function visibleTeamSummaries(view: ChiliRuntimeView, sessionId: SessionId | undefined): TeamLiveTeamSummary[] {
+  return view.teamIds.flatMap((teamId) => {
+    const team = view.teams[teamId];
+    if (!team || !teamInSessionScope(view, team, sessionId)) return [];
+    return [teamLiveTeamSummary(view, team, sessionId)];
+  });
+}
+
+function teamLiveSelectedTeam(
+  view: ChiliRuntimeView,
+  team: RuntimeTeamView,
+  summary: TeamLiveTeamSummary,
+  inputSessionId: SessionId | undefined,
+  limit: number,
+): TeamLiveSelectedTeam {
+  const sessionScope = scopedSessionIdsForTeam(view, team, inputSessionId);
+  const taskRows = teamTaskRows(view, team);
+  const taskSummaries = taskRows.map((task) => teamTaskSummary(task));
+  const memberRows = teamMemberRows(view, team, taskRows);
+  const members = memberRows.map((member) => teamMemberSummary(team, member, taskRows));
+  const pendingApprovals = approvalSummariesForScope(view, sessionScope).filter((approval) => approval.status === "pending");
+  const activeTools = activeToolSummariesForScope(view, sessionScope);
+  const mergeQueue = taskSummaries.flatMap((task) => (task.merge ? [task.merge] : []));
+  const runs = teamRunsForTeam(view, team.id).map((run) => teamRunSummary(run));
+  const health = teamLiveHealth(taskSummaries, pendingApprovals, activeTools, mergeQueue);
+  const selected: TeamLiveSelectedTeam = {
+    team: summary,
+    members,
+    tasks: taskSummaries,
+    runs,
+    activeTools,
+    pendingApprovals,
+    mergeQueue,
+    recentActivity: teamLiveRecentActivity(view, team, sessionScope, limit),
+    availableActions: teamLiveActions(view, team, sessionScope, pendingApprovals, mergeQueue),
+    health,
+  };
+  return selected;
+}
+
+function teamLiveScope(
+  view: ChiliRuntimeView,
+  sessionId: SessionId | undefined,
+  selectedTeam: RuntimeTeamView | undefined,
+  teams: readonly TeamLiveTeamSummary[],
+): TeamLiveScope {
+  const sessionIds = selectedTeam
+    ? scopedSessionIdsForTeam(view, selectedTeam, sessionId)
+    : new Set(sessionId ? [sessionId] : []);
+  const scope: TeamLiveScope = {
+    teamIds: teams.map((team) => team.id),
+    sessionIds: [...sessionIds],
+  };
+  assignOptional(scope, "sessionId", sessionId);
+  assignOptional(scope, "teamId", selectedTeam?.id);
+  return scope;
 }
 
 function teamLiveTeamSummary(
@@ -833,10 +1103,339 @@ function metadataEntry(task: TeamLiveTaskRow, value: Record<string, unknown>): T
   return entry;
 }
 
+function teamTaskSummary(task: TeamLiveTaskRow): TeamLiveTaskSummary {
+  const verifier = verifierSummary(task.metadata.verification);
+  const merge = mergeSummary(task, task.metadata.merge);
+  const worktree = worktreeSummary(task.metadata.worktree);
+  const dispatch = dispatchSummary(task.metadata.dispatch);
+  const summary: TeamLiveTaskSummary = {
+    ...task,
+    blocked: task.status === "blocked",
+    final: isFinalTaskStatus(task.status),
+  };
+  assignOptional(summary, "verifier", verifier);
+  assignOptional(summary, "merge", merge);
+  assignOptional(summary, "worktree", worktree);
+  assignOptional(summary, "dispatch", dispatch);
+  return summary;
+}
+
+function teamMemberSummary(
+  team: RuntimeTeamView,
+  member: TeamLiveMemberRow,
+  tasks: readonly TeamLiveTaskRow[],
+): TeamLiveMemberSummary {
+  const currentTask = member.currentTaskId ? tasks.find((task) => task.id === member.currentTaskId) : undefined;
+  const summary: TeamLiveMemberSummary = {
+    ...member,
+  };
+  assignOptional(summary, "sessionId", member.childSessionId ?? (member.isLead ? team.sessionId : undefined));
+  assignOptional(summary, "currentTaskStatus", currentTask?.status);
+  return summary;
+}
+
+function teamRunSummary(run: RuntimeTeamRunView): TeamLiveRunSummary {
+  const summary: TeamLiveRunSummary = {
+    id: run.id,
+    teamId: run.teamId,
+    status: run.status,
+    cycle: run.cycle,
+    counts: run.counts,
+    updatedAt: run.updatedAt,
+  };
+  assignOptional(summary, "phase", run.phase);
+  assignOptional(summary, "stopReason", run.stopReason);
+  assignOptional(summary, "startedAt", run.startedAt);
+  assignOptional(summary, "endedAt", run.endedAt);
+  assignOptional(summary, "mode", run.mode);
+  assignOptional(summary, "once", run.once);
+  return summary;
+}
+
+function approvalSummariesForScope(view: ChiliRuntimeView, sessionScope: ReadonlySet<SessionId>): TeamLiveApprovalSummary[] {
+  if (sessionScope.size === 0) return [];
+  return Object.values(view.approvals)
+    .filter((approval) => Boolean(approval.sessionId && sessionScope.has(approval.sessionId)))
+    .map((approval) => {
+      const toolCall = approval.callId ? view.toolCalls[approval.callId] : undefined;
+      const summary: TeamLiveApprovalSummary = {
+        id: approval.id,
+        permission: approval.permission,
+        patterns: approval.patterns,
+        status: approval.status,
+        createdAt: approval.createdAt,
+      };
+      assignOptional(summary, "sessionId", approval.sessionId);
+      assignOptional(summary, "threadId", approval.threadId);
+      assignOptional(summary, "callId", approval.callId);
+      assignOptional(summary, "toolName", toolCall?.toolName);
+      assignOptional(summary, "decision", approval.decision);
+      assignOptional(summary, "feedback", approval.feedback);
+      assignOptional(summary, "resolvedAt", approval.resolvedAt);
+      return summary;
+    })
+    .sort((left, right) => (right.resolvedAt ?? right.createdAt) - (left.resolvedAt ?? left.createdAt));
+}
+
+function activeToolSummariesForScope(view: ChiliRuntimeView, sessionScope: ReadonlySet<SessionId>): TeamLiveToolSummary[] {
+  if (sessionScope.size === 0) return [];
+  return Object.values(view.toolCalls)
+    .filter((toolCall) => Boolean(toolCall.sessionId && sessionScope.has(toolCall.sessionId)))
+    .filter((toolCall) => !isFinalToolStatus(toolCall.status))
+    .map((toolCall) => {
+      const summary: TeamLiveToolSummary = {
+        id: toolCall.id,
+        toolName: toolCall.toolName || "(unknown)",
+        status: toolCall.status,
+        updatedAt: toolCall.updatedAt,
+        waitingForApproval: toolCall.status === "waiting_for_approval",
+      };
+      assignOptional(summary, "sessionId", toolCall.sessionId);
+      assignOptional(summary, "threadId", toolCall.threadId);
+      assignOptional(summary, "turnId", toolCall.turnId);
+      assignOptional(summary, "error", toolCall.error);
+      return summary;
+    })
+    .sort((left, right) => right.updatedAt - left.updatedAt);
+}
+
+function teamLiveActions(
+  view: ChiliRuntimeView,
+  team: RuntimeTeamView | undefined,
+  sessionScope: ReadonlySet<SessionId>,
+  pendingApprovals: readonly TeamLiveApprovalSummary[],
+  mergeQueue: readonly TeamLiveMergeSummary[],
+): TeamLiveAction[] {
+  if (!team) {
+    return [
+      { type: "run_loop", enabled: false, reason: "no_team" },
+      { type: "merge", enabled: false, reason: "no_team" },
+      { type: "interrupt", enabled: false, reason: "no_session" },
+    ];
+  }
+
+  const activeRun = team.activeRunId ? view.teamRuns[team.activeRunId] : undefined;
+  const runLoop: TeamLiveAction = {
+    type: "run_loop",
+    teamId: team.id,
+    enabled: team.status === "active" && activeRun?.status !== "running",
+  };
+  if (team.status !== "active") runLoop.reason = "team_inactive";
+  else if (activeRun?.status === "running") runLoop.reason = "run_active";
+  const actions: TeamLiveAction[] = [runLoop];
+
+  const pendingMerges = mergeQueue.filter((merge) => merge.status === "pending");
+  if (pendingMerges.length === 0) {
+    actions.push({ type: "merge", teamId: team.id, enabled: false, reason: "no_pending_merge" });
+  } else {
+    for (const merge of pendingMerges) {
+      actions.push({
+        type: "merge",
+        teamId: team.id,
+        taskId: merge.taskId,
+        enabled: team.status === "active",
+        ...(team.status === "active" ? {} : { reason: "team_inactive" }),
+      });
+    }
+  }
+
+  for (const approval of pendingApprovals) {
+    const approve: TeamLiveAction = {
+      type: "approve",
+      approvalId: approval.id,
+      enabled: approval.status === "pending" && Boolean(approval.sessionId),
+      ...(approval.sessionId ? {} : { reason: "missing_session" }),
+    };
+    assignOptional(approve, "sessionId", approval.sessionId);
+    actions.push(approve);
+    const reject: TeamLiveAction = {
+      type: "reject",
+      approvalId: approval.id,
+      enabled: approval.status === "pending" && Boolean(approval.sessionId),
+      ...(approval.sessionId ? {} : { reason: "missing_session" }),
+    };
+    assignOptional(reject, "sessionId", approval.sessionId);
+    actions.push(reject);
+  }
+
+  const sessions = [...sessionScope].flatMap((sessionId) => {
+    const session = view.sessions[sessionId];
+    return session ? [session] : [];
+  });
+  const interruptible = sessions.filter((session) => session.status === "running" || session.status === "waiting_for_approval");
+  if (interruptible.length === 0) {
+    const interrupt: TeamLiveAction = {
+      type: "interrupt",
+      enabled: false,
+      reason: sessions.length === 0 ? "no_session" : "session_idle",
+    };
+    assignOptional(interrupt, "sessionId", sessions[0]?.id ?? team.sessionId);
+    actions.push(interrupt);
+  } else {
+    for (const session of interruptible) {
+      actions.push({ type: "interrupt", sessionId: session.id, enabled: true });
+    }
+  }
+
+  return actions;
+}
+
+function teamLiveHealth(
+  tasks: readonly TeamLiveTaskSummary[],
+  pendingApprovals: readonly TeamLiveApprovalSummary[],
+  activeTools: readonly TeamLiveToolSummary[],
+  mergeQueue: readonly TeamLiveMergeSummary[],
+): TeamLiveHealth {
+  const counts = {
+    runningTasks: tasks.filter((task) => task.status === "running" || task.status === "in_progress").length,
+    pendingTasks: tasks.filter((task) => task.status === "pending").length,
+    blockedTasks: tasks.filter((task) => task.status === "blocked").length,
+    failedTasks: tasks.filter((task) => task.status === "failed" || task.status === "cancelled").length,
+    pendingApprovals: pendingApprovals.length,
+    activeTools: activeTools.length,
+    pendingMerges: mergeQueue.filter((merge) => merge.status === "pending").length,
+    conflictedMerges: mergeQueue.filter((merge) => merge.status === "conflicted").length,
+    errors: tasks.filter((task) => Boolean(task.error)).length + mergeQueue.filter((merge) => Boolean(merge.error)).length,
+  };
+  const reasons: string[] = [];
+  if (counts.failedTasks > 0 || counts.errors > 0) reasons.push("errors");
+  if (counts.conflictedMerges > 0) reasons.push("merge_conflicts");
+  if (counts.blockedTasks > 0) reasons.push("blocked_tasks");
+  if (counts.pendingApprovals > 0) reasons.push("pending_approvals");
+  if (counts.pendingMerges > 0) reasons.push("pending_merge");
+  const status: TeamLiveHealthStatus =
+    counts.failedTasks > 0 || counts.errors > 0
+      ? "error"
+      : counts.conflictedMerges > 0 || counts.blockedTasks > 0
+        ? "blocked"
+        : counts.pendingApprovals > 0 || counts.pendingMerges > 0
+          ? "attention"
+          : "ok";
+  return { status, reasons, counts };
+}
+
+function verifierSummary(value: Record<string, unknown> | undefined): TeamLiveVerifierSummary | undefined {
+  if (!value) return undefined;
+  const status = stringValue(value.status);
+  const normalized: TeamLiveVerifierStatus =
+    status === "pending" || status === "passed" || status === "failed" ? status : "none";
+  const summary: TeamLiveVerifierSummary = { status: normalized };
+  assignOptional(summary, "verifierTaskId", stringValue(value.verifierTaskId) as TaskId | undefined);
+  assignOptional(summary, "verifierRunId", stringValue(value.verifierRunId) as AgentRunId | undefined);
+  assignOptional(summary, "verifierPath", stringValue(value.verifierPath) as AgentPath | undefined);
+  assignOptional(summary, "checkedAt", finiteNumberValue(value.checkedAt));
+  assignOptional(summary, "startedAt", finiteNumberValue(value.startedAt));
+  assignOptional(summary, "feedback", stringValue(value.feedback));
+  return summary;
+}
+
+function mergeSummary(task: TeamLiveTaskRow, value: Record<string, unknown> | undefined): TeamLiveMergeSummary | undefined {
+  if (!value) return undefined;
+  const status = stringValue(value.status);
+  const normalized: TeamLiveMergeStatus =
+    status === "pending" || status === "applied" || status === "failed" || status === "conflicted" || status === "skipped"
+      ? status
+      : "none";
+  const summary: TeamLiveMergeSummary = {
+    taskId: task.id,
+    title: task.title,
+    status: normalized,
+  };
+  assignOptional(summary, "teamId", task.teamId);
+  assignOptional(summary, "ownerPath", task.ownerPath);
+  assignOptional(summary, "worktreePath", stringValue(value.worktreePath));
+  assignOptional(summary, "baseRef", stringValue(value.baseRef));
+  assignOptional(summary, "diffSummary", recordObjectValue(value.diffSummary));
+  assignOptional(summary, "error", stringValue(value.error));
+  assignOptional(summary, "conflicts", stringArrayValue(value.conflicts));
+  assignOptional(summary, "reason", stringValue(value.reason));
+  assignOptional(summary, "createdAt", finiteNumberValue(value.createdAt));
+  assignOptional(summary, "mergedAt", finiteNumberValue(value.mergedAt));
+  return summary;
+}
+
+function worktreeSummary(value: Record<string, unknown> | undefined): TeamLiveWorktreeSummary | undefined {
+  const path = stringValue(value?.path);
+  if (!value || !path) return undefined;
+  const summary: TeamLiveWorktreeSummary = { path };
+  assignOptional(summary, "baseRef", stringValue(value.baseRef));
+  assignOptional(summary, "status", stringValue(value.status));
+  assignOptional(summary, "createdAt", finiteNumberValue(value.createdAt));
+  return summary;
+}
+
+function dispatchSummary(value: Record<string, unknown> | undefined): TeamLiveDispatchSummary | undefined {
+  if (!value) return undefined;
+  const summary: TeamLiveDispatchSummary = {};
+  assignOptional(summary, "agentTaskId", stringValue(value.agentTaskId) as TaskId | undefined);
+  assignOptional(summary, "agentPath", stringValue(value.agentPath) as AgentPath | undefined);
+  assignOptional(summary, "runId", stringValue(value.runId) as AgentRunId | undefined);
+  assignOptional(summary, "childSessionId", stringValue(value.childSessionId) as SessionId | undefined);
+  assignOptional(summary, "childThreadId", stringValue(value.childThreadId) as ThreadId | undefined);
+  assignOptional(summary, "mode", stringValue(value.mode));
+  assignOptional(summary, "agentStatus", stringValue(value.agentStatus));
+  assignOptional(summary, "dispatchedAt", finiteNumberValue(value.dispatchedAt));
+  assignOptional(summary, "syncedAt", finiteNumberValue(value.syncedAt));
+  assignOptional(summary, "policy", recordObjectValue(value.policy));
+  return summary;
+}
+
+function teamLiveRecentActivity(
+  view: ChiliRuntimeView,
+  team: RuntimeTeamView,
+  sessionScope: ReadonlySet<SessionId>,
+  limit: number,
+): TeamLiveActivityItem[] {
+  const items = teamRecentActivity(view, team, sessionScope, limit * 2);
+  for (const memberId of team.memberIds) {
+    const member = view.teamMembers[memberId];
+    if (!member) continue;
+    items.push(activityItem({
+      id: `member:${member.id}`,
+      kind: "member",
+      time: member.updatedAt,
+      label: `${member.name || member.path}`,
+      status: member.status,
+      teamId: member.teamId,
+      taskId: member.currentTaskId,
+    }));
+  }
+  for (const task of teamTaskRows(view, team)) {
+    const verifier = verifierSummary(task.metadata.verification);
+    if (verifier && verifier.status !== "none") {
+      items.push(activityItem({
+        id: `verifier:${task.id}`,
+        kind: "verifier",
+        time: verifier.checkedAt ?? verifier.startedAt ?? task.updatedAt,
+        label: task.title,
+        status: verifier.status,
+        detail: verifier.feedback,
+        taskId: task.id,
+        teamId: task.teamId,
+      }));
+    }
+    const merge = mergeSummary(task, task.metadata.merge);
+    if (merge && merge.status !== "none") {
+      items.push(activityItem({
+        id: `merge:${task.id}`,
+        kind: "merge",
+        time: merge.mergedAt ?? merge.createdAt ?? task.updatedAt,
+        label: task.title,
+        status: merge.status,
+        detail: merge.error ?? merge.reason,
+        taskId: task.id,
+        teamId: task.teamId,
+      }));
+    }
+  }
+  return items.sort((left, right) => right.time - left.time).slice(0, limit);
+}
+
 function toolCountsForScope(view: ChiliRuntimeView, sessionScope: ReadonlySet<SessionId>): TeamLiveToolCount[] {
+  if (sessionScope.size === 0) return [];
   const counts = new Map<string, TeamLiveToolCount>();
   for (const toolCall of Object.values(view.toolCalls)) {
-    if (sessionScope.size > 0 && (!toolCall.sessionId || !sessionScope.has(toolCall.sessionId))) continue;
+    if (!toolCall.sessionId || !sessionScope.has(toolCall.sessionId)) continue;
     const toolName = toolCall.toolName || "(unknown)";
     const current = counts.get(toolName) ?? { toolName, total: 0, running: 0, completed: 0, failed: 0 };
     current.total++;
@@ -897,7 +1496,7 @@ function teamRecentActivity(
     }));
   }
   for (const toolCall of Object.values(view.toolCalls)) {
-    if (sessionScope.size > 0 && (!toolCall.sessionId || !sessionScope.has(toolCall.sessionId))) continue;
+    if (sessionScope.size === 0 || !toolCall.sessionId || !sessionScope.has(toolCall.sessionId)) continue;
     items.push(activityItem({
       id: toolCall.id,
       kind: "tool",
@@ -908,7 +1507,7 @@ function teamRecentActivity(
       toolName: toolCall.toolName,
     }));
   }
-  for (const approval of pendingApprovalsForScope(view, sessionScope)) {
+  for (const approval of approvalsForScope(view, sessionScope)) {
     items.push(activityItem({
       id: approval.id,
       kind: "approval",
@@ -1784,19 +2383,34 @@ function scopedSessionIdsForTeam(
     const task = view.tasks[taskId];
     if (task?.sessionId) ids.add(task.sessionId);
     if (task?.childSessionId) ids.add(task.childSessionId);
+    if (!task?.metadata) continue;
+    for (const metadataTaskId of metadataLinkedTaskIds(task.metadata)) {
+      const linkedTask: RuntimeTaskView | undefined = view.tasks[metadataTaskId];
+      if (linkedTask?.sessionId) ids.add(linkedTask.sessionId);
+      if (linkedTask?.childSessionId) ids.add(linkedTask.childSessionId);
+    }
+    for (const metadataSessionId of metadataLinkedSessionIds(task.metadata)) ids.add(metadataSessionId);
   }
   for (const messageId of team.messageIds) {
     const message = view.teamMessages[messageId];
     if (message?.sessionId) ids.add(message.sessionId);
   }
+  for (const runId of team.runIds) {
+    const run = view.teamRuns[runId];
+    if (run?.sessionId) ids.add(run.sessionId);
+  }
   return ids;
 }
 
-function pendingApprovalsForScope(view: ChiliRuntimeView, sessionScope: ReadonlySet<SessionId>): RuntimeApprovalView[] {
+function approvalsForScope(view: ChiliRuntimeView, sessionScope: ReadonlySet<SessionId>): RuntimeApprovalView[] {
+  if (sessionScope.size === 0) return [];
   return Object.values(view.approvals).filter((approval) => {
-    if (approval.status !== "pending") return false;
-    return sessionScope.size === 0 ? true : Boolean(approval.sessionId && sessionScope.has(approval.sessionId));
+    return Boolean(approval.sessionId && sessionScope.has(approval.sessionId));
   });
+}
+
+function pendingApprovalsForScope(view: ChiliRuntimeView, sessionScope: ReadonlySet<SessionId>): RuntimeApprovalView[] {
+  return approvalsForScope(view, sessionScope).filter((approval) => approval.status === "pending");
 }
 
 function teamInSessionScope(
@@ -1813,6 +2427,13 @@ function teamInSessionScope(
   for (const taskId of team.taskIds) {
     const task = view.tasks[taskId];
     if (task?.sessionId === sessionId || task?.childSessionId === sessionId) return true;
+    if (!task?.metadata) continue;
+    if (metadataLinkedSessionIds(task.metadata).some((item) => item === sessionId)) return true;
+    const linkedTaskIds: TaskId[] = metadataLinkedTaskIds(task.metadata);
+    for (const metadataTaskId of linkedTaskIds) {
+      const linkedTask: RuntimeTaskView | undefined = view.tasks[metadataTaskId];
+      if (linkedTask?.sessionId === sessionId || linkedTask?.childSessionId === sessionId) return true;
+    }
   }
   for (const messageId of team.messageIds) {
     const message = view.teamMessages[messageId];
@@ -1823,6 +2444,25 @@ function teamInSessionScope(
     if (run?.sessionId === sessionId) return true;
   }
   return false;
+}
+
+function metadataLinkedTaskIds(metadata: Record<string, unknown>): TaskId[] {
+  const ids: TaskId[] = [];
+  const dispatch = metadataRecord(metadata, "chiliTeamDispatch");
+  const verification = metadataRecord(metadata, "verification");
+  const agentTaskId = stringValue(dispatch?.agentTaskId) as TaskId | undefined;
+  const verifierTaskId = stringValue(verification?.verifierTaskId) as TaskId | undefined;
+  if (agentTaskId) ids.push(agentTaskId);
+  if (verifierTaskId) ids.push(verifierTaskId);
+  return ids;
+}
+
+function metadataLinkedSessionIds(metadata: Record<string, unknown>): SessionId[] {
+  const ids: SessionId[] = [];
+  const dispatch = metadataRecord(metadata, "chiliTeamDispatch");
+  const childSessionId = stringValue(dispatch?.childSessionId) as SessionId | undefined;
+  if (childSessionId) ids.push(childSessionId);
+  return ids;
 }
 
 function activityItem(input: {
@@ -1911,5 +2551,9 @@ function isStaleTaskSpawn(task: RuntimeTaskView, generation: number | undefined)
 }
 
 function isFinalTaskStatus(status: RuntimeTaskStatus): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+function isFinalToolStatus(status: RuntimeToolCallView["status"]): boolean {
   return status === "completed" || status === "failed" || status === "cancelled";
 }

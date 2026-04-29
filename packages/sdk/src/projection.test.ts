@@ -20,13 +20,14 @@ import {
   type RuntimeAgentTaskRecord,
   type RuntimeLocalSubagentTaskRecord,
   type RuntimeTeamExecutionRunSummary,
+  type RuntimeTeamMergeResult,
   type RuntimeTeamTaskDispatchResult,
   type RuntimeTeamTaskReconcileResult,
   type RuntimeTeamTaskRecord,
   type RuntimeTeamTaskSyncResult,
   type RuntimeTeamSnapshot,
 } from "./client.js";
-import { createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, sessionMessages, teamLiveCockpit } from "./projection.js";
+import { createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, sessionMessages, teamLiveCockpit, teamLiveView } from "./projection.js";
 
 test("replays session, message, tool, and approval events into a runtime view", () => {
   const sessionId = "session_test" as SessionId;
@@ -395,14 +396,21 @@ test("derives Team Live cockpit view from team projection state", () => {
   const otherThreadId = "thread_team_live_other" as ThreadId;
   const childSessionId = "session_team_live_child" as SessionId;
   const childThreadId = "thread_team_live_child" as ThreadId;
+  const verifierSessionId = "session_team_live_verifier" as SessionId;
+  const verifierThreadId = "thread_team_live_verifier" as ThreadId;
   const teamId = "team_live" as TeamId;
   const otherTeamId = "team_live_other" as TeamId;
   const taskId = "task_live" as TaskId;
+  const verifierTaskId = "task_verify_live" as TaskId;
+  const conflictedTaskId = "task_merge_conflict" as TaskId;
+  const failedMergeTaskId = "task_merge_failed" as TaskId;
+  const appliedMergeTaskId = "task_merge_applied" as TaskId;
   const leadPath = "/root" as AgentPath;
   const memberPath = "/root/worker" as AgentPath;
   const callId = "toolcall_live" as ToolCallId;
   const approvalId = "approval_live" as ApprovalId;
   const childApprovalId = "approval_live_child" as ApprovalId;
+  const resolvedApprovalId = "approval_live_resolved" as ApprovalId;
 
   const view = reduceRuntimeEvents(
     [
@@ -468,11 +476,74 @@ test("derives Team Live cockpit view from team projection state", () => {
           title: "Build live cockpit",
           ownerPath: memberPath,
           metadata: {
-            chiliTeamDispatch: { agentTaskId: "task_agent_live", agentStatus: "running" },
-            verification: { status: "pending", verifierTaskId: "task_verify_live" },
+            chiliTeamDispatch: { agentTaskId: "task_agent_live", agentStatus: "running", childSessionId },
+            verification: { status: "pending", verifierTaskId },
             worktree: { path: "/repo/.chili/worktrees/live", baseRef: "HEAD", createdAt: 5, status: "active" },
             merge: { status: "pending", createdAt: 6, worktreePath: "/repo/.chili/worktrees/live" },
           },
+        },
+      },
+      {
+        id: "event_verifier_task",
+        type: "agent.task_created",
+        time: 5 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          taskId: verifierTaskId,
+          path: "/root/worker/verifier" as AgentPath,
+          parentPath: memberPath,
+          parentSessionId: sessionId,
+          childSessionId: verifierSessionId,
+          childThreadId: verifierThreadId,
+          taskName: "Verify live cockpit",
+          cwd: "/repo",
+          prompt: "verify",
+        },
+      },
+      {
+        id: "event_conflicted_merge_task",
+        type: "team.task_created",
+        time: 5 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          taskId: conflictedTaskId,
+          title: "Conflicted merge",
+          ownerPath: memberPath,
+          status: "completed",
+          metadata: { merge: { status: "conflicted", createdAt: 5, mergedAt: 9, error: "conflict", conflicts: ["src/a.ts"] } },
+        },
+      },
+      {
+        id: "event_failed_merge_task",
+        type: "team.task_created",
+        time: 5 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          taskId: failedMergeTaskId,
+          title: "Failed merge",
+          ownerPath: memberPath,
+          status: "completed",
+          metadata: { merge: { status: "failed", createdAt: 5, mergedAt: 10, error: "apply failed" } },
+        },
+      },
+      {
+        id: "event_applied_merge_task",
+        type: "team.task_created",
+        time: 5 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          taskId: appliedMergeTaskId,
+          title: "Applied merge",
+          ownerPath: memberPath,
+          status: "completed",
+          metadata: { merge: { status: "applied", createdAt: 5, mergedAt: 11 } },
         },
       },
       {
@@ -545,6 +616,14 @@ test("derives Team Live cockpit view from team projection state", () => {
         payload: { teamId, runId: "teamrun_live", cycle: 1, phase: "dispatch", counts: teamRunCounts({ dispatched: 1 }) },
       },
       {
+        id: "event_child_turn",
+        type: "turn.started",
+        time: 11 as TimestampMs,
+        sessionId: childSessionId,
+        threadId: childThreadId,
+        payload: { turnId: "turn_live" as TurnId },
+      },
+      {
         id: "event_tool",
         type: "tool.call_started",
         time: 11 as TimestampMs,
@@ -567,6 +646,22 @@ test("derives Team Live cockpit view from team projection state", () => {
         sessionId: childSessionId,
         threadId: childThreadId,
         payload: { approvalId: childApprovalId, callId, permission: "tool.bash", patterns: ["bun test"] },
+      },
+      {
+        id: "event_resolved_approval",
+        type: "approval.requested",
+        time: 14 as TimestampMs,
+        sessionId: childSessionId,
+        threadId: childThreadId,
+        payload: { approvalId: resolvedApprovalId, callId, permission: "tool.read", patterns: ["README.md"] },
+      },
+      {
+        id: "event_resolved_approval_done",
+        type: "approval.resolved",
+        time: 15 as TimestampMs,
+        sessionId: childSessionId,
+        threadId: childThreadId,
+        payload: { approvalId: resolvedApprovalId, decision: "allow_once" },
       },
     ],
     createRuntimeView(),
@@ -613,6 +708,149 @@ test("derives Team Live cockpit view from team projection state", () => {
   expect(cockpit.recentActivity.map((item) => item.kind)).toContain("tool");
   expect(cockpit.recentActivity.map((item) => item.id)).toContain(childApprovalId);
   expect(teamLiveCockpit(view, { teamId: otherTeamId, sessionId }).team).toBeUndefined();
+
+  const live = teamLiveView(view, { teamId, sessionId, limit: 20, connection: { status: "streaming" } });
+  expect(live.scope.teamIds).toEqual([teamId]);
+  expect(live.selectedTeamId).toBe(teamId);
+  expect(live.scope.sessionIds).toContain(sessionId);
+  expect(live.scope.sessionIds).toContain(childSessionId);
+  expect(live.scope.sessionIds).toContain(verifierSessionId);
+  expect(live.selected?.pendingApprovals.map((approval) => approval.id)).toEqual([childApprovalId, approvalId]);
+  expect(live.selected?.pendingApprovals.map((approval) => approval.id)).not.toContain(resolvedApprovalId);
+  expect(live.selected?.activeTools.map((tool) => tool.id)).toEqual([callId]);
+  expect(live.selected?.mergeQueue.map((merge) => merge.status).sort()).toEqual(["applied", "conflicted", "failed", "pending"]);
+  expect(live.selected?.recentActivity.map((item) => item.kind)).toContain("verifier");
+  expect(live.selected?.recentActivity.map((item) => item.kind)).toContain("merge");
+  expect(live.selected?.recentActivity).toContainEqual(
+    expect.objectContaining({ id: resolvedApprovalId, kind: "approval", status: "resolved" }),
+  );
+  expect(live.selected?.availableActions).toContainEqual({ type: "run_loop", teamId, enabled: false, reason: "run_active" });
+  expect(live.selected?.availableActions).toContainEqual({ type: "merge", teamId, taskId, enabled: true });
+  expect(live.selected?.availableActions).toContainEqual({ type: "approve", approvalId: childApprovalId, sessionId: childSessionId, enabled: true });
+  expect(live.selected?.availableActions).toContainEqual({ type: "interrupt", sessionId: childSessionId, enabled: true });
+  expect(teamLiveView(view, { teamId: otherTeamId, sessionId }).selected).toBeUndefined();
+});
+
+test("Team Live v1 scopes selected teams through run sessions without falling back to global tools", () => {
+  const teamId = "team_run_scoped" as TeamId;
+  const emptyTeamId = "team_empty_scope" as TeamId;
+  const runSessionId = "session_run_scoped" as SessionId;
+  const otherSessionId = "session_run_other" as SessionId;
+  const threadId = "thread_run_scoped" as ThreadId;
+  const leadPath = "/root" as AgentPath;
+  const callId = "tool_run_scoped" as ToolCallId;
+  const otherCallId = "tool_run_other" as ToolCallId;
+  const approvalId = "approval_run_scoped" as ApprovalId;
+  const otherApprovalId = "approval_run_other" as ApprovalId;
+
+  const view = reduceRuntimeEvents(
+    [
+      {
+        id: "event_run_scoped_team",
+        type: "team.created",
+        time: 1 as TimestampMs,
+        payload: { teamId, name: "run scoped", leadPath },
+      },
+      {
+        id: "event_empty_scope_team",
+        type: "team.created",
+        time: 1 as TimestampMs,
+        payload: { teamId: emptyTeamId, name: "empty scoped", leadPath },
+      },
+      {
+        id: "event_run_scoped_start",
+        type: "team.run_started",
+        time: 2 as TimestampMs,
+        sessionId: runSessionId,
+        threadId,
+        payload: { teamId, runId: "teamrun_scoped" },
+      },
+      {
+        id: "event_run_scoped_tool",
+        type: "tool.call_started",
+        time: 3 as TimestampMs,
+        sessionId: runSessionId,
+        threadId,
+        payload: { turnId: "turn_run_scoped" as TurnId, callId, toolName: "read_file", input: { path: "README.md" } },
+      },
+      {
+        id: "event_run_scoped_approval",
+        type: "approval.requested",
+        time: 4 as TimestampMs,
+        sessionId: runSessionId,
+        threadId,
+        payload: { approvalId, callId, permission: "tool.read", patterns: ["README.md"] },
+      },
+      {
+        id: "event_other_tool",
+        type: "tool.call_started",
+        time: 5 as TimestampMs,
+        sessionId: otherSessionId,
+        threadId,
+        payload: { turnId: "turn_run_other" as TurnId, callId: otherCallId, toolName: "bash", input: { command: "bun test" } },
+      },
+      {
+        id: "event_other_approval",
+        type: "approval.requested",
+        time: 6 as TimestampMs,
+        sessionId: otherSessionId,
+        threadId,
+        payload: { approvalId: otherApprovalId, callId: otherCallId, permission: "tool.bash", patterns: ["bun test"] },
+      },
+    ],
+    createRuntimeView(),
+  );
+
+  const live = teamLiveView(view, { teamId });
+  expect(live.scope.sessionIds).toEqual([runSessionId]);
+  expect(live.selected?.activeTools.map((tool) => tool.id)).toEqual([callId]);
+  expect(live.selected?.pendingApprovals.map((approval) => approval.id)).toEqual([approvalId]);
+  expect(live.selected?.recentActivity.map((item) => item.id)).toContain(approvalId);
+  expect(live.selected?.recentActivity.map((item) => item.id)).not.toContain(otherApprovalId);
+  expect(live.selected?.availableActions).toContainEqual({ type: "run_loop", teamId, enabled: false, reason: "run_active" });
+
+  const emptyScope = teamLiveView(view, { teamId: emptyTeamId });
+  expect(emptyScope.scope.sessionIds).toEqual([]);
+  expect(emptyScope.selected?.activeTools).toEqual([]);
+  expect(emptyScope.selected?.pendingApprovals).toEqual([]);
+  expect(emptyScope.selected?.recentActivity.map((item) => item.id)).not.toContain(otherApprovalId);
+  expect(emptyScope.selected?.recentActivity.map((item) => item.id)).not.toContain(otherCallId);
+});
+
+test("Team Live v1 exposes disabled actions for no-team and inactive-team states", () => {
+  const empty = teamLiveView(createRuntimeView());
+  expect(empty.selected).toBeUndefined();
+  expect(empty.availableActions).toContainEqual({ type: "run_loop", enabled: false, reason: "no_team" });
+
+  const sessionId = "session_team_inactive" as SessionId;
+  const teamId = "team_inactive" as TeamId;
+  const view = reduceRuntimeEvents(
+    [
+      {
+        id: "event_inactive_session",
+        type: "session.created",
+        time: 1 as TimestampMs,
+        sessionId,
+        payload: { sessionId, cwd: "/repo" },
+      },
+      {
+        id: "event_inactive_team",
+        type: "team.created",
+        time: 2 as TimestampMs,
+        sessionId,
+        payload: { teamId, name: "inactive", leadPath: "/root" as AgentPath },
+      },
+    ],
+    createRuntimeView(),
+  );
+  const team = view.teams[teamId];
+  if (!team) throw new Error("expected team");
+  team.status = "archived";
+
+  const live = teamLiveView(view, { teamId, sessionId });
+  expect(live.selected?.availableActions).toContainEqual({ type: "run_loop", teamId, enabled: false, reason: "team_inactive" });
+  expect(live.selected?.availableActions).toContainEqual({ type: "merge", teamId, enabled: false, reason: "no_pending_merge" });
+  expect(live.selected?.availableActions).toContainEqual({ type: "interrupt", sessionId, enabled: false, reason: "session_idle" });
 });
 
 test("replays completed local subagent tasks as running on newer-generation spawn without completedAt", () => {
@@ -846,17 +1084,27 @@ test("client preserves team dispatcher JSON shapes for dispatch, sync, and recon
   ]);
 });
 
-test("client can cancel team run loop requests without serializing AbortSignal", async () => {
+test("client can cancel team run and merge commands without serializing AbortSignal", async () => {
   const teamId = "team_sdk_abort" as TeamId;
   const controller = new AbortController();
-  let recorded: { body: unknown; signalled: boolean } | undefined;
-  const fetchImpl = (async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
-    recorded = {
+  const records: { url: string; body: unknown; signalled: boolean }[] = [];
+  const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    records.push({
+      url: String(input),
       body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
       signalled: init?.signal === controller.signal,
-    };
-    return new Response(
-      JSON.stringify({
+    });
+    const url = String(input);
+    const body = url.endsWith("/merge")
+      ? ({
+          scanned: 0,
+          applied: [],
+          failed: [],
+          conflicted: [],
+          skipped: [],
+          errors: [],
+        } satisfies RuntimeTeamMergeResult)
+      : ({
         teamId,
         cycles: 0,
         stopReason: "aborted",
@@ -875,7 +1123,9 @@ test("client can cancel team run loop requests without serializing AbortSignal",
         skipped: [],
         stillRunning: [],
         errors: [],
-      } satisfies RuntimeTeamExecutionRunSummary),
+      } satisfies RuntimeTeamExecutionRunSummary);
+    return new Response(
+      JSON.stringify(body),
       {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -885,11 +1135,55 @@ test("client can cancel team run loop requests without serializing AbortSignal",
   const client = new HttpRuntimeClient({ baseUrl: "http://runtime.test/api", fetch: fetchImpl });
 
   await client.runTeamLoop({ teamId, once: true, signal: controller.signal });
+  await client.mergeTeamTasks({ teamId, signal: controller.signal });
 
-  expect(recorded).toEqual({
-    body: { teamId, once: true },
-    signalled: true,
-  });
+  expect(records).toEqual([
+    {
+      url: "http://runtime.test/api/teams/team_sdk_abort/run_loop",
+      body: { teamId, once: true },
+      signalled: true,
+    },
+    {
+      url: "http://runtime.test/api/teams/team_sdk_abort/merge",
+      body: { teamId },
+      signalled: true,
+    },
+  ]);
+});
+
+test("client approval command wrappers map product actions onto resolve calls", async () => {
+  const approvalId = "approval_sdk_wrapper" as ApprovalId;
+  const records: { url: string; body: unknown }[] = [];
+  const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    records.push({
+      url: String(input),
+      body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
+    });
+    return new Response(JSON.stringify({ resolved: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+  const client = new HttpRuntimeClient({ baseUrl: "http://runtime.test/api", fetch: fetchImpl });
+
+  await client.approveApproval({ approvalId });
+  await client.approveApproval({ approvalId, always: true, feedback: "trusted" });
+  await client.rejectApproval({ approvalId, feedback: "needs review" });
+
+  expect(records).toEqual([
+    {
+      url: "http://runtime.test/api/approvals/approval_sdk_wrapper/resolve",
+      body: { decision: "allow_once" },
+    },
+    {
+      url: "http://runtime.test/api/approvals/approval_sdk_wrapper/resolve",
+      body: { decision: "allow_always", feedback: "trusted" },
+    },
+    {
+      url: "http://runtime.test/api/approvals/approval_sdk_wrapper/resolve",
+      body: { decision: "deny", feedback: "needs review" },
+    },
+  ]);
 });
 
 test("client fetches team snapshots through the runtime HTTP API", async () => {
