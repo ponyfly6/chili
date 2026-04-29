@@ -47,7 +47,7 @@ test("CLI DeepSeek env resolution uses official V4 OpenAI-compatible endpoint an
   }) as typeof fetch;
 
   const model = await createCliModel("deepseek", { fetch: fetchImpl });
-  await collect(model.stream(emptyInput()));
+  const events = await collect(model.stream(emptyInput()));
 
   expect(url).toBe("https://api.deepseek.com/chat/completions");
   expect(body).toMatchObject({
@@ -55,6 +55,13 @@ test("CLI DeepSeek env resolution uses official V4 OpenAI-compatible endpoint an
     max_tokens: 4096,
     thinking: { type: "enabled" },
   });
+  expect(events).toContainEqual(expect.objectContaining({
+    type: "metadata",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    contextWindowTokens: 1048576,
+    maxOutputTokens: 393216,
+  }));
 });
 
 test("CLI MiniMax env resolution prefers Anthropic-compatible base URL over generic MiniMax base URL", async () => {
@@ -78,10 +85,12 @@ test("CLI MiniMax env resolution prefers Anthropic-compatible base URL over gene
   expect(url).toBe("https://api.minimaxi.com/anthropic/v1/messages");
 });
 
-async function collect(stream: AsyncIterable<unknown>): Promise<void> {
+async function collect(stream: AsyncIterable<unknown>): Promise<unknown[]> {
+  const events: unknown[] = [];
   for await (const _event of stream) {
-    // Drain stream.
+    events.push(_event);
   }
+  return events;
 }
 
 function emptyInput(): ModelStreamInput {

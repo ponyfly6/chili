@@ -3,6 +3,7 @@ import { createMiniMaxM27HighspeedRouter } from "@chili/core";
 import {
   DEEPSEEK_OPENAI_BASE_URL,
   DEEPSEEK_V4_PRO_MODEL,
+  findKnownModel,
   MINIMAX_ANTHROPIC_BASE_URL,
   MINIMAX_M27_HIGHSPEED_MODEL,
   readDeepSeekEnvironment,
@@ -188,10 +189,25 @@ class ProviderModelRouterAdapter implements ModelRouter {
   async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
     for await (const event of this.model.stream(toProviderInput(input))) {
       if (isModelStreamEvent(event)) {
-        yield event as ModelStreamEvent;
+        yield enrichMetadata(event as ModelStreamEvent);
       }
     }
   }
+}
+
+function enrichMetadata(event: ModelStreamEvent): ModelStreamEvent {
+  if (event.type !== "metadata" || !event.provider || !event.model) return event;
+  const descriptor = findKnownModel(event.provider, event.model);
+  if (!descriptor) return event;
+
+  const output: Extract<ModelStreamEvent, { type: "metadata" }> = { ...event };
+  if (output.contextWindowTokens === undefined && descriptor.contextWindowTokens !== undefined) {
+    output.contextWindowTokens = descriptor.contextWindowTokens;
+  }
+  if (output.maxOutputTokens === undefined && descriptor.maxOutputTokens !== undefined) {
+    output.maxOutputTokens = descriptor.maxOutputTokens;
+  }
+  return output;
 }
 
 function isModelStreamEvent(event: ProviderModelStreamEvent): boolean {
