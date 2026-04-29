@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
-import { act } from "react";
-import { createRuntimeView, type HttpRuntimeClient, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
+import { act, useState, type Dispatch, type SetStateAction } from "react";
+import { createRuntimeView, type ChatTranscriptItem, type HttpRuntimeClient, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
 import type { ApprovalId, ChiliEvent, MessageId, PartId, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import { ChatShellApp, ChatShellSurface } from "./ChatShellApp.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
@@ -210,6 +210,177 @@ test("running session blocks a second prompt submit", async () => {
 
     expect(submitted).toHaveLength(0);
     expect(app.captureCharFrame()).toContain("Session running - ctrl+x interrupt");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("prompt history navigates successful ordinary prompts with Up and Down", async () => {
+  const submitted: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async (text) => {
+        submitted.push(text);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "first prompt");
+    await press(app, () => app.mockInput.pressEnter());
+    await typeText(app, "second prompt");
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(submitted).toEqual(["first prompt", "second prompt"]);
+
+    await press(app, () => app.mockInput.pressArrow("up"));
+    expect(app.captureCharFrame()).toContain("second prompt");
+
+    await press(app, () => app.mockInput.pressArrow("up"));
+    expect(app.captureCharFrame()).toContain("first prompt");
+
+    await press(app, () => app.mockInput.pressArrow("down"));
+    expect(app.captureCharFrame()).toContain("second prompt");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("prompt history restores the in-progress draft at the bottom", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "stored prompt");
+    await press(app, () => app.mockInput.pressEnter());
+    await typeText(app, "current draft");
+
+    await press(app, () => app.mockInput.pressArrow("up"));
+    expect(app.captureCharFrame()).toContain("stored prompt");
+
+    await press(app, () => app.mockInput.pressArrow("down"));
+    expect(app.captureCharFrame()).toContain("current draft");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("slash completion selection uses Up and Down without switching prompt history", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "history prompt");
+    await press(app, () => app.mockInput.pressEnter());
+    await typeText(app, "/");
+
+    expect(app.captureCharFrame()).toContain("> /team - Open the team cockpit");
+
+    await press(app, () => app.mockInput.pressArrow("down"));
+    expect(app.captureCharFrame()).toContain("> /team run - Start the selected team loop");
+    expect(app.captureCharFrame()).not.toContain("history prompt");
+
+    await press(app, () => app.mockInput.pressArrow("up"));
+    expect(app.captureCharFrame()).toContain("> /team - Open the team cockpit");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("command palette selection uses Up and Down without switching prompt history", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "palette history");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
+
+    expect(app.captureCharFrame()).toContain("Command Palette");
+    expect(app.captureCharFrame()).toContain("> /team - Open the team cockpit");
+
+    await press(app, () => app.mockInput.pressArrow("down"));
+    expect(app.captureCharFrame()).toContain("> /team run - Start the selected team loop");
+    expect(app.captureCharFrame()).not.toContain("palette history");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("Shift+Up and Shift+Down scroll the transcript instead of prompt history", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    width: 120,
+    height: 24,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: chatMessages(30),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "scroll history");
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(app.captureCharFrame()).toContain("message 30");
+    expect(app.captureCharFrame()).not.toContain("message 01");
+
+    await press(app, () => app.mockInput.pressArrow("up", { shift: true }));
+    await press(app, () => app.mockInput.pressArrow("up", { shift: true }));
+    expect(app.captureCharFrame()).toContain("message 01");
+    expect(app.captureCharFrame()).not.toContain("scroll history");
+
+    await press(app, () => app.mockInput.pressArrow("down", { shift: true }));
+    await press(app, () => app.mockInput.pressArrow("down", { shift: true }));
+    expect(app.captureCharFrame()).toContain("message 30");
+    expect(app.captureCharFrame()).not.toContain("scroll history");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("running disabled composer does not switch to prompt history", async () => {
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "saved prompt");
+    await press(app, () => app.mockInput.pressEnter());
+
+    await act(async () => {
+      app.setRuntime((current) => ({
+        ...current,
+        canSubmit: false,
+        chatView: {
+          ...current.chatView,
+          status: "running",
+        },
+      }));
+    });
+    await app.renderOnce();
+
+    await press(app, () => app.mockInput.pressArrow("up"));
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("Session running - ctrl+x interrupt");
+    expect(frame).not.toContain("saved prompt");
   } finally {
     app.renderer.destroy();
   }
@@ -589,6 +760,79 @@ async function mountShell(
   return app;
 }
 
+async function mountStatefulShell(
+  model: TeamLiveView,
+  options: {
+    width?: number;
+    height?: number;
+    executed?: TeamLiveAction[];
+    runtime?: Partial<ChatRuntimeState>;
+  } = {},
+) {
+  const initialRuntime = chatRuntime(model, options);
+  let setRuntime: Dispatch<SetStateAction<ChatRuntimeState>> | undefined;
+
+  function StatefulShell() {
+    const [runtime, updateRuntime] = useState<ChatRuntimeState>(initialRuntime);
+    setRuntime = updateRuntime;
+    return (
+      <ChatShellSurface
+        model={model}
+        runtime={runtime}
+        selectedTeamId={model.selectedTeamId}
+        selectedTeamLocked={false}
+        onSelectTeam={() => undefined}
+        onExit={() => undefined}
+        options={{ cwd: "/repo/chili", modeName: "Build", modelName: "test-model", providerName: "test-provider" }}
+      />
+    );
+  }
+
+  const app = await testRender(<StatefulShell />, {
+    width: options.width ?? 120,
+    height: options.height ?? 40,
+    exitOnCtrlC: false,
+  });
+  await act(async () => {
+    await app.renderOnce();
+  });
+
+  return {
+    ...app,
+    setRuntime: (update: SetStateAction<ChatRuntimeState>) => {
+      if (!setRuntime) throw new Error("stateful shell runtime setter was not initialized");
+      setRuntime(update);
+    },
+  };
+}
+
+function chatRuntime(
+  model: TeamLiveView,
+  options: {
+    executed?: TeamLiveAction[];
+    runtime?: Partial<ChatRuntimeState>;
+  } = {},
+): ChatRuntimeState {
+  return {
+    runtimeView: createRuntimeView(),
+    revision: 0,
+    connection: model.connection,
+    message: "test stream",
+    reconnect: () => undefined,
+    executeAction: (action) => {
+      options.executed?.push(action);
+    },
+    clearActionFeedback: () => undefined,
+    chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
+    canSubmit: true,
+    submitPrompt: async () => true,
+    interruptActiveSession: async () => undefined,
+    approveApproval: async () => undefined,
+    rejectApproval: async () => undefined,
+    ...options.runtime,
+  };
+}
+
 async function mountChatApp(
   client: HttpRuntimeClient,
   options: {
@@ -747,6 +991,25 @@ function approvalEvents(sessionId: SessionId, threadId: ThreadId, approvalId: Ap
       payload: { approvalId, callId, permission: "bash", patterns: ["ls -la"] },
     },
   ];
+}
+
+function chatMessages(count: number): ChatTranscriptItem[] {
+  return Array.from({ length: count }, (_, index) => {
+    const number = String(index + 1).padStart(2, "0");
+    return {
+      id: `msg_${number}` as MessageId,
+      kind: "message",
+      role: index % 2 === 0 ? "user" : "assistant",
+      createdAt: index + 1,
+      parts: [
+        {
+          type: "text",
+          id: `part_${number}` as PartId,
+          text: `message ${number}`,
+        },
+      ],
+    };
+  });
 }
 
 async function waitForAbort(signal: AbortSignal | undefined): Promise<void> {

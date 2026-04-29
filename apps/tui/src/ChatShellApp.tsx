@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useKeyboard, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, MouseEvent } from "@opentui/core";
 import type { HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
@@ -9,13 +9,14 @@ import { useChatRuntime, type ChatRuntimeState } from "./useChatRuntime.js";
 import { findAction } from "./components/helpers.js";
 import { ApprovalDock, approvalDockHeight } from "./chat/ApprovalDock.js";
 import { BrandMark } from "./chat/BrandMark.js";
-import { CommandList } from "./chat/CommandList.js";
 import { MessageList } from "./chat/MessageList.js";
 import { PROMPT_PLACEHOLDER, PromptComposer } from "./chat/PromptComposer.js";
 import { StatusFooter, TeamStatusRow } from "./chat/StatusFooter.js";
 import type { LocalTranscriptItem, PromptPart } from "./chat/types.js";
+import { usePromptHistory } from "./chat/usePromptHistory.js";
 import { createDefaultSlashCommands, resolveSlashCommand, slashCompletions } from "./slash/registry.js";
 import type { SlashCommand, SlashCommandContext, SlashCommandResult, SlashCompletion } from "./slash/types.js";
+import { resolveTuiTheme, type TuiTheme } from "./theme/index.js";
 
 type ShellView = "chat" | "team" | "help" | "agents" | "status";
 
@@ -23,6 +24,7 @@ export interface ChatShellOptions extends TeamLiveTuiOptions {
   modelName?: string;
   providerName?: string;
   modeName?: string;
+  themeId?: string;
 }
 
 export function ChatShellApp(props: {
@@ -85,8 +87,11 @@ export function ChatShellSurface(props: {
   const [localItems, setLocalItems] = useState<LocalTranscriptItem[]>([]);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteIndex, setPaletteIndex] = useState(0);
+  const [completionIndex, setCompletionIndex] = useState(0);
   const [messageScrollOffset, setMessageScrollOffset] = useState(0);
   const prompt = promptText(promptParts);
+  const history = usePromptHistory();
+  const theme = resolveTuiTheme(props.options?.themeId);
   const slashContext = useMemo<SlashCommandContext>(() => ({
     model: props.model,
     ...(props.options?.cwd ? { cwd: props.options.cwd } : {}),
@@ -94,9 +99,25 @@ export function ChatShellSurface(props: {
   const completions = prompt.startsWith("/")
     ? slashCompletions(commands, slashContext, prompt)
     : [];
+  const slashCompletionOpen = prompt.startsWith("/") && completions.length > 0;
+  const selectedCompletionIndex = clampIndex(completionIndex, completions.length);
   const paletteItems = slashCompletions(commands, slashContext, "/", 10);
   const firstApproval = props.runtime.chatView.pendingApprovals[0];
   const setPrompt = useMemo(() => setPromptText(setPromptParts), []);
+  const historyPromptValueRef = useRef<string | undefined>(undefined);
+  const handlePromptChange = useCallback((value: string) => {
+    if (historyPromptValueRef.current === value) {
+      setPrompt(value);
+      return;
+    }
+    historyPromptValueRef.current = undefined;
+    history.resetNavigation();
+    setPrompt(value);
+  }, [history, setPrompt]);
+  const setPromptFromHistory = useCallback((value: string) => {
+    historyPromptValueRef.current = value;
+    setPrompt(value);
+  }, [setPrompt]);
   const bottomAnchor = useMemo(() => {
     const lastItem = props.runtime.chatView.items.at(-1);
     const lastStatus = lastItem?.kind === "tool"
@@ -110,6 +131,27 @@ export function ChatShellSurface(props: {
   useEffect(() => {
     setMessageScrollOffset(0);
   }, [bottomAnchor]);
+
+  useEffect(() => {
+    setCompletionIndex(0);
+  }, [prompt]);
+
+  useEffect(() => {
+    setCompletionIndex((current) => clampIndex(current, completions.length));
+  }, [completions.length]);
+
+  const disabledReason = prompt.startsWith("/")
+    ? undefined
+    : props.runtime.chatView.pendingApprovals.length > 0
+      ? "Resolve approval to continue"
+      : props.runtime.chatView.status === "running"
+        ? "Session running - ctrl+x interrupt"
+        : props.runtime.submitBlockedReason
+          ? props.runtime.submitBlockedReason
+        : !props.runtime.canSubmit
+          ? "Waiting for runtime"
+          : undefined;
+  const promptDisabled = Boolean(disabledReason);
 
   useKeyboard((key) => {
     if (key.eventType !== "press") return;
@@ -126,14 +168,6 @@ export function ChatShellSurface(props: {
       setPaletteIndex(0);
       return;
     }
-    if (view === "chat" && key.ctrl && key.name === "y") {
-      setMessageScrollOffset((current) => current + scrollStep(dimensions.height));
-      return;
-    }
-    if (view === "chat" && key.ctrl && key.name === "v") {
-      setMessageScrollOffset((current) => Math.max(0, current - scrollStep(dimensions.height)));
-      return;
-    }
     if (view === "team") {
       if (isEscape(key)) setView("chat");
       return;
@@ -145,8 +179,29 @@ export function ChatShellSurface(props: {
       }, () => setPaletteOpen(false));
       return;
     }
+    if (slashCompletionOpen && !key.shift && (isArrowUp(key) || isArrowDown(key))) {
+      const delta = isArrowUp(key) ? -1 : 1;
+      setCompletionIndex((current) => clampIndex(current + delta, completions.length));
+      return;
+    }
+    if (slashCompletionOpen && isTab(key)) {
+      const completion = completions[selectedCompletionIndex] ?? completions[0];
+      if (completion) {
+        history.resetNavigation();
+        setPrompt(`${completion.value} `);
+      }
+      return;
+    }
     if (isEscape(key)) {
       if (view !== "chat") setView("chat");
+      return;
+    }
+    if (view === "chat" && key.ctrl && key.name === "y") {
+      setMessageScrollOffset((current) => current + scrollStep(dimensions.height));
+      return;
+    }
+    if (view === "chat" && key.ctrl && key.name === "v") {
+      setMessageScrollOffset((current) => Math.max(0, current - scrollStep(dimensions.height)));
       return;
     }
     if (view === "chat" && (isPageUp(key) || (key.shift && isArrowUp(key)))) {
@@ -157,16 +212,22 @@ export function ChatShellSurface(props: {
       setMessageScrollOffset((current) => Math.max(0, current - scrollStep(dimensions.height)));
       return;
     }
+    if (view === "chat" && !promptDisabled && isPlainArrowUp(key) && !slashCompletionOpen) {
+      const previous = history.previous(prompt);
+      if (previous !== undefined) setPromptFromHistory(previous);
+      return;
+    }
+    if (view === "chat" && !promptDisabled && isPlainArrowDown(key) && !slashCompletionOpen) {
+      const next = history.next(prompt);
+      if (next !== undefined) setPromptFromHistory(next);
+      return;
+    }
     if (!prompt && firstApproval && key.name === "a") {
       void props.runtime.approveApproval(firstApproval.id);
       return;
     }
     if (!prompt && firstApproval && key.name === "x") {
       void props.runtime.rejectApproval(firstApproval.id);
-      return;
-    }
-    if (isTab(key) && completions[0]) {
-      setPrompt(`${completions[0].value} `);
       return;
     }
   });
@@ -195,29 +256,18 @@ export function ChatShellSurface(props: {
     && localItems.length === 0
     && props.runtime.chatView.pendingApprovals.length === 0
     && view === "chat";
-  const disabledReason = prompt.startsWith("/")
-    ? undefined
-    : props.runtime.chatView.pendingApprovals.length > 0
-      ? "Resolve approval to continue"
-      : props.runtime.chatView.status === "running"
-        ? "Session running - ctrl+x interrupt"
-        : props.runtime.submitBlockedReason
-          ? props.runtime.submitBlockedReason
-        : !props.runtime.canSubmit
-          ? "Waiting for runtime"
-          : undefined;
-
   return (
-    <box width="100%" height="100%" flexDirection="column" backgroundColor="#050505">
+    <box width="100%" height="100%" flexDirection="column" backgroundColor={theme.colors.background}>
       {home ? (
         <HomeScreen
           width={dimensions.width}
           height={dimensions.height}
           prompt={prompt}
           focused={view === "chat" && !paletteOpen && !disabledReason}
-          onPromptChange={setPrompt}
-          onSubmit={() => void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, setLocalItems, setPrompt)}
+          onPromptChange={handlePromptChange}
+          onSubmit={() => void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, setLocalItems, setPrompt, history.record)}
           completions={completions}
+          completionIndex={selectedCompletionIndex}
           paletteOpen={paletteOpen}
           paletteItems={paletteItems}
           paletteIndex={paletteIndex}
@@ -225,6 +275,7 @@ export function ChatShellSurface(props: {
           options={shellOptions}
           runtime={props.runtime}
           disabledReason={disabledReason}
+          theme={theme}
         />
       ) : (
         <SessionScreen
@@ -233,10 +284,10 @@ export function ChatShellSurface(props: {
           view={view}
           prompt={prompt}
           focused={view === "chat" && !paletteOpen && !disabledReason}
-          onPromptChange={setPrompt}
+          onPromptChange={handlePromptChange}
           onSubmit={() => {
             setMessageScrollOffset(0);
-            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, setLocalItems, setPrompt);
+            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, setLocalItems, setPrompt, history.record);
           }}
           onMessageScroll={(event) => {
             const direction = event.scroll?.direction;
@@ -254,6 +305,7 @@ export function ChatShellSurface(props: {
           localItems={localItems}
           messageScrollOffset={messageScrollOffset}
           completions={completions}
+          completionIndex={selectedCompletionIndex}
           paletteOpen={paletteOpen}
           paletteItems={paletteItems}
           paletteIndex={paletteIndex}
@@ -262,6 +314,7 @@ export function ChatShellSurface(props: {
           runtime={props.runtime}
           commands={commands}
           disabledReason={disabledReason}
+          theme={theme}
         />
       )}
     </box>
@@ -276,6 +329,7 @@ function HomeScreen(props: {
   onPromptChange: (value: string) => void;
   onSubmit: () => void;
   completions: readonly SlashCompletion[];
+  completionIndex: number;
   paletteOpen: boolean;
   paletteItems: readonly SlashCompletion[];
   paletteIndex: number;
@@ -283,6 +337,7 @@ function HomeScreen(props: {
   runtime: ChatRuntimeState;
   options: { modeName: string; modelName: string; providerName: string; cwd: string };
   disabledReason?: string | undefined;
+  theme: TuiTheme;
 }) {
   const promptWidth = Math.min(76, Math.max(42, props.width - 12));
   const compactBrand = props.width < 92 || props.height < 32;
@@ -292,7 +347,7 @@ function HomeScreen(props: {
       <box width="100%" flexDirection="column" alignItems="center">
         <BrandMark compact={compactBrand} />
         <box height={1} />
-        <text fg="#f8f8f2" wrapMode="none" truncate>{"Chili"}</text>
+        <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Chili"}</text>
         <box height={1} />
         <PromptComposer
           width={promptWidth}
@@ -303,16 +358,18 @@ function HomeScreen(props: {
           onPromptChange={props.onPromptChange}
           onSubmit={props.onSubmit}
           completions={props.completions}
+          completionIndex={props.completionIndex}
           paletteOpen={props.paletteOpen}
           paletteItems={props.paletteItems}
           paletteIndex={props.paletteIndex}
           feedback={currentFeedback(props.runtime)}
+          theme={props.theme}
         />
-        <text fg="#7d8590" wrapMode="none" truncate>{`${props.options.modeName} | ${props.options.modelName} | ${props.options.providerName}`}</text>
+        <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`${props.options.modeName} | ${props.options.modelName} | ${props.options.providerName}`}</text>
       </box>
       <box flexGrow={3} />
-      <TeamStatusRow model={props.model} />
-      <StatusFooter options={props.options} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} />
+      <TeamStatusRow model={props.model} theme={props.theme} />
+      <StatusFooter options={props.options} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} theme={props.theme} />
     </box>
   );
 }
@@ -329,6 +386,7 @@ function SessionScreen(props: {
   localItems: readonly LocalTranscriptItem[];
   messageScrollOffset: number;
   completions: readonly SlashCompletion[];
+  completionIndex: number;
   paletteOpen: boolean;
   paletteItems: readonly SlashCompletion[];
   paletteIndex: number;
@@ -337,10 +395,11 @@ function SessionScreen(props: {
   options: { modeName: string; modelName: string; providerName: string; cwd: string };
   commands: readonly SlashCommand[];
   disabledReason?: string | undefined;
+  theme: TuiTheme;
 }) {
   const promptWidth = Math.min(96, Math.max(42, props.width - 8));
   const messageWidth = Math.max(24, props.width - 8);
-  const approvalHeight = approvalDockHeight(props.runtime.chatView.pendingApprovals, messageWidth);
+  const approvalHeight = approvalDockHeight(props.runtime.chatView.pendingApprovals, messageWidth, props.theme);
   const visibleLimit = Math.max(4, props.height - 8 - approvalHeight);
   return (
     <box
@@ -353,11 +412,11 @@ function SessionScreen(props: {
     >
       <box flexGrow={1} flexDirection="column" paddingX={3} paddingY={1}>
         {props.view === "help" ? (
-          <HelpView commands={props.commands} />
+          <HelpView commands={props.commands} theme={props.theme} />
         ) : props.view === "status" ? (
-          <StatusView model={props.model} runtime={props.runtime} options={props.options} />
+          <StatusView model={props.model} runtime={props.runtime} options={props.options} theme={props.theme} />
         ) : props.view === "agents" ? (
-          <AgentsView model={props.model} />
+          <AgentsView model={props.model} theme={props.theme} />
         ) : (
           <MessageList
             chatView={props.runtime.chatView}
@@ -365,6 +424,7 @@ function SessionScreen(props: {
             width={messageWidth}
             visibleLimit={visibleLimit}
             scrollOffset={props.messageScrollOffset}
+            theme={props.theme}
           />
         )}
       </box>
@@ -373,8 +433,9 @@ function SessionScreen(props: {
         width={messageWidth}
         onApprove={(approvalId: ApprovalId) => void props.runtime.approveApproval(approvalId)}
         onReject={(approvalId: ApprovalId) => void props.runtime.rejectApproval(approvalId)}
+        theme={props.theme}
       />
-      <TeamStatusRow model={props.model} />
+      <TeamStatusRow model={props.model} theme={props.theme} />
       <box width="100%" alignItems="center" flexDirection="column">
         <PromptComposer
           width={promptWidth}
@@ -385,29 +446,31 @@ function SessionScreen(props: {
           onPromptChange={props.onPromptChange}
           onSubmit={props.onSubmit}
           completions={props.completions}
+          completionIndex={props.completionIndex}
           paletteOpen={props.paletteOpen}
           paletteItems={props.paletteItems}
           paletteIndex={props.paletteIndex}
           feedback={currentFeedback(props.runtime)}
+          theme={props.theme}
         />
       </box>
-      <StatusFooter options={props.options} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} />
+      <StatusFooter options={props.options} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} theme={props.theme} />
     </box>
   );
 }
 
-function HelpView(props: { commands: readonly SlashCommand[] }) {
+function HelpView(props: { commands: readonly SlashCommand[]; theme: TuiTheme }) {
   return (
     <box width="100%" height="100%" flexDirection="column">
-      <text fg="#f8f8f2" wrapMode="none" truncate>{"Commands"}</text>
+      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Commands"}</text>
       <box height={1} />
       {props.commands.filter((command) => !command.hidden).map((command) => (
-        <text key={command.name} fg="#d8dee9" wrapMode="none" truncate>
+        <text key={command.name} fg={props.theme.colors.text.secondary} wrapMode="none" truncate>
           {`/${command.name.padEnd(12)} ${command.description}`}
         </text>
       ))}
       <box height={1} />
-      <text fg="#7d8590" wrapMode="none" truncate>{"Esc closes views. Ctrl+P opens commands. Tab accepts the first slash completion."}</text>
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"Esc closes views. Ctrl+P opens commands. Tab accepts the selected slash completion."}</text>
     </box>
   );
 }
@@ -416,35 +479,36 @@ function StatusView(props: {
   model: TeamLiveView;
   runtime: ChatRuntimeState;
   options: { modeName: string; modelName: string; providerName: string; cwd: string };
+  theme: TuiTheme;
 }) {
   const selected = props.model.selected;
   return (
     <box width="100%" height="100%" flexDirection="column">
-      <text fg="#f8f8f2" wrapMode="none" truncate>{"Status"}</text>
+      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Status"}</text>
       <box height={1} />
-      <text fg="#d8dee9" wrapMode="none" truncate>{`connection: ${props.model.connection.status}`}</text>
-      <text fg="#d8dee9" wrapMode="none" truncate>{`session: ${props.runtime.activeSessionId ?? "none"}`}</text>
-      <text fg="#d8dee9" wrapMode="none" truncate>{`thread: ${props.runtime.activeThreadId ?? "none"}`}</text>
-      <text fg="#d8dee9" wrapMode="none" truncate>{`mode: ${props.options.modeName}`}</text>
-      <text fg="#d8dee9" wrapMode="none" truncate>{`model: ${props.options.modelName}`}</text>
-      <text fg="#d8dee9" wrapMode="none" truncate>{`provider: ${props.options.providerName}`}</text>
-      <text fg="#d8dee9" wrapMode="none" truncate>{`cwd: ${props.options.cwd}`}</text>
-      <text fg="#d8dee9" wrapMode="none" truncate>{`team: ${selected?.team.name ?? selected?.team.id ?? "none"}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`connection: ${props.model.connection.status}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`session: ${props.runtime.activeSessionId ?? "none"}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thread: ${props.runtime.activeThreadId ?? "none"}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`mode: ${props.options.modeName}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`model: ${props.options.modelName}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`provider: ${props.options.providerName}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`cwd: ${props.options.cwd}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`team: ${selected?.team.name ?? selected?.team.id ?? "none"}`}</text>
     </box>
   );
 }
 
-function AgentsView(props: { model: TeamLiveView }) {
+function AgentsView(props: { model: TeamLiveView; theme: TuiTheme }) {
   const members = props.model.selected?.members ?? [];
   return (
     <box width="100%" height="100%" flexDirection="column">
-      <text fg="#f8f8f2" wrapMode="none" truncate>{"Agents"}</text>
+      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Agents"}</text>
       <box height={1} />
       {members.length === 0 ? (
-        <text fg="#7d8590" wrapMode="none" truncate>{"No active agents yet."}</text>
+        <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"No active agents yet."}</text>
       ) : (
         members.slice(0, 10).map((member) => (
-          <text key={member.id} fg="#d8dee9" wrapMode="none" truncate>
+          <text key={member.id} fg={props.theme.colors.text.secondary} wrapMode="none" truncate>
             {`${member.isLead ? "lead" : "agent"} ${member.name ?? member.path} ${member.status}`}
           </text>
         ))
@@ -462,6 +526,7 @@ async function submitPrompt(
   setView: (view: ShellView) => void,
   setLocalItems: (update: (current: LocalTranscriptItem[]) => LocalTranscriptItem[]) => void,
   setPrompt: (value: string | ((current: string) => string)) => void,
+  onAccepted?: (text: string) => void,
 ): Promise<void> {
   const trimmed = prompt.trim();
   if (!trimmed) return;
@@ -475,7 +540,10 @@ async function submitPrompt(
     return;
   }
   const accepted = await runtime.submitPrompt(trimmed);
-  if (accepted) setPrompt("");
+  if (accepted) {
+    onAccepted?.(trimmed);
+    setPrompt("");
+  }
 }
 
 async function runSlashInput(
@@ -626,6 +694,18 @@ function isArrowDown(key: KeyEvent): boolean {
   return key.name === "down" || key.name === "arrow_down";
 }
 
+function isPlainArrowUp(key: KeyEvent): boolean {
+  return isArrowUp(key) && !hasModifier(key);
+}
+
+function isPlainArrowDown(key: KeyEvent): boolean {
+  return isArrowDown(key) && !hasModifier(key);
+}
+
+function hasModifier(key: KeyEvent): boolean {
+  return Boolean(key.shift || key.ctrl || key.meta || key.super || key.hyper || key.option);
+}
+
 function isPageUp(key: KeyEvent): boolean {
   return key.name === "pageup" || key.name === "page_up" || key.name === "page-up";
 }
@@ -636,4 +716,8 @@ function isPageDown(key: KeyEvent): boolean {
 
 function scrollStep(height: number): number {
   return Math.max(4, Math.floor(height / 2));
+}
+
+function clampIndex(index: number, length: number): number {
+  return Math.min(Math.max(0, index), Math.max(0, length - 1));
 }

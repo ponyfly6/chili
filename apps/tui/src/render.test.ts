@@ -3,6 +3,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import type { SessionId, ThreadId } from "@chili/protocol";
 import { parseArgs, teamLiveStreamInput } from "./index.js";
+import { resolveTuiTheme } from "./theme/index.js";
 
 test("parses runtime flags and keeps Team Live stream unscoped for child-session events", () => {
   const controller = new AbortController();
@@ -42,6 +43,26 @@ test("apps/tui source does not import core, server, or store packages", async ()
     const source = await readFile(file, "utf8");
     expect(source, relative(root, file)).not.toMatch(forbidden);
   }
+});
+
+test("resolves the default TUI theme", () => {
+  expect(resolveTuiTheme(undefined, {})).toMatchObject({
+    id: "chili-dark",
+    name: "Chili Dark",
+  });
+});
+
+test("falls back to the default TUI theme for unknown names", () => {
+  expect(resolveTuiTheme("does-not-exist", {})).toMatchObject({
+    id: "chili-dark",
+  });
+});
+
+test("resolves TUI theme from CHILI_TUI_THEME", () => {
+  expect(resolveTuiTheme(undefined, { CHILI_TUI_THEME: "terminal-dark" })).toMatchObject({
+    id: "terminal-dark",
+    name: "Terminal Dark",
+  });
 });
 
 async function sourceFiles(dir: string): Promise<string[]> {

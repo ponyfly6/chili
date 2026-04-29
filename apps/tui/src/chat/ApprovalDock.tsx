@@ -1,5 +1,6 @@
 import type { ApprovalId } from "@chili/protocol";
 import type { ChatApprovalRow } from "@chili/sdk";
+import type { TuiTheme } from "../theme/index.js";
 
 const MAX_APPROVAL_BODY_LINES = 3;
 
@@ -8,12 +9,13 @@ export function ApprovalDock(props: {
   width?: number;
   onApprove: (approvalId: ApprovalId) => void;
   onReject: (approvalId: ApprovalId) => void;
+  theme: TuiTheme;
 }) {
   if (props.approvals.length === 0) return null;
   const width = Math.max(24, props.width ?? 80);
-  const lines = approvalDockLines(props.approvals, width);
+  const lines = approvalDockLines(props.approvals, width, props.theme);
   return (
-    <box width="100%" height={lines.length + 2} flexDirection="column" border borderStyle="single" borderColor="#544a20" paddingX={1}>
+    <box width="100%" height={lines.length + 2} flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.warning} paddingX={1}>
       {lines.map((line) => (
         <text key={line.key} fg={line.fg} wrapMode="none" truncate>
           {line.text}
@@ -23,9 +25,9 @@ export function ApprovalDock(props: {
   );
 }
 
-export function approvalDockHeight(approvals: readonly ChatApprovalRow[], width?: number): number {
+export function approvalDockHeight(approvals: readonly ChatApprovalRow[], width: number | undefined, theme: TuiTheme): number {
   if (approvals.length === 0) return 0;
-  return approvalDockLines(approvals, Math.max(24, width ?? 80)).length + 2;
+  return approvalDockLines(approvals, Math.max(24, width ?? 80), theme).length + 2;
 }
 
 interface ApprovalDockLine {
@@ -34,11 +36,11 @@ interface ApprovalDockLine {
   fg: string;
 }
 
-function approvalDockLines(approvals: readonly ChatApprovalRow[], width: number): ApprovalDockLine[] {
+function approvalDockLines(approvals: readonly ChatApprovalRow[], width: number, theme: TuiTheme): ApprovalDockLine[] {
   const visible = approvals.slice(0, 3);
   const contentWidth = Math.max(12, width - 6);
   const lines: ApprovalDockLine[] = [
-    { key: "title", text: "Approval required", fg: "#ffd166" },
+    { key: "title", text: "Approval required", fg: theme.colors.status.pending },
   ];
   const body: ApprovalDockLine[] = [];
 
@@ -48,47 +50,47 @@ function approvalDockLines(approvals: readonly ChatApprovalRow[], width: number)
     body.push({
       key: `${approval.id}:head`,
       text: `${active ? ">" : " "} ${tool} ${approval.toolDisplayStatus ?? "waiting_permission"} (${approval.permission})`,
-      fg: active ? "#f8f8f2" : "#d8dee9",
+      fg: active ? theme.colors.text.primary : theme.colors.text.secondary,
     });
 
     if (!active) {
       const summary = approvalSummary(approval);
       const compact = summary.detail ?? summary.scope;
-      if (compact) body.push(...wrapDetail(`${approval.id}:compact`, `  ${compact}`, contentWidth, "#8f9baa"));
+      if (compact) body.push(...wrapDetail(`${approval.id}:compact`, `  ${compact}`, contentWidth, theme.colors.text.muted));
       return;
     }
 
     const summary = approvalSummary(approval);
     if (summary.command) {
-      body.push(...wrapDetail(`${approval.id}:command`, `  command: ${summary.command}`, contentWidth, "#f8f8f2"));
+      body.push(...wrapDetail(`${approval.id}:command`, `  command: ${summary.command}`, contentWidth, theme.colors.text.primary));
     }
     if (summary.path) {
-      body.push(...wrapDetail(`${approval.id}:path`, `  path: ${summary.path}`, contentWidth, "#d8dee9"));
+      body.push(...wrapDetail(`${approval.id}:path`, `  path: ${summary.path}`, contentWidth, theme.colors.text.secondary));
     }
     if (summary.pattern) {
-      body.push(...wrapDetail(`${approval.id}:pattern`, `  pattern: ${summary.pattern}`, contentWidth, "#d8dee9"));
+      body.push(...wrapDetail(`${approval.id}:pattern`, `  pattern: ${summary.pattern}`, contentWidth, theme.colors.text.secondary));
     }
     if (summary.scope && summary.scope !== summary.path) {
-      body.push(...wrapDetail(`${approval.id}:scope`, `  scope: ${summary.scope}`, contentWidth, "#d8dee9"));
+      body.push(...wrapDetail(`${approval.id}:scope`, `  scope: ${summary.scope}`, contentWidth, theme.colors.text.secondary));
     }
     if (summary.diffSummary) {
-      body.push(...wrapDetail(`${approval.id}:diff`, `  change: ${summary.diffSummary}`, contentWidth, "#d8dee9"));
+      body.push(...wrapDetail(`${approval.id}:diff`, `  change: ${summary.diffSummary}`, contentWidth, theme.colors.text.secondary));
     }
     if (!summary.command && !summary.path && !summary.pattern && !summary.scope && summary.detail) {
-      body.push(...wrapDetail(`${approval.id}:detail`, `  ${summary.detail}`, contentWidth, "#d8dee9"));
+      body.push(...wrapDetail(`${approval.id}:detail`, `  ${summary.detail}`, contentWidth, theme.colors.text.secondary));
     }
   });
 
   if (approvals.length > visible.length) {
-    body.push({ key: "more", text: `  +${approvals.length - visible.length} more approval(s)`, fg: "#8f9baa" });
+    body.push({ key: "more", text: `  +${approvals.length - visible.length} more approval(s)`, fg: theme.colors.text.muted });
   }
 
   const foldedCount = Math.max(0, body.length - MAX_APPROVAL_BODY_LINES);
   lines.push(...body.slice(0, MAX_APPROVAL_BODY_LINES));
   if (foldedCount > 0) {
-    lines.push({ key: "folded", text: `  +${foldedCount} lines folded`, fg: "#8f9baa" });
+    lines.push({ key: "folded", text: `  +${foldedCount} lines folded`, fg: theme.colors.text.muted });
   }
-  lines.push({ key: "hint", text: "a approve once | x reject", fg: "#8f9baa" });
+  lines.push({ key: "hint", text: "a approve once | x reject", fg: theme.colors.text.muted });
   return lines;
 }
 

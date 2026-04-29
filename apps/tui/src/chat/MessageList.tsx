@@ -1,5 +1,6 @@
 import type { ChatMessagePart, ChatMessageRow, ChatSessionView, ChatToolCallRow, ChatTranscriptItem } from "@chili/sdk";
 import { shorten } from "../components/helpers.js";
+import type { TuiTheme } from "../theme/index.js";
 import type { LocalTranscriptItem } from "./types.js";
 
 export function MessageList(props: {
@@ -8,9 +9,10 @@ export function MessageList(props: {
   width?: number;
   visibleLimit?: number;
   scrollOffset?: number;
+  theme: TuiTheme;
 }) {
   const allItems = [...props.chatView.items, ...props.localItems];
-  const allLines = transcriptLines(allItems, Math.max(24, props.width ?? 80));
+  const allLines = transcriptLines(allItems, Math.max(24, props.width ?? 80), props.theme);
   const limit = Math.max(1, props.visibleLimit ?? 18);
   const contentLimit = allLines.length > limit ? Math.max(1, limit - 1) : limit;
   const maxOffset = Math.max(0, allLines.length - contentLimit);
@@ -21,11 +23,11 @@ export function MessageList(props: {
   return (
     <box width="100%" height="100%" flexDirection="column">
       {lines.length === 0 ? (
-        <text fg="#6e7681" wrapMode="none" truncate>{"Start a conversation from the prompt below."}</text>
+        <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>{"Start a conversation from the prompt below."}</text>
       ) : (
         <>
           {allLines.length > contentLimit ? (
-            <text fg="#6e7681" wrapMode="none" truncate>
+            <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>
               {`History ${start + 1}-${end}/${allLines.length} PgUp/PgDn Ctrl+Y/V`}
             </text>
           ) : null}
@@ -52,24 +54,24 @@ function TranscriptLine(props: { line: TranscriptLineModel }) {
   );
 }
 
-function transcriptLines(items: readonly TranscriptSourceItem[], width: number): TranscriptLineModel[] {
+function transcriptLines(items: readonly TranscriptSourceItem[], width: number, theme: TuiTheme): TranscriptLineModel[] {
   return items.flatMap((item) => {
     if (item.kind === "local") {
       return wrapLine(`${item.level}: ${item.text}`, {
         key: item.id,
-        fg: item.level === "error" ? "#ff7b72" : "#8f9baa",
+        fg: item.level === "error" ? theme.colors.status.error : theme.colors.text.muted,
         width,
       });
     }
-    if (item.kind === "message") return messageLines(item, width);
-    if (item.kind === "tool") return toolLines(item, width);
-    return approvalLines(item, width);
+    if (item.kind === "message") return messageLines(item, width, theme);
+    if (item.kind === "tool") return toolLines(item, width, theme);
+    return approvalLines(item, width, theme);
   });
 }
 
-function messageLines(item: ChatMessageRow, width: number): TranscriptLineModel[] {
+function messageLines(item: ChatMessageRow, width: number, theme: TuiTheme): TranscriptLineModel[] {
   const role = item.role === "user" ? "You" : item.role === "assistant" ? "Assistant" : item.role;
-  const fg = item.role === "user" ? "#f8f8f2" : "#d8dee9";
+  const fg = item.role === "user" ? theme.colors.text.primary : theme.colors.text.secondary;
   const lines: TranscriptLineModel[] = [];
   for (const [index, part] of item.parts.entries()) {
     if (part.type === "text") {
@@ -82,24 +84,24 @@ function messageLines(item: ChatMessageRow, width: number): TranscriptLineModel[
       continue;
     }
     if (part.type === "reasoning") {
-      lines.push(...reasoningLines(item, part, width, index));
+      lines.push(...reasoningLines(item, part, width, index, theme));
       continue;
     }
     if (part.type === "tool_result") {
-      lines.push(...toolResultLines(`${item.kind}:${item.id}:result:${part.id}:${index}`, part.callId, part.error ?? part.output, Boolean(part.error), width));
+      lines.push(...toolResultLines(`${item.kind}:${item.id}:result:${part.id}:${index}`, part.callId, part.error ?? part.output, Boolean(part.error), width, theme));
       continue;
     }
     if (part.type === "tool_call") {
       lines.push(...wrapLine(`tool ${part.toolName} ${part.displayStatus ?? part.status}`, {
         key: `${item.kind}:${item.id}:tool:${part.id}:${index}`,
-        fg: "#8f9baa",
+        fg: theme.colors.text.muted,
         width,
       }));
       continue;
     }
     lines.push(...wrapLine(part.text, {
       key: `${item.kind}:${item.id}:summary:${part.id}:${index}`,
-      fg: "#8f9baa",
+      fg: theme.colors.text.muted,
       width,
       hangingIndent: "    ",
     }));
@@ -115,25 +117,29 @@ function messageLines(item: ChatMessageRow, width: number): TranscriptLineModel[
   return lines;
 }
 
-function reasoningLines(item: ChatMessageRow, part: Extract<ChatMessagePart, { type: "reasoning" }>, width: number, index: number): TranscriptLineModel[] {
+function reasoningLines(item: ChatMessageRow, part: Extract<ChatMessagePart, { type: "reasoning" }>, width: number, index: number, theme: TuiTheme): TranscriptLineModel[] {
   const lines: TranscriptLineModel[] = [
-    { key: `${item.kind}:${item.id}:thinking:${part.id}:${index}:label`, fg: "#7d8590", text: "Thinking" },
+    { key: `${item.kind}:${item.id}:thinking:${part.id}:${index}:label`, fg: theme.colors.text.muted, text: "Thinking" },
   ];
   lines.push(...wrapLine(`| ${part.text || "..."}`, {
     key: `${item.kind}:${item.id}:thinking:${part.id}:${index}`,
-    fg: "#7d8590",
+    fg: theme.colors.text.muted,
     width,
     hangingIndent: "| ",
   }));
   return lines;
 }
 
-function toolLines(item: ChatToolCallRow, width: number): TranscriptLineModel[] {
+function toolLines(item: ChatToolCallRow, width: number, theme: TuiTheme): TranscriptLineModel[] {
   const displayStatus = item.displayStatus ?? item.status;
   const bits = [`tool ${item.toolName}`, displayStatus];
   const detail = toolDetail(item);
   if (detail) bits.push(detail);
-  const fg = displayStatus === "failed" || displayStatus === "rejected" ? "#ff7b72" : displayStatus === "waiting_permission" ? "#ffd166" : "#8f9baa";
+  const fg = displayStatus === "failed" || displayStatus === "rejected"
+    ? theme.colors.status.error
+    : displayStatus === "waiting_permission"
+      ? theme.colors.status.pending
+      : theme.colors.text.muted;
   const lines = wrapLine(bits.join(" "), {
     key: `${item.kind}:${item.id}`,
     fg,
@@ -141,21 +147,21 @@ function toolLines(item: ChatToolCallRow, width: number): TranscriptLineModel[] 
     hangingIndent: "  ",
   });
   if (item.error) {
-    lines.push(...toolResultLines(`${item.kind}:${item.id}:error`, item.id, item.error, true, width));
+    lines.push(...toolResultLines(`${item.kind}:${item.id}:error`, item.id, item.error, true, width, theme));
   } else if (item.output) {
-    lines.push(...toolResultLines(`${item.kind}:${item.id}:output`, item.id, item.output, false, width));
+    lines.push(...toolResultLines(`${item.kind}:${item.id}:output`, item.id, item.output, false, width, theme));
   }
   return lines;
 }
 
-function approvalLines(item: Extract<ChatTranscriptItem, { kind: "approval" }>, width: number): TranscriptLineModel[] {
+function approvalLines(item: Extract<ChatTranscriptItem, { kind: "approval" }>, width: number, theme: TuiTheme): TranscriptLineModel[] {
   const tool = item.toolName ?? item.permission;
   const decision = item.decision ? ` ${item.decision}` : "";
   const summary = item.inputSummary ?? { title: tool, detail: item.patterns.join(", "), scope: item.patterns.join(", ") };
   const detail = summary.detail ?? summary.scope;
   return wrapLine(`approval ${tool} ${item.status}${decision}${detail ? ` ${detail}` : ""}`, {
     key: `${item.kind}:${item.id}`,
-    fg: item.status === "pending" ? "#ffd166" : item.decision === "deny" ? "#ff7b72" : "#8f9baa",
+    fg: item.status === "pending" ? theme.colors.status.pending : item.decision === "deny" ? theme.colors.status.error : theme.colors.text.muted,
     width,
     hangingIndent: "  ",
   });
@@ -171,8 +177,8 @@ function toolDetail(item: ChatToolCallRow): string | undefined {
   return summary.detail ?? summary.scope;
 }
 
-function toolResultLines(key: string, callId: string, value: string, error: boolean, width: number): TranscriptLineModel[] {
-  const fg = error ? "#ff7b72" : "#8f9baa";
+function toolResultLines(key: string, callId: string, value: string, error: boolean, width: number, theme: TuiTheme): TranscriptLineModel[] {
+  const fg = error ? theme.colors.status.error : theme.colors.text.muted;
   const label = error ? "error" : "result";
   if (!isLargeOutput(value)) {
     return wrapLine(`${label} ${callId}: ${shorten(value.replace(/\s+/g, " ").trim(), 140)}`, {
