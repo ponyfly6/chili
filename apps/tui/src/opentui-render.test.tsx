@@ -62,6 +62,7 @@ test("renders token usage and known context when model metadata is available", a
           turnId: "turn_usage" as TurnId,
           provider: "minimax",
           model: "MiniMax-M2.7",
+          contextWindowTokens: 204800,
           usage: { inputTokens: 20000, outputTokens: 3000, totalTokens: 23000 },
         },
         usageSummary: { inputTokens: 70000, outputTokens: 5000, totalTokens: 75000 },
@@ -72,6 +73,33 @@ test("renders token usage and known context when model metadata is available", a
   expect(frame).toContain("ctx 20.0k/205k 10%");
   expect(frame).toContain("used 75.0k");
   expect(frame).toContain("minimax/MiniMax-M2.7 Build");
+});
+
+test("renders latest context tokens without a percentage when the model limit is unavailable", async () => {
+  const frame = await renderShellFrame(teamLiveFixture(), {
+    width: 120,
+    height: 24,
+    runtime: fakeChatRuntime({
+      chatView: {
+        status: "idle",
+        items: chatMessages(1),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+        latestModelMetadata: {
+          turnId: "turn_usage_without_limit" as TurnId,
+          provider: "custom",
+          model: "custom-model",
+          usage: { inputTokens: 20000, outputTokens: 3000, totalTokens: 23000 },
+        },
+        usageSummary: { inputTokens: 70000, outputTokens: 5000, totalTokens: 75000 },
+      },
+    }),
+  });
+
+  expect(frame).toContain("ctx 20.0k  used 75.0k");
+  expect(frame).not.toContain("ctx 20.0k/");
+  expect(frame).not.toContain("10%");
 });
 
 test("keeps the input visible in a short narrow chat frame", async () => {

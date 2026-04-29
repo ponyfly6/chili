@@ -32,7 +32,7 @@ export function StatusFooter(props: {
   const compact = isCompactFooter(props.width);
   const cwd = compact ? compactCwd(props.options.cwd) : shorten(props.options.cwd, 54);
   const branch = props.options.gitBranch ?? "--";
-  const usage = usageText(props.chatView, props.options);
+  const usage = usageText(props.chatView);
   const status = sessionStatusText(props.chatView, props.canSubmit, props.model);
   const model = modelText(props.chatView, props.options, compact);
   const actionHint = compact ? "/commands" : "/ commands";
@@ -93,8 +93,8 @@ function teamStatusText(model: TeamLiveView): string | undefined {
   return parts.length > 0 ? `team ${parts.join(" ")}` : undefined;
 }
 
-function usageText(chatView: ChatSessionView, options: StatusFooterOptions): string {
-  const context = contextText(chatView.latestModelMetadata?.usage, contextWindowFor(chatView, options));
+function usageText(chatView: ChatSessionView): string {
+  const context = contextText(chatView.latestModelMetadata?.usage, contextWindowFor(chatView));
   const used = usedText(chatView.usageSummary ?? chatView.latestModelMetadata?.usage);
   return used ? `${context}  ${used}` : context;
 }
@@ -136,23 +136,9 @@ function cumulativeTokenTotal(usage: NonNullable<ChatSessionView["usageSummary"]
   return total > 0 ? total : undefined;
 }
 
-function contextWindowFor(chatView: ChatSessionView, options: StatusFooterOptions): number | undefined {
-  const provider = chatView.latestModelMetadata?.provider ?? options.providerName;
-  const model = chatView.latestModelMetadata?.model ?? options.modelName;
-  return knownContextWindowTokens(provider, model);
+function contextWindowFor(chatView: ChatSessionView): number | undefined {
+  return finiteTokenCount(chatView.latestModelMetadata?.contextWindowTokens);
 }
-
-function knownContextWindowTokens(provider: string | undefined, model: string | undefined): number | undefined {
-  if (!provider || !model) return undefined;
-  return KNOWN_CONTEXT_WINDOWS[`${provider.toLowerCase()}/${model.toLowerCase()}`];
-}
-
-const KNOWN_CONTEXT_WINDOWS: Record<string, number> = {
-  "deepseek/deepseek-v4-pro": 1048576,
-  "deepseek/deepseek-v4-flash": 1048576,
-  "minimax/minimax-m2.7": 204800,
-  "minimax/minimax-m2.7-highspeed": 204800,
-};
 
 function modelText(chatView: ChatSessionView, options: StatusFooterOptions, compact: boolean): string {
   const provider = chatView.latestModelMetadata?.provider ?? options.providerName;

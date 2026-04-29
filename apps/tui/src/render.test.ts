@@ -46,6 +46,14 @@ test("apps/tui source does not import core, server, or store packages", async ()
   }
 });
 
+test("status footer does not keep a local model context catalog", async () => {
+  const source = await readFile(join(import.meta.dir, "chat", "StatusFooter.tsx"), "utf8");
+
+  expect(source).not.toContain("KNOWN_CONTEXT_WINDOWS");
+  expect(source).not.toContain("deepseek-v4-pro");
+  expect(source).not.toContain("MiniMax-M2.7");
+});
+
 test("resolves the default TUI theme", () => {
   expect(resolveTuiTheme(undefined, {})).toMatchObject({
     id: "chili-dark",
