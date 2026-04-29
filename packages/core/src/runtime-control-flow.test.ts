@@ -73,7 +73,13 @@ test("consumes rich model streams and executes tool calls after the stream finis
   });
   const model: ModelRouter = {
     async *stream(): AsyncIterable<ModelStreamEvent> {
-      yield { type: "metadata", provider: "test", model: "rich", responseId: "resp_1" };
+      yield {
+        type: "metadata",
+        provider: "test",
+        model: "rich",
+        responseId: "resp_1",
+        contextWindowTokens: 64000,
+      };
       yield { type: "reasoning_delta", text: "think" };
       yield { type: "text_delta", text: "hel" };
       yield { type: "text_delta", text: "lo" };
@@ -125,6 +131,7 @@ test("consumes rich model streams and executes tool calls after the stream finis
       provider: "test",
       model: "rich",
       responseId: "resp_1",
+      contextWindowTokens: 64000,
     },
   ]);
   expect(textParts(store).map((part) => part.text)).toEqual(["hello"]);

@@ -740,6 +740,8 @@ export class SingleAgentRuntime implements AgentRunner {
       ...(isModelMetadataEvent(metadata) && metadata.model ? { model: metadata.model } : {}),
       ...(metadata.responseId ? { responseId: metadata.responseId } : {}),
       ...(metadata.usage ? { usage: metadata.usage } : {}),
+      ...(isModelMetadataEvent(metadata) && metadata.contextWindowTokens !== undefined ? { contextWindowTokens: metadata.contextWindowTokens } : {}),
+      ...(isModelMetadataEvent(metadata) && metadata.maxOutputTokens !== undefined ? { maxOutputTokens: metadata.maxOutputTokens } : {}),
     });
   }
 

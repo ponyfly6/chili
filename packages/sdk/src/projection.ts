@@ -1015,6 +1015,8 @@ function runtimeModelMetadata(
   assignOptional(output, "model", payload.model ?? existing?.model);
   assignOptional(output, "responseId", payload.responseId ?? existing?.responseId);
   assignOptional(output, "usage", payload.usage ? cloneModelUsage(payload.usage) : existing?.usage ? cloneModelUsage(existing.usage) : undefined);
+  assignOptional(output, "contextWindowTokens", payload.contextWindowTokens ?? existing?.contextWindowTokens);
+  assignOptional(output, "maxOutputTokens", payload.maxOutputTokens ?? existing?.maxOutputTokens);
   assignOptional(output, "sessionId", sessionId ?? existing?.sessionId);
   assignOptional(output, "threadId", threadId ?? existing?.threadId);
   return output;
@@ -1028,6 +1030,8 @@ function chatModelMetadata(metadata: RuntimeModelMetadataView): ModelMetadataPay
   assignOptional(output, "model", metadata.model);
   assignOptional(output, "responseId", metadata.responseId);
   assignOptional(output, "usage", metadata.usage ? cloneModelUsage(metadata.usage) : undefined);
+  assignOptional(output, "contextWindowTokens", metadata.contextWindowTokens);
+  assignOptional(output, "maxOutputTokens", metadata.maxOutputTokens);
   return output;
 }
 

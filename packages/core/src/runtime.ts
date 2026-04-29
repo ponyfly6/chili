@@ -71,6 +71,8 @@ export interface ModelMetadataEvent {
   model?: string;
   responseId?: string;
   usage?: ModelUsage;
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
 }
 
 export interface ModelTextDeltaEvent {

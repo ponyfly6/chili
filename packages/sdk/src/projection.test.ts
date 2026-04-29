@@ -376,6 +376,8 @@ test("projects latest model metadata and stable usage summaries for chat session
           turnId: firstTurnId,
           provider: "minimax",
           model: "MiniMax-M2.7",
+          contextWindowTokens: 204800,
+          maxOutputTokens: 131072,
         },
       },
       {
@@ -391,21 +393,34 @@ test("projects latest model metadata and stable usage summaries for chat session
         },
       },
       {
-        id: "event_metadata_second_initial",
+        id: "event_metadata_first_final",
         type: "turn.model_metadata",
         time: 4 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          turnId: firstTurnId,
+          usage: { inputTokens: 75, outputTokens: 55, totalTokens: 130 },
+        },
+      },
+      {
+        id: "event_metadata_second_initial",
+        type: "turn.model_metadata",
+        time: 5 as TimestampMs,
         sessionId,
         threadId,
         payload: {
           turnId: secondTurnId,
           provider: "deepseek",
           model: "deepseek-v4-pro",
+          contextWindowTokens: 1048576,
+          maxOutputTokens: 393216,
         },
       },
       {
         id: "event_metadata_second_update",
         type: "turn.model_metadata",
-        time: 5 as TimestampMs,
+        time: 6 as TimestampMs,
         sessionId,
         threadId,
         payload: {
@@ -425,19 +440,67 @@ test("projects latest model metadata and stable usage summaries for chat session
     provider: "deepseek",
     model: "deepseek-v4-pro",
     responseId: "response_second",
+    contextWindowTokens: 1048576,
+    maxOutputTokens: 393216,
   });
   expect(view.modelMetadataByTurn[firstTurnId]).toMatchObject({
     provider: "minimax",
     model: "MiniMax-M2.7",
     responseId: "response_first",
-    usage: { totalTokens: 120 },
+    contextWindowTokens: 204800,
+    maxOutputTokens: 131072,
+    usage: { inputTokens: 75, outputTokens: 55, totalTokens: 130 },
   });
   expect(chat.usageSummary).toMatchObject({
-    inputTokens: 80,
-    outputTokens: 65,
+    inputTokens: 85,
+    outputTokens: 70,
     cacheReadInputTokens: 2,
-    totalTokens: 145,
+    totalTokens: 155,
   });
+});
+
+test("projects model metadata without optional model limits", () => {
+  const sessionId = "session_model_metadata_limits" as SessionId;
+  const threadId = "thread_model_metadata_limits" as ThreadId;
+  const turnId = "turn_model_metadata_limits" as TurnId;
+
+  const view = reduceRuntimeEvents(
+    [
+      {
+        id: "event_metadata_limits_session",
+        type: "session.created",
+        time: 1 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { sessionId, cwd: "/repo" },
+      },
+      {
+        id: "event_metadata_limits",
+        type: "turn.model_metadata",
+        time: 2 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          turnId,
+          provider: "custom",
+          model: "unknown",
+          usage: { inputTokens: 10, outputTokens: 5 },
+        },
+      },
+    ],
+    createRuntimeView(),
+  );
+
+  const chat = chatSessionView(view, { sessionId, threadId });
+
+  expect(chat.latestModelMetadata).toMatchObject({
+    turnId,
+    provider: "custom",
+    model: "unknown",
+    usage: { inputTokens: 10, outputTokens: 5 },
+  });
+  expect(chat.latestModelMetadata?.contextWindowTokens).toBeUndefined();
+  expect(chat.latestModelMetadata?.maxOutputTokens).toBeUndefined();
 });
 
 test("projects tool-specific approval summaries for chat TUI", () => {
