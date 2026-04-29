@@ -1,9 +1,10 @@
 import type { ChatRequestStatus } from "../useChatRuntime.js";
 import type { SlashCompletion } from "../slash/types.js";
 import type { TuiTheme } from "../theme/index.js";
-import { CommandList } from "./CommandList.js";
+import { commandListHeight, DEFAULT_COMMAND_LIST_MAX_ITEMS, CommandList } from "./CommandList.js";
 
 export const PROMPT_PLACEHOLDER = 'Ask anything... "fix failing tests"';
+export const PROMPT_INPUT_HEIGHT = 3;
 
 export function PromptComposer(props: {
   width: number;
@@ -20,22 +21,32 @@ export function PromptComposer(props: {
   feedback?: { status: ChatRequestStatus | string; message: string } | undefined;
   completionIndex: number;
   theme: TuiTheme;
+  maxCommandItems?: number | undefined;
 }) {
   const colors = props.theme.colors;
   const placeholder = props.disabled && props.disabledReason ? props.disabledReason : PROMPT_PLACEHOLDER;
+  const maxCommandItems = props.maxCommandItems ?? DEFAULT_COMMAND_LIST_MAX_ITEMS;
+  const compactCommands = props.width < 72;
+  const height = promptComposerHeight({
+    completions: props.completions,
+    paletteOpen: props.paletteOpen,
+    paletteItems: props.paletteItems,
+    feedback: props.feedback,
+    maxCommandItems,
+  });
   return (
-    <box width={props.width} flexDirection="column">
-      {props.paletteOpen ? (
-        <CommandList title="Command Palette" items={props.paletteItems} selectedIndex={props.paletteIndex} theme={props.theme} />
-      ) : props.completions.length > 0 ? (
-        <CommandList title="Commands" items={props.completions} selectedIndex={props.completionIndex} theme={props.theme} />
-      ) : null}
+    <box width={props.width} height={height} flexDirection="column">
       {props.feedback ? (
         <text fg={feedbackColor(props.feedback.status, props.theme)} wrapMode="none" truncate>
           {props.feedback.status === "error" ? props.feedback.message : `${props.feedback.status}: ${props.feedback.message}`}
         </text>
       ) : null}
-      <box width="100%" height={3} border borderStyle="single" borderColor={props.disabled ? colors.input.disabledBorder : colors.border.default} paddingX={1} alignItems="center">
+      {props.paletteOpen ? (
+        <CommandList title="Command Palette" items={props.paletteItems} selectedIndex={props.paletteIndex} maxItems={maxCommandItems} compact={compactCommands} theme={props.theme} />
+      ) : props.completions.length > 0 ? (
+        <CommandList title="Commands" items={props.completions} selectedIndex={props.completionIndex} maxItems={maxCommandItems} compact={compactCommands} theme={props.theme} />
+      ) : null}
+      <box width="100%" height={PROMPT_INPUT_HEIGHT} border borderStyle="single" borderColor={props.disabled ? colors.input.disabledBorder : colors.border.default} paddingX={1} alignItems="center">
         <text fg={props.disabled ? colors.input.disabledText : colors.input.text} wrapMode="none" truncate>{"> "}</text>
         {props.disabled ? (
           <text fg={colors.input.disabledText} wrapMode="none" truncate>{props.prompt || placeholder}</text>
@@ -61,6 +72,21 @@ export function PromptComposer(props: {
       </box>
     </box>
   );
+}
+
+export function promptComposerHeight(input: {
+  completions: readonly SlashCompletion[];
+  paletteOpen: boolean;
+  paletteItems: readonly SlashCompletion[];
+  feedback?: unknown;
+  maxCommandItems?: number | undefined;
+}): number {
+  const maxCommandItems = input.maxCommandItems ?? DEFAULT_COMMAND_LIST_MAX_ITEMS;
+  const commandItems = input.paletteOpen ? input.paletteItems : input.completions;
+  const commandHeight = input.paletteOpen || input.completions.length > 0
+    ? commandListHeight(commandItems, maxCommandItems)
+    : 0;
+  return PROMPT_INPUT_HEIGHT + commandHeight + (input.feedback ? 1 : 0);
 }
 
 function feedbackColor(status: string, theme: TuiTheme): string {

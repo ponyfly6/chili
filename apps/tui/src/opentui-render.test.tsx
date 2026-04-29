@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import { act } from "react";
 import { createRuntimeView, type ChatTranscriptItem, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
-import type { ApprovalId, MessageId, PartId, TaskId, ToolCallId } from "@chili/protocol";
+import type { ApprovalId, MessageId, PartId, TaskId, ToolCallId, TurnId } from "@chili/protocol";
 import { ChatShellSurface } from "./ChatShellApp.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import type { ChatRuntimeState } from "./useChatRuntime.js";
@@ -36,6 +36,62 @@ test("chat prompt exposes a native renderer cursor", async () => {
   } finally {
     app.renderer.destroy();
   }
+});
+
+test("renders fielded chat footer with cwd status model and usage fallback", async () => {
+  const frame = await renderShellFrame(teamLiveFixture(), { width: 120, height: 24 });
+
+  expect(frame).toContain("/repo/chili");
+  expect(frame).toContain("idle");
+  expect(frame).toContain("ctx --");
+  expect(frame).toContain("test-provider/test-model Build");
+});
+
+test("renders token usage and known context when model metadata is available", async () => {
+  const frame = await renderShellFrame(teamLiveFixture(), {
+    width: 120,
+    height: 24,
+    runtime: fakeChatRuntime({
+      chatView: {
+        status: "idle",
+        items: chatMessages(1),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+        latestModelMetadata: {
+          turnId: "turn_usage" as TurnId,
+          provider: "minimax",
+          model: "MiniMax-M2.7",
+          usage: { inputTokens: 20000, outputTokens: 3000, totalTokens: 23000 },
+        },
+        usageSummary: { inputTokens: 70000, outputTokens: 5000, totalTokens: 75000 },
+      },
+    }),
+  });
+
+  expect(frame).toContain("ctx 20.0k/205k 10%");
+  expect(frame).toContain("used 75.0k");
+  expect(frame).toContain("minimax/MiniMax-M2.7 Build");
+});
+
+test("keeps the input visible in a short narrow chat frame", async () => {
+  const frame = await renderShellFrame(teamLiveFixture(), {
+    width: 64,
+    height: 12,
+    runtime: fakeChatRuntime({
+      chatView: {
+        status: "idle",
+        items: chatMessages(8),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    }),
+  });
+
+  expect(frame).toContain("Ask anything");
+  expect(frame).toContain("ctx --");
+  expect(lineCount(frame)).toBe(12);
 });
 
 test("renders chat shell action feedback", async () => {
@@ -246,7 +302,6 @@ test("folds long approval details without hiding the prompt", async () => {
   expect(frame).toContain("Approval required");
   expect(frame).toContain("lines folded");
   expect(frame).toContain("Resolve approval to continue");
-  expect(frame).toContain("ctrl+p");
   expect(frame).toContain("commands");
 });
 

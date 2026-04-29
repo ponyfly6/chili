@@ -3,6 +3,8 @@ import { useKeyboard, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, MouseEvent } from "@opentui/core";
 import type { HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
 import type { ApprovalId, TeamId } from "@chili/protocol";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import { teamLiveModel, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
 import { useChatRuntime, type ChatRuntimeState } from "./useChatRuntime.js";
@@ -10,8 +12,8 @@ import { findAction } from "./components/helpers.js";
 import { ApprovalDock, approvalDockHeight } from "./chat/ApprovalDock.js";
 import { BrandMark } from "./chat/BrandMark.js";
 import { MessageList } from "./chat/MessageList.js";
-import { PROMPT_PLACEHOLDER, PromptComposer } from "./chat/PromptComposer.js";
-import { StatusFooter, TeamStatusRow } from "./chat/StatusFooter.js";
+import { PROMPT_INPUT_HEIGHT, PROMPT_PLACEHOLDER, PromptComposer, promptComposerHeight } from "./chat/PromptComposer.js";
+import { StatusFooter, statusFooterHeight, type StatusFooterOptions } from "./chat/StatusFooter.js";
 import type { LocalTranscriptItem, PromptPart } from "./chat/types.js";
 import { usePromptHistory } from "./chat/usePromptHistory.js";
 import { createDefaultSlashCommands, resolveSlashCommand, slashCompletions } from "./slash/registry.js";
@@ -32,9 +34,13 @@ export interface ChatShellOptions extends TeamLiveTuiOptions {
   modelName?: string;
   providerName?: string;
   modeName?: string;
+  gitBranch?: string;
   themeId?: string;
   systemTheme?: TuiTheme;
 }
+
+const execFileAsync = promisify(execFile);
+const PROMPT_MENU_MAX_ITEMS = 5;
 
 export function ChatShellApp(props: {
   client: HttpRuntimeClient;
@@ -97,6 +103,8 @@ export function ChatShellSurface(props: {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteIndex, setPaletteIndex] = useState(0);
   const [completionIndex, setCompletionIndex] = useState(0);
+  const [acceptedCompletionPrompt, setAcceptedCompletionPrompt] = useState<string | undefined>(undefined);
+  const acceptedCompletionPromptRef = useRef<string | undefined>(undefined);
   const [themeId, setThemeId] = useState(() => initialTuiThemeId(props.options?.themeId));
   const [themePicker, setThemePicker] = useState<ThemePickerNavigation | undefined>(undefined);
   const [messageScrollOffset, setMessageScrollOffset] = useState(0);
@@ -110,7 +118,8 @@ export function ChatShellSurface(props: {
     model: props.model,
     ...(props.options?.cwd ? { cwd: props.options.cwd } : {}),
   }), [props.model, props.options?.cwd]);
-  const completions = prompt.startsWith("/")
+  const completionSuppressed = acceptedCompletionPrompt !== undefined && prompt === acceptedCompletionPrompt;
+  const completions = prompt.startsWith("/") && !completionSuppressed
     ? slashCompletions(commands, slashContext, prompt)
     : [];
   const slashCompletionOpen = prompt.startsWith("/") && completions.length > 0;
@@ -119,7 +128,12 @@ export function ChatShellSurface(props: {
   const firstApproval = props.runtime.chatView.pendingApprovals[0];
   const setPrompt = useMemo(() => setPromptText(setPromptParts), []);
   const historyPromptValueRef = useRef<string | undefined>(undefined);
+  const updateAcceptedCompletionPrompt = useCallback((value: string | undefined) => {
+    acceptedCompletionPromptRef.current = value;
+    setAcceptedCompletionPrompt(value);
+  }, []);
   const handlePromptChange = useCallback((value: string) => {
+    if (value !== acceptedCompletionPromptRef.current) updateAcceptedCompletionPrompt(undefined);
     if (historyPromptValueRef.current === value) {
       setPrompt(value);
       return;
@@ -127,11 +141,12 @@ export function ChatShellSurface(props: {
     historyPromptValueRef.current = undefined;
     history.resetNavigation();
     setPrompt(value);
-  }, [history, setPrompt]);
+  }, [history, setPrompt, updateAcceptedCompletionPrompt]);
   const setPromptFromHistory = useCallback((value: string) => {
+    updateAcceptedCompletionPrompt(undefined);
     historyPromptValueRef.current = value;
     setPrompt(value);
-  }, [setPrompt]);
+  }, [setPrompt, updateAcceptedCompletionPrompt]);
   const openThemePicker = useCallback(() => {
     const index = themeOptionIndex(themeOptions, themeId);
     setThemePicker({
@@ -171,6 +186,12 @@ export function ChatShellSurface(props: {
   useEffect(() => {
     setCompletionIndex(0);
   }, [prompt]);
+
+  useEffect(() => {
+    if (acceptedCompletionPrompt !== undefined && prompt !== acceptedCompletionPrompt) {
+      updateAcceptedCompletionPrompt(undefined);
+    }
+  }, [acceptedCompletionPrompt, prompt, updateAcceptedCompletionPrompt]);
 
   useEffect(() => {
     setCompletionIndex((current) => clampIndex(current, completions.length));
@@ -239,8 +260,10 @@ export function ChatShellSurface(props: {
     if (slashCompletionOpen && isTab(key)) {
       const completion = completions[selectedCompletionIndex] ?? completions[0];
       if (completion) {
+        const accepted = `${completion.value} `;
         history.resetNavigation();
-        setPrompt(`${completion.value} `);
+        updateAcceptedCompletionPrompt(accepted);
+        setPrompt(accepted);
       }
       return;
     }
@@ -284,6 +307,16 @@ export function ChatShellSurface(props: {
     }
   });
 
+  const cwd = props.options?.cwd ?? process.cwd();
+  const gitBranch = useGitBranch(cwd, props.options?.gitBranch);
+  const shellOptions: StatusFooterOptions = {
+    modeName: props.options?.modeName ?? "Build",
+    modelName: props.options?.modelName ?? "auto",
+    providerName: props.options?.providerName ?? "runtime",
+    cwd,
+    ...(gitBranch ? { gitBranch } : {}),
+  };
+
   if (view === "team") {
     return (
       <TeamLiveSurface
@@ -298,12 +331,6 @@ export function ChatShellSurface(props: {
     );
   }
 
-  const shellOptions = {
-    modeName: props.options?.modeName ?? "Build",
-    modelName: props.options?.modelName ?? "auto",
-    providerName: props.options?.providerName ?? "runtime",
-    cwd: props.options?.cwd ?? process.cwd(),
-  };
   const home = props.runtime.chatView.items.length === 0
     && localItems.length === 0
     && props.runtime.chatView.pendingApprovals.length === 0
@@ -397,13 +424,24 @@ function HomeScreen(props: {
   paletteIndex: number;
   model: TeamLiveView;
   runtime: ChatRuntimeState;
-  options: { modeName: string; modelName: string; providerName: string; cwd: string };
+  options: StatusFooterOptions;
   disabledReason?: string | undefined;
   theme: TuiTheme;
   themePicker?: ThemePickerModel | undefined;
 }) {
   const promptWidth = Math.min(76, Math.max(42, props.width - 12));
   const compactBrand = props.width < 92 || props.height < 32;
+  const feedback = currentFeedback(props.runtime);
+  const footerHeight = statusFooterHeight(props.width);
+  const themePickerHeight = props.themePicker ? pickerHeight(props.themePicker.items.length) : 0;
+  const maxCommandItems = promptMenuItemLimit({
+    height: props.height,
+    footerHeight,
+    approvalHeight: 0,
+    themePickerHeight,
+    feedback: Boolean(feedback),
+    menuOpen: props.paletteOpen || props.completions.length > 0,
+  });
   return (
     <box width="100%" height="100%" flexDirection="column">
       <box flexGrow={2} />
@@ -426,14 +464,13 @@ function HomeScreen(props: {
           paletteOpen={props.paletteOpen}
           paletteItems={props.paletteItems}
           paletteIndex={props.paletteIndex}
-          feedback={currentFeedback(props.runtime)}
+          feedback={feedback}
           theme={props.theme}
+          maxCommandItems={maxCommandItems}
         />
-        <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`${props.options.modeName} | ${props.options.modelName} | ${props.options.providerName}`}</text>
       </box>
       <box flexGrow={3} />
-      <TeamStatusRow model={props.model} theme={props.theme} />
-      <StatusFooter options={props.options} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} theme={props.theme} />
+      <StatusFooter options={props.options} model={props.model} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} />
     </box>
   );
 }
@@ -456,7 +493,7 @@ function SessionScreen(props: {
   paletteIndex: number;
   model: TeamLiveView;
   runtime: ChatRuntimeState;
-  options: { modeName: string; modelName: string; providerName: string; cwd: string };
+  options: StatusFooterOptions;
   commands: readonly SlashCommand[];
   disabledReason?: string | undefined;
   theme: TuiTheme;
@@ -465,7 +502,27 @@ function SessionScreen(props: {
   const promptWidth = Math.min(96, Math.max(42, props.width - 8));
   const messageWidth = Math.max(24, props.width - 8);
   const approvalHeight = approvalDockHeight(props.runtime.chatView.pendingApprovals, messageWidth, props.theme);
-  const visibleLimit = Math.max(4, props.height - 8 - approvalHeight);
+  const feedback = currentFeedback(props.runtime);
+  const footerHeight = statusFooterHeight(props.width);
+  const themePickerHeight = props.themePicker ? pickerHeight(props.themePicker.items.length) : 0;
+  const maxCommandItems = promptMenuItemLimit({
+    height: props.height,
+    footerHeight,
+    approvalHeight,
+    themePickerHeight,
+    feedback: Boolean(feedback),
+    menuOpen: props.paletteOpen || props.completions.length > 0,
+  });
+  const promptHeight = promptComposerHeight({
+    completions: props.completions,
+    paletteOpen: props.paletteOpen,
+    paletteItems: props.paletteItems,
+    feedback,
+    maxCommandItems,
+  });
+  const messagePaneHeight = Math.max(1, props.height - approvalHeight - themePickerHeight - promptHeight - footerHeight);
+  const transcriptChrome = props.height < 16 ? 6 : 3;
+  const visibleLimit = Math.max(1, props.height - approvalHeight - themePickerHeight - promptHeight - footerHeight - transcriptChrome);
   return (
     <box
       width="100%"
@@ -475,7 +532,7 @@ function SessionScreen(props: {
         if (props.view === "chat") props.onMessageScroll(event);
       }}
     >
-      <box flexGrow={1} flexDirection="column" paddingX={3} paddingY={1}>
+      <box height={messagePaneHeight} flexDirection="column" paddingX={3} paddingY={1}>
         {props.view === "help" ? (
           <HelpView commands={props.commands} theme={props.theme} />
         ) : props.view === "status" ? (
@@ -500,7 +557,6 @@ function SessionScreen(props: {
         onReject={(approvalId: ApprovalId) => void props.runtime.rejectApproval(approvalId)}
         theme={props.theme}
       />
-      <TeamStatusRow model={props.model} theme={props.theme} />
       <box width="100%" alignItems="center" flexDirection="column">
         {props.themePicker ? <ThemePicker model={props.themePicker} theme={props.theme} /> : null}
         <PromptComposer
@@ -516,11 +572,12 @@ function SessionScreen(props: {
           paletteOpen={props.paletteOpen}
           paletteItems={props.paletteItems}
           paletteIndex={props.paletteIndex}
-          feedback={currentFeedback(props.runtime)}
+          feedback={feedback}
           theme={props.theme}
+          maxCommandItems={maxCommandItems}
         />
       </box>
-      <StatusFooter options={props.options} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} theme={props.theme} />
+      <StatusFooter options={props.options} model={props.model} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} />
     </box>
   );
 }
@@ -534,6 +591,28 @@ interface ThemePickerModel {
   items: readonly TuiThemeOption[];
   selectedIndex: number;
   systemThemeAvailable: boolean;
+}
+
+function pickerHeight(itemCount: number): number {
+  return itemCount + 3;
+}
+
+function promptMenuItemLimit(input: {
+  height: number;
+  footerHeight: number;
+  approvalHeight: number;
+  themePickerHeight: number;
+  feedback: boolean;
+  menuOpen: boolean;
+}): number {
+  if (!input.menuOpen) return PROMPT_MENU_MAX_ITEMS;
+  const reserved = input.footerHeight
+    + input.approvalHeight
+    + input.themePickerHeight
+    + PROMPT_INPUT_HEIGHT
+    + (input.feedback ? 1 : 0)
+    + 1;
+  return Math.max(1, Math.min(PROMPT_MENU_MAX_ITEMS, input.height - reserved - 3));
 }
 
 function ThemePicker(props: { model: ThemePickerModel; theme: TuiTheme }) {
@@ -578,7 +657,7 @@ function HelpView(props: { commands: readonly SlashCommand[]; theme: TuiTheme })
 function StatusView(props: {
   model: TeamLiveView;
   runtime: ChatRuntimeState;
-  options: { modeName: string; modelName: string; providerName: string; cwd: string };
+  options: StatusFooterOptions;
   theme: TuiTheme;
 }) {
   const selected = props.model.selected;
@@ -745,6 +824,33 @@ function currentFeedback(runtime: ChatRuntimeState): { status: string; message: 
   if (runtime.chatFeedback) return runtime.chatFeedback;
   if (runtime.actionFeedback) return runtime.actionFeedback;
   return undefined;
+}
+
+function useGitBranch(cwd: string, explicitBranch: string | undefined): string | undefined {
+  const [branch, setBranch] = useState<string | undefined>(explicitBranch);
+  useEffect(() => {
+    if (explicitBranch) {
+      setBranch(explicitBranch);
+      return;
+    }
+
+    let cancelled = false;
+    setBranch(undefined);
+    void execFileAsync("git", ["-C", cwd, "branch", "--show-current"], { timeout: 1000 })
+      .then(({ stdout }) => {
+        if (cancelled) return;
+        const next = String(stdout).trim();
+        setBranch(next || undefined);
+      })
+      .catch(() => {
+        if (!cancelled) setBranch(undefined);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [cwd, explicitBranch]);
+  return branch;
 }
 
 function setPromptText(setPromptParts: (value: PromptPart[] | ((current: PromptPart[]) => PromptPart[])) => void) {

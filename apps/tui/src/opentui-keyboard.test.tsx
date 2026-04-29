@@ -294,6 +294,49 @@ test("slash completion selection uses Up and Down without switching prompt histo
   }
 });
 
+test("slash completion keeps the input visible in a short frame", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    width: 72,
+    height: 12,
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "/");
+    const frame = app.captureCharFrame();
+
+    expect(frame).toContain("Commands");
+    expect(frame).toContain("/team");
+    expect(frame).toContain("> /");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("Tab accepts slash completion without leaving the completion list open", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "/");
+    expect(app.captureCharFrame()).toContain("Open the team cockpit");
+
+    await press(app, () => app.mockInput.pressTab());
+    const frame = app.captureCharFrame();
+
+    expect(frame).toContain("/team ");
+    expect(frame).not.toContain("Open the team cockpit");
+    expect(frame).not.toContain("Start the selected team loop");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("command palette selection uses Up and Down without switching prompt history", async () => {
   const app = await mountShell(teamLiveFixture(), {
     runtime: {
@@ -312,6 +355,29 @@ test("command palette selection uses Up and Down without switching prompt histor
     await press(app, () => app.mockInput.pressArrow("down"));
     expect(app.captureCharFrame()).toContain("> /team run - Start the selected team loop");
     expect(app.captureCharFrame()).not.toContain("palette history");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("command palette keeps the draft visible without entering prompt history", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "draft before palette");
+    await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
+
+    expect(app.captureCharFrame()).toContain("Command Palette");
+    expect(app.captureCharFrame()).toContain("draft before palette");
+
+    await press(app, () => app.mockInput.pressArrow("down"));
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("draft before palette");
+    expect(frame).toContain("> /team run - Start the selected team loop");
   } finally {
     app.renderer.destroy();
   }
