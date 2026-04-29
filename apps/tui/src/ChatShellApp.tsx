@@ -8,6 +8,7 @@ import { teamLiveModel, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js"
 import { useChatRuntime, type ChatRuntimeState } from "./useChatRuntime.js";
 import { findAction } from "./components/helpers.js";
 import { ApprovalDock, approvalDockHeight } from "./chat/ApprovalDock.js";
+import { BrandMark } from "./chat/BrandMark.js";
 import { CommandList } from "./chat/CommandList.js";
 import { MessageList } from "./chat/MessageList.js";
 import { PROMPT_PLACEHOLDER, PromptComposer } from "./chat/PromptComposer.js";
@@ -211,6 +212,7 @@ export function ChatShellSurface(props: {
       {home ? (
         <HomeScreen
           width={dimensions.width}
+          height={dimensions.height}
           prompt={prompt}
           focused={view === "chat" && !paletteOpen && !disabledReason}
           onPromptChange={setPrompt}
@@ -268,6 +270,7 @@ export function ChatShellSurface(props: {
 
 function HomeScreen(props: {
   width: number;
+  height: number;
   prompt: string;
   focused: boolean;
   onPromptChange: (value: string) => void;
@@ -282,12 +285,14 @@ function HomeScreen(props: {
   disabledReason?: string | undefined;
 }) {
   const promptWidth = Math.min(76, Math.max(42, props.width - 12));
+  const compactBrand = props.width < 92 || props.height < 32;
   return (
     <box width="100%" height="100%" flexDirection="column">
       <box flexGrow={2} />
       <box width="100%" flexDirection="column" alignItems="center">
+        <BrandMark compact={compactBrand} />
+        <box height={1} />
         <text fg="#f8f8f2" wrapMode="none" truncate>{"Chili"}</text>
-        <text fg="#8f9baa" wrapMode="none" truncate>{"coding agent"}</text>
         <box height={1} />
         <PromptComposer
           width={promptWidth}

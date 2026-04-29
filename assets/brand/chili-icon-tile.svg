@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Chili app icon">
+  <defs>
+    <style>
+      .tile {
+        fill: #1d2228;
+      }
+
+      .line {
+        stroke: #24282d;
+        stroke-width: 24;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      .body {
+        fill: #ff3b1f;
+      }
+
+      .shade {
+        fill: #d92518;
+        opacity: 0.42;
+      }
+
+      .stem {
+        fill: #69b34c;
+      }
+
+    </style>
+  </defs>
+
+  <rect class="tile" width="512" height="512" />
+  <g transform="translate(34 46) scale(0.88)">
+    <path
+      class="stem line"
+      d="M326 147c1-39 24-70 60-78 15-3 25 13 13 25-22 22-27 49-14 76-23 1-43-7-59-23Z"
+    />
+    <path
+      class="body line"
+      d="M338 128c61 18 90 77 66 143-35 98-140 163-276 153-26-2-32-23-9-36 79-45 99-120 126-180 23-50 53-78 93-80Z"
+    />
+    <path
+      class="shade"
+      d="M387 220c-8 44-40 89-88 123-44 32-101 51-163 54 117 8 207-47 245-126 9-18 12-35 6-51Z"
+    />
+    <path
+      class="stem line"
+      d="M288 145c28 25 64 31 101 18-13 29-44 48-78 42-15-3-27-10-36-20 4-16 8-29 13-40Z"
+    />
+  </g>
+</svg>

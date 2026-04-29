@@ -21,6 +21,8 @@ test("renders chat shell by default instead of the team cockpit", async () => {
 
   expect(frame).toContain("Ask anything");
   expect(frame).toContain("Chili");
+  expect(frame).toContain("████");
+  expect(frame).not.toContain("coding agent");
   expect(frame).not.toContain("Chili Team Live");
 });
 
