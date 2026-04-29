@@ -1,10 +1,11 @@
 import { expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import { act } from "react";
-import type { TeamLiveAction, TeamLiveView } from "@chili/sdk";
-import type { ApprovalId, TaskId } from "@chili/protocol";
+import { createRuntimeView, type ChatTranscriptItem, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
+import type { ApprovalId, MessageId, PartId, TaskId } from "@chili/protocol";
 import { ChatShellSurface } from "./ChatShellApp.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
+import type { ChatRuntimeState } from "./useChatRuntime.js";
 import type { TeamLiveSurfaceRuntime } from "./components/types.js";
 import {
   emptyTeamLiveFixture,
@@ -23,11 +24,23 @@ test("renders chat shell by default instead of the team cockpit", async () => {
   expect(frame).not.toContain("Chili Team Live");
 });
 
+test("chat prompt exposes a native renderer cursor", async () => {
+  const app = await renderShell(teamLiveFixture(), { width: 120, height: 40 });
+
+  try {
+    const cursor = app.captureSpans().cursor;
+    expect(cursor[0]).toBeGreaterThan(0);
+    expect(cursor[1]).toBeGreaterThan(0);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("renders chat shell action feedback", async () => {
   const pending = await renderShellFrame(teamLiveFixture(), {
     width: 120,
     height: 40,
-    runtime: fakeRuntime({
+    runtime: fakeChatRuntime({
       actionFeedback: { key: "run_loop:team_live", type: "run_loop", status: "pending", message: "starting team loop" },
       pendingActionKey: "run_loop:team_live",
     }),
@@ -35,21 +48,136 @@ test("renders chat shell action feedback", async () => {
   const success = await renderShellFrame(teamLiveFixture(), {
     width: 120,
     height: 40,
-    runtime: fakeRuntime({
+    runtime: fakeChatRuntime({
       actionFeedback: { key: "merge:team_live:task_live", type: "merge", status: "success", message: "merge completed" },
     }),
   });
   const error = await renderShellFrame(teamLiveFixture(), {
     width: 120,
     height: 40,
-    runtime: fakeRuntime({
+    runtime: fakeChatRuntime({
       actionFeedback: { key: "merge:team_live:task_live", type: "merge", status: "error", message: "merge failed" },
     }),
   });
 
   expect(pending).toContain("pending: starting team loop");
   expect(success).toContain("success: merge completed");
-  expect(error).toContain("error: merge failed");
+  expect(error).toContain("merge failed");
+});
+
+test("renders chat transcript as a scrollable window", async () => {
+  const app = await renderShell(teamLiveFixture(), {
+    width: 120,
+    height: 24,
+    runtime: fakeChatRuntime({
+      chatView: {
+        status: "idle",
+        items: chatMessages(30),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    }),
+  });
+
+  try {
+    expect(app.captureCharFrame()).toContain("History");
+    expect(app.captureCharFrame()).toContain("message 30");
+    expect(app.captureCharFrame()).not.toContain("message 01");
+
+    act(() => {
+      app.mockInput.pressKey("y", { ctrl: true });
+      app.mockInput.pressKey("y", { ctrl: true });
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).toContain("History");
+    expect(app.captureCharFrame()).toContain("message 01");
+    expect(app.captureCharFrame()).not.toContain("message 30");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("scrolls a long single assistant message by rendered lines", async () => {
+  const app = await renderShell(teamLiveFixture(), {
+    width: 120,
+    height: 24,
+    runtime: fakeChatRuntime({
+      chatView: {
+        status: "idle",
+        items: [longAssistantMessage(30)],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    }),
+  });
+
+  try {
+    expect(app.captureCharFrame()).toContain("History");
+    expect(app.captureCharFrame()).toContain("long line 30");
+    expect(app.captureCharFrame()).not.toContain("long line 01");
+
+    act(() => {
+      app.mockInput.pressKey("y", { ctrl: true });
+      app.mockInput.pressKey("y", { ctrl: true });
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).toContain("long line 01");
+    expect(app.captureCharFrame()).not.toContain("long line 30");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("mouse wheel scrolls the chat transcript", async () => {
+  const app = await renderShell(teamLiveFixture(), {
+    width: 120,
+    height: 24,
+    runtime: fakeChatRuntime({
+      chatView: {
+        status: "idle",
+        items: chatMessages(30),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    }),
+    useMouse: true,
+  });
+
+  try {
+    expect(app.captureCharFrame()).toContain("message 30");
+    expect(app.captureCharFrame()).not.toContain("message 01");
+
+    await act(async () => {
+      for (let index = 0; index < 8; index += 1) {
+        await app.mockMouse.scroll(10, 3, "up");
+      }
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).toContain("History");
+    expect(app.captureCharFrame()).toContain("message 01");
+    expect(app.captureCharFrame()).not.toContain("message 30");
+
+    await act(async () => {
+      for (let index = 0; index < 8; index += 1) {
+        await app.mockMouse.scroll(10, 3, "down");
+      }
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).toContain("message 30");
+  } finally {
+    app.renderer.destroy();
+  }
 });
 
 test("renders empty Team Live frame", async () => {
@@ -173,30 +301,49 @@ async function renderShellFrame(
   options: {
     width: number;
     height: number;
-    runtime?: TeamLiveSurfaceRuntime;
+    runtime?: ChatRuntimeState;
   },
 ): Promise<string> {
+  const app = await renderShell(model, options);
+
+  try {
+    return app.captureCharFrame();
+  } finally {
+    app.renderer.destroy();
+  }
+}
+
+async function renderShell(
+  model: TeamLiveView,
+  options: {
+    width: number;
+    height: number;
+    runtime?: ChatRuntimeState;
+    useMouse?: boolean;
+  },
+) {
   const app = await testRender(
     <ChatShellSurface
       model={model}
-      runtime={options.runtime ?? fakeRuntime()}
+      runtime={options.runtime ?? fakeChatRuntime()}
       selectedTeamId={model.selectedTeamId}
       selectedTeamLocked={false}
       onSelectTeam={() => undefined}
       onExit={() => undefined}
       options={{ cwd: "/repo/chili", modeName: "Build", modelName: "test-model", providerName: "test-provider" }}
     />,
-    { width: options.width, height: options.height, exitOnCtrlC: false },
+    {
+      width: options.width,
+      height: options.height,
+      exitOnCtrlC: false,
+      ...(options.useMouse === undefined ? {} : { useMouse: options.useMouse }),
+    },
   );
 
-  try {
-    await act(async () => {
-      await app.renderOnce();
-    });
-    return app.captureCharFrame();
-  } finally {
-    app.renderer.destroy();
-  }
+  await act(async () => {
+    await app.renderOnce();
+  });
+  return app;
 }
 
 function lineCount(frame: string): number {
@@ -210,6 +357,61 @@ function fakeRuntime(input: Partial<TeamLiveSurfaceRuntime> = {}): TeamLiveSurfa
     executeAction: (_action: TeamLiveAction) => undefined,
     clearActionFeedback: () => undefined,
     ...input,
+  };
+}
+
+function fakeChatRuntime(input: Partial<ChatRuntimeState> = {}): ChatRuntimeState {
+  return {
+    runtimeView: createRuntimeView(),
+    revision: 0,
+    connection: { status: "streaming", lastEventId: "event_live" },
+    message: "test stream",
+    reconnect: () => undefined,
+    executeAction: (_action: TeamLiveAction) => undefined,
+    clearActionFeedback: () => undefined,
+    chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
+    canSubmit: true,
+    submitPrompt: async () => true,
+    interruptActiveSession: async () => undefined,
+    approveApproval: async () => undefined,
+    rejectApproval: async () => undefined,
+    ...input,
+  };
+}
+
+function chatMessages(count: number): ChatTranscriptItem[] {
+  return Array.from({ length: count }, (_, index) => {
+    const number = String(index + 1).padStart(2, "0");
+    return {
+      id: `msg_${number}` as MessageId,
+      kind: "message",
+      role: index % 2 === 0 ? "user" : "assistant",
+      createdAt: index + 1,
+      parts: [
+        {
+          type: "text",
+          id: `part_${number}` as PartId,
+          text: `message ${number}`,
+        },
+      ],
+    };
+  });
+}
+
+function longAssistantMessage(lineCount: number): ChatTranscriptItem {
+  const lines = Array.from({ length: lineCount }, (_, index) => `long line ${String(index + 1).padStart(2, "0")}`);
+  return {
+    id: "msg_long" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [
+      {
+        type: "text",
+        id: "part_long" as PartId,
+        text: lines.join("\n"),
+      },
+    ],
   };
 }
 

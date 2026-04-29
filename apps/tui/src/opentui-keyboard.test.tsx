@@ -1,12 +1,267 @@
 import { expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import { act } from "react";
-import type { TeamLiveAction, TeamLiveView } from "@chili/sdk";
-import type { ApprovalId, TaskId } from "@chili/protocol";
-import { ChatShellSurface } from "./ChatShellApp.js";
+import { createRuntimeView, type HttpRuntimeClient, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
+import type { ApprovalId, ChiliEvent, MessageId, PartId, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
+import { ChatShellApp, ChatShellSurface } from "./ChatShellApp.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
+import type { ChatRuntimeState } from "./useChatRuntime.js";
 import type { TeamLiveSurfaceRuntime } from "./components/types.js";
 import { teamLiveFixture } from "./test-fixtures.js";
+
+test("plain prompt creates a session and submits through the runtime client", async () => {
+  const records = chatClientRecords();
+  const client = fakeChatClient(records);
+  const app = await mountChatApp(client);
+
+  try {
+    await typeText(app, "fix failing tests");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(records.create).toHaveLength(1);
+    expect(records.submit).toHaveLength(1);
+    expect(records.create[0]).toMatchObject({ cwd: "/repo/chili" });
+    expect(records.create[0]?.signal).toBeInstanceOf(AbortSignal);
+    expect(records.submit[0]).toMatchObject({
+      sessionId: "session_created",
+      threadId: "thread_created",
+      text: "fix failing tests",
+      cwd: "/repo/chili",
+    });
+    expect(records.submit[0]?.signal).toBeInstanceOf(AbortSignal);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("runtime connection error keeps the typed prompt visible", async () => {
+  const records = chatClientRecords();
+  const client = fakeChatClient(records, [], {
+    createError: new Error("Unable to connect. Is the computer able to access the url?"),
+  });
+  const app = await mountChatApp(client);
+
+  try {
+    await typeText(app, "hello runtime");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(records.create).toHaveLength(1);
+    expect(records.submit).toHaveLength(0);
+    expect(frame).toContain("Runtime offline at http://runtime.test");
+    expect(frame).toContain("hello runtime");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("Chinese prompt submits through native input without text drift", async () => {
+  const records = chatClientRecords();
+  const client = fakeChatClient(records);
+  const app = await mountChatApp(client);
+
+  try {
+    await typeText(app, "修复中文光标");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(records.submit[0]).toMatchObject({
+      text: "修复中文光标",
+    });
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("resume session and thread submit without creating a new session", async () => {
+  const records = chatClientRecords();
+  const client = fakeChatClient(records);
+  const app = await mountChatApp(client, {
+    sessionId: "session_resume" as SessionId,
+    threadId: "thread_resume" as ThreadId,
+  });
+
+  try {
+    await typeText(app, "continue");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(records.create).toHaveLength(0);
+    expect(records.submit).toHaveLength(1);
+    expect(records.submit[0]).toMatchObject({
+      sessionId: "session_resume",
+      threadId: "thread_resume",
+      text: "continue",
+    });
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("default chat ignores streamed history and starts a new session", async () => {
+  const records = chatClientRecords();
+  const sessionId = "session_streamed" as SessionId;
+  const threadId = "thread_streamed" as ThreadId;
+  const messageId = "msg_streamed" as MessageId;
+  const partId = "part_streamed" as PartId;
+  const client = fakeChatClient(records, [
+    {
+      id: "event_streamed_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo/chili" },
+    },
+    {
+      id: "event_streamed_message",
+      type: "message.created",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId, role: "assistant" },
+    },
+    {
+      id: "event_streamed_part",
+      type: "message.part_added",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        messageId,
+        part: { id: partId, messageId, sessionId, type: "text", text: "old streamed answer" },
+      },
+    },
+  ]);
+  const app = await mountChatApp(client);
+
+  try {
+    await Bun.sleep(80);
+    await app.renderOnce();
+    expect(app.captureCharFrame()).toContain("Ask anything");
+    expect(app.captureCharFrame()).not.toContain("old streamed answer");
+
+    await typeText(app, "start fresh");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(records.create).toHaveLength(1);
+    expect(records.submit[0]).toMatchObject({
+      sessionId: "session_created",
+      threadId: "thread_created",
+      text: "start fresh",
+    });
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("running session blocks a second prompt submit", async () => {
+  const submitted: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      canSubmit: false,
+      chatView: {
+        status: "running",
+        items: [],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      submitPrompt: async (text) => {
+        submitted.push(text);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "another prompt");
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(submitted).toHaveLength(0);
+    expect(app.captureCharFrame()).toContain("Session running - ctrl+x interrupt");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("pending approval renders the approval dock and shortcuts resolve it", async () => {
+  const approved: ApprovalId[] = [];
+  const rejected: ApprovalId[] = [];
+  const approvalId = "approval_chat_pending" as ApprovalId;
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      canSubmit: false,
+      chatView: {
+        status: "waiting_for_approval",
+        items: [],
+        pendingApprovals: [
+          {
+            id: approvalId,
+            kind: "approval",
+            permission: "tool.bash",
+            patterns: ["bun test"],
+            status: "pending",
+            createdAt: 1,
+            toolName: "bash",
+          },
+        ],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      approveApproval: async (id) => {
+        approved.push(id);
+      },
+      rejectApproval: async (id) => {
+        rejected.push(id);
+      },
+    },
+  });
+
+  try {
+    expect(app.captureCharFrame()).toContain("tool.bash");
+    expect(app.captureCharFrame()).toContain("a approve once | x reject");
+
+    await press(app, () => app.mockInput.pressKey("a"));
+    expect(approved).toEqual([approvalId]);
+
+    await press(app, () => app.mockInput.pressKey("x"));
+    expect(rejected).toEqual([approvalId]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("stale approval resolve failures are shown instead of success", async () => {
+  const records = chatClientRecords();
+  const sessionId = "session_stale_approval" as SessionId;
+  const threadId = "thread_stale_approval" as ThreadId;
+  const approvalId = "approval_stale" as ApprovalId;
+  const client = fakeChatClient(records, approvalEvents(sessionId, threadId, approvalId), {
+    approveResolved: false,
+  });
+  const app = await mountChatApp(client, { sessionId, threadId });
+
+  try {
+    await Bun.sleep(80);
+    await app.renderOnce();
+    expect(app.captureCharFrame()).toContain("approval bash pending");
+
+    await press(app, () => app.mockInput.pressKey("a"));
+    expect(records.approve).toHaveLength(1);
+    expect(app.captureCharFrame()).toContain("Approval is no longer pending");
+  } finally {
+    app.renderer.destroy();
+  }
+});
 
 test("slash team opens cockpit and Escape returns to chat shell", async () => {
   const app = await mountShell(teamLiveFixture());
@@ -268,15 +523,26 @@ async function mountShell(
     width?: number;
     height?: number;
     executed?: TeamLiveAction[];
+    runtime?: Partial<ChatRuntimeState>;
   } = {},
 ) {
-  const runtime: TeamLiveSurfaceRuntime = {
+  const runtime: ChatRuntimeState = {
+    runtimeView: createRuntimeView(),
+    revision: 0,
+    connection: model.connection,
     message: "test stream",
     reconnect: () => undefined,
     executeAction: (action) => {
       options.executed?.push(action);
     },
     clearActionFeedback: () => undefined,
+    chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
+    canSubmit: true,
+    submitPrompt: async () => true,
+    interruptActiveSession: async () => undefined,
+    approveApproval: async () => undefined,
+    rejectApproval: async () => undefined,
+    ...options.runtime,
   };
 
   const app = await testRender(
@@ -297,7 +563,36 @@ async function mountShell(
   return app;
 }
 
-async function press(app: Awaited<ReturnType<typeof mountSurface>> | Awaited<ReturnType<typeof mountShell>>, input: () => void): Promise<void> {
+async function mountChatApp(
+  client: HttpRuntimeClient,
+  options: {
+    sessionId?: SessionId;
+    threadId?: ThreadId;
+  } = {},
+) {
+  const app = await testRender(
+    <ChatShellApp
+      client={client}
+      options={{
+        baseUrl: "http://runtime.test",
+        cwd: "/repo/chili",
+        runLoop: false,
+        once: false,
+        ...options,
+      }}
+      onExit={() => undefined}
+    />,
+    { width: 120, height: 40, exitOnCtrlC: false },
+  );
+  await act(async () => {
+    await app.renderOnce();
+  });
+  return app;
+}
+
+type TestRenderHarness = Awaited<ReturnType<typeof testRender>>;
+
+async function press(app: TestRenderHarness, input: () => void): Promise<void> {
   act(() => {
     input();
   });
@@ -305,12 +600,134 @@ async function press(app: Awaited<ReturnType<typeof mountSurface>> | Awaited<Ret
   await app.renderOnce();
 }
 
-async function typeText(app: Awaited<ReturnType<typeof mountShell>>, text: string): Promise<void> {
+async function typeText(app: TestRenderHarness, text: string): Promise<void> {
   await act(async () => {
     await app.mockInput.typeText(text);
   });
   await Bun.sleep(60);
   await app.renderOnce();
+}
+
+function chatClientRecords(): {
+  create: Array<Record<string, unknown>>;
+  submit: Array<Record<string, unknown>>;
+  interrupt: Array<Record<string, unknown>>;
+  approve: Array<Record<string, unknown>>;
+  reject: Array<Record<string, unknown>>;
+} {
+  return { create: [], submit: [], interrupt: [], approve: [], reject: [] };
+}
+
+function fakeChatClient(
+  records: ReturnType<typeof chatClientRecords>,
+  events: readonly ChiliEvent[] = [],
+  options: { createError?: Error; approveResolved?: boolean; rejectResolved?: boolean } = {},
+): HttpRuntimeClient {
+  const client = {
+    createSession: async (input: Record<string, unknown> = {}) => {
+      records.create.push(input);
+      if (options.createError) throw options.createError;
+      return { sessionId: "session_created" as SessionId, threadId: "thread_created" as ThreadId };
+    },
+    submitPromptAsync: async (input: Record<string, unknown>) => {
+      records.submit.push(input);
+      return { status: "accepted", sessionId: input.sessionId as SessionId, threadId: input.threadId as ThreadId };
+    },
+    submitPrompt: async () => ({ status: "completed", turns: [] }),
+    interruptSession: async (input: Record<string, unknown>) => {
+      records.interrupt.push(input);
+      return { interrupted: true };
+    },
+    approveApproval: async (input: Record<string, unknown>) => {
+      records.approve.push(input);
+      return { resolved: options.approveResolved ?? true };
+    },
+    rejectApproval: async (input: Record<string, unknown>) => {
+      records.reject.push(input);
+      return { resolved: options.rejectResolved ?? true };
+    },
+    streamEvents: async function* (input: { signal?: AbortSignal } = {}) {
+      for (const event of events) {
+        if (input.signal?.aborted) return;
+        yield event;
+      }
+      await waitForAbort(input.signal);
+    },
+    runTeamLoop: async () => ({
+      teamId: "team_test",
+      cycles: 0,
+      stopReason: "once",
+      startedAt: 0,
+      endedAt: 0,
+      dispatched: [],
+      completed: [],
+      accepted: [],
+      reopened: [],
+      merged: [],
+      mergeFailed: [],
+      mergeConflicted: [],
+      mergeSkipped: [],
+      failed: [],
+      blocked: [],
+      skipped: [],
+      stillRunning: [],
+      errors: [],
+    }),
+    mergeTeamTasks: async () => ({
+      scanned: 0,
+      applied: [],
+      failed: [],
+      conflicted: [],
+      skipped: [],
+      errors: [],
+    }),
+  };
+  return client as unknown as HttpRuntimeClient;
+}
+
+function approvalEvents(sessionId: SessionId, threadId: ThreadId, approvalId: ApprovalId): ChiliEvent[] {
+  const callId = "toolcall_stale" as ToolCallId;
+  return [
+    {
+      id: "event_stale_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo/chili" },
+    },
+    {
+      id: "event_stale_tool",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_stale" as TurnId, callId, toolName: "bash", input: { command: "ls -la" } },
+    },
+    {
+      id: "event_stale_waiting",
+      type: "tool.call_updated",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId, status: "waiting_for_approval" },
+    },
+    {
+      id: "event_stale_approval",
+      type: "approval.requested",
+      time: 4 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { approvalId, callId, permission: "bash", patterns: ["ls -la"] },
+    },
+  ];
+}
+
+async function waitForAbort(signal: AbortSignal | undefined): Promise<void> {
+  if (!signal || signal.aborted) return;
+  await new Promise<void>((resolve) => {
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
 }
 
 function withRunLoopReady(view: TeamLiveView): TeamLiveView {

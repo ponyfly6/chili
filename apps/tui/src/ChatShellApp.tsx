@@ -1,25 +1,22 @@
 import { useEffect, useMemo, useState } from "react";
 import { useKeyboard, useTerminalDimensions } from "@opentui/react";
-import type { KeyEvent } from "@opentui/core";
+import type { KeyEvent, MouseEvent } from "@opentui/core";
 import type { HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
-import type { TeamId } from "@chili/protocol";
+import type { ApprovalId, TeamId } from "@chili/protocol";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
-import {
-  teamLiveModel,
-  useTeamLiveRuntime,
-  type TeamLiveTuiOptions,
-} from "./useTeamLiveRuntime.js";
-import type { TeamLiveSurfaceRuntime } from "./components/types.js";
-import { findAction, shorten } from "./components/helpers.js";
+import { teamLiveModel, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
+import { useChatRuntime, type ChatRuntimeState } from "./useChatRuntime.js";
+import { findAction } from "./components/helpers.js";
+import { ApprovalDock } from "./chat/ApprovalDock.js";
+import { CommandList } from "./chat/CommandList.js";
+import { MessageList } from "./chat/MessageList.js";
+import { PROMPT_PLACEHOLDER, PromptComposer } from "./chat/PromptComposer.js";
+import { StatusFooter, TeamStatusRow } from "./chat/StatusFooter.js";
+import type { LocalTranscriptItem, PromptPart } from "./chat/types.js";
 import { createDefaultSlashCommands, resolveSlashCommand, slashCompletions } from "./slash/registry.js";
 import type { SlashCommand, SlashCommandContext, SlashCommandResult, SlashCompletion } from "./slash/types.js";
 
 type ShellView = "chat" | "team" | "help" | "agents" | "status";
-
-type TranscriptItem =
-  | { id: string; kind: "user"; text: string }
-  | { id: string; kind: "assistant"; text: string }
-  | { id: string; kind: "local"; level: "info" | "error"; text: string };
 
 export interface ChatShellOptions extends TeamLiveTuiOptions {
   modelName?: string;
@@ -27,14 +24,12 @@ export interface ChatShellOptions extends TeamLiveTuiOptions {
   modeName?: string;
 }
 
-const PROMPT_PLACEHOLDER = 'Ask anything... "fix failing tests"';
-
 export function ChatShellApp(props: {
   client: HttpRuntimeClient;
   options: ChatShellOptions;
   onExit: () => void;
 }) {
-  const runtime = useTeamLiveRuntime({ client: props.client, options: props.options });
+  const runtime = useChatRuntime({ client: props.client, options: props.options });
   const allTeams = teamLiveModel(runtime.runtimeView, {
     connection: runtime.connection,
     sessionId: props.options.sessionId,
@@ -74,7 +69,7 @@ export function ChatShellApp(props: {
 
 export function ChatShellSurface(props: {
   model: TeamLiveView;
-  runtime: TeamLiveSurfaceRuntime;
+  runtime: ChatRuntimeState;
   options?: Partial<ChatShellOptions>;
   selectedTeamId?: TeamId | undefined;
   selectedTeamLocked?: boolean;
@@ -85,10 +80,12 @@ export function ChatShellSurface(props: {
   const dimensions = useTerminalDimensions();
   const commands = useMemo(() => props.commands ?? createDefaultSlashCommands(), [props.commands]);
   const [view, setView] = useState<ShellView>("chat");
-  const [prompt, setPrompt] = useState("");
-  const [transcript, setTranscript] = useState<TranscriptItem[]>([]);
+  const [promptParts, setPromptParts] = useState<PromptPart[]>([{ type: "text", text: "" }]);
+  const [localItems, setLocalItems] = useState<LocalTranscriptItem[]>([]);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteIndex, setPaletteIndex] = useState(0);
+  const [messageScrollOffset, setMessageScrollOffset] = useState(0);
+  const prompt = promptText(promptParts);
   const slashContext = useMemo<SlashCommandContext>(() => ({
     model: props.model,
     ...(props.options?.cwd ? { cwd: props.options.cwd } : {}),
@@ -97,6 +94,8 @@ export function ChatShellSurface(props: {
     ? slashCompletions(commands, slashContext, prompt)
     : [];
   const paletteItems = slashCompletions(commands, slashContext, "/", 10);
+  const firstApproval = props.runtime.chatView.pendingApprovals[0];
+  const setPrompt = useMemo(() => setPromptText(setPromptParts), []);
 
   useKeyboard((key) => {
     if (key.eventType !== "press") return;
@@ -104,9 +103,21 @@ export function ChatShellSurface(props: {
       props.onExit?.();
       return;
     }
+    if (key.ctrl && key.name === "x") {
+      void props.runtime.interruptActiveSession();
+      return;
+    }
     if (key.ctrl && key.name === "p") {
       setPaletteOpen(true);
       setPaletteIndex(0);
+      return;
+    }
+    if (view === "chat" && key.ctrl && key.name === "y") {
+      setMessageScrollOffset((current) => current + scrollStep(dimensions.height));
+      return;
+    }
+    if (view === "chat" && key.ctrl && key.name === "v") {
+      setMessageScrollOffset((current) => Math.max(0, current - scrollStep(dimensions.height)));
       return;
     }
     if (view === "team") {
@@ -116,7 +127,7 @@ export function ChatShellSurface(props: {
     if (paletteOpen) {
       handlePaletteKey(key, paletteItems, paletteIndex, setPaletteIndex, (completion) => {
         setPaletteOpen(false);
-        void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, setView, setTranscript, setPrompt);
+        void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, setView, setLocalItems, setPrompt);
       }, () => setPaletteOpen(false));
       return;
     }
@@ -124,20 +135,26 @@ export function ChatShellSurface(props: {
       if (view !== "chat") setView("chat");
       return;
     }
-    if (isEnter(key)) {
-      void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, setTranscript, setPrompt);
+    if (view === "chat" && (isPageUp(key) || (key.shift && isArrowUp(key)))) {
+      setMessageScrollOffset((current) => current + scrollStep(dimensions.height));
       return;
     }
-    if (isBackspace(key)) {
-      setPrompt((current) => current.slice(0, -1));
+    if (view === "chat" && (isPageDown(key) || (key.shift && isArrowDown(key)))) {
+      setMessageScrollOffset((current) => Math.max(0, current - scrollStep(dimensions.height)));
+      return;
+    }
+    if (!prompt && firstApproval && key.name === "a") {
+      void props.runtime.approveApproval(firstApproval.id);
+      return;
+    }
+    if (!prompt && firstApproval && key.name === "x") {
+      void props.runtime.rejectApproval(firstApproval.id);
       return;
     }
     if (isTab(key) && completions[0]) {
       setPrompt(`${completions[0].value} `);
       return;
     }
-    const printable = printableKey(key);
-    if (printable) setPrompt((current) => `${current}${printable}`);
   });
 
   if (view === "team") {
@@ -160,7 +177,19 @@ export function ChatShellSurface(props: {
     providerName: props.options?.providerName ?? "runtime",
     cwd: props.options?.cwd ?? process.cwd(),
   };
-  const home = transcript.length === 0 && view === "chat";
+  const home = props.runtime.chatView.items.length === 0
+    && localItems.length === 0
+    && props.runtime.chatView.pendingApprovals.length === 0
+    && view === "chat";
+  const disabledReason = prompt.startsWith("/")
+    ? undefined
+    : props.runtime.chatView.pendingApprovals.length > 0
+      ? "Resolve approval to continue"
+      : props.runtime.chatView.status === "running"
+        ? "Session running - ctrl+x interrupt"
+        : !props.runtime.canSubmit
+          ? "Waiting for runtime"
+          : undefined;
 
   return (
     <box width="100%" height="100%" flexDirection="column" backgroundColor="#050505">
@@ -168,6 +197,9 @@ export function ChatShellSurface(props: {
         <HomeScreen
           width={dimensions.width}
           prompt={prompt}
+          focused={view === "chat" && !paletteOpen && !disabledReason}
+          onPromptChange={setPrompt}
+          onSubmit={() => void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, setLocalItems, setPrompt)}
           completions={completions}
           paletteOpen={paletteOpen}
           paletteItems={paletteItems}
@@ -175,13 +207,35 @@ export function ChatShellSurface(props: {
           model={props.model}
           options={shellOptions}
           runtime={props.runtime}
+          disabledReason={disabledReason}
         />
       ) : (
         <SessionScreen
           width={dimensions.width}
+          height={dimensions.height}
           view={view}
           prompt={prompt}
-          transcript={transcript}
+          focused={view === "chat" && !paletteOpen && !disabledReason}
+          onPromptChange={setPrompt}
+          onSubmit={() => {
+            setMessageScrollOffset(0);
+            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, setLocalItems, setPrompt);
+          }}
+          onMessageScroll={(event) => {
+            const direction = event.scroll?.direction;
+            if (direction !== "up" && direction !== "down") return;
+            event.preventDefault();
+            event.stopPropagation();
+            const delta = Math.max(1, event.scroll?.delta ?? 1);
+            const amount = Math.max(2, Math.ceil(delta * 3));
+            if (direction === "up") {
+              setMessageScrollOffset((current) => current + amount);
+            } else {
+              setMessageScrollOffset((current) => Math.max(0, current - amount));
+            }
+          }}
+          localItems={localItems}
+          messageScrollOffset={messageScrollOffset}
           completions={completions}
           paletteOpen={paletteOpen}
           paletteItems={paletteItems}
@@ -190,6 +244,7 @@ export function ChatShellSurface(props: {
           options={shellOptions}
           runtime={props.runtime}
           commands={commands}
+          disabledReason={disabledReason}
         />
       )}
     </box>
@@ -199,13 +254,17 @@ export function ChatShellSurface(props: {
 function HomeScreen(props: {
   width: number;
   prompt: string;
+  focused: boolean;
+  onPromptChange: (value: string) => void;
+  onSubmit: () => void;
   completions: readonly SlashCompletion[];
   paletteOpen: boolean;
   paletteItems: readonly SlashCompletion[];
   paletteIndex: number;
   model: TeamLiveView;
-  runtime: TeamLiveSurfaceRuntime;
+  runtime: ChatRuntimeState;
   options: { modeName: string; modelName: string; providerName: string; cwd: string };
+  disabledReason?: string | undefined;
 }) {
   const promptWidth = Math.min(76, Math.max(42, props.width - 12));
   return (
@@ -218,38 +277,57 @@ function HomeScreen(props: {
         <PromptComposer
           width={promptWidth}
           prompt={props.prompt}
+          disabled={Boolean(props.disabledReason)}
+          disabledReason={props.disabledReason}
+          focused={props.focused}
+          onPromptChange={props.onPromptChange}
+          onSubmit={props.onSubmit}
           completions={props.completions}
           paletteOpen={props.paletteOpen}
           paletteItems={props.paletteItems}
           paletteIndex={props.paletteIndex}
-          runtime={props.runtime}
+          feedback={currentFeedback(props.runtime)}
         />
         <text fg="#7d8590" wrapMode="none" truncate>{`${props.options.modeName} | ${props.options.modelName} | ${props.options.providerName}`}</text>
       </box>
       <box flexGrow={3} />
       <TeamStatusRow model={props.model} />
-      <Footer options={props.options} />
+      <StatusFooter options={props.options} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} />
     </box>
   );
 }
 
 function SessionScreen(props: {
   width: number;
+  height: number;
   view: Exclude<ShellView, "team">;
   prompt: string;
-  transcript: readonly TranscriptItem[];
+  focused: boolean;
+  onPromptChange: (value: string) => void;
+  onSubmit: () => void;
+  onMessageScroll: (event: MouseEvent) => void;
+  localItems: readonly LocalTranscriptItem[];
+  messageScrollOffset: number;
   completions: readonly SlashCompletion[];
   paletteOpen: boolean;
   paletteItems: readonly SlashCompletion[];
   paletteIndex: number;
   model: TeamLiveView;
-  runtime: TeamLiveSurfaceRuntime;
+  runtime: ChatRuntimeState;
   options: { modeName: string; modelName: string; providerName: string; cwd: string };
   commands: readonly SlashCommand[];
+  disabledReason?: string | undefined;
 }) {
   const promptWidth = Math.min(96, Math.max(42, props.width - 8));
   return (
-    <box width="100%" height="100%" flexDirection="column">
+    <box
+      width="100%"
+      height="100%"
+      flexDirection="column"
+      onMouseScroll={(event) => {
+        if (props.view === "chat") props.onMessageScroll(event);
+      }}
+    >
       <box flexGrow={1} flexDirection="column" paddingX={3} paddingY={1}>
         {props.view === "help" ? (
           <HelpView commands={props.commands} />
@@ -258,88 +336,38 @@ function SessionScreen(props: {
         ) : props.view === "agents" ? (
           <AgentsView model={props.model} />
         ) : (
-          <TranscriptTimeline items={props.transcript} />
+          <MessageList
+            chatView={props.runtime.chatView}
+            localItems={props.localItems}
+            width={Math.max(24, props.width - 8)}
+            visibleLimit={Math.max(4, props.height - 14)}
+            scrollOffset={props.messageScrollOffset}
+          />
         )}
       </box>
+      <ApprovalDock
+        approvals={props.runtime.chatView.pendingApprovals}
+        onApprove={(approvalId: ApprovalId) => void props.runtime.approveApproval(approvalId)}
+        onReject={(approvalId: ApprovalId) => void props.runtime.rejectApproval(approvalId)}
+      />
       <TeamStatusRow model={props.model} />
       <box width="100%" alignItems="center" flexDirection="column">
         <PromptComposer
           width={promptWidth}
           prompt={props.prompt}
+          disabled={Boolean(props.disabledReason)}
+          disabledReason={props.disabledReason}
+          focused={props.focused}
+          onPromptChange={props.onPromptChange}
+          onSubmit={props.onSubmit}
           completions={props.completions}
           paletteOpen={props.paletteOpen}
           paletteItems={props.paletteItems}
           paletteIndex={props.paletteIndex}
-          runtime={props.runtime}
+          feedback={currentFeedback(props.runtime)}
         />
       </box>
-      <Footer options={props.options} />
-    </box>
-  );
-}
-
-function PromptComposer(props: {
-  width: number;
-  prompt: string;
-  completions: readonly SlashCompletion[];
-  paletteOpen: boolean;
-  paletteItems: readonly SlashCompletion[];
-  paletteIndex: number;
-  runtime: TeamLiveSurfaceRuntime;
-}) {
-  const display = props.prompt.length > 0 ? props.prompt : PROMPT_PLACEHOLDER;
-  const promptColor = props.prompt.length > 0 ? "#f8f8f2" : "#6e7681";
-  return (
-    <box width={props.width} flexDirection="column">
-      {props.paletteOpen ? (
-        <CommandList title="Command Palette" items={props.paletteItems} selectedIndex={props.paletteIndex} />
-      ) : props.completions.length > 0 ? (
-        <CommandList title="Commands" items={props.completions} selectedIndex={0} />
-      ) : null}
-      {props.runtime.actionFeedback ? (
-        <text fg={feedbackColor(props.runtime.actionFeedback.status)} wrapMode="none" truncate>
-          {`${props.runtime.actionFeedback.status}: ${props.runtime.actionFeedback.message}`}
-        </text>
-      ) : null}
-      <box width="100%" height={3} border borderStyle="single" borderColor="#30363d" paddingX={1} flexDirection="column">
-        <text fg={promptColor} wrapMode="none" truncate>{`> ${display}${props.prompt.length > 0 ? " |" : ""}`}</text>
-      </box>
-    </box>
-  );
-}
-
-function CommandList(props: {
-  title: string;
-  items: readonly SlashCompletion[];
-  selectedIndex: number;
-}) {
-  return (
-    <box width="100%" flexDirection="column" border borderStyle="single" borderColor="#30363d" paddingX={1}>
-      <text fg="#f8f8f2" wrapMode="none" truncate>{props.title}</text>
-      {props.items.length === 0 ? (
-        <text fg="#6e7681" wrapMode="none" truncate>{"  no commands"}</text>
-      ) : (
-        props.items.slice(0, 8).map((item, index) => (
-          <text key={item.value} fg={index === props.selectedIndex ? "#f8f8f2" : "#8f9baa"} wrapMode="none" truncate>
-            {`${index === props.selectedIndex ? ">" : " "} ${item.label} - ${item.description}`}
-          </text>
-        ))
-      )}
-    </box>
-  );
-}
-
-function TranscriptTimeline(props: { items: readonly TranscriptItem[] }) {
-  return (
-    <box width="100%" height="100%" flexDirection="column">
-      {props.items.slice(-14).map((item) => (
-        <box key={item.id} width="100%" flexDirection="column" marginBottom={1}>
-          <text fg={item.kind === "user" ? "#f8f8f2" : item.kind === "assistant" ? "#a3be8c" : item.level === "error" ? "#ff7b72" : "#8f9baa"} wrapMode="none" truncate>
-            {item.kind === "user" ? "You" : item.kind === "assistant" ? "Chili" : item.level}
-          </text>
-          <text fg="#d8dee9" wrapMode="word">{shorten(item.text, 180)}</text>
-        </box>
-      ))}
+      <StatusFooter options={props.options} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} />
     </box>
   );
 }
@@ -362,7 +390,7 @@ function HelpView(props: { commands: readonly SlashCommand[] }) {
 
 function StatusView(props: {
   model: TeamLiveView;
-  runtime: TeamLiveSurfaceRuntime;
+  runtime: ChatRuntimeState;
   options: { modeName: string; modelName: string; providerName: string; cwd: string };
 }) {
   const selected = props.model.selected;
@@ -371,12 +399,13 @@ function StatusView(props: {
       <text fg="#f8f8f2" wrapMode="none" truncate>{"Status"}</text>
       <box height={1} />
       <text fg="#d8dee9" wrapMode="none" truncate>{`connection: ${props.model.connection.status}`}</text>
+      <text fg="#d8dee9" wrapMode="none" truncate>{`session: ${props.runtime.activeSessionId ?? "none"}`}</text>
+      <text fg="#d8dee9" wrapMode="none" truncate>{`thread: ${props.runtime.activeThreadId ?? "none"}`}</text>
       <text fg="#d8dee9" wrapMode="none" truncate>{`mode: ${props.options.modeName}`}</text>
       <text fg="#d8dee9" wrapMode="none" truncate>{`model: ${props.options.modelName}`}</text>
       <text fg="#d8dee9" wrapMode="none" truncate>{`provider: ${props.options.providerName}`}</text>
       <text fg="#d8dee9" wrapMode="none" truncate>{`cwd: ${props.options.cwd}`}</text>
       <text fg="#d8dee9" wrapMode="none" truncate>{`team: ${selected?.team.name ?? selected?.team.id ?? "none"}`}</text>
-      <text fg="#d8dee9" wrapMode="none" truncate>{`stream: ${props.runtime.message}`}</text>
     </box>
   );
 }
@@ -400,52 +429,29 @@ function AgentsView(props: { model: TeamLiveView }) {
   );
 }
 
-function TeamStatusRow(props: { model: TeamLiveView }) {
-  const selected = props.model.selected;
-  const counts = selected?.health.counts;
-  const line = selected
-    ? `Team: ${selected.team.taskCount} tasks | ${counts?.runningTasks ?? 0} running | ${counts?.pendingApprovals ?? 0} approval | /team`
-    : "Team: idle | /team";
-  return (
-    <box width="100%" paddingX={2}>
-      <text fg="#7d8590" wrapMode="none" truncate>{line}</text>
-    </box>
-  );
-}
-
-function Footer(props: { options: { modeName: string; modelName: string; providerName: string; cwd: string } }) {
-  return (
-    <box width="100%" height={1} flexDirection="row" paddingX={2}>
-      <text fg="#6e7681" wrapMode="none" truncate>{shorten(props.options.cwd, 54)}</text>
-      <box flexGrow={1} />
-      <text fg="#6e7681" wrapMode="none" truncate>{`${props.options.modeName} | ${props.options.modelName} | ${props.options.providerName} | / commands | tab agents | ctrl+p commands`}</text>
-    </box>
-  );
-}
-
 async function submitPrompt(
   prompt: string,
   commands: readonly SlashCommand[],
   ctx: SlashCommandContext,
   model: TeamLiveView,
-  runtime: TeamLiveSurfaceRuntime,
+  runtime: ChatRuntimeState,
   setView: (view: ShellView) => void,
-  setTranscript: (update: (current: TranscriptItem[]) => TranscriptItem[]) => void,
-  setPrompt: (value: string) => void,
+  setLocalItems: (update: (current: LocalTranscriptItem[]) => LocalTranscriptItem[]) => void,
+  setPrompt: (value: string | ((current: string) => string)) => void,
 ): Promise<void> {
   const trimmed = prompt.trim();
   if (!trimmed) return;
-  setPrompt("");
   if (trimmed.startsWith("/")) {
-    await runSlashInput(trimmed, commands, ctx, model, runtime, setView, setTranscript, setPrompt);
+    setPrompt("");
+    await runSlashInput(trimmed, commands, ctx, model, runtime, setView, setLocalItems, setPrompt);
     return;
   }
-  const id = String(Date.now());
-  setTranscript((current) => [
-    ...current,
-    { id: `${id}:user`, kind: "user", text: trimmed },
-    { id: `${id}:assistant`, kind: "assistant", text: "Ready to send once runtime prompt submit is wired." },
-  ]);
+  if (!runtime.canSubmit) {
+    setLocalItems((current) => [...current, localItem("error", "Session is not ready for another prompt.")]);
+    return;
+  }
+  const accepted = await runtime.submitPrompt(trimmed);
+  if (accepted) setPrompt("");
 }
 
 async function runSlashInput(
@@ -453,27 +459,27 @@ async function runSlashInput(
   commands: readonly SlashCommand[],
   ctx: SlashCommandContext,
   model: TeamLiveView,
-  runtime: TeamLiveSurfaceRuntime,
+  runtime: ChatRuntimeState,
   setView: (view: ShellView) => void,
-  setTranscript: (update: (current: TranscriptItem[]) => TranscriptItem[]) => void,
-  setPrompt: (value: string) => void,
+  setLocalItems: (update: (current: LocalTranscriptItem[]) => LocalTranscriptItem[]) => void,
+  setPrompt: (value: string | ((current: string) => string)) => void,
 ): Promise<void> {
   const match = resolveSlashCommand(commands, input);
   if (!match) {
-    setTranscript((current) => [...current, localItem("error", `Unknown command: ${input}`)]);
+    setLocalItems((current) => [...current, localItem("error", `Unknown command: ${input}`)]);
     return;
   }
   const result = await match.command.run(ctx, match.args);
-  applySlashResult(result, model, runtime, setView, setTranscript, setPrompt);
+  applySlashResult(result, model, runtime, setView, setLocalItems, setPrompt);
 }
 
 function applySlashResult(
   result: SlashCommandResult,
   model: TeamLiveView,
-  runtime: TeamLiveSurfaceRuntime,
+  runtime: ChatRuntimeState,
   setView: (view: ShellView) => void,
-  setTranscript: (update: (current: TranscriptItem[]) => TranscriptItem[]) => void,
-  setPrompt: (value: string) => void,
+  setLocalItems: (update: (current: LocalTranscriptItem[]) => LocalTranscriptItem[]) => void,
+  setPrompt: (value: string | ((current: string) => string)) => void,
 ): void {
   if (result.type === "open_view") {
     setView(result.view);
@@ -484,7 +490,7 @@ function applySlashResult(
     return;
   }
   if (result.type === "clear_transcript") {
-    setTranscript(() => []);
+    setLocalItems(() => []);
     return;
   }
   if (result.type === "insert_prompt") {
@@ -492,7 +498,7 @@ function applySlashResult(
     return;
   }
   if (result.type === "local_message") {
-    setTranscript((current) => [...current, localItem(result.level, result.text)]);
+    setLocalItems((current) => [...current, localItem(result.level, result.text)]);
     return;
   }
   const action = actionForSlashResult(result, model);
@@ -536,15 +542,28 @@ function handlePaletteKey(
   }
 }
 
-function localItem(level: "info" | "error", text: string): TranscriptItem {
-  return { id: `${Date.now()}:${level}:${text}`, kind: "local", level, text };
+function currentFeedback(runtime: ChatRuntimeState): { status: string; message: string } | undefined {
+  if (runtime.chatFeedback) return runtime.chatFeedback;
+  if (runtime.actionFeedback) return runtime.actionFeedback;
+  return undefined;
 }
 
-function feedbackColor(status: string): string {
-  if (status === "success") return "#a3be8c";
-  if (status === "error") return "#ff7b72";
-  if (status === "pending") return "#ffd166";
-  return "#8f9baa";
+function setPromptText(setPromptParts: (value: PromptPart[] | ((current: PromptPart[]) => PromptPart[])) => void) {
+  return (value: string | ((current: string) => string)) => {
+    setPromptParts((current) => {
+      const currentText = promptText(current);
+      const next = typeof value === "function" ? value(currentText) : value;
+      return [{ type: "text", text: next }];
+    });
+  };
+}
+
+function promptText(parts: readonly PromptPart[]): string {
+  return parts.map((part) => part.text).join("");
+}
+
+function localItem(level: "info" | "error", text: string): LocalTranscriptItem {
+  return { id: `${Date.now()}:${level}:${text}`, kind: "local", level, text };
 }
 
 function validSelectedTeamId(model: TeamLiveView, selectedTeamId: TeamId | undefined): TeamId | undefined {
@@ -583,3 +602,14 @@ function isArrowDown(key: KeyEvent): boolean {
   return key.name === "down" || key.name === "arrow_down";
 }
 
+function isPageUp(key: KeyEvent): boolean {
+  return key.name === "pageup" || key.name === "page_up" || key.name === "page-up";
+}
+
+function isPageDown(key: KeyEvent): boolean {
+  return key.name === "pagedown" || key.name === "page_down" || key.name === "page-down";
+}
+
+function scrollStep(height: number): number {
+  return Math.max(4, Math.floor(height / 2));
+}

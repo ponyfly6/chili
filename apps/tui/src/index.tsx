@@ -81,7 +81,7 @@ function rendererConfig(): CliRendererConfig {
     exitOnCtrlC: false,
     gatherStats: false,
     targetFps: 30,
-    useMouse: false,
+    useMouse: true,
     autoFocus: false,
     openConsoleOnError: false,
     useKittyKeyboard: {},

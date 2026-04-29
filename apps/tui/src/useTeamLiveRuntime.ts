@@ -271,13 +271,13 @@ async function callAction(
   signal: AbortSignal | undefined,
 ): Promise<unknown> {
   if (action.type === "approve") {
-    return client.approveApproval({ approvalId: requireApprovalId(action.approvalId, action.type) });
+    return resolveApprovalAction(client.approveApproval({ approvalId: requireApprovalId(action.approvalId, action.type) }));
   }
   if (action.type === "reject") {
-    return client.rejectApproval({
+    return resolveApprovalAction(client.rejectApproval({
       approvalId: requireApprovalId(action.approvalId, action.type),
       feedback: "Rejected from Team Live TUI",
-    });
+    }));
   }
   if (action.type === "merge") {
     const request: MergeTeamTasksRequest = { teamId: requireTeamId(action.teamId, action.type) };
@@ -295,6 +295,14 @@ async function callAction(
     sessionId: requireSessionId(action.sessionId, action.type),
     reason: "Interrupted from Team Live TUI",
   });
+}
+
+async function resolveApprovalAction(resultPromise: Promise<{ resolved: boolean }>): Promise<unknown> {
+  const result = await resultPromise;
+  if (!result.resolved) {
+    throw new Error("Approval is no longer pending in this runtime. Reconnect or start a fresh prompt.");
+  }
+  return result;
 }
 
 function requireTeamId(value: TeamId | undefined, action: string): TeamId {

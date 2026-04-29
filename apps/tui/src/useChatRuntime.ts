@@ -1,0 +1,189 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  chatSessionView,
+  type ChatSessionView,
+  type HttpRuntimeClient,
+} from "@chili/sdk";
+import type { ApprovalId, RuntimeApprovalResolveResult, SessionId, ThreadId } from "@chili/protocol";
+import { useTeamLiveRuntime, type TeamLiveRuntimeState, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
+
+export type ChatRequestStatus = "idle" | "pending" | "success" | "error";
+
+export interface ChatRuntimeFeedback {
+  status: ChatRequestStatus;
+  message: string;
+}
+
+export interface ChatRuntimeState extends TeamLiveRuntimeState {
+  activeSessionId?: SessionId;
+  activeThreadId?: ThreadId;
+  chatView: ChatSessionView;
+  chatFeedback?: ChatRuntimeFeedback;
+  canSubmit: boolean;
+  submitPrompt: (text: string) => Promise<boolean>;
+  interruptActiveSession: () => Promise<void>;
+  approveApproval: (approvalId: ApprovalId) => Promise<void>;
+  rejectApproval: (approvalId: ApprovalId) => Promise<void>;
+}
+
+export interface UseChatRuntimeInput {
+  client: HttpRuntimeClient;
+  options: TeamLiveTuiOptions;
+}
+
+export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
+  const { client, options } = input;
+  const teamRuntime = useTeamLiveRuntime(input);
+  const [activeSessionId, setActiveSessionId] = useState<SessionId | undefined>(options.sessionId);
+  const [activeThreadId, setActiveThreadId] = useState<ThreadId | undefined>(options.threadId);
+  const [submitPending, setSubmitPending] = useState(false);
+  const [chatFeedback, setChatFeedback] = useState<ChatRuntimeFeedback | undefined>();
+  const requestAbortRefs = useRef(new Set<AbortController>());
+
+  useEffect(() => {
+    setActiveSessionId(options.sessionId);
+    setActiveThreadId(options.threadId);
+  }, [options.sessionId, options.threadId]);
+
+  const chatView = useMemo(() => {
+    const request: Parameters<typeof chatSessionView>[1] = { limit: 120, requireSession: true };
+    if (activeSessionId) request.sessionId = activeSessionId;
+    if (activeThreadId) request.threadId = activeThreadId;
+    return chatSessionView(teamRuntime.runtimeView, request);
+  }, [activeSessionId, activeThreadId, teamRuntime.revision, teamRuntime.runtimeView]);
+
+  useEffect(() => {
+    if (activeSessionId && chatView.sessionId && activeSessionId !== chatView.sessionId) setActiveSessionId(chatView.sessionId);
+    if (!activeThreadId && chatView.threadId) setActiveThreadId(chatView.threadId);
+  }, [activeSessionId, activeThreadId, chatView.sessionId, chatView.threadId]);
+
+  const running = chatView.status === "running" || chatView.status === "waiting_for_approval";
+  const canSubmit = !submitPending && !running && chatView.pendingApprovals.length === 0;
+
+  const withAbort = useCallback(<T,>(run: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+    const controller = new AbortController();
+    requestAbortRefs.current.add(controller);
+    return run(controller.signal).finally(() => {
+      requestAbortRefs.current.delete(controller);
+    });
+  }, []);
+
+  const submitPrompt = useCallback(async (text: string): Promise<boolean> => {
+    const trimmed = text.trim();
+    if (!trimmed || submitPending || running || chatView.pendingApprovals.length > 0) return false;
+    setSubmitPending(true);
+    setChatFeedback({ status: "pending", message: "sending prompt" });
+    try {
+      await withAbort(async (signal) => {
+        let sessionId = activeSessionId ?? chatView.sessionId;
+        let threadId = activeThreadId ?? chatView.threadId;
+        if (!sessionId || !threadId) {
+          const created = await client.createSession({
+            ...(options.cwd ? { cwd: options.cwd } : {}),
+            signal,
+          });
+          sessionId = created.sessionId;
+          threadId = created.threadId;
+          setActiveSessionId(sessionId);
+          setActiveThreadId(threadId);
+        }
+        await client.submitPromptAsync({
+          sessionId,
+          threadId,
+          text: trimmed,
+          ...(options.cwd ? { cwd: options.cwd } : {}),
+          signal,
+        });
+      });
+      setChatFeedback({ status: "success", message: "prompt accepted" });
+      return true;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return false;
+    } finally {
+      setSubmitPending(false);
+    }
+  }, [activeSessionId, activeThreadId, chatView.pendingApprovals.length, chatView.sessionId, chatView.threadId, client, options.baseUrl, options.cwd, running, submitPending, withAbort]);
+
+  const interruptActiveSession = useCallback(async () => {
+    if (!activeSessionId) return;
+    setChatFeedback({ status: "pending", message: "interrupting session" });
+    try {
+      await withAbort((signal) => client.interruptSession({
+        sessionId: activeSessionId,
+        reason: "Interrupted from TUI",
+        signal,
+      }));
+      setChatFeedback({ status: "success", message: "interrupt sent" });
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: toError(error).message });
+    }
+  }, [activeSessionId, client, withAbort]);
+
+  const approveApproval = useCallback(async (approvalId: ApprovalId) => {
+    await resolveApproval("approve", approvalId, client, withAbort, setChatFeedback);
+  }, [client, withAbort]);
+
+  const rejectApproval = useCallback(async (approvalId: ApprovalId) => {
+    await resolveApproval("reject", approvalId, client, withAbort, setChatFeedback);
+  }, [client, withAbort]);
+
+  useEffect(() => () => {
+    for (const controller of requestAbortRefs.current) controller.abort();
+    requestAbortRefs.current.clear();
+  }, []);
+
+  return useMemo(() => ({
+    ...teamRuntime,
+    ...(activeSessionId ? { activeSessionId } : {}),
+    ...(activeThreadId ? { activeThreadId } : {}),
+    chatView,
+    ...(chatFeedback ? { chatFeedback } : {}),
+    canSubmit,
+    submitPrompt,
+    interruptActiveSession,
+    approveApproval,
+    rejectApproval,
+  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, submitPrompt, teamRuntime]);
+}
+
+async function resolveApproval(
+  action: "approve" | "reject",
+  approvalId: ApprovalId,
+  client: HttpRuntimeClient,
+  withAbort: <T>(run: (signal: AbortSignal) => Promise<T>) => Promise<T>,
+  setFeedback: (feedback: ChatRuntimeFeedback | undefined) => void,
+): Promise<void> {
+  setFeedback({ status: "pending", message: action === "approve" ? "approving request" : "rejecting request" });
+  try {
+    const result = await withAbort((signal) => action === "approve"
+      ? client.approveApproval({ approvalId, signal })
+      : client.rejectApproval({ approvalId, feedback: "Rejected from TUI", signal }));
+    requireResolvedApproval(result);
+    setFeedback({ status: "success", message: action === "approve" ? "approval allowed" : "approval rejected" });
+  } catch (error) {
+    if (!isAbortError(error)) setFeedback({ status: "error", message: toError(error).message });
+  }
+}
+
+function requireResolvedApproval(result: RuntimeApprovalResolveResult): void {
+  if (!result.resolved) {
+    throw new Error("Approval is no longer pending in this runtime. Reconnect or start a fresh prompt.");
+  }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+function runtimeErrorMessage(error: unknown, baseUrl: string): string {
+  const message = toError(error).message;
+  if (/unable to connect|fetch failed|econnrefused|connection refused/i.test(message)) {
+    return `Runtime offline at ${baseUrl}. Start serve or check --url.`;
+  }
+  return message;
+}
+
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
