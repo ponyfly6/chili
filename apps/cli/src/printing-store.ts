@@ -34,6 +34,9 @@ import type {
   TeamProjectionStore,
   TeamQuery,
   TeamRow,
+  TeamTaskClaimInput,
+  TeamTaskClaimStore,
+  TeamTaskMutationResult,
   TeamTaskQuery,
   TeamTaskRow,
 } from "@chili/store";
@@ -45,7 +48,8 @@ export class PrintingEventStore
     AgentTaskLeaseStore,
     AgentTaskFinalizationStore,
     AgentMailboxDeliveryStore,
-    TeamProjectionStore
+    TeamProjectionStore,
+    TeamTaskClaimStore
 {
   constructor(private readonly inner: EventStore, private readonly printer: CliPrinter) {}
 
@@ -158,6 +162,13 @@ export class PrintingEventStore
     return result;
   }
 
+  async claimTeamTask(input: TeamTaskClaimInput): Promise<TeamTaskMutationResult> {
+    const result = await (this.teamTaskClaimStore()?.claimTeamTask(input) ??
+      Promise.resolve({ applied: false, reason: "not_found" as const, events: [] }));
+    for (const event of result.events) this.printer.event(event);
+    return result;
+  }
+
   private subagentStore(): SubagentProjectionStore | undefined {
     const inner = this.inner as EventStore & Partial<SubagentProjectionStore>;
     if (inner.agentTasks && inner.agentTask && inner.agentRuns && inner.agentMailbox) {
@@ -194,6 +205,14 @@ export class PrintingEventStore
     const inner = this.inner as EventStore & Partial<TeamProjectionStore>;
     if (inner.teams && inner.teamMembers && inner.teamTasks && inner.teamMessages && inner.teamMessageDeliveries) {
       return inner as EventStore & TeamProjectionStore;
+    }
+    return undefined;
+  }
+
+  private teamTaskClaimStore(): TeamTaskClaimStore | undefined {
+    const inner = this.inner as EventStore & Partial<TeamTaskClaimStore>;
+    if (inner.claimTeamTask) {
+      return inner as EventStore & TeamTaskClaimStore;
     }
     return undefined;
   }
