@@ -350,6 +350,96 @@ test("projects chat session transcript rows from message, tool, and approval eve
   expect(completedTool).toMatchObject({ kind: "tool", id: callId, status: "completed", displayStatus: "succeeded", output: "ok" });
 });
 
+test("projects latest model metadata and stable usage summaries for chat sessions", () => {
+  const sessionId = "session_model_metadata" as SessionId;
+  const threadId = "thread_model_metadata" as ThreadId;
+  const firstTurnId = "turn_model_metadata_first" as TurnId;
+  const secondTurnId = "turn_model_metadata_second" as TurnId;
+
+  const view = reduceRuntimeEvents(
+    [
+      {
+        id: "event_metadata_session",
+        type: "session.created",
+        time: 1 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { sessionId, cwd: "/repo" },
+      },
+      {
+        id: "event_metadata_first_initial",
+        type: "turn.model_metadata",
+        time: 2 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          turnId: firstTurnId,
+          provider: "minimax",
+          model: "MiniMax-M2.7",
+        },
+      },
+      {
+        id: "event_metadata_first_update",
+        type: "turn.model_metadata",
+        time: 3 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          turnId: firstTurnId,
+          responseId: "response_first",
+          usage: { inputTokens: 70, outputTokens: 50, totalTokens: 120 },
+        },
+      },
+      {
+        id: "event_metadata_second_initial",
+        type: "turn.model_metadata",
+        time: 4 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          turnId: secondTurnId,
+          provider: "deepseek",
+          model: "deepseek-v4-pro",
+        },
+      },
+      {
+        id: "event_metadata_second_update",
+        type: "turn.model_metadata",
+        time: 5 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          turnId: secondTurnId,
+          responseId: "response_second",
+          usage: { inputTokens: 10, outputTokens: 15, cacheReadInputTokens: 2 },
+        },
+      },
+    ],
+    createRuntimeView(),
+  );
+
+  const chat = chatSessionView(view, { sessionId, threadId });
+
+  expect(chat.latestModelMetadata).toMatchObject({
+    turnId: secondTurnId,
+    provider: "deepseek",
+    model: "deepseek-v4-pro",
+    responseId: "response_second",
+  });
+  expect(view.modelMetadataByTurn[firstTurnId]).toMatchObject({
+    provider: "minimax",
+    model: "MiniMax-M2.7",
+    responseId: "response_first",
+    usage: { totalTokens: 120 },
+  });
+  expect(chat.usageSummary).toMatchObject({
+    inputTokens: 80,
+    outputTokens: 65,
+    cacheReadInputTokens: 2,
+    totalTokens: 145,
+  });
+});
+
 test("projects tool-specific approval summaries for chat TUI", () => {
   const sessionId = "session_approval_summaries" as SessionId;
   const threadId = "thread_approval_summaries" as ThreadId;

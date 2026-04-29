@@ -8,6 +8,8 @@ import type {
   MessageId,
   MessagePart,
   MessageRole,
+  ModelMetadataPayload,
+  ModelUsage,
   PartId,
   RuntimeSessionStatus,
   SessionId,
@@ -50,6 +52,8 @@ export interface ChiliRuntimeView {
   teamRunIds: string[];
   teamRuns: Record<string, RuntimeTeamRunView>;
   teamRunIdsByTeam: Record<string, string[]>;
+  modelMetadataTurnIds: TurnId[];
+  modelMetadataByTurn: Record<string, RuntimeModelMetadataView>;
   partIndex: Record<string, RuntimePartIndexEntry>;
   lastEventId?: string;
 }
@@ -93,6 +97,12 @@ export interface RuntimeToolCallView {
   error?: string;
   synthetic?: boolean;
   metadata?: Record<string, unknown>;
+}
+
+export interface RuntimeModelMetadataView extends ModelMetadataPayload {
+  updatedAt: number;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
 }
 
 export interface RuntimeApprovalView {
@@ -594,6 +604,8 @@ export interface ChatSessionView {
   pendingApprovals: ChatApprovalRow[];
   activeTools: ChatToolCallRow[];
   generatedAt: string;
+  latestModelMetadata?: ModelMetadataPayload;
+  usageSummary?: ModelUsage;
   lastEventId?: string;
 }
 
@@ -711,6 +723,8 @@ export function createRuntimeView(): ChiliRuntimeView {
     teamRunIds: [],
     teamRuns: {},
     teamRunIdsByTeam: {},
+    modelMetadataTurnIds: [],
+    modelMetadataByTurn: {},
     partIndex: {},
   };
 }
@@ -770,6 +784,16 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
         session.currentTurnId = event.payload.turnId;
         session.updatedAt = event.time;
       }
+      break;
+    }
+    case "turn.model_metadata": {
+      const existing = view.modelMetadataByTurn[event.payload.turnId];
+      if (!existing) {
+        view.modelMetadataTurnIds.push(event.payload.turnId);
+      }
+      view.modelMetadataByTurn[event.payload.turnId] = runtimeModelMetadata(event.payload, event.time, event.sessionId, event.threadId, existing);
+      const sessionId = event.sessionId ?? existing?.sessionId;
+      if (sessionId) touchSession(view, sessionId, event.time);
       break;
     }
     case "message.created": {
@@ -945,6 +969,11 @@ export function chatSessionView(view: ChiliRuntimeView, input: ChatSessionInput 
       return [chatApprovalRow(view, approval)];
     })
     : [];
+  const modelMetadata = session
+    ? modelMetadataForSession(view, session.id, input.threadId)
+    : [];
+  const latestModelMetadata = modelMetadata.at(-1);
+  const usageSummary = modelUsageSummary(modelMetadata);
   const items = [...messages, ...tools, ...approvals]
     .sort((left, right) => chatItemTime(left) - chatItemTime(right))
     .slice(-limit);
@@ -957,6 +986,8 @@ export function chatSessionView(view: ChiliRuntimeView, input: ChatSessionInput 
   };
   assignOptional(output, "sessionId", sessionId);
   assignOptional(output, "threadId", input.threadId ?? session?.threadId);
+  assignOptional(output, "latestModelMetadata", latestModelMetadata ? chatModelMetadata(latestModelMetadata) : undefined);
+  assignOptional(output, "usageSummary", usageSummary);
   assignOptional(output, "lastEventId", view.lastEventId);
   return output;
 }
@@ -967,6 +998,96 @@ function latestSession(view: ChiliRuntimeView): RuntimeSessionView | undefined {
     if (session) return session;
   }
   return undefined;
+}
+
+function runtimeModelMetadata(
+  payload: ModelMetadataPayload,
+  updatedAt: number,
+  sessionId: SessionId | undefined,
+  threadId: ThreadId | undefined,
+  existing: RuntimeModelMetadataView | undefined,
+): RuntimeModelMetadataView {
+  const output: RuntimeModelMetadataView = {
+    turnId: payload.turnId,
+    updatedAt,
+  };
+  assignOptional(output, "provider", payload.provider ?? existing?.provider);
+  assignOptional(output, "model", payload.model ?? existing?.model);
+  assignOptional(output, "responseId", payload.responseId ?? existing?.responseId);
+  assignOptional(output, "usage", payload.usage ? cloneModelUsage(payload.usage) : existing?.usage ? cloneModelUsage(existing.usage) : undefined);
+  assignOptional(output, "sessionId", sessionId ?? existing?.sessionId);
+  assignOptional(output, "threadId", threadId ?? existing?.threadId);
+  return output;
+}
+
+function chatModelMetadata(metadata: RuntimeModelMetadataView): ModelMetadataPayload {
+  const output: ModelMetadataPayload = {
+    turnId: metadata.turnId,
+  };
+  assignOptional(output, "provider", metadata.provider);
+  assignOptional(output, "model", metadata.model);
+  assignOptional(output, "responseId", metadata.responseId);
+  assignOptional(output, "usage", metadata.usage ? cloneModelUsage(metadata.usage) : undefined);
+  return output;
+}
+
+function modelMetadataForSession(
+  view: ChiliRuntimeView,
+  sessionId: SessionId,
+  threadId: ThreadId | undefined,
+): RuntimeModelMetadataView[] {
+  return view.modelMetadataTurnIds
+    .flatMap((turnId) => {
+      const metadata = view.modelMetadataByTurn[turnId];
+      return metadata ? [metadata] : [];
+    })
+    .filter((metadata) => metadata.sessionId === sessionId && matchesThread(metadata.threadId, threadId))
+    .sort((left, right) => left.updatedAt - right.updatedAt);
+}
+
+function modelUsageSummary(metadata: readonly RuntimeModelMetadataView[]): ModelUsage | undefined {
+  const summary: ModelUsage = {};
+  let hasUsage = false;
+
+  for (const item of metadata) {
+    const usage = item.usage;
+    if (!usage) continue;
+    hasUsage = addUsageField(summary, "inputTokens", usage.inputTokens) || hasUsage;
+    hasUsage = addUsageField(summary, "outputTokens", usage.outputTokens) || hasUsage;
+    hasUsage = addUsageField(summary, "cacheReadInputTokens", usage.cacheReadInputTokens) || hasUsage;
+    hasUsage = addUsageField(summary, "cacheCreationInputTokens", usage.cacheCreationInputTokens) || hasUsage;
+    const total = usage.totalTokens ?? usageTokenTotal(usage);
+    hasUsage = addUsageField(summary, "totalTokens", total) || hasUsage;
+  }
+
+  return hasUsage ? summary : undefined;
+}
+
+function usageTokenTotal(usage: ModelUsage): number | undefined {
+  const parts = [usage.inputTokens, usage.outputTokens].filter(isFiniteNumber);
+  if (parts.length === 0) return undefined;
+  return parts.reduce((total, value) => total + value, 0);
+}
+
+function addUsageField(summary: ModelUsage, field: keyof Omit<ModelUsage, "raw">, value: number | undefined): boolean {
+  if (!isFiniteNumber(value)) return false;
+  summary[field] = (summary[field] ?? 0) + value;
+  return true;
+}
+
+function cloneModelUsage(usage: ModelUsage): ModelUsage {
+  const output: ModelUsage = {};
+  assignOptional(output, "inputTokens", usage.inputTokens);
+  assignOptional(output, "outputTokens", usage.outputTokens);
+  assignOptional(output, "cacheReadInputTokens", usage.cacheReadInputTokens);
+  assignOptional(output, "cacheCreationInputTokens", usage.cacheCreationInputTokens);
+  assignOptional(output, "totalTokens", usage.totalTokens);
+  assignOptional(output, "raw", usage.raw);
+  return output;
+}
+
+function isFiniteNumber(value: number | undefined): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }
 
 function matchesThread(value: ThreadId | undefined, requested: ThreadId | undefined): boolean {
