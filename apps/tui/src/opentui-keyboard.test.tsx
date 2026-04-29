@@ -104,6 +104,28 @@ test("resume session and thread submit without creating a new session", async ()
   }
 });
 
+test("resume session without a thread blocks submit without creating a new session", async () => {
+  const records = chatClientRecords();
+  const client = fakeChatClient(records);
+  const app = await mountChatApp(client, {
+    sessionId: "session_resume_missing_thread" as SessionId,
+  });
+
+  try {
+    await Bun.sleep(80);
+    await app.renderOnce();
+    expect(app.captureCharFrame()).toContain("Session resume needs a thread");
+
+    await typeText(app, "continue");
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(records.create).toHaveLength(0);
+    expect(records.submit).toHaveLength(0);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("default chat ignores streamed history and starts a new session", async () => {
   const records = chatClientRecords();
   const sessionId = "session_streamed" as SessionId;
@@ -212,6 +234,8 @@ test("pending approval renders the approval dock and shortcuts resolve it", asyn
             status: "pending",
             createdAt: 1,
             toolName: "bash",
+            toolDisplayStatus: "waiting_permission",
+            inputSummary: { title: "bash", command: "bun test", detail: "bun test" },
           },
         ],
         activeTools: [],
@@ -228,6 +252,8 @@ test("pending approval renders the approval dock and shortcuts resolve it", asyn
 
   try {
     expect(app.captureCharFrame()).toContain("tool.bash");
+    expect(app.captureCharFrame()).toContain("waiting_permission");
+    expect(app.captureCharFrame()).toContain("command: bun test");
     expect(app.captureCharFrame()).toContain("a approve once | x reject");
 
     await press(app, () => app.mockInput.pressKey("a"));

@@ -7,7 +7,7 @@ import { TeamLiveSurface } from "./TeamLiveApp.js";
 import { teamLiveModel, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
 import { useChatRuntime, type ChatRuntimeState } from "./useChatRuntime.js";
 import { findAction } from "./components/helpers.js";
-import { ApprovalDock } from "./chat/ApprovalDock.js";
+import { ApprovalDock, approvalDockHeight } from "./chat/ApprovalDock.js";
 import { CommandList } from "./chat/CommandList.js";
 import { MessageList } from "./chat/MessageList.js";
 import { PROMPT_PLACEHOLDER, PromptComposer } from "./chat/PromptComposer.js";
@@ -96,6 +96,19 @@ export function ChatShellSurface(props: {
   const paletteItems = slashCompletions(commands, slashContext, "/", 10);
   const firstApproval = props.runtime.chatView.pendingApprovals[0];
   const setPrompt = useMemo(() => setPromptText(setPromptParts), []);
+  const bottomAnchor = useMemo(() => {
+    const lastItem = props.runtime.chatView.items.at(-1);
+    const lastStatus = lastItem?.kind === "tool"
+      ? lastItem.displayStatus
+      : lastItem?.kind === "approval"
+        ? `${lastItem.status}:${lastItem.decision ?? ""}`
+        : "";
+    return `${props.runtime.chatView.items.length}:${lastItem?.kind ?? ""}:${lastItem?.id ?? ""}:${lastStatus}:${props.runtime.chatView.pendingApprovals.length}`;
+  }, [props.runtime.chatView.items, props.runtime.chatView.pendingApprovals.length]);
+
+  useEffect(() => {
+    setMessageScrollOffset(0);
+  }, [bottomAnchor]);
 
   useKeyboard((key) => {
     if (key.eventType !== "press") return;
@@ -187,6 +200,8 @@ export function ChatShellSurface(props: {
       ? "Resolve approval to continue"
       : props.runtime.chatView.status === "running"
         ? "Session running - ctrl+x interrupt"
+        : props.runtime.submitBlockedReason
+          ? props.runtime.submitBlockedReason
         : !props.runtime.canSubmit
           ? "Waiting for runtime"
           : undefined;
@@ -319,6 +334,9 @@ function SessionScreen(props: {
   disabledReason?: string | undefined;
 }) {
   const promptWidth = Math.min(96, Math.max(42, props.width - 8));
+  const messageWidth = Math.max(24, props.width - 8);
+  const approvalHeight = approvalDockHeight(props.runtime.chatView.pendingApprovals, messageWidth);
+  const visibleLimit = Math.max(4, props.height - 8 - approvalHeight);
   return (
     <box
       width="100%"
@@ -339,14 +357,15 @@ function SessionScreen(props: {
           <MessageList
             chatView={props.runtime.chatView}
             localItems={props.localItems}
-            width={Math.max(24, props.width - 8)}
-            visibleLimit={Math.max(4, props.height - 14)}
+            width={messageWidth}
+            visibleLimit={visibleLimit}
             scrollOffset={props.messageScrollOffset}
           />
         )}
       </box>
       <ApprovalDock
         approvals={props.runtime.chatView.pendingApprovals}
+        width={messageWidth}
         onApprove={(approvalId: ApprovalId) => void props.runtime.approveApproval(approvalId)}
         onReject={(approvalId: ApprovalId) => void props.runtime.rejectApproval(approvalId)}
       />
@@ -447,7 +466,7 @@ async function submitPrompt(
     return;
   }
   if (!runtime.canSubmit) {
-    setLocalItems((current) => [...current, localItem("error", "Session is not ready for another prompt.")]);
+    setLocalItems((current) => [...current, localItem("error", runtime.submitBlockedReason ?? "Session is not ready for another prompt.")]);
     return;
   }
   const accepted = await runtime.submitPrompt(trimmed);

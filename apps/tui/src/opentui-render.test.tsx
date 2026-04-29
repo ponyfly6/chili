@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import { act } from "react";
 import { createRuntimeView, type ChatTranscriptItem, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
-import type { ApprovalId, MessageId, PartId, TaskId } from "@chili/protocol";
+import type { ApprovalId, MessageId, PartId, TaskId, ToolCallId } from "@chili/protocol";
 import { ChatShellSurface } from "./ChatShellApp.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import type { ChatRuntimeState } from "./useChatRuntime.js";
@@ -132,6 +132,120 @@ test("scrolls a long single assistant message by rendered lines", async () => {
   } finally {
     app.renderer.destroy();
   }
+});
+
+test("renders reasoning separately from assistant text", async () => {
+  const frame = await renderShellFrame(teamLiveFixture(), {
+    width: 120,
+    height: 24,
+    runtime: fakeChatRuntime({
+      chatView: {
+        status: "idle",
+        items: [
+          {
+            id: "msg_reasoning" as MessageId,
+            kind: "message",
+            role: "assistant",
+            createdAt: 1,
+            parts: [
+              { type: "reasoning", id: "part_reasoning" as PartId, text: "checking the plan" },
+              { type: "text", id: "part_answer" as PartId, text: "final answer" },
+            ],
+          },
+        ],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    }),
+  });
+
+  expect(frame).toContain("Thinking");
+  expect(frame).toContain("| checking the plan");
+  expect(frame).toContain("Assistant: final answer");
+  expect(frame).not.toContain("Assistant: checking the plan final answer");
+});
+
+test("renders tool rows with display statuses and output blocks", async () => {
+  const frame = await renderShellFrame(teamLiveFixture(), {
+    width: 120,
+    height: 30,
+    runtime: fakeChatRuntime({
+      chatView: {
+        status: "idle",
+        items: [
+          chatTool("tool_wait", "bash", "waiting_for_approval", "waiting_permission", { title: "bash", command: "bun test", detail: "bun test" }),
+          chatTool("tool_run", "grep", "running", "running", { title: "grep", pattern: "TODO", scope: "apps/tui", detail: "TODO in apps/tui" }),
+          { ...chatTool("tool_done", "read", "completed", "succeeded", { title: "read", path: "README.md", detail: "README.md" }), output: "ok" },
+          { ...chatTool("tool_reject", "edit", "cancelled", "rejected", { title: "edit", path: "src/a.ts", detail: "src/a.ts" }), approvalDecision: "deny" },
+        ],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    }),
+  });
+
+  expect(frame).toContain("tool bash waiting_permission bun test");
+  expect(frame).toContain("tool grep running TODO in apps/tui");
+  expect(frame).toContain("tool read succeeded README.md");
+  expect(frame).toContain("result tool_done: ok");
+  expect(frame).toContain("tool edit rejected src/a.ts");
+});
+
+test("does not render approval dock when no approval is pending", async () => {
+  const frame = await renderShellFrame(teamLiveFixture(), {
+    width: 120,
+    height: 24,
+    runtime: fakeChatRuntime({
+      chatView: {
+        status: "idle",
+        items: chatMessages(1),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    }),
+  });
+
+  expect(frame).not.toContain("Approval required");
+  expect(frame).not.toContain("a approve once | x reject");
+});
+
+test("folds long approval details without hiding the prompt", async () => {
+  const longCommand = Array.from({ length: 80 }, (_, index) => `echo segment_${index}`).join(" && ");
+  const frame = await renderShellFrame(teamLiveFixture(), {
+    width: 80,
+    height: 24,
+    runtime: fakeChatRuntime({
+      canSubmit: false,
+      chatView: {
+        status: "waiting_for_approval",
+        items: chatMessages(2),
+        pendingApprovals: [
+          {
+            id: "approval_long_command" as ApprovalId,
+            kind: "approval",
+            permission: "tool.bash",
+            patterns: [longCommand],
+            status: "pending",
+            createdAt: 1,
+            toolName: "bash",
+            toolDisplayStatus: "waiting_permission",
+            inputSummary: { title: "bash", command: longCommand, detail: longCommand },
+          },
+        ],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    }),
+  });
+
+  expect(frame).toContain("Approval required");
+  expect(frame).toContain("lines folded");
+  expect(frame).toContain("Resolve approval to continue");
+  expect(frame).toContain("ctrl+p");
+  expect(frame).toContain("commands");
 });
 
 test("mouse wheel scrolls the chat transcript", async () => {
@@ -396,6 +510,25 @@ function chatMessages(count: number): ChatTranscriptItem[] {
       ],
     };
   });
+}
+
+function chatTool(
+  id: string,
+  toolName: string,
+  status: Extract<ChatTranscriptItem, { kind: "tool" }>["status"],
+  displayStatus: Extract<ChatTranscriptItem, { kind: "tool" }>["displayStatus"],
+  inputSummary: Extract<ChatTranscriptItem, { kind: "tool" }>["inputSummary"],
+): Extract<ChatTranscriptItem, { kind: "tool" }> {
+  return {
+    id: id as ToolCallId,
+    kind: "tool",
+    toolName,
+    status,
+    displayStatus,
+    waitingForApproval: displayStatus === "waiting_permission",
+    updatedAt: 1,
+    inputSummary,
+  };
 }
 
 function longAssistantMessage(lineCount: number): ChatTranscriptItem {

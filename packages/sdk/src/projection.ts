@@ -615,21 +615,57 @@ export interface ChatMessageRow {
 export type ChatMessagePart =
   | { type: "text"; id: PartId; text: string; synthetic?: boolean }
   | { type: "reasoning"; id: PartId; text: string; redacted?: boolean }
-  | { type: "tool_call"; id: PartId; callId: ToolCallId; toolName: string; status: ToolPartStatus; input?: unknown }
+  | { type: "tool_call"; id: PartId; callId: ToolCallId; toolName: string; status: ToolPartStatus; input?: unknown; displayStatus?: ChatToolDisplayStatus }
   | { type: "tool_result"; id: PartId; callId: ToolCallId; output: string; error?: string; synthetic?: boolean }
   | { type: "summary"; id: PartId; text: string };
+
+export type ChatToolDisplayStatus =
+  | "queued"
+  | "checking"
+  | "waiting_permission"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "rejected"
+  | "cancelled";
+
+export interface ChatToolInputSummary {
+  title: string;
+  detail?: string;
+  scope?: string;
+  command?: string;
+  path?: string;
+  pattern?: string;
+  diffSummary?: string;
+}
+
+type ChatToolInputSummaryDraft = {
+  title: string;
+  detail?: string | undefined;
+  scope?: string | undefined;
+  command?: string | undefined;
+  path?: string | undefined;
+  pattern?: string | undefined;
+  diffSummary?: string | undefined;
+};
 
 export interface ChatToolCallRow {
   id: ToolCallId;
   kind: "tool";
   toolName: string;
   status: RuntimeToolCallView["status"];
+  displayStatus: ChatToolDisplayStatus;
+  waitingForApproval: boolean;
   updatedAt: number;
+  inputSummary: ChatToolInputSummary;
   input?: unknown;
   output?: string;
   error?: string;
   sessionId?: SessionId;
   threadId?: ThreadId;
+  approvalId?: ApprovalId;
+  approvalStatus?: RuntimeApprovalView["status"];
+  approvalDecision?: RuntimeApprovalView["decision"];
 }
 
 export interface ChatApprovalRow {
@@ -643,6 +679,10 @@ export interface ChatApprovalRow {
   threadId?: ThreadId;
   callId?: ToolCallId;
   toolName?: string;
+  toolInput?: unknown;
+  toolStatus?: RuntimeToolCallView["status"];
+  toolDisplayStatus?: ChatToolDisplayStatus;
+  inputSummary: ChatToolInputSummary;
   decision?: RuntimeApprovalView["decision"];
   feedback?: string;
   resolvedAt?: number;
@@ -895,7 +935,7 @@ export function chatSessionView(view: ChiliRuntimeView, input: ChatSessionInput 
     ? session.toolCallIds.flatMap((callId) => {
       const toolCall = view.toolCalls[callId];
       if (!toolCall || !matchesThread(toolCall.threadId, input.threadId)) return [];
-      return [chatToolCallRow(toolCall)];
+      return [chatToolCallRow(view, toolCall)];
     })
     : [];
   const approvals = session
@@ -965,6 +1005,7 @@ function chatMessagePart(part: MessagePart): ChatMessagePart {
       toolName: part.toolName,
       status: part.status,
       input: part.input,
+      displayStatus: chatToolDisplayStatus(part.status),
     };
   }
   if (part.type === "tool_result") {
@@ -979,24 +1020,36 @@ function chatMessagePart(part: MessagePart): ChatMessagePart {
   return { type: "summary", id: part.id, text: `agent handoff: ${part.agentPath}` };
 }
 
-function chatToolCallRow(toolCall: RuntimeToolCallView): ChatToolCallRow {
+function chatToolCallRow(view: ChiliRuntimeView, toolCall: RuntimeToolCallView): ChatToolCallRow {
+  const linkedApprovals = approvalsForToolCall(view, toolCall.id);
+  const pendingApproval = linkedApprovals.find((approval) => approval.status === "pending");
+  const latestApproval = latestApprovalForToolCall(linkedApprovals);
+  const status = pendingApproval ? "waiting_for_approval" : toolCall.status;
   const row: ChatToolCallRow = {
     id: toolCall.id,
     kind: "tool",
     toolName: toolCall.toolName,
-    status: toolCall.status,
+    status,
+    displayStatus: chatToolDisplayStatus(status, latestApproval),
+    waitingForApproval: Boolean(pendingApproval),
     updatedAt: toolCall.updatedAt,
+    inputSummary: chatToolInputSummary(toolCall.toolName, toolCall.input, pendingApproval?.patterns ?? latestApproval?.patterns ?? []),
   };
   assignOptional(row, "input", toolCall.input);
   assignOptional(row, "output", toolCall.output);
   assignOptional(row, "error", toolCall.error);
   assignOptional(row, "sessionId", toolCall.sessionId);
   assignOptional(row, "threadId", toolCall.threadId);
+  assignOptional(row, "approvalId", pendingApproval?.id ?? latestApproval?.id);
+  assignOptional(row, "approvalStatus", pendingApproval?.status ?? latestApproval?.status);
+  assignOptional(row, "approvalDecision", latestApproval?.decision);
   return row;
 }
 
 function chatApprovalRow(view: ChiliRuntimeView, approval: RuntimeApprovalView): ChatApprovalRow {
   const toolCall = approval.callId ? view.toolCalls[approval.callId] : undefined;
+  const toolName = toolCall?.toolName ?? permissionToolName(approval.permission);
+  const toolStatus = toolCall?.status;
   const row: ChatApprovalRow = {
     id: approval.id,
     kind: "approval",
@@ -1004,15 +1057,254 @@ function chatApprovalRow(view: ChiliRuntimeView, approval: RuntimeApprovalView):
     patterns: approval.patterns,
     status: approval.status,
     createdAt: approval.createdAt,
+    inputSummary: chatToolInputSummary(toolName, toolCall?.input, approval.patterns),
   };
   assignOptional(row, "sessionId", approval.sessionId);
   assignOptional(row, "threadId", approval.threadId);
   assignOptional(row, "callId", approval.callId);
-  assignOptional(row, "toolName", toolCall?.toolName);
+  assignOptional(row, "toolName", toolName);
+  assignOptional(row, "toolInput", toolCall?.input);
+  assignOptional(row, "toolStatus", toolStatus);
+  assignOptional(row, "toolDisplayStatus", toolStatus ? chatToolDisplayStatus(approval.status === "pending" ? "waiting_for_approval" : toolStatus, approval) : undefined);
   assignOptional(row, "decision", approval.decision);
   assignOptional(row, "feedback", approval.feedback);
   assignOptional(row, "resolvedAt", approval.resolvedAt);
   return row;
+}
+
+function approvalsForToolCall(view: ChiliRuntimeView, callId: ToolCallId): RuntimeApprovalView[] {
+  return Object.values(view.approvals)
+    .filter((approval) => approval.callId === callId)
+    .sort((left, right) => approvalTime(left) - approvalTime(right));
+}
+
+function latestApprovalForToolCall(approvals: readonly RuntimeApprovalView[]): RuntimeApprovalView | undefined {
+  return approvals[approvals.length - 1];
+}
+
+function approvalTime(approval: RuntimeApprovalView): number {
+  return approval.resolvedAt ?? approval.createdAt;
+}
+
+function chatToolDisplayStatus(
+  status: RuntimeToolCallView["status"] | ToolPartStatus,
+  approval?: RuntimeApprovalView,
+): ChatToolDisplayStatus {
+  if (approval?.status === "pending") return "waiting_permission";
+  if (approval?.decision === "deny" && (status === "waiting_for_approval" || status === "cancelled" || status === "failed")) {
+    return "rejected";
+  }
+  if (status === "pending") return "queued";
+  if (status === "validating") return "checking";
+  if (status === "waiting_for_approval") return "waiting_permission";
+  if (status === "running") return "running";
+  if (status === "completed") return "succeeded";
+  if (status === "failed") return "failed";
+  return "cancelled";
+}
+
+function chatToolInputSummary(toolName: string | undefined, input: unknown, patterns: readonly string[]): ChatToolInputSummary {
+  const name = toolName && toolName.length > 0 ? toolName : "tool";
+  const record = recordValue(input);
+  const normalized = name.toLowerCase();
+  const path = record ? firstString(record, ["filePath", "file_path", "path"]) : undefined;
+  const pattern = record ? firstString(record, ["pattern", "query"]) : undefined;
+  const paths = record ? firstStringArray(record, ["paths", "filePaths", "file_paths"]) : undefined;
+  const scope = scopeSummary(patterns, path, paths);
+
+  if (normalized === "bash" || normalized === "run_shell_command") {
+    const command = record ? firstString(record, ["command", "cmd"]) : undefined;
+    return compactSummary({
+      title: "bash",
+      detail: command ?? scope,
+      command,
+      scope: record ? firstString(record, ["cwd"]) : undefined,
+    });
+  }
+
+  if (normalized === "edit" || normalized === "replace") {
+    const oldText = record ? firstString(record, ["oldString", "old_string", "oldText"]) : undefined;
+    const newText = record ? firstString(record, ["newString", "new_string", "newText"]) : undefined;
+    return compactSummary({
+      title: "edit",
+      detail: path ?? scope,
+      path: path ?? firstPattern(patterns),
+      scope,
+      diffSummary: editDiffSummary(oldText, newText, record ? booleanRecordValue(record, "replaceAll", "allow_multiple", "replace_all") : undefined),
+    });
+  }
+
+  if (normalized === "write" || normalized === "write_file") {
+    const content = record ? firstString(record, ["content"]) : undefined;
+    return compactSummary({
+      title: "write",
+      detail: path ?? scope,
+      path: path ?? firstPattern(patterns),
+      scope,
+      diffSummary: content === undefined ? undefined : `write ${lineCount(content)} line(s), ${content.length} chars`,
+    });
+  }
+
+  if (normalized === "apply_patch") {
+    const operations = record && Array.isArray(record.operations) ? record.operations : [];
+    const operationSummary = applyPatchSummary(operations);
+    return compactSummary({
+      title: "apply_patch",
+      detail: operationSummary.paths.join(", ") || scope,
+      path: operationSummary.paths[0] ?? firstPattern(patterns),
+      scope,
+      diffSummary: operationSummary.summary,
+    });
+  }
+
+  if (normalized === "read" || normalized === "read_file") {
+    return compactSummary({
+      title: "read",
+      detail: path ?? scope,
+      path: path ?? firstPattern(patterns),
+      scope,
+    });
+  }
+
+  if (normalized === "grep") {
+    return compactSummary({
+      title: "grep",
+      detail: pattern ? `${pattern}${path ? ` in ${path}` : ""}` : scope,
+      pattern,
+      path,
+      scope: path ?? scope,
+    });
+  }
+
+  if (normalized === "glob") {
+    return compactSummary({
+      title: "glob",
+      detail: pattern ? `${pattern}${path ? ` under ${path}` : ""}` : scope,
+      pattern,
+      path,
+      scope: path ?? scope,
+    });
+  }
+
+  return compactSummary({
+    title: name,
+    detail: scope ?? previewUnknown(input, 120),
+    path: path ?? firstPattern(patterns),
+    pattern,
+    scope,
+  });
+}
+
+function permissionToolName(permission: string): string | undefined {
+  const trimmed = permission.trim();
+  if (!trimmed) return undefined;
+  return trimmed.startsWith("tool.") ? trimmed.slice("tool.".length) : trimmed;
+}
+
+function compactSummary(summary: ChatToolInputSummaryDraft): ChatToolInputSummary {
+  const output: ChatToolInputSummary = { title: summary.title };
+  assignOptional(output, "detail", emptyToUndefined(summary.detail));
+  assignOptional(output, "scope", emptyToUndefined(summary.scope));
+  assignOptional(output, "command", emptyToUndefined(summary.command));
+  assignOptional(output, "path", emptyToUndefined(summary.path));
+  assignOptional(output, "pattern", emptyToUndefined(summary.pattern));
+  assignOptional(output, "diffSummary", emptyToUndefined(summary.diffSummary));
+  return output;
+}
+
+function scopeSummary(patterns: readonly string[], path: string | undefined, paths: readonly string[] | undefined): string | undefined {
+  if (paths?.length) return paths.join(", ");
+  if (path) return path;
+  return patterns.length > 0 ? patterns.join(", ") : undefined;
+}
+
+function firstPattern(patterns: readonly string[]): string | undefined {
+  return patterns.find((pattern) => pattern.length > 0);
+}
+
+function editDiffSummary(oldText: string | undefined, newText: string | undefined, replaceAll: boolean | undefined): string | undefined {
+  if (oldText === undefined || newText === undefined) return undefined;
+  const mode = replaceAll ? "replace all" : "replace";
+  return `${mode} ${lineCount(oldText)} line(s) with ${lineCount(newText)} line(s): ${previewText(oldText, 32)} -> ${previewText(newText, 32)}`;
+}
+
+function applyPatchSummary(operations: readonly unknown[]): { paths: string[]; summary?: string } {
+  const rows = operations.flatMap((operation): Array<{ type: string; path: string; movePath?: string }> => {
+    const record = recordValue(operation);
+    if (!record) return [];
+    const type = firstString(record, ["type"]) ?? "update";
+    const path = firstString(record, ["path"]);
+    if (!path) return [];
+    const movePath = firstString(record, ["movePath", "move_path"]);
+    return [{ type, path, ...(movePath ? { movePath } : {}) }];
+  });
+  const paths = [...new Set(rows.flatMap((row) => row.movePath ? [row.path, row.movePath] : [row.path]))];
+  if (rows.length === 0) return { paths };
+  const preview = rows
+    .slice(0, 4)
+    .map((row) => row.movePath ? `${row.type} ${row.path} -> ${row.movePath}` : `${row.type} ${row.path}`)
+    .join(", ");
+  const suffix = rows.length > 4 ? `, +${rows.length - 4} more` : "";
+  return { paths, summary: `${rows.length} operation(s): ${preview}${suffix}` };
+}
+
+function firstString(record: Record<string, unknown>, keys: readonly string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+function firstStringArray(record: Record<string, unknown>, keys: readonly string[]): string[] | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (!Array.isArray(value)) continue;
+    const items = value.filter((item): item is string => typeof item === "string" && item.length > 0);
+    if (items.length > 0) return items;
+  }
+  return undefined;
+}
+
+function booleanRecordValue(record: Record<string, unknown>, ...keys: string[]): boolean | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "boolean") return value;
+  }
+  return undefined;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function lineCount(text: string): number {
+  if (text.length === 0) return 0;
+  return text.split(/\r\n|\r|\n/).length;
+}
+
+function previewText(text: string, maxLength: number): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return JSON.stringify(normalized);
+  return JSON.stringify(`${normalized.slice(0, Math.max(0, maxLength - 1))}...`);
+}
+
+function previewUnknown(value: unknown, maxLength: number): string | undefined {
+  if (value === undefined) return undefined;
+  try {
+    return previewRaw(JSON.stringify(value), maxLength);
+  } catch {
+    return previewRaw(String(value), maxLength);
+  }
+}
+
+function previewRaw(text: string | undefined, maxLength: number): string | undefined {
+  if (!text) return undefined;
+  return text.length <= maxLength ? text : `${text.slice(0, Math.max(0, maxLength - 1))}...`;
+}
+
+function emptyToUndefined(value: string | undefined): string | undefined {
+  return value && value.length > 0 ? value : undefined;
 }
 
 function chatItemTime(item: ChatTranscriptItem): number {

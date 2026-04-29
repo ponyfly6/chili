@@ -20,6 +20,7 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
   chatView: ChatSessionView;
   chatFeedback?: ChatRuntimeFeedback;
   canSubmit: boolean;
+  submitBlockedReason?: string;
   submitPrompt: (text: string) => Promise<boolean>;
   interruptActiveSession: () => Promise<void>;
   approveApproval: (approvalId: ApprovalId) => Promise<void>;
@@ -58,7 +59,12 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   }, [activeSessionId, activeThreadId, chatView.sessionId, chatView.threadId]);
 
   const running = chatView.status === "running" || chatView.status === "waiting_for_approval";
-  const canSubmit = !submitPending && !running && chatView.pendingApprovals.length === 0;
+  const resolvedThreadId = activeThreadId ?? chatView.threadId;
+  const resumeThreadMissing = Boolean(activeSessionId && !resolvedThreadId);
+  const submitBlockedReason = resumeThreadMissing
+    ? "Session resume needs a thread. Pass --thread or wait for history to load."
+    : undefined;
+  const canSubmit = !submitPending && !running && chatView.pendingApprovals.length === 0 && !submitBlockedReason;
 
   const withAbort = useCallback(<T,>(run: (signal: AbortSignal) => Promise<T>): Promise<T> => {
     const controller = new AbortController();
@@ -71,13 +77,20 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   const submitPrompt = useCallback(async (text: string): Promise<boolean> => {
     const trimmed = text.trim();
     if (!trimmed || submitPending || running || chatView.pendingApprovals.length > 0) return false;
+    if (resumeThreadMissing) {
+      setChatFeedback({ status: "error", message: submitBlockedReason ?? "Session resume needs a thread." });
+      return false;
+    }
     setSubmitPending(true);
     setChatFeedback({ status: "pending", message: "sending prompt" });
     try {
       await withAbort(async (signal) => {
         let sessionId = activeSessionId ?? chatView.sessionId;
         let threadId = activeThreadId ?? chatView.threadId;
-        if (!sessionId || !threadId) {
+        if (sessionId && !threadId) {
+          throw new Error(submitBlockedReason ?? "Session resume needs a thread.");
+        }
+        if (!sessionId && !threadId) {
           const created = await client.createSession({
             ...(options.cwd ? { cwd: options.cwd } : {}),
             signal,
@@ -86,6 +99,9 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
           threadId = created.threadId;
           setActiveSessionId(sessionId);
           setActiveThreadId(threadId);
+        }
+        if (!sessionId || !threadId) {
+          throw new Error("Unable to determine a session and thread for this prompt.");
         }
         await client.submitPromptAsync({
           sessionId,
@@ -103,7 +119,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     } finally {
       setSubmitPending(false);
     }
-  }, [activeSessionId, activeThreadId, chatView.pendingApprovals.length, chatView.sessionId, chatView.threadId, client, options.baseUrl, options.cwd, running, submitPending, withAbort]);
+  }, [activeSessionId, activeThreadId, chatView.pendingApprovals.length, chatView.sessionId, chatView.threadId, client, options.baseUrl, options.cwd, resumeThreadMissing, running, submitBlockedReason, submitPending, withAbort]);
 
   const interruptActiveSession = useCallback(async () => {
     if (!activeSessionId) return;
@@ -140,11 +156,12 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     chatView,
     ...(chatFeedback ? { chatFeedback } : {}),
     canSubmit,
+    ...(submitBlockedReason ? { submitBlockedReason } : {}),
     submitPrompt,
     interruptActiveSession,
     approveApproval,
     rejectApproval,
-  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, submitPrompt, teamRuntime]);
+  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, submitBlockedReason, submitPrompt, teamRuntime]);
 }
 
 async function resolveApproval(

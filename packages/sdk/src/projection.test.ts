@@ -290,9 +290,25 @@ test("projects chat session transcript rows from message, tool, and approval eve
   expect(pending.status).toBe("waiting_for_approval");
   expect(assistant?.kind === "message" ? assistant.parts : []).toContainEqual({ type: "reasoning", id: reasoningPartId, text: "thinking through" });
   expect(assistant?.kind === "message" ? assistant.parts : []).toContainEqual({ type: "text", id: textPartId, text: "hello world" });
-  expect(tool).toMatchObject({ kind: "tool", id: callId, toolName: "bash", status: "waiting_for_approval" });
+  expect(tool).toMatchObject({
+    kind: "tool",
+    id: callId,
+    toolName: "bash",
+    status: "waiting_for_approval",
+    displayStatus: "waiting_permission",
+    waitingForApproval: true,
+    approvalId,
+    inputSummary: { command: "bun test" },
+  });
   expect(pending.pendingApprovals).toEqual([
-    expect.objectContaining({ id: approvalId, status: "pending", permission: "tool.bash", toolName: "bash" }),
+    expect.objectContaining({
+      id: approvalId,
+      status: "pending",
+      permission: "tool.bash",
+      toolName: "bash",
+      toolInput: { command: "bun test" },
+      inputSummary: expect.objectContaining({ command: "bun test" }),
+    }),
   ]);
 
   const resolvedView = reduceRuntimeEvents(
@@ -331,7 +347,105 @@ test("projects chat session transcript rows from message, tool, and approval eve
   expect(resolved.status).toBe("idle");
   expect(resolved.pendingApprovals).toHaveLength(0);
   expect(resolvedApproval).toMatchObject({ kind: "approval", id: approvalId, status: "resolved", decision: "allow_once" });
-  expect(completedTool).toMatchObject({ kind: "tool", id: callId, status: "completed", output: "ok" });
+  expect(completedTool).toMatchObject({ kind: "tool", id: callId, status: "completed", displayStatus: "succeeded", output: "ok" });
+});
+
+test("projects tool-specific approval summaries for chat TUI", () => {
+  const sessionId = "session_approval_summaries" as SessionId;
+  const threadId = "thread_approval_summaries" as ThreadId;
+  const turnId = "turn_approval_summaries" as TurnId;
+  const bashCallId = "toolcall_summary_bash" as ToolCallId;
+  const editCallId = "toolcall_summary_edit" as ToolCallId;
+  const grepCallId = "toolcall_summary_grep" as ToolCallId;
+  const patchCallId = "toolcall_summary_patch" as ToolCallId;
+  const bashApprovalId = "approval_summary_bash" as ApprovalId;
+  const editApprovalId = "approval_summary_edit" as ApprovalId;
+  const grepApprovalId = "approval_summary_grep" as ApprovalId;
+  const patchApprovalId = "approval_summary_patch" as ApprovalId;
+
+  const view = reduceRuntimeEvents(
+    [
+      {
+        id: "event_summary_session",
+        type: "session.created",
+        time: 1 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { sessionId, cwd: "/repo" },
+      },
+      ...toolApprovalEvents({
+        time: 2,
+        sessionId,
+        threadId,
+        turnId,
+        callId: bashCallId,
+        approvalId: bashApprovalId,
+        toolName: "bash",
+        input: { command: "rm -rf build && bun test" },
+        permission: "tool.bash",
+        patterns: ["rm -rf build && bun test"],
+      }),
+      ...toolApprovalEvents({
+        time: 5,
+        sessionId,
+        threadId,
+        turnId,
+        callId: editCallId,
+        approvalId: editApprovalId,
+        toolName: "edit",
+        input: { filePath: "apps/tui/src/ChatShellApp.tsx", oldString: "old", newString: "new" },
+        permission: "edit",
+        patterns: ["apps/tui/src/ChatShellApp.tsx"],
+      }),
+      ...toolApprovalEvents({
+        time: 8,
+        sessionId,
+        threadId,
+        turnId,
+        callId: grepCallId,
+        approvalId: grepApprovalId,
+        toolName: "grep",
+        input: { pattern: "waiting_for_approval", path: "packages/sdk/src" },
+        permission: "grep",
+        patterns: ["packages/sdk/src"],
+      }),
+      ...toolApprovalEvents({
+        time: 11,
+        sessionId,
+        threadId,
+        turnId,
+        callId: patchCallId,
+        approvalId: patchApprovalId,
+        toolName: "apply_patch",
+        input: { operations: [{ type: "replace", path: "apps/tui/src/chat/MessageList.tsx", oldText: "a", newText: "b" }] },
+        permission: "edit",
+        patterns: ["apps/tui/src/chat/MessageList.tsx"],
+      }),
+    ],
+    createRuntimeView(),
+  );
+
+  const chat = chatSessionView(view, { sessionId, threadId });
+  const approval = (id: ApprovalId) => chat.pendingApprovals.find((row) => row.id === id);
+  const tool = (id: ToolCallId) => chat.activeTools.find((row) => row.id === id);
+
+  expect(tool(bashCallId)).toMatchObject({ displayStatus: "waiting_permission", waitingForApproval: true, inputSummary: { command: "rm -rf build && bun test" } });
+  expect(approval(bashApprovalId)).toMatchObject({ toolName: "bash", toolInput: { command: "rm -rf build && bun test" }, inputSummary: { command: "rm -rf build && bun test" } });
+  expect(approval(editApprovalId)).toMatchObject({
+    toolName: "edit",
+    inputSummary: expect.objectContaining({
+      path: "apps/tui/src/ChatShellApp.tsx",
+      diffSummary: expect.stringContaining("replace"),
+    }),
+  });
+  expect(approval(grepApprovalId)).toMatchObject({ toolName: "grep", inputSummary: { pattern: "waiting_for_approval", scope: "packages/sdk/src" } });
+  expect(approval(patchApprovalId)).toMatchObject({
+    toolName: "apply_patch",
+    inputSummary: expect.objectContaining({
+      path: "apps/tui/src/chat/MessageList.tsx",
+      diffSummary: expect.stringContaining("replace apps/tui/src/chat/MessageList.tsx"),
+    }),
+  });
 });
 
 test("projects subagent runs, mailbox messages, and team tasks", () => {
@@ -1611,6 +1725,46 @@ function sdkAgentTaskRecord(input: { status: "running" | "completed" | "failed" 
     createdAt: 1,
     updatedAt: 2,
   };
+}
+
+function toolApprovalEvents(input: {
+  time: number;
+  sessionId: SessionId;
+  threadId: ThreadId;
+  turnId: TurnId;
+  callId: ToolCallId;
+  approvalId: ApprovalId;
+  toolName: string;
+  input: unknown;
+  permission: string;
+  patterns: string[];
+}): ChiliEvent[] {
+  return [
+    {
+      id: `event_${input.callId}_started`,
+      type: "tool.call_started",
+      time: input.time as TimestampMs,
+      sessionId: input.sessionId,
+      threadId: input.threadId,
+      payload: { turnId: input.turnId, callId: input.callId, toolName: input.toolName, input: input.input },
+    },
+    {
+      id: `event_${input.callId}_waiting`,
+      type: "tool.call_updated",
+      time: (input.time + 1) as TimestampMs,
+      sessionId: input.sessionId,
+      threadId: input.threadId,
+      payload: { callId: input.callId, status: "waiting_for_approval" },
+    },
+    {
+      id: `event_${input.callId}_approval`,
+      type: "approval.requested",
+      time: (input.time + 2) as TimestampMs,
+      sessionId: input.sessionId,
+      threadId: input.threadId,
+      payload: { approvalId: input.approvalId, callId: input.callId, permission: input.permission, patterns: input.patterns },
+    },
+  ];
 }
 
 function teamRunCounts(input: Partial<TeamRunSummaryCounts>): TeamRunSummaryCounts {

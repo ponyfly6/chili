@@ -1,4 +1,4 @@
-import type { ChatMessagePart, ChatSessionView, ChatTranscriptItem } from "@chili/sdk";
+import type { ChatMessagePart, ChatMessageRow, ChatSessionView, ChatToolCallRow, ChatTranscriptItem } from "@chili/sdk";
 import { shorten } from "../components/helpers.js";
 import type { LocalTranscriptItem } from "./types.js";
 
@@ -61,41 +61,141 @@ function transcriptLines(items: readonly TranscriptSourceItem[], width: number):
         width,
       });
     }
-    if (item.kind === "message") {
-      const role = item.role === "user" ? "You" : item.role;
-      const fg = item.role === "user" ? "#f8f8f2" : "#a3be8c";
-      const body = messageText(item.parts);
-      return wrapLine(`${role}: ${body || "..."}`, {
-        key: `${item.kind}:${item.id}`,
-        fg,
-        width,
-        hangingIndent: "    ",
-      });
-    }
-    if (item.kind === "tool") {
-      const suffix = item.error ? ` error:${shorten(item.error, 120)}` : item.output ? ` output:${shorten(item.output, 120)}` : "";
-      return wrapLine(`tool ${item.toolName} ${item.status}${suffix}`, {
-        key: `${item.kind}:${item.id}`,
-        fg: item.status === "failed" ? "#ff7b72" : "#8f9baa",
-        width,
-      });
-    }
-    return wrapLine(`approval ${item.permission} ${item.status}`, {
-      key: `${item.kind}:${item.id}`,
-      fg: item.status === "pending" ? "#ffd166" : "#8f9baa",
-      width,
-    });
+    if (item.kind === "message") return messageLines(item, width);
+    if (item.kind === "tool") return toolLines(item, width);
+    return approvalLines(item, width);
   });
 }
 
-function messageText(parts: readonly ChatMessagePart[]): string {
-  return parts.map((part) => {
-    if (part.type === "text") return part.text;
-    if (part.type === "reasoning") return `thinking: ${part.text}`;
-    if (part.type === "tool_call") return `tool ${part.toolName} ${part.status}`;
-    if (part.type === "tool_result") return `result ${part.callId} ${shorten(part.error ?? part.output, 100)}`;
-    return part.text;
-  }).join(" ");
+function messageLines(item: ChatMessageRow, width: number): TranscriptLineModel[] {
+  const role = item.role === "user" ? "You" : item.role === "assistant" ? "Assistant" : item.role;
+  const fg = item.role === "user" ? "#f8f8f2" : "#d8dee9";
+  const lines: TranscriptLineModel[] = [];
+  for (const [index, part] of item.parts.entries()) {
+    if (part.type === "text") {
+      lines.push(...wrapLine(`${role}: ${part.text || "..."}`, {
+        key: `${item.kind}:${item.id}:text:${part.id}:${index}`,
+        fg,
+        width,
+        hangingIndent: "    ",
+      }));
+      continue;
+    }
+    if (part.type === "reasoning") {
+      lines.push(...reasoningLines(item, part, width, index));
+      continue;
+    }
+    if (part.type === "tool_result") {
+      lines.push(...toolResultLines(`${item.kind}:${item.id}:result:${part.id}:${index}`, part.callId, part.error ?? part.output, Boolean(part.error), width));
+      continue;
+    }
+    if (part.type === "tool_call") {
+      lines.push(...wrapLine(`tool ${part.toolName} ${part.displayStatus ?? part.status}`, {
+        key: `${item.kind}:${item.id}:tool:${part.id}:${index}`,
+        fg: "#8f9baa",
+        width,
+      }));
+      continue;
+    }
+    lines.push(...wrapLine(part.text, {
+      key: `${item.kind}:${item.id}:summary:${part.id}:${index}`,
+      fg: "#8f9baa",
+      width,
+      hangingIndent: "    ",
+    }));
+  }
+  if (lines.length === 0) {
+    return wrapLine(`${role}: ...`, {
+      key: `${item.kind}:${item.id}`,
+      fg,
+      width,
+      hangingIndent: "    ",
+    });
+  }
+  return lines;
+}
+
+function reasoningLines(item: ChatMessageRow, part: Extract<ChatMessagePart, { type: "reasoning" }>, width: number, index: number): TranscriptLineModel[] {
+  const lines: TranscriptLineModel[] = [
+    { key: `${item.kind}:${item.id}:thinking:${part.id}:${index}:label`, fg: "#7d8590", text: "Thinking" },
+  ];
+  lines.push(...wrapLine(`| ${part.text || "..."}`, {
+    key: `${item.kind}:${item.id}:thinking:${part.id}:${index}`,
+    fg: "#7d8590",
+    width,
+    hangingIndent: "| ",
+  }));
+  return lines;
+}
+
+function toolLines(item: ChatToolCallRow, width: number): TranscriptLineModel[] {
+  const displayStatus = item.displayStatus ?? item.status;
+  const bits = [`tool ${item.toolName}`, displayStatus];
+  const detail = toolDetail(item);
+  if (detail) bits.push(detail);
+  const fg = displayStatus === "failed" || displayStatus === "rejected" ? "#ff7b72" : displayStatus === "waiting_permission" ? "#ffd166" : "#8f9baa";
+  const lines = wrapLine(bits.join(" "), {
+    key: `${item.kind}:${item.id}`,
+    fg,
+    width,
+    hangingIndent: "  ",
+  });
+  if (item.error) {
+    lines.push(...toolResultLines(`${item.kind}:${item.id}:error`, item.id, item.error, true, width));
+  } else if (item.output) {
+    lines.push(...toolResultLines(`${item.kind}:${item.id}:output`, item.id, item.output, false, width));
+  }
+  return lines;
+}
+
+function approvalLines(item: Extract<ChatTranscriptItem, { kind: "approval" }>, width: number): TranscriptLineModel[] {
+  const tool = item.toolName ?? item.permission;
+  const decision = item.decision ? ` ${item.decision}` : "";
+  const summary = item.inputSummary ?? { title: tool, detail: item.patterns.join(", "), scope: item.patterns.join(", ") };
+  const detail = summary.detail ?? summary.scope;
+  return wrapLine(`approval ${tool} ${item.status}${decision}${detail ? ` ${detail}` : ""}`, {
+    key: `${item.kind}:${item.id}`,
+    fg: item.status === "pending" ? "#ffd166" : item.decision === "deny" ? "#ff7b72" : "#8f9baa",
+    width,
+    hangingIndent: "  ",
+  });
+}
+
+function toolDetail(item: ChatToolCallRow): string | undefined {
+  const summary = item.inputSummary ?? { title: item.toolName };
+  if (summary.command) return summary.command;
+  if (summary.diffSummary && summary.path) return `${summary.path} ${summary.diffSummary}`;
+  if (summary.path) return summary.path;
+  if (summary.pattern && summary.scope) return `${summary.pattern} in ${summary.scope}`;
+  if (summary.pattern) return summary.pattern;
+  return summary.detail ?? summary.scope;
+}
+
+function toolResultLines(key: string, callId: string, value: string, error: boolean, width: number): TranscriptLineModel[] {
+  const fg = error ? "#ff7b72" : "#8f9baa";
+  const label = error ? "error" : "result";
+  if (!isLargeOutput(value)) {
+    return wrapLine(`${label} ${callId}: ${shorten(value.replace(/\s+/g, " ").trim(), 140)}`, {
+      key,
+      fg,
+      width,
+      hangingIndent: "  ",
+    });
+  }
+  const preview = value.split("\n").slice(0, 8).join("\n");
+  return [
+    { key: `${key}:head`, fg, text: `${label} ${callId}` },
+    ...wrapLine(preview, {
+      key: `${key}:body`,
+      fg,
+      width,
+      hangingIndent: "  ",
+    }),
+  ];
+}
+
+function isLargeOutput(value: string): boolean {
+  return value.length > 180 || value.includes("\n") || /^diff --git/m.test(value);
 }
 
 function wrapLine(text: string, options: { key: string; fg: string; width: number; hangingIndent?: string }): TranscriptLineModel[] {
