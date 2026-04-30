@@ -645,6 +645,133 @@ test("Shift+Up and Shift+Down scroll the transcript instead of prompt history", 
   }
 });
 
+test("chat scroll stays on history when new messages arrive above the bottom", async () => {
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    width: 120,
+    height: 24,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: chatMessages(30),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
+    await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
+    expect(app.captureCharFrame()).toContain("message 01");
+    expect(app.captureCharFrame()).not.toContain("message 30");
+
+    await act(async () => {
+      app.setRuntime((current) => ({
+        ...current,
+        chatView: {
+          ...current.chatView,
+          items: chatMessages(31),
+          generatedAt: "1970-01-01T00:00:01.000Z",
+        },
+      }));
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("message 01");
+    expect(frame).not.toContain("message 31");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("chat follows the bottom when new messages arrive at offset zero", async () => {
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    width: 120,
+    height: 24,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: chatMessages(2),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    expect(app.captureCharFrame()).toContain("message 02");
+
+    await act(async () => {
+      app.setRuntime((current) => ({
+        ...current,
+        chatView: {
+          ...current.chatView,
+          items: chatMessages(3),
+          generatedAt: "1970-01-01T00:00:01.000Z",
+        },
+      }));
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).toContain("message 03");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("transcript scroll stays on history when raw output grows above the bottom", async () => {
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    width: 120,
+    height: 24,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: rawOutputToolItems(40),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await press(app, () => app.mockInput.pressKey("t", { ctrl: true }));
+    expect(app.captureCharFrame()).toContain("raw_line_40");
+
+    await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
+    await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
+    await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
+    expect(app.captureCharFrame()).toContain("raw_line_01");
+
+    await act(async () => {
+      app.setRuntime((current) => ({
+        ...current,
+        chatView: {
+          ...current.chatView,
+          items: rawOutputToolItems(45),
+          generatedAt: "1970-01-01T00:00:01.000Z",
+        },
+      }));
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("raw_line_01");
+    expect(frame).not.toContain("raw_line_45");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("running disabled composer does not switch to prompt history", async () => {
   const app = await mountStatefulShell(teamLiveFixture(), {
     runtime: {
@@ -1425,6 +1552,24 @@ function chatMessages(count: number): ChatTranscriptItem[] {
       ],
     };
   });
+}
+
+function rawOutputToolItems(lineCount: number): ChatTranscriptItem[] {
+  const output = Array.from({ length: lineCount }, (_, index) => `raw_line_${String(index + 1).padStart(2, "0")}`).join("\n");
+  return [
+    {
+      id: "tool_scroll_raw" as ToolCallId,
+      kind: "tool",
+      toolName: "bash",
+      status: "completed",
+      displayStatus: "succeeded",
+      waitingForApproval: false,
+      updatedAt: 1,
+      inputSummary: { title: "bash", command: "bun test", detail: "bun test" },
+      input: { command: "bun test" },
+      output,
+    },
+  ];
 }
 
 function transcriptCopyItems(): ChatTranscriptItem[] {

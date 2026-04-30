@@ -3,6 +3,7 @@ import { shorten } from "../components/helpers.js";
 import type { TuiTheme } from "../theme/index.js";
 import { markdownToTerminalLines, wrapTerminalText, type MarkdownLineTone } from "./markdown.js";
 import { buildChatDisplayItems, type ChatDisplayItem, type ToolActivityDisplay } from "./presentation.js";
+import { splitStreamingMarkdown } from "./streaming.js";
 import type { ToolActivityDetail } from "./tool-renderers.js";
 import type { LocalTranscriptItem } from "./types.js";
 
@@ -18,6 +19,8 @@ export function MessageList(props: {
   const allLines = transcriptLines(props.chatView.items, props.localItems, {
     width: Math.max(24, props.width ?? 80),
     showToolDetails: props.showToolDetails === true,
+    sessionStatus: props.chatView.status,
+    activeToolCount: props.chatView.activeTools.length,
     theme: props.theme,
   });
   const limit = Math.max(1, props.visibleLimit ?? 18);
@@ -62,9 +65,13 @@ function TranscriptLine(props: { line: TranscriptLineModel }) {
 function transcriptLines(
   items: readonly ChatTranscriptItem[],
   localItems: readonly LocalTranscriptItem[],
-  options: { width: number; showToolDetails: boolean; theme: TuiTheme },
+  options: { width: number; showToolDetails: boolean; sessionStatus: ChatSessionView["status"]; activeToolCount: number; theme: TuiTheme },
 ): TranscriptLineModel[] {
-  const displayItems = buildChatDisplayItems(items, { showToolDetails: options.showToolDetails });
+  const displayItems = buildChatDisplayItems(items, {
+    showToolDetails: options.showToolDetails,
+    sessionStatus: options.sessionStatus,
+    activeToolCount: options.activeToolCount,
+  });
   return [
     ...displayItems.flatMap((item) => displayItemLines(item, options.width, options.theme)),
     ...localItems.flatMap((item) => localItemLines(item, options.width, options.theme)),
@@ -81,6 +88,7 @@ function displayItemLines(item: ChatDisplayItem, width: number, theme: TuiTheme)
     });
   }
   if (item.kind === "assistant_text") {
+    if (item.streaming) return streamingAssistantLines(item, width, theme);
     return markdownToTerminalLines(item.text || "...", {
       key: `display:${item.kind}:${item.id}`,
       width,
@@ -104,6 +112,33 @@ function displayItemLines(item: ChatDisplayItem, width: number, theme: TuiTheme)
     });
   }
   return approvalLines(item.approval, width, theme);
+}
+
+function streamingAssistantLines(item: Extract<ChatDisplayItem, { kind: "assistant_text" }>, width: number, theme: TuiTheme): TranscriptLineModel[] {
+  const { stableText, activeTail } = splitStreamingMarkdown(item.text);
+  const lines = stableText.length > 0
+    ? markdownToTerminalLines(stableText, {
+      key: `display:${item.kind}:${item.id}:stable`,
+      width,
+      prefix: "🌶️: ",
+      hangingIndent: "    ",
+    }).map((line) => ({
+      key: line.key,
+      text: line.text,
+      fg: markdownFg(line.tone, theme),
+    }))
+    : [];
+
+  const tail = activeTail || (lines.length === 0 ? "..." : "");
+  if (!tail) return lines;
+  const prefix = lines.length === 0 ? "🌶️: " : "    ";
+  lines.push(...wrapLine(`${prefix}${tail}`, {
+    key: `display:${item.kind}:${item.id}:active-tail`,
+    fg: markdownFg("text", theme),
+    width,
+    hangingIndent: "    ",
+  }));
+  return lines;
 }
 
 function localItemLines(item: LocalTranscriptItem, width: number, theme: TuiTheme): TranscriptLineModel[] {

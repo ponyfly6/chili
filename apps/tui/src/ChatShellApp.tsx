@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAppContext, useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, MouseEvent, PasteEvent, Selection } from "@opentui/core";
-import type { ChatTranscriptItem, HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
+import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
 import type { ApprovalId, TeamId } from "@chili/protocol";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -12,10 +12,12 @@ import { useChatRuntime, type ChatRuntimeState } from "./useChatRuntime.js";
 import { findAction } from "./components/helpers.js";
 import { ApprovalDock, approvalDockHeight } from "./chat/ApprovalDock.js";
 import { BrandMark } from "./chat/BrandMark.js";
+import { charDisplayWidth } from "./chat/markdown.js";
 import { MessageList } from "./chat/MessageList.js";
+import { buildChatDisplayItems, type ChatDisplayItem, type ToolActivityDisplay } from "./chat/presentation.js";
 import { PROMPT_INPUT_HEIGHT, PROMPT_PLACEHOLDER, PromptComposer, promptComposerHeight } from "./chat/PromptComposer.js";
 import { StatusFooter, statusFooterHeight, type StatusFooterOptions } from "./chat/StatusFooter.js";
-import { buildTranscriptText } from "./chat/transcript.js";
+import { buildTranscriptLines, buildTranscriptText } from "./chat/transcript.js";
 import { TranscriptView } from "./chat/TranscriptView.js";
 import type { LocalTranscriptItem, PromptPart } from "./chat/types.js";
 import { usePromptHistory } from "./chat/usePromptHistory.js";
@@ -116,6 +118,11 @@ export function ChatShellSurface(props: {
   const [messageScrollOffset, setMessageScrollOffset] = useState(0);
   const [transcriptScrollOffset, setTranscriptScrollOffset] = useState(0);
   const [showToolDetails, setShowToolDetails] = useState(false);
+  const scrollEstimateWidth = Math.max(24, dimensions.width - 8);
+  const chatLineCount = useMemo(() => estimatedChatLineCount(props.runtime.chatView, localItems, showToolDetails, scrollEstimateWidth), [localItems, props.runtime.chatView, scrollEstimateWidth, showToolDetails]);
+  const transcriptLineCount = useMemo(() => estimatedTranscriptLineCount(props.runtime.chatView.items, localItems, scrollEstimateWidth), [localItems, props.runtime.chatView.items, scrollEstimateWidth]);
+  const previousChatLineCount = useRef<number | undefined>(undefined);
+  const previousTranscriptLineCount = useRef<number | undefined>(undefined);
   const prompt = promptText(promptParts);
   const history = usePromptHistory();
   const systemTheme = props.options?.systemTheme;
@@ -183,20 +190,6 @@ export function ChatShellSurface(props: {
       return undefined;
     });
   }, []);
-  const bottomAnchor = useMemo(() => {
-    const lastItem = props.runtime.chatView.items.at(-1);
-    const lastStatus = lastItem?.kind === "tool"
-      ? lastItem.displayStatus
-      : lastItem?.kind === "approval"
-        ? `${lastItem.status}:${lastItem.decision ?? ""}`
-        : "";
-    return `${props.runtime.chatView.items.length}:${lastItem?.kind ?? ""}:${lastItem?.id ?? ""}:${lastStatus}:${props.runtime.chatView.pendingApprovals.length}`;
-  }, [props.runtime.chatView.items, props.runtime.chatView.pendingApprovals.length]);
-
-  useEffect(() => {
-    setMessageScrollOffset(0);
-  }, [bottomAnchor]);
-
   useEffect(() => {
     setCompletionIndex(0);
   }, [prompt]);
@@ -224,6 +217,24 @@ export function ChatShellSurface(props: {
           : undefined;
   const promptDisabled = Boolean(disabledReason);
   const clipboard = props.clipboard ?? systemClipboard;
+
+  useEffect(() => {
+    const previous = previousChatLineCount.current;
+    previousChatLineCount.current = chatLineCount;
+    if (previous === undefined) return;
+    const delta = chatLineCount - previous;
+    if (delta <= 0) return;
+    setMessageScrollOffset((current) => current > 0 ? current + delta : current);
+  }, [chatLineCount]);
+
+  useEffect(() => {
+    const previous = previousTranscriptLineCount.current;
+    previousTranscriptLineCount.current = transcriptLineCount;
+    if (previous === undefined) return;
+    const delta = transcriptLineCount - previous;
+    if (delta <= 0) return;
+    setTranscriptScrollOffset((current) => current > 0 ? current + delta : current);
+  }, [transcriptLineCount]);
 
   useEffect(() => {
     const handlePaste = (event: PasteEvent) => {
@@ -707,6 +718,59 @@ function SessionScreen(props: {
       <StatusFooter options={props.options} model={props.model} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
     </box>
   );
+}
+
+function estimatedChatLineCount(chatView: ChatSessionView, localItems: readonly LocalTranscriptItem[], showToolDetails: boolean, width: number): number {
+  const displayItems = buildChatDisplayItems(chatView.items, {
+    showToolDetails,
+    sessionStatus: chatView.status,
+    activeToolCount: chatView.activeTools.length,
+  });
+  const displayLineCount = displayItems.reduce((count, item) => count + estimatedDisplayItemLineCount(item, width), 0);
+  const localLineCount = localItems.reduce((count, item) => count + roughTextLineCount(`${item.level}: ${item.text}`, width), 0);
+  return displayLineCount + localLineCount;
+}
+
+function estimatedTranscriptLineCount(items: readonly ChatTranscriptItem[], localItems: readonly LocalTranscriptItem[], width: number): number {
+  const transcriptLineCount = buildTranscriptLines(items).reduce((count, line) => count + roughTextLineCount(line.text, width), 0);
+  const localLineCount = localItems.reduce((count, item) => count + roughTextLineCount(`${item.level}: ${item.text}`, width), 0);
+  return transcriptLineCount + localLineCount;
+}
+
+function estimatedDisplayItemLineCount(item: ChatDisplayItem, width: number): number {
+  if (item.kind === "user_text" || item.kind === "assistant_text" || item.kind === "summary") return roughTextLineCount(item.text, width);
+  if (item.kind === "reasoning" || item.kind === "approval") return 1;
+  if (item.kind === "tool_activity") return estimatedToolActivityLineCount(item.activity, width);
+  return roughTextLineCount(item.label, width) + item.activities.reduce((count, activity) => {
+    const detailLabel = activity.details.length > 0 ? 1 : 0;
+    return count + detailLabel + estimatedToolActivityExtraLineCount(activity, width);
+  }, 0);
+}
+
+function estimatedToolActivityLineCount(activity: ToolActivityDisplay, width: number): number {
+  return roughTextLineCount(activity.label, width) + estimatedToolActivityExtraLineCount(activity, width);
+}
+
+function estimatedToolActivityExtraLineCount(activity: ToolActivityDisplay, width: number): number {
+  let count = 0;
+  if (activity.outputHint) count += roughTextLineCount(`  ${activity.outputHint}`, width);
+  if (activity.compactErrorLines?.length) {
+    count += roughTextLineCount("  error:", width);
+    for (const line of activity.compactErrorLines) count += roughTextLineCount(`    ${line}`, width);
+  }
+  for (const detail of activity.details) {
+    count += roughTextLineCount(`  ${detail.label}:`, width);
+    for (const line of detail.lines) count += roughTextLineCount(`    ${line}`, width);
+  }
+  return count;
+}
+
+function roughTextLineCount(value: string, width: number): number {
+  const safeWidth = Math.max(8, width);
+  return value.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").reduce((count, line) => {
+    const lineWidth = [...line].reduce((sum, char) => sum + charDisplayWidth(char), 0);
+    return count + Math.max(1, Math.ceil(lineWidth / safeWidth));
+  }, 0);
 }
 
 interface ThemePickerNavigation {

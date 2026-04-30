@@ -275,7 +275,7 @@ test("renders tool rows as compact activity without raw output blocks", async ()
   });
 
   expect(frame).toContain("Waiting approval for bun test");
-  expect(frame).toContain("Explored 1 file, searched 1 pattern");
+  expect(frame).toContain("Exploring 1 file, searched 1 pattern");
   expect(frame).not.toContain("result tool_done: ok");
   expect(frame).toContain("Rejected a.ts");
 });

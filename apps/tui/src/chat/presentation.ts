@@ -2,6 +2,7 @@ import type {
   ChatApprovalRow,
   ChatMessagePart,
   ChatMessageRow,
+  ChatSessionView,
   ChatToolCallRow,
   ChatToolDisplayStatus,
   ChatToolInputSummary,
@@ -17,7 +18,7 @@ import {
 
 export type ChatDisplayItem =
   | { kind: "user_text"; id: string; text: string }
-  | { kind: "assistant_text"; id: string; text: string }
+  | { kind: "assistant_text"; id: string; text: string; streaming?: boolean }
   | { kind: "reasoning"; id: string; text: string; collapsed: true }
   | { kind: "tool_activity"; id: string; activity: ToolActivityDisplay }
   | { kind: "tool_group"; id: string; label: string; tone: ToolActivityTone; activities: ToolActivityDisplay[] }
@@ -46,6 +47,8 @@ export interface ToolActivityDisplay {
 
 interface BuildOptions {
   showToolDetails?: boolean;
+  sessionStatus?: ChatSessionView["status"];
+  activeToolCount?: number;
 }
 
 interface ToolCallPartInfo {
@@ -55,6 +58,7 @@ interface ToolCallPartInfo {
 
 export function buildChatDisplayItems(items: readonly ChatTranscriptItem[], options: BuildOptions = {}): ChatDisplayItem[] {
   const showToolDetails = options.showToolDetails === true;
+  const streamingMessageId = streamingAssistantMessageId(items, options);
   const toolRowsById = new Set<string>();
   const toolCallParts = new Map<string, ToolCallPartInfo>();
 
@@ -76,7 +80,7 @@ export function buildChatDisplayItems(items: readonly ChatTranscriptItem[], opti
   const output: ChatDisplayItem[] = [];
   for (const item of items) {
     if (item.kind === "message") {
-      output.push(...messageDisplayItems(item, toolRowsById, toolCallParts, showToolDetails));
+      output.push(...messageDisplayItems(item, toolRowsById, toolCallParts, showToolDetails, item.id === streamingMessageId));
       continue;
     }
     if (item.kind === "tool") {
@@ -98,13 +102,15 @@ function messageDisplayItems(
   toolRowsById: ReadonlySet<string>,
   toolCallParts: ReadonlyMap<string, ToolCallPartInfo>,
   showToolDetails: boolean,
+  streaming: boolean,
 ): ChatDisplayItem[] {
   const output: ChatDisplayItem[] = [];
+  const streamingTextPartIndex = streaming ? lastTextPartIndex(message.parts) : -1;
   for (const [index, part] of message.parts.entries()) {
     const id = `${message.id}:${part.id}:${index}`;
     if (part.type === "text") {
       if (message.role === "user") output.push({ kind: "user_text", id, text: part.text });
-      else if (message.role === "assistant") output.push({ kind: "assistant_text", id, text: part.text });
+      else if (message.role === "assistant") output.push({ kind: "assistant_text", id, text: part.text, ...(index === streamingTextPartIndex ? { streaming: true } : {}) });
       else output.push({ kind: "summary", id, text: `${message.role}: ${part.text}` });
       continue;
     }
@@ -261,7 +267,9 @@ function explorationGroupLabel(activities: readonly ToolActivityDisplay[]): stri
   if (reads > 0) parts.push(`${reads} ${plural(reads, "file", "files")}`);
   if (searches > 0) parts.push(`searched ${searches} ${plural(searches, "pattern", "patterns")}`);
   if (lists > 0) parts.push(`listed ${lists} ${plural(lists, "path", "paths")}`);
-  return parts.length > 0 ? `Explored ${parts.join(", ")}` : `Explored ${activities.length} tools`;
+  const verb = activities.some((activity) => activity.tone === "pending") ? "Exploring" : "Explored";
+  const suffix = activities.some((activity) => activity.tone === "error") ? " with errors" : "";
+  return parts.length > 0 ? `${verb} ${parts.join(", ")}${suffix}` : `${verb} ${activities.length} tools${suffix}`;
 }
 
 function groupTone(activities: readonly ToolActivityDisplay[]): ToolActivityTone {
@@ -278,4 +286,22 @@ function toolTone(status: ChatToolDisplayStatus): ToolActivityTone {
 
 function plural(count: number, singular: string, pluralValue: string): string {
   return count === 1 ? singular : pluralValue;
+}
+
+function streamingAssistantMessageId(items: readonly ChatTranscriptItem[], options: BuildOptions): string | undefined {
+  if (options.sessionStatus !== "running") return undefined;
+  if ((options.activeToolCount ?? 0) > 0) return undefined;
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (item?.kind !== "message" || item.role !== "assistant" || item.completedAt !== undefined) continue;
+    if (lastTextPartIndex(item.parts) >= 0) return item.id;
+  }
+  return undefined;
+}
+
+function lastTextPartIndex(parts: readonly ChatMessagePart[]): number {
+  for (let index = parts.length - 1; index >= 0; index -= 1) {
+    if (parts[index]?.type === "text") return index;
+  }
+  return -1;
 }

@@ -7,6 +7,7 @@ import { resolveTuiTheme } from "../theme/index.js";
 import { markdownToTerminalLines } from "./markdown.js";
 import { MessageList } from "./MessageList.js";
 import { buildChatDisplayItems } from "./presentation.js";
+import { splitStreamingMarkdown } from "./streaming.js";
 import { renderToolActivity } from "./tool-renderers.js";
 
 test("assistant markdown renders readable terminal lines", () => {
@@ -38,6 +39,74 @@ test("assistant markdown renders readable terminal lines", () => {
   expect(text).toContain("> compact by default");
   expect(text).toContain("docs (https://example.test)");
   expect(text).toContain("| A | B |");
+});
+
+test("streaming assistant text keeps the active tail separate", async () => {
+  const initial = splitStreamingMarkdown("Stable line\npartial");
+  const updated = splitStreamingMarkdown("Stable line\npartial answer");
+  expect(initial).toEqual({ stableText: "Stable line\n", activeTail: "partial" });
+  expect(updated.stableText).toBe(initial.stableText);
+  expect(updated.activeTail).toBe("partial answer");
+
+  const frame = await renderMessageList([
+    {
+      id: "msg_streaming" as MessageId,
+      kind: "message",
+      role: "assistant",
+      createdAt: 1,
+      parts: [
+        { type: "text", id: "part_streaming" as PartId, text: "Stable line\npartial answer" },
+      ],
+    },
+  ], { status: "running" });
+
+  expect(occurrences(frame, "Stable line")).toBe(1);
+  expect(occurrences(frame, "partial answer")).toBe(1);
+});
+
+test("streaming assistant text does not prematurely close unfinished code fences", async () => {
+  const split = splitStreamingMarkdown("Intro\n\n```ts\nconst ok");
+  expect(split).toEqual({ stableText: "Intro\n\n", activeTail: "```ts\nconst ok" });
+  expect(splitStreamingMarkdown("```ts\nconst ok = true;\n```\nnext")).toEqual({
+    stableText: "```ts\nconst ok = true;\n```\n",
+    activeTail: "next",
+  });
+
+  const frame = await renderMessageList([
+    {
+      id: "msg_streaming_fence" as MessageId,
+      kind: "message",
+      role: "assistant",
+      createdAt: 1,
+      parts: [
+        { type: "text", id: "part_streaming_fence" as PartId, text: "Intro\n\n```ts\nconst ok" },
+      ],
+    },
+  ], { status: "running" });
+
+  expect(frame).toContain("🌶️: Intro");
+  expect(frame).toContain("```ts");
+  expect(frame).toContain("const ok");
+  expect(occurrences(frame, "```")).toBe(1);
+});
+
+test("completed assistant markdown keeps block rendering", async () => {
+  const frame = await renderMessageList([
+    {
+      id: "msg_completed_markdown" as MessageId,
+      kind: "message",
+      role: "assistant",
+      createdAt: 1,
+      completedAt: 2,
+      parts: [
+        { type: "text", id: "part_completed_markdown" as PartId, text: "# Done\n\n- ship it\n\n```ts\nconst ok = true;\n```" },
+      ],
+    },
+  ]);
+
+  expect(frame).toContain("# Done");
+  expect(frame).toContain("- ship it");
+  expect(frame).toContain("```ts");
 });
 
 test("assistant tool parts stay out of default chat text while tool rows render compact activity", async () => {
@@ -74,9 +143,25 @@ test("assistant tool parts stay out of default chat text while tool rows render 
 
   expect(frame).toContain("🌶️: Done with tests.");
   expect(frame).toContain("Ran bun test");
+  expect(occurrences(frame, "Ran bun test")).toBe(1);
   expect(frame).not.toContain("tool_call");
   expect(frame).not.toContain("tool_result");
   expect(frame).not.toContain("RAW_TOOL_OUTPUT_SHOULD_NOT_RENDER");
+});
+
+test("same running tool call updates in place by id", () => {
+  const id = "tool_same_call" as ToolCallId;
+  const running = buildChatDisplayItems([
+    chatTool(id, "bash", "running", "running", { title: "bash", command: "bun test", detail: "bun test" }),
+  ]);
+  const succeeded = buildChatDisplayItems([
+    chatTool(id, "bash", "completed", "succeeded", { title: "bash", command: "bun test", detail: "bun test" }),
+  ]);
+
+  expect(running).toHaveLength(1);
+  expect(succeeded).toHaveLength(1);
+  expect(running[0]).toMatchObject({ kind: "tool_activity", activity: { id, label: "Running bun test" } });
+  expect(succeeded[0]).toMatchObject({ kind: "tool_activity", activity: { id, label: "Ran bun test" } });
 });
 
 test("consecutive exploration tools merge into a compact group", () => {
@@ -90,6 +175,28 @@ test("consecutive exploration tools merge into a compact group", () => {
   expect(display[0]).toMatchObject({
     kind: "tool_group",
     label: "Explored 1 file, searched 1 pattern, listed 1 path",
+  });
+});
+
+test("exploration group labels pending and failed runs naturally", () => {
+  const running = buildChatDisplayItems([
+    chatTool("read_running" as ToolCallId, "read", "running", "running", { title: "read", path: "package.json", detail: "package.json" }),
+    chatTool("grep_done" as ToolCallId, "grep", "completed", "succeeded", { title: "grep", pattern: "TODO", scope: "apps/tui", detail: "TODO in apps/tui" }),
+  ]);
+  const failed = buildChatDisplayItems([
+    chatTool("read_failed" as ToolCallId, "read", "failed", "failed", { title: "read", path: "package.json", detail: "package.json" }, { error: "read failed" }),
+    chatTool("grep_after_failed" as ToolCallId, "grep", "completed", "succeeded", { title: "grep", pattern: "TODO", scope: "apps/tui", detail: "TODO in apps/tui" }),
+  ]);
+
+  expect(running[0]).toMatchObject({
+    kind: "tool_group",
+    label: "Exploring 1 file, searched 1 pattern",
+    tone: "pending",
+  });
+  expect(failed[0]).toMatchObject({
+    kind: "tool_group",
+    label: "Explored 1 file, searched 1 pattern with errors",
+    tone: "error",
   });
 });
 
@@ -177,11 +284,11 @@ test("unknown tools use the fallback renderer label", () => {
 
 async function renderMessageList(
   items: readonly ChatTranscriptItem[],
-  options: { showToolDetails?: boolean; width?: number; height?: number } = {},
+  options: { showToolDetails?: boolean; width?: number; height?: number; status?: ChatSessionView["status"]; activeTools?: ChatSessionView["activeTools"] } = {},
 ): Promise<string> {
   const app = await testRender(
     <MessageList
-      chatView={chatView(items)}
+      chatView={chatView(items, options)}
       localItems={[]}
       width={options.width ?? 110}
       visibleLimit={options.height ?? 24}
@@ -201,14 +308,18 @@ async function renderMessageList(
   }
 }
 
-function chatView(items: readonly ChatTranscriptItem[]): ChatSessionView {
+function chatView(items: readonly ChatTranscriptItem[], options: { status?: ChatSessionView["status"]; activeTools?: ChatSessionView["activeTools"] } = {}): ChatSessionView {
   return {
-    status: "idle",
+    status: options.status ?? "idle",
     items: [...items],
     pendingApprovals: [],
-    activeTools: [],
+    activeTools: options.activeTools ?? [],
     generatedAt: "1970-01-01T00:00:00.000Z",
   };
+}
+
+function occurrences(value: string, needle: string): number {
+  return value.split(needle).length - 1;
 }
 
 function chatTool(
