@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useKeyboard, useTerminalDimensions } from "@opentui/react";
-import type { KeyEvent, MouseEvent } from "@opentui/core";
-import type { HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
+import { useAppContext, useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
+import type { KeyEvent, MouseEvent, PasteEvent, Selection } from "@opentui/core";
+import type { ChatTranscriptItem, HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
 import type { ApprovalId, TeamId } from "@chili/protocol";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { cleanClipboardText, promptClipboardText, promptPasteBytes, systemClipboard, type ClipboardAccess } from "./clipboard.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import { teamLiveModel, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
 import { useChatRuntime, type ChatRuntimeState } from "./useChatRuntime.js";
@@ -94,8 +95,11 @@ export function ChatShellSurface(props: {
   onSelectTeam?: (teamId: TeamId) => void;
   onExit?: () => void;
   commands?: readonly SlashCommand[];
+  clipboard?: ClipboardAccess | undefined;
 }) {
   const dimensions = useTerminalDimensions();
+  const { keyHandler } = useAppContext();
+  const renderer = useRenderer() as ClipboardRenderer;
   const commands = useMemo(() => props.commands ?? createDefaultSlashCommands(), [props.commands]);
   const [view, setView] = useState<ShellView>("chat");
   const [promptParts, setPromptParts] = useState<PromptPart[]>([{ type: "text", text: "" }]);
@@ -132,6 +136,12 @@ export function ChatShellSurface(props: {
     acceptedCompletionPromptRef.current = value;
     setAcceptedCompletionPrompt(value);
   }, []);
+  const appendPromptText = useCallback((value: string) => {
+    updateAcceptedCompletionPrompt(undefined);
+    historyPromptValueRef.current = undefined;
+    history.resetNavigation();
+    setPrompt((current) => `${current}${value}`);
+  }, [history, setPrompt, updateAcceptedCompletionPrompt]);
   const handlePromptChange = useCallback((value: string) => {
     if (value !== acceptedCompletionPromptRef.current) updateAcceptedCompletionPrompt(undefined);
     if (historyPromptValueRef.current === value) {
@@ -209,10 +219,52 @@ export function ChatShellSurface(props: {
           ? "Waiting for runtime"
           : undefined;
   const promptDisabled = Boolean(disabledReason);
+  const clipboard = props.clipboard ?? systemClipboard;
+
+  useEffect(() => {
+    const handlePaste = (event: PasteEvent) => {
+      if (view !== "chat" || promptDisabled) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const text = promptPasteBytes(event.bytes);
+      if (text) appendPromptText(text);
+    };
+    keyHandler?.on("paste", handlePaste);
+    return () => {
+      keyHandler?.off("paste", handlePaste);
+    };
+  }, [appendPromptText, keyHandler, promptDisabled, view]);
+
+  useEffect(() => {
+    const handleSelection = (selection: Selection) => {
+      const text = cleanClipboardText(selection.getSelectedText());
+      if (text) void copyClipboardText(text, clipboard, renderer);
+    };
+    renderer.on?.("selection", handleSelection);
+    return () => {
+      renderer.off?.("selection", handleSelection);
+    };
+  }, [clipboard, renderer]);
 
   useKeyboard((key) => {
     if (key.eventType !== "press") return;
-    if (key.ctrl && key.name === "c") {
+    if (isCopyShortcut(key)) {
+      key.preventDefault();
+      key.stopPropagation();
+      const source = clipboardCopySource(renderer, props.runtime.chatView.items);
+      if (!source) {
+        setLocalItems((current) => [...current, localItem("error", "Nothing to copy yet.")]);
+        return;
+      }
+      void copyClipboardText(source.text, clipboard, renderer).then((copied) => {
+        setLocalItems((current) => [
+          ...current,
+          localItem(copied ? "info" : "error", copied ? `Copied ${source.label}.` : "Clipboard copy is unavailable."),
+        ]);
+      });
+      return;
+    }
+    if (key.ctrl && key.name === "c" && !key.shift) {
       props.onExit?.();
       return;
     }
@@ -223,6 +275,26 @@ export function ChatShellSurface(props: {
     if (key.ctrl && key.name === "p") {
       setPaletteOpen(true);
       setPaletteIndex(0);
+      return;
+    }
+    if (isPasteShortcut(key)) {
+      key.preventDefault();
+      key.stopPropagation();
+      if (view !== "chat" || promptDisabled) return;
+      void clipboard.readText().then((raw) => {
+        if (raw === undefined) {
+          setLocalItems((current) => [...current, localItem("error", "Clipboard paste is unavailable.")]);
+          return;
+        }
+        const text = promptClipboardText(raw);
+        if (!text) {
+          setLocalItems((current) => [...current, localItem("error", "Clipboard is empty.")]);
+          return;
+        }
+        appendPromptText(text);
+      }).catch(() => {
+        setLocalItems((current) => [...current, localItem("error", "Clipboard paste is unavailable.")]);
+      });
       return;
     }
     if (view === "team") {
@@ -273,10 +345,6 @@ export function ChatShellSurface(props: {
     }
     if (view === "chat" && key.ctrl && key.name === "y") {
       setMessageScrollOffset((current) => current + scrollStep(dimensions.height));
-      return;
-    }
-    if (view === "chat" && key.ctrl && key.name === "v") {
-      setMessageScrollOffset((current) => Math.max(0, current - scrollStep(dimensions.height)));
       return;
     }
     if (view === "chat" && (isPageUp(key) || (key.shift && isArrowUp(key)))) {
@@ -649,7 +717,7 @@ function HelpView(props: { commands: readonly SlashCommand[]; theme: TuiTheme })
         </text>
       ))}
       <box height={1} />
-      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"Esc closes views. Ctrl+P opens commands. Tab accepts the selected slash completion."}</text>
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"Esc closes views. Ctrl+P opens commands. Ctrl+V pastes. Ctrl+Shift+C copies selection or latest reply."}</text>
     </box>
   );
 }
@@ -826,6 +894,42 @@ function currentFeedback(runtime: ChatRuntimeState): { status: string; message: 
   return undefined;
 }
 
+interface ClipboardRenderer {
+  getSelection?: () => Selection | null;
+  copyToClipboardOSC52?: (text: string) => boolean;
+  on?: (event: "selection", handler: (selection: Selection) => void) => void;
+  off?: (event: "selection", handler: (selection: Selection) => void) => void;
+}
+
+function clipboardCopySource(renderer: ClipboardRenderer, items: readonly ChatTranscriptItem[]): { text: string; label: string } | undefined {
+  const selected = cleanClipboardText(renderer.getSelection?.()?.getSelectedText() ?? "");
+  if (selected) return { text: selected, label: "selection" };
+
+  const assistant = latestAssistantText(items);
+  if (assistant) return { text: assistant, label: "latest assistant reply" };
+  return undefined;
+}
+
+async function copyClipboardText(text: string, clipboard: ClipboardAccess, renderer: ClipboardRenderer): Promise<boolean> {
+  const systemCopied = await clipboard.writeText(text).catch(() => false);
+  if (systemCopied) return true;
+  return Boolean(renderer.copyToClipboardOSC52?.(text));
+}
+
+function latestAssistantText(items: readonly ChatTranscriptItem[]): string | undefined {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (item?.kind !== "message" || item.role !== "assistant") continue;
+    const text = item.parts
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .filter(Boolean)
+      .join("\n\n");
+    if (text.trim()) return text;
+  }
+  return undefined;
+}
+
 function useGitBranch(cwd: string, explicitBranch: string | undefined): string | undefined {
   const [branch, setBranch] = useState<string | undefined>(explicitBranch);
   useEffect(() => {
@@ -902,6 +1006,14 @@ function isBackspace(key: KeyEvent): boolean {
 
 function isTab(key: KeyEvent): boolean {
   return key.name === "tab";
+}
+
+function isCopyShortcut(key: KeyEvent): boolean {
+  return key.name === "c" && (Boolean(key.super || key.meta) || (key.ctrl && key.shift));
+}
+
+function isPasteShortcut(key: KeyEvent): boolean {
+  return key.name === "v" && !key.shift && (key.ctrl || Boolean(key.super || key.meta));
 }
 
 function isArrowUp(key: KeyEvent): boolean {

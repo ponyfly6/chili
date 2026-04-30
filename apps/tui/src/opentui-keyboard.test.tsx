@@ -3,6 +3,7 @@ import { testRender } from "@opentui/react/test-utils";
 import { act, useState, type Dispatch, type SetStateAction } from "react";
 import { createRuntimeView, type ChatTranscriptItem, type HttpRuntimeClient, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
 import type { ApprovalId, ChiliEvent, MessageId, PartId, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
+import type { ClipboardAccess } from "./clipboard.js";
 import { ChatShellApp, ChatShellSurface } from "./ChatShellApp.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import type { ChatRuntimeState } from "./useChatRuntime.js";
@@ -378,6 +379,193 @@ test("command palette keeps the draft visible without entering prompt history", 
     const frame = app.captureCharFrame();
     expect(frame).toContain("draft before palette");
     expect(frame).toContain("> /team run - Start the selected team loop");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("Ctrl+V pastes clipboard text into the prompt", async () => {
+  const submitted: string[] = [];
+  const clipboard = fakeClipboard({
+    readText: async () => "from\nclipboard",
+  });
+  const app = await mountShell(teamLiveFixture(), {
+    clipboard,
+    runtime: {
+      submitPrompt: async (text) => {
+        submitted.push(text);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await press(app, () => app.mockInput.pressKey("v", { ctrl: true }));
+    expect(app.captureCharFrame()).toContain("from clipboard");
+
+    await press(app, () => app.mockInput.pressEnter());
+    expect(submitted).toEqual(["from clipboard"]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("Ctrl+V ignores decorative-only clipboard text", async () => {
+  const clipboard = fakeClipboard({
+    readText: async () => "▝              ",
+  });
+  const app = await mountShell(teamLiveFixture(), { clipboard });
+
+  try {
+    await press(app, () => app.mockInput.pressKey("v", { ctrl: true }));
+
+    expect(app.captureCharFrame()).toContain("Clipboard is empty.");
+    expect(app.captureCharFrame()).not.toContain("▝");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("terminal bracketed paste inserts text into the prompt", async () => {
+  const submitted: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async (text) => {
+        submitted.push(text);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await act(async () => {
+      await app.mockInput.pasteBracketedText("terminal\npaste");
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).toContain("terminal paste");
+
+    await press(app, () => app.mockInput.pressEnter());
+    expect(submitted).toEqual(["terminal paste"]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("Ctrl+V pastes without scrolling the transcript down", async () => {
+  const clipboard = fakeClipboard({
+    readText: async () => "clip",
+  });
+  const app = await mountShell(teamLiveFixture(), {
+    width: 120,
+    height: 24,
+    clipboard,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: chatMessages(30),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
+    await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
+    expect(app.captureCharFrame()).toContain("message 01");
+
+    await press(app, () => app.mockInput.pressKey("v", { ctrl: true }));
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("message 01");
+    expect(frame).not.toContain("message 30");
+    expect(frame).toContain("clip");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("Ctrl+Shift+C copies the latest assistant reply when nothing is selected", async () => {
+  const copied: string[] = [];
+  const clipboard = fakeClipboard({
+    writeText: async (text) => {
+      copied.push(text);
+      return true;
+    },
+  });
+  const app = await mountShell(teamLiveFixture(), {
+    clipboard,
+    kittyKeyboard: true,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: [
+          {
+            id: "msg_copy" as MessageId,
+            kind: "message",
+            role: "assistant",
+            createdAt: 1,
+            parts: [
+              { type: "text", id: "part_copy" as PartId, text: "copy this reply" },
+            ],
+          },
+        ],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await press(app, () => app.mockInput.pressKey("c", { ctrl: true, shift: true }));
+
+    expect(copied).toEqual(["copy this reply"]);
+    expect(app.captureCharFrame()).toContain("Copied latest assistant reply.");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("finished terminal selection is copied to the clipboard", async () => {
+  const copied: string[] = [];
+  const clipboard = fakeClipboard({
+    writeText: async (text) => {
+      copied.push(text);
+      return true;
+    },
+  });
+  const app = await mountShell(teamLiveFixture(), { clipboard });
+
+  try {
+    emitSelection(app.renderer, "selected text   \n");
+    await Bun.sleep(60);
+
+    expect(copied).toEqual(["selected text"]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("decorative-only terminal selection is not copied", async () => {
+  const copied: string[] = [];
+  const clipboard = fakeClipboard({
+    writeText: async (text) => {
+      copied.push(text);
+      return true;
+    },
+  });
+  const app = await mountShell(teamLiveFixture(), { clipboard });
+
+  try {
+    emitSelection(app.renderer, "▝              ");
+    await Bun.sleep(60);
+
+    expect(copied).toEqual([]);
   } finally {
     app.renderer.destroy();
   }
@@ -890,6 +1078,8 @@ async function mountShell(
     height?: number;
     executed?: TeamLiveAction[];
     runtime?: Partial<ChatRuntimeState>;
+    clipboard?: ClipboardAccess;
+    kittyKeyboard?: boolean;
   } = {},
 ) {
   const runtime: ChatRuntimeState = {
@@ -911,6 +1101,12 @@ async function mountShell(
     ...options.runtime,
   };
 
+  const renderOptions = {
+    width: options.width ?? 120,
+    height: options.height ?? 40,
+    exitOnCtrlC: false,
+    ...(options.kittyKeyboard === undefined ? {} : { kittyKeyboard: options.kittyKeyboard }),
+  };
   const app = await testRender(
     <ChatShellSurface
       model={model}
@@ -920,8 +1116,9 @@ async function mountShell(
       onSelectTeam={() => undefined}
       onExit={() => undefined}
       options={{ cwd: "/repo/chili", modeName: "Build", modelName: "test-model", providerName: "test-provider" }}
+      clipboard={options.clipboard}
     />,
-    { width: options.width ?? 120, height: options.height ?? 40, exitOnCtrlC: false },
+    renderOptions,
   );
   await act(async () => {
     await app.renderOnce();
@@ -1000,6 +1197,18 @@ function chatRuntime(
     rejectApproval: async () => undefined,
     ...options.runtime,
   };
+}
+
+function fakeClipboard(overrides: Partial<ClipboardAccess> = {}): ClipboardAccess {
+  return {
+    readText: async () => "",
+    writeText: async () => true,
+    ...overrides,
+  };
+}
+
+function emitSelection(renderer: { emit: (event: string, ...args: unknown[]) => boolean }, text: string): void {
+  renderer.emit("selection", { getSelectedText: () => text });
 }
 
 async function mountChatApp(

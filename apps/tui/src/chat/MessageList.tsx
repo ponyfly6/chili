@@ -28,7 +28,7 @@ export function MessageList(props: {
         <>
           {allLines.length > contentLimit ? (
             <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>
-              {`History ${start + 1}-${end}/${allLines.length} PgUp/PgDn Ctrl+Y/V`}
+              {`History ${start + 1}-${end}/${allLines.length} PgUp/PgDn Shift+Up/Down`}
             </text>
           ) : null}
           {lines.map((line) => <TranscriptLine key={line.key} line={line} />)}
