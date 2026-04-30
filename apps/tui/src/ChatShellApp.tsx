@@ -112,6 +112,7 @@ export function ChatShellSurface(props: {
   const [themeId, setThemeId] = useState(() => initialTuiThemeId(props.options?.themeId));
   const [themePicker, setThemePicker] = useState<ThemePickerNavigation | undefined>(undefined);
   const [messageScrollOffset, setMessageScrollOffset] = useState(0);
+  const [showToolDetails, setShowToolDetails] = useState(false);
   const prompt = promptText(promptParts);
   const history = usePromptHistory();
   const systemTheme = props.options?.systemTheme;
@@ -277,6 +278,10 @@ export function ChatShellSurface(props: {
       setPaletteIndex(0);
       return;
     }
+    if (key.ctrl && key.name === "o" && !key.shift) {
+      setShowToolDetails((current) => !current);
+      return;
+    }
     if (isPasteShortcut(key)) {
       key.preventDefault();
       key.stopPropagation();
@@ -421,6 +426,7 @@ export function ChatShellSurface(props: {
           model={props.model}
           options={shellOptions}
           runtime={props.runtime}
+          showToolDetails={showToolDetails}
           disabledReason={disabledReason}
           theme={theme}
           themePicker={themePicker ? {
@@ -464,6 +470,7 @@ export function ChatShellSurface(props: {
           model={props.model}
           options={shellOptions}
           runtime={props.runtime}
+          showToolDetails={showToolDetails}
           commands={commands}
           disabledReason={disabledReason}
           theme={theme}
@@ -493,6 +500,7 @@ function HomeScreen(props: {
   model: TeamLiveView;
   runtime: ChatRuntimeState;
   options: StatusFooterOptions;
+  showToolDetails: boolean;
   disabledReason?: string | undefined;
   theme: TuiTheme;
   themePicker?: ThemePickerModel | undefined;
@@ -538,7 +546,7 @@ function HomeScreen(props: {
         />
       </box>
       <box flexGrow={3} />
-      <StatusFooter options={props.options} model={props.model} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} />
+      <StatusFooter options={props.options} model={props.model} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} />
     </box>
   );
 }
@@ -562,6 +570,7 @@ function SessionScreen(props: {
   model: TeamLiveView;
   runtime: ChatRuntimeState;
   options: StatusFooterOptions;
+  showToolDetails: boolean;
   commands: readonly SlashCommand[];
   disabledReason?: string | undefined;
   theme: TuiTheme;
@@ -602,9 +611,9 @@ function SessionScreen(props: {
     >
       <box height={messagePaneHeight} flexDirection="column" paddingX={3} paddingY={1}>
         {props.view === "help" ? (
-          <HelpView commands={props.commands} theme={props.theme} />
+          <HelpView commands={props.commands} theme={props.theme} showToolDetails={props.showToolDetails} />
         ) : props.view === "status" ? (
-          <StatusView model={props.model} runtime={props.runtime} options={props.options} theme={props.theme} />
+          <StatusView model={props.model} runtime={props.runtime} options={props.options} theme={props.theme} showToolDetails={props.showToolDetails} />
         ) : props.view === "agents" ? (
           <AgentsView model={props.model} theme={props.theme} />
         ) : (
@@ -615,6 +624,7 @@ function SessionScreen(props: {
             visibleLimit={visibleLimit}
             scrollOffset={props.messageScrollOffset}
             theme={props.theme}
+            showToolDetails={props.showToolDetails}
           />
         )}
       </box>
@@ -645,7 +655,7 @@ function SessionScreen(props: {
           maxCommandItems={maxCommandItems}
         />
       </box>
-      <StatusFooter options={props.options} model={props.model} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} />
+      <StatusFooter options={props.options} model={props.model} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} />
     </box>
   );
 }
@@ -706,7 +716,8 @@ function ThemePicker(props: { model: ThemePickerModel; theme: TuiTheme }) {
   );
 }
 
-function HelpView(props: { commands: readonly SlashCommand[]; theme: TuiTheme }) {
+function HelpView(props: { commands: readonly SlashCommand[]; theme: TuiTheme; showToolDetails: boolean }) {
+  const detailsText = props.showToolDetails ? "on" : "off";
   return (
     <box width="100%" height="100%" flexDirection="column">
       <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Commands"}</text>
@@ -717,7 +728,7 @@ function HelpView(props: { commands: readonly SlashCommand[]; theme: TuiTheme })
         </text>
       ))}
       <box height={1} />
-      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"Esc closes views. Ctrl+P opens commands. Ctrl+V pastes. Ctrl+Shift+C copies selection or latest reply."}</text>
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`Esc closes views. Ctrl+P opens commands. Ctrl+O toggles tool details (${detailsText}). Ctrl+V pastes. Ctrl+Shift+C copies selection or latest reply.`}</text>
     </box>
   );
 }
@@ -727,6 +738,7 @@ function StatusView(props: {
   runtime: ChatRuntimeState;
   options: StatusFooterOptions;
   theme: TuiTheme;
+  showToolDetails: boolean;
 }) {
   const selected = props.model.selected;
   return (
@@ -739,6 +751,7 @@ function StatusView(props: {
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`mode: ${props.options.modeName}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`model: ${props.options.modelName}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`provider: ${props.options.providerName}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`details: ${props.showToolDetails ? "on" : "off"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`cwd: ${props.options.cwd}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`team: ${selected?.team.name ?? selected?.team.id ?? "none"}`}</text>
     </box>

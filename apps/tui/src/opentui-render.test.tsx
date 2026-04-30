@@ -45,6 +45,7 @@ test("renders fielded chat footer with cwd status model and usage fallback", asy
   expect(frame).toContain("idle");
   expect(frame).toContain("ctx --");
   expect(frame).toContain("test-provider/test-model Build");
+  expect(frame).toContain("Details off");
 });
 
 test("renders token usage and known context when model metadata is available", async () => {
@@ -276,6 +277,50 @@ test("renders tool rows as compact activity without raw output blocks", async ()
   expect(frame).toContain("Explored 1 file, searched 1 pattern");
   expect(frame).not.toContain("result tool_done: ok");
   expect(frame).toContain("Rejected a.ts");
+});
+
+test("ctrl+o toggles tool details and footer status", async () => {
+  const output = Array.from({ length: 12 }, (_, index) => `line_${String(index + 1).padStart(2, "0")}`).join("\n");
+  const app = await renderShell(teamLiveFixture(), {
+    width: 120,
+    height: 36,
+    runtime: fakeChatRuntime({
+      chatView: {
+        status: "idle",
+        items: [
+          {
+            ...chatTool("tool_toggle_details", "bash", "completed", "succeeded", { title: "bash", command: "bun test", detail: "bun test" }),
+            input: { command: "bun test" },
+            output,
+          },
+        ],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    }),
+  });
+
+  try {
+    expect(app.captureCharFrame()).toContain("Details off");
+    expect(app.captureCharFrame()).toContain("output hidden (12 lines, details available)");
+    expect(app.captureCharFrame()).not.toContain("line_01");
+
+    act(() => {
+      app.mockInput.pressKey("o", { ctrl: true });
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).toContain("Details on");
+    expect(app.captureCharFrame()).not.toContain("output hidden");
+    expect(app.captureCharFrame()).toContain("output (truncated):");
+    expect(app.captureCharFrame()).toContain("line_01");
+    expect(app.captureCharFrame()).toContain("line_05");
+    expect(app.captureCharFrame()).not.toContain("line_06");
+  } finally {
+    app.renderer.destroy();
+  }
 });
 
 test("does not render approval dock when no approval is pending", async () => {
