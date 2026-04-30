@@ -41,12 +41,16 @@ test("assistant markdown renders readable terminal lines", () => {
   expect(text).toContain("| A | B |");
 });
 
-test("streaming assistant text keeps the active tail separate", async () => {
+test("streaming assistant plain text keeps the active tail line separate", async () => {
   const initial = splitStreamingMarkdown("Stable line\npartial");
   const updated = splitStreamingMarkdown("Stable line\npartial answer");
   expect(initial).toEqual({ stableText: "Stable line\n", activeTail: "partial" });
   expect(updated.stableText).toBe(initial.stableText);
   expect(updated.activeTail).toBe("partial answer");
+  expect(splitStreamingMarkdown("Stable line\ncomplete line\n")).toEqual({
+    stableText: "Stable line\ncomplete line\n",
+    activeTail: "",
+  });
 
   const frame = await renderMessageList([
     {
@@ -67,6 +71,10 @@ test("streaming assistant text keeps the active tail separate", async () => {
 test("streaming assistant text does not prematurely close unfinished code fences", async () => {
   const split = splitStreamingMarkdown("Intro\n\n```ts\nconst ok");
   expect(split).toEqual({ stableText: "Intro\n\n", activeTail: "```ts\nconst ok" });
+  expect(splitStreamingMarkdown("Intro\n\n~~~\nconst ok")).toEqual({
+    stableText: "Intro\n\n",
+    activeTail: "~~~\nconst ok",
+  });
   expect(splitStreamingMarkdown("```ts\nconst ok = true;\n```\nnext")).toEqual({
     stableText: "```ts\nconst ok = true;\n```\n",
     activeTail: "next",
@@ -88,6 +96,44 @@ test("streaming assistant text does not prematurely close unfinished code fences
   expect(frame).toContain("```ts");
   expect(frame).toContain("const ok");
   expect(occurrences(frame, "```")).toBe(1);
+});
+
+test("streaming markdown keeps the last growing block active", () => {
+  expect(splitStreamingMarkdown("# Plan\n\n- first\n- sec")).toEqual({
+    stableText: "# Plan\n\n",
+    activeTail: "- first\n- sec",
+  });
+  expect(splitStreamingMarkdown("# Plan\n\nNext paragraph")).toEqual({
+    stableText: "# Plan\n\n",
+    activeTail: "Next paragraph",
+  });
+  expect(splitStreamingMarkdown("Intro\n\n## Section")).toEqual({
+    stableText: "Intro\n\n",
+    activeTail: "## Section",
+  });
+  expect(splitStreamingMarkdown("Intro\n\nUse `code` and **bold**")).toEqual({
+    stableText: "Intro\n\n",
+    activeTail: "Use `code` and **bold**",
+  });
+});
+
+test("streaming markdown can stabilize text at complete block boundaries", () => {
+  expect(splitStreamingMarkdown("# Plan\n")).toEqual({
+    stableText: "# Plan\n",
+    activeTail: "",
+  });
+  expect(splitStreamingMarkdown("# Plan\n\n- first\n\n")).toEqual({
+    stableText: "# Plan\n\n- first\n\n",
+    activeTail: "",
+  });
+  expect(splitStreamingMarkdown("# Plan\n\nNext paragraph\n\n")).toEqual({
+    stableText: "# Plan\n\nNext paragraph\n\n",
+    activeTail: "",
+  });
+  expect(splitStreamingMarkdown("# Plan\n\n```ts\nconst ok = true;\n```\n")).toEqual({
+    stableText: "# Plan\n\n```ts\nconst ok = true;\n```\n",
+    activeTail: "",
+  });
 });
 
 test("completed assistant markdown keeps block rendering", async () => {
