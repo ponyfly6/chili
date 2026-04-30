@@ -5,8 +5,8 @@ export type { TuiTheme } from "./types.js";
 export { chiliDarkTheme, chiliLightTheme, terminalDarkTheme, tuiThemes, warmLightTheme } from "./palettes.js";
 export { generateSystemTheme, normalizeHexColor, type SystemPaletteInput } from "./system.js";
 
-export const DEFAULT_TUI_THEME_ID = chiliDarkTheme.id;
 export const SYSTEM_TUI_THEME_ID = "system";
+export const DEFAULT_TUI_THEME_ID = SYSTEM_TUI_THEME_ID;
 
 export interface TuiThemeOption {
   id: string;
@@ -37,5 +37,10 @@ export function initialTuiThemeId(themeId?: string | null, env?: TuiThemeEnviron
 export function resolveTuiTheme(themeId?: string | null, env?: TuiThemeEnvironment, extra?: ResolveTuiThemeExtra): TuiTheme {
   const requested = initialTuiThemeId(themeId, env);
   if (requested === SYSTEM_TUI_THEME_ID) return extra?.systemTheme ?? chiliDarkTheme;
-  return tuiThemes.find((theme) => theme.id === requested) ?? chiliDarkTheme;
+  return tuiThemes.find((theme) => theme.id === requested) ?? resolveDefaultTuiTheme(extra);
+}
+
+function resolveDefaultTuiTheme(extra?: ResolveTuiThemeExtra): TuiTheme {
+  if (DEFAULT_TUI_THEME_ID === SYSTEM_TUI_THEME_ID) return extra?.systemTheme ?? chiliDarkTheme;
+  return tuiThemes.find((theme) => theme.id === DEFAULT_TUI_THEME_ID) ?? chiliDarkTheme;
 }

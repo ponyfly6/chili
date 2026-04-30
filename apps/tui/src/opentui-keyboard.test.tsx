@@ -764,9 +764,9 @@ test("/theme opens the theme picker", async () => {
 
     const frame = app.captureCharFrame();
     expect(frame).toContain("Theme");
-    expect(frame).toContain("> Chili Dark");
+    expect(frame).toContain("  Chili Dark");
     expect(frame).toContain("  Terminal Dark");
-    expect(frame).toContain("  System (fallback)");
+    expect(frame).toContain("> System (fallback)");
     expect(frame).toContain("  Chili Light");
     expect(frame).toContain("  Warm Light");
   } finally {
@@ -782,13 +782,13 @@ test("theme picker Up and Down preview the selected theme", async () => {
     await press(app, () => app.mockInput.pressEnter());
 
     await press(app, () => app.mockInput.pressArrow("down"));
-    expect(app.captureCharFrame()).toContain("> Terminal Dark");
+    expect(app.captureCharFrame()).toContain("> Chili Light");
 
     await press(app, () => app.mockInput.pressArrow("down"));
-    expect(app.captureCharFrame()).toContain("> System (fallback)");
+    expect(app.captureCharFrame()).toContain("> Warm Light");
 
     await press(app, () => app.mockInput.pressArrow("up"));
-    expect(app.captureCharFrame()).toContain("> Terminal Dark");
+    expect(app.captureCharFrame()).toContain("> Chili Light");
   } finally {
     app.renderer.destroy();
   }
@@ -801,14 +801,14 @@ test("theme picker Escape rolls back the previewed theme", async () => {
     await typeText(app, "/theme");
     await press(app, () => app.mockInput.pressEnter());
     await press(app, () => app.mockInput.pressArrow("down"));
-    expect(app.captureCharFrame()).toContain("> Terminal Dark");
+    expect(app.captureCharFrame()).toContain("> Chili Light");
 
     await press(app, () => app.mockInput.pressEscape());
-    expect(app.captureCharFrame()).not.toContain("> Terminal Dark");
+    expect(app.captureCharFrame()).not.toContain("> Chili Light");
 
     await typeText(app, "/theme");
     await press(app, () => app.mockInput.pressEnter());
-    expect(app.captureCharFrame()).toContain("> Chili Dark");
+    expect(app.captureCharFrame()).toContain("> System (fallback)");
   } finally {
     app.renderer.destroy();
   }
@@ -829,7 +829,7 @@ test("theme picker preserves an in-progress draft opened from the command palett
     expect(app.captureCharFrame()).toContain("draft before theme");
 
     await press(app, () => app.mockInput.pressArrow("down"));
-    expect(app.captureCharFrame()).toContain("> Terminal Dark");
+    expect(app.captureCharFrame()).toContain("> Chili Light");
 
     await press(app, () => app.mockInput.pressEscape());
     expect(app.captureCharFrame()).toContain("draft before theme");
@@ -847,11 +847,11 @@ test("theme picker Enter confirms the previewed theme", async () => {
     await press(app, () => app.mockInput.pressEnter());
     await press(app, () => app.mockInput.pressArrow("down"));
     await press(app, () => app.mockInput.pressEnter());
-    expect(app.captureCharFrame()).not.toContain("> Terminal Dark");
+    expect(app.captureCharFrame()).not.toContain("> Chili Light");
 
     await typeText(app, "/theme");
     await press(app, () => app.mockInput.pressEnter());
-    expect(app.captureCharFrame()).toContain("> Terminal Dark");
+    expect(app.captureCharFrame()).toContain("> Chili Light");
   } finally {
     app.renderer.destroy();
   }

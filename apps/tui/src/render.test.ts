@@ -3,7 +3,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import type { SessionId, ThreadId } from "@chili/protocol";
 import { parseArgs, teamLiveStreamInput } from "./index.js";
-import { generateSystemTheme, resolveTuiTheme } from "./theme/index.js";
+import { generateSystemTheme, initialTuiThemeId, resolveTuiTheme } from "./theme/index.js";
 
 test("parses runtime flags and keeps Team Live stream unscoped for child-session events", () => {
   const controller = new AbortController();
@@ -55,6 +55,7 @@ test("status footer does not keep a local model context catalog", async () => {
 });
 
 test("resolves the default TUI theme", () => {
+  expect(initialTuiThemeId(undefined, {})).toBe("system");
   expect(resolveTuiTheme(undefined, {})).toMatchObject({
     id: "chili-dark",
     name: "Chili Dark",
@@ -62,8 +63,14 @@ test("resolves the default TUI theme", () => {
 });
 
 test("falls back to the default TUI theme for unknown names", () => {
-  expect(resolveTuiTheme("does-not-exist", {})).toMatchObject({
-    id: "chili-dark",
+  const systemTheme = generateSystemTheme({
+    defaultBackground: "#101820",
+    defaultForeground: "#f8f8f2",
+    palette: ["#000000", "#ff5555", "#50fa7b", "#f1fa8c", "#8be9fd", "#ff79c6", "#7ee7c8", "#bbbbbb"],
+  });
+
+  expect(resolveTuiTheme("does-not-exist", {}, { systemTheme })).toMatchObject({
+    id: "system",
   });
 });
 
