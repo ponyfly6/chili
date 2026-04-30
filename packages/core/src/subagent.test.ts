@@ -175,7 +175,7 @@ test("runs a child task through an AgentRunner", async () => {
     cwd: "/repo",
     system: [
       "child system",
-      "Subagent task id: task_child. Agent path: /root/task_child. When the task is complete, either provide a final concise answer or call complete_task with this task id and a clear summary.",
+      "Subagent task id: task_child. Repository cwd: /repo. Agent path: /root/task_child (logical agent identifier, not a filesystem path). Use repository-relative paths, or absolute paths under the repository cwd; never prefix file paths with the agent path. When the task is complete, either provide a final concise answer or call complete_task with this task id and a clear summary.",
     ],
   });
 });

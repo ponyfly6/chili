@@ -35,7 +35,8 @@ export function createTaskTool(controller: SubagentController): ChiliToolDefinit
   return {
     name: "task",
     aliases: ["agent"],
-    description: "Spawn a local subagent task through the injected subagent controller.",
+    description:
+      "Spawn an ad-hoc local subagent task through the injected subagent controller. If you created or assigned a persistent team task, use team_task_dispatch instead so the team board stays linked and synced.",
     risk: "execute",
     inputSchema: {
       type: "object",

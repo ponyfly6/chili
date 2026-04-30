@@ -577,7 +577,7 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
         cwd: input.cwd,
         system: [
           ...(this.options.system ?? []),
-          `Subagent task id: ${input.taskId}. Agent path: ${input.path}. When the task is complete, either provide a final concise answer or call complete_task with this task id and a clear summary.`,
+          subagentRunSystemLine(input),
           ...(input.workerPolicy ? [workerPolicySystemSummary(input.workerPolicy)] : []),
         ],
       };
@@ -624,6 +624,16 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
 
 function defaultCreateId(prefix: string): string {
   return `${prefix}_${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+function subagentRunSystemLine(input: LocalSubagentRunInput): string {
+  return [
+    `Subagent task id: ${input.taskId}.`,
+    `Repository cwd: ${input.cwd}.`,
+    `Agent path: ${input.path} (logical agent identifier, not a filesystem path).`,
+    "Use repository-relative paths, or absolute paths under the repository cwd; never prefix file paths with the agent path.",
+    "When the task is complete, either provide a final concise answer or call complete_task with this task id and a clear summary.",
+  ].join(" ");
 }
 
 function toError(error: unknown): Error {
