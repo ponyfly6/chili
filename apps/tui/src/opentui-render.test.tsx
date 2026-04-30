@@ -247,12 +247,12 @@ test("renders reasoning separately from assistant text", async () => {
   });
 
   expect(frame).toContain("Thinking");
-  expect(frame).toContain("| checking the plan");
+  expect(frame).toContain("Thinking: checking the plan");
   expect(frame).toContain("🌶️: final answer");
   expect(frame).not.toContain("🌶️: checking the plan final answer");
 });
 
-test("renders tool rows with display statuses and output blocks", async () => {
+test("renders tool rows as compact activity without raw output blocks", async () => {
   const frame = await renderShellFrame(teamLiveFixture(), {
     width: 120,
     height: 30,
@@ -272,11 +272,10 @@ test("renders tool rows with display statuses and output blocks", async () => {
     }),
   });
 
-  expect(frame).toContain("tool bash waiting_permission bun test");
-  expect(frame).toContain("tool grep running TODO in apps/tui");
-  expect(frame).toContain("tool read succeeded README.md");
-  expect(frame).toContain("result tool_done: ok");
-  expect(frame).toContain("tool edit rejected src/a.ts");
+  expect(frame).toContain("Waiting approval for bun test");
+  expect(frame).toContain("Explored 1 file, searched 1 pattern");
+  expect(frame).not.toContain("result tool_done: ok");
+  expect(frame).toContain("Rejected a.ts");
 });
 
 test("does not render approval dock when no approval is pending", async () => {
