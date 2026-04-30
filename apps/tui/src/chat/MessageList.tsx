@@ -1,6 +1,8 @@
-import type { ChatMessagePart, ChatMessageRow, ChatSessionView, ChatToolCallRow, ChatTranscriptItem } from "@chili/sdk";
+import type { ChatSessionView, ChatTranscriptItem } from "@chili/sdk";
 import { shorten } from "../components/helpers.js";
 import type { TuiTheme } from "../theme/index.js";
+import { markdownToTerminalLines, wrapTerminalText, type MarkdownLineTone } from "./markdown.js";
+import { buildChatDisplayItems, type ChatDisplayItem, type ToolActivityDetail, type ToolActivityDisplay } from "./presentation.js";
 import type { LocalTranscriptItem } from "./types.js";
 
 export function MessageList(props: {
@@ -9,10 +11,14 @@ export function MessageList(props: {
   width?: number;
   visibleLimit?: number;
   scrollOffset?: number;
+  showToolDetails?: boolean;
   theme: TuiTheme;
 }) {
-  const allItems = [...props.chatView.items, ...props.localItems];
-  const allLines = transcriptLines(allItems, Math.max(24, props.width ?? 80), props.theme);
+  const allLines = transcriptLines(props.chatView.items, props.localItems, {
+    width: Math.max(24, props.width ?? 80),
+    showToolDetails: props.showToolDetails === true,
+    theme: props.theme,
+  });
   const limit = Math.max(1, props.visibleLimit ?? 18);
   const contentLimit = allLines.length > limit ? Math.max(1, limit - 1) : limit;
   const maxOffset = Math.max(0, allLines.length - contentLimit);
@@ -38,8 +44,6 @@ export function MessageList(props: {
   );
 }
 
-type TranscriptSourceItem = ChatTranscriptItem | LocalTranscriptItem;
-
 interface TranscriptLineModel {
   key: string;
   text: string;
@@ -54,104 +58,144 @@ function TranscriptLine(props: { line: TranscriptLineModel }) {
   );
 }
 
-function transcriptLines(items: readonly TranscriptSourceItem[], width: number, theme: TuiTheme): TranscriptLineModel[] {
-  return items.flatMap((item) => {
-    if (item.kind === "local") {
-      return wrapLine(`${item.level}: ${item.text}`, {
-        key: item.id,
-        fg: item.level === "error" ? theme.colors.status.error : theme.colors.text.muted,
-        width,
-      });
-    }
-    if (item.kind === "message") return messageLines(item, width, theme);
-    if (item.kind === "tool") return toolLines(item, width, theme);
-    return approvalLines(item, width, theme);
-  });
+function transcriptLines(
+  items: readonly ChatTranscriptItem[],
+  localItems: readonly LocalTranscriptItem[],
+  options: { width: number; showToolDetails: boolean; theme: TuiTheme },
+): TranscriptLineModel[] {
+  const displayItems = buildChatDisplayItems(items, { showToolDetails: options.showToolDetails });
+  return [
+    ...displayItems.flatMap((item) => displayItemLines(item, options.width, options.theme)),
+    ...localItems.flatMap((item) => localItemLines(item, options.width, options.theme)),
+  ];
 }
 
-function messageLines(item: ChatMessageRow, width: number, theme: TuiTheme): TranscriptLineModel[] {
-  const role = item.role === "user" ? "🥔" : item.role === "assistant" ? "🌶️" : item.role;
-  const fg = item.role === "user" ? theme.colors.text.primary : theme.colors.text.secondary;
-  const lines: TranscriptLineModel[] = [];
-  for (const [index, part] of item.parts.entries()) {
-    if (part.type === "text") {
-      lines.push(...wrapLine(`${role}: ${part.text || "..."}`, {
-        key: `${item.kind}:${item.id}:text:${part.id}:${index}`,
-        fg,
-        width,
-        hangingIndent: "    ",
-      }));
-      continue;
-    }
-    if (part.type === "reasoning") {
-      lines.push(...reasoningLines(item, part, width, index, theme));
-      continue;
-    }
-    if (part.type === "tool_result") {
-      lines.push(...toolResultLines(`${item.kind}:${item.id}:result:${part.id}:${index}`, part.callId, part.error ?? part.output, Boolean(part.error), width, theme));
-      continue;
-    }
-    if (part.type === "tool_call") {
-      lines.push(...wrapLine(`tool ${part.toolName} ${part.displayStatus ?? part.status}`, {
-        key: `${item.kind}:${item.id}:tool:${part.id}:${index}`,
-        fg: theme.colors.text.muted,
-        width,
-      }));
-      continue;
-    }
-    lines.push(...wrapLine(part.text, {
-      key: `${item.kind}:${item.id}:summary:${part.id}:${index}`,
-      fg: theme.colors.text.muted,
-      width,
-      hangingIndent: "    ",
-    }));
-  }
-  if (lines.length === 0) {
-    return wrapLine(`${role}: ...`, {
-      key: `${item.kind}:${item.id}`,
-      fg,
+function displayItemLines(item: ChatDisplayItem, width: number, theme: TuiTheme): TranscriptLineModel[] {
+  if (item.kind === "user_text") {
+    return wrapLine(`🥔: ${item.text || "..."}`, {
+      key: `display:${item.kind}:${item.id}`,
+      fg: theme.colors.text.primary,
       width,
       hangingIndent: "    ",
     });
   }
-  return lines;
+  if (item.kind === "assistant_text") {
+    return markdownToTerminalLines(item.text || "...", {
+      key: `display:${item.kind}:${item.id}`,
+      width,
+      prefix: "🌶️: ",
+      hangingIndent: "    ",
+    }).map((line) => ({
+      key: line.key,
+      text: line.text,
+      fg: markdownFg(line.tone, theme),
+    }));
+  }
+  if (item.kind === "reasoning") return reasoningLines(item, width, theme);
+  if (item.kind === "tool_activity") return toolActivityLines(item.activity, width, theme);
+  if (item.kind === "tool_group") return toolGroupLines(item, width, theme);
+  if (item.kind === "summary") {
+    return wrapLine(`summary: ${item.text || "..."}`, {
+      key: `display:${item.kind}:${item.id}`,
+      fg: theme.colors.text.muted,
+      width,
+      hangingIndent: "  ",
+    });
+  }
+  return approvalLines(item.approval, width, theme);
 }
 
-function reasoningLines(item: ChatMessageRow, part: Extract<ChatMessagePart, { type: "reasoning" }>, width: number, index: number, theme: TuiTheme): TranscriptLineModel[] {
-  const lines: TranscriptLineModel[] = [
-    { key: `${item.kind}:${item.id}:thinking:${part.id}:${index}:label`, fg: theme.colors.text.muted, text: "Thinking" },
-  ];
-  lines.push(...wrapLine(`| ${part.text || "..."}`, {
-    key: `${item.kind}:${item.id}:thinking:${part.id}:${index}`,
-    fg: theme.colors.text.muted,
+function localItemLines(item: LocalTranscriptItem, width: number, theme: TuiTheme): TranscriptLineModel[] {
+  return wrapLine(`${item.level}: ${item.text}`, {
+    key: item.id,
+    fg: item.level === "error" ? theme.colors.status.error : theme.colors.text.muted,
     width,
-    hangingIndent: "| ",
-  }));
-  return lines;
+  });
 }
 
-function toolLines(item: ChatToolCallRow, width: number, theme: TuiTheme): TranscriptLineModel[] {
-  const displayStatus = item.displayStatus ?? item.status;
-  const bits = [`tool ${item.toolName}`, displayStatus];
-  const detail = toolDetail(item);
-  if (detail) bits.push(detail);
-  const fg = displayStatus === "failed" || displayStatus === "rejected"
-    ? theme.colors.status.error
-    : displayStatus === "waiting_permission"
-      ? theme.colors.status.pending
-      : theme.colors.text.muted;
-  const lines = wrapLine(bits.join(" "), {
-    key: `${item.kind}:${item.id}`,
-    fg,
+function reasoningLines(item: Extract<ChatDisplayItem, { kind: "reasoning" }>, width: number, theme: TuiTheme): TranscriptLineModel[] {
+  const compact = shorten((item.text || "...").replace(/\s+/g, " ").trim(), 180);
+  return wrapLine(`Thinking: ${compact}`, {
+    key: `display:${item.kind}:${item.id}`,
+    fg: theme.colors.text.muted,
     width,
     hangingIndent: "  ",
   });
-  if (item.error) {
-    lines.push(...toolResultLines(`${item.kind}:${item.id}:error`, item.id, item.error, true, width, theme));
-  } else if (item.output) {
-    lines.push(...toolResultLines(`${item.kind}:${item.id}:output`, item.id, item.output, false, width, theme));
+}
+
+function toolActivityLines(item: ToolActivityDisplay, width: number, theme: TuiTheme): TranscriptLineModel[] {
+  const lines = wrapLine(item.label, {
+    key: `display:tool:${item.id}`,
+    fg: toolFg(item.tone, theme),
+    width,
+    hangingIndent: "  ",
+  });
+  if (item.outputHint) {
+    lines.push(...wrapLine(`  ${item.outputHint}`, {
+      key: `display:tool:${item.id}:output-hint`,
+      fg: theme.colors.text.disabled,
+      width,
+      hangingIndent: "    ",
+    }));
+  }
+  if (item.compactErrorLines?.length) {
+    lines.push(...detailPreviewLines(`display:tool:${item.id}:compact-error`, "error", item.compactErrorLines, false, width, theme.colors.status.error));
+  }
+  for (const detail of item.details) {
+    lines.push(...toolDetailLines(`display:tool:${item.id}:detail:${detail.label}`, detail, width, theme));
   }
   return lines;
+}
+
+function toolGroupLines(item: Extract<ChatDisplayItem, { kind: "tool_group" }>, width: number, theme: TuiTheme): TranscriptLineModel[] {
+  const lines = wrapLine(item.label, {
+    key: `display:${item.kind}:${item.id}`,
+    fg: toolFg(item.tone, theme),
+    width,
+    hangingIndent: "  ",
+  });
+  for (const activity of item.activities) {
+    if (activity.compactErrorLines?.length) {
+      lines.push(...detailPreviewLines(`display:${item.kind}:${item.id}:${activity.id}:error`, "error", activity.compactErrorLines, false, width, theme.colors.status.error));
+    }
+    if (activity.details.length > 0) {
+      lines.push(...wrapLine(`  ${activity.label}`, {
+        key: `display:${item.kind}:${item.id}:${activity.id}:label`,
+        fg: theme.colors.text.muted,
+        width,
+        hangingIndent: "    ",
+      }));
+    }
+    for (const detail of activity.details) {
+      lines.push(...toolDetailLines(`display:${item.kind}:${item.id}:${activity.id}:detail:${detail.label}`, detail, width, theme));
+    }
+  }
+  return lines;
+}
+
+function toolDetailLines(key: string, detail: ToolActivityDetail, width: number, theme: TuiTheme): TranscriptLineModel[] {
+  const fg = detail.tone === "error" ? theme.colors.status.error : theme.colors.text.muted;
+  return detailPreviewLines(key, detail.label, detail.lines, detail.truncated, width, fg);
+}
+
+function detailPreviewLines(key: string, label: string, lines: readonly string[], truncated: boolean, width: number, fg: string): TranscriptLineModel[] {
+  const output: TranscriptLineModel[] = [];
+  const suffix = truncated ? " (truncated)" : "";
+  output.push(...wrapLine(`  ${label}${suffix}:`, {
+    key: `${key}:label`,
+    fg,
+    width,
+    hangingIndent: "    ",
+  }));
+  for (const [index, line] of lines.entries()) {
+    output.push(...wrapLine(`    ${line || " "}`, {
+      key: `${key}:line:${index}`,
+      fg,
+      width,
+      hangingIndent: "    ",
+    }));
+  }
+  return output;
 }
 
 function approvalLines(item: Extract<ChatTranscriptItem, { kind: "approval" }>, width: number, theme: TuiTheme): TranscriptLineModel[] {
@@ -167,88 +211,22 @@ function approvalLines(item: Extract<ChatTranscriptItem, { kind: "approval" }>, 
   });
 }
 
-function toolDetail(item: ChatToolCallRow): string | undefined {
-  const summary = item.inputSummary ?? { title: item.toolName };
-  if (summary.command) return summary.command;
-  if (summary.diffSummary && summary.path) return `${summary.path} ${summary.diffSummary}`;
-  if (summary.path) return summary.path;
-  if (summary.pattern && summary.scope) return `${summary.pattern} in ${summary.scope}`;
-  if (summary.pattern) return summary.pattern;
-  return summary.detail ?? summary.scope;
+function markdownFg(tone: MarkdownLineTone, theme: TuiTheme): string {
+  if (tone === "heading") return theme.colors.text.primary;
+  if (tone === "quote" || tone === "code" || tone === "muted") return theme.colors.text.muted;
+  return theme.colors.text.secondary;
 }
 
-function toolResultLines(key: string, callId: string, value: string, error: boolean, width: number, theme: TuiTheme): TranscriptLineModel[] {
-  const fg = error ? theme.colors.status.error : theme.colors.text.muted;
-  const label = error ? "error" : "result";
-  if (!isLargeOutput(value)) {
-    return wrapLine(`${label} ${callId}: ${shorten(value.replace(/\s+/g, " ").trim(), 140)}`, {
-      key,
-      fg,
-      width,
-      hangingIndent: "  ",
-    });
-  }
-  const preview = value.split("\n").slice(0, 8).join("\n");
-  return [
-    { key: `${key}:head`, fg, text: `${label} ${callId}` },
-    ...wrapLine(preview, {
-      key: `${key}:body`,
-      fg,
-      width,
-      hangingIndent: "  ",
-    }),
-  ];
-}
-
-function isLargeOutput(value: string): boolean {
-  return value.length > 180 || value.includes("\n") || /^diff --git/m.test(value);
+function toolFg(tone: "muted" | "pending" | "error", theme: TuiTheme): string {
+  if (tone === "error") return theme.colors.status.error;
+  if (tone === "pending") return theme.colors.status.pending;
+  return theme.colors.text.muted;
 }
 
 function wrapLine(text: string, options: { key: string; fg: string; width: number; hangingIndent?: string }): TranscriptLineModel[] {
-  const lines: TranscriptLineModel[] = [];
-  const paragraphs = text.split("\n");
-  const width = Math.max(8, options.width);
-  for (const [paragraphIndex, paragraph] of paragraphs.entries()) {
-    const source = paragraph.length > 0 ? paragraph : " ";
-    let current = "";
-    let currentWidth = 0;
-    let lineIndex = 0;
-    const push = () => {
-      const prefix = lineIndex === 0 ? "" : options.hangingIndent ?? "";
-      lines.push({
-        key: `${options.key}:${paragraphIndex}:${lineIndex}`,
-        fg: options.fg,
-        text: `${prefix}${current || " "}`,
-      });
-      current = "";
-      currentWidth = 0;
-      lineIndex += 1;
-    };
-
-    for (const char of source) {
-      const nextWidth = charDisplayWidth(char);
-      if (current && currentWidth + nextWidth > width) push();
-      current += char;
-      currentWidth += nextWidth;
-    }
-    push();
-  }
-  return lines;
-}
-
-function charDisplayWidth(char: string): number {
-  const code = char.codePointAt(0) ?? 0;
-  if (code === 0) return 0;
-  if (code < 32 || (code >= 0x7f && code < 0xa0)) return 0;
-  if (
-    (code >= 0x1100 && code <= 0x115f)
-    || (code >= 0x2e80 && code <= 0xa4cf)
-    || (code >= 0xac00 && code <= 0xd7a3)
-    || (code >= 0xf900 && code <= 0xfaff)
-    || (code >= 0xfe10 && code <= 0xfe19)
-    || (code >= 0xfe30 && code <= 0xfe6f)
-    || (code >= 0xff00 && code <= 0xff60)
-    || (code >= 0xffe0 && code <= 0xffe6)
-  ) return 2;
-  return 1;
+  return wrapTerminalText(text, {
+    key: options.key,
+    width: options.width,
+    ...(options.hangingIndent === undefined ? {} : { hangingIndent: options.hangingIndent }),
+  }).map((line) => ({ key: line.key, text: line.text, fg: options.fg }));
 }
