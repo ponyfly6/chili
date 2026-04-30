@@ -37,6 +37,7 @@
         "@chili/sdk": "workspace:*",
         "@opentui/core": "0.1.106",
         "@opentui/react": "0.1.106",
+        "marked": "17.0.1",
         "react": "19.2.5",
       },
     },
