@@ -2,7 +2,8 @@ import type { ChatSessionView, ChatTranscriptItem } from "@chili/sdk";
 import { shorten } from "../components/helpers.js";
 import type { TuiTheme } from "../theme/index.js";
 import { markdownToTerminalLines, wrapTerminalText, type MarkdownLineTone } from "./markdown.js";
-import { buildChatDisplayItems, type ChatDisplayItem, type ToolActivityDetail, type ToolActivityDisplay } from "./presentation.js";
+import { buildChatDisplayItems, type ChatDisplayItem, type ToolActivityDisplay } from "./presentation.js";
+import type { ToolActivityDetail } from "./tool-renderers.js";
 import type { LocalTranscriptItem } from "./types.js";
 
 export function MessageList(props: {

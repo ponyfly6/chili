@@ -7,6 +7,7 @@ import { resolveTuiTheme } from "../theme/index.js";
 import { markdownToTerminalLines } from "./markdown.js";
 import { MessageList } from "./MessageList.js";
 import { buildChatDisplayItems } from "./presentation.js";
+import { renderToolActivity } from "./tool-renderers.js";
 
 test("assistant markdown renders readable terminal lines", () => {
   const markdown = [
@@ -92,6 +93,39 @@ test("consecutive exploration tools merge into a compact group", () => {
   });
 });
 
+test("exploration tool groups hide raw output when compact and expand in details mode", async () => {
+  const items: ChatTranscriptItem[] = [
+    chatTool("read_group_1" as ToolCallId, "read", "completed", "succeeded", { title: "read", path: "package.json", detail: "package.json" }, {
+      input: { path: "package.json" },
+      output: "FILE_RAW_LINE_1\nFILE_RAW_LINE_2",
+    }),
+    chatTool("grep_group_1" as ToolCallId, "grep", "completed", "succeeded", { title: "grep", pattern: "TODO", scope: "apps/tui", detail: "TODO in apps/tui" }, {
+      input: { pattern: "TODO", path: "apps/tui" },
+      output: "GREP_RAW_MATCH_1\nGREP_RAW_MATCH_2",
+    }),
+    chatTool("glob_group_1" as ToolCallId, "glob", "completed", "succeeded", { title: "glob", pattern: "*.tsx", path: "apps/tui/src", detail: "*.tsx under apps/tui/src" }, {
+      input: { pattern: "*.tsx", path: "apps/tui/src" },
+      output: "GLOB_RAW_PATH_1\nGLOB_RAW_PATH_2",
+    }),
+  ];
+
+  const compact = await renderMessageList(items, { height: 16 });
+  const details = await renderMessageList(items, { showToolDetails: true, height: 48 });
+
+  expect(compact).toContain("Explored 1 file, searched 1 pattern, listed 1 path");
+  expect(compact).not.toContain("FILE_RAW_LINE_1");
+  expect(compact).not.toContain("GREP_RAW_MATCH_1");
+  expect(compact).not.toContain("GLOB_RAW_PATH_1");
+  expect(details).toContain("Explored 1 file, searched 1 pattern, listed 1 path");
+  expect(details).toContain("Read package.json");
+  expect(details).toContain("Searched TODO in apps/tui");
+  expect(details).toContain("Listed *.tsx under apps/tui/src");
+  expect(details).toContain("FILE_RAW_LINE_1");
+  expect(details).toContain("GREP_RAW_MATCH_1");
+  expect(details).toContain("GLOB_RAW_PATH_1");
+  expect(details).not.toContain("output hidden");
+});
+
 test("large tool output is hidden by default and truncated in details mode", async () => {
   const output = Array.from({ length: 20 }, (_, index) => `line_${String(index + 1).padStart(2, "0")}`).join("\n");
   const item = chatTool("tool_big_output" as ToolCallId, "bash", "completed", "succeeded", { title: "bash", command: "bun test", detail: "bun test" }, {
@@ -124,6 +158,21 @@ test("failed tools show a compact error summary", async () => {
   expect(frame).not.toContain("fifth failure");
   expect(details.match(/error:/g)).toHaveLength(1);
   expect(details).toContain("fifth failure");
+});
+
+test("unknown tools use the fallback renderer label", () => {
+  const rendered = renderToolActivity({
+    id: "tool_unknown",
+    callId: "tool_unknown",
+    toolName: "custom_probe",
+    status: "completed",
+    displayStatus: "succeeded",
+    inputSummary: { title: "custom_probe", detail: "mystery target" },
+    showToolDetails: false,
+    source: "row",
+  });
+
+  expect(rendered.label).toBe("Ran custom_probe mystery target");
 });
 
 async function renderMessageList(
