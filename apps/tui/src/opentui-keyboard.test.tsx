@@ -531,6 +531,43 @@ test("Ctrl+Shift+C copies the latest assistant reply when nothing is selected", 
   }
 });
 
+test("Ctrl+Shift+C copies the transcript when transcript view is active", async () => {
+  const copied: string[] = [];
+  const clipboard = fakeClipboard({
+    writeText: async (text) => {
+      copied.push(text);
+      return true;
+    },
+  });
+  const app = await mountShell(teamLiveFixture(), {
+    clipboard,
+    kittyKeyboard: true,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: transcriptCopyItems(),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await press(app, () => app.mockInput.pressKey("t", { ctrl: true }));
+    await press(app, () => app.mockInput.pressKey("c", { ctrl: true, shift: true }));
+
+    expect(copied).toHaveLength(1);
+    expect(copied[0]).toContain("message assistant msg_copy_transcript");
+    expect(copied[0]).toContain("tool bash succeeded tool_copy_transcript");
+    expect(copied[0]).toContain("RAW_COPY_OUTPUT");
+    expect(app.captureCharFrame()).toContain("Copied transcript.");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("finished terminal selection is copied to the clipboard", async () => {
   const copied: string[] = [];
   const clipboard = fakeClipboard({
@@ -1388,6 +1425,33 @@ function chatMessages(count: number): ChatTranscriptItem[] {
       ],
     };
   });
+}
+
+function transcriptCopyItems(): ChatTranscriptItem[] {
+  const callId = "tool_copy_transcript" as ToolCallId;
+  return [
+    {
+      id: "msg_copy_transcript" as MessageId,
+      kind: "message",
+      role: "assistant",
+      createdAt: 1,
+      parts: [
+        { type: "text", id: "part_copy_transcript" as PartId, text: "copy transcript reply" },
+      ],
+    },
+    {
+      id: callId,
+      kind: "tool",
+      toolName: "bash",
+      status: "completed",
+      displayStatus: "succeeded",
+      waitingForApproval: false,
+      updatedAt: 2,
+      inputSummary: { title: "bash", command: "bun test", detail: "bun test" },
+      input: { command: "bun test" },
+      output: "RAW_COPY_OUTPUT",
+    },
+  ];
 }
 
 async function waitForAbort(signal: AbortSignal | undefined): Promise<void> {

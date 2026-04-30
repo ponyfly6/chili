@@ -29,6 +29,7 @@ export function StatusFooter(props: {
   width: number;
   theme: TuiTheme;
   showToolDetails: boolean;
+  transcriptActive: boolean;
 }) {
   const compact = isCompactFooter(props.width);
   const cwd = compact ? compactCwd(props.options.cwd) : shorten(props.options.cwd, 54);
@@ -37,12 +38,13 @@ export function StatusFooter(props: {
   const status = sessionStatusText(props.chatView, props.canSubmit, props.model);
   const model = modelText(props.chatView, props.options, compact);
   const details = props.showToolDetails ? "Details on" : "Details off";
+  const transcript = props.transcriptActive ? "Transcript on" : "Transcript";
   const actionHint = compact ? "/commands" : "/ commands";
 
   if (compact) {
     return (
       <box width="100%" height={1} flexDirection="row" paddingX={1}>
-        <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>{`${cwd} ${branch}  ${usage}  ${status}  ${model}  ${details}  ${actionHint}`}</text>
+        <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>{`${cwd} ${branch}  ${usage}  ${status}  ${model}  ${details}  Ctrl+T ${transcript}  ${actionHint}`}</text>
       </box>
     );
   }
@@ -59,7 +61,7 @@ export function StatusFooter(props: {
       <box width="100%" height={1} flexDirection="row">
         <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{usage}</text>
         <box flexGrow={1} />
-        <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>{`${model}     Ctrl+O ${details}     ${actionHint}`}</text>
+        <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>{`${model}     Ctrl+O ${details}     Ctrl+T ${transcript}     ${actionHint}`}</text>
       </box>
     </box>
   );

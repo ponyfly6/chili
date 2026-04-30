@@ -46,6 +46,7 @@ test("renders fielded chat footer with cwd status model and usage fallback", asy
   expect(frame).toContain("ctx --");
   expect(frame).toContain("test-provider/test-model Build");
   expect(frame).toContain("Details off");
+  expect(frame).toContain("Ctrl+T Transcript");
 });
 
 test("renders token usage and known context when model metadata is available", async () => {
@@ -318,6 +319,159 @@ test("ctrl+o toggles tool details and footer status", async () => {
     expect(app.captureCharFrame()).toContain("line_01");
     expect(app.captureCharFrame()).toContain("line_05");
     expect(app.captureCharFrame()).not.toContain("line_06");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("ctrl+t opens transcript view with raw tool and approval details, and escape returns to chat", async () => {
+  const items = rawTranscriptItems();
+  const app = await renderShell(teamLiveFixture(), {
+    width: 120,
+    height: 54,
+    runtime: fakeChatRuntime({
+      chatView: {
+        status: "idle",
+        items,
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    }),
+  });
+
+  try {
+    expect(app.captureCharFrame()).toContain("Failed bun test");
+    expect(app.captureCharFrame()).not.toContain("RAW_TOOL_OUTPUT_LINE_1");
+    expect(app.captureCharFrame()).not.toContain("RAW_MESSAGE_RESULT_LINE_1");
+
+    act(() => {
+      app.mockInput.pressKey("t", { ctrl: true });
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).toContain("Transcript");
+    expect(app.captureCharFrame()).toContain("Ctrl+T Transcript on");
+    expect(app.captureCharFrame()).toContain("tool bash failed tool_raw");
+    expect(app.captureCharFrame()).toContain("\"command\": \"bun test\"");
+    expect(app.captureCharFrame()).toContain("RAW_TOOL_OUTPUT_LINE_1");
+    expect(app.captureCharFrame()).toContain("RAW_TOOL_ERROR_LINE_1");
+    expect(app.captureCharFrame()).toContain("approval approval_transcript pending");
+    expect(app.captureCharFrame()).toContain("permission: tool.bash");
+
+    act(() => {
+      app.mockInput.pressKey("y", { ctrl: true });
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).toContain("part tool_call");
+    expect(app.captureCharFrame()).toContain("part tool_result");
+    expect(app.captureCharFrame()).toContain("RAW_MESSAGE_RESULT_LINE_1");
+
+    act(() => {
+      app.mockInput.pressEscape();
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).not.toContain("Transcript on");
+    expect(app.captureCharFrame()).toContain("Failed bun test");
+    expect(app.captureCharFrame()).not.toContain("RAW_TOOL_OUTPUT_LINE_1");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("transcript scroll offset is independent from chat scroll offset", async () => {
+  const app = await renderShell(teamLiveFixture(), {
+    width: 120,
+    height: 24,
+    runtime: fakeChatRuntime({
+      chatView: {
+        status: "idle",
+        items: chatMessages(30),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    }),
+  });
+
+  try {
+    expect(app.captureCharFrame()).toContain("message 30");
+    expect(app.captureCharFrame()).not.toContain("message 01");
+
+    act(() => {
+      app.mockInput.pressKey("t", { ctrl: true });
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+    expect(app.captureCharFrame()).toContain("Transcript");
+    expect(app.captureCharFrame()).toContain("message 30");
+
+    act(() => {
+      for (let index = 0; index < 12; index += 1) app.mockInput.pressKey("y", { ctrl: true });
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+    expect(app.captureCharFrame()).toContain("message 01");
+
+    act(() => {
+      app.mockInput.pressEscape();
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).not.toContain("Transcript on");
+    expect(app.captureCharFrame()).toContain("message 30");
+    expect(app.captureCharFrame()).not.toContain("message 01");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("transcript view scrolls through long raw tool output", async () => {
+  const output = Array.from({ length: 40 }, (_, index) => `raw_line_${String(index + 1).padStart(2, "0")}`).join("\n");
+  const app = await renderShell(teamLiveFixture(), {
+    width: 120,
+    height: 24,
+    runtime: fakeChatRuntime({
+      chatView: {
+        status: "idle",
+        items: [
+          {
+            ...chatTool("tool_long_raw", "bash", "completed", "succeeded", { title: "bash", command: "bun test", detail: "bun test" }),
+            input: { command: "bun test" },
+            output,
+          },
+        ],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    }),
+  });
+
+  try {
+    act(() => {
+      app.mockInput.pressKey("t", { ctrl: true });
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).toContain("Transcript");
+    expect(app.captureCharFrame()).toContain("raw_line_40");
+    expect(app.captureCharFrame()).not.toContain("raw_line_01");
+
+    act(() => {
+      for (let index = 0; index < 3; index += 1) app.mockInput.pressKey("y", { ctrl: true });
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).toContain("raw_line_01");
   } finally {
     app.renderer.destroy();
   }
@@ -647,6 +801,7 @@ function chatTool(
   status: Extract<ChatTranscriptItem, { kind: "tool" }>["status"],
   displayStatus: Extract<ChatTranscriptItem, { kind: "tool" }>["displayStatus"],
   inputSummary: Extract<ChatTranscriptItem, { kind: "tool" }>["inputSummary"],
+  extra: Partial<Pick<Extract<ChatTranscriptItem, { kind: "tool" }>, "input" | "output" | "error">> = {},
 ): Extract<ChatTranscriptItem, { kind: "tool" }> {
   return {
     id: id as ToolCallId,
@@ -657,7 +812,58 @@ function chatTool(
     waitingForApproval: displayStatus === "waiting_permission",
     updatedAt: 1,
     inputSummary,
+    ...extra,
   };
+}
+
+function rawTranscriptItems(): ChatTranscriptItem[] {
+  const callId = "tool_raw" as ToolCallId;
+  return [
+    {
+      id: "msg_transcript" as MessageId,
+      kind: "message",
+      role: "assistant",
+      createdAt: 1,
+      parts: [
+        { type: "text", id: "part_transcript_text" as PartId, text: "I ran the command." },
+        {
+          type: "tool_call",
+          id: "part_transcript_call" as PartId,
+          callId,
+          toolName: "bash",
+          status: "completed",
+          displayStatus: "failed",
+          input: { command: "bun test" },
+        },
+        {
+          type: "tool_result",
+          id: "part_transcript_result" as PartId,
+          callId,
+          output: "RAW_MESSAGE_RESULT_LINE_1",
+          error: "RAW_MESSAGE_ERROR_LINE_1",
+        },
+      ],
+    },
+    chatTool(callId, "bash", "failed", "failed", { title: "bash", command: "bun test", detail: "bun test" }, {
+      input: { command: "bun test" },
+      output: "RAW_TOOL_OUTPUT_LINE_1\nRAW_TOOL_OUTPUT_LINE_2",
+      error: "RAW_TOOL_ERROR_LINE_1\nRAW_TOOL_ERROR_LINE_2",
+    }),
+    {
+      id: "approval_transcript" as ApprovalId,
+      kind: "approval",
+      permission: "tool.bash",
+      patterns: ["bun test"],
+      status: "pending",
+      createdAt: 2,
+      callId,
+      toolName: "bash",
+      toolInput: { command: "bun test" },
+      toolStatus: "waiting_for_approval",
+      toolDisplayStatus: "waiting_permission",
+      inputSummary: { title: "bash", command: "bun test", detail: "bun test" },
+    },
+  ];
 }
 
 function longAssistantMessage(lineCount: number): ChatTranscriptItem {

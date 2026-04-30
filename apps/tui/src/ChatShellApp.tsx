@@ -15,6 +15,8 @@ import { BrandMark } from "./chat/BrandMark.js";
 import { MessageList } from "./chat/MessageList.js";
 import { PROMPT_INPUT_HEIGHT, PROMPT_PLACEHOLDER, PromptComposer, promptComposerHeight } from "./chat/PromptComposer.js";
 import { StatusFooter, statusFooterHeight, type StatusFooterOptions } from "./chat/StatusFooter.js";
+import { buildTranscriptText } from "./chat/transcript.js";
+import { TranscriptView } from "./chat/TranscriptView.js";
 import type { LocalTranscriptItem, PromptPart } from "./chat/types.js";
 import { usePromptHistory } from "./chat/usePromptHistory.js";
 import { createDefaultSlashCommands, resolveSlashCommand, slashCompletions } from "./slash/registry.js";
@@ -29,7 +31,7 @@ import {
   type TuiThemeOption,
 } from "./theme/index.js";
 
-type ShellView = "chat" | "team" | "help" | "agents" | "status";
+type ShellView = "chat" | "team" | "help" | "agents" | "status" | "transcript";
 
 export interface ChatShellOptions extends TeamLiveTuiOptions {
   modelName?: string;
@@ -112,6 +114,7 @@ export function ChatShellSurface(props: {
   const [themeId, setThemeId] = useState(() => initialTuiThemeId(props.options?.themeId));
   const [themePicker, setThemePicker] = useState<ThemePickerNavigation | undefined>(undefined);
   const [messageScrollOffset, setMessageScrollOffset] = useState(0);
+  const [transcriptScrollOffset, setTranscriptScrollOffset] = useState(0);
   const [showToolDetails, setShowToolDetails] = useState(false);
   const prompt = promptText(promptParts);
   const history = usePromptHistory();
@@ -252,7 +255,7 @@ export function ChatShellSurface(props: {
     if (isCopyShortcut(key)) {
       key.preventDefault();
       key.stopPropagation();
-      const source = clipboardCopySource(renderer, props.runtime.chatView.items);
+      const source = clipboardCopySource(renderer, props.runtime.chatView.items, view);
       if (!source) {
         setLocalItems((current) => [...current, localItem("error", "Nothing to copy yet.")]);
         return;
@@ -280,6 +283,10 @@ export function ChatShellSurface(props: {
     }
     if (key.ctrl && key.name === "o" && !key.shift) {
       setShowToolDetails((current) => !current);
+      return;
+    }
+    if (key.ctrl && key.name === "t" && !key.shift) {
+      setView((current) => current === "transcript" ? "chat" : "transcript");
       return;
     }
     if (isPasteShortcut(key)) {
@@ -352,12 +359,24 @@ export function ChatShellSurface(props: {
       setMessageScrollOffset((current) => current + scrollStep(dimensions.height));
       return;
     }
+    if (view === "transcript" && key.ctrl && key.name === "y") {
+      setTranscriptScrollOffset((current) => current + scrollStep(dimensions.height));
+      return;
+    }
     if (view === "chat" && (isPageUp(key) || (key.shift && isArrowUp(key)))) {
       setMessageScrollOffset((current) => current + scrollStep(dimensions.height));
       return;
     }
+    if (view === "transcript" && (isPageUp(key) || (key.shift && isArrowUp(key)))) {
+      setTranscriptScrollOffset((current) => current + scrollStep(dimensions.height));
+      return;
+    }
     if (view === "chat" && (isPageDown(key) || (key.shift && isArrowDown(key)))) {
       setMessageScrollOffset((current) => Math.max(0, current - scrollStep(dimensions.height)));
+      return;
+    }
+    if (view === "transcript" && (isPageDown(key) || (key.shift && isArrowDown(key)))) {
+      setTranscriptScrollOffset((current) => Math.max(0, current - scrollStep(dimensions.height)));
       return;
     }
     if (view === "chat" && !promptDisabled && isPlainArrowUp(key) && !slashCompletionOpen) {
@@ -427,6 +446,7 @@ export function ChatShellSurface(props: {
           options={shellOptions}
           runtime={props.runtime}
           showToolDetails={showToolDetails}
+          transcriptActive={false}
           disabledReason={disabledReason}
           theme={theme}
           themePicker={themePicker ? {
@@ -460,8 +480,22 @@ export function ChatShellSurface(props: {
               setMessageScrollOffset((current) => Math.max(0, current - amount));
             }
           }}
+          onTranscriptScroll={(event) => {
+            const direction = event.scroll?.direction;
+            if (direction !== "up" && direction !== "down") return;
+            event.preventDefault();
+            event.stopPropagation();
+            const delta = Math.max(1, event.scroll?.delta ?? 1);
+            const amount = Math.max(2, Math.ceil(delta * 3));
+            if (direction === "up") {
+              setTranscriptScrollOffset((current) => current + amount);
+            } else {
+              setTranscriptScrollOffset((current) => Math.max(0, current - amount));
+            }
+          }}
           localItems={localItems}
           messageScrollOffset={messageScrollOffset}
+          transcriptScrollOffset={transcriptScrollOffset}
           completions={completions}
           completionIndex={selectedCompletionIndex}
           paletteOpen={paletteOpen}
@@ -471,6 +505,7 @@ export function ChatShellSurface(props: {
           options={shellOptions}
           runtime={props.runtime}
           showToolDetails={showToolDetails}
+          transcriptActive={view === "transcript"}
           commands={commands}
           disabledReason={disabledReason}
           theme={theme}
@@ -501,6 +536,7 @@ function HomeScreen(props: {
   runtime: ChatRuntimeState;
   options: StatusFooterOptions;
   showToolDetails: boolean;
+  transcriptActive: boolean;
   disabledReason?: string | undefined;
   theme: TuiTheme;
   themePicker?: ThemePickerModel | undefined;
@@ -546,7 +582,7 @@ function HomeScreen(props: {
         />
       </box>
       <box flexGrow={3} />
-      <StatusFooter options={props.options} model={props.model} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} />
+      <StatusFooter options={props.options} model={props.model} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
     </box>
   );
 }
@@ -560,8 +596,10 @@ function SessionScreen(props: {
   onPromptChange: (value: string) => void;
   onSubmit: () => void;
   onMessageScroll: (event: MouseEvent) => void;
+  onTranscriptScroll: (event: MouseEvent) => void;
   localItems: readonly LocalTranscriptItem[];
   messageScrollOffset: number;
+  transcriptScrollOffset: number;
   completions: readonly SlashCompletion[];
   completionIndex: number;
   paletteOpen: boolean;
@@ -571,6 +609,7 @@ function SessionScreen(props: {
   runtime: ChatRuntimeState;
   options: StatusFooterOptions;
   showToolDetails: boolean;
+  transcriptActive: boolean;
   commands: readonly SlashCommand[];
   disabledReason?: string | undefined;
   theme: TuiTheme;
@@ -607,15 +646,25 @@ function SessionScreen(props: {
       flexDirection="column"
       onMouseScroll={(event) => {
         if (props.view === "chat") props.onMessageScroll(event);
+        if (props.view === "transcript") props.onTranscriptScroll(event);
       }}
     >
       <box height={messagePaneHeight} flexDirection="column" paddingX={3} paddingY={1}>
         {props.view === "help" ? (
           <HelpView commands={props.commands} theme={props.theme} showToolDetails={props.showToolDetails} />
         ) : props.view === "status" ? (
-          <StatusView model={props.model} runtime={props.runtime} options={props.options} theme={props.theme} showToolDetails={props.showToolDetails} />
+          <StatusView model={props.model} runtime={props.runtime} options={props.options} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
         ) : props.view === "agents" ? (
           <AgentsView model={props.model} theme={props.theme} />
+        ) : props.view === "transcript" ? (
+          <TranscriptView
+            chatView={props.runtime.chatView}
+            localItems={props.localItems}
+            width={messageWidth}
+            visibleLimit={visibleLimit}
+            scrollOffset={props.transcriptScrollOffset}
+            theme={props.theme}
+          />
         ) : (
           <MessageList
             chatView={props.runtime.chatView}
@@ -655,7 +704,7 @@ function SessionScreen(props: {
           maxCommandItems={maxCommandItems}
         />
       </box>
-      <StatusFooter options={props.options} model={props.model} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} />
+      <StatusFooter options={props.options} model={props.model} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
     </box>
   );
 }
@@ -728,7 +777,7 @@ function HelpView(props: { commands: readonly SlashCommand[]; theme: TuiTheme; s
         </text>
       ))}
       <box height={1} />
-      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`Esc closes views. Ctrl+P opens commands. Ctrl+O toggles tool details (${detailsText}). Ctrl+V pastes. Ctrl+Shift+C copies selection or latest reply.`}</text>
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`Esc closes views. Ctrl+P opens commands. Ctrl+O toggles tool details (${detailsText}). Ctrl+T opens transcript. Ctrl+V pastes. Ctrl+Shift+C copies selection or latest reply.`}</text>
     </box>
   );
 }
@@ -739,6 +788,7 @@ function StatusView(props: {
   options: StatusFooterOptions;
   theme: TuiTheme;
   showToolDetails: boolean;
+  transcriptActive: boolean;
 }) {
   const selected = props.model.selected;
   return (
@@ -752,6 +802,7 @@ function StatusView(props: {
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`model: ${props.options.modelName}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`provider: ${props.options.providerName}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`details: ${props.showToolDetails ? "on" : "off"}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`transcript: ${props.transcriptActive ? "on" : "off"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`cwd: ${props.options.cwd}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`team: ${selected?.team.name ?? selected?.team.id ?? "none"}`}</text>
     </box>
@@ -914,9 +965,14 @@ interface ClipboardRenderer {
   off?: (event: "selection", handler: (selection: Selection) => void) => void;
 }
 
-function clipboardCopySource(renderer: ClipboardRenderer, items: readonly ChatTranscriptItem[]): { text: string; label: string } | undefined {
+function clipboardCopySource(renderer: ClipboardRenderer, items: readonly ChatTranscriptItem[], view: ShellView): { text: string; label: string } | undefined {
   const selected = cleanClipboardText(renderer.getSelection?.()?.getSelectedText() ?? "");
   if (selected) return { text: selected, label: "selection" };
+
+  if (view === "transcript") {
+    const transcript = buildTranscriptText(items).trimEnd();
+    if (transcript.trim()) return { text: transcript, label: "transcript" };
+  }
 
   const assistant = latestAssistantText(items);
   if (assistant) return { text: assistant, label: "latest assistant reply" };
