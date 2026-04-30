@@ -248,8 +248,8 @@ test("renders reasoning separately from assistant text", async () => {
 
   expect(frame).toContain("Thinking");
   expect(frame).toContain("| checking the plan");
-  expect(frame).toContain("Assistant: final answer");
-  expect(frame).not.toContain("Assistant: checking the plan final answer");
+  expect(frame).toContain("🌶️: final answer");
+  expect(frame).not.toContain("🌶️: checking the plan final answer");
 });
 
 test("renders tool rows with display statuses and output blocks", async () => {

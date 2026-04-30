@@ -70,7 +70,7 @@ function transcriptLines(items: readonly TranscriptSourceItem[], width: number, 
 }
 
 function messageLines(item: ChatMessageRow, width: number, theme: TuiTheme): TranscriptLineModel[] {
-  const role = item.role === "user" ? "You" : item.role === "assistant" ? "Assistant" : item.role;
+  const role = item.role === "user" ? "🥔" : item.role === "assistant" ? "🌶️" : item.role;
   const fg = item.role === "user" ? theme.colors.text.primary : theme.colors.text.secondary;
   const lines: TranscriptLineModel[] = [];
   for (const [index, part] of item.parts.entries()) {
