@@ -3,6 +3,7 @@ import type { TeamLiveView } from "@chili/sdk";
 export type SlashCommandCategory =
   | "session"
   | "team"
+  | "auth"
   | "model"
   | "view"
   | "debug";
@@ -14,6 +15,7 @@ export type SlashCommandResult =
   | { type: "new_session" }
   | { type: "insert_prompt"; text: string }
   | { type: "local_message"; level: "info" | "error"; text: string }
+  | { type: "auth_action"; action: "login" | "logout" | "status"; provider: "openai-codex" }
   | { type: "sdk_action"; action: "team_run" | "team_merge" | "approve" | "reject"; payload?: unknown };
 
 export interface SlashCompletion {

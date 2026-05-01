@@ -1,5 +1,5 @@
 {
-  "name": "@chili/tools",
+  "name": "@chili/skills",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -8,11 +8,6 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     }
-  },
-  "dependencies": {
-    "@chili/policy": "workspace:*",
-    "@chili/protocol": "workspace:*",
-    "@chili/skills": "workspace:*"
   },
   "scripts": {
     "typecheck": "tsc -b"

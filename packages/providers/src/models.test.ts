@@ -11,8 +11,12 @@ import {
   MINIMAX_M27_HIGHSPEED_MODEL,
   MINIMAX_M27_MODEL,
   MINIMAX_PROVIDER_ID,
+  OPENAI_CODEX_BASE_URL,
+  OPENAI_CODEX_DEFAULT_MODEL,
+  OPENAI_CODEX_PROVIDER_ID,
   readDeepSeekEnvironment,
   readMiniMaxEnvironment,
+  readOpenAICodexEnvironment,
 } from "./index.js";
 
 test("catalog describes the built-in DeepSeek V4 OpenAI-compatible models", () => {
@@ -77,6 +81,30 @@ test("catalog describes the built-in MiniMax Anthropic-family models", () => {
   });
 });
 
+test("catalog describes the built-in ChatGPT Codex Responses models", () => {
+  const models = listKnownModels(OPENAI_CODEX_PROVIDER_ID);
+
+  expect(models.map((model) => model.model)).toContain(OPENAI_CODEX_DEFAULT_MODEL);
+  expect(findDefaultKnownModel(OPENAI_CODEX_PROVIDER_ID)).toMatchObject({
+    provider: OPENAI_CODEX_PROVIDER_ID,
+    model: OPENAI_CODEX_DEFAULT_MODEL,
+    apiFamily: "openai-responses",
+    baseUrl: OPENAI_CODEX_BASE_URL,
+    default: true,
+    inputCapabilities: ["text", "image"],
+    contextWindowTokens: 272000,
+    maxOutputTokens: 128000,
+    capabilities: {
+      streaming: true,
+      reasoning: true,
+      toolCalls: true,
+      toolCallDeltas: true,
+      usage: true,
+      responseId: true,
+    },
+  });
+});
+
 test("DeepSeek env resolution uses provider-specific variables", () => {
   expect(
     readDeepSeekEnvironment({
@@ -124,5 +152,22 @@ test("MiniMax env resolution uses Anthropic base URL before generic MiniMax base
   ).toEqual({
     baseUrl: "https://anthropic.test",
     baseUrlEnv: "ANTHROPIC_BASE_URL",
+  });
+});
+
+test("OpenAI Codex env resolution uses provider-specific variables", () => {
+  expect(
+    readOpenAICodexEnvironment({
+      OPENAI_CODEX_ACCESS_TOKEN: "token",
+      OPENAI_CODEX_BASE_URL: "https://chatgpt.test/backend-api",
+      OPENAI_CODEX_MODEL: "gpt-5.3-codex",
+    }),
+  ).toEqual({
+    apiKey: "token",
+    apiKeyEnv: "OPENAI_CODEX_ACCESS_TOKEN",
+    baseUrl: "https://chatgpt.test/backend-api",
+    baseUrlEnv: "OPENAI_CODEX_BASE_URL",
+    model: "gpt-5.3-codex",
+    modelEnv: "OPENAI_CODEX_MODEL",
   });
 });

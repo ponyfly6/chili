@@ -726,12 +726,16 @@ test("Ctrl+Shift+C copies the transcript when transcript view is active", async 
 });
 
 test("local notices clear when the active session changes", async () => {
-  const app = await mountStatefulShell(teamLiveFixture());
+  const clipboard = fakeClipboard({
+    readText: async () => "",
+  });
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    clipboard,
+  });
 
   try {
-    await typeText(app, "/te");
-    await press(app, () => app.mockInput.pressEnter());
-    expect(app.captureCharFrame()).toContain("Unknown command: /te");
+    await press(app, () => app.mockInput.pressKey("v", { ctrl: true }));
+    expect(app.captureCharFrame()).toContain("Clipboard is empty.");
 
     await act(async () => {
       app.setRuntime((current) => ({
@@ -742,7 +746,7 @@ test("local notices clear when the active session changes", async () => {
     });
     await app.renderOnce();
 
-    expect(app.captureCharFrame()).not.toContain("Unknown command: /te");
+    expect(app.captureCharFrame()).not.toContain("Clipboard is empty.");
   } finally {
     app.renderer.destroy();
   }
@@ -1480,6 +1484,7 @@ async function mountStatefulShell(
     height?: number;
     executed?: TeamLiveAction[];
     runtime?: Partial<ChatRuntimeState>;
+    clipboard?: ClipboardAccess;
   } = {},
 ) {
   const initialRuntime = chatRuntime(model, options);
@@ -1497,6 +1502,7 @@ async function mountStatefulShell(
         onSelectTeam={() => undefined}
         onExit={() => undefined}
         options={{ cwd: "/repo/chili", modeName: "Build", modelName: "test-model", providerName: "test-provider" }}
+        clipboard={options.clipboard}
       />
     );
   }

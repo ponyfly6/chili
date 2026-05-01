@@ -7,6 +7,9 @@ const savedEnv = {
   DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY,
   DEEPSEEK_BASE_URL: process.env.DEEPSEEK_BASE_URL,
   DEEPSEEK_MODEL: process.env.DEEPSEEK_MODEL,
+  OPENAI_CODEX_ACCESS_TOKEN: process.env.OPENAI_CODEX_ACCESS_TOKEN,
+  OPENAI_CODEX_BASE_URL: process.env.OPENAI_CODEX_BASE_URL,
+  OPENAI_CODEX_MODEL: process.env.OPENAI_CODEX_MODEL,
   MINIMAX_API_KEY: process.env.MINIMAX_API_KEY,
   MINIMAX_BASE_URL: process.env.MINIMAX_BASE_URL,
   MINIMAX_ANTHROPIC_BASE_URL: process.env.MINIMAX_ANTHROPIC_BASE_URL,
@@ -17,6 +20,9 @@ afterEach(() => {
   restoreEnv("DEEPSEEK_API_KEY", savedEnv.DEEPSEEK_API_KEY);
   restoreEnv("DEEPSEEK_BASE_URL", savedEnv.DEEPSEEK_BASE_URL);
   restoreEnv("DEEPSEEK_MODEL", savedEnv.DEEPSEEK_MODEL);
+  restoreEnv("OPENAI_CODEX_ACCESS_TOKEN", savedEnv.OPENAI_CODEX_ACCESS_TOKEN);
+  restoreEnv("OPENAI_CODEX_BASE_URL", savedEnv.OPENAI_CODEX_BASE_URL);
+  restoreEnv("OPENAI_CODEX_MODEL", savedEnv.OPENAI_CODEX_MODEL);
   restoreEnv("MINIMAX_API_KEY", savedEnv.MINIMAX_API_KEY);
   restoreEnv("MINIMAX_BASE_URL", savedEnv.MINIMAX_BASE_URL);
   restoreEnv("MINIMAX_ANTHROPIC_BASE_URL", savedEnv.MINIMAX_ANTHROPIC_BASE_URL);
@@ -85,6 +91,57 @@ test("CLI MiniMax env resolution prefers Anthropic-compatible base URL over gene
   expect(url).toBe("https://api.minimaxi.com/anthropic/v1/messages");
 });
 
+test("CLI Codex env resolution uses ChatGPT Codex endpoint and session metadata", async () => {
+  process.env.OPENAI_CODEX_ACCESS_TOKEN = jwtWithAccount("acct_cli");
+  process.env.OPENAI_CODEX_BASE_URL = "https://chatgpt.test/backend-api";
+  process.env.OPENAI_CODEX_MODEL = "gpt-5.3-codex";
+
+  let url = "";
+  let headers = new Headers();
+  let body: Record<string, unknown> = {};
+  const fetchImpl = (async (input, init) => {
+    url = String(input);
+    headers = new Headers(init?.headers);
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(
+      streamText([
+        data({ type: "response.created", response: { id: "resp_cli", model: "gpt-5.3-codex" } }),
+        data({
+          type: "response.completed",
+          response: {
+            id: "resp_cli",
+            model: "gpt-5.3-codex",
+            status: "completed",
+            usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3 },
+          },
+        }),
+      ].join("")),
+      {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      },
+    );
+  }) as typeof fetch;
+
+  const model = await createCliModel("codex", { fetch: fetchImpl });
+  const events = await collect(model.stream(emptyInput()));
+
+  expect(url).toBe("https://chatgpt.test/backend-api/codex/responses");
+  expect(headers.get("chatgpt-account-id")).toBe("acct_cli");
+  expect(headers.get("session_id")).toBe("session_cli_model");
+  expect(body).toMatchObject({
+    model: "gpt-5.3-codex",
+    prompt_cache_key: "session_cli_model",
+  });
+  expect(events).toContainEqual(expect.objectContaining({
+    type: "metadata",
+    provider: "openai-codex",
+    model: "gpt-5.3-codex",
+    contextWindowTokens: 272000,
+    maxOutputTokens: 128000,
+  }));
+});
+
 async function collect(stream: AsyncIterable<unknown>): Promise<unknown[]> {
   const events: unknown[] = [];
   for await (const _event of stream) {
@@ -110,4 +167,26 @@ function restoreEnv(name: string, value: string | undefined): void {
   } else {
     process.env[name] = value;
   }
+}
+
+function data(payload: unknown): string {
+  return `data: ${JSON.stringify(payload)}\n\n`;
+}
+
+function streamText(text: string): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(text));
+      controller.close();
+    },
+  });
+}
+
+function jwtWithAccount(accountId: string): string {
+  const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({
+    "https://api.openai.com/auth": { chatgpt_account_id: accountId },
+  })).toString("base64url");
+  return `${header}.${payload}.sig`;
 }

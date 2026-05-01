@@ -65,6 +65,29 @@ export function createDefaultSlashCommands(): SlashCommand[] {
       isSafeConcurrent: true,
       run: () => ({ type: "open_view", view: "agents" }),
     },
+    {
+      name: "login",
+      aliases: ["auth login"],
+      description: "Login to ChatGPT Codex",
+      category: "auth",
+      isSafeConcurrent: false,
+      run: () => ({ type: "auth_action", action: "login", provider: "openai-codex" }),
+    },
+    {
+      name: "logout",
+      aliases: ["auth logout"],
+      description: "Remove ChatGPT Codex credentials",
+      category: "auth",
+      isSafeConcurrent: false,
+      run: () => ({ type: "auth_action", action: "logout", provider: "openai-codex" }),
+    },
+    {
+      name: "auth",
+      description: "Show ChatGPT Codex auth status",
+      category: "auth",
+      isSafeConcurrent: true,
+      run: () => ({ type: "auth_action", action: "status", provider: "openai-codex" }),
+    },
   ];
 }
 

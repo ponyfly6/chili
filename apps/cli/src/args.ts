@@ -343,6 +343,7 @@ export function usage(): string {
     "  bun run chili -- revert <snapshot-id> --resume <session-id>",
     "  bun run chili -- --model fake \"hello\"",
     "  bun run chili -- --model deepseek \"hello\"",
+    "  bun run chili -- --model codex \"hello\"",
     "  bun run chili -- --model legacy-minimax \"hello\"",
     "",
     "Options:",
@@ -350,7 +351,7 @@ export function usage(): string {
     "  --host <host>       Runtime server host, default 127.0.0.1",
     "  --port <port>       Runtime server port for serve, default 4777",
     "  --resume, -r <id>   Resume a session",
-    "  --model <name>      minimax | deepseek | fake | legacy-minimax, default minimax",
+    "  --model <name>      minimax | deepseek | codex | fake | legacy-minimax, default minimax",
     "  --yes, -y           Auto-approve tool permissions",
     "  --json              Print machine-readable JSON for supported read commands",
     "  --once              Run one team execution cycle",
@@ -364,7 +365,12 @@ export function usage(): string {
 }
 
 function isCliModelName(value: string): value is CliModelName {
-  return value === "minimax" || value === "deepseek" || value === "fake" || value === "legacy-minimax";
+  return value === "minimax"
+    || value === "deepseek"
+    || value === "codex"
+    || value === "openai-codex"
+    || value === "fake"
+    || value === "legacy-minimax";
 }
 
 function parseMemoryCommand(result: CliArgs, args: string[], prompt: string[]): void {

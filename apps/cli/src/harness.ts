@@ -32,6 +32,7 @@ import {
   type SubagentControlController,
   ToolExecutor,
   createApplyPatchTool,
+  createActivateSkillTool,
   createBashTool,
   createMailboxConsumeTool,
   createMailboxListTool,
@@ -84,6 +85,7 @@ import {
   type TeamToolController,
   type ToolAccessPolicyResolver,
 } from "@chili/tools";
+import { discoverSkills, formatAvailableSkillsPrompt, type SkillRegistry } from "@chili/skills";
 import { createCliApprovalBroker, createCliPermissionRules } from "./approval.js";
 import { createIdFactory } from "./id.js";
 import type { CliModelName } from "./model.js";
@@ -127,8 +129,10 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const eventStore = new ObservableEventStore(printableStore);
   const childToolPolicyResolver = createWorkerToolPolicyResolver(eventStore);
   const model = await createCliModel(options.model);
-  const registry = createToolRegistry();
-  const childRegistry = createChildToolRegistry();
+  const skillRegistry = await discoverSkills({ cwd });
+  const registry = createToolRegistry(skillRegistry);
+  const childRegistry = createChildToolRegistry(skillRegistry);
+  const systemContext = (context: { cwd: string }) => buildCliSystemContext({ cwd: context.cwd, skillRegistry });
   const childSystem = [
     "You are a local Chili subagent. Work in the assigned repository scope, keep results concise, and return a clear final summary.",
   ];
@@ -173,7 +177,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     createId,
     maxTurns: 8,
     system: childSystem,
-    systemContext: (context) => buildChiliMemorySystemContext({ cwd: context.cwd }),
+    systemContext,
   });
   const subagents = new LocalSubagentManager({
     store: eventStore,
@@ -182,6 +186,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
       store: eventStore,
       maxTurns: 8,
       system: childSystem,
+      systemContext,
     }),
     createId,
   });
@@ -271,7 +276,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     store: eventStore,
     cwd,
     createId,
-    systemContext: (context) => buildChiliMemorySystemContext({ cwd: context.cwd }),
+    systemContext,
   });
   const teamRunner = new TeamExecutionRunner({
     teams,
@@ -391,12 +396,20 @@ function workerToolPolicyFromEvent(
   } as WorkerToolPolicy;
 }
 
-function createToolRegistry(): InMemoryToolRegistry {
+async function buildCliSystemContext(input: { cwd: string; skillRegistry: SkillRegistry }): Promise<string[]> {
+  const context = await buildChiliMemorySystemContext({ cwd: input.cwd });
+  const skillsPrompt = formatAvailableSkillsPrompt(input.skillRegistry.list());
+  if (skillsPrompt) context.push(skillsPrompt);
+  return context;
+}
+
+function createToolRegistry(skillRegistry: SkillRegistry): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
   registry.register(createMemoryTool());
+  registry.register(createActivateSkillTool(skillRegistry));
   registry.register(createEditTool());
   registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());
@@ -416,12 +429,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function createChildToolRegistry(): InMemoryToolRegistry {
+function createChildToolRegistry(skillRegistry: SkillRegistry): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
   registry.register(createMemoryTool());
+  registry.register(createActivateSkillTool(skillRegistry));
   registry.register(createEditTool());
   registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());

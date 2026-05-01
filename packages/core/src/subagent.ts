@@ -19,6 +19,7 @@ import type {
   TaskToolInput,
 } from "@chili/tools";
 import type { AgentRunner } from "./runner.js";
+import type { RuntimeSystemContextProvider } from "./runtime-service.js";
 import {
   completeWorkerToolPolicy,
   workerPolicySystemSummary,
@@ -116,6 +117,7 @@ export interface AgentRunnerSubagentRunnerOptions {
   store: EventStore;
   maxTurns?: number;
   system?: string[];
+  systemContext?: RuntimeSystemContextProvider;
 }
 
 export class LocalSubagentManager implements SubagentController {
@@ -570,6 +572,11 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
     });
 
     const maxTurns = this.options.maxTurns ?? 12;
+    const dynamicSystem = await this.options.systemContext?.({
+      sessionId: input.childSessionId,
+      threadId: input.childThreadId,
+      cwd: input.cwd,
+    }) ?? [];
     for (let index = 0; index < maxTurns; index++) {
       const runInput = {
         sessionId: input.childSessionId,
@@ -577,6 +584,7 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
         cwd: input.cwd,
         system: [
           ...(this.options.system ?? []),
+          ...dynamicSystem,
           subagentRunSystemLine(input),
           ...(input.workerPolicy ? [workerPolicySystemSummary(input.workerPolicy)] : []),
         ],

@@ -1,4 +1,5 @@
 export * from "./approval.js";
+export * from "./builtins/activate-skill.js";
 export * from "./builtins/apply-patch.js";
 export * from "./builtins/bash.js";
 export * from "./builtins/edit.js";

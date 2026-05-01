@@ -145,7 +145,12 @@ test("runProcess bounds verbose live output while keeping a fresh tail", async (
       maxOutputBytes: 16,
       outputFlushIntervalMs: 10_000,
       onOutput: (chunk) => {
-        if (chunk.stream === "stdout") deltas.push({ delta: chunk.delta, truncated: chunk.truncated });
+        if (chunk.stream === "stdout") {
+          deltas.push({
+            delta: chunk.delta,
+            ...(chunk.truncated !== undefined ? { truncated: chunk.truncated } : {}),
+          });
+        }
       },
     });
 

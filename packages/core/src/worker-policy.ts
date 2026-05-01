@@ -18,6 +18,7 @@ export const SCOPED_WORKER_BASE_TOOLS = [
   "grep",
   "git_diff",
   "tool_search",
+  "activate_skill",
   "complete_task",
   "team_snapshot",
   "team_task_list",

@@ -270,7 +270,7 @@ interface OutputState {
   decoder: StringDecoder;
   pending: string;
   truncated: boolean;
-  timer?: NodeJS.Timeout;
+  timer: NodeJS.Timeout | undefined;
 }
 
 function createOutputState(): OutputState {
@@ -278,6 +278,7 @@ function createOutputState(): OutputState {
     decoder: new StringDecoder("utf8"),
     pending: "",
     truncated: false,
+    timer: undefined,
   };
 }
 
@@ -285,7 +286,7 @@ function utf8Tail(value: string, maxBytes: number): { text: string; truncated: b
   const bytes = Buffer.from(value, "utf8");
   if (bytes.byteLength <= maxBytes) return { text: value, truncated: false };
   let start = Math.max(0, bytes.byteLength - maxBytes);
-  while (start < bytes.byteLength && (bytes[start] & 0b1100_0000) === 0b1000_0000) {
+  while (start < bytes.byteLength && ((bytes[start] ?? 0) & 0b1100_0000) === 0b1000_0000) {
     start += 1;
   }
   return {

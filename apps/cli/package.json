@@ -12,6 +12,7 @@
     "@chili/protocol": "workspace:*",
     "@chili/providers": "workspace:*",
     "@chili/server": "workspace:*",
+    "@chili/skills": "workspace:*",
     "@chili/store": "workspace:*",
     "@chili/tools": "workspace:*"
   },

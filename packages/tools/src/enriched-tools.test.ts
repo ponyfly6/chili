@@ -241,7 +241,7 @@ test("bash publishes live stdout and stderr tool output deltas", async () => {
     }
 
     const deltas = events.filter((event): event is Extract<ChiliEvent, { type: "tool.output_delta" }> => event.type === "tool.output_delta");
-    expect(deltas.map((event) => event.payload.callId)).toEqual(deltas.map(() => "toolcall_bash_stream"));
+    expect(deltas.map((event) => String(event.payload.callId))).toEqual(deltas.map(() => "toolcall_bash_stream"));
     expect(deltas.filter((event) => event.payload.stream === "stdout").map((event) => event.payload.delta).join("")).toBe("out1out2");
     expect(deltas.filter((event) => event.payload.stream === "stderr").map((event) => event.payload.delta).join("")).toBe("err1err2");
     expect(events.at(-1)?.type).toBe("tool.call_finished");

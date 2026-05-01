@@ -3,6 +3,7 @@ import { useAppContext, useKeyboard, useRenderer, useTerminalDimensions } from "
 import type { KeyEvent, MouseEvent, PasteEvent, Selection } from "@opentui/core";
 import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
 import type { ApprovalId, TeamId } from "@chili/protocol";
+import { FileAuthStorage, loginOpenAICodex, OPENAI_CODEX_PROVIDER_ID } from "@chili/providers";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { cleanClipboardText, promptClipboardText, promptPasteBytes, systemClipboard, type ClipboardAccess } from "./clipboard.js";
@@ -43,6 +44,11 @@ export interface ChatShellOptions extends TeamLiveTuiOptions {
   gitBranch?: string;
   themeId?: string;
   systemTheme?: TuiTheme;
+}
+
+interface AuthManualPrompt {
+  resolve: (value: string) => void;
+  reject: (error: Error) => void;
 }
 
 const execFileAsync = promisify(execFile);
@@ -120,6 +126,7 @@ export function ChatShellSurface(props: {
   const [themePicker, setThemePicker] = useState<ThemePickerNavigation | undefined>(undefined);
   const [messageScrollOffset, setMessageScrollOffset] = useState(0);
   const [transcriptScrollOffset, setTranscriptScrollOffset] = useState(0);
+  const [authManualPrompt, setAuthManualPromptState] = useState<AuthManualPrompt | undefined>(undefined);
   const [showToolDetails, setShowToolDetails] = useState(false);
   const localMessageTtlMs = props.localMessageTtlMs ?? LOCAL_ITEM_TTL_MS;
   const localItemTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
@@ -157,6 +164,7 @@ export function ChatShellSurface(props: {
   const previousTranscriptLineCount = useRef<number | undefined>(undefined);
   const prompt = promptText(promptParts);
   const history = usePromptHistory();
+  const authManualPromptRef = useRef<AuthManualPrompt | undefined>(undefined);
   const systemTheme = props.options?.systemTheme;
   const theme = resolveTuiTheme(themeId, undefined, { systemTheme });
   const themeOptions = selectableTuiThemeOptions;
@@ -202,15 +210,31 @@ export function ChatShellSurface(props: {
     historyPromptValueRef.current = value;
     setPrompt(value);
   }, [setPrompt, updateAcceptedCompletionPrompt]);
+  const setAuthManualPrompt = useCallback((value: AuthManualPrompt | undefined) => {
+    authManualPromptRef.current = value;
+    setAuthManualPromptState(value);
+  }, []);
   const startNewChatSession = useCallback(async () => {
     setView("chat");
+    setAuthManualPrompt(undefined);
     setPrompt("");
     history.clear();
     clearLocalItems();
     setMessageScrollOffset(0);
     setTranscriptScrollOffset(0);
     await props.runtime.startNewSession();
-  }, [clearLocalItems, history, props.runtime, setPrompt]);
+  }, [clearLocalItems, history, props.runtime, setAuthManualPrompt, setPrompt]);
+  const submitAuthManualInput = useCallback(() => {
+    const manual = authManualPromptRef.current;
+    if (!manual) return false;
+    const value = prompt.trim();
+    if (!value) return true;
+    manual.resolve(value);
+    setAuthManualPrompt(undefined);
+    setPrompt("");
+    appendLocalItem("info", "Using pasted OpenAI authorization response...");
+    return true;
+  }, [appendLocalItem, prompt, setAuthManualPrompt, setPrompt]);
   const openThemePicker = useCallback(() => {
     const index = themeOptionIndex(themeOptions, themeId);
     setThemePicker({
@@ -240,9 +264,9 @@ export function ChatShellSurface(props: {
     updateAcceptedCompletionPrompt(undefined);
     history.resetNavigation();
     setPrompt("");
-    void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker);
+    void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, setAuthManualPrompt);
     return true;
-  }, [appendLocalItem, commands, completions, history, openThemePicker, props.model, props.runtime, selectedCompletionIndex, setPrompt, slashCompletionOpen, slashContext, startNewChatSession, updateAcceptedCompletionPrompt]);
+  }, [appendLocalItem, commands, completions, history, openThemePicker, props.model, props.runtime, selectedCompletionIndex, setAuthManualPrompt, setPrompt, slashCompletionOpen, slashContext, startNewChatSession, updateAcceptedCompletionPrompt]);
   useEffect(() => {
     setCompletionIndex(0);
   }, [prompt]);
@@ -257,7 +281,9 @@ export function ChatShellSurface(props: {
     setCompletionIndex((current) => clampIndex(current, completions.length));
   }, [completions.length]);
 
-  const disabledReason = slashInputActive
+  const disabledReason = authManualPrompt
+    ? undefined
+    : slashInputActive
     ? undefined
     : props.runtime.chatView.pendingApprovals.length > 0
       ? "Resolve approval to continue"
@@ -377,7 +403,7 @@ export function ChatShellSurface(props: {
     if (paletteOpen) {
       handlePaletteKey(key, paletteItems, paletteIndex, setPaletteIndex, (completion) => {
         setPaletteOpen(false);
-        void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker);
+        void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, setAuthManualPrompt);
       }, () => setPaletteOpen(false));
       return;
     }
@@ -498,8 +524,9 @@ export function ChatShellSurface(props: {
           focused={view === "chat" && !paletteOpen && !themePicker && !disabledReason}
           onPromptChange={handlePromptChange}
           onSubmit={() => {
+            if (submitAuthManualInput()) return;
             if (runSelectedSlashCompletion()) return;
-            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, history.record);
+            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, setAuthManualPrompt, history.record);
           }}
           completions={completions}
           completionIndex={selectedCompletionIndex}
@@ -528,9 +555,10 @@ export function ChatShellSurface(props: {
           focused={view === "chat" && !paletteOpen && !themePicker && !disabledReason}
           onPromptChange={handlePromptChange}
           onSubmit={() => {
+            if (submitAuthManualInput()) return;
             if (runSelectedSlashCompletion()) return;
             setMessageScrollOffset(0);
-            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, history.record);
+            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, setAuthManualPrompt, history.record);
           }}
           onMessageScroll={(event) => {
             const direction = event.scroll?.direction;
@@ -957,6 +985,7 @@ async function submitPrompt(
   startNewChatSession: () => Promise<void>,
   setPrompt: (value: string | ((current: string) => string)) => void,
   openThemePicker: () => void,
+  setAuthManualPrompt: (value: AuthManualPrompt | undefined) => void,
   onAccepted?: (text: string) => void,
 ): Promise<void> {
   const trimmed = prompt.trim();
@@ -965,7 +994,7 @@ async function submitPrompt(
     const slashMatch = resolveSlashCommand(commands, trimmed);
     if (slashMatch) {
       setPrompt("");
-      await runResolvedSlashCommand(slashMatch, ctx, model, runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker);
+      await runResolvedSlashCommand(slashMatch, ctx, model, runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, setAuthManualPrompt);
       return;
     }
     if (isSlashCommandCandidate(commands, ctx, trimmed)) {
@@ -995,13 +1024,14 @@ async function runSlashInput(
   startNewChatSession: () => Promise<void>,
   setPrompt: (value: string | ((current: string) => string)) => void,
   openThemePicker: () => void,
+  setAuthManualPrompt: (value: AuthManualPrompt | undefined) => void,
 ): Promise<void> {
   const match = resolveSlashCommand(commands, input);
   if (!match) {
     appendLocalItem("error", `Unknown command: ${input}`);
     return;
   }
-  await runResolvedSlashCommand(match, ctx, model, runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker);
+  await runResolvedSlashCommand(match, ctx, model, runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, setAuthManualPrompt);
 }
 
 async function runResolvedSlashCommand(
@@ -1014,9 +1044,10 @@ async function runResolvedSlashCommand(
   startNewChatSession: () => Promise<void>,
   setPrompt: (value: string | ((current: string) => string)) => void,
   openThemePicker: () => void,
+  setAuthManualPrompt: (value: AuthManualPrompt | undefined) => void,
 ): Promise<void> {
   const result = await match.command.run(ctx, match.args);
-  await applySlashResult(result, model, runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker);
+  await applySlashResult(result, model, runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, setAuthManualPrompt);
 }
 
 async function applySlashResult(
@@ -1028,6 +1059,7 @@ async function applySlashResult(
   startNewChatSession: () => Promise<void>,
   setPrompt: (value: string | ((current: string) => string)) => void,
   openThemePicker: () => void,
+  setAuthManualPrompt: (value: AuthManualPrompt | undefined) => void,
 ): Promise<void> {
   if (result.type === "open_view") {
     setView(result.view);
@@ -1053,8 +1085,88 @@ async function applySlashResult(
     appendLocalItem(result.level, result.text);
     return;
   }
-  const action = actionForSlashResult(result, model);
-  if (action) runtime.executeAction(action);
+  if (result.type === "auth_action") {
+    await performAuthAction(result, appendLocalItem, setAuthManualPrompt);
+    return;
+  }
+  if (result.type === "sdk_action") {
+    const action = actionForSlashResult(result, model);
+    if (action) runtime.executeAction(action);
+  }
+}
+
+async function performAuthAction(
+  result: Extract<SlashCommandResult, { type: "auth_action" }>,
+  appendLocalItem: AppendLocalItem,
+  setAuthManualPrompt: (value: AuthManualPrompt | undefined) => void,
+): Promise<void> {
+  if (result.provider !== OPENAI_CODEX_PROVIDER_ID) {
+    appendLocalItem("error", `Unsupported auth provider: ${result.provider}`);
+    return;
+  }
+
+  const storage = new FileAuthStorage();
+  if (result.action === "status") {
+    const status = await storage.status(OPENAI_CODEX_PROVIDER_ID);
+    const text = status.configured
+      ? `ChatGPT Codex auth: ${status.type}${status.accountId ? ` account ${status.accountId}` : ""}${status.expires ? `, expires ${formatAuthTime(status.expires)}` : ""}. Stored at ${status.authPath}.`
+      : `ChatGPT Codex auth: not configured. Run /login to connect a ChatGPT Plus/Pro account. Auth file: ${status.authPath}.`;
+    appendLocalItem("info", text);
+    return;
+  }
+
+  if (result.action === "logout") {
+    const removed = await storage.remove(OPENAI_CODEX_PROVIDER_ID);
+    appendLocalItem("info", removed ? "Removed ChatGPT Codex credentials." : "No ChatGPT Codex credentials were stored.");
+    return;
+  }
+
+  appendLocalItem("info", "Starting ChatGPT Codex login...");
+  try {
+    const credentials = await loginOpenAICodex({
+      originator: "chili",
+      onAuth: ({ url }: { url: string }) => {
+        appendLocalItem("info", `Browser login opened. If it does not open, visit: ${url}`);
+        void openExternalUrl(url).catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          appendLocalItem("error", `Could not open browser automatically: ${message}`);
+        });
+      },
+      onProgress: (message: string) => {
+        appendLocalItem("info", message);
+      },
+      onManualCodeInput: () => new Promise<string>((resolve, reject) => {
+        setAuthManualPrompt({ resolve, reject });
+        appendLocalItem("info", "If browser login stalls, paste the full redirect URL or authorization code here and press Enter.");
+      }),
+      onPrompt: async () => {
+        throw new Error("Local callback did not complete. Run /login again and keep the browser redirect window open.");
+      },
+    });
+    await storage.setOAuthCredentials(OPENAI_CODEX_PROVIDER_ID, credentials);
+    appendLocalItem("info", `ChatGPT Codex login complete for account ${credentials.accountId}. Token expires ${formatAuthTime(credentials.expires)}.`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    appendLocalItem("error", `ChatGPT Codex login failed: ${message}`);
+  } finally {
+    setAuthManualPrompt(undefined);
+  }
+}
+
+async function openExternalUrl(url: string): Promise<void> {
+  if (process.platform === "darwin") {
+    await execFileAsync("open", [url]);
+    return;
+  }
+  if (process.platform === "win32") {
+    await execFileAsync("cmd", ["/c", "start", "", url]);
+    return;
+  }
+  await execFileAsync("xdg-open", [url]);
+}
+
+function formatAuthTime(value: number): string {
+  return new Date(value).toLocaleString();
 }
 
 function actionForSlashResult(result: Extract<SlashCommandResult, { type: "sdk_action" }>, model: TeamLiveView): TeamLiveAction | undefined {

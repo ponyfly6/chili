@@ -22,6 +22,7 @@
         "@chili/protocol": "workspace:*",
         "@chili/providers": "workspace:*",
         "@chili/server": "workspace:*",
+        "@chili/skills": "workspace:*",
         "@chili/store": "workspace:*",
         "@chili/tools": "workspace:*",
       },
@@ -34,12 +35,17 @@
       },
       "dependencies": {
         "@chili/protocol": "workspace:*",
+        "@chili/providers": "workspace:*",
         "@chili/sdk": "workspace:*",
         "@opentui/core": "0.1.106",
         "@opentui/react": "0.1.106",
         "marked": "17.0.1",
         "react": "19.2.5",
       },
+    },
+    "packages/commands": {
+      "name": "@chili/commands",
+      "version": "0.0.0",
     },
     "packages/core": {
       "name": "@chili/core",
@@ -82,6 +88,10 @@
         "@chili/store": "workspace:*",
       },
     },
+    "packages/skills": {
+      "name": "@chili/skills",
+      "version": "0.0.0",
+    },
     "packages/store": {
       "name": "@chili/store",
       "version": "0.0.0",
@@ -95,11 +105,14 @@
       "dependencies": {
         "@chili/policy": "workspace:*",
         "@chili/protocol": "workspace:*",
+        "@chili/skills": "workspace:*",
       },
     },
   },
   "packages": {
     "@chili/cli": ["@chili/cli@workspace:apps/cli"],
+
+    "@chili/commands": ["@chili/commands@workspace:packages/commands"],
 
     "@chili/core": ["@chili/core@workspace:packages/core"],
 
@@ -112,6 +125,8 @@
     "@chili/sdk": ["@chili/sdk@workspace:packages/sdk"],
 
     "@chili/server": ["@chili/server@workspace:packages/server"],
+
+    "@chili/skills": ["@chili/skills@workspace:packages/skills"],
 
     "@chili/store": ["@chili/store@workspace:packages/store"],
 

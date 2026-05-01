@@ -9,6 +9,19 @@ test("parses DeepSeek as a CLI model", () => {
   });
 });
 
+test("parses ChatGPT Codex as a CLI model", () => {
+  expect(parseArgs(["--model", "codex", "hello"])).toMatchObject({
+    command: "run",
+    model: "codex",
+    prompt: "hello",
+  });
+  expect(parseArgs(["--model", "openai-codex", "hello"])).toMatchObject({
+    command: "run",
+    model: "openai-codex",
+    prompt: "hello",
+  });
+});
+
 test("parses team status and nested team view commands", () => {
   expect(parseArgs(["team", "status", "team_1", "--json"])).toMatchObject({
     command: "team",

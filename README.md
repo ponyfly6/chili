@@ -102,6 +102,27 @@ DEEPSEEK_MODEL=deepseek-v4-pro
 
 可选模型为 `deepseek-v4-pro` 和 `deepseek-v4-flash`。官方 Anthropic 格式端点为 `https://api.deepseek.com/anthropic`，当前 CLI 默认使用 OpenAI 格式端点。
 
+ChatGPT 订阅里的 Codex 可以通过 TUI 斜杠命令登录：
+
+```bash
+bun run chili -- serve --model codex
+bun run tui
+```
+
+在 TUI 里执行 `/login`，浏览器完成 ChatGPT 登录后，Chili 会把 OAuth 凭据保存到 `~/.chili/auth.json`。这个文件包含 access/refresh token，应按密码处理。登录后使用 `--model codex` 会走 ChatGPT Codex Responses 后端，默认模型为 `gpt-5.5`：
+
+```bash
+bun run chili -- --model codex "总结这个仓库"
+```
+
+也可以用 `/auth` 查看状态，或用 `/logout` 删除本地 Codex 凭据。可选环境变量：
+
+```bash
+OPENAI_CODEX_MODEL=gpt-5.5
+OPENAI_CODEX_BASE_URL=https://chatgpt.com/backend-api
+OPENAI_CODEX_ACCESS_TOKEN=...
+```
+
 ---
 
 ## 开发

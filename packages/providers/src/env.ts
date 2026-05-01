@@ -1,4 +1,4 @@
-import { DEEPSEEK_PROVIDER_ID, MINIMAX_PROVIDER_ID } from "./models.js";
+import { DEEPSEEK_PROVIDER_ID, MINIMAX_PROVIDER_ID, OPENAI_CODEX_PROVIDER_ID } from "./models.js";
 
 export type EnvironmentSource = Record<string, string | undefined>;
 
@@ -29,9 +29,16 @@ export const DEEPSEEK_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
   model: ["DEEPSEEK_MODEL"],
 };
 
+export const OPENAI_CODEX_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
+  apiKey: ["OPENAI_CODEX_ACCESS_TOKEN"],
+  baseUrl: ["OPENAI_CODEX_BASE_URL"],
+  model: ["OPENAI_CODEX_MODEL"],
+};
+
 const PROVIDER_ENVIRONMENT: Record<string, ProviderEnvironmentSpec> = {
   [DEEPSEEK_PROVIDER_ID]: DEEPSEEK_ENVIRONMENT,
   [MINIMAX_PROVIDER_ID]: MINIMAX_ENVIRONMENT,
+  [OPENAI_CODEX_PROVIDER_ID]: OPENAI_CODEX_ENVIRONMENT,
 };
 
 export function readProviderEnvironment(
@@ -49,6 +56,10 @@ export function readMiniMaxEnvironment(env: EnvironmentSource = currentEnvironme
 
 export function readDeepSeekEnvironment(env: EnvironmentSource = currentEnvironment()): ProviderEnvironment {
   return readEnvironmentSpec(DEEPSEEK_ENVIRONMENT, env);
+}
+
+export function readOpenAICodexEnvironment(env: EnvironmentSource = currentEnvironment()): ProviderEnvironment {
+  return readEnvironmentSpec(OPENAI_CODEX_ENVIRONMENT, env);
 }
 
 export function findConfiguredEnvironmentNames(

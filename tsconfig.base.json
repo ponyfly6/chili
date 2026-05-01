@@ -40,6 +40,9 @@
       "@chili/server": [
         "packages/server/src/index.ts"
       ],
+      "@chili/skills": [
+        "packages/skills/src/index.ts"
+      ],
       "@chili/store": [
         "packages/store/src/index.ts"
       ],

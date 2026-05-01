@@ -6,12 +6,15 @@ import {
   findKnownModel,
   MINIMAX_ANTHROPIC_BASE_URL,
   MINIMAX_M27_HIGHSPEED_MODEL,
+  OPENAI_CODEX_BASE_URL,
+  OPENAI_CODEX_DEFAULT_MODEL,
   readDeepSeekEnvironment,
   readMiniMaxEnvironment,
+  readOpenAICodexEnvironment,
 } from "@chili/providers";
 import { FakeModelRouter } from "./fake-model.js";
 
-export type CliModelName = "fake" | "minimax" | "deepseek" | "legacy-minimax";
+export type CliModelName = "fake" | "minimax" | "deepseek" | "codex" | "openai-codex" | "legacy-minimax";
 
 interface ProviderRouterOptions {
   apiKey?: string;
@@ -39,6 +42,7 @@ interface ProviderModelStreamInput {
   system?: readonly string[];
   maxTokens?: number;
   signal?: AbortSignal;
+  metadata?: Record<string, unknown>;
 }
 
 type ProviderModelOrProvider = ProviderModel | ProviderModelProvider;
@@ -57,6 +61,9 @@ const DEFAULT_MAX_TOKENS = 4096;
 export async function createCliModel(name: CliModelName, options: CliModelOptions = {}): Promise<ModelRouter> {
   if (name === "fake") return new FakeModelRouter();
   if (name === "deepseek") return createProvidersDeepSeekRouter(readDeepSeekOptionsFromEnv(options));
+  if (name === "codex" || name === "openai-codex") {
+    return createProvidersOpenAICodexRouter(readOpenAICodexOptionsFromEnv(options));
+  }
   const miniMaxOptions = readMiniMaxOptionsFromEnv(options);
   if (name === "legacy-minimax") return createMiniMaxM27HighspeedRouter(miniMaxOptions);
   return createProvidersMiniMaxRouter(miniMaxOptions);
@@ -76,7 +83,14 @@ async function createProvidersDeepSeekRouter(options: ProviderRouterOptions): Pr
   return toModelRouter(modelOrProvider, options.model, "DeepSeek");
 }
 
-async function loadProvidersModule(providerName: "minimax" | "deepseek"): Promise<Record<string, unknown>> {
+async function createProvidersOpenAICodexRouter(options: ProviderRouterOptions): Promise<ModelRouter> {
+  const providers = await loadProvidersModule("codex");
+  const createRouter = resolveOpenAICodexFactory(providers);
+  const modelOrProvider = await createRouter(options);
+  return toModelRouter(modelOrProvider, options.model, "OpenAI Codex");
+}
+
+async function loadProvidersModule(providerName: "minimax" | "deepseek" | "codex"): Promise<Record<string, unknown>> {
   try {
     return (await import(PROVIDERS_PACKAGE_NAME)) as Record<string, unknown>;
   } catch (error) {
@@ -135,6 +149,25 @@ function resolveDeepSeekFactory(providers: Record<string, unknown>): ProviderRou
   return factory as ProviderRouterFactory;
 }
 
+function resolveOpenAICodexFactory(providers: Record<string, unknown>): ProviderRouterFactory {
+  const defaultExport = providers.default;
+  const defaultObject = isRecord(defaultExport) ? defaultExport : {};
+  const candidates = [
+    providers.createOpenAICodexRouter,
+    providers.createOpenAICodexModel,
+    providers.createOpenAICodexProvider,
+    defaultObject.createOpenAICodexRouter,
+    defaultObject.createOpenAICodexModel,
+    defaultObject.createOpenAICodexProvider,
+    typeof defaultExport === "function" ? defaultExport : undefined,
+  ];
+  const factory = candidates.find((candidate) => typeof candidate === "function");
+  if (!factory) {
+    throw new Error("@chili/providers must export createOpenAICodexRouter(options) or another compatible OpenAI Codex factory");
+  }
+  return factory as ProviderRouterFactory;
+}
+
 function toModelRouter(modelOrProvider: ProviderModelOrProvider, modelName: string | undefined, providerName: string): ModelRouter {
   if (isProviderModelProvider(modelOrProvider)) {
     return new ProviderModelRouterAdapter(modelOrProvider.getModel(modelName));
@@ -163,6 +196,20 @@ function readDeepSeekOptionsFromEnv(input: CliModelOptions): ProviderRouterOptio
   const resolvedApiKey = input.apiKey ?? env.apiKey;
   const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? DEEPSEEK_OPENAI_BASE_URL;
   const resolvedModel = input.model ?? env.model ?? DEEPSEEK_V4_PRO_MODEL;
+
+  if (resolvedApiKey) options.apiKey = resolvedApiKey;
+  if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
+  if (resolvedModel) options.model = resolvedModel;
+  if (input.fetch) options.fetch = input.fetch;
+  return options;
+}
+
+function readOpenAICodexOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
+  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_MAX_TOKENS };
+  const env = readOpenAICodexEnvironment();
+  const resolvedApiKey = input.apiKey ?? env.apiKey;
+  const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? OPENAI_CODEX_BASE_URL;
+  const resolvedModel = input.model ?? env.model ?? OPENAI_CODEX_DEFAULT_MODEL;
 
   if (resolvedApiKey) options.apiKey = resolvedApiKey;
   if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
@@ -229,6 +276,11 @@ function toProviderInput(input: ModelStreamInput): ProviderModelStreamInput {
     messages: input.messages,
     tools: input.tools,
     system: input.system,
+    metadata: {
+      sessionId: input.sessionId,
+      threadId: input.threadId,
+      turnId: input.turnId,
+    },
   };
   if (input.signal) providerInput.signal = input.signal;
   return providerInput;

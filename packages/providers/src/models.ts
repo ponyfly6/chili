@@ -9,6 +9,21 @@ export const DEEPSEEK_V4_PRO_MODEL = "deepseek-v4-pro";
 export const DEEPSEEK_V4_FLASH_MODEL = "deepseek-v4-flash";
 export const DEEPSEEK_OPENAI_BASE_URL = "https://api.deepseek.com";
 export const DEEPSEEK_ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic";
+export const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
+export const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
+export const OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.5";
+export const OPENAI_CODEX_MODELS = [
+  "gpt-5.1",
+  "gpt-5.1-codex-max",
+  "gpt-5.1-codex-mini",
+  "gpt-5.2",
+  "gpt-5.2-codex",
+  "gpt-5.3-codex",
+  "gpt-5.3-codex-spark",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+  OPENAI_CODEX_DEFAULT_MODEL,
+] as const;
 
 const BUILTIN_MODELS = [
   {
@@ -133,6 +148,7 @@ const BUILTIN_MODELS = [
       },
     },
   },
+  ...OPENAI_CODEX_MODELS.map(openAICodexModelDescriptor),
 ] satisfies readonly ModelDescriptor[];
 
 const knownModels = new Map<string, Map<string, ModelDescriptor>>();
@@ -181,4 +197,33 @@ function cloneModelDescriptor(model: ModelDescriptor): ModelDescriptor {
   }
   if (model.inputCapabilities) clone.inputCapabilities = [...model.inputCapabilities];
   return clone;
+}
+
+function openAICodexDisplayName(model: string): string {
+  return model
+    .split("-")
+    .map((part) => part === "gpt" ? "GPT" : part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function openAICodexModelDescriptor(model: (typeof OPENAI_CODEX_MODELS)[number]): ModelDescriptor {
+  return {
+    provider: OPENAI_CODEX_PROVIDER_ID,
+    model,
+    displayName: openAICodexDisplayName(model),
+    apiFamily: "openai-responses",
+    baseUrl: OPENAI_CODEX_BASE_URL,
+    default: model === OPENAI_CODEX_DEFAULT_MODEL,
+    inputCapabilities: model === "gpt-5.3-codex-spark" ? ["text"] : ["text", "image"],
+    contextWindowTokens: model === "gpt-5.3-codex-spark" ? 128000 : 272000,
+    maxOutputTokens: 128000,
+    capabilities: {
+      streaming: true,
+      reasoning: true,
+      toolCalls: true,
+      toolCallDeltas: true,
+      usage: true,
+      responseId: true,
+    },
+  };
 }
