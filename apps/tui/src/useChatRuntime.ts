@@ -22,6 +22,7 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
   canSubmit: boolean;
   submitBlockedReason?: string;
   submitPrompt: (text: string) => Promise<boolean>;
+  startNewSession: () => Promise<void>;
   interruptActiveSession: () => Promise<void>;
   approveApproval: (approvalId: ApprovalId) => Promise<void>;
   rejectApproval: (approvalId: ApprovalId) => Promise<void>;
@@ -136,6 +137,26 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     }
   }, [activeSessionId, client, withAbort]);
 
+  const startNewSession = useCallback(async () => {
+    for (const controller of requestAbortRefs.current) controller.abort();
+    requestAbortRefs.current.clear();
+    setSubmitPending(false);
+    setChatFeedback(undefined);
+    setActiveSessionId(undefined);
+    setActiveThreadId(undefined);
+    try {
+      const created = await withAbort((signal) => client.createSession({
+        ...(options.cwd ? { cwd: options.cwd } : {}),
+        signal,
+      }));
+      setActiveSessionId(created.sessionId);
+      setActiveThreadId(created.threadId);
+      setChatFeedback(undefined);
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+    }
+  }, [client, options.baseUrl, options.cwd, withAbort]);
+
   const approveApproval = useCallback(async (approvalId: ApprovalId) => {
     await resolveApproval("approve", approvalId, client, withAbort, setChatFeedback);
   }, [client, withAbort]);
@@ -158,10 +179,11 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     canSubmit,
     ...(submitBlockedReason ? { submitBlockedReason } : {}),
     submitPrompt,
+    startNewSession,
     interruptActiveSession,
     approveApproval,
     rejectApproval,
-  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, submitBlockedReason, submitPrompt, teamRuntime]);
+  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, startNewSession, submitBlockedReason, submitPrompt, teamRuntime]);
 }
 
 async function resolveApproval(

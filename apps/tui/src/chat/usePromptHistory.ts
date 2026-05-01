@@ -7,6 +7,7 @@ export interface PromptHistory {
   previous: (currentDraft: string) => string | undefined;
   next: (currentDraft: string) => string | undefined;
   resetNavigation: () => void;
+  clear: () => void;
 }
 
 export function usePromptHistory(limit = DEFAULT_PROMPT_HISTORY_LIMIT): PromptHistory {
@@ -18,6 +19,11 @@ export function usePromptHistory(limit = DEFAULT_PROMPT_HISTORY_LIMIT): PromptHi
     historyIndexRef.current = -1;
     draftRef.current = "";
   }, []);
+
+  const clear = useCallback(() => {
+    entriesRef.current = [];
+    resetNavigation();
+  }, [resetNavigation]);
 
   const record = useCallback((text: string) => {
     const trimmed = text.trim();
@@ -67,5 +73,6 @@ export function usePromptHistory(limit = DEFAULT_PROMPT_HISTORY_LIMIT): PromptHi
     previous,
     next,
     resetNavigation,
-  }), [next, previous, record, resetNavigation]);
+    clear,
+  }), [clear, next, previous, record, resetNavigation]);
 }

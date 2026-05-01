@@ -186,6 +186,46 @@ test("default chat ignores streamed history and starts a new session", async () 
   }
 });
 
+test("/new starts a fresh runtime session for following prompts", async () => {
+  const records = chatClientRecords();
+  const client = fakeChatClient(records);
+  const app = await mountChatApp(client);
+
+  try {
+    await typeText(app, "first session");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(records.create).toHaveLength(1);
+    expect(records.submit[0]).toMatchObject({
+      sessionId: "session_created",
+      threadId: "thread_created",
+      text: "first session",
+    });
+
+    await typeText(app, "/new");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(records.create).toHaveLength(2);
+
+    await typeText(app, "second session");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(records.submit[1]).toMatchObject({
+      sessionId: "session_created_2",
+      threadId: "thread_created_2",
+      text: "second session",
+    });
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("running session blocks a second prompt submit", async () => {
   const submitted: string[] = [];
   const app = await mountShell(teamLiveFixture(), {
@@ -211,6 +251,46 @@ test("running session blocks a second prompt submit", async () => {
 
     expect(submitted).toHaveLength(0);
     expect(app.captureCharFrame()).toContain("Session running - ctrl+x interrupt");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/clear clears local TUI notices and resets prompt history", async () => {
+  const submitted: string[] = [];
+  let started = 0;
+  const clipboard = fakeClipboard({
+    readText: async () => "",
+  });
+  const app = await mountShell(teamLiveFixture(), {
+    clipboard,
+    runtime: {
+      submitPrompt: async (text) => {
+        submitted.push(text);
+        return true;
+      },
+      startNewSession: async () => {
+        started += 1;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "remembered prompt");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(submitted).toEqual(["remembered prompt"]);
+
+    await press(app, () => app.mockInput.pressKey("v", { ctrl: true }));
+    expect(app.captureCharFrame()).toContain("Clipboard is empty.");
+
+    await typeText(app, "/clear");
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(started).toBe(1);
+    expect(app.captureCharFrame()).not.toContain("Clipboard is empty.");
+
+    await press(app, () => app.mockInput.pressArrow("up"));
+    expect(app.captureCharFrame()).not.toContain("remembered prompt");
   } finally {
     app.renderer.destroy();
   }
@@ -1344,6 +1424,7 @@ async function mountShell(
     chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
     canSubmit: true,
     submitPrompt: async () => true,
+    startNewSession: async () => undefined,
     interruptActiveSession: async () => undefined,
     approveApproval: async () => undefined,
     rejectApproval: async () => undefined,
@@ -1442,6 +1523,7 @@ function chatRuntime(
     chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
     canSubmit: true,
     submitPrompt: async () => true,
+    startNewSession: async () => undefined,
     interruptActiveSession: async () => undefined,
     approveApproval: async () => undefined,
     rejectApproval: async () => undefined,
@@ -1523,9 +1605,11 @@ function fakeChatClient(
 ): HttpRuntimeClient {
   const client = {
     createSession: async (input: Record<string, unknown> = {}) => {
+      const index = records.create.length + 1;
       records.create.push(input);
       if (options.createError) throw options.createError;
-      return { sessionId: "session_created" as SessionId, threadId: "thread_created" as ThreadId };
+      const suffix = index === 1 ? "" : `_${index}`;
+      return { sessionId: `session_created${suffix}` as SessionId, threadId: `thread_created${suffix}` as ThreadId };
     },
     submitPromptAsync: async (input: Record<string, unknown>) => {
       records.submit.push(input);

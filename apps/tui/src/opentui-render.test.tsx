@@ -769,6 +769,7 @@ function fakeChatRuntime(input: Partial<ChatRuntimeState> = {}): ChatRuntimeStat
     chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
     canSubmit: true,
     submitPrompt: async () => true,
+    startNewSession: async () => undefined,
     interruptActiveSession: async () => undefined,
     approveApproval: async () => undefined,
     rejectApproval: async () => undefined,

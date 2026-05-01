@@ -11,7 +11,7 @@ export type SlashCommandResult =
   | { type: "open_view"; view: "team" | "help" | "agents" | "status" }
   | { type: "open_theme_picker" }
   | { type: "close_view" }
-  | { type: "clear_transcript" }
+  | { type: "new_session" }
   | { type: "insert_prompt"; text: string }
   | { type: "local_message"; level: "info" | "error"; text: string }
   | { type: "sdk_action"; action: "team_run" | "team_merge" | "approve" | "reject"; payload?: unknown };

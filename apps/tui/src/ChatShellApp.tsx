@@ -202,6 +202,15 @@ export function ChatShellSurface(props: {
     historyPromptValueRef.current = value;
     setPrompt(value);
   }, [setPrompt, updateAcceptedCompletionPrompt]);
+  const startNewChatSession = useCallback(async () => {
+    setView("chat");
+    setPrompt("");
+    history.clear();
+    clearLocalItems();
+    setMessageScrollOffset(0);
+    setTranscriptScrollOffset(0);
+    await props.runtime.startNewSession();
+  }, [clearLocalItems, history, props.runtime, setPrompt]);
   const openThemePicker = useCallback(() => {
     const index = themeOptionIndex(themeOptions, themeId);
     setThemePicker({
@@ -358,7 +367,7 @@ export function ChatShellSurface(props: {
     if (paletteOpen) {
       handlePaletteKey(key, paletteItems, paletteIndex, setPaletteIndex, (completion) => {
         setPaletteOpen(false);
-        void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, clearLocalItems, setPrompt, openThemePicker);
+        void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker);
       }, () => setPaletteOpen(false));
       return;
     }
@@ -478,7 +487,7 @@ export function ChatShellSurface(props: {
           prompt={prompt}
           focused={view === "chat" && !paletteOpen && !themePicker && !disabledReason}
           onPromptChange={handlePromptChange}
-          onSubmit={() => void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, clearLocalItems, setPrompt, openThemePicker, history.record)}
+          onSubmit={() => void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, history.record)}
           completions={completions}
           completionIndex={selectedCompletionIndex}
           paletteOpen={paletteOpen}
@@ -507,7 +516,7 @@ export function ChatShellSurface(props: {
           onPromptChange={handlePromptChange}
           onSubmit={() => {
             setMessageScrollOffset(0);
-            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, clearLocalItems, setPrompt, openThemePicker, history.record);
+            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, history.record);
           }}
           onMessageScroll={(event) => {
             const direction = event.scroll?.direction;
@@ -931,7 +940,7 @@ async function submitPrompt(
   runtime: ChatRuntimeState,
   setView: (view: ShellView) => void,
   appendLocalItem: AppendLocalItem,
-  clearLocalItems: () => void,
+  startNewChatSession: () => Promise<void>,
   setPrompt: (value: string | ((current: string) => string)) => void,
   openThemePicker: () => void,
   onAccepted?: (text: string) => void,
@@ -942,7 +951,7 @@ async function submitPrompt(
     const slashMatch = resolveSlashCommand(commands, trimmed);
     if (slashMatch) {
       setPrompt("");
-      await runResolvedSlashCommand(slashMatch, ctx, model, runtime, setView, appendLocalItem, clearLocalItems, setPrompt, openThemePicker);
+      await runResolvedSlashCommand(slashMatch, ctx, model, runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker);
       return;
     }
     if (isSlashCommandCandidate(commands, ctx, trimmed)) {
@@ -969,7 +978,7 @@ async function runSlashInput(
   runtime: ChatRuntimeState,
   setView: (view: ShellView) => void,
   appendLocalItem: AppendLocalItem,
-  clearLocalItems: () => void,
+  startNewChatSession: () => Promise<void>,
   setPrompt: (value: string | ((current: string) => string)) => void,
   openThemePicker: () => void,
 ): Promise<void> {
@@ -978,7 +987,7 @@ async function runSlashInput(
     appendLocalItem("error", `Unknown command: ${input}`);
     return;
   }
-  await runResolvedSlashCommand(match, ctx, model, runtime, setView, appendLocalItem, clearLocalItems, setPrompt, openThemePicker);
+  await runResolvedSlashCommand(match, ctx, model, runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker);
 }
 
 async function runResolvedSlashCommand(
@@ -988,24 +997,24 @@ async function runResolvedSlashCommand(
   runtime: ChatRuntimeState,
   setView: (view: ShellView) => void,
   appendLocalItem: AppendLocalItem,
-  clearLocalItems: () => void,
+  startNewChatSession: () => Promise<void>,
   setPrompt: (value: string | ((current: string) => string)) => void,
   openThemePicker: () => void,
 ): Promise<void> {
   const result = await match.command.run(ctx, match.args);
-  applySlashResult(result, model, runtime, setView, appendLocalItem, clearLocalItems, setPrompt, openThemePicker);
+  await applySlashResult(result, model, runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker);
 }
 
-function applySlashResult(
+async function applySlashResult(
   result: SlashCommandResult,
   model: TeamLiveView,
   runtime: ChatRuntimeState,
   setView: (view: ShellView) => void,
   appendLocalItem: AppendLocalItem,
-  clearLocalItems: () => void,
+  startNewChatSession: () => Promise<void>,
   setPrompt: (value: string | ((current: string) => string)) => void,
   openThemePicker: () => void,
-): void {
+): Promise<void> {
   if (result.type === "open_view") {
     setView(result.view);
     return;
@@ -1018,8 +1027,8 @@ function applySlashResult(
     openThemePicker();
     return;
   }
-  if (result.type === "clear_transcript") {
-    clearLocalItems();
+  if (result.type === "new_session") {
+    await startNewChatSession();
     return;
   }
   if (result.type === "insert_prompt") {

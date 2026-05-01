@@ -31,10 +31,17 @@ export function createDefaultSlashCommands(): SlashCommand[] {
     },
     {
       name: "clear",
-      description: "Clear the local transcript",
+      description: "Start a fresh chat session",
       category: "session",
       isSafeConcurrent: true,
-      run: () => ({ type: "clear_transcript" }),
+      run: () => ({ type: "new_session" }),
+    },
+    {
+      name: "new",
+      description: "Start a fresh chat session",
+      category: "session",
+      isSafeConcurrent: true,
+      run: () => ({ type: "new_session" }),
     },
     {
       name: "help",
