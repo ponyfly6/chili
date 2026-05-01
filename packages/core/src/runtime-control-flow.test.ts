@@ -153,9 +153,134 @@ test("consumes rich model streams and executes tool calls after the stream finis
   const toolCallPartIndex = store.items.findIndex(
     (event) => event.type === "message.part_added" && event.payload.part.type === "tool_call",
   );
+  const liveToolUpdates = store.items.filter(
+    (event) => event.type === "tool.call_updated" && event.payload.callId === "tool_provider_1" && event.payload.toolName !== undefined,
+  );
+  expect(liveToolUpdates.map((event) => event.payload)).toEqual([
+    { callId: "tool_provider_1" as ToolCallId, status: "running", toolName: "echo", input: {} },
+    { callId: "tool_provider_1" as ToolCallId, status: "running", toolName: "echo", input: { value: "ok" } },
+    { callId: "tool_provider_1" as ToolCallId, status: "running", toolName: "echo", input: { value: "ok" } },
+  ]);
+  const liveToolUpdateIndex = store.items.findIndex(
+    (event) => event.type === "tool.call_updated" && event.payload.callId === "tool_provider_1" && event.payload.toolName === "echo",
+  );
   const toolStartedIndex = store.items.findIndex((event) => event.type === "tool.call_started");
+  expect(liveToolUpdateIndex).toBeGreaterThan(-1);
+  expect(liveToolUpdateIndex).toBeLessThan(toolCallPartIndex);
   expect(toolCallPartIndex).toBeGreaterThan(-1);
   expect(toolStartedIndex).toBeGreaterThan(toolCallPartIndex);
+});
+
+test("finishes live streaming tool rows as failed when the model errors before tool_call_end", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "tool_call_start", toolCallId: "tool_error", name: "bash" };
+      yield { type: "tool_call_delta", toolCallId: "tool_error", name: "bash", delta: "{\"command\"", partialInput: { command: "bun test" } };
+      yield { type: "error", error: new Error("provider exploded") };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_stream_error" as SessionId,
+    threadId: "thread_stream_error" as ThreadId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("failed");
+  expect(toolCallParts(store)).toEqual([]);
+  expect(toolFinishedPayloads(store)).toEqual([
+    { callId: "tool_error" as ToolCallId, status: "failed", error: "provider exploded", synthetic: true },
+  ]);
+});
+
+test("finishes live streaming tool rows as cancelled when aborted before tool_call_end", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const controller = new AbortController();
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "tool_call_start", toolCallId: "tool_abort", name: "bash" };
+      controller.abort();
+      yield { type: "text_delta", text: "after abort" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_stream_abort" as SessionId,
+    threadId: "thread_stream_abort" as ThreadId,
+    cwd: "/repo",
+    signal: controller.signal,
+  });
+
+  expect(result.status).toBe("cancelled");
+  expect(toolCallParts(store)).toEqual([]);
+  expect(toolFinishedPayloads(store)).toEqual([
+    { callId: "tool_abort" as ToolCallId, status: "cancelled", error: "Turn aborted", synthetic: true },
+  ]);
+});
+
+test("finishes live streaming tool rows as failed when finish arrives before tool_call_end", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "tool_call_start", toolCallId: "tool_unfinished", name: "bash" };
+      yield { type: "tool_call_delta", toolCallId: "tool_unfinished", name: "bash", delta: "{\"command\"", partialInput: { command: "bun test" } };
+      yield { type: "finish", reason: "end_turn" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_stream_finish" as SessionId,
+    threadId: "thread_stream_finish" as ThreadId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(toolCallParts(store)).toEqual([]);
+  expect(toolResultParts(store)).toEqual([]);
+  expect(toolFinishedPayloads(store)).toEqual([
+    {
+      callId: "tool_unfinished" as ToolCallId,
+      status: "failed",
+      error: "Tool call stream ended before tool_call_end",
+      synthetic: true,
+    },
+  ]);
+});
+
+test("finishes live streaming tool rows as failed when the stream ends before tool_call_end", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "tool_call_start", toolCallId: "tool_eof", name: "bash" };
+      yield { type: "tool_call_delta", toolCallId: "tool_eof", name: "bash", delta: "{\"command\"", partialInput: { command: "bun test" } };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_stream_eof" as SessionId,
+    threadId: "thread_stream_eof" as ThreadId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(toolCallParts(store)).toEqual([]);
+  expect(toolFinishedPayloads(store)).toEqual([
+    {
+      callId: "tool_eof" as ToolCallId,
+      status: "failed",
+      error: "Tool call stream ended before tool_call_end",
+      synthetic: true,
+    },
+  ]);
 });
 
 test("runtime hides unauthorized tools from model input", async () => {
@@ -338,6 +463,21 @@ class ThrowingStatusStore extends MemoryEventStore {
   }
 }
 
+function testRuntime(store: MemoryEventStore, registry: InMemoryToolRegistry, model: ModelRouter): SingleAgentRuntime {
+  return new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+    }),
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+}
+
 function createSequentialId(): (prefix: string) => string {
   let index = 0;
   return (prefix) => `${prefix}_${++index}`;
@@ -379,6 +519,14 @@ function toolResultParts(store: MemoryEventStore): Extract<MessagePart, { type: 
   return messageParts(store).filter(
     (part): part is Extract<MessagePart, { type: "tool_result" }> => part.type === "tool_result",
   );
+}
+
+function toolFinishedPayloads(
+  store: MemoryEventStore,
+): Array<Extract<ChiliEvent, { type: "tool.call_finished" }>["payload"]> {
+  return store.items
+    .filter((event): event is Extract<ChiliEvent, { type: "tool.call_finished" }> => event.type === "tool.call_finished")
+    .map((event) => event.payload);
 }
 
 function abortError(message: string): Error {

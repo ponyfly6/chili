@@ -297,11 +297,11 @@ export class SingleAgentRuntime implements AgentRunner {
 
     while (true) {
       let assistantMutated = false;
+      const state: AssistantStreamState = {
+        toolCalls: [],
+        streamingToolCalls: new Map(),
+      };
       try {
-        const state: AssistantStreamState = {
-          toolCalls: [],
-          streamingToolCalls: new Map(),
-        };
         for await (const event of this.options.model.stream(modelInput)) {
           if (input.signal?.aborted) throw abortError("Turn aborted");
           if (event.type === "text_delta") {
@@ -334,18 +334,35 @@ export class SingleAgentRuntime implements AgentRunner {
           }
 
           if (event.type === "tool_call_start") {
-            state.streamingToolCalls.set(toolCallKey(event.toolCallId, event.index), {
+            assistantMutated = true;
+            const toolCall: StreamingToolCall = {
               callId: event.toolCallId as ToolCallId,
               toolName: event.name,
               input: {},
-            });
+            };
+            state.streamingToolCalls.set(toolCallKey(event.toolCallId, event.index), toolCall);
+            await this.updateStreamingToolCall(input, toolCall);
             continue;
           }
 
           if (event.type === "tool_call_delta") {
-            const toolCall = state.streamingToolCalls.get(toolCallKey(event.toolCallId, event.index));
+            const key = toolCallKey(event.toolCallId, event.index);
+            let toolCall = state.streamingToolCalls.get(key);
+            if (!toolCall && event.name) {
+              assistantMutated = true;
+              toolCall = {
+                callId: event.toolCallId as ToolCallId,
+                toolName: event.name,
+                input: {},
+              };
+              state.streamingToolCalls.set(key, toolCall);
+              await this.updateStreamingToolCall(input, toolCall);
+            }
             if (toolCall && event.partialInput !== undefined) {
+              assistantMutated = true;
+              if (event.name) toolCall.toolName = event.name;
               toolCall.input = event.partialInput;
+              await this.updateStreamingToolCall(input, toolCall);
             }
             continue;
           }
@@ -355,15 +372,17 @@ export class SingleAgentRuntime implements AgentRunner {
             const key = toolCallKey(event.toolCallId, event.index);
             const existing = state.streamingToolCalls.get(key);
             state.streamingToolCalls.delete(key);
+            const toolCall = {
+              callId: (existing?.callId ?? event.toolCallId) as ToolCallId,
+              toolName: event.name || existing?.toolName || "",
+              input: event.input,
+            };
+            await this.updateStreamingToolCall(input, toolCall);
             await this.queueToolCall(
               input,
               turnId,
               assistantMessageId,
-              {
-                callId: (existing?.callId ?? event.toolCallId) as ToolCallId,
-                toolName: event.name || existing?.toolName || "",
-                input: event.input,
-              },
+              toolCall,
               guard,
               state,
             );
@@ -374,6 +393,7 @@ export class SingleAgentRuntime implements AgentRunner {
             if (event.responseId || event.usage) {
               await this.appendModelMetadata(input, turnId, event);
             }
+            await this.finishUnfinishedStreamingToolCalls(input, state, "failed", "Tool call stream ended before tool_call_end");
             return { finishReason: event.reason, toolCalls: state.toolCalls };
           }
 
@@ -384,12 +404,15 @@ export class SingleAgentRuntime implements AgentRunner {
 
           throw toError(event.error);
         }
+        await this.finishUnfinishedStreamingToolCalls(input, state, "failed", "Tool call stream ended before tool_call_end");
         return { toolCalls: state.toolCalls };
       } catch (error) {
         const err = toError(error);
         if (input.signal?.aborted || isAbortError(err)) {
+          await this.finishUnfinishedStreamingToolCalls(input, state, "cancelled", err.message);
           throw err;
         }
+        await this.finishUnfinishedStreamingToolCalls(input, state, "failed", err.message);
         if (!assistantMutated && attempt < retryPolicy.maxAttempts && retryPolicy.retryable(err)) {
           const delayMs = retryDelay(retryPolicy, attempt);
           await this.append(input, "turn.retry_scheduled", {
@@ -611,6 +634,36 @@ export class SingleAgentRuntime implements AgentRunner {
     }
 
     state.toolCalls.push(toolCall);
+  }
+
+  private async updateStreamingToolCall(input: EventContext, toolCall: StreamingToolCall): Promise<void> {
+    await this.append(input, "tool.call_updated", {
+      callId: toolCall.callId,
+      status: "running",
+      toolName: toolCall.toolName,
+      input: toolCall.input,
+    });
+  }
+
+  private async finishUnfinishedStreamingToolCalls(
+    input: EventContext,
+    state: AssistantStreamState,
+    status: "failed" | "cancelled",
+    error: string,
+  ): Promise<void> {
+    const unfinished = [...state.streamingToolCalls.values()];
+    state.streamingToolCalls.clear();
+    const seen = new Set<ToolCallId>();
+    for (const toolCall of unfinished) {
+      if (seen.has(toolCall.callId)) continue;
+      seen.add(toolCall.callId);
+      await this.append(input, "tool.call_finished", {
+        callId: toolCall.callId,
+        status,
+        error,
+        synthetic: true,
+      });
+    }
   }
 
   private async executeToolCalls(
