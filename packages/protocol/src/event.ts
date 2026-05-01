@@ -58,7 +58,7 @@ export type MessageEvent =
 
 export type ToolEvent =
   | EventEnvelope<"tool.call_started", { turnId: TurnId; callId: ToolCallId; toolName: string; input: unknown }>
-  | EventEnvelope<"tool.call_updated", { callId: ToolCallId; status: ToolCallStatus; metadata?: Record<string, unknown> }>
+  | EventEnvelope<"tool.call_updated", { callId: ToolCallId; status: ToolCallStatus; toolName?: string; input?: unknown; metadata?: Record<string, unknown> }>
   | EventEnvelope<"tool.call_finished", { callId: ToolCallId; status: "completed" | "failed" | "cancelled"; output?: string; error?: string; synthetic?: boolean }>;
 
 export type ApprovalEvent =

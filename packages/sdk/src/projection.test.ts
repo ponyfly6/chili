@@ -27,7 +27,7 @@ import {
   type RuntimeTeamTaskSyncResult,
   type RuntimeTeamSnapshot,
 } from "./client.js";
-import { chatSessionView, createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, sessionMessages, teamLiveCockpit, teamLiveView } from "./projection.js";
+import { chatSessionView, createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, sessionMessages, teamLiveCockpit, teamLiveView, type ChatTranscriptItem } from "./projection.js";
 
 test("replays session, message, tool, and approval events into a runtime view", () => {
   const sessionId = "session_test" as SessionId;
@@ -132,6 +132,133 @@ test("replays session, message, tool, and approval events into a runtime view", 
   expect(message?.parts[0]?.type === "text" ? message.parts[0].text : "").toBe("hello world");
   expect(view.toolCalls[callId]?.status).toBe("completed");
   expect(pendingApprovals(view, sessionId)).toHaveLength(0);
+});
+
+test("projects live tool input updates before the final assistant tool part", () => {
+  const sessionId = "session_live_tool" as SessionId;
+  const threadId = "thread_live_tool" as ThreadId;
+  const turnId = "turn_live_tool" as TurnId;
+  const messageId = "msg_live_tool" as MessageId;
+  const partId = "part_live_tool_call" as PartId;
+  const callId = "toolcall_live" as ToolCallId;
+
+  const view = reduceRuntimeEvents(
+    [
+      {
+        id: "event_live_session",
+        type: "session.created",
+        time: 1 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { sessionId, cwd: "/repo" },
+      },
+      {
+        id: "event_live_assistant",
+        type: "message.created",
+        time: 2 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { messageId, role: "assistant" },
+      },
+      {
+        id: "event_live_tool_start",
+        type: "tool.call_updated",
+        time: 3 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { callId, status: "running", toolName: "bash", input: {} },
+      },
+      {
+        id: "event_live_tool_partial",
+        type: "tool.call_updated",
+        time: 4 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { callId, status: "running", toolName: "bash", input: { command: "bun test" } },
+      },
+    ],
+    createRuntimeView(),
+  );
+
+  const live = chatSessionView(view, { sessionId, threadId, generatedAt: "now" });
+  const liveTools = live.items.filter((item): item is Extract<ChatTranscriptItem, { kind: "tool" }> => item.kind === "tool");
+  const liveAssistant = live.items.find((item) => item.kind === "message");
+  expect(liveTools).toHaveLength(1);
+  expect(liveTools[0]).toMatchObject({
+    id: callId,
+    toolName: "bash",
+    status: "running",
+    displayStatus: "running",
+    input: { command: "bun test" },
+    inputSummary: { command: "bun test" },
+  });
+  expect(live.activeTools).toHaveLength(1);
+  expect(liveAssistant?.kind === "message" ? liveAssistant.parts : []).toEqual([]);
+
+  const completedView = reduceRuntimeEvents(
+    [
+      {
+        id: "event_live_tool_final",
+        type: "tool.call_updated",
+        time: 5 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { callId, status: "running", toolName: "bash", input: { command: "bun test --run" } },
+      },
+      {
+        id: "event_live_tool_part",
+        type: "message.part_added",
+        time: 6 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          messageId,
+          part: {
+            id: partId,
+            messageId,
+            sessionId,
+            type: "tool_call",
+            callId,
+            toolName: "bash",
+            input: { command: "bun test --run" },
+            status: "pending",
+          },
+        },
+      },
+      {
+        id: "event_live_tool_started",
+        type: "tool.call_started",
+        time: 7 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { turnId, callId, toolName: "bash", input: { command: "bun test --run" } },
+      },
+      {
+        id: "event_live_tool_finished",
+        type: "tool.call_finished",
+        time: 8 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { callId, status: "completed", output: "ok" },
+      },
+    ],
+    view,
+  );
+  const completed = chatSessionView(completedView, { sessionId, threadId, generatedAt: "now" });
+  const completedTools = completed.items.filter((item): item is Extract<ChatTranscriptItem, { kind: "tool" }> => item.kind === "tool");
+  const completedAssistant = completed.items.find((item) => item.kind === "message");
+
+  expect(completedTools).toHaveLength(1);
+  expect(completedTools[0]).toMatchObject({
+    id: callId,
+    status: "completed",
+    displayStatus: "succeeded",
+    input: { command: "bun test --run" },
+    inputSummary: { command: "bun test --run" },
+    output: "ok",
+  });
+  expect(completed.activeTools).toEqual([]);
+  expect(completedAssistant?.kind === "message" ? completedAssistant.parts : []).toContainEqual(expect.objectContaining({ type: "tool_call", callId }));
 });
 
 test("projects chat session transcript rows from message, tool, and approval events", () => {

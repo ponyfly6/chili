@@ -852,8 +852,13 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
     case "tool.call_updated": {
       const toolCall = upsertToolCall(view, event.payload.callId, event.time);
       toolCall.status = event.payload.status;
-      toolCall.updatedAt = event.time;
+      if (event.payload.toolName !== undefined) toolCall.toolName = event.payload.toolName;
+      if (hasOwn(event.payload, "input")) toolCall.input = event.payload.input;
+      assignOptional(toolCall, "sessionId", event.sessionId);
+      assignOptional(toolCall, "threadId", event.threadId);
       assignOptional(toolCall, "metadata", event.payload.metadata);
+      toolCall.updatedAt = event.time;
+      linkToolCallToSession(view, toolCall, event.time);
       setToolPartStatus(view, event.payload.callId, event.payload.status);
       if (event.payload.status === "waiting_for_approval" && toolCall.sessionId) {
         const session = upsertSession(view, toolCall.sessionId, event.time);
@@ -2842,6 +2847,10 @@ function normalizeToolPartStatus(status: RuntimeToolCallView["status"]): ToolPar
 
 function assignOptional<T extends object, K extends keyof T>(target: T, key: K, value: T[K] | undefined): void {
   if (value !== undefined) target[key] = value;
+}
+
+function hasOwn<T extends object, K extends PropertyKey>(target: T, key: K): target is T & Record<K, unknown> {
+  return Object.prototype.hasOwnProperty.call(target, key);
 }
 
 function recordPayload(event: EventEnvelope): Record<string, unknown> | undefined {

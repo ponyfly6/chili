@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { ToolCallId } from "@chili/protocol";
+import type { MessageId, PartId, ToolCallId } from "@chili/protocol";
 import type { ChatTranscriptItem } from "@chili/sdk";
 import { buildChatDisplayItems } from "./presentation.js";
 
@@ -22,6 +22,44 @@ test("tool activity presentation carries renderer cell fields", () => {
     bodyLines: ["diff --git a/src/example.ts b/src/example.ts", "+const ok = true;"],
     bodyTruncated: false,
   });
+});
+
+test("live tool rows render partial input labels without exposing assistant tool parts", () => {
+  const callId = "tool_live_partial" as ToolCallId;
+  const display = buildChatDisplayItems([
+    {
+      id: "msg_live_partial" as MessageId,
+      kind: "message",
+      role: "assistant",
+      createdAt: 1,
+      parts: [
+        {
+          type: "tool_call",
+          id: "part_live_partial" as PartId,
+          callId,
+          toolName: "bash",
+          status: "pending",
+          input: { command: "bun test" },
+          displayStatus: "queued",
+        },
+      ],
+    },
+    chatTool(callId, "bash", "running", "running", { title: "bash", command: "bun test", detail: "bun test" }, {
+      input: { command: "bun test" },
+    }),
+  ]);
+
+  const activities = display.filter((item) => item.kind === "tool_activity");
+  expect(activities).toHaveLength(1);
+  expect(activities[0]).toMatchObject({
+    kind: "tool_activity",
+    activity: {
+      id: callId,
+      label: "Running bun test",
+      inputSummary: { command: "bun test" },
+    },
+  });
+  expect(display.some((item) => item.kind === "summary" && item.text.includes("tool_call"))).toBe(false);
 });
 
 test("exploration groups expose compact metadata without changing labels", () => {
