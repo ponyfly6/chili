@@ -375,6 +375,22 @@ test("slash completion selection uses Up and Down without switching prompt histo
   }
 });
 
+test("Enter executes the selected slash completion without Tab", async () => {
+  const executed: TeamLiveAction[] = [];
+  const app = await mountShell(withRunLoopReady(teamLiveFixture()), { executed });
+
+  try {
+    await typeText(app, "/");
+    await press(app, () => app.mockInput.pressArrow("down"));
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(executed).toEqual([expect.objectContaining({ type: "run_loop" })]);
+    expect(app.captureCharFrame()).not.toContain("Unknown command");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("slash completion keeps the input visible in a short frame", async () => {
   const app = await mountShell(teamLiveFixture(), {
     width: 72,

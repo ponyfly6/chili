@@ -233,6 +233,16 @@ export function ChatShellSurface(props: {
       return undefined;
     });
   }, []);
+  const runSelectedSlashCompletion = useCallback(() => {
+    if (!slashCompletionOpen) return false;
+    const completion = completions[selectedCompletionIndex] ?? completions[0];
+    if (!completion) return false;
+    updateAcceptedCompletionPrompt(undefined);
+    history.resetNavigation();
+    setPrompt("");
+    void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker);
+    return true;
+  }, [appendLocalItem, commands, completions, history, openThemePicker, props.model, props.runtime, selectedCompletionIndex, setPrompt, slashCompletionOpen, slashContext, startNewChatSession, updateAcceptedCompletionPrompt]);
   useEffect(() => {
     setCompletionIndex(0);
   }, [prompt]);
@@ -487,7 +497,10 @@ export function ChatShellSurface(props: {
           prompt={prompt}
           focused={view === "chat" && !paletteOpen && !themePicker && !disabledReason}
           onPromptChange={handlePromptChange}
-          onSubmit={() => void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, history.record)}
+          onSubmit={() => {
+            if (runSelectedSlashCompletion()) return;
+            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, history.record);
+          }}
           completions={completions}
           completionIndex={selectedCompletionIndex}
           paletteOpen={paletteOpen}
@@ -515,6 +528,7 @@ export function ChatShellSurface(props: {
           focused={view === "chat" && !paletteOpen && !themePicker && !disabledReason}
           onPromptChange={handlePromptChange}
           onSubmit={() => {
+            if (runSelectedSlashCompletion()) return;
             setMessageScrollOffset(0);
             void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, history.record);
           }}
