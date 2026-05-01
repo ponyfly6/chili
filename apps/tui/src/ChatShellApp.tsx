@@ -34,6 +34,7 @@ import {
 } from "./theme/index.js";
 
 type ShellView = "chat" | "team" | "help" | "agents" | "status" | "transcript";
+type AppendLocalItem = (level: "info" | "error", text: string) => void;
 
 export interface ChatShellOptions extends TeamLiveTuiOptions {
   modelName?: string;
@@ -46,6 +47,7 @@ export interface ChatShellOptions extends TeamLiveTuiOptions {
 
 const execFileAsync = promisify(execFile);
 const PROMPT_MENU_MAX_ITEMS = 5;
+const LOCAL_ITEM_TTL_MS = 4_000;
 
 export function ChatShellApp(props: {
   client: HttpRuntimeClient;
@@ -100,6 +102,7 @@ export function ChatShellSurface(props: {
   onExit?: () => void;
   commands?: readonly SlashCommand[];
   clipboard?: ClipboardAccess | undefined;
+  localMessageTtlMs?: number | undefined;
 }) {
   const dimensions = useTerminalDimensions();
   const { keyHandler } = useAppContext();
@@ -118,6 +121,35 @@ export function ChatShellSurface(props: {
   const [messageScrollOffset, setMessageScrollOffset] = useState(0);
   const [transcriptScrollOffset, setTranscriptScrollOffset] = useState(0);
   const [showToolDetails, setShowToolDetails] = useState(false);
+  const localMessageTtlMs = props.localMessageTtlMs ?? LOCAL_ITEM_TTL_MS;
+  const localItemTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const dismissLocalItem = useCallback((id: string) => {
+    const timer = localItemTimersRef.current.get(id);
+    if (timer) clearTimeout(timer);
+    localItemTimersRef.current.delete(id);
+    setLocalItems((current) => current.filter((item) => item.id !== id));
+  }, []);
+  const appendLocalItem = useCallback<AppendLocalItem>((level, text) => {
+    const item = localItem(level, text);
+    setLocalItems((current) => [...current, item]);
+    if (localMessageTtlMs <= 0) return;
+    const timer = setTimeout(() => dismissLocalItem(item.id), localMessageTtlMs);
+    localItemTimersRef.current.set(item.id, timer);
+  }, [dismissLocalItem, localMessageTtlMs]);
+  const clearLocalItems = useCallback(() => {
+    clearLocalItemTimers(localItemTimersRef.current);
+    setLocalItems([]);
+  }, []);
+  useEffect(() => {
+    return () => clearLocalItemTimers(localItemTimersRef.current);
+  }, []);
+  const sessionKey = `${props.runtime.activeSessionId ?? ""}\0${props.runtime.activeThreadId ?? ""}`;
+  const previousSessionKey = useRef(sessionKey);
+  useEffect(() => {
+    if (previousSessionKey.current === sessionKey) return;
+    previousSessionKey.current = sessionKey;
+    clearLocalItems();
+  }, [clearLocalItems, sessionKey]);
   const scrollEstimateWidth = Math.max(24, dimensions.width - 8);
   const chatLineCount = useMemo(() => estimatedChatLineCount(props.runtime.chatView, localItems, showToolDetails, scrollEstimateWidth), [localItems, props.runtime.chatView, scrollEstimateWidth, showToolDetails]);
   const transcriptLineCount = useMemo(() => estimatedTranscriptLineCount(props.runtime.chatView.items, localItems, scrollEstimateWidth), [localItems, props.runtime.chatView.items, scrollEstimateWidth]);
@@ -137,6 +169,8 @@ export function ChatShellSurface(props: {
   const completions = prompt.startsWith("/") && !completionSuppressed
     ? slashCompletions(commands, slashContext, prompt)
     : [];
+  const resolvedSlashPrompt = prompt.startsWith("/") ? resolveSlashCommand(commands, prompt) : undefined;
+  const slashInputActive = prompt.startsWith("/") && (prompt.trim() === "/" || completions.length > 0 || resolvedSlashPrompt !== undefined);
   const slashCompletionOpen = prompt.startsWith("/") && completions.length > 0;
   const selectedCompletionIndex = clampIndex(completionIndex, completions.length);
   const paletteItems = slashCompletions(commands, slashContext, "/", 10);
@@ -204,7 +238,7 @@ export function ChatShellSurface(props: {
     setCompletionIndex((current) => clampIndex(current, completions.length));
   }, [completions.length]);
 
-  const disabledReason = prompt.startsWith("/")
+  const disabledReason = slashInputActive
     ? undefined
     : props.runtime.chatView.pendingApprovals.length > 0
       ? "Resolve approval to continue"
@@ -268,14 +302,11 @@ export function ChatShellSurface(props: {
       key.stopPropagation();
       const source = clipboardCopySource(renderer, props.runtime.chatView.items, view);
       if (!source) {
-        setLocalItems((current) => [...current, localItem("error", "Nothing to copy yet.")]);
+        appendLocalItem("error", "Nothing to copy yet.");
         return;
       }
       void copyClipboardText(source.text, clipboard, renderer).then((copied) => {
-        setLocalItems((current) => [
-          ...current,
-          localItem(copied ? "info" : "error", copied ? `Copied ${source.label}.` : "Clipboard copy is unavailable."),
-        ]);
+        appendLocalItem(copied ? "info" : "error", copied ? `Copied ${source.label}.` : "Clipboard copy is unavailable.");
       });
       return;
     }
@@ -306,17 +337,17 @@ export function ChatShellSurface(props: {
       if (view !== "chat" || promptDisabled) return;
       void clipboard.readText().then((raw) => {
         if (raw === undefined) {
-          setLocalItems((current) => [...current, localItem("error", "Clipboard paste is unavailable.")]);
+          appendLocalItem("error", "Clipboard paste is unavailable.");
           return;
         }
         const text = promptClipboardText(raw);
         if (!text) {
-          setLocalItems((current) => [...current, localItem("error", "Clipboard is empty.")]);
+          appendLocalItem("error", "Clipboard is empty.");
           return;
         }
         appendPromptText(text);
       }).catch(() => {
-        setLocalItems((current) => [...current, localItem("error", "Clipboard paste is unavailable.")]);
+        appendLocalItem("error", "Clipboard paste is unavailable.");
       });
       return;
     }
@@ -327,7 +358,7 @@ export function ChatShellSurface(props: {
     if (paletteOpen) {
       handlePaletteKey(key, paletteItems, paletteIndex, setPaletteIndex, (completion) => {
         setPaletteOpen(false);
-        void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, setView, setLocalItems, setPrompt, openThemePicker);
+        void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, clearLocalItems, setPrompt, openThemePicker);
       }, () => setPaletteOpen(false));
       return;
     }
@@ -447,7 +478,7 @@ export function ChatShellSurface(props: {
           prompt={prompt}
           focused={view === "chat" && !paletteOpen && !themePicker && !disabledReason}
           onPromptChange={handlePromptChange}
-          onSubmit={() => void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, setLocalItems, setPrompt, openThemePicker, history.record)}
+          onSubmit={() => void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, clearLocalItems, setPrompt, openThemePicker, history.record)}
           completions={completions}
           completionIndex={selectedCompletionIndex}
           paletteOpen={paletteOpen}
@@ -476,7 +507,7 @@ export function ChatShellSurface(props: {
           onPromptChange={handlePromptChange}
           onSubmit={() => {
             setMessageScrollOffset(0);
-            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, setLocalItems, setPrompt, openThemePicker, history.record);
+            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, clearLocalItems, setPrompt, openThemePicker, history.record);
           }}
           onMessageScroll={(event) => {
             const direction = event.scroll?.direction;
@@ -899,7 +930,8 @@ async function submitPrompt(
   model: TeamLiveView,
   runtime: ChatRuntimeState,
   setView: (view: ShellView) => void,
-  setLocalItems: (update: (current: LocalTranscriptItem[]) => LocalTranscriptItem[]) => void,
+  appendLocalItem: AppendLocalItem,
+  clearLocalItems: () => void,
   setPrompt: (value: string | ((current: string) => string)) => void,
   openThemePicker: () => void,
   onAccepted?: (text: string) => void,
@@ -907,12 +939,19 @@ async function submitPrompt(
   const trimmed = prompt.trim();
   if (!trimmed) return;
   if (trimmed.startsWith("/")) {
-    setPrompt("");
-    await runSlashInput(trimmed, commands, ctx, model, runtime, setView, setLocalItems, setPrompt, openThemePicker);
-    return;
+    const slashMatch = resolveSlashCommand(commands, trimmed);
+    if (slashMatch) {
+      setPrompt("");
+      await runResolvedSlashCommand(slashMatch, ctx, model, runtime, setView, appendLocalItem, clearLocalItems, setPrompt, openThemePicker);
+      return;
+    }
+    if (isSlashCommandCandidate(commands, ctx, trimmed)) {
+      appendLocalItem("error", `Unknown command: ${trimmed}`);
+      return;
+    }
   }
   if (!runtime.canSubmit) {
-    setLocalItems((current) => [...current, localItem("error", runtime.submitBlockedReason ?? "Session is not ready for another prompt.")]);
+    appendLocalItem("error", runtime.submitBlockedReason ?? "Session is not ready for another prompt.");
     return;
   }
   const accepted = await runtime.submitPrompt(trimmed);
@@ -929,17 +968,32 @@ async function runSlashInput(
   model: TeamLiveView,
   runtime: ChatRuntimeState,
   setView: (view: ShellView) => void,
-  setLocalItems: (update: (current: LocalTranscriptItem[]) => LocalTranscriptItem[]) => void,
+  appendLocalItem: AppendLocalItem,
+  clearLocalItems: () => void,
   setPrompt: (value: string | ((current: string) => string)) => void,
   openThemePicker: () => void,
 ): Promise<void> {
   const match = resolveSlashCommand(commands, input);
   if (!match) {
-    setLocalItems((current) => [...current, localItem("error", `Unknown command: ${input}`)]);
+    appendLocalItem("error", `Unknown command: ${input}`);
     return;
   }
+  await runResolvedSlashCommand(match, ctx, model, runtime, setView, appendLocalItem, clearLocalItems, setPrompt, openThemePicker);
+}
+
+async function runResolvedSlashCommand(
+  match: { command: SlashCommand; args: string },
+  ctx: SlashCommandContext,
+  model: TeamLiveView,
+  runtime: ChatRuntimeState,
+  setView: (view: ShellView) => void,
+  appendLocalItem: AppendLocalItem,
+  clearLocalItems: () => void,
+  setPrompt: (value: string | ((current: string) => string)) => void,
+  openThemePicker: () => void,
+): Promise<void> {
   const result = await match.command.run(ctx, match.args);
-  applySlashResult(result, model, runtime, setView, setLocalItems, setPrompt, openThemePicker);
+  applySlashResult(result, model, runtime, setView, appendLocalItem, clearLocalItems, setPrompt, openThemePicker);
 }
 
 function applySlashResult(
@@ -947,7 +1001,8 @@ function applySlashResult(
   model: TeamLiveView,
   runtime: ChatRuntimeState,
   setView: (view: ShellView) => void,
-  setLocalItems: (update: (current: LocalTranscriptItem[]) => LocalTranscriptItem[]) => void,
+  appendLocalItem: AppendLocalItem,
+  clearLocalItems: () => void,
   setPrompt: (value: string | ((current: string) => string)) => void,
   openThemePicker: () => void,
 ): void {
@@ -964,7 +1019,7 @@ function applySlashResult(
     return;
   }
   if (result.type === "clear_transcript") {
-    setLocalItems(() => []);
+    clearLocalItems();
     return;
   }
   if (result.type === "insert_prompt") {
@@ -972,7 +1027,7 @@ function applySlashResult(
     return;
   }
   if (result.type === "local_message") {
-    setLocalItems((current) => [...current, localItem(result.level, result.text)]);
+    appendLocalItem(result.level, result.text);
     return;
   }
   const action = actionForSlashResult(result, model);
@@ -990,6 +1045,11 @@ function actionForSlashResult(result: Extract<SlashCommandResult, { type: "sdk_a
   if (result.action === "approve") return findAction(actions, "approve");
   if (result.action === "reject") return findAction(actions, "reject");
   return undefined;
+}
+
+function isSlashCommandCandidate(commands: readonly SlashCommand[], ctx: SlashCommandContext, input: string): boolean {
+  if (input.trim() === "/") return true;
+  return slashCompletions(commands, ctx, input, 1).length > 0;
 }
 
 function handlePaletteKey(
@@ -1106,6 +1166,11 @@ function promptText(parts: readonly PromptPart[]): string {
 
 function localItem(level: "info" | "error", text: string): LocalTranscriptItem {
   return { id: `${Date.now()}:${level}:${text}`, kind: "local", level, text };
+}
+
+function clearLocalItemTimers(timers: Map<string, ReturnType<typeof setTimeout>>): void {
+  for (const timer of timers.values()) clearTimeout(timer);
+  timers.clear();
 }
 
 function validSelectedTeamId(model: TeamLiveView, selectedTeamId: TeamId | undefined): TeamId | undefined {

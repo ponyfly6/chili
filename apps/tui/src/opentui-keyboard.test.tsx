@@ -338,6 +338,29 @@ test("Tab accepts slash completion without leaving the completion list open", as
   }
 });
 
+test("leading slash absolute paths submit as normal prompts", async () => {
+  const submitted: string[] = [];
+  const prompt = "/Users/pony/Code/opensource/ai/agent/clis/opencli go inspect this repo";
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async (text) => {
+        submitted.push(text);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, prompt);
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(submitted).toEqual([prompt]);
+    expect(app.captureCharFrame()).not.toContain("Unknown command");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("command palette selection uses Up and Down without switching prompt history", async () => {
   const app = await mountShell(teamLiveFixture(), {
     runtime: {
@@ -531,6 +554,44 @@ test("Ctrl+Shift+C copies the latest assistant reply when nothing is selected", 
   }
 });
 
+test("local copy notices expire", async () => {
+  const copied: string[] = [];
+  const clipboard = fakeClipboard({
+    writeText: async (text) => {
+      copied.push(text);
+      return true;
+    },
+  });
+  const app = await mountShell(teamLiveFixture(), {
+    clipboard,
+    kittyKeyboard: true,
+    localMessageTtlMs: 120,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: transcriptCopyItems(),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await press(app, () => app.mockInput.pressKey("c", { ctrl: true, shift: true }));
+    expect(copied).toEqual(["copy transcript reply"]);
+    expect(app.captureCharFrame()).toContain("Copied latest assistant reply.");
+
+    await Bun.sleep(180);
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).not.toContain("Copied latest assistant reply.");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("Ctrl+Shift+C copies the transcript when transcript view is active", async () => {
   const copied: string[] = [];
   const clipboard = fakeClipboard({
@@ -563,6 +624,29 @@ test("Ctrl+Shift+C copies the transcript when transcript view is active", async 
     expect(copied[0]).toContain("tool bash succeeded tool_copy_transcript");
     expect(copied[0]).toContain("RAW_COPY_OUTPUT");
     expect(app.captureCharFrame()).toContain("Copied transcript.");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("local notices clear when the active session changes", async () => {
+  const app = await mountStatefulShell(teamLiveFixture());
+
+  try {
+    await typeText(app, "/te");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(app.captureCharFrame()).toContain("Unknown command: /te");
+
+    await act(async () => {
+      app.setRuntime((current) => ({
+        ...current,
+        activeSessionId: "session_next" as SessionId,
+        activeThreadId: "thread_next" as ThreadId,
+      }));
+    });
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).not.toContain("Unknown command: /te");
   } finally {
     app.renderer.destroy();
   }
@@ -1244,6 +1328,7 @@ async function mountShell(
     runtime?: Partial<ChatRuntimeState>;
     clipboard?: ClipboardAccess;
     kittyKeyboard?: boolean;
+    localMessageTtlMs?: number;
   } = {},
 ) {
   const runtime: ChatRuntimeState = {
@@ -1281,6 +1366,7 @@ async function mountShell(
       onExit={() => undefined}
       options={{ cwd: "/repo/chili", modeName: "Build", modelName: "test-model", providerName: "test-provider" }}
       clipboard={options.clipboard}
+      localMessageTtlMs={options.localMessageTtlMs}
     />,
     renderOptions,
   );
