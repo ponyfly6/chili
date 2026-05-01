@@ -171,6 +171,45 @@ test("consumes rich model streams and executes tool calls after the stream finis
   expect(toolStartedIndex).toBeGreaterThan(toolCallPartIndex);
 });
 
+test("keeps live tool output deltas out of model-facing tool result parts", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  registry.register({
+    name: "streamer",
+    description: "Emit live output before final result.",
+    risk: "read",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async (_input, context) => {
+      await context.streamOutput({ stream: "stdout", delta: "partial stdout\n" });
+      await context.streamOutput({ stream: "stderr", delta: "partial stderr\n" });
+      return { title: "streamer", output: "canonical final output" };
+    },
+  });
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "tool_call", name: "streamer", input: {} };
+      yield { type: "finish", reason: "tool_use" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_tool_output_delta" as SessionId,
+    threadId: "thread_tool_output_delta" as ThreadId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("completed");
+  const deltas = store.items.filter((event): event is Extract<ChiliEvent, { type: "tool.output_delta" }> => event.type === "tool.output_delta");
+  expect(deltas.map((event) => ({ stream: event.payload.stream, delta: event.payload.delta }))).toEqual([
+    { stream: "stdout", delta: "partial stdout\n" },
+    { stream: "stderr", delta: "partial stderr\n" },
+  ]);
+  expect(toolResultParts(store).map((part) => part.output)).toEqual(["canonical final output"]);
+  expect(messageParts(store).map((part) => JSON.stringify(part)).join("\n")).not.toContain("partial stdout");
+});
+
 test("finishes live streaming tool rows as failed when the model errors before tool_call_end", async () => {
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();

@@ -261,6 +261,81 @@ test("projects live tool input updates before the final assistant tool part", ()
   expect(completedAssistant?.kind === "message" ? completedAssistant.parts : []).toContainEqual(expect.objectContaining({ type: "tool_call", callId }));
 });
 
+test("projects live tool output deltas without duplicating final output", () => {
+  const sessionId = "session_live_tool_output" as SessionId;
+  const threadId = "thread_live_tool_output" as ThreadId;
+  const turnId = "turn_live_tool_output" as TurnId;
+  const callId = "toolcall_live_output" as ToolCallId;
+
+  const runningView = reduceRuntimeEvents(
+    [
+      {
+        id: "event_live_output_session",
+        type: "session.created",
+        time: 1 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { sessionId, cwd: "/repo" },
+      },
+      {
+        id: "event_live_output_started",
+        type: "tool.call_started",
+        time: 2 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { turnId, callId, toolName: "bash", input: { command: "bun test" } },
+      },
+      {
+        id: "event_live_output_stdout",
+        type: "tool.output_delta",
+        time: 3 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { callId, stream: "stdout", delta: "pass 1\n", bytes: 7, sequence: 1 },
+      },
+      {
+        id: "event_live_output_stderr",
+        type: "tool.output_delta",
+        time: 4 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { callId, stream: "stderr", delta: "warn\n", bytes: 5, sequence: 2 },
+      },
+    ],
+    createRuntimeView(),
+  );
+
+  const running = chatSessionView(runningView, { sessionId, threadId, generatedAt: "now" });
+  const runningTool = running.items.find((item): item is Extract<ChatTranscriptItem, { kind: "tool" }> => item.kind === "tool");
+  expect(runningTool).toMatchObject({ id: callId, status: "running" });
+  expect(runningTool?.output).toBeUndefined();
+  expect(runningTool?.liveOutput).toEqual([
+    expect.objectContaining({ stream: "stdout", delta: "pass 1\n", sequence: 1 }),
+    expect.objectContaining({ stream: "stderr", delta: "warn\n", sequence: 2 }),
+  ]);
+  expect(running.activeTools).toHaveLength(1);
+
+  const finalOutput = "pass 1\n\n[stderr]\nwarn\n";
+  const completedView = reduceRuntimeEvents(
+    [
+      {
+        id: "event_live_output_finished",
+        type: "tool.call_finished",
+        time: 5 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { callId, status: "completed", output: finalOutput },
+      },
+    ],
+    runningView,
+  );
+  const completed = chatSessionView(completedView, { sessionId, threadId, generatedAt: "now" });
+  const completedTool = completed.items.find((item): item is Extract<ChatTranscriptItem, { kind: "tool" }> => item.kind === "tool");
+  expect(completedTool?.output).toBe(finalOutput);
+  expect(completedTool?.liveOutput?.map((delta) => delta.delta).join("")).toBe("pass 1\nwarn\n");
+  expect(completed.activeTools).toEqual([]);
+});
+
 test("projects chat session transcript rows from message, tool, and approval events", () => {
   const sessionId = "session_chat_view" as SessionId;
   const threadId = "thread_chat_view" as ThreadId;

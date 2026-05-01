@@ -25,6 +25,7 @@ import type {
   ThreadId,
   ToolCallId,
   ToolCallStatus,
+  ToolOutputStream,
   TurnId,
 } from "@chili/protocol";
 
@@ -97,6 +98,16 @@ export interface RuntimeToolCallView {
   error?: string;
   synthetic?: boolean;
   metadata?: Record<string, unknown>;
+  liveOutput?: RuntimeToolOutputDelta[];
+}
+
+export interface RuntimeToolOutputDelta {
+  stream: ToolOutputStream;
+  delta: string;
+  time: number;
+  bytes?: number;
+  truncated?: boolean;
+  sequence?: number;
 }
 
 export interface RuntimeModelMetadataView extends ModelMetadataPayload {
@@ -673,6 +684,7 @@ export interface ChatToolCallRow {
   input?: unknown;
   output?: string;
   error?: string;
+  liveOutput?: RuntimeToolOutputDelta[];
   sessionId?: SessionId;
   threadId?: ThreadId;
   approvalId?: ApprovalId;
@@ -865,6 +877,22 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
         session.status = "waiting_for_approval";
         session.updatedAt = event.time;
       }
+      break;
+    }
+    case "tool.output_delta": {
+      const toolCall = upsertToolCall(view, event.payload.callId, event.time);
+      appendToolOutputDelta(toolCall, {
+        stream: event.payload.stream,
+        delta: event.payload.delta,
+        time: event.time,
+        ...(event.payload.bytes === undefined ? {} : { bytes: event.payload.bytes }),
+        ...(event.payload.truncated === undefined ? {} : { truncated: event.payload.truncated }),
+        ...(event.payload.sequence === undefined ? {} : { sequence: event.payload.sequence }),
+      });
+      assignOptional(toolCall, "sessionId", event.sessionId);
+      assignOptional(toolCall, "threadId", event.threadId);
+      toolCall.updatedAt = event.time;
+      linkToolCallToSession(view, toolCall, event.time);
       break;
     }
     case "tool.call_finished": {
@@ -1168,6 +1196,7 @@ function chatToolCallRow(view: ChiliRuntimeView, toolCall: RuntimeToolCallView):
   assignOptional(row, "input", toolCall.input);
   assignOptional(row, "output", toolCall.output);
   assignOptional(row, "error", toolCall.error);
+  assignOptional(row, "liveOutput", toolCall.liveOutput ? toolCall.liveOutput.map((delta) => ({ ...delta })) : undefined);
   assignOptional(row, "sessionId", toolCall.sessionId);
   assignOptional(row, "threadId", toolCall.threadId);
   assignOptional(row, "approvalId", pendingApproval?.id ?? latestApproval?.id);
@@ -2728,6 +2757,17 @@ function upsertToolCall(view: ChiliRuntimeView, callId: ToolCallId, time: number
   };
   view.toolCalls[callId] = toolCall;
   return toolCall;
+}
+
+const MAX_TOOL_OUTPUT_DELTAS = 80;
+
+function appendToolOutputDelta(toolCall: RuntimeToolCallView, delta: RuntimeToolOutputDelta): void {
+  if (!delta.delta) return;
+  const liveOutput = toolCall.liveOutput ? [...toolCall.liveOutput, delta] : [delta];
+  if (liveOutput.length > MAX_TOOL_OUTPUT_DELTAS) {
+    liveOutput.splice(0, liveOutput.length - MAX_TOOL_OUTPUT_DELTAS);
+  }
+  toolCall.liveOutput = liveOutput;
 }
 
 function touchSession(view: ChiliRuntimeView, sessionId: SessionId, time: number): void {

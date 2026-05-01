@@ -14,7 +14,7 @@ import type {
 import type { AgentPath } from "./agent-path.js";
 import type { MessagePart } from "./message.js";
 import type { ModelMetadataPayload, RuntimeStatusPayload } from "./runtime.js";
-import type { ToolCallStatus } from "./tool.js";
+import type { ToolCallStatus, ToolOutputStream } from "./tool.js";
 
 export interface EventEnvelope<TType extends string = string, TPayload = unknown> {
   id: string;
@@ -59,6 +59,7 @@ export type MessageEvent =
 export type ToolEvent =
   | EventEnvelope<"tool.call_started", { turnId: TurnId; callId: ToolCallId; toolName: string; input: unknown }>
   | EventEnvelope<"tool.call_updated", { callId: ToolCallId; status: ToolCallStatus; toolName?: string; input?: unknown; metadata?: Record<string, unknown> }>
+  | EventEnvelope<"tool.output_delta", { callId: ToolCallId; stream: ToolOutputStream; delta: string; bytes?: number; truncated?: boolean; sequence?: number }>
   | EventEnvelope<"tool.call_finished", { callId: ToolCallId; status: "completed" | "failed" | "cancelled"; output?: string; error?: string; synthetic?: boolean }>;
 
 export type ApprovalEvent =

@@ -11,6 +11,8 @@ export type ToolCallStatus =
   | "failed"
   | "cancelled";
 
+export type ToolOutputStream = "stdout" | "stderr";
+
 export interface ToolDefinition<Input = unknown, Output extends ToolResult = ToolResult> {
   name: string;
   description: string;
@@ -27,6 +29,7 @@ export interface ToolExecutionContext {
   signal: AbortSignal;
   cwd: string;
   metadata(update: ToolMetadataUpdate): Promise<void>;
+  streamOutput(update: ToolOutputUpdate): Promise<void>;
   requestApproval(request: ApprovalRequest): Promise<ApprovalDecision>;
 }
 
@@ -34,6 +37,13 @@ export interface ToolMetadataUpdate {
   title?: string;
   status?: ToolCallStatus;
   metadata?: Record<string, unknown>;
+}
+
+export interface ToolOutputUpdate {
+  stream: ToolOutputStream;
+  delta: string;
+  bytes?: number;
+  truncated?: boolean;
 }
 
 export interface ToolResult {

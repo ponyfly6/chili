@@ -223,6 +223,33 @@ test("bash supports workspace-scoped cwd and env overrides", async () => {
   }
 });
 
+test("bash publishes live stdout and stderr tool output deltas", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-bash-stream-"));
+  const events: ChiliEvent[] = [];
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register(createBashTool());
+    const executor = createExecutor(registry, undefined, undefined, events);
+
+    const result = await executor.execute(
+      toolInput("bash", { command: "printf out1; printf err1 >&2; sleep 0.05; printf out2; printf err2 >&2" }, workspace, "toolcall_bash_stream" as ToolCallId),
+    );
+    expect(result.status).toBe("completed");
+    if (result.status === "completed") {
+      expect(result.result.output).toContain("out1out2");
+      expect(result.result.output).toContain("[stderr]\nerr1err2");
+    }
+
+    const deltas = events.filter((event): event is Extract<ChiliEvent, { type: "tool.output_delta" }> => event.type === "tool.output_delta");
+    expect(deltas.map((event) => event.payload.callId)).toEqual(deltas.map(() => "toolcall_bash_stream"));
+    expect(deltas.filter((event) => event.payload.stream === "stdout").map((event) => event.payload.delta).join("")).toBe("out1out2");
+    expect(deltas.filter((event) => event.payload.stream === "stderr").map((event) => event.payload.delta).join("")).toBe("err1err2");
+    expect(events.at(-1)?.type).toBe("tool.call_finished");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("snapshot creation failure fails closed before write tools mutate files", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-tools-snapshot-fail-"));
   try {
@@ -361,10 +388,11 @@ function createExecutor(
   registry: InMemoryToolRegistry,
   policyResolver?: ToolAccessPolicyResolver,
   snapshotProvider?: SnapshotProvider,
+  events?: ChiliEvent[],
 ): ToolExecutor {
   return new ToolExecutor({
     registry,
-    events: { publish: async (_event: ChiliEvent) => undefined },
+    events: { publish: async (event: ChiliEvent) => { events?.push(event); } },
     approvals: { decide: async () => ({ action: "allow_once" }) },
     ...(policyResolver ? { policyResolver } : {}),
     ...(snapshotProvider ? { snapshotProvider } : {}),

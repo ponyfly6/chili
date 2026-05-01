@@ -8,6 +8,7 @@ import type {
   TimestampMs,
   ToolCallId,
   ToolMetadataUpdate,
+  ToolOutputUpdate,
   ToolResult,
   TurnId,
 } from "@chili/protocol";
@@ -216,6 +217,7 @@ export class ToolExecutor {
   }
 
   private context(tool: ChiliToolDefinition, input: ExecuteToolInput, callId: ToolCallId): ChiliToolExecutionContext {
+    let outputSequence = 0;
     return {
       sessionId: input.sessionId,
       ...(input.threadId ? { threadId: input.threadId } : {}),
@@ -226,6 +228,10 @@ export class ToolExecutor {
       fileReads: this.fileReads,
       visibleTools: () => this.visibleTools(input),
       metadata: (update) => this.metadata(input, callId, update),
+      streamOutput: (update) => {
+        outputSequence += 1;
+        return this.streamOutput(input, callId, outputSequence, update);
+      },
       requestApproval: (request) =>
         this.requestApproval(input, callId, tool, {
           permission: request.permission,
@@ -276,6 +282,23 @@ export class ToolExecutor {
       callId,
       status: update.status ?? "running",
       ...(update.metadata ? { metadata: update.metadata } : {}),
+    });
+  }
+
+  private async streamOutput(
+    input: ExecuteToolInput,
+    callId: ToolCallId,
+    sequence: number,
+    update: ToolOutputUpdate,
+  ): Promise<void> {
+    if (!update.delta) return;
+    await this.publish("tool.output_delta", input, {
+      callId,
+      stream: update.stream,
+      delta: update.delta,
+      ...(update.bytes === undefined ? {} : { bytes: update.bytes }),
+      ...(update.truncated === undefined ? {} : { truncated: update.truncated }),
+      sequence,
     });
   }
 

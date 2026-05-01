@@ -101,6 +101,7 @@ export function createBashTool(): ChiliToolDefinition<BashInput> {
         signal: context.signal,
         timeoutMs: input.timeoutMs ?? 30_000,
         maxOutputBytes: input.maxOutputBytes ?? 256_000,
+        onOutput: (chunk) => context.streamOutput(chunk),
       };
       if (input.env) processOptions.env = input.env;
       const result = await runProcess("bash", ["-lc", input.command], processOptions);
