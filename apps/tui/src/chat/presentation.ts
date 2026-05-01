@@ -7,6 +7,7 @@ import type {
   ChatToolDisplayStatus,
   ChatToolInputSummary,
   ChatTranscriptItem,
+  RuntimeToolOutputDelta,
 } from "@chili/sdk";
 import {
   explorationToolKind,
@@ -49,6 +50,7 @@ export interface ToolActivityDisplay {
   input?: unknown;
   output?: string;
   error?: string;
+  liveOutput?: RuntimeToolOutputDelta[];
   outputHint?: string;
   compactErrorLines?: string[];
 }
@@ -171,6 +173,7 @@ function toolActivityFromRow(row: ChatToolCallRow, showToolDetails: boolean): To
     ...(row.input === undefined ? {} : { input: row.input }),
     ...(row.output === undefined ? {} : { output: row.output }),
     ...(row.error === undefined ? {} : { error: row.error }),
+    ...(row.liveOutput === undefined ? {} : { liveOutput: row.liveOutput }),
   });
 }
 
@@ -207,6 +210,7 @@ function toolActivity(input: {
   input?: unknown;
   output?: string;
   error?: string;
+  liveOutput?: RuntimeToolOutputDelta[];
 }): ToolActivityDisplay {
   const summary = input.inputSummary ?? inputSummaryFromUnknown(input.toolName, input.input);
   const rendered = renderToolActivity({
@@ -221,6 +225,7 @@ function toolActivity(input: {
     ...(input.input === undefined ? {} : { input: input.input }),
     ...(input.output === undefined ? {} : { output: input.output }),
     ...(input.error === undefined ? {} : { error: input.error }),
+    ...(input.liveOutput === undefined ? {} : { liveOutput: input.liveOutput }),
   });
 
   return {
@@ -243,6 +248,7 @@ function toolActivity(input: {
     ...(input.input === undefined ? {} : { input: input.input }),
     ...(input.output === undefined ? {} : { output: input.output }),
     ...(input.error === undefined ? {} : { error: input.error }),
+    ...(input.liveOutput === undefined ? {} : { liveOutput: input.liveOutput }),
     ...(rendered.outputHint === undefined ? {} : { outputHint: rendered.outputHint }),
     ...(rendered.compactErrorLines === undefined ? {} : { compactErrorLines: rendered.compactErrorLines }),
   };

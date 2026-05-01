@@ -156,6 +156,31 @@ test("completed assistant markdown keeps block rendering", async () => {
   expect(frame).toContain("```ts");
 });
 
+test("long assistant markdown scrolls by rendered transcript lines", async () => {
+  const text = Array.from({ length: 12 }, (_, index) => `long line ${String(index + 1).padStart(2, "0")}`).join("\n");
+  const items: ChatTranscriptItem[] = [
+    {
+      id: "msg_long_markdown_scroll" as MessageId,
+      kind: "message",
+      role: "assistant",
+      createdAt: 1,
+      completedAt: 2,
+      parts: [
+        { type: "text", id: "part_long_markdown_scroll" as PartId, text },
+      ],
+    },
+  ];
+
+  const bottom = await renderMessageList(items, { height: 6, width: 100 });
+  const scrolled = await renderMessageList(items, { height: 6, width: 100, scrollOffset: 7 });
+
+  expect(bottom).toContain("History");
+  expect(bottom).toContain("long line 12");
+  expect(bottom).not.toContain("long line 01");
+  expect(scrolled).toContain("long line 01");
+  expect(scrolled).not.toContain("long line 12");
+});
+
 test("history render model caches completed assistant markdown lines by part identity and content", () => {
   const calls: string[] = [];
   const model = new HistoryRenderModel({
@@ -380,6 +405,7 @@ test("exploration tool groups hide raw output when compact and expand in details
   expect(details).toContain("GREP_RAW_MATCH_1");
   expect(details).toContain("GLOB_RAW_PATH_1");
   expect(details).not.toContain("output hidden");
+  expect(occurrences(details, "output:")).toBe(3);
 });
 
 test("large tool output is hidden by default and truncated in details mode", async () => {
@@ -399,6 +425,71 @@ test("large tool output is hidden by default and truncated in details mode", asy
   expect(details).toContain("line_01");
   expect(details).toContain("line_05");
   expect(details).not.toContain("line_06");
+});
+
+test("running command rows show live output tail without exposing completed live output", async () => {
+  const running = chatTool("tool_live_output" as ToolCallId, "bash", "running", "running", { title: "bash", command: "npm install", detail: "npm install" }, {
+    liveOutput: [
+      { stream: "stdout", delta: "live_01\nlive_02\nlive_03\nlive_04\n", time: 1 },
+      { stream: "stderr", delta: "warn_05\n", time: 2 },
+      { stream: "stdout", delta: "live_06\n", time: 3 },
+    ],
+  });
+  const completed = chatTool("tool_completed_live_output" as ToolCallId, "bash", "completed", "succeeded", { title: "bash", command: "npm install", detail: "npm install" }, {
+    output: "FINAL_OUTPUT_SHOULD_STAY_COMPACT",
+    liveOutput: [
+      { stream: "stdout", delta: "LIVE_OUTPUT_SHOULD_NOT_RENDER_AFTER_SUCCESS\n", time: 1 },
+    ],
+  });
+
+  const runningFrame = await renderMessageList([running], { height: 16 });
+  const completedFrame = await renderMessageList([completed], { height: 8 });
+
+  expect(runningFrame).toContain("Running npm install");
+  expect(runningFrame).toContain("live output (truncated):");
+  expect(runningFrame).not.toContain("error (truncated):");
+  expect(runningFrame).not.toContain("live_01");
+  expect(runningFrame).toContain("live_02");
+  expect(runningFrame).toContain("warn_05");
+  expect(runningFrame).toContain("live_06");
+  expect(completedFrame).toContain("Ran npm install");
+  expect(completedFrame).not.toContain("LIVE_OUTPUT_SHOULD_NOT_RENDER_AFTER_SUCCESS");
+  expect(completedFrame).not.toContain("FINAL_OUTPUT_SHOULD_STAY_COMPACT");
+});
+
+test("tool details show a longer live output tail", async () => {
+  const item = chatTool("tool_live_output_details" as ToolCallId, "bash", "running", "running", { title: "bash", command: "npm install", detail: "npm install" }, {
+    input: { command: "npm install" },
+    liveOutput: [
+      { stream: "stdout", delta: Array.from({ length: 8 }, (_, index) => `detail_live_${index + 1}`).join("\n"), time: 1 },
+    ],
+  });
+
+  const frame = await renderMessageList([item], { showToolDetails: true, height: 24 });
+
+  expect(frame).toContain("Running npm install");
+  expect(frame).toContain("live output:");
+  expect(frame).toContain("detail_live_1");
+  expect(frame).toContain("detail_live_8");
+  expect(frame).not.toContain("output hidden");
+});
+
+test("tool details line count participates in transcript window slicing", async () => {
+  const output = Array.from({ length: 20 }, (_, index) => `slice_line_${String(index + 1).padStart(2, "0")}`).join("\n");
+  const item = chatTool("tool_slice_output" as ToolCallId, "bash", "completed", "succeeded", { title: "bash", command: "bun test", detail: "bun test" }, {
+    output,
+  });
+
+  const bottom = await renderMessageList([item], { showToolDetails: true, height: 5, width: 120 });
+  const scrolled = await renderMessageList([item], { showToolDetails: true, height: 5, width: 120, scrollOffset: 3 });
+
+  expect(bottom).toContain("History");
+  expect(bottom).toContain("slice_line_05");
+  expect(bottom).not.toContain("slice_line_01");
+  expect(scrolled).toContain("Ran bun test");
+  expect(scrolled).toContain("output (truncated):");
+  expect(scrolled).toContain("slice_line_01");
+  expect(scrolled).not.toContain("slice_line_05");
 });
 
 test("block tool details render the cell body without duplicating the primary detail", async () => {
@@ -451,7 +542,7 @@ test("unknown tools use the fallback renderer label", () => {
 
 async function renderMessageList(
   items: readonly ChatTranscriptItem[],
-  options: { showToolDetails?: boolean; width?: number; height?: number; status?: ChatSessionView["status"]; activeTools?: ChatSessionView["activeTools"] } = {},
+  options: { showToolDetails?: boolean; width?: number; height?: number; scrollOffset?: number; status?: ChatSessionView["status"]; activeTools?: ChatSessionView["activeTools"] } = {},
 ): Promise<string> {
   const app = await testRender(
     <MessageList
@@ -459,6 +550,7 @@ async function renderMessageList(
       localItems={[]}
       width={options.width ?? 110}
       visibleLimit={options.height ?? 24}
+      {...(options.scrollOffset === undefined ? {} : { scrollOffset: options.scrollOffset })}
       showToolDetails={options.showToolDetails === true}
       theme={resolveTuiTheme("chili-dark", {})}
     />,
@@ -502,7 +594,7 @@ function chatTool(
   status: Extract<ChatTranscriptItem, { kind: "tool" }>["status"],
   displayStatus: Extract<ChatTranscriptItem, { kind: "tool" }>["displayStatus"],
   inputSummary: Extract<ChatTranscriptItem, { kind: "tool" }>["inputSummary"],
-  extra: Partial<Pick<Extract<ChatTranscriptItem, { kind: "tool" }>, "output" | "error" | "input">> = {},
+  extra: Partial<Pick<Extract<ChatTranscriptItem, { kind: "tool" }>, "output" | "error" | "input" | "liveOutput">> = {},
 ): Extract<ChatTranscriptItem, { kind: "tool" }> {
   return {
     id,

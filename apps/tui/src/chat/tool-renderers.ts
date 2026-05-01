@@ -1,9 +1,10 @@
-import type { ChatToolDisplayStatus, ChatToolInputSummary } from "@chili/sdk";
+import type { ChatToolDisplayStatus, ChatToolInputSummary, RuntimeToolOutputDelta } from "@chili/sdk";
 
 export interface ToolActivityDetail {
   label: string;
   lines: string[];
   tone: "muted" | "error";
+  lineTones?: ("muted" | "error")[];
   truncated: boolean;
 }
 
@@ -30,6 +31,7 @@ export interface ToolRenderInput {
   input?: unknown;
   output?: string;
   error?: string;
+  liveOutput?: readonly RuntimeToolOutputDelta[];
   showToolDetails: boolean;
   source: "row" | "fallback";
 }
@@ -70,12 +72,12 @@ export class ToolRendererRegistry {
     const label = renderer.label(input);
     const details = input.showToolDetails
       ? renderer.details?.(input) ?? defaultToolDetails(input)
-      : [];
+      : compactLiveOutputDetails(input);
     const hasDetails = details.length > 0;
     const outputHint = hasDetails
       ? undefined
       : renderer.outputHint?.(input) ?? defaultOutputHint(input);
-    const compactErrorLines = hasDetails
+    const compactErrorLines = input.showToolDetails
       ? undefined
       : renderer.compactErrorLines?.(input) ?? defaultCompactErrorLines(input);
     const body = bodyFromDetails(details, renderer.bodyKind?.(input));
@@ -105,7 +107,7 @@ const bashRenderer: ToolRenderer = {
   name: "bash",
   match: (toolName) => matchesTool(toolName, ["bash", "run_shell_command"]),
   label: (input) => labelWithTarget(statusVerb(input.displayStatus, "Ran", "Running"), input.inputSummary.command ?? input.inputSummary.detail ?? input.inputSummary.title),
-  details: (input) => defaultToolDetails(input, { maxOutputLines: 5 }),
+  details: (input) => defaultToolDetails(input, { maxOutputLines: 5, maxLiveOutputLines: 16 }),
 };
 
 const readRenderer: ToolRenderer = {
@@ -277,12 +279,14 @@ export function normalizeToolName(toolName: string): string {
   return toolName.toLowerCase().replace(/^tool\./, "");
 }
 
-function defaultToolDetails(input: ToolRenderInput, options: { maxOutputLines?: number } = {}): ToolActivityDetail[] {
+function defaultToolDetails(input: ToolRenderInput, options: { maxOutputLines?: number; maxLiveOutputLines?: number } = {}): ToolActivityDetail[] {
   const details: ToolActivityDetail[] = [];
   if (input.input !== undefined) {
     const preview = previewTextLines(formatInput(input.input), { maxLines: 8, maxLineLength: 180 });
     details.push({ label: "input", tone: "muted", lines: preview.lines, truncated: preview.truncated });
   }
+  const liveOutput = liveOutputDetail(input, options.maxLiveOutputLines ?? 16);
+  if (liveOutput) details.push(liveOutput);
   if (input.error) {
     const preview = previewTextLines(input.error, { maxLines: 5, maxLineLength: 180 });
     details.push({ label: "error", tone: "error", lines: preview.lines, truncated: preview.truncated });
@@ -297,18 +301,41 @@ function defaultToolDetails(input: ToolRenderInput, options: { maxOutputLines?: 
   return details;
 }
 
+function compactLiveOutputDetails(input: ToolRenderInput): ToolActivityDetail[] {
+  const liveOutput = liveOutputDetail(input, 5);
+  return liveOutput ? [liveOutput] : [];
+}
+
+function liveOutputDetail(input: ToolRenderInput, maxLines: number): ToolActivityDetail | undefined {
+  if (!hasVisibleLiveOutput(input)) return undefined;
+  const preview = liveOutputPreview(input.liveOutput ?? [], {
+    maxLines,
+    maxLineLength: 180,
+    stderrTone: isFailedDisplayStatus(input.displayStatus) ? "error" : "muted",
+  });
+  if (preview.lines.length === 0) return undefined;
+  return {
+    label: "live output",
+    tone: "muted",
+    lines: preview.lines,
+    lineTones: preview.lineTones,
+    truncated: preview.truncated,
+  };
+}
+
 function bodyFromDetails(
   details: readonly ToolActivityDetail[],
   requestedKind: Exclude<ToolRenderBodyKind, "none"> | undefined,
 ): { kind: ToolRenderBodyKind; lines: string[]; truncated: boolean } {
   const primary = primaryBodyDetail(details);
   if (!primary) return { kind: "none", lines: [], truncated: false };
-  const kind = primary.tone === "error" ? "error" : requestedKind ?? "text";
+  const kind = primary.label === "live output" ? "text" : primary.tone === "error" ? "error" : requestedKind ?? "text";
   return { kind, lines: primary.lines, truncated: primary.truncated };
 }
 
 function primaryBodyDetail(details: readonly ToolActivityDetail[]): ToolActivityDetail | undefined {
-  return details.find((detail) => detail.tone === "error")
+  return details.find((detail) => detail.label === "live output")
+    ?? details.find((detail) => detail.tone === "error")
     ?? details.find((detail) => detail.label === "output")
     ?? details.find((detail) => detail.label === "input")
     ?? details[0];
@@ -316,6 +343,7 @@ function primaryBodyDetail(details: readonly ToolActivityDetail[]): ToolActivity
 
 function defaultToolMode(input: ToolRenderInput): ToolRenderMode {
   if (isFailedDisplayStatus(input.displayStatus) || input.error) return "block";
+  if (hasVisibleLiveOutput(input)) return "block";
   if (input.output && isLargeOutput(input.output)) return "block";
   if (input.showToolDetails && (input.input !== undefined || input.output || input.error)) return "block";
   return "inline";
@@ -351,6 +379,87 @@ function previewTextLines(value: string, options: { maxLines: number; maxLineLen
 
 function isLargeOutput(value: string): boolean {
   return value.length > 180 || value.includes("\n") || /^diff --git/m.test(value);
+}
+
+function hasVisibleLiveOutput(input: ToolRenderInput): boolean {
+  return input.displayStatus !== "succeeded" && input.liveOutput?.some((delta) => delta.delta.length > 0) === true;
+}
+
+function liveOutputPreview(
+  deltas: readonly RuntimeToolOutputDelta[],
+  options: { maxLines: number; maxLineLength: number; stderrTone: LiveOutputTone },
+): { lines: string[]; lineTones: ("muted" | "error")[]; truncated: boolean } {
+  const entries = liveOutputLineEntries(deltas, options.maxLineLength, options.stderrTone);
+  let truncated = deltas.some((delta) => delta.truncated === true);
+  if (entries.length > options.maxLines) truncated = true;
+  if (entries.some((entry) => entry.shortened)) truncated = true;
+  const visible = entries.slice(-options.maxLines);
+  return {
+    lines: visible.map((entry) => entry.line),
+    lineTones: visible.map((entry) => entry.tone),
+    truncated,
+  };
+}
+
+type LiveOutputTone = "muted" | "error";
+
+interface LiveOutputLineEntry {
+  line: string;
+  tone: LiveOutputTone;
+  shortened: boolean;
+}
+
+interface LiveOutputStreamState {
+  pending: string;
+  lastSeen: number;
+}
+
+function liveOutputLineEntries(
+  deltas: readonly RuntimeToolOutputDelta[],
+  maxLineLength: number,
+  stderrTone: LiveOutputTone,
+): LiveOutputLineEntry[] {
+  const entries: LiveOutputLineEntry[] = [];
+  const states: Record<"stdout" | "stderr", LiveOutputStreamState> = {
+    stdout: { pending: "", lastSeen: -1 },
+    stderr: { pending: "", lastSeen: -1 },
+  };
+
+  for (const [deltaIndex, delta] of deltas.entries()) {
+    const state = states[delta.stream];
+    const tone = liveOutputTone(delta.stream, stderrTone);
+    state.lastSeen = deltaIndex;
+    if (delta.truncated) state.pending = "";
+    state.pending += delta.delta.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+    const parts = state.pending.split("\n");
+    state.pending = parts.pop() ?? "";
+    for (const part of parts) {
+      entries.push(liveOutputLineEntry(part, tone, maxLineLength));
+    }
+  }
+
+  const pending = Object.entries(states)
+    .filter((entry): entry is ["stdout" | "stderr", LiveOutputStreamState] => entry[1].pending.length > 0)
+    .sort((left, right) => left[1].lastSeen - right[1].lastSeen);
+  for (const [stream, state] of pending) {
+    entries.push(liveOutputLineEntry(state.pending, liveOutputTone(stream, stderrTone), maxLineLength));
+  }
+
+  return entries;
+}
+
+function liveOutputLineEntry(line: string, tone: LiveOutputTone, maxLineLength: number): LiveOutputLineEntry {
+  const shortened = shortenLine(line, maxLineLength);
+  return {
+    line: shortened,
+    tone,
+    shortened: shortened !== line,
+  };
+}
+
+function liveOutputTone(stream: "stdout" | "stderr", stderrTone: LiveOutputTone): LiveOutputTone {
+  return stream === "stderr" ? stderrTone : "muted";
 }
 
 function isFailedDisplayStatus(status: ChatToolDisplayStatus): boolean {

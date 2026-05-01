@@ -1,10 +1,11 @@
 import type { ChatSessionView, ChatTranscriptItem } from "@chili/sdk";
 import { shorten } from "../components/helpers.js";
 import type { TuiTheme } from "../theme/index.js";
-import { wrapTerminalText, type MarkdownLineTone } from "./markdown.js";
-import { buildChatDisplayItems, type ChatDisplayItem, type ToolActivityDisplay } from "./presentation.js";
-import { historyRenderModel } from "./render-model.js";
-import type { ToolActivityDetail } from "./tool-renderers.js";
+import { AssistantMarkdownCell, assistantTextCellLines } from "./AssistantCells.js";
+import { componentBackedCell, lineBackedCell, TranscriptCellSliceView, type TranscriptCellModel, windowTranscriptCells } from "./cells.js";
+import { type TranscriptLineModel, wrapLine } from "./lines.js";
+import { buildChatDisplayItems, type ChatDisplayItem } from "./presentation.js";
+import { ToolCell, ToolGroupCell, toolCellLines, toolGroupCellLines } from "./ToolCells.js";
 import type { LocalTranscriptItem } from "./types.js";
 
 export function MessageList(props: {
@@ -16,7 +17,7 @@ export function MessageList(props: {
   showToolDetails?: boolean;
   theme: TuiTheme;
 }) {
-  const allLines = transcriptLines(props.chatView.items, props.localItems, {
+  const allCells = transcriptCells(props.chatView.items, props.localItems, {
     width: Math.max(24, props.width ?? 80),
     showToolDetails: props.showToolDetails === true,
     sessionStatus: props.chatView.status,
@@ -24,103 +25,106 @@ export function MessageList(props: {
     theme: props.theme,
   });
   const limit = Math.max(1, props.visibleLimit ?? 18);
-  const contentLimit = allLines.length > limit ? Math.max(1, limit - 1) : limit;
-  const maxOffset = Math.max(0, allLines.length - contentLimit);
-  const offset = Math.min(Math.max(0, props.scrollOffset ?? 0), maxOffset);
-  const end = allLines.length - offset;
-  const start = Math.max(0, end - contentLimit);
-  const lines = allLines.slice(start, end);
+  const window = windowTranscriptCells(allCells, { visibleLimit: limit, scrollOffset: props.scrollOffset });
   return (
     <box width="100%" height="100%" flexDirection="column">
-      {lines.length === 0 ? (
+      {window.totalLineCount === 0 ? (
         <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>{"Start a conversation from the prompt below."}</text>
       ) : (
         <>
-          {allLines.length > contentLimit ? (
+          {window.totalLineCount > window.contentLimit ? (
             <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>
-              {`History ${start + 1}-${end}/${allLines.length} PgUp/PgDn Shift+Up/Down`}
+              {`History ${window.startLine + 1}-${window.endLine}/${window.totalLineCount} PgUp/PgDn Shift+Up/Down`}
             </text>
           ) : null}
-          {lines.map((line) => <TranscriptLine key={line.key} line={line} />)}
+          {window.slices.map((slice) => <TranscriptCellSliceView key={slice.key} slice={slice} />)}
         </>
       )}
     </box>
   );
 }
 
-interface TranscriptLineModel {
-  key: string;
-  text: string;
-  fg: string;
-}
-
-function TranscriptLine(props: { line: TranscriptLineModel }) {
-  return (
-    <text fg={props.line.fg} wrapMode="none" truncate>
-      {props.line.text}
-    </text>
-  );
-}
-
-function transcriptLines(
+function transcriptCells(
   items: readonly ChatTranscriptItem[],
   localItems: readonly LocalTranscriptItem[],
   options: { width: number; showToolDetails: boolean; sessionStatus: ChatSessionView["status"]; activeToolCount: number; theme: TuiTheme },
-): TranscriptLineModel[] {
+): TranscriptCellModel[] {
   const displayItems = buildChatDisplayItems(items, {
     showToolDetails: options.showToolDetails,
     sessionStatus: options.sessionStatus,
     activeToolCount: options.activeToolCount,
   });
   return [
-    ...displayItems.flatMap((item) => displayItemLines(item, options.width, options.theme)),
-    ...localItems.flatMap((item) => localItemLines(item, options.width, options.theme)),
+    ...displayItems.map((item) => displayItemCell(item, options.width, options.theme)),
+    ...localItems.map((item) => localItemCell(item, options.width, options.theme)),
   ];
 }
 
-function displayItemLines(item: ChatDisplayItem, width: number, theme: TuiTheme): TranscriptLineModel[] {
+function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme): TranscriptCellModel {
   if (item.kind === "user_text") {
-    return wrapLine(`🥔: ${item.text || "..."}`, {
+    return lineBackedCell(`display:${item.kind}:${item.id}`, wrapLine(`🥔: ${item.text || "..."}`, {
       key: `display:${item.kind}:${item.id}`,
       fg: theme.colors.text.primary,
       width,
       hangingIndent: "    ",
-    });
+    }));
   }
   if (item.kind === "assistant_text") {
-    return historyRenderModel.assistantTextLines({
-      key: `display:${item.kind}:${item.id}`,
+    const key = `display:${item.kind}:${item.id}`;
+    const lines = assistantTextCellLines({
+      key,
       text: item.text,
       streaming: item.streaming === true,
       width,
-      prefix: "🌶️: ",
-      hangingIndent: "    ",
-    }).map((line) => ({
-      key: line.key,
-      text: line.text,
-      fg: markdownFg(line.tone, theme),
-    }));
+      theme,
+    });
+    return componentBackedCell({
+      key,
+      render: () => (
+        <AssistantMarkdownCell
+          cellKey={key}
+          text={item.text}
+          streaming={item.streaming === true}
+          width={width}
+          theme={theme}
+          fallbackLines={lines}
+        />
+      ),
+      fallbackLines: lines,
+    });
   }
-  if (item.kind === "reasoning") return reasoningLines(item, width, theme);
-  if (item.kind === "tool_activity") return toolActivityLines(item.activity, width, theme);
-  if (item.kind === "tool_group") return toolGroupLines(item, width, theme);
+  if (item.kind === "reasoning") return lineBackedCell(`display:${item.kind}:${item.id}`, reasoningLines(item, width, theme));
+  if (item.kind === "tool_activity") {
+    return componentBackedCell({
+      key: `display:tool:${item.activity.id}`,
+      render: () => <ToolCell activity={item.activity} width={width} theme={theme} />,
+      fallbackLines: toolCellLines(item.activity, width, theme),
+    });
+  }
+  if (item.kind === "tool_group") {
+    return componentBackedCell({
+      key: `display:${item.kind}:${item.id}`,
+      render: () => <ToolGroupCell group={item} width={width} theme={theme} />,
+      fallbackLines: toolGroupCellLines(item, width, theme),
+    });
+  }
   if (item.kind === "summary") {
-    return wrapLine(`summary: ${item.text || "..."}`, {
+    return lineBackedCell(`display:${item.kind}:${item.id}`, wrapLine(`summary: ${item.text || "..."}`, {
       key: `display:${item.kind}:${item.id}`,
       fg: theme.colors.text.muted,
       width,
       hangingIndent: "  ",
-    });
+    }));
   }
-  return approvalLines(item.approval, width, theme);
+  return lineBackedCell(`${item.approval.kind}:${item.approval.id}`, approvalLines(item.approval, width, theme));
 }
 
-function localItemLines(item: LocalTranscriptItem, width: number, theme: TuiTheme): TranscriptLineModel[] {
-  return wrapLine(`${item.level}: ${item.text}`, {
+function localItemCell(item: LocalTranscriptItem, width: number, theme: TuiTheme): TranscriptCellModel {
+  return lineBackedCell(item.id, wrapLine(`${item.level}: ${item.text}`, {
     key: item.id,
     fg: item.level === "error" ? theme.colors.status.error : theme.colors.text.muted,
     width,
-  });
+  }));
 }
 
 function reasoningLines(item: Extract<ChatDisplayItem, { kind: "reasoning" }>, width: number, theme: TuiTheme): TranscriptLineModel[] {
@@ -131,114 +135,6 @@ function reasoningLines(item: Extract<ChatDisplayItem, { kind: "reasoning" }>, w
     width,
     hangingIndent: "  ",
   });
-}
-
-function toolActivityLines(item: ToolActivityDisplay, width: number, theme: TuiTheme): TranscriptLineModel[] {
-  const lines = wrapLine(item.label, {
-    key: `display:tool:${item.id}`,
-    fg: toolFg(item.tone, theme),
-    width,
-    hangingIndent: "  ",
-  });
-  if (item.outputHint) {
-    lines.push(...wrapLine(`  ${item.outputHint}`, {
-      key: `display:tool:${item.id}:output-hint`,
-      fg: theme.colors.text.disabled,
-      width,
-      hangingIndent: "    ",
-    }));
-  }
-  if (item.compactErrorLines?.length) {
-    lines.push(...detailPreviewLines(`display:tool:${item.id}:compact-error`, "error", item.compactErrorLines, false, width, theme.colors.status.error));
-  }
-  lines.push(...toolSupplementLines(`display:tool:${item.id}`, item, width, theme));
-  return lines;
-}
-
-function toolGroupLines(item: Extract<ChatDisplayItem, { kind: "tool_group" }>, width: number, theme: TuiTheme): TranscriptLineModel[] {
-  const lines = wrapLine(item.label, {
-    key: `display:${item.kind}:${item.id}`,
-    fg: toolFg(item.tone, theme),
-    width,
-    hangingIndent: "  ",
-  });
-  for (const activity of item.activities) {
-    if (activity.compactErrorLines?.length) {
-      lines.push(...detailPreviewLines(`display:${item.kind}:${item.id}:${activity.id}:error`, "error", activity.compactErrorLines, false, width, theme.colors.status.error));
-    }
-    if (activity.details.length > 0 || activity.bodyLines.length > 0) {
-      lines.push(...wrapLine(`  ${activity.label}`, {
-        key: `display:${item.kind}:${item.id}:${activity.id}:label`,
-        fg: theme.colors.text.muted,
-        width,
-        hangingIndent: "    ",
-      }));
-    }
-    lines.push(...toolSupplementLines(`display:${item.kind}:${item.id}:${activity.id}`, activity, width, theme));
-  }
-  return lines;
-}
-
-function toolSupplementLines(key: string, item: ToolActivityDisplay, width: number, theme: TuiTheme): TranscriptLineModel[] {
-  const lines: TranscriptLineModel[] = [];
-  const bodyDetail = bodyDetailForActivity(item);
-  if (item.bodyLines.length > 0) {
-    lines.push(...detailPreviewLines(`${key}:body:${item.bodyKind}`, bodyLabel(item, bodyDetail), item.bodyLines, item.bodyTruncated, width, bodyFg(item, theme)));
-  }
-  for (const detail of item.details) {
-    if (detail === bodyDetail) continue;
-    lines.push(...toolDetailLines(`${key}:detail:${detail.label}`, detail, width, theme));
-  }
-  return lines;
-}
-
-function bodyDetailForActivity(item: ToolActivityDisplay): ToolActivityDetail | undefined {
-  if (item.bodyLines.length === 0 || item.bodyKind === "none") return undefined;
-  const candidates = item.details.filter((detail) => detail.truncated === item.bodyTruncated && sameLines(detail.lines, item.bodyLines));
-  if (item.bodyKind === "error") return candidates.find((detail) => detail.tone === "error") ?? candidates[0];
-  return candidates.find((detail) => detail.label === "output")
-    ?? candidates.find((detail) => detail.label === "input")
-    ?? candidates[0];
-}
-
-function bodyLabel(item: ToolActivityDisplay, detail: ToolActivityDetail | undefined): string {
-  if (item.bodyKind === "diff") return "diff";
-  if (item.bodyKind === "code") return "code";
-  if (item.bodyKind === "error") return "error";
-  return detail?.label ?? "output";
-}
-
-function bodyFg(item: ToolActivityDisplay, theme: TuiTheme): string {
-  return item.bodyKind === "error" ? theme.colors.status.error : theme.colors.text.muted;
-}
-
-function sameLines(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((line, index) => line === right[index]);
-}
-
-function toolDetailLines(key: string, detail: ToolActivityDetail, width: number, theme: TuiTheme): TranscriptLineModel[] {
-  const fg = detail.tone === "error" ? theme.colors.status.error : theme.colors.text.muted;
-  return detailPreviewLines(key, detail.label, detail.lines, detail.truncated, width, fg);
-}
-
-function detailPreviewLines(key: string, label: string, lines: readonly string[], truncated: boolean, width: number, fg: string): TranscriptLineModel[] {
-  const output: TranscriptLineModel[] = [];
-  const suffix = truncated ? " (truncated)" : "";
-  output.push(...wrapLine(`  ${label}${suffix}:`, {
-    key: `${key}:label`,
-    fg,
-    width,
-    hangingIndent: "    ",
-  }));
-  for (const [index, line] of lines.entries()) {
-    output.push(...wrapLine(`    ${line || " "}`, {
-      key: `${key}:line:${index}`,
-      fg,
-      width,
-      hangingIndent: "    ",
-    }));
-  }
-  return output;
 }
 
 function approvalLines(item: Extract<ChatTranscriptItem, { kind: "approval" }>, width: number, theme: TuiTheme): TranscriptLineModel[] {
@@ -252,24 +148,4 @@ function approvalLines(item: Extract<ChatTranscriptItem, { kind: "approval" }>, 
     width,
     hangingIndent: "  ",
   });
-}
-
-function markdownFg(tone: MarkdownLineTone, theme: TuiTheme): string {
-  if (tone === "heading") return theme.colors.text.primary;
-  if (tone === "quote" || tone === "code" || tone === "muted") return theme.colors.text.muted;
-  return theme.colors.text.secondary;
-}
-
-function toolFg(tone: "muted" | "pending" | "error", theme: TuiTheme): string {
-  if (tone === "error") return theme.colors.status.error;
-  if (tone === "pending") return theme.colors.status.pending;
-  return theme.colors.text.muted;
-}
-
-function wrapLine(text: string, options: { key: string; fg: string; width: number; hangingIndent?: string }): TranscriptLineModel[] {
-  return wrapTerminalText(text, {
-    key: options.key,
-    width: options.width,
-    ...(options.hangingIndent === undefined ? {} : { hangingIndent: options.hangingIndent }),
-  }).map((line) => ({ key: line.key, text: line.text, fg: options.fg }));
 }

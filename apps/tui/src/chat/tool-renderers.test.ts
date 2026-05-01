@@ -81,6 +81,154 @@ test("details mode promotes truncated preview lines into the cell body", () => {
   });
 });
 
+test("running command tools expose live output tail without mixing it into final compact output", () => {
+  const running = renderToolActivity(toolInput({
+    toolName: "bash",
+    status: "running",
+    displayStatus: "running",
+    inputSummary: { title: "bash", command: "npm install", detail: "npm install" },
+    liveOutput: [
+      { stream: "stdout", delta: "line_01\nline_02\nline_03\nline_04\n", time: 1 },
+      { stream: "stderr", delta: "warn_05\n", time: 2 },
+      { stream: "stdout", delta: "line_06\n", time: 3 },
+    ],
+  }));
+  const completed = renderToolActivity(toolInput({
+    toolName: "bash",
+    inputSummary: { title: "bash", command: "npm install", detail: "npm install" },
+    output: "FINAL_OUTPUT",
+    liveOutput: [
+      { stream: "stdout", delta: "LIVE_OUTPUT_SHOULD_NOT_COMPACT_AFTER_SUCCESS\n", time: 1 },
+    ],
+  }));
+
+  expect(running).toMatchObject({
+    mode: "block",
+    bodyKind: "text",
+    bodyLines: ["line_02", "line_03", "line_04", "warn_05", "line_06"],
+    bodyTruncated: true,
+  });
+  expect(running.details[0]).toMatchObject({
+    label: "live output",
+    lineTones: ["muted", "muted", "muted", "muted", "muted"],
+  });
+  expect(completed).toMatchObject({ mode: "inline", bodyKind: "none", bodyLines: [] });
+  expect(completed.details).toEqual([]);
+});
+
+test("running stderr-only live output stays a live output text body", () => {
+  const rendered = renderToolActivity(toolInput({
+    toolName: "bash",
+    status: "running",
+    displayStatus: "running",
+    inputSummary: { title: "bash", command: "bun test --watch", detail: "bun test --watch" },
+    liveOutput: [
+      { stream: "stderr", delta: "pass 1\nwatching for changes\n", time: 1 },
+    ],
+  }));
+
+  expect(rendered.bodyKind).toBe("text");
+  expect(rendered.bodyLines).toEqual(["pass 1", "watching for changes"]);
+  expect(rendered.details[0]).toMatchObject({
+    label: "live output",
+    tone: "muted",
+    lineTones: ["muted", "muted"],
+  });
+});
+
+test("live output preview reassembles logical lines across delta boundaries", () => {
+  const rendered = renderToolActivity(toolInput({
+    toolName: "bash",
+    status: "running",
+    displayStatus: "running",
+    inputSummary: { title: "bash", command: "npm install", detail: "npm install" },
+    liveOutput: [
+      { stream: "stdout", delta: "hel", time: 1 },
+      { stream: "stdout", delta: "lo\nnext\n", time: 2 },
+    ],
+  }));
+
+  expect(rendered.bodyLines).toEqual(["hello", "next"]);
+  expect(rendered.bodyLines).not.toEqual(["hel", "lo", "next"]);
+  expect(rendered.details[0]?.lineTones).toEqual(["muted", "muted"]);
+});
+
+test("live output preview reassembles stdout and stderr with separate tones", () => {
+  const rendered = renderToolActivity(toolInput({
+    toolName: "bash",
+    status: "running",
+    displayStatus: "running",
+    inputSummary: { title: "bash", command: "npm install", detail: "npm install" },
+    liveOutput: [
+      { stream: "stdout", delta: "out", time: 1 },
+      { stream: "stderr", delta: "err", time: 2 },
+      { stream: "stdout", delta: "put\n", time: 3 },
+      { stream: "stderr", delta: "or\n", time: 4 },
+    ],
+  }));
+
+  expect(rendered.bodyLines).toEqual(["output", "error"]);
+  expect(rendered.details[0]?.lineTones).toEqual(["muted", "muted"]);
+});
+
+test("failed command tools keep compact error summary when live output exists", () => {
+  const failed = renderToolActivity(toolInput({
+    toolName: "bash",
+    status: "failed",
+    displayStatus: "failed",
+    inputSummary: { title: "bash", command: "npm install", detail: "npm install" },
+    error: "command failed",
+    liveOutput: [
+      { stream: "stderr", delta: "installing\n", time: 1 },
+    ],
+  }));
+
+  expect(failed.bodyKind).toBe("text");
+  expect(failed.details.find((detail) => detail.label === "live output")?.lines).toEqual(["installing"]);
+  expect(failed.details.find((detail) => detail.label === "live output")?.lineTones).toEqual(["error"]);
+  expect(failed.compactErrorLines).toEqual(["command failed"]);
+});
+
+test("live output always renders as text even for diff-oriented tools", () => {
+  const rendered = renderToolActivity(toolInput({
+    toolName: "git_diff",
+    status: "running",
+    displayStatus: "running",
+    inputSummary: { title: "git_diff", detail: "src/example.ts" },
+    liveOutput: [
+      { stream: "stdout", delta: "reading diff\n", time: 1 },
+    ],
+  }));
+
+  expect(rendered.bodyKind).toBe("text");
+  expect(rendered.bodyLines).toEqual(["reading diff"]);
+  expect(rendered.details[0]?.label).toBe("live output");
+});
+
+test("details mode keeps a longer live output tail for running command tools", () => {
+  const rendered = renderToolActivity(toolInput({
+    toolName: "bash",
+    status: "running",
+    displayStatus: "running",
+    inputSummary: { title: "bash", command: "npm install", detail: "npm install" },
+    showToolDetails: true,
+    liveOutput: [
+      { stream: "stdout", delta: Array.from({ length: 8 }, (_, index) => `live_${index + 1}`).join("\n"), time: 1 },
+    ],
+  }));
+
+  expect(rendered.details.find((detail) => detail.label === "live output")?.lines).toEqual([
+    "live_1",
+    "live_2",
+    "live_3",
+    "live_4",
+    "live_5",
+    "live_6",
+    "live_7",
+    "live_8",
+  ]);
+});
+
 test("file-changing and diff tools are block-ready while fallback stays inline", () => {
   for (const toolName of ["edit", "write", "apply_patch", "git_diff"]) {
     const rendered = renderToolActivity(toolInput({
@@ -130,5 +278,6 @@ function toolInput(overrides: Partial<ToolRenderInput> & { toolName: string }): 
     ...(overrides.input === undefined ? {} : { input: overrides.input }),
     ...(overrides.output === undefined ? {} : { output: overrides.output }),
     ...(overrides.error === undefined ? {} : { error: overrides.error }),
+    ...(overrides.liveOutput === undefined ? {} : { liveOutput: overrides.liveOutput }),
   };
 }
