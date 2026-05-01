@@ -21,13 +21,18 @@ export interface MarkdownRenderOptions {
 }
 
 const MAX_CACHE_ENTRIES = 80;
-const markdownLineCache = new Map<string, MarkdownTerminalLine[]>();
+const markdownLineCache = new Map<string, { source: string; lines: MarkdownTerminalLine[] }>();
 
 export function markdownToTerminalLines(text: string, options: MarkdownRenderOptions): MarkdownTerminalLine[] {
   const source = text.length > 0 ? text : "...";
-  const cacheKey = `${options.key}\0${options.width}\0${options.prefix ?? ""}\0${options.hangingIndent ?? ""}\0${source}`;
+  const cacheKey = markdownCacheKey(source, options);
   const cached = markdownLineCache.get(cacheKey);
-  if (cached) return cached;
+  if (cached?.source === source) {
+    markdownLineCache.delete(cacheKey);
+    markdownLineCache.set(cacheKey, cached);
+    return cached.lines;
+  }
+  if (cached) markdownLineCache.delete(cacheKey);
 
   let tokens: Token[];
   try {
@@ -40,7 +45,7 @@ export function markdownToTerminalLines(text: string, options: MarkdownRenderOpt
       ...(options.prefix === undefined ? {} : { prefix: options.prefix }),
       ...(options.hangingIndent === undefined ? {} : { hangingIndent: options.hangingIndent }),
     });
-    remember(cacheKey, fallback);
+    remember(cacheKey, source, fallback);
     return fallback;
   }
 
@@ -55,8 +60,24 @@ export function markdownToTerminalLines(text: string, options: MarkdownRenderOpt
       ...(options.prefix === undefined ? {} : { prefix: options.prefix }),
       ...(options.hangingIndent === undefined ? {} : { hangingIndent: options.hangingIndent }),
     });
-  remember(cacheKey, lines);
+  remember(cacheKey, source, lines);
   return lines;
+}
+
+export function textContentHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (const char of value) {
+    const code = char.codePointAt(0) ?? 0;
+    hash ^= code & 0xff;
+    hash = Math.imul(hash, 0x01000193);
+    hash ^= (code >>> 8) & 0xff;
+    hash = Math.imul(hash, 0x01000193);
+    hash ^= (code >>> 16) & 0xff;
+    hash = Math.imul(hash, 0x01000193);
+    hash ^= (code >>> 24) & 0xff;
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${value.length.toString(36)}:${(hash >>> 0).toString(36)}`;
 }
 
 export function wrapTerminalText(text: string, options: {
@@ -260,9 +281,21 @@ function stripHtml(value: string): string {
   return value.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
 }
 
-function remember(key: string, lines: MarkdownTerminalLine[]): void {
-  markdownLineCache.set(key, lines);
-  if (markdownLineCache.size <= MAX_CACHE_ENTRIES) return;
-  const firstKey = markdownLineCache.keys().next().value;
-  if (firstKey) markdownLineCache.delete(firstKey);
+function markdownCacheKey(source: string, options: MarkdownRenderOptions): string {
+  return [
+    options.key,
+    String(options.width),
+    options.prefix ?? "",
+    options.hangingIndent ?? "",
+    textContentHash(source),
+  ].join("\0");
+}
+
+function remember(cacheKey: string, source: string, lines: MarkdownTerminalLine[]): void {
+  markdownLineCache.set(cacheKey, { source, lines });
+  while (markdownLineCache.size > MAX_CACHE_ENTRIES) {
+    const oldest = markdownLineCache.keys().next().value;
+    if (oldest === undefined) break;
+    markdownLineCache.delete(oldest);
+  }
 }

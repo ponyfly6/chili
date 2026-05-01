@@ -1,9 +1,9 @@
 import type { ChatSessionView, ChatTranscriptItem } from "@chili/sdk";
 import { shorten } from "../components/helpers.js";
 import type { TuiTheme } from "../theme/index.js";
-import { markdownToTerminalLines, wrapTerminalText, type MarkdownLineTone } from "./markdown.js";
+import { wrapTerminalText, type MarkdownLineTone } from "./markdown.js";
 import { buildChatDisplayItems, type ChatDisplayItem, type ToolActivityDisplay } from "./presentation.js";
-import { splitStreamingMarkdown } from "./streaming.js";
+import { historyRenderModel } from "./render-model.js";
 import type { ToolActivityDetail } from "./tool-renderers.js";
 import type { LocalTranscriptItem } from "./types.js";
 
@@ -88,9 +88,10 @@ function displayItemLines(item: ChatDisplayItem, width: number, theme: TuiTheme)
     });
   }
   if (item.kind === "assistant_text") {
-    if (item.streaming) return streamingAssistantLines(item, width, theme);
-    return markdownToTerminalLines(item.text || "...", {
+    return historyRenderModel.assistantTextLines({
       key: `display:${item.kind}:${item.id}`,
+      text: item.text,
+      streaming: item.streaming === true,
       width,
       prefix: "🌶️: ",
       hangingIndent: "    ",
@@ -112,33 +113,6 @@ function displayItemLines(item: ChatDisplayItem, width: number, theme: TuiTheme)
     });
   }
   return approvalLines(item.approval, width, theme);
-}
-
-function streamingAssistantLines(item: Extract<ChatDisplayItem, { kind: "assistant_text" }>, width: number, theme: TuiTheme): TranscriptLineModel[] {
-  const { stableText, activeTail } = splitStreamingMarkdown(item.text);
-  const lines = stableText.length > 0
-    ? markdownToTerminalLines(stableText, {
-      key: `display:${item.kind}:${item.id}:stable`,
-      width,
-      prefix: "🌶️: ",
-      hangingIndent: "    ",
-    }).map((line) => ({
-      key: line.key,
-      text: line.text,
-      fg: markdownFg(line.tone, theme),
-    }))
-    : [];
-
-  const tail = activeTail || (lines.length === 0 ? "..." : "");
-  if (!tail) return lines;
-  const prefix = lines.length === 0 ? "🌶️: " : "    ";
-  lines.push(...wrapLine(`${prefix}${tail}`, {
-    key: `display:${item.kind}:${item.id}:active-tail`,
-    fg: markdownFg("text", theme),
-    width,
-    hangingIndent: "    ",
-  }));
-  return lines;
 }
 
 function localItemLines(item: LocalTranscriptItem, width: number, theme: TuiTheme): TranscriptLineModel[] {
@@ -177,9 +151,7 @@ function toolActivityLines(item: ToolActivityDisplay, width: number, theme: TuiT
   if (item.compactErrorLines?.length) {
     lines.push(...detailPreviewLines(`display:tool:${item.id}:compact-error`, "error", item.compactErrorLines, false, width, theme.colors.status.error));
   }
-  for (const detail of item.details) {
-    lines.push(...toolDetailLines(`display:tool:${item.id}:detail:${detail.label}`, detail, width, theme));
-  }
+  lines.push(...toolSupplementLines(`display:tool:${item.id}`, item, width, theme));
   return lines;
 }
 
@@ -194,7 +166,7 @@ function toolGroupLines(item: Extract<ChatDisplayItem, { kind: "tool_group" }>, 
     if (activity.compactErrorLines?.length) {
       lines.push(...detailPreviewLines(`display:${item.kind}:${item.id}:${activity.id}:error`, "error", activity.compactErrorLines, false, width, theme.colors.status.error));
     }
-    if (activity.details.length > 0) {
+    if (activity.details.length > 0 || activity.bodyLines.length > 0) {
       lines.push(...wrapLine(`  ${activity.label}`, {
         key: `display:${item.kind}:${item.id}:${activity.id}:label`,
         fg: theme.colors.text.muted,
@@ -202,11 +174,46 @@ function toolGroupLines(item: Extract<ChatDisplayItem, { kind: "tool_group" }>, 
         hangingIndent: "    ",
       }));
     }
-    for (const detail of activity.details) {
-      lines.push(...toolDetailLines(`display:${item.kind}:${item.id}:${activity.id}:detail:${detail.label}`, detail, width, theme));
-    }
+    lines.push(...toolSupplementLines(`display:${item.kind}:${item.id}:${activity.id}`, activity, width, theme));
   }
   return lines;
+}
+
+function toolSupplementLines(key: string, item: ToolActivityDisplay, width: number, theme: TuiTheme): TranscriptLineModel[] {
+  const lines: TranscriptLineModel[] = [];
+  const bodyDetail = bodyDetailForActivity(item);
+  if (item.bodyLines.length > 0) {
+    lines.push(...detailPreviewLines(`${key}:body:${item.bodyKind}`, bodyLabel(item, bodyDetail), item.bodyLines, item.bodyTruncated, width, bodyFg(item, theme)));
+  }
+  for (const detail of item.details) {
+    if (detail === bodyDetail) continue;
+    lines.push(...toolDetailLines(`${key}:detail:${detail.label}`, detail, width, theme));
+  }
+  return lines;
+}
+
+function bodyDetailForActivity(item: ToolActivityDisplay): ToolActivityDetail | undefined {
+  if (item.bodyLines.length === 0 || item.bodyKind === "none") return undefined;
+  const candidates = item.details.filter((detail) => detail.truncated === item.bodyTruncated && sameLines(detail.lines, item.bodyLines));
+  if (item.bodyKind === "error") return candidates.find((detail) => detail.tone === "error") ?? candidates[0];
+  return candidates.find((detail) => detail.label === "output")
+    ?? candidates.find((detail) => detail.label === "input")
+    ?? candidates[0];
+}
+
+function bodyLabel(item: ToolActivityDisplay, detail: ToolActivityDetail | undefined): string {
+  if (item.bodyKind === "diff") return "diff";
+  if (item.bodyKind === "code") return "code";
+  if (item.bodyKind === "error") return "error";
+  return detail?.label ?? "output";
+}
+
+function bodyFg(item: ToolActivityDisplay, theme: TuiTheme): string {
+  return item.bodyKind === "error" ? theme.colors.status.error : theme.colors.text.muted;
+}
+
+function sameLines(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((line, index) => line === right[index]);
 }
 
 function toolDetailLines(key: string, detail: ToolActivityDetail, width: number, theme: TuiTheme): TranscriptLineModel[] {

@@ -4,9 +4,10 @@ import { act } from "react";
 import type { ChatSessionView, ChatTranscriptItem } from "@chili/sdk";
 import type { MessageId, PartId, ToolCallId } from "@chili/protocol";
 import { resolveTuiTheme } from "../theme/index.js";
-import { markdownToTerminalLines } from "./markdown.js";
+import { markdownToTerminalLines, type MarkdownRenderOptions, type MarkdownTerminalLine } from "./markdown.js";
 import { MessageList } from "./MessageList.js";
 import { buildChatDisplayItems } from "./presentation.js";
+import { HistoryRenderModel } from "./render-model.js";
 import { splitStreamingMarkdown } from "./streaming.js";
 import { renderToolActivity } from "./tool-renderers.js";
 
@@ -155,6 +156,108 @@ test("completed assistant markdown keeps block rendering", async () => {
   expect(frame).toContain("```ts");
 });
 
+test("history render model caches completed assistant markdown lines by part identity and content", () => {
+  const calls: string[] = [];
+  const model = new HistoryRenderModel({
+    maxMarkdownEntries: 8,
+    markdownRenderer: countingMarkdownRenderer(calls),
+  });
+  const options = {
+    key: "display:assistant_text:msg_1:part_1:0",
+    text: "# Done\n\n- ship it",
+    width: 48,
+    prefix: "🌶️: ",
+    hangingIndent: "    ",
+  };
+
+  const first = model.assistantTextLines(options).map((line) => line.text);
+  const second = model.assistantTextLines(options).map((line) => line.text);
+  expect(second).toEqual(first);
+  expect(calls).toHaveLength(1);
+  expect(model.cacheStats()).toMatchObject({
+    markdownCacheHits: 1,
+    markdownCacheMisses: 1,
+    markdownCacheSize: 1,
+  });
+
+  model.assistantTextLines({ ...options, key: "display:assistant_text:msg_2:part_1:0" });
+  model.assistantTextLines({ ...options, text: "# Done\n\n- ship it now" });
+  model.assistantTextLines({ ...options, prefix: "AI: " });
+  model.assistantTextLines({ ...options, hangingIndent: "  " });
+  expect(calls).toHaveLength(5);
+});
+
+test("history render model rewraps assistant markdown when width changes", () => {
+  const calls: string[] = [];
+  const model = new HistoryRenderModel({ markdownRenderer: countingMarkdownRenderer(calls) });
+  const options = {
+    key: "display:assistant_text:msg_width:part_width:0",
+    text: "abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz",
+    prefix: "🌶️: ",
+    hangingIndent: "    ",
+  };
+
+  const narrow = model.assistantTextLines({ ...options, width: 16 }).map((line) => line.text);
+  const wide = model.assistantTextLines({ ...options, width: 96 }).map((line) => line.text);
+  model.assistantTextLines({ ...options, width: 96 });
+
+  expect(calls).toHaveLength(2);
+  expect(narrow.length).toBeGreaterThan(wide.length);
+  expect(model.cacheStats()).toMatchObject({
+    markdownCacheHits: 1,
+    markdownCacheMisses: 2,
+  });
+});
+
+test("history render model caches streaming stable markdown and wraps only the active tail", () => {
+  const calls: string[] = [];
+  const model = new HistoryRenderModel({ markdownRenderer: countingMarkdownRenderer(calls) });
+  const options = {
+    key: "display:assistant_text:msg_stream_cache:part_stream_cache:0",
+    streaming: true,
+    width: 40,
+    prefix: "🌶️: ",
+    hangingIndent: "    ",
+  };
+
+  const first = model.assistantTextLines({ ...options, text: "# Plan\n\npartial" }).map((line) => line.text).join("\n");
+  const second = model.assistantTextLines({ ...options, text: "# Plan\n\npartial answer" }).map((line) => line.text).join("\n");
+
+  expect(calls).toEqual(["# Plan\n\n"]);
+  expect(first).toContain("# Plan");
+  expect(first).toContain("partial");
+  expect(second).toContain("partial answer");
+  expect(calls.some((source) => source.includes("partial"))).toBe(false);
+  expect(model.cacheStats()).toMatchObject({
+    markdownCacheHits: 1,
+    markdownCacheMisses: 1,
+  });
+});
+
+test("history render model bounds assistant markdown line cache", () => {
+  const calls: string[] = [];
+  const model = new HistoryRenderModel({
+    maxMarkdownEntries: 2,
+    markdownRenderer: countingMarkdownRenderer(calls),
+  });
+  const base = {
+    width: 40,
+    prefix: "🌶️: ",
+    hangingIndent: "    ",
+  };
+
+  model.assistantTextLines({ ...base, key: "assistant:one", text: "one" });
+  model.assistantTextLines({ ...base, key: "assistant:two", text: "two" });
+  model.assistantTextLines({ ...base, key: "assistant:three", text: "three" });
+  model.assistantTextLines({ ...base, key: "assistant:one", text: "one" });
+
+  expect(calls).toHaveLength(4);
+  expect(model.cacheStats()).toMatchObject({
+    markdownCacheEvictions: 2,
+    markdownCacheSize: 2,
+  });
+});
+
 test("assistant tool parts stay out of default chat text while tool rows render compact activity", async () => {
   const callId = "toolcall_hidden_raw" as ToolCallId;
   const frame = await renderMessageList([
@@ -298,6 +401,24 @@ test("large tool output is hidden by default and truncated in details mode", asy
   expect(details).not.toContain("line_06");
 });
 
+test("block tool details render the cell body without duplicating the primary detail", async () => {
+  const diff = "diff --git a/src/example.ts b/src/example.ts\n+const ok = true;";
+  const item = chatTool("tool_diff_body" as ToolCallId, "git_diff", "completed", "succeeded", { title: "git_diff", detail: "src/example.ts" }, {
+    output: diff,
+  });
+
+  const compact = await renderMessageList([item], { height: 18 });
+  const details = await renderMessageList([item], { showToolDetails: true, height: 28 });
+
+  expect(compact).toContain("Read git diff src/example.ts");
+  expect(compact).toContain("output hidden (2 lines, details available)");
+  expect(compact).not.toContain("+const ok = true;");
+  expect(details).toContain("diff:");
+  expect(details).toContain("diff --git a/src/example.ts b/src/example.ts");
+  expect(details).toContain("+const ok = true;");
+  expect(details).not.toContain("output:");
+});
+
 test("failed tools show a compact error summary", async () => {
   const error = ["first failure", "second failure", "third failure", "fourth failure", "fifth failure"].join("\n");
   const item = chatTool("tool_failed" as ToolCallId, "bash", "failed", "failed", { title: "bash", command: "bun test", detail: "bun test" }, { error });
@@ -366,6 +487,13 @@ function chatView(items: readonly ChatTranscriptItem[], options: { status?: Chat
 
 function occurrences(value: string, needle: string): number {
   return value.split(needle).length - 1;
+}
+
+function countingMarkdownRenderer(calls: string[]): (text: string, options: MarkdownRenderOptions) => MarkdownTerminalLine[] {
+  return (text, options) => {
+    calls.push(text);
+    return markdownToTerminalLines(text, options);
+  };
 }
 
 function chatTool(

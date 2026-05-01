@@ -7,6 +7,19 @@ export interface ToolActivityDetail {
   truncated: boolean;
 }
 
+export type ToolRenderMode = "inline" | "block";
+export type ToolRenderBodyKind = "none" | "text" | "code" | "diff" | "error";
+
+export interface ToolRenderCellModel {
+  mode: ToolRenderMode;
+  title: string;
+  status: ChatToolDisplayStatus;
+  summary?: string;
+  bodyKind: ToolRenderBodyKind;
+  bodyLines: string[];
+  bodyTruncated: boolean;
+}
+
 export interface ToolRenderInput {
   id: string;
   callId: string;
@@ -25,12 +38,15 @@ export interface ToolRenderer {
   name: string;
   match(toolName: string): boolean;
   label(input: ToolRenderInput): string;
+  mode?(input: ToolRenderInput): ToolRenderMode;
+  summary?(input: ToolRenderInput): string | undefined;
+  bodyKind?(input: ToolRenderInput): Exclude<ToolRenderBodyKind, "none"> | undefined;
   details?(input: ToolRenderInput): ToolActivityDetail[];
   outputHint?(input: ToolRenderInput): string | undefined;
   compactErrorLines?(input: ToolRenderInput): string[] | undefined;
 }
 
-export interface ToolRenderOutput {
+export interface ToolRenderOutput extends ToolRenderCellModel {
   label: string;
   details: ToolActivityDetail[];
   outputHint?: string;
@@ -51,6 +67,7 @@ export class ToolRendererRegistry {
 
   render(input: ToolRenderInput): ToolRenderOutput {
     const renderer = this.rendererFor(input.toolName);
+    const label = renderer.label(input);
     const details = input.showToolDetails
       ? renderer.details?.(input) ?? defaultToolDetails(input)
       : [];
@@ -61,9 +78,18 @@ export class ToolRendererRegistry {
     const compactErrorLines = hasDetails
       ? undefined
       : renderer.compactErrorLines?.(input) ?? defaultCompactErrorLines(input);
+    const body = bodyFromDetails(details, renderer.bodyKind?.(input));
+    const summary = renderer.summary?.(input) ?? defaultSummary(input);
 
     return {
-      label: renderer.label(input),
+      label,
+      mode: renderer.mode?.(input) ?? defaultToolMode(input),
+      title: label,
+      status: input.displayStatus,
+      ...(summary === undefined ? {} : { summary }),
+      bodyKind: body.kind,
+      bodyLines: body.lines,
+      bodyTruncated: body.truncated,
       details,
       ...(outputHint === undefined ? {} : { outputHint }),
       ...(compactErrorLines === undefined ? {} : { compactErrorLines }),
@@ -85,12 +111,14 @@ const bashRenderer: ToolRenderer = {
 const readRenderer: ToolRenderer = {
   name: "read",
   match: (toolName) => explorationToolKind(toolName) === "read",
+  mode: () => "inline",
   label: (input) => labelWithTarget(statusVerb(input.displayStatus, "Read", "Reading"), displayPath(input.inputSummary.path ?? input.inputSummary.detail ?? input.inputSummary.scope ?? "file")),
 };
 
 const searchRenderer: ToolRenderer = {
   name: "search",
   match: (toolName) => explorationToolKind(toolName) === "search",
+  mode: () => "inline",
   label: (input) => {
     const target = input.inputSummary.pattern
       ? `${input.inputSummary.pattern}${input.inputSummary.scope ? ` in ${input.inputSummary.scope}` : ""}`
@@ -102,6 +130,7 @@ const searchRenderer: ToolRenderer = {
 const listRenderer: ToolRenderer = {
   name: "list",
   match: (toolName) => explorationToolKind(toolName) === "list",
+  mode: () => "inline",
   label: (input) => {
     const target = input.inputSummary.pattern
       ? `${input.inputSummary.pattern}${input.inputSummary.path ? ` under ${input.inputSummary.path}` : ""}`
@@ -113,24 +142,32 @@ const listRenderer: ToolRenderer = {
 const editRenderer: ToolRenderer = {
   name: "edit",
   match: (toolName) => matchesTool(toolName, ["edit", "replace"]),
+  mode: () => "block",
+  bodyKind: () => "text",
   label: (input) => labelWithTarget(statusVerb(input.displayStatus, "Edited", "Editing"), displayPath(input.inputSummary.path ?? input.inputSummary.detail ?? "file")),
 };
 
 const writeRenderer: ToolRenderer = {
   name: "write",
   match: (toolName) => matchesTool(toolName, ["write", "write_file"]),
+  mode: () => "block",
+  bodyKind: () => "text",
   label: (input) => labelWithTarget(statusVerb(input.displayStatus, "Wrote", "Writing"), displayPath(input.inputSummary.path ?? input.inputSummary.detail ?? "file")),
 };
 
 const applyPatchRenderer: ToolRenderer = {
   name: "apply_patch",
   match: (toolName) => matchesTool(toolName, ["apply_patch"]),
+  mode: () => "block",
+  bodyKind: () => "diff",
   label: (input) => labelWithTarget(statusVerb(input.displayStatus, "Patched", "Patching"), displayPath(input.inputSummary.path ?? input.inputSummary.detail ?? "files")),
 };
 
 const gitRenderer: ToolRenderer = {
   name: "git",
   match: (toolName) => normalizeToolName(toolName).startsWith("git_"),
+  mode: (input) => normalizeToolName(input.toolName) === "git_diff" ? "block" : defaultToolMode(input),
+  bodyKind: (input) => normalizeToolName(input.toolName) === "git_diff" ? "diff" : undefined,
   label: (input) => {
     const name = normalizeToolName(input.toolName);
     if (name === "git_status") return labelWithTarget(statusVerb(input.displayStatus, "Checked git status", "Checking git status"), pathListTarget(input) ?? input.inputSummary.detail);
@@ -179,6 +216,7 @@ const teamRenderer: ToolRenderer = {
 const fallbackToolRenderer: ToolRenderer = {
   name: "fallback",
   match: () => true,
+  mode: () => "inline",
   label: (input) => {
     const detail = input.inputSummary.command
       ?? input.inputSummary.detail
@@ -259,6 +297,38 @@ function defaultToolDetails(input: ToolRenderInput, options: { maxOutputLines?: 
   return details;
 }
 
+function bodyFromDetails(
+  details: readonly ToolActivityDetail[],
+  requestedKind: Exclude<ToolRenderBodyKind, "none"> | undefined,
+): { kind: ToolRenderBodyKind; lines: string[]; truncated: boolean } {
+  const primary = primaryBodyDetail(details);
+  if (!primary) return { kind: "none", lines: [], truncated: false };
+  const kind = primary.tone === "error" ? "error" : requestedKind ?? "text";
+  return { kind, lines: primary.lines, truncated: primary.truncated };
+}
+
+function primaryBodyDetail(details: readonly ToolActivityDetail[]): ToolActivityDetail | undefined {
+  return details.find((detail) => detail.tone === "error")
+    ?? details.find((detail) => detail.label === "output")
+    ?? details.find((detail) => detail.label === "input")
+    ?? details[0];
+}
+
+function defaultToolMode(input: ToolRenderInput): ToolRenderMode {
+  if (isFailedDisplayStatus(input.displayStatus) || input.error) return "block";
+  if (input.output && isLargeOutput(input.output)) return "block";
+  if (input.showToolDetails && (input.input !== undefined || input.output || input.error)) return "block";
+  return "inline";
+}
+
+function defaultSummary(input: ToolRenderInput): string | undefined {
+  return input.inputSummary.command
+    ?? input.inputSummary.detail
+    ?? input.inputSummary.path
+    ?? input.inputSummary.pattern
+    ?? input.inputSummary.scope;
+}
+
 function defaultOutputHint(input: ToolRenderInput): string | undefined {
   if (input.error || !input.output || !isLargeOutput(input.output)) return undefined;
   const lines = Math.max(1, input.output.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").length);
@@ -281,6 +351,10 @@ function previewTextLines(value: string, options: { maxLines: number; maxLineLen
 
 function isLargeOutput(value: string): boolean {
   return value.length > 180 || value.includes("\n") || /^diff --git/m.test(value);
+}
+
+function isFailedDisplayStatus(status: ChatToolDisplayStatus): boolean {
+  return status === "failed" || status === "rejected" || status === "cancelled";
 }
 
 function statusVerb(status: ChatToolDisplayStatus, succeeded: string, active: string): string {

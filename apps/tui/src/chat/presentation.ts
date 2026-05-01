@@ -14,6 +14,8 @@ import {
   isExplorationTool,
   renderToolActivity,
   type ToolActivityDetail,
+  type ToolRenderBodyKind,
+  type ToolRenderMode,
 } from "./tool-renderers.js";
 
 export type ChatDisplayItem =
@@ -21,7 +23,7 @@ export type ChatDisplayItem =
   | { kind: "assistant_text"; id: string; text: string; streaming?: boolean }
   | { kind: "reasoning"; id: string; text: string; collapsed: true }
   | { kind: "tool_activity"; id: string; activity: ToolActivityDisplay }
-  | { kind: "tool_group"; id: string; label: string; tone: ToolActivityTone; activities: ToolActivityDisplay[] }
+  | { kind: "tool_group"; id: string; label: string; tone: ToolActivityTone; metadata: ToolGroupMetadata; activities: ToolActivityDisplay[] }
   | { kind: "approval"; id: string; approval: ChatApprovalRow }
   | { kind: "summary"; id: string; text: string };
 
@@ -34,15 +36,32 @@ export interface ToolActivityDisplay {
   status: string;
   displayStatus: ChatToolDisplayStatus;
   label: string;
+  mode: ToolRenderMode;
+  title: string;
   tone: ToolActivityTone;
   source: "row" | "fallback";
   details: ToolActivityDetail[];
+  summary?: string;
+  bodyKind: ToolRenderBodyKind;
+  bodyLines: string[];
+  bodyTruncated: boolean;
   inputSummary?: ChatToolInputSummary;
   input?: unknown;
   output?: string;
   error?: string;
   outputHint?: string;
   compactErrorLines?: string[];
+}
+
+export interface ToolGroupMetadata {
+  activeHint?: string;
+  hasErrors: boolean;
+  collapsedCount: number;
+  readCount: number;
+  searchCount: number;
+  listCount: number;
+  activeCount: number;
+  errorCount: number;
 }
 
 interface BuildOptions {
@@ -211,9 +230,15 @@ function toolActivity(input: {
     status: input.status,
     displayStatus: input.displayStatus,
     label: rendered.label,
+    mode: rendered.mode,
+    title: rendered.title,
     tone: toolTone(input.displayStatus),
     source: input.source,
     details: rendered.details,
+    ...(rendered.summary === undefined ? {} : { summary: rendered.summary }),
+    bodyKind: rendered.bodyKind,
+    bodyLines: rendered.bodyLines,
+    bodyTruncated: rendered.bodyTruncated,
     ...(summary ? { inputSummary: summary } : {}),
     ...(input.input === undefined ? {} : { input: input.input }),
     ...(input.output === undefined ? {} : { output: input.output }),
@@ -242,6 +267,7 @@ function groupExplorationTools(items: readonly ChatDisplayItem[]): ChatDisplayIt
       id: `tool-group:${first?.id ?? "start"}:${last?.id ?? "end"}`,
       label: explorationGroupLabel(activities),
       tone: groupTone(activities),
+      metadata: explorationGroupMetadata(activities),
       activities,
     });
     pending = [];
@@ -270,6 +296,24 @@ function explorationGroupLabel(activities: readonly ToolActivityDisplay[]): stri
   const verb = activities.some((activity) => activity.tone === "pending") ? "Exploring" : "Explored";
   const suffix = activities.some((activity) => activity.tone === "error") ? " with errors" : "";
   return parts.length > 0 ? `${verb} ${parts.join(", ")}${suffix}` : `${verb} ${activities.length} tools${suffix}`;
+}
+
+function explorationGroupMetadata(activities: readonly ToolActivityDisplay[]): ToolGroupMetadata {
+  const active = activities.filter((activity) => activity.tone === "pending");
+  const errors = activities.filter((activity) => activity.tone === "error");
+  const readCount = activities.filter((activity) => explorationToolKind(activity.toolName) === "read").length;
+  const searchCount = activities.filter((activity) => explorationToolKind(activity.toolName) === "search").length;
+  const listCount = activities.filter((activity) => explorationToolKind(activity.toolName) === "list").length;
+  return {
+    ...(active.length > 0 ? { activeHint: active.length === 1 ? active[0]?.label ?? "Tool running" : `${active.length} tools running` } : {}),
+    hasErrors: errors.length > 0,
+    collapsedCount: activities.length,
+    readCount,
+    searchCount,
+    listCount,
+    activeCount: active.length,
+    errorCount: errors.length,
+  };
 }
 
 function groupTone(activities: readonly ToolActivityDisplay[]): ToolActivityTone {
