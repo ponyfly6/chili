@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { readdir, readFile } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { basename, join, relative } from "node:path";
 import type { SessionId, ThreadId } from "@chili/protocol";
 import { parseArgs, teamLiveStreamInput } from "./index.js";
 import { generateSystemTheme, initialTuiThemeId, resolveTuiTheme } from "./theme/index.js";
@@ -36,7 +36,7 @@ test("parses runtime flags and keeps Team Live stream unscoped for child-session
 });
 
 test("apps/tui source does not import core, server, or store packages", async () => {
-  const root = join(import.meta.dir);
+  const root = tuiSourceRoot();
   const files = await sourceFiles(root);
   const forbidden = /from\s+["'](?:@chili\/(?:core|server|store)|.*packages\/(?:core|server|store)\b)/;
 
@@ -47,7 +47,7 @@ test("apps/tui source does not import core, server, or store packages", async ()
 });
 
 test("status footer does not keep a local model context catalog", async () => {
-  const source = await readFile(join(import.meta.dir, "chat", "StatusFooter.tsx"), "utf8");
+  const source = await readFile(join(tuiSourceRoot(), "chat", "StatusFooter.tsx"), "utf8");
 
   expect(source).not.toContain("KNOWN_CONTEXT_WINDOWS");
   expect(source).not.toContain("deepseek-v4-pro");
@@ -177,4 +177,9 @@ async function sourceFiles(dir: string): Promise<string[]> {
     if (entry.isFile() && /\.(?:ts|tsx)$/.test(entry.name)) output.push(path);
   }
   return output;
+}
+
+function tuiSourceRoot(): string {
+  if (basename(import.meta.dir) === "dist") return join(import.meta.dir, "..", "src");
+  return import.meta.dir;
 }
