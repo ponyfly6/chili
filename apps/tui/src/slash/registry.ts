@@ -1,4 +1,13 @@
 import type { SlashCommand, SlashCommandContext, SlashCompletion } from "./types.js";
+import {
+  REASONING_LEVELS,
+  defaultModelCandidates,
+  isReasoningLevel,
+  modelDescriptorSelection,
+  modelSelectionLabel,
+  parseModelCommand,
+  type ReasoningLevel,
+} from "../model-state.js";
 
 export function createDefaultSlashCommands(): SlashCommand[] {
   return [
@@ -88,6 +97,47 @@ export function createDefaultSlashCommands(): SlashCommand[] {
       isSafeConcurrent: true,
       run: () => ({ type: "auth_action", action: "status", provider: "openai-codex" }),
     },
+    {
+      name: "model",
+      description: "Select model",
+      category: "model",
+      argumentHint: "[provider/model]",
+      isSafeConcurrent: true,
+      complete: modelCompletions,
+      run: (ctx, args) => {
+        const match = parseModelCommand(args, modelCandidates(ctx));
+        if (match.selection) {
+          return {
+            type: "set_model",
+            selection: match.selection,
+            ...(match.reasoningLevel ? { reasoningLevel: match.reasoningLevel } : {}),
+          };
+        }
+        return {
+          type: "open_model_picker",
+          ...(match.query ? { query: match.query } : {}),
+        };
+      },
+    },
+    {
+      name: "thinking",
+      aliases: ["reasoning"],
+      description: "Set reasoning level",
+      category: "model",
+      argumentHint: "<off|minimal|low|medium|high|xhigh>",
+      isSafeConcurrent: true,
+      complete: reasoningCompletions,
+      run: (_ctx, args) => {
+        const level = args.trim().toLowerCase();
+        if (!level) return { type: "open_reasoning_picker" };
+        if (isReasoningLevel(level)) return { type: "set_reasoning", level };
+        return {
+          type: "local_message",
+          level: "error",
+          text: `Unknown reasoning level: ${args.trim() || "none"}`,
+        };
+      },
+    },
   ];
 }
 
@@ -163,4 +213,78 @@ function uniqueCompletions(completions: readonly SlashCompletion[]): SlashComple
     output.push(completion);
   }
   return output;
+}
+
+function modelCompletions(ctx: SlashCommandContext, input: string): SlashCompletion[] {
+  const query = commandArgument(input, "model");
+  if (query === undefined) return [];
+
+  const candidates = modelCandidates(ctx);
+  const normalized = query.trim().toLowerCase();
+  const matches = candidates
+    .filter((model) => !normalized || fuzzyMatch(`${model.provider} ${model.model} ${model.provider}/${model.model} ${model.displayName ?? ""}`.toLowerCase(), normalized))
+    .slice(0, 8);
+  return matches.flatMap((model) => {
+    const selection = modelDescriptorSelection(model);
+    const canonical = modelSelectionLabel(selection);
+    const description = model.provider;
+    return [
+      {
+        value: `/model ${canonical}`,
+        label: canonical,
+        description,
+        category: "model" as const,
+      },
+      {
+        value: `/model ${model.model}`,
+        label: model.model,
+        description: `${description} model id`,
+        category: "model" as const,
+      },
+    ];
+  });
+}
+
+function reasoningCompletions(_ctx: SlashCommandContext, input: string): SlashCompletion[] {
+  const thinkingQuery = commandArgument(input, "thinking");
+  const reasoningQuery = commandArgument(input, "reasoning");
+  const query = thinkingQuery ?? reasoningQuery;
+  if (query === undefined) return [];
+  const command = thinkingQuery !== undefined ? "thinking" : "reasoning";
+  const normalized = query.trim().toLowerCase();
+  return REASONING_LEVELS
+    .filter((level) => !normalized || level.startsWith(normalized) || fuzzyMatch(level, normalized))
+    .map((level) => ({
+      value: `/${command} ${level}`,
+      label: level,
+      description: reasoningDescription(level),
+      category: "model" as const,
+    }));
+}
+
+function commandArgument(input: string, command: string): string | undefined {
+  if (input === `${command} `) return "";
+  if (input.startsWith(`${command} `)) return input.slice(command.length + 1);
+  return undefined;
+}
+
+function modelCandidates(ctx: SlashCommandContext) {
+  return ctx.modelCandidates ?? defaultModelCandidates();
+}
+
+function reasoningDescription(level: ReasoningLevel): string {
+  switch (level) {
+    case "off":
+      return "No reasoning";
+    case "minimal":
+      return "Very brief reasoning";
+    case "low":
+      return "Light reasoning";
+    case "medium":
+      return "Moderate reasoning";
+    case "high":
+      return "Deep reasoning";
+    case "xhigh":
+      return "Maximum reasoning";
+  }
 }

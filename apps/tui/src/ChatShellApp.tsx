@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { useAppContext, useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, MouseEvent, PasteEvent, Selection } from "@opentui/core";
 import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
@@ -11,6 +11,20 @@ import { TeamLiveSurface } from "./TeamLiveApp.js";
 import { teamLiveModel, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
 import { useChatRuntime, type ChatRuntimeState } from "./useChatRuntime.js";
 import { findAction } from "./components/helpers.js";
+import {
+  DEFAULT_REASONING_LEVEL,
+  REASONING_LEVELS,
+  defaultOpenAICodexSelection,
+  filterModelCandidates,
+  isValidModelSelection,
+  type ModelCandidate,
+  modelDescriptorSelection,
+  modelSelectionLabel,
+  modelSupportsReasoning,
+  sameModelSelection,
+  type ModelSelection,
+  type ReasoningLevel,
+} from "./model-state.js";
 import { ApprovalDock, approvalDockHeight } from "./chat/ApprovalDock.js";
 import { BrandMark } from "./chat/BrandMark.js";
 import { charDisplayWidth } from "./chat/markdown.js";
@@ -36,6 +50,20 @@ import {
 
 type ShellView = "chat" | "team" | "help" | "agents" | "status" | "transcript";
 type AppendLocalItem = (level: "info" | "error", text: string) => void;
+
+interface SlashActions {
+  setView: (view: ShellView) => void;
+  appendLocalItem: AppendLocalItem;
+  startNewChatSession: () => Promise<void>;
+  setPrompt: (value: string | ((current: string) => string)) => void;
+  openThemePicker: () => void;
+  setAuthManualPrompt: (value: AuthManualPrompt | undefined) => void;
+  openModelPicker: (query?: string) => void;
+  setModelSelection: (selection: ModelSelection, reasoningLevel?: ReasoningLevel) => Promise<void>;
+  openReasoningPicker: () => void;
+  setReasoningLevel: (level: ReasoningLevel) => Promise<void>;
+  ensureOpenAICodexDefaultModel: () => Promise<void>;
+}
 
 export interface ChatShellOptions extends TeamLiveTuiOptions {
   modelName?: string;
@@ -124,6 +152,14 @@ export function ChatShellSurface(props: {
   const acceptedCompletionPromptRef = useRef<string | undefined>(undefined);
   const [themeId, setThemeId] = useState(() => initialTuiThemeId(props.options?.themeId));
   const [themePicker, setThemePicker] = useState<ThemePickerNavigation | undefined>(undefined);
+  const modelCandidates = useMemo(
+    () => (props.runtime.modelCandidates ?? []).filter((candidate) => candidate.available !== false),
+    [props.runtime.modelCandidates],
+  );
+  const [modelSelection, setModelSelectionState] = useState<ModelSelection | undefined>(undefined);
+  const [reasoningLevel, setReasoningLevelState] = useState<ReasoningLevel | undefined>(undefined);
+  const [modelPicker, setModelPicker] = useState<ModelPickerNavigation | undefined>(undefined);
+  const [reasoningPicker, setReasoningPicker] = useState<ReasoningPickerNavigation | undefined>(undefined);
   const [messageScrollOffset, setMessageScrollOffset] = useState(0);
   const [transcriptScrollOffset, setTranscriptScrollOffset] = useState(0);
   const [authManualPrompt, setAuthManualPromptState] = useState<AuthManualPrompt | undefined>(undefined);
@@ -157,6 +193,17 @@ export function ChatShellSurface(props: {
     previousSessionKey.current = sessionKey;
     clearLocalItems();
   }, [clearLocalItems, sessionKey]);
+  useEffect(() => {
+    const config = props.runtime.modelConfig;
+    if (!config) return;
+    setModelSelectionState(config.modelSelection);
+    setReasoningLevelState(config.reasoningLevel);
+  }, [
+    props.runtime.modelConfig?.modelSelection?.provider,
+    props.runtime.modelConfig?.modelSelection?.model,
+    props.runtime.modelConfig?.reasoningLevel,
+    props.runtime.modelConfig,
+  ]);
   const scrollEstimateWidth = Math.max(24, dimensions.width - 8);
   const chatLineCount = useMemo(() => estimatedChatLineCount(props.runtime.chatView, localItems, showToolDetails, scrollEstimateWidth), [localItems, props.runtime.chatView, scrollEstimateWidth, showToolDetails]);
   const transcriptLineCount = useMemo(() => estimatedTranscriptLineCount(props.runtime.chatView.items, localItems, scrollEstimateWidth), [localItems, props.runtime.chatView.items, scrollEstimateWidth]);
@@ -172,7 +219,10 @@ export function ChatShellSurface(props: {
   const slashContext = useMemo<SlashCommandContext>(() => ({
     model: props.model,
     ...(props.options?.cwd ? { cwd: props.options.cwd } : {}),
-  }), [props.model, props.options?.cwd]);
+    ...(modelSelection ? { modelSelection } : {}),
+    ...(reasoningLevel ? { reasoningLevel } : {}),
+    modelCandidates,
+  }), [modelCandidates, modelSelection, props.model, props.options?.cwd, reasoningLevel]);
   const completionSuppressed = acceptedCompletionPrompt !== undefined && prompt === acceptedCompletionPrompt;
   const completions = prompt.startsWith("/") && !completionSuppressed
     ? slashCompletions(commands, slashContext, prompt)
@@ -257,6 +307,89 @@ export function ChatShellSurface(props: {
       return undefined;
     });
   }, []);
+  const openModelPicker = useCallback((query = "") => {
+    void props.runtime.refreshModelConfig?.();
+    const index = modelPickerIndex(modelCandidates, query, modelSelection);
+    setReasoningPicker(undefined);
+    setThemePicker(undefined);
+    setModelPicker({ query, selectedIndex: index });
+  }, [modelCandidates, modelSelection, props.runtime]);
+  const closeModelPicker = useCallback(() => {
+    setModelPicker(undefined);
+  }, []);
+  const openReasoningPicker = useCallback(() => {
+    const selectedIndex = Math.max(0, REASONING_LEVELS.indexOf(reasoningLevel ?? DEFAULT_REASONING_LEVEL));
+    setModelPicker(undefined);
+    setThemePicker(undefined);
+    setReasoningPicker({ selectedIndex });
+  }, [reasoningLevel]);
+  const closeReasoningPicker = useCallback(() => {
+    setReasoningPicker(undefined);
+  }, []);
+  const setModelSelection = useCallback(async (selection: ModelSelection, nextReasoningLevel?: ReasoningLevel) => {
+    const persisted = props.runtime.setRuntimeModel ? await props.runtime.setRuntimeModel(selection) : true;
+    if (!persisted) {
+      setModelPicker(undefined);
+      appendLocalItem("error", `Model unchanged: failed to persist ${modelSelectionLabel(selection)}`);
+      return;
+    }
+
+    let reasoningPersisted = false;
+    let resolvedReasoning: ReasoningLevel | undefined;
+    if (modelSupportsReasoning(selection, modelCandidates)) {
+      resolvedReasoning = nextReasoningLevel;
+    } else {
+      resolvedReasoning = "off";
+    }
+
+    if (resolvedReasoning !== undefined) {
+      reasoningPersisted = props.runtime.setRuntimeReasoning
+        ? await props.runtime.setRuntimeReasoning(resolvedReasoning)
+        : true;
+      if (!reasoningPersisted) {
+        appendLocalItem("error", `Thinking unchanged: failed to persist ${resolvedReasoning}`);
+      }
+    }
+
+    setModelSelectionState(selection);
+    if (resolvedReasoning && reasoningPersisted) setReasoningLevelState(resolvedReasoning);
+    setModelPicker(undefined);
+    const reasoningText = resolvedReasoning && reasoningPersisted ? ` (thinking ${resolvedReasoning})` : "";
+    appendLocalItem("info", `Model: ${modelSelectionLabel(selection)}${reasoningText}`);
+  }, [appendLocalItem, modelCandidates, props.runtime]);
+
+  const setReasoningLevel = useCallback(async (level: ReasoningLevel) => {
+    const persisted = props.runtime.setRuntimeReasoning ? await props.runtime.setRuntimeReasoning(level) : true;
+    if (!persisted) {
+      setReasoningPicker(undefined);
+      appendLocalItem("error", `Thinking unchanged: failed to persist ${level}`);
+      return;
+    }
+    setReasoningLevelState(level);
+    setReasoningPicker(undefined);
+    appendLocalItem("info", `Thinking: ${level}`);
+  }, [appendLocalItem, props.runtime]);
+
+  const ensureOpenAICodexDefaultModel = useCallback(async () => {
+    await props.runtime.refreshModelConfig?.();
+    if (isValidModelSelection(modelSelection, modelCandidates)) return;
+    const selection = defaultOpenAICodexSelection();
+    await setModelSelection(selection);
+    await props.runtime.refreshModelConfig?.();
+  }, [modelCandidates, modelSelection, props.runtime, setModelSelection]);
+  const slashActions = useMemo<SlashActions>(() => ({
+    setView,
+    appendLocalItem,
+    startNewChatSession,
+    setPrompt,
+    openThemePicker,
+    setAuthManualPrompt,
+    openModelPicker,
+    setModelSelection,
+    openReasoningPicker,
+    setReasoningLevel,
+    ensureOpenAICodexDefaultModel,
+  }), [appendLocalItem, ensureOpenAICodexDefaultModel, openModelPicker, openReasoningPicker, openThemePicker, setAuthManualPrompt, setModelSelection, setPrompt, setReasoningLevel, startNewChatSession]);
   const runSelectedSlashCompletion = useCallback(() => {
     if (!slashCompletionOpen) return false;
     const completion = completions[selectedCompletionIndex] ?? completions[0];
@@ -264,9 +397,9 @@ export function ChatShellSurface(props: {
     updateAcceptedCompletionPrompt(undefined);
     history.resetNavigation();
     setPrompt("");
-    void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, setAuthManualPrompt);
+    void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, slashActions);
     return true;
-  }, [appendLocalItem, commands, completions, history, openThemePicker, props.model, props.runtime, selectedCompletionIndex, setAuthManualPrompt, setPrompt, slashCompletionOpen, slashContext, startNewChatSession, updateAcceptedCompletionPrompt]);
+  }, [commands, completions, history, props.model, props.runtime, selectedCompletionIndex, setPrompt, slashActions, slashCompletionOpen, slashContext, updateAcceptedCompletionPrompt]);
   useEffect(() => {
     setCompletionIndex(0);
   }, [prompt]);
@@ -281,8 +414,13 @@ export function ChatShellSurface(props: {
     setCompletionIndex((current) => clampIndex(current, completions.length));
   }, [completions.length]);
 
+  const selectorOpen = Boolean(modelPicker || reasoningPicker);
   const disabledReason = authManualPrompt
     ? undefined
+    : modelPicker
+    ? "Choose a model"
+    : reasoningPicker
+    ? "Choose thinking level"
     : slashInputActive
     ? undefined
     : props.runtime.chatView.pendingApprovals.length > 0
@@ -403,8 +541,24 @@ export function ChatShellSurface(props: {
     if (paletteOpen) {
       handlePaletteKey(key, paletteItems, paletteIndex, setPaletteIndex, (completion) => {
         setPaletteOpen(false);
-        void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, setAuthManualPrompt);
+        void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, slashActions);
       }, () => setPaletteOpen(false));
+      return;
+    }
+    if (modelPicker) {
+      handleModelPickerKey(key, modelPicker, modelCandidates, modelSelection, {
+        setModelPicker,
+        selectModel: setModelSelection,
+        cancel: closeModelPicker,
+      });
+      return;
+    }
+    if (reasoningPicker) {
+      handleReasoningPickerKey(key, reasoningPicker, {
+        setReasoningPicker,
+        selectLevel: setReasoningLevel,
+        cancel: closeReasoningPicker,
+      });
       return;
     }
     if (themePicker) {
@@ -492,9 +646,17 @@ export function ChatShellSurface(props: {
     modeName: props.options?.modeName ?? "Build",
     modelName: props.options?.modelName ?? "auto",
     providerName: props.options?.providerName ?? "runtime",
+    ...(modelSelection ? { modelSelection } : {}),
+    ...(reasoningLevel ? { reasoningLevel } : {}),
     cwd,
     ...(gitBranch ? { gitBranch } : {}),
   };
+  const modelPickerModel = modelPicker
+    ? modelPickerView(modelPicker, modelCandidates, modelSelection)
+    : undefined;
+  const reasoningPickerModel = reasoningPicker
+    ? reasoningPickerView(reasoningPicker, reasoningLevel ?? DEFAULT_REASONING_LEVEL)
+    : undefined;
 
   if (view === "team") {
     return (
@@ -526,7 +688,7 @@ export function ChatShellSurface(props: {
           onSubmit={() => {
             if (submitAuthManualInput()) return;
             if (runSelectedSlashCompletion()) return;
-            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, setAuthManualPrompt, history.record);
+            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record);
           }}
           completions={completions}
           completionIndex={selectedCompletionIndex}
@@ -545,6 +707,8 @@ export function ChatShellSurface(props: {
             selectedIndex: themePicker.index,
             systemThemeAvailable,
           } : undefined}
+          modelPicker={modelPickerModel}
+          reasoningPicker={reasoningPickerModel}
         />
       ) : (
         <SessionScreen
@@ -558,7 +722,7 @@ export function ChatShellSurface(props: {
             if (submitAuthManualInput()) return;
             if (runSelectedSlashCompletion()) return;
             setMessageScrollOffset(0);
-            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, setAuthManualPrompt, history.record);
+            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record);
           }}
           onMessageScroll={(event) => {
             const direction = event.scroll?.direction;
@@ -607,6 +771,8 @@ export function ChatShellSurface(props: {
             selectedIndex: themePicker.index,
             systemThemeAvailable,
           } : undefined}
+          modelPicker={modelPickerModel}
+          reasoningPicker={reasoningPickerModel}
         />
       )}
     </box>
@@ -633,17 +799,21 @@ function HomeScreen(props: {
   disabledReason?: string | undefined;
   theme: TuiTheme;
   themePicker?: ThemePickerModel | undefined;
+  modelPicker?: ModelPickerModel | undefined;
+  reasoningPicker?: ReasoningPickerModel | undefined;
 }) {
   const promptWidth = Math.min(76, Math.max(42, props.width - 12));
   const compactBrand = props.width < 92 || props.height < 32;
   const feedback = currentFeedback(props.runtime);
   const footerHeight = statusFooterHeight(props.width);
   const themePickerHeight = props.themePicker ? pickerHeight(props.themePicker.items.length) : 0;
+  const selectorHeight = selectorPickerHeight(props.modelPicker, props.reasoningPicker);
   const maxCommandItems = promptMenuItemLimit({
     height: props.height,
     footerHeight,
     approvalHeight: 0,
     themePickerHeight,
+    selectorHeight,
     feedback: Boolean(feedback),
     menuOpen: props.paletteOpen || props.completions.length > 0,
   });
@@ -656,6 +826,8 @@ function HomeScreen(props: {
         <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Chili"}</text>
         <box height={1} />
         {props.themePicker ? <ThemePicker model={props.themePicker} theme={props.theme} /> : null}
+        {props.modelPicker ? <ModelPicker model={props.modelPicker} theme={props.theme} /> : null}
+        {props.reasoningPicker ? <ReasoningPicker model={props.reasoningPicker} theme={props.theme} /> : null}
         <PromptComposer
           width={promptWidth}
           prompt={props.prompt}
@@ -707,6 +879,8 @@ function SessionScreen(props: {
   disabledReason?: string | undefined;
   theme: TuiTheme;
   themePicker?: ThemePickerModel | undefined;
+  modelPicker?: ModelPickerModel | undefined;
+  reasoningPicker?: ReasoningPickerModel | undefined;
 }) {
   const promptWidth = Math.min(96, Math.max(42, props.width - 8));
   const messageWidth = Math.max(24, props.width - 8);
@@ -714,11 +888,13 @@ function SessionScreen(props: {
   const feedback = currentFeedback(props.runtime);
   const footerHeight = statusFooterHeight(props.width);
   const themePickerHeight = props.themePicker ? pickerHeight(props.themePicker.items.length) : 0;
+  const selectorHeight = selectorPickerHeight(props.modelPicker, props.reasoningPicker);
   const maxCommandItems = promptMenuItemLimit({
     height: props.height,
     footerHeight,
     approvalHeight,
     themePickerHeight,
+    selectorHeight,
     feedback: Boolean(feedback),
     menuOpen: props.paletteOpen || props.completions.length > 0,
   });
@@ -729,9 +905,9 @@ function SessionScreen(props: {
     feedback,
     maxCommandItems,
   });
-  const messagePaneHeight = Math.max(1, props.height - approvalHeight - themePickerHeight - promptHeight - footerHeight);
+  const messagePaneHeight = Math.max(1, props.height - approvalHeight - themePickerHeight - selectorHeight - promptHeight - footerHeight);
   const transcriptChrome = props.height < 16 ? 6 : 3;
-  const visibleLimit = Math.max(1, props.height - approvalHeight - themePickerHeight - promptHeight - footerHeight - transcriptChrome);
+  const visibleLimit = Math.max(1, props.height - approvalHeight - themePickerHeight - selectorHeight - promptHeight - footerHeight - transcriptChrome);
   return (
     <box
       width="100%"
@@ -779,6 +955,8 @@ function SessionScreen(props: {
       />
       <box width="100%" alignItems="center" flexDirection="column">
         {props.themePicker ? <ThemePicker model={props.themePicker} theme={props.theme} /> : null}
+        {props.modelPicker ? <ModelPicker model={props.modelPicker} theme={props.theme} /> : null}
+        {props.reasoningPicker ? <ReasoningPicker model={props.reasoningPicker} theme={props.theme} /> : null}
         <PromptComposer
           width={promptWidth}
           prompt={props.prompt}
@@ -866,8 +1044,49 @@ interface ThemePickerModel {
   systemThemeAvailable: boolean;
 }
 
+interface ModelPickerNavigation {
+  query: string;
+  selectedIndex: number;
+}
+
+interface ModelPickerModel {
+  query: string;
+  items: readonly ModelPickerItem[];
+  selectedIndex: number;
+  total: number;
+}
+
+interface ModelPickerItem {
+  selection: ModelSelection;
+  label: string;
+  provider: string;
+  displayName?: string | undefined;
+  current: boolean;
+}
+
+interface ReasoningPickerNavigation {
+  selectedIndex: number;
+}
+
+interface ReasoningPickerModel {
+  items: readonly ReasoningPickerItem[];
+  selectedIndex: number;
+}
+
+interface ReasoningPickerItem {
+  level: ReasoningLevel;
+  description: string;
+  current: boolean;
+}
+
 function pickerHeight(itemCount: number): number {
   return itemCount + 3;
+}
+
+function selectorPickerHeight(modelPicker: ModelPickerModel | undefined, reasoningPicker: ReasoningPickerModel | undefined): number {
+  if (modelPicker) return Math.min(modelPicker.items.length, 8) + 4;
+  if (reasoningPicker) return reasoningPicker.items.length + 3;
+  return 0;
 }
 
 function promptMenuItemLimit(input: {
@@ -875,6 +1094,7 @@ function promptMenuItemLimit(input: {
   footerHeight: number;
   approvalHeight: number;
   themePickerHeight: number;
+  selectorHeight: number;
   feedback: boolean;
   menuOpen: boolean;
 }): number {
@@ -882,6 +1102,7 @@ function promptMenuItemLimit(input: {
   const reserved = input.footerHeight
     + input.approvalHeight
     + input.themePickerHeight
+    + input.selectorHeight
     + PROMPT_INPUT_HEIGHT
     + (input.feedback ? 1 : 0)
     + 1;
@@ -911,6 +1132,134 @@ function ThemePicker(props: { model: ThemePickerModel; theme: TuiTheme }) {
   );
 }
 
+function ModelPicker(props: { model: ModelPickerModel; theme: TuiTheme }) {
+  const visibleItems = visiblePickerItems(props.model.items, props.model.selectedIndex, 8);
+  return (
+    <box width="100%" flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.focus} paddingX={1}>
+      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Model"}</text>
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`Filter: ${props.model.query || "all"}`}</text>
+      {visibleItems.map(({ item, index }) => {
+        const selected = index === props.model.selectedIndex;
+        const suffix = item.current ? " *" : "";
+        return (
+          <text
+            key={modelSelectionLabel(item.selection)}
+            fg={selected ? props.theme.colors.menu.selectedText : props.theme.colors.menu.text}
+            bg={selected ? props.theme.colors.menu.selectedBackground : props.theme.colors.menu.background}
+            wrapMode="none"
+            truncate
+          >
+            {`${selected ? ">" : " "} ${item.label} [${item.provider}]${suffix}`}
+          </text>
+        );
+      })}
+      {props.model.items.length === 0 ? (
+        <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"  No matching models"}</text>
+      ) : (
+        <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{modelPickerDetail(props.model)}</text>
+      )}
+    </box>
+  );
+}
+
+function ReasoningPicker(props: { model: ReasoningPickerModel; theme: TuiTheme }) {
+  return (
+    <box width="100%" flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.focus} paddingX={1}>
+      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Thinking"}</text>
+      {props.model.items.map((item, index) => {
+        const selected = index === props.model.selectedIndex;
+        const suffix = item.current ? " *" : "";
+        return (
+          <text
+            key={item.level}
+            fg={selected ? props.theme.colors.menu.selectedText : props.theme.colors.menu.text}
+            bg={selected ? props.theme.colors.menu.selectedBackground : props.theme.colors.menu.background}
+            wrapMode="none"
+            truncate
+          >
+            {`${selected ? ">" : " "} ${item.level.padEnd(7)} ${item.description}${suffix}`}
+          </text>
+        );
+      })}
+    </box>
+  );
+}
+
+function modelPickerView(
+  picker: ModelPickerNavigation,
+  candidates: readonly ModelCandidate[],
+  current: ModelSelection | undefined,
+): ModelPickerModel {
+  const items = filterModelCandidates(candidates, picker.query, current).map((candidate) => ({
+    selection: modelDescriptorSelection(candidate),
+    label: candidate.model,
+    provider: candidate.provider,
+    ...(candidate.displayName ? { displayName: candidate.displayName } : {}),
+    current: sameModelSelection(current, modelDescriptorSelection(candidate)),
+  }));
+  return {
+    query: picker.query,
+    items,
+    selectedIndex: clampIndex(picker.selectedIndex, items.length),
+    total: items.length,
+  };
+}
+
+function reasoningPickerView(picker: ReasoningPickerNavigation, current: ReasoningLevel): ReasoningPickerModel {
+  const items = REASONING_LEVELS.map((level) => ({
+    level,
+    description: reasoningDescription(level),
+    current: level === current,
+  }));
+  return {
+    items,
+    selectedIndex: clampIndex(picker.selectedIndex, items.length),
+  };
+}
+
+function visiblePickerItems<T>(items: readonly T[], selectedIndex: number, maxVisible: number): Array<{ item: T; index: number }> {
+  const start = Math.max(0, Math.min(selectedIndex - Math.floor(maxVisible / 2), Math.max(0, items.length - maxVisible)));
+  return items.slice(start, start + maxVisible).map((item, offset) => ({ item, index: start + offset }));
+}
+
+function modelPickerDetail(model: ModelPickerModel): string {
+  const selected = model.items[model.selectedIndex];
+  if (!selected) return "  No matching models";
+  const count = model.total > 1 ? ` (${model.selectedIndex + 1}/${model.total})` : "";
+  const displayName = selected.displayName && selected.displayName !== selected.label ? ` ${selected.displayName}` : "";
+  return `  ${modelSelectionLabel(selected.selection)}${displayName}${count}`;
+}
+
+function modelPickerIndex(
+  candidates: readonly ModelCandidate[],
+  query: string,
+  current: ModelSelection | undefined,
+): number {
+  const items = filterModelCandidates(candidates, query, current);
+  if (items.length === 0) return 0;
+  const currentIndex = current
+    ? items.findIndex((item) => sameModelSelection(current, modelDescriptorSelection(item)))
+    : -1;
+  return currentIndex >= 0 ? currentIndex : 0;
+}
+
+function reasoningDescription(level: ReasoningLevel): string {
+  switch (level) {
+    case "off":
+      return "No reasoning";
+    case "minimal":
+      return "Very brief reasoning (~1k tokens)";
+    case "low":
+      return "Light reasoning (~2k tokens)";
+    case "medium":
+      return "Moderate reasoning (~8k tokens)";
+    case "high":
+      return "Deep reasoning (~16k tokens)";
+    case "xhigh":
+      return "Maximum reasoning (~32k tokens)";
+  }
+}
+
 function HelpView(props: { commands: readonly SlashCommand[]; theme: TuiTheme; showToolDetails: boolean }) {
   const detailsText = props.showToolDetails ? "on" : "off";
   return (
@@ -937,6 +1286,9 @@ function StatusView(props: {
   transcriptActive: boolean;
 }) {
   const selected = props.model.selected;
+  const modelLabel = props.options.modelSelection
+    ? modelSelectionLabel(props.options.modelSelection)
+    : `${props.options.providerName}/${props.options.modelName}`;
   return (
     <box width="100%" height="100%" flexDirection="column">
       <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Status"}</text>
@@ -945,8 +1297,8 @@ function StatusView(props: {
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`session: ${props.runtime.activeSessionId ?? "none"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thread: ${props.runtime.activeThreadId ?? "none"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`mode: ${props.options.modeName}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`model: ${props.options.modelName}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`provider: ${props.options.providerName}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`model: ${modelLabel}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thinking: ${props.options.reasoningLevel ?? "default"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`details: ${props.showToolDetails ? "on" : "off"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`transcript: ${props.transcriptActive ? "on" : "off"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`cwd: ${props.options.cwd}`}</text>
@@ -980,12 +1332,7 @@ async function submitPrompt(
   ctx: SlashCommandContext,
   model: TeamLiveView,
   runtime: ChatRuntimeState,
-  setView: (view: ShellView) => void,
-  appendLocalItem: AppendLocalItem,
-  startNewChatSession: () => Promise<void>,
-  setPrompt: (value: string | ((current: string) => string)) => void,
-  openThemePicker: () => void,
-  setAuthManualPrompt: (value: AuthManualPrompt | undefined) => void,
+  actions: SlashActions,
   onAccepted?: (text: string) => void,
 ): Promise<void> {
   const trimmed = prompt.trim();
@@ -993,23 +1340,26 @@ async function submitPrompt(
   if (trimmed.startsWith("/")) {
     const slashMatch = resolveSlashCommand(commands, trimmed);
     if (slashMatch) {
-      setPrompt("");
-      await runResolvedSlashCommand(slashMatch, ctx, model, runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, setAuthManualPrompt);
+      actions.setPrompt("");
+      await runResolvedSlashCommand(slashMatch, ctx, model, runtime, actions);
       return;
     }
     if (isSlashCommandCandidate(commands, ctx, trimmed)) {
-      appendLocalItem("error", `Unknown command: ${trimmed}`);
+      actions.appendLocalItem("error", `Unknown command: ${trimmed}`);
       return;
     }
   }
   if (!runtime.canSubmit) {
-    appendLocalItem("error", runtime.submitBlockedReason ?? "Session is not ready for another prompt.");
+    actions.appendLocalItem("error", runtime.submitBlockedReason ?? "Session is not ready for another prompt.");
     return;
   }
-  const accepted = await runtime.submitPrompt(trimmed);
+  const accepted = await runtime.submitPrompt(trimmed, {
+    ...(ctx.modelSelection ? { modelSelection: ctx.modelSelection } : {}),
+    ...(ctx.reasoningLevel ? { reasoningLevel: ctx.reasoningLevel } : {}),
+  });
   if (accepted) {
     onAccepted?.(trimmed);
-    setPrompt("");
+    actions.setPrompt("");
   }
 }
 
@@ -1019,19 +1369,14 @@ async function runSlashInput(
   ctx: SlashCommandContext,
   model: TeamLiveView,
   runtime: ChatRuntimeState,
-  setView: (view: ShellView) => void,
-  appendLocalItem: AppendLocalItem,
-  startNewChatSession: () => Promise<void>,
-  setPrompt: (value: string | ((current: string) => string)) => void,
-  openThemePicker: () => void,
-  setAuthManualPrompt: (value: AuthManualPrompt | undefined) => void,
+  actions: SlashActions,
 ): Promise<void> {
   const match = resolveSlashCommand(commands, input);
   if (!match) {
-    appendLocalItem("error", `Unknown command: ${input}`);
+    actions.appendLocalItem("error", `Unknown command: ${input}`);
     return;
   }
-  await runResolvedSlashCommand(match, ctx, model, runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, setAuthManualPrompt);
+  await runResolvedSlashCommand(match, ctx, model, runtime, actions);
 }
 
 async function runResolvedSlashCommand(
@@ -1039,54 +1384,60 @@ async function runResolvedSlashCommand(
   ctx: SlashCommandContext,
   model: TeamLiveView,
   runtime: ChatRuntimeState,
-  setView: (view: ShellView) => void,
-  appendLocalItem: AppendLocalItem,
-  startNewChatSession: () => Promise<void>,
-  setPrompt: (value: string | ((current: string) => string)) => void,
-  openThemePicker: () => void,
-  setAuthManualPrompt: (value: AuthManualPrompt | undefined) => void,
+  actions: SlashActions,
 ): Promise<void> {
   const result = await match.command.run(ctx, match.args);
-  await applySlashResult(result, model, runtime, setView, appendLocalItem, startNewChatSession, setPrompt, openThemePicker, setAuthManualPrompt);
+  await applySlashResult(result, model, runtime, actions);
 }
 
 async function applySlashResult(
   result: SlashCommandResult,
   model: TeamLiveView,
   runtime: ChatRuntimeState,
-  setView: (view: ShellView) => void,
-  appendLocalItem: AppendLocalItem,
-  startNewChatSession: () => Promise<void>,
-  setPrompt: (value: string | ((current: string) => string)) => void,
-  openThemePicker: () => void,
-  setAuthManualPrompt: (value: AuthManualPrompt | undefined) => void,
+  actions: SlashActions,
 ): Promise<void> {
   if (result.type === "open_view") {
-    setView(result.view);
+    actions.setView(result.view);
     return;
   }
   if (result.type === "close_view") {
-    setView("chat");
+    actions.setView("chat");
     return;
   }
   if (result.type === "open_theme_picker") {
-    openThemePicker();
+    actions.openThemePicker();
     return;
   }
   if (result.type === "new_session") {
-    await startNewChatSession();
+    await actions.startNewChatSession();
     return;
   }
   if (result.type === "insert_prompt") {
-    setPrompt(result.text);
+    actions.setPrompt(result.text);
     return;
   }
   if (result.type === "local_message") {
-    appendLocalItem(result.level, result.text);
+    actions.appendLocalItem(result.level, result.text);
+    return;
+  }
+  if (result.type === "open_model_picker") {
+    actions.openModelPicker(result.query ?? "");
+    return;
+  }
+  if (result.type === "set_model") {
+    await actions.setModelSelection(result.selection, result.reasoningLevel);
+    return;
+  }
+  if (result.type === "open_reasoning_picker") {
+    actions.openReasoningPicker();
+    return;
+  }
+  if (result.type === "set_reasoning") {
+    await actions.setReasoningLevel(result.level);
     return;
   }
   if (result.type === "auth_action") {
-    await performAuthAction(result, appendLocalItem, setAuthManualPrompt);
+    await performAuthAction(result, actions.appendLocalItem, actions.setAuthManualPrompt, actions.ensureOpenAICodexDefaultModel);
     return;
   }
   if (result.type === "sdk_action") {
@@ -1099,6 +1450,7 @@ async function performAuthAction(
   result: Extract<SlashCommandResult, { type: "auth_action" }>,
   appendLocalItem: AppendLocalItem,
   setAuthManualPrompt: (value: AuthManualPrompt | undefined) => void,
+  onLoginComplete?: () => Promise<void>,
 ): Promise<void> {
   if (result.provider !== OPENAI_CODEX_PROVIDER_ID) {
     appendLocalItem("error", `Unsupported auth provider: ${result.provider}`);
@@ -1145,6 +1497,7 @@ async function performAuthAction(
     });
     await storage.setOAuthCredentials(OPENAI_CODEX_PROVIDER_ID, credentials);
     appendLocalItem("info", `ChatGPT Codex login complete for account ${credentials.accountId}. Token expires ${formatAuthTime(credentials.expires)}.`);
+    await onLoginComplete?.();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     appendLocalItem("error", `ChatGPT Codex login failed: ${message}`);
@@ -1208,6 +1561,74 @@ function handlePaletteKey(
   if (isEnter(key)) {
     const item = items[selectedIndex] ?? items[0];
     if (item) onSelect(item);
+  }
+}
+
+function handleModelPickerKey(
+  key: KeyEvent,
+  picker: ModelPickerNavigation,
+  candidates: readonly ModelCandidate[],
+  current: ModelSelection | undefined,
+  actions: {
+    setModelPicker: Dispatch<SetStateAction<ModelPickerNavigation | undefined>>;
+    selectModel: (selection: ModelSelection) => Promise<void>;
+    cancel: () => void;
+  },
+): void {
+  if (isEscape(key)) {
+    actions.cancel();
+    return;
+  }
+  const items = filterModelCandidates(candidates, picker.query, current);
+  if (isArrowUp(key) || isArrowDown(key)) {
+    const delta = isArrowUp(key) ? -1 : 1;
+    actions.setModelPicker((state) => state ? { ...state, selectedIndex: clampIndex(state.selectedIndex + delta, items.length) } : state);
+    return;
+  }
+  if (isEnter(key)) {
+    const selected = items[clampIndex(picker.selectedIndex, items.length)];
+    if (selected) void actions.selectModel(modelDescriptorSelection(selected));
+    return;
+  }
+  if (isBackspace(key)) {
+    actions.setModelPicker((state) => {
+      if (!state) return state;
+      const query = state.query.slice(0, -1);
+      return { query, selectedIndex: modelPickerIndex(candidates, query, current) };
+    });
+    return;
+  }
+  const printable = printableKey(key);
+  if (printable) {
+    actions.setModelPicker((state) => {
+      if (!state) return state;
+      const query = `${state.query}${printable}`;
+      return { query, selectedIndex: modelPickerIndex(candidates, query, current) };
+    });
+  }
+}
+
+function handleReasoningPickerKey(
+  key: KeyEvent,
+  picker: ReasoningPickerNavigation,
+  actions: {
+    setReasoningPicker: Dispatch<SetStateAction<ReasoningPickerNavigation | undefined>>;
+    selectLevel: (level: ReasoningLevel) => Promise<void>;
+    cancel: () => void;
+  },
+): void {
+  if (isEscape(key)) {
+    actions.cancel();
+    return;
+  }
+  if (isArrowUp(key) || isArrowDown(key)) {
+    const delta = isArrowUp(key) ? -1 : 1;
+    actions.setReasoningPicker((state) => state ? { selectedIndex: clampIndex(state.selectedIndex + delta, REASONING_LEVELS.length) } : state);
+    return;
+  }
+  if (isEnter(key)) {
+    const level = REASONING_LEVELS[clampIndex(picker.selectedIndex, REASONING_LEVELS.length)];
+    if (level) void actions.selectLevel(level);
   }
 }
 

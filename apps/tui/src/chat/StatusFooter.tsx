@@ -1,12 +1,15 @@
 import type { ChatSessionView, TeamLiveView } from "@chili/sdk";
 import { basename } from "node:path";
 import { shorten } from "../components/helpers.js";
+import { modelSelectionLabel, type ModelSelection, type ReasoningLevel } from "../model-state.js";
 import type { TuiTheme } from "../theme/index.js";
 
 export interface StatusFooterOptions {
   modeName: string;
   modelName: string;
   providerName: string;
+  modelSelection?: ModelSelection | undefined;
+  reasoningLevel?: ReasoningLevel | undefined;
   cwd: string;
   gitBranch?: string | undefined;
 }
@@ -145,11 +148,17 @@ function contextWindowFor(chatView: ChatSessionView): number | undefined {
 }
 
 function modelText(chatView: ChatSessionView, options: StatusFooterOptions, compact: boolean): string {
-  const provider = chatView.latestModelMetadata?.provider ?? options.providerName;
-  const model = chatView.latestModelMetadata?.model ?? options.modelName;
+  const provider = options.modelSelection?.provider ?? chatView.latestModelMetadata?.provider ?? options.providerName;
+  const model = options.modelSelection?.model ?? chatView.latestModelMetadata?.model ?? options.modelName;
   const mode = options.modeName;
-  if (compact) return shorten(model, 22);
-  return `${provider}/${model} ${mode}`;
+  const reasoning = options.reasoningLevel ? reasoningText(options.reasoningLevel) : undefined;
+  if (compact) return shorten(reasoning ? `${model} ${reasoning}` : model, 22);
+  const modelLabel = options.modelSelection ? modelSelectionLabel(options.modelSelection) : `${provider}/${model}`;
+  return `${modelLabel} ${mode}${reasoning ? ` ${reasoning}` : ""}`;
+}
+
+function reasoningText(level: ReasoningLevel): string {
+  return level === "off" ? "thinking off" : `thinking ${level}`;
 }
 
 function compactCwd(cwd: string): string {

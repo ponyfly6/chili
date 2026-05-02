@@ -4,8 +4,9 @@ import {
   type ChatSessionView,
   type HttpRuntimeClient,
 } from "@chili/sdk";
-import type { ApprovalId, RuntimeApprovalResolveResult, SessionId, ThreadId } from "@chili/protocol";
+import type { ApprovalId, RuntimeApprovalResolveResult, RuntimeModelConfig, SessionId, ThreadId } from "@chili/protocol";
 import { useTeamLiveRuntime, type TeamLiveRuntimeState, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
+import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
 
 export type ChatRequestStatus = "idle" | "pending" | "success" | "error";
 
@@ -19,13 +20,23 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
   activeThreadId?: ThreadId;
   chatView: ChatSessionView;
   chatFeedback?: ChatRuntimeFeedback;
+  modelCandidates?: readonly ModelCandidate[];
+  modelConfig?: RuntimeModelConfig;
   canSubmit: boolean;
   submitBlockedReason?: string;
-  submitPrompt: (text: string) => Promise<boolean>;
+  submitPrompt: (text: string, options?: ChatSubmitOptions) => Promise<boolean>;
+  setRuntimeModel?: (selection: ModelSelection) => Promise<boolean>;
+  setRuntimeReasoning?: (level: ReasoningLevel) => Promise<boolean>;
+  refreshModelConfig?: () => Promise<void>;
   startNewSession: () => Promise<void>;
   interruptActiveSession: () => Promise<void>;
   approveApproval: (approvalId: ApprovalId) => Promise<void>;
   rejectApproval: (approvalId: ApprovalId) => Promise<void>;
+}
+
+export interface ChatSubmitOptions {
+  modelSelection?: ModelSelection | undefined;
+  reasoningLevel?: ReasoningLevel | undefined;
 }
 
 export interface UseChatRuntimeInput {
@@ -40,6 +51,8 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   const [activeThreadId, setActiveThreadId] = useState<ThreadId | undefined>(options.threadId);
   const [submitPending, setSubmitPending] = useState(false);
   const [chatFeedback, setChatFeedback] = useState<ChatRuntimeFeedback | undefined>();
+  const [modelCandidates, setModelCandidates] = useState<readonly ModelCandidate[]>([]);
+  const [modelConfig, setModelConfig] = useState<RuntimeModelConfig | undefined>();
   const requestAbortRefs = useRef(new Set<AbortController>());
 
   useEffect(() => {
@@ -75,7 +88,56 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     });
   }, []);
 
-  const submitPrompt = useCallback(async (text: string): Promise<boolean> => {
+  const refreshModelConfigForSession = useCallback(async (sessionIdOverride?: SessionId): Promise<void> => {
+    try {
+      await withAbort(async (signal) => {
+        const models = await client.listModels();
+        if (signal.aborted) return;
+        const sessionId = sessionIdOverride ?? activeSessionId ?? chatView.sessionId;
+        if (!sessionId) {
+          setModelConfig(undefined);
+          setModelCandidates(models);
+          return;
+        }
+        const config = await client.getModelConfig({ sessionId, signal });
+        if (signal.aborted) return;
+        setModelConfig(config);
+        setModelCandidates(config.models.length > 0 ? config.models : models);
+      });
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+    }
+  }, [activeSessionId, chatView.sessionId, client, options.baseUrl, withAbort]);
+
+  const refreshModelConfig = useCallback(async (): Promise<void> => {
+    await refreshModelConfigForSession();
+  }, [refreshModelConfigForSession]);
+
+  useEffect(() => {
+    void refreshModelConfig();
+  }, [refreshModelConfig]);
+
+  const ensureSession = useCallback(async (signal: AbortSignal): Promise<{ sessionId: SessionId; threadId: ThreadId }> => {
+    let sessionId = activeSessionId ?? chatView.sessionId;
+    let threadId = activeThreadId ?? chatView.threadId;
+    if (sessionId && !threadId) {
+      throw new Error(submitBlockedReason ?? "Session resume needs a thread.");
+    }
+    if (!sessionId && !threadId) {
+      const created = await client.createSession({
+        ...(options.cwd ? { cwd: options.cwd } : {}),
+        signal,
+      });
+      sessionId = created.sessionId;
+      threadId = created.threadId;
+      setActiveSessionId(sessionId);
+      setActiveThreadId(threadId);
+    }
+    if (!sessionId || !threadId) throw new Error("Unable to determine a session and thread.");
+    return { sessionId, threadId };
+  }, [activeSessionId, activeThreadId, chatView.sessionId, chatView.threadId, client, options.cwd, submitBlockedReason]);
+
+  const submitPrompt = useCallback(async (text: string, submitOptions: ChatSubmitOptions = {}): Promise<boolean> => {
     const trimmed = text.trim();
     if (!trimmed || submitPending || running || chatView.pendingApprovals.length > 0) return false;
     if (resumeThreadMissing) {
@@ -104,13 +166,16 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
         if (!sessionId || !threadId) {
           throw new Error("Unable to determine a session and thread for this prompt.");
         }
-        await client.submitPromptAsync({
+        const request = {
           sessionId,
           threadId,
           text: trimmed,
           ...(options.cwd ? { cwd: options.cwd } : {}),
+          ...(submitOptions.modelSelection ? { modelSelection: submitOptions.modelSelection } : {}),
+          ...(submitOptions.reasoningLevel ? { reasoningLevel: submitOptions.reasoningLevel } : {}),
           signal,
-        });
+        };
+        await client.submitPromptAsync(request);
       });
       setChatFeedback({ status: "success", message: "prompt accepted" });
       return true;
@@ -121,6 +186,48 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
       setSubmitPending(false);
     }
   }, [activeSessionId, activeThreadId, chatView.pendingApprovals.length, chatView.sessionId, chatView.threadId, client, options.baseUrl, options.cwd, resumeThreadMissing, running, submitBlockedReason, submitPending, withAbort]);
+
+  const setRuntimeModel = useCallback(async (selection: ModelSelection): Promise<boolean> => {
+    let updatedSessionId: SessionId | undefined;
+    try {
+      await withAbort(async (signal) => {
+        const session = await ensureSession(signal);
+        updatedSessionId = session.sessionId;
+        await client.setModel({
+          ...session,
+          modelSelection: selection,
+          signal,
+        });
+      });
+      setChatFeedback({ status: "success", message: "model selected" });
+      await refreshModelConfigForSession(updatedSessionId);
+      return true;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return false;
+    }
+  }, [client, ensureSession, options.baseUrl, refreshModelConfigForSession, withAbort]);
+
+  const setRuntimeReasoning = useCallback(async (level: ReasoningLevel): Promise<boolean> => {
+    let updatedSessionId: SessionId | undefined;
+    try {
+      await withAbort(async (signal) => {
+        const session = await ensureSession(signal);
+        updatedSessionId = session.sessionId;
+        await client.setReasoning({
+          ...session,
+          reasoningLevel: level,
+          signal,
+        });
+      });
+      setChatFeedback({ status: "success", message: "thinking level selected" });
+      await refreshModelConfigForSession(updatedSessionId);
+      return true;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return false;
+    }
+  }, [client, ensureSession, options.baseUrl, refreshModelConfigForSession, withAbort]);
 
   const interruptActiveSession = useCallback(async () => {
     if (!activeSessionId) return;
@@ -176,14 +283,19 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     ...(activeThreadId ? { activeThreadId } : {}),
     chatView,
     ...(chatFeedback ? { chatFeedback } : {}),
+    modelCandidates,
+    ...(modelConfig ? { modelConfig } : {}),
     canSubmit,
     ...(submitBlockedReason ? { submitBlockedReason } : {}),
     submitPrompt,
+    setRuntimeModel,
+    setRuntimeReasoning,
+    refreshModelConfig,
     startNewSession,
     interruptActiveSession,
     approveApproval,
     rejectApproval,
-  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, startNewSession, submitBlockedReason, submitPrompt, teamRuntime]);
+  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, refreshModelConfig, setRuntimeModel, setRuntimeReasoning, startNewSession, submitBlockedReason, submitPrompt, teamRuntime]);
 }
 
 async function resolveApproval(

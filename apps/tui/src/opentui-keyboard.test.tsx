@@ -7,6 +7,7 @@ import type { ClipboardAccess } from "./clipboard.js";
 import { ChatShellApp, ChatShellSurface } from "./ChatShellApp.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import type { ChatRuntimeState } from "./useChatRuntime.js";
+import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
 import type { TeamLiveSurfaceRuntime } from "./components/types.js";
 import { teamLiveFixture } from "./test-fixtures.js";
 
@@ -1205,6 +1206,68 @@ test("theme picker Enter confirms the previewed theme", async () => {
   }
 });
 
+test("/model uses runtime catalog and persists the selected model", async () => {
+  const records = chatClientRecords();
+  const client = fakeChatClient(records, [], {
+    models: [
+      { provider: "minimax", model: "MiniMax-M2.7-highspeed", displayName: "MiniMax runtime" },
+    ],
+  });
+  const app = await mountChatApp(client);
+
+  try {
+    await Bun.sleep(120);
+    await app.renderOnce();
+
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const pickerFrame = app.captureCharFrame();
+    expect(records.listModels.length).toBeGreaterThan(0);
+    expect(pickerFrame).toContain("MiniMax-M2.7-highspeed");
+    expect(pickerFrame).not.toContain("gpt-5.5");
+
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(120);
+    await app.renderOnce();
+
+    expect(records.create).toHaveLength(1);
+    expect(records.setModel[0]).toMatchObject({
+      sessionId: "session_created",
+      threadId: "thread_created",
+      modelSelection: { provider: "minimax", model: "MiniMax-M2.7-highspeed" },
+    });
+    expect(app.captureCharFrame()).toContain("minimax/MiniMax-M2.7-highspeed Build");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model keeps the old UI state when persistence fails", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: [
+        { provider: "openai-codex", model: "gpt-5.5", displayName: "GPT-5.5" },
+      ],
+      setRuntimeModel: async () => false,
+    },
+  });
+
+  try {
+    await typeText(app, "/model openai-codex/gpt-5.5");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(120);
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("Model unchanged: failed to persist openai-codex/gpt-5.5");
+    expect(frame).toContain("test-provider/test-model Build");
+    expect(frame).not.toContain("openai-codex/gpt-5.5 Build");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("team run slash command executes SDK run-loop action", async () => {
   const executed: TeamLiveAction[] = [];
   const app = await mountShell(withRunLoopReady(teamLiveFixture()), { executed });
@@ -1616,16 +1679,80 @@ function chatClientRecords(): {
   interrupt: Array<Record<string, unknown>>;
   approve: Array<Record<string, unknown>>;
   reject: Array<Record<string, unknown>>;
+  listModels: Array<Record<string, unknown>>;
+  getModel: Array<Record<string, unknown>>;
+  setModel: Array<Record<string, unknown>>;
+  setReasoning: Array<Record<string, unknown>>;
 } {
-  return { create: [], submit: [], interrupt: [], approve: [], reject: [] };
+  return {
+    create: [],
+    submit: [],
+    interrupt: [],
+    approve: [],
+    reject: [],
+    listModels: [],
+    getModel: [],
+    setModel: [],
+    setReasoning: [],
+  };
 }
 
 function fakeChatClient(
   records: ReturnType<typeof chatClientRecords>,
   events: readonly ChiliEvent[] = [],
-  options: { createError?: Error; approveResolved?: boolean; rejectResolved?: boolean } = {},
+  options: {
+    createError?: Error;
+    approveResolved?: boolean;
+    rejectResolved?: boolean;
+    models?: readonly ModelCandidate[];
+    modelSelection?: ModelSelection;
+    reasoningLevel?: ReasoningLevel;
+    setModelError?: Error;
+    setReasoningError?: Error;
+  } = {},
 ): HttpRuntimeClient {
+  let currentModelSelection = options.modelSelection;
+  let currentReasoningLevel = options.reasoningLevel;
   const client = {
+    listModels: async (input: Record<string, unknown> = {}) => {
+      records.listModels.push(input);
+      return [...(options.models ?? [])];
+    },
+    getModelConfig: async (input: Record<string, unknown>) => {
+      records.getModel.push(input);
+      const config = {
+        sessionId: input.sessionId as SessionId,
+        models: [...(options.models ?? [])],
+        availableReasoningLevels: ["off", "minimal", "low", "medium", "high", "xhigh"],
+        ...(currentModelSelection ? { modelSelection: currentModelSelection } : {}),
+        ...(currentReasoningLevel ? { reasoningLevel: currentReasoningLevel } : {}),
+      };
+      return config;
+    },
+    setModel: async (input: Record<string, unknown>) => {
+      records.setModel.push(input);
+      if (options.setModelError) throw options.setModelError;
+      currentModelSelection = input.modelSelection as ModelSelection;
+      return {
+        sessionId: input.sessionId as SessionId,
+        models: [...(options.models ?? [])],
+        availableReasoningLevels: ["off", "minimal", "low", "medium", "high", "xhigh"],
+        modelSelection: currentModelSelection,
+        ...(currentReasoningLevel ? { reasoningLevel: currentReasoningLevel } : {}),
+      };
+    },
+    setReasoning: async (input: Record<string, unknown>) => {
+      records.setReasoning.push(input);
+      if (options.setReasoningError) throw options.setReasoningError;
+      currentReasoningLevel = input.reasoningLevel as ReasoningLevel;
+      return {
+        sessionId: input.sessionId as SessionId,
+        models: [...(options.models ?? [])],
+        availableReasoningLevels: ["off", "minimal", "low", "medium", "high", "xhigh"],
+        ...(currentModelSelection ? { modelSelection: currentModelSelection } : {}),
+        reasoningLevel: currentReasoningLevel,
+      };
+    },
     createSession: async (input: Record<string, unknown> = {}) => {
       const index = records.create.length + 1;
       records.create.push(input);

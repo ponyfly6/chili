@@ -1,4 +1,5 @@
 import type { TeamLiveView } from "@chili/sdk";
+import type { ModelCandidate, ModelSelection, ReasoningLevel } from "../model-state.js";
 
 export type SlashCommandCategory =
   | "session"
@@ -16,6 +17,10 @@ export type SlashCommandResult =
   | { type: "insert_prompt"; text: string }
   | { type: "local_message"; level: "info" | "error"; text: string }
   | { type: "auth_action"; action: "login" | "logout" | "status"; provider: "openai-codex" }
+  | { type: "open_model_picker"; query?: string }
+  | { type: "set_model"; selection: ModelSelection; reasoningLevel?: ReasoningLevel }
+  | { type: "open_reasoning_picker" }
+  | { type: "set_reasoning"; level: ReasoningLevel }
   | { type: "sdk_action"; action: "team_run" | "team_merge" | "approve" | "reject"; payload?: unknown };
 
 export interface SlashCompletion {
@@ -28,6 +33,9 @@ export interface SlashCompletion {
 export interface SlashCommandContext {
   model: TeamLiveView;
   cwd?: string;
+  modelSelection?: ModelSelection | undefined;
+  reasoningLevel?: ReasoningLevel | undefined;
+  modelCandidates?: readonly ModelCandidate[] | undefined;
 }
 
 export type SlashCommand = {
