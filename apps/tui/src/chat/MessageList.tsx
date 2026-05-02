@@ -15,11 +15,13 @@ export function MessageList(props: {
   visibleLimit?: number;
   scrollOffset?: number;
   showToolDetails?: boolean;
+  hideThinking?: boolean;
   theme: TuiTheme;
 }) {
   const allCells = transcriptCells(props.chatView.items, props.localItems, {
     width: Math.max(24, props.width ?? 80),
     showToolDetails: props.showToolDetails === true,
+    hideThinking: props.hideThinking === true,
     sessionStatus: props.chatView.status,
     activeToolCount: props.chatView.activeTools.length,
     theme: props.theme,
@@ -47,20 +49,21 @@ export function MessageList(props: {
 function transcriptCells(
   items: readonly ChatTranscriptItem[],
   localItems: readonly LocalTranscriptItem[],
-  options: { width: number; showToolDetails: boolean; sessionStatus: ChatSessionView["status"]; activeToolCount: number; theme: TuiTheme },
+  options: { width: number; showToolDetails: boolean; hideThinking: boolean; sessionStatus: ChatSessionView["status"]; activeToolCount: number; theme: TuiTheme },
 ): TranscriptCellModel[] {
   const displayItems = buildChatDisplayItems(items, {
     showToolDetails: options.showToolDetails,
+    hideThinking: options.hideThinking,
     sessionStatus: options.sessionStatus,
     activeToolCount: options.activeToolCount,
   });
   return [
-    ...displayItems.map((item) => displayItemCell(item, options.width, options.theme)),
+    ...displayItems.map((item) => displayItemCell(item, options.width, options.theme, options.hideThinking)),
     ...localItems.map((item) => localItemCell(item, options.width, options.theme)),
   ];
 }
 
-function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme): TranscriptCellModel {
+function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, hideThinking: boolean): TranscriptCellModel {
   if (item.kind === "user_text") {
     return lineBackedCell(`display:${item.kind}:${item.id}`, wrapLine(`🥔: ${item.text || "..."}`, {
       key: `display:${item.kind}:${item.id}`,
@@ -93,7 +96,7 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme):
       fallbackLines: lines,
     });
   }
-  if (item.kind === "reasoning") return lineBackedCell(`display:${item.kind}:${item.id}`, reasoningLines(item, width, theme));
+  if (item.kind === "reasoning") return lineBackedCell(`display:${item.kind}:${item.id}`, reasoningLines(item, width, theme, hideThinking));
   if (item.kind === "tool_activity") {
     return componentBackedCell({
       key: `display:tool:${item.activity.id}`,
@@ -127,9 +130,9 @@ function localItemCell(item: LocalTranscriptItem, width: number, theme: TuiTheme
   }));
 }
 
-function reasoningLines(item: Extract<ChatDisplayItem, { kind: "reasoning" }>, width: number, theme: TuiTheme): TranscriptLineModel[] {
-  const compact = shorten((item.text || "...").replace(/\s+/g, " ").trim(), 180);
-  return wrapLine(`Thinking: ${compact}`, {
+function reasoningLines(item: Extract<ChatDisplayItem, { kind: "reasoning" }>, width: number, theme: TuiTheme, hideThinking: boolean): TranscriptLineModel[] {
+  const text = hideThinking ? "🫧" : `Thinking: ${shorten((item.text || "...").replace(/\s+/g, " ").trim(), 180)}`;
+  return wrapLine(text, {
     key: `display:${item.kind}:${item.id}`,
     fg: theme.colors.text.muted,
     width,

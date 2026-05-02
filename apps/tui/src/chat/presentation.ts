@@ -68,6 +68,7 @@ export interface ToolGroupMetadata {
 
 interface BuildOptions {
   showToolDetails?: boolean;
+  hideThinking?: boolean;
   sessionStatus?: ChatSessionView["status"];
   activeToolCount?: number;
 }
@@ -101,7 +102,7 @@ export function buildChatDisplayItems(items: readonly ChatTranscriptItem[], opti
   const output: ChatDisplayItem[] = [];
   for (const item of items) {
     if (item.kind === "message") {
-      output.push(...messageDisplayItems(item, toolRowsById, toolCallParts, showToolDetails, item.id === streamingMessageId));
+      output.push(...messageDisplayItems(item, toolRowsById, toolCallParts, showToolDetails, options.hideThinking === true, item.id === streamingMessageId));
       continue;
     }
     if (item.kind === "tool") {
@@ -123,19 +124,36 @@ function messageDisplayItems(
   toolRowsById: ReadonlySet<string>,
   toolCallParts: ReadonlyMap<string, ToolCallPartInfo>,
   showToolDetails: boolean,
+  hideThinking: boolean,
   streaming: boolean,
 ): ChatDisplayItem[] {
   const output: ChatDisplayItem[] = [];
   const streamingTextPartIndex = streaming ? lastTextPartIndex(message.parts) : -1;
+  const hideAssistantTrace = hideThinking && message.role === "assistant" && message.parts.some((part) => part.type === "tool_call");
+  let hiddenTraceShown = false;
   for (const [index, part] of message.parts.entries()) {
     const id = `${message.id}:${part.id}:${index}`;
     if (part.type === "text") {
+      if (hideAssistantTrace && part.text.trim()) {
+        if (!hiddenTraceShown) {
+          output.push({ kind: "reasoning", id: `${message.id}:hidden-thinking`, text: "", collapsed: true });
+          hiddenTraceShown = true;
+        }
+        continue;
+      }
       if (message.role === "user") output.push({ kind: "user_text", id, text: part.text });
       else if (message.role === "assistant") output.push({ kind: "assistant_text", id, text: part.text, ...(index === streamingTextPartIndex ? { streaming: true } : {}) });
       else output.push({ kind: "summary", id, text: `${message.role}: ${part.text}` });
       continue;
     }
     if (part.type === "reasoning") {
+      if (hideAssistantTrace) {
+        if (part.text.trim() && !hiddenTraceShown) {
+          output.push({ kind: "reasoning", id: `${message.id}:hidden-thinking`, text: "", collapsed: true });
+          hiddenTraceShown = true;
+        }
+        continue;
+      }
       output.push({ kind: "reasoning", id, text: part.text, collapsed: true });
       continue;
     }

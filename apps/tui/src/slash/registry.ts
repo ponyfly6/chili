@@ -148,19 +148,21 @@ export function createDefaultSlashCommands(): SlashCommand[] {
     {
       name: "thinking",
       aliases: ["reasoning"],
-      description: "Set reasoning level",
+      description: "Set reasoning level or visibility",
       category: "model",
-      argumentHint: "<off|minimal|low|medium|high|xhigh>",
+      argumentHint: "<off|minimal|low|medium|high|xhigh|hide|show>",
       isSafeConcurrent: true,
       complete: reasoningCompletions,
       run: (_ctx, args) => {
         const level = args.trim().toLowerCase();
         if (!level) return { type: "open_reasoning_picker" };
+        if (level === "hide") return { type: "set_hide_thinking", hidden: true };
+        if (level === "show") return { type: "set_hide_thinking", hidden: false };
         if (isReasoningLevel(level)) return { type: "set_reasoning", level };
         return {
           type: "local_message",
           level: "error",
-          text: `Unknown reasoning level: ${args.trim() || "none"}`,
+          text: `Unknown thinking option: ${args.trim() || "none"}`,
         };
       },
     },
@@ -278,12 +280,12 @@ function reasoningCompletions(_ctx: SlashCommandContext, input: string): SlashCo
   if (query === undefined) return [];
   const command = thinkingQuery !== undefined ? "thinking" : "reasoning";
   const normalized = query.trim().toLowerCase();
-  return REASONING_LEVELS
+  return [...REASONING_LEVELS, "hide", "show"]
     .filter((level) => !normalized || level.startsWith(normalized) || fuzzyMatch(level, normalized))
     .map((level) => ({
       value: `/${command} ${level}`,
       label: level,
-      description: reasoningDescription(level),
+      description: level === "hide" ? "Hide thinking traces" : level === "show" ? "Show thinking traces" : reasoningDescription(level),
       category: "model" as const,
     }));
 }

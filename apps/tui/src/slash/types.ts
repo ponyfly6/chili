@@ -23,6 +23,7 @@ export type SlashCommandResult =
   | { type: "set_model"; selection: ModelSelection; reasoningLevel?: ReasoningLevel }
   | { type: "open_reasoning_picker" }
   | { type: "set_reasoning"; level: ReasoningLevel }
+  | { type: "set_hide_thinking"; hidden: boolean }
   | { type: "skills_action"; action: "enable" | "disable"; name: string; scope?: SkillSettingsScope }
   | { type: "sdk_action"; action: "team_run" | "team_merge" | "approve" | "reject"; payload?: unknown };
 

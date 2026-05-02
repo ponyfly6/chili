@@ -64,6 +64,7 @@ interface SlashActions {
   setModelSelection: (selection: ModelSelection, reasoningLevel?: ReasoningLevel) => Promise<void>;
   openReasoningPicker: () => void;
   setReasoningLevel: (level: ReasoningLevel) => Promise<void>;
+  setHideThinking: (hidden: boolean) => void;
   ensureOpenAICodexDefaultModel: () => Promise<void>;
   reloadSkills: () => Promise<void>;
 }
@@ -181,6 +182,7 @@ export function ChatShellSurface(props: {
   const [transcriptScrollOffset, setTranscriptScrollOffset] = useState(0);
   const [authManualPrompt, setAuthManualPromptState] = useState<AuthManualPrompt | undefined>(undefined);
   const [showToolDetails, setShowToolDetails] = useState(false);
+  const [hideThinking, setHideThinkingState] = useState(false);
   const localMessageTtlMs = props.localMessageTtlMs ?? LOCAL_ITEM_TTL_MS;
   const localItemTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const dismissLocalItem = useCallback((id: string) => {
@@ -398,6 +400,10 @@ export function ChatShellSurface(props: {
     setReasoningPicker(undefined);
     appendLocalItem("info", `Thinking: ${level}`);
   }, [appendLocalItem, props.runtime]);
+  const setHideThinking = useCallback((hidden: boolean) => {
+    setHideThinkingState(hidden);
+    appendLocalItem("info", hidden ? "Thinking traces hidden." : "Thinking traces shown.");
+  }, [appendLocalItem]);
 
   const ensureOpenAICodexDefaultModel = useCallback(async () => {
     await props.runtime.refreshModelConfig?.();
@@ -418,11 +424,12 @@ export function ChatShellSurface(props: {
     setModelSelection,
     openReasoningPicker,
     setReasoningLevel,
+    setHideThinking,
     ensureOpenAICodexDefaultModel,
     reloadSkills: async () => {
       await props.onSkillsChanged?.();
     },
-  }), [appendLocalItem, cwd, ensureOpenAICodexDefaultModel, openModelPicker, openReasoningPicker, openThemePicker, props.onSkillsChanged, setAuthManualPrompt, setModelSelection, setPrompt, setReasoningLevel, startNewChatSession]);
+  }), [appendLocalItem, cwd, ensureOpenAICodexDefaultModel, openModelPicker, openReasoningPicker, openThemePicker, props.onSkillsChanged, setAuthManualPrompt, setHideThinking, setModelSelection, setPrompt, setReasoningLevel, startNewChatSession]);
   const runSelectedSlashCompletion = useCallback(() => {
     if (!slashCompletionOpen) return false;
     const completion = slashCompletionItems[selectedCompletionIndex] ?? slashCompletionItems[0];
@@ -829,6 +836,7 @@ export function ChatShellSurface(props: {
           options={shellOptions}
           runtime={props.runtime}
           showToolDetails={showToolDetails}
+          hideThinking={hideThinking}
           transcriptActive={view === "transcript"}
           commands={commands}
           disabledReason={disabledReason}
@@ -950,6 +958,7 @@ function SessionScreen(props: {
   runtime: ChatRuntimeState;
   options: StatusFooterOptions;
   showToolDetails: boolean;
+  hideThinking: boolean;
   transcriptActive: boolean;
   commands: readonly SlashCommand[];
   disabledReason?: string | undefined;
@@ -999,7 +1008,7 @@ function SessionScreen(props: {
         {props.view === "help" ? (
           <HelpView commands={props.commands} theme={props.theme} showToolDetails={props.showToolDetails} />
         ) : props.view === "status" ? (
-          <StatusView model={props.model} runtime={props.runtime} options={props.options} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
+          <StatusView model={props.model} runtime={props.runtime} options={props.options} theme={props.theme} showToolDetails={props.showToolDetails} hideThinking={props.hideThinking} transcriptActive={props.transcriptActive} />
         ) : props.view === "agents" ? (
           <AgentsView model={props.model} theme={props.theme} />
         ) : props.view === "transcript" ? (
@@ -1020,6 +1029,7 @@ function SessionScreen(props: {
             scrollOffset={props.messageScrollOffset}
             theme={props.theme}
             showToolDetails={props.showToolDetails}
+            hideThinking={props.hideThinking}
           />
         )}
       </box>
@@ -1501,6 +1511,7 @@ function StatusView(props: {
   options: StatusFooterOptions;
   theme: TuiTheme;
   showToolDetails: boolean;
+  hideThinking: boolean;
   transcriptActive: boolean;
 }) {
   const selected = props.model.selected;
@@ -1517,6 +1528,7 @@ function StatusView(props: {
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`mode: ${props.options.modeName}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`model: ${modelLabel}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thinking: ${props.options.reasoningLevel ?? "default"}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thinking traces: ${props.hideThinking ? "hidden" : "shown"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`details: ${props.showToolDetails ? "on" : "off"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`transcript: ${props.transcriptActive ? "on" : "off"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`cwd: ${props.options.cwd}`}</text>
@@ -1658,6 +1670,10 @@ async function applySlashResult(
   }
   if (result.type === "set_reasoning") {
     await actions.setReasoningLevel(result.level);
+    return;
+  }
+  if (result.type === "set_hide_thinking") {
+    actions.setHideThinking(result.hidden);
     return;
   }
   if (result.type === "auth_action") {
