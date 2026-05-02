@@ -693,6 +693,46 @@ test("/thinking hide and show toggle reasoning visibility", async () => {
   }
 });
 
+test("/hide-thinking and /show-thinking toggle reasoning visibility", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: [
+          {
+            id: "msg_hide_thinking_command" as MessageId,
+            kind: "message",
+            role: "assistant",
+            createdAt: 1,
+            parts: [
+              { type: "reasoning", id: "part_hide_thinking_reasoning" as PartId, text: "checking command visibility" },
+              { type: "text", id: "part_hide_thinking_answer" as PartId, text: "done" },
+            ],
+          },
+        ],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/hide-thinking");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(app.captureCharFrame()).toContain("Thinking traces hidden.");
+    expect(app.captureCharFrame()).toContain("🫧");
+    expect(app.captureCharFrame()).not.toContain("Thinking: checking command visibility");
+
+    await typeText(app, "/show-thinking");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(app.captureCharFrame()).toContain("Thinking traces shown.");
+    expect(app.captureCharFrame()).toContain("Thinking: checking command visibility");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("leading slash absolute paths submit as normal prompts", async () => {
   const submitted: string[] = [];
   const prompt = "/Users/pony/Code/opensource/ai/agent/clis/opencli go inspect this repo";
@@ -1447,6 +1487,8 @@ test("Ctrl+P opens the command palette", async () => {
     expect(app.captureCharFrame()).toContain("Command Palette");
     expect(app.captureCharFrame()).toContain("/team");
     expect(app.captureCharFrame()).toContain("/theme - Switch theme");
+    expect(app.captureCharFrame()).toContain("/hide-thinking - Hide thinking traces");
+    expect(app.captureCharFrame()).toContain("/show-thinking - Show thinking traces");
   } finally {
     app.renderer.destroy();
   }
@@ -1459,6 +1501,7 @@ test("slash completion includes team command", async () => {
     await typeText(app, "/");
     expect(app.captureCharFrame()).toContain("Commands");
     expect(app.captureCharFrame()).toContain("/team");
+    expect(app.captureCharFrame()).toContain("/hide-thinking");
   } finally {
     app.renderer.destroy();
   }

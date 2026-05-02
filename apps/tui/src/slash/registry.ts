@@ -40,6 +40,20 @@ export function createDefaultSlashCommands(): SlashCommand[] {
       run: () => ({ type: "open_theme_picker" }),
     },
     {
+      name: "hide-thinking",
+      description: "Hide thinking traces",
+      category: "model",
+      isSafeConcurrent: true,
+      run: () => ({ type: "set_hide_thinking", hidden: true }),
+    },
+    {
+      name: "show-thinking",
+      description: "Show thinking traces",
+      category: "model",
+      isSafeConcurrent: true,
+      run: () => ({ type: "set_hide_thinking", hidden: false }),
+    },
+    {
       name: "clear",
       description: "Start a fresh chat session",
       category: "session",

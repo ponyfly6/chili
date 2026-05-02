@@ -90,7 +90,7 @@ interface AuthManualPrompt {
 }
 
 const execFileAsync = promisify(execFile);
-const PROMPT_MENU_MAX_ITEMS = 5;
+const PROMPT_MENU_MAX_ITEMS = 6;
 const LOCAL_ITEM_TTL_MS = 4_000;
 
 export function ChatShellApp(props: {
