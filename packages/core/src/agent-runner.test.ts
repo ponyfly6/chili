@@ -196,6 +196,60 @@ test("RuntimeService adds a no-tool final turn after the tool continuation limit
   expect(statuses(store)).toEqual(["running", "running", "running", "running", "idle"]);
 });
 
+test("RuntimeService uses the last persisted model config for new sessions", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const firstService = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    defaultModelSelection: { provider: "minimax", model: "MiniMax-M2.7" },
+    defaultReasoningLevel: "medium",
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  await firstService.setModel({
+    sessionId: "session_previous" as SessionId,
+    threadId: "thread_previous" as ThreadId,
+    modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
+  });
+  await firstService.setReasoning({
+    sessionId: "session_previous" as SessionId,
+    threadId: "thread_previous" as ThreadId,
+    reasoningLevel: "high",
+  });
+
+  const nextRunner = new FakeAgentRunner();
+  const nextService = new RuntimeService({
+    runtime: nextRunner,
+    store,
+    cwd: "/repo",
+    defaultModelSelection: { provider: "minimax", model: "MiniMax-M2.7" },
+    defaultReasoningLevel: "medium",
+    createId: createSequentialId(),
+    now: () => 2 as TimestampMs,
+  });
+
+  await nextService.createSession({
+    sessionId: "session_next" as SessionId,
+    threadId: "thread_next" as ThreadId,
+  });
+  const config = await nextService.getModelConfig("session_next" as SessionId);
+  expect(config.modelSelection).toEqual({ provider: "openai-codex", model: "gpt-5.5" });
+  expect(config.reasoningLevel).toBe("high");
+
+  const result = await nextService.submitPrompt({
+    sessionId: "session_next" as SessionId,
+    threadId: "thread_next" as ThreadId,
+    text: "hello",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(nextRunner.turnInputs[0]?.modelSelection).toEqual({ provider: "openai-codex", model: "gpt-5.5" });
+  expect(nextRunner.turnInputs[0]?.reasoningLevel).toBe("high");
+});
+
 test("RuntimeService still stops on Anthropic-style end_turn finish reason", async () => {
   const store = new MemoryEventStore();
   const runner = new FakeAgentRunner();

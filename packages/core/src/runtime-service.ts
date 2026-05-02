@@ -117,6 +117,7 @@ export class RuntimeBusyError extends Error {
 export class RuntimeService {
   private readonly running = new Map<SessionId, AbortController>();
   private readonly sessionModelState = new Map<SessionId, RuntimeSessionModelState>();
+  private globalModelState?: RuntimeSessionModelState;
 
   constructor(private readonly options: RuntimeServiceOptions) {}
 
@@ -156,6 +157,7 @@ export class RuntimeService {
     const state = await this.resolveSessionModelState(input.sessionId);
     state.modelSelection = modelSelection;
     this.sessionModelState.set(input.sessionId, cloneSessionModelState(state));
+    this.globalModelState = cloneSessionModelState(state);
     await this.append(input, "session.model_changed", {
       sessionId: input.sessionId,
       modelSelection,
@@ -170,6 +172,7 @@ export class RuntimeService {
     const state = await this.resolveSessionModelState(input.sessionId);
     state.reasoningLevel = input.reasoningLevel;
     this.sessionModelState.set(input.sessionId, cloneSessionModelState(state));
+    this.globalModelState = cloneSessionModelState(state);
     await this.append(input, "session.reasoning_changed", {
       sessionId: input.sessionId,
       reasoningLevel: input.reasoningLevel,
@@ -472,7 +475,7 @@ export class RuntimeService {
     const cached = this.sessionModelState.get(sessionId);
     if (cached) return cloneSessionModelState(cached);
 
-    const state = defaultSessionModelState(this.options);
+    const state = await this.resolveGlobalModelState();
     const modelEvents = await this.options.store.events({
       sessionId,
       type: "session.model_changed",
@@ -497,6 +500,34 @@ export class RuntimeService {
 
     this.sessionModelState.set(sessionId, cloneSessionModelState(state));
     return state;
+  }
+
+  private async resolveGlobalModelState(): Promise<RuntimeSessionModelState> {
+    if (this.globalModelState) return cloneSessionModelState(this.globalModelState);
+
+    const state = defaultSessionModelState(this.options);
+    const modelEvents = await this.options.store.events({
+      type: "session.model_changed",
+      limit: 10_000,
+    });
+    for (const event of modelEvents) {
+      if (event.type === "session.model_changed" && isModelSelectionPayload(event.payload)) {
+        state.modelSelection = normalizeModelSelection(event.payload.modelSelection);
+      }
+    }
+
+    const reasoningEvents = await this.options.store.events({
+      type: "session.reasoning_changed",
+      limit: 10_000,
+    });
+    for (const event of reasoningEvents) {
+      if (event.type === "session.reasoning_changed" && isReasoningPayload(event.payload)) {
+        state.reasoningLevel = event.payload.reasoningLevel;
+      }
+    }
+
+    this.globalModelState = cloneSessionModelState(state);
+    return cloneSessionModelState(state);
   }
 
   private async buildModelConfig(
