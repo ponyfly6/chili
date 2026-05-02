@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { ChiliEvent, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import { createApplyPatchTool } from "./builtins/apply-patch.js";
 import { createBashTool } from "./builtins/bash.js";
+import type { BashRunRequest, BashRunner } from "./builtins/bash.js";
 import { createEditTool } from "./builtins/edit.js";
 import { createGlobTool } from "./builtins/glob.js";
 import { createGrepTool } from "./builtins/grep.js";
@@ -248,6 +249,101 @@ test("bash publishes live stdout and stderr tool output deltas", async () => {
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
+});
+
+test("bash runner injection receives resolved request and formats process output", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-bash-runner-"));
+  const events: ChiliEvent[] = [];
+  const controller = new AbortController();
+  let seen: BashRunRequest | undefined;
+  try {
+    await mkdir(join(workspace, "subdir"), { recursive: true });
+    const runner: BashRunner = {
+      async run(request) {
+        seen = request;
+        await request.onOutput?.({ stream: "stdout", delta: "live-out" });
+        await request.onOutput?.({ stream: "stderr", delta: "live-err" });
+        return {
+          exitCode: null,
+          signal: "SIGTERM",
+          stdout: "captured stdout",
+          stderr: "captured stderr",
+          stdoutTruncated: false,
+          stderrTruncated: false,
+          stdoutBytes: 15,
+          stderrBytes: 15,
+          outputLimitBytes: request.maxOutputBytes,
+          durationMs: 42,
+          timedOut: true,
+          aborted: false,
+        };
+      },
+    };
+    const registry = new InMemoryToolRegistry();
+    registry.register(createBashTool({ runner }));
+    const executor = createExecutor(registry, undefined, undefined, events);
+    const input = toolInput(
+      "bash",
+      {
+        command: "printf fake",
+        cwd: "subdir",
+        env: { CHILI_TEST_ENV: "ok" },
+        timeoutMs: 123,
+        maxOutputBytes: 17,
+      },
+      workspace,
+      "toolcall_fake_bash_runner" as ToolCallId,
+    );
+    input.signal = controller.signal;
+
+    const result = await executor.execute(input);
+
+    expect(result.status).toBe("completed");
+    expect(seen).toMatchObject({
+      command: "printf fake",
+      cwd: join(workspace, "subdir"),
+      env: { CHILI_TEST_ENV: "ok" },
+      timeoutMs: 123,
+      maxOutputBytes: 17,
+      signal: controller.signal,
+    });
+    expect(typeof seen?.onOutput).toBe("function");
+    if (result.status === "completed") {
+      expect(result.result.title).toBe("timed out after 123ms");
+      expect(result.result.output).toContain("captured stdout");
+      expect(result.result.output).toContain("[stderr]\ncaptured stderr");
+      expect(result.result.output).toContain("[process timed out after 123ms and was terminated]");
+      expect(result.result.metadata).toMatchObject({
+        command: "printf fake",
+        cwd: join(workspace, "subdir"),
+        envKeys: ["CHILI_TEST_ENV"],
+        signal: "SIGTERM",
+        timedOut: true,
+        stdoutBytes: 15,
+        stderrBytes: 15,
+        outputLimitBytes: 17,
+      });
+    }
+    const deltas = events.filter((event): event is Extract<ChiliEvent, { type: "tool.output_delta" }> => event.type === "tool.output_delta");
+    expect(deltas.map((event) => event.payload.delta)).toEqual(["live-out", "live-err"]);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("bash approval metadata is unchanged by runner injection", () => {
+  const runner: BashRunner = {
+    async run() {
+      throw new Error("not used");
+    },
+  };
+  const input = {
+    command: "rm -rf *",
+    cwd: "subdir",
+    env: { ZED: "1", ALPHA: "2" },
+  };
+
+  expect(createBashTool({ runner }).approval?.(input)).toEqual(createBashTool().approval?.(input));
 });
 
 test("snapshot creation failure fails closed before write tools mutate files", async () => {

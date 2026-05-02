@@ -23,7 +23,7 @@ import {
   type RuntimePromptTurnContext,
   type WorkerToolPolicy,
 } from "@chili/core";
-import type { AgentPath, EventEnvelope, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
+import type { AgentPath, ApprovalDecision, EventEnvelope, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
 import { ObservableEventStore, SqliteEventStore } from "@chili/store";
 import type { AgentMailboxRow, AgentTaskQuery, AgentTaskRow, TeamMemberRow, TeamMessageRow, TeamRow, TeamTaskRow } from "@chili/store";
 import {
@@ -99,7 +99,8 @@ import {
   type SkillResourceListing,
   type SkillRegistry,
 } from "@chili/skills";
-import { createCliApprovalBroker, createCliPermissionRules } from "./approval.js";
+import { createCliApprovalBroker, createCliApprovalRulesets, persistAllowAlwaysDecision } from "./approval.js";
+import { loadCliConfig, type CliConfig } from "./config.js";
 import { createIdFactory } from "./id.js";
 import type { CliModelName, CliReasoningLevel } from "./model.js";
 import { createCliModel } from "./model.js";
@@ -118,6 +119,7 @@ export interface CliHarnessOptions {
   yes?: boolean;
   quiet?: boolean;
   approvalQueue?: DeferredApprovalQueue;
+  chiliHome?: string;
 }
 
 export interface CliHarness {
@@ -154,6 +156,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   if (options.reasoningLevel !== undefined) cliModelInput.reasoningLevel = options.reasoningLevel;
   const model = await createCliModel(cliModelInput);
   const skillRegistry = await discoverSkills({ cwd });
+  const config = await loadCliConfig(cwd, options.chiliHome ? { chiliHome: options.chiliHome } : {});
   const registry = createToolRegistry(skillRegistry);
   const childRegistry = createChildToolRegistry(skillRegistry);
   const promptFragments = (context: { cwd: string; turn?: RuntimePromptTurnContext }) =>
@@ -179,7 +182,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const childToolExecutor = new ToolExecutor({
     registry: childRegistry,
     events: { publish: (event) => eventStore.append(event) },
-    approvals: createApprovalBroker(options),
+    approvals: createApprovalBroker(options, config),
     policyResolver: childToolPolicyResolver,
     snapshotProvider,
     createId,
@@ -275,7 +278,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const toolExecutor = new ToolExecutor({
     registry,
     events: { publish: (event) => eventStore.append(event) },
-    approvals: createApprovalBroker(options),
+    approvals: createApprovalBroker(options, config),
     snapshotProvider,
     createId,
     maxResultOutputBytes: 256_000,
@@ -678,16 +681,29 @@ function registerTeamDispatchTools(registry: InMemoryToolRegistry, controller: T
   registry.register(createTeamTaskReconcileTool(controller));
 }
 
-function createApprovalBroker(options: CliHarnessOptions): PolicyApprovalBroker {
+function createApprovalBroker(options: CliHarnessOptions, config: CliConfig): PolicyApprovalBroker {
   if (!options.approvalQueue) {
-    return createCliApprovalBroker(options.yes === undefined ? {} : { yes: options.yes });
+    return createCliApprovalBroker({
+      ...(options.yes === undefined ? {} : { yes: options.yes }),
+      config,
+      ...(options.chiliHome ? { chiliHome: options.chiliHome } : {}),
+    });
   }
 
-  return new PolicyApprovalBroker({
-    rulesets: [createCliPermissionRules(options.yes ?? false)],
-    ask: async (request) =>
-      options.approvalQueue?.ask(request) ?? { action: "deny", feedback: "Approval queue is unavailable." },
+  let broker: PolicyApprovalBroker;
+  broker = new PolicyApprovalBroker({
+    rulesets: createCliApprovalRulesets(options.yes ?? false, config),
+    ask: async (request) => {
+      const decision: ApprovalDecision = options.approvalQueue
+        ? await options.approvalQueue.ask(request)
+        : { action: "deny", feedback: "Approval queue is unavailable." };
+      return persistAllowAlwaysDecision(request, decision, options.chiliHome ? { chiliHome: options.chiliHome } : {});
+    },
+    onSessionGrant: async () => {
+      await options.approvalQueue?.recheckPending((request) => broker.preflight(request));
+    },
   });
+  return broker;
 }
 
 function createSubagentControlController(

@@ -23,6 +23,7 @@ import type {
   ChiliToolExecutionContext,
   ExecuteToolInput,
   ExecuteToolResult,
+  ApprovalPreflightDecision,
   SnapshotRecord,
   ToolApprovalSpec,
   ToolExecutorOptions,
@@ -64,7 +65,10 @@ export class ToolExecutor {
         isReadOnly: (definition, toolInput) => this.resolvePredicate(definition.isReadOnly, toolInput),
       });
 
-      const approval = await this.requestLifecycleApproval(tool, input, callId, validated, spec);
+      const approval = await this.requestLifecycleApproval(tool, input, callId, spec);
+      if (!isApprovalDecisionAction(approval.action)) {
+        throw new ToolDeniedError(tool.name, `Invalid approval decision action: ${String(approval.action)}`);
+      }
       if (approval.action === "deny") {
         throw new ToolDeniedError(tool.name, approval.feedback);
       }
@@ -109,23 +113,26 @@ export class ToolExecutor {
     tool: ChiliToolDefinition<Input>,
     input: ExecuteToolInput,
     callId: ToolCallId,
-    validated: Input,
     spec: false | Required<ToolApprovalSpec>,
   ): Promise<ApprovalDecision> {
     if (spec === false) return { action: "allow_once" };
 
+    const preflight = await this.preflightApproval(input, callId, tool, spec);
+    if (preflight.action === "allow") return { action: "allow_once" };
+    if (preflight.action === "deny") return denyDecision(preflight);
+
     await this.update(input, callId, "waiting_for_approval");
-    return this.requestApproval(input, callId, tool, spec);
+    return this.createApprovalRequest(input, callId, tool, spec, preflight);
   }
 
   private approvalSpec<Input>(tool: ChiliToolDefinition<Input>, input: Input): false | Required<ToolApprovalSpec> {
     const spec = tool.approval ? tool.approval(input) : { patterns: ["*"] };
     if (spec === false) return false;
-    return {
+    return validateApprovalSpec(tool.name, {
       permission: spec.permission ?? tool.name,
       patterns: spec.patterns,
       metadata: spec.metadata ?? {},
-    };
+    });
   }
 
   private async createSnapshotIfNeeded<Input>(
@@ -233,19 +240,32 @@ export class ToolExecutor {
         return this.streamOutput(input, callId, outputSequence, update);
       },
       requestApproval: (request) =>
-        this.requestApproval(input, callId, tool, {
+        this.approveOrRequest(input, callId, tool, validateApprovalSpec(tool.name, {
           permission: request.permission,
           patterns: request.patterns,
           metadata: request.metadata ?? {},
-        }),
+        })),
     };
   }
 
-  private async requestApproval(
+  private async approveOrRequest(
     input: ExecuteToolInput,
     callId: ToolCallId,
     tool: ChiliToolDefinition,
     spec: Required<ToolApprovalSpec>,
+  ): Promise<ApprovalDecision> {
+    const preflight = await this.preflightApproval(input, callId, tool, spec);
+    if (preflight.action === "allow") return { action: "allow_once" };
+    if (preflight.action === "deny") return denyDecision(preflight);
+    return this.createApprovalRequest(input, callId, tool, spec, preflight);
+  }
+
+  private async createApprovalRequest(
+    input: ExecuteToolInput,
+    callId: ToolCallId,
+    tool: ChiliToolDefinition,
+    spec: Required<ToolApprovalSpec>,
+    preflight?: ApprovalPreflightDecision,
   ): Promise<ApprovalDecision> {
     const approvalId = this.id<ApprovalId>("approval");
 
@@ -254,9 +274,10 @@ export class ToolExecutor {
       callId,
       permission: spec.permission,
       patterns: spec.patterns,
+      ...metadataPayload(approvalRequestMetadata(spec, preflight)),
     });
 
-    const decision = await this.options.approvals.decide({
+    const rawDecision = await this.options.approvals.decide({
       approvalId,
       sessionId: input.sessionId,
       ...(input.threadId ? { threadId: input.threadId } : {}),
@@ -267,6 +288,7 @@ export class ToolExecutor {
       patterns: spec.patterns,
       metadata: spec.metadata,
     });
+    const decision = normalizeApprovalDecision(rawDecision);
 
     await this.publish("approval.resolved", input, {
       approvalId,
@@ -275,6 +297,35 @@ export class ToolExecutor {
     });
 
     return decision;
+  }
+
+  private async preflightApproval(
+    input: ExecuteToolInput,
+    callId: ToolCallId,
+    tool: ChiliToolDefinition,
+    spec: Required<ToolApprovalSpec>,
+  ): Promise<ApprovalPreflightDecision> {
+    if (!this.options.approvals.preflight) {
+      return {
+        action: "ask",
+        source: "approval_broker",
+        reason: "Approval broker does not support preflight.",
+        metadata: {
+          permission: spec.permission,
+          patterns: spec.patterns,
+        },
+      };
+    }
+    return this.options.approvals.preflight({
+      sessionId: input.sessionId,
+      ...(input.threadId ? { threadId: input.threadId } : {}),
+      callId,
+      toolName: tool.name,
+      risk: tool.risk,
+      permission: spec.permission,
+      patterns: spec.patterns,
+      metadata: spec.metadata,
+    });
   }
 
   private async metadata(input: ExecuteToolInput, callId: ToolCallId, update: ToolMetadataUpdate): Promise<void> {
@@ -387,6 +438,52 @@ export class ToolExecutor {
   }
 }
 
+function approvalRequestMetadata(
+  spec: Required<ToolApprovalSpec>,
+  preflight: ApprovalPreflightDecision | undefined,
+): Record<string, unknown> | undefined {
+  const metadata: Record<string, unknown> = { ...spec.metadata };
+  if (preflight) {
+    metadata.preflightDecision = preflight;
+    if (preflight.reason) metadata.reason = preflight.reason;
+    if (preflight.feedback) metadata.feedback = preflight.feedback;
+    metadata.source = preflight.source;
+    if (preflight.matchedRule) metadata.matchedRule = preflight.matchedRule;
+    if (preflight.suggestions) metadata.suggestions = preflight.suggestions;
+    if (preflight.metadata) {
+      for (const key of ["patternDecisions", "risks", "approvalRisks"] as const) {
+        if (preflight.metadata[key] !== undefined) metadata[key] = preflight.metadata[key];
+      }
+    }
+  }
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
+}
+
+function metadataPayload(metadata: Record<string, unknown> | undefined): { metadata?: Record<string, unknown> } {
+  return metadata ? { metadata } : {};
+}
+
+function validateApprovalSpec(toolName: string, spec: Required<ToolApprovalSpec>): Required<ToolApprovalSpec> {
+  if (!Array.isArray(spec.patterns) || spec.patterns.length === 0) {
+    throw new ToolValidationError(toolName, "Approval spec must include at least one pattern.");
+  }
+  const invalidIndex = spec.patterns.findIndex((pattern) => typeof pattern !== "string" || pattern.trim().length === 0);
+  if (invalidIndex >= 0) {
+    throw new ToolValidationError(toolName, `Approval spec pattern at index ${invalidIndex} must be a non-empty string.`);
+  }
+  return spec;
+}
+
+function isApprovalDecisionAction(action: unknown): action is ApprovalDecision["action"] {
+  return action === "allow_once" || action === "allow_session" || action === "allow_always" || action === "deny";
+}
+
+function normalizeApprovalDecision(decision: ApprovalDecision): ApprovalDecision {
+  const action = (decision as { action?: unknown } | null | undefined)?.action;
+  if (isApprovalDecisionAction(action)) return decision;
+  return { action: "deny", feedback: `Invalid approval decision action: ${String(action)}` };
+}
+
 function defaultCreateId(prefix: string): string {
   return `${prefix}_${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
 }
@@ -399,4 +496,9 @@ function truncateUtf8(text: string, maxBytes: number): { text: string; bytes: nu
     bytes,
     truncated: true,
   };
+}
+
+function denyDecision(decision: ApprovalPreflightDecision): ApprovalDecision {
+  const feedback = decision.feedback ?? decision.reason;
+  return feedback ? { action: "deny", feedback } : { action: "deny" };
 }

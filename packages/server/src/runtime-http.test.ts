@@ -19,6 +19,7 @@ import { ObservableEventStore, SqliteEventStore } from "@chili/store";
 import type {
   AgentPath,
   AgentRunId,
+  ApprovalDecisionAction,
   ChiliEvent,
   EventEnvelope,
   Message,
@@ -606,10 +607,12 @@ test("resolves approvals through the runtime HTTP handler", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
   const service = new FakeRuntimeService(store);
+  const calls: unknown[] = [];
   const approvals = {
     resolved: false,
-    resolve(input: { decision: "allow_once" | "allow_always" | "deny" }) {
-      this.resolved = input.decision === "allow_once";
+    resolve(input: { decision: ApprovalDecisionAction; feedback?: string }) {
+      calls.push(input);
+      this.resolved = input.decision === "allow_session";
       return this.resolved;
     },
   };
@@ -618,7 +621,7 @@ test("resolves approvals through the runtime HTTP handler", async () => {
   const response = await handler(
     new Request("http://chili.test/approvals/approval_http/resolve", {
       method: "POST",
-      body: JSON.stringify({ decision: "allow_once" }),
+      body: JSON.stringify({ decision: "allow_session", feedback: "" }),
       headers: { "content-type": "application/json" },
     }),
   );
@@ -626,6 +629,46 @@ test("resolves approvals through the runtime HTTP handler", async () => {
   expect(response.status).toBe(200);
   expect(await response.json()).toEqual({ resolved: true });
   expect(approvals.resolved).toBe(true);
+  expect(calls).toEqual([{ approvalId: "approval_http", decision: "allow_session", feedback: "" }]);
+});
+
+test("rejects malformed approval resolve payloads before the runtime resolver", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const calls: unknown[] = [];
+  const handler = createRuntimeHttpHandler({
+    service,
+    store,
+    approvals: {
+      resolve(input: unknown) {
+        calls.push(input);
+        return true;
+      },
+    },
+  });
+
+  const cases = [
+    { body: {}, message: "decision is required" },
+    { body: { decision: "allow_forever" }, message: "decision must be one of allow_once, allow_session, allow_always, deny" },
+    { body: { decision: "allow_once", feedback: 123 }, message: "feedback must be a string" },
+    { body: { decision: "allow_once", scope: "session" }, message: "Unexpected field: scope" },
+  ];
+
+  for (const testCase of cases) {
+    const response = await handler(
+      new Request("http://chili.test/approvals/approval_http/resolve", {
+        method: "POST",
+        body: JSON.stringify(testCase.body),
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: { message: testCase.message } });
+  }
+
+  expect(calls).toEqual([]);
 });
 
 test("returns conflict when approval is not pending in the runtime queue", async () => {

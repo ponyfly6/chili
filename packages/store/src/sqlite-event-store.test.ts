@@ -6,6 +6,7 @@ import { expect, test } from "bun:test";
 import type {
   AgentPath,
   AgentRunId,
+  ApprovalId,
   ChiliEvent,
   MessageId,
   PartId,
@@ -165,6 +166,56 @@ test("migrates older team message tables without delivery", async () => {
         teamId: "team_old",
         kind: "text",
         content: "old message",
+      },
+    ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("migrates older approval tables and reads approval metadata", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-approval-migration-"));
+  const dbPath = join(dir, "events.sqlite");
+  const db = new Database(dbPath, { create: true, strict: true });
+  db.exec(`
+    create table approvals (
+      id text primary key,
+      session_id text,
+      thread_id text,
+      call_id text,
+      permission text not null,
+      patterns_json text not null,
+      status text not null,
+      decision text,
+      feedback text,
+      created_at integer not null,
+      resolved_at integer
+    )
+  `);
+  db.close();
+
+  const store = new SqliteEventStore(dbPath);
+  try {
+    const sessionId = "session_approval_metadata" as SessionId;
+    await store.append({
+      id: "event_approval_metadata",
+      type: "approval.requested",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId: "thread_approval_metadata" as ThreadId,
+      payload: {
+        approvalId: "approval_metadata" as ApprovalId,
+        permission: "tool.bash",
+        patterns: ["bun test"],
+        metadata: { reason: "Policy requires approval", source: "workspace config" },
+      },
+    });
+
+    expect(await store.pendingApprovals(sessionId)).toMatchObject([
+      {
+        id: "approval_metadata",
+        metadata: { reason: "Policy requires approval", source: "workspace config" },
       },
     ]);
   } finally {

@@ -1,5 +1,7 @@
 export type PermissionAction = "allow" | "deny" | "ask";
 
+export type PermissionDecisionSource = "default" | "policy_rule" | "session_grant" | string;
+
 export interface PermissionRule {
   permission: string;
   pattern: string;
@@ -7,10 +9,25 @@ export interface PermissionRule {
   source?: string;
 }
 
-export interface PolicyDecision {
+export interface PermissionSuggestion {
+  permission: string;
+  pattern: string;
   action: PermissionAction;
-  matchedRule?: PermissionRule;
+  scope?: "session" | "project" | "user";
+  source?: string;
 }
+
+export interface PermissionDecision {
+  action: PermissionAction;
+  reason?: string;
+  feedback?: string;
+  source: PermissionDecisionSource;
+  matchedRule?: PermissionRule;
+  suggestions?: PermissionSuggestion[];
+  metadata?: Record<string, unknown>;
+}
+
+export type PolicyDecision = PermissionDecision;
 
 export function evaluatePolicy(
   permission: string,
@@ -18,15 +35,23 @@ export function evaluatePolicy(
   rulesets: readonly (readonly PermissionRule[])[],
 ): PolicyDecision {
   const rules = rulesets.flat();
+  let fallback: PolicyDecision | undefined;
 
   for (let index = rules.length - 1; index >= 0; index -= 1) {
     const rule = rules[index];
     if (!rule) continue;
     if (!matchesRule(rule, permission, pattern)) continue;
-    return { action: rule.action, matchedRule: rule };
+    const decision = decisionForRule(rule, permission, pattern);
+    if (rule.action === "deny") return decision;
+    fallback ??= decision;
   }
 
-  return { action: "ask" };
+  return fallback ?? {
+    action: "ask",
+    source: "default",
+    reason: `No permission rule matched ${permission}:${pattern}.`,
+    metadata: { permission, pattern },
+  };
 }
 
 export function disabledTools(tools: readonly string[], rules: readonly PermissionRule[]): Set<string> {
@@ -70,6 +95,21 @@ function matchesRule(rule: PermissionRule, permission: string, pattern: string):
 
 function matchesPermission(pattern: string, value: string): boolean {
   return matches(pattern.toLowerCase(), value.toLowerCase());
+}
+
+function decisionForRule(rule: PermissionRule, permission: string, pattern: string): PolicyDecision {
+  const source = rule.source?.startsWith("session:") ? "session_grant" : "policy_rule";
+  const decision: PolicyDecision = {
+    action: rule.action,
+    source,
+    reason: `Matched ${rule.action} rule for ${permission}:${pattern}.`,
+    matchedRule: rule,
+    metadata: { permission, pattern },
+  };
+  if (rule.source) {
+    decision.metadata = { ...decision.metadata, ruleSource: rule.source };
+  }
+  return decision;
 }
 
 function unescapePermissionContent(content: string): string {

@@ -1,4 +1,5 @@
 import type { ApprovalId, MessageId, SessionId, ThreadId, TurnId } from "./ids.js";
+import type { ApprovalDecisionAction } from "./tool.js";
 
 export type RuntimeSessionStatus =
   | "idle"
@@ -88,7 +89,7 @@ export interface RuntimeInterruptCommand {
 export interface RuntimeResolveApprovalCommand {
   type: "approval.resolve";
   approvalId: ApprovalId;
-  decision: "allow_once" | "allow_always" | "deny";
+  decision: ApprovalDecisionAction;
   feedback?: string;
 }
 

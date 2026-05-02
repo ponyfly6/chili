@@ -6,6 +6,7 @@ import type {
   AgentTaskStatus,
   Message,
   ApprovalId,
+  ApprovalDecisionAction,
   RuntimeApprovalResolveResult,
   RuntimeInterruptResult,
   RuntimeModelConfig,
@@ -124,14 +125,16 @@ export interface InterruptSessionRequest {
 
 export interface ResolveApprovalRequest {
   approvalId: ApprovalId;
-  decision: "allow_once" | "allow_always" | "deny";
+  decision: ApprovalDecisionAction;
   feedback?: string;
   signal?: AbortSignal;
 }
 
+export type ApprovalGrantScope = "once" | "session" | "persistent";
+
 export interface ApproveApprovalRequest {
   approvalId: ApprovalId;
-  always?: boolean;
+  scope?: ApprovalGrantScope;
   feedback?: string;
   signal?: AbortSignal;
 }
@@ -820,7 +823,7 @@ export class HttpRuntimeClient implements RuntimeClient {
   approveApproval(input: ApproveApprovalRequest): Promise<RuntimeApprovalResolveResult> {
     const request: ResolveApprovalRequest = {
       approvalId: input.approvalId,
-      decision: input.always ? "allow_always" : "allow_once",
+      decision: approvalDecisionForApproveRequest(input),
     };
     if (input.feedback !== undefined) request.feedback = input.feedback;
     if (input.signal) request.signal = input.signal;
@@ -1071,6 +1074,13 @@ export class HttpRuntimeClient implements RuntimeClient {
   private url(path: string): URL {
     return new URL(path.replace(/^\/+/, ""), this.baseUrl);
   }
+}
+
+function approvalDecisionForApproveRequest(input: ApproveApprovalRequest): ApprovalDecisionAction {
+  if (input.scope === undefined || input.scope === "once") return "allow_once";
+  if (input.scope === "session") return "allow_session";
+  if (input.scope === "persistent") return "allow_always";
+  throw new Error("approval scope must be one of once, session, persistent");
 }
 
 function parseSseFrame(frame: string): ChiliEvent | undefined {

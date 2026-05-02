@@ -494,7 +494,49 @@ test("does not render approval dock when no approval is pending", async () => {
   });
 
   expect(frame).not.toContain("Approval required");
-  expect(frame).not.toContain("a approve once | x reject");
+  expect(frame).not.toContain("a once | s session");
+});
+
+test("renders approval permission patterns and risk metadata", async () => {
+  const frame = await renderShellFrame(teamLiveFixture(), {
+    width: 110,
+    height: 28,
+    runtime: fakeChatRuntime({
+      canSubmit: false,
+      chatView: {
+        status: "waiting_for_approval",
+        items: chatMessages(1),
+        pendingApprovals: [
+          {
+            id: "approval_metadata" as ApprovalId,
+            kind: "approval",
+            permission: "tool.bash",
+            patterns: ["rm -rf build", "bun test"],
+            status: "pending",
+            createdAt: 1,
+            toolName: "bash",
+            toolDisplayStatus: "waiting_permission",
+            inputSummary: { title: "bash", command: "rm -rf build && bun test", detail: "rm -rf build && bun test" },
+            metadata: {
+              patternDecisions: [{ pattern: "rm -rf build", action: "ask", reason: "Auto policy paused for destructive shell command", source: "workspace settings", matchedRule: "bash rm rule" }],
+              risks: [{ pattern: "rm -rf build", action: "ask", reason: "removes files before tests" }],
+            },
+          },
+        ] as never,
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    }),
+  });
+
+  expect(frame).toContain("Approval required");
+  expect(frame).toContain("permission: tool.bash");
+  expect(frame).toContain("patterns: rm -rf build, bun test");
+  expect(frame).toContain("reason: ask - Auto policy paused");
+  expect(frame).toContain("source: workspace settings");
+  expect(frame).toContain("matched: bash rm rule");
+  expect(frame).toContain("risk: ask - removes files");
+  expect(frame).toContain("a once | s session | A always | x deny");
 });
 
 test("folds long approval details without hiding the prompt", async () => {

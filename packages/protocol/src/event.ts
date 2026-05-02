@@ -14,7 +14,7 @@ import type {
 import type { AgentPath } from "./agent-path.js";
 import type { MessagePart } from "./message.js";
 import type { ModelSelection, ReasoningLevel, ModelMetadataPayload, RuntimeStatusPayload } from "./runtime.js";
-import type { ToolCallStatus, ToolOutputStream } from "./tool.js";
+import type { ApprovalDecisionAction, ToolCallStatus, ToolOutputStream } from "./tool.js";
 
 export interface EventEnvelope<TType extends string = string, TPayload = unknown> {
   id: string;
@@ -65,8 +65,8 @@ export type ToolEvent =
   | EventEnvelope<"tool.call_finished", { callId: ToolCallId; status: "completed" | "failed" | "cancelled"; output?: string; error?: string; synthetic?: boolean }>;
 
 export type ApprovalEvent =
-  | EventEnvelope<"approval.requested", { approvalId: ApprovalId; callId?: ToolCallId; permission: string; patterns: string[] }>
-  | EventEnvelope<"approval.resolved", { approvalId: ApprovalId; decision: "allow_once" | "allow_always" | "deny"; feedback?: string }>;
+  | EventEnvelope<"approval.requested", { approvalId: ApprovalId; callId?: ToolCallId; permission: string; patterns: string[]; metadata?: Record<string, unknown> }>
+  | EventEnvelope<"approval.resolved", { approvalId: ApprovalId; decision: ApprovalDecisionAction; feedback?: string }>;
 
 export type RecoveryEvent =
   | EventEnvelope<"snapshot.created", { snapshotId: SnapshotId; callId?: ToolCallId; toolName?: string; paths: string[]; reason: string }>

@@ -60,7 +60,9 @@ export interface ApprovalRequest {
   metadata?: Record<string, unknown>;
 }
 
+export type ApprovalDecisionAction = "allow_once" | "allow_session" | "allow_always" | "deny";
+
 export interface ApprovalDecision {
-  action: "allow_once" | "allow_always" | "deny";
+  action: ApprovalDecisionAction;
   feedback?: string;
 }

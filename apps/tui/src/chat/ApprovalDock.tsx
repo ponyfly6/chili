@@ -1,13 +1,14 @@
 import type { ApprovalId } from "@chili/protocol";
 import type { ChatApprovalRow } from "@chili/sdk";
+import type { ChatApprovalGrantScope } from "../useChatRuntime.js";
 import type { TuiTheme } from "../theme/index.js";
 
-const MAX_APPROVAL_BODY_LINES = 3;
+const MAX_APPROVAL_BODY_LINES = 7;
 
 export function ApprovalDock(props: {
   approvals: readonly ChatApprovalRow[];
   width?: number;
-  onApprove: (approvalId: ApprovalId) => void;
+  onApprove: (approvalId: ApprovalId, scope: ChatApprovalGrantScope) => void;
   onReject: (approvalId: ApprovalId) => void;
   theme: TuiTheme;
 }) {
@@ -36,6 +37,30 @@ interface ApprovalDockLine {
   fg: string;
 }
 
+interface ApprovalRiskMetadata {
+  permission?: unknown;
+  pattern?: unknown;
+  patterns?: unknown;
+  action?: unknown;
+  reason?: unknown;
+  level?: unknown;
+  severity?: unknown;
+  source?: unknown;
+  matchedRule?: unknown;
+}
+
+interface TuiApprovalMetadata {
+  metadata?: Record<string, unknown>;
+  reason?: unknown;
+  source?: unknown;
+  danger?: unknown;
+  dangerLevel?: unknown;
+  risk?: unknown;
+  riskLevel?: unknown;
+  policySource?: unknown;
+  matchedRule?: unknown;
+}
+
 function approvalDockLines(approvals: readonly ChatApprovalRow[], width: number, theme: TuiTheme): ApprovalDockLine[] {
   const visible = approvals.slice(0, 3);
   const contentWidth = Math.max(12, width - 6);
@@ -61,6 +86,14 @@ function approvalDockLines(approvals: readonly ChatApprovalRow[], width: number,
     }
 
     const summary = approvalSummary(approval);
+    body.push(...wrapDetail(`${approval.id}:permission`, `  permission: ${approval.permission}`, contentWidth, theme.colors.text.secondary));
+    if (approval.patterns.length > 0) {
+      body.push(...wrapDetail(`${approval.id}:patterns`, `  patterns: ${approval.patterns.join(", ")}`, contentWidth, theme.colors.text.secondary));
+    }
+    for (const line of approvalMetadataLines(approval)) {
+      const fg = line.kind === "danger" ? theme.colors.status.error : line.kind === "reason" ? theme.colors.status.warning : theme.colors.text.secondary;
+      body.push(...wrapDetail(`${approval.id}:${line.kind}:${line.index}`, `  ${line.label}: ${line.value}`, contentWidth, fg));
+    }
     if (summary.command) {
       body.push(...wrapDetail(`${approval.id}:command`, `  command: ${summary.command}`, contentWidth, theme.colors.text.primary));
     }
@@ -90,7 +123,7 @@ function approvalDockLines(approvals: readonly ChatApprovalRow[], width: number,
   if (foldedCount > 0) {
     lines.push({ key: "folded", text: `  +${foldedCount} lines folded`, fg: theme.colors.text.muted });
   }
-  lines.push({ key: "hint", text: "a approve once | x reject", fg: theme.colors.text.muted });
+  lines.push({ key: "hint", text: "a once | s session | A always | x deny", fg: theme.colors.text.muted });
   return lines;
 }
 
@@ -100,6 +133,98 @@ function approvalSummary(approval: ChatApprovalRow): ChatApprovalRow["inputSumma
     detail: approval.patterns.join(", "),
     scope: approval.patterns.join(", "),
   };
+}
+
+function approvalMetadataLines(approval: ChatApprovalRow): Array<{ index: number; kind: "reason" | "source" | "danger"; label: string; value: string }> {
+  const extended = approval as ChatApprovalRow & TuiApprovalMetadata;
+  const metadata = isRecord(extended.metadata) ? extended.metadata : {};
+  const lines: Array<{ index: number; kind: "reason" | "source" | "danger"; label: string; value: string }> = [];
+  const seen = new Set<string>();
+
+  const add = (kind: "reason" | "source" | "danger", label: string, value: unknown) => {
+    const text = metadataValueText(value);
+    if (!text) return;
+    const key = `${kind}:${label}:${text}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    lines.push({ index: lines.length, kind, label, value: text });
+  };
+
+  add("reason", "reason", extended.reason ?? metadata.reason ?? metadata.decisionReason ?? metadata.approvalReason);
+  add("source", "source", extended.source ?? metadata.source ?? metadata.policySource ?? metadata.hookSource);
+  add("source", "matched", extended.matchedRule ?? metadata.matchedRule ?? metadata.rule);
+  add("danger", "danger", extended.danger ?? extended.dangerLevel ?? metadata.danger ?? metadata.dangerLevel ?? metadata.destructiveWarning);
+  add("danger", "risk", extended.risk ?? extended.riskLevel ?? metadata.risk ?? metadata.riskLevel);
+
+  for (const decision of approvalRisks(metadata.patternDecisions)) {
+    add("reason", "reason", decisionSummary(decision));
+    add("source", "source", decision.source);
+    add("source", "matched", decision.matchedRule);
+  }
+
+  for (const [index, risk] of approvalRisks(metadata.approvalRisks ?? metadata.risks).entries()) {
+    const parts = [
+      stringValue(risk.action),
+      stringValue(risk.level ?? risk.severity),
+      stringValue(risk.reason),
+      patternText(risk.pattern ?? risk.patterns) ? `pattern ${patternText(risk.pattern ?? risk.patterns)}` : undefined,
+      stringValue(risk.source),
+    ].filter((part): part is string => Boolean(part));
+    add("danger", index === 0 ? "risk" : "risk", parts.join(" - "));
+  }
+
+  return lines;
+}
+
+function decisionSummary(decision: ApprovalRiskMetadata): string | undefined {
+  const parts = [
+    stringValue(decision.action),
+    stringValue(decision.reason),
+    patternText(decision.pattern ?? decision.patterns) ? `pattern ${patternText(decision.pattern ?? decision.patterns)}` : undefined,
+  ].filter((part): part is string => Boolean(part));
+  return parts.join(" - ") || undefined;
+}
+
+function approvalRisks(value: unknown): ApprovalRiskMetadata[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(isRecord);
+}
+
+function metadataValueText(value: unknown): string | undefined {
+  if (typeof value === "string") return value.trim() || undefined;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (!isRecord(value)) return undefined;
+  const typed = value as ApprovalRiskMetadata & { type?: unknown; name?: unknown; rule?: unknown };
+  const parts = [
+    stringValue(typed.type),
+    stringValue(typed.name),
+    stringValue(typed.action),
+    stringValue(typed.permission),
+    patternText(typed.pattern ?? typed.patterns),
+    stringValue(typed.level ?? typed.severity),
+    stringValue(typed.reason),
+    stringValue(typed.rule),
+    stringValue(typed.source),
+  ].filter((part): part is string => Boolean(part));
+  return parts.join(" - ") || undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  if (typeof value === "string") return value.trim() || undefined;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return undefined;
+}
+
+function patternText(value: unknown): string | undefined {
+  if (Array.isArray(value)) {
+    const joined = value.map(stringValue).filter((part): part is string => Boolean(part)).join(", ");
+    return joined || undefined;
+  }
+  return stringValue(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function wrapDetail(key: string, text: string, width: number, fg: string): ApprovalDockLine[] {

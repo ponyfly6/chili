@@ -13,6 +13,7 @@ import type {
   ToolResult,
   TurnId,
 } from "@chili/protocol";
+import type { PermissionDecision } from "@chili/policy";
 import type { FileReadStateStore } from "./file-read-state.js";
 
 export type ValidationResult<Input> =
@@ -70,7 +71,16 @@ export interface ApprovalBrokerRequest {
   metadata?: Record<string, unknown>;
 }
 
+export type ApprovalPreflightAction = "allow" | "ask" | "deny";
+
+export interface ApprovalPreflightDecision extends Omit<PermissionDecision, "action"> {
+  action: ApprovalPreflightAction;
+}
+
+export interface ApprovalPreflightRequest extends Omit<ApprovalBrokerRequest, "approvalId"> {}
+
 export interface ApprovalBroker {
+  preflight?(request: ApprovalPreflightRequest): Promise<ApprovalPreflightDecision>;
   decide(request: ApprovalBrokerRequest): Promise<ApprovalDecision>;
 }
 

@@ -3,6 +3,7 @@ import type {
   AgentPath,
   AgentTaskMode,
   AgentTaskStatus,
+  ApprovalDecisionAction,
   RuntimeInterruptResult,
   RuntimeModelConfig,
   RuntimeModelDescriptor,
@@ -143,7 +144,7 @@ export interface RuntimeHttpHandlerOptions {
 export interface ApprovalResolver {
   resolve(input: {
     approvalId: import("@chili/protocol").ApprovalId;
-    decision: "allow_once" | "allow_always" | "deny";
+    decision: ApprovalDecisionAction;
     feedback?: string;
   }): boolean | Promise<boolean>;
 }
@@ -455,17 +456,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "resolveApproval") {
         if (!options.approvals) return jsonError(501, "No approval resolver is configured");
-        const body = await readJson<ResolveApprovalBody>(request);
-        if (!body.decision) throw badRequest("decision is required");
-        const resolveInput: {
-          approvalId: import("@chili/protocol").ApprovalId;
-          decision: "allow_once" | "allow_always" | "deny";
-          feedback?: string;
-        } = {
-          approvalId: route.approvalId,
-          decision: body.decision,
-        };
-        if (body.feedback) resolveInput.feedback = body.feedback;
+        const resolveInput = parseResolveApprovalBody(route.approvalId, await readJson<unknown>(request));
         const resolved = await options.approvals.resolve(resolveInput);
         if (!resolved) {
           return jsonError(409, "Approval is not pending in this runtime. It may have been handled already or orphaned by a server restart.");
@@ -710,11 +701,6 @@ interface InterruptBody {
   reason?: string;
 }
 
-interface ResolveApprovalBody {
-  decision?: "allow_once" | "allow_always" | "deny";
-  feedback?: string;
-}
-
 interface EventStreamOptions {
   store: EventStore & EventPublisher;
   request: Request;
@@ -857,6 +843,36 @@ function parseSkillMentions(value: unknown): RuntimeSkillMention[] {
     mentions.push(mention);
   }
   return mentions;
+}
+
+function parseResolveApprovalBody(approvalId: import("@chili/protocol").ApprovalId, body: unknown): {
+  approvalId: import("@chili/protocol").ApprovalId;
+  decision: ApprovalDecisionAction;
+  feedback?: string;
+} {
+  if (!isRecord(body)) throw badRequest("JSON object body is required");
+  const unknownKeys = Object.keys(body).filter((key) => key !== "decision" && key !== "feedback");
+  if (unknownKeys.length > 0) throw badRequest(`Unexpected field: ${unknownKeys[0]}`);
+  if (body.decision === undefined) throw badRequest("decision is required");
+  if (!isApprovalDecisionAction(body.decision)) throw badRequest("decision must be one of allow_once, allow_session, allow_always, deny");
+
+  const input: {
+    approvalId: import("@chili/protocol").ApprovalId;
+    decision: ApprovalDecisionAction;
+    feedback?: string;
+  } = {
+    approvalId,
+    decision: body.decision,
+  };
+  if (body.feedback !== undefined) {
+    if (typeof body.feedback !== "string") throw badRequest("feedback must be a string");
+    input.feedback = body.feedback;
+  }
+  return input;
+}
+
+function isApprovalDecisionAction(value: unknown): value is ApprovalDecisionAction {
+  return value === "allow_once" || value === "allow_session" || value === "allow_always" || value === "deny";
 }
 
 function rejectLegacySystemField(body: unknown): void {

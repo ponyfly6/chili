@@ -12,7 +12,40 @@ export interface BashInput {
   env?: Record<string, string>;
 }
 
-export function createBashTool(): ChiliToolDefinition<BashInput> {
+export interface BashRunRequest {
+  command: string;
+  cwd: string;
+  env?: Record<string, string>;
+  timeoutMs: number;
+  maxOutputBytes: number;
+  signal: AbortSignal;
+  onOutput: RunProcessOptions["onOutput"];
+}
+
+export interface BashRunner {
+  run(request: BashRunRequest): Promise<RunProcessResult>;
+}
+
+export interface BashToolOptions {
+  runner?: BashRunner;
+}
+
+const DEFAULT_BASH_RUNNER: BashRunner = {
+  run(request) {
+    const processOptions: RunProcessOptions = {
+      cwd: request.cwd,
+      signal: request.signal,
+      timeoutMs: request.timeoutMs,
+      maxOutputBytes: request.maxOutputBytes,
+    };
+    if (request.env) processOptions.env = request.env;
+    if (request.onOutput) processOptions.onOutput = request.onOutput;
+    return runProcess("bash", ["-lc", request.command], processOptions);
+  },
+};
+
+export function createBashTool(options: BashToolOptions = {}): ChiliToolDefinition<BashInput> {
+  const runner = options.runner ?? DEFAULT_BASH_RUNNER;
   return {
     name: "bash",
     aliases: ["run_shell_command"],
@@ -83,7 +116,7 @@ export function createBashTool(): ChiliToolDefinition<BashInput> {
           readOnly: isReadOnlyShellCommand(input.command),
           cwd: input.cwd,
           envKeys: input.env ? Object.keys(input.env).sort() : [],
-          ...(danger ? { danger: danger.action, dangerReason: danger.reason } : {}),
+          ...(danger ? { danger: danger.action, dangerReason: danger.reason, dangerSource: "bash_danger_classifier" } : {}),
         },
       };
     },
@@ -96,20 +129,23 @@ export function createBashTool(): ChiliToolDefinition<BashInput> {
         },
       });
 
-      const processOptions: RunProcessOptions = {
+      const timeoutMs = input.timeoutMs ?? 30_000;
+      const maxOutputBytes = input.maxOutputBytes ?? 256_000;
+      const runRequest: BashRunRequest = {
+        command: input.command,
         cwd,
         signal: context.signal,
-        timeoutMs: input.timeoutMs ?? 30_000,
-        maxOutputBytes: input.maxOutputBytes ?? 256_000,
+        timeoutMs,
+        maxOutputBytes,
         onOutput: (chunk) => context.streamOutput(chunk),
       };
-      if (input.env) processOptions.env = input.env;
-      const result = await runProcess("bash", ["-lc", input.command], processOptions);
+      if (input.env) runRequest.env = input.env;
+      const result = await runner.run(runRequest);
 
-      const output = formatCommandOutput(result, input.timeoutMs ?? 30_000);
+      const output = formatCommandOutput(result, timeoutMs);
 
       return {
-        title: result.timedOut ? `timed out after ${input.timeoutMs ?? 30_000}ms` : `exit ${result.exitCode ?? "signal"}`,
+        title: result.timedOut ? `timed out after ${timeoutMs}ms` : `exit ${result.exitCode ?? "signal"}`,
         output,
         metadata: {
           command: input.command,

@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import { cleanClipboardText, promptClipboardText, promptPasteBytes, systemClipboard, type ClipboardAccess } from "./clipboard.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import { teamLiveModel, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
-import { useChatRuntime, type ChatRuntimeState } from "./useChatRuntime.js";
+import { useChatRuntime, type ChatApprovalGrantScope, type ChatRuntimeState } from "./useChatRuntime.js";
 import { findAction } from "./components/helpers.js";
 import {
   DEFAULT_REASONING_LEVEL,
@@ -681,11 +681,19 @@ export function ChatShellSurface(props: {
       if (next !== undefined) setPromptFromHistory(next);
       return;
     }
-    if (!prompt && firstApproval && key.name === "a") {
-      void props.runtime.approveApproval(firstApproval.id);
+    if (view === "chat" && !prompt && firstApproval && isApproveAlwaysKey(key)) {
+      void props.runtime.approveApproval(firstApproval.id, { scope: "persistent" });
       return;
     }
-    if (!prompt && firstApproval && key.name === "x") {
+    if (view === "chat" && !prompt && firstApproval && isApproveSessionKey(key)) {
+      void props.runtime.approveApproval(firstApproval.id, { scope: "session" });
+      return;
+    }
+    if (view === "chat" && !prompt && firstApproval && isApproveOnceKey(key)) {
+      void props.runtime.approveApproval(firstApproval.id, { scope: "once" });
+      return;
+    }
+    if (view === "chat" && !prompt && firstApproval && isRejectApprovalKey(key)) {
       void props.runtime.rejectApproval(firstApproval.id);
       return;
     }
@@ -1018,7 +1026,7 @@ function SessionScreen(props: {
       <ApprovalDock
         approvals={props.runtime.chatView.pendingApprovals}
         width={messageWidth}
-        onApprove={(approvalId: ApprovalId) => void props.runtime.approveApproval(approvalId)}
+        onApprove={(approvalId: ApprovalId, scope: ChatApprovalGrantScope) => void props.runtime.approveApproval(approvalId, { scope })}
         onReject={(approvalId: ApprovalId) => void props.runtime.rejectApproval(approvalId)}
         theme={props.theme}
       />
@@ -2051,6 +2059,23 @@ function isCopyShortcut(key: KeyEvent): boolean {
 
 function isPasteShortcut(key: KeyEvent): boolean {
   return key.name === "v" && !key.shift && (key.ctrl || Boolean(key.super || key.meta));
+}
+
+function isApproveOnceKey(key: KeyEvent): boolean {
+  return key.name === "a" && !hasModifier(key);
+}
+
+function isApproveSessionKey(key: KeyEvent): boolean {
+  return key.name === "s" && !hasModifier(key);
+}
+
+function isApproveAlwaysKey(key: KeyEvent): boolean {
+  const upperA = key.name === "A" || key.sequence === "A" || (key.name === "a" && key.shift);
+  return upperA && !key.ctrl && !key.meta && !key.super && !key.hyper && !key.option;
+}
+
+function isRejectApprovalKey(key: KeyEvent): boolean {
+  return key.name === "x" && !hasModifier(key);
 }
 
 function isArrowUp(key: KeyEvent): boolean {

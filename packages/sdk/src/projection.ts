@@ -3,6 +3,7 @@ import type {
   AgentRunId,
   AgentTaskMode,
   ApprovalId,
+  ApprovalDecisionAction,
   ChiliEvent,
   EventEnvelope,
   MessageId,
@@ -125,7 +126,8 @@ export interface RuntimeApprovalView {
   sessionId?: SessionId;
   threadId?: ThreadId;
   callId?: ToolCallId;
-  decision?: "allow_once" | "allow_always" | "deny";
+  metadata?: Record<string, unknown>;
+  decision?: ApprovalDecisionAction;
   feedback?: string;
   resolvedAt?: number;
 }
@@ -707,6 +709,7 @@ export interface ChatApprovalRow {
   toolStatus?: RuntimeToolCallView["status"];
   toolDisplayStatus?: ChatToolDisplayStatus;
   inputSummary: ChatToolInputSummary;
+  metadata?: Record<string, unknown>;
   decision?: RuntimeApprovalView["decision"];
   feedback?: string;
   resolvedAt?: number;
@@ -917,6 +920,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       assignOptional(approval, "sessionId", event.sessionId);
       assignOptional(approval, "threadId", event.threadId);
       assignOptional(approval, "callId", event.payload.callId);
+      assignOptional(approval, "metadata", event.payload.metadata);
       view.approvals[approval.id] = approval;
       linkApprovalToSession(view, approval, event.time);
       break;
@@ -1225,6 +1229,7 @@ function chatApprovalRow(view: ChiliRuntimeView, approval: RuntimeApprovalView):
   assignOptional(row, "toolInput", toolCall?.input);
   assignOptional(row, "toolStatus", toolStatus);
   assignOptional(row, "toolDisplayStatus", toolStatus ? chatToolDisplayStatus(approval.status === "pending" ? "waiting_for_approval" : toolStatus, approval) : undefined);
+  assignOptional(row, "metadata", approval.metadata);
   assignOptional(row, "decision", approval.decision);
   assignOptional(row, "feedback", approval.feedback);
   assignOptional(row, "resolvedAt", approval.resolvedAt);

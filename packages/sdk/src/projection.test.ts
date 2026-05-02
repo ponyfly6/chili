@@ -95,7 +95,13 @@ test("replays session, message, tool, and approval events into a runtime view", 
       time: 7 as TimestampMs,
       sessionId,
       threadId,
-      payload: { approvalId: "approval_test" as never, callId, permission: "tool.read", patterns: ["README.md"] },
+      payload: {
+        approvalId: "approval_test" as never,
+        callId,
+        permission: "tool.read",
+        patterns: ["README.md"],
+        metadata: { reason: "Policy asks for README reads", source: "project .chili/config.toml" },
+      },
     },
     {
       id: "event_8",
@@ -131,6 +137,10 @@ test("replays session, message, tool, and approval events into a runtime view", 
   expect(message?.parts[0]?.type).toBe("text");
   expect(message?.parts[0]?.type === "text" ? message.parts[0].text : "").toBe("hello world");
   expect(view.toolCalls[callId]?.status).toBe("completed");
+  expect(view.approvals.approval_test?.metadata).toEqual({
+    reason: "Policy asks for README reads",
+    source: "project .chili/config.toml",
+  });
   expect(pendingApprovals(view, sessionId)).toHaveLength(0);
 });
 
@@ -1980,13 +1990,19 @@ test("client approval command wrappers map product actions onto resolve calls", 
   const client = new HttpRuntimeClient({ baseUrl: "http://runtime.test/api", fetch: fetchImpl });
 
   await client.approveApproval({ approvalId });
-  await client.approveApproval({ approvalId, always: true, feedback: "trusted" });
+  await client.approveApproval({ approvalId, scope: "session" });
+  await client.approveApproval({ approvalId, scope: "persistent", feedback: "trusted" });
   await client.rejectApproval({ approvalId, feedback: "needs review" });
+  expect(() => client.approveApproval({ approvalId, scope: "forever" as never })).toThrow("approval scope must be one of once, session, persistent");
 
   expect(records).toEqual([
     {
       url: "http://runtime.test/api/approvals/approval_sdk_wrapper/resolve",
       body: { decision: "allow_once" },
+    },
+    {
+      url: "http://runtime.test/api/approvals/approval_sdk_wrapper/resolve",
+      body: { decision: "allow_session" },
     },
     {
       url: "http://runtime.test/api/approvals/approval_sdk_wrapper/resolve",

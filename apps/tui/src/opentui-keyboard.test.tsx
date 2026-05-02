@@ -9,7 +9,7 @@ import type { ApprovalId, ChiliEvent, MessageId, PartId, SessionId, TaskId, Thre
 import type { ClipboardAccess } from "./clipboard.js";
 import { ChatShellApp, ChatShellSurface } from "./ChatShellApp.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
-import type { ChatRuntimeState } from "./useChatRuntime.js";
+import type { ChatApproveOptions, ChatRuntimeState } from "./useChatRuntime.js";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
 import type { SkillSummary } from "@chili/skills";
 import type { TeamLiveSurfaceRuntime } from "./components/types.js";
@@ -1182,7 +1182,7 @@ test("running disabled composer does not switch to prompt history", async () => 
 });
 
 test("pending approval renders the approval dock and shortcuts resolve it", async () => {
-  const approved: ApprovalId[] = [];
+  const approved: Array<{ id: ApprovalId; scope: ChatApproveOptions["scope"] }> = [];
   const rejected: ApprovalId[] = [];
   const approvalId = "approval_chat_pending" as ApprovalId;
   const app = await mountShell(teamLiveFixture(), {
@@ -1202,13 +1202,18 @@ test("pending approval renders the approval dock and shortcuts resolve it", asyn
             toolName: "bash",
             toolDisplayStatus: "waiting_permission",
             inputSummary: { title: "bash", command: "bun test", detail: "bun test" },
+            metadata: {
+              reason: "Policy requires approval for shell execution",
+              source: "project permissions",
+              approvalRisks: [{ pattern: "bun test", action: "ask", reason: "shell command can execute local scripts" }],
+            },
           },
-        ],
+        ] as never,
         activeTools: [],
         generatedAt: "1970-01-01T00:00:00.000Z",
       },
-      approveApproval: async (id) => {
-        approved.push(id);
+      approveApproval: async (id, options) => {
+        approved.push({ id, scope: options?.scope });
       },
       rejectApproval: async (id) => {
         rejected.push(id);
@@ -1219,11 +1224,26 @@ test("pending approval renders the approval dock and shortcuts resolve it", asyn
   try {
     expect(app.captureCharFrame()).toContain("tool.bash");
     expect(app.captureCharFrame()).toContain("waiting_permission");
+    expect(app.captureCharFrame()).toContain("permission: tool.bash");
+    expect(app.captureCharFrame()).toContain("patterns: bun test");
+    expect(app.captureCharFrame()).toContain("reason: Policy requires approval");
+    expect(app.captureCharFrame()).toContain("source: project permissions");
+    expect(app.captureCharFrame()).toContain("risk: ask - shell command");
     expect(app.captureCharFrame()).toContain("command: bun test");
-    expect(app.captureCharFrame()).toContain("a approve once | x reject");
+    expect(app.captureCharFrame()).toContain("a once | s session | A always | x deny");
 
     await press(app, () => app.mockInput.pressKey("a"));
-    expect(approved).toEqual([approvalId]);
+    expect(approved).toEqual([{ id: approvalId, scope: "once" }]);
+
+    await press(app, () => app.mockInput.pressKey("s"));
+    expect(approved).toEqual([{ id: approvalId, scope: "once" }, { id: approvalId, scope: "session" }]);
+
+    await press(app, () => app.mockInput.pressKey("a", { shift: true }));
+    expect(approved).toEqual([
+      { id: approvalId, scope: "once" },
+      { id: approvalId, scope: "session" },
+      { id: approvalId, scope: "persistent" },
+    ]);
 
     await press(app, () => app.mockInput.pressKey("x"));
     expect(rejected).toEqual([approvalId]);
@@ -1249,7 +1269,50 @@ test("stale approval resolve failures are shown instead of success", async () =>
 
     await press(app, () => app.mockInput.pressKey("a"));
     expect(records.approve).toHaveLength(1);
-    expect(app.captureCharFrame()).toContain("Approval is no longer pending");
+    expect(app.captureCharFrame()).toContain("Approval is no longer pending after recheck");
+    expect(app.captureCharFrame()).not.toContain("approval allowed once");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("session approval shortcut sends session-scoped approval", async () => {
+  const records = chatClientRecords();
+  const sessionId = "session_scoped_approval" as SessionId;
+  const threadId = "thread_scoped_approval" as ThreadId;
+  const approvalId = "approval_scoped" as ApprovalId;
+  const client = fakeChatClient(records, approvalEvents(sessionId, threadId, approvalId));
+  const app = await mountChatApp(client, { sessionId, threadId });
+
+  try {
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    await press(app, () => app.mockInput.pressKey("s"));
+    expect(records.approve).toHaveLength(1);
+    expect(records.approve[0]).toMatchObject({ approvalId, scope: "session" });
+    expect(app.captureCharFrame()).toContain("approval allowed for session");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("persistent approval shortcut sends persistent-scoped approval", async () => {
+  const records = chatClientRecords();
+  const sessionId = "session_persistent_approval" as SessionId;
+  const threadId = "thread_persistent_approval" as ThreadId;
+  const approvalId = "approval_persistent" as ApprovalId;
+  const client = fakeChatClient(records, approvalEvents(sessionId, threadId, approvalId));
+  const app = await mountChatApp(client, { sessionId, threadId });
+
+  try {
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    await press(app, () => app.mockInput.pressKey("a", { shift: true }));
+    expect(records.approve).toHaveLength(1);
+    expect(records.approve[0]).toMatchObject({ approvalId, scope: "persistent" });
+    expect(app.captureCharFrame()).toContain("approval allowed always");
   } finally {
     app.renderer.destroy();
   }

@@ -19,6 +19,7 @@ import type {
   TeamTaskStatus,
   ThreadId,
   ToolCallStatus,
+  ApprovalDecisionAction,
 } from "@chili/protocol";
 
 export interface EventQuery {
@@ -60,8 +61,9 @@ export interface ApprovalRow {
   callId?: string;
   permission: string;
   patterns: string[];
+  metadata?: Record<string, unknown>;
   status: "pending" | "resolved";
-  decision?: "allow_once" | "allow_always" | "deny";
+  decision?: ApprovalDecisionAction;
   feedback?: string;
   createdAt: number;
   resolvedAt?: number;

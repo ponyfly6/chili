@@ -281,6 +281,7 @@ export class SqliteEventStore
     for (const statement of remainingStatements) {
       this.db.exec(statement);
     }
+    this.migrateApprovalSchema();
     this.migrateSubagentSchema();
     this.migrateTeamSchema();
   }
@@ -1224,6 +1225,10 @@ export class SqliteEventStore
     this.db.exec(`create index if not exists agent_tasks_lease_owner_idx on agent_tasks(lease_owner, status)`);
   }
 
+  private migrateApprovalSchema(): void {
+    this.addColumnIfMissing("approvals", "metadata_json", "text");
+  }
+
   private migrateTeamSchema(): void {
     this.addColumnIfMissing("teams", "description", "text");
     this.addColumnIfMissing("team_tasks", "description", "text");
@@ -1420,9 +1425,11 @@ export class SqliteEventStore
       this.db
         .query(
           `insert into approvals
-             (id, session_id, thread_id, call_id, permission, patterns_json, status, created_at)
-           values (?, ?, ?, ?, ?, ?, 'pending', ?)
-           on conflict(id) do update set status = 'pending'`,
+             (id, session_id, thread_id, call_id, permission, patterns_json, metadata_json, status, created_at)
+           values (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+           on conflict(id) do update set
+             status = 'pending',
+             metadata_json = excluded.metadata_json`,
         )
         .run(
           event.payload.approvalId,
@@ -1431,6 +1438,7 @@ export class SqliteEventStore
           event.payload.callId ?? null,
           event.payload.permission,
           encodeJson(event.payload.patterns),
+          event.payload.metadata ? encodeJson(event.payload.metadata) : null,
           event.time,
         );
       return;
@@ -2187,6 +2195,7 @@ function approvalFromRow(row: Record<string, unknown>): ApprovalRow {
   if (row.session_id) approval.sessionId = String(row.session_id) as SessionId;
   if (row.thread_id) approval.threadId = String(row.thread_id) as ThreadId;
   if (row.call_id) approval.callId = String(row.call_id);
+  if (row.metadata_json) approval.metadata = decodeJson<Record<string, unknown>>(String(row.metadata_json), {});
   if (row.decision) approval.decision = row.decision as NonNullable<ApprovalRow["decision"]>;
   if (row.feedback) approval.feedback = String(row.feedback);
   if (row.resolved_at) approval.resolvedAt = Number(row.resolved_at);

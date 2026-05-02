@@ -30,7 +30,7 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
   refreshModelConfig?: () => Promise<void>;
   startNewSession: () => Promise<void>;
   interruptActiveSession: () => Promise<void>;
-  approveApproval: (approvalId: ApprovalId) => Promise<void>;
+  approveApproval: (approvalId: ApprovalId, options?: ChatApproveOptions) => Promise<void>;
   rejectApproval: (approvalId: ApprovalId) => Promise<void>;
 }
 
@@ -38,6 +38,12 @@ export interface ChatSubmitOptions {
   modelSelection?: ModelSelection | undefined;
   reasoningLevel?: ReasoningLevel | undefined;
   skillMentions?: readonly RuntimeSkillMention[] | undefined;
+}
+
+export type ChatApprovalGrantScope = "once" | "session" | "persistent";
+
+export interface ChatApproveOptions {
+  scope?: ChatApprovalGrantScope | undefined;
 }
 
 export interface UseChatRuntimeInput {
@@ -266,8 +272,8 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     }
   }, [client, options.baseUrl, options.cwd, withAbort]);
 
-  const approveApproval = useCallback(async (approvalId: ApprovalId) => {
-    await resolveApproval("approve", approvalId, client, withAbort, setChatFeedback);
+  const approveApproval = useCallback(async (approvalId: ApprovalId, approveOptions: ChatApproveOptions = {}) => {
+    await resolveApproval("approve", approvalId, client, withAbort, setChatFeedback, approveOptions);
   }, [client, withAbort]);
 
   const rejectApproval = useCallback(async (approvalId: ApprovalId) => {
@@ -306,22 +312,42 @@ async function resolveApproval(
   client: HttpRuntimeClient,
   withAbort: <T>(run: (signal: AbortSignal) => Promise<T>) => Promise<T>,
   setFeedback: (feedback: ChatRuntimeFeedback | undefined) => void,
+  approveOptions: ChatApproveOptions = {},
 ): Promise<void> {
-  setFeedback({ status: "pending", message: action === "approve" ? "approving request" : "rejecting request" });
+  setFeedback({ status: "pending", message: action === "approve" ? pendingApprovalMessage(approveOptions.scope) : "rejecting request" });
   try {
-    const result = await withAbort((signal) => action === "approve"
-      ? client.approveApproval({ approvalId, signal })
-      : client.rejectApproval({ approvalId, feedback: "Rejected from TUI", signal }));
+    const result = await withAbort((signal) => {
+      if (action === "approve") {
+        return client.approveApproval({
+          approvalId,
+          signal,
+          scope: approveOptions.scope ?? "once",
+        });
+      }
+      return client.rejectApproval({ approvalId, feedback: "Rejected from TUI", signal });
+    });
     requireResolvedApproval(result);
-    setFeedback({ status: "success", message: action === "approve" ? "approval allowed" : "approval rejected" });
+    setFeedback({ status: "success", message: action === "approve" ? resolvedApprovalMessage(approveOptions.scope) : "approval rejected" });
   } catch (error) {
     if (!isAbortError(error)) setFeedback({ status: "error", message: toError(error).message });
   }
 }
 
+function pendingApprovalMessage(scope: ChatApprovalGrantScope | undefined): string {
+  if (scope === "persistent") return "approving request permanently";
+  if (scope === "session") return "approving request for session";
+  return "approving request once";
+}
+
+function resolvedApprovalMessage(scope: ChatApprovalGrantScope | undefined): string {
+  if (scope === "persistent") return "approval allowed always";
+  if (scope === "session") return "approval allowed for session";
+  return "approval allowed once";
+}
+
 function requireResolvedApproval(result: RuntimeApprovalResolveResult): void {
   if (!result.resolved) {
-    throw new Error("Approval is no longer pending in this runtime. Reconnect or start a fresh prompt.");
+    throw new Error("Approval is no longer pending after recheck. Nothing was approved; reconnect or start a fresh prompt.");
   }
 }
 
