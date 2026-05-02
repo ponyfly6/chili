@@ -19,13 +19,16 @@ async function main(): Promise<void> {
   }
 
   const approvalQueue = args.command === "serve" ? new DeferredApprovalQueue() : undefined;
-  const harness = await createCliHarness({
+  const harnessInput: Parameters<typeof createCliHarness>[0] = {
     cwd: args.cwd,
-    model: args.model,
     yes: args.yes,
     quiet: args.command === "sessions" || args.json,
     ...(approvalQueue ? { approvalQueue } : {}),
-  });
+  };
+  if (args.provider !== undefined) harnessInput.provider = args.provider;
+  if (args.model !== undefined) harnessInput.model = args.model;
+  if (args.reasoningLevel !== undefined) harnessInput.reasoningLevel = args.reasoningLevel;
+  const harness = await createCliHarness(harnessInput);
 
   try {
     if (args.command === "serve") {

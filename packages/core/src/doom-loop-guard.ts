@@ -19,8 +19,8 @@ export class DoomLoopGuard {
   private readonly maxToolCallsPerTurn: number;
 
   constructor(options: DoomLoopGuardOptions = {}) {
-    this.maxRepeatedToolCalls = options.maxRepeatedToolCalls ?? 3;
-    this.maxToolCallsPerTurn = options.maxToolCallsPerTurn ?? 30;
+    this.maxRepeatedToolCalls = options.maxRepeatedToolCalls ?? 20;
+    this.maxToolCallsPerTurn = options.maxToolCallsPerTurn ?? 200;
   }
 
   check(input: DoomLoopCheckInput): DoomLoopCheckResult {

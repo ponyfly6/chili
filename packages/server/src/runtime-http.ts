@@ -4,11 +4,15 @@ import type {
   AgentTaskMode,
   AgentTaskStatus,
   RuntimeInterruptResult,
+  RuntimeModelConfig,
+  RuntimeModelDescriptor,
   RuntimeApprovalResolveResult,
   RuntimePromptAccepted,
   RuntimePromptResult,
   RuntimeSessionRef,
   RuntimeTurnResult,
+  ModelSelection,
+  ReasoningLevel,
   SessionId,
   ThreadId,
   TaskId,
@@ -66,6 +70,10 @@ import { projectRuntimeAgents } from "./agent-projection.js";
 
 export interface RuntimeHttpService {
   createSession(input?: { sessionId?: SessionId; threadId?: ThreadId; cwd?: string }): Promise<RuntimeSessionRef>;
+  listModels?(input?: { provider?: string }): Promise<RuntimeModelDescriptor[]>;
+  getModelConfig?(sessionId: SessionId): Promise<RuntimeModelConfig>;
+  setModel?(input: { sessionId: SessionId; threadId?: ThreadId; modelSelection: ModelSelection }): Promise<RuntimeModelConfig>;
+  setReasoning?(input: { sessionId: SessionId; threadId?: ThreadId; reasoningLevel: ReasoningLevel }): Promise<RuntimeModelConfig>;
   submitPrompt(input: SubmitPromptInput): Promise<SubmitPromptResult>;
   submitPromptAsync(input: SubmitPromptInput, onError?: RuntimeBackgroundErrorHandler): void;
   interrupt(sessionId: SessionId, reason?: string): Promise<boolean>;
@@ -142,6 +150,7 @@ export interface ApprovalResolver {
 export interface StartRuntimeHttpServerOptions extends RuntimeHttpHandlerOptions {
   hostname?: string;
   port?: number;
+  idleTimeout?: number;
 }
 
 export interface RuntimeHttpServer {
@@ -163,6 +172,11 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "listSessions") {
         return json(await options.store.sessions());
+      }
+
+      if (route.name === "models") {
+        const provider = url.searchParams.get("provider") ?? undefined;
+        return json(await requireModelControl(options).listModels(provider ? { provider } : {}));
       }
 
       if (route.name === "listTasks") {
@@ -374,6 +388,35 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         return json(await options.store.messages(route.sessionId));
       }
 
+      if (route.name === "modelConfig") {
+        await requireSession(options.store, route.sessionId);
+        return json(await requireModelControl(options).getModelConfig(route.sessionId));
+      }
+
+      if (route.name === "setModel") {
+        await requireSession(options.store, route.sessionId);
+        const body = await readJson<ModelBody>(request);
+        if (!isModelSelection(body.modelSelection)) throw badRequest("modelSelection with provider and model is required");
+        return json(await requireModelControl(options).setModel({
+          sessionId: route.sessionId,
+          ...(body.threadId ? { threadId: body.threadId } : {}),
+          modelSelection: body.modelSelection,
+        }));
+      }
+
+      if (route.name === "setReasoning") {
+        await requireSession(options.store, route.sessionId);
+        const body = await readJson<ReasoningBody>(request);
+        if (!isReasoningLevel(body.reasoningLevel)) {
+          throw badRequest("reasoningLevel must be off, minimal, low, medium, high, or xhigh");
+        }
+        return json(await requireModelControl(options).setReasoning({
+          sessionId: route.sessionId,
+          ...(body.threadId ? { threadId: body.threadId } : {}),
+          reasoningLevel: body.reasoningLevel,
+        }));
+      }
+
       if (route.name === "prompt" || route.name === "promptAsync") {
         const body = await readJson<PromptBody>(request);
         if (!body.threadId) throw badRequest("threadId is required");
@@ -456,6 +499,7 @@ export function startRuntimeHttpServer(options: StartRuntimeHttpServerOptions): 
   const server = Bun.serve({
     hostname: options.hostname ?? "127.0.0.1",
     port: options.port ?? 0,
+    idleTimeout: options.idleTimeout ?? 255,
     fetch: createRuntimeHttpHandler(options),
   });
 
@@ -472,6 +516,7 @@ type Route =
   | { name: "listSessions" }
   | { name: "listTasks" }
   | { name: "tasksReconcileStale" }
+  | { name: "models" }
   | { name: "agentTree" }
   | { name: "agentRuns" }
   | { name: "mailbox" }
@@ -499,6 +544,9 @@ type Route =
   | { name: "taskClose"; taskId: TaskId }
   | { name: "createSession" }
   | { name: "messages"; sessionId: SessionId }
+  | { name: "modelConfig"; sessionId: SessionId }
+  | { name: "setModel"; sessionId: SessionId }
+  | { name: "setReasoning"; sessionId: SessionId }
   | { name: "prompt"; sessionId: SessionId }
   | { name: "promptAsync"; sessionId: SessionId }
   | { name: "interrupt"; sessionId: SessionId }
@@ -518,6 +566,18 @@ interface PromptBody {
   cwd?: string;
   maxTurns?: number;
   system?: string[];
+  modelSelection?: ModelSelection;
+  reasoningLevel?: ReasoningLevel;
+}
+
+interface ModelBody {
+  threadId?: ThreadId;
+  modelSelection?: unknown;
+}
+
+interface ReasoningBody {
+  threadId?: ThreadId;
+  reasoningLevel?: unknown;
 }
 
 interface TaskFollowupBody {
@@ -680,6 +740,7 @@ function routeRequest(method: string, pathname: string): Route {
   if (method === "POST" && path === "/teams") return { name: "createTeam" };
   if (method === "POST" && path === "/teams/reconcile_dispatches") return { name: "teamReconcileDispatches" };
   if (method === "GET" && path === "/sessions") return { name: "listSessions" };
+  if (method === "GET" && path === "/models") return { name: "models" };
   if (method === "GET" && path === "/tasks") return { name: "listTasks" };
   if (method === "POST" && path === "/tasks/reconcile_stale") return { name: "tasksReconcileStale" };
   if (method === "POST" && path === "/sessions") return { name: "createSession" };
@@ -752,6 +813,9 @@ function routeRequest(method: string, pathname: string): Route {
   const action = sessionRoute[2];
   if (method === "GET" && action === "agents") return { name: "agents", sessionId };
   if (method === "GET" && action === "messages") return { name: "messages", sessionId };
+  if (method === "GET" && action === "model") return { name: "modelConfig", sessionId };
+  if (method === "POST" && action === "model") return { name: "setModel", sessionId };
+  if (method === "POST" && action === "reasoning") return { name: "setReasoning", sessionId };
   if (method === "POST" && action === "prompt") return { name: "prompt", sessionId };
   if (method === "POST" && action === "prompt_async") return { name: "promptAsync", sessionId };
   if (method === "POST" && action === "interrupt") return { name: "interrupt", sessionId };
@@ -768,6 +832,8 @@ function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody): SubmitP
   if (body.cwd) input.cwd = body.cwd;
   if (body.maxTurns !== undefined) input.maxTurns = body.maxTurns;
   if (body.system) input.system = body.system;
+  if (isModelSelection(body.modelSelection)) input.modelSelection = body.modelSelection;
+  if (isReasoningLevel(body.reasoningLevel)) input.reasoningLevel = body.reasoningLevel;
   return input;
 }
 
@@ -818,7 +884,7 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
       options.request.signal.addEventListener("abort", cleanup, { once: true });
       heartbeat = setInterval(() => {
         if (!closed) controller.enqueue(encoder.encode(": heartbeat\n\n"));
-      }, 15_000);
+      }, 5_000);
 
       const query = {
         limit: options.maxBacklogEvents,
@@ -997,6 +1063,40 @@ function asSessionId(value: string | null): SessionId | undefined {
 
 function asThreadId(value: string | null): ThreadId | undefined {
   return value ? (value as ThreadId) : undefined;
+}
+
+function requireModelControl(options: RuntimeHttpHandlerOptions): Required<Pick<RuntimeHttpService, "listModels" | "getModelConfig" | "setModel" | "setReasoning">> {
+  const service = options.service;
+  if (!service.listModels || !service.getModelConfig || !service.setModel || !service.setReasoning) {
+    throw { status: 501, message: "No model control service is configured" } satisfies HttpError;
+  }
+  return {
+    listModels: service.listModels.bind(service),
+    getModelConfig: service.getModelConfig.bind(service),
+    setModel: service.setModel.bind(service),
+    setReasoning: service.setReasoning.bind(service),
+  };
+}
+
+function isModelSelection(value: unknown): value is ModelSelection {
+  return isRecord(value)
+    && typeof value.provider === "string"
+    && value.provider.trim().length > 0
+    && typeof value.model === "string"
+    && value.model.trim().length > 0;
+}
+
+function isReasoningLevel(value: unknown): value is ReasoningLevel {
+  return value === "off"
+    || value === "minimal"
+    || value === "low"
+    || value === "medium"
+    || value === "high"
+    || value === "xhigh";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function requireTaskControl(options: RuntimeHttpHandlerOptions): RuntimeTaskControlService {

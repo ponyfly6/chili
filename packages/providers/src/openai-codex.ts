@@ -10,19 +10,31 @@ import {
   OPENAI_CODEX_DEFAULT_MODEL,
   OPENAI_CODEX_PROVIDER_ID,
 } from "./models.js";
+import { normalizeReasoningLevel, parseModelSelectionPattern } from "./model-selection.js";
 import {
   extractOpenAICodexAccountId,
   refreshOpenAICodexToken,
 } from "./oauth/openai-codex.js";
 import { readSseEvents } from "./sse.js";
 import { transformModelMessages } from "./transform-messages.js";
-import type { ChiliModel, ChiliModelProvider, ModelDescriptor, ModelStreamEvent, ModelStreamInput, ModelTool, ModelUsage } from "./types.js";
+import type {
+  ChiliModel,
+  ChiliModelProvider,
+  ModelDescriptor,
+  ModelStreamEvent,
+  ModelStreamInput,
+  ModelTool,
+  ModelUsage,
+  ReasoningLevel,
+} from "./types.js";
 
 export {
   OPENAI_CODEX_BASE_URL,
   OPENAI_CODEX_DEFAULT_MODEL,
   OPENAI_CODEX_PROVIDER_ID,
 } from "./models.js";
+
+export type OpenAICodexReasoningEffort = Exclude<ReasoningLevel, "off">;
 
 export interface OpenAICodexModelOptions {
   apiKey?: string;
@@ -36,7 +48,7 @@ export interface OpenAICodexModelOptions {
   authPath?: string;
   authStorage?: FileAuthStorage;
   env?: EnvironmentSource;
-  reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
+  reasoningEffort?: ReasoningLevel;
   reasoningSummary?: "auto" | "concise" | "detailed" | "off" | "on" | null;
   textVerbosity?: "low" | "medium" | "high";
 }
@@ -46,7 +58,7 @@ export interface OpenAICodexRequestBuildOptions {
   maxTokens?: number;
   temperature?: number;
   sessionId?: string;
-  reasoningEffort?: OpenAICodexModelOptions["reasoningEffort"];
+  reasoningEffort?: ReasoningLevel;
   reasoningSummary?: OpenAICodexModelOptions["reasoningSummary"];
   textVerbosity?: OpenAICodexModelOptions["textVerbosity"];
 }
@@ -157,6 +169,7 @@ export class OpenAICodexProvider implements ChiliModelProvider {
     if (fallback?.inputCapabilities) descriptor.inputCapabilities = fallback.inputCapabilities;
     if (fallback?.contextWindowTokens !== undefined) descriptor.contextWindowTokens = fallback.contextWindowTokens;
     if (fallback?.maxOutputTokens !== undefined) descriptor.maxOutputTokens = fallback.maxOutputTokens;
+    if (fallback?.cost) descriptor.cost = fallback.cost;
     return [descriptor, ...models.map(withoutDefaultFlag)];
   }
 
@@ -192,16 +205,7 @@ export class OpenAICodexResponsesModel implements ChiliModel {
   async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
     const credentials = await this.resolveCredentials();
     const env = readOpenAICodexEnvironment(this.options.env);
-    const maxTokens = input.maxTokens ?? this.options.maxTokens;
-    const temperature = input.temperature ?? this.options.temperature;
-    const requestOptions: OpenAICodexRequestBuildOptions = { model: this.model };
-    const sessionId = metadataString(input.metadata, "sessionId");
-    if (sessionId) requestOptions.sessionId = sessionId;
-    if (this.options.textVerbosity !== undefined) requestOptions.textVerbosity = this.options.textVerbosity;
-    if (this.options.reasoningEffort !== undefined) requestOptions.reasoningEffort = this.options.reasoningEffort;
-    if (this.options.reasoningSummary !== undefined) requestOptions.reasoningSummary = this.options.reasoningSummary;
-    if (maxTokens !== undefined) requestOptions.maxTokens = maxTokens;
-    if (temperature !== undefined) requestOptions.temperature = temperature;
+    const requestOptions = resolveOpenAICodexStreamRequestOptions(input, this.options);
 
     const init: RequestInit = {
       method: "POST",
@@ -210,13 +214,13 @@ export class OpenAICodexResponsesModel implements ChiliModel {
     };
     if (input.signal) init.signal = input.signal;
 
-    yield { type: "metadata", provider: this.provider, model: this.model };
+    yield { type: "metadata", provider: this.provider, model: requestOptions.model };
     const response = await this.fetchImpl(resolveOpenAICodexResponsesUrl(this.options.baseUrl ?? env.baseUrl), init);
     if (!response.ok) {
       throw new Error(await parseCodexErrorResponse(response));
     }
     if (!response.body) throw new Error("OpenAI Codex response did not include a body");
-    yield* this.streamSseResponse(response.body, input.signal);
+    yield* this.streamSseResponse(response.body, input.signal, requestOptions.model);
   }
 
   private async resolveCredentials(): Promise<ResolvedCodexCredentials> {
@@ -265,6 +269,7 @@ export class OpenAICodexResponsesModel implements ChiliModel {
   private async *streamSseResponse(
     body: ReadableStream<Uint8Array>,
     signal?: AbortSignal,
+    requestModel: string = this.model,
   ): AsyncIterable<ModelStreamEvent> {
     let responseId: string | undefined;
     let usage: ModelUsage | undefined;
@@ -287,7 +292,7 @@ export class OpenAICodexResponsesModel implements ChiliModel {
 
       if (payload.type === "response.created") {
         responseId = payload.response?.id ?? responseId;
-        yield metadataEvent(this.provider, payload.response?.model ?? this.model, responseId, usage);
+        yield metadataEvent(this.provider, payload.response?.model ?? requestModel, responseId, usage);
         continue;
       }
 
@@ -351,7 +356,7 @@ export class OpenAICodexResponsesModel implements ChiliModel {
         responseId = payload.response?.id ?? responseId;
         usage = toModelUsage(payload.response?.usage) ?? usage;
         finishReason = mapCodexFinishReason(payload.response?.status, sawToolCall);
-        if (responseId || usage) yield metadataEvent(this.provider, payload.response?.model ?? this.model, responseId, usage);
+        if (responseId || usage) yield metadataEvent(this.provider, payload.response?.model ?? requestModel, responseId, usage);
         break;
       }
     }
@@ -373,6 +378,31 @@ export function createOpenAICodexRouter(options: OpenAICodexModelOptions = {}): 
 
 export function createOpenAICodexModel(options: OpenAICodexModelOptions = {}): OpenAICodexResponsesModel {
   return new OpenAICodexResponsesModel(options);
+}
+
+export function resolveOpenAICodexStreamRequestOptions(
+  input: ModelStreamInput,
+  options: OpenAICodexModelOptions = {},
+): OpenAICodexRequestBuildOptions {
+  const env = readOpenAICodexEnvironment(options.env);
+  const selection = readOpenAICodexInputSelection(input);
+  if (selection.provider && selection.provider.toLowerCase() !== OPENAI_CODEX_PROVIDER_ID) {
+    throw new Error(`OpenAI Codex model cannot stream provider "${selection.provider}"`);
+  }
+
+  const model = selection.model ?? options.model ?? env.model ?? OPENAI_CODEX_DEFAULT_MODEL;
+  const maxTokens = input.maxTokens ?? options.maxTokens;
+  const temperature = input.temperature ?? options.temperature;
+  const requestOptions: OpenAICodexRequestBuildOptions = { model };
+  const sessionId = metadataString(input.metadata, "sessionId");
+  const reasoningEffort = selection.reasoning ?? options.reasoningEffort;
+  if (sessionId) requestOptions.sessionId = sessionId;
+  if (options.textVerbosity !== undefined) requestOptions.textVerbosity = options.textVerbosity;
+  if (reasoningEffort !== undefined) requestOptions.reasoningEffort = reasoningEffort;
+  if (options.reasoningSummary !== undefined) requestOptions.reasoningSummary = options.reasoningSummary;
+  if (maxTokens !== undefined) requestOptions.maxTokens = maxTokens;
+  if (temperature !== undefined) requestOptions.temperature = temperature;
+  return requestOptions;
 }
 
 export function resolveOpenAICodexResponsesUrl(baseUrl?: string): string {
@@ -404,11 +434,12 @@ export function buildOpenAICodexResponsesRequestBody(
   if (options.maxTokens !== undefined) body.max_output_tokens = options.maxTokens;
   if (options.temperature !== undefined) body.temperature = options.temperature;
   if (options.sessionId) body.prompt_cache_key = options.sessionId;
-  if (options.reasoningEffort !== undefined || options.reasoningSummary !== undefined) {
+  const effort = resolveOpenAICodexReasoningEffort(options.model, options.reasoningEffort);
+  if (effort !== undefined || options.reasoningSummary !== undefined) {
     const reasoning: Record<string, string> = {};
-    if (options.reasoningEffort !== undefined) reasoning.effort = clampReasoningEffort(options.model, options.reasoningEffort);
+    if (effort !== undefined) reasoning.effort = effort;
     if (options.reasoningSummary !== null) reasoning.summary = options.reasoningSummary ?? "auto";
-    body.reasoning = reasoning;
+    if (Object.keys(reasoning).length > 0) body.reasoning = reasoning;
   }
 
   const tools = toResponsesTools(input.tools ?? []);
@@ -599,7 +630,18 @@ async function parseCodexErrorResponse(response: Response): Promise<string> {
   return raw || `OpenAI Codex request failed with HTTP ${response.status}`;
 }
 
-function clampReasoningEffort(model: string, effort: string): string {
+export function resolveOpenAICodexReasoningEffort(
+  model: string,
+  effort: ReasoningLevel | null | undefined,
+): OpenAICodexReasoningEffort | undefined {
+  if (effort === undefined || effort === null || effort === "off") return undefined;
+  return clampOpenAICodexReasoningEffort(model, effort);
+}
+
+export function clampOpenAICodexReasoningEffort(
+  model: string,
+  effort: OpenAICodexReasoningEffort,
+): OpenAICodexReasoningEffort {
   const id = model.includes("/") ? model.split("/").at(-1) ?? model : model;
   if (
     (id.startsWith("gpt-5.2") || id.startsWith("gpt-5.3") || id.startsWith("gpt-5.4") || id.startsWith("gpt-5.5")) &&
@@ -610,6 +652,30 @@ function clampReasoningEffort(model: string, effort: string): string {
   if (id === "gpt-5.1" && effort === "xhigh") return "high";
   if (id === "gpt-5.1-codex-mini") return effort === "high" || effort === "xhigh" ? "high" : "medium";
   return effort;
+}
+
+function readOpenAICodexInputSelection(input: ModelStreamInput): {
+  provider?: string;
+  model?: string;
+  reasoning?: ReasoningLevel;
+} {
+  const pattern = input.selection?.model ?? input.model ?? metadataString(input.metadata, "model");
+  const parsed = pattern ? parseModelSelectionPattern(pattern) : undefined;
+  const provider = input.selection?.provider ?? input.provider ?? parsed?.provider;
+  const reasoning =
+    input.reasoning ??
+    input.thinking ??
+    input.selection?.reasoning ??
+    input.selection?.thinking ??
+    parsed?.reasoning ??
+    normalizeReasoningLevel(metadataString(input.metadata, "reasoning")) ??
+    normalizeReasoningLevel(metadataString(input.metadata, "thinking"));
+  const result: { provider?: string; model?: string; reasoning?: ReasoningLevel } = {};
+  if (provider) result.provider = provider;
+  const model = parsed?.model ?? pattern;
+  if (model) result.model = model;
+  if (reasoning) result.reasoning = reasoning;
+  return result;
 }
 
 function normalizeResponsesId(id: string): string {

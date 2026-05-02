@@ -1,4 +1,4 @@
-import type { ModelDescriptor } from "./types.js";
+import type { ModelCost, ModelDescriptor } from "./types.js";
 
 export const MINIMAX_PROVIDER_ID = "minimax";
 export const MINIMAX_M27_MODEL = "MiniMax-M2.7";
@@ -24,6 +24,19 @@ export const OPENAI_CODEX_MODELS = [
   "gpt-5.4-mini",
   OPENAI_CODEX_DEFAULT_MODEL,
 ] as const;
+
+const OPENAI_CODEX_MODEL_COSTS = {
+  "gpt-5.1": { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
+  "gpt-5.1-codex-max": { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
+  "gpt-5.1-codex-mini": { input: 0.25, output: 2, cacheRead: 0.025, cacheWrite: 0 },
+  "gpt-5.2": { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
+  "gpt-5.2-codex": { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
+  "gpt-5.3-codex": { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
+  "gpt-5.3-codex-spark": { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  "gpt-5.4": { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
+  "gpt-5.4-mini": { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
+  "gpt-5.5": { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
+} satisfies Record<(typeof OPENAI_CODEX_MODELS)[number], ModelCost>;
 
 const BUILTIN_MODELS = [
   {
@@ -196,14 +209,18 @@ function cloneModelDescriptor(model: ModelDescriptor): ModelDescriptor {
     };
   }
   if (model.inputCapabilities) clone.inputCapabilities = [...model.inputCapabilities];
+  if (model.cost) clone.cost = { ...model.cost };
   return clone;
 }
 
 function openAICodexDisplayName(model: string): string {
-  return model
-    .split("-")
-    .map((part) => part === "gpt" ? "GPT" : part.charAt(0).toUpperCase() + part.slice(1))
+  const match = /^gpt-(\d+(?:\.\d+)?)(?:-(.*))?$/.exec(model);
+  if (!match) return model;
+  const suffix = match[2]
+    ?.split("-")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
+  return suffix ? `GPT-${match[1]} ${suffix}` : `GPT-${match[1]}`;
 }
 
 function openAICodexModelDescriptor(model: (typeof OPENAI_CODEX_MODELS)[number]): ModelDescriptor {
@@ -217,6 +234,7 @@ function openAICodexModelDescriptor(model: (typeof OPENAI_CODEX_MODELS)[number])
     inputCapabilities: model === "gpt-5.3-codex-spark" ? ["text"] : ["text", "image"],
     contextWindowTokens: model === "gpt-5.3-codex-spark" ? 128000 : 272000,
     maxOutputTokens: 128000,
+    cost: OPENAI_CODEX_MODEL_COSTS[model],
     capabilities: {
       streaming: true,
       reasoning: true,

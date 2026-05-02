@@ -22,6 +22,54 @@ test("parses ChatGPT Codex as a CLI model", () => {
   });
 });
 
+test("keeps legacy model aliases parseable", () => {
+  for (const alias of ["fake", "minimax", "deepseek", "codex", "openai-codex", "legacy-minimax"]) {
+    expect(parseArgs(["--model", alias, "hello"])).toMatchObject({
+      command: "run",
+      model: alias,
+      prompt: "hello",
+    });
+  }
+});
+
+test("parses provider and concrete model references", () => {
+  expect(parseArgs(["--provider", "openai-codex", "--model", "gpt-5.5", "hello"])).toMatchObject({
+    command: "run",
+    provider: "openai-codex",
+    model: "gpt-5.5",
+    prompt: "hello",
+  });
+  expect(parseArgs(["--model", "openai-codex/gpt-5.3-codex", "hello"])).toMatchObject({
+    command: "run",
+    model: "openai-codex/gpt-5.3-codex",
+    prompt: "hello",
+  });
+  expect(parseArgs(["--model", "gpt-5.5", "hello"])).toMatchObject({
+    command: "run",
+    model: "gpt-5.5",
+    prompt: "hello",
+  });
+});
+
+test("parses thinking and reasoning levels", () => {
+  expect(parseArgs(["--model", "gpt-5.3-codex:high", "hello"])).toMatchObject({
+    command: "run",
+    model: "gpt-5.3-codex",
+    reasoningLevel: "high",
+    prompt: "hello",
+  });
+  expect(parseArgs(["--thinking", "xhigh", "hello"])).toMatchObject({
+    command: "run",
+    reasoningLevel: "xhigh",
+    prompt: "hello",
+  });
+  expect(parseArgs(["--reasoning", "off", "hello"])).toMatchObject({
+    command: "run",
+    reasoningLevel: "off",
+    prompt: "hello",
+  });
+});
+
 test("parses team status and nested team view commands", () => {
   expect(parseArgs(["team", "status", "team_1", "--json"])).toMatchObject({
     command: "team",

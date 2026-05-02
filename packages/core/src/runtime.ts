@@ -3,7 +3,10 @@ import type {
   ChiliEvent,
   EventEnvelope,
   Message,
+  ModelSelection,
   ModelUsage as ProtocolModelUsage,
+  ReasoningLevel,
+  RuntimeModelDescriptor,
   SessionId,
   ThreadId,
   ToolDefinition,
@@ -40,6 +43,7 @@ export interface ToolRegistry {
 
 export interface ModelRouter {
   stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent>;
+  listModels?(): Promise<readonly RuntimeModelDescriptor[]> | readonly RuntimeModelDescriptor[];
 }
 
 export interface ModelStreamInput {
@@ -49,6 +53,8 @@ export interface ModelStreamInput {
   messages: Message[];
   tools: ToolDefinition[];
   system: string[];
+  modelSelection?: ModelSelection;
+  reasoningLevel?: ReasoningLevel;
   signal?: AbortSignal;
 }
 

@@ -1,4 +1,4 @@
-import type { CliModelName } from "./model.js";
+import type { CliModelName, CliReasoningLevel } from "./model.js";
 import type { AgentTaskStatus } from "@chili/protocol";
 
 export interface CliArgs {
@@ -45,7 +45,9 @@ export interface CliArgs {
   timeoutMs?: number;
   staleAfterMs?: number;
   maxCycles?: number;
-  model: CliModelName;
+  provider?: string;
+  model?: CliModelName;
+  reasoningLevel?: CliReasoningLevel;
   yes: boolean;
   json: boolean;
   once: boolean;
@@ -59,11 +61,10 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     cwd: process.cwd(),
     host: "127.0.0.1",
     port: 4777,
-    model: "minimax",
     yes: false,
     json: false,
     once: false,
-    maxTurns: 12,
+    maxTurns: 128,
   };
   const prompt: string[] = [];
 
@@ -246,10 +247,18 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       result.resume = requireValue(arg, args);
       continue;
     }
+    if (arg === "--provider") {
+      result.provider = requireValue(arg, args);
+      continue;
+    }
     if (arg === "--model") {
-      const model = requireValue(arg, args);
-      if (!isCliModelName(model)) throw new Error(`Unknown model: ${model}`);
-      result.model = model;
+      const parsed = parseModelValue(requireValue(arg, args));
+      result.model = parsed.model;
+      if (parsed.reasoningLevel) result.reasoningLevel = parsed.reasoningLevel;
+      continue;
+    }
+    if (arg === "--thinking" || arg === "--reasoning") {
+      result.reasoningLevel = parseReasoningLevel(requireValue(arg, args), arg);
       continue;
     }
     if (arg === "--yes" || arg === "-y") {
@@ -344,6 +353,9 @@ export function usage(): string {
     "  bun run chili -- --model fake \"hello\"",
     "  bun run chili -- --model deepseek \"hello\"",
     "  bun run chili -- --model codex \"hello\"",
+    "  bun run chili -- --provider openai-codex --model gpt-5.5 \"hello\"",
+    "  bun run chili -- --model openai-codex/gpt-5.3-codex \"hello\"",
+    "  bun run chili -- --model gpt-5.3-codex --thinking high \"hello\"",
     "  bun run chili -- --model legacy-minimax \"hello\"",
     "",
     "Options:",
@@ -351,11 +363,14 @@ export function usage(): string {
     "  --host <host>       Runtime server host, default 127.0.0.1",
     "  --port <port>       Runtime server port for serve, default 4777",
     "  --resume, -r <id>   Resume a session",
-    "  --model <name>      minimax | deepseek | codex | fake | legacy-minimax, default minimax",
+    "  --provider <name>   Provider name: minimax | deepseek | codex | openai-codex",
+    "  --model <pattern>   Provider alias, provider/model, or bare model id; default minimax",
+    "  --thinking <level>  Thinking level: off | minimal | low | medium | high | xhigh",
+    "  --reasoning <level> Alias for --thinking",
     "  --yes, -y           Auto-approve tool permissions",
     "  --json              Print machine-readable JSON for supported read commands",
     "  --once              Run one team execution cycle",
-    "  --max-turns <n>     Max automatic tool-use continuation turns, default 12",
+    "  --max-turns <n>     Max automatic tool-use continuation turns before final answer, default 128",
     "  --max-cycles <n>    Max team execution runner cycles",
     "  --status <status>   Task close status: completed | failed | cancelled",
     "  --task <task-id>     Limit team merge to one task",
@@ -364,13 +379,30 @@ export function usage(): string {
   ].join("\n");
 }
 
-function isCliModelName(value: string): value is CliModelName {
-  return value === "minimax"
-    || value === "deepseek"
-    || value === "codex"
-    || value === "openai-codex"
-    || value === "fake"
-    || value === "legacy-minimax";
+function parseModelValue(value: string): { model: CliModelName; reasoningLevel?: CliReasoningLevel } {
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error("--model requires a value");
+  const colonIndex = trimmed.lastIndexOf(":");
+  if (colonIndex === -1) return { model: trimmed };
+  const suffix = trimmed.slice(colonIndex + 1);
+  if (!isReasoningLevel(suffix)) return { model: trimmed };
+  const model = trimmed.slice(0, colonIndex);
+  if (!model) throw new Error("--model requires a model before the thinking suffix");
+  return { model, reasoningLevel: suffix };
+}
+
+function parseReasoningLevel(value: string, flag: string): CliReasoningLevel {
+  if (isReasoningLevel(value)) return value;
+  throw new Error(`${flag} must be off, minimal, low, medium, high, or xhigh`);
+}
+
+function isReasoningLevel(value: string): value is CliReasoningLevel {
+  return value === "off"
+    || value === "minimal"
+    || value === "low"
+    || value === "medium"
+    || value === "high"
+    || value === "xhigh";
 }
 
 function parseMemoryCommand(result: CliArgs, args: string[], prompt: string[]): void {

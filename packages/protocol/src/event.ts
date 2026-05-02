@@ -13,7 +13,7 @@ import type {
 } from "./ids.js";
 import type { AgentPath } from "./agent-path.js";
 import type { MessagePart } from "./message.js";
-import type { ModelMetadataPayload, RuntimeStatusPayload } from "./runtime.js";
+import type { ModelSelection, ReasoningLevel, ModelMetadataPayload, RuntimeStatusPayload } from "./runtime.js";
 import type { ToolCallStatus, ToolOutputStream } from "./tool.js";
 
 export interface EventEnvelope<TType extends string = string, TPayload = unknown> {
@@ -38,6 +38,8 @@ export type ChiliEvent =
 export type SessionEvent =
   | EventEnvelope<"session.created", { sessionId: SessionId; cwd: string }>
   | EventEnvelope<"session.status_changed", RuntimeStatusPayload>
+  | EventEnvelope<"session.model_changed", { sessionId: SessionId; modelSelection: ModelSelection }>
+  | EventEnvelope<"session.reasoning_changed", { sessionId: SessionId; reasoningLevel: ReasoningLevel }>
   | EventEnvelope<"session.archived", { sessionId: SessionId }>;
 
 export type TurnEvent =

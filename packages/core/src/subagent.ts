@@ -18,7 +18,7 @@ import type {
   SubagentToolContext,
   TaskToolInput,
 } from "@chili/tools";
-import type { AgentRunner } from "./runner.js";
+import type { AgentRunner, RunTurnInput } from "./runner.js";
 import type { RuntimeSystemContextProvider } from "./runtime-service.js";
 import {
   completeWorkerToolPolicy,
@@ -26,6 +26,9 @@ import {
   type WorkerToolPolicy,
   type WorkerToolPolicyTemplate,
 } from "./worker-policy.js";
+
+const FINAL_RESPONSE_AFTER_MAX_TURNS_SYSTEM =
+  "The automatic tool-use continuation limit has been reached. Do not call tools. Use the information already available in the conversation to give the best final answer now, and briefly state anything that remains uncertain.";
 
 export type LocalSubagentMode = "one_shot" | "resumable" | "background";
 export type LocalSubagentStatus = "running" | "completed" | "failed" | "cancelled";
@@ -571,25 +574,26 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
       text: input.prompt,
     });
 
-    const maxTurns = this.options.maxTurns ?? 12;
+    const maxTurns = this.options.maxTurns ?? 128;
     const dynamicSystem = await this.options.systemContext?.({
       sessionId: input.childSessionId,
       threadId: input.childThreadId,
       cwd: input.cwd,
     }) ?? [];
+    const baseSystem = [
+      ...(this.options.system ?? []),
+      ...dynamicSystem,
+      subagentRunSystemLine(input),
+      ...(input.workerPolicy ? [workerPolicySystemSummary(input.workerPolicy)] : []),
+    ];
     for (let index = 0; index < maxTurns; index++) {
-      const runInput = {
+      const runInput: RunTurnInput = {
         sessionId: input.childSessionId,
         threadId: input.childThreadId,
         cwd: input.cwd,
-        system: [
-          ...(this.options.system ?? []),
-          ...dynamicSystem,
-          subagentRunSystemLine(input),
-          ...(input.workerPolicy ? [workerPolicySystemSummary(input.workerPolicy)] : []),
-        ],
+        system: baseSystem,
       };
-      if (input.signal) Object.assign(runInput, { signal: input.signal });
+      if (input.signal) runInput.signal = input.signal;
       const result = await this.options.runner.runTurn(runInput);
 
       if (result.status !== "completed") {
@@ -599,7 +603,7 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
         };
       }
 
-      if (result.finishReason !== "tool_use") {
+      if (!isToolUseFinishReason(result.finishReason)) {
         const completed: LocalSubagentRunResult = {
           status: "completed",
         };
@@ -607,6 +611,30 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
         if (summary) completed.summary = summary;
         return completed;
       }
+    }
+
+    const finalInput: RunTurnInput = {
+      sessionId: input.childSessionId,
+      threadId: input.childThreadId,
+      cwd: input.cwd,
+      system: [...baseSystem, FINAL_RESPONSE_AFTER_MAX_TURNS_SYSTEM],
+      toolMode: "disabled",
+    };
+    if (input.signal) finalInput.signal = input.signal;
+    const finalResult = await this.options.runner.runTurn(finalInput);
+    if (finalResult.status !== "completed") {
+      return {
+        status: finalResult.status,
+        error: finalResult.error,
+      };
+    }
+    if (!isToolUseFinishReason(finalResult.finishReason)) {
+      const completed: LocalSubagentRunResult = {
+        status: "completed",
+      };
+      const summary = await this.latestAssistantText(input.childSessionId);
+      if (summary) completed.summary = summary;
+      return completed;
     }
 
     return {
@@ -650,6 +678,10 @@ function toError(error: unknown): Error {
 
 function isAbortError(error: Error): boolean {
   return error.name === "AbortError" || error.message.toLowerCase().includes("aborted");
+}
+
+function isToolUseFinishReason(reason: string | undefined): boolean {
+  return reason === "tool_use" || reason === "tool_calls" || reason === "function_call";
 }
 
 function leaseOwner(runId: AgentRunId): string {

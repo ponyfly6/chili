@@ -2,9 +2,11 @@ import { expect, test } from "bun:test";
 import type { Message, MessageId, PartId, SessionId, TimestampMs, ToolCallId } from "@chili/protocol";
 import {
   buildOpenAICodexResponsesRequestBody,
+  clampOpenAICodexReasoningEffort,
   exchangeOpenAICodexAuthorizationCode,
   OpenAICodexResponsesModel,
   refreshOpenAICodexToken,
+  resolveOpenAICodexStreamRequestOptions,
   resolveOpenAICodexResponsesUrl,
 } from "./index.js";
 import type { ModelStreamEvent, ModelTool } from "./types.js";
@@ -87,6 +89,52 @@ test("resolves Codex Responses URL variants", () => {
   expect(resolveOpenAICodexResponsesUrl("https://chatgpt.com/backend-api/codex/responses")).toBe(
     "https://chatgpt.com/backend-api/codex/responses",
   );
+});
+
+test("resolves per-stream Codex model and reasoning request options", () => {
+  expect(
+    resolveOpenAICodexStreamRequestOptions(
+      {
+        messages: [],
+        model: "openai-codex/gpt-5.1:xhigh",
+        reasoning: "low",
+        metadata: { sessionId: "session_2" },
+      },
+      { model: "gpt-5.5", reasoningEffort: "medium" },
+    ),
+  ).toMatchObject({
+    model: "gpt-5.1",
+    reasoningEffort: "low",
+    sessionId: "session_2",
+  });
+
+  expect(
+    resolveOpenAICodexStreamRequestOptions(
+      {
+        messages: [],
+        model: "openai-codex/gpt-5.1:xhigh",
+      },
+      { model: "gpt-5.5", reasoningEffort: "medium" },
+    ),
+  ).toMatchObject({
+    model: "gpt-5.1",
+    reasoningEffort: "xhigh",
+  });
+});
+
+test("clamps and omits Codex reasoning levels for the request body", () => {
+  expect(clampOpenAICodexReasoningEffort("gpt-5.1", "xhigh")).toBe("high");
+  expect(clampOpenAICodexReasoningEffort("gpt-5.5", "minimal")).toBe("low");
+
+  const body = buildOpenAICodexResponsesRequestBody(
+    { messages: [] },
+    {
+      model: "gpt-5.5",
+      reasoningEffort: "off",
+    },
+  );
+
+  expect(body).not.toHaveProperty("reasoning");
 });
 
 test("accepts OpenAI Codex token exchange fields from id_token", async () => {
@@ -203,10 +251,19 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
 
   const model = new OpenAICodexResponsesModel({
     model: "gpt-test",
+    reasoningEffort: "medium",
     apiKey: token,
     fetch: fetchImpl,
   });
-  const events = await collect(model.stream({ messages: [], tools: [], system: [], metadata: { sessionId: "session_1" } }));
+  const events = await collect(
+    model.stream({
+      messages: [],
+      model: "openai-codex/gpt-dynamic:high",
+      tools: [],
+      system: [],
+      metadata: { sessionId: "session_1" },
+    }),
+  );
 
   expect(url).toBe("https://chatgpt.com/backend-api/codex/responses");
   expect(headers.get("authorization")).toBe(`Bearer ${token}`);
@@ -214,7 +271,11 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
   expect(headers.get("originator")).toBe("chili");
   expect(headers.get("openai-beta")).toBe("responses=experimental");
   expect(headers.get("session_id")).toBe("session_1");
-  expect(body).toMatchObject({ model: "gpt-test", prompt_cache_key: "session_1" });
+  expect(body).toMatchObject({
+    model: "gpt-dynamic",
+    prompt_cache_key: "session_1",
+    reasoning: { effort: "high", summary: "auto" },
+  });
   expect(events.map((event) => event.type)).toEqual([
     "metadata",
     "metadata",

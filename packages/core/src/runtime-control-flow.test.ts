@@ -379,6 +379,37 @@ test("runtime hides unauthorized tools from model input", async () => {
   expect(seenTools).toEqual([["read"]]);
 });
 
+test("runtime hides all tools when tool mode is disabled", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  registry.register({
+    name: "read",
+    description: "Read",
+    risk: "read",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => ({ title: "read", output: "ok" }),
+  });
+  const seenTools: string[][] = [];
+  const model: ModelRouter = {
+    async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+      seenTools.push(input.tools.map((tool) => tool.name));
+      yield { type: "finish", reason: "end_turn" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_no_tools" as SessionId,
+    threadId: "thread_no_tools" as ThreadId,
+    cwd: "/repo",
+    toolMode: "disabled",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(seenTools).toEqual([[]]);
+});
+
 test("runs concurrency-safe tool calls in parallel and preserves result order", async () => {
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();

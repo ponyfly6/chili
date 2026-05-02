@@ -88,13 +88,27 @@ import {
 import { discoverSkills, formatAvailableSkillsPrompt, type SkillRegistry } from "@chili/skills";
 import { createCliApprovalBroker, createCliPermissionRules } from "./approval.js";
 import { createIdFactory } from "./id.js";
-import type { CliModelName } from "./model.js";
+import type { CliModelName, CliReasoningLevel } from "./model.js";
 import { createCliModel } from "./model.js";
 import { CliPrinter, PrintingEventStore } from "./printing-store.js";
 
+const DEFAULT_MAIN_SYSTEM_PROMPT = [
+  "You are Chili, a terminal-first coding agent working inside a real repository.",
+  "Use tools for repository inspection, glob/grep search, shell commands, writes, edits, patch application, and git diffs.",
+  "Read existing files fully before editing or overwriting them. Prefer small, precise edits. Keep final responses concise.",
+  "When you use tools, continue after tool results until the user request is genuinely handled.",
+].join("\n");
+
+const DEV_MAX_TURNS = 128;
+const DEV_MAX_REPEATED_TOOL_CALLS = 20;
+const DEV_MAX_TOOL_CALLS_PER_TURN = 200;
+const DEV_MAX_CONCURRENT_TOOL_CALLS = 32;
+
 export interface CliHarnessOptions {
   cwd: string;
-  model: CliModelName;
+  provider?: string;
+  model?: CliModelName;
+  reasoningLevel?: CliReasoningLevel;
   yes?: boolean;
   quiet?: boolean;
   approvalQueue?: DeferredApprovalQueue;
@@ -128,7 +142,11 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const printableStore = options.quiet ? sqliteStore : new PrintingEventStore(sqliteStore, printer);
   const eventStore = new ObservableEventStore(printableStore);
   const childToolPolicyResolver = createWorkerToolPolicyResolver(eventStore);
-  const model = await createCliModel(options.model);
+  const cliModelInput: { provider?: string; model?: CliModelName; reasoningLevel?: CliReasoningLevel } = {};
+  if (options.provider !== undefined) cliModelInput.provider = options.provider;
+  if (options.model !== undefined) cliModelInput.model = options.model;
+  if (options.reasoningLevel !== undefined) cliModelInput.reasoningLevel = options.reasoningLevel;
+  const model = await createCliModel(cliModelInput);
   const skillRegistry = await discoverSkills({ cwd });
   const registry = createToolRegistry(skillRegistry);
   const childRegistry = createChildToolRegistry(skillRegistry);
@@ -157,25 +175,26 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     toolPolicyResolver: childToolPolicyResolver,
     createId,
     contextBudget: {
-      maxInputChars: 120_000,
-      maxToolResultChars: 16_000,
-      preserveRecentMessages: 4,
+      maxInputChars: 500_000,
+      maxToolResultChars: 80_000,
+      preserveRecentMessages: 12,
     },
     retryPolicy: {
       maxAttempts: 2,
       initialDelayMs: 500,
     },
     doomLoopGuard: {
-      maxRepeatedToolCalls: 3,
-      maxToolCallsPerTurn: 20,
+      maxRepeatedToolCalls: DEV_MAX_REPEATED_TOOL_CALLS,
+      maxToolCallsPerTurn: DEV_MAX_TOOL_CALLS_PER_TURN,
     },
+    maxConcurrentToolCalls: DEV_MAX_CONCURRENT_TOOL_CALLS,
   });
   const childService = new RuntimeService({
     runtime: childRuntime,
     store: eventStore,
     cwd,
     createId,
-    maxTurns: 8,
+    maxTurns: DEV_MAX_TURNS,
     system: childSystem,
     systemContext,
   });
@@ -184,7 +203,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     runner: new AgentRunnerSubagentRunner({
       runner: childRuntime,
       store: eventStore,
-      maxTurns: 8,
+      maxTurns: DEV_MAX_TURNS,
       system: childSystem,
       systemContext,
     }),
@@ -253,18 +272,19 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     toolExecutor,
     createId,
     contextBudget: {
-      maxInputChars: 160_000,
-      maxToolResultChars: 24_000,
-      preserveRecentMessages: 6,
+      maxInputChars: 500_000,
+      maxToolResultChars: 80_000,
+      preserveRecentMessages: 12,
     },
     retryPolicy: {
       maxAttempts: 2,
       initialDelayMs: 500,
     },
     doomLoopGuard: {
-      maxRepeatedToolCalls: 3,
-      maxToolCallsPerTurn: 40,
+      maxRepeatedToolCalls: DEV_MAX_REPEATED_TOOL_CALLS,
+      maxToolCallsPerTurn: DEV_MAX_TOOL_CALLS_PER_TURN,
     },
+    maxConcurrentToolCalls: DEV_MAX_CONCURRENT_TOOL_CALLS,
   });
   const recovery = new SnapshotRecoveryService({
     store: eventStore,
@@ -276,6 +296,8 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     store: eventStore,
     cwd,
     createId,
+    maxTurns: DEV_MAX_TURNS,
+    system: [DEFAULT_MAIN_SYSTEM_PROMPT],
     systemContext,
   });
   const teamRunner = new TeamExecutionRunner({

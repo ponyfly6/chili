@@ -8,9 +8,13 @@ import type {
   ApprovalId,
   RuntimeApprovalResolveResult,
   RuntimeInterruptResult,
+  RuntimeModelConfig,
+  RuntimeModelDescriptor,
   RuntimePromptAccepted,
   RuntimePromptResult,
   RuntimeSessionRef,
+  ModelSelection,
+  ReasoningLevel,
   SessionId,
   TaskId,
   TeamId,
@@ -25,6 +29,10 @@ import type { RuntimeAgentsSnapshot } from "./projection.js";
 
 export interface RuntimeClient {
   createSession(input?: CreateSessionRequest): Promise<RuntimeSessionRef>;
+  listModels(input?: ListModelsRequest): Promise<RuntimeModelDescriptor[]>;
+  getModelConfig(input: GetModelConfigRequest): Promise<RuntimeModelConfig>;
+  setModel(input: SetModelRequest): Promise<RuntimeModelConfig>;
+  setReasoning(input: SetReasoningRequest): Promise<RuntimeModelConfig>;
   submitPrompt(input: SubmitPromptRequest): Promise<RuntimePromptResult>;
   submitPromptAsync(input: SubmitPromptRequest): Promise<RuntimePromptAccepted>;
   interruptSession(input: InterruptSessionRequest): Promise<RuntimeInterruptResult>;
@@ -79,6 +87,31 @@ export interface SubmitPromptRequest {
   cwd?: string;
   maxTurns?: number;
   system?: string[];
+  modelSelection?: ModelSelection;
+  reasoningLevel?: ReasoningLevel;
+  signal?: AbortSignal;
+}
+
+export interface ListModelsRequest {
+  provider?: string;
+}
+
+export interface GetModelConfigRequest {
+  sessionId: SessionId;
+  signal?: AbortSignal;
+}
+
+export interface SetModelRequest {
+  sessionId: SessionId;
+  threadId?: ThreadId;
+  modelSelection: ModelSelection;
+  signal?: AbortSignal;
+}
+
+export interface SetReasoningRequest {
+  sessionId: SessionId;
+  threadId?: ThreadId;
+  reasoningLevel: ReasoningLevel;
   signal?: AbortSignal;
 }
 
@@ -738,6 +771,31 @@ export class HttpRuntimeClient implements RuntimeClient {
     return this.post("sessions", body, signal);
   }
 
+  listModels(input: ListModelsRequest = {}): Promise<RuntimeModelDescriptor[]> {
+    const params = new URLSearchParams();
+    if (input.provider) params.set("provider", input.provider);
+    const query = params.toString();
+    return this.get(`models${query ? `?${query}` : ""}`);
+  }
+
+  getModelConfig(input: GetModelConfigRequest): Promise<RuntimeModelConfig> {
+    return this.get(`sessions/${encodeURIComponent(input.sessionId)}/model`, input.signal);
+  }
+
+  setModel(input: SetModelRequest): Promise<RuntimeModelConfig> {
+    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/model`, {
+      threadId: input.threadId,
+      modelSelection: input.modelSelection,
+    }, input.signal);
+  }
+
+  setReasoning(input: SetReasoningRequest): Promise<RuntimeModelConfig> {
+    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/reasoning`, {
+      threadId: input.threadId,
+      reasoningLevel: input.reasoningLevel,
+    }, input.signal);
+  }
+
   submitPrompt(input: SubmitPromptRequest): Promise<RuntimePromptResult> {
     const { signal, ...body } = input;
     return this.post(`sessions/${encodeURIComponent(input.sessionId)}/prompt`, body, signal);
@@ -988,8 +1046,10 @@ export class HttpRuntimeClient implements RuntimeClient {
     }
   }
 
-  private get<T>(path: string): Promise<T> {
-    return this.request(path, { method: "GET" });
+  private get<T>(path: string, signal?: AbortSignal): Promise<T> {
+    const init: RequestInit = { method: "GET" };
+    if (signal) init.signal = signal;
+    return this.request(path, init);
   }
 
   private post<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {

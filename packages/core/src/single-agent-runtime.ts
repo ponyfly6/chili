@@ -4,6 +4,7 @@ import type {
   Message,
   MessageId,
   MessagePart,
+  RuntimeModelDescriptor,
   PartId,
   SessionId,
   ThreadId,
@@ -100,6 +101,10 @@ export type CompactContextResult =
 
 export class SingleAgentRuntime implements AgentRunner {
   constructor(private readonly options: SingleAgentRuntimeOptions) {}
+
+  listModels(): Promise<readonly RuntimeModelDescriptor[]> | readonly RuntimeModelDescriptor[] {
+    return this.options.model.listModels?.() ?? [];
+  }
 
   async createSession(input: CreateSessionInput): Promise<SessionId> {
     const sessionId = input.sessionId ?? this.id<SessionId>("session");
@@ -213,6 +218,8 @@ export class SingleAgentRuntime implements AgentRunner {
         tools: await this.visibleTools(input, turnId),
         system: input.system ?? [],
       };
+      if (input.modelSelection) modelInput.modelSelection = input.modelSelection;
+      if (input.reasoningLevel !== undefined) modelInput.reasoningLevel = input.reasoningLevel;
       if (input.signal) modelInput.signal = input.signal;
 
       const guard = new DoomLoopGuard(this.options.doomLoopGuard);
@@ -276,6 +283,7 @@ export class SingleAgentRuntime implements AgentRunner {
   }
 
   private async visibleTools(input: RunTurnInput, turnId: TurnId) {
+    if (input.toolMode === "disabled") return [];
     const policy = await this.options.toolPolicyResolver?.resolve({
       sessionId: input.sessionId,
       threadId: input.threadId,

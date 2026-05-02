@@ -1,30 +1,50 @@
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "@chili/core";
+import type { RuntimeModelDescriptor } from "@chili/protocol";
 import { createMiniMaxM27HighspeedRouter } from "@chili/core";
 import {
   DEEPSEEK_OPENAI_BASE_URL,
+  DEEPSEEK_PROVIDER_ID,
+  FileAuthStorage,
   DEEPSEEK_V4_PRO_MODEL,
   findKnownModel,
+  listModelCatalogFromStorage,
+  listKnownModels,
   MINIMAX_ANTHROPIC_BASE_URL,
   MINIMAX_M27_HIGHSPEED_MODEL,
+  MINIMAX_PROVIDER_ID,
   OPENAI_CODEX_BASE_URL,
   OPENAI_CODEX_DEFAULT_MODEL,
+  OPENAI_CODEX_PROVIDER_ID,
   readDeepSeekEnvironment,
   readMiniMaxEnvironment,
   readOpenAICodexEnvironment,
 } from "@chili/providers";
 import { FakeModelRouter } from "./fake-model.js";
 
-export type CliModelName = "fake" | "minimax" | "deepseek" | "codex" | "openai-codex" | "legacy-minimax";
+export type CliModelName = string;
+export type CliProviderName = "minimax" | "deepseek" | "openai-codex";
+export type CliReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export interface CliModelSelection {
+  provider?: string;
+  model?: CliModelName;
+  reasoningLevel?: CliReasoningLevel;
+}
 
 interface ProviderRouterOptions {
   apiKey?: string;
   baseUrl?: string;
   model?: string;
   maxTokens?: number;
+  temperature?: number;
   fetch?: typeof fetch;
+  headers?: Record<string, string>;
+  reasoning?: boolean;
+  reasoningEffort?: CliReasoningLevel;
+  reasoningSummary?: "auto" | "concise" | "detailed" | "off" | "on" | null;
 }
 
-type CliModelOptions = ProviderRouterOptions;
+type CliModelOptions = ProviderRouterOptions & CliModelSelection;
 
 type ProviderRouterFactory = (options?: ProviderRouterOptions) => ProviderModelOrProvider | Promise<ProviderModelOrProvider>;
 
@@ -41,6 +61,7 @@ interface ProviderModelStreamInput {
   tools?: ModelStreamInput["tools"];
   system?: readonly string[];
   maxTokens?: number;
+  temperature?: number;
   signal?: AbortSignal;
   metadata?: Record<string, unknown>;
 }
@@ -57,37 +78,32 @@ type ProviderModelStreamEvent =
 
 const PROVIDERS_PACKAGE_NAME = "@chili/providers";
 const DEFAULT_MAX_TOKENS = 4096;
+const DEFAULT_PROVIDER: CliProviderName = "minimax";
+const PROVIDER_DISPLAY_NAMES: Record<CliProviderName, string> = {
+  minimax: "MiniMax",
+  deepseek: "DeepSeek",
+  "openai-codex": "OpenAI Codex",
+};
 
-export async function createCliModel(name: CliModelName, options: CliModelOptions = {}): Promise<ModelRouter> {
-  if (name === "fake") return new FakeModelRouter();
-  if (name === "deepseek") return createProvidersDeepSeekRouter(readDeepSeekOptionsFromEnv(options));
-  if (name === "codex" || name === "openai-codex") {
-    return createProvidersOpenAICodexRouter(readOpenAICodexOptionsFromEnv(options));
+export async function createCliModel(selection?: CliModelName | CliModelSelection, options: CliModelOptions = {}): Promise<ModelRouter> {
+  const config = normalizeCreateCliModelInput(selection, options);
+  const defaultSelection = resolveCliModelSelection(config.provider, config.model);
+  const baseOptions = providerBaseOptions(config);
+
+  if (defaultSelection.kind === "fake") return new FakeModelRouter();
+  if (defaultSelection.kind === "legacy-minimax") {
+    return createMiniMaxM27HighspeedRouter(readMiniMaxOptionsFromEnv({
+      ...baseOptions,
+      ...(defaultSelection.model ? { model: defaultSelection.model } : {}),
+    }));
   }
-  const miniMaxOptions = readMiniMaxOptionsFromEnv(options);
-  if (name === "legacy-minimax") return createMiniMaxM27HighspeedRouter(miniMaxOptions);
-  return createProvidersMiniMaxRouter(miniMaxOptions);
-}
 
-async function createProvidersMiniMaxRouter(options: ProviderRouterOptions): Promise<ModelRouter> {
-  const providers = await loadProvidersModule("minimax");
-  const createRouter = resolveMiniMaxFactory(providers);
-  const modelOrProvider = await createRouter(options);
-  return toModelRouter(modelOrProvider, options.model, "MiniMax");
-}
-
-async function createProvidersDeepSeekRouter(options: ProviderRouterOptions): Promise<ModelRouter> {
-  const providers = await loadProvidersModule("deepseek");
-  const createRouter = resolveDeepSeekFactory(providers);
-  const modelOrProvider = await createRouter(options);
-  return toModelRouter(modelOrProvider, options.model, "DeepSeek");
-}
-
-async function createProvidersOpenAICodexRouter(options: ProviderRouterOptions): Promise<ModelRouter> {
-  const providers = await loadProvidersModule("codex");
-  const createRouter = resolveOpenAICodexFactory(providers);
-  const modelOrProvider = await createRouter(options);
-  return toModelRouter(modelOrProvider, options.model, "OpenAI Codex");
+  const routerOptions: CliProviderRouterOptions = {
+    defaultSelection,
+    baseOptions,
+  };
+  if (config.reasoningLevel !== undefined) routerOptions.defaultReasoningLevel = config.reasoningLevel;
+  return new CliProviderRouter(routerOptions);
 }
 
 async function loadProvidersModule(providerName: "minimax" | "deepseek" | "codex"): Promise<Record<string, unknown>> {
@@ -168,12 +184,291 @@ function resolveOpenAICodexFactory(providers: Record<string, unknown>): Provider
   return factory as ProviderRouterFactory;
 }
 
-function toModelRouter(modelOrProvider: ProviderModelOrProvider, modelName: string | undefined, providerName: string): ModelRouter {
-  if (isProviderModelProvider(modelOrProvider)) {
-    return new ProviderModelRouterAdapter(modelOrProvider.getModel(modelName));
-  }
-  if (isProviderModel(modelOrProvider)) return new ProviderModelRouterAdapter(modelOrProvider);
+function modelFromFactoryResult(
+  modelOrProvider: ProviderModelOrProvider,
+  modelName: string | undefined,
+  providerName: string,
+): ProviderModel {
+  if (isProviderModelProvider(modelOrProvider)) return modelOrProvider.getModel(modelName);
+  if (isProviderModel(modelOrProvider)) return modelOrProvider;
   throw new Error(`@chili/providers ${providerName} factory did not return a model or provider-compatible object`);
+}
+
+function normalizeCreateCliModelInput(
+  selection: CliModelName | CliModelSelection | undefined,
+  options: CliModelOptions,
+): CliModelSelection & ProviderRouterOptions {
+  const merged: CliModelSelection & ProviderRouterOptions = { ...options };
+  if (typeof selection === "string") {
+    const parsed = splitReasoningSuffix(selection);
+    merged.model = parsed.model;
+    if (parsed.reasoningLevel && merged.reasoningLevel === undefined) merged.reasoningLevel = parsed.reasoningLevel;
+    return merged;
+  }
+  if (selection) {
+    if (selection.provider !== undefined) merged.provider = selection.provider;
+    if (selection.model !== undefined) {
+      const parsed = splitReasoningSuffix(selection.model);
+      merged.model = parsed.model;
+      if (parsed.reasoningLevel && merged.reasoningLevel === undefined) merged.reasoningLevel = parsed.reasoningLevel;
+    }
+    if (selection.reasoningLevel !== undefined) merged.reasoningLevel = selection.reasoningLevel;
+  }
+  return merged;
+}
+
+function providerBaseOptions(input: CliModelOptions): ProviderRouterOptions {
+  const options: ProviderRouterOptions = {};
+  if (input.apiKey !== undefined) options.apiKey = input.apiKey;
+  if (input.baseUrl !== undefined) options.baseUrl = input.baseUrl;
+  if (input.maxTokens !== undefined) options.maxTokens = input.maxTokens;
+  if (input.temperature !== undefined) options.temperature = input.temperature;
+  if (input.fetch !== undefined) options.fetch = input.fetch;
+  if (input.headers !== undefined) options.headers = input.headers;
+  return options;
+}
+
+type ResolvedCliModelSelection =
+  | { kind: "fake"; model?: string }
+  | { kind: "legacy-minimax"; model?: string }
+  | { kind: "provider"; provider: CliProviderName; model?: string };
+
+function resolveCliModelSelection(providerInput: string | undefined, modelInput: string | undefined): ResolvedCliModelSelection {
+  const provider = normalizeProviderName(providerInput);
+  let model = modelInput?.trim();
+  if (model) {
+    const parsed = splitReasoningSuffix(model);
+    model = parsed.model;
+  }
+
+  if (!model) {
+    return { kind: "provider", provider: provider ?? DEFAULT_PROVIDER };
+  }
+
+  const modelAlias = normalizeSpecialModelAlias(model);
+  if (!provider && modelAlias) return modelAlias;
+
+  const split = splitProviderModelReference(model);
+  if (provider) {
+    if (split && split.provider !== provider) {
+      throw new Error(`--model ${model} conflicts with --provider ${provider}`);
+    }
+    return { kind: "provider", provider, model: split?.model ?? model };
+  }
+
+  if (split) return { kind: "provider", provider: split.provider, model: split.model };
+
+  const exact = findKnownModelByBareId(model);
+  if (exact) return { kind: "provider", provider: exact.provider, model: exact.model };
+
+  const heuristicProvider = inferProviderFromBareModel(model);
+  if (heuristicProvider) return { kind: "provider", provider: heuristicProvider, model };
+
+  return { kind: "provider", provider: DEFAULT_PROVIDER, model };
+}
+
+function normalizeProviderName(value: string | undefined): CliProviderName | undefined {
+  if (!value) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "minimax") return "minimax";
+  if (normalized === "deepseek") return "deepseek";
+  if (normalized === "codex" || normalized === "openai-codex") return "openai-codex";
+  throw new Error(`Unknown provider: ${value}`);
+}
+
+function normalizeSpecialModelAlias(value: string): ResolvedCliModelSelection | undefined {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "fake") return { kind: "fake" };
+  if (normalized === "legacy-minimax") return { kind: "legacy-minimax" };
+  const provider = normalizeProviderAlias(normalized);
+  return provider ? { kind: "provider", provider } : undefined;
+}
+
+function normalizeProviderAlias(value: string): CliProviderName | undefined {
+  if (value === "minimax") return "minimax";
+  if (value === "deepseek") return "deepseek";
+  if (value === "codex" || value === "openai-codex") return "openai-codex";
+  return undefined;
+}
+
+function splitProviderModelReference(value: string): { provider: CliProviderName; model: string } | undefined {
+  const slashIndex = value.indexOf("/");
+  if (slashIndex === -1) return undefined;
+  const provider = normalizeProviderAlias(value.slice(0, slashIndex).trim().toLowerCase());
+  const model = value.slice(slashIndex + 1).trim();
+  if (!provider || !model) return undefined;
+  return { provider, model };
+}
+
+function findKnownModelByBareId(model: string): { provider: CliProviderName; model: string } | undefined {
+  const normalized = model.toLowerCase();
+  const matches = listKnownModels()
+    .filter((descriptor) => isCliProviderName(descriptor.provider) && descriptor.model.toLowerCase() === normalized)
+    .map((descriptor) => ({ provider: descriptor.provider as CliProviderName, model: descriptor.model }));
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function inferProviderFromBareModel(model: string): CliProviderName | undefined {
+  const normalized = model.toLowerCase();
+  if (normalized.startsWith("gpt-")) return "openai-codex";
+  if (normalized.startsWith("deepseek-")) return "deepseek";
+  if (normalized.startsWith("minimax-")) return "minimax";
+  return undefined;
+}
+
+function isCliProviderName(provider: string): provider is CliProviderName {
+  return provider === MINIMAX_PROVIDER_ID || provider === DEEPSEEK_PROVIDER_ID || provider === OPENAI_CODEX_PROVIDER_ID;
+}
+
+function splitReasoningSuffix(value: string): { model: string; reasoningLevel?: CliReasoningLevel } {
+  const trimmed = value.trim();
+  const colonIndex = trimmed.lastIndexOf(":");
+  if (colonIndex === -1) return { model: trimmed };
+  const suffix = trimmed.slice(colonIndex + 1);
+  if (!isReasoningLevel(suffix)) return { model: trimmed };
+  const model = trimmed.slice(0, colonIndex).trim();
+  if (!model) throw new Error(`Model reference ${value} is missing a model before the thinking suffix`);
+  return { model, reasoningLevel: suffix };
+}
+
+function isReasoningLevel(value: string): value is CliReasoningLevel {
+  return value === "off"
+    || value === "minimal"
+    || value === "low"
+    || value === "medium"
+    || value === "high"
+    || value === "xhigh";
+}
+
+interface CliProviderRouterOptions {
+  defaultSelection: Extract<ResolvedCliModelSelection, { kind: "provider" }>;
+  defaultReasoningLevel?: CliReasoningLevel;
+  baseOptions: ProviderRouterOptions;
+}
+
+class CliProviderRouter implements ModelRouter {
+  private readonly factories = new Map<CliProviderName, Promise<ProviderRouterFactory>>();
+
+  constructor(private readonly options: CliProviderRouterOptions) {}
+
+  async listModels(): Promise<readonly RuntimeModelDescriptor[]> {
+    const catalog = await listModelCatalogFromStorage(undefined, new FileAuthStorage());
+    return catalog.filter((model) => isCliProviderName(model.provider) && model.available).map((model) => ({
+      provider: model.provider,
+      model: model.model,
+      ...(model.displayName ? { displayName: model.displayName } : {}),
+      ...(model.providerDisplayName ? { providerDisplayName: model.providerDisplayName } : {}),
+      available: model.available,
+      ...(model.capabilities ? { capabilities: { ...model.capabilities } } : {}),
+      ...(model.inputCapabilities ? { inputCapabilities: [...model.inputCapabilities] } : {}),
+      ...(model.contextWindowTokens !== undefined ? { contextWindowTokens: model.contextWindowTokens } : {}),
+      ...(model.maxOutputTokens !== undefined ? { maxOutputTokens: model.maxOutputTokens } : {}),
+      ...(model.default !== undefined ? { default: model.default } : {}),
+    }));
+  }
+
+  async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+    const extended = input as ExtendedModelStreamInput;
+    const selection = this.selectionForInput(extended);
+    if (selection.kind === "fake") {
+      yield* new FakeModelRouter().stream(input);
+      return;
+    }
+    if (selection.kind === "legacy-minimax") {
+      const legacyOptions = readMiniMaxOptionsFromEnv({
+        ...this.options.baseOptions,
+        ...(selection.model ? { model: selection.model } : {}),
+      });
+      yield* createMiniMaxM27HighspeedRouter(legacyOptions).stream(input);
+      return;
+    }
+
+    const reasoningLevel = reasoningLevelForInput(extended, this.options.defaultReasoningLevel);
+    const providerOptions = this.optionsForProvider(selection, reasoningLevel);
+    const factory = await this.factoryFor(selection.provider);
+    const modelOrProvider = await factory(providerOptions);
+    const model = modelFromFactoryResult(
+      modelOrProvider,
+      providerOptions.model,
+      PROVIDER_DISPLAY_NAMES[selection.provider],
+    );
+    yield* new ProviderModelRouterAdapter(model).stream(input);
+  }
+
+  private selectionForInput(input: ExtendedModelStreamInput): ResolvedCliModelSelection {
+    const override = modelSelectionForInput(input);
+    if (!override) return this.options.defaultSelection;
+    return resolveCliModelSelection(override.provider, override.model);
+  }
+
+  private optionsForProvider(selection: Extract<ResolvedCliModelSelection, { kind: "provider" }>, reasoningLevel: CliReasoningLevel | undefined): ProviderRouterOptions {
+    const input: ProviderRouterOptions = {
+      ...this.options.baseOptions,
+      ...(selection.model ? { model: selection.model } : {}),
+    };
+    const withEnv = readOptionsForProvider(selection.provider, input);
+    applyReasoningOptions(withEnv, selection.provider, reasoningLevel);
+    return withEnv;
+  }
+
+  private async factoryFor(provider: CliProviderName): Promise<ProviderRouterFactory> {
+    const existing = this.factories.get(provider);
+    if (existing) return existing;
+    const promise = loadFactoryForProvider(provider);
+    this.factories.set(provider, promise);
+    return promise;
+  }
+}
+
+type ExtendedModelStreamInput = ModelStreamInput & {
+  model?: unknown;
+  modelSelection?: unknown;
+  provider?: unknown;
+  reasoning?: unknown;
+  reasoningLevel?: unknown;
+  thinking?: unknown;
+  maxTokens?: number;
+  temperature?: number;
+};
+
+function modelSelectionForInput(input: ExtendedModelStreamInput): { provider?: string; model?: string } | undefined {
+  const fromSelection = parseModelSelectionValue(input.modelSelection);
+  if (fromSelection) return fromSelection;
+  const model = typeof input.model === "string" && input.model.trim() ? input.model.trim() : undefined;
+  const provider = typeof input.provider === "string" && input.provider.trim() ? input.provider.trim() : undefined;
+  if (!model && !provider) return undefined;
+  return { ...(provider ? { provider } : {}), ...(model ? { model } : {}) };
+}
+
+function parseModelSelectionValue(value: unknown): { provider?: string; model?: string } | undefined {
+  if (typeof value === "string" && value.trim()) return { model: value.trim() };
+  if (!isRecord(value)) return undefined;
+  const provider = stringProperty(value, "provider");
+  const model = stringProperty(value, "model") ?? stringProperty(value, "modelId") ?? stringProperty(value, "id");
+  if (!provider && !model) return undefined;
+  return { ...(provider ? { provider } : {}), ...(model ? { model } : {}) };
+}
+
+function reasoningLevelForInput(
+  input: ExtendedModelStreamInput,
+  defaultReasoningLevel: CliReasoningLevel | undefined,
+): CliReasoningLevel | undefined {
+  const candidates = [input.reasoningLevel, input.thinking, input.reasoning];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && isReasoningLevel(candidate)) return candidate;
+  }
+  return defaultReasoningLevel;
+}
+
+function stringProperty(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+async function loadFactoryForProvider(provider: CliProviderName): Promise<ProviderRouterFactory> {
+  if (provider === "deepseek") return resolveDeepSeekFactory(await loadProvidersModule("deepseek"));
+  if (provider === "openai-codex") return resolveOpenAICodexFactory(await loadProvidersModule("codex"));
+  return resolveMiniMaxFactory(await loadProvidersModule("minimax"));
 }
 
 function readMiniMaxOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
@@ -186,7 +481,9 @@ function readMiniMaxOptionsFromEnv(input: CliModelOptions): ProviderRouterOption
   if (resolvedApiKey) options.apiKey = resolvedApiKey;
   if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
   if (resolvedModel) options.model = resolvedModel;
+  if (input.temperature !== undefined) options.temperature = input.temperature;
   if (input.fetch) options.fetch = input.fetch;
+  if (input.headers !== undefined) options.headers = input.headers;
   return options;
 }
 
@@ -200,12 +497,14 @@ function readDeepSeekOptionsFromEnv(input: CliModelOptions): ProviderRouterOptio
   if (resolvedApiKey) options.apiKey = resolvedApiKey;
   if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
   if (resolvedModel) options.model = resolvedModel;
+  if (input.temperature !== undefined) options.temperature = input.temperature;
   if (input.fetch) options.fetch = input.fetch;
+  if (input.headers !== undefined) options.headers = input.headers;
   return options;
 }
 
 function readOpenAICodexOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
-  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_MAX_TOKENS };
+  const options: ProviderRouterOptions = {};
   const env = readOpenAICodexEnvironment();
   const resolvedApiKey = input.apiKey ?? env.apiKey;
   const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? OPENAI_CODEX_BASE_URL;
@@ -214,8 +513,34 @@ function readOpenAICodexOptionsFromEnv(input: CliModelOptions): ProviderRouterOp
   if (resolvedApiKey) options.apiKey = resolvedApiKey;
   if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
   if (resolvedModel) options.model = resolvedModel;
+  if (input.maxTokens !== undefined) options.maxTokens = input.maxTokens;
+  if (input.temperature !== undefined) options.temperature = input.temperature;
   if (input.fetch) options.fetch = input.fetch;
+  if (input.headers !== undefined) options.headers = input.headers;
   return options;
+}
+
+function readOptionsForProvider(provider: CliProviderName, input: ProviderRouterOptions): ProviderRouterOptions {
+  if (provider === "deepseek") return readDeepSeekOptionsFromEnv(input);
+  if (provider === "openai-codex") return readOpenAICodexOptionsFromEnv(input);
+  return readMiniMaxOptionsFromEnv(input);
+}
+
+function applyReasoningOptions(
+  options: ProviderRouterOptions,
+  provider: CliProviderName,
+  reasoningLevel: CliReasoningLevel | undefined,
+): void {
+  if (!reasoningLevel) return;
+  if (provider === "openai-codex") {
+    if (reasoningLevel === "off") return;
+    options.reasoningEffort = reasoningLevel;
+    options.reasoningSummary = "auto";
+    return;
+  }
+  if (provider === "deepseek") {
+    options.reasoning = reasoningLevel !== "off";
+  }
 }
 
 function isProviderModel(value: unknown): value is ProviderModel {
@@ -272,6 +597,7 @@ function isModelStreamEvent(event: ProviderModelStreamEvent): boolean {
 }
 
 function toProviderInput(input: ModelStreamInput): ProviderModelStreamInput {
+  const extended = input as ExtendedModelStreamInput;
   const providerInput: ProviderModelStreamInput = {
     messages: input.messages,
     tools: input.tools,
@@ -283,5 +609,7 @@ function toProviderInput(input: ModelStreamInput): ProviderModelStreamInput {
     },
   };
   if (input.signal) providerInput.signal = input.signal;
+  if (extended.maxTokens !== undefined) providerInput.maxTokens = extended.maxTokens;
+  if (extended.temperature !== undefined) providerInput.temperature = extended.temperature;
   return providerInput;
 }

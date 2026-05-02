@@ -1,5 +1,7 @@
 export * from "./types.js";
 export * from "./models.js";
+export * from "./model-selection.js";
+export * from "./catalog.js";
 export * from "./env.js";
 export * from "./auth.js";
 export * from "./transform-messages.js";

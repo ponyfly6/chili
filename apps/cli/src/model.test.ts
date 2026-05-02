@@ -133,6 +133,7 @@ test("CLI Codex env resolution uses ChatGPT Codex endpoint and session metadata"
     model: "gpt-5.3-codex",
     prompt_cache_key: "session_cli_model",
   });
+  expect(body).not.toHaveProperty("max_output_tokens");
   expect(events).toContainEqual(expect.objectContaining({
     type: "metadata",
     provider: "openai-codex",
@@ -140,6 +141,113 @@ test("CLI Codex env resolution uses ChatGPT Codex endpoint and session metadata"
     contextWindowTokens: 272000,
     maxOutputTokens: 128000,
   }));
+});
+
+test("CLI Codex supports bare concrete model ids with thinking", async () => {
+  process.env.OPENAI_CODEX_ACCESS_TOKEN = jwtWithAccount("acct_cli");
+  process.env.OPENAI_CODEX_BASE_URL = "https://chatgpt.test/backend-api";
+  delete process.env.OPENAI_CODEX_MODEL;
+
+  let body: Record<string, unknown> = {};
+  const fetchImpl = (async (_input, init) => {
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return codexResponse(String(body.model));
+  }) as typeof fetch;
+
+  const model = await createCliModel("gpt-5.3-codex:high", { fetch: fetchImpl });
+  await collect(model.stream(emptyInput()));
+
+  expect(body).toMatchObject({
+    model: "gpt-5.3-codex",
+    reasoning: { effort: "high", summary: "auto" },
+  });
+});
+
+test("CLI Codex thinking off omits reasoning options", async () => {
+  process.env.OPENAI_CODEX_ACCESS_TOKEN = jwtWithAccount("acct_cli");
+  process.env.OPENAI_CODEX_BASE_URL = "https://chatgpt.test/backend-api";
+  delete process.env.OPENAI_CODEX_MODEL;
+
+  let body: Record<string, unknown> = {};
+  const fetchImpl = (async (_input, init) => {
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return codexResponse(String(body.model));
+  }) as typeof fetch;
+
+  const model = await createCliModel("gpt-5.5:off", { fetch: fetchImpl });
+  await collect(model.stream(emptyInput()));
+
+  expect(body).toMatchObject({ model: "gpt-5.5" });
+  expect(body).not.toHaveProperty("reasoning");
+});
+
+test("CLI router passes core modelSelection and reasoningLevel through to provider", async () => {
+  process.env.OPENAI_CODEX_ACCESS_TOKEN = jwtWithAccount("acct_cli");
+  process.env.OPENAI_CODEX_BASE_URL = "https://chatgpt.test/backend-api";
+  delete process.env.OPENAI_CODEX_MODEL;
+
+  const bodies: Record<string, unknown>[] = [];
+  const fetchImpl = (async (_input, init) => {
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    bodies.push(body);
+    return codexResponse(String(body.model));
+  }) as typeof fetch;
+
+  const model = await createCliModel(
+    { provider: "openai-codex", model: "gpt-5.5", reasoningLevel: "low" },
+    { fetch: fetchImpl },
+  );
+
+  await collect(model.stream(emptyInput()));
+  await collect(model.stream({
+    ...emptyInput(),
+    modelSelection: { provider: "openai-codex", model: "gpt-5.3-codex" },
+    reasoningLevel: "high",
+  } as ModelStreamInput & {
+    modelSelection: { provider: string; model: string };
+    reasoningLevel: string;
+  }));
+
+  expect(bodies).toHaveLength(2);
+  expect(bodies.at(0)).toMatchObject({
+    model: "gpt-5.5",
+    reasoning: { effort: "low", summary: "auto" },
+  });
+  expect(bodies.at(1)).toMatchObject({
+    model: "gpt-5.3-codex",
+    reasoning: { effort: "high", summary: "auto" },
+  });
+});
+
+test("CLI DeepSeek reasoning off disables thinking", async () => {
+  process.env.DEEPSEEK_API_KEY = "env-key";
+  process.env.DEEPSEEK_BASE_URL = "https://api.deepseek.com";
+  delete process.env.DEEPSEEK_MODEL;
+
+  let body: Record<string, unknown> = {};
+  const fetchImpl = (async (_input, init) => {
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(
+      JSON.stringify({
+        id: "chatcmpl_cli",
+        model: "deepseek-v4-pro",
+        choices: [{ index: 0, finish_reason: "stop", message: { content: "ok" } }],
+      }),
+      {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      },
+    );
+  }) as typeof fetch;
+
+  const model = await createCliModel({ provider: "deepseek", reasoningLevel: "off" }, { fetch: fetchImpl });
+  await collect(model.stream(emptyInput()));
+
+  expect(body).toMatchObject({
+    model: "deepseek-v4-pro",
+    thinking: { type: "disabled" },
+  });
+  expect(body).not.toHaveProperty("reasoning_effort");
 });
 
 async function collect(stream: AsyncIterable<unknown>): Promise<unknown[]> {
@@ -181,6 +289,27 @@ function streamText(text: string): ReadableStream<Uint8Array> {
       controller.close();
     },
   });
+}
+
+function codexResponse(model: string): Response {
+  return new Response(
+    streamText([
+      data({ type: "response.created", response: { id: "resp_cli", model } }),
+      data({
+        type: "response.completed",
+        response: {
+          id: "resp_cli",
+          model,
+          status: "completed",
+          usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3 },
+        },
+      }),
+    ].join("")),
+    {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    },
+  );
 }
 
 function jwtWithAccount(accountId: string): string {

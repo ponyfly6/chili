@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import { TeamControlService, type AgentTreeSnapshot } from "@chili/core";
+import { TeamControlService, type AgentTreeSnapshot, type SubmitPromptInput } from "@chili/core";
 import type {
   ApprovalRow,
   AgentMailboxQuery,
@@ -22,6 +22,10 @@ import type {
   ChiliEvent,
   EventEnvelope,
   Message,
+  ModelSelection,
+  ReasoningLevel,
+  RuntimeModelConfig,
+  RuntimeModelDescriptor,
   RuntimeSessionRef,
   SessionId,
   TaskId,
@@ -662,6 +666,60 @@ test("passes request cancellation through team run loop HTTP route", async () =>
   expect(teamRunner.signalAbortedAfterAbort).toBe(true);
 });
 
+test("serves model control routes and prompt model overrides", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const handler = createRuntimeHttpHandler({ service, store });
+  const session = await service.createSession();
+
+  const modelsResponse = await handler(new Request("http://chili.test/models?provider=openai-codex"));
+  expect(modelsResponse.status).toBe(200);
+  expect(await modelsResponse.json()).toEqual([
+    {
+      provider: "openai-codex",
+      model: "gpt-5.5",
+      displayName: "GPT-5.5",
+      capabilities: { reasoning: true },
+    },
+  ]);
+
+  const setModelResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/model`, {
+    method: "POST",
+    body: JSON.stringify({
+      threadId: session.threadId,
+      modelSelection: { provider: "openai-codex", model: "gpt-5.3-codex" },
+    }),
+    headers: { "content-type": "application/json" },
+  }));
+  expect(setModelResponse.status).toBe(200);
+  expect(service.modelSelection).toEqual({ provider: "openai-codex", model: "gpt-5.3-codex" });
+
+  const setReasoningResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/reasoning`, {
+    method: "POST",
+    body: JSON.stringify({ threadId: session.threadId, reasoningLevel: "high" }),
+    headers: { "content-type": "application/json" },
+  }));
+  expect(setReasoningResponse.status).toBe(200);
+  expect(service.reasoningLevel).toBe("high");
+
+  const promptResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/prompt_async`, {
+    method: "POST",
+    body: JSON.stringify({
+      threadId: session.threadId,
+      text: "hello",
+      modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
+      reasoningLevel: "xhigh",
+    }),
+    headers: { "content-type": "application/json" },
+  }));
+  expect(promptResponse.status).toBe(202);
+  expect(service.lastPrompt).toMatchObject({
+    modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
+    reasoningLevel: "xhigh",
+  });
+});
+
 test("does not accept async prompts for missing or busy sessions", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
@@ -705,6 +763,10 @@ test("cleans up SSE subscriptions when the stream reader is cancelled", async ()
 });
 
 class FakeRuntimeService implements RuntimeHttpService {
+  modelSelection: ModelSelection | undefined;
+  reasoningLevel: ReasoningLevel | undefined;
+  lastPrompt: SubmitPromptInput | undefined;
+
   constructor(private readonly store: EventStore & EventPublisher) {}
 
   async createSession(input: { sessionId?: SessionId; threadId?: ThreadId; cwd?: string } = {}): Promise<RuntimeSessionRef> {
@@ -721,12 +783,45 @@ class FakeRuntimeService implements RuntimeHttpService {
     return { sessionId, threadId };
   }
 
-  async submitPrompt(): Promise<never> {
-    throw new Error("not needed in this test");
+  async listModels(input: { provider?: string } = {}): Promise<RuntimeModelDescriptor[]> {
+    const models: RuntimeModelDescriptor[] = [
+      {
+        provider: "openai-codex",
+        model: "gpt-5.5",
+        displayName: "GPT-5.5",
+        capabilities: { reasoning: true },
+      },
+    ];
+    return input.provider ? models.filter((model) => model.provider === input.provider) : models;
   }
 
-  submitPromptAsync(): void {
-    throw new Error("not needed in this test");
+  async getModelConfig(sessionId: SessionId): Promise<RuntimeModelConfig> {
+    return {
+      sessionId,
+      availableReasoningLevels: ["off", "minimal", "low", "medium", "high", "xhigh"],
+      models: await this.listModels(),
+      ...(this.modelSelection ? { modelSelection: this.modelSelection } : {}),
+      ...(this.reasoningLevel ? { reasoningLevel: this.reasoningLevel } : {}),
+    };
+  }
+
+  async setModel(input: { sessionId: SessionId; modelSelection: ModelSelection }): Promise<RuntimeModelConfig> {
+    this.modelSelection = input.modelSelection;
+    return this.getModelConfig(input.sessionId);
+  }
+
+  async setReasoning(input: { sessionId: SessionId; reasoningLevel: ReasoningLevel }): Promise<RuntimeModelConfig> {
+    this.reasoningLevel = input.reasoningLevel;
+    return this.getModelConfig(input.sessionId);
+  }
+
+  async submitPrompt(input: SubmitPromptInput): Promise<Awaited<ReturnType<RuntimeHttpService["submitPrompt"]>>> {
+    this.lastPrompt = input;
+    return { status: "completed", turns: [], finishReason: "stop" };
+  }
+
+  submitPromptAsync(input: SubmitPromptInput): void {
+    this.lastPrompt = input;
   }
 
   async interrupt(): Promise<boolean> {

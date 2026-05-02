@@ -8,6 +8,47 @@ export type RuntimeSessionStatus =
   | "cancelled"
   | "failed";
 
+export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+
+export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
+
+export const THINKING_LEVELS = REASONING_LEVELS;
+
+export type ThinkingLevel = ReasoningLevel;
+
+export interface ModelSelection {
+  provider: string;
+  model: string;
+}
+
+export interface RuntimeModelCapabilities {
+  streaming?: boolean;
+  reasoning?: boolean;
+  toolCalls?: boolean;
+  toolCallDeltas?: boolean;
+  usage?: boolean;
+  responseId?: boolean;
+}
+
+export interface RuntimeModelDescriptor extends ModelSelection {
+  displayName?: string;
+  providerDisplayName?: string;
+  available?: boolean;
+  capabilities?: RuntimeModelCapabilities;
+  inputCapabilities?: string[];
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
+  default?: boolean;
+}
+
+export interface RuntimeModelConfig {
+  sessionId: SessionId;
+  availableReasoningLevels: ReasoningLevel[];
+  models: RuntimeModelDescriptor[];
+  modelSelection?: ModelSelection;
+  reasoningLevel?: ReasoningLevel;
+}
+
 export type RuntimeCommand =
   | RuntimeCreateSessionCommand
   | RuntimeSubmitPromptCommand
@@ -29,6 +70,8 @@ export interface RuntimeSubmitPromptCommand {
   text: string;
   maxTurns?: number;
   system?: string[];
+  modelSelection?: ModelSelection;
+  reasoningLevel?: ReasoningLevel;
 }
 
 export interface RuntimeInterruptCommand {

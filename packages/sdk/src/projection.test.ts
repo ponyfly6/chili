@@ -1881,6 +1881,76 @@ test("client can cancel chat commands without serializing AbortSignal", async ()
   ]);
 });
 
+test("client sends model control requests and prompt overrides", async () => {
+  const sessionId = "session_sdk_model" as SessionId;
+  const threadId = "thread_sdk_model" as ThreadId;
+  const records: { url: string; method: string | undefined; body: unknown }[] = [];
+  const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url = String(input);
+    records.push({
+      url,
+      method: init?.method,
+      body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
+    });
+    const body = url.endsWith("/models")
+      ? [{ provider: "openai-codex", model: "gpt-5.5" }]
+      : url.endsWith("/prompt_async")
+        ? ({ status: "accepted", sessionId, threadId })
+        : ({ sessionId, models: [], availableReasoningLevels: ["off", "high"] });
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+  const client = new HttpRuntimeClient({ baseUrl: "http://runtime.test/api", fetch: fetchImpl });
+
+  await client.listModels();
+  await client.getModelConfig({ sessionId });
+  await client.setModel({ sessionId, threadId, modelSelection: { provider: "openai-codex", model: "gpt-5.5" } });
+  await client.setReasoning({ sessionId, threadId, reasoningLevel: "high" });
+  await client.submitPromptAsync({
+    sessionId,
+    threadId,
+    text: "hello",
+    modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
+    reasoningLevel: "xhigh",
+  });
+
+  expect(records).toEqual([
+    {
+      url: "http://runtime.test/api/models",
+      method: "GET",
+      body: undefined,
+    },
+    {
+      url: "http://runtime.test/api/sessions/session_sdk_model/model",
+      method: "GET",
+      body: undefined,
+    },
+    {
+      url: "http://runtime.test/api/sessions/session_sdk_model/model",
+      method: "POST",
+      body: { threadId, modelSelection: { provider: "openai-codex", model: "gpt-5.5" } },
+    },
+    {
+      url: "http://runtime.test/api/sessions/session_sdk_model/reasoning",
+      method: "POST",
+      body: { threadId, reasoningLevel: "high" },
+    },
+    {
+      url: "http://runtime.test/api/sessions/session_sdk_model/prompt_async",
+      method: "POST",
+      body: {
+        sessionId,
+        threadId,
+        text: "hello",
+        modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
+        reasoningLevel: "xhigh",
+      },
+    },
+  ]);
+});
+
 test("client approval command wrappers map product actions onto resolve calls", async () => {
   const approvalId = "approval_sdk_wrapper" as ApprovalId;
   const records: { url: string; body: unknown }[] = [];

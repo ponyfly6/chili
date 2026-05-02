@@ -1,4 +1,4 @@
-import type { MessageId, SessionId, ThreadId, TurnId } from "@chili/protocol";
+import type { MessageId, ModelSelection, ReasoningLevel, SessionId, ThreadId, TurnId } from "@chili/protocol";
 import type { ContextUsage } from "./context.js";
 
 export interface CreateSessionInput {
@@ -19,6 +19,9 @@ export interface RunTurnInput {
   turnId?: TurnId;
   cwd: string;
   system?: string[];
+  toolMode?: "auto" | "disabled";
+  modelSelection?: ModelSelection;
+  reasoningLevel?: ReasoningLevel;
   signal?: AbortSignal;
 }
 

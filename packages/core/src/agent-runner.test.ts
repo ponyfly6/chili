@@ -161,6 +161,41 @@ test("RuntimeService continues after OpenAI-compatible tool_calls finish reason"
   expect(statuses(store)).toEqual(["running", "running", "running", "idle"]);
 });
 
+test("RuntimeService adds a no-tool final turn after the tool continuation limit", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+  runner.onRunTurn = async () => {
+    const turnNumber = runner.turnInputs.length;
+    runner.runTurnResult = {
+      status: "completed",
+      turnId: `turn_${turnNumber}` as TurnId,
+      assistantMessageId: `message_assistant_${turnNumber}` as MessageId,
+      finishReason: turnNumber <= 2 ? "tool_use" : "stop",
+    };
+  };
+
+  const result = await service.submitPrompt({
+    sessionId: "session_final_after_tools" as SessionId,
+    threadId: "thread_final_after_tools" as ThreadId,
+    text: "inspect deeply",
+    maxTurns: 2,
+  });
+
+  expect(result.status).toBe("completed");
+  expect(result.finishReason).toBe("stop");
+  expect(runner.turnInputs).toHaveLength(3);
+  expect(runner.turnInputs[2]?.toolMode).toBe("disabled");
+  expect(runner.turnInputs[2]?.system?.at(-1)).toContain("Do not call tools");
+  expect(statuses(store)).toEqual(["running", "running", "running", "running", "idle"]);
+});
+
 test("RuntimeService still stops on Anthropic-style end_turn finish reason", async () => {
   const store = new MemoryEventStore();
   const runner = new FakeAgentRunner();

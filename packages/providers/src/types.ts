@@ -5,6 +5,18 @@ export type ModelApiFamily = "anthropic-messages" | "openai-completions" | "open
 
 export type ModelInputCapability = "text" | "image";
 
+export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
+export const THINKING_LEVELS = REASONING_LEVELS;
+export type ThinkingLevel = ReasoningLevel;
+
+export interface ModelCost {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
 export interface ModelCapabilities {
   streaming: boolean;
   reasoning?: boolean;
@@ -25,7 +37,15 @@ export interface ModelDescriptor {
   inputCapabilities?: readonly ModelInputCapability[];
   contextWindowTokens?: number;
   maxOutputTokens?: number;
+  cost?: ModelCost;
   default?: boolean;
+}
+
+export interface ModelSelection {
+  provider: string;
+  model: string;
+  reasoning?: ReasoningLevel;
+  thinking?: ThinkingLevel;
 }
 
 export interface ChiliModelProvider {
@@ -49,6 +69,11 @@ export interface ModelTool {
 
 export interface ModelStreamInput {
   messages: readonly Message[];
+  provider?: string;
+  model?: string;
+  selection?: Partial<ModelSelection>;
+  reasoning?: ReasoningLevel;
+  thinking?: ThinkingLevel;
   tools?: readonly ModelTool[];
   system?: readonly string[];
   maxTokens?: number;

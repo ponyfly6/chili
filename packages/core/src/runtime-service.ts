@@ -2,16 +2,28 @@ import type {
   ChiliEvent,
   EventEnvelope,
   MessageId,
+  ModelSelection,
+  ReasoningLevel,
+  RuntimeModelConfig,
+  RuntimeModelDescriptor,
   RuntimeSessionStatus,
   SessionId,
   ThreadId,
   TimestampMs,
   TurnId,
 } from "@chili/protocol";
-import { timestampNow } from "@chili/protocol";
+import { REASONING_LEVELS, timestampNow } from "@chili/protocol";
 import type { EventStore } from "@chili/store";
-import type { AgentRunner, RunTurnResult } from "./runner.js";
+import type { AgentRunner, RunTurnInput, RunTurnResult } from "./runner.js";
 import type { CompactContextResult } from "./single-agent-runtime.js";
+
+const FINAL_RESPONSE_AFTER_MAX_TURNS_SYSTEM =
+  "The automatic tool-use continuation limit has been reached. Do not call tools. Use the information already available in the conversation to give the best final answer now, and briefly state anything that remains uncertain.";
+const DEFAULT_MAX_TURNS = 128;
+
+export type RuntimeModelCatalogProvider = () =>
+  | Promise<readonly RuntimeModelDescriptor[]>
+  | readonly RuntimeModelDescriptor[];
 
 export interface RuntimeServiceOptions {
   runtime: AgentRunner;
@@ -20,6 +32,9 @@ export interface RuntimeServiceOptions {
   maxTurns?: number;
   system?: string[];
   systemContext?: RuntimeSystemContextProvider;
+  models?: RuntimeModelCatalogProvider | readonly RuntimeModelDescriptor[];
+  defaultModelSelection?: ModelSelection;
+  defaultReasoningLevel?: ReasoningLevel;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
 }
@@ -48,6 +63,8 @@ export interface SubmitPromptInput {
   cwd?: string;
   maxTurns?: number;
   system?: string[];
+  modelSelection?: ModelSelection;
+  reasoningLevel?: ReasoningLevel;
   signal?: AbortSignal;
 }
 
@@ -56,6 +73,23 @@ export interface CompactSessionInput {
   threadId: ThreadId;
   instructions?: string;
   signal?: AbortSignal;
+}
+
+export interface SetRuntimeModelInput {
+  sessionId: SessionId;
+  threadId?: ThreadId;
+  modelSelection: ModelSelection;
+}
+
+export interface SetRuntimeReasoningInput {
+  sessionId: SessionId;
+  threadId?: ThreadId;
+  reasoningLevel: ReasoningLevel;
+}
+
+interface RuntimeSessionModelState {
+  modelSelection?: ModelSelection;
+  reasoningLevel?: ReasoningLevel;
 }
 
 export type SubmitPromptResult =
@@ -82,6 +116,7 @@ export class RuntimeBusyError extends Error {
 
 export class RuntimeService {
   private readonly running = new Map<SessionId, AbortController>();
+  private readonly sessionModelState = new Map<SessionId, RuntimeSessionModelState>();
 
   constructor(private readonly options: RuntimeServiceOptions) {}
 
@@ -103,6 +138,43 @@ export class RuntimeService {
 
   appendUserMessage(input: { sessionId: SessionId; threadId: ThreadId; text: string }): Promise<MessageId> {
     return this.options.runtime.appendUserMessage(input);
+  }
+
+  async listModels(input: { provider?: string } = {}): Promise<RuntimeModelDescriptor[]> {
+    const models = await this.resolveModelCatalog();
+    return models
+      .filter((model) => !input.provider || model.provider === input.provider)
+      .map(cloneModelDescriptor);
+  }
+
+  async getModelConfig(sessionId: SessionId): Promise<RuntimeModelConfig> {
+    return this.buildModelConfig(sessionId, await this.resolveSessionModelState(sessionId));
+  }
+
+  async setModel(input: SetRuntimeModelInput): Promise<RuntimeModelConfig> {
+    const modelSelection = normalizeModelSelection(input.modelSelection);
+    const state = await this.resolveSessionModelState(input.sessionId);
+    state.modelSelection = modelSelection;
+    this.sessionModelState.set(input.sessionId, cloneSessionModelState(state));
+    await this.append(input, "session.model_changed", {
+      sessionId: input.sessionId,
+      modelSelection,
+    });
+    return this.buildModelConfig(input.sessionId, state);
+  }
+
+  async setReasoning(input: SetRuntimeReasoningInput): Promise<RuntimeModelConfig> {
+    if (!isReasoningLevel(input.reasoningLevel)) {
+      throw new Error(`Invalid reasoning level: ${input.reasoningLevel}`);
+    }
+    const state = await this.resolveSessionModelState(input.sessionId);
+    state.reasoningLevel = input.reasoningLevel;
+    this.sessionModelState.set(input.sessionId, cloneSessionModelState(state));
+    await this.append(input, "session.reasoning_changed", {
+      sessionId: input.sessionId,
+      reasoningLevel: input.reasoningLevel,
+    });
+    return this.buildModelConfig(input.sessionId, state);
   }
 
   async compactSession(input: CompactSessionInput): Promise<CompactContextResult> {
@@ -184,10 +256,11 @@ export class RuntimeService {
 
   private async runReservedPrompt(input: SubmitPromptInput, controller: AbortController): Promise<SubmitPromptResult> {
     const turns: RunTurnResult[] = [];
-    const maxTurns = input.maxTurns ?? this.options.maxTurns ?? 12;
+    const maxTurns = input.maxTurns ?? this.options.maxTurns ?? DEFAULT_MAX_TURNS;
     const cwd = input.cwd ?? this.options.cwd;
 
     try {
+      const promptModelState = await this.resolvePromptModelState(input);
       const system = await this.resolveSystem({
         base: input.system ?? this.options.system ?? [],
         sessionId: input.sessionId,
@@ -213,30 +286,16 @@ export class RuntimeService {
           return await this.cancelledPrompt(input, turns, "Prompt aborted");
         }
 
-        const result = await this.options.runtime.runTurn({
-          sessionId: input.sessionId,
-          threadId: input.threadId,
+        const runInput = this.buildRunTurnInput({
+          input,
           cwd,
           system,
           signal: controller.signal,
+          modelState: promptModelState,
         });
+        const result = await this.options.runtime.runTurn(runInput);
         turns.push(result);
-
-        const turnStatus: {
-          sessionId: SessionId;
-          threadId: ThreadId;
-          status: RuntimeSessionStatus;
-          turnId: TurnId;
-          reason?: string;
-        } = {
-          sessionId: input.sessionId,
-          threadId: input.threadId,
-          status: result.status === "completed" ? "running" : result.status,
-          turnId: result.turnId,
-        };
-        const turnReason = result.status === "completed" ? result.finishReason : result.error.message;
-        if (turnReason) turnStatus.reason = turnReason;
-        await this.publishStatus(turnStatus);
+        await this.publishTurnProgress(input, result);
 
         if (result.status !== "completed") {
           return {
@@ -251,40 +310,53 @@ export class RuntimeService {
         }
 
         if (!isToolUseFinishReason(result.finishReason)) {
-          const idleStatus: {
-            sessionId: SessionId;
-            threadId: ThreadId;
-            status: RuntimeSessionStatus;
-            turnId: TurnId;
-            reason?: string;
-          } = {
-            sessionId: input.sessionId,
-            threadId: input.threadId,
-            status: "idle",
-            turnId: result.turnId,
-          };
-          if (result.finishReason) idleStatus.reason = result.finishReason;
-          await this.publishStatus(idleStatus);
-
-          const completed: Extract<SubmitPromptResult, { status: "completed" }> = {
-            status: "completed",
-            turns,
-          };
-          if (result.finishReason) completed.finishReason = result.finishReason;
-          return completed;
+          return await this.completedPrompt(input, turns, result);
         }
+      }
+
+      if (controller.signal.aborted) {
+        return await this.cancelledPrompt(input, turns, "Prompt aborted");
+      }
+
+      const finalRunInput = this.buildRunTurnInput({
+        input,
+        cwd,
+        system: [...system, FINAL_RESPONSE_AFTER_MAX_TURNS_SYSTEM],
+        signal: controller.signal,
+        modelState: promptModelState,
+        toolMode: "disabled",
+      });
+      const finalResult = await this.options.runtime.runTurn(finalRunInput);
+      turns.push(finalResult);
+      await this.publishTurnProgress(input, finalResult);
+
+      if (finalResult.status !== "completed") {
+        return {
+          status: finalResult.status,
+          turns,
+          error: finalResult.error,
+        };
+      }
+
+      if (controller.signal.aborted) {
+        return await this.cancelledPrompt(input, turns, "Prompt aborted");
+      }
+
+      if (!isToolUseFinishReason(finalResult.finishReason)) {
+        return await this.completedPrompt(input, turns, finalResult);
       }
 
       await this.publishStatus({
         sessionId: input.sessionId,
         threadId: input.threadId,
         status: "failed",
+        turnId: finalResult.turnId,
         reason: "max_turns",
       });
       return {
         status: "max_turns",
         turns,
-        finishReason: "tool_use",
+        finishReason: finalResult.finishReason ?? "tool_use",
       };
     } catch (error) {
       const err = toError(error);
@@ -305,6 +377,73 @@ export class RuntimeService {
     }
   }
 
+  private buildRunTurnInput(input: {
+    input: SubmitPromptInput;
+    cwd: string;
+    system: string[];
+    signal: AbortSignal;
+    modelState: RuntimeSessionModelState;
+    toolMode?: "auto" | "disabled";
+  }): RunTurnInput {
+    const runInput: RunTurnInput = {
+      sessionId: input.input.sessionId,
+      threadId: input.input.threadId,
+      cwd: input.cwd,
+      system: input.system,
+      signal: input.signal,
+    };
+    if (input.toolMode) runInput.toolMode = input.toolMode;
+    if (input.modelState.modelSelection) runInput.modelSelection = input.modelState.modelSelection;
+    if (input.modelState.reasoningLevel !== undefined) runInput.reasoningLevel = input.modelState.reasoningLevel;
+    return runInput;
+  }
+
+  private async publishTurnProgress(input: SubmitPromptInput, result: RunTurnResult): Promise<void> {
+    const turnStatus: {
+      sessionId: SessionId;
+      threadId: ThreadId;
+      status: RuntimeSessionStatus;
+      turnId: TurnId;
+      reason?: string;
+    } = {
+      sessionId: input.sessionId,
+      threadId: input.threadId,
+      status: result.status === "completed" ? "running" : result.status,
+      turnId: result.turnId,
+    };
+    const turnReason = result.status === "completed" ? result.finishReason : result.error.message;
+    if (turnReason) turnStatus.reason = turnReason;
+    await this.publishStatus(turnStatus);
+  }
+
+  private async completedPrompt(
+    input: SubmitPromptInput,
+    turns: RunTurnResult[],
+    result: Extract<RunTurnResult, { status: "completed" }>,
+  ): Promise<Extract<SubmitPromptResult, { status: "completed" }>> {
+    const idleStatus: {
+      sessionId: SessionId;
+      threadId: ThreadId;
+      status: RuntimeSessionStatus;
+      turnId: TurnId;
+      reason?: string;
+    } = {
+      sessionId: input.sessionId,
+      threadId: input.threadId,
+      status: "idle",
+      turnId: result.turnId,
+    };
+    if (result.finishReason) idleStatus.reason = result.finishReason;
+    await this.publishStatus(idleStatus);
+
+    const completed: Extract<SubmitPromptResult, { status: "completed" }> = {
+      status: "completed",
+      turns,
+    };
+    if (result.finishReason) completed.finishReason = result.finishReason;
+    return completed;
+  }
+
   private async resolveSystem(input: {
     base: readonly string[];
     sessionId: SessionId;
@@ -317,6 +456,69 @@ export class RuntimeService {
       cwd: input.cwd,
     });
     return [...input.base, ...(dynamic ?? [])];
+  }
+
+  private async resolvePromptModelState(input: SubmitPromptInput): Promise<RuntimeSessionModelState> {
+    const state = await this.resolveSessionModelState(input.sessionId);
+    if (input.modelSelection) state.modelSelection = normalizeModelSelection(input.modelSelection);
+    if (input.reasoningLevel !== undefined) {
+      if (!isReasoningLevel(input.reasoningLevel)) throw new Error(`Invalid reasoning level: ${input.reasoningLevel}`);
+      state.reasoningLevel = input.reasoningLevel;
+    }
+    return state;
+  }
+
+  private async resolveSessionModelState(sessionId: SessionId): Promise<RuntimeSessionModelState> {
+    const cached = this.sessionModelState.get(sessionId);
+    if (cached) return cloneSessionModelState(cached);
+
+    const state = defaultSessionModelState(this.options);
+    const modelEvents = await this.options.store.events({
+      sessionId,
+      type: "session.model_changed",
+      limit: 10_000,
+    });
+    for (const event of modelEvents) {
+      if (event.type === "session.model_changed" && isModelSelectionPayload(event.payload)) {
+        state.modelSelection = normalizeModelSelection(event.payload.modelSelection);
+      }
+    }
+
+    const reasoningEvents = await this.options.store.events({
+      sessionId,
+      type: "session.reasoning_changed",
+      limit: 10_000,
+    });
+    for (const event of reasoningEvents) {
+      if (event.type === "session.reasoning_changed" && isReasoningPayload(event.payload)) {
+        state.reasoningLevel = event.payload.reasoningLevel;
+      }
+    }
+
+    this.sessionModelState.set(sessionId, cloneSessionModelState(state));
+    return state;
+  }
+
+  private async buildModelConfig(
+    sessionId: SessionId,
+    state: RuntimeSessionModelState,
+  ): Promise<RuntimeModelConfig> {
+    const config: RuntimeModelConfig = {
+      sessionId,
+      availableReasoningLevels: [...REASONING_LEVELS],
+      models: await this.listModels(),
+    };
+    if (state.modelSelection) config.modelSelection = cloneModelSelection(state.modelSelection);
+    if (state.reasoningLevel !== undefined) config.reasoningLevel = state.reasoningLevel;
+    return config;
+  }
+
+  private async resolveModelCatalog(): Promise<readonly RuntimeModelDescriptor[]> {
+    const source = this.options.models;
+    if (typeof source === "function") return source();
+    if (source) return source;
+    const runtime = this.options.runtime as AgentRunner & { listModels?: RuntimeModelCatalogProvider };
+    return runtime.listModels?.() ?? [];
   }
 
   async interrupt(sessionId: SessionId, reason = "user_interrupt"): Promise<boolean> {
@@ -412,6 +614,71 @@ export class RuntimeService {
 
 function defaultCreateId(prefix: string): string {
   return `${prefix}_${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+function defaultSessionModelState(options: RuntimeServiceOptions): RuntimeSessionModelState {
+  const state: RuntimeSessionModelState = {};
+  if (options.defaultModelSelection) state.modelSelection = normalizeModelSelection(options.defaultModelSelection);
+  if (options.defaultReasoningLevel !== undefined) {
+    if (!isReasoningLevel(options.defaultReasoningLevel)) {
+      throw new Error(`Invalid default reasoning level: ${options.defaultReasoningLevel}`);
+    }
+    state.reasoningLevel = options.defaultReasoningLevel;
+  }
+  return state;
+}
+
+function cloneSessionModelState(state: RuntimeSessionModelState): RuntimeSessionModelState {
+  const clone: RuntimeSessionModelState = {};
+  if (state.modelSelection) clone.modelSelection = cloneModelSelection(state.modelSelection);
+  if (state.reasoningLevel !== undefined) clone.reasoningLevel = state.reasoningLevel;
+  return clone;
+}
+
+function normalizeModelSelection(selection: ModelSelection): ModelSelection {
+  const provider = typeof selection.provider === "string" ? selection.provider.trim() : "";
+  const model = typeof selection.model === "string" ? selection.model.trim() : "";
+  if (!provider || !model) throw new Error("Model selection requires provider and model");
+  return { provider, model };
+}
+
+function cloneModelSelection(selection: ModelSelection): ModelSelection {
+  return {
+    provider: selection.provider,
+    model: selection.model,
+  };
+}
+
+function cloneModelDescriptor(model: RuntimeModelDescriptor): RuntimeModelDescriptor {
+  const clone: RuntimeModelDescriptor = {
+    provider: model.provider,
+    model: model.model,
+  };
+  if (model.displayName !== undefined) clone.displayName = model.displayName;
+  if (model.providerDisplayName !== undefined) clone.providerDisplayName = model.providerDisplayName;
+  if (model.available !== undefined) clone.available = model.available;
+  if (model.capabilities) clone.capabilities = { ...model.capabilities };
+  if (model.inputCapabilities) clone.inputCapabilities = [...model.inputCapabilities];
+  if (model.contextWindowTokens !== undefined) clone.contextWindowTokens = model.contextWindowTokens;
+  if (model.maxOutputTokens !== undefined) clone.maxOutputTokens = model.maxOutputTokens;
+  if (model.default !== undefined) clone.default = model.default;
+  return clone;
+}
+
+function isReasoningLevel(value: unknown): value is ReasoningLevel {
+  return typeof value === "string" && (REASONING_LEVELS as readonly string[]).includes(value);
+}
+
+function isModelSelectionPayload(payload: unknown): payload is { modelSelection: ModelSelection } {
+  return isRecord(payload) && isRecord(payload.modelSelection) && typeof payload.modelSelection.provider === "string" && typeof payload.modelSelection.model === "string";
+}
+
+function isReasoningPayload(payload: unknown): payload is { reasoningLevel: ReasoningLevel } {
+  return isRecord(payload) && isReasoningLevel(payload.reasoningLevel);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function toError(error: unknown): Error {
