@@ -1,6 +1,7 @@
 import type { Message, MessageId, PartId, SessionId, ThreadId, TimestampMs, TurnId } from "@chili/protocol";
-import { compactedMessageView, estimateMessages, type CompactionBoundary } from "./context.js";
-import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.js";
+import { formatCompactionSourceMessages } from "./format.js";
+import { compactedMessageView, estimateMessages, type CompactionBoundary } from "./window.js";
+import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "../runtime.js";
 
 export interface ContextCompactionOptions {
   model: ModelRouter;
@@ -79,7 +80,7 @@ export class ContextCompactionService {
       throw new Error("No messages available to compact");
     }
 
-    const sourceText = budgetSourceText(formatMessages(sourceMessages), this.maxSourceChars);
+    const sourceText = budgetSourceText(formatCompactionSourceMessages(sourceMessages), this.maxSourceChars);
     const draftSummary = await this.generateSummary(input, sourceText);
     const verifiedSummary = this.verifySummary
       ? await this.verifyAndReviseSummary(input, sourceText, draftSummary)
@@ -197,40 +198,6 @@ function hasVisibleParts(message: Message): boolean {
   return message.parts.length > 0;
 }
 
-function formatMessages(messages: readonly Message[]): string {
-  return messages.map(formatMessage).join("\n\n");
-}
-
-function formatMessage(message: Message): string {
-  const compactionPart = message.parts.find((part) => part.type === "compaction");
-  if (compactionPart?.type === "compaction") {
-    return `[context_summary ${message.id}]\n${compactionPart.summary ?? ""}`;
-  }
-  const parts = message.parts.map(formatPart).filter(Boolean).join("\n");
-  return `[${message.role} ${message.id}]\n${parts}`;
-}
-
-function formatPart(part: Message["parts"][number]): string {
-  switch (part.type) {
-    case "text":
-      return part.text;
-    case "reasoning":
-      return `[reasoning]\n${part.text}`;
-    case "tool_call":
-      return `[tool_call ${part.toolName} ${part.callId}]\n${safeJson(part.input)}`;
-    case "tool_result":
-      return `[tool_result ${part.callId}${part.error ? " error" : ""}]\n${part.error ? `Error: ${part.error}\n` : ""}${part.output}`;
-    case "patch":
-      return `[patch]\n${part.files.join("\n")}`;
-    case "artifact":
-      return `[artifact ${part.artifactId}]`;
-    case "compaction":
-      return `[previous_context_summary]\n${part.summary ?? ""}`;
-    case "agent_handoff":
-      return `[agent_handoff ${part.agentPath}]\n${part.summary}`;
-  }
-}
-
 function budgetSourceText(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
   const marker = "\n[older conversation omitted from compaction request because it exceeded the compressor budget]\n";
@@ -253,14 +220,6 @@ function stripContextSummary(summary: string): string {
 function clipSummary(summary: string, maxChars: number): string {
   if (summary.length <= maxChars) return summary;
   return `${summary.slice(0, maxChars)}\n[context summary truncated after ${maxChars} chars]`;
-}
-
-function safeJson(value: unknown): string {
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
 }
 
 function isUnexpectedToolEvent(event: ModelStreamEvent): boolean {

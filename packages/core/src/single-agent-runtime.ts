@@ -16,8 +16,15 @@ import { timestampNow } from "@chili/protocol";
 import type { EventStore } from "@chili/store";
 import type { ToolAccessPolicyResolver, ToolRegistry } from "@chili/tools";
 import { ToolExecutor, filterToolsByPolicy } from "@chili/tools";
-import { ContextCompactionService, type ContextCompactionOptions, type ContextCompactionResult } from "./compaction.js";
-import { ContextWindowBuilder, type CompactionBoundary, type ContextBudgetOptions, type ContextUsage } from "./context.js";
+import {
+  ContextCompactionService,
+  ContextWindowBuilder,
+  type CompactionBoundary,
+  type ContextBudgetOptions,
+  type ContextCompactionOptions,
+  type ContextCompactionResult,
+  type ContextUsage,
+} from "./context/index.js";
 import { DoomLoopError, DoomLoopGuard, type DoomLoopGuardOptions } from "./doom-loop-guard.js";
 import { normalizeRetryPolicy, retryDelay, sleep, type RetryPolicy } from "./retry.js";
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.js";

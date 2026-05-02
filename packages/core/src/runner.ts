@@ -1,5 +1,5 @@
 import type { MessageId, ModelSelection, ReasoningLevel, SessionId, ThreadId, TurnId } from "@chili/protocol";
-import type { ContextUsage } from "./context.js";
+import type { ContextUsage } from "./context/index.js";
 import type { PromptDebugManifest } from "./prompt/index.js";
 
 export interface CreateSessionInput {

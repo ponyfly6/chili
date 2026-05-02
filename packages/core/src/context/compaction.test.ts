@@ -11,9 +11,9 @@ import type {
 } from "@chili/protocol";
 import type { ApprovalRow, EventQuery, EventStore, SessionRow } from "@chili/store";
 import { InMemoryToolRegistry, ToolExecutor } from "@chili/tools";
-import { ContextWindowBuilder, compactedMessageView } from "./context.js";
-import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.js";
-import { SingleAgentRuntime } from "./single-agent-runtime.js";
+import { ContextWindowBuilder, compactedMessageView } from "./window.js";
+import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "../runtime.js";
+import { SingleAgentRuntime } from "../single-agent-runtime.js";
 
 test("context builder uses the latest compaction message as replacement history", () => {
   const sessionId = "session_compacted_view" as SessionId;
