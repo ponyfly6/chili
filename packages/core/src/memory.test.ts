@@ -12,7 +12,7 @@ import {
   loadChiliMemoryContext,
   removeChiliMemoryEntry,
   sanitizeMemoryEntry,
-} from "./memory.js";
+} from "./memory/index.js";
 import { assemblePromptFragments } from "./prompt/index.js";
 
 test("memory loader reads user memory, project memory, and project instructions in order", async () => {
