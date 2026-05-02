@@ -30,6 +30,8 @@ export interface DeepSeekModelOptions {
   env?: EnvironmentSource;
 }
 
+const DEFAULT_DEEPSEEK_MAX_TOKENS = 128 * 1024;
+
 export class DeepSeekOpenAIProvider implements ChiliModelProvider {
   readonly id = DEEPSEEK_PROVIDER_ID;
   readonly name = "DeepSeek";
@@ -108,9 +110,9 @@ export function createDeepSeekV4Model(options: DeepSeekModelOptions = {}): OpenA
     baseUrl: resolveDeepSeekCompletionsUrl(options.baseUrl ?? env.baseUrl ?? descriptor?.baseUrl ?? DEEPSEEK_OPENAI_BASE_URL),
     apiKey: options.apiKey ?? env.apiKey ?? "",
     reasoning: options.reasoning ?? true,
+    maxTokens: options.maxTokens ?? DEFAULT_DEEPSEEK_MAX_TOKENS,
   };
   if (descriptor?.compatibility?.chatCompletions) modelOptions.compatibility = descriptor.compatibility.chatCompletions;
-  if (options.maxTokens !== undefined) modelOptions.maxTokens = options.maxTokens;
   if (options.temperature !== undefined) modelOptions.temperature = options.temperature;
   if (options.fetch !== undefined) modelOptions.fetch = options.fetch;
   if (options.headers !== undefined) modelOptions.headers = options.headers;

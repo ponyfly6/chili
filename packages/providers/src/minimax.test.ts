@@ -30,6 +30,7 @@ test("MiniMax model factory resolves model, baseUrl, and API key from env", asyn
   expect(url).toBe("https://env.minimax.test/anthropic/v1/messages");
   expect(headers.authorization).toBe("Bearer env-key");
   expect(body.model).toBe("MiniMax-M2.7");
+  expect(body.max_tokens).toBe(32768);
   expect(events.at(-1)).toMatchObject({ type: "finish", reason: "end_turn", responseId: "msg_env" });
 });
 

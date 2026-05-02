@@ -58,7 +58,7 @@ test("CLI DeepSeek env resolution uses official V4 OpenAI-compatible endpoint an
   expect(url).toBe("https://api.deepseek.com/chat/completions");
   expect(body).toMatchObject({
     model: "deepseek-v4-flash",
-    max_tokens: 4096,
+    max_tokens: 131072,
     thinking: { type: "enabled" },
   });
   expect(events).toContainEqual(expect.objectContaining({
@@ -77,8 +77,10 @@ test("CLI MiniMax env resolution prefers Anthropic-compatible base URL over gene
   delete process.env.ANTHROPIC_BASE_URL;
 
   let url = "";
-  const fetchImpl = (async (input) => {
+  let body: Record<string, unknown> = {};
+  const fetchImpl = (async (input, init) => {
     url = String(input);
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     return new Response(JSON.stringify({ content: [], stop_reason: "end_turn" }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -89,6 +91,7 @@ test("CLI MiniMax env resolution prefers Anthropic-compatible base URL over gene
   await collect(model.stream(emptyInput()));
 
   expect(url).toBe("https://api.minimaxi.com/anthropic/v1/messages");
+  expect(body).toMatchObject({ max_tokens: 32768 });
 });
 
 test("CLI Codex env resolution uses ChatGPT Codex endpoint and session metadata", async () => {

@@ -46,7 +46,7 @@ test("DeepSeek model factory resolves model, baseUrl, and API key from env", asy
   expect(headers.authorization).toBe("Bearer env-key");
   expect(body).toMatchObject({
     model: DEEPSEEK_V4_FLASH_MODEL,
-    max_tokens: 4096,
+    max_tokens: 131072,
     thinking: { type: "enabled" },
     reasoning_effort: "high",
   });

@@ -28,6 +28,8 @@ export interface MiniMaxModelOptions {
   env?: EnvironmentSource;
 }
 
+const DEFAULT_MINIMAX_MAX_TOKENS = 32 * 1024;
+
 export class MiniMaxAnthropicProvider implements ChiliModelProvider {
   readonly id = MINIMAX_PROVIDER_ID;
   readonly name = "MiniMax";
@@ -107,8 +109,8 @@ export function createMiniMaxM27HighspeedModel(options: MiniMaxModelOptions = {}
     baseUrl: options.baseUrl ?? env.baseUrl ?? descriptor?.baseUrl ?? MINIMAX_ANTHROPIC_BASE_URL,
     apiKey: options.apiKey ?? env.apiKey ?? "",
     authScheme: options.authScheme ?? "bearer",
+    maxTokens: options.maxTokens ?? DEFAULT_MINIMAX_MAX_TOKENS,
   };
-  if (options.maxTokens !== undefined) modelOptions.maxTokens = options.maxTokens;
   if (options.temperature !== undefined) modelOptions.temperature = options.temperature;
   if (options.fetch !== undefined) modelOptions.fetch = options.fetch;
   if (options.headers !== undefined) modelOptions.headers = options.headers;

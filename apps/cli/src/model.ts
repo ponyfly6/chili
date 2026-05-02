@@ -79,7 +79,8 @@ type ProviderModelStreamEvent =
   | { type: "tool_call_end"; name: string; input: unknown; [key: string]: unknown };
 
 const PROVIDERS_PACKAGE_NAME = "@chili/providers";
-const DEFAULT_MAX_TOKENS = 4096;
+const DEFAULT_DEEPSEEK_MAX_TOKENS = 128 * 1024;
+const DEFAULT_MINIMAX_MAX_TOKENS = 32 * 1024;
 const DEFAULT_PROVIDER: CliProviderName = "minimax";
 const PROVIDER_DISPLAY_NAMES: Record<CliProviderName, string> = {
   minimax: "MiniMax",
@@ -474,7 +475,7 @@ async function loadFactoryForProvider(provider: CliProviderName): Promise<Provid
 }
 
 function readMiniMaxOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
-  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_MAX_TOKENS };
+  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_MINIMAX_MAX_TOKENS };
   const env = readMiniMaxEnvironment();
   const resolvedApiKey = input.apiKey ?? env.apiKey;
   const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? MINIMAX_ANTHROPIC_BASE_URL;
@@ -490,7 +491,7 @@ function readMiniMaxOptionsFromEnv(input: CliModelOptions): ProviderRouterOption
 }
 
 function readDeepSeekOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
-  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_MAX_TOKENS };
+  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_DEEPSEEK_MAX_TOKENS };
   const env = readDeepSeekEnvironment();
   const resolvedApiKey = input.apiKey ?? env.apiKey;
   const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? DEEPSEEK_OPENAI_BASE_URL;
