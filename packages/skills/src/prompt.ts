@@ -22,6 +22,7 @@ export function formatAvailableSkillsPrompt(
 ): string | undefined {
   const visible = skills
     .filter((skill) => options.includeHidden === true || skill.hidden !== true)
+    .filter((skill) => skill.disabled !== true)
     .sort((left, right) => left.name.localeCompare(right.name));
   if (visible.length === 0) return undefined;
 

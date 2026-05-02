@@ -1335,7 +1335,7 @@ function activeSkillMentionTrigger(prompt: string): SkillMentionTrigger | undefi
 function skillCompletions(skills: readonly SkillSummary[], query: string): SkillCompletion[] {
   const normalized = query.trim().toLowerCase();
   return skills
-    .filter((skill) => skill.hidden !== true)
+    .filter((skill) => skill.hidden !== true && skill.disabled !== true)
     .filter((skill) => skillMatches(skill, normalized))
     .sort((left, right) => left.name.localeCompare(right.name) || left.filePath.localeCompare(right.filePath))
     .slice(0, 8)

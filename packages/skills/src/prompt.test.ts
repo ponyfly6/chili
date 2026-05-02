@@ -89,12 +89,14 @@ test("available skills prompt hides hidden skills by default", () => {
   const registry = new SkillRegistry([
     skill({ name: "visible", description: "Visible.", body: "visible body" }),
     skill({ name: "hidden", description: "Hidden.", body: "hidden body", hidden: true }),
-  ]);
+    skill({ name: "disabled", description: "Disabled.", body: "disabled body" }),
+  ], [], [], ["disabled"], true);
 
   const prompt = formatAvailableSkillsPrompt(registry.list());
 
   expect(prompt).toContain("visible");
   expect(prompt).not.toContain("hidden");
+  expect(prompt).not.toContain("disabled");
 });
 
 function skill(input: {

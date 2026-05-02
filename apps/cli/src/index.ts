@@ -5,6 +5,7 @@ import type { AgentTreeNode, TeamExecutionRunSummary, TeamMergeSweepResult, Team
 import type { SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
 import { ROOT_AGENT_PATH } from "@chili/protocol";
 import { startRuntimeHttpServer } from "@chili/server";
+import { loadSkillSettings, loadSkills, updateSkillDisabledSetting, type Skill } from "@chili/skills";
 import { DeferredApprovalQueue } from "@chili/tools";
 import { parseArgs, usage } from "./args.js";
 import { createCliHarness } from "./harness.js";
@@ -16,6 +17,11 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   if (args.command === "help") {
     console.log(usage());
+    return;
+  }
+
+  if (args.command === "skills-list" || args.command === "skills-enable" || args.command === "skills-disable") {
+    await handleSkillsCommand(args);
     return;
   }
 
@@ -716,6 +722,76 @@ async function reloadMemory(harness: Awaited<ReturnType<typeof createCliHarness>
       console.log(`[memory] ${document.label}\t${document.path}`);
     }
   }
+}
+
+async function handleSkillsCommand(args: ReturnType<typeof parseArgs>): Promise<void> {
+  if (args.command === "skills-list") {
+    await printSkills(args.cwd, args.json);
+    return;
+  }
+  if (!args.skillName) throw new Error("skills enable/disable requires a skill name");
+  const scope = args.skillScope ?? "project";
+  const disabled = args.command === "skills-disable";
+  const snapshot = await updateSkillDisabledSetting({
+    cwd: args.cwd,
+    scope,
+    name: args.skillName,
+    disabled,
+  });
+  const state = snapshot.disabledSkillNames.includes(args.skillName) ? "disabled" : "enabled";
+  const path = scope === "user" ? snapshot.userPath : snapshot.projectPath;
+  console.log(`[skills] ${args.skillName}\t${state}\t${scope}\t${path}`);
+}
+
+async function printSkills(cwd: string, asJson: boolean): Promise<void> {
+  const settings = await loadSkillSettings({ cwd });
+  const result = await loadSkills({
+    cwd,
+    includeDisabled: true,
+    disabledSkills: [],
+  });
+  const disabled = new Set(settings.disabledSkillNames);
+  const skills = result.allSkills.map((skill) => skillListItem(skill, disabled));
+  if (asJson) {
+    console.log(jsonStringify({
+      disabledSkillNames: settings.disabledSkillNames,
+      userPath: settings.userPath,
+      projectPath: settings.projectPath,
+      skills,
+    }));
+    return;
+  }
+  if (skills.length === 0) {
+    console.log("No skills found.");
+    return;
+  }
+  for (const skill of skills) {
+    console.log([
+      skill.name,
+      skill.disabled ? "disabled" : "enabled",
+      skill.source,
+      skill.filePath,
+      skill.description,
+    ].join("\t"));
+  }
+}
+
+function skillListItem(skill: Skill, disabled: Set<string>): {
+  name: string;
+  disabled: boolean;
+  source: Skill["source"];
+  filePath: string;
+  baseDir: string;
+  description: string;
+} {
+  return {
+    name: skill.name,
+    disabled: disabled.has(skill.name),
+    source: skill.source,
+    filePath: skill.filePath,
+    baseDir: skill.baseDir,
+    description: skill.metadata.description,
+  };
 }
 
 function filterMemoryDocuments(

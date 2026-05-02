@@ -37,6 +37,29 @@ test("project skill overrides same-name user skill", async () => {
   expect(registry.diagnostics()).toContainEqual(expect.objectContaining({ code: "skill_overridden" }));
 });
 
+test("disabled skills are omitted from registry lookup and summaries", async () => {
+  const fixture = await tempFixture();
+  await writeSkill(fixture.cwd, "project", "reviewer", "Review code.", "review body");
+  await writeSkill(fixture.cwd, "project", "writer", "Write docs.", "writer body");
+  await mkdir(path.join(fixture.cwd, ".chili"), { recursive: true });
+  await writeFile(path.join(fixture.cwd, ".chili", "skills.json"), JSON.stringify({ disabled: ["reviewer"] }), "utf8");
+
+  const registry = await discoverSkills({ cwd: fixture.cwd, homeDir: fixture.home });
+
+  expect(registry.list().map((skill) => skill.name)).toEqual(["writer"]);
+  expect(registry.listAll().map((skill) => skill.name)).toEqual(["writer"]);
+  expect(registry.get("reviewer")).toBeUndefined();
+  expect(registry.findByName("reviewer")).toEqual([]);
+  expect(registry.disabled()).toEqual(["reviewer"]);
+
+  const withDisabled = await discoverSkills({ cwd: fixture.cwd, homeDir: fixture.home, includeDisabled: true });
+  expect(withDisabled.list().find((skill) => skill.name === "reviewer")).toMatchObject({
+    name: "reviewer",
+    disabled: true,
+  });
+  expect(withDisabled.get("reviewer")?.name).toBe("reviewer");
+});
+
 test("invalid skills return diagnostics without failing the load", async () => {
   const fixture = await tempFixture();
   await writeSkill(fixture.cwd, "project", "valid-skill", "Valid description.", "valid body");

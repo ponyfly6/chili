@@ -164,3 +164,23 @@ test("parses prompt-debug command and flags", () => {
     json: false,
   });
 });
+
+test("parses skills commands", () => {
+  expect(parseArgs(["skills"])).toMatchObject({
+    command: "skills-list",
+  });
+  expect(parseArgs(["skills", "list", "--json"])).toMatchObject({
+    command: "skills-list",
+    json: true,
+  });
+  expect(parseArgs(["skills", "disable", "--user", "reviewer"])).toMatchObject({
+    command: "skills-disable",
+    skillScope: "user",
+    skillName: "reviewer",
+  });
+  expect(parseArgs(["skills", "enable", "--project", "reviewer"])).toMatchObject({
+    command: "skills-enable",
+    skillScope: "project",
+    skillName: "reviewer",
+  });
+});

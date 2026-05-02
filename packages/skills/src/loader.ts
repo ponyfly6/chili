@@ -9,6 +9,7 @@ import type {
   SkillRoot,
   SkillsLoadResult,
 } from "./types.js";
+import { isSkillDisabled, loadSkillSettings } from "./settings.js";
 
 const SKILL_FILENAME = "SKILL.md";
 
@@ -23,6 +24,10 @@ export async function loadSkills(options: DiscoverSkillsOptions): Promise<Skills
   const cwd = path.resolve(options.cwd);
   const home = path.resolve(options.homeDir ?? homedir());
   const includeAgentsAlias = options.includeAgentsAlias ?? true;
+  const settings = options.disabledSkills
+    ? { disabledSkillNames: [...options.disabledSkills] }
+    : await loadSkillSettings({ cwd, homeDir: home });
+  const disabledSkillNames = settings.disabledSkillNames;
   const roots = skillRoots({ cwd, homeDir: home, includeAgentsAlias });
   const diagnostics: SkillDiagnostic[] = [];
   const byName = new Map<string, Skill>();
@@ -47,8 +52,11 @@ export async function loadSkills(options: DiscoverSkillsOptions): Promise<Skills
   }
 
   return {
-    skills: [...byName.values()].sort((left, right) => left.name.localeCompare(right.name)),
+    skills: [...byName.values()]
+      .filter((skill) => options.includeDisabled === true || !isSkillDisabled(skill.name, disabledSkillNames))
+      .sort((left, right) => left.name.localeCompare(right.name)),
     allSkills: allSkills.sort(compareSkills),
+    disabledSkillNames,
     diagnostics,
     roots,
   };

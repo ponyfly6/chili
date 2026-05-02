@@ -28,6 +28,9 @@ export interface CliArgs {
     | "prompt-debug"
     | "mailbox"
     | "mailbox-consume"
+    | "skills-list"
+    | "skills-enable"
+    | "skills-disable"
     | "memory-show"
     | "memory-add"
     | "memory-reload"
@@ -43,6 +46,8 @@ export interface CliArgs {
   teamId?: string;
   messageId?: string;
   memoryScope?: "user" | "project" | "all";
+  skillName?: string;
+  skillScope?: "user" | "project";
   taskStatus?: Extract<AgentTaskStatus, "completed" | "failed" | "cancelled">;
   timeoutMs?: number;
   staleAfterMs?: number;
@@ -186,6 +191,10 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     }
     if (arg === "mailbox") {
       result.command = "mailbox";
+      continue;
+    }
+    if (arg === "skills") {
+      parseSkillsCommand(result, args);
       continue;
     }
     if (arg === "memory") {
@@ -360,6 +369,7 @@ export function usage(): string {
     "  bun run chili -- team-sync <team-id> <task-id>",
     "  bun run chili -- team-reconcile [team-id]",
     "  bun run chili -- mailbox",
+    "  bun run chili -- skills [list|enable|disable] [--user|--project] [skill-name]",
     "  bun run chili -- memory show",
     "  bun run chili -- memory add [--user|--project] \"remember this\"",
     "  bun run chili -- memory reload",
@@ -391,6 +401,8 @@ export function usage(): string {
     "  --reasoning <level> Alias for --thinking",
     "  --yes, -y           Auto-approve tool permissions",
     "  --json              Print machine-readable JSON for supported read commands",
+    "  --user              Use user scope for memory or skills commands",
+    "  --project           Use project scope for memory or skills commands",
     "  --text <prompt>     Assemble prompt-debug as if this current-turn text were submitted",
     "  --content           Include prompt fragment content for prompt-debug",
     "  --once              Run one team execution cycle",
@@ -401,6 +413,51 @@ export function usage(): string {
     "  --timeout-ms <n>    Task wait timeout in milliseconds",
     "  --stale-after-ms <n> Recover running background tasks older than this many milliseconds",
   ].join("\n");
+}
+
+function parseSkillsCommand(result: CliArgs, args: string[]): void {
+  const action = args[0] && !args[0].startsWith("-") ? args.shift() : "list";
+  if (action === "list" || action === "show") {
+    result.command = "skills-list";
+    parseSkillFlags(result, args, false);
+    return;
+  }
+  if (action === "enable") {
+    result.command = "skills-enable";
+    parseSkillFlags(result, args, true);
+    if (!result.skillName) throw new Error("skills enable requires a skill name");
+    return;
+  }
+  if (action === "disable") {
+    result.command = "skills-disable";
+    parseSkillFlags(result, args, true);
+    if (!result.skillName) throw new Error("skills disable requires a skill name");
+    return;
+  }
+  throw new Error(`Unknown skills command: ${action}`);
+}
+
+function parseSkillFlags(result: CliArgs, args: string[], nameAllowed: boolean): void {
+  while (args.length > 0) {
+    const arg = args.shift();
+    if (!arg) continue;
+    if (arg === "--user") {
+      result.skillScope = "user";
+      continue;
+    }
+    if (arg === "--project") {
+      result.skillScope = "project";
+      continue;
+    }
+    if (arg === "--json") {
+      result.json = true;
+      continue;
+    }
+    if (arg.startsWith("-")) throw new Error(`Unknown skills option: ${arg}`);
+    if (!nameAllowed) throw new Error(`Unexpected skills argument: ${arg}`);
+    if (result.skillName) throw new Error("skills command accepts one skill name");
+    result.skillName = arg;
+  }
 }
 
 function parseModelValue(value: string): { model: CliModelName; reasoningLevel?: CliReasoningLevel } {

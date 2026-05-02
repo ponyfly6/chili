@@ -30,6 +30,7 @@ export interface SkillSummary {
   baseDir: string;
   when_to_use?: string;
   hidden?: boolean;
+  disabled?: boolean;
 }
 
 export interface SkillDiagnostic {
@@ -45,6 +46,8 @@ export interface DiscoverSkillsOptions {
   cwd: string;
   homeDir?: string;
   includeAgentsAlias?: boolean;
+  includeDisabled?: boolean;
+  disabledSkills?: readonly string[];
 }
 
 export interface SkillRoot {
@@ -56,6 +59,19 @@ export interface SkillRoot {
 export interface SkillsLoadResult {
   skills: readonly Skill[];
   allSkills: readonly Skill[];
+  disabledSkillNames: readonly string[];
   diagnostics: readonly SkillDiagnostic[];
   roots: readonly SkillRoot[];
+}
+
+export type SkillSettingsScope = "user" | "project";
+
+export interface SkillSettings {
+  disabled: readonly string[];
+}
+
+export interface SkillSettingsSnapshot {
+  disabledSkillNames: readonly string[];
+  userPath: string;
+  projectPath: string;
 }
