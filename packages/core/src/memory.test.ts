@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { SessionId, TimestampMs, TurnId } from "@chili/protocol";
 import { InMemoryToolRegistry, ToolExecutor } from "@chili/tools";
 import {
@@ -187,6 +187,189 @@ test(".chili/rules markdown files load as unconditional project rules in stable 
   }
 });
 
+test(".chili/rules frontmatter is stripped before rule content enters prompt fragments", async () => {
+  const fixture = await createMemoryFixture();
+  try {
+    const rulesDir = join(fixture.repo, ".chili", "rules");
+    const rulePath = join(rulesDir, "core.md");
+    await mkdirp(rulesDir);
+    await writeFile(
+      rulePath,
+      [
+        "---",
+        "paths:",
+        "  - packages/core/**",
+        "description: Core package conventions",
+        "---",
+        "# Core rule",
+        "Use explicit imports.",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const loaded = await loadChiliMemoryContext({
+      cwd: fixture.repo,
+      homeDir: fixture.home,
+      projectRoot: fixture.repo,
+    });
+    const rule = loaded.documents.find((document) => document.kind === "project_rule");
+    expect(rule?.content).toBe("# Core rule\nUse explicit imports.");
+
+    const fragments = await buildChiliMemoryPromptFragments({
+      cwd: fixture.repo,
+      homeDir: fixture.home,
+      projectRoot: fixture.repo,
+    });
+    const ruleFragment = fragments.find((fragment) => fragment.metadata?.path === rulePath);
+    expect(ruleFragment?.content).toContain("# Core rule\nUse explicit imports.");
+    expect(ruleFragment?.content).not.toContain("paths:");
+    expect(ruleFragment?.content).not.toContain("packages/core/**");
+    expect(ruleFragment?.content).not.toContain("description:");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test(".chili/rules frontmatter fields appear in debug metadata", async () => {
+  const fixture = await createMemoryFixture();
+  try {
+    const rulesDir = join(fixture.repo, ".chili", "rules");
+    const rulePath = join(rulesDir, "scoped.md");
+    await mkdirp(rulesDir);
+    await writeFile(
+      rulePath,
+      [
+        "---",
+        "paths: [packages/core/**, docs/*.md]",
+        "alwaysApply: false",
+        "description: Applies to core and docs changes",
+        "priority: 7",
+        "---",
+        "Scoped rule body.",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const fragments = await buildChiliMemoryPromptFragments({
+      cwd: fixture.repo,
+      homeDir: fixture.home,
+      projectRoot: fixture.repo,
+    });
+    const assembly = assemblePromptFragments(fragments);
+    const ruleManifest = assembly.debug.fragments.find((fragment) => fragment.metadata?.path === rulePath);
+
+    expect(ruleManifest).toEqual(
+      expect.objectContaining({
+        layer: "contextual_user",
+        source: "project",
+        metadata: expect.objectContaining({
+          path: rulePath,
+          kind: "project_rule",
+          scope: "project",
+          truncated: false,
+          truncatedAfter: null,
+          ruleType: "unconditional",
+          paths: ["packages/core/**", "docs/*.md"],
+          alwaysApply: false,
+          description: "Applies to core and docs changes",
+          priority: 7,
+        }),
+      }),
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test(".chili/rules priority sorts before path, with equal priority sorted by path", async () => {
+  const fixture = await createMemoryFixture();
+  try {
+    const rulesDir = join(fixture.repo, ".chili", "rules");
+    await mkdirp(rulesDir);
+    await writeFile(join(rulesDir, "z.md"), "rule z\n", "utf8");
+    await writeFile(join(rulesDir, "b.md"), "---\npriority: 10\n---\nrule b\n", "utf8");
+    await writeFile(join(rulesDir, "a.md"), "---\npriority: 10\n---\nrule a\n", "utf8");
+    await writeFile(join(rulesDir, "c.md"), "---\npriority: 1\n---\nrule c\n", "utf8");
+
+    const loaded = await loadChiliMemoryContext({
+      cwd: fixture.repo,
+      homeDir: fixture.home,
+      projectRoot: fixture.repo,
+    });
+    const rules = loaded.documents.filter((document) => document.kind === "project_rule");
+    expect(rules.map((rule) => basename(rule.path))).toEqual(["c.md", "a.md", "b.md", "z.md"]);
+    expect(rules.map((rule) => rule.content)).toEqual(["rule c", "rule a", "rule b", "rule z"]);
+
+    const fragments = await buildChiliMemoryPromptFragments({
+      cwd: fixture.repo,
+      homeDir: fixture.home,
+      projectRoot: fixture.repo,
+    });
+    const ruleFragments = fragments.filter((fragment) => fragment.metadata?.kind === "project_rule");
+    expect(ruleFragments.map((fragment) => basename(String(fragment.metadata?.path)))).toEqual([
+      "c.md",
+      "a.md",
+      "b.md",
+      "z.md",
+    ]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("malformed .chili/rules frontmatter is treated as ordinary markdown body", async () => {
+  const fixture = await createMemoryFixture();
+  try {
+    const rulesDir = join(fixture.repo, ".chili", "rules");
+    const badRulePath = join(rulesDir, "bad.md");
+    await mkdirp(rulesDir);
+    await writeFile(
+      badRulePath,
+      [
+        "---",
+        "paths:",
+        "  nested: nope",
+        "---",
+        "Body remains loadable.",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await writeFile(join(rulesDir, "good.md"), "Good rule.\n", "utf8");
+
+    const loaded = await loadChiliMemoryContext({
+      cwd: fixture.repo,
+      homeDir: fixture.home,
+      projectRoot: fixture.repo,
+    });
+    const rules = loaded.documents.filter((document) => document.kind === "project_rule");
+    expect(rules).toHaveLength(2);
+
+    const badRule = rules.find((rule) => rule.path === badRulePath);
+    expect(badRule?.content).toContain("paths:");
+    expect(badRule?.content).toContain("nested: nope");
+    expect(badRule?.content).toContain("Body remains loadable.");
+
+    const fragments = await buildChiliMemoryPromptFragments({
+      cwd: fixture.repo,
+      homeDir: fixture.home,
+      projectRoot: fixture.repo,
+    });
+    const badRuleFragment = fragments.find((fragment) => fragment.metadata?.path === badRulePath);
+    expect(badRuleFragment?.metadata).toEqual(
+      expect.objectContaining({
+        kind: "project_rule",
+        ruleType: "unconditional",
+      }),
+    );
+    expect(Object.hasOwn(badRuleFragment?.metadata ?? {}, "paths")).toBe(false);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("project instruction loading does not cross project root", async () => {
   const fixture = await createMemoryFixture();
   try {
@@ -231,12 +414,13 @@ test("memory debug manifest includes document path kind scope and truncation met
         id: "chili.context.user_memory.0",
         source: "memory",
         layer: "contextual_user",
-        metadata: {
+        metadata: expect.objectContaining({
           path: memoryPath,
           kind: "user_memory",
           scope: "user",
           truncated: true,
-        },
+          truncatedAfter: 4,
+        }),
       }),
     );
     expect(renderedMemoryDocument?.content).toContain("[truncated after 4 chars]");
@@ -246,12 +430,13 @@ test("memory debug manifest includes document path kind scope and truncation met
         id: "chili.context.project_instruction.1",
         source: "project",
         layer: "contextual_user",
-        metadata: {
+        metadata: expect.objectContaining({
           path: instructionPath,
           kind: "project_instruction",
           scope: "project",
           truncated: false,
-        },
+          truncatedAfter: null,
+        }),
       }),
     );
   } finally {
