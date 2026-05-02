@@ -86,7 +86,6 @@ export interface SubmitPromptRequest {
   text: string;
   cwd?: string;
   maxTurns?: number;
-  system?: string[];
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
   signal?: AbortSignal;
@@ -711,7 +710,6 @@ export interface FollowupTaskRequest {
   taskId: TaskId;
   text: string;
   maxTurns?: number;
-  system?: string[];
 }
 
 export interface RuntimeTaskFollowupResult {
@@ -980,7 +978,6 @@ export class HttpRuntimeClient implements RuntimeClient {
     return this.post(`tasks/${encodeURIComponent(input.taskId)}/followup`, {
       text: input.text,
       maxTurns: input.maxTurns,
-      system: input.system,
     });
   }
 

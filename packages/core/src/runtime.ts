@@ -13,6 +13,7 @@ import type {
   TurnId,
 } from "@chili/protocol";
 import type { PermissionRule } from "@chili/policy";
+import type { PromptDebugManifest } from "./prompt/index.js";
 
 export interface RuntimeConfig {
   cwd: string;
@@ -53,6 +54,9 @@ export interface ModelStreamInput {
   messages: Message[];
   tools: ToolDefinition[];
   system: string[];
+  developer?: string[];
+  contextualUser?: string[];
+  promptDebug?: PromptDebugManifest;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
   signal?: AbortSignal;

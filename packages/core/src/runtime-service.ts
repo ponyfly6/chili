@@ -14,6 +14,11 @@ import type {
 } from "@chili/protocol";
 import { REASONING_LEVELS, timestampNow } from "@chili/protocol";
 import type { EventStore } from "@chili/store";
+import {
+  PromptAssembler,
+  type PromptAssembly,
+  type PromptFragment,
+} from "./prompt/index.js";
 import type { AgentRunner, RunTurnInput, RunTurnResult } from "./runner.js";
 import type { CompactContextResult } from "./single-agent-runtime.js";
 
@@ -30,8 +35,7 @@ export interface RuntimeServiceOptions {
   store: EventStore;
   cwd: string;
   maxTurns?: number;
-  system?: string[];
-  systemContext?: RuntimeSystemContextProvider;
+  promptFragments?: RuntimePromptFragmentsProvider;
   models?: RuntimeModelCatalogProvider | readonly RuntimeModelDescriptor[];
   defaultModelSelection?: ModelSelection;
   defaultReasoningLevel?: ReasoningLevel;
@@ -39,11 +43,11 @@ export interface RuntimeServiceOptions {
   now?: () => TimestampMs;
 }
 
-export type RuntimeSystemContextProvider = (input: {
+export type RuntimePromptFragmentsProvider = (input: {
   sessionId: SessionId;
   threadId: ThreadId;
   cwd: string;
-}) => Promise<string[]> | string[];
+}) => Promise<PromptFragment[]> | PromptFragment[];
 
 export interface CreateRuntimeSessionInput {
   sessionId?: SessionId;
@@ -62,7 +66,6 @@ export interface SubmitPromptInput {
   text: string;
   cwd?: string;
   maxTurns?: number;
-  system?: string[];
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
   signal?: AbortSignal;
@@ -264,8 +267,7 @@ export class RuntimeService {
 
     try {
       const promptModelState = await this.resolvePromptModelState(input);
-      const system = await this.resolveSystem({
-        base: input.system ?? this.options.system ?? [],
+      const prompt = await this.resolvePromptAssembly({
         sessionId: input.sessionId,
         threadId: input.threadId,
         cwd,
@@ -292,7 +294,7 @@ export class RuntimeService {
         const runInput = this.buildRunTurnInput({
           input,
           cwd,
-          system,
+          prompt,
           signal: controller.signal,
           modelState: promptModelState,
         });
@@ -324,7 +326,7 @@ export class RuntimeService {
       const finalRunInput = this.buildRunTurnInput({
         input,
         cwd,
-        system: [...system, FINAL_RESPONSE_AFTER_MAX_TURNS_SYSTEM],
+        prompt: this.withFinalResponsePrompt(prompt),
         signal: controller.signal,
         modelState: promptModelState,
         toolMode: "disabled",
@@ -383,7 +385,7 @@ export class RuntimeService {
   private buildRunTurnInput(input: {
     input: SubmitPromptInput;
     cwd: string;
-    system: string[];
+    prompt: PromptAssembly;
     signal: AbortSignal;
     modelState: RuntimeSessionModelState;
     toolMode?: "auto" | "disabled";
@@ -392,9 +394,12 @@ export class RuntimeService {
       sessionId: input.input.sessionId,
       threadId: input.input.threadId,
       cwd: input.cwd,
-      system: input.system,
+      system: input.prompt.system,
       signal: input.signal,
     };
+    if (input.prompt.developer.length > 0) runInput.developer = input.prompt.developer;
+    if (input.prompt.contextualUser.length > 0) runInput.contextualUser = input.prompt.contextualUser;
+    runInput.promptDebug = input.prompt.debug;
     if (input.toolMode) runInput.toolMode = input.toolMode;
     if (input.modelState.modelSelection) runInput.modelSelection = input.modelState.modelSelection;
     if (input.modelState.reasoningLevel !== undefined) runInput.reasoningLevel = input.modelState.reasoningLevel;
@@ -447,18 +452,32 @@ export class RuntimeService {
     return completed;
   }
 
-  private async resolveSystem(input: {
-    base: readonly string[];
+  private async resolvePromptAssembly(input: {
     sessionId: SessionId;
     threadId: ThreadId;
     cwd: string;
-  }): Promise<string[]> {
-    const dynamic = await this.options.systemContext?.({
+  }): Promise<PromptAssembly> {
+    const fragments = await this.options.promptFragments?.({
       sessionId: input.sessionId,
       threadId: input.threadId,
       cwd: input.cwd,
     });
-    return [...input.base, ...(dynamic ?? [])];
+    return new PromptAssembler().addMany(fragments).assemble();
+  }
+
+  private withFinalResponsePrompt(prompt: PromptAssembly): PromptAssembly {
+    return new PromptAssembler()
+      .addMany(prompt.fragments)
+      .add({
+        id: "runtime.final_response_after_max_turns",
+        layer: "base",
+        source: "runtime",
+        priority: Number.MAX_SAFE_INTEGER,
+        lifecycle: "turn",
+        trust: "system",
+        content: FINAL_RESPONSE_AFTER_MAX_TURNS_SYSTEM,
+      })
+      .assemble();
   }
 
   private async resolvePromptModelState(input: SubmitPromptInput): Promise<RuntimeSessionModelState> {

@@ -34,6 +34,7 @@ test("plain prompt creates a session and submits through the runtime client", as
       cwd: "/repo/chili",
     });
     expect(records.submit[0]?.signal).toBeInstanceOf(AbortSignal);
+    expect(records.submit[0]).not.toHaveProperty("system");
   } finally {
     app.renderer.destroy();
   }

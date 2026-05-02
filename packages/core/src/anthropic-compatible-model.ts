@@ -91,14 +91,15 @@ export class AnthropicCompatibleModelRouter implements ModelRouter {
   }
 
   private requestBody(input: ModelStreamInput): Record<string, unknown> {
+    const messages = prependContextualUserMessage(input.messages, input.contextualUser);
     const body: Record<string, unknown> = {
       model: this.options.model,
       max_tokens: this.options.maxTokens ?? 4096,
-      messages: toAnthropicMessages(input.messages),
+      messages: toAnthropicMessages(messages),
       tools: toAnthropicTools(input.tools),
       stream: false,
     };
-    const system = [...input.system, ...systemMessages(input.messages)].filter(Boolean).join("\n\n");
+    const system = [...input.system, ...(input.developer ?? []), ...systemMessages(messages)].filter(Boolean).join("\n\n");
     if (system) body.system = system;
     if (this.options.temperature !== undefined) body.temperature = this.options.temperature;
     return body;
@@ -136,6 +137,35 @@ export function resolveMessagesUrl(baseUrl: string): string {
   if (clean.endsWith("/v1/messages")) return clean;
   if (clean.endsWith("/v1")) return `${clean}/messages`;
   return `${clean}/v1/messages`;
+}
+
+function prependContextualUserMessage(
+  messages: readonly Message[],
+  contextualUser: readonly string[] | undefined,
+): Message[] {
+  const content = (contextualUser ?? []).map((item) => item.trim()).filter(Boolean).join("\n\n");
+  if (!content) return [...messages];
+
+  const sessionId = messages[0]?.sessionId ?? ("session_context" as Message["sessionId"]);
+  return [
+    {
+      id: "msg_contextual_user" as Message["id"],
+      sessionId,
+      role: "user",
+      createdAt: 0 as Message["createdAt"],
+      parts: [
+        {
+          id: "part_contextual_user" as MessagePart["id"],
+          messageId: "msg_contextual_user" as Message["id"],
+          sessionId,
+          type: "text",
+          text: content,
+          synthetic: true,
+        },
+      ],
+    },
+    ...messages,
+  ];
 }
 
 function toAnthropicMessages(messages: readonly Message[]): AnthropicMessage[] {

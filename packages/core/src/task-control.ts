@@ -37,14 +37,12 @@ export interface AgentTaskControlServiceOptions {
   now?: () => TimestampMs;
   defaultWaitTimeoutMs?: number;
   pollIntervalMs?: number;
-  system?: string[];
 }
 
 export interface AgentTaskFollowupInput {
   taskId: TaskId;
   text: string;
   maxTurns?: number;
-  system?: string[];
   signal?: AbortSignal;
 }
 
@@ -273,11 +271,6 @@ export class AgentTaskControlService {
       sessionId: task.childSessionId,
       threadId: task.childThreadId,
       text: input.text,
-      system: [
-        ...(this.options.system ?? []),
-        ...(input.system ?? []),
-        taskFollowupSystemLine(task),
-      ],
     };
     if (task.cwd) promptInput.cwd = task.cwd;
     if (input.maxTurns !== undefined) promptInput.maxTurns = input.maxTurns;
@@ -562,16 +555,6 @@ function abortError(message: string): Error {
   const error = new Error(message);
   error.name = "AbortError";
   return error;
-}
-
-function taskFollowupSystemLine(task: AgentTaskRow): string {
-  const cwd = task.cwd ? ` Repository cwd: ${task.cwd}.` : "";
-  return [
-    `Subagent task id: ${task.id}.${cwd}`,
-    `Agent path: ${task.path} (logical agent identifier, not a filesystem path).`,
-    "Use repository-relative paths, or absolute paths under the repository cwd; never prefix file paths with the agent path.",
-    "This is a follow-up for an existing task; answer in the task context and call complete_task with this task id when finished.",
-  ].join(" ");
 }
 
 function toError(error: unknown): Error {

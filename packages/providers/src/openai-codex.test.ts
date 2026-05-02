@@ -82,6 +82,29 @@ test("converts Chili messages and tools into a Codex Responses body", () => {
   });
 });
 
+test("adds developer fragments to instructions and contextual fragments to input", () => {
+  const body = buildOpenAICodexResponsesRequestBody(
+    {
+      messages: [message("user", [{ type: "text", text: "hello" }])],
+      tools: [],
+      system: ["base instructions"],
+      developer: ["skills catalog"],
+      contextualUser: ["memory context"],
+    },
+    {
+      model: "gpt-5.5",
+    },
+  );
+
+  expect(body).toMatchObject({
+    instructions: "base instructions\n\nskills catalog",
+    input: [
+      { role: "user", content: [{ type: "input_text", text: "memory context" }] },
+      { role: "user", content: [{ type: "input_text", text: "hello" }] },
+    ],
+  });
+});
+
 test("resolves Codex Responses URL variants", () => {
   expect(resolveOpenAICodexResponsesUrl()).toBe("https://chatgpt.com/backend-api/codex/responses");
   expect(resolveOpenAICodexResponsesUrl("https://chatgpt.com/backend-api")).toBe("https://chatgpt.com/backend-api/codex/responses");

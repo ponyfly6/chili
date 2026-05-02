@@ -198,13 +198,13 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "taskFollowup") {
         const tasks = requireTaskControl(options);
         const body = await readJson<TaskFollowupBody>(request);
+        rejectLegacySystemField(body);
         if (!body.text) throw badRequest("text is required");
         const input: AgentTaskFollowupInput = {
           taskId: route.taskId,
           text: body.text,
         };
         if (body.maxTurns !== undefined) input.maxTurns = body.maxTurns;
-        if (body.system) input.system = body.system;
         return json(serializeTaskFollowupResult(await tasks.followupTask(input)));
       }
 
@@ -419,6 +419,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "prompt" || route.name === "promptAsync") {
         const body = await readJson<PromptBody>(request);
+        rejectLegacySystemField(body);
         if (!body.threadId) throw badRequest("threadId is required");
         if (!body.text) throw badRequest("text is required");
         await requireSession(options.store, route.sessionId);
@@ -565,7 +566,6 @@ interface PromptBody {
   text?: string;
   cwd?: string;
   maxTurns?: number;
-  system?: string[];
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
 }
@@ -583,7 +583,6 @@ interface ReasoningBody {
 interface TaskFollowupBody {
   text?: string;
   maxTurns?: number;
-  system?: string[];
 }
 
 interface TaskWaitBody {
@@ -831,10 +830,15 @@ function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody): SubmitP
   };
   if (body.cwd) input.cwd = body.cwd;
   if (body.maxTurns !== undefined) input.maxTurns = body.maxTurns;
-  if (body.system) input.system = body.system;
   if (isModelSelection(body.modelSelection)) input.modelSelection = body.modelSelection;
   if (isReasoningLevel(body.reasoningLevel)) input.reasoningLevel = body.reasoningLevel;
   return input;
+}
+
+function rejectLegacySystemField(body: unknown): void {
+  if (isRecord(body) && Object.prototype.hasOwnProperty.call(body, "system")) {
+    throw badRequest("system is no longer supported in runtime prompt requests");
+  }
 }
 
 async function eventStream(options: EventStreamOptions): Promise<Response> {

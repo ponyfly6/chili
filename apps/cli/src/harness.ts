@@ -15,9 +15,11 @@ import {
   TeamTaskDispatchService,
   TeamTaskVerificationService,
   TeamWorktreeService,
-  buildChiliMemorySystemContext,
+  buildChiliMemoryPromptFragments,
+  chiliBasePromptFragment,
   createMemoryTool,
   defaultScopedWorkerPolicy,
+  type PromptFragment,
   type WorkerToolPolicy,
 } from "@chili/core";
 import type { AgentPath, EventEnvelope, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
@@ -92,13 +94,6 @@ import type { CliModelName, CliReasoningLevel } from "./model.js";
 import { createCliModel } from "./model.js";
 import { CliPrinter, PrintingEventStore } from "./printing-store.js";
 
-const DEFAULT_MAIN_SYSTEM_PROMPT = [
-  "You are Chili, a terminal-first coding agent working inside a real repository.",
-  "Use tools for repository inspection, glob/grep search, shell commands, writes, edits, patch application, and git diffs.",
-  "Read existing files fully before editing or overwriting them. Prefer small, precise edits. Keep final responses concise.",
-  "When you use tools, continue after tool results until the user request is genuinely handled.",
-].join("\n");
-
 const DEV_MAX_TURNS = 128;
 const DEV_MAX_REPEATED_TOOL_CALLS = 20;
 const DEV_MAX_TOOL_CALLS_PER_TURN = 200;
@@ -150,10 +145,16 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const skillRegistry = await discoverSkills({ cwd });
   const registry = createToolRegistry(skillRegistry);
   const childRegistry = createChildToolRegistry(skillRegistry);
-  const systemContext = (context: { cwd: string }) => buildCliSystemContext({ cwd: context.cwd, skillRegistry });
-  const childSystem = [
-    "You are a local Chili subagent. Work in the assigned repository scope, keep results concise, and return a clear final summary.",
-  ];
+  const promptFragments = (context: { cwd: string }) => buildCliPromptFragments({ cwd: context.cwd, skillRegistry });
+  const childPromptFragments = (context: { sessionId: SessionId; threadId: ThreadId; cwd: string }) =>
+    buildCliChildPromptFragments({
+      cwd: context.cwd,
+      sessionId: context.sessionId,
+      threadId: context.threadId,
+      skillRegistry,
+      store: eventStore,
+    });
+  const subagentPromptFragments = (context: { cwd: string }) => buildCliPromptFragments({ cwd: context.cwd, skillRegistry });
   const snapshotProvider = new FileSystemSnapshotProvider({
     rootDir: join(stateDir, "snapshots"),
     createId,
@@ -195,8 +196,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     cwd,
     createId,
     maxTurns: DEV_MAX_TURNS,
-    system: childSystem,
-    systemContext,
+    promptFragments: childPromptFragments,
   });
   const subagents = new LocalSubagentManager({
     store: eventStore,
@@ -204,8 +204,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
       runner: childRuntime,
       store: eventStore,
       maxTurns: DEV_MAX_TURNS,
-      system: childSystem,
-      systemContext,
+      promptFragments: subagentPromptFragments,
     }),
     createId,
   });
@@ -214,7 +213,6 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     runtime: childService,
     interruptTask: (taskId) => subagents.interruptTask(taskId),
     createId,
-    system: childSystem,
   });
   const teams = new TeamControlService({
     store: eventStore,
@@ -297,8 +295,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     cwd,
     createId,
     maxTurns: DEV_MAX_TURNS,
-    system: [DEFAULT_MAIN_SYSTEM_PROMPT],
-    systemContext,
+    promptFragments,
   });
   const teamRunner = new TeamExecutionRunner({
     teams,
@@ -418,11 +415,95 @@ function workerToolPolicyFromEvent(
   } as WorkerToolPolicy;
 }
 
-async function buildCliSystemContext(input: { cwd: string; skillRegistry: SkillRegistry }): Promise<string[]> {
-  const context = await buildChiliMemorySystemContext({ cwd: input.cwd });
+export async function buildCliPromptFragments(input: {
+  cwd: string;
+  skillRegistry: SkillRegistry;
+  homeDir?: string;
+  projectRoot?: string;
+}): Promise<PromptFragment[]> {
+  const context: PromptFragment[] = [
+    chiliBasePromptFragment(),
+    ...(await buildChiliMemoryPromptFragments({
+      cwd: input.cwd,
+      ...(input.homeDir ? { homeDir: input.homeDir } : {}),
+      ...(input.projectRoot ? { projectRoot: input.projectRoot } : {}),
+    })),
+  ];
   const skillsPrompt = formatAvailableSkillsPrompt(input.skillRegistry.list());
-  if (skillsPrompt) context.push(skillsPrompt);
+  if (skillsPrompt) {
+    context.push({
+      id: "chili.skills.catalog",
+      layer: "developer",
+      source: "skills",
+      priority: 100,
+      lifecycle: "session",
+      trust: "tool",
+      content: skillsPrompt,
+    });
+  }
   return context;
+}
+
+export async function buildCliChildPromptFragments(input: {
+  cwd: string;
+  sessionId: SessionId;
+  threadId: ThreadId;
+  skillRegistry: SkillRegistry;
+  store: ObservableEventStore;
+  homeDir?: string;
+  projectRoot?: string;
+}): Promise<PromptFragment[]> {
+  return [
+    ...(await buildCliPromptFragments({
+      cwd: input.cwd,
+      skillRegistry: input.skillRegistry,
+      ...(input.homeDir ? { homeDir: input.homeDir } : {}),
+      ...(input.projectRoot ? { projectRoot: input.projectRoot } : {}),
+    })),
+    chiliChildRuntimeBasePromptFragment(),
+    ...(await buildTaskFollowupPromptFragments(input.store, input.sessionId, input.threadId)),
+  ];
+}
+
+function chiliChildRuntimeBasePromptFragment(): PromptFragment {
+  return {
+    id: "chili.child_runtime.base",
+    layer: "base",
+    source: "core",
+    priority: 10,
+    lifecycle: "stable",
+    trust: "system",
+    content:
+      "You are a local Chili subagent. Work in the assigned repository scope, keep results concise, and return a clear final summary.",
+  };
+}
+
+async function buildTaskFollowupPromptFragments(
+  store: ObservableEventStore,
+  sessionId: SessionId,
+  threadId: ThreadId,
+): Promise<PromptFragment[]> {
+  const tasks = await store.agentTasks({ childSessionId: sessionId, limit: 10 });
+  const task = tasks.find((candidate) => candidate.childThreadId === threadId);
+  return task ? [taskFollowupPromptFragment(task)] : [];
+}
+
+function taskFollowupPromptFragment(task: AgentTaskRow): PromptFragment {
+  const cwd = task.cwd ? ` Repository cwd: ${task.cwd}.` : "";
+  return {
+    id: `chili.task.followup.${task.id}`,
+    layer: "developer",
+    source: "runtime",
+    priority: 30,
+    lifecycle: "turn",
+    trust: "system",
+    content: [
+      `Subagent task id: ${task.id}.${cwd}`,
+      `Agent path: ${task.path} (logical agent identifier, not a filesystem path).`,
+      "Use repository-relative paths, or absolute paths under the repository cwd; never prefix file paths with the agent path.",
+      "This is a follow-up for an existing task; answer in the task context and call complete_task with this task id when finished.",
+    ].join(" "),
+  };
 }
 
 function createToolRegistry(skillRegistry: SkillRegistry): InMemoryToolRegistry {

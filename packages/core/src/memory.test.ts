@@ -2,18 +2,18 @@ import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { MessageId, SessionId, ThreadId, TimestampMs, TurnId } from "@chili/protocol";
+import type { SessionId, TimestampMs, TurnId } from "@chili/protocol";
 import { InMemoryToolRegistry, ToolExecutor } from "@chili/tools";
-import type { AgentRunner, RunTurnInput, RunTurnResult } from "./runner.js";
-import { RuntimeService } from "./runtime-service.js";
 import {
   addChiliMemoryEntry,
+  buildChiliMemoryPromptFragments,
   createMemoryTool,
   listChiliMemoryEntries,
   loadChiliMemoryContext,
   removeChiliMemoryEntry,
   sanitizeMemoryEntry,
 } from "./memory.js";
+import { assemblePromptFragments } from "./prompt/index.js";
 
 test("memory loader reads user memory, project memory, and project instructions in order", async () => {
   const fixture = await createMemoryFixture();
@@ -57,6 +57,203 @@ test("memory loader tolerates missing files", async () => {
 
     expect(loaded.documents).toEqual([]);
     expect(loaded.missingPaths).toHaveLength(4);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("memory prompt fragments keep mechanics in developer and content in contextual user", async () => {
+  const fixture = await createMemoryFixture();
+  try {
+    await writeFile(join(fixture.home, ".chili", "memory.md"), "user prefers concise answers\n", "utf8");
+    await writeFile(join(fixture.repo, ".chili", "memory.md"), "project uses bun\n", "utf8");
+
+    const fragments = await buildChiliMemoryPromptFragments({
+      cwd: fixture.repo,
+      homeDir: fixture.home,
+      projectRoot: fixture.repo,
+    });
+
+    const developer = fragments.filter((fragment) => fragment.layer === "developer");
+    const contextual = fragments.filter((fragment) => fragment.layer === "contextual_user");
+
+    expect(developer).toEqual([
+      expect.objectContaining({
+        id: "chili.memory.mechanics",
+        source: "memory",
+        layer: "developer",
+        trust: "system",
+      }),
+    ]);
+    expect(developer[0]?.content).toContain("Memory may be stale");
+    expect(contextual.map((fragment) => fragment.source)).toEqual(["memory", "memory"]);
+    expect(contextual.map((fragment) => fragment.content).join("\n")).toContain("user prefers concise answers");
+    expect(contextual.map((fragment) => fragment.content).join("\n")).toContain("project uses bun");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("project instructions load from project root to cwd hierarchy", async () => {
+  const fixture = await createMemoryFixture();
+  const workspace = join(fixture.repo, "packages");
+  const app = join(workspace, "app");
+  try {
+    await mkdirp(app);
+    await writeFile(join(fixture.repo, "AGENTS.md"), "root agents\n", "utf8");
+    await writeFile(join(fixture.repo, "CHILI.md"), "root chili\n", "utf8");
+    await writeFile(join(workspace, "AGENTS.md"), "workspace agents\n", "utf8");
+    await writeFile(join(app, "CHILI.md"), "app chili\n", "utf8");
+
+    const loaded = await loadChiliMemoryContext({
+      cwd: app,
+      homeDir: fixture.home,
+      projectRoot: fixture.repo,
+    });
+
+    expect(loaded.documents.map((document) => document.content)).toEqual([
+      "root agents",
+      "root chili",
+      "workspace agents",
+      "app chili",
+    ]);
+    expect(loaded.documents.every((document) => document.scope === "project")).toBe(true);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test(".chili/rules markdown files load as unconditional project rules in stable path order", async () => {
+  const fixture = await createMemoryFixture();
+  try {
+    const rulesDir = join(fixture.repo, ".chili", "rules");
+    await mkdirp(rulesDir);
+    await writeFile(join(rulesDir, "b.md"), "rule b\n", "utf8");
+    await writeFile(join(rulesDir, "a.md"), "rule a\n", "utf8");
+    await writeFile(join(rulesDir, "notes.txt"), "not a rule\n", "utf8");
+
+    const loaded = await loadChiliMemoryContext({
+      cwd: fixture.repo,
+      homeDir: fixture.home,
+      projectRoot: fixture.repo,
+    });
+
+    const rules = loaded.documents.filter((document) => document.kind === "project_rule");
+    expect(rules.map((rule) => rule.content)).toEqual(["rule a", "rule b"]);
+    expect(rules.map((rule) => rule.path)).toEqual([
+      join(rulesDir, "a.md"),
+      join(rulesDir, "b.md"),
+    ]);
+
+    const fragments = await buildChiliMemoryPromptFragments({
+      cwd: fixture.repo,
+      homeDir: fixture.home,
+      projectRoot: fixture.repo,
+    });
+    const ruleFragments = fragments.filter((fragment) => fragment.metadata?.kind === "project_rule");
+    expect(ruleFragments).toEqual([
+      expect.objectContaining({
+        layer: "contextual_user",
+        source: "project",
+        metadata: expect.objectContaining({
+          kind: "project_rule",
+          ruleType: "unconditional",
+        }),
+      }),
+      expect.objectContaining({
+        layer: "contextual_user",
+        source: "project",
+        metadata: expect.objectContaining({
+          kind: "project_rule",
+          ruleType: "unconditional",
+        }),
+      }),
+    ]);
+
+    const assembly = assemblePromptFragments(fragments);
+    const ruleManifest = assembly.debug.fragments.find((fragment) => fragment.metadata?.path === join(rulesDir, "a.md"));
+    expect(ruleManifest).toEqual(
+      expect.objectContaining({
+        layer: "contextual_user",
+        source: "project",
+        metadata: expect.objectContaining({
+          kind: "project_rule",
+          ruleType: "unconditional",
+        }),
+      }),
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("project instruction loading does not cross project root", async () => {
+  const fixture = await createMemoryFixture();
+  try {
+    await writeFile(join(fixture.repo, "..", "AGENTS.md"), "outside agents\n", "utf8");
+    await writeFile(join(fixture.repo, "AGENTS.md"), "inside agents\n", "utf8");
+    const cwd = join(fixture.repo, "nested");
+    await mkdirp(cwd);
+
+    const loaded = await loadChiliMemoryContext({
+      cwd,
+      homeDir: fixture.home,
+      projectRoot: fixture.repo,
+    });
+
+    expect(loaded.documents.map((document) => document.content)).toEqual(["inside agents"]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("memory debug manifest includes document path kind scope and truncation metadata", async () => {
+  const fixture = await createMemoryFixture();
+  try {
+    const memoryPath = join(fixture.home, ".chili", "memory.md");
+    const instructionPath = join(fixture.repo, "AGENTS.md");
+    await writeFile(memoryPath, "abcdef\n", "utf8");
+    await writeFile(instructionPath, "abc\n", "utf8");
+
+    const fragments = await buildChiliMemoryPromptFragments({
+      cwd: fixture.repo,
+      homeDir: fixture.home,
+      projectRoot: fixture.repo,
+      maxDocumentChars: 4,
+    });
+    const assembly = assemblePromptFragments(fragments);
+    const memoryDocument = assembly.debug.fragments.find((fragment) => fragment.id.includes("user_memory"));
+    const renderedMemoryDocument = assembly.fragments.find((fragment) => fragment.id.includes("user_memory"));
+    const instructionDocument = assembly.debug.fragments.find((fragment) => fragment.id.includes("project_instruction"));
+
+    expect(memoryDocument).toEqual(
+      expect.objectContaining({
+        id: "chili.context.user_memory.0",
+        source: "memory",
+        layer: "contextual_user",
+        metadata: {
+          path: memoryPath,
+          kind: "user_memory",
+          scope: "user",
+          truncated: true,
+        },
+      }),
+    );
+    expect(renderedMemoryDocument?.content).toContain("[truncated after 4 chars]");
+    expect(renderedMemoryDocument?.content).not.toContain("[truncated after 32000 chars]");
+    expect(instructionDocument).toEqual(
+      expect.objectContaining({
+        id: "chili.context.project_instruction.1",
+        source: "project",
+        layer: "contextual_user",
+        metadata: {
+          path: instructionPath,
+          kind: "project_instruction",
+          scope: "project",
+          truncated: false,
+        },
+      }),
+    );
   } finally {
     await fixture.cleanup();
   }
@@ -182,35 +379,6 @@ test("memory tool supports add and list", async () => {
   }
 });
 
-test("runtime service appends dynamic memory context to system prompts", async () => {
-  const runner = new CapturingRunner();
-  const service = new RuntimeService({
-    runtime: runner,
-    store: {
-      append: async () => undefined,
-      appendMany: async () => undefined,
-      events: async () => [],
-      sessions: async () => [],
-      messages: async () => [],
-      pendingApprovals: async () => [],
-    },
-    cwd: "/repo",
-    system: ["base system"],
-    systemContext: () => ["memory context"],
-    createId: createSequentialId(),
-    now: () => 1 as TimestampMs,
-  });
-
-  const session = await service.createSession();
-  await service.submitPrompt({
-    sessionId: session.sessionId,
-    threadId: session.threadId,
-    text: "hello",
-  });
-
-  expect(runner.runInputs[0]?.system).toEqual(["base system", "memory context"]);
-});
-
 async function createMemoryFixture(): Promise<{ home: string; repo: string; cleanup: () => Promise<void> }> {
   const root = await mkdtemp(join(tmpdir(), "chili-memory-"));
   const home = join(root, "home");
@@ -227,28 +395,6 @@ async function createMemoryFixture(): Promise<{ home: string; repo: string; clea
 
 async function mkdirp(path: string): Promise<void> {
   await mkdir(path, { recursive: true });
-}
-
-class CapturingRunner implements AgentRunner {
-  readonly runInputs: RunTurnInput[] = [];
-
-  async createSession(input: { sessionId?: SessionId }): Promise<SessionId> {
-    return input.sessionId ?? ("session_memory_runtime" as SessionId);
-  }
-
-  async appendUserMessage(): Promise<MessageId> {
-    return "msg_memory_runtime" as MessageId;
-  }
-
-  async runTurn(input: RunTurnInput): Promise<RunTurnResult> {
-    this.runInputs.push(input);
-    return {
-      status: "completed",
-      turnId: "turn_memory_runtime" as TurnId,
-      assistantMessageId: "msg_memory_runtime_assistant" as MessageId,
-      finishReason: "stop",
-    };
-  }
 }
 
 function createSequentialId(): (prefix: string) => string {

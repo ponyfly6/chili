@@ -1,5 +1,6 @@
 import type { MessageId, ModelSelection, ReasoningLevel, SessionId, ThreadId, TurnId } from "@chili/protocol";
 import type { ContextUsage } from "./context.js";
+import type { PromptDebugManifest } from "./prompt/index.js";
 
 export interface CreateSessionInput {
   sessionId?: SessionId;
@@ -19,6 +20,9 @@ export interface RunTurnInput {
   turnId?: TurnId;
   cwd: string;
   system?: string[];
+  developer?: string[];
+  contextualUser?: string[];
+  promptDebug?: PromptDebugManifest;
   toolMode?: "auto" | "disabled";
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;

@@ -60,6 +60,8 @@ interface ProviderModelStreamInput {
   messages: ModelStreamInput["messages"];
   tools?: ModelStreamInput["tools"];
   system?: readonly string[];
+  developer?: readonly string[];
+  contextualUser?: readonly string[];
   maxTokens?: number;
   temperature?: number;
   signal?: AbortSignal;
@@ -608,6 +610,8 @@ function toProviderInput(input: ModelStreamInput): ProviderModelStreamInput {
       turnId: input.turnId,
     },
   };
+  if (input.developer !== undefined) providerInput.developer = input.developer;
+  if (input.contextualUser !== undefined) providerInput.contextualUser = input.contextualUser;
   if (input.signal) providerInput.signal = input.signal;
   if (extended.maxTokens !== undefined) providerInput.maxTokens = extended.maxTokens;
   if (extended.temperature !== undefined) providerInput.temperature = extended.temperature;

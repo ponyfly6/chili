@@ -26,6 +26,39 @@ export function transformModelMessages(
   return insertMissingToolResults(normalized, options);
 }
 
+export function prependContextualUserMessage(
+  messages: readonly Message[],
+  contextualUser: readonly string[] | undefined,
+  options: { now?: () => number } = {},
+): Message[] {
+  const content = (contextualUser ?? []).map((item) => item.trim()).filter(Boolean).join("\n\n");
+  if (!content) return [...messages];
+
+  const sessionId = messages[0]?.sessionId ?? ("session_context" as Message["sessionId"]);
+  const createdAt = (options.now?.() ?? Date.now()) as TimestampMs;
+  const suffix = stableHash(content);
+  const messageId = `msg_contextual_user_${suffix}` as MessageId;
+  return [
+    {
+      id: messageId,
+      sessionId,
+      role: "user",
+      parts: [
+        {
+          id: `part_contextual_user_${suffix}` as PartId,
+          messageId,
+          sessionId,
+          type: "text",
+          text: content,
+          synthetic: true,
+        },
+      ],
+      createdAt,
+    },
+    ...messages,
+  ];
+}
+
 export function normalizeAnthropicToolCallId(id: string): string {
   if (ANTHROPIC_TOOL_CALL_ID.test(id)) return id;
 

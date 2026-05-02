@@ -32,7 +32,6 @@ test("follows up an existing task through the child session and records a new ru
       runtime,
       createId: createSequentialId(),
       now: () => 10 as TimestampMs,
-      system: ["child base system"],
     });
 
     const result = await service.followupTask({
@@ -48,10 +47,7 @@ test("follows up an existing task through the child session and records a new ru
       text: "check the package name again",
       maxTurns: 3,
     });
-    expect(runtime.inputs[0]?.system).toEqual([
-      "child base system",
-      "Subagent task id: task_reader. Repository cwd: /repo. Agent path: /root/task_reader (logical agent identifier, not a filesystem path). Use repository-relative paths, or absolute paths under the repository cwd; never prefix file paths with the agent path. This is a follow-up for an existing task; answer in the task context and call complete_task with this task id when finished.",
-    ]);
+    expect(runtime.inputs[0]).not.toHaveProperty("system");
     expect(result.result.status).toBe("completed");
     expect(result.task).toMatchObject({
       id: taskId,

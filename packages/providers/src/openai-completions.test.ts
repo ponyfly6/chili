@@ -125,6 +125,55 @@ test("uses compatibility settings when shaping OpenAI-compatible requests", () =
   expect(body).not.toHaveProperty("max_completion_tokens");
 });
 
+test("routes developer and contextual user prompt fragments with system fallback", () => {
+  const supported = buildOpenAICompletionsRequestBody(
+    {
+      messages: [message("user", [{ type: "text", text: "hello" }])],
+      tools: [],
+      system: ["base instructions"],
+      developer: ["skills catalog"],
+      contextualUser: ["memory context"],
+    },
+    {
+      provider: "openai",
+      model: "gpt-test",
+      baseUrl: "https://api.openai.com/v1",
+      stream: true,
+      compatibility: { supportsDeveloperRole: true },
+    },
+  );
+
+  expect(supported.messages).toEqual([
+    { role: "system", content: "base instructions" },
+    { role: "developer", content: "skills catalog" },
+    { role: "user", content: "memory context" },
+    { role: "user", content: "hello" },
+  ]);
+
+  const fallback = buildOpenAICompletionsRequestBody(
+    {
+      messages: [message("user", [{ type: "text", text: "hello" }])],
+      tools: [],
+      system: ["base instructions"],
+      developer: ["skills catalog"],
+      contextualUser: ["memory context"],
+    },
+    {
+      provider: "deepseek",
+      model: "deepseek-chat",
+      baseUrl: "https://api.deepseek.com",
+      stream: true,
+      compatibility: { supportsDeveloperRole: false, supportsStore: false, supportsUsageInStreaming: false },
+    },
+  );
+
+  expect(fallback.messages).toEqual([
+    { role: "system", content: "base instructions\n\nskills catalog" },
+    { role: "user", content: "memory context" },
+    { role: "user", content: "hello" },
+  ]);
+});
+
 test("converts assistant-attached tool results into OpenAI tool messages", () => {
   const callId = "call_attached" as ToolCallId;
   const body = buildOpenAICompletionsRequestBody(

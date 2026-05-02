@@ -172,6 +172,20 @@ test("runtime auto-compacts before the main model request and sends the summary 
   expect(mainInputText).not.toContain("old context xxx");
   expect(store.items.some((event) => event.type === "turn.compaction_completed")).toBe(true);
   expect(store.items.some((event) => event.type === "message.part_added" && event.payload.part.type === "compaction")).toBe(true);
+  const compactionMessageIds = new Set<string>();
+  for (const event of store.items) {
+    if (event.type === "message.part_added" && event.payload.part.type === "compaction") {
+      compactionMessageIds.add(event.payload.messageId);
+    }
+  }
+  expect(
+    store.items.some(
+      (event) =>
+        event.type === "message.created" &&
+        event.payload.role === "user" &&
+        compactionMessageIds.has(event.payload.messageId),
+    ),
+  ).toBe(true);
 });
 
 test("runtime reactively compacts and retries context limit failures before output starts", async () => {
@@ -355,7 +369,7 @@ function compactionMessage(id: string, sessionId: SessionId, boundaryMessageId: 
   return {
     id: id as MessageId,
     sessionId,
-    role: "system",
+    role: "user",
     createdAt: 1 as TimestampMs,
     parts: [
       {

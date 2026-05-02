@@ -7,7 +7,7 @@ import type {
   ModelUsage,
 } from "./types.js";
 import { readSseEvents } from "./sse.js";
-import { normalizeAnthropicToolCallId, transformModelMessages } from "./transform-messages.js";
+import { normalizeAnthropicToolCallId, prependContextualUserMessage, transformModelMessages } from "./transform-messages.js";
 
 export type AnthropicAuthScheme = "bearer" | "x-api-key";
 
@@ -301,9 +301,12 @@ export function buildAnthropicRequestBody(
   input: ModelStreamInput,
   options: AnthropicRequestBuildOptions,
 ): Record<string, unknown> {
-  const messages = transformModelMessages(input.messages, {
-    normalizeToolCallId: normalizeAnthropicToolCallId,
-  });
+  const messages = prependContextualUserMessage(
+    transformModelMessages(input.messages, {
+      normalizeToolCallId: normalizeAnthropicToolCallId,
+    }),
+    input.contextualUser,
+  );
   const body: Record<string, unknown> = {
     model: options.model,
     max_tokens: options.maxTokens ?? 4096,
@@ -314,7 +317,7 @@ export function buildAnthropicRequestBody(
   const tools = toAnthropicTools(input.tools ?? []);
   if (tools.length > 0) body.tools = tools;
 
-  const system = [...(input.system ?? []), ...systemMessages(messages)].filter(Boolean).join("\n\n");
+  const system = [...(input.system ?? []), ...(input.developer ?? []), ...systemMessages(messages)].filter(Boolean).join("\n\n");
   if (system) body.system = system;
   if (options.temperature !== undefined) body.temperature = options.temperature;
   return body;

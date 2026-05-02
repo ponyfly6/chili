@@ -218,6 +218,9 @@ export class SingleAgentRuntime implements AgentRunner {
         tools: await this.visibleTools(input, turnId),
         system: input.system ?? [],
       };
+      if (input.developer && input.developer.length > 0) modelInput.developer = input.developer;
+      if (input.contextualUser && input.contextualUser.length > 0) modelInput.contextualUser = input.contextualUser;
+      if (input.promptDebug) modelInput.promptDebug = input.promptDebug;
       if (input.modelSelection) modelInput.modelSelection = input.modelSelection;
       if (input.reasoningLevel !== undefined) modelInput.reasoningLevel = input.reasoningLevel;
       if (input.signal) modelInput.signal = input.signal;
@@ -513,7 +516,7 @@ export class SingleAgentRuntime implements AgentRunner {
     const messageId = this.id<MessageId>("msg");
     await this.append(input, "message.created", {
       messageId,
-      role: "system",
+      role: "user",
     });
 
     const summaryText = renderContextSummary(result);

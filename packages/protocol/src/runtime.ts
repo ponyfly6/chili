@@ -69,7 +69,6 @@ export interface RuntimeSubmitPromptCommand {
   threadId: ThreadId;
   text: string;
   maxTurns?: number;
-  system?: string[];
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
 }

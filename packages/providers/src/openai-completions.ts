@@ -1,7 +1,7 @@
 import type { Message, MessagePart } from "@chili/protocol";
 import { resolveChatCompletionsCompatibility, type ChatCompletionsCompatibility } from "./compat.js";
 import { readSseEvents } from "./sse.js";
-import { transformModelMessages } from "./transform-messages.js";
+import { prependContextualUserMessage, transformModelMessages } from "./transform-messages.js";
 import type { ChiliModel, ModelStreamEvent, ModelStreamInput, ModelTool, ModelUsage } from "./types.js";
 
 export interface OpenAICompletionsModelOptions {
@@ -271,10 +271,10 @@ export function buildOpenAICompletionsRequestBody(
   };
   if (options.baseUrl !== undefined) compatibilityInput.baseUrl = options.baseUrl;
   const compatibility = resolveChatCompletionsCompatibility(compatibilityInput, options.compatibility);
-  const messages = transformModelMessages(input.messages);
+  const messages = prependContextualUserMessage(transformModelMessages(input.messages), input.contextualUser);
   const body: Record<string, unknown> = {
     model: options.model,
-    messages: toOpenAIMessages(messages, input.system ?? [], compatibility, options.reasoning ?? false),
+    messages: toOpenAIMessages(messages, input.system ?? [], input.developer ?? [], compatibility, options.reasoning ?? false),
     stream: options.stream ?? true,
   };
 
@@ -313,12 +313,18 @@ export function resolveChatCompletionsUrl(baseUrl: string): string {
 function toOpenAIMessages(
   messages: readonly Message[],
   system: readonly string[],
+  developer: readonly string[],
   compatibility: ChatCompletionsCompatibility,
   reasoning: boolean,
 ): OpenAIMessage[] {
   const result: OpenAIMessage[] = [];
   const systemText = [...system, ...systemMessages(messages)].filter(Boolean).join("\n\n");
-  if (systemText) {
+  const developerText = developer.filter(Boolean).join("\n\n");
+  if (developerText) {
+    const fallbackSystem = [systemText, compatibility.supportsDeveloperRole ? "" : developerText].filter(Boolean).join("\n\n");
+    if (fallbackSystem) result.push({ role: "system", content: fallbackSystem });
+    if (compatibility.supportsDeveloperRole) result.push({ role: "developer", content: developerText });
+  } else if (systemText) {
     result.push({
       role: reasoning && compatibility.supportsDeveloperRole ? "developer" : "system",
       content: systemText,

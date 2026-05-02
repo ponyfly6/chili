@@ -124,6 +124,27 @@ test("normalizes Anthropic tool ids and synthesizes missing tool results in requ
   ]);
 });
 
+test("adds developer fragments to system and contextual fragments as synthetic user context", () => {
+  const body = buildAnthropicRequestBody(
+    {
+      messages: [message("user", [{ type: "text", text: "hello" }])],
+      tools: [],
+      system: ["base instructions"],
+      developer: ["skills catalog"],
+      contextualUser: ["memory context"],
+    },
+    {
+      model: "test-model",
+      stream: true,
+    },
+  );
+
+  expect(body.system).toBe("base instructions\n\nskills catalog");
+  expect(body.messages).toEqual([
+    { role: "user", content: [{ type: "text", text: "memory context" }, { type: "text", text: "hello" }] },
+  ]);
+});
+
 test("converts assistant-attached tool results into Anthropic user tool results", () => {
   const firstCallId = "toolcall_ls" as ToolCallId;
   const secondCallId = "toolcall_glob" as ToolCallId;

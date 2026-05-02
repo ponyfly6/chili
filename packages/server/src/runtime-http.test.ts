@@ -236,6 +236,18 @@ test("serves task control routes", async () => {
   });
   expect(tasks.lastFollowupText).toBe("continue");
 
+  const legacyFollowupResponse = await handler(
+    new Request("http://chili.test/tasks/task_http/followup", {
+      method: "POST",
+      body: JSON.stringify({ text: "continue", system: ["old"] }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  expect(legacyFollowupResponse.status).toBe(400);
+  expect(await legacyFollowupResponse.json()).toMatchObject({
+    error: { message: "system is no longer supported in runtime prompt requests" },
+  });
+
   const waitResponse = await handler(
     new Request("http://chili.test/tasks/task_http/wait", {
       method: "POST",
@@ -717,6 +729,20 @@ test("serves model control routes and prompt model overrides", async () => {
   expect(service.lastPrompt).toMatchObject({
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
     reasoningLevel: "xhigh",
+  });
+
+  const legacyPromptResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/prompt_async`, {
+    method: "POST",
+    body: JSON.stringify({
+      threadId: session.threadId,
+      text: "hello",
+      system: ["old"],
+    }),
+    headers: { "content-type": "application/json" },
+  }));
+  expect(legacyPromptResponse.status).toBe(400);
+  expect(await legacyPromptResponse.json()).toMatchObject({
+    error: { message: "system is no longer supported in runtime prompt requests" },
   });
 });
 

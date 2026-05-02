@@ -18,8 +18,13 @@ import type {
   SubagentToolContext,
   TaskToolInput,
 } from "@chili/tools";
+import {
+  PromptAssembler,
+  type PromptAssembly,
+  type PromptFragment,
+} from "./prompt/index.js";
 import type { AgentRunner, RunTurnInput } from "./runner.js";
-import type { RuntimeSystemContextProvider } from "./runtime-service.js";
+import type { RuntimePromptFragmentsProvider } from "./runtime-service.js";
 import {
   completeWorkerToolPolicy,
   workerPolicySystemSummary,
@@ -119,8 +124,7 @@ export interface AgentRunnerSubagentRunnerOptions {
   runner: AgentRunner;
   store: EventStore;
   maxTurns?: number;
-  system?: string[];
-  systemContext?: RuntimeSystemContextProvider;
+  promptFragments?: RuntimePromptFragmentsProvider;
 }
 
 export class LocalSubagentManager implements SubagentController {
@@ -575,24 +579,9 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
     });
 
     const maxTurns = this.options.maxTurns ?? 128;
-    const dynamicSystem = await this.options.systemContext?.({
-      sessionId: input.childSessionId,
-      threadId: input.childThreadId,
-      cwd: input.cwd,
-    }) ?? [];
-    const baseSystem = [
-      ...(this.options.system ?? []),
-      ...dynamicSystem,
-      subagentRunSystemLine(input),
-      ...(input.workerPolicy ? [workerPolicySystemSummary(input.workerPolicy)] : []),
-    ];
+    const prompt = await this.resolvePromptAssembly(input);
     for (let index = 0; index < maxTurns; index++) {
-      const runInput: RunTurnInput = {
-        sessionId: input.childSessionId,
-        threadId: input.childThreadId,
-        cwd: input.cwd,
-        system: baseSystem,
-      };
+      const runInput = runTurnInputFromPrompt(input, prompt);
       if (input.signal) runInput.signal = input.signal;
       const result = await this.options.runner.runTurn(runInput);
 
@@ -613,13 +602,17 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
       }
     }
 
+    const finalPrompt = this.withFinalResponsePrompt(prompt);
     const finalInput: RunTurnInput = {
       sessionId: input.childSessionId,
       threadId: input.childThreadId,
       cwd: input.cwd,
-      system: [...baseSystem, FINAL_RESPONSE_AFTER_MAX_TURNS_SYSTEM],
+      system: finalPrompt.system,
       toolMode: "disabled",
     };
+    if (finalPrompt.developer.length > 0) finalInput.developer = finalPrompt.developer;
+    if (finalPrompt.contextualUser.length > 0) finalInput.contextualUser = finalPrompt.contextualUser;
+    finalInput.promptDebug = finalPrompt.debug;
     if (input.signal) finalInput.signal = input.signal;
     const finalResult = await this.options.runner.runTurn(finalInput);
     if (finalResult.status !== "completed") {
@@ -643,6 +636,33 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
     };
   }
 
+  private async resolvePromptAssembly(input: LocalSubagentRunInput): Promise<PromptAssembly> {
+    const fragments = await this.options.promptFragments?.({
+      sessionId: input.childSessionId,
+      threadId: input.childThreadId,
+      cwd: input.cwd,
+    });
+    return new PromptAssembler()
+      .addMany(fragments)
+      .addMany(subagentRunPromptFragments(input))
+      .assemble();
+  }
+
+  private withFinalResponsePrompt(prompt: PromptAssembly): PromptAssembly {
+    return new PromptAssembler()
+      .addMany(prompt.fragments)
+      .add({
+        id: "subagent.final_response_after_max_turns",
+        layer: "base",
+        source: "runtime",
+        priority: Number.MAX_SAFE_INTEGER,
+        lifecycle: "turn",
+        trust: "system",
+        content: FINAL_RESPONSE_AFTER_MAX_TURNS_SYSTEM,
+      })
+      .assemble();
+  }
+
   private async latestAssistantText(sessionId: SessionId): Promise<string | undefined> {
     const messages = await this.options.store.messages(sessionId);
     for (let index = messages.length - 1; index >= 0; index--) {
@@ -658,6 +678,19 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
   }
 }
 
+function runTurnInputFromPrompt(input: LocalSubagentRunInput, prompt: PromptAssembly): RunTurnInput {
+  const runInput: RunTurnInput = {
+    sessionId: input.childSessionId,
+    threadId: input.childThreadId,
+    cwd: input.cwd,
+    system: prompt.system,
+    promptDebug: prompt.debug,
+  };
+  if (prompt.developer.length > 0) runInput.developer = prompt.developer;
+  if (prompt.contextualUser.length > 0) runInput.contextualUser = prompt.contextualUser;
+  return runInput;
+}
+
 function defaultCreateId(prefix: string): string {
   return `${prefix}_${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
 }
@@ -670,6 +703,42 @@ function subagentRunSystemLine(input: LocalSubagentRunInput): string {
     "Use repository-relative paths, or absolute paths under the repository cwd; never prefix file paths with the agent path.",
     "When the task is complete, either provide a final concise answer or call complete_task with this task id and a clear summary.",
   ].join(" ");
+}
+
+function subagentRunPromptFragments(input: LocalSubagentRunInput): PromptFragment[] {
+  const fragments: PromptFragment[] = [
+    {
+      id: "chili.subagent.base",
+      layer: "base",
+      source: "core",
+      priority: 10,
+      lifecycle: "stable",
+      trust: "system",
+      content:
+        "You are a local Chili subagent. Work in the assigned repository scope, keep results concise, and return a clear final summary.",
+    },
+    {
+      id: "chili.subagent.assignment",
+      layer: "developer",
+      source: "runtime",
+      priority: 10,
+      lifecycle: "turn",
+      trust: "system",
+      content: subagentRunSystemLine(input),
+    },
+  ];
+  if (input.workerPolicy) {
+    fragments.push({
+      id: "chili.subagent.worker_policy",
+      layer: "developer",
+      source: "runtime",
+      priority: 20,
+      lifecycle: "turn",
+      trust: "system",
+      content: workerPolicySystemSummary(input.workerPolicy),
+    });
+  }
+  return fragments;
 }
 
 function toError(error: unknown): Error {

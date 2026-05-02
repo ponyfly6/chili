@@ -134,7 +134,6 @@ test("runs a child task through an AgentRunner", async () => {
     runner,
     store,
     maxTurns: 2,
-    system: ["child system"],
   });
 
   const result = await subagentRunner.run({
@@ -174,7 +173,9 @@ test("runs a child task through an AgentRunner", async () => {
     threadId: "thread_child",
     cwd: "/repo",
     system: [
-      "child system",
+      "You are a local Chili subagent. Work in the assigned repository scope, keep results concise, and return a clear final summary.",
+    ],
+    developer: [
       "Subagent task id: task_child. Repository cwd: /repo. Agent path: /root/task_child (logical agent identifier, not a filesystem path). Use repository-relative paths, or absolute paths under the repository cwd; never prefix file paths with the agent path. When the task is complete, either provide a final concise answer or call complete_task with this task id and a clear summary.",
     ],
   });

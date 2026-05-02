@@ -1,13 +1,6 @@
 import type { SessionId, ThreadId } from "@chili/protocol";
 import type { CliHarness } from "./harness.js";
 
-const DEFAULT_SYSTEM_PROMPT = [
-  "You are Chili, a terminal-first coding agent working inside a real repository.",
-  "Use tools for repository inspection, glob/grep search, shell commands, writes, edits, patch application, and git diffs.",
-  "Read existing files fully before editing or overwriting them. Prefer small, precise edits. Keep final responses concise.",
-  "When you use tools, continue after tool results until the user request is genuinely handled.",
-].join("\n");
-
 export interface RunPromptOptions {
   harness: CliHarness;
   sessionId: SessionId;
@@ -23,7 +16,6 @@ export async function runPrompt(options: RunPromptOptions): Promise<void> {
     threadId: options.threadId,
     text: options.prompt,
     maxTurns: options.maxTurns,
-    system: [DEFAULT_SYSTEM_PROMPT],
   };
   const result = await options.harness.service.submitPrompt(
     options.signal ? { ...input, signal: options.signal } : input,

@@ -76,6 +76,8 @@ export interface ModelStreamInput {
   thinking?: ThinkingLevel;
   tools?: readonly ModelTool[];
   system?: readonly string[];
+  developer?: readonly string[];
+  contextualUser?: readonly string[];
   maxTokens?: number;
   temperature?: number;
   signal?: AbortSignal;

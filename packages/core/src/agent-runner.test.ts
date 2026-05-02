@@ -25,6 +25,17 @@ test("RuntimeService accepts an AgentRunner implementation", async () => {
     runtime: runner,
     store,
     cwd: "/repo",
+    promptFragments: () => [
+      {
+        id: "test.base",
+        layer: "base",
+        source: "core",
+        priority: 0,
+        lifecycle: "turn",
+        trust: "system",
+        content: "be brief",
+      },
+    ],
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
   });
@@ -38,7 +49,6 @@ test("RuntimeService accepts an AgentRunner implementation", async () => {
     threadId: handle.threadId,
     text: "hello",
     cwd: "/workspace/subdir",
-    system: ["be brief"],
   });
 
   expect(result.status).toBe("completed");
@@ -58,6 +68,63 @@ test("RuntimeService accepts an AgentRunner implementation", async () => {
   expect(runner.turnInputs[0]?.system).toEqual(["be brief"]);
   expect(runner.turnInputs[0]?.signal?.aborted).toBe(false);
   expect(statuses(store)).toEqual(["idle", "running", "running", "idle"]);
+});
+
+test("RuntimeService passes promptFragments by prompt layer", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    promptFragments: () => [
+      {
+        id: "base",
+        layer: "base",
+        source: "core",
+        priority: 0,
+        lifecycle: "stable",
+        trust: "system",
+        content: "base system",
+      },
+      {
+        id: "skills",
+        layer: "developer",
+        source: "skills",
+        priority: 10,
+        lifecycle: "session",
+        trust: "tool",
+        content: "skills catalog",
+      },
+      {
+        id: "memory",
+        layer: "contextual_user",
+        source: "memory",
+        priority: 10,
+        lifecycle: "session",
+        trust: "user",
+        content: "memory context",
+      },
+    ],
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const result = await service.submitPrompt({
+    sessionId: "session_prompt_layers" as SessionId,
+    threadId: "thread_prompt_layers" as ThreadId,
+    text: "hello",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(runner.turnInputs[0]?.system).toEqual(["base system"]);
+  expect(runner.turnInputs[0]?.developer).toEqual(["skills catalog"]);
+  expect(runner.turnInputs[0]?.contextualUser).toEqual(["memory context"]);
+  expect(runner.turnInputs[0]?.promptDebug?.fragments.map((fragment) => [fragment.id, fragment.source, fragment.layer])).toEqual([
+    ["base", "core", "base"],
+    ["skills", "skills", "developer"],
+    ["memory", "memory", "contextual_user"],
+  ]);
 });
 
 test("RuntimeService clears running reservation when initial running status write fails with a fake runner", async () => {

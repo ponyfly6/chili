@@ -16,7 +16,7 @@ import {
   refreshOpenAICodexToken,
 } from "./oauth/openai-codex.js";
 import { readSseEvents } from "./sse.js";
-import { transformModelMessages } from "./transform-messages.js";
+import { prependContextualUserMessage, transformModelMessages } from "./transform-messages.js";
 import type {
   ChiliModel,
   ChiliModelProvider,
@@ -417,7 +417,10 @@ export function buildOpenAICodexResponsesRequestBody(
   input: ModelStreamInput,
   options: OpenAICodexRequestBuildOptions,
 ): Record<string, unknown> {
-  const messages = transformModelMessages(input.messages, { normalizeToolCallId: normalizeResponsesId });
+  const messages = prependContextualUserMessage(
+    transformModelMessages(input.messages, { normalizeToolCallId: normalizeResponsesId }),
+    input.contextualUser,
+  );
   const body: Record<string, unknown> = {
     model: options.model,
     store: false,
@@ -429,7 +432,7 @@ export function buildOpenAICodexResponsesRequestBody(
     parallel_tool_calls: true,
   };
 
-  const instructions = instructionText(messages, input.system ?? []);
+  const instructions = instructionText(messages, input.system ?? [], input.developer ?? []);
   if (instructions) body.instructions = instructions;
   if (options.maxTokens !== undefined) body.max_output_tokens = options.maxTokens;
   if (options.temperature !== undefined) body.temperature = options.temperature;
@@ -480,9 +483,10 @@ function toResponsesInput(messages: readonly Message[]): CodexResponseInputItem[
   return output;
 }
 
-function instructionText(messages: readonly Message[], system: readonly string[]): string {
+function instructionText(messages: readonly Message[], system: readonly string[], developer: readonly string[]): string {
   return [
     ...system,
+    ...developer,
     ...messages
       .filter((message) => message.role === "system")
       .map((message) => messageText(message.parts, "text"))
