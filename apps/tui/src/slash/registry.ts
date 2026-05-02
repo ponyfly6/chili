@@ -280,12 +280,17 @@ function reasoningCompletions(_ctx: SlashCommandContext, input: string): SlashCo
   if (query === undefined) return [];
   const command = thinkingQuery !== undefined ? "thinking" : "reasoning";
   const normalized = query.trim().toLowerCase();
-  return [...REASONING_LEVELS, "hide", "show"]
-    .filter((level) => !normalized || level.startsWith(normalized) || fuzzyMatch(level, normalized))
-    .map((level) => ({
-      value: `/${command} ${level}`,
-      label: level,
-      description: level === "hide" ? "Hide thinking traces" : level === "show" ? "Show thinking traces" : reasoningDescription(level),
+  const candidates: { value: ReasoningLevel | "hide" | "show"; description: string }[] = [
+    ...REASONING_LEVELS.map((value) => ({ value, description: reasoningDescription(value) })),
+    { value: "hide", description: "Hide thinking traces" },
+    { value: "show", description: "Show thinking traces" },
+  ];
+  return candidates
+    .filter((candidate) => !normalized || candidate.value.startsWith(normalized) || fuzzyMatch(candidate.value, normalized))
+    .map((candidate) => ({
+      value: `/${command} ${candidate.value}`,
+      label: candidate.value,
+      description: candidate.description,
       category: "model" as const,
     }));
 }
