@@ -1,3 +1,6 @@
+import { mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import { act, useState, type Dispatch, type SetStateAction } from "react";
@@ -1252,6 +1255,45 @@ test("stale approval resolve failures are shown instead of success", async () =>
   }
 });
 
+test("/skills enable and disable update project skill settings", async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), "chili-tui-skills-"));
+  const refreshed: string[] = [];
+  const reviewer = skillSummary("reviewer", { baseDir: path.join(cwd, ".chili", "skills", "reviewer") });
+  const app = await mountShell(teamLiveFixture(), {
+    cwd,
+    skills: [reviewer],
+    allSkills: [reviewer],
+    onSkillsChanged: async () => {
+      refreshed.push("yes");
+    },
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "/skills disable reviewer");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(JSON.parse(await readFile(path.join(cwd, ".chili", "skills.json"), "utf8"))).toEqual({ disabled: ["reviewer"] });
+    expect(refreshed).toEqual(["yes"]);
+    expect(app.captureCharFrame()).toContain("Skill $reviewer disabled (project).");
+
+    await typeText(app, "/skills enable reviewer");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(JSON.parse(await readFile(path.join(cwd, ".chili", "skills.json"), "utf8"))).toEqual({ disabled: [] });
+    expect(refreshed).toEqual(["yes", "yes"]);
+    expect(app.captureCharFrame()).toContain("Skill $reviewer enabled (project).");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("slash team opens cockpit and Escape returns to chat shell", async () => {
   const app = await mountShell(teamLiveFixture());
 
@@ -1682,7 +1724,10 @@ async function mountShell(
     clipboard?: ClipboardAccess;
     kittyKeyboard?: boolean;
     localMessageTtlMs?: number;
+    cwd?: string;
     skills?: readonly SkillSummary[];
+    allSkills?: readonly SkillSummary[];
+    onSkillsChanged?: () => Promise<void> | void;
   } = {},
 ) {
   const runtime: ChatRuntimeState = {
@@ -1719,10 +1764,12 @@ async function mountShell(
       selectedTeamLocked={false}
       onSelectTeam={() => undefined}
       onExit={() => undefined}
-      options={{ cwd: "/repo/chili", modeName: "Build", modelName: "test-model", providerName: "test-provider" }}
+      options={{ cwd: options.cwd ?? "/repo/chili", modeName: "Build", modelName: "test-model", providerName: "test-provider" }}
       clipboard={options.clipboard}
       localMessageTtlMs={options.localMessageTtlMs}
       skills={options.skills}
+      allSkills={options.allSkills}
+      onSkillsChanged={options.onSkillsChanged}
     />,
     renderOptions,
   );
@@ -1816,7 +1863,7 @@ function fakeClipboard(overrides: Partial<ClipboardAccess> = {}): ClipboardAcces
   };
 }
 
-function skillSummary(name: string, options: Partial<Pick<SkillSummary, "source" | "description" | "filePath" | "baseDir" | "hidden">> = {}): SkillSummary {
+function skillSummary(name: string, options: Partial<Pick<SkillSummary, "source" | "description" | "filePath" | "baseDir" | "hidden" | "disabled">> = {}): SkillSummary {
   const source = options.source ?? "project";
   const baseDir = options.baseDir ?? `/repo/.chili/skills/${name}`;
   return {
@@ -1826,6 +1873,7 @@ function skillSummary(name: string, options: Partial<Pick<SkillSummary, "source"
     filePath: options.filePath ?? `${baseDir}/SKILL.md`,
     baseDir,
     ...(options.hidden === undefined ? {} : { hidden: options.hidden }),
+    ...(options.disabled === undefined ? {} : { disabled: options.disabled }),
   };
 }
 

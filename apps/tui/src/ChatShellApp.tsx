@@ -4,7 +4,7 @@ import type { KeyEvent, MouseEvent, PasteEvent, Selection } from "@opentui/core"
 import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
 import type { ApprovalId, RuntimeSkillMention, TeamId } from "@chili/protocol";
 import { FileAuthStorage, loginOpenAICodex, OPENAI_CODEX_PROVIDER_ID } from "@chili/providers";
-import { discoverSkills, type SkillSummary } from "@chili/skills";
+import { discoverSkills, updateSkillDisabledSetting, type SkillSettingsScope, type SkillSummary } from "@chili/skills";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { cleanClipboardText, promptClipboardText, promptPasteBytes, systemClipboard, type ClipboardAccess } from "./clipboard.js";
@@ -53,6 +53,7 @@ type ShellView = "chat" | "team" | "help" | "agents" | "status" | "transcript";
 type AppendLocalItem = (level: "info" | "error", text: string) => void;
 
 interface SlashActions {
+  cwd: string;
   setView: (view: ShellView) => void;
   appendLocalItem: AppendLocalItem;
   startNewChatSession: () => Promise<void>;
@@ -64,6 +65,13 @@ interface SlashActions {
   openReasoningPicker: () => void;
   setReasoningLevel: (level: ReasoningLevel) => Promise<void>;
   ensureOpenAICodexDefaultModel: () => Promise<void>;
+  reloadSkills: () => Promise<void>;
+}
+
+interface SkillSummariesState {
+  skills: readonly SkillSummary[];
+  allSkills: readonly SkillSummary[];
+  reload: () => Promise<void>;
 }
 
 export interface ChatShellOptions extends TeamLiveTuiOptions {
@@ -103,7 +111,7 @@ export function ChatShellApp(props: {
     sessionId: props.options.sessionId,
     limit: 64,
   });
-  const skills = useSkillSummaries(props.options.cwd ?? process.cwd());
+  const skillSummaries = useSkillSummaries(props.options.cwd ?? process.cwd());
 
   useEffect(() => {
     if (props.options.teamId) {
@@ -124,7 +132,9 @@ export function ChatShellApp(props: {
       selectedTeamLocked={Boolean(props.options.teamId)}
       onSelectTeam={setSelectedTeamId}
       onExit={props.onExit}
-      skills={skills}
+      skills={skillSummaries.skills}
+      allSkills={skillSummaries.allSkills}
+      onSkillsChanged={skillSummaries.reload}
     />
   );
 }
@@ -141,6 +151,8 @@ export function ChatShellSurface(props: {
   clipboard?: ClipboardAccess | undefined;
   localMessageTtlMs?: number | undefined;
   skills?: readonly SkillSummary[] | undefined;
+  allSkills?: readonly SkillSummary[] | undefined;
+  onSkillsChanged?: (() => Promise<void> | void) | undefined;
 }) {
   const dimensions = useTerminalDimensions();
   const { keyHandler } = useAppContext();
@@ -221,13 +233,16 @@ export function ChatShellSurface(props: {
   const theme = resolveTuiTheme(themeId, undefined, { systemTheme });
   const themeOptions = selectableTuiThemeOptions;
   const systemThemeAvailable = Boolean(systemTheme);
+  const cwd = props.options?.cwd ?? process.cwd();
   const slashContext = useMemo<SlashCommandContext>(() => ({
     model: props.model,
-    ...(props.options?.cwd ? { cwd: props.options.cwd } : {}),
+    cwd,
     ...(modelSelection ? { modelSelection } : {}),
     ...(reasoningLevel ? { reasoningLevel } : {}),
     modelCandidates,
-  }), [modelCandidates, modelSelection, props.model, props.options?.cwd, reasoningLevel]);
+    skills: props.skills ?? [],
+    allSkills: props.allSkills ?? props.skills ?? [],
+  }), [cwd, modelCandidates, modelSelection, props.allSkills, props.model, props.skills, reasoningLevel]);
   const completionSuppressed = acceptedCompletionPrompt !== undefined && prompt === acceptedCompletionPrompt;
   const skillTrigger = activeSkillMentionTrigger(prompt);
   const skillCompletionItems = skillTrigger && !prompt.startsWith("/")
@@ -392,6 +407,7 @@ export function ChatShellSurface(props: {
     await props.runtime.refreshModelConfig?.();
   }, [modelCandidates, modelSelection, props.runtime, setModelSelection]);
   const slashActions = useMemo<SlashActions>(() => ({
+    cwd,
     setView,
     appendLocalItem,
     startNewChatSession,
@@ -403,7 +419,10 @@ export function ChatShellSurface(props: {
     openReasoningPicker,
     setReasoningLevel,
     ensureOpenAICodexDefaultModel,
-  }), [appendLocalItem, ensureOpenAICodexDefaultModel, openModelPicker, openReasoningPicker, openThemePicker, setAuthManualPrompt, setModelSelection, setPrompt, setReasoningLevel, startNewChatSession]);
+    reloadSkills: async () => {
+      await props.onSkillsChanged?.();
+    },
+  }), [appendLocalItem, cwd, ensureOpenAICodexDefaultModel, openModelPicker, openReasoningPicker, openThemePicker, props.onSkillsChanged, setAuthManualPrompt, setModelSelection, setPrompt, setReasoningLevel, startNewChatSession]);
   const runSelectedSlashCompletion = useCallback(() => {
     if (!slashCompletionOpen) return false;
     const completion = slashCompletionItems[selectedCompletionIndex] ?? slashCompletionItems[0];
@@ -672,7 +691,6 @@ export function ChatShellSurface(props: {
     }
   });
 
-  const cwd = props.options?.cwd ?? process.cwd();
   const gitBranch = useGitBranch(cwd, props.options?.gitBranch);
   const shellOptions: StatusFooterOptions = {
     modeName: props.options?.modeName ?? "Build",
@@ -1423,7 +1441,7 @@ function localSkillMentionWarnings(
   const warnings: string[] = [];
   for (const name of extractSkillMentionNames(prompt)) {
     if (boundNames.has(name)) continue;
-    const matches = skills.filter((skill) => skill.hidden !== true && skill.name === name);
+    const matches = skills.filter((skill) => skill.hidden !== true && skill.disabled !== true && skill.name === name);
     if (matches.length === 0) {
       warnings.push(`Skill $${name} was not found; it will not be injected.`);
     } else if (matches.length > 1) {
@@ -1638,9 +1656,34 @@ async function applySlashResult(
     await performAuthAction(result, actions.appendLocalItem, actions.setAuthManualPrompt, actions.ensureOpenAICodexDefaultModel);
     return;
   }
+  if (result.type === "skills_action") {
+    await performSkillsAction(result, actions);
+    return;
+  }
   if (result.type === "sdk_action") {
     const action = actionForSlashResult(result, model);
     if (action) runtime.executeAction(action);
+  }
+}
+
+async function performSkillsAction(
+  result: Extract<SlashCommandResult, { type: "skills_action" }>,
+  actions: SlashActions,
+): Promise<void> {
+  const scope: SkillSettingsScope = result.scope ?? "project";
+  try {
+    await updateSkillDisabledSetting({
+      cwd: actions.cwd,
+      scope,
+      name: result.name,
+      disabled: result.action === "disable",
+    });
+    await actions.reloadSkills();
+    const nextState = result.action === "disable" ? "disabled" : "enabled";
+    actions.appendLocalItem("info", `Skill $${result.name} ${nextState} (${scope}).`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    actions.appendLocalItem("error", `Could not ${result.action} skill $${result.name}: ${message}`);
   }
 }
 
@@ -1877,22 +1920,46 @@ function latestAssistantText(items: readonly ChatTranscriptItem[]): string | und
   return undefined;
 }
 
-function useSkillSummaries(cwd: string): readonly SkillSummary[] {
-  const [skills, setSkills] = useState<readonly SkillSummary[]>([]);
+function useSkillSummaries(cwd: string): SkillSummariesState {
+  const [state, setState] = useState<{ skills: readonly SkillSummary[]; allSkills: readonly SkillSummary[] }>({
+    skills: [],
+    allSkills: [],
+  });
+  const load = useCallback(async () => {
+    const [activeRegistry, allRegistry] = await Promise.all([
+      discoverSkills({ cwd }),
+      discoverSkills({ cwd, includeDisabled: true }),
+    ]);
+    setState({
+      skills: activeRegistry.listAll(),
+      allSkills: allRegistry.listAll(),
+    });
+  }, [cwd]);
+
   useEffect(() => {
     let cancelled = false;
-    void discoverSkills({ cwd })
-      .then((registry) => {
-        if (!cancelled) setSkills(registry.listAll());
+    void Promise.all([
+      discoverSkills({ cwd }),
+      discoverSkills({ cwd, includeDisabled: true }),
+    ])
+      .then(([activeRegistry, allRegistry]) => {
+        if (cancelled) return;
+        setState({
+          skills: activeRegistry.listAll(),
+          allSkills: allRegistry.listAll(),
+        });
       })
       .catch(() => {
-        if (!cancelled) setSkills([]);
+        if (!cancelled) setState({ skills: [], allSkills: [] });
       });
     return () => {
       cancelled = true;
     };
   }, [cwd]);
-  return skills;
+  return {
+    ...state,
+    reload: load,
+  };
 }
 
 function useGitBranch(cwd: string, explicitBranch: string | undefined): string | undefined {
