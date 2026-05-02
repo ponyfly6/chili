@@ -224,7 +224,7 @@ export function ChatShellSurface(props: {
     props.runtime.modelConfig,
   ]);
   const scrollEstimateWidth = Math.max(24, dimensions.width - 8);
-  const chatLineCount = useMemo(() => estimatedChatLineCount(props.runtime.chatView, localItems, showToolDetails, scrollEstimateWidth), [localItems, props.runtime.chatView, scrollEstimateWidth, showToolDetails]);
+  const chatLineCount = useMemo(() => estimatedChatLineCount(props.runtime.chatView, localItems, showToolDetails, hideThinking, scrollEstimateWidth), [hideThinking, localItems, props.runtime.chatView, scrollEstimateWidth, showToolDetails]);
   const transcriptLineCount = useMemo(() => estimatedTranscriptLineCount(props.runtime.chatView.items, localItems, scrollEstimateWidth), [localItems, props.runtime.chatView.items, scrollEstimateWidth]);
   const previousChatLineCount = useRef<number | undefined>(undefined);
   const previousTranscriptLineCount = useRef<number | undefined>(undefined);
@@ -1070,9 +1070,10 @@ function SessionScreen(props: {
   );
 }
 
-function estimatedChatLineCount(chatView: ChatSessionView, localItems: readonly LocalTranscriptItem[], showToolDetails: boolean, width: number): number {
+function estimatedChatLineCount(chatView: ChatSessionView, localItems: readonly LocalTranscriptItem[], showToolDetails: boolean, hideThinking: boolean, width: number): number {
   const displayItems = buildChatDisplayItems(chatView.items, {
     showToolDetails,
+    hideThinking,
     sessionStatus: chatView.status,
     activeToolCount: chatView.activeTools.length,
   });

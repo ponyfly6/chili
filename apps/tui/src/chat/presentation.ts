@@ -22,7 +22,7 @@ import {
 export type ChatDisplayItem =
   | { kind: "user_text"; id: string; text: string }
   | { kind: "assistant_text"; id: string; text: string; streaming?: boolean }
-  | { kind: "reasoning"; id: string; text: string; collapsed: true }
+  | { kind: "reasoning"; id: string; text: string; collapsed: true; active?: boolean }
   | { kind: "tool_activity"; id: string; activity: ToolActivityDisplay }
   | { kind: "tool_group"; id: string; label: string; tone: ToolActivityTone; metadata: ToolGroupMetadata; activities: ToolActivityDisplay[] }
   | { kind: "approval"; id: string; approval: ChatApprovalRow }
@@ -129,16 +129,20 @@ function messageDisplayItems(
 ): ChatDisplayItem[] {
   const output: ChatDisplayItem[] = [];
   const streamingTextPartIndex = streaming ? lastTextPartIndex(message.parts) : -1;
-  const hideAssistantTrace = hideThinking && message.role === "assistant" && message.parts.some((part) => part.type === "tool_call");
+  const hideStreamingAssistantText = hideThinking && message.role === "assistant" && streaming;
+  const hideAssistantTrace = hideThinking && message.role === "assistant" && (hideStreamingAssistantText || message.parts.some((part) => part.type === "tool_call"));
   let hiddenTraceShown = false;
+  const showHiddenTrace = (active: boolean) => {
+    if (hiddenTraceShown) return;
+    output.push({ kind: "reasoning", id: `${message.id}:hidden-thinking`, text: "", collapsed: true, ...(active ? { active } : {}) });
+    hiddenTraceShown = true;
+  };
+
   for (const [index, part] of message.parts.entries()) {
     const id = `${message.id}:${part.id}:${index}`;
     if (part.type === "text") {
       if (hideAssistantTrace && part.text.trim()) {
-        if (!hiddenTraceShown) {
-          output.push({ kind: "reasoning", id: `${message.id}:hidden-thinking`, text: "", collapsed: true });
-          hiddenTraceShown = true;
-        }
+        showHiddenTrace(hideStreamingAssistantText);
         continue;
       }
       if (message.role === "user") output.push({ kind: "user_text", id, text: part.text });
@@ -148,13 +152,10 @@ function messageDisplayItems(
     }
     if (part.type === "reasoning") {
       if (hideAssistantTrace) {
-        if (part.text.trim() && !hiddenTraceShown) {
-          output.push({ kind: "reasoning", id: `${message.id}:hidden-thinking`, text: "", collapsed: true });
-          hiddenTraceShown = true;
-        }
+        if (part.text.trim()) showHiddenTrace(hideStreamingAssistantText);
         continue;
       }
-      output.push({ kind: "reasoning", id, text: part.text, collapsed: true });
+      output.push({ kind: "reasoning", id, text: part.text, collapsed: true, ...(streaming ? { active: true } : {}) });
       continue;
     }
     if (part.type === "summary") {

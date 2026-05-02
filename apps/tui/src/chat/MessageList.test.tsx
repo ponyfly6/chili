@@ -150,6 +150,40 @@ test("hidden thinking masks intermediate assistant text before tool calls", asyn
   expect(frame).not.toContain("🌶️: Let me inspect");
 });
 
+test("hidden thinking masks live assistant text before a tool call arrives", async () => {
+  const frame = await renderMessageList([
+    {
+      id: "msg_live_trace_hidden" as MessageId,
+      kind: "message",
+      role: "assistant",
+      createdAt: 1,
+      parts: [
+        { type: "text", id: "part_live_trace_hidden" as PartId, text: "Let me inspect the prompt handling." },
+      ],
+    },
+  ], { hideThinking: true, status: "running" });
+
+  expect(frame).toContain("🫧 thinking...");
+  expect(frame).not.toContain("🌶️: Let me inspect");
+});
+
+test("hidden thinking shows completed assistant text without tool calls", async () => {
+  const frame = await renderMessageList([
+    {
+      id: "msg_final_answer_visible" as MessageId,
+      kind: "message",
+      role: "assistant",
+      createdAt: 1,
+      parts: [
+        { type: "text", id: "part_final_answer_visible" as PartId, text: "Final answer is visible." },
+      ],
+    },
+  ], { hideThinking: true, status: "idle" });
+
+  expect(frame).toContain("🌶️: Final answer is visible.");
+  expect(frame).not.toContain("🫧 thinking...");
+});
+
 test("streaming markdown keeps the last growing block active", () => {
   expect(splitStreamingMarkdown("# Plan\n\n- first\n- sec")).toEqual({
     stableText: "# Plan\n\n",

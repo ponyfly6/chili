@@ -131,7 +131,9 @@ function localItemCell(item: LocalTranscriptItem, width: number, theme: TuiTheme
 }
 
 function reasoningLines(item: Extract<ChatDisplayItem, { kind: "reasoning" }>, width: number, theme: TuiTheme, hideThinking: boolean): TranscriptLineModel[] {
-  const text = hideThinking ? "🫧" : `Thinking: ${shorten((item.text || "...").replace(/\s+/g, " ").trim(), 180)}`;
+  const hiddenText = item.active === true ? "🫧 thinking..." : "🫧";
+  const visibleThinking = item.active === true ? (item.text || "thinking...") : item.text;
+  const text = hideThinking ? hiddenText : `Thinking: ${shorten((visibleThinking || "...").replace(/\s+/g, " ").trim(), 180)}`;
   return wrapLine(text, {
     key: `display:${item.kind}:${item.id}`,
     fg: theme.colors.text.muted,
