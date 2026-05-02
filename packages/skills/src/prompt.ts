@@ -1,10 +1,16 @@
 import type { Skill, SkillSummary } from "./types.js";
+import type { SkillResourceFile } from "./resources.js";
 
 export interface FormatAvailableSkillsPromptOptions {
   maxChars?: number;
   descriptionMaxChars?: number;
   whenToUseMaxChars?: number;
   includeHidden?: boolean;
+}
+
+export interface FormatSkillBodyPromptOptions {
+  resourceFiles?: readonly SkillResourceFile[];
+  resourcesTruncated?: boolean;
 }
 
 const DEFAULT_MAX_CHARS = 4_000;
@@ -48,20 +54,45 @@ export function formatAvailableSkillsPrompt(
   return lines.join("\n");
 }
 
-export function formatSkillBodyPrompt(skill: Skill): string {
+export function formatSkillBodyPrompt(skill: Skill, options: FormatSkillBodyPromptOptions = {}): string {
   return [
     `<skill name="${escapeAttribute(skill.name)}" source="${skill.source}">`,
     "<metadata>",
-    `path: ${skill.filePath}`,
-    `baseDir: ${skill.baseDir}`,
-    `description: ${inlineMetadata(skill.metadata.description)}`,
-    ...(skill.metadata.when_to_use !== undefined ? [`when_to_use: ${inlineMetadata(skill.metadata.when_to_use)}`] : []),
+    ...skillMetadataLines(skill),
     "</metadata>",
     "<instructions>",
     skill.body.trimEnd(),
     "</instructions>",
+    "<skill_files>",
+    ...skillFileLines(options.resourceFiles ?? [], options.resourcesTruncated ?? false),
+    "</skill_files>",
     "</skill>",
   ].join("\n");
+}
+
+export function skillMetadataLines(skill: Skill): string[] {
+  const metadata = skill.metadata;
+  const lines = [
+    `source: ${skill.source}`,
+    `path: ${skill.filePath}`,
+    `baseDir: ${skill.baseDir}`,
+    `description: ${inlineMetadata(metadata.description)}`,
+  ];
+  if (metadata.when_to_use !== undefined) lines.push(`when_to_use: ${inlineMetadata(metadata.when_to_use)}`);
+  if (metadata.allowedTools !== undefined) lines.push(`allowedTools: ${metadata.allowedTools.join(", ")}`);
+  if (metadata.model !== undefined) lines.push(`model: ${inlineMetadata(metadata.model)}`);
+  if (metadata.argumentHint !== undefined) lines.push(`argumentHint: ${inlineMetadata(metadata.argumentHint)}`);
+  if (metadata.paths !== undefined) lines.push(`paths: ${metadata.paths.join(", ")}`);
+  if (metadata.context !== undefined) lines.push(`context: ${inlineMetadata(metadata.context)}`);
+  if (metadata.hidden !== undefined) lines.push(`hidden: ${metadata.hidden}`);
+  if (metadata.shouldDefer !== undefined) lines.push(`shouldDefer: ${metadata.shouldDefer}`);
+  return lines;
+}
+
+export function skillFileLines(files: readonly SkillResourceFile[], truncated = false): string[] {
+  const lines = files.length > 0 ? files.map((file) => `- ${file.path} (${file.bytes} bytes)`) : ["(none)"];
+  if (truncated) lines.push("- ... more files omitted due to skill file budget.");
+  return lines;
 }
 
 function formatSkillLine(

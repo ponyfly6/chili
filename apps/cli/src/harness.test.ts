@@ -78,7 +78,10 @@ test("CLI prompt fragments inject explicitly mentioned skill bodies for one turn
   const repo = join(root, "repo");
   try {
     await mkdir(repo, { recursive: true });
-    const skillRegistry = new SkillRegistry([skill("reviewer")]);
+    const skillDir = join(repo, ".chili", "skills", "reviewer");
+    await mkdir(join(skillDir, "templates"), { recursive: true });
+    await writeFile(join(skillDir, "templates", "review.md"), "review template\n", "utf8");
+    const skillRegistry = new SkillRegistry([skill("reviewer", "project", skillDir)]);
     const fragments = await buildCliPromptFragments({
       cwd: repo,
       skillRegistry,
@@ -95,10 +98,13 @@ test("CLI prompt fragments inject explicitly mentioned skill bodies for one turn
       metadata: {
         kind: "skill_body",
         name: "reviewer",
-        path: "/repo/.chili/skills/reviewer/SKILL.md",
+        path: join(skillDir, "SKILL.md"),
+        baseDir: skillDir,
+        skillFiles: ["templates/review.md"],
       },
     });
     expect(body?.content).toContain("<instructions>\nreview body\n</instructions>");
+    expect(body?.content).toContain("<skill_files>\n- templates/review.md");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -274,12 +280,13 @@ async function mkdtempName(): Promise<string> {
   return mkdtemp(join(tmpdir(), "chili-harness-"));
 }
 
-function skill(name: string, source: Skill["source"] = "project"): Skill {
+function skill(name: string, source: Skill["source"] = "project", baseDir?: string): Skill {
+  const resolvedBaseDir = baseDir ?? (source === "user" ? `/home/.chili/skills/${name}` : `/repo/.chili/skills/${name}`);
   return {
     name,
     source,
-    filePath: source === "user" ? `/home/.chili/skills/${name}/SKILL.md` : `/repo/.chili/skills/${name}/SKILL.md`,
-    baseDir: source === "user" ? `/home/.chili/skills/${name}` : `/repo/.chili/skills/${name}`,
+    filePath: join(resolvedBaseDir, "SKILL.md"),
+    baseDir: resolvedBaseDir,
     metadata: {
       name,
       description: "Review code changes.",

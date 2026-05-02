@@ -92,9 +92,11 @@ import {
   discoverSkills,
   formatAvailableSkillsPrompt,
   formatSkillBodyPrompt,
+  listSkillResourceFiles,
   resolveSkillMentions,
   type Skill,
   type SkillMentionDiagnostic,
+  type SkillResourceListing,
   type SkillRegistry,
 } from "@chili/skills";
 import { createCliApprovalBroker, createCliPermissionRules } from "./approval.js";
@@ -457,7 +459,8 @@ export async function buildCliPromptFragments(input: {
       content: skillsPrompt,
     });
   }
-  context.push(...buildSkillMentionPromptFragments(input.skillRegistry, input.turn));
+  const skillMentionFragments = await buildSkillMentionPromptFragments(input.skillRegistry, input.turn);
+  context.push(...skillMentionFragments);
   return context;
 }
 
@@ -525,22 +528,26 @@ function taskFollowupPromptFragment(task: AgentTaskRow): PromptFragment {
   };
 }
 
-function buildSkillMentionPromptFragments(
+async function buildSkillMentionPromptFragments(
   skillRegistry: SkillRegistry,
   turn: RuntimePromptTurnContext | undefined,
-): PromptFragment[] {
+): Promise<PromptFragment[]> {
   if (!turn) return [];
   const resolved = resolveSkillMentions({
     text: turn.text,
     ...(turn.skillMentions ? { mentions: turn.skillMentions } : {}),
     registry: skillRegistry,
   });
-  const fragments = resolved.skills.map((skill, index, skills) => skillBodyPromptFragment(skill, needsPathSuffix(skill, skills)));
+  const fragments: PromptFragment[] = [];
+  for (const skill of resolved.skills) {
+    const resources = await listSkillResourceFiles(skill.baseDir);
+    fragments.push(skillBodyPromptFragment(skill, resources, needsPathSuffix(skill, resolved.skills)));
+  }
   if (resolved.diagnostics.length > 0) fragments.push(skillMentionWarningsFragment(resolved.diagnostics));
   return fragments;
 }
 
-function skillBodyPromptFragment(skill: Skill, withPathSuffix: boolean): PromptFragment {
+function skillBodyPromptFragment(skill: Skill, resources: SkillResourceListing, withPathSuffix: boolean): PromptFragment {
   return {
     id: `chili.skill.${promptFragmentIdPart(skill.name)}${withPathSuffix ? `.${shortHash(skill.filePath)}` : ""}`,
     layer: "contextual_user",
@@ -548,12 +555,21 @@ function skillBodyPromptFragment(skill: Skill, withPathSuffix: boolean): PromptF
     priority: 30,
     lifecycle: "turn",
     trust: "tool",
-    content: formatSkillBodyPrompt(skill),
+    content: formatSkillBodyPrompt(skill, {
+      resourceFiles: resources.files,
+      resourcesTruncated: resources.truncated,
+    }),
     metadata: {
       kind: "skill_body",
       name: skill.name,
       path: skill.filePath,
+      baseDir: skill.baseDir,
       source: skill.source,
+      skillFiles: resources.files.map((file) => file.path),
+      skillFilesTruncated: resources.truncated,
+      omittedHiddenSkillFiles: resources.omittedHidden,
+      omittedLargeSkillFiles: resources.omittedLarge,
+      omittedUnreadableSkillFiles: resources.omittedUnreadable,
     },
   };
 }

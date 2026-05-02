@@ -60,6 +60,29 @@ test("skill body prompt includes full body for contextual injection", () => {
   expect(prompt).toContain("description: Write docs.");
   expect(prompt).toContain("when_to_use: When docs are requested.");
   expect(prompt).toContain("# Instructions\nKeep docs crisp.");
+  expect(prompt).toContain("<skill_files>\n(none)\n</skill_files>");
+});
+
+test("skill body prompt includes resource file hints without file bodies", () => {
+  const prompt = formatSkillBodyPrompt(
+    skill({
+      name: "writer",
+      description: "Write docs.",
+      body: "# Instructions\nUse the template when needed.\n",
+    }),
+    {
+      resourceFiles: [
+        { path: "scripts/create.ts", bytes: 22 },
+        { path: "templates/post.md", bytes: 12 },
+      ],
+      resourcesTruncated: true,
+    },
+  );
+
+  expect(prompt).toContain("- scripts/create.ts (22 bytes)");
+  expect(prompt).toContain("- templates/post.md (12 bytes)");
+  expect(prompt).toContain("more files omitted");
+  expect(prompt).not.toContain("template file contents");
 });
 
 test("available skills prompt hides hidden skills by default", () => {

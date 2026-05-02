@@ -1,6 +1,11 @@
-import { readdir } from "node:fs/promises";
-import path from "node:path";
-import type { Skill, SkillRegistry } from "@chili/skills";
+import {
+  listSkillResourceFiles,
+  skillFileLines,
+  skillMetadataLines,
+  type Skill,
+  type SkillResourceFile,
+  type SkillRegistry,
+} from "@chili/skills";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
 
 export interface ActivateSkillInput {
@@ -8,9 +13,6 @@ export interface ActivateSkillInput {
 }
 
 export type SkillRegistryLike = Pick<SkillRegistry, "get" | "list">;
-
-const DEFAULT_SKILL_FILE_LIMIT = 30;
-const EXCLUDED_DIRS = new Set([".git", "node_modules"]);
 
 export function createActivateSkillTool(registry: SkillRegistryLike): ChiliToolDefinition<ActivateSkillInput> {
   return {
@@ -54,90 +56,40 @@ export function createActivateSkillTool(registry: SkillRegistryLike): ChiliToolD
         };
       }
 
-      const skillFiles = await listSkillFiles(skill.baseDir, DEFAULT_SKILL_FILE_LIMIT);
+      const skillResources = await listSkillResourceFiles(skill.baseDir);
       return {
         title: `activate skill ${skill.name}`,
-        output: formatActivatedSkill(skill, skillFiles),
+        output: formatActivatedSkill(skill, skillResources.files, skillResources.truncated),
         metadata: {
           name: skill.name,
           source: skill.source,
           filePath: skill.filePath,
           baseDir: skill.baseDir,
-          skillFiles,
+          skillFiles: skillResources.files.map((file) => file.path),
+          skillFilesTruncated: skillResources.truncated,
+          omittedHiddenSkillFiles: skillResources.omittedHidden,
+          omittedLargeSkillFiles: skillResources.omittedLarge,
+          omittedUnreadableSkillFiles: skillResources.omittedUnreadable,
         },
       };
     },
   };
 }
 
-async function listSkillFiles(baseDir: string, limit: number): Promise<string[]> {
-  const files: string[] = [];
-  const queue = [""];
-
-  while (queue.length > 0 && files.length < limit) {
-    const relativeDir = queue.shift() ?? "";
-    const absoluteDir = path.join(baseDir, relativeDir);
-    let entries;
-    try {
-      entries = await readdir(absoluteDir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-
-    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-      const relativePath = relativeDir ? path.join(relativeDir, entry.name) : entry.name;
-      if (entry.isDirectory()) {
-        if (!EXCLUDED_DIRS.has(entry.name)) queue.push(relativePath);
-        continue;
-      }
-      if (!entry.isFile() || entry.name === "SKILL.md") continue;
-      files.push(relativePath.split(path.sep).join("/"));
-      if (files.length >= limit) break;
-    }
-  }
-
-  return files;
-}
-
-function formatActivatedSkill(skill: Skill, skillFiles: readonly string[]): string {
-  const metadata = metadataLines(skill).join("\n");
-  const files = skillFiles.length > 0 ? skillFiles.map((file) => `- ${file}`).join("\n") : "(none)";
+function formatActivatedSkill(skill: Skill, skillFiles: readonly SkillResourceFile[], truncated: boolean): string {
   return [
     `<activated_skill name="${skill.name}">`,
     "<metadata>",
-    metadata,
+    skillMetadataLines(skill).join("\n"),
     "</metadata>",
     "<instructions>",
     skill.body.trimEnd(),
     "</instructions>",
     "<skill_files>",
-    files,
+    ...skillFileLines(skillFiles, truncated),
     "</skill_files>",
     "</activated_skill>",
   ].join("\n");
-}
-
-function metadataLines(skill: Skill): string[] {
-  const metadata = skill.metadata;
-  const lines = [
-    `source: ${skill.source}`,
-    `path: ${skill.filePath}`,
-    `baseDir: ${skill.baseDir}`,
-    `description: ${metadataValue(metadata.description)}`,
-  ];
-  if (metadata.when_to_use !== undefined) lines.push(`when_to_use: ${metadataValue(metadata.when_to_use)}`);
-  if (metadata.allowedTools !== undefined) lines.push(`allowedTools: ${metadata.allowedTools.join(", ")}`);
-  if (metadata.model !== undefined) lines.push(`model: ${metadataValue(metadata.model)}`);
-  if (metadata.argumentHint !== undefined) lines.push(`argumentHint: ${metadataValue(metadata.argumentHint)}`);
-  if (metadata.paths !== undefined) lines.push(`paths: ${metadata.paths.join(", ")}`);
-  if (metadata.context !== undefined) lines.push(`context: ${metadataValue(metadata.context)}`);
-  if (metadata.hidden !== undefined) lines.push(`hidden: ${metadata.hidden}`);
-  if (metadata.shouldDefer !== undefined) lines.push(`shouldDefer: ${metadata.shouldDefer}`);
-  return lines;
-}
-
-function metadataValue(value: string): string {
-  return value.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

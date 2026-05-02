@@ -12,8 +12,11 @@ export interface CliPromptDebugOutput {
 
 const PROMPT_DEBUG_METADATA_KEYS = [
   "path",
+  "baseDir",
   "kind",
   "scope",
+  "skillFiles",
+  "skillFilesTruncated",
   "truncated",
   "truncatedAfter",
   "ruleType",
