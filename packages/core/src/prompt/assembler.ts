@@ -10,6 +10,7 @@ export interface PromptAssembly {
   system: string[];
   developer: string[];
   contextualUser: string[];
+  conversation: string[];
   fragments: RenderedPromptFragment[];
   debug: PromptDebugManifest;
 }
@@ -38,6 +39,7 @@ export class PromptAssembler {
       system: contentForLayer(fragments, "base"),
       developer: contentForLayer(fragments, "developer"),
       contextualUser: contentForLayer(fragments, "contextual_user"),
+      conversation: contentForLayer(fragments, "conversation"),
       fragments,
       debug: buildPromptDebugManifest(fragments),
     };

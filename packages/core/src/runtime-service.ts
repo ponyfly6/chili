@@ -1,8 +1,10 @@
 import type {
   ChiliEvent,
   EventEnvelope,
+  Message,
   MessageId,
   ModelSelection,
+  PartId,
   ReasoningLevel,
   RuntimeModelConfig,
   RuntimeModelDescriptor,
@@ -15,6 +17,11 @@ import type {
 } from "@chili/protocol";
 import { REASONING_LEVELS, timestampNow } from "@chili/protocol";
 import type { EventStore } from "@chili/store";
+import {
+  ContextWindowBuilder,
+  conversationPromptFragment,
+  type ContextBudgetOptions,
+} from "./context/index.js";
 import {
   PromptAssembler,
   type PromptAssembly,
@@ -38,6 +45,8 @@ export interface RuntimeServiceOptions {
   store: EventStore;
   cwd: string;
   maxTurns?: number;
+  contextBudget?: ContextBudgetOptions;
+  contextBuilder?: ContextWindowBuilder;
   promptFragments?: RuntimePromptFragmentsProvider;
   models?: RuntimeModelCatalogProvider | readonly RuntimeModelDescriptor[];
   defaultModelSelection?: ModelSelection;
@@ -275,7 +284,7 @@ export class RuntimeService {
       sessionId: input.sessionId,
       threadId: input.threadId,
       cwd: input.cwd,
-      ...(input.text !== undefined ? { turn: turnContext(input) } : {}),
+      ...(input.text !== undefined ? { turn: turnContext(input), previewTurnInConversation: true } : {}),
     });
     if (!input.includeContent) return prompt.debug;
     return {
@@ -308,12 +317,6 @@ export class RuntimeService {
 
     try {
       const promptModelState = await this.resolvePromptModelState(input);
-      const prompt = await this.resolvePromptAssembly({
-        sessionId: input.sessionId,
-        threadId: input.threadId,
-        cwd,
-        turn: turnContext(input),
-      });
 
       await this.publishStatus({
         sessionId: input.sessionId,
@@ -333,6 +336,12 @@ export class RuntimeService {
           return await this.cancelledPrompt(input, turns, "Prompt aborted");
         }
 
+        const prompt = await this.resolvePromptAssembly({
+          sessionId: input.sessionId,
+          threadId: input.threadId,
+          cwd,
+          turn: turnContext(input),
+        });
         const runInput = this.buildRunTurnInput({
           input,
           cwd,
@@ -365,6 +374,12 @@ export class RuntimeService {
         return await this.cancelledPrompt(input, turns, "Prompt aborted");
       }
 
+      const prompt = await this.resolvePromptAssembly({
+        sessionId: input.sessionId,
+        threadId: input.threadId,
+        cwd,
+        turn: turnContext(input),
+      });
       const finalRunInput = this.buildRunTurnInput({
         input,
         cwd,
@@ -499,6 +514,7 @@ export class RuntimeService {
     threadId: ThreadId;
     cwd: string;
     turn?: RuntimePromptTurnContext;
+    previewTurnInConversation?: boolean;
   }): Promise<PromptAssembly> {
     const fragments = await this.options.promptFragments?.({
       sessionId: input.sessionId,
@@ -506,7 +522,47 @@ export class RuntimeService {
       cwd: input.cwd,
       ...(input.turn ? { turn: input.turn } : {}),
     });
-    return new PromptAssembler().addMany(fragments).assemble();
+    const conversation = await this.resolveConversationPromptFragment(input);
+    return new PromptAssembler().addMany(fragments).add(conversation).assemble();
+  }
+
+  private async resolveConversationPromptFragment(input: {
+    sessionId: SessionId;
+    threadId: ThreadId;
+    turn?: RuntimePromptTurnContext;
+    previewTurnInConversation?: boolean;
+  }): Promise<PromptFragment | undefined> {
+    const messages = await this.options.store.messages(input.sessionId);
+    const conversationMessages =
+      input.turn && input.previewTurnInConversation
+        ? [...messages, this.syntheticInspectUserMessage(input.sessionId, input.turn.text)]
+        : messages;
+    const context = this.contextBuilder().build(conversationMessages);
+    return conversationPromptFragment({
+      messages: context.messages,
+      usage: context.usage,
+      ...(context.compactionBoundary ? { compactionBoundary: context.compactionBoundary } : {}),
+    });
+  }
+
+  private syntheticInspectUserMessage(sessionId: SessionId, text: string): Message {
+    const messageId = "msg_prompt_inspect_current_user" as MessageId;
+    return {
+      id: messageId,
+      sessionId,
+      role: "user",
+      createdAt: this.now(),
+      parts: [
+        {
+          id: "part_prompt_inspect_current_user" as PartId,
+          messageId,
+          sessionId,
+          type: "text",
+          text,
+          synthetic: true,
+        },
+      ],
+    };
   }
 
   private withFinalResponsePrompt(prompt: PromptAssembly): PromptAssembly {
@@ -522,6 +578,10 @@ export class RuntimeService {
         content: FINAL_RESPONSE_AFTER_MAX_TURNS_SYSTEM,
       })
       .assemble();
+  }
+
+  private contextBuilder(): ContextWindowBuilder {
+    return this.options.contextBuilder ?? new ContextWindowBuilder(this.options.contextBudget);
   }
 
   private async resolvePromptModelState(input: SubmitPromptInput): Promise<RuntimeSessionModelState> {

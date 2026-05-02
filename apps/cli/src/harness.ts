@@ -188,6 +188,11 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     createId,
     maxResultOutputBytes: 128_000,
   });
+  const childContextBudget = {
+    maxInputChars: 500_000,
+    maxToolResultChars: 80_000,
+    preserveRecentMessages: 12,
+  };
   const childRuntime = new SingleAgentRuntime({
     store: eventStore,
     model,
@@ -195,11 +200,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     toolExecutor: childToolExecutor,
     toolPolicyResolver: childToolPolicyResolver,
     createId,
-    contextBudget: {
-      maxInputChars: 500_000,
-      maxToolResultChars: 80_000,
-      preserveRecentMessages: 12,
-    },
+    contextBudget: childContextBudget,
     retryPolicy: {
       maxAttempts: 2,
       initialDelayMs: 500,
@@ -216,6 +217,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     cwd,
     createId,
     maxTurns: DEV_MAX_TURNS,
+    contextBudget: childContextBudget,
     promptFragments: childPromptFragments,
   });
   const subagents = new LocalSubagentManager({
@@ -283,17 +285,18 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     createId,
     maxResultOutputBytes: 256_000,
   });
+  const runtimeContextBudget = {
+    maxInputChars: 500_000,
+    maxToolResultChars: 80_000,
+    preserveRecentMessages: 12,
+  };
   const runtime = new SingleAgentRuntime({
     store: eventStore,
     model,
     toolRegistry: registry,
     toolExecutor,
     createId,
-    contextBudget: {
-      maxInputChars: 500_000,
-      maxToolResultChars: 80_000,
-      preserveRecentMessages: 12,
-    },
+    contextBudget: runtimeContextBudget,
     retryPolicy: {
       maxAttempts: 2,
       initialDelayMs: 500,
@@ -315,6 +318,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     cwd,
     createId,
     maxTurns: DEV_MAX_TURNS,
+    contextBudget: runtimeContextBudget,
     promptFragments,
   });
   const teamRunner = new TeamExecutionRunner({

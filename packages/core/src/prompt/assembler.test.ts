@@ -12,6 +12,7 @@ test("prompt assembler sorts by layer and priority while preserving stable ties"
     fragment("dev-a", "developer", 10, "developer a"),
     fragment("dev-a-tie", "developer", 10, "developer a tie"),
     fragment("ctx-a", "contextual_user", 0, "context a"),
+    fragment("conversation", "conversation", 0, "conversation history"),
   ]);
 
   expect(assembly.fragments.map((item) => item.id)).toEqual([
@@ -21,10 +22,12 @@ test("prompt assembler sorts by layer and priority while preserving stable ties"
     "dev-b",
     "ctx-a",
     "ctx-b",
+    "conversation",
   ]);
   expect(assembly.system).toEqual(["base"]);
   expect(assembly.developer).toEqual(["developer a", "developer a tie", "developer b"]);
   expect(assembly.contextualUser).toEqual(["context a", "context b"]);
+  expect(assembly.conversation).toEqual(["conversation history"]);
 });
 
 test("debug manifest records id source layer and rendered char counts", () => {

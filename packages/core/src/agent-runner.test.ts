@@ -4,6 +4,7 @@ import type {
   EventEnvelope,
   Message,
   MessageId,
+  PartId,
   SessionId,
   ThreadId,
   TimestampMs,
@@ -174,6 +175,108 @@ test("RuntimeService passes current turn text and skill mentions to prompt fragm
     id: "chili.skill.reviewer",
     lifecycle: "turn",
   }));
+});
+
+test("RuntimeService assembles turn prompt after appending submitted user message", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const sessionId = "session_prompt_after_append" as SessionId;
+  const threadId = "thread_prompt_after_append" as ThreadId;
+  const observedUserMessages: AppendUserMessageInput[][] = [];
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    promptFragments: () => {
+      observedUserMessages.push([...runner.userMessages]);
+      return [
+        {
+          id: "runtime.latest_user_message",
+          layer: "contextual_user",
+          source: "runtime",
+          priority: 0,
+          lifecycle: "turn",
+          trust: "user",
+          content: `latest user: ${runner.userMessages.at(-1)?.text ?? "missing"}`,
+        },
+      ];
+    },
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const result = await service.submitPrompt({
+    sessionId,
+    threadId,
+    text: "what changed?",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(observedUserMessages).toEqual([
+    [
+      {
+        sessionId,
+        threadId,
+        text: "what changed?",
+      },
+    ],
+  ]);
+  expect(runner.turnInputs[0]?.contextualUser).toEqual(["latest user: what changed?"]);
+});
+
+test("RuntimeService inspectPrompt includes conversation context as a prompt fragment", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const sessionId = "session_prompt_conversation" as SessionId;
+  const threadId = "thread_prompt_conversation" as ThreadId;
+  store.messageRows.push(textMessage({
+    id: "msg_existing_user" as MessageId,
+    sessionId,
+    role: "user",
+    text: "existing request",
+  }));
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    promptFragments: () => [
+      {
+        id: "debug.base",
+        layer: "base",
+        source: "core",
+        priority: 0,
+        lifecycle: "stable",
+        trust: "system",
+        content: "base instructions",
+      },
+    ],
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const inspected = await service.inspectPrompt({
+    sessionId,
+    threadId,
+    cwd: "/repo",
+    text: "current turn",
+    includeContent: true,
+  });
+
+  const conversation = inspected.fragments.find((fragment) => fragment.layer === "conversation");
+  expect(inspected.debug.fragments.map((fragment) => fragment.layer)).toEqual(["base", "conversation"]);
+  expect(conversation).toMatchObject({
+    id: "runtime.conversation",
+    source: "runtime",
+    lifecycle: "turn",
+    metadata: {
+      kind: "conversation_context",
+      messageCount: 2,
+    },
+  });
+  expect(conversation?.content).toContain("existing request");
+  expect(conversation?.content).toContain("current turn");
+  expect(runner.userMessages).toEqual([]);
+  expect(runner.turnInputs).toEqual([]);
 });
 
 test("RuntimeService inspectPrompt only assembles prompt debug output", async () => {
@@ -618,6 +721,7 @@ class FakeAgentRunner implements AgentRunner {
 
 class MemoryEventStore implements EventStore {
   readonly items: ChiliEvent[] = [];
+  readonly messageRows: Message[] = [];
 
   async append(event: ChiliEvent): Promise<void> {
     this.items.push(event);
@@ -647,8 +751,10 @@ class MemoryEventStore implements EventStore {
     return [];
   }
 
-  async messages(): Promise<Message[]> {
-    return [];
+  async messages(sessionId: SessionId): Promise<Message[]> {
+    return this.messageRows
+      .filter((message) => message.sessionId === sessionId)
+      .map((message) => ({ ...message, parts: message.parts.map((part) => ({ ...part }) as Message["parts"][number]) }));
   }
 
   async pendingApprovals(): Promise<ApprovalRow[]> {
@@ -672,6 +778,29 @@ function statuses(store: MemoryEventStore): string[] {
 function createSequentialId(): (prefix: string) => string {
   let index = 0;
   return (prefix) => `${prefix}_${++index}`;
+}
+
+function textMessage(input: {
+  id: MessageId;
+  sessionId: SessionId;
+  role: Message["role"];
+  text: string;
+}): Message {
+  return {
+    id: input.id,
+    sessionId: input.sessionId,
+    role: input.role,
+    createdAt: 1 as TimestampMs,
+    parts: [
+      {
+        id: `${input.id}_part` as PartId,
+        messageId: input.id,
+        sessionId: input.sessionId,
+        type: "text",
+        text: input.text,
+      },
+    ],
+  };
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void } {
