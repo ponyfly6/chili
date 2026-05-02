@@ -1,4 +1,4 @@
-import type { SkillSummary } from "./types.js";
+import type { Skill, SkillSummary } from "./types.js";
 
 export interface FormatAvailableSkillsPromptOptions {
   maxChars?: number;
@@ -24,7 +24,7 @@ export function formatAvailableSkillsPrompt(
   const whenToUseMaxChars = options.whenToUseMaxChars ?? DEFAULT_FIELD_MAX_CHARS;
   const lines = [
     "<available_skills>",
-    "Skills are reusable instruction packs. When a task matches a skill description, call activate_skill with the skill name before proceeding.",
+    "Skills are reusable instruction packs. The user may explicitly mention $skill-name to include the full skill instructions for the current turn. When a task matches a skill but it was not explicitly mentioned, you may call activate_skill with the skill name to inspect it before proceeding.",
   ];
   let omitted = 0;
 
@@ -48,6 +48,22 @@ export function formatAvailableSkillsPrompt(
   return lines.join("\n");
 }
 
+export function formatSkillBodyPrompt(skill: Skill): string {
+  return [
+    `<skill name="${escapeAttribute(skill.name)}" source="${skill.source}">`,
+    "<metadata>",
+    `path: ${skill.filePath}`,
+    `baseDir: ${skill.baseDir}`,
+    `description: ${inlineMetadata(skill.metadata.description)}`,
+    ...(skill.metadata.when_to_use !== undefined ? [`when_to_use: ${inlineMetadata(skill.metadata.when_to_use)}`] : []),
+    "</metadata>",
+    "<instructions>",
+    skill.body.trimEnd(),
+    "</instructions>",
+    "</skill>",
+  ].join("\n");
+}
+
 function formatSkillLine(
   skill: SkillSummary,
   options: { descriptionMaxChars: number; whenToUseMaxChars: number },
@@ -67,4 +83,12 @@ function truncateInline(input: string, maxChars: number): string {
   if (normalized.length <= maxChars) return normalized;
   if (maxChars <= 3) return normalized.slice(0, maxChars);
   return `${normalized.slice(0, maxChars - 3).trimEnd()}...`;
+}
+
+function inlineMetadata(input: string): string {
+  return input.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function escapeAttribute(input: string): string {
+  return input.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }

@@ -10,6 +10,7 @@
     "@chili/providers": "workspace:*",
     "@chili/protocol": "workspace:*",
     "@chili/sdk": "workspace:*",
+    "@chili/skills": "workspace:*",
     "@opentui/core": "0.1.106",
     "@opentui/react": "0.1.106",
     "marked": "17.0.1",

@@ -21,6 +21,11 @@ export interface ModelSelection {
   model: string;
 }
 
+export interface RuntimeSkillMention {
+  name: string;
+  path?: string;
+}
+
 export interface RuntimeModelCapabilities {
   streaming?: boolean;
   reasoning?: boolean;
@@ -68,6 +73,7 @@ export interface RuntimeSubmitPromptCommand {
   sessionId: SessionId;
   threadId: ThreadId;
   text: string;
+  skillMentions?: RuntimeSkillMention[];
   maxTurns?: number;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;

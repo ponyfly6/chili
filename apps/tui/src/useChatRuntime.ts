@@ -4,7 +4,7 @@ import {
   type ChatSessionView,
   type HttpRuntimeClient,
 } from "@chili/sdk";
-import type { ApprovalId, RuntimeApprovalResolveResult, RuntimeModelConfig, SessionId, ThreadId } from "@chili/protocol";
+import type { ApprovalId, RuntimeApprovalResolveResult, RuntimeModelConfig, RuntimeSkillMention, SessionId, ThreadId } from "@chili/protocol";
 import { useTeamLiveRuntime, type TeamLiveRuntimeState, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
 
@@ -37,6 +37,7 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
 export interface ChatSubmitOptions {
   modelSelection?: ModelSelection | undefined;
   reasoningLevel?: ReasoningLevel | undefined;
+  skillMentions?: readonly RuntimeSkillMention[] | undefined;
 }
 
 export interface UseChatRuntimeInput {
@@ -173,6 +174,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
           ...(options.cwd ? { cwd: options.cwd } : {}),
           ...(submitOptions.modelSelection ? { modelSelection: submitOptions.modelSelection } : {}),
           ...(submitOptions.reasoningLevel ? { reasoningLevel: submitOptions.reasoningLevel } : {}),
+          ...(submitOptions.skillMentions && submitOptions.skillMentions.length > 0 ? { skillMentions: [...submitOptions.skillMentions] } : {}),
           signal,
         };
         await client.submitPromptAsync(request);

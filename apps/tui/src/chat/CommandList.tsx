@@ -8,6 +8,7 @@ export function CommandList(props: {
   theme: TuiTheme;
   maxItems?: number | undefined;
   compact?: boolean | undefined;
+  emptyText?: string | undefined;
 }) {
   const maxItems = Math.max(1, props.maxItems ?? DEFAULT_COMMAND_LIST_MAX_ITEMS);
   const visible = visibleItems(props.items, props.selectedIndex, maxItems);
@@ -15,7 +16,7 @@ export function CommandList(props: {
     <box width="100%" flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.default} paddingX={1}>
       <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{props.title}</text>
       {props.items.length === 0 ? (
-        <text fg={props.theme.colors.menu.muted} wrapMode="none" truncate>{"  no commands"}</text>
+        <text fg={props.theme.colors.menu.muted} wrapMode="none" truncate>{`  ${props.emptyText ?? "no commands"}`}</text>
       ) : (
         visible.map(({ item, index }) => (
           <text

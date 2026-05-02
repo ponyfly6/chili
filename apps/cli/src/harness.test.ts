@@ -73,6 +73,70 @@ test("CLI harness promptFragments provider includes chili.base", async () => {
   }
 });
 
+test("CLI prompt fragments inject explicitly mentioned skill bodies for one turn", async () => {
+  const root = await mkdtempName();
+  const repo = join(root, "repo");
+  try {
+    await mkdir(repo, { recursive: true });
+    const skillRegistry = new SkillRegistry([skill("reviewer")]);
+    const fragments = await buildCliPromptFragments({
+      cwd: repo,
+      skillRegistry,
+      turn: {
+        text: "please use $reviewer here",
+      },
+    });
+
+    const body = fragments.find((fragment) => fragment.id === "chili.skill.reviewer");
+    expect(body).toMatchObject({
+      layer: "contextual_user",
+      source: "skills",
+      lifecycle: "turn",
+      metadata: {
+        kind: "skill_body",
+        name: "reviewer",
+        path: "/repo/.chili/skills/reviewer/SKILL.md",
+      },
+    });
+    expect(body?.content).toContain("<instructions>\nreview body\n</instructions>");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI prompt fragments warn instead of choosing ambiguous plain skill mentions", async () => {
+  const userSkill = skill("same", "user");
+  const projectSkill = skill("same", "project");
+  const fragments = await buildCliPromptFragments({
+    cwd: "/repo",
+    skillRegistry: new SkillRegistry([projectSkill], [], [userSkill, projectSkill]),
+    turn: {
+      text: "try $same",
+    },
+  });
+
+  expect(fragments.some((fragment) => fragment.id.startsWith("chili.skill.same"))).toBe(false);
+  expect(fragments.find((fragment) => fragment.id === "chili.skill_mentions.warnings")?.content).toContain("ambiguous");
+});
+
+test("CLI prompt fragments use structured skill path bindings for duplicate names", async () => {
+  const userSkill = skill("same", "user");
+  const projectSkill = skill("same", "project");
+  const fragments = await buildCliPromptFragments({
+    cwd: "/repo",
+    skillRegistry: new SkillRegistry([projectSkill], [], [userSkill, projectSkill]),
+    turn: {
+      text: "try $same",
+      skillMentions: [{ name: "same", path: userSkill.filePath }],
+    },
+  });
+
+  const body = fragments.find((fragment) => fragment.id.startsWith("chili.skill.same"));
+  expect(body?.metadata).toMatchObject({ name: "same", path: userSkill.filePath });
+  expect(body?.content).toContain("review body");
+  expect(fragments.some((fragment) => fragment.id === "chili.skill_mentions.warnings")).toBe(false);
+});
+
 test("CLI runPrompt leaves system prompt selection to the harness service", async () => {
   const submitted: Record<string, unknown>[] = [];
   const harness = {
@@ -210,12 +274,12 @@ async function mkdtempName(): Promise<string> {
   return mkdtemp(join(tmpdir(), "chili-harness-"));
 }
 
-function skill(name: string): Skill {
+function skill(name: string, source: Skill["source"] = "project"): Skill {
   return {
     name,
-    source: "project",
-    filePath: `/repo/.chili/skills/${name}/SKILL.md`,
-    baseDir: `/repo/.chili/skills/${name}`,
+    source,
+    filePath: source === "user" ? `/home/.chili/skills/${name}/SKILL.md` : `/repo/.chili/skills/${name}/SKILL.md`,
+    baseDir: source === "user" ? `/home/.chili/skills/${name}` : `/repo/.chili/skills/${name}`,
     metadata: {
       name,
       description: "Review code changes.",

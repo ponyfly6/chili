@@ -127,6 +127,55 @@ test("RuntimeService passes promptFragments by prompt layer", async () => {
   ]);
 });
 
+test("RuntimeService passes current turn text and skill mentions to prompt fragments", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const observed: unknown[] = [];
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    promptFragments: (input) => {
+      observed.push(input.turn);
+      return input.turn?.skillMentions?.length
+        ? [
+            {
+              id: "chili.skill.reviewer",
+              layer: "contextual_user",
+              source: "skills",
+              priority: 30,
+              lifecycle: "turn",
+              trust: "tool",
+              content: `skill for ${input.turn.text}`,
+            },
+          ]
+        : [];
+    },
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const result = await service.submitPrompt({
+    sessionId: "session_skill_turn" as SessionId,
+    threadId: "thread_skill_turn" as ThreadId,
+    text: "use $reviewer",
+    skillMentions: [{ name: "reviewer", path: "/repo/.chili/skills/reviewer/SKILL.md" }],
+  });
+
+  expect(result.status).toBe("completed");
+  expect(observed).toEqual([
+    {
+      text: "use $reviewer",
+      skillMentions: [{ name: "reviewer", path: "/repo/.chili/skills/reviewer/SKILL.md" }],
+    },
+  ]);
+  expect(runner.turnInputs[0]?.contextualUser).toEqual(["skill for use $reviewer"]);
+  expect(runner.turnInputs[0]?.promptDebug?.fragments).toContainEqual(expect.objectContaining({
+    id: "chili.skill.reviewer",
+    lifecycle: "turn",
+  }));
+});
+
 test("RuntimeService inspectPrompt only assembles prompt debug output", async () => {
   const store = new MemoryEventStore();
   const runner = new FakeAgentRunner();

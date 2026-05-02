@@ -286,6 +286,7 @@ async function printPromptDebug(
       sessionId: session.sessionId,
       threadId: session.threadId,
       cwd: harness.cwd,
+      ...(args.prompt !== undefined ? { text: args.prompt } : {}),
       includeContent: true,
     });
     const output: CliPromptDebugOutput = {
@@ -304,6 +305,7 @@ async function printPromptDebug(
     sessionId: session.sessionId,
     threadId: session.threadId,
     cwd: harness.cwd,
+    ...(args.prompt !== undefined ? { text: args.prompt } : {}),
   });
   const output: CliPromptDebugOutput = {
     sessionId: session.sessionId,

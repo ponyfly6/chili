@@ -26,9 +26,11 @@ export async function loadSkills(options: DiscoverSkillsOptions): Promise<Skills
   const roots = skillRoots({ cwd, homeDir: home, includeAgentsAlias });
   const diagnostics: SkillDiagnostic[] = [];
   const byName = new Map<string, Skill>();
+  const allSkills: Skill[] = [];
 
   for (const root of roots) {
     for (const skill of await loadSkillsFromRoot(root, diagnostics)) {
+      allSkills.push(skill);
       const existing = byName.get(skill.name);
       if (existing) {
         diagnostics.push({
@@ -46,9 +48,16 @@ export async function loadSkills(options: DiscoverSkillsOptions): Promise<Skills
 
   return {
     skills: [...byName.values()].sort((left, right) => left.name.localeCompare(right.name)),
+    allSkills: allSkills.sort(compareSkills),
     diagnostics,
     roots,
   };
+}
+
+function compareSkills(left: Skill, right: Skill): number {
+  return left.name.localeCompare(right.name)
+    || left.source.localeCompare(right.source)
+    || left.filePath.localeCompare(right.filePath);
 }
 
 function skillRoots(input: { cwd: string; homeDir: string; includeAgentsAlias: boolean }): SkillRoot[] {

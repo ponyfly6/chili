@@ -2,8 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type 
 import { useAppContext, useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, MouseEvent, PasteEvent, Selection } from "@opentui/core";
 import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
-import type { ApprovalId, TeamId } from "@chili/protocol";
+import type { ApprovalId, RuntimeSkillMention, TeamId } from "@chili/protocol";
 import { FileAuthStorage, loginOpenAICodex, OPENAI_CODEX_PROVIDER_ID } from "@chili/providers";
+import { discoverSkills, type SkillSummary } from "@chili/skills";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { cleanClipboardText, promptClipboardText, promptPasteBytes, systemClipboard, type ClipboardAccess } from "./clipboard.js";
@@ -102,6 +103,7 @@ export function ChatShellApp(props: {
     sessionId: props.options.sessionId,
     limit: 64,
   });
+  const skills = useSkillSummaries(props.options.cwd ?? process.cwd());
 
   useEffect(() => {
     if (props.options.teamId) {
@@ -122,6 +124,7 @@ export function ChatShellApp(props: {
       selectedTeamLocked={Boolean(props.options.teamId)}
       onSelectTeam={setSelectedTeamId}
       onExit={props.onExit}
+      skills={skills}
     />
   );
 }
@@ -137,6 +140,7 @@ export function ChatShellSurface(props: {
   commands?: readonly SlashCommand[];
   clipboard?: ClipboardAccess | undefined;
   localMessageTtlMs?: number | undefined;
+  skills?: readonly SkillSummary[] | undefined;
 }) {
   const dimensions = useTerminalDimensions();
   const { keyHandler } = useAppContext();
@@ -144,6 +148,7 @@ export function ChatShellSurface(props: {
   const commands = useMemo(() => props.commands ?? createDefaultSlashCommands(), [props.commands]);
   const [view, setView] = useState<ShellView>("chat");
   const [promptParts, setPromptParts] = useState<PromptPart[]>([{ type: "text", text: "" }]);
+  const [skillMentionBindings, setSkillMentionBindings] = useState<RuntimeSkillMention[]>([]);
   const [localItems, setLocalItems] = useState<LocalTranscriptItem[]>([]);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteIndex, setPaletteIndex] = useState(0);
@@ -224,12 +229,18 @@ export function ChatShellSurface(props: {
     modelCandidates,
   }), [modelCandidates, modelSelection, props.model, props.options?.cwd, reasoningLevel]);
   const completionSuppressed = acceptedCompletionPrompt !== undefined && prompt === acceptedCompletionPrompt;
-  const completions = prompt.startsWith("/") && !completionSuppressed
+  const skillTrigger = activeSkillMentionTrigger(prompt);
+  const skillCompletionItems = skillTrigger && !prompt.startsWith("/")
+    ? skillCompletions(props.skills ?? [], skillTrigger.query)
+    : [];
+  const skillCompletionOpen = Boolean(skillTrigger && !prompt.startsWith("/"));
+  const slashCompletionItems = prompt.startsWith("/") && !completionSuppressed
     ? slashCompletions(commands, slashContext, prompt)
     : [];
+  const completions = skillCompletionOpen ? skillCompletionItems : slashCompletionItems;
   const resolvedSlashPrompt = prompt.startsWith("/") ? resolveSlashCommand(commands, prompt) : undefined;
   const slashInputActive = prompt.startsWith("/") && (prompt.trim() === "/" || completions.length > 0 || resolvedSlashPrompt !== undefined);
-  const slashCompletionOpen = prompt.startsWith("/") && completions.length > 0;
+  const slashCompletionOpen = prompt.startsWith("/") && slashCompletionItems.length > 0;
   const selectedCompletionIndex = clampIndex(completionIndex, completions.length);
   const paletteItems = slashCompletions(commands, slashContext, "/", 10);
   const firstApproval = props.runtime.chatView.pendingApprovals[0];
@@ -255,6 +266,9 @@ export function ChatShellSurface(props: {
     history.resetNavigation();
     setPrompt(value);
   }, [history, setPrompt, updateAcceptedCompletionPrompt]);
+  useEffect(() => {
+    setSkillMentionBindings((current) => filterSkillMentionBindings(current, prompt));
+  }, [prompt]);
   const setPromptFromHistory = useCallback((value: string) => {
     updateAcceptedCompletionPrompt(undefined);
     historyPromptValueRef.current = value;
@@ -392,14 +406,29 @@ export function ChatShellSurface(props: {
   }), [appendLocalItem, ensureOpenAICodexDefaultModel, openModelPicker, openReasoningPicker, openThemePicker, setAuthManualPrompt, setModelSelection, setPrompt, setReasoningLevel, startNewChatSession]);
   const runSelectedSlashCompletion = useCallback(() => {
     if (!slashCompletionOpen) return false;
-    const completion = completions[selectedCompletionIndex] ?? completions[0];
+    const completion = slashCompletionItems[selectedCompletionIndex] ?? slashCompletionItems[0];
     if (!completion) return false;
     updateAcceptedCompletionPrompt(undefined);
     history.resetNavigation();
     setPrompt("");
     void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, slashActions);
     return true;
-  }, [commands, completions, history, props.model, props.runtime, selectedCompletionIndex, setPrompt, slashActions, slashCompletionOpen, slashContext, updateAcceptedCompletionPrompt]);
+  }, [commands, history, props.model, props.runtime, selectedCompletionIndex, setPrompt, slashActions, slashCompletionItems, slashCompletionOpen, slashContext, updateAcceptedCompletionPrompt]);
+  const runSelectedSkillCompletion = useCallback(() => {
+    if (!skillCompletionOpen || !skillTrigger) return false;
+    const completion = skillCompletionItems[selectedCompletionIndex] ?? skillCompletionItems[0];
+    if (!completion?.skill) return false;
+    insertSkillMention({
+      skill: completion.skill,
+      trigger: skillTrigger,
+      prompt,
+      setPrompt,
+      setSkillMentionBindings,
+      history,
+      updateAcceptedCompletionPrompt,
+    });
+    return true;
+  }, [history, prompt, selectedCompletionIndex, setPrompt, skillCompletionItems, skillCompletionOpen, skillTrigger, updateAcceptedCompletionPrompt]);
   useEffect(() => {
     setCompletionIndex(0);
   }, [prompt]);
@@ -577,13 +606,16 @@ export function ChatShellSurface(props: {
       }
       return;
     }
-    if (slashCompletionOpen && !key.shift && (isArrowUp(key) || isArrowDown(key))) {
+    if ((slashCompletionOpen || skillCompletionOpen) && !key.shift && (isArrowUp(key) || isArrowDown(key))) {
       const delta = isArrowUp(key) ? -1 : 1;
       setCompletionIndex((current) => clampIndex(current + delta, completions.length));
       return;
     }
+    if (skillCompletionOpen && isTab(key)) {
+      if (runSelectedSkillCompletion()) return;
+    }
     if (slashCompletionOpen && isTab(key)) {
-      const completion = completions[selectedCompletionIndex] ?? completions[0];
+      const completion = slashCompletionItems[selectedCompletionIndex] ?? slashCompletionItems[0];
       if (completion) {
         const accepted = `${completion.value} `;
         history.resetNavigation();
@@ -620,12 +652,12 @@ export function ChatShellSurface(props: {
       setTranscriptScrollOffset((current) => Math.max(0, current - scrollStep(dimensions.height)));
       return;
     }
-    if (view === "chat" && !promptDisabled && isPlainArrowUp(key) && !slashCompletionOpen) {
+    if (view === "chat" && !promptDisabled && isPlainArrowUp(key) && !slashCompletionOpen && !skillCompletionOpen) {
       const previous = history.previous(prompt);
       if (previous !== undefined) setPromptFromHistory(previous);
       return;
     }
-    if (view === "chat" && !promptDisabled && isPlainArrowDown(key) && !slashCompletionOpen) {
+    if (view === "chat" && !promptDisabled && isPlainArrowDown(key) && !slashCompletionOpen && !skillCompletionOpen) {
       const next = history.next(prompt);
       if (next !== undefined) setPromptFromHistory(next);
       return;
@@ -688,10 +720,14 @@ export function ChatShellSurface(props: {
           onPromptChange={handlePromptChange}
           onSubmit={() => {
             if (submitAuthManualInput()) return;
+            if (runSelectedSkillCompletion()) return;
             if (runSelectedSlashCompletion()) return;
-            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record);
+            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings);
           }}
           completions={completions}
+          completionOpen={skillCompletionOpen || slashCompletionOpen}
+          completionTitle={skillCompletionOpen ? "Skills" : "Commands"}
+          emptyCompletionText={skillCompletionOpen ? "no skills" : "no commands"}
           completionIndex={selectedCompletionIndex}
           paletteOpen={paletteOpen}
           paletteItems={paletteItems}
@@ -721,9 +757,10 @@ export function ChatShellSurface(props: {
           onPromptChange={handlePromptChange}
           onSubmit={() => {
             if (submitAuthManualInput()) return;
+            if (runSelectedSkillCompletion()) return;
             if (runSelectedSlashCompletion()) return;
             setMessageScrollOffset(0);
-            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record);
+            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings);
           }}
           onMessageScroll={(event) => {
             const direction = event.scroll?.direction;
@@ -755,6 +792,9 @@ export function ChatShellSurface(props: {
           messageScrollOffset={messageScrollOffset}
           transcriptScrollOffset={transcriptScrollOffset}
           completions={completions}
+          completionOpen={skillCompletionOpen || slashCompletionOpen}
+          completionTitle={skillCompletionOpen ? "Skills" : "Commands"}
+          emptyCompletionText={skillCompletionOpen ? "no skills" : "no commands"}
           completionIndex={selectedCompletionIndex}
           paletteOpen={paletteOpen}
           paletteItems={paletteItems}
@@ -788,6 +828,9 @@ function HomeScreen(props: {
   onPromptChange: (value: string) => void;
   onSubmit: () => void;
   completions: readonly SlashCompletion[];
+  completionOpen: boolean;
+  completionTitle: string;
+  emptyCompletionText: string;
   completionIndex: number;
   paletteOpen: boolean;
   paletteItems: readonly SlashCompletion[];
@@ -816,7 +859,7 @@ function HomeScreen(props: {
     themePickerHeight,
     selectorHeight,
     feedback: Boolean(feedback),
-    menuOpen: props.paletteOpen || props.completions.length > 0,
+    menuOpen: props.paletteOpen || props.completionOpen || props.completions.length > 0,
   });
   return (
     <box width="100%" height="100%" flexDirection="column">
@@ -838,6 +881,9 @@ function HomeScreen(props: {
           onPromptChange={props.onPromptChange}
           onSubmit={props.onSubmit}
           completions={props.completions}
+          completionOpen={props.completionOpen}
+          completionTitle={props.completionTitle}
+          emptyCompletionText={props.emptyCompletionText}
           completionIndex={props.completionIndex}
           paletteOpen={props.paletteOpen}
           paletteItems={props.paletteItems}
@@ -867,6 +913,9 @@ function SessionScreen(props: {
   messageScrollOffset: number;
   transcriptScrollOffset: number;
   completions: readonly SlashCompletion[];
+  completionOpen: boolean;
+  completionTitle: string;
+  emptyCompletionText: string;
   completionIndex: number;
   paletteOpen: boolean;
   paletteItems: readonly SlashCompletion[];
@@ -897,10 +946,11 @@ function SessionScreen(props: {
     themePickerHeight,
     selectorHeight,
     feedback: Boolean(feedback),
-    menuOpen: props.paletteOpen || props.completions.length > 0,
+    menuOpen: props.paletteOpen || props.completionOpen || props.completions.length > 0,
   });
   const promptHeight = promptComposerHeight({
     completions: props.completions,
+    completionOpen: props.completionOpen,
     paletteOpen: props.paletteOpen,
     paletteItems: props.paletteItems,
     feedback,
@@ -967,6 +1017,9 @@ function SessionScreen(props: {
           onPromptChange={props.onPromptChange}
           onSubmit={props.onSubmit}
           completions={props.completions}
+          completionOpen={props.completionOpen}
+          completionTitle={props.completionTitle}
+          emptyCompletionText={props.emptyCompletionText}
           completionIndex={props.completionIndex}
           paletteOpen={props.paletteOpen}
           paletteItems={props.paletteItems}
@@ -1079,6 +1132,13 @@ interface ReasoningPickerItem {
   description: string;
   current: boolean;
 }
+
+interface SkillMentionTrigger {
+  start: number;
+  query: string;
+}
+
+type SkillCompletion = SlashCompletion & { skill: SkillSummary };
 
 function pickerHeight(itemCount: number): number {
   return itemCount + 3;
@@ -1261,6 +1321,116 @@ function reasoningDescription(level: ReasoningLevel): string {
   }
 }
 
+function activeSkillMentionTrigger(prompt: string): SkillMentionTrigger | undefined {
+  const match = /(?:^|\s)\$([A-Za-z0-9._-]*)$/.exec(prompt);
+  if (!match) return undefined;
+  const token = match[0] ?? "";
+  const query = match[1] ?? "";
+  return {
+    start: match.index + token.indexOf("$"),
+    query,
+  };
+}
+
+function skillCompletions(skills: readonly SkillSummary[], query: string): SkillCompletion[] {
+  const normalized = query.trim().toLowerCase();
+  return skills
+    .filter((skill) => skill.hidden !== true)
+    .filter((skill) => skillMatches(skill, normalized))
+    .sort((left, right) => left.name.localeCompare(right.name) || left.filePath.localeCompare(right.filePath))
+    .slice(0, 8)
+    .map((skill) => ({
+      value: `$${skill.name}`,
+      label: `$${skill.name}`,
+      description: skillDescription(skill),
+      category: "skills",
+      skill,
+    }));
+}
+
+function skillMatches(skill: SkillSummary, query: string): boolean {
+  if (!query) return true;
+  const haystack = `${skill.name} ${skill.description} ${skill.source}`.toLowerCase();
+  return haystack.includes(query) || fuzzyMatchText(haystack, query);
+}
+
+function skillDescription(skill: SkillSummary): string {
+  const description = skill.description.replace(/\s+/g, " ").trim();
+  return `${skill.source} ${description}`;
+}
+
+function insertSkillMention(input: {
+  skill: SkillSummary;
+  trigger: SkillMentionTrigger;
+  prompt: string;
+  setPrompt: (value: string | ((current: string) => string)) => void;
+  setSkillMentionBindings: Dispatch<SetStateAction<RuntimeSkillMention[]>>;
+  history: ReturnType<typeof usePromptHistory>;
+  updateAcceptedCompletionPrompt: (value: string | undefined) => void;
+}): void {
+  const next = `${input.prompt.slice(0, input.trigger.start)}$${input.skill.name} ${input.prompt.slice(input.trigger.start + input.trigger.query.length + 1)}`;
+  input.history.resetNavigation();
+  input.updateAcceptedCompletionPrompt(undefined);
+  input.setSkillMentionBindings((current) => upsertSkillMentionBinding(current, {
+    name: input.skill.name,
+    path: input.skill.filePath,
+  }));
+  input.setPrompt(next);
+}
+
+function upsertSkillMentionBinding(
+  bindings: readonly RuntimeSkillMention[],
+  mention: RuntimeSkillMention,
+): RuntimeSkillMention[] {
+  const output = bindings.filter((binding) => binding.name !== mention.name);
+  output.push(mention);
+  return output;
+}
+
+function activeSkillMentionsOption(
+  prompt: string,
+  bindings: readonly RuntimeSkillMention[],
+): { skillMentions?: RuntimeSkillMention[] } {
+  const active = filterSkillMentionBindings(bindings, prompt);
+  return active.length > 0 ? { skillMentions: active } : {};
+}
+
+function filterSkillMentionBindings(
+  bindings: readonly RuntimeSkillMention[],
+  prompt: string,
+): RuntimeSkillMention[] {
+  const activeNames = new Set(extractSkillMentionNames(prompt));
+  const seen = new Set<string>();
+  const active: RuntimeSkillMention[] = [];
+  for (const binding of bindings) {
+    if (!activeNames.has(binding.name)) continue;
+    const key = `${binding.name}\0${binding.path ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    active.push(binding);
+  }
+  return active;
+}
+
+function extractSkillMentionNames(prompt: string): string[] {
+  const names: string[] = [];
+  for (const match of prompt.matchAll(/(^|[^A-Za-z0-9_$])\$([A-Za-z0-9][A-Za-z0-9._-]{0,127})/g)) {
+    const name = match[2];
+    if (name && !names.includes(name)) names.push(name);
+  }
+  return names;
+}
+
+function fuzzyMatchText(value: string, query: string): boolean {
+  let index = 0;
+  for (const char of query) {
+    index = value.indexOf(char, index);
+    if (index === -1) return false;
+    index += 1;
+  }
+  return true;
+}
+
 function HelpView(props: { commands: readonly SlashCommand[]; theme: TuiTheme; showToolDetails: boolean }) {
   const detailsText = props.showToolDetails ? "on" : "off";
   return (
@@ -1335,6 +1505,7 @@ async function submitPrompt(
   runtime: ChatRuntimeState,
   actions: SlashActions,
   onAccepted?: (text: string) => void,
+  skillMentionBindings: readonly RuntimeSkillMention[] = [],
 ): Promise<void> {
   const trimmed = prompt.trim();
   if (!trimmed) return;
@@ -1357,6 +1528,7 @@ async function submitPrompt(
   const accepted = await runtime.submitPrompt(trimmed, {
     ...(ctx.modelSelection ? { modelSelection: ctx.modelSelection } : {}),
     ...(ctx.reasoningLevel ? { reasoningLevel: ctx.reasoningLevel } : {}),
+    ...activeSkillMentionsOption(trimmed, skillMentionBindings),
   });
   if (accepted) {
     onAccepted?.(trimmed);
@@ -1678,6 +1850,24 @@ function latestAssistantText(items: readonly ChatTranscriptItem[]): string | und
     if (text.trim()) return text;
   }
   return undefined;
+}
+
+function useSkillSummaries(cwd: string): readonly SkillSummary[] {
+  const [skills, setSkills] = useState<readonly SkillSummary[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    void discoverSkills({ cwd })
+      .then((registry) => {
+        if (!cancelled) setSkills(registry.listAll());
+      })
+      .catch(() => {
+        if (!cancelled) setSkills([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [cwd]);
+  return skills;
 }
 
 function useGitBranch(cwd: string, explicitBranch: string | undefined): string | undefined {

@@ -98,6 +98,13 @@ export function createDefaultSlashCommands(): SlashCommand[] {
       run: () => ({ type: "auth_action", action: "status", provider: "openai-codex" }),
     },
     {
+      name: "skills",
+      description: "List skills",
+      category: "skills",
+      isSafeConcurrent: true,
+      run: () => ({ type: "insert_prompt", text: "$" }),
+    },
+    {
       name: "model",
       description: "Select model",
       category: "model",

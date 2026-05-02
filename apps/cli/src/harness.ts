@@ -20,6 +20,7 @@ import {
   createMemoryTool,
   defaultScopedWorkerPolicy,
   type PromptFragment,
+  type RuntimePromptTurnContext,
   type WorkerToolPolicy,
 } from "@chili/core";
 import type { AgentPath, EventEnvelope, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
@@ -87,7 +88,15 @@ import {
   type TeamToolController,
   type ToolAccessPolicyResolver,
 } from "@chili/tools";
-import { discoverSkills, formatAvailableSkillsPrompt, type SkillRegistry } from "@chili/skills";
+import {
+  discoverSkills,
+  formatAvailableSkillsPrompt,
+  formatSkillBodyPrompt,
+  resolveSkillMentions,
+  type Skill,
+  type SkillMentionDiagnostic,
+  type SkillRegistry,
+} from "@chili/skills";
 import { createCliApprovalBroker, createCliPermissionRules } from "./approval.js";
 import { createIdFactory } from "./id.js";
 import type { CliModelName, CliReasoningLevel } from "./model.js";
@@ -145,14 +154,20 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const skillRegistry = await discoverSkills({ cwd });
   const registry = createToolRegistry(skillRegistry);
   const childRegistry = createChildToolRegistry(skillRegistry);
-  const promptFragments = (context: { cwd: string }) => buildCliPromptFragments({ cwd: context.cwd, skillRegistry });
-  const childPromptFragments = (context: { sessionId: SessionId; threadId: ThreadId; cwd: string }) =>
+  const promptFragments = (context: { cwd: string; turn?: RuntimePromptTurnContext }) =>
+    buildCliPromptFragments({
+      cwd: context.cwd,
+      skillRegistry,
+      ...(context.turn ? { turn: context.turn } : {}),
+    });
+  const childPromptFragments = (context: { sessionId: SessionId; threadId: ThreadId; cwd: string; turn?: RuntimePromptTurnContext }) =>
     buildCliChildPromptFragments({
       cwd: context.cwd,
       sessionId: context.sessionId,
       threadId: context.threadId,
       skillRegistry,
       store: eventStore,
+      ...(context.turn ? { turn: context.turn } : {}),
     });
   const subagentPromptFragments = (context: { cwd: string }) => buildCliPromptFragments({ cwd: context.cwd, skillRegistry });
   const snapshotProvider = new FileSystemSnapshotProvider({
@@ -418,6 +433,7 @@ function workerToolPolicyFromEvent(
 export async function buildCliPromptFragments(input: {
   cwd: string;
   skillRegistry: SkillRegistry;
+  turn?: RuntimePromptTurnContext;
   homeDir?: string;
   projectRoot?: string;
 }): Promise<PromptFragment[]> {
@@ -441,6 +457,7 @@ export async function buildCliPromptFragments(input: {
       content: skillsPrompt,
     });
   }
+  context.push(...buildSkillMentionPromptFragments(input.skillRegistry, input.turn));
   return context;
 }
 
@@ -450,6 +467,7 @@ export async function buildCliChildPromptFragments(input: {
   threadId: ThreadId;
   skillRegistry: SkillRegistry;
   store: ObservableEventStore;
+  turn?: RuntimePromptTurnContext;
   homeDir?: string;
   projectRoot?: string;
 }): Promise<PromptFragment[]> {
@@ -457,6 +475,7 @@ export async function buildCliChildPromptFragments(input: {
     ...(await buildCliPromptFragments({
       cwd: input.cwd,
       skillRegistry: input.skillRegistry,
+      ...(input.turn ? { turn: input.turn } : {}),
       ...(input.homeDir ? { homeDir: input.homeDir } : {}),
       ...(input.projectRoot ? { projectRoot: input.projectRoot } : {}),
     })),
@@ -504,6 +523,72 @@ function taskFollowupPromptFragment(task: AgentTaskRow): PromptFragment {
       "This is a follow-up for an existing task; answer in the task context and call complete_task with this task id when finished.",
     ].join(" "),
   };
+}
+
+function buildSkillMentionPromptFragments(
+  skillRegistry: SkillRegistry,
+  turn: RuntimePromptTurnContext | undefined,
+): PromptFragment[] {
+  if (!turn) return [];
+  const resolved = resolveSkillMentions({
+    text: turn.text,
+    ...(turn.skillMentions ? { mentions: turn.skillMentions } : {}),
+    registry: skillRegistry,
+  });
+  const fragments = resolved.skills.map((skill, index, skills) => skillBodyPromptFragment(skill, needsPathSuffix(skill, skills)));
+  if (resolved.diagnostics.length > 0) fragments.push(skillMentionWarningsFragment(resolved.diagnostics));
+  return fragments;
+}
+
+function skillBodyPromptFragment(skill: Skill, withPathSuffix: boolean): PromptFragment {
+  return {
+    id: `chili.skill.${promptFragmentIdPart(skill.name)}${withPathSuffix ? `.${shortHash(skill.filePath)}` : ""}`,
+    layer: "contextual_user",
+    source: "skills",
+    priority: 30,
+    lifecycle: "turn",
+    trust: "tool",
+    content: formatSkillBodyPrompt(skill),
+    metadata: {
+      kind: "skill_body",
+      name: skill.name,
+      path: skill.filePath,
+      source: skill.source,
+    },
+  };
+}
+
+function skillMentionWarningsFragment(diagnostics: readonly SkillMentionDiagnostic[]): PromptFragment {
+  return {
+    id: "chili.skill_mentions.warnings",
+    layer: "contextual_user",
+    source: "skills",
+    priority: 31,
+    lifecycle: "turn",
+    trust: "tool",
+    content: diagnostics.map((diagnostic) => `[skill mention warning] ${diagnostic.message}`).join("\n"),
+    metadata: {
+      kind: "skill_mention_warnings",
+      count: diagnostics.length,
+    },
+  };
+}
+
+function needsPathSuffix(skill: Skill, skills: readonly Skill[]): boolean {
+  return skills.filter((candidate) => candidate.name === skill.name).length > 1;
+}
+
+function promptFragmentIdPart(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]+/g, "_");
+}
+
+function shortHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0").slice(0, 8);
 }
 
 function createToolRegistry(skillRegistry: SkillRegistry): InMemoryToolRegistry {

@@ -55,6 +55,7 @@ export interface SkillRoot {
 
 export interface SkillsLoadResult {
   skills: readonly Skill[];
+  allSkills: readonly Skill[];
   diagnostics: readonly SkillDiagnostic[];
   roots: readonly SkillRoot[];
 }

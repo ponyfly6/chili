@@ -285,6 +285,10 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       result.content = true;
       continue;
     }
+    if (arg === "--text") {
+      prompt.push(requireValue(arg, args));
+      continue;
+    }
     if (arg === "--once") {
       result.once = true;
       continue;
@@ -359,7 +363,7 @@ export function usage(): string {
     "  bun run chili -- memory show",
     "  bun run chili -- memory add [--user|--project] \"remember this\"",
     "  bun run chili -- memory reload",
-    "  bun run chili -- prompt-debug [--resume <session-id>] [--thread <thread-id>] [--content] [--json]",
+    "  bun run chili -- prompt-debug [--resume <session-id>] [--thread <thread-id>] [--text <prompt>] [--content] [--json]",
     "  bun run chili -- consume <mailbox-message-id>",
     "  bun run chili -- task <task-id>",
     "  bun run chili -- followup <task-id> \"continue this task\"",
@@ -387,6 +391,7 @@ export function usage(): string {
     "  --reasoning <level> Alias for --thinking",
     "  --yes, -y           Auto-approve tool permissions",
     "  --json              Print machine-readable JSON for supported read commands",
+    "  --text <prompt>     Assemble prompt-debug as if this current-turn text were submitted",
     "  --content           Include prompt fragment content for prompt-debug",
     "  --once              Run one team execution cycle",
     "  --max-turns <n>     Max automatic tool-use continuation turns before final answer, default 128",

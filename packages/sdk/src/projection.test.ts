@@ -1847,7 +1847,14 @@ test("client can cancel chat commands without serializing AbortSignal", async ()
   const client = new HttpRuntimeClient({ baseUrl: "http://runtime.test/api", fetch: fetchImpl });
 
   await client.createSession({ cwd: "/repo", signal: controller.signal });
-  await client.submitPromptAsync({ sessionId, threadId, text: "hello", cwd: "/repo", signal: controller.signal });
+  await client.submitPromptAsync({
+    sessionId,
+    threadId,
+    text: "hello",
+    cwd: "/repo",
+    skillMentions: [{ name: "reviewer", path: "/repo/.chili/skills/reviewer/SKILL.md" }],
+    signal: controller.signal,
+  });
   await client.interruptSession({ sessionId, reason: "stop", signal: controller.signal });
   await client.approveApproval({ approvalId: "approval_sdk_abort" as ApprovalId, signal: controller.signal });
   await client.rejectApproval({ approvalId: "approval_sdk_abort" as ApprovalId, feedback: "no", signal: controller.signal });
@@ -1860,7 +1867,13 @@ test("client can cancel chat commands without serializing AbortSignal", async ()
     },
     {
       url: "http://runtime.test/api/sessions/session_sdk_abort/prompt_async",
-      body: { sessionId, threadId, text: "hello", cwd: "/repo" },
+      body: {
+        sessionId,
+        threadId,
+        text: "hello",
+        cwd: "/repo",
+        skillMentions: [{ name: "reviewer", path: "/repo/.chili/skills/reviewer/SKILL.md" }],
+      },
       signalled: true,
     },
     {

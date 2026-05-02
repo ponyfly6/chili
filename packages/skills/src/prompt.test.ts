@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { SkillRegistry } from "./registry.js";
-import { formatAvailableSkillsPrompt } from "./prompt.js";
+import { resolveSkillMentions } from "./mentions.js";
+import { formatAvailableSkillsPrompt, formatSkillBodyPrompt } from "./prompt.js";
 import type { Skill } from "./types.js";
 
 test("available skills prompt omits full bodies and truncates long descriptions", () => {
@@ -19,10 +20,46 @@ test("available skills prompt omits full bodies and truncates long descriptions"
   });
 
   expect(prompt).toContain("<available_skills>");
+  expect(prompt).toContain("$skill-name");
   expect(prompt).toContain("long-skill");
   expect(prompt).toContain("AAAAAAAAAAAAAAAAAAAAA...");
   expect(prompt).toContain("When to use: Use when the user asks for...");
   expect(prompt).not.toContain("SECRET BODY");
+});
+
+test("explicit skill mention resolver prefers structured path bindings and skips ambiguous plain mentions", () => {
+  const userSkill = skill({ name: "dupe", description: "User skill.", body: "user body", source: "user" });
+  const projectSkill = skill({ name: "dupe", description: "Project skill.", body: "project body", source: "project" });
+  const registry = new SkillRegistry([projectSkill], [], [userSkill, projectSkill]);
+
+  const plain = resolveSkillMentions({
+    text: "use $dupe",
+    registry,
+  });
+  expect(plain.skills).toEqual([]);
+  expect(plain.diagnostics).toContainEqual(expect.objectContaining({ code: "skill_ambiguous", name: "dupe" }));
+
+  const structured = resolveSkillMentions({
+    text: "use $dupe twice $dupe",
+    mentions: [{ name: "dupe", path: userSkill.filePath }],
+    registry,
+  });
+  expect(structured.skills.map((item) => item.filePath)).toEqual([userSkill.filePath]);
+  expect(structured.diagnostics).toEqual([]);
+});
+
+test("skill body prompt includes full body for contextual injection", () => {
+  const prompt = formatSkillBodyPrompt(skill({
+    name: "writer",
+    description: "Write docs.",
+    when_to_use: "When docs are requested.",
+    body: "# Instructions\nKeep docs crisp.\n",
+  }));
+
+  expect(prompt).toContain("<skill name=\"writer\" source=\"project\">");
+  expect(prompt).toContain("description: Write docs.");
+  expect(prompt).toContain("when_to_use: When docs are requested.");
+  expect(prompt).toContain("# Instructions\nKeep docs crisp.");
 });
 
 test("available skills prompt hides hidden skills by default", () => {
@@ -43,6 +80,7 @@ function skill(input: {
   body: string;
   when_to_use?: string;
   hidden?: boolean;
+  source?: Skill["source"];
 }): Skill {
   const metadata: Skill["metadata"] = {
     name: input.name,
@@ -52,9 +90,9 @@ function skill(input: {
   if (input.hidden !== undefined) metadata.hidden = input.hidden;
   return {
     name: input.name,
-    source: "project",
-    filePath: `/repo/.chili/skills/${input.name}/SKILL.md`,
-    baseDir: `/repo/.chili/skills/${input.name}`,
+    source: input.source ?? "project",
+    filePath: input.source === "user" ? `/home/.chili/skills/${input.name}/SKILL.md` : `/repo/.chili/skills/${input.name}/SKILL.md`,
+    baseDir: input.source === "user" ? `/home/.chili/skills/${input.name}` : `/repo/.chili/skills/${input.name}`,
     metadata,
     body: input.body,
   };

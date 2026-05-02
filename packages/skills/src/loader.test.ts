@@ -24,10 +24,15 @@ test("project skill overrides same-name user skill", async () => {
   await writeSkill(fixture.home, "user", "shared-skill", "User description.", "user body");
   await writeSkill(fixture.cwd, "project", "shared-skill", "Project description.", "project body");
 
+  const result = await loadSkills({ cwd: fixture.cwd, homeDir: fixture.home });
   const registry = await discoverSkills({ cwd: fixture.cwd, homeDir: fixture.home });
   const skill = registry.get("shared-skill");
 
+  expect(result.skills).toHaveLength(1);
+  expect(result.allSkills.map((item) => `${item.source}:${item.filePath}`)).toHaveLength(2);
   expect(skill?.source).toBe("project");
+  expect(registry.findByName("shared-skill")).toHaveLength(2);
+  expect(registry.getByPath(path.join(fixture.home, ".chili", "skills", "shared-skill", "SKILL.md"))?.source).toBe("user");
   expect(skill?.body).toBe("project body\n");
   expect(registry.diagnostics()).toContainEqual(expect.objectContaining({ code: "skill_overridden" }));
 });

@@ -153,6 +153,10 @@ test("parses prompt-debug command and flags", () => {
     content: true,
     json: true,
   });
+  expect(parseArgs(["prompt-debug", "--text", "use $reviewer"])).toMatchObject({
+    command: "prompt-debug",
+    prompt: "use $reviewer",
+  });
   expect(parseArgs(["prompt-debug", "--cwd", "/repo"])).toMatchObject({
     command: "prompt-debug",
     cwd: "/repo",

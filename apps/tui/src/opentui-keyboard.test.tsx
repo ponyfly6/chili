@@ -8,6 +8,7 @@ import { ChatShellApp, ChatShellSurface } from "./ChatShellApp.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import type { ChatRuntimeState } from "./useChatRuntime.js";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
+import type { SkillSummary } from "@chili/skills";
 import type { TeamLiveSurfaceRuntime } from "./components/types.js";
 import { chiliDarkTheme } from "./theme/index.js";
 import { teamLiveFixture } from "./test-fixtures.js";
@@ -432,6 +433,87 @@ test("Tab accepts slash completion without leaving the completion list open", as
     expect(frame).toContain("/team ");
     expect(frame).not.toContain("Open the team cockpit");
     expect(frame).not.toContain("Start the selected team loop");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("$ opens a skill picker and Tab inserts a path-bound skill mention", async () => {
+  const submissions: Array<{ text: string; skillMentions?: unknown }> = [];
+  const app = await mountShell(teamLiveFixture(), {
+    skills: [skillSummary("reviewer"), skillSummary("react-component")],
+    runtime: {
+      submitPrompt: async (text, options) => {
+        submissions.push({ text, skillMentions: options?.skillMentions });
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "$rev");
+    expect(app.captureCharFrame()).toContain("Skills");
+    expect(app.captureCharFrame()).toContain("> $reviewer");
+
+    await press(app, () => app.mockInput.pressTab());
+    expect(app.captureCharFrame()).toContain("$reviewer ");
+    expect(app.captureCharFrame()).not.toContain("Skills");
+
+    await typeText(app, "please review");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(submissions).toEqual([
+      {
+        text: "$reviewer please review",
+        skillMentions: [{ name: "reviewer", path: "/repo/.chili/skills/reviewer/SKILL.md" }],
+      },
+    ]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("deleted skill mention bindings are not submitted", async () => {
+  const submissions: Array<{ text: string; skillMentions?: unknown }> = [];
+  const app = await mountShell(teamLiveFixture(), {
+    skills: [skillSummary("reviewer")],
+    runtime: {
+      submitPrompt: async (text, options) => {
+        submissions.push({ text, skillMentions: options?.skillMentions });
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "$rev");
+    await press(app, () => app.mockInput.pressTab());
+    await typeText(app, "plain prompt");
+    await backspace(app, "$reviewer plain prompt".length);
+    await typeText(app, "plain prompt");
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(submissions[0]).toEqual({ text: "plain prompt", skillMentions: undefined });
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/skills inserts $ and opens the skill picker", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    skills: [skillSummary("reviewer")],
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "/skills");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("> $");
+    expect(frame).toContain("Skills");
+    expect(frame).toContain("$reviewer");
   } finally {
     app.renderer.destroy();
   }
@@ -1495,6 +1577,7 @@ async function mountShell(
     clipboard?: ClipboardAccess;
     kittyKeyboard?: boolean;
     localMessageTtlMs?: number;
+    skills?: readonly SkillSummary[];
   } = {},
 ) {
   const runtime: ChatRuntimeState = {
@@ -1534,6 +1617,7 @@ async function mountShell(
       options={{ cwd: "/repo/chili", modeName: "Build", modelName: "test-model", providerName: "test-provider" }}
       clipboard={options.clipboard}
       localMessageTtlMs={options.localMessageTtlMs}
+      skills={options.skills}
     />,
     renderOptions,
   );
@@ -1627,6 +1711,16 @@ function fakeClipboard(overrides: Partial<ClipboardAccess> = {}): ClipboardAcces
   };
 }
 
+function skillSummary(name: string): SkillSummary {
+  return {
+    name,
+    source: "project",
+    description: `${name} skill`,
+    filePath: `/repo/.chili/skills/${name}/SKILL.md`,
+    baseDir: `/repo/.chili/skills/${name}`,
+  };
+}
+
 function emitSelection(renderer: { emit: (event: string, ...args: unknown[]) => boolean }, text: string): void {
   renderer.emit("selection", { getSelectedText: () => text });
 }
@@ -1674,6 +1768,12 @@ async function typeText(app: TestRenderHarness, text: string): Promise<void> {
   });
   await Bun.sleep(60);
   await app.renderOnce();
+}
+
+async function backspace(app: TestRenderHarness, count: number): Promise<void> {
+  for (let index = 0; index < count; index += 1) {
+    await press(app, () => app.mockInput.pressBackspace());
+  }
 }
 
 function chatClientRecords(): {

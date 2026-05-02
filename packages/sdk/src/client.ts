@@ -13,6 +13,7 @@ import type {
   RuntimePromptAccepted,
   RuntimePromptResult,
   RuntimeSessionRef,
+  RuntimeSkillMention,
   ModelSelection,
   ReasoningLevel,
   SessionId,
@@ -84,6 +85,7 @@ export interface SubmitPromptRequest {
   sessionId: SessionId;
   threadId: ThreadId;
   text: string;
+  skillMentions?: RuntimeSkillMention[];
   cwd?: string;
   maxTurns?: number;
   modelSelection?: ModelSelection;

@@ -6,6 +6,7 @@ export type SlashCommandCategory =
   | "team"
   | "auth"
   | "model"
+  | "skills"
   | "view"
   | "debug";
 

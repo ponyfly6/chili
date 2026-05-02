@@ -720,6 +720,7 @@ test("serves model control routes and prompt model overrides", async () => {
     body: JSON.stringify({
       threadId: session.threadId,
       text: "hello",
+      skillMentions: [{ name: "reviewer", path: "/repo/.chili/skills/reviewer/SKILL.md" }],
       modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
       reasoningLevel: "xhigh",
     }),
@@ -727,6 +728,7 @@ test("serves model control routes and prompt model overrides", async () => {
   }));
   expect(promptResponse.status).toBe(202);
   expect(service.lastPrompt).toMatchObject({
+    skillMentions: [{ name: "reviewer", path: "/repo/.chili/skills/reviewer/SKILL.md" }],
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
     reasoningLevel: "xhigh",
   });

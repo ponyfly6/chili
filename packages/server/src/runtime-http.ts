@@ -11,6 +11,7 @@ import type {
   RuntimePromptResult,
   RuntimeSessionRef,
   RuntimeTurnResult,
+  RuntimeSkillMention,
   ModelSelection,
   ReasoningLevel,
   SessionId,
@@ -564,6 +565,7 @@ interface CreateSessionBody {
 interface PromptBody {
   threadId?: ThreadId;
   text?: string;
+  skillMentions?: unknown;
   cwd?: string;
   maxTurns?: number;
   modelSelection?: ModelSelection;
@@ -829,10 +831,32 @@ function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody): SubmitP
     text: body.text ?? "",
   };
   if (body.cwd) input.cwd = body.cwd;
+  const skillMentions = parseSkillMentions(body.skillMentions);
+  if (skillMentions.length > 0) input.skillMentions = skillMentions;
   if (body.maxTurns !== undefined) input.maxTurns = body.maxTurns;
   if (isModelSelection(body.modelSelection)) input.modelSelection = body.modelSelection;
   if (isReasoningLevel(body.reasoningLevel)) input.reasoningLevel = body.reasoningLevel;
   return input;
+}
+
+function parseSkillMentions(value: unknown): RuntimeSkillMention[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw badRequest("skillMentions must be an array");
+  const mentions: RuntimeSkillMention[] = [];
+  for (const item of value) {
+    if (!isRecord(item) || typeof item.name !== "string" || item.name.trim().length === 0) {
+      throw badRequest("skillMentions entries require a non-empty name");
+    }
+    const mention: RuntimeSkillMention = { name: item.name.trim() };
+    if (item.path !== undefined) {
+      if (typeof item.path !== "string" || item.path.trim().length === 0) {
+        throw badRequest("skillMentions path must be a non-empty string when provided");
+      }
+      mention.path = item.path;
+    }
+    mentions.push(mention);
+  }
+  return mentions;
 }
 
 function rejectLegacySystemField(body: unknown): void {

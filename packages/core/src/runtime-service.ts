@@ -7,6 +7,7 @@ import type {
   RuntimeModelConfig,
   RuntimeModelDescriptor,
   RuntimeSessionStatus,
+  RuntimeSkillMention,
   SessionId,
   ThreadId,
   TimestampMs,
@@ -49,7 +50,13 @@ export type RuntimePromptFragmentsProvider = (input: {
   sessionId: SessionId;
   threadId: ThreadId;
   cwd: string;
+  turn?: RuntimePromptTurnContext;
 }) => Promise<PromptFragment[]> | PromptFragment[];
+
+export interface RuntimePromptTurnContext {
+  text: string;
+  skillMentions?: readonly RuntimeSkillMention[];
+}
 
 export interface CreateRuntimeSessionInput {
   sessionId?: SessionId;
@@ -66,6 +73,7 @@ export interface SubmitPromptInput {
   sessionId: SessionId;
   threadId: ThreadId;
   text: string;
+  skillMentions?: readonly RuntimeSkillMention[];
   cwd?: string;
   maxTurns?: number;
   modelSelection?: ModelSelection;
@@ -77,6 +85,8 @@ export interface InspectPromptInput {
   sessionId: SessionId;
   threadId: ThreadId;
   cwd: string;
+  text?: string;
+  skillMentions?: readonly RuntimeSkillMention[];
   includeContent?: boolean;
 }
 
@@ -265,6 +275,7 @@ export class RuntimeService {
       sessionId: input.sessionId,
       threadId: input.threadId,
       cwd: input.cwd,
+      ...(input.text !== undefined ? { turn: turnContext(input) } : {}),
     });
     if (!input.includeContent) return prompt.debug;
     return {
@@ -301,6 +312,7 @@ export class RuntimeService {
         sessionId: input.sessionId,
         threadId: input.threadId,
         cwd,
+        turn: turnContext(input),
       });
 
       await this.publishStatus({
@@ -486,11 +498,13 @@ export class RuntimeService {
     sessionId: SessionId;
     threadId: ThreadId;
     cwd: string;
+    turn?: RuntimePromptTurnContext;
   }): Promise<PromptAssembly> {
     const fragments = await this.options.promptFragments?.({
       sessionId: input.sessionId,
       threadId: input.threadId,
       cwd: input.cwd,
+      ...(input.turn ? { turn: input.turn } : {}),
     });
     return new PromptAssembler().addMany(fragments).assemble();
   }
@@ -694,6 +708,14 @@ export class RuntimeService {
 
 function defaultCreateId(prefix: string): string {
   return `${prefix}_${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+function turnContext(input: { text?: string; skillMentions?: readonly RuntimeSkillMention[] }): RuntimePromptTurnContext {
+  const turn: RuntimePromptTurnContext = {
+    text: input.text ?? "",
+  };
+  if (input.skillMentions && input.skillMentions.length > 0) turn.skillMentions = input.skillMentions;
+  return turn;
 }
 
 function defaultSessionModelState(options: RuntimeServiceOptions): RuntimeSessionModelState {
