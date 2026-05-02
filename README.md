@@ -66,6 +66,23 @@ bun run chili -- --resume <session-id> "继续"
 bun run chili -- --model fake "read package"
 ```
 
+查看 prompt 分层和当前注入的上下文：
+
+```bash
+bun run chili -- prompt-debug --cwd .
+bun run chili -- prompt-debug --cwd . --text 'use $reviewer' --content
+```
+
+Skills 可以用 `$skill` 显式激活，也可以在 CLI/TUI 中启用或禁用：
+
+```bash
+bun run chili -- skills
+bun run chili -- skills disable reviewer
+bun run chili -- skills enable --user reviewer
+```
+
+TUI 中执行 `/skills` 会打开 `$` skill picker，`/skills enable|disable <name>` 会更新 skill 配置。
+
 默认模型是 `minimax`。它会加载自研 `@chili/providers` 里的 MiniMax router：
 
 ```bash
@@ -142,6 +159,8 @@ bun run scripts/probe-minimax.ts --mock
 已有分层 smoke 仍可单独运行：`smoke:cli`、`smoke:p0p1`、`smoke:p2`、`smoke:p2-control`、`smoke:p3`、`smoke:p3-background`。`bun run test:index` 会输出当前 smoke 脚本和按 workspace 分组的 `*.test.ts` 清单，便于后续 worker 快速选择验证范围。
 
 配置好真实 MiniMax key 后，可以运行 `bun run probe:minimax` 做端到端探针。
+
+Prompt、memory/project context 和 skills 的维护说明见 [docs/prompt-skills.md](docs/prompt-skills.md)。
 
 ---
 
