@@ -25,6 +25,7 @@ export interface CliArgs {
     | "task-wait"
     | "task-close"
     | "tasks-reconcile-stale"
+    | "prompt-debug"
     | "mailbox"
     | "mailbox-consume"
     | "memory-show"
@@ -36,6 +37,7 @@ export interface CliArgs {
   host: string;
   port: number;
   resume?: string;
+  threadId?: string;
   snapshotId?: string;
   taskId?: string;
   teamId?: string;
@@ -50,6 +52,7 @@ export interface CliArgs {
   reasoningLevel?: CliReasoningLevel;
   yes: boolean;
   json: boolean;
+  content: boolean;
   once: boolean;
   maxTurns: number;
 }
@@ -63,6 +66,7 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     port: 4777,
     yes: false,
     json: false,
+    content: false,
     once: false,
     maxTurns: 128,
   };
@@ -188,6 +192,10 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       parseMemoryCommand(result, args, prompt);
       continue;
     }
+    if (arg === "prompt-debug") {
+      result.command = "prompt-debug";
+      continue;
+    }
     if (arg === "consume") {
       result.command = "mailbox-consume";
       result.messageId = requireValue(arg, args);
@@ -247,6 +255,10 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       result.resume = requireValue(arg, args);
       continue;
     }
+    if (arg === "--thread") {
+      result.threadId = requireValue(arg, args);
+      continue;
+    }
     if (arg === "--provider") {
       result.provider = requireValue(arg, args);
       continue;
@@ -267,6 +279,10 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     }
     if (arg === "--json") {
       result.json = true;
+      continue;
+    }
+    if (arg === "--content") {
+      result.content = true;
       continue;
     }
     if (arg === "--once") {
@@ -343,6 +359,7 @@ export function usage(): string {
     "  bun run chili -- memory show",
     "  bun run chili -- memory add [--user|--project] \"remember this\"",
     "  bun run chili -- memory reload",
+    "  bun run chili -- prompt-debug [--resume <session-id>] [--thread <thread-id>] [--content] [--json]",
     "  bun run chili -- consume <mailbox-message-id>",
     "  bun run chili -- task <task-id>",
     "  bun run chili -- followup <task-id> \"continue this task\"",
@@ -363,12 +380,14 @@ export function usage(): string {
     "  --host <host>       Runtime server host, default 127.0.0.1",
     "  --port <port>       Runtime server port for serve, default 4777",
     "  --resume, -r <id>   Resume a session",
+    "  --thread <id>       Select a thread for prompt-debug",
     "  --provider <name>   Provider name: minimax | deepseek | codex | openai-codex",
     "  --model <pattern>   Provider alias, provider/model, or bare model id; default minimax",
     "  --thinking <level>  Thinking level: off | minimal | low | medium | high | xhigh",
     "  --reasoning <level> Alias for --thinking",
     "  --yes, -y           Auto-approve tool permissions",
     "  --json              Print machine-readable JSON for supported read commands",
+    "  --content           Include prompt fragment content for prompt-debug",
     "  --once              Run one team execution cycle",
     "  --max-turns <n>     Max automatic tool-use continuation turns before final answer, default 128",
     "  --max-cycles <n>    Max team execution runner cycles",

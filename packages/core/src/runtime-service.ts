@@ -17,7 +17,9 @@ import type { EventStore } from "@chili/store";
 import {
   PromptAssembler,
   type PromptAssembly,
+  type PromptDebugManifest,
   type PromptFragment,
+  type RenderedPromptFragment,
 } from "./prompt/index.js";
 import type { AgentRunner, RunTurnInput, RunTurnResult } from "./runner.js";
 import type { CompactContextResult } from "./single-agent-runtime.js";
@@ -69,6 +71,18 @@ export interface SubmitPromptInput {
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
   signal?: AbortSignal;
+}
+
+export interface InspectPromptInput {
+  sessionId: SessionId;
+  threadId: ThreadId;
+  cwd: string;
+  includeContent?: boolean;
+}
+
+export interface InspectPromptWithContentResult {
+  debug: PromptDebugManifest;
+  fragments: RenderedPromptFragment[];
 }
 
 export interface CompactSessionInput {
@@ -241,6 +255,22 @@ export class RuntimeService {
 
     const controller = this.createRunController(input);
     return this.runReservedPrompt(input, controller);
+  }
+
+  async inspectPrompt(input: InspectPromptInput & { includeContent: true }): Promise<InspectPromptWithContentResult>;
+  async inspectPrompt(input: InspectPromptInput & { includeContent?: false | undefined }): Promise<PromptDebugManifest>;
+  async inspectPrompt(input: InspectPromptInput): Promise<PromptDebugManifest | InspectPromptWithContentResult>;
+  async inspectPrompt(input: InspectPromptInput): Promise<PromptDebugManifest | InspectPromptWithContentResult> {
+    const prompt = await this.resolvePromptAssembly({
+      sessionId: input.sessionId,
+      threadId: input.threadId,
+      cwd: input.cwd,
+    });
+    if (!input.includeContent) return prompt.debug;
+    return {
+      debug: prompt.debug,
+      fragments: prompt.fragments,
+    };
   }
 
   submitPromptAsync(input: SubmitPromptInput, onError?: RuntimeBackgroundErrorHandler): void {

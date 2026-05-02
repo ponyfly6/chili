@@ -2,12 +2,13 @@
 import { createInterface } from "node:readline/promises";
 import { addChiliMemoryEntry, loadChiliMemoryContext } from "@chili/core";
 import type { AgentTreeNode, TeamExecutionRunSummary, TeamMergeSweepResult, TeamSnapshot } from "@chili/core";
-import type { SessionId, TaskId, TeamId } from "@chili/protocol";
+import type { SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
 import { ROOT_AGENT_PATH } from "@chili/protocol";
 import { startRuntimeHttpServer } from "@chili/server";
 import { DeferredApprovalQueue } from "@chili/tools";
 import { parseArgs, usage } from "./args.js";
 import { createCliHarness } from "./harness.js";
+import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
 import { runPrompt } from "./runner.js";
 import { resolveSession } from "./session.js";
 
@@ -22,7 +23,7 @@ async function main(): Promise<void> {
   const harnessInput: Parameters<typeof createCliHarness>[0] = {
     cwd: args.cwd,
     yes: args.yes,
-    quiet: args.command === "sessions" || args.json,
+    quiet: args.command === "sessions" || args.command === "prompt-debug" || args.json,
     ...(approvalQueue ? { approvalQueue } : {}),
   };
   if (args.provider !== undefined) harnessInput.provider = args.provider;
@@ -173,6 +174,11 @@ async function main(): Promise<void> {
       return;
     }
 
+    if (args.command === "prompt-debug") {
+      await printPromptDebug(harness, args);
+      return;
+    }
+
     if (args.command === "mailbox-consume") {
       if (!args.messageId) throw new Error("consume requires a mailbox message id");
       const message = await harness.agents.consumeMailbox({ messageId: args.messageId });
@@ -260,6 +266,53 @@ async function main(): Promise<void> {
   } finally {
     await harness.close();
   }
+}
+
+async function printPromptDebug(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  args: ReturnType<typeof parseArgs>,
+): Promise<void> {
+  const sessionInput: Parameters<typeof resolveSession>[0] = {
+    service: harness.service,
+    store: harness.store,
+    cwd: harness.cwd,
+  };
+  if (args.resume) sessionInput.resume = args.resume;
+  if (args.threadId) sessionInput.threadId = args.threadId;
+  const session = await resolveSession(sessionInput);
+
+  if (args.content) {
+    const inspected = await harness.service.inspectPrompt({
+      sessionId: session.sessionId,
+      threadId: session.threadId,
+      cwd: harness.cwd,
+      includeContent: true,
+    });
+    const output: CliPromptDebugOutput = {
+      sessionId: session.sessionId,
+      threadId: session.threadId,
+      cwd: harness.cwd,
+      created: session.isNew,
+      debug: inspected.debug,
+      fragments: inspected.fragments,
+    };
+    console.log(args.json ? formatPromptDebugJson(output) : formatPromptDebugText(output));
+    return;
+  }
+
+  const debug = await harness.service.inspectPrompt({
+    sessionId: session.sessionId,
+    threadId: session.threadId,
+    cwd: harness.cwd,
+  });
+  const output: CliPromptDebugOutput = {
+    sessionId: session.sessionId,
+    threadId: session.threadId,
+    cwd: harness.cwd,
+    created: session.isNew,
+    debug,
+  };
+  console.log(args.json ? formatPromptDebugJson(output) : formatPromptDebugText(output));
 }
 
 async function serve(input: {

@@ -127,6 +127,121 @@ test("RuntimeService passes promptFragments by prompt layer", async () => {
   ]);
 });
 
+test("RuntimeService inspectPrompt only assembles prompt debug output", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    promptFragments: ({ cwd }) => [
+      {
+        id: "debug.base",
+        layer: "base",
+        source: "core",
+        priority: 0,
+        lifecycle: "stable",
+        trust: "system",
+        content: "base instructions",
+      },
+      {
+        id: "debug.project",
+        layer: "contextual_user",
+        source: "project",
+        priority: 100,
+        lifecycle: "session",
+        trust: "project",
+        content: "project instructions",
+        metadata: {
+          path: `${cwd}/AGENTS.md`,
+          kind: "project_instruction",
+          scope: "project",
+          truncated: false,
+        },
+      },
+      {
+        id: "debug.skills",
+        layer: "developer",
+        source: "skills",
+        priority: 50,
+        lifecycle: "session",
+        trust: "tool",
+        content: "skills catalog",
+      },
+    ],
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const debug = await service.inspectPrompt({
+    sessionId: "session_prompt_debug" as SessionId,
+    threadId: "thread_prompt_debug" as ThreadId,
+    cwd: "/repo/app",
+  });
+
+  expect(debug.fragments.map((fragment) => [fragment.id, fragment.layer, fragment.source])).toEqual([
+    ["debug.base", "base", "core"],
+    ["debug.skills", "developer", "skills"],
+    ["debug.project", "contextual_user", "project"],
+  ]);
+  expect(debug.fragments[0]).not.toHaveProperty("content");
+  expect(debug.fragments.find((fragment) => fragment.id === "debug.project")?.metadata).toMatchObject({
+    path: "/repo/app/AGENTS.md",
+    kind: "project_instruction",
+    scope: "project",
+    truncated: false,
+  });
+  expect(debug.totalChars).toBe("base instructions".length + "skills catalog".length + "project instructions".length);
+  expect(runner.createInputs).toEqual([]);
+  expect(runner.userMessages).toEqual([]);
+  expect(runner.turnInputs).toEqual([]);
+  expect(store.items).toEqual([]);
+});
+
+test("RuntimeService inspectPrompt only returns fragment content when requested", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    promptFragments: () => [
+      {
+        id: "debug.content",
+        layer: "base",
+        source: "core",
+        priority: 0,
+        lifecycle: "turn",
+        trust: "system",
+        content: "visible only with content flag",
+      },
+    ],
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const debug = await service.inspectPrompt({
+    sessionId: "session_prompt_debug_no_content" as SessionId,
+    threadId: "thread_prompt_debug_no_content" as ThreadId,
+    cwd: "/repo",
+    includeContent: false,
+  });
+  const withContent = await service.inspectPrompt({
+    sessionId: "session_prompt_debug_content" as SessionId,
+    threadId: "thread_prompt_debug_content" as ThreadId,
+    cwd: "/repo",
+    includeContent: true,
+  });
+
+  expect(debug.fragments[0]).not.toHaveProperty("content");
+  expect(withContent.debug.fragments[0]).not.toHaveProperty("content");
+  expect(withContent.fragments[0]?.content).toBe("visible only with content flag");
+  expect(runner.createInputs).toEqual([]);
+  expect(runner.userMessages).toEqual([]);
+  expect(runner.turnInputs).toEqual([]);
+  expect(store.items).toEqual([]);
+});
+
 test("RuntimeService clears running reservation when initial running status write fails with a fake runner", async () => {
   const store = new ThrowingStatusStore();
   const runner = new FakeAgentRunner();

@@ -7,6 +7,7 @@ import type { AgentPath, SessionId, TaskId, ThreadId } from "@chili/protocol";
 import { SkillRegistry, type Skill } from "@chili/skills";
 import type { AgentTaskRow } from "@chili/store";
 import { buildCliChildPromptFragments, buildCliPromptFragments, createCliHarness, type CliHarness } from "./harness.js";
+import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
 import { runPrompt } from "./runner.js";
 
 test("CLI prompt fragments include base, memory/project context, and skills catalog", async () => {
@@ -100,6 +101,55 @@ test("CLI runPrompt leaves system prompt selection to the harness service", asyn
   expect(submitted[0]).not.toHaveProperty("system");
 });
 
+test("CLI prompt-debug text output shows manifest without content by default", () => {
+  const output = promptDebugOutput(false);
+  const text = formatPromptDebugText(output);
+
+  expect(text).toContain("totalChars=31");
+  expect(text).toContain("sessionId=session_prompt_debug");
+  expect(text).toContain("threadId=thread_prompt_debug");
+  expect(text).toContain("cwd=/repo");
+  expect(text).toContain("created=true");
+  expect(text).toContain("id=debug.project");
+  expect(text).toContain("layer=contextual_user");
+  expect(text).toContain("source=project");
+  expect(text).toContain("trust=project");
+  expect(text).toContain("lifecycle=session");
+  expect(text).toContain("priority=100");
+  expect(text).toContain("chars=12");
+  expect(text).toContain("path=/repo/AGENTS.md");
+  expect(text).toContain("kind=project_instruction");
+  expect(text).toContain("scope=project");
+  expect(text).toContain("truncated=false");
+  expect(text).not.toContain("SECRET fragment content");
+  expect(text).not.toContain("--- fragment debug.project begin ---");
+});
+
+test("CLI prompt-debug content output includes fragment boundaries", () => {
+  const text = formatPromptDebugText(promptDebugOutput(true));
+
+  expect(text).toContain("--- fragment debug.project begin ---");
+  expect(text).toContain("SECRET fragment content");
+  expect(text).toContain("--- fragment debug.project end ---");
+});
+
+test("CLI prompt-debug json output is machine-readable and omits content unless requested", () => {
+  const parsed = JSON.parse(formatPromptDebugJson(promptDebugOutput(false))) as Record<string, unknown>;
+  expect(parsed).toMatchObject({
+    sessionId: "session_prompt_debug",
+    threadId: "thread_prompt_debug",
+    cwd: "/repo",
+    created: true,
+  });
+  expect(parsed).toHaveProperty("debug");
+  expect(parsed).not.toHaveProperty("fragments");
+
+  const parsedWithContent = JSON.parse(formatPromptDebugJson(promptDebugOutput(true))) as {
+    fragments?: Array<{ content?: string }>;
+  };
+  expect(parsedWithContent.fragments?.some((fragment) => fragment.content === "SECRET fragment content")).toBe(true);
+});
+
 test("CLI child prompt fragments only inject follow-up context for the matching child thread", async () => {
   const root = await mkdtempName();
   const home = join(root, "home");
@@ -172,5 +222,77 @@ function skill(name: string): Skill {
       when_to_use: "When reviewing code.",
     },
     body: "review body",
+  };
+}
+
+function promptDebugOutput(includeContent: boolean): CliPromptDebugOutput {
+  const output: CliPromptDebugOutput = {
+    sessionId: "session_prompt_debug" as SessionId,
+    threadId: "thread_prompt_debug" as ThreadId,
+    cwd: "/repo",
+    created: true,
+    debug: {
+      totalChars: 31,
+      fragments: [
+        {
+          id: "debug.base",
+          layer: "base",
+          source: "core",
+          priority: 0,
+          chars: 19,
+          lifecycle: "stable",
+          trust: "system",
+        },
+        {
+          id: "debug.project",
+          layer: "contextual_user",
+          source: "project",
+          priority: 100,
+          chars: 12,
+          lifecycle: "session",
+          trust: "project",
+          metadata: {
+            path: "/repo/AGENTS.md",
+            kind: "project_instruction",
+            scope: "project",
+            truncated: false,
+            truncatedAfter: 5000,
+            ruleType: "unconditional",
+          },
+        },
+      ],
+    },
+  };
+  if (!includeContent) return output;
+  return {
+    ...output,
+    fragments: [
+      {
+        id: "debug.base",
+        layer: "base",
+        source: "core",
+        priority: 0,
+        chars: 19,
+        lifecycle: "stable",
+        trust: "system",
+        content: "base fragment text",
+      },
+      {
+        id: "debug.project",
+        layer: "contextual_user",
+        source: "project",
+        priority: 100,
+        chars: 12,
+        lifecycle: "session",
+        trust: "project",
+        content: "SECRET fragment content",
+        metadata: {
+          path: "/repo/AGENTS.md",
+          kind: "project_instruction",
+          scope: "project",
+          truncated: false,
+        },
+      },
+    ],
   };
 }

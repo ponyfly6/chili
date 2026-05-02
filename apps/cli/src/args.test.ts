@@ -144,3 +144,19 @@ test("parses memory commands", () => {
     memoryScope: "project",
   });
 });
+
+test("parses prompt-debug command and flags", () => {
+  expect(parseArgs(["prompt-debug", "--resume", "session_1", "--thread", "thread_1", "--content", "--json"])).toMatchObject({
+    command: "prompt-debug",
+    resume: "session_1",
+    threadId: "thread_1",
+    content: true,
+    json: true,
+  });
+  expect(parseArgs(["prompt-debug", "--cwd", "/repo"])).toMatchObject({
+    command: "prompt-debug",
+    cwd: "/repo",
+    content: false,
+    json: false,
+  });
+});
