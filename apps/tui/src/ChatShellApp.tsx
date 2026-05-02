@@ -722,7 +722,7 @@ export function ChatShellSurface(props: {
             if (submitAuthManualInput()) return;
             if (runSelectedSkillCompletion()) return;
             if (runSelectedSlashCompletion()) return;
-            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings);
+            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings, props.skills ?? []);
           }}
           completions={completions}
           completionOpen={skillCompletionOpen || slashCompletionOpen}
@@ -760,7 +760,7 @@ export function ChatShellSurface(props: {
             if (runSelectedSkillCompletion()) return;
             if (runSelectedSlashCompletion()) return;
             setMessageScrollOffset(0);
-            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings);
+            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings, props.skills ?? []);
           }}
           onMessageScroll={(event) => {
             const direction = event.scroll?.direction;
@@ -1356,7 +1356,12 @@ function skillMatches(skill: SkillSummary, query: string): boolean {
 
 function skillDescription(skill: SkillSummary): string {
   const description = skill.description.replace(/\s+/g, " ").trim();
-  return `${skill.source} ${description}`;
+  return `${skill.source} ${skillPathHint(skill)}${description ? ` - ${description}` : ""}`;
+}
+
+function skillPathHint(skill: SkillSummary): string {
+  const skillPath = skill.baseDir || skill.filePath;
+  return skillPath.replace(/\/SKILL\.md$/, "");
 }
 
 function insertSkillMention(input: {
@@ -1400,16 +1405,32 @@ function filterSkillMentionBindings(
   prompt: string,
 ): RuntimeSkillMention[] {
   const activeNames = new Set(extractSkillMentionNames(prompt));
-  const seen = new Set<string>();
-  const active: RuntimeSkillMention[] = [];
+  const active = new Map<string, RuntimeSkillMention>();
   for (const binding of bindings) {
     if (!activeNames.has(binding.name)) continue;
-    const key = `${binding.name}\0${binding.path ?? ""}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    active.push(binding);
+    if (active.has(binding.name)) active.delete(binding.name);
+    active.set(binding.name, binding);
   }
-  return active;
+  return [...active.values()];
+}
+
+function localSkillMentionWarnings(
+  prompt: string,
+  skills: readonly SkillSummary[],
+  bindings: readonly RuntimeSkillMention[],
+): string[] {
+  const boundNames = new Set(filterSkillMentionBindings(bindings, prompt).map((binding) => binding.name));
+  const warnings: string[] = [];
+  for (const name of extractSkillMentionNames(prompt)) {
+    if (boundNames.has(name)) continue;
+    const matches = skills.filter((skill) => skill.hidden !== true && skill.name === name);
+    if (matches.length === 0) {
+      warnings.push(`Skill $${name} was not found; it will not be injected.`);
+    } else if (matches.length > 1) {
+      warnings.push(`Skill $${name} is ambiguous; select it from /skills so Chili can bind the exact SKILL.md.`);
+    }
+  }
+  return warnings;
 }
 
 function extractSkillMentionNames(prompt: string): string[] {
@@ -1506,6 +1527,7 @@ async function submitPrompt(
   actions: SlashActions,
   onAccepted?: (text: string) => void,
   skillMentionBindings: readonly RuntimeSkillMention[] = [],
+  skills: readonly SkillSummary[] = [],
 ): Promise<void> {
   const trimmed = prompt.trim();
   if (!trimmed) return;
@@ -1524,6 +1546,9 @@ async function submitPrompt(
   if (!runtime.canSubmit) {
     actions.appendLocalItem("error", runtime.submitBlockedReason ?? "Session is not ready for another prompt.");
     return;
+  }
+  for (const warning of localSkillMentionWarnings(trimmed, skills, skillMentionBindings)) {
+    actions.appendLocalItem("info", warning);
   }
   const accepted = await runtime.submitPrompt(trimmed, {
     ...(ctx.modelSelection ? { modelSelection: ctx.modelSelection } : {}),

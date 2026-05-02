@@ -472,6 +472,111 @@ test("$ opens a skill picker and Tab inserts a path-bound skill mention", async 
   }
 });
 
+test("$ skill picker distinguishes duplicate names with source and path hints", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    width: 160,
+    skills: [
+      skillSummary("same", { source: "user", baseDir: "/home/.chili/skills/same" }),
+      skillSummary("same", { source: "project", baseDir: "/repo/.chili/skills/same" }),
+    ],
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "$same");
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("> $same - user /home/.chili/skills/same");
+    expect(frame).toContain("  $same - project /repo/.chili/skills/same");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("duplicate skill picker keeps only the latest path binding by name", async () => {
+  const submissions: Array<{ text: string; skillMentions?: unknown }> = [];
+  const userSkill = skillSummary("same", { source: "user", baseDir: "/home/.chili/skills/same" });
+  const projectSkill = skillSummary("same", { source: "project", baseDir: "/repo/.chili/skills/same" });
+  const app = await mountShell(teamLiveFixture(), {
+    skills: [userSkill, projectSkill],
+    runtime: {
+      submitPrompt: async (text, options) => {
+        submissions.push({ text, skillMentions: options?.skillMentions });
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "$same");
+    await press(app, () => app.mockInput.pressTab());
+    await typeText(app, "and $same");
+    await press(app, () => app.mockInput.pressArrow("down"));
+    await press(app, () => app.mockInput.pressTab());
+    await typeText(app, "please");
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(submissions).toEqual([
+      {
+        text: "$same and $same please",
+        skillMentions: [{ name: "same", path: projectSkill.filePath }],
+      },
+    ]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("manual unknown skill mention warns locally and still submits", async () => {
+  const submissions: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    skills: [skillSummary("reviewer")],
+    runtime: {
+      submitPrompt: async (text) => {
+        submissions.push(text);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "$unknown please");
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(submissions).toEqual(["$unknown please"]);
+    expect(app.captureCharFrame()).toContain("Skill $unknown was not found; it will not be injected.");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("manual ambiguous skill mention warns locally without picker binding", async () => {
+  const submissions: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    skills: [
+      skillSummary("same", { source: "user", baseDir: "/home/.chili/skills/same" }),
+      skillSummary("same", { source: "project", baseDir: "/repo/.chili/skills/same" }),
+    ],
+    runtime: {
+      submitPrompt: async (text) => {
+        submissions.push(text);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "$same please");
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(submissions).toEqual(["$same please"]);
+    expect(app.captureCharFrame()).toContain("Skill $same is ambiguous; select it from /skills so Chili can bind the exact SKILL.md.");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("deleted skill mention bindings are not submitted", async () => {
   const submissions: Array<{ text: string; skillMentions?: unknown }> = [];
   const app = await mountShell(teamLiveFixture(), {
@@ -1711,13 +1816,16 @@ function fakeClipboard(overrides: Partial<ClipboardAccess> = {}): ClipboardAcces
   };
 }
 
-function skillSummary(name: string): SkillSummary {
+function skillSummary(name: string, options: Partial<Pick<SkillSummary, "source" | "description" | "filePath" | "baseDir" | "hidden">> = {}): SkillSummary {
+  const source = options.source ?? "project";
+  const baseDir = options.baseDir ?? `/repo/.chili/skills/${name}`;
   return {
     name,
-    source: "project",
-    description: `${name} skill`,
-    filePath: `/repo/.chili/skills/${name}/SKILL.md`,
-    baseDir: `/repo/.chili/skills/${name}`,
+    source,
+    description: options.description ?? `${name} skill`,
+    filePath: options.filePath ?? `${baseDir}/SKILL.md`,
+    baseDir,
+    ...(options.hidden === undefined ? {} : { hidden: options.hidden }),
   };
 }
 

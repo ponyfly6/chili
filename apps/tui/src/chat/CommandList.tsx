@@ -20,7 +20,7 @@ export function CommandList(props: {
       ) : (
         visible.map(({ item, index }) => (
           <text
-            key={item.value}
+            key={`${item.value}:${item.description}:${index}`}
             fg={index === props.selectedIndex ? props.theme.colors.menu.selectedText : props.theme.colors.menu.text}
             bg={index === props.selectedIndex ? props.theme.colors.menu.selectedBackground : props.theme.colors.menu.background}
             wrapMode="none"
