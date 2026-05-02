@@ -57,10 +57,19 @@ test("resolves thinking slash command and completions", async () => {
     type: "set_reasoning",
     level: "xhigh",
   });
+  expect(await resolveSlashCommand(commands, "/thinking hide")?.command.run(ctx, "hide")).toEqual({
+    type: "set_hide_thinking",
+    hidden: true,
+  });
+  expect(await resolveSlashCommand(commands, "/reasoning show")?.command.run(ctx, "show")).toEqual({
+    type: "set_hide_thinking",
+    hidden: false,
+  });
   expect(await resolveSlashCommand(commands, "/reasoning")?.command.run(ctx, "")).toEqual({
     type: "open_reasoning_picker",
   });
   expect(slashCompletions(commands, ctx, "/thinking h", 8).map((completion) => completion.value)).toContain("/thinking high");
+  expect(slashCompletions(commands, ctx, "/thinking h", 8).map((completion) => completion.value)).toContain("/thinking hide");
 });
 
 test("resolves skills enable and disable commands", async () => {

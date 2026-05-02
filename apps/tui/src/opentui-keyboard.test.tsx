@@ -627,6 +627,72 @@ test("/skills inserts $ and opens the skill picker", async () => {
   }
 });
 
+test("/thinking hide and show toggle reasoning visibility", async () => {
+  const callId = "call_reasoning_toggle" as ToolCallId;
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: [
+          {
+            id: "msg_reasoning_toggle" as MessageId,
+            kind: "message",
+            role: "assistant",
+            createdAt: 1,
+            parts: [
+              { type: "reasoning", id: "part_reasoning_toggle" as PartId, text: "checking private chain" },
+              { type: "text", id: "part_intermediate_toggle" as PartId, text: "Let me inspect private chain." },
+              {
+                type: "tool_call",
+                id: "part_call_toggle" as PartId,
+                callId,
+                toolName: "read",
+                status: "completed",
+                input: { file: "private.ts" },
+                displayStatus: "succeeded",
+              },
+            ],
+          },
+          {
+            id: "msg_answer_toggle" as MessageId,
+            kind: "message",
+            role: "assistant",
+            createdAt: 2,
+            parts: [
+              { type: "text", id: "part_answer_toggle" as PartId, text: "done" },
+            ],
+          },
+        ],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    },
+  });
+
+  try {
+    expect(app.captureCharFrame()).toContain("Thinking: checking private chain");
+    expect(app.captureCharFrame()).toContain("🌶️: Let me inspect private chain.");
+    expect(app.captureCharFrame()).toContain("🌶️: done");
+
+    await typeText(app, "/thinking hide");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(app.captureCharFrame()).toContain("Thinking traces hidden.");
+    expect(app.captureCharFrame()).toContain("🫧");
+    expect(app.captureCharFrame()).not.toContain("Thinking: checking private chain");
+    expect(app.captureCharFrame()).not.toContain("🌶️: Let me inspect private chain.");
+    expect(app.captureCharFrame()).toContain("🌶️: done");
+
+    await typeText(app, "/thinking show");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(app.captureCharFrame()).toContain("Thinking traces shown.");
+    expect(app.captureCharFrame()).toContain("Thinking: checking private chain");
+    expect(app.captureCharFrame()).toContain("🌶️: Let me inspect private chain.");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("leading slash absolute paths submit as normal prompts", async () => {
   const submitted: string[] = [];
   const prompt = "/Users/pony/Code/opensource/ai/agent/clis/opencli go inspect this repo";

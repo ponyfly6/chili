@@ -99,6 +99,57 @@ test("streaming assistant text does not prematurely close unfinished code fences
   expect(occurrences(frame, "```")).toBe(1);
 });
 
+test("hidden thinking masks reasoning text", async () => {
+  const frame = await renderMessageList([
+    {
+      id: "msg_reasoning_hidden" as MessageId,
+      kind: "message",
+      role: "assistant",
+      createdAt: 1,
+      parts: [
+        { type: "reasoning", id: "part_reasoning_hidden" as PartId, text: "checking a sensitive plan" },
+        { type: "text", id: "part_answer_hidden" as PartId, text: "final answer" },
+      ],
+    },
+  ], { hideThinking: true });
+
+  expect(frame).toContain("🫧");
+  expect(frame).not.toContain("checking a sensitive plan");
+  expect(frame).toContain("🌶️: final answer");
+});
+
+test("hidden thinking masks intermediate assistant text before tool calls", async () => {
+  const callId = "toolcall_hidden_thinking_text" as ToolCallId;
+  const frame = await renderMessageList([
+    {
+      id: "msg_tool_thinking_hidden" as MessageId,
+      kind: "message",
+      role: "assistant",
+      createdAt: 1,
+      parts: [
+        { type: "reasoning", id: "part_hidden_reasoning" as PartId, text: "deciding which file to inspect" },
+        { type: "text", id: "part_hidden_text" as PartId, text: "Let me inspect the prompt handling." },
+        {
+          type: "tool_call",
+          id: "part_hidden_call" as PartId,
+          callId,
+          toolName: "read",
+          status: "completed",
+          input: { file: "apps/tui/src/ChatShellApp.tsx" },
+          displayStatus: "succeeded",
+        },
+      ],
+    },
+    chatTool(callId, "read", "completed", "succeeded", { title: "read", path: "apps/tui/src/ChatShellApp.tsx", detail: "apps/tui/src/ChatShellApp.tsx" }),
+  ], { hideThinking: true });
+
+  expect(frame).toContain("🫧");
+  expect(occurrences(frame, "🫧")).toBe(1);
+  expect(frame).toContain("Read ChatShellApp.tsx");
+  expect(frame).not.toContain("deciding which file");
+  expect(frame).not.toContain("🌶️: Let me inspect");
+});
+
 test("streaming markdown keeps the last growing block active", () => {
   expect(splitStreamingMarkdown("# Plan\n\n- first\n- sec")).toEqual({
     stableText: "# Plan\n\n",
@@ -542,7 +593,7 @@ test("unknown tools use the fallback renderer label", () => {
 
 async function renderMessageList(
   items: readonly ChatTranscriptItem[],
-  options: { showToolDetails?: boolean; width?: number; height?: number; scrollOffset?: number; status?: ChatSessionView["status"]; activeTools?: ChatSessionView["activeTools"] } = {},
+  options: { showToolDetails?: boolean; hideThinking?: boolean; width?: number; height?: number; scrollOffset?: number; status?: ChatSessionView["status"]; activeTools?: ChatSessionView["activeTools"] } = {},
 ): Promise<string> {
   const app = await testRender(
     <MessageList
@@ -552,6 +603,7 @@ async function renderMessageList(
       visibleLimit={options.height ?? 24}
       {...(options.scrollOffset === undefined ? {} : { scrollOffset: options.scrollOffset })}
       showToolDetails={options.showToolDetails === true}
+      hideThinking={options.hideThinking === true}
       theme={resolveTuiTheme("chili-dark", {})}
     />,
     { width: options.width ?? 120, height: options.height ?? 24, exitOnCtrlC: false },
