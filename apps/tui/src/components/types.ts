@@ -1,5 +1,6 @@
 import type { TeamLiveAction, TeamLiveView } from "@chili/sdk";
 import type { TeamId } from "@chili/protocol";
+import type { TuiTheme } from "../theme/index.js";
 import type { TeamLiveActionFeedback } from "../useTeamLiveRuntime.js";
 
 export type FocusRegion = "teams" | "runs" | "members" | "tasks" | "approvals" | "activity" | "actions" | "detail";
@@ -41,6 +42,7 @@ export interface PanelProps {
   model: TeamLiveView;
   focused: boolean;
   selectedIndex: number;
+  theme: TuiTheme;
 }
 
 export interface RuntimeActions {

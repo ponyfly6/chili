@@ -1,4 +1,5 @@
 import type { TeamLiveView } from "@chili/sdk";
+import type { TuiTheme } from "../theme/index.js";
 import type { FocusRegion, SelectionState } from "./types.js";
 import { countsCompact, focusLabel, shorten } from "./helpers.js";
 
@@ -8,13 +9,15 @@ export function DetailPane(props: {
   focused: boolean;
   selection: SelectionState;
   width?: number;
+  theme: TuiTheme;
 }) {
   const lines = detailLines(props.model, props.focus, props.selection);
+  const { theme } = props;
   return (
-    <box width={props.width ?? 36} height="100%" flexDirection="column" border borderStyle="single" borderColor={props.focused ? "#88c0d0" : "#3b4252"} paddingX={1}>
-      <text fg="#f8f8f2" truncate>{focusLabel("Detail", props.focused)}</text>
+    <box width={props.width ?? 36} height="100%" flexDirection="column" border borderStyle="single" borderColor={props.focused ? theme.colors.border.focus : theme.colors.border.subtle} paddingX={1}>
+      <text fg={theme.colors.text.primary} truncate>{focusLabel("Detail", props.focused)}</text>
       {lines.map((line, index) => (
-        <text key={`${index}:${line}`} fg={index === 0 ? "#f8f8f2" : "#d8dee9"} wrapMode="word">
+        <text key={`${index}:${line}`} fg={index === 0 ? theme.colors.text.primary : theme.colors.text.secondary} wrapMode="word">
           {shorten(line, 96)}
         </text>
       ))}

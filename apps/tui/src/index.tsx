@@ -5,7 +5,7 @@ import { HttpRuntimeClient } from "@chili/sdk";
 import type { SessionId, TeamId, ThreadId } from "@chili/protocol";
 import { ChatShellApp, type ChatShellOptions } from "./ChatShellApp.js";
 import { TeamLiveApp } from "./TeamLiveApp.js";
-import { generateSystemTheme, type SystemPaletteInput, type TuiTheme } from "./theme/index.js";
+import { generateSystemTheme, resolveTuiTheme, type SystemPaletteInput, type TuiTheme } from "./theme/index.js";
 export { teamLiveStreamInput, type TeamLiveStreamScopeInput } from "./useTeamLiveRuntime.js";
 
 export interface TuiOptions extends ChatShellOptions {
@@ -148,8 +148,9 @@ async function main(): Promise<void> {
       resolve();
     };
 
+    const theme = resolveTuiTheme(options.themeId, undefined, { systemTheme });
     root.render(options.teamLive
-      ? <TeamLiveApp client={client} options={options} onExit={close} />
+      ? <TeamLiveApp client={client} options={options} onExit={close} theme={theme} />
       : <ChatShellApp client={client} options={options} onExit={close} />);
     renderer.start();
   });

@@ -668,6 +668,7 @@ export function ChatShellSurface(props: {
         onSelectTeam={props.onSelectTeam}
         onBack={() => setView("chat")}
         onExit={props.onExit}
+        theme={theme}
       />
     );
   }

@@ -7,6 +7,7 @@ import { ChatShellSurface } from "./ChatShellApp.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import type { ChatRuntimeState } from "./useChatRuntime.js";
 import type { TeamLiveSurfaceRuntime } from "./components/types.js";
+import { chiliDarkTheme } from "./theme/index.js";
 import {
   emptyTeamLiveFixture,
   teamLiveFixture,
@@ -679,6 +680,7 @@ async function renderFrame(
       selectedTeamLocked={false}
       onSelectTeam={() => undefined}
       onExit={() => undefined}
+      theme={chiliDarkTheme}
     />,
     { width: options.width, height: options.height, exitOnCtrlC: false },
   );

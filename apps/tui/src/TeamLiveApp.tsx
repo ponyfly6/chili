@@ -3,6 +3,7 @@ import { useKeyboard, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent } from "@opentui/core";
 import type { HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
 import type { TeamId } from "@chili/protocol";
+import type { TuiTheme } from "./theme/index.js";
 import {
   teamLiveModel,
   useTeamLiveRuntime,
@@ -42,6 +43,7 @@ export function TeamLiveApp(props: {
   client: HttpRuntimeClient;
   options: TeamLiveTuiOptions;
   onExit: () => void;
+  theme: TuiTheme;
 }) {
   const runtime = useTeamLiveRuntime({ client: props.client, options: props.options });
   const allTeams = teamLiveModel(runtime.runtimeView, {
@@ -76,6 +78,7 @@ export function TeamLiveApp(props: {
       selectedTeamLocked={Boolean(props.options.teamId)}
       onSelectTeam={setSelectedTeamId}
       onExit={props.onExit}
+      theme={props.theme}
     />
   );
 }
@@ -88,6 +91,7 @@ export function TeamLiveSurface(props: {
   onSelectTeam?: ((teamId: TeamId) => void) | undefined;
   onBack?: (() => void) | undefined;
   onExit?: (() => void) | undefined;
+  theme: TuiTheme;
 }) {
   const dimensions = useTerminalDimensions();
   const [focus, setFocus] = useState<FocusRegion>("teams");
@@ -178,7 +182,7 @@ export function TeamLiveSurface(props: {
   const showWideDetail = !narrow && (detailOpen || dimensions.width >= 120);
 
   return (
-    <box width="100%" height="100%" flexDirection="column" backgroundColor="#0f1419">
+    <box width="100%" height="100%" flexDirection="column" backgroundColor={props.theme.colors.background}>
       <HeaderBar
         model={props.model}
         connection={props.model.connection}
@@ -186,6 +190,7 @@ export function TeamLiveSurface(props: {
         focus={focus}
         width={dimensions.width}
         height={dimensions.height}
+        theme={props.theme}
       />
       {narrow ? (
         <NarrowBody
@@ -195,6 +200,7 @@ export function TeamLiveSurface(props: {
           detailOpen={detailOpen}
           selectedTeamId={props.selectedTeamId}
           runtime={runtime}
+          theme={props.theme}
         />
       ) : (
         <box width="100%" flexGrow={1} flexDirection="row">
@@ -204,24 +210,25 @@ export function TeamLiveSurface(props: {
             selectedIndex={selection.teams}
             selectedTeamId={props.selectedTeamId}
             width={26}
+            theme={props.theme}
           />
           <box flexGrow={1} height="100%" flexDirection="column">
             <box flexGrow={1} minHeight={8} width="100%" flexDirection="row">
-              <RunsPanel model={props.model} focused={focus === "runs"} selectedIndex={selection.runs} />
-              <ApprovalsPanel model={props.model} focused={focus === "approvals"} selectedIndex={selection.approvals} />
+              <RunsPanel model={props.model} focused={focus === "runs"} selectedIndex={selection.runs} theme={props.theme} />
+              <ApprovalsPanel model={props.model} focused={focus === "approvals"} selectedIndex={selection.approvals} theme={props.theme} />
             </box>
             <box flexGrow={2} minHeight={10} width="100%" flexDirection="row">
-              <MembersPanel model={props.model} focused={focus === "members"} selectedIndex={selection.members} />
-              <TaskBoard model={props.model} focused={focus === "tasks"} selectedIndex={selection.tasks} />
+              <MembersPanel model={props.model} focused={focus === "members"} selectedIndex={selection.members} theme={props.theme} />
+              <TaskBoard model={props.model} focused={focus === "tasks"} selectedIndex={selection.tasks} theme={props.theme} />
             </box>
-            <ActivityLog model={props.model} focused={focus === "activity"} selectedIndex={selection.activity} />
+            <ActivityLog model={props.model} focused={focus === "activity"} selectedIndex={selection.activity} theme={props.theme} />
           </box>
           {showWideDetail ? (
-            <DetailPane model={props.model} focus={focus} focused={focus === "detail"} selection={selection} width={Math.min(44, Math.max(30, Math.floor(dimensions.width * 0.28)))} />
+            <DetailPane model={props.model} focus={focus} focused={focus === "detail"} selection={selection} width={Math.min(44, Math.max(30, Math.floor(dimensions.width * 0.28)))} theme={props.theme} />
           ) : null}
         </box>
       )}
-      <ActionsBar actions={availableActions} focused={focus === "actions"} selectedIndex={selection.actions} runtime={runtime} />
+      <ActionsBar actions={availableActions} focused={focus === "actions"} selectedIndex={selection.actions} runtime={runtime} theme={props.theme} />
       <DialogStack
         helpOpen={helpOpen}
         confirm={confirm}
@@ -230,6 +237,7 @@ export function TeamLiveSurface(props: {
           setConfirm(undefined);
         }}
         onCancel={() => setConfirm(undefined)}
+        theme={props.theme}
       />
     </box>
   );
@@ -242,10 +250,11 @@ function NarrowBody(props: {
   detailOpen: boolean;
   selectedTeamId?: TeamId | undefined;
   runtime: TeamLiveSurfaceRuntime;
+  theme: TuiTheme;
 }) {
-  const common = { model: props.model, focused: true };
+  const common = { model: props.model, focused: true, theme: props.theme };
   const panel = props.detailOpen || props.focus === "detail"
-    ? <DetailPane model={props.model} focus={props.focus} focused selection={props.selection} width={80} />
+    ? <DetailPane model={props.model} focus={props.focus} focused selection={props.selection} width={80} theme={props.theme} />
     : props.focus === "teams"
       ? <TeamRail {...common} selectedIndex={props.selection.teams} selectedTeamId={props.selectedTeamId} width={80} />
       : props.focus === "runs"
@@ -258,7 +267,7 @@ function NarrowBody(props: {
               ? <ApprovalsPanel {...common} selectedIndex={props.selection.approvals} />
               : props.focus === "activity"
                 ? <ActivityLog {...common} selectedIndex={props.selection.activity} />
-                : <DetailPane model={props.model} focus={props.focus} focused selection={props.selection} width={80} />;
+                : <DetailPane model={props.model} focus={props.focus} focused selection={props.selection} width={80} theme={props.theme} />;
 
   return (
     <box width="100%" flexGrow={1} flexDirection="column">

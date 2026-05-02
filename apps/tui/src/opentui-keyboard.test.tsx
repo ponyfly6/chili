@@ -9,6 +9,7 @@ import { TeamLiveSurface } from "./TeamLiveApp.js";
 import type { ChatRuntimeState } from "./useChatRuntime.js";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
 import type { TeamLiveSurfaceRuntime } from "./components/types.js";
+import { chiliDarkTheme } from "./theme/index.js";
 import { teamLiveFixture } from "./test-fixtures.js";
 
 test("plain prompt creates a session and submits through the runtime client", async () => {
@@ -1473,6 +1474,7 @@ async function mountSurface(
       selectedTeamLocked={false}
       onSelectTeam={() => undefined}
       onExit={() => undefined}
+      theme={chiliDarkTheme}
     />,
     { width: options.width ?? 120, height: options.height ?? 40, exitOnCtrlC: false },
   );
