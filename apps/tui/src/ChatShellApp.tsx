@@ -575,19 +575,9 @@ export function ChatShellSurface(props: {
     setTranscriptScrollOffset((current) => current > 0 ? current + delta : current);
   }, [transcriptLineCount]);
 
-  useEffect(() => {
-    const handlePaste = (event: PasteEvent) => {
-      if (view !== "chat" || promptDisabled) return;
-      event.preventDefault();
-      event.stopPropagation();
-      const text = promptPasteBytes(event.bytes);
-      if (text) appendPromptText(text);
-    };
-    keyHandler?.on("paste", handlePaste);
-    return () => {
-      keyHandler?.off("paste", handlePaste);
-    };
-  }, [appendPromptText, keyHandler, promptDisabled, view]);
+  // Note: We no longer intercept paste events here to let the input component
+  // handle cursor position correctly. The input component naturally places
+  // the cursor after the pasted text, which is the expected behavior.
 
   useEffect(() => {
     const handleSelection = (selection: Selection) => {
@@ -636,26 +626,9 @@ export function ChatShellSurface(props: {
       setView((current) => current === "transcript" ? "chat" : "transcript");
       return;
     }
-    if (isPasteShortcut(key)) {
-      key.preventDefault();
-      key.stopPropagation();
-      if (view !== "chat" || promptDisabled) return;
-      void clipboard.readText().then((raw) => {
-        if (raw === undefined) {
-          appendLocalItem("error", "Clipboard paste is unavailable.");
-          return;
-        }
-        const text = promptClipboardText(raw);
-        if (!text) {
-          appendLocalItem("error", "Clipboard is empty.");
-          return;
-        }
-        appendPromptText(text);
-      }).catch(() => {
-        appendLocalItem("error", "Clipboard paste is unavailable.");
-      });
-      return;
-    }
+    // Note: We no longer intercept paste shortcuts here to let the input component
+    // handle cursor position correctly. The input component naturally places
+    // the cursor after the pasted text, which is the expected behavior.
     if (view === "team") {
       if (isEscape(key)) setView("chat");
       return;
