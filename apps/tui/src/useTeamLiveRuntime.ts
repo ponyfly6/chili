@@ -20,6 +20,7 @@ export interface TeamLiveTuiOptions {
   sessionId?: SessionId;
   threadId?: ThreadId;
   cwd?: string;
+  streamScope?: "all" | "session";
   runLoop: boolean;
   once: boolean;
   maxCycles?: number;
@@ -30,6 +31,7 @@ export interface TeamLiveTuiOptions {
 export interface TeamLiveStreamScopeInput {
   sessionId?: SessionId;
   threadId?: ThreadId;
+  streamScope?: "all" | "session";
 }
 
 export function teamLiveStreamInput(
@@ -39,6 +41,10 @@ export function teamLiveStreamInput(
 ): StreamEventsRequest {
   // Team Live needs child-session worker events; SDK projection handles session/team filtering.
   const input: StreamEventsRequest = { signal };
+  if (_scope.streamScope === "session") {
+    if (_scope.sessionId) input.sessionId = _scope.sessionId;
+    if (_scope.threadId) input.threadId = _scope.threadId;
+  }
   if (afterEventId) input.afterEventId = afterEventId;
   return input;
 }

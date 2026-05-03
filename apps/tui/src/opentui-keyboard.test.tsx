@@ -112,6 +112,27 @@ test("resume session and thread submit without creating a new session", async ()
   }
 });
 
+test("resume session and thread hydrate the chat stream with scoped history", async () => {
+  const records = chatClientRecords();
+  const client = fakeChatClient(records);
+  const app = await mountChatApp(client, {
+    sessionId: "session_resume" as SessionId,
+    threadId: "thread_resume" as ThreadId,
+  });
+
+  try {
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(records.stream[0]).toMatchObject({
+      sessionId: "session_resume",
+      threadId: "thread_resume",
+    });
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("resume session without a thread blocks submit without creating a new session", async () => {
   const records = chatClientRecords();
   const client = fakeChatClient(records);
@@ -2114,6 +2135,7 @@ function chatClientRecords(): {
   getModel: Array<Record<string, unknown>>;
   setModel: Array<Record<string, unknown>>;
   setReasoning: Array<Record<string, unknown>>;
+  stream: Array<Record<string, unknown>>;
 } {
   return {
     create: [],
@@ -2125,6 +2147,7 @@ function chatClientRecords(): {
     getModel: [],
     setModel: [],
     setReasoning: [],
+    stream: [],
   };
 }
 
@@ -2209,6 +2232,7 @@ function fakeChatClient(
       return { resolved: options.rejectResolved ?? true };
     },
     streamEvents: async function* (input: { signal?: AbortSignal } = {}) {
+      records.stream.push(input);
       for (const event of events) {
         if (input.signal?.aborted) return;
         yield event;

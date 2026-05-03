@@ -3,7 +3,7 @@ import { createCliRenderer, type CliRendererConfig } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { HttpRuntimeClient } from "@chili/sdk";
 import type { SessionId, TeamId, ThreadId } from "@chili/protocol";
-import { ChatShellApp, type ChatShellOptions } from "./ChatShellApp.js";
+import { ChatShellApp, type ChatShellExitInfo, type ChatShellOptions } from "./ChatShellApp.js";
 import { TeamLiveApp } from "./TeamLiveApp.js";
 import { generateSystemTheme, resolveTuiTheme, type SystemPaletteInput, type TuiTheme } from "./theme/index.js";
 export { teamLiveStreamInput, type TeamLiveStreamScopeInput } from "./useTeamLiveRuntime.js";
@@ -35,7 +35,7 @@ export function parseArgs(argv: readonly string[]): TuiOptions | "help" {
       options.teamLive = true;
       continue;
     }
-    if (arg === "--session") {
+    if (arg === "--session" || arg === "--resume") {
       options.sessionId = requireValue(argv, ++index, arg) as SessionId;
       continue;
     }
@@ -95,9 +95,12 @@ function rendererConfig(): CliRendererConfig {
 
 function usage(): string {
   return [
-    "Usage: chili-tui --url <runtime-url> [--team <team-id>] [--session <session-id>] [--thread <thread-id>]",
+    "Usage: chili-tui --url <runtime-url> [--team <team-id>] [--resume <session-id>] [--thread <thread-id>]",
     "",
     "Options:",
+    "  --resume <session-id> Resume a chat session. Alias for --session.",
+    "  --session <session-id> Select a chat session.",
+    "  --thread <thread-id>  Select a chat thread.",
     "  --team-live           Open the team cockpit directly.",
     "  --run-loop             Trigger SDK runTeamLoop for --team.",
     "  --once                 Pass once=true to runTeamLoop.",
@@ -125,6 +128,11 @@ function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
+export function formatResumeCommand(info: ChatShellExitInfo | undefined): string | undefined {
+  if (!info?.sessionId || !info.threadId) return undefined;
+  return `chili --resume ${shellQuote(info.sessionId)} --thread ${shellQuote(info.threadId)}`;
+}
+
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
   if (options === "help") {
@@ -137,12 +145,14 @@ async function main(): Promise<void> {
   const systemTheme = await detectSystemTheme(renderer);
   if (systemTheme) options.systemTheme = systemTheme;
   const root = createRoot(renderer);
+  let exitInfo: ChatShellExitInfo | undefined;
 
   await new Promise<void>((resolve) => {
     let closed = false;
-    const close = () => {
+    const close = (info?: ChatShellExitInfo) => {
       if (closed) return;
       closed = true;
+      exitInfo = info;
       root.unmount();
       renderer.destroy();
       resolve();
@@ -154,6 +164,11 @@ async function main(): Promise<void> {
       : <ChatShellApp client={client} options={options} onExit={close} />);
     renderer.start();
   });
+
+  const resumeCommand = formatResumeCommand(exitInfo);
+  if (resumeCommand) {
+    console.log(`Resume this session: ${resumeCommand}`);
+  }
 }
 
 async function detectSystemTheme(renderer: { getPalette?: (options?: { size?: number; timeout?: number }) => Promise<SystemPaletteInput> }): Promise<TuiTheme | undefined> {
@@ -163,6 +178,11 @@ async function detectSystemTheme(renderer: { getPalette?: (options?: { size?: nu
   } catch {
     return undefined;
   }
+}
+
+function shellQuote(value: string): string {
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) return value;
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 if (import.meta.main) {

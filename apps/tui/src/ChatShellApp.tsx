@@ -2,7 +2,7 @@ import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, ty
 import { useAppContext, useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, MouseEvent, PasteEvent, Selection } from "@opentui/core";
 import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
-import type { ApprovalId, RuntimePermissionProfileDescriptor, RuntimePermissionProfileId, RuntimeSkillMention, TeamId } from "@chili/protocol";
+import type { ApprovalId, RuntimePermissionProfileDescriptor, RuntimePermissionProfileId, RuntimeSkillMention, SessionId, TeamId, ThreadId } from "@chili/protocol";
 import { FileAuthStorage, loginOpenAICodex, OPENAI_CODEX_PROVIDER_ID } from "@chili/providers";
 import { discoverSkills, updateSkillDisabledSetting, type SkillSettingsScope, type SkillSummary } from "@chili/skills";
 import { execFile } from "node:child_process";
@@ -88,6 +88,11 @@ export interface ChatShellOptions extends TeamLiveTuiOptions {
   systemTheme?: TuiTheme;
 }
 
+export interface ChatShellExitInfo {
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+}
+
 interface AuthManualPrompt {
   resolve: (value: string) => void;
   reject: (error: Error) => void;
@@ -100,9 +105,16 @@ const LOCAL_ITEM_TTL_MS = 4_000;
 export function ChatShellApp(props: {
   client: HttpRuntimeClient;
   options: ChatShellOptions;
-  onExit: () => void;
+  onExit: (info?: ChatShellExitInfo) => void;
 }) {
-  const runtime = useChatRuntime({ client: props.client, options: props.options });
+  const chatOptions = useMemo(
+    () => ({
+      ...props.options,
+      streamScope: props.options.sessionId ? "session" as const : "all" as const,
+    }),
+    [props.options],
+  );
+  const runtime = useChatRuntime({ client: props.client, options: chatOptions });
   const allTeams = teamLiveModel(runtime.runtimeView, {
     connection: runtime.connection,
     sessionId: props.options.sessionId,
@@ -151,7 +163,7 @@ export function ChatShellSurface(props: {
   selectedTeamId?: TeamId | undefined;
   selectedTeamLocked?: boolean;
   onSelectTeam?: (teamId: TeamId) => void;
-  onExit?: () => void;
+  onExit?: (info?: ChatShellExitInfo) => void;
   commands?: readonly SlashCommand[];
   clipboard?: ClipboardAccess | undefined;
   localMessageTtlMs?: number | undefined;
@@ -606,7 +618,7 @@ export function ChatShellSurface(props: {
       return;
     }
     if (key.ctrl && key.name === "c" && !key.shift) {
-      props.onExit?.();
+      props.onExit?.(chatShellExitInfo(props.runtime));
       return;
     }
     if (key.ctrl && key.name === "x") {
@@ -2141,6 +2153,16 @@ function latestAssistantText(items: readonly ChatTranscriptItem[]): string | und
     if (text.trim()) return text;
   }
   return undefined;
+}
+
+function chatShellExitInfo(runtime: ChatRuntimeState): ChatShellExitInfo | undefined {
+  const sessionId = runtime.activeSessionId ?? runtime.chatView.sessionId;
+  const threadId = runtime.activeThreadId ?? runtime.chatView.threadId;
+  if (!sessionId && !threadId) return undefined;
+  const info: ChatShellExitInfo = {};
+  if (sessionId) info.sessionId = sessionId;
+  if (threadId) info.threadId = threadId;
+  return info;
 }
 
 function useSkillSummaries(cwd: string): SkillSummariesState {

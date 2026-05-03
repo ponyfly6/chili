@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { readdir, readFile } from "node:fs/promises";
 import { basename, join, relative } from "node:path";
 import type { SessionId, ThreadId } from "@chili/protocol";
-import { parseArgs, teamLiveStreamInput } from "./index.js";
+import { formatResumeCommand, parseArgs, teamLiveStreamInput } from "./index.js";
 import { generateSystemTheme, initialTuiThemeId, resolveTuiTheme } from "./theme/index.js";
 
 test("parses runtime flags and keeps Team Live stream unscoped for child-session events", () => {
@@ -23,6 +23,10 @@ test("parses runtime flags and keeps Team Live stream unscoped for child-session
     themeId: "chili-light",
     maxCycles: 2,
   });
+  expect(parseArgs(["--resume", "session_resume", "--thread", "thread_resume"])).toMatchObject({
+    sessionId: "session_resume",
+    threadId: "thread_resume",
+  });
 
   const streamInput = teamLiveStreamInput(
     { sessionId: "session_live" as SessionId, threadId: "thread_live" as ThreadId },
@@ -33,6 +37,23 @@ test("parses runtime flags and keeps Team Live stream unscoped for child-session
   expect(streamInput.afterEventId).toBe("event_live");
   expect(streamInput.sessionId).toBeUndefined();
   expect(streamInput.threadId).toBeUndefined();
+
+  const scopedStreamInput = teamLiveStreamInput(
+    { sessionId: "session_resume" as SessionId, threadId: "thread_resume" as ThreadId, streamScope: "session" },
+    controller.signal,
+  );
+  expect(scopedStreamInput.sessionId).toBe("session_resume" as SessionId);
+  expect(scopedStreamInput.threadId).toBe("thread_resume" as ThreadId);
+});
+
+test("formats a resume command when a chat session and thread are available", () => {
+  expect(formatResumeCommand({
+    sessionId: "session_resume" as SessionId,
+    threadId: "thread_resume" as ThreadId,
+  })).toBe("chili --resume session_resume --thread thread_resume");
+  expect(formatResumeCommand({
+    sessionId: "session_resume" as SessionId,
+  })).toBeUndefined();
 });
 
 test("apps/tui source does not import core, server, or store packages", async () => {
