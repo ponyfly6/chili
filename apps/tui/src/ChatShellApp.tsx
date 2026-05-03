@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { useAppContext, useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, MouseEvent, PasteEvent, Selection } from "@opentui/core";
 import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
-import type { ApprovalId, RuntimeSkillMention, TeamId } from "@chili/protocol";
+import type { ApprovalId, RuntimePermissionProfileDescriptor, RuntimePermissionProfileId, RuntimeSkillMention, TeamId } from "@chili/protocol";
 import { FileAuthStorage, loginOpenAICodex, OPENAI_CODEX_PROVIDER_ID } from "@chili/providers";
 import { discoverSkills, updateSkillDisabledSetting, type SkillSettingsScope, type SkillSummary } from "@chili/skills";
 import { execFile } from "node:child_process";
@@ -37,7 +37,7 @@ import { buildTranscriptLines, buildTranscriptText } from "./chat/transcript.js"
 import { TranscriptView } from "./chat/TranscriptView.js";
 import type { LocalTranscriptItem, PromptPart } from "./chat/types.js";
 import { usePromptHistory } from "./chat/usePromptHistory.js";
-import { loadCustomSlashCommands, type CustomSlashCommandsState } from "./slash/custom.js";
+import { customSlashCommandsFromRuntime } from "./slash/custom.js";
 import { createDefaultSlashCommands, resolveSlashCommand, slashCompletions } from "./slash/registry.js";
 import type { SlashCommand, SlashCommandContext, SlashCommandResult, SlashCompletion } from "./slash/types.js";
 import {
@@ -64,7 +64,9 @@ interface SlashActions {
   openModelPicker: (query?: string) => void;
   setModelSelection: (selection: ModelSelection, reasoningLevel?: ReasoningLevel) => Promise<void>;
   openReasoningPicker: () => void;
+  openPermissionsPicker: () => void;
   setReasoningLevel: (level: ReasoningLevel) => Promise<void>;
+  setPermissionProfile: (profile: RuntimePermissionProfileId) => Promise<void>;
   setHideThinking: (hidden: boolean) => void;
   ensureOpenAICodexDefaultModel: () => Promise<void>;
   reloadSkills: () => Promise<void>;
@@ -75,10 +77,6 @@ interface SkillSummariesState {
   skills: readonly SkillSummary[];
   allSkills: readonly SkillSummary[];
   reload: () => Promise<void>;
-}
-
-interface CustomSlashCommandsHookState extends CustomSlashCommandsState {
-  error?: string | undefined;
 }
 
 export interface ChatShellOptions extends TeamLiveTuiOptions {
@@ -168,6 +166,7 @@ export function ChatShellSurface(props: {
   const [promptParts, setPromptParts] = useState<PromptPart[]>([{ type: "text", text: "" }]);
   const [skillMentionBindings, setSkillMentionBindings] = useState<RuntimeSkillMention[]>([]);
   const [localItems, setLocalItems] = useState<LocalTranscriptItem[]>([]);
+  const deferredLocalItems = useDeferredValue(localItems);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteIndex, setPaletteIndex] = useState(0);
   const [completionIndex, setCompletionIndex] = useState(0);
@@ -183,6 +182,7 @@ export function ChatShellSurface(props: {
   const [reasoningLevel, setReasoningLevelState] = useState<ReasoningLevel | undefined>(undefined);
   const [modelPicker, setModelPicker] = useState<ModelPickerNavigation | undefined>(undefined);
   const [reasoningPicker, setReasoningPicker] = useState<ReasoningPickerNavigation | undefined>(undefined);
+  const [permissionsPicker, setPermissionsPicker] = useState<PermissionsPickerNavigation | undefined>(undefined);
   const [messageScrollOffset, setMessageScrollOffset] = useState(0);
   const [transcriptScrollOffset, setTranscriptScrollOffset] = useState(0);
   const [authManualPrompt, setAuthManualPromptState] = useState<AuthManualPrompt | undefined>(undefined);
@@ -229,8 +229,8 @@ export function ChatShellSurface(props: {
     props.runtime.modelConfig,
   ]);
   const scrollEstimateWidth = Math.max(24, dimensions.width - 8);
-  const chatLineCount = useMemo(() => estimatedChatLineCount(props.runtime.chatView, localItems, showToolDetails, hideThinking, scrollEstimateWidth), [hideThinking, localItems, props.runtime.chatView, scrollEstimateWidth, showToolDetails]);
-  const transcriptLineCount = useMemo(() => estimatedTranscriptLineCount(props.runtime.chatView.items, localItems, scrollEstimateWidth), [localItems, props.runtime.chatView.items, scrollEstimateWidth]);
+  const chatLineCount = useMemo(() => estimatedChatLineCount(props.runtime.chatView, deferredLocalItems, showToolDetails, hideThinking, scrollEstimateWidth), [hideThinking, deferredLocalItems, props.runtime.chatView, scrollEstimateWidth, showToolDetails]);
+  const transcriptLineCount = useMemo(() => estimatedTranscriptLineCount(props.runtime.chatView.items, deferredLocalItems, scrollEstimateWidth), [deferredLocalItems, props.runtime.chatView.items, scrollEstimateWidth]);
   const previousChatLineCount = useRef<number | undefined>(undefined);
   const previousTranscriptLineCount = useRef<number | undefined>(undefined);
   const prompt = promptText(promptParts);
@@ -242,7 +242,10 @@ export function ChatShellSurface(props: {
   const systemThemeAvailable = Boolean(systemTheme);
   const cwd = props.options?.cwd ?? process.cwd();
   const defaultSlashCommands = useMemo(() => createDefaultSlashCommands(), []);
-  const customSlashCommands = useCustomSlashCommands(cwd);
+  const customSlashCommands = useMemo(
+    () => customSlashCommandsFromRuntime(props.runtime.commandList),
+    [props.runtime.commandList],
+  );
   const commands = useMemo(
     () => props.commands ?? [...defaultSlashCommands, ...customSlashCommands.commands],
     [customSlashCommands.commands, defaultSlashCommands, props.commands],
@@ -329,6 +332,9 @@ export function ChatShellSurface(props: {
   }, [appendLocalItem, prompt, setAuthManualPrompt, setPrompt]);
   const openThemePicker = useCallback(() => {
     const index = themeOptionIndex(themeOptions, themeId);
+    setModelPicker(undefined);
+    setReasoningPicker(undefined);
+    setPermissionsPicker(undefined);
     setThemePicker({
       previousThemeId: themeId,
       index,
@@ -353,6 +359,7 @@ export function ChatShellSurface(props: {
     void props.runtime.refreshModelConfig?.();
     const index = modelPickerIndex(modelCandidates, query, modelSelection);
     setReasoningPicker(undefined);
+    setPermissionsPicker(undefined);
     setThemePicker(undefined);
     setModelPicker({ query, selectedIndex: index });
   }, [modelCandidates, modelSelection, props.runtime]);
@@ -362,11 +369,24 @@ export function ChatShellSurface(props: {
   const openReasoningPicker = useCallback(() => {
     const selectedIndex = Math.max(0, REASONING_LEVELS.indexOf(reasoningLevel ?? DEFAULT_REASONING_LEVEL));
     setModelPicker(undefined);
+    setPermissionsPicker(undefined);
     setThemePicker(undefined);
     setReasoningPicker({ selectedIndex });
   }, [reasoningLevel]);
   const closeReasoningPicker = useCallback(() => {
     setReasoningPicker(undefined);
+  }, []);
+  const openPermissionsPicker = useCallback(() => {
+    void props.runtime.refreshPermissionConfig?.();
+    const profiles = props.runtime.permissionConfig?.profiles ?? [];
+    const selectedIndex = Math.max(0, profiles.findIndex((profile) => profile.current));
+    setModelPicker(undefined);
+    setReasoningPicker(undefined);
+    setThemePicker(undefined);
+    setPermissionsPicker({ selectedIndex });
+  }, [props.runtime]);
+  const closePermissionsPicker = useCallback(() => {
+    setPermissionsPicker(undefined);
   }, []);
   const setModelSelection = useCallback(async (selection: ModelSelection, nextReasoningLevel?: ReasoningLevel) => {
     const persisted = props.runtime.setRuntimeModel ? await props.runtime.setRuntimeModel(selection) : true;
@@ -411,6 +431,22 @@ export function ChatShellSurface(props: {
     setReasoningPicker(undefined);
     appendLocalItem("info", `Thinking: ${level}`);
   }, [appendLocalItem, props.runtime]);
+  const setPermissionProfile = useCallback(async (profile: RuntimePermissionProfileId) => {
+    const item = props.runtime.permissionConfig?.profiles.find((candidate) => candidate.id === profile);
+    if (item?.disabledReason) {
+      appendLocalItem("error", `${item.label}: ${item.disabledReason}`);
+      return;
+    }
+    const persisted = props.runtime.setRuntimePermissionProfile
+      ? await props.runtime.setRuntimePermissionProfile(profile)
+      : false;
+    setPermissionsPicker(undefined);
+    if (!persisted) {
+      appendLocalItem("error", `Permissions unchanged: failed to select ${item?.label ?? profile}`);
+      return;
+    }
+    appendLocalItem("info", `Permissions updated to ${item?.label ?? profile}`);
+  }, [appendLocalItem, props.runtime]);
   const setHideThinking = useCallback((hidden: boolean) => {
     setHideThinkingState(hidden);
     appendLocalItem("info", hidden ? "Thinking traces hidden." : "Thinking traces shown.");
@@ -424,11 +460,12 @@ export function ChatShellSurface(props: {
     await props.runtime.refreshModelConfig?.();
   }, [modelCandidates, modelSelection, props.runtime, setModelSelection]);
   const reloadCommands = useCallback(async () => {
-    const state = await customSlashCommands.reload();
-    if (state.error) {
-      appendLocalItem("error", `Could not reload commands: ${state.error}`);
+    const commandList = await props.runtime.reloadCommands?.();
+    if (!commandList) {
+      appendLocalItem("error", "Could not reload commands.");
       return;
     }
+    const state = customSlashCommandsFromRuntime(commandList);
     appendLocalItem("info", `Commands reloaded: ${state.commands.length} custom command${state.commands.length === 1 ? "" : "s"}.`);
     for (const diagnostic of state.diagnostics) {
       appendLocalItem(diagnostic.level === "error" ? "error" : "info", `/${diagnostic.code}: ${diagnostic.message}`);
@@ -436,7 +473,7 @@ export function ChatShellSurface(props: {
     for (const name of state.skippedConflicts) {
       appendLocalItem("info", `Skipped user command /${name}; project command wins.`);
     }
-  }, [appendLocalItem, customSlashCommands.reload]);
+  }, [appendLocalItem, props.runtime]);
   const slashActions = useMemo<SlashActions>(() => ({
     cwd,
     setView,
@@ -448,14 +485,16 @@ export function ChatShellSurface(props: {
     openModelPicker,
     setModelSelection,
     openReasoningPicker,
+    openPermissionsPicker,
     setReasoningLevel,
+    setPermissionProfile,
     setHideThinking,
     ensureOpenAICodexDefaultModel,
     reloadSkills: async () => {
       await props.onSkillsChanged?.();
     },
     reloadCommands,
-  }), [appendLocalItem, cwd, ensureOpenAICodexDefaultModel, openModelPicker, openReasoningPicker, openThemePicker, props.onSkillsChanged, reloadCommands, setAuthManualPrompt, setHideThinking, setModelSelection, setPrompt, setReasoningLevel, startNewChatSession]);
+  }), [appendLocalItem, cwd, ensureOpenAICodexDefaultModel, openModelPicker, openPermissionsPicker, openReasoningPicker, openThemePicker, props.onSkillsChanged, reloadCommands, setAuthManualPrompt, setHideThinking, setModelSelection, setPermissionProfile, setPrompt, setReasoningLevel, startNewChatSession]);
   const runSelectedSlashCompletion = useCallback(() => {
     if (!slashCompletionOpen) return false;
     const completion = slashCompletionItems[selectedCompletionIndex] ?? slashCompletionItems[0];
@@ -495,13 +534,15 @@ export function ChatShellSurface(props: {
     setCompletionIndex((current) => clampIndex(current, completions.length));
   }, [completions.length]);
 
-  const selectorOpen = Boolean(modelPicker || reasoningPicker);
+  const selectorOpen = Boolean(modelPicker || reasoningPicker || permissionsPicker);
   const disabledReason = authManualPrompt
     ? undefined
     : modelPicker
     ? "Choose a model"
     : reasoningPicker
     ? "Choose thinking level"
+    : permissionsPicker
+    ? "Choose permissions"
     : slashInputActive
     ? undefined
     : props.runtime.chatView.pendingApprovals.length > 0
@@ -642,6 +683,14 @@ export function ChatShellSurface(props: {
       });
       return;
     }
+    if (permissionsPicker) {
+      handlePermissionsPickerKey(key, permissionsPicker, props.runtime.permissionConfig?.profiles ?? [], {
+        setPermissionsPicker,
+        selectProfile: setPermissionProfile,
+        cancel: closePermissionsPicker,
+      });
+      return;
+    }
     if (themePicker) {
       if (isEscape(key)) {
         cancelThemePicker();
@@ -677,7 +726,41 @@ export function ChatShellSurface(props: {
       return;
     }
     if (isEscape(key)) {
-      if (view !== "chat") setView("chat");
+      // Interrupt the active session if running
+      if (props.runtime.chatView.status === "running") {
+        void props.runtime.interruptActiveSession();
+        return;
+      }
+      // Close theme picker if open
+      if (themePicker) {
+        cancelThemePicker();
+        return;
+      }
+      // Close model picker if open
+      if (modelPicker) {
+        closeModelPicker();
+        return;
+      }
+      // Close reasoning picker if open
+      if (reasoningPicker) {
+        closeReasoningPicker();
+        return;
+      }
+      // Close permissions picker if open
+      if (permissionsPicker) {
+        closePermissionsPicker();
+        return;
+      }
+      // Close palette if open
+      if (paletteOpen) {
+        setPaletteOpen(false);
+        return;
+      }
+      // Return to chat view if in another view
+      if (view !== "chat") {
+        setView("chat");
+        return;
+      }
       return;
     }
     if (view === "chat" && key.ctrl && key.name === "y") {
@@ -748,6 +831,9 @@ export function ChatShellSurface(props: {
   const reasoningPickerModel = reasoningPicker
     ? reasoningPickerView(reasoningPicker, reasoningLevel ?? DEFAULT_REASONING_LEVEL)
     : undefined;
+  const permissionsPickerModel = permissionsPicker
+    ? permissionsPickerView(permissionsPicker, props.runtime.permissionConfig?.profiles ?? [])
+    : undefined;
 
   if (view === "team") {
     return (
@@ -775,7 +861,7 @@ export function ChatShellSurface(props: {
           width={dimensions.width}
           height={dimensions.height}
           prompt={prompt}
-          focused={view === "chat" && !paletteOpen && !themePicker && !disabledReason}
+          focused={view === "chat" && !paletteOpen && !themePicker && !modelPicker && !reasoningPicker && !permissionsPicker && !disabledReason}
           onPromptChange={handlePromptChange}
           onSubmit={() => {
             if (submitAuthManualInput()) return;
@@ -805,6 +891,7 @@ export function ChatShellSurface(props: {
           } : undefined}
           modelPicker={modelPickerModel}
           reasoningPicker={reasoningPickerModel}
+          permissionsPicker={permissionsPickerModel}
         />
       ) : (
         <SessionScreen
@@ -812,7 +899,7 @@ export function ChatShellSurface(props: {
           height={dimensions.height}
           view={view}
           prompt={prompt}
-          focused={view === "chat" && !paletteOpen && !themePicker && !disabledReason}
+          focused={view === "chat" && !paletteOpen && !themePicker && !modelPicker && !reasoningPicker && !permissionsPicker && !disabledReason}
           onPromptChange={handlePromptChange}
           onSubmit={() => {
             if (submitAuthManualInput()) return;
@@ -847,7 +934,7 @@ export function ChatShellSurface(props: {
               setTranscriptScrollOffset((current) => Math.max(0, current - amount));
             }
           }}
-          localItems={localItems}
+          localItems={deferredLocalItems}
           messageScrollOffset={messageScrollOffset}
           transcriptScrollOffset={transcriptScrollOffset}
           completions={completions}
@@ -874,6 +961,7 @@ export function ChatShellSurface(props: {
           } : undefined}
           modelPicker={modelPickerModel}
           reasoningPicker={reasoningPickerModel}
+          permissionsPicker={permissionsPickerModel}
         />
       )}
     </box>
@@ -905,13 +993,14 @@ function HomeScreen(props: {
   themePicker?: ThemePickerModel | undefined;
   modelPicker?: ModelPickerModel | undefined;
   reasoningPicker?: ReasoningPickerModel | undefined;
+  permissionsPicker?: PermissionsPickerModel | undefined;
 }) {
   const promptWidth = Math.min(76, Math.max(42, props.width - 12));
   const compactBrand = props.width < 92 || props.height < 32;
   const feedback = currentFeedback(props.runtime);
   const footerHeight = statusFooterHeight(props.width);
   const themePickerHeight = props.themePicker ? pickerHeight(props.themePicker.items.length) : 0;
-  const selectorHeight = selectorPickerHeight(props.modelPicker, props.reasoningPicker);
+  const selectorHeight = selectorPickerHeight(props.modelPicker, props.reasoningPicker, props.permissionsPicker);
   const maxCommandItems = promptMenuItemLimit({
     height: props.height,
     footerHeight,
@@ -932,6 +1021,7 @@ function HomeScreen(props: {
         {props.themePicker ? <ThemePicker model={props.themePicker} theme={props.theme} /> : null}
         {props.modelPicker ? <ModelPicker model={props.modelPicker} theme={props.theme} /> : null}
         {props.reasoningPicker ? <ReasoningPicker model={props.reasoningPicker} theme={props.theme} /> : null}
+        {props.permissionsPicker ? <PermissionsPicker model={props.permissionsPicker} theme={props.theme} /> : null}
         <PromptComposer
           width={promptWidth}
           prompt={props.prompt}
@@ -992,6 +1082,7 @@ function SessionScreen(props: {
   themePicker?: ThemePickerModel | undefined;
   modelPicker?: ModelPickerModel | undefined;
   reasoningPicker?: ReasoningPickerModel | undefined;
+  permissionsPicker?: PermissionsPickerModel | undefined;
 }) {
   const promptWidth = Math.min(96, Math.max(42, props.width - 8));
   const messageWidth = Math.max(24, props.width - 8);
@@ -999,7 +1090,7 @@ function SessionScreen(props: {
   const feedback = currentFeedback(props.runtime);
   const footerHeight = statusFooterHeight(props.width);
   const themePickerHeight = props.themePicker ? pickerHeight(props.themePicker.items.length) : 0;
-  const selectorHeight = selectorPickerHeight(props.modelPicker, props.reasoningPicker);
+  const selectorHeight = selectorPickerHeight(props.modelPicker, props.reasoningPicker, props.permissionsPicker);
   const maxCommandItems = promptMenuItemLimit({
     height: props.height,
     footerHeight,
@@ -1070,6 +1161,7 @@ function SessionScreen(props: {
         {props.themePicker ? <ThemePicker model={props.themePicker} theme={props.theme} /> : null}
         {props.modelPicker ? <ModelPicker model={props.modelPicker} theme={props.theme} /> : null}
         {props.reasoningPicker ? <ReasoningPicker model={props.reasoningPicker} theme={props.theme} /> : null}
+        {props.permissionsPicker ? <PermissionsPicker model={props.permissionsPicker} theme={props.theme} /> : null}
         <PromptComposer
           width={promptWidth}
           prompt={props.prompt}
@@ -1196,6 +1288,15 @@ interface ReasoningPickerItem {
   current: boolean;
 }
 
+interface PermissionsPickerNavigation {
+  selectedIndex: number;
+}
+
+interface PermissionsPickerModel {
+  items: readonly RuntimePermissionProfileDescriptor[];
+  selectedIndex: number;
+}
+
 interface SkillMentionTrigger {
   start: number;
   query: string;
@@ -1207,9 +1308,14 @@ function pickerHeight(itemCount: number): number {
   return itemCount + 3;
 }
 
-function selectorPickerHeight(modelPicker: ModelPickerModel | undefined, reasoningPicker: ReasoningPickerModel | undefined): number {
+function selectorPickerHeight(
+  modelPicker: ModelPickerModel | undefined,
+  reasoningPicker: ReasoningPickerModel | undefined,
+  permissionsPicker: PermissionsPickerModel | undefined,
+): number {
   if (modelPicker) return Math.min(modelPicker.items.length, 8) + 4;
   if (reasoningPicker) return reasoningPicker.items.length + 3;
+  if (permissionsPicker) return permissionsPicker.items.length + 3;
   return 0;
 }
 
@@ -1309,6 +1415,29 @@ function ReasoningPicker(props: { model: ReasoningPickerModel; theme: TuiTheme }
   );
 }
 
+function PermissionsPicker(props: { model: PermissionsPickerModel; theme: TuiTheme }) {
+  return (
+    <box width="100%" flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.focus} paddingX={1}>
+      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Update Model Permissions"}</text>
+      {props.model.items.map((item, index) => {
+        const selected = index === props.model.selectedIndex;
+        const suffix = item.current ? " (current)" : item.disabledReason ? " (disabled)" : "";
+        return (
+          <text
+            key={item.id}
+            fg={selected ? props.theme.colors.menu.selectedText : item.disabledReason ? props.theme.colors.text.muted : props.theme.colors.menu.text}
+            bg={selected ? props.theme.colors.menu.selectedBackground : props.theme.colors.menu.background}
+            wrapMode="none"
+            truncate
+          >
+            {`${selected ? ">" : " "} ${index + 1}. ${item.label}${suffix}  ${item.description}`}
+          </text>
+        );
+      })}
+    </box>
+  );
+}
+
 function modelPickerView(
   picker: ModelPickerNavigation,
   candidates: readonly ModelCandidate[],
@@ -1338,6 +1467,16 @@ function reasoningPickerView(picker: ReasoningPickerNavigation, current: Reasoni
   return {
     items,
     selectedIndex: clampIndex(picker.selectedIndex, items.length),
+  };
+}
+
+function permissionsPickerView(
+  picker: PermissionsPickerNavigation,
+  profiles: readonly RuntimePermissionProfileDescriptor[],
+): PermissionsPickerModel {
+  return {
+    items: profiles,
+    selectedIndex: clampIndex(picker.selectedIndex, profiles.length),
   };
 }
 
@@ -1676,16 +1815,20 @@ async function applySlashResult(
     await actions.reloadCommands();
     return;
   }
-  if (result.type === "submit_prompt") {
+  if (result.type === "submit_command") {
     if (!runtime.canSubmit) {
       actions.appendLocalItem("error", runtime.submitBlockedReason ?? "Session is not ready for another prompt.");
       return;
     }
-    const accepted = await runtime.submitPrompt(result.prompt, {
+    const accepted = await runtime.submitCommand(result.commandName, result.args, {
       ...(ctx.modelSelection ? { modelSelection: ctx.modelSelection } : {}),
       ...(ctx.reasoningLevel ? { reasoningLevel: ctx.reasoningLevel } : {}),
     });
     if (!accepted) actions.appendLocalItem("error", `/${result.commandName} did not submit.`);
+    return;
+  }
+  if (result.type === "open_permissions_picker") {
+    actions.openPermissionsPicker();
     return;
   }
   if (result.type === "new_session") {
@@ -1941,6 +2084,37 @@ function handleReasoningPickerKey(
   }
 }
 
+function handlePermissionsPickerKey(
+  key: KeyEvent,
+  picker: PermissionsPickerNavigation,
+  profiles: readonly RuntimePermissionProfileDescriptor[],
+  actions: {
+    setPermissionsPicker: Dispatch<SetStateAction<PermissionsPickerNavigation | undefined>>;
+    selectProfile: (profile: RuntimePermissionProfileId) => Promise<void>;
+    cancel: () => void;
+  },
+): void {
+  if (isEscape(key)) {
+    actions.cancel();
+    return;
+  }
+  if (isArrowUp(key) || isArrowDown(key)) {
+    const delta = isArrowUp(key) ? -1 : 1;
+    actions.setPermissionsPicker((state) => state ? { selectedIndex: clampIndex(state.selectedIndex + delta, profiles.length) } : state);
+    return;
+  }
+  const numericIndex = numericShortcutIndex(key);
+  if (numericIndex !== undefined) {
+    const profile = profiles[numericIndex];
+    if (profile) void actions.selectProfile(profile.id);
+    return;
+  }
+  if (isEnter(key)) {
+    const profile = profiles[clampIndex(picker.selectedIndex, profiles.length)];
+    if (profile) void actions.selectProfile(profile.id);
+  }
+}
+
 function currentFeedback(runtime: ChatRuntimeState): { status: string; message: string } | undefined {
   if (runtime.chatFeedback) return runtime.chatFeedback;
   if (runtime.actionFeedback) return runtime.actionFeedback;
@@ -2030,53 +2204,6 @@ function useSkillSummaries(cwd: string): SkillSummariesState {
   };
 }
 
-function useCustomSlashCommands(cwd: string): CustomSlashCommandsHookState & { reload: () => Promise<CustomSlashCommandsHookState> } {
-  const empty = useMemo<CustomSlashCommandsHookState>(() => ({
-    commands: [],
-    diagnostics: [],
-    directories: [],
-    skippedConflicts: [],
-  }), []);
-  const [state, setState] = useState<CustomSlashCommandsHookState>(empty);
-  const reload = useCallback(async () => {
-    try {
-      const next = await loadCustomSlashCommands(cwd);
-      setState(next);
-      return next;
-    } catch (error) {
-      const next = {
-        ...empty,
-        error: error instanceof Error ? error.message : String(error),
-      };
-      setState(next);
-      return next;
-    }
-  }, [cwd, empty]);
-
-  useEffect(() => {
-    let cancelled = false;
-    void loadCustomSlashCommands(cwd)
-      .then((next) => {
-        if (!cancelled) setState(next);
-      })
-      .catch((error) => {
-        if (cancelled) return;
-        setState({
-          ...empty,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [cwd, empty]);
-
-  return {
-    ...state,
-    reload,
-  };
-}
-
 function useGitBranch(cwd: string, explicitBranch: string | undefined): string | undefined {
   const [branch, setBranch] = useState<string | undefined>(explicitBranch);
   useEffect(() => {
@@ -2142,6 +2269,13 @@ function printableKey(key: KeyEvent): string | undefined {
   if (key.sequence.length === 1 && key.sequence >= " " && key.sequence !== "\x7f") return key.sequence;
   if (key.name.length === 1) return key.name;
   return undefined;
+}
+
+function numericShortcutIndex(key: KeyEvent): number | undefined {
+  if (hasModifier(key)) return undefined;
+  const value = key.sequence.length === 1 ? key.sequence : key.name;
+  if (!/^[1-9]$/.test(value)) return undefined;
+  return Number(value) - 1;
 }
 
 function isEnter(key: KeyEvent): boolean {
