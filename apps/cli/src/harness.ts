@@ -24,7 +24,7 @@ import {
   type WorkerToolPolicy,
 } from "@chili/core";
 import type { AgentPath, ApprovalDecision, EventEnvelope, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
-import { ObservableEventStore, SqliteEventStore } from "@chili/store";
+import { ObservableEventStore, SessionTranscriptJsonlMirror, SqliteEventStore } from "@chili/store";
 import type { AgentMailboxRow, AgentTaskQuery, AgentTaskRow, TeamMemberRow, TeamMessageRow, TeamRow, TeamTaskRow } from "@chili/store";
 import {
   DeferredApprovalQueue,
@@ -99,6 +99,7 @@ import {
   type SkillResourceListing,
   type SkillRegistry,
 } from "@chili/skills";
+import { defaultChiliHome } from "@chili/providers";
 import { createCliApprovalBroker, createCliApprovalRulesets, persistAllowAlwaysDecision } from "./approval.js";
 import { loadCliConfig, type CliConfig } from "./config.js";
 import { createIdFactory } from "./id.js";
@@ -145,7 +146,13 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   await mkdir(stateDir, { recursive: true });
 
   const createId = createIdFactory();
-  const sqliteStore = new SqliteEventStore(join(stateDir, "chili.sqlite"));
+  const chiliHome = options.chiliHome ?? defaultChiliHome();
+  let sqliteStore: SqliteEventStore;
+  const sessionMirror = new SessionTranscriptJsonlMirror(join(chiliHome, "sessions"), {
+    groupByCwd: true,
+    resolveSessionCwd: async (sessionId) => (await sqliteStore.sessions()).find((session) => session.id === sessionId)?.cwd,
+  });
+  sqliteStore = new SqliteEventStore(join(stateDir, "chili.sqlite"), { mirror: sessionMirror });
   const printer = new CliPrinter();
   const printableStore = options.quiet ? sqliteStore : new PrintingEventStore(sqliteStore, printer);
   const eventStore = new ObservableEventStore(printableStore);
@@ -156,7 +163,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   if (options.reasoningLevel !== undefined) cliModelInput.reasoningLevel = options.reasoningLevel;
   const model = await createCliModel(cliModelInput);
   const skillRegistry = await discoverSkills({ cwd });
-  const config = await loadCliConfig(cwd, options.chiliHome ? { chiliHome: options.chiliHome } : {});
+  const config = await loadCliConfig(cwd, { chiliHome });
   const registry = createToolRegistry(skillRegistry);
   const childRegistry = createChildToolRegistry(skillRegistry);
   const promptFragments = (context: { cwd: string; turn?: RuntimePromptTurnContext }) =>
