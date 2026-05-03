@@ -4,7 +4,25 @@ export interface SseEvent {
   id?: string;
 }
 
-export async function* readSseEvents(body: ReadableStream<Uint8Array>, signal?: AbortSignal): AsyncIterable<SseEvent> {
+export interface ReadSseEventsOptions {
+  signal?: AbortSignal;
+  idleTimeoutMs?: number;
+}
+
+export const DEFAULT_SSE_IDLE_TIMEOUT_MS = 120_000;
+
+interface NormalizedReadSseEventsOptions {
+  signal?: AbortSignal;
+  idleTimeoutMs: number;
+}
+
+type SseReaderReadResult = Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>>;
+
+export async function* readSseEvents(
+  body: ReadableStream<Uint8Array>,
+  options?: AbortSignal | ReadSseEventsOptions,
+): AsyncIterable<SseEvent> {
+  const { signal, idleTimeoutMs } = normalizeOptions(options);
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -19,7 +37,7 @@ export async function* readSseEvents(body: ReadableStream<Uint8Array>, signal?: 
     signal?.addEventListener("abort", cancelReader, { once: true });
     while (true) {
       if (signal?.aborted) throw abortError();
-      const chunk = await reader.read();
+      const chunk = await readWithIdleTimeout(reader, idleTimeoutMs);
       if (chunk.done) break;
       buffer += normalizeNewlines(decoder.decode(chunk.value, { stream: true }));
       yield* drainEvents(buffer, (next) => {
@@ -35,6 +53,49 @@ export async function* readSseEvents(body: ReadableStream<Uint8Array>, signal?: 
     signal?.removeEventListener("abort", cancelReader);
     reader.releaseLock();
   }
+}
+
+function normalizeOptions(options: AbortSignal | ReadSseEventsOptions | undefined): NormalizedReadSseEventsOptions {
+  if (isAbortSignal(options)) {
+    return { signal: options, idleTimeoutMs: DEFAULT_SSE_IDLE_TIMEOUT_MS };
+  }
+  const normalized: NormalizedReadSseEventsOptions = {
+    idleTimeoutMs: options?.idleTimeoutMs ?? DEFAULT_SSE_IDLE_TIMEOUT_MS,
+  };
+  if (options?.signal) normalized.signal = options.signal;
+  return normalized;
+}
+
+async function readWithIdleTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  idleTimeoutMs: number,
+): Promise<SseReaderReadResult> {
+  if (idleTimeoutMs <= 0) return reader.read();
+
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => {
+          const error = idleTimeoutError(idleTimeoutMs);
+          reject(error);
+          void reader.cancel(error).catch(() => undefined);
+        }, idleTimeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function isAbortSignal(value: unknown): value is AbortSignal {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "aborted" in value &&
+    typeof (value as { addEventListener?: unknown }).addEventListener === "function"
+  );
 }
 
 function* drainEvents(buffer: string, updateBuffer: (next: string) => void): Iterable<SseEvent> {
@@ -76,5 +137,11 @@ function normalizeNewlines(value: string): string {
 function abortError(): Error {
   const error = new Error("Model stream aborted");
   error.name = "AbortError";
+  return error;
+}
+
+function idleTimeoutError(idleTimeoutMs: number): Error {
+  const error = new Error(`SSE stream timed out after ${idleTimeoutMs}ms without data`);
+  error.name = "SseIdleTimeoutError";
   return error;
 }
