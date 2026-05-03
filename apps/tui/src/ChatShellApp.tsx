@@ -548,6 +548,7 @@ export function ChatShellSurface(props: {
   }, [completions.length]);
 
   const selectorOpen = Boolean(modelPicker || reasoningPicker || permissionsPicker);
+  const approvalShortcutsEnabled = view === "chat" && Boolean(firstApproval) && props.runtime.chatView.pendingApprovals.length > 0 && !authManualPrompt && !selectorOpen && !themePicker && !paletteOpen && !slashCompletionOpen && !skillCompletionOpen;
   const disabledReason = authManualPrompt
     ? undefined
     : modelPicker
@@ -783,19 +784,19 @@ export function ChatShellSurface(props: {
       if (next !== undefined) setPromptFromHistory(next);
       return;
     }
-    if (view === "chat" && !prompt && firstApproval && isApproveAlwaysKey(key)) {
+    if (approvalShortcutsEnabled && firstApproval && isApproveAlwaysKey(key)) {
       void props.runtime.approveApproval(firstApproval.id, { scope: "persistent" });
       return;
     }
-    if (view === "chat" && !prompt && firstApproval && isApproveSessionKey(key)) {
+    if (approvalShortcutsEnabled && firstApproval && isApproveSessionKey(key)) {
       void props.runtime.approveApproval(firstApproval.id, { scope: "session" });
       return;
     }
-    if (view === "chat" && !prompt && firstApproval && isApproveOnceKey(key)) {
+    if (approvalShortcutsEnabled && firstApproval && isApproveOnceKey(key)) {
       void props.runtime.approveApproval(firstApproval.id, { scope: "once" });
       return;
     }
-    if (view === "chat" && !prompt && firstApproval && isRejectApprovalKey(key)) {
+    if (approvalShortcutsEnabled && firstApproval && isRejectApprovalKey(key)) {
       void props.runtime.rejectApproval(firstApproval.id);
       return;
     }

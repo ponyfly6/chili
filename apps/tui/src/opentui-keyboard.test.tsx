@@ -1374,6 +1374,63 @@ test("pending approval renders the approval dock and shortcuts resolve it", asyn
   }
 });
 
+test("pending approval shortcuts work when the prompt still has a draft", async () => {
+  const approved: Array<{ id: ApprovalId; scope: ChatApproveOptions["scope"] }> = [];
+  const approvalId = "approval_with_draft" as ApprovalId;
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    runtime: {
+      approveApproval: async (id, options) => {
+        approved.push({ id, scope: options?.scope });
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "draft left in composer");
+    await act(async () => {
+      app.setRuntime((current) => ({
+        ...current,
+        canSubmit: false,
+        chatView: {
+          status: "waiting_for_approval",
+          items: [],
+          pendingApprovals: [
+            {
+              id: approvalId,
+              kind: "approval",
+              permission: "git_stage",
+              patterns: ["apps/tui/src/ChatShellApp.tsx"],
+              status: "pending",
+              createdAt: 1,
+              toolName: "git_stage",
+              toolDisplayStatus: "waiting_permission",
+              inputSummary: { title: "git_stage", detail: "apps/tui/src/ChatShellApp.tsx" },
+              metadata: { reason: "No permission rule matched git_stage:apps/tui/src/ChatShellApp.tsx.", source: "default" },
+            },
+          ] as never,
+          activeTools: [],
+          generatedAt: "1970-01-01T00:00:01.000Z",
+        },
+      }));
+    });
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("draft left");
+    expect(frame).toContain("in composer");
+
+    await press(app, () => app.mockInput.pressKey("s"));
+    await press(app, () => app.mockInput.pressKey("a", { shift: true }));
+
+    expect(approved).toEqual([
+      { id: approvalId, scope: "session" },
+      { id: approvalId, scope: "persistent" },
+    ]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("stale approval resolve failures are shown instead of success", async () => {
   const records = chatClientRecords();
   const sessionId = "session_stale_approval" as SessionId;
