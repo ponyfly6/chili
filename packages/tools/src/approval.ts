@@ -7,6 +7,7 @@ export interface PolicyApprovalBrokerOptions {
   rulesets?: readonly (readonly PermissionRule[])[];
   ask?: (request: ApprovalBrokerRequest) => Promise<ApprovalDecision>;
   onSessionGrant?: (grant: SessionApprovalGrant) => Promise<void> | void;
+  dangerousShellCommands?: "ask" | "allow";
 }
 
 export interface SessionApprovalGrant {
@@ -21,6 +22,14 @@ export class PolicyApprovalBroker implements ApprovalBroker {
   private readonly sessionGrants = new Map<SessionId, PermissionRule[]>();
 
   constructor(private readonly options: PolicyApprovalBrokerOptions = {}) {}
+
+  setRulesets(rulesets: readonly (readonly PermissionRule[])[]): void {
+    this.options.rulesets = rulesets;
+  }
+
+  setDangerousShellCommands(mode: "ask" | "allow"): void {
+    this.options.dangerousShellCommands = mode;
+  }
 
   async preflight(request: ApprovalPreflightRequest): Promise<ApprovalPreflightDecision> {
     return this.evaluate(request).decision;
@@ -93,7 +102,7 @@ export class PolicyApprovalBroker implements ApprovalBroker {
     const patternDecisions: ApprovalPreflightDecision[] = [];
 
     for (const pattern of request.patterns) {
-      const risk = approvalRisk(request.permission, pattern);
+      const risk = this.options.dangerousShellCommands === "allow" ? undefined : approvalRisk(request.permission, pattern);
       if (risk?.action === "deny") {
         return {
           decision: dangerDecision(request, risk),

@@ -218,7 +218,8 @@ function applyTranscriptPartDelta(part: MessagePart, field: string, delta: strin
 function messageText(parts: readonly MessagePart[]): string {
   return parts
     .map((part) => {
-      if (part.type === "text" || part.type === "reasoning") return part.text;
+      if (part.type === "text") return part.displayText ?? part.text;
+      if (part.type === "reasoning") return part.text;
       if (part.type === "tool_call") return `[${part.toolName}]`;
       if (part.type === "tool_result") return part.output || part.error || "";
       if (part.type === "compaction") return part.summary ?? "";

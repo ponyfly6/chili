@@ -132,13 +132,15 @@ export class SingleAgentRuntime implements AgentRunner {
       messageId,
       role: "user",
     });
-    await this.appendPart(input, messageId, {
+    const part: Extract<MessagePart, { type: "text" }> = {
       id: this.id<PartId>("part"),
       messageId,
       sessionId: input.sessionId,
       type: "text",
       text: input.text,
-    });
+    };
+    if (input.displayText) part.displayText = input.displayText;
+    await this.appendPart(input, messageId, part);
     return messageId;
   }
 

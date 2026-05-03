@@ -42,6 +42,20 @@ test("resolves commands view and reload slash commands", async () => {
   });
 });
 
+test("resolves permissions slash commands to the permissions picker", async () => {
+  const commands = createDefaultSlashCommands();
+  const ctx = { model: {} } as SlashCommandContext;
+
+  expect(await resolveSlashCommand(commands, "/permissions")?.command.run(ctx, "")).toEqual({
+    type: "open_permissions_picker",
+  });
+  expect(await resolveSlashCommand(commands, "/approvals")?.command.run(ctx, "")).toEqual({
+    type: "open_permissions_picker",
+  });
+  expect(slashCompletions(commands, ctx, "/per", 8).map((completion) => completion.value)).toContain("/permissions");
+  expect(slashCompletions(commands, ctx, "/app", 8).map((completion) => completion.value)).toContain("/approvals");
+});
+
 test("resolves model slash command to model selection actions", async () => {
   const commands = createDefaultSlashCommands();
   const ctx = {

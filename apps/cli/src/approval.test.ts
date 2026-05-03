@@ -5,7 +5,7 @@ import { expect, test } from "bun:test";
 import type { ApprovalId, SessionId, ToolCallId } from "@chili/protocol";
 import { evaluatePolicy } from "@chili/policy";
 import type { ApprovalBrokerRequest } from "@chili/tools";
-import { createCliApprovalBroker, createCliApprovalRulesets, persistAllowAlwaysDecision } from "./approval.js";
+import { createCliApprovalBroker, createCliApprovalRulesets, persistAllowAlwaysDecision, runtimePermissionConfig } from "./approval.js";
 
 test("CLI approval rules layer defaults, user config, then project config", () => {
   const rulesets = createCliApprovalRulesets(false, {
@@ -29,6 +29,21 @@ test("--yes keeps configured denies while bypassing configured asks", () => {
   expect(evaluatePolicy("bash", "npm test", rulesets).action).toBe("allow");
   expect(evaluatePolicy("read", "~/.ssh/id_rsa", rulesets).action).toBe("deny");
   expect(evaluatePolicy("write", ".chili/config.toml", rulesets).action).toBe("deny");
+});
+
+test("permission profiles expose Codex-style default and full-access semantics", async () => {
+  const defaultRulesets = createCliApprovalRulesets("default");
+  expect(evaluatePolicy("edit", "src/app.ts", defaultRulesets).action).toBe("allow");
+  expect(evaluatePolicy("bash", "npm test", defaultRulesets).action).toBe("allow");
+
+  const fullAccessBroker = createCliApprovalBroker({ yes: true });
+  expect(await fullAccessBroker.preflight(approvalRequest("sudo echo ok"))).toMatchObject({
+    action: "allow",
+  });
+
+  const config = runtimePermissionConfig("default");
+  expect(config.profiles.map((profile) => profile.label)).toEqual(["Default", "Auto-review", "Full Access"]);
+  expect(config.profiles.find((profile) => profile.id === "auto-review")?.disabledReason).toContain("not implemented");
 });
 
 test("allow_always decisions persist user-level grants", async () => {
@@ -80,6 +95,10 @@ test("CLI broker persists interactive always approvals through CLI helper", asyn
     console.log = () => undefined;
     const broker = createCliApprovalBroker({
       chiliHome: root,
+      config: {
+        userPermissions: [{ permission: "bash(*)", pattern: "*", action: "ask" }],
+        projectPermissions: [],
+      },
       readline: {
         question: async () => "always",
       } as never,

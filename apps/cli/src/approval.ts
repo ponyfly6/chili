@@ -1,5 +1,5 @@
 import { createInterface, type Interface } from "node:readline/promises";
-import type { ApprovalDecision } from "@chili/protocol";
+import type { ApprovalDecision, RuntimePermissionConfig, RuntimePermissionProfileId } from "@chili/protocol";
 import { PolicyApprovalBroker, type ApprovalBrokerRequest } from "@chili/tools";
 import type { PermissionRule } from "@chili/policy";
 import {
@@ -16,35 +16,76 @@ export interface CliApprovalOptions {
 }
 
 export function createCliApprovalBroker(options: CliApprovalOptions = {}): PolicyApprovalBroker {
+  const profile = options.yes ? "full-access" : "default";
   return new PolicyApprovalBroker({
-    rulesets: createCliApprovalRulesets(options.yes ?? false, options.config),
+    rulesets: createCliApprovalRulesets(profile, options.config),
+    dangerousShellCommands: dangerousShellCommandsForProfile(profile),
     ask: async (request) => askApproval(request, options),
   });
 }
 
-export function createCliApprovalRulesets(yes: boolean, config?: CliConfig): readonly (readonly PermissionRule[])[] {
-  const rulesets: PermissionRule[][] = [createCliPermissionRules(yes)];
-  const userPermissions = configuredRulesForMode(yes, config?.userPermissions ?? []);
-  const projectPermissions = configuredRulesForMode(yes, config?.projectPermissions ?? []);
+export function createCliApprovalRulesets(profile: RuntimePermissionProfileId | boolean, config?: CliConfig): readonly (readonly PermissionRule[])[] {
+  const resolvedProfile = typeof profile === "boolean" ? (profile ? "full-access" : "default") : profile;
+  const rulesets: PermissionRule[][] = [createCliPermissionRules(resolvedProfile)];
+  const userPermissions = configuredRulesForMode(resolvedProfile, config?.userPermissions ?? []);
+  const projectPermissions = configuredRulesForMode(resolvedProfile, config?.projectPermissions ?? []);
   if (userPermissions.length) rulesets.push(userPermissions);
   if (projectPermissions.length) rulesets.push(projectPermissions);
   return rulesets;
 }
 
-export function createCliPermissionRules(yes: boolean): PermissionRule[] {
-  return yes
-    ? [{ permission: "*", pattern: "*", action: "allow" }]
-    : [
-        { permission: "read", pattern: "*", action: "allow" },
-        { permission: "glob", pattern: "*", action: "allow" },
-        { permission: "grep", pattern: "*", action: "allow" },
-        { permission: "git_status", pattern: "*", action: "allow" },
-        { permission: "git_diff", pattern: "*", action: "allow" },
-      ];
+export function createCliPermissionRules(profile: RuntimePermissionProfileId | boolean): PermissionRule[] {
+  const resolvedProfile = typeof profile === "boolean" ? (profile ? "full-access" : "default") : profile;
+  if (resolvedProfile === "full-access") {
+    return [{ permission: "*", pattern: "*", action: "allow", source: "permission_profile:full-access" }];
+  }
+
+  const source = `permission_profile:${resolvedProfile}`;
+  return [
+    { permission: "read", pattern: "*", action: "allow", source },
+    { permission: "glob", pattern: "*", action: "allow", source },
+    { permission: "grep", pattern: "*", action: "allow", source },
+    { permission: "edit", pattern: "*", action: "allow", source },
+    { permission: "write", pattern: "*", action: "allow", source },
+    { permission: "bash", pattern: "*", action: "allow", source },
+    { permission: "git_status", pattern: "*", action: "allow", source },
+    { permission: "git_diff", pattern: "*", action: "allow", source },
+  ];
 }
 
-function configuredRulesForMode(yes: boolean, rules: readonly PermissionRule[]): PermissionRule[] {
-  return yes ? rules.filter((rule) => rule.action !== "ask") : [...rules];
+export function dangerousShellCommandsForProfile(profile: RuntimePermissionProfileId): "ask" | "allow" {
+  return profile === "full-access" ? "allow" : "ask";
+}
+
+function configuredRulesForMode(profile: RuntimePermissionProfileId, rules: readonly PermissionRule[]): PermissionRule[] {
+  return profile === "full-access" ? rules.filter((rule) => rule.action !== "ask") : [...rules];
+}
+
+export function runtimePermissionConfig(profile: RuntimePermissionProfileId): RuntimePermissionConfig {
+  return {
+    profile,
+    profiles: [
+      {
+        id: "default",
+        label: "Default",
+        description: "Chili can read and edit files in the current workspace, and run commands. Project/user deny rules still apply.",
+        current: profile === "default",
+      },
+      {
+        id: "auto-review",
+        label: "Auto-review",
+        description: "Same workspace-write permissions as Default, but eligible approvals are routed through an auto-reviewer subagent.",
+        current: profile === "auto-review",
+        disabledReason: "Auto-reviewer approval routing is not implemented in Chili yet.",
+      },
+      {
+        id: "full-access",
+        label: "Full Access",
+        description: "Chili can use all tools without asking for approval. Exercise caution when using.",
+        current: profile === "full-access",
+      },
+    ],
+  };
 }
 
 export async function persistApprovalGrantForRequest(

@@ -1,3 +1,4 @@
+import { RUNTIME_PERMISSION_PROFILE_IDS } from "@chili/protocol";
 import type {
   ChiliEvent,
   AgentPath,
@@ -7,6 +8,8 @@ import type {
   RuntimeInterruptResult,
   RuntimeModelConfig,
   RuntimeModelDescriptor,
+  RuntimePermissionConfig,
+  RuntimePermissionProfileId,
   RuntimeApprovalResolveResult,
   RuntimePromptAccepted,
   RuntimePromptResult,
@@ -55,6 +58,8 @@ import type {
   UpdateTeamTaskInput,
 } from "@chili/core";
 import type { EventPublisher, EventStore } from "@chili/store";
+import type { PromptCommandControl } from "./commands.js";
+import { PromptCommandAmbiguousError, PromptCommandNotFoundError } from "./commands.js";
 import type {
   AgentMailboxQuery,
   AgentMailboxRow,
@@ -137,6 +142,8 @@ export interface RuntimeHttpHandlerOptions {
   teamMerger?: RuntimeTeamMergeService;
   teamRunner?: RuntimeTeamExecutionRunnerService;
   approvals?: ApprovalResolver;
+  permissions?: PermissionProfileControl;
+  commands?: PromptCommandControl;
   maxBacklogEvents?: number;
   onBackgroundError?: (error: unknown) => void;
 }
@@ -147,6 +154,11 @@ export interface ApprovalResolver {
     decision: ApprovalDecisionAction;
     feedback?: string;
   }): boolean | Promise<boolean>;
+}
+
+export interface PermissionProfileControl {
+  get(): RuntimePermissionConfig | Promise<RuntimePermissionConfig>;
+  set(profile: RuntimePermissionProfileId): RuntimePermissionConfig | Promise<RuntimePermissionConfig>;
 }
 
 export interface StartRuntimeHttpServerOptions extends RuntimeHttpHandlerOptions {
@@ -179,6 +191,26 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "models") {
         const provider = url.searchParams.get("provider") ?? undefined;
         return json(await requireModelControl(options).listModels(provider ? { provider } : {}));
+      }
+
+      if (route.name === "permissionsConfig") {
+        if (!options.permissions) return jsonError(501, "No permission profile controller is configured");
+        return json(await options.permissions.get());
+      }
+
+      if (route.name === "setPermissions") {
+        if (!options.permissions) return jsonError(501, "No permission profile controller is configured");
+        const body = await readJson<PermissionsBody>(request);
+        if (!isRuntimePermissionProfileId(body.profile)) throw badRequest("profile must be default, auto-review, or full-access");
+        return json(await options.permissions.set(body.profile));
+      }
+
+      if (route.name === "commands") {
+        return json(await requireCommandControl(options).list());
+      }
+
+      if (route.name === "commandsReload") {
+        return json(await requireCommandControl(options).reload());
       }
 
       if (route.name === "listTasks") {
@@ -441,6 +473,39 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         return json(accepted, 202);
       }
 
+      if (route.name === "commandAsync") {
+        const body = await readJson<CommandPromptBody>(request);
+        if (!body.threadId) throw badRequest("threadId is required");
+        if (typeof body.name !== "string" || body.name.trim().length === 0) throw badRequest("name is required");
+        if (body.args !== undefined && typeof body.args !== "string") throw badRequest("args must be a string when provided");
+        if (body.cwd !== undefined && typeof body.cwd !== "string") throw badRequest("cwd must be a string when provided");
+        await requireSession(options.store, route.sessionId);
+
+        const command = await requireCommandControl(options).run({
+          name: body.name.trim(),
+          ...(body.args ? { args: body.args } : {}),
+          ...(body.cwd ? { cwd: body.cwd } : {}),
+        });
+        const displayText = body.args?.trim()
+          ? `/${command.command.name} ${body.args.trim()}`
+          : `/${command.command.name}`;
+        const input = buildSubmitPromptInput(route.sessionId, {
+          threadId: body.threadId,
+          text: command.prompt,
+          displayText,
+          ...(body.cwd ? { cwd: body.cwd } : {}),
+          ...(body.modelSelection ? { modelSelection: body.modelSelection } : {}),
+          ...(body.reasoningLevel ? { reasoningLevel: body.reasoningLevel } : {}),
+        });
+        options.service.submitPromptAsync(input, options.onBackgroundError);
+        const accepted: RuntimePromptAccepted = {
+          status: "accepted",
+          sessionId: route.sessionId,
+          threadId: body.threadId,
+        };
+        return json(accepted, 202);
+      }
+
       if (route.name === "interrupt") {
         const body = await readJson<InterruptBody>(request);
         const result: RuntimeInterruptResult = {
@@ -510,6 +575,10 @@ type Route =
   | { name: "listTasks" }
   | { name: "tasksReconcileStale" }
   | { name: "models" }
+  | { name: "permissionsConfig" }
+  | { name: "setPermissions" }
+  | { name: "commands" }
+  | { name: "commandsReload" }
   | { name: "agentTree" }
   | { name: "agentRuns" }
   | { name: "mailbox" }
@@ -542,6 +611,7 @@ type Route =
   | { name: "setReasoning"; sessionId: SessionId }
   | { name: "prompt"; sessionId: SessionId }
   | { name: "promptAsync"; sessionId: SessionId }
+  | { name: "commandAsync"; sessionId: SessionId }
   | { name: "interrupt"; sessionId: SessionId }
   | { name: "archive"; sessionId: SessionId }
   | { name: "resolveApproval"; approvalId: import("@chili/protocol").ApprovalId }
@@ -556,9 +626,19 @@ interface CreateSessionBody {
 interface PromptBody {
   threadId?: ThreadId;
   text?: string;
+  displayText?: string;
   skillMentions?: unknown;
   cwd?: string;
   maxTurns?: number;
+  modelSelection?: ModelSelection;
+  reasoningLevel?: ReasoningLevel;
+}
+
+interface CommandPromptBody {
+  threadId?: ThreadId;
+  name?: string;
+  args?: string;
+  cwd?: string;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
 }
@@ -571,6 +651,10 @@ interface ModelBody {
 interface ReasoningBody {
   threadId?: ThreadId;
   reasoningLevel?: unknown;
+}
+
+interface PermissionsBody {
+  profile?: unknown;
 }
 
 interface TaskFollowupBody {
@@ -728,6 +812,8 @@ function routeRequest(method: string, pathname: string): Route {
   if (method === "POST" && path === "/teams/reconcile_dispatches") return { name: "teamReconcileDispatches" };
   if (method === "GET" && path === "/sessions") return { name: "listSessions" };
   if (method === "GET" && path === "/models") return { name: "models" };
+  if (method === "GET" && path === "/commands") return { name: "commands" };
+  if (method === "POST" && path === "/commands/reload") return { name: "commandsReload" };
   if (method === "GET" && path === "/tasks") return { name: "listTasks" };
   if (method === "POST" && path === "/tasks/reconcile_stale") return { name: "tasksReconcileStale" };
   if (method === "POST" && path === "/sessions") return { name: "createSession" };
@@ -793,6 +879,12 @@ function routeRequest(method: string, pathname: string): Route {
     return { name: "notFound" };
   }
 
+  if (path === "/permissions") {
+    if (method === "GET") return { name: "permissionsConfig" };
+    if (method === "POST") return { name: "setPermissions" };
+    return { name: "notFound" };
+  }
+
   const sessionRoute = /^\/sessions\/([^/]+)\/([^/]+)$/.exec(path);
   if (!sessionRoute) return { name: "notFound" };
 
@@ -805,6 +897,7 @@ function routeRequest(method: string, pathname: string): Route {
   if (method === "POST" && action === "reasoning") return { name: "setReasoning", sessionId };
   if (method === "POST" && action === "prompt") return { name: "prompt", sessionId };
   if (method === "POST" && action === "prompt_async") return { name: "promptAsync", sessionId };
+  if (method === "POST" && action === "command_async") return { name: "commandAsync", sessionId };
   if (method === "POST" && action === "interrupt") return { name: "interrupt", sessionId };
   if (method === "POST" && action === "archive") return { name: "archive", sessionId };
   return { name: "notFound" };
@@ -816,6 +909,7 @@ function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody): SubmitP
     threadId: body.threadId as ThreadId,
     text: body.text ?? "",
   };
+  if (body.displayText) input.displayText = body.displayText;
   if (body.cwd) input.cwd = body.cwd;
   const skillMentions = parseSkillMentions(body.skillMentions);
   if (skillMentions.length > 0) input.skillMentions = skillMentions;
@@ -1087,6 +1181,12 @@ function toHttpError(error: unknown): HttpError {
   if (err.name === "RuntimeBusyError") {
     return { status: 409, message: err.message };
   }
+  if (err instanceof PromptCommandNotFoundError) {
+    return { status: 404, message: err.message };
+  }
+  if (err instanceof PromptCommandAmbiguousError) {
+    return { status: 409, message: err.message };
+  }
   return { status: 500, message: err.message };
 }
 
@@ -1139,6 +1239,10 @@ function isReasoningLevel(value: unknown): value is ReasoningLevel {
     || value === "xhigh";
 }
 
+function isRuntimePermissionProfileId(value: unknown): value is RuntimePermissionProfileId {
+  return typeof value === "string" && RUNTIME_PERMISSION_PROFILE_IDS.includes(value as RuntimePermissionProfileId);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -1146,6 +1250,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function requireTaskControl(options: RuntimeHttpHandlerOptions): RuntimeTaskControlService {
   if (!options.tasks) throw { status: 501, message: "No task control service is configured" } satisfies HttpError;
   return options.tasks;
+}
+
+function requireCommandControl(options: RuntimeHttpHandlerOptions): PromptCommandControl {
+  if (!options.commands) throw { status: 501, message: "No command control service is configured" } satisfies HttpError;
+  return options.commands;
 }
 
 function requireAgentTree(options: RuntimeHttpHandlerOptions): RuntimeAgentTreeService {

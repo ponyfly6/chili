@@ -37,6 +37,7 @@ export interface BasePart {
 export interface TextPart extends BasePart {
   type: "text";
   text: string;
+  displayText?: string;
   synthetic?: boolean;
 }
 

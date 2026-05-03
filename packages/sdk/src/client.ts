@@ -11,6 +11,10 @@ import type {
   RuntimeInterruptResult,
   RuntimeModelConfig,
   RuntimeModelDescriptor,
+  RuntimePermissionConfig,
+  RuntimePermissionProfileId,
+  RuntimePromptCommandInvocation,
+  RuntimePromptCommandList,
   RuntimePromptAccepted,
   RuntimePromptResult,
   RuntimeSessionRef,
@@ -35,8 +39,13 @@ export interface RuntimeClient {
   getModelConfig(input: GetModelConfigRequest): Promise<RuntimeModelConfig>;
   setModel(input: SetModelRequest): Promise<RuntimeModelConfig>;
   setReasoning(input: SetReasoningRequest): Promise<RuntimeModelConfig>;
+  getPermissionConfig(input?: GetPermissionConfigRequest): Promise<RuntimePermissionConfig>;
+  setPermissionProfile(input: SetPermissionProfileRequest): Promise<RuntimePermissionConfig>;
+  listCommands(input?: ListCommandsRequest): Promise<RuntimePromptCommandList>;
+  reloadCommands(input?: ReloadCommandsRequest): Promise<RuntimePromptCommandList>;
   submitPrompt(input: SubmitPromptRequest): Promise<RuntimePromptResult>;
   submitPromptAsync(input: SubmitPromptRequest): Promise<RuntimePromptAccepted>;
+  submitCommandAsync(input: SubmitCommandRequest): Promise<RuntimePromptAccepted>;
   interruptSession(input: InterruptSessionRequest): Promise<RuntimeInterruptResult>;
   resolveApproval(input: ResolveApprovalRequest): Promise<RuntimeApprovalResolveResult>;
   approveApproval(input: ApproveApprovalRequest): Promise<RuntimeApprovalResolveResult>;
@@ -114,6 +123,31 @@ export interface SetReasoningRequest {
   sessionId: SessionId;
   threadId?: ThreadId;
   reasoningLevel: ReasoningLevel;
+  signal?: AbortSignal;
+}
+
+export interface GetPermissionConfigRequest {
+  signal?: AbortSignal;
+}
+
+export interface SetPermissionProfileRequest {
+  profile: RuntimePermissionProfileId;
+  signal?: AbortSignal;
+}
+
+export interface ListCommandsRequest {
+  signal?: AbortSignal;
+}
+
+export interface ReloadCommandsRequest {
+  signal?: AbortSignal;
+}
+
+export interface SubmitCommandRequest extends RuntimePromptCommandInvocation {
+  sessionId: SessionId;
+  threadId: ThreadId;
+  modelSelection?: ModelSelection;
+  reasoningLevel?: ReasoningLevel;
   signal?: AbortSignal;
 }
 
@@ -799,6 +833,22 @@ export class HttpRuntimeClient implements RuntimeClient {
     }, input.signal);
   }
 
+  getPermissionConfig(input: GetPermissionConfigRequest = {}): Promise<RuntimePermissionConfig> {
+    return this.get("permissions", input.signal);
+  }
+
+  setPermissionProfile(input: SetPermissionProfileRequest): Promise<RuntimePermissionConfig> {
+    return this.post("permissions", { profile: input.profile }, input.signal);
+  }
+
+  listCommands(input: ListCommandsRequest = {}): Promise<RuntimePromptCommandList> {
+    return this.get("commands", input.signal);
+  }
+
+  reloadCommands(input: ReloadCommandsRequest = {}): Promise<RuntimePromptCommandList> {
+    return this.post("commands/reload", {}, input.signal);
+  }
+
   submitPrompt(input: SubmitPromptRequest): Promise<RuntimePromptResult> {
     const { signal, ...body } = input;
     return this.post(`sessions/${encodeURIComponent(input.sessionId)}/prompt`, body, signal);
@@ -807,6 +857,11 @@ export class HttpRuntimeClient implements RuntimeClient {
   submitPromptAsync(input: SubmitPromptRequest): Promise<RuntimePromptAccepted> {
     const { signal, ...body } = input;
     return this.post(`sessions/${encodeURIComponent(input.sessionId)}/prompt_async`, body, signal);
+  }
+
+  submitCommandAsync(input: SubmitCommandRequest): Promise<RuntimePromptAccepted> {
+    const { signal, ...body } = input;
+    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/command_async`, body, signal);
   }
 
   interruptSession(input: InterruptSessionRequest): Promise<RuntimeInterruptResult> {

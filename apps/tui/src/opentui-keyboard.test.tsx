@@ -1936,6 +1936,7 @@ async function mountShell(
     chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
     canSubmit: true,
     submitPrompt: async () => true,
+    submitCommand: async () => true,
     startNewSession: async () => undefined,
     interruptActiveSession: async () => undefined,
     approveApproval: async () => undefined,
@@ -2040,6 +2041,7 @@ function chatRuntime(
     chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
     canSubmit: true,
     submitPrompt: async () => true,
+    submitCommand: async () => true,
     startNewSession: async () => undefined,
     interruptActiveSession: async () => undefined,
     approveApproval: async () => undefined,
@@ -2218,7 +2220,23 @@ function fakeChatClient(
       records.submit.push(input);
       return { status: "accepted", sessionId: input.sessionId as SessionId, threadId: input.threadId as ThreadId };
     },
+    submitCommandAsync: async (input: Record<string, unknown>) => {
+      records.submit.push(input);
+      return { status: "accepted", sessionId: input.sessionId as SessionId, threadId: input.threadId as ThreadId };
+    },
     submitPrompt: async () => ({ status: "completed", turns: [] }),
+    listCommands: async () => ({
+      commands: [],
+      diagnostics: [],
+      directories: [],
+      skippedConflicts: [],
+    }),
+    reloadCommands: async () => ({
+      commands: [],
+      diagnostics: [],
+      directories: [],
+      skippedConflicts: [],
+    }),
     interruptSession: async (input: Record<string, unknown>) => {
       records.interrupt.push(input);
       return { interrupted: true };

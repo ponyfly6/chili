@@ -82,6 +82,7 @@ export interface SubmitPromptInput {
   sessionId: SessionId;
   threadId: ThreadId;
   text: string;
+  displayText?: string;
   skillMentions?: readonly RuntimeSkillMention[];
   cwd?: string;
   maxTurns?: number;
@@ -173,7 +174,7 @@ export class RuntimeService {
     return { sessionId, threadId };
   }
 
-  appendUserMessage(input: { sessionId: SessionId; threadId: ThreadId; text: string }): Promise<MessageId> {
+  appendUserMessage(input: { sessionId: SessionId; threadId: ThreadId; text: string; displayText?: string }): Promise<MessageId> {
     return this.options.runtime.appendUserMessage(input);
   }
 
@@ -329,6 +330,7 @@ export class RuntimeService {
         sessionId: input.sessionId,
         threadId: input.threadId,
         text: input.text,
+        ...(input.displayText ? { displayText: input.displayText } : {}),
       });
 
       for (let index = 0; index < maxTurns; index++) {

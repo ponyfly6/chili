@@ -1,41 +1,25 @@
-import {
-  createCommandRegistry,
-  createCommandRunInput,
-  loadProjectCommands,
-  loadUserCommands,
-  type CommandDefinition,
-  type ProjectCommandDiagnostic,
-  type ProjectCommandsLoadResult,
-} from "@chili/commands";
+import type { RuntimePromptCommandDescriptor, RuntimePromptCommandList } from "@chili/protocol";
 import type { SlashCommand } from "./types.js";
 
 export interface CustomSlashCommandsState {
   commands: readonly SlashCommand[];
-  diagnostics: readonly ProjectCommandDiagnostic[];
+  diagnostics: RuntimePromptCommandList["diagnostics"];
   directories: readonly string[];
   skippedConflicts: readonly string[];
 }
 
-export async function loadCustomSlashCommands(cwd: string): Promise<CustomSlashCommandsState> {
-  const [project, user] = await Promise.all([
-    loadProjectCommands({ cwd }),
-    loadUserCommands(),
-  ]);
-  const registry = createCommandRegistry(project.commands);
-  const userResults = registry.registerMany(user.commands);
-  const skippedConflicts = userResults
-    .filter((result) => result.status === "skipped")
-    .map((result) => result.name);
-
+export function customSlashCommandsFromRuntime(
+  commandList: RuntimePromptCommandList | undefined,
+): CustomSlashCommandsState {
   return {
-    commands: registry.list().map(commandToSlashCommand),
-    diagnostics: [...project.diagnostics, ...user.diagnostics],
-    directories: directoriesOf(project, user),
-    skippedConflicts,
+    commands: (commandList?.commands ?? []).map(commandToSlashCommand),
+    diagnostics: commandList?.diagnostics ?? [],
+    directories: commandList?.directories ?? [],
+    skippedConflicts: commandList?.skippedConflicts ?? [],
   };
 }
 
-function commandToSlashCommand(command: CommandDefinition): SlashCommand {
+function commandToSlashCommand(command: RuntimePromptCommandDescriptor): SlashCommand {
   return {
     name: command.name,
     aliases: [...command.aliases],
@@ -43,28 +27,11 @@ function commandToSlashCommand(command: CommandDefinition): SlashCommand {
     category: "custom",
     argumentHint: command.argumentHint,
     hidden: command.hidden,
-    isSafeConcurrent: command.isSafeConcurrent,
-    run: async (ctx, args) => {
-      const invocation = `/${command.name}`;
-      const input = args.length > 0 ? `${invocation} ${args}` : invocation;
-      const commandContext = ctx.cwd ? { cwd: ctx.cwd } : {};
-      const result = await command.run(commandContext, createCommandRunInput(input, args, invocation));
-      return {
-        type: "submit_prompt",
-        prompt: result.prompt,
-        commandName: command.name,
-      };
-    },
+    isSafeConcurrent: true,
+    run: (_ctx, args) => ({
+      type: "submit_command",
+      commandName: command.name,
+      args,
+    }),
   };
-}
-
-function directoriesOf(...results: readonly ProjectCommandsLoadResult[]): string[] {
-  const seen = new Set<string>();
-  const directories: string[] = [];
-  for (const result of results) {
-    if (seen.has(result.directory)) continue;
-    seen.add(result.directory);
-    directories.push(result.directory);
-  }
-  return directories;
 }

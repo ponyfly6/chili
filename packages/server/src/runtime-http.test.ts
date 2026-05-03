@@ -27,6 +27,10 @@ import type {
   ReasoningLevel,
   RuntimeModelConfig,
   RuntimeModelDescriptor,
+  RuntimePermissionConfig,
+  RuntimePermissionProfileId,
+  RuntimePromptCommandInvocation,
+  RuntimePromptCommandList,
   RuntimeSessionRef,
   SessionId,
   TaskId,
@@ -43,6 +47,7 @@ import type {
   RuntimeTeamExecutionRunnerService,
   RuntimeTeamMergeService,
 } from "./runtime-http.js";
+import type { PromptCommandControl, PromptCommandRunResult } from "./commands.js";
 import { createRuntimeHttpHandler } from "./runtime-http.js";
 
 test("serves sessions and event backlog over the runtime HTTP handler", async () => {
@@ -632,6 +637,91 @@ test("resolves approvals through the runtime HTTP handler", async () => {
   expect(calls).toEqual([{ approvalId: "approval_http", decision: "allow_session", feedback: "" }]);
 });
 
+test("gets and sets permission profiles through the runtime HTTP handler", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  let profile: RuntimePermissionProfileId = "default";
+  const permissions = {
+    get() {
+      return permissionConfig(profile);
+    },
+    set(nextProfile: RuntimePermissionProfileId) {
+      profile = nextProfile;
+      return permissionConfig(profile);
+    },
+  };
+  const handler = createRuntimeHttpHandler({ service, store, permissions });
+
+  const getResponse = await handler(new Request("http://chili.test/permissions"));
+  expect(getResponse.status).toBe(200);
+  expect(await getResponse.json()).toMatchObject({ profile: "default" });
+
+  const setResponse = await handler(
+    new Request("http://chili.test/permissions", {
+      method: "POST",
+      body: JSON.stringify({ profile: "full-access" }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  expect(setResponse.status).toBe(200);
+  expect(await setResponse.json()).toMatchObject({ profile: "full-access" });
+  expect(String(profile)).toBe("full-access");
+
+  const badResponse = await handler(
+    new Request("http://chili.test/permissions", {
+      method: "POST",
+      body: JSON.stringify({ profile: "unsafe" }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  expect(badResponse.status).toBe(400);
+});
+
+test("serves prompt commands and submits expanded command prompts", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const commands = new FakePromptCommandControl();
+  const handler = createRuntimeHttpHandler({ service, store, commands });
+  const session = await service.createSession();
+
+  const listResponse = await handler(new Request("http://chili.test/commands"));
+  expect(listResponse.status).toBe(200);
+  expect(await listResponse.json()).toMatchObject({
+    commands: [{ name: "joke", description: "Tell a joke" }],
+  });
+
+  const reloadResponse = await handler(
+    new Request("http://chili.test/commands/reload", { method: "POST" }),
+  );
+  expect(reloadResponse.status).toBe(200);
+  expect(commands.reloadCount).toBe(1);
+
+  const submitResponse = await handler(
+    new Request(`http://chili.test/sessions/${session.sessionId}/command_async`, {
+      method: "POST",
+      body: JSON.stringify({
+        threadId: session.threadId,
+        name: "joke",
+        args: "typescript",
+        modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
+        reasoningLevel: "high",
+      }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+
+  expect(submitResponse.status).toBe(202);
+  expect(commands.lastRun).toEqual({ name: "joke", args: "typescript" });
+  expect(service.lastPrompt).toMatchObject({
+    text: "Tell a short joke about typescript.",
+    displayText: "/joke typescript",
+    modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
+    reasoningLevel: "high",
+  });
+});
+
 test("rejects malformed approval resolve payloads before the runtime resolver", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
@@ -917,6 +1007,28 @@ class BusyRuntimeService extends FakeRuntimeService {
     const error = new Error("Session is already running: session_http");
     error.name = "RuntimeBusyError";
     throw error;
+  }
+}
+
+class FakePromptCommandControl implements PromptCommandControl {
+  reloadCount = 0;
+  lastRun: RuntimePromptCommandInvocation | undefined;
+
+  async list(): Promise<RuntimePromptCommandList> {
+    return promptCommandList();
+  }
+
+  async reload(): Promise<RuntimePromptCommandList> {
+    this.reloadCount += 1;
+    return promptCommandList();
+  }
+
+  async run(input: RuntimePromptCommandInvocation): Promise<PromptCommandRunResult> {
+    this.lastRun = { ...input };
+    return {
+      prompt: `Tell a short joke about ${input.args ?? "coding"}.`,
+      command: promptCommandList().commands[0]!,
+    };
   }
 }
 
@@ -1298,6 +1410,36 @@ function mailboxRow(input: { status: AgentMailboxRow["status"] }): AgentMailboxR
 function createSequentialId(): (prefix: string) => string {
   let next = 0;
   return (prefix: string) => `${prefix}_${++next}`;
+}
+
+function permissionConfig(profile: RuntimePermissionProfileId): RuntimePermissionConfig {
+  return {
+    profile,
+    profiles: [
+      { id: "default", label: "Default", description: "Default permissions", current: profile === "default" },
+      { id: "auto-review", label: "Auto-review", description: "Auto-review permissions", current: profile === "auto-review", disabledReason: "disabled" },
+      { id: "full-access", label: "Full Access", description: "Full access permissions", current: profile === "full-access" },
+    ],
+  };
+}
+
+function promptCommandList(): RuntimePromptCommandList {
+  return {
+    commands: [
+      {
+        name: "joke",
+        aliases: [],
+        description: "Tell a joke",
+        category: "project",
+        source: "project",
+        argumentHint: "[topic]",
+        hidden: false,
+      },
+    ],
+    diagnostics: [],
+    directories: ["/repo/.chili/commands"],
+    skippedConflicts: [],
+  };
 }
 
 class MemoryEventStore implements EventStore {

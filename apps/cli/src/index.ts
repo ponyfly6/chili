@@ -341,6 +341,8 @@ async function serve(input: {
     teamMerger: input.harness.teamMerger,
     teamRunner: input.harness.teamRunner,
     approvals: input.approvalQueue,
+    permissions: input.harness.permissions,
+    commands: input.harness.commands,
     hostname: input.host,
     port: input.port,
   });

@@ -1,5 +1,5 @@
 import type { SkillSettingsScope, SkillSummary } from "@chili/skills";
-import type { SlashCommand, SlashCommandContext, SlashCompletion } from "./types.js";
+import type { SlashCommand, SlashCommandContext, SlashCommandResult, SlashCompletion } from "./types.js";
 import {
   REASONING_LEVELS,
   defaultModelCandidates,
@@ -94,6 +94,21 @@ export function createDefaultSlashCommands(): SlashCommand[] {
       category: "view",
       isSafeConcurrent: true,
       run: () => ({ type: "open_view", view: "status" }),
+    },
+    {
+      name: "permissions",
+      aliases: ["approvals"],
+      description: "Choose what Chili is allowed to do",
+      category: "policy",
+      isSafeConcurrent: true,
+      run: openPermissionsView,
+    },
+    {
+      name: "approvals",
+      description: "Choose what Chili is allowed to do",
+      category: "policy",
+      isSafeConcurrent: true,
+      run: openPermissionsView,
     },
     {
       name: "agents",
@@ -194,6 +209,10 @@ export function createDefaultSlashCommands(): SlashCommand[] {
       },
     },
   ];
+}
+
+function openPermissionsView(): SlashCommandResult {
+  return { type: "open_permissions_picker" };
 }
 
 export function resolveSlashCommand(

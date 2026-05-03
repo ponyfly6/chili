@@ -55,6 +55,55 @@ export interface RuntimeModelConfig {
   reasoningLevel?: ReasoningLevel;
 }
 
+export const RUNTIME_PERMISSION_PROFILE_IDS = ["default", "auto-review", "full-access"] as const;
+
+export type RuntimePermissionProfileId = (typeof RUNTIME_PERMISSION_PROFILE_IDS)[number];
+
+export interface RuntimePermissionProfileDescriptor {
+  id: RuntimePermissionProfileId;
+  label: string;
+  description: string;
+  current: boolean;
+  disabledReason?: string;
+}
+
+export interface RuntimePermissionConfig {
+  profile: RuntimePermissionProfileId;
+  profiles: RuntimePermissionProfileDescriptor[];
+}
+
+export type RuntimePromptCommandSource = "project" | "user";
+
+export interface RuntimePromptCommandDescriptor {
+  name: string;
+  aliases: string[];
+  description: string;
+  category: string;
+  source: RuntimePromptCommandSource;
+  argumentHint: string;
+  hidden: boolean;
+}
+
+export interface RuntimePromptCommandDiagnostic {
+  level: "warning" | "error";
+  code: string;
+  message: string;
+  filePath?: string;
+}
+
+export interface RuntimePromptCommandList {
+  commands: RuntimePromptCommandDescriptor[];
+  diagnostics: RuntimePromptCommandDiagnostic[];
+  directories: string[];
+  skippedConflicts: string[];
+}
+
+export interface RuntimePromptCommandInvocation {
+  name: string;
+  args?: string;
+  cwd?: string;
+}
+
 export type RuntimeCommand =
   | RuntimeCreateSessionCommand
   | RuntimeSubmitPromptCommand

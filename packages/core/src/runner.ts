@@ -12,6 +12,7 @@ export interface AppendUserMessageInput {
   sessionId: SessionId;
   threadId: ThreadId;
   text: string;
+  displayText?: string;
 }
 
 export interface RunTurnInput {

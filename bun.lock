@@ -34,10 +34,10 @@
         "chili-tui": "./dist/index.js",
       },
       "dependencies": {
-        "@chili/commands": "workspace:*",
         "@chili/protocol": "workspace:*",
         "@chili/providers": "workspace:*",
         "@chili/sdk": "workspace:*",
+        "@chili/skills": "workspace:*",
         "@opentui/core": "0.1.106",
         "@opentui/react": "0.1.106",
         "marked": "17.0.1",
@@ -84,6 +84,7 @@
       "name": "@chili/server",
       "version": "0.0.0",
       "dependencies": {
+        "@chili/commands": "workspace:*",
         "@chili/core": "workspace:*",
         "@chili/protocol": "workspace:*",
         "@chili/store": "workspace:*",

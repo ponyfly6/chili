@@ -23,7 +23,7 @@ import {
   type RuntimePromptTurnContext,
   type WorkerToolPolicy,
 } from "@chili/core";
-import type { AgentPath, ApprovalDecision, EventEnvelope, ModelSelection, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
+import type { AgentPath, ApprovalDecision, EventEnvelope, ModelSelection, RuntimePermissionConfig, RuntimePermissionProfileId, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
 import { ObservableEventStore, SessionTranscriptJsonlMirror, SqliteEventStore } from "@chili/store";
 import type { AgentMailboxRow, AgentTaskQuery, AgentTaskRow, TeamMemberRow, TeamMessageRow, TeamRow, TeamTaskRow } from "@chili/store";
 import {
@@ -100,7 +100,8 @@ import {
   type SkillRegistry,
 } from "@chili/skills";
 import { defaultChiliHome } from "@chili/providers";
-import { createCliApprovalBroker, createCliApprovalRulesets, persistAllowAlwaysDecision } from "./approval.js";
+import { createFilesystemPromptCommandControl, type PromptCommandControl } from "@chili/server";
+import { createCliApprovalBroker, createCliApprovalRulesets, dangerousShellCommandsForProfile, persistAllowAlwaysDecision, runtimePermissionConfig } from "./approval.js";
 import { loadCliConfig, type CliConfig } from "./config.js";
 import { createIdFactory } from "./id.js";
 import type { CliModelName, CliReasoningLevel } from "./model.js";
@@ -137,10 +138,17 @@ export interface CliHarness {
   teamDispatcher: TeamTaskDispatchService;
   teamMerger: TeamMergeService;
   teamRunner: TeamExecutionRunner;
+  permissions: CliPermissionProfileControl;
+  commands: PromptCommandControl;
   recovery: SnapshotRecoveryService;
   defaultModelSelection?: ModelSelection;
   defaultReasoningLevel?: CliReasoningLevel;
   close(): Promise<void>;
+}
+
+export interface CliPermissionProfileControl {
+  get(): RuntimePermissionConfig;
+  set(profile: RuntimePermissionProfileId): RuntimePermissionConfig;
 }
 
 export async function createCliHarness(options: CliHarnessOptions): Promise<CliHarness> {
@@ -150,6 +158,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
 
   const createId = createIdFactory();
   const chiliHome = options.chiliHome ?? defaultChiliHome();
+  const commands = createFilesystemPromptCommandControl({ cwd, chiliHome });
   let sqliteStore: SqliteEventStore;
   const sessionMirror = new SessionTranscriptJsonlMirror(join(chiliHome, "sessions"), {
     groupByCwd: true,
@@ -169,6 +178,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const runtimeModelSelection = explicitModelSelection ? resolveCliRuntimeModelSelection(cliModelInput) : undefined;
   const skillRegistry = await discoverSkills({ cwd });
   const config = await loadCliConfig(cwd, { chiliHome });
+  const permissions = createPermissionProfileControl(config, options.yes ? "full-access" : "default");
   const registry = createToolRegistry(skillRegistry);
   const childRegistry = createChildToolRegistry(skillRegistry);
   const promptFragments = (context: { cwd: string; turn?: RuntimePromptTurnContext }) =>
@@ -194,7 +204,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const childToolExecutor = new ToolExecutor({
     registry: childRegistry,
     events: { publish: (event) => eventStore.append(event) },
-    approvals: createApprovalBroker(options, config),
+    approvals: createApprovalBroker(options, config, permissions),
     policyResolver: childToolPolicyResolver,
     snapshotProvider,
     createId,
@@ -294,7 +304,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const toolExecutor = new ToolExecutor({
     registry,
     events: { publish: (event) => eventStore.append(event) },
-    approvals: createApprovalBroker(options, config),
+    approvals: createApprovalBroker(options, config, permissions),
     snapshotProvider,
     createId,
     maxResultOutputBytes: 256_000,
@@ -389,6 +399,8 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     teamDispatcher,
     teamMerger,
     teamRunner,
+    permissions,
+    commands,
     recovery,
     ...(runtimeModelSelection ? { defaultModelSelection: runtimeModelSelection } : {}),
     ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
@@ -710,18 +722,67 @@ function registerTeamDispatchTools(registry: InMemoryToolRegistry, controller: T
   registry.register(createTeamTaskReconcileTool(controller));
 }
 
-function createApprovalBroker(options: CliHarnessOptions, config: CliConfig): PolicyApprovalBroker {
+interface MutableCliPermissionProfileControl extends CliPermissionProfileControl {
+  register(broker: PolicyApprovalBroker): void;
+  rulesets(): readonly (readonly import("@chili/policy").PermissionRule[])[];
+  dangerousShellCommands(): "ask" | "allow";
+}
+
+function createPermissionProfileControl(
+  config: CliConfig,
+  initialProfile: RuntimePermissionProfileId,
+): MutableCliPermissionProfileControl {
+  let profile = initialProfile;
+  const brokers = new Set<PolicyApprovalBroker>();
+  const control: MutableCliPermissionProfileControl = {
+    get() {
+      return runtimePermissionConfig(profile);
+    },
+    set(nextProfile) {
+      if (nextProfile === "auto-review") {
+        throw new Error("Auto-reviewer approval routing is not implemented in Chili yet.");
+      }
+      profile = nextProfile;
+      for (const broker of brokers) {
+        broker.setRulesets(control.rulesets());
+        broker.setDangerousShellCommands(control.dangerousShellCommands());
+      }
+      return control.get();
+    },
+    register(broker) {
+      brokers.add(broker);
+      broker.setRulesets(control.rulesets());
+      broker.setDangerousShellCommands(control.dangerousShellCommands());
+    },
+    rulesets() {
+      return createCliApprovalRulesets(profile, config);
+    },
+    dangerousShellCommands() {
+      return dangerousShellCommandsForProfile(profile);
+    },
+  };
+  return control;
+}
+
+function createApprovalBroker(
+  options: CliHarnessOptions,
+  config: CliConfig,
+  permissions?: MutableCliPermissionProfileControl,
+): PolicyApprovalBroker {
   if (!options.approvalQueue) {
-    return createCliApprovalBroker({
+    const broker = createCliApprovalBroker({
       ...(options.yes === undefined ? {} : { yes: options.yes }),
       config,
       ...(options.chiliHome ? { chiliHome: options.chiliHome } : {}),
     });
+    permissions?.register(broker);
+    return broker;
   }
 
   let broker: PolicyApprovalBroker;
   broker = new PolicyApprovalBroker({
-    rulesets: createCliApprovalRulesets(options.yes ?? false, config),
+    rulesets: permissions?.rulesets() ?? createCliApprovalRulesets(options.yes ?? false, config),
+    ...(permissions ? { dangerousShellCommands: permissions.dangerousShellCommands() } : {}),
     ask: async (request) => {
       const decision: ApprovalDecision = options.approvalQueue
         ? await options.approvalQueue.ask(request)
@@ -732,6 +793,7 @@ function createApprovalBroker(options: CliHarnessOptions, config: CliConfig): Po
       await options.approvalQueue?.recheckPending((request) => broker.preflight(request));
     },
   });
+  permissions?.register(broker);
   return broker;
 }
 

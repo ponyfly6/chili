@@ -10,6 +10,9 @@
   ],
   "references": [
     {
+      "path": "../commands"
+    },
+    {
       "path": "../protocol"
     },
     {

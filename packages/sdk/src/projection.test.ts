@@ -1917,6 +1917,10 @@ test("client sends model control requests and prompt overrides", async () => {
     });
     const body = url.endsWith("/models")
       ? [{ provider: "openai-codex", model: "gpt-5.5" }]
+      : url.endsWith("/commands") || url.endsWith("/commands/reload")
+        ? ({ commands: [], diagnostics: [], directories: [], skippedConflicts: [] })
+        : url.endsWith("/command_async")
+          ? ({ status: "accepted", sessionId, threadId })
       : url.endsWith("/prompt_async")
         ? ({ status: "accepted", sessionId, threadId })
         : ({ sessionId, models: [], availableReasoningLevels: ["off", "high"] });
@@ -1931,12 +1935,22 @@ test("client sends model control requests and prompt overrides", async () => {
   await client.getModelConfig({ sessionId });
   await client.setModel({ sessionId, threadId, modelSelection: { provider: "openai-codex", model: "gpt-5.5" } });
   await client.setReasoning({ sessionId, threadId, reasoningLevel: "high" });
+  await client.listCommands();
+  await client.reloadCommands();
   await client.submitPromptAsync({
     sessionId,
     threadId,
     text: "hello",
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
     reasoningLevel: "xhigh",
+  });
+  await client.submitCommandAsync({
+    sessionId,
+    threadId,
+    name: "joke",
+    args: "typescript",
+    modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
+    reasoningLevel: "high",
   });
 
   expect(records).toEqual([
@@ -1961,6 +1975,16 @@ test("client sends model control requests and prompt overrides", async () => {
       body: { threadId, reasoningLevel: "high" },
     },
     {
+      url: "http://runtime.test/api/commands",
+      method: "GET",
+      body: undefined,
+    },
+    {
+      url: "http://runtime.test/api/commands/reload",
+      method: "POST",
+      body: {},
+    },
+    {
       url: "http://runtime.test/api/sessions/session_sdk_model/prompt_async",
       method: "POST",
       body: {
@@ -1969,6 +1993,18 @@ test("client sends model control requests and prompt overrides", async () => {
         text: "hello",
         modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
         reasoningLevel: "xhigh",
+      },
+    },
+    {
+      url: "http://runtime.test/api/sessions/session_sdk_model/command_async",
+      method: "POST",
+      body: {
+        sessionId,
+        threadId,
+        name: "joke",
+        args: "typescript",
+        modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
+        reasoningLevel: "high",
       },
     },
   ]);

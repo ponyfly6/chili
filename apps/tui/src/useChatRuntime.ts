@@ -4,7 +4,7 @@ import {
   type ChatSessionView,
   type HttpRuntimeClient,
 } from "@chili/sdk";
-import type { ApprovalId, RuntimeApprovalResolveResult, RuntimeModelConfig, RuntimeSkillMention, SessionId, ThreadId } from "@chili/protocol";
+import type { ApprovalId, RuntimeApprovalResolveResult, RuntimeModelConfig, RuntimePermissionConfig, RuntimePermissionProfileId, RuntimePromptCommandList, RuntimeSkillMention, SessionId, ThreadId } from "@chili/protocol";
 import { useTeamLiveRuntime, type TeamLiveRuntimeState, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
 
@@ -22,12 +22,18 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
   chatFeedback?: ChatRuntimeFeedback;
   modelCandidates?: readonly ModelCandidate[];
   modelConfig?: RuntimeModelConfig;
+  permissionConfig?: RuntimePermissionConfig;
+  commandList?: RuntimePromptCommandList;
   canSubmit: boolean;
   submitBlockedReason?: string;
   submitPrompt: (text: string, options?: ChatSubmitOptions) => Promise<boolean>;
+  submitCommand: (name: string, args: string, options?: ChatCommandSubmitOptions) => Promise<boolean>;
   setRuntimeModel?: (selection: ModelSelection) => Promise<boolean>;
   setRuntimeReasoning?: (level: ReasoningLevel) => Promise<boolean>;
   refreshModelConfig?: () => Promise<void>;
+  refreshPermissionConfig?: () => Promise<void>;
+  reloadCommands?: () => Promise<RuntimePromptCommandList | undefined>;
+  setRuntimePermissionProfile?: (profile: RuntimePermissionProfileId) => Promise<boolean>;
   startNewSession: () => Promise<void>;
   interruptActiveSession: () => Promise<void>;
   approveApproval: (approvalId: ApprovalId, options?: ChatApproveOptions) => Promise<void>;
@@ -38,6 +44,11 @@ export interface ChatSubmitOptions {
   modelSelection?: ModelSelection | undefined;
   reasoningLevel?: ReasoningLevel | undefined;
   skillMentions?: readonly RuntimeSkillMention[] | undefined;
+}
+
+export interface ChatCommandSubmitOptions {
+  modelSelection?: ModelSelection | undefined;
+  reasoningLevel?: ReasoningLevel | undefined;
 }
 
 export type ChatApprovalGrantScope = "once" | "session" | "persistent";
@@ -60,6 +71,8 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   const [chatFeedback, setChatFeedback] = useState<ChatRuntimeFeedback | undefined>();
   const [modelCandidates, setModelCandidates] = useState<readonly ModelCandidate[]>([]);
   const [modelConfig, setModelConfig] = useState<RuntimeModelConfig | undefined>();
+  const [permissionConfig, setPermissionConfig] = useState<RuntimePermissionConfig | undefined>();
+  const [commandList, setCommandList] = useState<RuntimePromptCommandList | undefined>();
   const requestAbortRefs = useRef(new Set<AbortController>());
 
   useEffect(() => {
@@ -123,6 +136,51 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   useEffect(() => {
     void refreshModelConfig();
   }, [refreshModelConfig]);
+
+  const refreshPermissionConfig = useCallback(async (): Promise<void> => {
+    try {
+      await withAbort(async (signal) => {
+        const config = await client.getPermissionConfig({ signal });
+        if (!signal.aborted) setPermissionConfig(config);
+      });
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+    }
+  }, [client, options.baseUrl, withAbort]);
+
+  useEffect(() => {
+    void refreshPermissionConfig();
+  }, [refreshPermissionConfig]);
+
+  const refreshCommands = useCallback(async (): Promise<RuntimePromptCommandList | undefined> => {
+    try {
+      return await withAbort(async (signal) => {
+        const commands = await client.listCommands({ signal });
+        if (!signal.aborted) setCommandList(commands);
+        return commands;
+      });
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return undefined;
+    }
+  }, [client, options.baseUrl, withAbort]);
+
+  useEffect(() => {
+    void refreshCommands();
+  }, [refreshCommands]);
+
+  const reloadCommands = useCallback(async (): Promise<RuntimePromptCommandList | undefined> => {
+    try {
+      return await withAbort(async (signal) => {
+        const commands = await client.reloadCommands({ signal });
+        if (!signal.aborted) setCommandList(commands);
+        return commands;
+      });
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return undefined;
+    }
+  }, [client, options.baseUrl, withAbort]);
 
   const ensureSession = useCallback(async (signal: AbortSignal): Promise<{ sessionId: SessionId; threadId: ThreadId }> => {
     let sessionId = activeSessionId ?? chatView.sessionId;
@@ -195,6 +253,60 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     }
   }, [activeSessionId, activeThreadId, chatView.pendingApprovals.length, chatView.sessionId, chatView.threadId, client, options.baseUrl, options.cwd, resumeThreadMissing, running, submitBlockedReason, submitPending, withAbort]);
 
+  const submitCommand = useCallback(async (
+    name: string,
+    args: string,
+    submitOptions: ChatCommandSubmitOptions = {},
+  ): Promise<boolean> => {
+    const commandName = name.trim();
+    if (!commandName || submitPending || running || chatView.pendingApprovals.length > 0) return false;
+    if (resumeThreadMissing) {
+      setChatFeedback({ status: "error", message: submitBlockedReason ?? "Session resume needs a thread." });
+      return false;
+    }
+    setSubmitPending(true);
+    setChatFeedback({ status: "pending", message: "sending command" });
+    try {
+      await withAbort(async (signal) => {
+        let sessionId = activeSessionId ?? chatView.sessionId;
+        let threadId = activeThreadId ?? chatView.threadId;
+        if (sessionId && !threadId) {
+          throw new Error(submitBlockedReason ?? "Session resume needs a thread.");
+        }
+        if (!sessionId && !threadId) {
+          const created = await client.createSession({
+            ...(options.cwd ? { cwd: options.cwd } : {}),
+            signal,
+          });
+          sessionId = created.sessionId;
+          threadId = created.threadId;
+          setActiveSessionId(sessionId);
+          setActiveThreadId(threadId);
+        }
+        if (!sessionId || !threadId) {
+          throw new Error("Unable to determine a session and thread for this command.");
+        }
+        await client.submitCommandAsync({
+          sessionId,
+          threadId,
+          name: commandName,
+          ...(args.trim().length > 0 ? { args: args.trim() } : {}),
+          ...(options.cwd ? { cwd: options.cwd } : {}),
+          ...(submitOptions.modelSelection ? { modelSelection: submitOptions.modelSelection } : {}),
+          ...(submitOptions.reasoningLevel ? { reasoningLevel: submitOptions.reasoningLevel } : {}),
+          signal,
+        });
+      });
+      setChatFeedback({ status: "success", message: "command accepted" });
+      return true;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return false;
+    } finally {
+      setSubmitPending(false);
+    }
+  }, [activeSessionId, activeThreadId, chatView.pendingApprovals.length, chatView.sessionId, chatView.threadId, client, options.baseUrl, options.cwd, resumeThreadMissing, running, submitBlockedReason, submitPending, withAbort]);
+
   const setRuntimeModel = useCallback(async (selection: ModelSelection): Promise<boolean> => {
     let updatedSessionId: SessionId | undefined;
     try {
@@ -236,6 +348,20 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
       return false;
     }
   }, [client, ensureSession, options.baseUrl, refreshModelConfigForSession, withAbort]);
+
+  const setRuntimePermissionProfile = useCallback(async (profile: RuntimePermissionProfileId): Promise<boolean> => {
+    try {
+      await withAbort(async (signal) => {
+        const config = await client.setPermissionProfile({ profile, signal });
+        if (!signal.aborted) setPermissionConfig(config);
+      });
+      setChatFeedback({ status: "success", message: "permissions updated" });
+      return true;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return false;
+    }
+  }, [client, options.baseUrl, withAbort]);
 
   const interruptActiveSession = useCallback(async () => {
     if (!activeSessionId) return;
@@ -293,17 +419,23 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     ...(chatFeedback ? { chatFeedback } : {}),
     modelCandidates,
     ...(modelConfig ? { modelConfig } : {}),
+    ...(permissionConfig ? { permissionConfig } : {}),
+    ...(commandList ? { commandList } : {}),
     canSubmit,
     ...(submitBlockedReason ? { submitBlockedReason } : {}),
     submitPrompt,
+    submitCommand,
     setRuntimeModel,
     setRuntimeReasoning,
     refreshModelConfig,
+    refreshPermissionConfig,
+    reloadCommands,
+    setRuntimePermissionProfile,
     startNewSession,
     interruptActiveSession,
     approveApproval,
     rejectApproval,
-  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, refreshModelConfig, setRuntimeModel, setRuntimeReasoning, startNewSession, submitBlockedReason, submitPrompt, teamRuntime]);
+  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, permissionConfig, commandList, refreshModelConfig, refreshPermissionConfig, reloadCommands, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, startNewSession, submitBlockedReason, submitCommand, submitPrompt, teamRuntime]);
 }
 
 async function resolveApproval(

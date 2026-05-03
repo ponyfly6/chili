@@ -10,6 +10,7 @@
     }
   },
   "dependencies": {
+    "@chili/commands": "workspace:*",
     "@chili/core": "workspace:*",
     "@chili/protocol": "workspace:*",
     "@chili/store": "workspace:*"
