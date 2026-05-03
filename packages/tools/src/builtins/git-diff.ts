@@ -426,9 +426,9 @@ export function createGitCommitTool(): ChiliToolDefinition<GitCommitInput> {
 
       const args = ["commit", "--no-gpg-sign"];
       if (input.allowEmpty) args.push("--allow-empty");
-            // Add "chili🌶️来自" attribution prefix to commit message
-      const attribution = `chili🌶️来自`;
-      const commitMessage = `${attribution}\n\n${input.message}`;
+            // Add "Co-Authored-By: chili🌶️" attribution as trailer to commit message
+      const attribution = `Co-Authored-By: chili🌶️ <noreply@chili.ai>`;
+      const commitMessage = `${input.message}\n\n${attribution}`;
       args.push("-m", commitMessage);
       const result = await runGit(args, {
         cwd: context.cwd,
