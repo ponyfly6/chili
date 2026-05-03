@@ -7,6 +7,7 @@ export type SlashCommandCategory =
   | "team"
   | "auth"
   | "model"
+  | "custom"
   | "skills"
   | "view"
   | "debug";
@@ -14,8 +15,10 @@ export type SlashCommandCategory =
 export type SlashCommandResult =
   | { type: "open_view"; view: "team" | "help" | "agents" | "status" }
   | { type: "open_theme_picker" }
+  | { type: "reload_commands" }
   | { type: "close_view" }
   | { type: "new_session" }
+  | { type: "submit_prompt"; prompt: string; commandName: string }
   | { type: "insert_prompt"; text: string }
   | { type: "local_message"; level: "info" | "error"; text: string }
   | { type: "auth_action"; action: "login" | "logout" | "status"; provider: "openai-codex" }

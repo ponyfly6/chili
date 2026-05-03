@@ -37,6 +37,7 @@ import { buildTranscriptLines, buildTranscriptText } from "./chat/transcript.js"
 import { TranscriptView } from "./chat/TranscriptView.js";
 import type { LocalTranscriptItem, PromptPart } from "./chat/types.js";
 import { usePromptHistory } from "./chat/usePromptHistory.js";
+import { loadCustomSlashCommands, type CustomSlashCommandsState } from "./slash/custom.js";
 import { createDefaultSlashCommands, resolveSlashCommand, slashCompletions } from "./slash/registry.js";
 import type { SlashCommand, SlashCommandContext, SlashCommandResult, SlashCompletion } from "./slash/types.js";
 import {
@@ -67,12 +68,17 @@ interface SlashActions {
   setHideThinking: (hidden: boolean) => void;
   ensureOpenAICodexDefaultModel: () => Promise<void>;
   reloadSkills: () => Promise<void>;
+  reloadCommands: () => Promise<void>;
 }
 
 interface SkillSummariesState {
   skills: readonly SkillSummary[];
   allSkills: readonly SkillSummary[];
   reload: () => Promise<void>;
+}
+
+interface CustomSlashCommandsHookState extends CustomSlashCommandsState {
+  error?: string | undefined;
 }
 
 export interface ChatShellOptions extends TeamLiveTuiOptions {
@@ -158,7 +164,6 @@ export function ChatShellSurface(props: {
   const dimensions = useTerminalDimensions();
   const { keyHandler } = useAppContext();
   const renderer = useRenderer() as ClipboardRenderer;
-  const commands = useMemo(() => props.commands ?? createDefaultSlashCommands(), [props.commands]);
   const [view, setView] = useState<ShellView>("chat");
   const [promptParts, setPromptParts] = useState<PromptPart[]>([{ type: "text", text: "" }]);
   const [skillMentionBindings, setSkillMentionBindings] = useState<RuntimeSkillMention[]>([]);
@@ -236,6 +241,12 @@ export function ChatShellSurface(props: {
   const themeOptions = selectableTuiThemeOptions;
   const systemThemeAvailable = Boolean(systemTheme);
   const cwd = props.options?.cwd ?? process.cwd();
+  const defaultSlashCommands = useMemo(() => createDefaultSlashCommands(), []);
+  const customSlashCommands = useCustomSlashCommands(cwd);
+  const commands = useMemo(
+    () => props.commands ?? [...defaultSlashCommands, ...customSlashCommands.commands],
+    [customSlashCommands.commands, defaultSlashCommands, props.commands],
+  );
   const slashContext = useMemo<SlashCommandContext>(() => ({
     model: props.model,
     cwd,
@@ -412,6 +423,20 @@ export function ChatShellSurface(props: {
     await setModelSelection(selection);
     await props.runtime.refreshModelConfig?.();
   }, [modelCandidates, modelSelection, props.runtime, setModelSelection]);
+  const reloadCommands = useCallback(async () => {
+    const state = await customSlashCommands.reload();
+    if (state.error) {
+      appendLocalItem("error", `Could not reload commands: ${state.error}`);
+      return;
+    }
+    appendLocalItem("info", `Commands reloaded: ${state.commands.length} custom command${state.commands.length === 1 ? "" : "s"}.`);
+    for (const diagnostic of state.diagnostics) {
+      appendLocalItem(diagnostic.level === "error" ? "error" : "info", `/${diagnostic.code}: ${diagnostic.message}`);
+    }
+    for (const name of state.skippedConflicts) {
+      appendLocalItem("info", `Skipped user command /${name}; project command wins.`);
+    }
+  }, [appendLocalItem, customSlashCommands.reload]);
   const slashActions = useMemo<SlashActions>(() => ({
     cwd,
     setView,
@@ -429,7 +454,8 @@ export function ChatShellSurface(props: {
     reloadSkills: async () => {
       await props.onSkillsChanged?.();
     },
-  }), [appendLocalItem, cwd, ensureOpenAICodexDefaultModel, openModelPicker, openReasoningPicker, openThemePicker, props.onSkillsChanged, setAuthManualPrompt, setHideThinking, setModelSelection, setPrompt, setReasoningLevel, startNewChatSession]);
+    reloadCommands,
+  }), [appendLocalItem, cwd, ensureOpenAICodexDefaultModel, openModelPicker, openReasoningPicker, openThemePicker, props.onSkillsChanged, reloadCommands, setAuthManualPrompt, setHideThinking, setModelSelection, setPrompt, setReasoningLevel, startNewChatSession]);
   const runSelectedSlashCompletion = useCallback(() => {
     if (!slashCompletionOpen) return false;
     const completion = slashCompletionItems[selectedCompletionIndex] ?? slashCompletionItems[0];
@@ -1624,11 +1650,12 @@ async function runResolvedSlashCommand(
   actions: SlashActions,
 ): Promise<void> {
   const result = await match.command.run(ctx, match.args);
-  await applySlashResult(result, model, runtime, actions);
+  await applySlashResult(result, ctx, model, runtime, actions);
 }
 
 async function applySlashResult(
   result: SlashCommandResult,
+  ctx: SlashCommandContext,
   model: TeamLiveView,
   runtime: ChatRuntimeState,
   actions: SlashActions,
@@ -1643,6 +1670,22 @@ async function applySlashResult(
   }
   if (result.type === "open_theme_picker") {
     actions.openThemePicker();
+    return;
+  }
+  if (result.type === "reload_commands") {
+    await actions.reloadCommands();
+    return;
+  }
+  if (result.type === "submit_prompt") {
+    if (!runtime.canSubmit) {
+      actions.appendLocalItem("error", runtime.submitBlockedReason ?? "Session is not ready for another prompt.");
+      return;
+    }
+    const accepted = await runtime.submitPrompt(result.prompt, {
+      ...(ctx.modelSelection ? { modelSelection: ctx.modelSelection } : {}),
+      ...(ctx.reasoningLevel ? { reasoningLevel: ctx.reasoningLevel } : {}),
+    });
+    if (!accepted) actions.appendLocalItem("error", `/${result.commandName} did not submit.`);
     return;
   }
   if (result.type === "new_session") {
@@ -1984,6 +2027,53 @@ function useSkillSummaries(cwd: string): SkillSummariesState {
   return {
     ...state,
     reload: load,
+  };
+}
+
+function useCustomSlashCommands(cwd: string): CustomSlashCommandsHookState & { reload: () => Promise<CustomSlashCommandsHookState> } {
+  const empty = useMemo<CustomSlashCommandsHookState>(() => ({
+    commands: [],
+    diagnostics: [],
+    directories: [],
+    skippedConflicts: [],
+  }), []);
+  const [state, setState] = useState<CustomSlashCommandsHookState>(empty);
+  const reload = useCallback(async () => {
+    try {
+      const next = await loadCustomSlashCommands(cwd);
+      setState(next);
+      return next;
+    } catch (error) {
+      const next = {
+        ...empty,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      setState(next);
+      return next;
+    }
+  }, [cwd, empty]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void loadCustomSlashCommands(cwd)
+      .then((next) => {
+        if (!cancelled) setState(next);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setState({
+          ...empty,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [cwd, empty]);
+
+  return {
+    ...state,
+    reload,
   };
 }
 

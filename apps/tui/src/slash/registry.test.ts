@@ -29,6 +29,19 @@ test("includes auth commands in slash completions", () => {
   expect(completions.map((completion) => completion.value)).toContain("/login");
 });
 
+test("resolves commands view and reload slash commands", async () => {
+  const commands = createDefaultSlashCommands();
+  const ctx = { model: {} } as SlashCommandContext;
+
+  expect(await resolveSlashCommand(commands, "/commands")?.command.run(ctx, "")).toEqual({
+    type: "open_view",
+    view: "help",
+  });
+  expect(await resolveSlashCommand(commands, "/commands reload")?.command.run(ctx, "")).toEqual({
+    type: "reload_commands",
+  });
+});
+
 test("resolves model slash command to model selection actions", async () => {
   const commands = createDefaultSlashCommands();
   const ctx = {

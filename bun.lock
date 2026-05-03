@@ -34,6 +34,7 @@
         "chili-tui": "./dist/index.js",
       },
       "dependencies": {
+        "@chili/commands": "workspace:*",
         "@chili/protocol": "workspace:*",
         "@chili/providers": "workspace:*",
         "@chili/sdk": "workspace:*",

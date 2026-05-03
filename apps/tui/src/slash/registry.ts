@@ -69,11 +69,24 @@ export function createDefaultSlashCommands(): SlashCommand[] {
     },
     {
       name: "help",
-      aliases: ["commands"],
       description: "Show commands and shortcuts",
       category: "view",
       isSafeConcurrent: true,
       run: () => ({ type: "open_view", view: "help" }),
+    },
+    {
+      name: "commands",
+      description: "Show commands and shortcuts",
+      category: "view",
+      isSafeConcurrent: true,
+      run: () => ({ type: "open_view", view: "help" }),
+    },
+    {
+      name: "commands reload",
+      description: "Reload project and user commands",
+      category: "custom",
+      isSafeConcurrent: true,
+      run: () => ({ type: "reload_commands" }),
     },
     {
       name: "status",
