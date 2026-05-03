@@ -66,6 +66,27 @@ test("CLI config discovers project permission config from child directories", as
   }
 });
 
+test("CLI config does not treat the user config under home as project config", async () => {
+  const root = await mkdtempName();
+  const home = join(root, "home");
+  const chiliHome = join(home, ".chili");
+  const repo = join(home, "repo");
+  try {
+    await mkdir(chiliHome, { recursive: true });
+    await mkdir(repo, { recursive: true });
+    await writeFile(join(chiliHome, "config.toml"), '[permissions]\nallow = ["bash(git status*)"]\n', "utf8");
+
+    const config = await loadCliConfig(repo, { chiliHome });
+
+    expect(config.userPermissions).toEqual([
+      expect.objectContaining({ permission: "bash", pattern: "git status*", action: "allow" }),
+    ]);
+    expect(config.projectPermissions).toEqual([]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("project config rejects allow rules", () => {
   expect(() =>
     permissionRulesFromConfig(

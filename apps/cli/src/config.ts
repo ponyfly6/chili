@@ -25,7 +25,7 @@ export async function loadCliConfig(cwd: string, options: LoadCliConfigOptions =
     source: "user config.toml",
     allowedActions: PERMISSION_ACTIONS,
   });
-  const projectConfig = await findProjectConfigPath(cwd);
+  const projectConfig = await findProjectConfigPath(cwd, userConfigPath(chiliHome));
   const projectPermissions = projectConfig
     ? await loadPermissionRules(projectConfig, {
         source: "project .chili/config.toml",
@@ -273,15 +273,18 @@ function userConfigPath(chiliHome: string): string {
   return join(chiliHome, "config.toml");
 }
 
-async function findProjectConfigPath(cwd: string): Promise<string | undefined> {
+async function findProjectConfigPath(cwd: string, userConfig: string): Promise<string | undefined> {
   let current = resolve(cwd);
+  const ignoredConfig = resolve(userConfig);
   while (true) {
     const candidate = join(current, ".chili", "config.toml");
-    try {
-      await access(candidate);
-      return candidate;
-    } catch (error) {
-      if (!isNotFound(error)) throw error;
+    if (resolve(candidate) !== ignoredConfig) {
+      try {
+        await access(candidate);
+        return candidate;
+      } catch (error) {
+        if (!isNotFound(error)) throw error;
+      }
     }
     const parent = dirname(current);
     if (parent === current) return undefined;
