@@ -1512,11 +1512,19 @@ function skillCompletions(skills: readonly SkillSummary[], query: string): Skill
   return skills
     .filter((skill) => skill.hidden !== true && skill.disabled !== true)
     .filter((skill) => skillMatches(skill, normalized))
-    .sort((left, right) => left.name.localeCompare(right.name) || left.filePath.localeCompare(right.filePath))
+    .sort((left, right) => {
+      // Priority: name starts with query first
+      if (normalized) {
+        const leftStarts = left.name.toLowerCase().startsWith(normalized);
+        const rightStarts = right.name.toLowerCase().startsWith(normalized);
+        if (leftStarts !== rightStarts) return leftStarts ? -1 : 1;
+      }
+      return left.name.localeCompare(right.name) || left.filePath.localeCompare(right.filePath);
+    })
     .slice(0, 8)
     .map((skill) => ({
-      value: `$${skill.name}`,
-      label: `$${skill.name}`,
+      value: `${skill.name}`,
+      label: `${skill.name}`,
       description: skillDescription(skill),
       category: "skills",
       skill,
