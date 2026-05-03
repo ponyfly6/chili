@@ -530,12 +530,8 @@ test("renders approval permission patterns and risk metadata", async () => {
   });
 
   expect(frame).toContain("Approval required");
-  expect(frame).toContain("permission: tool.bash");
-  expect(frame).toContain("patterns: rm -rf build, bun test");
-  expect(frame).toContain("reason: ask - Auto policy paused");
-  expect(frame).toContain("source: workspace settings");
-  expect(frame).toContain("matched: bash rm rule");
-  expect(frame).toContain("risk: ask - removes files");
+  expect(frame).toContain("> rm -rf build && bun test");
+  expect(frame).toContain("risk: removes files");
   expect(frame).toContain("a once | s session | A always | x deny");
 });
 
@@ -569,7 +565,7 @@ test("folds long approval details without hiding the prompt", async () => {
   });
 
   expect(frame).toContain("Approval required");
-  expect(frame).toContain("lines folded");
+  expect(frame).toContain("...");
   expect(frame).toContain("Resolve approval to continue");
   expect(frame).toContain("commands");
 });
@@ -813,6 +809,7 @@ function fakeChatRuntime(input: Partial<ChatRuntimeState> = {}): ChatRuntimeStat
     chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
     canSubmit: true,
     submitPrompt: async () => true,
+    submitCommand: async () => true,
     startNewSession: async () => undefined,
     interruptActiveSession: async () => undefined,
     approveApproval: async () => undefined,

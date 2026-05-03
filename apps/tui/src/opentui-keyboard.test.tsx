@@ -1349,14 +1349,9 @@ test("pending approval renders the approval dock and shortcuts resolve it", asyn
   });
 
   try {
-    expect(app.captureCharFrame()).toContain("tool.bash");
-    expect(app.captureCharFrame()).toContain("waiting_permission");
-    expect(app.captureCharFrame()).toContain("permission: tool.bash");
-    expect(app.captureCharFrame()).toContain("patterns: bun test");
-    expect(app.captureCharFrame()).toContain("reason: Policy requires approval");
-    expect(app.captureCharFrame()).toContain("source: project permissions");
-    expect(app.captureCharFrame()).toContain("risk: ask - shell command");
-    expect(app.captureCharFrame()).toContain("command: bun test");
+    expect(app.captureCharFrame()).toContain("Approval required: bash");
+    expect(app.captureCharFrame()).toContain("risk: shell command");
+    expect(app.captureCharFrame()).toContain("> bun test");
     expect(app.captureCharFrame()).toContain("a once | s session | A always | x deny");
 
     await press(app, () => app.mockInput.pressKey("a"));

@@ -3,7 +3,7 @@ import type { ChatApprovalRow } from "@chili/sdk";
 import type { ChatApprovalGrantScope } from "../useChatRuntime.js";
 import type { TuiTheme } from "../theme/index.js";
 
-const MAX_APPROVAL_BODY_LINES = 7;
+const MAX_APPROVAL_TARGET_LINES = 2;
 
 export function ApprovalDock(props: {
   approvals: readonly ChatApprovalRow[];
@@ -62,67 +62,32 @@ interface TuiApprovalMetadata {
 }
 
 function approvalDockLines(approvals: readonly ChatApprovalRow[], width: number, theme: TuiTheme): ApprovalDockLine[] {
-  const visible = approvals.slice(0, 3);
   const contentWidth = Math.max(12, width - 6);
-  const lines: ApprovalDockLine[] = [
-    { key: "title", text: "Approval required", fg: theme.colors.status.pending },
-  ];
-  const body: ApprovalDockLine[] = [];
+  const active = approvals[0];
+  if (!active) return [];
+  const tool = active.toolName ?? active.permission;
+  const lines: ApprovalDockLine[] = [{
+    key: "title",
+    text: approvals.length > 1 ? `Approval required: ${tool} (+${approvals.length - 1})` : `Approval required: ${tool}`,
+    fg: theme.colors.status.pending,
+  }];
 
-  visible.forEach((approval, index) => {
-    const active = index === 0;
-    const tool = approval.toolName ?? approval.permission;
-    body.push({
-      key: `${approval.id}:head`,
-      text: `${active ? ">" : " "} ${tool} ${approval.toolDisplayStatus ?? "waiting_permission"} (${approval.permission})`,
-      fg: active ? theme.colors.text.primary : theme.colors.text.secondary,
-    });
-
-    if (!active) {
-      const summary = approvalSummary(approval);
-      const compact = summary.detail ?? summary.scope;
-      if (compact) body.push(...wrapDetail(`${approval.id}:compact`, `  ${compact}`, contentWidth, theme.colors.text.muted));
-      return;
-    }
-
-    const summary = approvalSummary(approval);
-    body.push(...wrapDetail(`${approval.id}:permission`, `  permission: ${approval.permission}`, contentWidth, theme.colors.text.secondary));
-    if (approval.patterns.length > 0) {
-      body.push(...wrapDetail(`${approval.id}:patterns`, `  patterns: ${approval.patterns.join(", ")}`, contentWidth, theme.colors.text.secondary));
-    }
-    for (const line of approvalMetadataLines(approval)) {
-      const fg = line.kind === "danger" ? theme.colors.status.error : line.kind === "reason" ? theme.colors.status.warning : theme.colors.text.secondary;
-      body.push(...wrapDetail(`${approval.id}:${line.kind}:${line.index}`, `  ${line.label}: ${line.value}`, contentWidth, fg));
-    }
-    if (summary.command) {
-      body.push(...wrapDetail(`${approval.id}:command`, `  command: ${summary.command}`, contentWidth, theme.colors.text.primary));
-    }
-    if (summary.path) {
-      body.push(...wrapDetail(`${approval.id}:path`, `  path: ${summary.path}`, contentWidth, theme.colors.text.secondary));
-    }
-    if (summary.pattern) {
-      body.push(...wrapDetail(`${approval.id}:pattern`, `  pattern: ${summary.pattern}`, contentWidth, theme.colors.text.secondary));
-    }
-    if (summary.scope && summary.scope !== summary.path) {
-      body.push(...wrapDetail(`${approval.id}:scope`, `  scope: ${summary.scope}`, contentWidth, theme.colors.text.secondary));
-    }
-    if (summary.diffSummary) {
-      body.push(...wrapDetail(`${approval.id}:diff`, `  change: ${summary.diffSummary}`, contentWidth, theme.colors.text.secondary));
-    }
-    if (!summary.command && !summary.path && !summary.pattern && !summary.scope && summary.detail) {
-      body.push(...wrapDetail(`${approval.id}:detail`, `  ${summary.detail}`, contentWidth, theme.colors.text.secondary));
-    }
-  });
-
-  if (approvals.length > visible.length) {
-    body.push({ key: "more", text: `  +${approvals.length - visible.length} more approval(s)`, fg: theme.colors.text.muted });
+  const targetLines = wrapDetail(
+    `${active.id}:target`,
+    `> ${approvalTarget(active)}`,
+    contentWidth,
+    theme.colors.text.primary,
+  );
+  lines.push(...targetLines.slice(0, MAX_APPROVAL_TARGET_LINES));
+  if (targetLines.length > MAX_APPROVAL_TARGET_LINES) {
+    lines.push({ key: `${active.id}:target-folded`, text: "  ...", fg: theme.colors.text.muted });
   }
 
-  const foldedCount = Math.max(0, body.length - MAX_APPROVAL_BODY_LINES);
-  lines.push(...body.slice(0, MAX_APPROVAL_BODY_LINES));
-  if (foldedCount > 0) {
-    lines.push({ key: "folded", text: `  +${foldedCount} lines folded`, fg: theme.colors.text.muted });
+  const reason = approvalReason(active);
+  if (reason) {
+    lines.push({ key: `${active.id}:reason`, text: `  ${reason}`, fg: reason.startsWith("risk:") ? theme.colors.status.warning : theme.colors.text.muted });
   }
+
   lines.push({ key: "hint", text: "a once | s session | A always | x deny", fg: theme.colors.text.muted });
   return lines;
 }
@@ -133,6 +98,33 @@ function approvalSummary(approval: ChatApprovalRow): ChatApprovalRow["inputSumma
     detail: approval.patterns.join(", "),
     scope: approval.patterns.join(", "),
   };
+}
+
+function approvalTarget(approval: ChatApprovalRow): string {
+  const summary = approvalSummary(approval);
+  return summary.command
+    ?? summary.path
+    ?? summary.pattern
+    ?? summary.scope
+    ?? summary.detail
+    ?? approval.patterns.join(", ")
+    ?? approval.permission;
+}
+
+function approvalReason(approval: ChatApprovalRow): string | undefined {
+  const metadata = isRecord(approval.metadata) ? approval.metadata : {};
+  const risks = approvalRisks(metadata.approvalRisks ?? metadata.risks);
+  const risk = risks[0];
+  if (risk) {
+    const reason = stringValue(risk.reason);
+    return reason ? `risk: ${reason}` : "risk detected";
+  }
+
+  const preflight = isRecord(metadata.preflightDecision) ? metadata.preflightDecision : {};
+  const reason = stringValue(metadata.reason) ?? stringValue(preflight.reason);
+  if (!reason) return undefined;
+  if (/^No permission rule matched\b/i.test(reason)) return "no matching permission rule";
+  return reason;
 }
 
 function approvalMetadataLines(approval: ChatApprovalRow): Array<{ index: number; kind: "reason" | "source" | "danger"; label: string; value: string }> {
