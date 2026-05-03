@@ -23,7 +23,7 @@ import {
   type RuntimePromptTurnContext,
   type WorkerToolPolicy,
 } from "@chili/core";
-import type { AgentPath, ApprovalDecision, EventEnvelope, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
+import type { AgentPath, ApprovalDecision, EventEnvelope, ModelSelection, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
 import { ObservableEventStore, SessionTranscriptJsonlMirror, SqliteEventStore } from "@chili/store";
 import type { AgentMailboxRow, AgentTaskQuery, AgentTaskRow, TeamMemberRow, TeamMessageRow, TeamRow, TeamTaskRow } from "@chili/store";
 import {
@@ -104,13 +104,14 @@ import { createCliApprovalBroker, createCliApprovalRulesets, persistAllowAlwaysD
 import { loadCliConfig, type CliConfig } from "./config.js";
 import { createIdFactory } from "./id.js";
 import type { CliModelName, CliReasoningLevel } from "./model.js";
-import { createCliModel } from "./model.js";
+import { createCliModel, resolveCliRuntimeModelSelection } from "./model.js";
 import { CliPrinter, PrintingEventStore } from "./printing-store.js";
 
 const DEV_MAX_TURNS = 128;
 const DEV_MAX_REPEATED_TOOL_CALLS = 20;
 const DEV_MAX_TOOL_CALLS_PER_TURN = 200;
 const DEV_MAX_CONCURRENT_TOOL_CALLS = 32;
+const STALE_TURN_RECOVERY_MS = 30 * 60 * 1000;
 
 export interface CliHarnessOptions {
   cwd: string;
@@ -137,6 +138,8 @@ export interface CliHarness {
   teamMerger: TeamMergeService;
   teamRunner: TeamExecutionRunner;
   recovery: SnapshotRecoveryService;
+  defaultModelSelection?: ModelSelection;
+  defaultReasoningLevel?: CliReasoningLevel;
   close(): Promise<void>;
 }
 
@@ -162,6 +165,8 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   if (options.model !== undefined) cliModelInput.model = options.model;
   if (options.reasoningLevel !== undefined) cliModelInput.reasoningLevel = options.reasoningLevel;
   const model = await createCliModel(cliModelInput);
+  const explicitModelSelection = options.provider !== undefined || options.model !== undefined;
+  const runtimeModelSelection = explicitModelSelection ? resolveCliRuntimeModelSelection(cliModelInput) : undefined;
   const skillRegistry = await discoverSkills({ cwd });
   const config = await loadCliConfig(cwd, { chiliHome });
   const registry = createToolRegistry(skillRegistry);
@@ -226,6 +231,8 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     maxTurns: DEV_MAX_TURNS,
     contextBudget: childContextBudget,
     promptFragments: childPromptFragments,
+    ...(runtimeModelSelection ? { defaultModelSelection: runtimeModelSelection } : {}),
+    ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
   });
   const subagents = new LocalSubagentManager({
     store: eventStore,
@@ -327,6 +334,15 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     maxTurns: DEV_MAX_TURNS,
     contextBudget: runtimeContextBudget,
     promptFragments,
+    ...(runtimeModelSelection ? { defaultModelSelection: runtimeModelSelection } : {}),
+    ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
+  });
+  await sqliteStore.reconcileStaleTurns({
+    staleBefore: Date.now() - STALE_TURN_RECOVERY_MS,
+    now: Date.now(),
+    createId,
+    status: "failed",
+    reason: "stale_turn_recovered",
   });
   const teamRunner = new TeamExecutionRunner({
     teams,
@@ -374,6 +390,8 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     teamMerger,
     teamRunner,
     recovery,
+    ...(runtimeModelSelection ? { defaultModelSelection: runtimeModelSelection } : {}),
+    ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
     close: async () => {
       await mailboxPump.stop();
       await subagents.waitForBackgroundTasks();

@@ -258,6 +258,8 @@ async function main(): Promise<void> {
         threadId: session.threadId,
         prompt: args.prompt,
         maxTurns: args.maxTurns,
+        ...(harness.defaultModelSelection ? { modelSelection: harness.defaultModelSelection } : {}),
+        ...(harness.defaultReasoningLevel !== undefined ? { reasoningLevel: harness.defaultReasoningLevel } : {}),
         signal: controller.signal,
       });
       return;
@@ -918,6 +920,8 @@ async function repl(input: {
         threadId: input.threadId,
         prompt: line,
         maxTurns: input.maxTurns,
+        ...(input.harness.defaultModelSelection ? { modelSelection: input.harness.defaultModelSelection } : {}),
+        ...(input.harness.defaultReasoningLevel !== undefined ? { reasoningLevel: input.harness.defaultReasoningLevel } : {}),
         signal: controller.signal,
       });
     }

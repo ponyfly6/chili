@@ -24,7 +24,9 @@ import type {
   TeamMessageDeliveryStatus,
   TeamTaskClaimedPayload,
   ThreadId,
+  TimestampMs,
   ToolEvent,
+  TurnId,
 } from "@chili/protocol";
 import { decodeJson, encodeJson } from "./json.js";
 import { SQLITE_SCHEMA } from "./schema.js";
@@ -255,6 +257,8 @@ interface TeamMessageDeliveryProjectionRow {
 export interface SqliteEventStoreOptions {
   mirror?: EventMirror;
   onMirrorError?: (error: unknown, event: ChiliEvent) => void;
+  busyTimeoutMs?: number;
+  writeRetryAttempts?: number;
 }
 
 export class SqliteEventStore
@@ -272,6 +276,7 @@ export class SqliteEventStore
   constructor(path = ".chili/chili.sqlite", private readonly options: SqliteEventStoreOptions = {}) {
     this.db = new Database(path, { create: true, strict: true });
     this.db.exec("pragma journal_mode = WAL");
+    this.db.exec(`pragma busy_timeout = ${Math.max(0, Math.trunc(options.busyTimeoutMs ?? 10_000))}`);
     this.db.exec("pragma foreign_keys = ON");
     const [eventTableStatement, ...remainingStatements] = SQLITE_SCHEMA;
     if (eventTableStatement) {
@@ -737,7 +742,7 @@ export class SqliteEventStore
   }
 
   async claimTeamTask(input: TeamTaskClaimInput): Promise<TeamTaskMutationResult> {
-    const result = this.db.transaction((item: TeamTaskClaimInput) => {
+    const run = this.db.transaction((item: TeamTaskClaimInput) => {
       const current = this.teamTaskState(item.teamId, item.taskId);
       if (!current) return { applied: false, reason: "not_found" as const, events: [] as ChiliEvent[] };
       if (isFinalTeamTaskStatus(current.status)) {
@@ -772,7 +777,8 @@ export class SqliteEventStore
       if (cas.changes === 0) return { applied: false, reason: "already_claimed" as const, events: [] as ChiliEvent[] };
       this.writeTransactionEvents([event]);
       return { applied: true, events: [event] };
-    })(input);
+    });
+    const result = this.runWithWriteRetry(() => run(input));
 
     await this.writeMirrors(result.events);
     const task = (await this.teamTasks({ teamId: input.teamId, taskId: input.taskId, limit: 1 }))[0];
@@ -780,7 +786,7 @@ export class SqliteEventStore
   }
 
   async claimAgentMailboxMessage(input: AgentMailboxClaimInput): Promise<AgentMailboxMutationResult> {
-    const result = this.db.transaction((item: AgentMailboxClaimInput) => {
+    const run = this.db.transaction((item: AgentMailboxClaimInput) => {
       const current = this.agentMailboxState(item.messageId);
       if (!current || current.status !== "queued") return { applied: false, events: [] as ChiliEvent[] };
 
@@ -791,7 +797,8 @@ export class SqliteEventStore
       if (cas.changes === 0) return { applied: false, events: [] as ChiliEvent[] };
       this.writeTransactionEvents([event]);
       return { applied: true, events: [event] };
-    })(input);
+    });
+    const result = this.runWithWriteRetry(() => run(input));
 
     await this.writeMirrors(result.events);
     const message = await this.agentMailboxMessage(input.messageId);
@@ -799,7 +806,7 @@ export class SqliteEventStore
   }
 
   async consumeAgentMailboxMessage(input: AgentMailboxConsumeInput): Promise<AgentMailboxMutationResult> {
-    const result = this.db.transaction((item: AgentMailboxConsumeInput) => {
+    const run = this.db.transaction((item: AgentMailboxConsumeInput) => {
       const current = this.agentMailboxState(item.messageId);
       if (!current || current.status === "consumed") return { applied: false, events: [] as ChiliEvent[] };
       if (current.status !== "delivering") return { applied: false, events: [] as ChiliEvent[] };
@@ -817,7 +824,8 @@ export class SqliteEventStore
       if (cas.changes === 0) return { applied: false, events: [] as ChiliEvent[] };
       this.writeTransactionEvents([event]);
       return { applied: true, events: [event] };
-    })(input);
+    });
+    const result = this.runWithWriteRetry(() => run(input));
 
     await this.writeMirrors(result.events);
     const message = await this.agentMailboxMessage(input.messageId);
@@ -825,7 +833,7 @@ export class SqliteEventStore
   }
 
   async requeueAgentMailboxMessage(input: AgentMailboxRequeueInput): Promise<AgentMailboxMutationResult> {
-    const result = this.db.transaction((item: AgentMailboxRequeueInput) => {
+    const run = this.db.transaction((item: AgentMailboxRequeueInput) => {
       const current = this.agentMailboxState(item.messageId);
       if (!current || current.status !== "delivering") return { applied: false, events: [] as ChiliEvent[] };
 
@@ -842,7 +850,8 @@ export class SqliteEventStore
       if (cas.changes === 0) return { applied: false, events: [] as ChiliEvent[] };
       this.writeTransactionEvents([event]);
       return { applied: true, events: [event] };
-    })(input);
+    });
+    const result = this.runWithWriteRetry(() => run(input));
 
     await this.writeMirrors(result.events);
     const message = await this.agentMailboxMessage(input.messageId);
@@ -931,7 +940,7 @@ export class SqliteEventStore
   }
 
   async completeAgentTaskCas(input: AgentTaskCompleteCasInput): Promise<AgentTaskFinalizationResult> {
-    const result = this.db.transaction((item: AgentTaskCompleteCasInput) => {
+    const run = this.db.transaction((item: AgentTaskCompleteCasInput) => {
       const current = this.agentTaskState(item.taskId);
       if (!current || isFinalTaskStatus(current.status)) return { applied: false, events: [] as ChiliEvent[] };
 
@@ -961,7 +970,8 @@ export class SqliteEventStore
       if (item.runId && item.agentEventId) events.push(this.agentCompletedEvent(item, current, generation));
       this.writeTransactionEvents(events);
       return { applied: true, events };
-    })(input);
+    });
+    const result = this.runWithWriteRetry(() => run(input));
 
     await this.writeMirrors(result.events);
     const task = await this.agentTask(input.taskId);
@@ -969,7 +979,7 @@ export class SqliteEventStore
   }
 
   async closeAgentTaskCas(input: AgentTaskCloseCasInput): Promise<AgentTaskFinalizationResult> {
-    const result = this.db.transaction((item: AgentTaskCloseCasInput) => {
+    const run = this.db.transaction((item: AgentTaskCloseCasInput) => {
       const current = this.agentTaskState(item.taskId);
       if (!current) return { applied: false, events: [] as ChiliEvent[] };
       if (isFinalTaskStatus(current.status)) return { applied: false, events: [] as ChiliEvent[] };
@@ -1007,7 +1017,8 @@ export class SqliteEventStore
       }
       this.writeTransactionEvents(events);
       return { applied: true, events };
-    })(input);
+    });
+    const result = this.runWithWriteRetry(() => run(input));
 
     await this.writeMirrors(result.events);
     const task = await this.agentTask(input.taskId);
@@ -1018,7 +1029,7 @@ export class SqliteEventStore
     const run = this.db.transaction((items: readonly ChiliEvent[]) => {
       this.writeTransactionEvents(items);
     });
-    run(events);
+    this.runWithWriteRetry(() => run(events));
   }
 
   private writeTransactionEvents(events: readonly ChiliEvent[]): void {
@@ -1026,6 +1037,90 @@ export class SqliteEventStore
       this.insertEvent(event);
       this.applyProjection(event);
     }
+  }
+
+  async reconcileStaleTurns(input: {
+    staleBefore: number;
+    createId: (prefix: string) => string;
+    now?: number;
+    status?: "failed" | "cancelled";
+    reason?: string;
+  }): Promise<ChiliEvent[]> {
+    const status = input.status ?? "failed";
+    const reason = input.reason ?? "stale_turn_recovered";
+    const now = (input.now ?? Date.now()) as TimestampMs;
+    const rows = this.db
+      .query<{
+        session_id: string;
+        thread_id: string | null;
+        turn_id: string;
+        time: number;
+      }, [number]>(
+        `select started.session_id, started.thread_id,
+                json_extract(started.payload_json, '$.turnId') as turn_id,
+                started.time
+           from events started
+          where started.type = 'turn.started'
+            and started.session_id is not null
+            and started.time < ?
+            and not exists (
+              select 1
+                from events completed
+               where completed.type = 'turn.completed'
+                 and json_extract(completed.payload_json, '$.turnId') = json_extract(started.payload_json, '$.turnId')
+            )
+          order by started.seq asc`,
+      )
+      .all(input.staleBefore);
+
+    const events: ChiliEvent[] = [];
+    for (const row of rows) {
+      const sessionId = row.session_id as SessionId;
+      const turnId = row.turn_id as TurnId;
+      const threadId = row.thread_id ? (row.thread_id as ThreadId) : undefined;
+      const base = {
+        time: now,
+        sessionId,
+        ...(threadId ? { threadId } : {}),
+      };
+      events.push({
+        ...base,
+        id: input.createId("event"),
+        type: "turn.completed",
+        payload: { turnId, status },
+      });
+      events.push({
+        ...base,
+        id: input.createId("event"),
+        type: "session.status_changed",
+        payload: {
+          sessionId,
+          status,
+          turnId,
+          reason,
+        },
+      });
+    }
+
+    if (events.length === 0) return [];
+    this.writeTransaction(events);
+    await this.writeMirrors(events);
+    return events;
+  }
+
+  private runWithWriteRetry<T>(action: () => T): T {
+    const attempts = Math.max(1, Math.trunc(this.options.writeRetryAttempts ?? 6));
+    let delayMs = 25;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        return action();
+      } catch (error) {
+        if (attempt >= attempts || !isSqliteBusyError(error)) throw error;
+        sleepSync(delayMs);
+        delayMs = Math.min(delayMs * 2, 500);
+      }
+    }
+    throw new Error("SQLite write retry exhausted");
   }
 
   private async writeMirror(event: ChiliEvent): Promise<void> {
@@ -2416,6 +2511,16 @@ function isFinalTaskStatus(status: string): boolean {
 
 function isFinalTeamTaskStatus(status: string): boolean {
   return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+function isSqliteBusyError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return message.includes("database is locked") || message.includes("database busy") || message.includes("sqlite_busy");
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 export type { AgentMailboxRow, AgentRunRow, AgentTaskRow };

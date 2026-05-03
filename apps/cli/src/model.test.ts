@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import type { ModelStreamInput } from "@chili/core";
 import type { SessionId, ThreadId, TurnId } from "@chili/protocol";
-import { createCliModel } from "./model.js";
+import { createCliModel, resolveCliRuntimeModelSelection } from "./model.js";
 
 const savedEnv = {
   DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY,
@@ -13,6 +13,7 @@ const savedEnv = {
   MINIMAX_API_KEY: process.env.MINIMAX_API_KEY,
   MINIMAX_BASE_URL: process.env.MINIMAX_BASE_URL,
   MINIMAX_ANTHROPIC_BASE_URL: process.env.MINIMAX_ANTHROPIC_BASE_URL,
+  MINIMAX_MODEL: process.env.MINIMAX_MODEL,
   ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
 };
 
@@ -26,6 +27,7 @@ afterEach(() => {
   restoreEnv("MINIMAX_API_KEY", savedEnv.MINIMAX_API_KEY);
   restoreEnv("MINIMAX_BASE_URL", savedEnv.MINIMAX_BASE_URL);
   restoreEnv("MINIMAX_ANTHROPIC_BASE_URL", savedEnv.MINIMAX_ANTHROPIC_BASE_URL);
+  restoreEnv("MINIMAX_MODEL", savedEnv.MINIMAX_MODEL);
   restoreEnv("ANTHROPIC_BASE_URL", savedEnv.ANTHROPIC_BASE_URL);
 });
 
@@ -92,6 +94,21 @@ test("CLI MiniMax env resolution prefers Anthropic-compatible base URL over gene
 
   expect(url).toBe("https://api.minimaxi.com/anthropic/v1/messages");
   expect(body).toMatchObject({ max_tokens: 32768 });
+});
+
+test("CLI runtime model selection resolves explicit provider aliases to concrete defaults", () => {
+  delete process.env.MINIMAX_MODEL;
+  process.env.DEEPSEEK_MODEL = "deepseek-v4-flash";
+
+  expect(resolveCliRuntimeModelSelection({ model: "minimax" })).toEqual({
+    provider: "minimax",
+    model: "MiniMax-M2.7-highspeed",
+  });
+  expect(resolveCliRuntimeModelSelection({ provider: "deepseek" })).toEqual({
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+  });
+  expect(resolveCliRuntimeModelSelection({ model: "fake" })).toBeUndefined();
 });
 
 test("CLI Codex env resolution uses ChatGPT Codex endpoint and session metadata", async () => {

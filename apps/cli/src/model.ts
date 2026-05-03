@@ -1,5 +1,5 @@
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "@chili/core";
-import type { RuntimeModelDescriptor } from "@chili/protocol";
+import type { ModelSelection, RuntimeModelDescriptor } from "@chili/protocol";
 import { createMiniMaxM27HighspeedRouter } from "@chili/core";
 import {
   DEEPSEEK_OPENAI_BASE_URL,
@@ -107,6 +107,18 @@ export async function createCliModel(selection?: CliModelName | CliModelSelectio
   };
   if (config.reasoningLevel !== undefined) routerOptions.defaultReasoningLevel = config.reasoningLevel;
   return new CliProviderRouter(routerOptions);
+}
+
+export function resolveCliRuntimeModelSelection(selection: CliModelSelection): ModelSelection | undefined {
+  const resolved = resolveCliModelSelection(selection.provider, selection.model);
+  if (resolved.kind === "fake") return undefined;
+  if (resolved.kind === "legacy-minimax") {
+    return { provider: MINIMAX_PROVIDER_ID, model: resolved.model ?? MINIMAX_M27_HIGHSPEED_MODEL };
+  }
+  const providerOptions = readOptionsForProvider(resolved.provider, resolved.model ? { model: resolved.model } : {});
+  const model = providerOptions.model;
+  if (!model) return undefined;
+  return { provider: resolved.provider, model };
 }
 
 async function loadProvidersModule(providerName: "minimax" | "deepseek" | "codex"): Promise<Record<string, unknown>> {

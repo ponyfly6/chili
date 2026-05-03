@@ -15,6 +15,7 @@ import type {
   TeamId,
   ThreadId,
   TimestampMs,
+  TurnId,
 } from "@chili/protocol";
 import { ObservableEventStore } from "./observable-event-store.js";
 import { SqliteEventStore } from "./sqlite-event-store.js";
@@ -31,6 +32,51 @@ test("orders event replay and afterEventId cursors by insertion sequence", async
     expect((await store.events({ limit: 10 })).map((event) => event.id)).toEqual(["z_event", "a_event"]);
     expect((await store.events({ afterEventId: "z_event", limit: 10 })).map((event) => event.id)).toEqual(["a_event"]);
     expect((await store.events({ afterEventId: "a_event", limit: 10 })).map((event) => event.id)).toEqual([]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reconciles stale turns without completion events", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-stale-turn-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const sessionId = "session_stale_turn" as SessionId;
+  const threadId = "thread_stale_turn" as ThreadId;
+  let recoveredIds = 0;
+
+  try {
+    await store.append(sessionEvent("event_session", sessionId, threadId, 100 as TimestampMs));
+    await store.append({
+      id: "event_turn_started",
+      type: "turn.started",
+      time: 110 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_stale" as TurnId },
+    });
+
+    const recovered = await store.reconcileStaleTurns({
+      staleBefore: 1_000,
+      createId: (prefix) => `${prefix}_${recoveredIds++}`,
+    });
+
+    expect(recovered.map((event) => event.type)).toEqual(["turn.completed", "session.status_changed"]);
+    const events = await store.events({ sessionId, limit: 10 });
+    expect(events.map((event) => event.type)).toEqual([
+      "session.created",
+      "turn.started",
+      "turn.completed",
+      "session.status_changed",
+    ]);
+    expect(events.at(-2)?.payload).toEqual({ turnId: "turn_stale", status: "failed" });
+    expect(events.at(-1)?.payload).toMatchObject({
+      sessionId,
+      status: "failed",
+      turnId: "turn_stale",
+      reason: "stale_turn_recovered",
+    });
+    expect(await store.reconcileStaleTurns({ staleBefore: 2_000, createId: (prefix) => `${prefix}_again` })).toEqual([]);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
