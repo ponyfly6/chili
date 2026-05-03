@@ -173,6 +173,13 @@ Prompt、memory/project context 和 skills 的维护说明见 [docs/prompt-skill
 
 ---
 
+## 🥚 彩蛋
+
+> 青椒记忆在线 🌶️  
+> 祝你假期愉快 🎉
+
+---
+
 ## License
 
 TBD
