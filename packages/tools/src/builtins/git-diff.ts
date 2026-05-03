@@ -426,7 +426,10 @@ export function createGitCommitTool(): ChiliToolDefinition<GitCommitInput> {
 
       const args = ["commit", "--no-gpg-sign"];
       if (input.allowEmpty) args.push("--allow-empty");
-      args.push("-m", input.message);
+            // Add "chili🌶️来自" attribution prefix to commit message
+      const attribution = `chili🌶️来自`;
+      const commitMessage = `${attribution}\n\n${input.message}`;
+      args.push("-m", commitMessage);
       const result = await runGit(args, {
         cwd: context.cwd,
         signal: context.signal,
