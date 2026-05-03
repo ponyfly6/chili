@@ -1,11 +1,4 @@
-import type {
-  CommandArgumentMode,
-  CommandCompletion,
-  CommandDefinition,
-  CommandDefinitionInput,
-  CommandRunResult,
-  CommandType,
-} from "./types.js";
+import type { CommandCompletion, CommandDefinition, CommandDefinitionInput } from "./types.js";
 
 export type RegisterCommandResult =
   | { status: "registered"; command: CommandDefinition }
@@ -76,7 +69,6 @@ export function createCommandRegistry(commands: readonly CommandDefinition[] = [
 
 export function defineCommand(input: CommandDefinitionInput): CommandDefinition {
   const name = normalizeCommandName(input.name);
-  const type = input.type;
   const command: CommandDefinition = {
     name,
     aliases: (input.aliases ?? []).map((alias) => normalizeCommandName(alias)).filter((alias) => alias.length > 0),
@@ -85,14 +77,17 @@ export function defineCommand(input: CommandDefinitionInput): CommandDefinition 
     argumentHint: input.argumentHint ?? "",
     source: input.source,
     hidden: input.hidden ?? false,
-    type,
-    argumentMode: input.argumentMode ?? defaultArgumentMode(input),
-    supportsNonInteractive: input.supportsNonInteractive ?? defaultSupportsNonInteractive(type),
-    isSafeConcurrent: input.isSafeConcurrent ?? defaultSafeConcurrent(type),
+    argumentMode: input.argumentMode ?? "variadic",
+    supportsNonInteractive: input.supportsNonInteractive ?? true,
+    isSafeConcurrent: input.isSafeConcurrent ?? true,
     isEnabled: input.isEnabled ?? (() => true),
     subCommands: (input.subCommands ?? []).map((subCommand) => defineCommand(subCommand)),
     complete: input.complete ?? (() => [] satisfies CommandCompletion[]),
-    run: input.run ?? (() => stubCommandResult(name, type)),
+    run: input.run ?? (() => ({
+      type: "prompt",
+      prompt: "",
+      metadata: { commandName: name, source: input.source },
+    })),
   };
 
   if (input.metadata !== undefined) {
@@ -117,29 +112,6 @@ export function commandNames(command: CommandDefinition): string[] {
 
 export function commandInvocations(command: CommandDefinition): string[] {
   return commandInvocationsInner(command, [""]);
-}
-
-export function stubCommandResult(command: string, intendedType: CommandType): CommandRunResult {
-  return {
-    type: "stub",
-    command,
-    intendedType,
-    message: `/${command} is registered, but host execution is not wired yet.`,
-  };
-}
-
-function defaultSupportsNonInteractive(type: CommandType): boolean {
-  return type === "local" || type === "prompt";
-}
-
-function defaultSafeConcurrent(type: CommandType): boolean {
-  return type === "local" || type === "prompt";
-}
-
-function defaultArgumentMode(input: CommandDefinitionInput): CommandArgumentMode {
-  if (input.type === "prompt") return "variadic";
-  if ((input.argumentHint ?? "").length > 0) return "variadic";
-  return "none";
 }
 
 function commandInvocationsInner(command: CommandDefinition, parents: readonly string[]): string[] {

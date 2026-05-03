@@ -1,5 +1,4 @@
-import { commandNames, splitCommandName } from "./registry.js";
-import { collectCommandCandidates, commandsOf, parseCommandInput } from "./resolve.js";
+import { commandsOf, collectCommandCandidates, parseCommandInput } from "./resolve.js";
 import type { CommandContext, CommandDefinition, CommandCompletion } from "./types.js";
 import type { CommandRegistry } from "./registry.js";
 
@@ -16,61 +15,49 @@ export function completeCommands(
 ): CommandCompletion[] {
   const roots = commandsOf(commands, options.includeHidden ?? false);
   const parsed = parseCommandInput(input);
-  const tokens = parsed.tokens.map((token) => token.normalized);
-  const currentPrefix = parsed.hasTrailingSpace ? "" : (tokens.at(-1) ?? "");
-  const parentTokens = parsed.hasTrailingSpace ? tokens : tokens.slice(0, -1);
-
-  const parent = findParentCommand(roots, parentTokens);
-  const generic = parent
-    ? completeChildren(parent.command.subCommands, parent.path, currentPrefix, options)
-    : completeChildren(roots, [], currentPrefix, options);
-
-  const custom = roots.flatMap((command) => (command.hidden && !options.includeHidden ? [] : command.complete(ctx, parsed.body)));
+  const inputTokens = parsed.tokens.map((token) => token.normalized);
+  const generic = collectCommandCandidates(roots)
+    .filter((candidate) => options.includeHidden || !candidate.command.hidden)
+    .filter((candidate) => matchesCandidate(candidate.invocationTokens, inputTokens, parsed.hasTrailingSpace))
+    .map((candidate) => completionFor(candidate.command, candidate.value));
+  const custom = roots.flatMap((command) =>
+    command.hidden && !options.includeHidden ? [] : command.complete(ctx, parsed.body),
+  );
 
   return uniqueCompletions([...custom, ...generic]).slice(0, options.limit ?? 20);
 }
 
-function findParentCommand(
-  commands: readonly CommandDefinition[],
-  parentTokens: readonly string[],
-): { command: CommandDefinition; path: readonly string[] } | undefined {
-  if (parentTokens.length === 0) return undefined;
-
-  const candidates = collectCommandCandidates(commands)
-    .filter((candidate) => candidate.invocationTokens.length === parentTokens.length)
-    .filter((candidate) => candidate.invocationTokens.every((token, index) => token === parentTokens[index]));
-
-  return candidates[0] ? { command: candidates[0].command, path: candidates[0].path } : undefined;
+function matchesCandidate(
+  invocationTokens: readonly string[],
+  inputTokens: readonly string[],
+  hasTrailingSpace: boolean,
+): boolean {
+  if (inputTokens.length === 0) return true;
+  if (inputTokens.length > invocationTokens.length) return false;
+  if (hasTrailingSpace && inputTokens.length >= invocationTokens.length) return false;
+  for (let index = 0; index < inputTokens.length; index += 1) {
+    const input = inputTokens[index];
+    const candidate = invocationTokens[index];
+    if (!input || !candidate) return false;
+    if (index === inputTokens.length - 1) {
+      if (!candidate.startsWith(input)) return false;
+    } else if (candidate !== input) {
+      return false;
+    }
+  }
+  return true;
 }
 
-function completeChildren(
-  commands: readonly CommandDefinition[],
-  parentPath: readonly string[],
-  prefix: string,
-  options: CommandCompletionOptions,
-): CommandCompletion[] {
-  return commands
-    .filter((command) => options.includeHidden || !command.hidden)
-    .filter((command) => commandNames(command).some((name) => matchesPrefix(name, prefix)))
-    .map((command) => {
-      const path = [...parentPath, ...splitCommandName(command.name)];
-      const value = `/${path.join(" ")}`;
-      return {
-        value,
-        label: `${value}${command.argumentHint ? ` ${command.argumentHint}` : ""}`,
-        description: command.description,
-        category: command.category,
-        source: command.source,
-        type: command.type,
-        argumentHint: command.argumentHint,
-        hidden: command.hidden,
-      };
-    });
-}
-
-function matchesPrefix(name: string, prefix: string): boolean {
-  if (prefix.length === 0) return true;
-  return splitCommandName(name).join(" ").startsWith(prefix);
+function completionFor(command: CommandDefinition, value: string): CommandCompletion {
+  return {
+    value,
+    label: `${value}${command.argumentHint ? ` ${command.argumentHint}` : ""}`,
+    description: command.description,
+    category: command.category,
+    source: command.source,
+    argumentHint: command.argumentHint,
+    hidden: command.hidden,
+  };
 }
 
 function uniqueCompletions(completions: readonly CommandCompletion[]): CommandCompletion[] {
@@ -83,4 +70,3 @@ function uniqueCompletions(completions: readonly CommandCompletion[]): CommandCo
   }
   return output;
 }
-

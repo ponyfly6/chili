@@ -1,16 +1,9 @@
-export type CommandSource = "builtin" | "project" | "user" | "plugin" | "mcp";
-
-export type CommandType = "local" | "action" | "prompt";
+export type CommandSource = "project" | "user";
 
 export type CommandArgumentMode = "none" | "optional" | "required" | "variadic";
 
-export type CommandExecutionMode = "interactive" | "non_interactive";
-
-export type CommandOutputFormat = "text" | "markdown" | "json";
-
 export interface CommandContext {
   cwd?: string;
-  mode?: CommandExecutionMode;
   metadata?: Readonly<Record<string, unknown>>;
 }
 
@@ -30,31 +23,11 @@ export interface PromptCommandMetadata {
   subtask?: boolean | string;
 }
 
-export type CommandRunResult =
-  | {
-      type: "local";
-      content: string;
-      format: CommandOutputFormat;
-      data?: unknown;
-    }
-  | {
-      type: "action";
-      action: string;
-      stub: boolean;
-      message: string;
-      payload?: unknown;
-    }
-  | {
-      type: "prompt";
-      prompt: string;
-      metadata: PromptCommandMetadata;
-    }
-  | {
-      type: "stub";
-      command: string;
-      intendedType: CommandType;
-      message: string;
-    };
+export interface CommandRunResult {
+  type: "prompt";
+  prompt: string;
+  metadata: PromptCommandMetadata;
+}
 
 export interface CommandCompletion {
   value: string;
@@ -62,7 +35,6 @@ export interface CommandCompletion {
   description: string;
   category: string;
   source: CommandSource;
-  type: CommandType;
   argumentHint: string;
   hidden: boolean;
 }
@@ -75,7 +47,6 @@ export interface CommandDefinition {
   argumentHint: string;
   source: CommandSource;
   hidden: boolean;
-  type: CommandType;
   argumentMode: CommandArgumentMode;
   supportsNonInteractive: boolean;
   isSafeConcurrent: boolean;
@@ -91,7 +62,6 @@ export interface CommandDefinitionInput {
   category: string;
   description: string;
   source: CommandSource;
-  type: CommandType;
   aliases?: readonly string[];
   argumentHint?: string;
   hidden?: boolean;

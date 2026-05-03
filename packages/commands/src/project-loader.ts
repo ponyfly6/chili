@@ -1,12 +1,23 @@
 import { readdir, readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import { defineCommand, normalizeCommandName } from "./registry.js";
 import { expandPromptTemplate } from "./template.js";
-import type { CommandDefinition, CommandDefinitionInput, PromptCommandMetadata } from "./types.js";
+import type { CommandDefinition, CommandDefinitionInput, CommandSource, PromptCommandMetadata } from "./types.js";
 
 export interface LoadProjectCommandsOptions {
   cwd: string;
   commandsDir?: string;
+}
+
+export interface LoadUserCommandsOptions {
+  chiliHome?: string;
+  commandsDir?: string;
+}
+
+export interface LoadCommandDirectoryOptions {
+  directory: string;
+  source: CommandSource;
 }
 
 export interface ProjectCommandsLoadResult {
@@ -39,27 +50,35 @@ interface ParsedMarkdownCommand {
 
 export async function loadProjectCommands(options: LoadProjectCommandsOptions): Promise<ProjectCommandsLoadResult> {
   const directory = path.resolve(options.cwd, options.commandsDir ?? ".chili/commands");
+  return loadCommandDirectory({ directory, source: "project" });
+}
+
+export async function loadUserCommands(options: LoadUserCommandsOptions = {}): Promise<ProjectCommandsLoadResult> {
+  const chiliHome = options.chiliHome ?? path.join(homedir(), ".chili");
+  const directory = path.resolve(chiliHome, options.commandsDir ?? "commands");
+  return loadCommandDirectory({ directory, source: "user" });
+}
+
+export async function loadCommandDirectory(options: LoadCommandDirectoryOptions): Promise<ProjectCommandsLoadResult> {
+  const directory = path.resolve(options.directory);
   const diagnostics: ProjectCommandDiagnostic[] = [];
   const commands: CommandDefinition[] = [];
 
-  let entries;
+  let files;
   try {
-    entries = await readdir(directory, { withFileTypes: true });
+    files = await markdownFiles(directory);
   } catch (error) {
     if (isNotFoundError(error)) return { commands, diagnostics, directory };
     throw error;
   }
 
-  for (const entry of entries
-    .filter((item) => item.isFile() && item.name.endsWith(".md"))
-    .sort((left, right) => left.name.localeCompare(right.name))) {
-    const filePath = path.join(directory, entry.name);
-    const commandName = normalizeCommandName(path.basename(entry.name, ".md"));
+  for (const filePath of files) {
+    const commandName = commandNameFromPath(directory, filePath);
     if (commandName.length === 0) {
       diagnostics.push({
         level: "warning",
         code: "invalid_command_name",
-        message: `Skipped ${entry.name} because it does not produce a command name.`,
+        message: `Skipped ${path.relative(directory, filePath)} because it does not produce a command name.`,
         filePath,
       });
       continue;
@@ -77,10 +96,29 @@ export async function loadProjectCommands(options: LoadProjectCommandsOptions): 
       continue;
     }
 
-    commands.push(createProjectCommand(commandName, filePath, parsed.command));
+    commands.push(createPromptCommand(commandName, filePath, options.source, parsed.command));
   }
 
   return { commands, diagnostics, directory };
+}
+
+async function markdownFiles(directory: string): Promise<string[]> {
+  const output: string[] = [];
+  const entries = await readdir(directory, { withFileTypes: true });
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    const filePath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      output.push(...await markdownFiles(filePath));
+      continue;
+    }
+    if (entry.isFile() && entry.name.endsWith(".md")) output.push(filePath);
+  }
+  return output;
+}
+
+function commandNameFromPath(directory: string, filePath: string): string {
+  const relative = path.relative(directory, filePath).replace(/\.md$/i, "");
+  return normalizeCommandName(relative.split(path.sep).join(" "));
 }
 
 export function parseMarkdownCommand(content: string):
@@ -106,14 +144,20 @@ export function parseMarkdownCommand(content: string):
   return { status: "ok", command: { frontmatter: parsed.frontmatter, body } };
 }
 
-function createProjectCommand(commandName: string, filePath: string, command: ParsedMarkdownCommand): CommandDefinition {
-  const metadata = projectMetadata(commandName, filePath, command.frontmatter);
+function createPromptCommand(
+  commandName: string,
+  filePath: string,
+  source: CommandSource,
+  command: ParsedMarkdownCommand,
+): CommandDefinition {
+  const metadata = promptMetadata(commandName, filePath, source, command.frontmatter);
   const input: CommandDefinitionInput = {
     name: commandName,
-    category: command.frontmatter.category ?? "project",
-    description: command.frontmatter.description ?? `Project command from ${path.basename(filePath)}`,
-    source: "project",
-    type: "prompt",
+    category: command.frontmatter.category ?? source,
+    description:
+      command.frontmatter.description ??
+      `${source === "user" ? "User" : "Project"} command from ${path.basename(filePath)}`,
+    source,
     hidden: command.frontmatter.hidden ?? false,
     supportsNonInteractive: true,
     isSafeConcurrent: true,
@@ -130,14 +174,15 @@ function createProjectCommand(commandName: string, filePath: string, command: Pa
   return defineCommand(input);
 }
 
-function projectMetadata(
+function promptMetadata(
   commandName: string,
   filePath: string,
+  source: CommandSource,
   frontmatter: ProjectCommandFrontmatter,
 ): PromptCommandMetadata {
   const metadata: PromptCommandMetadata = {
     commandName,
-    source: "project",
+    source,
     filePath,
   };
 

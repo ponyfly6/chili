@@ -2,8 +2,8 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "bun:test";
-import { createBuiltinCommandRegistry } from "./builtin.js";
-import { loadProjectCommands } from "./project-loader.js";
+import { createCommandRegistry } from "./registry.js";
+import { loadCommandDirectory, loadProjectCommands, loadUserCommands } from "./project-loader.js";
 import { resolveCommand } from "./resolve.js";
 
 test("project loader reads markdown commands with frontmatter", async () => {
@@ -67,43 +67,57 @@ test("project prompt command expands arguments without shell execution", async (
   expect(output.prompt).toContain("shell=!{echo no}");
 });
 
-test("builtin wins over conflicting project command registration", async () => {
+test("loader reads nested markdown commands as multi-token command names", async () => {
   const cwd = await tempProject();
-  await writeFile(path.join(cwd, ".chili/commands/help.md"), "custom help");
+  await mkdir(path.join(cwd, ".chili/commands/review"), { recursive: true });
+  await writeFile(path.join(cwd, ".chili/commands/review/security.md"), "Review security for $ARGUMENTS");
 
   const { commands } = await loadProjectCommands({ cwd });
-  const registry = createBuiltinCommandRegistry();
-  const results = registry.registerMany(commands);
-
-  expect(results).toHaveLength(1);
-  expect(results[0]?.status).toBe("skipped");
-
-  const resolved = resolveCommand(registry, "/help");
+  const resolved = resolveCommand(commands, "/review security src/auth.ts");
   expect(resolved.status).toBe("matched");
   if (resolved.status !== "matched") return;
-  expect(resolved.command.source).toBe("builtin");
+
+  expect(resolved.command.name).toBe("review security");
+  expect(resolved.path).toEqual(["review", "security"]);
+  const output = await resolved.command.run({}, resolved.args);
+  expect(output.prompt).toBe("Review security for src/auth.ts");
 });
 
-test("builtin wins over project command that shadows a nested builtin", async () => {
-  const cwd = await tempProject();
-  await writeFile(path.join(cwd, ".chili/commands/team run.md"), "custom team run");
+test("registry keeps first command when user and project commands conflict", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "chili-commands-conflict-"));
+  await mkdir(path.join(root, "project-commands"), { recursive: true });
+  await mkdir(path.join(root, "user-commands"), { recursive: true });
+  await writeFile(path.join(root, "project-commands/review.md"), "project review");
+  await writeFile(path.join(root, "user-commands/review.md"), "user review");
 
-  const { commands } = await loadProjectCommands({ cwd });
-  const registry = createBuiltinCommandRegistry();
-  const results = registry.registerMany(commands);
+  const project = await loadCommandDirectory({ directory: path.join(root, "project-commands"), source: "project" });
+  const user = await loadCommandDirectory({ directory: path.join(root, "user-commands"), source: "user" });
+  const registry = createCommandRegistry(project.commands);
+  const results = registry.registerMany(user.commands);
 
   expect(results).toHaveLength(1);
   expect(results[0]).toMatchObject({
     status: "skipped",
     reason: "name_conflict",
-    name: "team run",
+    name: "review",
   });
 
-  const resolved = resolveCommand(registry, "/team run");
+  const resolved = resolveCommand(registry, "/review");
   expect(resolved.status).toBe("matched");
   if (resolved.status !== "matched") return;
-  expect(resolved.command.source).toBe("builtin");
-  expect(resolved.path).toEqual(["team", "run"]);
+  expect(resolved.command.source).toBe("project");
+});
+
+test("user loader reads commands from a chili home directory", async () => {
+  const chiliHome = await mkdtemp(path.join(tmpdir(), "chili-home-"));
+  await mkdir(path.join(chiliHome, "commands"), { recursive: true });
+  await writeFile(path.join(chiliHome, "commands/fix-test.md"), "Fix $ARGUMENTS");
+
+  const result = await loadUserCommands({ chiliHome });
+
+  expect(result.commands).toHaveLength(1);
+  expect(result.commands[0]?.name).toBe("fix-test");
+  expect(result.commands[0]?.source).toBe("user");
 });
 
 test("malformed frontmatter returns a diagnostic and skips the command", async () => {
