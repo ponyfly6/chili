@@ -1,3 +1,5 @@
+import type { InputRenderable } from "@opentui/core";
+import { useCallback, useRef } from "react";
 import type { ChatRequestStatus } from "../useChatRuntime.js";
 import type { SlashCompletion } from "../slash/types.js";
 import type { TuiTheme } from "../theme/index.js";
@@ -26,8 +28,13 @@ export function PromptComposer(props: {
   theme: TuiTheme;
   maxCommandItems?: number | undefined;
 }) {
+  const inputRef = useRef<InputRenderable | null>(null);
   const colors = props.theme.colors;
   const placeholder = props.disabled && props.disabledReason ? props.disabledReason : PROMPT_PLACEHOLDER;
+  const handlePromptInput = useCallback((value: string) => {
+    props.onPromptChange(value);
+    correctTrailingUnicodeCursor(inputRef.current, value);
+  }, [props.onPromptChange]);
   const maxCommandItems = props.maxCommandItems ?? DEFAULT_COMMAND_LIST_MAX_ITEMS;
   const compactCommands = props.width < 72;
   const height = promptComposerHeight({
@@ -56,6 +63,7 @@ export function PromptComposer(props: {
           <text fg={colors.input.disabledText} wrapMode="none" truncate>{props.prompt || placeholder}</text>
         ) : (
           <input
+            ref={inputRef}
             width={Math.max(1, props.width - 6)}
             value={props.prompt}
             placeholder={placeholder}
@@ -68,7 +76,7 @@ export function PromptComposer(props: {
             placeholderColor={colors.input.placeholder}
             cursorColor={colors.input.cursor}
             cursorStyle={{ style: "block", blinking: true }}
-            onInput={props.onPromptChange}
+            onInput={handlePromptInput}
             onChange={props.onPromptChange}
             onSubmit={props.onSubmit}
           />
@@ -92,6 +100,50 @@ export function promptComposerHeight(input: {
     ? commandListHeight(commandItems, maxCommandItems)
     : 0;
   return PROMPT_INPUT_HEIGHT + commandHeight + (input.feedback ? 1 : 0);
+}
+
+function correctTrailingUnicodeCursor(input: InputRenderable | null, value: string): void {
+  if (!input || !value) return;
+
+  // OpenTUI's input reports cursor offsets as UTF-16 positions after text input.
+  // For wide Unicode graphemes (emoji, CJK), that places the native terminal
+  // cursor too far to the right when the user is typing at the end of the prompt.
+  // The editor accepts display-cell offsets for end positions, so normalize only
+  // trailing cursors and leave mid-line navigation/edits untouched.
+  const width = terminalDisplayWidth(value);
+  if (input.cursorOffset < width) return;
+  if (width !== input.cursorOffset) input.cursorOffset = width;
+}
+
+function terminalDisplayWidth(value: string): number {
+  let width = 0;
+  for (const cluster of graphemeClusters(value)) {
+    width += graphemeDisplayWidth(cluster);
+  }
+  return width;
+}
+
+function graphemeClusters(value: string): string[] {
+  if (typeof Intl !== "undefined" && "Segmenter" in Intl) {
+    const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+    return Array.from(segmenter.segment(value), (segment) => segment.segment);
+  }
+  return Array.from(value);
+}
+
+function graphemeDisplayWidth(cluster: string): number {
+  if (cluster.length === 0) return 0;
+  if (isZeroWidthCluster(cluster)) return 0;
+  if (isWideCluster(cluster)) return 2;
+  return 1;
+}
+
+function isZeroWidthCluster(cluster: string): boolean {
+  return /^[\u0300-\u036f\ufe00-\ufe0f\u200d]+$/u.test(cluster);
+}
+
+function isWideCluster(cluster: string): boolean {
+  return /\p{Extended_Pictographic}|\p{Script=Han}|\p{Script=Hiragana}|\p{Script=Katakana}|\p{Script=Hangul}|[\u1100-\u115f\u2329\u232a\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe19\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/u.test(cluster);
 }
 
 function feedbackColor(status: string, theme: TuiTheme): string {
