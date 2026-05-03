@@ -91,6 +91,7 @@ export interface ChatShellOptions extends TeamLiveTuiOptions {
 export interface ChatShellExitInfo {
   sessionId?: SessionId;
   threadId?: ThreadId;
+  cwd?: string;
 }
 
 interface AuthManualPrompt {
@@ -618,7 +619,7 @@ export function ChatShellSurface(props: {
       return;
     }
     if (key.ctrl && key.name === "c" && !key.shift) {
-      props.onExit?.(chatShellExitInfo(props.runtime));
+      props.onExit?.(chatShellExitInfo(props.runtime, props.options?.cwd));
       return;
     }
     if (key.ctrl && key.name === "x") {
@@ -2155,13 +2156,14 @@ function latestAssistantText(items: readonly ChatTranscriptItem[]): string | und
   return undefined;
 }
 
-function chatShellExitInfo(runtime: ChatRuntimeState): ChatShellExitInfo | undefined {
+function chatShellExitInfo(runtime: ChatRuntimeState, cwd: string | undefined): ChatShellExitInfo | undefined {
   const sessionId = runtime.activeSessionId ?? runtime.chatView.sessionId;
   const threadId = runtime.activeThreadId ?? runtime.chatView.threadId;
-  if (!sessionId && !threadId) return undefined;
+  if (!sessionId && !threadId && !cwd) return undefined;
   const info: ChatShellExitInfo = {};
   if (sessionId) info.sessionId = sessionId;
   if (threadId) info.threadId = threadId;
+  if (cwd) info.cwd = cwd;
   return info;
 }
 

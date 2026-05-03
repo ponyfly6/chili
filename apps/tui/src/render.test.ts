@@ -50,6 +50,11 @@ test("formats a resume command when a chat session and thread are available", ()
   expect(formatResumeCommand({
     sessionId: "session_resume" as SessionId,
     threadId: "thread_resume" as ThreadId,
+    cwd: "/repo/chili",
+  })).toBe("chili --cwd /repo/chili --resume session_resume --thread thread_resume");
+  expect(formatResumeCommand({
+    sessionId: "session_resume" as SessionId,
+    threadId: "thread_resume" as ThreadId,
   })).toBe("chili --resume session_resume --thread thread_resume");
   expect(formatResumeCommand({
     sessionId: "session_resume" as SessionId,

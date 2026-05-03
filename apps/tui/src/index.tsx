@@ -130,7 +130,8 @@ function toError(error: unknown): Error {
 
 export function formatResumeCommand(info: ChatShellExitInfo | undefined): string | undefined {
   if (!info?.sessionId || !info.threadId) return undefined;
-  return `chili --resume ${shellQuote(info.sessionId)} --thread ${shellQuote(info.threadId)}`;
+  const cwd = info.cwd ? ` --cwd ${shellQuote(info.cwd)}` : "";
+  return `chili${cwd} --resume ${shellQuote(info.sessionId)} --thread ${shellQuote(info.threadId)}`;
 }
 
 async function main(): Promise<void> {
