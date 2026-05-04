@@ -1,7 +1,10 @@
 import { expect, test } from "bun:test";
+import { CodeRenderable, DiffRenderable } from "@opentui/core";
+import { testRender } from "@opentui/react/test-utils";
+import { act } from "react";
 import type { ChatDisplayItem, ToolActivityDisplay } from "./presentation.js";
 import { resolveTuiTheme } from "../theme/index.js";
-import { toolCellLines, toolGroupCellLines } from "./ToolCells.js";
+import { ToolCell, toolCellLines, toolGroupCellLines, toolRichBodyRenderableId } from "./ToolCells.js";
 
 const theme = resolveTuiTheme("chili-dark", {});
 
@@ -70,6 +73,93 @@ test("diff body kind uses the diff body branch", () => {
   expect(lines).toContain("  diff:");
   expect(lines).toContain("    diff --git a/src/example.ts b/src/example.ts");
   expect(lines).toContain("    +const ok = true;");
+});
+
+test("diff body renders through the native diff renderable while fallback stays textual", async () => {
+  const activity = toolActivity({
+    id: "tool_diff_rich",
+    label: "Read git diff src/example.ts",
+    mode: "block",
+    bodyKind: "diff",
+    bodyLines: [
+      "diff --git a/src/example.ts b/src/example.ts",
+      "@@ -1 +1 @@",
+      "-const ok = false;",
+      "+const ok = true;",
+    ],
+    details: [
+      {
+        label: "output",
+        lines: [
+          "diff --git a/src/example.ts b/src/example.ts",
+          "@@ -1 +1 @@",
+          "-const ok = false;",
+          "+const ok = true;",
+        ],
+        tone: "muted",
+        truncated: false,
+      },
+    ],
+  });
+  const app = await renderToolCell(activity, 96);
+
+  try {
+    const id = toolRichBodyRenderableId("display:tool:tool_diff_rich", "diff");
+    expect(app.frame()).toContain("Read git diff src/example.ts");
+    expect(app.frame()).toContain("const ok = true;");
+    expect(app.renderable(id)).toBeInstanceOf(DiffRenderable);
+    expect(lineText(toolCellLines(activity, 96, theme))).toContain("    +const ok = true;");
+  } finally {
+    app.destroy();
+  }
+});
+
+test("code body renders through the native code renderable while fallback stays textual", async () => {
+  const activity = toolActivity({
+    id: "tool_code_rich",
+    label: "Read example.ts",
+    mode: "block",
+    bodyKind: "code",
+    bodyLines: ["const ok = true;", "console.log(ok);"],
+    inputSummary: { title: "read", path: "src/example.ts", detail: "src/example.ts" },
+    details: [
+      { label: "output", lines: ["const ok = true;", "console.log(ok);"], tone: "muted", truncated: false },
+    ],
+  });
+  const app = await renderToolCell(activity, 96);
+
+  try {
+    const id = toolRichBodyRenderableId("display:tool:tool_code_rich", "code");
+    expect(app.frame()).toContain("Read example.ts");
+    expect(app.frame()).toContain("const ok = true;");
+    expect(app.renderable(id)).toBeInstanceOf(CodeRenderable);
+    expect(lineText(toolCellLines(activity, 96, theme))).toContain("    const ok = true;");
+  } finally {
+    app.destroy();
+  }
+});
+
+test("short diff snippets use native code fallback instead of rendering blank diff output", async () => {
+  const activity = toolActivity({
+    id: "tool_diff_snippet_rich",
+    label: "Read git diff src/example.ts",
+    mode: "block",
+    bodyKind: "diff",
+    bodyLines: ["diff --git a/src/example.ts b/src/example.ts", "+const ok = true;"],
+    details: [
+      { label: "output", lines: ["diff --git a/src/example.ts b/src/example.ts", "+const ok = true;"], tone: "muted", truncated: false },
+    ],
+  });
+  const app = await renderToolCell(activity, 96);
+
+  try {
+    const id = toolRichBodyRenderableId("display:tool:tool_diff_snippet_rich", "diff");
+    expect(app.frame()).toContain("diff --git a/src/example.ts b/src/example.ts");
+    expect(app.frame()).toContain("+const ok = true;");
+    expect(app.renderable(id)).toBeInstanceOf(CodeRenderable);
+  } finally {
+    app.destroy();
+  }
 });
 
 test("tool group cell keeps compact metadata label and expands child details", () => {
@@ -209,4 +299,27 @@ function lineText(lines: readonly { text: string }[]): string[] {
 
 function occurrences(value: string, needle: string): number {
   return value.split(needle).length - 1;
+}
+
+async function renderToolCell(activity: ToolActivityDisplay, width: number): Promise<{
+  frame: () => string;
+  renderable: (id: string) => unknown;
+  destroy: () => void;
+}> {
+  const app = await testRender(
+    <box flexDirection="column" width={width} height={12}>
+      <ToolCell activity={activity} width={width} theme={theme} />
+    </box>,
+    { width, height: 12, exitOnCtrlC: false },
+  );
+
+  await act(async () => {
+    await app.renderOnce();
+  });
+
+  return {
+    frame: () => app.captureCharFrame(),
+    renderable: (id: string) => app.renderer.root.findDescendantById(id),
+    destroy: () => app.renderer.destroy(),
+  };
 }

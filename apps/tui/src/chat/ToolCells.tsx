@@ -1,3 +1,4 @@
+import { RGBA, SyntaxStyle } from "@opentui/core";
 import type { TuiTheme } from "../theme/index.js";
 import { detailPreviewLines, TranscriptLines, type TranscriptLineModel, wrapLine } from "./lines.js";
 import type { ChatDisplayItem, ToolActivityDisplay } from "./presentation.js";
@@ -11,7 +12,34 @@ export function ToolInlineCell(props: ToolCellBaseProps & { activity: ToolActivi
 }
 
 export function ToolBlockCell(props: ToolCellBaseProps & { activity: ToolActivityDisplay }) {
-  return <TranscriptLines lines={toolBlockCellLines(props.activity, props.width, props.theme, props.keyPrefix)} />;
+  const keyPrefix = props.keyPrefix ?? "display:tool";
+  const key = `${keyPrefix}:${props.activity.id}`;
+  const bodyDetail = bodyDetailForActivity(props.activity);
+  const headerLines = [
+    ...toolLabelLines(props.activity, props.width, props.theme, keyPrefix),
+    ...toolCompactSupplementLines(key, props.activity, props.width, props.theme),
+  ];
+
+  return (
+    <box width={props.width} maxWidth={props.width} flexDirection="column" overflow="hidden">
+      <TranscriptLines lines={headerLines} />
+      <ToolBodyBlock
+        activity={props.activity}
+        detail={bodyDetail}
+        width={props.width}
+        theme={props.theme}
+        cellKey={key}
+      />
+      {props.activity.details
+        .filter((detail) => detail !== bodyDetail)
+        .map((detail) => (
+          <TranscriptLines
+            key={`${key}:detail:${detail.label}`}
+            lines={toolDetailLines(`${key}:detail:${detail.label}`, detail, props.width, props.theme)}
+          />
+        ))}
+    </box>
+  );
 }
 
 export function ToolGroupCell(props: ToolCellBaseProps & { group: ToolGroupDisplay }) {
@@ -128,14 +156,144 @@ function toolBodyLines(
   return [];
 }
 
+function ToolBodyBlock(props: {
+  activity: ToolActivityDisplay;
+  detail: ToolActivityDetail | undefined;
+  width: number;
+  theme: TuiTheme;
+  cellKey: string;
+}) {
+  const { activity, detail, width, theme, cellKey } = props;
+  if (activity.bodyLines.length === 0) return null;
+  if (activity.bodyKind !== "diff" && activity.bodyKind !== "code") {
+    return <TranscriptLines lines={toolBodyLines(`${cellKey}:body:${activity.bodyKind}`, activity, detail, width, theme)} />;
+  }
+
+  const kind = activity.bodyKind;
+  const labelLines = richBodyLabelLines(`${cellKey}:body:${kind}`, kind, activity.bodyTruncated, width, theme);
+  const content = activity.bodyLines.join("\n") || " ";
+  const richWidth = Math.max(1, width - 4);
+  const richHeight = Math.max(1, activity.bodyLines.length);
+  const syntaxStyle = toolSyntaxStyle(theme);
+  const useNativeDiff = kind === "diff" && canRenderNativeDiff(content);
+  const codeFiletype = kind === "diff" ? "diff" : toolCodeFiletype(activity);
+
+  return (
+    <box width={width} maxWidth={width} flexDirection="column" overflow="hidden">
+      <TranscriptLines lines={labelLines} />
+      <box marginLeft={4} width={richWidth} maxWidth={richWidth} height={richHeight} overflow="hidden">
+        {useNativeDiff ? (
+          <diff
+            id={toolRichBodyRenderableId(cellKey, kind)}
+            diff={content}
+            width={richWidth}
+            height={richHeight}
+            fg={theme.colors.text.muted}
+            syntaxStyle={syntaxStyle}
+            view="unified"
+            wrapMode="none"
+            showLineNumbers={false}
+            addedSignColor={theme.colors.status.success}
+            removedSignColor={theme.colors.status.error}
+            lineNumberFg={theme.colors.text.disabled}
+            lineNumberBg={theme.colors.panel}
+          />
+        ) : (
+          <code
+            id={toolRichBodyRenderableId(cellKey, kind)}
+            content={content}
+            {...(codeFiletype === undefined ? {} : { filetype: codeFiletype })}
+            syntaxStyle={syntaxStyle}
+            width={richWidth}
+            height={richHeight}
+            fg={kind === "diff" ? theme.colors.text.muted : theme.colors.accent.secondary}
+            wrapMode="none"
+            truncate
+            conceal={false}
+            drawUnstyledText
+          />
+        )}
+      </box>
+    </box>
+  );
+}
+
+export function toolRichBodyRenderableId(cellKey: string, kind: "code" | "diff"): string {
+  return `${cellKey}:rich:${kind}`;
+}
+
+function richBodyLabelLines(key: string, label: "code" | "diff", truncated: boolean, width: number, theme: TuiTheme): TranscriptLineModel[] {
+  const suffix = truncated ? " (truncated)" : "";
+  return wrapLine(`  ${label}${suffix}:`, {
+    key: `${key}:label`,
+    fg: theme.colors.text.muted,
+    width,
+    hangingIndent: "    ",
+  });
+}
+
 function diffBodyLines(key: string, activity: ToolActivityDisplay, width: number, theme: TuiTheme): TranscriptLineModel[] {
-  // TODO: Replace this labeled text block with an OpenTUI <diff> component.
+  // Text fallback for transcript/copy paths and partial scroll slices.
   return detailPreviewLines(key, "diff", activity.bodyLines, activity.bodyTruncated, width, theme.colors.text.muted);
 }
 
 function codeBodyLines(key: string, activity: ToolActivityDisplay, width: number, theme: TuiTheme): TranscriptLineModel[] {
-  // TODO: Replace this labeled text block with an OpenTUI <code> component.
+  // Text fallback for transcript/copy paths and partial scroll slices.
   return detailPreviewLines(key, "code", activity.bodyLines, activity.bodyTruncated, width, theme.colors.text.muted);
+}
+
+function canRenderNativeDiff(content: string): boolean {
+  return /^@@ /m.test(content) || /^--- .*\n\+\+\+ /m.test(content);
+}
+
+const toolSyntaxStyleCache = new Map<string, SyntaxStyle>();
+
+function toolSyntaxStyle(theme: TuiTheme): SyntaxStyle {
+  const cacheKey = [
+    theme.id,
+    theme.colors.text.secondary,
+    theme.colors.text.muted,
+    theme.colors.text.disabled,
+    theme.colors.accent.secondary,
+    theme.colors.status.success,
+    theme.colors.status.error,
+    theme.colors.status.info,
+    theme.colors.status.warning,
+  ].join("\0");
+  const cached = toolSyntaxStyleCache.get(cacheKey);
+  if (cached) return cached;
+
+  const syntaxStyle = SyntaxStyle.fromStyles({
+    default: { fg: RGBA.fromHex(theme.colors.text.muted) },
+    comment: { fg: RGBA.fromHex(theme.colors.text.disabled), dim: true },
+    keyword: { fg: RGBA.fromHex(theme.colors.status.info) },
+    string: { fg: RGBA.fromHex(theme.colors.status.success) },
+    number: { fg: RGBA.fromHex(theme.colors.status.warning) },
+    function: { fg: RGBA.fromHex(theme.colors.accent.secondary) },
+    variable: { fg: RGBA.fromHex(theme.colors.text.secondary) },
+    operator: { fg: RGBA.fromHex(theme.colors.text.muted) },
+    punctuation: { fg: RGBA.fromHex(theme.colors.text.muted) },
+  });
+  toolSyntaxStyleCache.set(cacheKey, syntaxStyle);
+  return syntaxStyle;
+}
+
+function toolCodeFiletype(activity: ToolActivityDisplay): string | undefined {
+  const path = activity.inputSummary?.path ?? activity.inputSummary?.scope ?? activity.inputSummary?.detail;
+  const extension = path?.match(/\.([a-zA-Z0-9_+-]+)(?:[:\s].*)?$/)?.[1]?.toLowerCase();
+  if (!extension) return undefined;
+  if (extension === "ts" || extension === "tsx") return "typescript";
+  if (extension === "js" || extension === "jsx" || extension === "mjs" || extension === "cjs") return "javascript";
+  if (extension === "py") return "python";
+  if (extension === "rs") return "rust";
+  if (extension === "go") return "go";
+  if (extension === "rb") return "ruby";
+  if (extension === "sh" || extension === "bash" || extension === "zsh") return "bash";
+  if (extension === "json") return "json";
+  if (extension === "md" || extension === "mdx") return "markdown";
+  if (extension === "yml" || extension === "yaml") return "yaml";
+  if (extension === "html" || extension === "css" || extension === "sql" || extension === "java" || extension === "kt" || extension === "swift") return extension;
+  return undefined;
 }
 
 function bodyDetailForActivity(activity: ToolActivityDisplay): ToolActivityDetail | undefined {
