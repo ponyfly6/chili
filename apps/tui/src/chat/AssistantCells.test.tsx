@@ -39,7 +39,7 @@ test("assistant text cell lines keep completed markdown output", async () => {
   expect(frame).toContain("const ok = true;");
 });
 
-test("assistant markdown cell renders rich heading list code diff and quote blocks", async () => {
+test("assistant markdown cell renders native heading list code diff and quote blocks", async () => {
   const text = [
     "# Plan",
     "",
@@ -83,19 +83,20 @@ test("assistant markdown cell renders rich heading list code diff and quote bloc
   expect(blocks.map((block) => block.kind)).toEqual(["heading", "list", "code", "diff", "blockquote"]);
   expect(frame).toContain("# Plan");
   expect(frame).toContain("- inspect `MessageList`");
-  expect(frame).toContain("```ts");
   expect(frame).toContain("const ok = true;");
-  expect(frame).toContain("```diff");
   expect(frame).toContain("-old");
   expect(frame).toContain("+new");
   expect(frame).toContain("> compact by default");
+  expect(frame).not.toContain("🌶️:");
+  expect(frame).not.toContain("```ts");
+  expect(frame).not.toContain("```diff");
 
   const diffBlock = blocks.find((block) => block.kind === "diff");
   expect(diffBlock?.lines.find((line) => line.text.includes("+new"))?.fg).toBe(theme.colors.status.success);
   expect(diffBlock?.lines.find((line) => line.text.includes("-old"))?.fg).toBe(theme.colors.status.error);
 });
 
-test("assistant markdown cell renders rich aligned table blocks", async () => {
+test("assistant markdown cell renders native table while fallback keeps aligned table lines", async () => {
   const text = [
     "| Name | Count | State |",
     "| :--- | ---: | :---: |",
@@ -126,9 +127,44 @@ test("assistant markdown cell renders rich aligned table blocks", async () => {
 
   expect(blocks.map((block) => block.kind)).toEqual(["table"]);
   expect(blocks[0]?.lines.map((line) => line.text)).toEqual(fallbackLines.map((line) => line.text));
-  expect(frame).toContain("🌶️: | Name        | Count | State |");
-  expect(frame).toContain("    | alpha       |     7 |  ok   |");
+  expect(frame).toContain("┌");
+  expect(frame).toContain("┬");
+  expect(frame).toContain("│ Name");
+  expect(frame).toContain("│ alpha");
+  expect(frame).toContain("│ longer name");
+  expect(frame).not.toContain("🌶️:");
+  expect(frame).not.toContain(":---");
   expect(blocks[0]?.lines[1]?.fg).toBe(theme.colors.text.muted);
+});
+
+test("assistant markdown native table stays readable with narrow CJK and long cells", async () => {
+  const text = [
+    "| 名称 | Detail | 状态 |",
+    "| --- | --- | --- |",
+    "| 火锅 | very-long-cell-with-several-words for wrapping | 正常 |",
+    "| 面 | compact | 等待 |",
+  ].join("\n");
+  const fallbackLines = assistantTextCellLines({
+    key: "assistant:table-cjk",
+    text,
+    streaming: false,
+    width: 44,
+    theme,
+  });
+  const frame = await renderAssistantMarkdownCell({
+    cellKey: "assistant:table-cjk",
+    text,
+    streaming: false,
+    width: 44,
+    fallbackLines,
+  });
+
+  expect(frame).toContain("┌");
+  expect(frame).toContain("名称");
+  expect(frame).toContain("火锅");
+  expect(frame).toContain("very");
+  expect(frame).toContain("正常");
+  expect(frame).not.toContain("🌶️:");
 });
 
 test("assistant rich markdown cache hits for repeated completed content", () => {
@@ -257,9 +293,9 @@ test("assistant text cell lines keep unfinished streaming code fences open", asy
   });
 
   expect(frame).toContain("Intro");
-  expect(frame).toContain("```ts");
   expect(frame).toContain("const ok");
-  expect(occurrences(frame, "```")).toBe(1);
+  expect(frame).not.toContain("🌶️:");
+  expect(occurrences(frame, "```")).toBe(0);
   expect(assistantMarkdownBlockCacheStats()).toMatchObject({
     hits: 0,
     misses: 0,
@@ -362,6 +398,7 @@ test("assistant markdown component full render stays rich while partial slices u
   expect(fullFrame).toContain("# Rich visible");
   expect(fullFrame).toContain("- rendered component");
   expect(fullFrame).not.toContain("FALLBACK");
+  expect(fullFrame).not.toContain("🌶️:");
   expect(partialFrame).toContain("FALLBACK three");
   expect(partialFrame).not.toContain("# Rich visible");
 });

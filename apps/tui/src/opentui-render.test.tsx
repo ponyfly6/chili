@@ -248,7 +248,7 @@ test("renders reasoning separately from assistant text", async () => {
 
   expect(frame).toContain("Thinking");
   expect(frame).toContain("Thinking: checking the plan");
-  expect(frame).toContain("🌶️: final answer");
+  expect(frame).toContain("final answer");
   expect(frame).not.toContain("🌶️: checking the plan final answer");
 });
 

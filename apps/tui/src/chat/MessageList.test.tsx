@@ -141,10 +141,10 @@ test("streaming assistant text does not prematurely close unfinished code fences
     },
   ], { status: "running" });
 
-  expect(frame).toContain("🌶️: Intro");
-  expect(frame).toContain("```ts");
+  expect(frame).toContain("Intro");
   expect(frame).toContain("const ok");
-  expect(occurrences(frame, "```")).toBe(1);
+  expect(frame).not.toContain("🌶️:");
+  expect(occurrences(frame, "```")).toBe(0);
 });
 
 test("hidden thinking masks reasoning text", async () => {
@@ -163,7 +163,7 @@ test("hidden thinking masks reasoning text", async () => {
 
   expect(frame).toContain("🫧");
   expect(frame).not.toContain("checking a sensitive plan");
-  expect(frame).toContain("🌶️: final answer");
+  expect(frame).toContain("final answer");
 });
 
 test("hidden thinking masks intermediate assistant text before tool calls", async () => {
@@ -228,7 +228,7 @@ test("hidden thinking shows completed assistant text without tool calls", async 
     },
   ], { hideThinking: true, status: "idle" });
 
-  expect(frame).toContain("🌶️: Final answer is visible.");
+  expect(frame).toContain("Final answer is visible.");
   expect(frame).not.toContain("🫧 thinking...");
 });
 
@@ -286,7 +286,35 @@ test("completed assistant markdown keeps block rendering", async () => {
 
   expect(frame).toContain("# Done");
   expect(frame).toContain("- ship it");
-  expect(frame).toContain("```ts");
+  expect(frame).toContain("const ok = true;");
+  expect(frame).not.toContain("🌶️:");
+  expect(frame).not.toContain("```ts");
+});
+
+test("assistant markdown table uses native table rendering in the message list", async () => {
+  const frame = await renderMessageList([
+    {
+      id: "msg_native_table" as MessageId,
+      kind: "message",
+      role: "assistant",
+      createdAt: 1,
+      completedAt: 2,
+      parts: [
+        {
+          type: "text",
+          id: "part_native_table" as PartId,
+          text: "| Name | Count |\n| --- | ---: |\n| alpha | 7 |\n| beta | 12 |",
+        },
+      ],
+    },
+  ]);
+
+  expect(frame).toContain("┌");
+  expect(frame).toContain("┬");
+  expect(frame).toContain("│ Name");
+  expect(frame).toContain("│ alpha");
+  expect(frame).not.toContain("🌶️:");
+  expect(frame).not.toContain("| ---");
 });
 
 test("long assistant markdown scrolls inside the native scrollbox", async () => {
@@ -453,7 +481,9 @@ test("assistant tool parts stay out of default chat text while tool rows render 
     }),
   ]);
 
-  expect(frame).toContain("🌶️: Done with tests.");
+  expect(frame).toContain("Done with");
+  expect(frame).toContain("tests");
+  expect(frame).not.toContain("🌶️:");
   expect(frame).toContain("Ran bun test");
   expect(occurrences(frame, "Ran bun test")).toBe(1);
   expect(frame).not.toContain("tool_call");

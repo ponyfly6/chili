@@ -1,3 +1,4 @@
+import { CodeRenderable, RGBA, SyntaxStyle, type RenderNodeContext, type StyleDefinition } from "@opentui/core";
 import { Lexer, type Token, type Tokens } from "marked";
 import type { TuiTheme } from "../theme/index.js";
 import { TranscriptLines, type TranscriptLineModel } from "./lines.js";
@@ -52,17 +53,35 @@ export function AssistantMarkdownCell(props: {
   theme: TuiTheme;
   fallbackLines: readonly TranscriptLineModel[];
 }) {
-  const blocks = assistantMarkdownBlocks({
-    cellKey: props.cellKey,
-    text: props.text,
-    streaming: props.streaming,
-    width: props.width,
-    theme: props.theme,
-  });
-  if (blocks.length === 0) return <AssistantTextCell lines={props.fallbackLines} />;
+  const content = props.text.trim().length === 0 ? "..." : props.text;
+  const width = Math.max(1, Number.isFinite(props.width) ? Math.floor(props.width) : 80);
+  if (content.trim().length === 0) return <AssistantTextCell lines={props.fallbackLines} />;
   return (
-    <box flexDirection="column">
-      {blocks.map((block) => <AssistantMarkdownBlockView key={block.key} block={block} />)}
+    <box width={width} maxWidth={width} flexDirection="column" overflow="hidden">
+      <markdown
+        content={content}
+        width="100%"
+        maxWidth="100%"
+        fg={props.theme.colors.text.secondary}
+        syntaxStyle={assistantMarkdownSyntaxStyle(props.theme)}
+        conceal={false}
+        concealCode={false}
+        streaming={props.streaming}
+        renderNode={renderAssistantMarkdownNode}
+        internalBlockMode="top-level"
+        tableOptions={{
+          style: "grid",
+          widthMode: "full",
+          columnFitter: "balanced",
+          wrapMode: "word",
+          cellPadding: 1,
+          borders: true,
+          outerBorder: true,
+          borderStyle: "single",
+          borderColor: props.theme.colors.border.default,
+          selectable: true,
+        }}
+      />
     </box>
   );
 }
@@ -145,6 +164,61 @@ export function clearAssistantMarkdownBlockCache(): void {
 
 function AssistantMarkdownBlockView(props: { block: AssistantMarkdownBlock }) {
   return <TranscriptLines lines={props.block.lines} />;
+}
+
+function renderAssistantMarkdownNode(_token: Token, context: RenderNodeContext) {
+  const renderable = context.defaultRender();
+  if (renderable instanceof CodeRenderable) renderable.drawUnstyledText = true;
+  return renderable;
+}
+
+const assistantMarkdownSyntaxStyleCache = new Map<string, SyntaxStyle>();
+
+function assistantMarkdownSyntaxStyle(theme: TuiTheme): SyntaxStyle {
+  const cacheKey = [
+    theme.id,
+    theme.colors.text.primary,
+    theme.colors.text.secondary,
+    theme.colors.text.muted,
+    theme.colors.text.disabled,
+    theme.colors.accent.secondary,
+    theme.colors.status.success,
+    theme.colors.status.error,
+    theme.colors.status.info,
+    theme.colors.status.warning,
+  ].join("\0");
+  const cached = assistantMarkdownSyntaxStyleCache.get(cacheKey);
+  if (cached) return cached;
+
+  const styles: Record<string, StyleDefinition> = {
+    default: { fg: markdownRgba(theme.colors.text.secondary) },
+    conceal: { fg: markdownRgba(theme.colors.text.disabled), dim: true },
+    "markup.heading": { fg: markdownRgba(theme.colors.text.primary), bold: true },
+    "markup.strong": { fg: markdownRgba(theme.colors.text.primary), bold: true },
+    "markup.italic": { fg: markdownRgba(theme.colors.text.secondary), italic: true },
+    "markup.strikethrough": { fg: markdownRgba(theme.colors.text.muted), dim: true },
+    "markup.raw": { fg: markdownRgba(theme.colors.accent.secondary) },
+    "markup.raw.block": { fg: markdownRgba(theme.colors.accent.secondary) },
+    "markup.link": { fg: markdownRgba(theme.colors.accent.secondary) },
+    "markup.link.label": { fg: markdownRgba(theme.colors.accent.secondary), underline: true },
+    "markup.link.url": { fg: markdownRgba(theme.colors.text.muted), underline: true },
+    "markup.quote": { fg: markdownRgba(theme.colors.text.muted), dim: true },
+    comment: { fg: markdownRgba(theme.colors.text.muted), dim: true },
+    keyword: { fg: markdownRgba(theme.colors.status.info) },
+    string: { fg: markdownRgba(theme.colors.status.success) },
+    number: { fg: markdownRgba(theme.colors.status.warning) },
+    function: { fg: markdownRgba(theme.colors.accent.secondary) },
+    variable: { fg: markdownRgba(theme.colors.text.secondary) },
+    operator: { fg: markdownRgba(theme.colors.text.muted) },
+    punctuation: { fg: markdownRgba(theme.colors.text.muted) },
+  };
+  const syntaxStyle = SyntaxStyle.fromStyles(styles);
+  assistantMarkdownSyntaxStyleCache.set(cacheKey, syntaxStyle);
+  return syntaxStyle;
+}
+
+function markdownRgba(color: string): RGBA {
+  return RGBA.fromHex(color);
 }
 
 function markdownFg(tone: MarkdownLineTone, theme: TuiTheme): string {

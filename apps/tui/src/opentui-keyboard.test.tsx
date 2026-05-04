@@ -693,22 +693,22 @@ test("/thinking hide and show toggle reasoning visibility", async () => {
 
   try {
     expect(app.captureCharFrame()).toContain("Thinking: checking private chain");
-    expect(app.captureCharFrame()).toContain("🌶️: Let me inspect private chain.");
-    expect(app.captureCharFrame()).toContain("🌶️: done");
+    expect(app.captureCharFrame()).toContain("Let me inspect private chain.");
+    expect(app.captureCharFrame()).toContain("done");
 
     await typeText(app, "/thinking hide");
     await press(app, () => app.mockInput.pressEnter());
     expect(app.captureCharFrame()).toContain("Thinking traces hidden.");
     expect(app.captureCharFrame()).toContain("🫧");
     expect(app.captureCharFrame()).not.toContain("Thinking: checking private chain");
-    expect(app.captureCharFrame()).not.toContain("🌶️: Let me inspect private chain.");
-    expect(app.captureCharFrame()).toContain("🌶️: done");
+    expect(app.captureCharFrame()).not.toContain("Let me inspect private chain.");
+    expect(app.captureCharFrame()).toContain("done");
 
     await typeText(app, "/thinking show");
     await press(app, () => app.mockInput.pressEnter());
     expect(app.captureCharFrame()).toContain("Thinking traces shown.");
     expect(app.captureCharFrame()).toContain("Thinking: checking private chain");
-    expect(app.captureCharFrame()).toContain("🌶️: Let me inspect private chain.");
+    expect(app.captureCharFrame()).toContain("Let me inspect private chain.");
   } finally {
     app.renderer.destroy();
   }
