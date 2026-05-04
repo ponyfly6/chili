@@ -252,8 +252,11 @@ export function slashCompletions(
   const body = normalizeInput(input);
   const custom = commands.flatMap((command) => command.complete?.(ctx, body) ?? []);
   const registry = commands
+    .map((command, index) => ({ command, index, rank: commandMatchRank(command, body) }))
+    .filter((candidate): candidate is { command: SlashCommand; index: number; rank: CommandMatchRank } => candidate.rank !== undefined)
+    .sort((left, right) => compareCommandMatch(left.rank, right.rank) || left.index - right.index)
+    .map(({ command }) => command)
     .filter((command) => !command.hidden)
-    .filter((command) => commandNames(command).some((name) => matchesCommand(name, body)))
     .map((command) => ({
       value: `/${command.name}`,
       label: `/${command.name}${command.argumentHint ? ` ${command.argumentHint}` : ""}`,
@@ -272,10 +275,32 @@ function commandNames(command: SlashCommand): string[] {
   return [command.name, ...(command.aliases ?? [])].map((name) => name.toLowerCase());
 }
 
-function matchesCommand(name: string, input: string): boolean {
-  if (!input) return true;
-  if (name.startsWith(input)) return true;
-  return fuzzyMatch(name, input);
+interface CommandMatchRank {
+  kind: 0 | 1 | 2;
+  nameLength: number;
+}
+
+function commandMatchRank(command: SlashCommand, input: string): CommandMatchRank | undefined {
+  if (command.hidden) return undefined;
+  let best: CommandMatchRank | undefined;
+  for (const name of commandNames(command)) {
+    const rank = nameMatchRank(name, input);
+    if (!rank) continue;
+    if (!best || compareCommandMatch(rank, best) < 0) best = rank;
+  }
+  return best;
+}
+
+function nameMatchRank(name: string, input: string): CommandMatchRank | undefined {
+  if (!input) return { kind: 0, nameLength: 0 };
+  if (name === input) return { kind: 0, nameLength: name.length };
+  if (name.startsWith(input)) return { kind: 1, nameLength: name.length };
+  if (fuzzyMatch(name, input)) return { kind: 2, nameLength: name.length };
+  return undefined;
+}
+
+function compareCommandMatch(left: CommandMatchRank, right: CommandMatchRank): number {
+  return left.kind - right.kind || left.nameLength - right.nameLength;
 }
 
 function fuzzyMatch(value: string, query: string): boolean {

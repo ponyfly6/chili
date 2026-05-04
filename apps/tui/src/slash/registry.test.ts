@@ -29,6 +29,12 @@ test("includes auth commands in slash completions", () => {
   expect(completions.map((completion) => completion.value)).toContain("/login");
 });
 
+test("sorts prefix slash completions before fuzzy matches", () => {
+  const completions = slashCompletions(createDefaultSlashCommands(), { model: {} } as SlashCommandContext, "/mo", 8);
+  expect(completions[0]?.value).toBe("/model");
+  expect(completions.map((completion) => completion.value)).toContain("/commands reload");
+});
+
 test("resolves commands view and reload slash commands", async () => {
   const commands = createDefaultSlashCommands();
   const ctx = { model: {} } as SlashCommandContext;

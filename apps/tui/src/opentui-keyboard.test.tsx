@@ -462,6 +462,27 @@ test("Tab accepts slash completion without leaving the completion list open", as
   }
 });
 
+test("Tab accepts the strongest slash completion for a typed prefix", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "/mo");
+    expect(app.captureCharFrame()).toContain("> /model [provider/model] - Select model");
+
+    await press(app, () => app.mockInput.pressTab());
+    const frame = app.captureCharFrame();
+
+    expect(frame).toContain("/model ");
+    expect(frame).not.toContain("/commands reload ");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("$ opens a skill picker and Tab inserts a path-bound skill mention", async () => {
   const submissions: Array<{ text: string; skillMentions?: unknown }> = [];
   const app = await mountShell(teamLiveFixture(), {
