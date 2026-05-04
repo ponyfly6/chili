@@ -141,7 +141,7 @@ export function charDisplayWidth(char: string): number {
   return 1;
 }
 
-export function markdownTableToTerminalLines(token: Tokens.Table, options: MarkdownRenderOptions): MarkdownTerminalLine[] {
+function markdownTableToTerminalLines(token: Tokens.Table, options: MarkdownRenderOptions): MarkdownTerminalLine[] {
   return terminalTableLines({
     key: options.key,
     width: options.width,

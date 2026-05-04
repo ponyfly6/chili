@@ -1,23 +1,16 @@
-import { beforeEach, expect, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
-import { act } from "react";
+import { Children, act, isValidElement, type ReactElement, type ReactNode } from "react";
 import { resolveTuiTheme } from "../theme/index.js";
 import {
   AssistantMarkdownCell,
   AssistantTextCell,
-  assistantMarkdownBlockCacheStats,
-  assistantMarkdownBlocks,
   assistantTextCellLines,
-  clearAssistantMarkdownBlockCache,
 } from "./AssistantCells.js";
 import { componentBackedCell, TranscriptCellSliceView, windowTranscriptCells } from "./cells.js";
 import type { TranscriptLineModel } from "./lines.js";
 
 const theme = resolveTuiTheme("chili-dark", {});
-
-beforeEach(() => {
-  clearAssistantMarkdownBlockCache();
-});
 
 test("assistant text cell lines keep completed markdown output", async () => {
   const lines = assistantTextCellLines({
@@ -65,13 +58,6 @@ test("assistant markdown cell renders native heading list code diff and quote bl
     width: 96,
     theme,
   });
-  const blocks = assistantMarkdownBlocks({
-    cellKey: "assistant:rich",
-    text,
-    streaming: false,
-    width: 96,
-    theme,
-  });
   const frame = await renderAssistantMarkdownCell({
     cellKey: "assistant:rich",
     text,
@@ -80,7 +66,6 @@ test("assistant markdown cell renders native heading list code diff and quote bl
     fallbackLines,
   });
 
-  expect(blocks.map((block) => block.kind)).toEqual(["heading", "list", "code", "diff", "blockquote"]);
   expect(frame).toContain("# Plan");
   expect(frame).toContain("- inspect `MessageList`");
   expect(frame).toContain("const ok = true;");
@@ -90,13 +75,55 @@ test("assistant markdown cell renders native heading list code diff and quote bl
   expect(frame).not.toContain("🌶️:");
   expect(frame).not.toContain("```ts");
   expect(frame).not.toContain("```diff");
-
-  const diffBlock = blocks.find((block) => block.kind === "diff");
-  expect(diffBlock?.lines.find((line) => line.text.includes("+new"))?.fg).toBe(theme.colors.status.success);
-  expect(diffBlock?.lines.find((line) => line.text.includes("-old"))?.fg).toBe(theme.colors.status.error);
 });
 
-test("assistant markdown cell renders native table while fallback keeps aligned table lines", async () => {
+test("assistant markdown cell keeps OpenTUI markdown as the native render path", () => {
+  const text = "| Name | Count |\n| --- | ---: |\n| alpha | 7 |";
+  const fallbackLines = [line("fallback:1", "FALLBACK")];
+  const element = AssistantMarkdownCell({
+    cellKey: "assistant:native-path",
+    text,
+    streaming: true,
+    width: 72.8,
+    theme,
+    fallbackLines,
+  });
+  const markdown = findIntrinsicElement(element, "markdown");
+  const box = findIntrinsicElement(element, "box");
+
+  expect(box?.props).toMatchObject({
+    width: 72,
+    maxWidth: 72,
+    flexDirection: "column",
+    overflow: "hidden",
+  });
+  expect(markdown?.props).toMatchObject({
+    content: text,
+    width: "100%",
+    maxWidth: "100%",
+    fg: theme.colors.text.secondary,
+    conceal: false,
+    concealCode: false,
+    streaming: true,
+    internalBlockMode: "top-level",
+    tableOptions: {
+      style: "grid",
+      widthMode: "full",
+      columnFitter: "balanced",
+      wrapMode: "word",
+      cellPadding: 1,
+      borders: true,
+      outerBorder: true,
+      borderStyle: "single",
+      borderColor: theme.colors.border.default,
+      selectable: true,
+    },
+  });
+  expect(markdown?.props.syntaxStyle).toBeDefined();
+  expect(markdown?.props.renderNode).toBeFunction();
+});
+
+test("assistant markdown cell renders native table while partial fallback remains plain text", async () => {
   const text = [
     "| Name | Count | State |",
     "| :--- | ---: | :---: |",
@@ -110,13 +137,6 @@ test("assistant markdown cell renders native table while fallback keeps aligned 
     width: 80,
     theme,
   });
-  const blocks = assistantMarkdownBlocks({
-    cellKey: "assistant:table",
-    text,
-    streaming: false,
-    width: 80,
-    theme,
-  });
   const frame = await renderAssistantMarkdownCell({
     cellKey: "assistant:table",
     text,
@@ -124,9 +144,11 @@ test("assistant markdown cell renders native table while fallback keeps aligned 
     width: 80,
     fallbackLines,
   });
+  const fallbackText = fallbackLines.map((line) => line.text).join("\n");
 
-  expect(blocks.map((block) => block.kind)).toEqual(["table"]);
-  expect(blocks[0]?.lines.map((line) => line.text)).toEqual(fallbackLines.map((line) => line.text));
+  expect(fallbackText).toContain("🌶️: | Name");
+  expect(fallbackText).toContain("| alpha");
+  expect(fallbackText).not.toContain("┌");
   expect(frame).toContain("┌");
   expect(frame).toContain("┬");
   expect(frame).toContain("│ Name");
@@ -134,7 +156,6 @@ test("assistant markdown cell renders native table while fallback keeps aligned 
   expect(frame).toContain("│ longer name");
   expect(frame).not.toContain("🌶️:");
   expect(frame).not.toContain(":---");
-  expect(blocks[0]?.lines[1]?.fg).toBe(theme.colors.text.muted);
 });
 
 test("assistant markdown native table stays readable with narrow CJK and long cells", async () => {
@@ -165,86 +186,6 @@ test("assistant markdown native table stays readable with narrow CJK and long ce
   expect(frame).toContain("very");
   expect(frame).toContain("正常");
   expect(frame).not.toContain("🌶️:");
-});
-
-test("assistant rich markdown cache hits for repeated completed content", () => {
-  const input = {
-    cellKey: "assistant:cache-hit",
-    text: "# Cached\n\n- one",
-    streaming: false,
-    width: 96,
-    theme,
-  };
-
-  const first = assistantMarkdownBlocks(input);
-  const second = assistantMarkdownBlocks(input);
-
-  expect(second).toBe(first);
-  expect(assistantMarkdownBlockCacheStats()).toMatchObject({
-    hits: 1,
-    misses: 1,
-    evictions: 0,
-    size: 1,
-  });
-});
-
-test("assistant rich markdown cache misses when width changes", () => {
-  const base = {
-    cellKey: "assistant:cache-width",
-    text: "abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz",
-    streaming: false,
-    theme,
-  };
-
-  const narrow = assistantMarkdownBlocks({ ...base, width: 20 });
-  const wide = assistantMarkdownBlocks({ ...base, width: 96 });
-
-  expect(wide).not.toBe(narrow);
-  expect(assistantMarkdownBlockCacheStats()).toMatchObject({
-    hits: 0,
-    misses: 2,
-    size: 2,
-  });
-});
-
-test("assistant rich markdown cache misses when text changes", () => {
-  const base = {
-    cellKey: "assistant:cache-text",
-    streaming: false,
-    width: 96,
-    theme,
-  };
-
-  const first = assistantMarkdownBlocks({ ...base, text: "# One" });
-  const second = assistantMarkdownBlocks({ ...base, text: "# Two" });
-
-  expect(second).not.toBe(first);
-  expect(assistantMarkdownBlockCacheStats()).toMatchObject({
-    hits: 0,
-    misses: 2,
-    size: 2,
-  });
-});
-
-test("assistant rich markdown cache guards against text hash collisions", () => {
-  const base = {
-    cellKey: "assistant:cache-collision",
-    streaming: false,
-    width: 96,
-    theme,
-  };
-
-  const first = assistantMarkdownBlocks({ ...base, text: "zgDib656" });
-  const second = assistantMarkdownBlocks({ ...base, text: "kHML6ZQx" });
-
-  expect(second).not.toBe(first);
-  expect(lineText(second.flatMap((block) => block.lines)).join("\n")).toContain("kHML6ZQx");
-  expect(lineText(second.flatMap((block) => block.lines)).join("\n")).not.toContain("zgDib656");
-  expect(assistantMarkdownBlockCacheStats()).toMatchObject({
-    hits: 0,
-    misses: 2,
-    size: 1,
-  });
 });
 
 test("assistant text cell lines keep streaming stable and tail rendering", () => {
@@ -296,11 +237,6 @@ test("assistant text cell lines keep unfinished streaming code fences open", asy
   expect(frame).toContain("const ok");
   expect(frame).not.toContain("🌶️:");
   expect(occurrences(frame, "```")).toBe(0);
-  expect(assistantMarkdownBlockCacheStats()).toMatchObject({
-    hits: 0,
-    misses: 0,
-    size: 0,
-  });
 });
 
 test("assistant text cell lines rewrap when width changes", () => {
@@ -472,6 +408,17 @@ function lineText(lines: readonly TranscriptLineModel[]): string[] {
 
 function occurrences(value: string, needle: string): number {
   return value.split(needle).length - 1;
+}
+
+function findIntrinsicElement(node: ReactNode, type: string): ReactElement<Record<string, unknown>> | undefined {
+  if (!isValidElement(node)) return undefined;
+  if (node.type === type) return node as ReactElement<Record<string, unknown>>;
+  const props = node.props as { children?: ReactNode };
+  for (const child of Children.toArray(props.children)) {
+    const found = findIntrinsicElement(child, type);
+    if (found) return found;
+  }
+  return undefined;
 }
 
 function line(key: string, text: string): TranscriptLineModel {
