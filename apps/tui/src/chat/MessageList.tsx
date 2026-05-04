@@ -1,8 +1,10 @@
 import type { ChatSessionView, ChatTranscriptItem } from "@chili/sdk";
+import type { ScrollBoxRenderable } from "@opentui/core";
+import type { Ref } from "react";
 import { shorten } from "../components/helpers.js";
 import type { TuiTheme } from "../theme/index.js";
 import { AssistantMarkdownCell, assistantTextCellLines } from "./AssistantCells.js";
-import { componentBackedCell, lineBackedCell, TranscriptCellSliceView, type TranscriptCellModel, windowTranscriptCells } from "./cells.js";
+import { componentBackedCell, lineBackedCell, TranscriptCellView, type TranscriptCellModel } from "./cells.js";
 import { type TranscriptLineModel, wrapLine } from "./lines.js";
 import { buildChatDisplayItems, type ChatDisplayItem } from "./presentation.js";
 import { ToolCell, ToolGroupCell, toolCellLines, toolGroupCellLines } from "./ToolCells.js";
@@ -12,8 +14,7 @@ export function MessageList(props: {
   chatView: ChatSessionView;
   localItems: readonly LocalTranscriptItem[];
   width?: number;
-  visibleLimit?: number;
-  scrollOffset?: number;
+  scrollRef?: Ref<ScrollBoxRenderable> | undefined;
   showToolDetails?: boolean;
   hideThinking?: boolean;
   theme: TuiTheme;
@@ -26,23 +27,24 @@ export function MessageList(props: {
     activeToolCount: props.chatView.activeTools.length,
     theme: props.theme,
   });
-  const limit = Math.max(1, props.visibleLimit ?? 18);
-  const window = windowTranscriptCells(allCells, { visibleLimit: limit, scrollOffset: props.scrollOffset });
   return (
-    <box width="100%" height="100%" flexDirection="column">
-      {window.totalLineCount === 0 ? (
+    <scrollbox
+      {...(props.scrollRef === undefined ? {} : { ref: props.scrollRef })}
+      width="100%"
+      height="100%"
+      scrollY
+      scrollX={false}
+      stickyScroll
+      stickyStart="bottom"
+      viewportCulling
+      contentOptions={{ flexDirection: "column" }}
+    >
+      {allCells.length === 0 ? (
         <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>{"Start a conversation from the prompt below."}</text>
       ) : (
-        <>
-          {window.totalLineCount > window.contentLimit ? (
-            <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>
-              {`History ${window.startLine + 1}-${window.endLine}/${window.totalLineCount} PgUp/PgDn Shift+Up/Down`}
-            </text>
-          ) : null}
-          {window.slices.map((slice) => <TranscriptCellSliceView key={slice.key} slice={slice} />)}
-        </>
+        allCells.map((cell) => <TranscriptCellView key={cell.key} cell={cell} />)
       )}
-    </box>
+    </scrollbox>
   );
 }
 

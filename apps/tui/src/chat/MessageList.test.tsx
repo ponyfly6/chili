@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
-import { act } from "react";
+import type { ScrollBoxRenderable } from "@opentui/core";
+import { act, createRef } from "react";
 import type { ChatSessionView, ChatTranscriptItem } from "@chili/sdk";
 import type { MessageId, PartId, ToolCallId } from "@chili/protocol";
 import { resolveTuiTheme } from "../theme/index.js";
@@ -288,7 +289,7 @@ test("completed assistant markdown keeps block rendering", async () => {
   expect(frame).toContain("```ts");
 });
 
-test("long assistant markdown scrolls by rendered transcript lines", async () => {
+test("long assistant markdown scrolls inside the native scrollbox", async () => {
   const text = Array.from({ length: 12 }, (_, index) => `long line ${String(index + 1).padStart(2, "0")}`).join("\n");
   const items: ChatTranscriptItem[] = [
     {
@@ -303,14 +304,19 @@ test("long assistant markdown scrolls by rendered transcript lines", async () =>
     },
   ];
 
-  const bottom = await renderMessageList(items, { height: 6, width: 100 });
-  const scrolled = await renderMessageList(items, { height: 6, width: 100, scrollOffset: 7 });
+  const app = await renderMessageListApp(items, { height: 6, width: 100 });
 
-  expect(bottom).toContain("History");
-  expect(bottom).toContain("long line 12");
-  expect(bottom).not.toContain("long line 01");
-  expect(scrolled).toContain("long line 01");
-  expect(scrolled).not.toContain("long line 12");
+  try {
+    expect(app.frame()).toContain("long line 12");
+    expect(app.frame()).not.toContain("long line 01");
+
+    await app.scrollBy(-7);
+
+    expect(app.frame()).toContain("long line 01");
+    expect(app.frame()).not.toContain("long line 12");
+  } finally {
+    app.destroy();
+  }
 });
 
 test("history render model caches completed assistant markdown lines by part identity and content", () => {
@@ -606,22 +612,26 @@ test("tool details show a longer live output tail", async () => {
   expect(frame).not.toContain("output hidden");
 });
 
-test("tool details line count participates in transcript window slicing", async () => {
+test("tool details scroll as a full component in the native scrollbox", async () => {
   const output = Array.from({ length: 20 }, (_, index) => `slice_line_${String(index + 1).padStart(2, "0")}`).join("\n");
   const item = chatTool("tool_slice_output" as ToolCallId, "bash", "completed", "succeeded", { title: "bash", command: "bun test", detail: "bun test" }, {
     output,
   });
 
-  const bottom = await renderMessageList([item], { showToolDetails: true, height: 5, width: 120 });
-  const scrolled = await renderMessageList([item], { showToolDetails: true, height: 5, width: 120, scrollOffset: 3 });
+  const app = await renderMessageListApp([item], { showToolDetails: true, height: 5, width: 120 });
 
-  expect(bottom).toContain("History");
-  expect(bottom).toContain("slice_line_05");
-  expect(bottom).not.toContain("slice_line_01");
-  expect(scrolled).toContain("Ran bun test");
-  expect(scrolled).toContain("output (truncated):");
-  expect(scrolled).toContain("slice_line_01");
-  expect(scrolled).not.toContain("slice_line_05");
+  try {
+    expect(app.frame()).toContain("slice_line_05");
+    expect(app.frame()).not.toContain("Ran bun test");
+
+    await app.scrollBy(-3);
+
+    expect(app.frame()).toContain("Ran bun test");
+    expect(app.frame()).toContain("output (truncated):");
+    expect(app.frame()).toContain("slice_line_01");
+  } finally {
+    app.destroy();
+  }
 });
 
 test("block tool details render the cell body without duplicating the primary detail", async () => {
@@ -674,15 +684,31 @@ test("unknown tools use the fallback renderer label", () => {
 
 async function renderMessageList(
   items: readonly ChatTranscriptItem[],
-  options: { showToolDetails?: boolean; hideThinking?: boolean; width?: number; height?: number; scrollOffset?: number; status?: ChatSessionView["status"]; activeTools?: ChatSessionView["activeTools"] } = {},
+  options: { showToolDetails?: boolean; hideThinking?: boolean; width?: number; height?: number; status?: ChatSessionView["status"]; activeTools?: ChatSessionView["activeTools"] } = {},
 ): Promise<string> {
+  const app = await renderMessageListApp(items, options);
+  try {
+    return app.frame();
+  } finally {
+    app.destroy();
+  }
+}
+
+async function renderMessageListApp(
+  items: readonly ChatTranscriptItem[],
+  options: { showToolDetails?: boolean; hideThinking?: boolean; width?: number; height?: number; status?: ChatSessionView["status"]; activeTools?: ChatSessionView["activeTools"] } = {},
+): Promise<{
+  frame: () => string;
+  scrollBy: (delta: number) => Promise<void>;
+  destroy: () => void;
+}> {
+  const scrollRef = createRef<ScrollBoxRenderable>();
   const app = await testRender(
     <MessageList
       chatView={chatView(items, options)}
       localItems={[]}
       width={options.width ?? 110}
-      visibleLimit={options.height ?? 24}
-      {...(options.scrollOffset === undefined ? {} : { scrollOffset: options.scrollOffset })}
+      scrollRef={scrollRef}
       showToolDetails={options.showToolDetails === true}
       hideThinking={options.hideThinking === true}
       theme={resolveTuiTheme("chili-dark", {})}
@@ -694,9 +720,19 @@ async function renderMessageList(
     await act(async () => {
       await app.renderOnce();
     });
-    return app.captureCharFrame();
-  } finally {
+    return {
+      frame: () => app.captureCharFrame(),
+      scrollBy: async (delta: number) => {
+        await act(async () => {
+          scrollRef.current?.scrollBy(delta);
+          await app.renderOnce();
+        });
+      },
+      destroy: () => app.renderer.destroy(),
+    };
+  } catch (error) {
     app.renderer.destroy();
+    throw error;
   }
 }
 

@@ -136,6 +136,13 @@ export function TranscriptCellSliceView(props: { slice: TranscriptCellSlice }) {
   return <TranscriptLines lines={cell.fallbackLines.slice(startLine, endLine)} />;
 }
 
+export function TranscriptCellView(props: { cell: TranscriptCellModel }) {
+  if (props.cell.kind === "lines") {
+    return <TranscriptLines lines={props.cell.lines} />;
+  }
+  return <>{props.cell.render()}</>;
+}
+
 function cellSlices(cells: readonly TranscriptCellModel[], startLine: number, endLine: number): TranscriptCellSlice[] {
   const slices: TranscriptCellSlice[] = [];
   let cursor = 0;

@@ -1,6 +1,6 @@
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type Dispatch, type RefObject, type SetStateAction } from "react";
 import { useAppContext, useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
-import type { KeyEvent, MouseEvent, PasteEvent, Selection } from "@opentui/core";
+import type { KeyEvent, MouseEvent, ScrollBoxRenderable, Selection } from "@opentui/core";
 import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
 import type { ApprovalId, RuntimePermissionProfileDescriptor, RuntimePermissionProfileId, RuntimeSkillMention, SessionId, TeamId, ThreadId } from "@chili/protocol";
 import { FileAuthStorage, loginOpenAICodex, OPENAI_CODEX_PROVIDER_ID } from "@chili/providers";
@@ -30,7 +30,6 @@ import { ApprovalDock, approvalDockHeight } from "./chat/ApprovalDock.js";
 import { BrandMark } from "./chat/BrandMark.js";
 import { charDisplayWidth } from "./chat/markdown.js";
 import { MessageList } from "./chat/MessageList.js";
-import { buildChatDisplayItems, type ChatDisplayItem, type ToolActivityDisplay } from "./chat/presentation.js";
 import { PROMPT_INPUT_HEIGHT, PROMPT_PLACEHOLDER, PromptComposer, promptComposerHeight } from "./chat/PromptComposer.js";
 import { StatusFooter, statusFooterHeight, type StatusFooterOptions } from "./chat/StatusFooter.js";
 import { buildTranscriptLines, buildTranscriptText } from "./chat/transcript.js";
@@ -196,8 +195,8 @@ export function ChatShellSurface(props: {
   const [modelPicker, setModelPicker] = useState<ModelPickerNavigation | undefined>(undefined);
   const [reasoningPicker, setReasoningPicker] = useState<ReasoningPickerNavigation | undefined>(undefined);
   const [permissionsPicker, setPermissionsPicker] = useState<PermissionsPickerNavigation | undefined>(undefined);
-  const [messageScrollOffset, setMessageScrollOffset] = useState(0);
   const [transcriptScrollOffset, setTranscriptScrollOffset] = useState(0);
+  const messageScrollBoxRef = useRef<ScrollBoxRenderable | null>(null);
   const [authManualPrompt, setAuthManualPromptState] = useState<AuthManualPrompt | undefined>(undefined);
   const [showToolDetails, setShowToolDetails] = useState(false);
   const [hideThinking, setHideThinkingState] = useState(false);
@@ -242,9 +241,7 @@ export function ChatShellSurface(props: {
     props.runtime.modelConfig,
   ]);
   const scrollEstimateWidth = Math.max(24, dimensions.width - 8);
-  const chatLineCount = useMemo(() => estimatedChatLineCount(props.runtime.chatView, deferredLocalItems, showToolDetails, hideThinking, scrollEstimateWidth), [hideThinking, deferredLocalItems, props.runtime.chatView, scrollEstimateWidth, showToolDetails]);
   const transcriptLineCount = useMemo(() => estimatedTranscriptLineCount(props.runtime.chatView.items, deferredLocalItems, scrollEstimateWidth), [deferredLocalItems, props.runtime.chatView.items, scrollEstimateWidth]);
-  const previousChatLineCount = useRef<number | undefined>(undefined);
   const previousTranscriptLineCount = useRef<number | undefined>(undefined);
   const prompt = promptText(promptParts);
   const history = usePromptHistory();
@@ -322,16 +319,22 @@ export function ChatShellSurface(props: {
     authManualPromptRef.current = value;
     setAuthManualPromptState(value);
   }, []);
+  const scrollMessageBy = useCallback((delta: number) => {
+    messageScrollBoxRef.current?.scrollBy(delta);
+  }, []);
+  const scrollMessageToBottom = useCallback(() => {
+    messageScrollBoxRef.current?.scrollTo(Number.MAX_SAFE_INTEGER);
+  }, []);
   const startNewChatSession = useCallback(async () => {
     setView("chat");
     setAuthManualPrompt(undefined);
     setPrompt("");
     history.clear();
     clearLocalItems();
-    setMessageScrollOffset(0);
+    scrollMessageToBottom();
     setTranscriptScrollOffset(0);
     await props.runtime.startNewSession();
-  }, [clearLocalItems, history, props.runtime, setAuthManualPrompt, setPrompt]);
+  }, [clearLocalItems, history, props.runtime, scrollMessageToBottom, setAuthManualPrompt, setPrompt]);
   const submitAuthManualInput = useCallback(() => {
     const manual = authManualPromptRef.current;
     if (!manual) return false;
@@ -572,15 +575,6 @@ export function ChatShellSurface(props: {
   const clipboard = props.clipboard ?? systemClipboard;
 
   useEffect(() => {
-    const previous = previousChatLineCount.current;
-    previousChatLineCount.current = chatLineCount;
-    if (previous === undefined) return;
-    const delta = chatLineCount - previous;
-    if (delta <= 0) return;
-    setMessageScrollOffset((current) => current > 0 ? current + delta : current);
-  }, [chatLineCount]);
-
-  useEffect(() => {
     const previous = previousTranscriptLineCount.current;
     previousTranscriptLineCount.current = transcriptLineCount;
     if (previous === undefined) return;
@@ -751,7 +745,7 @@ export function ChatShellSurface(props: {
       return;
     }
     if (view === "chat" && key.ctrl && key.name === "y") {
-      setMessageScrollOffset((current) => current + scrollStep(dimensions.height));
+      scrollMessageBy(-scrollStep(dimensions.height));
       return;
     }
     if (view === "transcript" && key.ctrl && key.name === "y") {
@@ -759,7 +753,7 @@ export function ChatShellSurface(props: {
       return;
     }
     if (view === "chat" && (isPageUp(key) || (key.shift && isArrowUp(key)))) {
-      setMessageScrollOffset((current) => current + scrollStep(dimensions.height));
+      scrollMessageBy(-scrollStep(dimensions.height));
       return;
     }
     if (view === "transcript" && (isPageUp(key) || (key.shift && isArrowUp(key)))) {
@@ -767,7 +761,7 @@ export function ChatShellSurface(props: {
       return;
     }
     if (view === "chat" && (isPageDown(key) || (key.shift && isArrowDown(key)))) {
-      setMessageScrollOffset((current) => Math.max(0, current - scrollStep(dimensions.height)));
+      scrollMessageBy(scrollStep(dimensions.height));
       return;
     }
     if (view === "transcript" && (isPageDown(key) || (key.shift && isArrowDown(key)))) {
@@ -892,21 +886,8 @@ export function ChatShellSurface(props: {
             if (submitAuthManualInput()) return;
             if (runSelectedSkillCompletion()) return;
             if (runSelectedSlashCompletion()) return;
-            setMessageScrollOffset(0);
+            scrollMessageToBottom();
             void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings, props.skills ?? []);
-          }}
-          onMessageScroll={(event) => {
-            const direction = event.scroll?.direction;
-            if (direction !== "up" && direction !== "down") return;
-            event.preventDefault();
-            event.stopPropagation();
-            const delta = Math.max(1, event.scroll?.delta ?? 1);
-            const amount = Math.max(2, Math.ceil(delta * 3));
-            if (direction === "up") {
-              setMessageScrollOffset((current) => current + amount);
-            } else {
-              setMessageScrollOffset((current) => Math.max(0, current - amount));
-            }
           }}
           onTranscriptScroll={(event) => {
             const direction = event.scroll?.direction;
@@ -922,7 +903,7 @@ export function ChatShellSurface(props: {
             }
           }}
           localItems={deferredLocalItems}
-          messageScrollOffset={messageScrollOffset}
+          messageScrollRef={messageScrollBoxRef}
           transcriptScrollOffset={transcriptScrollOffset}
           completions={completions}
           completionOpen={skillCompletionOpen || slashCompletionOpen}
@@ -1044,10 +1025,9 @@ function SessionScreen(props: {
   focused: boolean;
   onPromptChange: (value: string) => void;
   onSubmit: () => void;
-  onMessageScroll: (event: MouseEvent) => void;
   onTranscriptScroll: (event: MouseEvent) => void;
   localItems: readonly LocalTranscriptItem[];
-  messageScrollOffset: number;
+  messageScrollRef: RefObject<ScrollBoxRenderable | null>;
   transcriptScrollOffset: number;
   completions: readonly SlashCompletion[];
   completionOpen: boolean;
@@ -1097,14 +1077,13 @@ function SessionScreen(props: {
   });
   const messagePaneHeight = Math.max(1, props.height - approvalHeight - themePickerHeight - selectorHeight - promptHeight - footerHeight);
   const transcriptChrome = props.height < 16 ? 6 : 3;
-  const visibleLimit = Math.max(1, props.height - approvalHeight - themePickerHeight - selectorHeight - promptHeight - footerHeight - transcriptChrome);
+  const transcriptVisibleLimit = Math.max(1, props.height - approvalHeight - themePickerHeight - selectorHeight - promptHeight - footerHeight - transcriptChrome);
   return (
     <box
       width="100%"
       height="100%"
       flexDirection="column"
       onMouseScroll={(event) => {
-        if (props.view === "chat") props.onMessageScroll(event);
         if (props.view === "transcript") props.onTranscriptScroll(event);
       }}
     >
@@ -1120,7 +1099,7 @@ function SessionScreen(props: {
             chatView={props.runtime.chatView}
             localItems={props.localItems}
             width={messageWidth}
-            visibleLimit={visibleLimit}
+            visibleLimit={transcriptVisibleLimit}
             scrollOffset={props.transcriptScrollOffset}
             theme={props.theme}
           />
@@ -1129,8 +1108,7 @@ function SessionScreen(props: {
             chatView={props.runtime.chatView}
             localItems={props.localItems}
             width={messageWidth}
-            visibleLimit={visibleLimit}
-            scrollOffset={props.messageScrollOffset}
+            scrollRef={props.messageScrollRef}
             theme={props.theme}
             showToolDetails={props.showToolDetails}
             hideThinking={props.hideThinking}
@@ -1175,50 +1153,10 @@ function SessionScreen(props: {
   );
 }
 
-function estimatedChatLineCount(chatView: ChatSessionView, localItems: readonly LocalTranscriptItem[], showToolDetails: boolean, hideThinking: boolean, width: number): number {
-  const displayItems = buildChatDisplayItems(chatView.items, {
-    showToolDetails,
-    hideThinking,
-    sessionStatus: chatView.status,
-    activeToolCount: chatView.activeTools.length,
-  });
-  const displayLineCount = displayItems.reduce((count, item) => count + estimatedDisplayItemLineCount(item, width), 0);
-  const localLineCount = localItems.reduce((count, item) => count + roughTextLineCount(`${item.level}: ${item.text}`, width), 0);
-  return displayLineCount + localLineCount;
-}
-
 function estimatedTranscriptLineCount(items: readonly ChatTranscriptItem[], localItems: readonly LocalTranscriptItem[], width: number): number {
   const transcriptLineCount = buildTranscriptLines(items).reduce((count, line) => count + roughTextLineCount(line.text, width), 0);
   const localLineCount = localItems.reduce((count, item) => count + roughTextLineCount(`${item.level}: ${item.text}`, width), 0);
   return transcriptLineCount + localLineCount;
-}
-
-function estimatedDisplayItemLineCount(item: ChatDisplayItem, width: number): number {
-  if (item.kind === "user_text" || item.kind === "assistant_text" || item.kind === "summary") return roughTextLineCount(item.text, width);
-  if (item.kind === "reasoning" || item.kind === "approval") return 1;
-  if (item.kind === "tool_activity") return estimatedToolActivityLineCount(item.activity, width);
-  return roughTextLineCount(item.label, width) + item.activities.reduce((count, activity) => {
-    const detailLabel = activity.details.length > 0 ? 1 : 0;
-    return count + detailLabel + estimatedToolActivityExtraLineCount(activity, width);
-  }, 0);
-}
-
-function estimatedToolActivityLineCount(activity: ToolActivityDisplay, width: number): number {
-  return roughTextLineCount(activity.label, width) + estimatedToolActivityExtraLineCount(activity, width);
-}
-
-function estimatedToolActivityExtraLineCount(activity: ToolActivityDisplay, width: number): number {
-  let count = 0;
-  if (activity.outputHint) count += roughTextLineCount(`  ${activity.outputHint}`, width);
-  if (activity.compactErrorLines?.length) {
-    count += roughTextLineCount("  error:", width);
-    for (const line of activity.compactErrorLines) count += roughTextLineCount(`    ${line}`, width);
-  }
-  for (const detail of activity.details) {
-    count += roughTextLineCount(`  ${detail.label}:`, width);
-    for (const line of detail.lines) count += roughTextLineCount(`    ${line}`, width);
-  }
-  return count;
 }
 
 function roughTextLineCount(value: string, width: number): number {

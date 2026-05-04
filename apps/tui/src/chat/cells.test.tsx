@@ -4,6 +4,7 @@ import { act } from "react";
 import {
   componentBackedCell,
   lineBackedCell,
+  TranscriptCellView,
   TranscriptCellSliceView,
   windowTranscriptCells,
   type TranscriptCellModel,
@@ -57,6 +58,23 @@ test("component-backed cells use render() when the whole cell is visible", async
   expect(window.slices[0]).toMatchObject({ startLine: 0, endLine: 1 });
   expect(frame).toContain("FULL_COMPONENT");
   expect(frame).not.toContain("FALLBACK_LINE");
+});
+
+test("full cell view always renders component-backed cells with render()", async () => {
+  const cell = componentBackedCell({
+    key: "component-full-view",
+    render: () => <text fg="#ffffff" wrapMode="none">FULL_COMPONENT</text>,
+    fallbackLines: [
+      line("fallback:1", "fallback 1"),
+      line("fallback:2", "fallback 2"),
+      line("fallback:3", "fallback 3"),
+    ],
+  });
+
+  const frame = await renderCell(cell);
+
+  expect(frame).toContain("FULL_COMPONENT");
+  expect(frame).not.toContain("fallback 1");
 });
 
 test("component-backed partial slices fall back to fallbackLines", async () => {
@@ -118,6 +136,24 @@ async function renderSlice(slice: TranscriptCellSlice): Promise<string> {
   const app = await testRender(
     <box flexDirection="column">
       <TranscriptCellSliceView slice={slice} />
+    </box>,
+    { width: 80, height: 8, exitOnCtrlC: false },
+  );
+
+  try {
+    await act(async () => {
+      await app.renderOnce();
+    });
+    return app.captureCharFrame();
+  } finally {
+    app.renderer.destroy();
+  }
+}
+
+async function renderCell(cell: TranscriptCellModel): Promise<string> {
+  const app = await testRender(
+    <box flexDirection="column">
+      <TranscriptCellView cell={cell} />
     </box>,
     { width: 80, height: 8, exitOnCtrlC: false },
   );

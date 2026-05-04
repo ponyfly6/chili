@@ -170,7 +170,6 @@ test("renders chat transcript as a scrollable window", async () => {
   });
 
   try {
-    expect(app.captureCharFrame()).toContain("History");
     expect(app.captureCharFrame()).toContain("message 30");
     expect(app.captureCharFrame()).not.toContain("message 01");
 
@@ -181,7 +180,6 @@ test("renders chat transcript as a scrollable window", async () => {
     await Bun.sleep(60);
     await app.renderOnce();
 
-    expect(app.captureCharFrame()).toContain("History");
     expect(app.captureCharFrame()).toContain("message 01");
     expect(app.captureCharFrame()).not.toContain("message 30");
   } finally {
@@ -205,7 +203,6 @@ test("scrolls a long single assistant message by rendered lines", async () => {
   });
 
   try {
-    expect(app.captureCharFrame()).toContain("History");
     expect(app.captureCharFrame()).toContain("long line 30");
     expect(app.captureCharFrame()).not.toContain("long line 01");
 
@@ -591,19 +588,18 @@ test("mouse wheel scrolls the chat transcript", async () => {
     expect(app.captureCharFrame()).not.toContain("message 01");
 
     await act(async () => {
-      for (let index = 0; index < 8; index += 1) {
+      for (let index = 0; index < 16; index += 1) {
         await app.mockMouse.scroll(10, 3, "up");
       }
     });
     await Bun.sleep(60);
     await app.renderOnce();
 
-    expect(app.captureCharFrame()).toContain("History");
     expect(app.captureCharFrame()).toContain("message 01");
     expect(app.captureCharFrame()).not.toContain("message 30");
 
     await act(async () => {
-      for (let index = 0; index < 8; index += 1) {
+      for (let index = 0; index < 16; index += 1) {
         await app.mockMouse.scroll(10, 3, "down");
       }
     });
