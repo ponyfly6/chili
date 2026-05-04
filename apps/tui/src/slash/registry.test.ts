@@ -42,6 +42,28 @@ test("resolves commands view and reload slash commands", async () => {
   });
 });
 
+test("resolves goal slash commands without lowercasing objectives", async () => {
+  const commands = createDefaultSlashCommands();
+  const ctx = { model: {} } as SlashCommandContext;
+  const match = resolveSlashCommand(commands, "/goal Ship The Goal --budget 50k");
+
+  expect(match?.args).toBe("Ship The Goal --budget 50k");
+  expect(await match?.command.run(ctx, match.args)).toEqual({
+    type: "goal_action",
+    action: "set",
+    objective: "Ship The Goal",
+    tokenBudget: 50_000,
+  });
+  expect(await resolveSlashCommand(commands, "/goal pause")?.command.run(ctx, "pause")).toEqual({
+    type: "goal_action",
+    action: "pause",
+  });
+  expect(await resolveSlashCommand(commands, "/goal")?.command.run(ctx, "")).toEqual({
+    type: "goal_action",
+    action: "show",
+  });
+});
+
 test("resolves permissions slash commands to the permissions picker", async () => {
   const commands = createDefaultSlashCommands();
   const ctx = { model: {} } as SlashCommandContext;

@@ -46,6 +46,7 @@ import {
   createGitDiffTool,
   createGitStageTool,
   createGitStatusTool,
+  createGoalTools,
   createGlobTool,
   createGrepTool,
   createReadFileTool,
@@ -71,6 +72,7 @@ import {
   createTeamTaskUpdateTool,
   createToolSearchTool,
   createWriteFileTool,
+  type GoalToolController,
   type MailboxListToolInput,
   type SubagentMailboxRecord,
   type SubagentTaskRecord,
@@ -347,6 +349,9 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     ...(runtimeModelSelection ? { defaultModelSelection: runtimeModelSelection } : {}),
     ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
   });
+  for (const tool of createGoalTools(createGoalToolController(service))) {
+    registry.register(tool);
+  }
   await sqliteStore.reconcileStaleTurns({
     staleBefore: Date.now() - STALE_TURN_RECOVERY_MS,
     now: Date.now(),
@@ -432,6 +437,38 @@ function createWorkerToolPolicyResolver(store: ObservableEventStore): ToolAccess
       return policy ?? defaultScopedWorkerPolicy();
     },
   };
+}
+
+function createGoalToolController(service: RuntimeService): GoalToolController {
+  return {
+    async getGoal(context) {
+      const threadId = requireToolThreadId(context.threadId);
+      return service.getGoal({ sessionId: context.sessionId, threadId });
+    },
+    async createGoal(input, context) {
+      const threadId = requireToolThreadId(context.threadId);
+      return service.setGoal({
+        sessionId: context.sessionId,
+        threadId,
+        objective: input.objective,
+        ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
+        replace: false,
+      });
+    },
+    async updateGoal(input, context) {
+      const threadId = requireToolThreadId(context.threadId);
+      return service.updateGoal({
+        sessionId: context.sessionId,
+        threadId,
+        status: input.status,
+      });
+    },
+  };
+}
+
+function requireToolThreadId(threadId: ThreadId | undefined): ThreadId {
+  if (!threadId) throw new Error("Goal tools require a thread id.");
+  return threadId;
 }
 
 async function findWorkerToolPolicy(

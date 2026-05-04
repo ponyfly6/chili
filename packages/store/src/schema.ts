@@ -27,6 +27,22 @@ export const SQLITE_SCHEMA = [
   )`,
   `create index if not exists sessions_updated_idx on sessions(updated_at)`,
 
+  `create table if not exists thread_goals (
+    thread_id text primary key,
+    session_id text,
+    objective text not null,
+    status text not null,
+    token_budget integer,
+    tokens_used integer not null default 0,
+    time_used_seconds real not null default 0,
+    created_at integer not null,
+    updated_at integer not null,
+    completed_at integer,
+    last_reason text
+  )`,
+  `create index if not exists thread_goals_session_idx on thread_goals(session_id)`,
+  `create index if not exists thread_goals_status_idx on thread_goals(status, updated_at)`,
+
   `create table if not exists messages (
     id text primary key,
     session_id text not null,

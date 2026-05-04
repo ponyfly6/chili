@@ -29,6 +29,8 @@ import type {
   TeamMessageDeliveryStatus,
   TeamMessageKind,
   TeamTaskStatus,
+  ThreadGoal,
+  ThreadGoalStatus,
   ThreadId,
 } from "@chili/protocol";
 import type { RuntimeAgentsSnapshot } from "./projection.js";
@@ -41,6 +43,10 @@ export interface RuntimeClient {
   setReasoning(input: SetReasoningRequest): Promise<RuntimeModelConfig>;
   getPermissionConfig(input?: GetPermissionConfigRequest): Promise<RuntimePermissionConfig>;
   setPermissionProfile(input: SetPermissionProfileRequest): Promise<RuntimePermissionConfig>;
+  getGoal(input: GetGoalRequest): Promise<ThreadGoal | undefined>;
+  setGoal(input: SetGoalRequest): Promise<ThreadGoal>;
+  updateGoal(input: UpdateGoalRequest): Promise<ThreadGoal>;
+  clearGoal(input: ClearGoalRequest): Promise<ClearGoalResult>;
   listCommands(input?: ListCommandsRequest): Promise<RuntimePromptCommandList>;
   reloadCommands(input?: ReloadCommandsRequest): Promise<RuntimePromptCommandList>;
   submitPrompt(input: SubmitPromptRequest): Promise<RuntimePromptResult>;
@@ -133,6 +139,41 @@ export interface GetPermissionConfigRequest {
 export interface SetPermissionProfileRequest {
   profile: RuntimePermissionProfileId;
   signal?: AbortSignal;
+}
+
+export interface GetGoalRequest {
+  sessionId: SessionId;
+  threadId: ThreadId;
+  signal?: AbortSignal;
+}
+
+export interface SetGoalRequest {
+  sessionId: SessionId;
+  threadId: ThreadId;
+  objective: string;
+  tokenBudget?: number;
+  replace?: boolean;
+  signal?: AbortSignal;
+}
+
+export interface UpdateGoalRequest {
+  sessionId: SessionId;
+  threadId: ThreadId;
+  status?: ThreadGoalStatus;
+  objective?: string;
+  tokenBudget?: number;
+  signal?: AbortSignal;
+}
+
+export interface ClearGoalRequest {
+  sessionId: SessionId;
+  threadId: ThreadId;
+  signal?: AbortSignal;
+}
+
+export interface ClearGoalResult {
+  cleared: boolean;
+  previousGoal?: ThreadGoal;
 }
 
 export interface ListCommandsRequest {
@@ -841,6 +882,26 @@ export class HttpRuntimeClient implements RuntimeClient {
     return this.post("permissions", { profile: input.profile }, input.signal);
   }
 
+  getGoal(input: GetGoalRequest): Promise<ThreadGoal | undefined> {
+    const params = new URLSearchParams({ threadId: input.threadId });
+    return this.get(`sessions/${encodeURIComponent(input.sessionId)}/goal?${params.toString()}`, input.signal);
+  }
+
+  setGoal(input: SetGoalRequest): Promise<ThreadGoal> {
+    const { signal, ...body } = input;
+    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/goal`, body, signal);
+  }
+
+  updateGoal(input: UpdateGoalRequest): Promise<ThreadGoal> {
+    const { signal, ...body } = input;
+    return this.patch(`sessions/${encodeURIComponent(input.sessionId)}/goal`, body, signal);
+  }
+
+  clearGoal(input: ClearGoalRequest): Promise<ClearGoalResult> {
+    const params = new URLSearchParams({ threadId: input.threadId });
+    return this.delete(`sessions/${encodeURIComponent(input.sessionId)}/goal?${params.toString()}`, input.signal);
+  }
+
   listCommands(input: ListCommandsRequest = {}): Promise<RuntimePromptCommandList> {
     return this.get("commands", input.signal);
   }
@@ -1115,6 +1176,22 @@ export class HttpRuntimeClient implements RuntimeClient {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     };
+    if (signal) init.signal = signal;
+    return this.request(path, init);
+  }
+
+  private patch<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
+    const init: RequestInit = {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    };
+    if (signal) init.signal = signal;
+    return this.request(path, init);
+  }
+
+  private delete<T>(path: string, signal?: AbortSignal): Promise<T> {
+    const init: RequestInit = { method: "DELETE" };
     if (signal) init.signal = signal;
     return this.request(path, init);
   }

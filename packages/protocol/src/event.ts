@@ -12,6 +12,7 @@ import type {
   TurnId,
 } from "./ids.js";
 import type { AgentPath } from "./agent-path.js";
+import type { ThreadGoal, ThreadGoalUpdateReason, ThreadGoalUsageDelta } from "./goal.js";
 import type { MessagePart } from "./message.js";
 import type { ModelSelection, ReasoningLevel, ModelMetadataPayload, RuntimeStatusPayload } from "./runtime.js";
 import type { ApprovalDecisionAction, ToolCallStatus, ToolOutputStream } from "./tool.js";
@@ -31,6 +32,7 @@ export type ChiliEvent =
   | MessageEvent
   | ToolEvent
   | ApprovalEvent
+  | GoalEvent
   | RecoveryEvent
   | AgentEvent
   | TeamEvent;
@@ -67,6 +69,10 @@ export type ToolEvent =
 export type ApprovalEvent =
   | EventEnvelope<"approval.requested", { approvalId: ApprovalId; callId?: ToolCallId; permission: string; patterns: string[]; metadata?: Record<string, unknown> }>
   | EventEnvelope<"approval.resolved", { approvalId: ApprovalId; decision: ApprovalDecisionAction; feedback?: string }>;
+
+export type GoalEvent =
+  | EventEnvelope<"goal.updated", { goal: ThreadGoal; reason?: ThreadGoalUpdateReason; usageDelta?: ThreadGoalUsageDelta }>
+  | EventEnvelope<"goal.cleared", { threadId: ThreadId; previousGoal?: ThreadGoal; reason?: ThreadGoalUpdateReason }>;
 
 export type RecoveryEvent =
   | EventEnvelope<"snapshot.created", { snapshotId: SnapshotId; callId?: ToolCallId; toolName?: string; paths: string[]; reason: string }>

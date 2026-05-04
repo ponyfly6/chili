@@ -144,6 +144,48 @@ test("replays session, message, tool, and approval events into a runtime view", 
   expect(pendingApprovals(view, sessionId)).toHaveLength(0);
 });
 
+test("projects persistent goals into chat session views", () => {
+  const sessionId = "session_goal_projection" as SessionId;
+  const threadId = "thread_goal_projection" as ThreadId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_goal_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_goal_updated",
+      type: "goal.updated",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        reason: "set",
+        goal: {
+          sessionId,
+          threadId,
+          objective: "finish goal projection",
+          status: "active",
+          tokenBudget: 50_000,
+          tokensUsed: 1_200,
+          timeUsedSeconds: 7,
+          createdAt: 2 as TimestampMs,
+          updatedAt: 2 as TimestampMs,
+        },
+      },
+    },
+  ], createRuntimeView());
+
+  expect(chatSessionView(view, { sessionId, threadId }).goal).toMatchObject({
+    objective: "finish goal projection",
+    status: "active",
+    tokensUsed: 1_200,
+  });
+});
+
 test("projects live tool input updates before the final assistant tool part", () => {
   const sessionId = "session_live_tool" as SessionId;
   const threadId = "thread_live_tool" as ThreadId;

@@ -1,4 +1,4 @@
-import type { MessageId, ModelSelection, ReasoningLevel, SessionId, ThreadId, TurnId } from "@chili/protocol";
+import type { MessageId, ModelSelection, ModelUsage, ReasoningLevel, SessionId, ThreadId, TurnId } from "@chili/protocol";
 import type { ContextUsage } from "./context/index.js";
 import type { PromptDebugManifest } from "./prompt/index.js";
 
@@ -36,6 +36,7 @@ export type RunTurnResult =
       turnId: TurnId;
       assistantMessageId: MessageId;
       contextUsage?: ContextUsage;
+      usage?: ModelUsage;
       finishReason?: string;
     }
   | {
@@ -43,6 +44,7 @@ export type RunTurnResult =
       turnId: TurnId;
       assistantMessageId?: MessageId;
       contextUsage?: ContextUsage;
+      usage?: ModelUsage;
       error: Error;
     };
 

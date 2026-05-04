@@ -86,8 +86,21 @@ function sessionStatusText(chatView: ChatSessionView, canSubmit: boolean, model:
       : canSubmit
         ? "idle"
         : "waiting";
+  const goal = goalStatusText(chatView);
   const team = teamStatusText(model);
-  return team ? `${session} | ${team}` : session;
+  return [session, goal, team].filter(Boolean).join(" | ");
+}
+
+function goalStatusText(chatView: ChatSessionView): string | undefined {
+  const goal = chatView.goal;
+  if (!goal) return undefined;
+  const usage = goal.tokenBudget !== undefined
+    ? `${formatTokenCount(goal.tokensUsed)}/${formatTokenCount(goal.tokenBudget)}`
+    : formatTokenCount(goal.tokensUsed);
+  if (goal.status === "active") return `goal ${usage}`;
+  if (goal.status === "paused") return "goal paused";
+  if (goal.status === "budgetLimited") return `goal budget ${usage}`;
+  return "goal complete";
 }
 
 function teamStatusText(model: TeamLiveView): string | undefined {

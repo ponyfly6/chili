@@ -35,6 +35,8 @@ import type {
   SessionId,
   TaskId,
   TeamId,
+  ThreadGoal,
+  ThreadGoalStatus,
   ThreadId,
   TimestampMs,
 } from "@chili/protocol";
@@ -881,6 +883,45 @@ test("serves model control routes and prompt model overrides", async () => {
   });
 });
 
+test("serves persistent goal control routes", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const handler = createRuntimeHttpHandler({ service, store });
+  const session = await service.createSession();
+
+  const setResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
+    method: "POST",
+    body: JSON.stringify({
+      threadId: session.threadId,
+      objective: "Ship the goal route",
+      tokenBudget: 50_000,
+      replace: true,
+    }),
+    headers: { "content-type": "application/json" },
+  }));
+  expect(setResponse.status).toBe(201);
+  expect(await setResponse.json()).toMatchObject({ objective: "Ship the goal route", status: "active" });
+
+  const pauseResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
+    method: "PATCH",
+    body: JSON.stringify({ threadId: session.threadId, status: "paused" }),
+    headers: { "content-type": "application/json" },
+  }));
+  expect(pauseResponse.status).toBe(200);
+  expect(await pauseResponse.json()).toMatchObject({ status: "paused" });
+
+  const getResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/goal?threadId=${session.threadId}`));
+  expect(getResponse.status).toBe(200);
+  expect(await getResponse.json()).toMatchObject({ objective: "Ship the goal route", status: "paused" });
+
+  const clearResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/goal?threadId=${session.threadId}`, {
+    method: "DELETE",
+  }));
+  expect(clearResponse.status).toBe(200);
+  expect(await clearResponse.json()).toMatchObject({ cleared: true });
+});
+
 test("does not accept async prompts for missing or busy sessions", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
@@ -927,6 +968,7 @@ class FakeRuntimeService implements RuntimeHttpService {
   modelSelection: ModelSelection | undefined;
   reasoningLevel: ReasoningLevel | undefined;
   lastPrompt: SubmitPromptInput | undefined;
+  goal: ThreadGoal | undefined;
 
   constructor(private readonly store: EventStore & EventPublisher) {}
 
@@ -974,6 +1016,43 @@ class FakeRuntimeService implements RuntimeHttpService {
   async setReasoning(input: { sessionId: SessionId; reasoningLevel: ReasoningLevel }): Promise<RuntimeModelConfig> {
     this.reasoningLevel = input.reasoningLevel;
     return this.getModelConfig(input.sessionId);
+  }
+
+  async getGoal(input: { threadId: ThreadId }): Promise<ThreadGoal | undefined> {
+    return this.goal?.threadId === input.threadId ? this.goal : undefined;
+  }
+
+  async setGoal(input: { sessionId: SessionId; threadId: ThreadId; objective: string; tokenBudget?: number }): Promise<ThreadGoal> {
+    this.goal = {
+      sessionId: input.sessionId,
+      threadId: input.threadId,
+      objective: input.objective,
+      status: "active",
+      ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      createdAt: 3 as TimestampMs,
+      updatedAt: 3 as TimestampMs,
+    };
+    return this.goal;
+  }
+
+  async updateGoal(input: { sessionId: SessionId; threadId: ThreadId; status?: ThreadGoalStatus }): Promise<ThreadGoal> {
+    if (!this.goal || this.goal.threadId !== input.threadId) throw new Error("No goal");
+    this.goal = {
+      ...this.goal,
+      sessionId: input.sessionId,
+      ...(input.status ? { status: input.status } : {}),
+      updatedAt: 4 as TimestampMs,
+    };
+    return this.goal;
+  }
+
+  async clearGoal(input: { threadId: ThreadId }): Promise<{ cleared: boolean; previousGoal?: ThreadGoal }> {
+    if (!this.goal || this.goal.threadId !== input.threadId) return { cleared: false };
+    const previousGoal = this.goal;
+    this.goal = undefined;
+    return { cleared: true, previousGoal };
   }
 
   async submitPrompt(input: SubmitPromptInput): Promise<Awaited<ReturnType<RuntimeHttpService["submitPrompt"]>>> {

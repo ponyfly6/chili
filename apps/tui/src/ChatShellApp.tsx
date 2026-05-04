@@ -1768,6 +1768,10 @@ async function applySlashResult(
     await actions.startNewChatSession();
     return;
   }
+  if (result.type === "goal_action") {
+    await performGoalAction(result, runtime, actions.appendLocalItem);
+    return;
+  }
   if (result.type === "insert_prompt") {
     actions.setPrompt(result.text);
     return;
@@ -1808,6 +1812,56 @@ async function applySlashResult(
     const action = actionForSlashResult(result, model);
     if (action) runtime.executeAction(action);
   }
+}
+
+async function performGoalAction(
+  result: Extract<SlashCommandResult, { type: "goal_action" }>,
+  runtime: ChatRuntimeState,
+  appendLocalItem: AppendLocalItem,
+): Promise<void> {
+  if (result.action === "show") {
+    const goal = runtime.chatView.goal;
+    appendLocalItem("info", goal ? goalSummary(goal) : "No goal set for this thread.");
+    return;
+  }
+  if (result.action === "set") {
+    if (!result.objective) {
+      appendLocalItem("error", "Goal objective is required.");
+      return;
+    }
+    const goal = await runtime.setGoal({
+      objective: result.objective,
+      ...(result.tokenBudget !== undefined ? { tokenBudget: result.tokenBudget } : {}),
+    });
+    if (goal) appendLocalItem("info", `Goal set: ${goal.objective}`);
+    return;
+  }
+  if (result.action === "pause") {
+    const goal = await runtime.pauseGoal();
+    if (goal) appendLocalItem("info", "Goal paused.");
+    return;
+  }
+  if (result.action === "resume") {
+    const goal = await runtime.resumeGoal();
+    if (goal) appendLocalItem("info", "Goal resumed.");
+    return;
+  }
+  const cleared = await runtime.clearGoal();
+  appendLocalItem("info", cleared ? "Goal cleared." : "No goal to clear.");
+}
+
+function goalSummary(goal: NonNullable<ChatRuntimeState["chatView"]["goal"]>): string {
+  const budget = goal.tokenBudget !== undefined
+    ? `${formatTokenCount(goal.tokensUsed)} / ${formatTokenCount(goal.tokenBudget)}`
+    : `${formatTokenCount(goal.tokensUsed)} used`;
+  return `Goal ${goal.status}: ${goal.objective} (${budget}, ${Math.round(goal.timeUsedSeconds)}s)`;
+}
+
+function formatTokenCount(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}m`;
+  if (value >= 100_000) return `${Math.round(value / 1_000)}k`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return String(Math.round(value));
 }
 
 async function performSkillsAction(

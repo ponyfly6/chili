@@ -5,6 +5,7 @@ export * from "./context/index.js";
 export * from "./memory/index.js";
 export * from "./prompt/index.js";
 export * from "./doom-loop-guard.js";
+export * from "./goal.js";
 export * from "./recovery.js";
 export * from "./retry.js";
 export * from "./runner.js";

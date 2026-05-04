@@ -4,7 +4,7 @@ import {
   type ChatSessionView,
   type HttpRuntimeClient,
 } from "@chili/sdk";
-import type { ApprovalId, RuntimeApprovalResolveResult, RuntimeModelConfig, RuntimePermissionConfig, RuntimePermissionProfileId, RuntimePromptCommandList, RuntimeSkillMention, SessionId, ThreadId } from "@chili/protocol";
+import type { ApprovalId, RuntimeApprovalResolveResult, RuntimeModelConfig, RuntimePermissionConfig, RuntimePermissionProfileId, RuntimePromptCommandList, RuntimeSkillMention, SessionId, ThreadGoal, ThreadId } from "@chili/protocol";
 import { useTeamLiveRuntime, type TeamLiveRuntimeState, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
 
@@ -34,6 +34,10 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
   refreshPermissionConfig?: () => Promise<void>;
   reloadCommands?: () => Promise<RuntimePromptCommandList | undefined>;
   setRuntimePermissionProfile?: (profile: RuntimePermissionProfileId) => Promise<boolean>;
+  setGoal: (input: { objective: string; tokenBudget?: number }) => Promise<ThreadGoal | undefined>;
+  pauseGoal: () => Promise<ThreadGoal | undefined>;
+  resumeGoal: () => Promise<ThreadGoal | undefined>;
+  clearGoal: () => Promise<boolean>;
   startNewSession: () => Promise<void>;
   interruptActiveSession: () => Promise<void>;
   approveApproval: (approvalId: ApprovalId, options?: ChatApproveOptions) => Promise<void>;
@@ -363,6 +367,68 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     }
   }, [client, options.baseUrl, withAbort]);
 
+  const setGoal = useCallback(async (goalInput: { objective: string; tokenBudget?: number }): Promise<ThreadGoal | undefined> => {
+    try {
+      const goal = await withAbort(async (signal) => {
+        const session = await ensureSession(signal);
+        return client.setGoal({
+          ...session,
+          objective: goalInput.objective,
+          ...(goalInput.tokenBudget !== undefined ? { tokenBudget: goalInput.tokenBudget } : {}),
+          replace: true,
+          signal,
+        });
+      });
+      setChatFeedback({ status: "success", message: "goal set" });
+      return goal;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return undefined;
+    }
+  }, [client, ensureSession, options.baseUrl, withAbort]);
+
+  const pauseGoal = useCallback(async (): Promise<ThreadGoal | undefined> => {
+    try {
+      const goal = await withAbort(async (signal) => {
+        const session = await ensureSession(signal);
+        return client.updateGoal({ ...session, status: "paused", signal });
+      });
+      setChatFeedback({ status: "success", message: "goal paused" });
+      return goal;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return undefined;
+    }
+  }, [client, ensureSession, options.baseUrl, withAbort]);
+
+  const resumeGoal = useCallback(async (): Promise<ThreadGoal | undefined> => {
+    try {
+      const goal = await withAbort(async (signal) => {
+        const session = await ensureSession(signal);
+        return client.updateGoal({ ...session, status: "active", signal });
+      });
+      setChatFeedback({ status: "success", message: "goal resumed" });
+      return goal;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return undefined;
+    }
+  }, [client, ensureSession, options.baseUrl, withAbort]);
+
+  const clearGoal = useCallback(async (): Promise<boolean> => {
+    try {
+      const result = await withAbort(async (signal) => {
+        const session = await ensureSession(signal);
+        return client.clearGoal({ ...session, signal });
+      });
+      setChatFeedback({ status: "success", message: result.cleared ? "goal cleared" : "no goal to clear" });
+      return result.cleared;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return false;
+    }
+  }, [client, ensureSession, options.baseUrl, withAbort]);
+
   const interruptActiveSession = useCallback(async () => {
     if (!activeSessionId) return;
     setChatFeedback({ status: "pending", message: "interrupting session" });
@@ -431,11 +497,15 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     refreshPermissionConfig,
     reloadCommands,
     setRuntimePermissionProfile,
+    setGoal,
+    pauseGoal,
+    resumeGoal,
+    clearGoal,
     startNewSession,
     interruptActiveSession,
     approveApproval,
     rejectApproval,
-  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, permissionConfig, commandList, refreshModelConfig, refreshPermissionConfig, reloadCommands, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, startNewSession, submitBlockedReason, submitCommand, submitPrompt, teamRuntime]);
+  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, permissionConfig, commandList, refreshModelConfig, refreshPermissionConfig, reloadCommands, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setGoal, pauseGoal, resumeGoal, clearGoal, startNewSession, submitBlockedReason, submitCommand, submitPrompt, teamRuntime]);
 }
 
 async function resolveApproval(

@@ -13,6 +13,15 @@ import {
 export function createDefaultSlashCommands(): SlashCommand[] {
   return [
     {
+      name: "goal",
+      description: "Set or control a persistent goal",
+      category: "session",
+      argumentHint: "[pause|resume|clear|--budget 50k|objective]",
+      isSafeConcurrent: true,
+      complete: goalCompletions,
+      run: (_ctx, args) => goalResult(args),
+    },
+    {
       name: "team",
       description: "Open the team cockpit",
       category: "team",
@@ -219,6 +228,7 @@ export function resolveSlashCommand(
   commands: readonly SlashCommand[],
   input: string,
 ): { command: SlashCommand; args: string } | undefined {
+  const rawBody = input.replace(/^\//, "").trimStart();
   const body = normalizeInput(input);
   if (!body) return undefined;
   const matches = commands
@@ -229,7 +239,7 @@ export function resolveSlashCommand(
   if (!match) return undefined;
   return {
     command: match.command,
-    args: body.slice(match.name.length).trimStart(),
+    args: rawBody.slice(match.name.length).trimStart(),
   };
 }
 
@@ -287,6 +297,75 @@ function uniqueCompletions(completions: readonly SlashCompletion[]): SlashComple
     output.push(completion);
   }
   return output;
+}
+
+function goalCompletions(_ctx: SlashCommandContext, input: string): SlashCompletion[] {
+  const query = commandArgument(input, "goal");
+  if (query === undefined) return [];
+  const rows = [
+    { value: "/goal pause", label: "/goal pause", description: "Pause the active goal" },
+    { value: "/goal resume", label: "/goal resume", description: "Resume the paused goal" },
+    { value: "/goal clear", label: "/goal clear", description: "Clear the current goal" },
+  ];
+  const normalized = query.trim().toLowerCase();
+  return rows
+    .filter((row) => !normalized || row.value.includes(normalized))
+    .map((row) => ({ ...row, category: "session" as const }));
+}
+
+function goalResult(args: string): SlashCommandResult {
+  const trimmed = args.trim();
+  if (!trimmed) return { type: "goal_action", action: "show" };
+  const normalized = trimmed.toLowerCase();
+  if (normalized === "pause") return { type: "goal_action", action: "pause" };
+  if (normalized === "resume") return { type: "goal_action", action: "resume" };
+  if (normalized === "clear" || normalized === "delete") return { type: "goal_action", action: "clear" };
+  const parsed = parseGoalSetArgs(trimmed);
+  if (!parsed.objective) {
+    return { type: "local_message", level: "error", text: "Goal objective is required." };
+  }
+  return {
+    type: "goal_action",
+    action: "set",
+    objective: parsed.objective,
+    ...(parsed.tokenBudget !== undefined ? { tokenBudget: parsed.tokenBudget } : {}),
+  };
+}
+
+function parseGoalSetArgs(args: string): { objective: string; tokenBudget?: number } {
+  const parts = args.split(/\s+/);
+  let tokenBudget: number | undefined;
+  const objectiveParts: string[] = [];
+  for (let index = 0; index < parts.length; index++) {
+    const part = parts[index] ?? "";
+    if (part === "--budget" || part === "-b") {
+      const value = parts[index + 1];
+      if (value) {
+        tokenBudget = parseTokenBudget(value);
+        index++;
+      }
+      continue;
+    }
+    if (part.startsWith("--budget=")) {
+      tokenBudget = parseTokenBudget(part.slice("--budget=".length));
+      continue;
+    }
+    objectiveParts.push(part);
+  }
+  return {
+    objective: objectiveParts.join(" ").trim(),
+    ...(tokenBudget !== undefined ? { tokenBudget } : {}),
+  };
+}
+
+function parseTokenBudget(value: string): number | undefined {
+  const match = /^(\d+(?:\.\d+)?)(k|m)?$/i.exec(value.trim());
+  if (!match) return undefined;
+  const amount = Number(match[1]);
+  const suffix = match[2]?.toLowerCase();
+  const multiplier = suffix === "m" ? 1_000_000 : suffix === "k" ? 1_000 : 1;
+  const budget = Math.round(amount * multiplier);
+  return Number.isFinite(budget) && budget > 0 ? budget : undefined;
 }
 
 function modelCompletions(ctx: SlashCommandContext, input: string): SlashCompletion[] {

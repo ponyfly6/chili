@@ -11,6 +11,7 @@ import type {
   EventEnvelope,
   AgentPath,
   AgentMailboxPayload,
+  GoalEvent,
   Message,
   MessageId,
   MessageEvent,
@@ -22,6 +23,8 @@ import type {
   TeamId,
   TeamMessageDelivery,
   TeamMessageDeliveryStatus,
+  ThreadGoal,
+  ThreadGoalStatus,
   TeamTaskClaimedPayload,
   ThreadId,
   TimestampMs,
@@ -55,6 +58,7 @@ import type {
   EventMirror,
   EventQuery,
   EventStore,
+  GoalProjectionStore,
   SessionRow,
   SubagentProjectionStore,
   TeamMemberQuery,
@@ -71,6 +75,8 @@ import type {
   TeamTaskMutationResult,
   TeamTaskQuery,
   TeamTaskRow,
+  ThreadGoalQuery,
+  ThreadGoalRow,
 } from "./types.js";
 
 interface StoredEventRow {
@@ -94,6 +100,20 @@ interface MessageRow {
 
 interface PartRow {
   data_json: string;
+}
+
+interface ThreadGoalProjectionRow {
+  thread_id: string;
+  session_id: string | null;
+  objective: string;
+  status: ThreadGoalStatus;
+  token_budget: number | null;
+  tokens_used: number;
+  time_used_seconds: number;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
+  last_reason: string | null;
 }
 
 interface AgentTaskProjectionRow {
@@ -264,6 +284,7 @@ export interface SqliteEventStoreOptions {
 export class SqliteEventStore
   implements
     EventStore,
+    GoalProjectionStore,
     SubagentProjectionStore,
     AgentTaskLeaseStore,
     AgentTaskFinalizationStore,
@@ -287,6 +308,7 @@ export class SqliteEventStore
       this.db.exec(statement);
     }
     this.migrateApprovalSchema();
+    this.migrateGoalSchema();
     this.migrateSubagentSchema();
     this.migrateTeamSchema();
   }
@@ -415,6 +437,42 @@ export class SqliteEventStore
       : this.db.query<Record<string, unknown>, []>(sql).all();
 
     return rows.map((row) => approvalFromRow(row));
+  }
+
+  async threadGoal(threadId: ThreadId): Promise<ThreadGoalRow | undefined> {
+    return (await this.threadGoals({ threadId, limit: 1 }))[0];
+  }
+
+  async threadGoals(query: ThreadGoalQuery = {}): Promise<ThreadGoalRow[]> {
+    const clauses: string[] = [];
+    const params: Record<string, unknown> = {};
+
+    if (query.threadId) {
+      clauses.push("thread_id = $threadId");
+      params.threadId = query.threadId;
+    }
+    if (query.sessionId) {
+      clauses.push("session_id = $sessionId");
+      params.sessionId = query.sessionId;
+    }
+    if (query.status) {
+      clauses.push("status = $status");
+      params.status = query.status;
+    }
+
+    params.limit = query.limit ?? 500;
+    const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
+    return this.db
+      .query<ThreadGoalProjectionRow, any>(
+        `select thread_id, session_id, objective, status, token_budget, tokens_used,
+                time_used_seconds, created_at, updated_at, completed_at, last_reason
+         from thread_goals
+         ${where}
+         order by updated_at desc, thread_id asc
+         limit $limit`,
+      )
+      .all(params)
+      .map((row) => threadGoalFromRow(row));
   }
 
   async agentTask(taskId: TaskId): Promise<AgentTaskRow | undefined> {
@@ -1324,6 +1382,32 @@ export class SqliteEventStore
     this.addColumnIfMissing("approvals", "metadata_json", "text");
   }
 
+  private migrateGoalSchema(): void {
+    this.db.exec(`
+      create table if not exists thread_goals (
+        thread_id text primary key,
+        session_id text,
+        objective text not null,
+        status text not null,
+        token_budget integer,
+        tokens_used integer not null default 0,
+        time_used_seconds real not null default 0,
+        created_at integer not null,
+        updated_at integer not null,
+        completed_at integer,
+        last_reason text
+      )
+    `);
+    this.addColumnIfMissing("thread_goals", "session_id", "text");
+    this.addColumnIfMissing("thread_goals", "token_budget", "integer");
+    this.addColumnIfMissing("thread_goals", "tokens_used", "integer not null default 0");
+    this.addColumnIfMissing("thread_goals", "time_used_seconds", "real not null default 0");
+    this.addColumnIfMissing("thread_goals", "completed_at", "integer");
+    this.addColumnIfMissing("thread_goals", "last_reason", "text");
+    this.db.exec(`create index if not exists thread_goals_session_idx on thread_goals(session_id)`);
+    this.db.exec(`create index if not exists thread_goals_status_idx on thread_goals(status, updated_at)`);
+  }
+
   private migrateTeamSchema(): void {
     this.addColumnIfMissing("teams", "description", "text");
     this.addColumnIfMissing("team_tasks", "description", "text");
@@ -1388,6 +1472,10 @@ export class SqliteEventStore
     }
     if (event.type.startsWith("approval.")) {
       this.applyApprovalEvent(event as ApprovalEvent);
+      return;
+    }
+    if (event.type.startsWith("goal.")) {
+      this.applyGoalEvent(event as GoalEvent);
       return;
     }
     if (event.type.startsWith("agent.")) {
@@ -1548,6 +1636,48 @@ export class SqliteEventStore
         )
         .run(event.payload.decision, event.payload.feedback ?? null, event.time, event.payload.approvalId);
     }
+  }
+
+  private applyGoalEvent(event: GoalEvent): void {
+    if (event.type === "goal.updated") {
+      const goal = event.payload.goal;
+      this.db
+        .query(
+          `insert into thread_goals
+             (thread_id, session_id, objective, status, token_budget, tokens_used,
+              time_used_seconds, created_at, updated_at, completed_at, last_reason)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           on conflict(thread_id) do update set
+             session_id = excluded.session_id,
+             objective = excluded.objective,
+             status = excluded.status,
+             token_budget = excluded.token_budget,
+             tokens_used = excluded.tokens_used,
+             time_used_seconds = excluded.time_used_seconds,
+             created_at = excluded.created_at,
+             updated_at = excluded.updated_at,
+             completed_at = excluded.completed_at,
+             last_reason = excluded.last_reason`,
+        )
+        .run(
+          goal.threadId,
+          goal.sessionId ?? event.sessionId ?? null,
+          goal.objective,
+          goal.status,
+          goal.tokenBudget ?? null,
+          goal.tokensUsed,
+          goal.timeUsedSeconds,
+          goal.createdAt,
+          goal.updatedAt,
+          goal.completedAt ?? null,
+          event.payload.reason ?? goal.lastReason ?? null,
+        );
+      return;
+    }
+
+    this.db
+      .query(`delete from thread_goals where thread_id = ?`)
+      .run(event.payload.threadId);
   }
 
   private applyAgentEvent(event: AgentEvent): void {
@@ -2295,6 +2425,23 @@ function approvalFromRow(row: Record<string, unknown>): ApprovalRow {
   if (row.feedback) approval.feedback = String(row.feedback);
   if (row.resolved_at) approval.resolvedAt = Number(row.resolved_at);
   return approval;
+}
+
+function threadGoalFromRow(row: ThreadGoalProjectionRow): ThreadGoalRow {
+  const goal: ThreadGoal = {
+    threadId: row.thread_id as ThreadId,
+    objective: row.objective,
+    status: row.status,
+    tokensUsed: row.tokens_used,
+    timeUsedSeconds: row.time_used_seconds,
+    createdAt: row.created_at as ThreadGoal["createdAt"],
+    updatedAt: row.updated_at as ThreadGoal["updatedAt"],
+  };
+  if (row.session_id) goal.sessionId = row.session_id as SessionId;
+  if (row.token_budget !== null) goal.tokenBudget = row.token_budget;
+  if (row.completed_at !== null) goal.completedAt = row.completed_at as TimestampMs;
+  if (row.last_reason) goal.lastReason = row.last_reason as NonNullable<ThreadGoal["lastReason"]>;
+  return goal;
 }
 
 function agentTaskFromRow(row: AgentTaskProjectionRow): AgentTaskRow {

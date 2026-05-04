@@ -1,4 +1,4 @@
-import type { ChiliEvent, EventEnvelope, Message, SessionId, TaskId } from "@chili/protocol";
+import type { ChiliEvent, EventEnvelope, Message, SessionId, TaskId, ThreadId } from "@chili/protocol";
 import type {
   AgentMailboxQuery,
   AgentMailboxRow,
@@ -23,6 +23,7 @@ import type {
   ApprovalRow,
   EventQuery,
   EventStore,
+  GoalProjectionStore,
   SessionRow,
   SubagentProjectionStore,
   TeamMemberQuery,
@@ -39,6 +40,8 @@ import type {
   TeamTaskMutationResult,
   TeamTaskQuery,
   TeamTaskRow,
+  ThreadGoalQuery,
+  ThreadGoalRow,
 } from "./types.js";
 
 export interface EventPublisher {
@@ -49,6 +52,7 @@ export class ObservableEventStore
   implements
     EventStore,
     EventPublisher,
+    GoalProjectionStore,
     SubagentProjectionStore,
     AgentTaskLeaseStore,
     AgentTaskFinalizationStore,
@@ -84,6 +88,14 @@ export class ObservableEventStore
 
   pendingApprovals(sessionId?: SessionId): Promise<ApprovalRow[]> {
     return this.inner.pendingApprovals(sessionId);
+  }
+
+  threadGoal(threadId: ThreadId): Promise<ThreadGoalRow | undefined> {
+    return this.goalStore()?.threadGoal(threadId) ?? Promise.resolve(undefined);
+  }
+
+  threadGoals(query?: ThreadGoalQuery): Promise<ThreadGoalRow[]> {
+    return this.goalStore()?.threadGoals(query) ?? Promise.resolve([]);
   }
 
   agentTasks(query?: AgentTaskQuery): Promise<AgentTaskRow[]> {
@@ -189,6 +201,14 @@ export class ObservableEventStore
     const inner = this.inner as EventStore & Partial<SubagentProjectionStore>;
     if (inner.agentTasks && inner.agentTask && inner.agentRuns && inner.agentMailbox) {
       return inner as SubagentProjectionStore;
+    }
+    return undefined;
+  }
+
+  private goalStore(): GoalProjectionStore | undefined {
+    const inner = this.inner as EventStore & Partial<GoalProjectionStore>;
+    if (inner.threadGoal && inner.threadGoals) {
+      return inner as EventStore & GoalProjectionStore;
     }
     return undefined;
   }

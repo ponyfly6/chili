@@ -10,7 +10,7 @@ import type {
   ToolCallId,
 } from "@chili/protocol";
 import type { ApprovalRow, EventQuery, EventStore, SessionRow } from "@chili/store";
-import { InMemoryToolRegistry, ToolExecutor } from "@chili/tools";
+import { InMemoryToolRegistry, ToolExecutor, createGoalTools } from "@chili/tools";
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.js";
 import { RuntimeService } from "./runtime-service.js";
 import { SingleAgentRuntime } from "./single-agent-runtime.js";
@@ -482,6 +482,101 @@ test("clears the reserved runtime when the initial running status write fails", 
     }),
   ).rejects.toThrow("status write failed");
   expect(service.isRunning(sessionId)).toBe(false);
+});
+
+test("continues an active persistent goal and lets update_goal complete it", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const createId = createSequentialId();
+  const sessionId = "session_goal" as SessionId;
+  const threadId = "thread_goal" as ThreadId;
+  let service!: RuntimeService;
+  let modelCalls = 0;
+
+  for (const tool of createGoalTools({
+    getGoal: (context) => service.getGoal({ sessionId: context.sessionId, threadId: context.threadId ?? threadId }),
+    createGoal: (input, context) => service.setGoal({
+      sessionId: context.sessionId,
+      threadId: context.threadId ?? threadId,
+      objective: input.objective,
+      ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
+      replace: false,
+    }),
+    updateGoal: (input, context) => service.updateGoal({
+      sessionId: context.sessionId,
+      threadId: context.threadId ?? threadId,
+      status: input.status,
+    }),
+  })) {
+    registry.register(tool);
+  }
+
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      modelCalls++;
+      if (modelCalls === 1) {
+        yield { type: "text_delta", text: "starting" };
+        yield { type: "finish", reason: "stop", usage: { inputTokens: 100, outputTokens: 20 } };
+        return;
+      }
+      if (modelCalls === 2) {
+        yield { type: "tool_call", name: "update_goal", input: { status: "complete", summary: "done" } };
+        yield { type: "finish", reason: "tool_use", usage: { inputTokens: 80, outputTokens: 10 } };
+        return;
+      }
+      yield { type: "text_delta", text: "Goal done" };
+      yield { type: "finish", reason: "stop", usage: { inputTokens: 50, outputTokens: 15 } };
+    },
+  };
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+    }),
+    createId,
+    now: () => 1 as TimestampMs,
+  });
+  service = new RuntimeService({
+    runtime,
+    store,
+    cwd: "/repo",
+    createId,
+    now: () => 1 as TimestampMs,
+  });
+  await store.append({
+    id: "event_goal_seed",
+    type: "goal.updated",
+    time: 1 as TimestampMs,
+    sessionId,
+    threadId,
+    payload: {
+      reason: "set",
+      goal: {
+        sessionId,
+        threadId,
+        objective: "finish the goal",
+        status: "active",
+        tokenBudget: 1_000,
+        tokensUsed: 0,
+        timeUsedSeconds: 0,
+        createdAt: 1 as TimestampMs,
+        updatedAt: 1 as TimestampMs,
+      },
+    },
+  });
+
+  const result = await service.submitPrompt({ sessionId, threadId, text: "start" });
+
+  expect(result.status).toBe("completed");
+  expect(modelCalls).toBe(3);
+  expect(textParts(store).map((part) => part.text)).toContain("Goal done");
+  const goalEvents = store.items.filter((event): event is Extract<ChiliEvent, { type: "goal.updated" }> => event.type === "goal.updated");
+  expect(goalEvents.at(-1)?.payload.goal.status).toBe("complete");
+  expect(goalEvents.at(-1)?.payload.goal.tokensUsed).toBe(275);
 });
 
 class MemoryEventStore implements EventStore {

@@ -10,6 +10,8 @@ import type {
   Message,
   MessageId,
   SessionId,
+  ThreadGoal,
+  ThreadGoalStatus,
   TaskId,
   TeamId,
   TeamMessageDelivery,
@@ -67,6 +69,15 @@ export interface ApprovalRow {
   feedback?: string;
   createdAt: number;
   resolvedAt?: number;
+}
+
+export interface ThreadGoalRow extends ThreadGoal {}
+
+export interface ThreadGoalQuery {
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  status?: ThreadGoalStatus;
+  limit?: number;
 }
 
 export interface AgentRunRow {
@@ -395,6 +406,11 @@ export interface EventStore {
   sessions(): Promise<SessionRow[]>;
   messages(sessionId: SessionId): Promise<Message[]>;
   pendingApprovals(sessionId?: SessionId): Promise<ApprovalRow[]>;
+}
+
+export interface GoalProjectionStore {
+  threadGoal(threadId: ThreadId): Promise<ThreadGoalRow | undefined>;
+  threadGoals(query?: ThreadGoalQuery): Promise<ThreadGoalRow[]>;
 }
 
 export interface SubagentProjectionStore {

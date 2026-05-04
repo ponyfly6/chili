@@ -4,6 +4,7 @@ import type {
   Message,
   MessageId,
   MessagePart,
+  ModelUsage,
   RuntimeModelDescriptor,
   PartId,
   SessionId,
@@ -76,6 +77,7 @@ interface AssistantStreamState {
 interface AssistantStreamResult {
   finishReason?: string;
   toolCalls: PendingToolCall[];
+  usage?: ModelUsage;
 }
 
 export interface CompactContextInput {
@@ -274,6 +276,7 @@ export class SingleAgentRuntime implements AgentRunner {
         assistantMessageId,
       };
       if (contextUsage) result.contextUsage = contextUsage;
+      if (streamResult.usage) result.usage = streamResult.usage;
       if (streamResult.finishReason) result.finishReason = streamResult.finishReason;
       return result;
     } catch (error) {
@@ -317,6 +320,7 @@ export class SingleAgentRuntime implements AgentRunner {
 
     while (true) {
       let assistantMutated = false;
+      let latestUsage: ModelUsage | undefined;
       const state: AssistantStreamState = {
         toolCalls: [],
         streamingToolCalls: new Map(),
@@ -410,14 +414,16 @@ export class SingleAgentRuntime implements AgentRunner {
           }
 
           if (event.type === "finish") {
+            if (event.usage) latestUsage = event.usage;
             if (event.responseId || event.usage) {
               await this.appendModelMetadata(input, turnId, event);
             }
             await this.finishUnfinishedStreamingToolCalls(input, state, "failed", "Tool call stream ended before tool_call_end");
-            return { finishReason: event.reason, toolCalls: state.toolCalls };
+            return { finishReason: event.reason, toolCalls: state.toolCalls, ...(latestUsage ? { usage: latestUsage } : {}) };
           }
 
           if (event.type === "metadata") {
+            if (event.usage) latestUsage = event.usage;
             await this.appendModelMetadata(input, turnId, event);
             continue;
           }
@@ -425,7 +431,7 @@ export class SingleAgentRuntime implements AgentRunner {
           throw toError(event.error);
         }
         await this.finishUnfinishedStreamingToolCalls(input, state, "failed", "Tool call stream ended before tool_call_end");
-        return { toolCalls: state.toolCalls };
+        return { toolCalls: state.toolCalls, ...(latestUsage ? { usage: latestUsage } : {}) };
       } catch (error) {
         const err = toError(error);
         if (input.signal?.aborted || isAbortError(err)) {

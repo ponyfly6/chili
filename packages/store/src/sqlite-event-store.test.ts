@@ -270,6 +270,59 @@ test("migrates older approval tables and reads approval metadata", async () => {
   }
 });
 
+test("projects persistent thread goals and clears them", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-goal-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const sessionId = "session_goal_store" as SessionId;
+  const threadId = "thread_goal_store" as ThreadId;
+
+  try {
+    await store.append(sessionEvent("event_goal_session", sessionId, threadId, 1 as TimestampMs));
+    await store.append({
+      id: "event_goal_set",
+      type: "goal.updated",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        reason: "set",
+        goal: {
+          sessionId,
+          threadId,
+          objective: "ship /goal",
+          status: "active",
+          tokenBudget: 50_000,
+          tokensUsed: 123,
+          timeUsedSeconds: 4,
+          createdAt: 2 as TimestampMs,
+          updatedAt: 2 as TimestampMs,
+        },
+      },
+    });
+
+    expect(await store.threadGoal(threadId)).toMatchObject({
+      threadId,
+      objective: "ship /goal",
+      status: "active",
+      tokenBudget: 50_000,
+      tokensUsed: 123,
+    });
+
+    await store.append({
+      id: "event_goal_clear",
+      type: "goal.cleared",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { threadId, reason: "clear" },
+    });
+    expect(await store.threadGoal(threadId)).toBeUndefined();
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("replays message part deltas into stored messages", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-part-delta-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));

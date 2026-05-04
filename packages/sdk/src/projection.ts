@@ -23,6 +23,7 @@ import type {
   TeamRunLifecyclePhase,
   TeamRunStopReason,
   TeamRunSummaryCounts,
+  ThreadGoal,
   ThreadId,
   ToolCallId,
   ToolCallStatus,
@@ -56,6 +57,7 @@ export interface ChiliRuntimeView {
   teamRunIdsByTeam: Record<string, string[]>;
   modelMetadataTurnIds: TurnId[];
   modelMetadataByTurn: Record<string, RuntimeModelMetadataView>;
+  goalsByThread: Record<string, RuntimeThreadGoalView>;
   partIndex: Record<string, RuntimePartIndexEntry>;
   lastEventId?: string;
 }
@@ -116,6 +118,8 @@ export interface RuntimeModelMetadataView extends ModelMetadataPayload {
   sessionId?: SessionId;
   threadId?: ThreadId;
 }
+
+export interface RuntimeThreadGoalView extends ThreadGoal {}
 
 export interface RuntimeApprovalView {
   id: ApprovalId;
@@ -616,6 +620,7 @@ export interface ChatSessionView {
   items: ChatTranscriptItem[];
   pendingApprovals: ChatApprovalRow[];
   activeTools: ChatToolCallRow[];
+  goal?: ThreadGoal;
   generatedAt: string;
   latestModelMetadata?: ModelMetadataPayload;
   usageSummary?: ModelUsage;
@@ -740,6 +745,7 @@ export function createRuntimeView(): ChiliRuntimeView {
     teamRunIdsByTeam: {},
     modelMetadataTurnIds: [],
     modelMetadataByTurn: {},
+    goalsByThread: {},
     partIndex: {},
   };
 }
@@ -935,6 +941,18 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       if (approval.sessionId) touchSession(view, approval.sessionId, event.time);
       break;
     }
+    case "goal.updated": {
+      const goal = cloneThreadGoal(event.payload.goal);
+      view.goalsByThread[goal.threadId] = goal;
+      const sessionId = goal.sessionId ?? event.sessionId;
+      if (sessionId) touchSession(view, sessionId, event.time);
+      break;
+    }
+    case "goal.cleared": {
+      delete view.goalsByThread[event.payload.threadId];
+      if (event.sessionId) touchSession(view, event.sessionId, event.time);
+      break;
+    }
   }
 
   return view;
@@ -1011,6 +1029,8 @@ export function chatSessionView(view: ChiliRuntimeView, input: ChatSessionInput 
     : [];
   const latestModelMetadata = modelMetadata.at(-1);
   const usageSummary = modelUsageSummary(modelMetadata);
+  const threadId = input.threadId ?? session?.threadId;
+  const goal = threadId ? view.goalsByThread[threadId] : undefined;
   const items = [...messages, ...tools, ...approvals]
     .sort((left, right) => chatItemTime(left) - chatItemTime(right))
     .slice(-limit);
@@ -1022,7 +1042,8 @@ export function chatSessionView(view: ChiliRuntimeView, input: ChatSessionInput 
     generatedAt: input.generatedAt ?? new Date().toISOString(),
   };
   assignOptional(output, "sessionId", sessionId);
-  assignOptional(output, "threadId", input.threadId ?? session?.threadId);
+  assignOptional(output, "threadId", threadId);
+  assignOptional(output, "goal", goal ? cloneThreadGoal(goal) : undefined);
   assignOptional(output, "latestModelMetadata", latestModelMetadata ? chatModelMetadata(latestModelMetadata) : undefined);
   assignOptional(output, "usageSummary", usageSummary);
   assignOptional(output, "lastEventId", view.lastEventId);
@@ -1124,6 +1145,23 @@ function cloneModelUsage(usage: ModelUsage): ModelUsage {
   assignOptional(output, "cacheCreationInputTokens", usage.cacheCreationInputTokens);
   assignOptional(output, "totalTokens", usage.totalTokens);
   assignOptional(output, "raw", usage.raw);
+  return output;
+}
+
+function cloneThreadGoal(goal: ThreadGoal): ThreadGoal {
+  const output: ThreadGoal = {
+    threadId: goal.threadId,
+    objective: goal.objective,
+    status: goal.status,
+    tokensUsed: goal.tokensUsed,
+    timeUsedSeconds: goal.timeUsedSeconds,
+    createdAt: goal.createdAt,
+    updatedAt: goal.updatedAt,
+  };
+  assignOptional(output, "sessionId", goal.sessionId);
+  assignOptional(output, "tokenBudget", goal.tokenBudget);
+  assignOptional(output, "completedAt", goal.completedAt);
+  assignOptional(output, "lastReason", goal.lastReason);
   return output;
 }
 

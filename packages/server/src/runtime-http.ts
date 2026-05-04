@@ -23,6 +23,8 @@ import type {
   TaskId,
   TeamId,
   TeamMessageDelivery,
+  ThreadGoal,
+  ThreadGoalStatus,
 } from "@chili/protocol";
 import type {
   AgentTreeSnapshot,
@@ -81,6 +83,10 @@ export interface RuntimeHttpService {
   getModelConfig?(sessionId: SessionId): Promise<RuntimeModelConfig>;
   setModel?(input: { sessionId: SessionId; threadId?: ThreadId; modelSelection: ModelSelection }): Promise<RuntimeModelConfig>;
   setReasoning?(input: { sessionId: SessionId; threadId?: ThreadId; reasoningLevel: ReasoningLevel }): Promise<RuntimeModelConfig>;
+  getGoal?(input: { sessionId: SessionId; threadId: ThreadId }): Promise<ThreadGoal | undefined>;
+  setGoal?(input: { sessionId: SessionId; threadId: ThreadId; objective: string; tokenBudget?: number; replace?: boolean }): Promise<ThreadGoal>;
+  updateGoal?(input: { sessionId: SessionId; threadId: ThreadId; status?: ThreadGoalStatus; objective?: string; tokenBudget?: number }): Promise<ThreadGoal>;
+  clearGoal?(input: { sessionId: SessionId; threadId: ThreadId }): Promise<{ cleared: boolean; previousGoal?: ThreadGoal }>;
   submitPrompt(input: SubmitPromptInput): Promise<SubmitPromptResult>;
   submitPromptAsync(input: SubmitPromptInput, onError?: RuntimeBackgroundErrorHandler): void;
   interrupt(sessionId: SessionId, reason?: string): Promise<boolean>;
@@ -451,6 +457,30 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         }));
       }
 
+      if (route.name === "goal") {
+        await requireSession(options.store, route.sessionId);
+        const goals = requireGoalControl(options);
+        if (request.method === "GET") {
+          const threadId = requiredThreadId(url.searchParams.get("threadId"));
+          const goal = await goals.getGoal({ sessionId: route.sessionId, threadId });
+          return goal ? json(goal) : new Response(null, { status: 204 });
+        }
+        if (request.method === "POST") {
+          const body = await readJson<GoalBody>(request);
+          const input = goalSetInput(route.sessionId, body);
+          return json(await goals.setGoal(input), 201);
+        }
+        if (request.method === "PATCH") {
+          const body = await readJson<GoalBody>(request);
+          const input = goalUpdateInput(route.sessionId, body);
+          return json(await goals.updateGoal(input));
+        }
+        if (request.method === "DELETE") {
+          const threadId = requiredThreadId(url.searchParams.get("threadId"));
+          return json(await goals.clearGoal({ sessionId: route.sessionId, threadId }));
+        }
+      }
+
       if (route.name === "prompt" || route.name === "promptAsync") {
         const body = await readJson<PromptBody>(request);
         rejectLegacySystemField(body);
@@ -609,6 +639,7 @@ type Route =
   | { name: "modelConfig"; sessionId: SessionId }
   | { name: "setModel"; sessionId: SessionId }
   | { name: "setReasoning"; sessionId: SessionId }
+  | { name: "goal"; sessionId: SessionId }
   | { name: "prompt"; sessionId: SessionId }
   | { name: "promptAsync"; sessionId: SessionId }
   | { name: "commandAsync"; sessionId: SessionId }
@@ -651,6 +682,14 @@ interface ModelBody {
 interface ReasoningBody {
   threadId?: ThreadId;
   reasoningLevel?: unknown;
+}
+
+interface GoalBody {
+  threadId?: ThreadId;
+  objective?: unknown;
+  status?: unknown;
+  tokenBudget?: unknown;
+  replace?: unknown;
 }
 
 interface PermissionsBody {
@@ -895,6 +934,7 @@ function routeRequest(method: string, pathname: string): Route {
   if (method === "GET" && action === "model") return { name: "modelConfig", sessionId };
   if (method === "POST" && action === "model") return { name: "setModel", sessionId };
   if (method === "POST" && action === "reasoning") return { name: "setReasoning", sessionId };
+  if ((method === "GET" || method === "POST" || method === "PATCH" || method === "DELETE") && action === "goal") return { name: "goal", sessionId };
   if (method === "POST" && action === "prompt") return { name: "prompt", sessionId };
   if (method === "POST" && action === "prompt_async") return { name: "promptAsync", sessionId };
   if (method === "POST" && action === "command_async") return { name: "commandAsync", sessionId };
@@ -917,6 +957,86 @@ function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody): SubmitP
   if (isModelSelection(body.modelSelection)) input.modelSelection = body.modelSelection;
   if (isReasoningLevel(body.reasoningLevel)) input.reasoningLevel = body.reasoningLevel;
   return input;
+}
+
+function goalSetInput(sessionId: SessionId, body: GoalBody): {
+  sessionId: SessionId;
+  threadId: ThreadId;
+  objective: string;
+  tokenBudget?: number;
+  replace?: boolean;
+} {
+  const threadId = requiredThreadId(body.threadId);
+  if (typeof body.objective !== "string" || body.objective.trim().length === 0) {
+    throw badRequest("objective is required");
+  }
+  const input: {
+    sessionId: SessionId;
+    threadId: ThreadId;
+    objective: string;
+    tokenBudget?: number;
+    replace?: boolean;
+  } = {
+    sessionId,
+    threadId,
+    objective: body.objective.trim(),
+  };
+  const tokenBudget = optionalPositiveInteger(body.tokenBudget, "tokenBudget");
+  if (tokenBudget !== undefined) input.tokenBudget = tokenBudget;
+  if (body.replace !== undefined) input.replace = Boolean(body.replace);
+  return input;
+}
+
+function goalUpdateInput(sessionId: SessionId, body: GoalBody): {
+  sessionId: SessionId;
+  threadId: ThreadId;
+  status?: ThreadGoalStatus;
+  objective?: string;
+  tokenBudget?: number;
+} {
+  const input: {
+    sessionId: SessionId;
+    threadId: ThreadId;
+    status?: ThreadGoalStatus;
+    objective?: string;
+    tokenBudget?: number;
+  } = {
+    sessionId,
+    threadId: requiredThreadId(body.threadId),
+  };
+  const status = optionalGoalStatus(body.status);
+  if (status) input.status = status;
+  if (body.objective !== undefined) {
+    if (typeof body.objective !== "string" || body.objective.trim().length === 0) {
+      throw badRequest("objective must be a non-empty string when provided");
+    }
+    input.objective = body.objective.trim();
+  }
+  const tokenBudget = optionalPositiveInteger(body.tokenBudget, "tokenBudget");
+  if (tokenBudget !== undefined) input.tokenBudget = tokenBudget;
+  if (!input.status && input.objective === undefined && input.tokenBudget === undefined) {
+    throw badRequest("status, objective, or tokenBudget is required");
+  }
+  return input;
+}
+
+function requiredThreadId(value: unknown): ThreadId {
+  if (typeof value !== "string" || value.trim().length === 0) throw badRequest("threadId is required");
+  return value.trim() as ThreadId;
+}
+
+function optionalGoalStatus(value: unknown): ThreadGoalStatus | undefined {
+  if (value === undefined) return undefined;
+  if (value === "active" || value === "paused" || value === "budgetLimited" || value === "complete") return value;
+  throw badRequest("status must be active, paused, budgetLimited, or complete");
+}
+
+function optionalPositiveInteger(value: unknown, field: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    throw badRequest(`${field} must be a positive integer`);
+  }
+  return value;
 }
 
 function parseSkillMentions(value: unknown): RuntimeSkillMention[] {
@@ -1181,6 +1301,12 @@ function toHttpError(error: unknown): HttpError {
   if (err.name === "RuntimeBusyError") {
     return { status: 409, message: err.message };
   }
+  if (err.name === "GoalAlreadyExistsError") {
+    return { status: 409, message: err.message };
+  }
+  if (err.name === "GoalNotFoundError") {
+    return { status: 404, message: err.message };
+  }
   if (err instanceof PromptCommandNotFoundError) {
     return { status: 404, message: err.message };
   }
@@ -1219,6 +1345,19 @@ function requireModelControl(options: RuntimeHttpHandlerOptions): Required<Pick<
     getModelConfig: service.getModelConfig.bind(service),
     setModel: service.setModel.bind(service),
     setReasoning: service.setReasoning.bind(service),
+  };
+}
+
+function requireGoalControl(options: RuntimeHttpHandlerOptions): Required<Pick<RuntimeHttpService, "getGoal" | "setGoal" | "updateGoal" | "clearGoal">> {
+  const service = options.service;
+  if (!service.getGoal || !service.setGoal || !service.updateGoal || !service.clearGoal) {
+    throw { status: 501, message: "No goal control service is configured" } satisfies HttpError;
+  }
+  return {
+    getGoal: service.getGoal.bind(service),
+    setGoal: service.setGoal.bind(service),
+    updateGoal: service.updateGoal.bind(service),
+    clearGoal: service.clearGoal.bind(service),
   };
 }
 

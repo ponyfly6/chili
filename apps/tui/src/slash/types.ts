@@ -20,6 +20,7 @@ export type SlashCommandResult =
   | { type: "reload_commands" }
   | { type: "close_view" }
   | { type: "new_session" }
+  | { type: "goal_action"; action: "show" | "set" | "pause" | "resume" | "clear"; objective?: string; tokenBudget?: number }
   | { type: "submit_command"; commandName: string; args: string }
   | { type: "insert_prompt"; text: string }
   | { type: "local_message"; level: "info" | "error"; text: string }
