@@ -309,10 +309,13 @@ test("assistant markdown table uses native table rendering in the message list",
     },
   ]);
 
+  expect(frame).toContain("Name");
+  expect(frame).toContain("alpha");
   expect(frame).toContain("┌");
   expect(frame).toContain("┬");
-  expect(frame).toContain("│ Name");
-  expect(frame).toContain("│ alpha");
+  expect(frame).toContain("│Name");
+  expect(frame).toContain("│alpha");
+  expect(frame).not.toContain("│ Name");
   expect(frame).not.toContain("🌶️:");
   expect(frame).not.toContain("| ---");
 });

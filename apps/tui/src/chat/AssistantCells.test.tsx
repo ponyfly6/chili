@@ -102,16 +102,16 @@ test("assistant markdown cell keeps OpenTUI markdown as the native render path",
     width: "100%",
     maxWidth: "100%",
     fg: theme.colors.text.secondary,
-    conceal: false,
+    conceal: true,
     concealCode: false,
     streaming: true,
     internalBlockMode: "top-level",
     tableOptions: {
       style: "grid",
-      widthMode: "full",
+      widthMode: "content",
       columnFitter: "balanced",
       wrapMode: "word",
-      cellPadding: 1,
+      cellPadding: 0,
       borders: true,
       outerBorder: true,
       borderStyle: "single",
@@ -123,7 +123,7 @@ test("assistant markdown cell keeps OpenTUI markdown as the native render path",
   expect(markdown?.props.renderNode).toBeFunction();
 });
 
-test("assistant markdown cell renders native table while partial fallback remains plain text", async () => {
+test("assistant markdown cell renders compact native table while partial fallback remains plain text", async () => {
   const text = [
     "| Name | Count | State |",
     "| :--- | ---: | :---: |",
@@ -149,11 +149,14 @@ test("assistant markdown cell renders native table while partial fallback remain
   expect(fallbackText).toContain("🌶️: | Name");
   expect(fallbackText).toContain("| alpha");
   expect(fallbackText).not.toContain("┌");
+  expect(frame).toContain("Name");
+  expect(frame).toContain("alpha");
+  expect(frame).toContain("longer name");
   expect(frame).toContain("┌");
   expect(frame).toContain("┬");
-  expect(frame).toContain("│ Name");
-  expect(frame).toContain("│ alpha");
-  expect(frame).toContain("│ longer name");
+  expect(frame).toContain("│Name");
+  expect(frame).toContain("│alpha");
+  expect(frame).not.toContain("│ Name");
   expect(frame).not.toContain("🌶️:");
   expect(frame).not.toContain(":---");
 });
@@ -180,11 +183,47 @@ test("assistant markdown native table stays readable with narrow CJK and long ce
     fallbackLines,
   });
 
-  expect(frame).toContain("┌");
   expect(frame).toContain("名称");
   expect(frame).toContain("火锅");
   expect(frame).toContain("very");
   expect(frame).toContain("正常");
+  expect(frame).toContain("┌");
+  expect(frame).toContain("│名称");
+  expect(frame).toContain("│火锅");
+  expect(frame).not.toContain("🌶️:");
+});
+
+test("assistant markdown compact table conceals inline markdown markers", async () => {
+  const text = [
+    "| 分类 | 内容 |",
+    "| --- | --- |",
+    "| **CLI 命令** | `srt` |",
+    "| **入口文件** | `src/cli.ts` |",
+    "| **核心模块** | `src/sandbox/`（sandbox 管理器、平台适配器、schemas） |",
+  ].join("\n");
+  const fallbackLines = assistantTextCellLines({
+    key: "assistant:table-inline",
+    text,
+    streaming: false,
+    width: 92,
+    theme,
+  });
+  const frame = await renderAssistantMarkdownCell({
+    cellKey: "assistant:table-inline",
+    text,
+    streaming: false,
+    width: 92,
+    fallbackLines,
+  });
+
+  expect(frame).toContain("┌");
+  expect(frame).toContain("┬");
+  expect(frame).toContain("│分类");
+  expect(frame).toContain("CLI 命令");
+  expect(frame).toContain("src/sandbox/");
+  expect(frame).not.toContain("**CLI 命令**");
+  expect(frame).not.toContain("`srt`");
+  expect(frame).not.toContain("`src/cli.ts`");
   expect(frame).not.toContain("🌶️:");
 });
 

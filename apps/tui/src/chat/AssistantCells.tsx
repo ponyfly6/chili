@@ -28,17 +28,17 @@ export function AssistantMarkdownCell(props: {
         maxWidth="100%"
         fg={props.theme.colors.text.secondary}
         syntaxStyle={assistantMarkdownSyntaxStyle(props.theme)}
-        conceal={false}
+        conceal
         concealCode={false}
         streaming={props.streaming}
         renderNode={renderAssistantMarkdownNode}
         internalBlockMode="top-level"
         tableOptions={{
           style: "grid",
-          widthMode: "full",
+          widthMode: "content",
           columnFitter: "balanced",
           wrapMode: "word",
-          cellPadding: 1,
+          cellPadding: 0,
           borders: true,
           outerBorder: true,
           borderStyle: "single",
