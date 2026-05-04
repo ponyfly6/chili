@@ -5,6 +5,7 @@ import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, TeamLiveAc
 import type { ApprovalId, RuntimePermissionProfileDescriptor, RuntimePermissionProfileId, RuntimeSkillMention, SessionId, TeamId, ThreadId } from "@chili/protocol";
 import { FileAuthStorage, loginOpenAICodex, OPENAI_CODEX_PROVIDER_ID } from "@chili/providers";
 import { discoverSkills, updateSkillDisabledSetting, type SkillSettingsScope, type SkillSummary } from "@chili/skills";
+import { runProcess, type RunProcessResult } from "@chili/tools";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { cleanClipboardText, promptClipboardText, systemClipboard, type ClipboardAccess } from "./clipboard.js";
@@ -50,12 +51,17 @@ import {
 } from "./theme/index.js";
 
 type ShellView = "chat" | "team" | "help" | "agents" | "status" | "transcript";
-type AppendLocalItem = (level: "info" | "error", text: string) => void;
+type AppendLocalItem = (level: "info" | "error", text: string, options?: { persistent?: boolean | undefined }) => void;
+type LocalShellItem = Extract<LocalTranscriptItem, { kind: "shell" }>;
+type AppendShellItem = (item: Omit<LocalShellItem, "id" | "kind">) => string;
+type UpdateShellItem = (id: string, update: Partial<Omit<LocalShellItem, "id" | "kind">>) => void;
 
 interface SlashActions {
   cwd: string;
   setView: (view: ShellView) => void;
   appendLocalItem: AppendLocalItem;
+  appendShellItem: AppendShellItem;
+  updateShellItem: UpdateShellItem;
   startNewChatSession: () => Promise<void>;
   setPrompt: (value: string | ((current: string) => string)) => void;
   openThemePicker: () => void;
@@ -101,6 +107,8 @@ interface AuthManualPrompt {
 const execFileAsync = promisify(execFile);
 const PROMPT_MENU_MAX_ITEMS = 6;
 const LOCAL_ITEM_TTL_MS = 4_000;
+const USER_SHELL_TIMEOUT_MS = 60 * 60 * 1_000;
+const USER_SHELL_OUTPUT_LIMIT_BYTES = 256_000;
 
 export function ChatShellApp(props: {
   client: HttpRuntimeClient;
@@ -208,13 +216,21 @@ export function ChatShellSurface(props: {
     localItemTimersRef.current.delete(id);
     setLocalItems((current) => current.filter((item) => item.id !== id));
   }, []);
-  const appendLocalItem = useCallback<AppendLocalItem>((level, text) => {
-    const item = localItem(level, text);
+  const appendLocalItem = useCallback<AppendLocalItem>((level, text, itemOptions) => {
+    const item = localItem(level, text, itemOptions?.persistent);
     setLocalItems((current) => [...current, item]);
-    if (localMessageTtlMs <= 0) return;
+    if (itemOptions?.persistent || localMessageTtlMs <= 0) return;
     const timer = setTimeout(() => dismissLocalItem(item.id), localMessageTtlMs);
     localItemTimersRef.current.set(item.id, timer);
   }, [dismissLocalItem, localMessageTtlMs]);
+  const appendShellItem = useCallback<AppendShellItem>((item) => {
+    const id = `${Date.now()}:shell:${item.command}`;
+    setLocalItems((current) => [...current, { id, kind: "shell", ...item }]);
+    return id;
+  }, []);
+  const updateShellItem = useCallback<UpdateShellItem>((id, update) => {
+    setLocalItems((current) => current.map((item) => item.kind === "shell" && item.id === id ? { ...item, ...update } : item));
+  }, []);
   const clearLocalItems = useCallback(() => {
     clearLocalItemTimers(localItemTimersRef.current);
     setLocalItems([]);
@@ -244,6 +260,7 @@ export function ChatShellSurface(props: {
   const transcriptLineCount = useMemo(() => estimatedTranscriptLineCount(props.runtime.chatView.items, deferredLocalItems, scrollEstimateWidth), [deferredLocalItems, props.runtime.chatView.items, scrollEstimateWidth]);
   const previousTranscriptLineCount = useRef<number | undefined>(undefined);
   const prompt = promptText(promptParts);
+  const shellInputActive = prompt.startsWith("!");
   const history = usePromptHistory();
   const authManualPromptRef = useRef<AuthManualPrompt | undefined>(undefined);
   const systemTheme = props.options?.systemTheme;
@@ -271,10 +288,10 @@ export function ChatShellSurface(props: {
   }), [cwd, modelCandidates, modelSelection, props.allSkills, props.model, props.skills, reasoningLevel]);
   const completionSuppressed = acceptedCompletionPrompt !== undefined && prompt === acceptedCompletionPrompt;
   const skillTrigger = activeSkillMentionTrigger(prompt);
-  const skillCompletionItems = skillTrigger && !prompt.startsWith("/")
+  const skillCompletionItems = skillTrigger && !prompt.startsWith("/") && !shellInputActive
     ? skillCompletions(props.skills ?? [], skillTrigger.query)
     : [];
-  const skillCompletionOpen = Boolean(skillTrigger && !prompt.startsWith("/"));
+  const skillCompletionOpen = Boolean(skillTrigger && !prompt.startsWith("/") && !shellInputActive);
   const slashCompletionItems = prompt.startsWith("/") && !completionSuppressed
     ? slashCompletions(commands, slashContext, prompt)
     : [];
@@ -488,6 +505,8 @@ export function ChatShellSurface(props: {
     cwd,
     setView,
     appendLocalItem,
+    appendShellItem,
+    updateShellItem,
     startNewChatSession,
     setPrompt,
     openThemePicker,
@@ -504,7 +523,7 @@ export function ChatShellSurface(props: {
       await props.onSkillsChanged?.();
     },
     reloadCommands,
-  }), [appendLocalItem, cwd, ensureOpenAICodexDefaultModel, openModelPicker, openPermissionsPicker, openReasoningPicker, openThemePicker, props.onSkillsChanged, reloadCommands, setAuthManualPrompt, setHideThinking, setModelSelection, setPermissionProfile, setPrompt, setReasoningLevel, startNewChatSession]);
+  }), [appendLocalItem, appendShellItem, cwd, ensureOpenAICodexDefaultModel, openModelPicker, openPermissionsPicker, openReasoningPicker, openThemePicker, props.onSkillsChanged, reloadCommands, setAuthManualPrompt, setHideThinking, setModelSelection, setPermissionProfile, setPrompt, setReasoningLevel, startNewChatSession, updateShellItem]);
   const runSelectedSlashCompletion = useCallback(() => {
     if (!slashCompletionOpen) return false;
     const completion = slashCompletionItems[selectedCompletionIndex] ?? slashCompletionItems[0];
@@ -554,6 +573,8 @@ export function ChatShellSurface(props: {
     ? "Choose thinking level"
     : permissionsPicker
     ? "Choose permissions"
+    : shellInputActive
+    ? undefined
     : slashInputActive
     ? undefined
     : props.runtime.chatView.pendingApprovals.length > 0
@@ -1074,6 +1095,7 @@ function SessionScreen(props: {
     paletteItems: props.paletteItems,
     feedback,
     maxCommandItems,
+    shellMode: props.prompt.startsWith("!"),
   });
   const messagePaneHeight = Math.max(1, props.height - approvalHeight - themePickerHeight - selectorHeight - promptHeight - footerHeight);
   const transcriptChrome = props.height < 16 ? 6 : 3;
@@ -1156,8 +1178,18 @@ function SessionScreen(props: {
 
 function estimatedTranscriptLineCount(items: readonly ChatTranscriptItem[], localItems: readonly LocalTranscriptItem[], width: number): number {
   const transcriptLineCount = buildTranscriptLines(items).reduce((count, line) => count + roughTextLineCount(line.text, width), 0);
-  const localLineCount = localItems.reduce((count, item) => count + roughTextLineCount(`${item.level}: ${item.text}`, width), 0);
+  const localLineCount = localItems.reduce((count, item) => count + roughTextLineCount(localTranscriptEstimateText(item), width), 0);
   return transcriptLineCount + localLineCount;
+}
+
+function localTranscriptEstimateText(item: LocalTranscriptItem): string {
+  if (item.kind === "local") return `${item.level}: ${item.text}`;
+  const status = item.status === "running"
+    ? `running in ${item.cwd}`
+    : item.exitCode !== undefined
+      ? `exit ${item.exitCode ?? "signal"}`
+      : item.status;
+  return `! ${item.command}\n${item.output || "(no output)"}\n${status}`;
 }
 
 function roughTextLineCount(value: string, width: number): number {
@@ -1600,6 +1632,7 @@ function HelpView(props: { commands: readonly SlashCommand[]; theme: TuiTheme; s
         </text>
       ))}
       <box height={1} />
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"!cmd runs a local shell command without asking the model."}</text>
       <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`Esc closes views. Ctrl+P opens commands. Ctrl+O toggles tool details (${detailsText}). Ctrl+T opens transcript. Ctrl+V pastes. Ctrl+Shift+C copies selection or latest reply.`}</text>
     </box>
   );
@@ -1669,6 +1702,17 @@ async function submitPrompt(
 ): Promise<void> {
   const trimmed = prompt.trim();
   if (!trimmed) return;
+  if (trimmed.startsWith("!")) {
+    actions.setPrompt("");
+    const command = trimmed.slice(1).trim();
+    if (!command) {
+      actions.appendLocalItem("info", "Prefix a command with ! to run it locally\nExample: !ls", { persistent: true });
+      return;
+    }
+    onAccepted?.(`!${command}`);
+    await runUserShellCommand(command, actions.cwd, actions);
+    return;
+  }
   if (trimmed.startsWith("/")) {
     const slashMatch = resolveSlashCommand(commands, trimmed);
     if (slashMatch) {
@@ -1697,6 +1741,45 @@ async function submitPrompt(
     onAccepted?.(trimmed);
     actions.setPrompt("");
   }
+}
+
+async function runUserShellCommand(command: string, cwd: string, actions: SlashActions): Promise<void> {
+  const id = actions.appendShellItem({
+    command,
+    cwd,
+    status: "running",
+    output: "",
+  });
+  try {
+    const result = await runProcess("bash", ["-lc", command], {
+      cwd,
+      timeoutMs: USER_SHELL_TIMEOUT_MS,
+      maxOutputBytes: USER_SHELL_OUTPUT_LIMIT_BYTES,
+    });
+    actions.updateShellItem(id, {
+      status: result.exitCode === 0 && !result.timedOut ? "completed" : "failed",
+      output: formatUserShellOutput(result),
+      exitCode: result.exitCode,
+      signal: result.signal,
+      durationMs: result.durationMs,
+      timedOut: result.timedOut,
+      stdoutTruncated: result.stdoutTruncated,
+      stderrTruncated: result.stderrTruncated,
+    });
+  } catch (error) {
+    actions.updateShellItem(id, {
+      status: "failed",
+      output: "",
+      error: errorMessage(error),
+    });
+  }
+}
+
+function formatUserShellOutput(result: RunProcessResult): string {
+  const sections: string[] = [];
+  if (result.stdout) sections.push(result.stdout.trimEnd());
+  if (result.stderr) sections.push(`[stderr]\n${result.stderr.trimEnd()}`);
+  return sections.filter((section) => section.length > 0).join("\n\n");
 }
 
 async function runSlashInput(
@@ -2244,13 +2327,17 @@ function promptText(parts: readonly PromptPart[]): string {
   return parts.map((part) => part.text).join("");
 }
 
-function localItem(level: "info" | "error", text: string): LocalTranscriptItem {
-  return { id: `${Date.now()}:${level}:${text}`, kind: "local", level, text };
+function localItem(level: "info" | "error", text: string, persistent?: boolean | undefined): LocalTranscriptItem {
+  return { id: `${Date.now()}:${level}:${text}`, kind: "local", level, text, ...(persistent ? { persistent } : {}) };
 }
 
 function clearLocalItemTimers(timers: Map<string, ReturnType<typeof setTimeout>>): void {
   for (const timer of timers.values()) clearTimeout(timer);
   timers.clear();
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function validSelectedTeamId(model: TeamLiveView, selectedTeamId: TeamId | undefined): TeamId | undefined {

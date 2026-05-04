@@ -23,6 +23,9 @@
     },
     {
       "path": "../../packages/skills"
+    },
+    {
+      "path": "../../packages/tools"
     }
   ]
 }

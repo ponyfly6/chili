@@ -125,11 +125,94 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, 
 }
 
 function localItemCell(item: LocalTranscriptItem, width: number, theme: TuiTheme): TranscriptCellModel {
+  if (item.kind === "shell") return lineBackedCell(item.id, shellItemLines(item, width, theme));
   return lineBackedCell(item.id, wrapLine(`${item.level}: ${item.text}`, {
     key: item.id,
     fg: item.level === "error" ? theme.colors.status.error : theme.colors.text.muted,
     width,
   }));
+}
+
+function shellItemLines(item: Extract<LocalTranscriptItem, { kind: "shell" }>, width: number, theme: TuiTheme): TranscriptLineModel[] {
+  const lines: TranscriptLineModel[] = [];
+  lines.push(...wrapLine(`! ${item.command}`, {
+    key: `${item.id}:command`,
+    fg: theme.colors.text.primary,
+    width,
+    hangingIndent: "  ",
+  }));
+
+  if (item.status === "running" && !item.output) {
+    lines.push(...wrapLine(`  running in ${item.cwd}`, {
+      key: `${item.id}:running`,
+      fg: theme.colors.status.pending,
+      width,
+      hangingIndent: "    ",
+    }));
+    return lines;
+  }
+
+  const outputLines = shellOutputPreviewLines(item.output);
+  if (outputLines.length === 0) {
+    lines.push(...wrapLine("  (no output)", {
+      key: `${item.id}:empty`,
+      fg: theme.colors.text.muted,
+      width,
+      hangingIndent: "    ",
+    }));
+  } else {
+    outputLines.forEach((text, index) => {
+      lines.push(...wrapLine(`  ${text}`, {
+        key: `${item.id}:output:${index}`,
+        fg: theme.colors.text.secondary,
+        width,
+        hangingIndent: "    ",
+      }));
+    });
+  }
+
+  for (const warning of shellOutputWarnings(item)) {
+    lines.push(...wrapLine(`  ${warning}`, {
+      key: `${item.id}:warning:${warning}`,
+      fg: theme.colors.text.muted,
+      width,
+      hangingIndent: "    ",
+    }));
+  }
+
+  lines.push(...wrapLine(`  ${shellStatusText(item)}`, {
+    key: `${item.id}:status`,
+    fg: item.status === "completed" && item.exitCode === 0 ? theme.colors.status.success : item.status === "running" ? theme.colors.status.pending : theme.colors.status.error,
+    width,
+    hangingIndent: "    ",
+  }));
+  return lines;
+}
+
+function shellOutputPreviewLines(output: string): string[] {
+  if (!output) return [];
+  const lines = output.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  const limit = 80;
+  if (lines.length <= limit) return lines;
+  return [...lines.slice(0, limit), `[output preview truncated after ${limit} lines]`];
+}
+
+function shellOutputWarnings(item: Extract<LocalTranscriptItem, { kind: "shell" }>): string[] {
+  const warnings: string[] = [];
+  if (item.stdoutTruncated) warnings.push("stdout truncated");
+  if (item.stderrTruncated) warnings.push("stderr truncated");
+  if (item.timedOut) warnings.push("process timed out");
+  if (item.error) warnings.push(item.error);
+  return warnings;
+}
+
+function shellStatusText(item: Extract<LocalTranscriptItem, { kind: "shell" }>): string {
+  if (item.status === "running") return `running in ${item.cwd}`;
+  const duration = item.durationMs === undefined ? "" : ` in ${item.durationMs}ms`;
+  if (item.exitCode !== undefined) return `exit ${item.exitCode ?? "signal"}${duration}`;
+  if (item.signal !== undefined && item.signal !== null) return `signal ${item.signal}${duration}`;
+  return item.status;
 }
 
 function reasoningLines(item: Extract<ChatDisplayItem, { kind: "reasoning" }>, width: number, theme: TuiTheme, hideThinking: boolean): TranscriptLineModel[] {

@@ -86,6 +86,82 @@ test("Chinese prompt submits through native input without text drift", async () 
   }
 });
 
+test("bang prompt runs a local shell command without submitting to the runtime", async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), "chili-tui-shell-"));
+  const submitted: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    cwd,
+    localMessageTtlMs: 0,
+    runtime: {
+      submitPrompt: async (text) => {
+        submitted.push(text);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "!printf shell-ok");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(160);
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(submitted).toEqual([]);
+    expect(frame).toContain("! printf shell-ok");
+    expect(frame).toContain("shell-ok");
+    expect(frame).toContain("exit 0");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("empty bang prompt shows local shell help", async () => {
+  const submitted: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    localMessageTtlMs: 0,
+    runtime: {
+      submitPrompt: async (text) => {
+        submitted.push(text);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "!");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(submitted).toEqual([]);
+    expect(frame).toContain("Prefix a command with ! to run it locally");
+    expect(frame).toContain("Example: !ls");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("bang prompt switches the composer into shell mode while typing", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "!echo shell-mode");
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("Shell");
+    expect(frame).toContain("echo shell-mode");
+    expect(frame).not.toContain("> !echo shell-mode");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("resume session and thread submit without creating a new session", async () => {
   const records = chatClientRecords();
   const client = fakeChatClient(records);
