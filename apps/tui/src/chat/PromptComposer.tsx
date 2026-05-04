@@ -1,8 +1,9 @@
-import type { InputRenderable } from "@opentui/core";
+import type { InputRenderable, KeyEvent, PasteEvent } from "@opentui/core";
 import { useCallback, useRef } from "react";
 import type { ChatRequestStatus } from "../useChatRuntime.js";
 import type { SlashCompletion } from "../slash/types.js";
 import type { TuiTheme } from "../theme/index.js";
+import { promptPasteBytes } from "../clipboard.js";
 import { commandListHeight, DEFAULT_COMMAND_LIST_MAX_ITEMS, CommandList } from "./CommandList.js";
 
 export const PROMPT_PLACEHOLDER = 'Ask anything... "fix failing tests"';
@@ -23,6 +24,7 @@ export function PromptComposer(props: {
   focused: boolean;
   onPromptChange: (value: string) => void;
   onSubmit: () => void;
+  onPasteShortcut?: (() => Promise<string | undefined>) | undefined;
   feedback?: { status: ChatRequestStatus | string; message: string } | undefined;
   completionIndex: number;
   theme: TuiTheme;
@@ -35,6 +37,31 @@ export function PromptComposer(props: {
     props.onPromptChange(value);
     correctTrailingUnicodeCursor(inputRef.current, value);
   }, [props.onPromptChange]);
+  const insertPromptText = useCallback((value: string) => {
+    const input = inputRef.current;
+    if (input) {
+      input.insertText(value);
+      correctTrailingUnicodeCursor(input, input.value);
+      return;
+    }
+    const next = `${props.prompt}${value}`;
+    props.onPromptChange(next);
+  }, [props.onPromptChange, props.prompt]);
+  const handlePromptPaste = useCallback((event: PasteEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const pasted = promptPasteBytes(event.bytes);
+    if (!pasted) return;
+    insertPromptText(pasted);
+  }, [insertPromptText]);
+  const handlePromptKeyDown = useCallback((key: KeyEvent) => {
+    if (!props.onPasteShortcut || key.eventType !== "press" || !key.ctrl || key.name !== "v") return;
+    key.preventDefault();
+    key.stopPropagation();
+    void props.onPasteShortcut().then((pasted) => {
+      if (pasted) insertPromptText(pasted);
+    });
+  }, [insertPromptText, props.onPasteShortcut]);
   const maxCommandItems = props.maxCommandItems ?? DEFAULT_COMMAND_LIST_MAX_ITEMS;
   const compactCommands = props.width < 72;
   const height = promptComposerHeight({
@@ -77,6 +104,8 @@ export function PromptComposer(props: {
             cursorColor={colors.input.cursor}
             cursorStyle={{ style: "block", blinking: true }}
             onInput={handlePromptInput}
+            onPaste={handlePromptPaste}
+            onKeyDown={handlePromptKeyDown}
             onChange={props.onPromptChange}
             onSubmit={props.onSubmit}
           />

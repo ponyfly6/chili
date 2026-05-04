@@ -7,7 +7,7 @@ import { FileAuthStorage, loginOpenAICodex, OPENAI_CODEX_PROVIDER_ID } from "@ch
 import { discoverSkills, updateSkillDisabledSetting, type SkillSettingsScope, type SkillSummary } from "@chili/skills";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { cleanClipboardText, promptClipboardText, promptPasteBytes, systemClipboard, type ClipboardAccess } from "./clipboard.js";
+import { cleanClipboardText, promptClipboardText, systemClipboard, type ClipboardAccess } from "./clipboard.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import { teamLiveModel, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
 import { useChatRuntime, type ChatApprovalGrantScope, type ChatRuntimeState } from "./useChatRuntime.js";
@@ -291,12 +291,6 @@ export function ChatShellSurface(props: {
     acceptedCompletionPromptRef.current = value;
     setAcceptedCompletionPrompt(value);
   }, []);
-  const appendPromptText = useCallback((value: string) => {
-    updateAcceptedCompletionPrompt(undefined);
-    historyPromptValueRef.current = undefined;
-    history.resetNavigation();
-    setPrompt((current) => `${current}${value}`);
-  }, [history, setPrompt, updateAcceptedCompletionPrompt]);
   const handlePromptChange = useCallback((value: string) => {
     if (value !== acceptedCompletionPromptRef.current) updateAcceptedCompletionPrompt(undefined);
     if (historyPromptValueRef.current === value) {
@@ -573,6 +567,14 @@ export function ChatShellSurface(props: {
           : undefined;
   const promptDisabled = Boolean(disabledReason);
   const clipboard = props.clipboard ?? systemClipboard;
+  const readPromptClipboard = useCallback(async () => {
+    const pasted = promptClipboardText(await clipboard.readText().catch(() => "") ?? "");
+    if (!pasted) {
+      appendLocalItem("error", "Clipboard is empty.");
+      return undefined;
+    }
+    return pasted;
+  }, [appendLocalItem, clipboard]);
 
   useEffect(() => {
     const previous = previousTranscriptLineCount.current;
@@ -582,10 +584,6 @@ export function ChatShellSurface(props: {
     if (delta <= 0) return;
     setTranscriptScrollOffset((current) => current > 0 ? current + delta : current);
   }, [transcriptLineCount]);
-
-  // Note: We no longer intercept paste events here to let the input component
-  // handle cursor position correctly. The input component naturally places
-  // the cursor after the pasted text, which is the expected behavior.
 
   useEffect(() => {
     const handleSelection = (selection: Selection) => {
@@ -634,9 +632,6 @@ export function ChatShellSurface(props: {
       setView((current) => current === "transcript" ? "chat" : "transcript");
       return;
     }
-    // Note: We no longer intercept paste shortcuts here to let the input component
-    // handle cursor position correctly. The input component naturally places
-    // the cursor after the pasted text, which is the expected behavior.
     if (view === "team") {
       if (isEscape(key)) setView("chat");
       return;
@@ -844,6 +839,7 @@ export function ChatShellSurface(props: {
           prompt={prompt}
           focused={view === "chat" && !paletteOpen && !themePicker && !modelPicker && !reasoningPicker && !permissionsPicker && !disabledReason}
           onPromptChange={handlePromptChange}
+          onPasteShortcut={readPromptClipboard}
           onSubmit={() => {
             if (submitAuthManualInput()) return;
             if (runSelectedSkillCompletion()) return;
@@ -882,6 +878,7 @@ export function ChatShellSurface(props: {
           prompt={prompt}
           focused={view === "chat" && !paletteOpen && !themePicker && !modelPicker && !reasoningPicker && !permissionsPicker && !disabledReason}
           onPromptChange={handlePromptChange}
+          onPasteShortcut={readPromptClipboard}
           onSubmit={() => {
             if (submitAuthManualInput()) return;
             if (runSelectedSkillCompletion()) return;
@@ -942,6 +939,7 @@ function HomeScreen(props: {
   prompt: string;
   focused: boolean;
   onPromptChange: (value: string) => void;
+  onPasteShortcut: () => Promise<string | undefined>;
   onSubmit: () => void;
   completions: readonly SlashCompletion[];
   completionOpen: boolean;
@@ -997,6 +995,7 @@ function HomeScreen(props: {
           disabledReason={props.disabledReason}
           focused={props.focused}
           onPromptChange={props.onPromptChange}
+          onPasteShortcut={props.onPasteShortcut}
           onSubmit={props.onSubmit}
           completions={props.completions}
           completionOpen={props.completionOpen}
@@ -1024,6 +1023,7 @@ function SessionScreen(props: {
   prompt: string;
   focused: boolean;
   onPromptChange: (value: string) => void;
+  onPasteShortcut: () => Promise<string | undefined>;
   onSubmit: () => void;
   onTranscriptScroll: (event: MouseEvent) => void;
   localItems: readonly LocalTranscriptItem[];
@@ -1134,6 +1134,7 @@ function SessionScreen(props: {
           disabledReason={props.disabledReason}
           focused={props.focused}
           onPromptChange={props.onPromptChange}
+          onPasteShortcut={props.onPasteShortcut}
           onSubmit={props.onSubmit}
           completions={props.completions}
           completionOpen={props.completionOpen}
@@ -1476,7 +1477,7 @@ function skillCompletions(skills: readonly SkillSummary[], query: string): Skill
     .slice(0, 8)
     .map((skill) => ({
       value: `${skill.name}`,
-      label: `${skill.name}`,
+      label: `$${skill.name}`,
       description: skillDescription(skill),
       category: "skills",
       skill,

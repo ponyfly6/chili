@@ -13,15 +13,6 @@ import {
 export function createDefaultSlashCommands(): SlashCommand[] {
   return [
     {
-      name: "goal",
-      description: "Set or control a persistent goal",
-      category: "session",
-      argumentHint: "[pause|resume|clear|--budget 50k|objective]",
-      isSafeConcurrent: true,
-      complete: goalCompletions,
-      run: (_ctx, args) => goalResult(args),
-    },
-    {
       name: "team",
       description: "Open the team cockpit",
       category: "team",
@@ -61,6 +52,15 @@ export function createDefaultSlashCommands(): SlashCommand[] {
       category: "model",
       isSafeConcurrent: true,
       run: () => ({ type: "set_hide_thinking", hidden: false }),
+    },
+    {
+      name: "goal",
+      description: "Set or control a persistent goal",
+      category: "session",
+      argumentHint: "[pause|resume|clear|--budget 50k|objective]",
+      isSafeConcurrent: true,
+      complete: goalCompletions,
+      run: (_ctx, args) => goalResult(args),
     },
     {
       name: "clear",
