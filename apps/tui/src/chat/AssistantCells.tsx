@@ -1,7 +1,7 @@
 import { Lexer, type Token, type Tokens } from "marked";
 import type { TuiTheme } from "../theme/index.js";
 import { TranscriptLines, type TranscriptLineModel } from "./lines.js";
-import { textContentHash, wrapTerminalText, type MarkdownLineTone } from "./markdown.js";
+import { markdownTableToTerminalLines, textContentHash, wrapTerminalText, type MarkdownLineTone } from "./markdown.js";
 import { historyRenderModel } from "./render-model.js";
 import { splitStreamingMarkdown } from "./streaming.js";
 
@@ -332,26 +332,17 @@ class AssistantRichMarkdownRenderer {
 
   private renderTable(token: Tokens.Table): void {
     const blockKey = this.nextBlockKey("table");
-    const header = token.header.map((cell) => inlineText(cell.tokens, cell.text));
-    const lines: TranscriptLineModel[] = [
-      ...this.wrapText(tableRow(header), {
-        key: `${blockKey}:header`,
-        fg: this.theme.colors.text.secondary,
-        hangingIndent: "    ",
-      }),
-      ...this.wrapText(tableRow(header.map((cell) => "-".repeat(Math.max(3, Math.min(12, cell.length))))), {
-        key: `${blockKey}:rule`,
-        fg: this.theme.colors.text.disabled,
-        hangingIndent: "    ",
-      }),
-    ];
-    for (const [index, row] of token.rows.entries()) {
-      lines.push(...this.wrapText(tableRow(row.map((cell) => inlineText(cell.tokens, cell.text))), {
-        key: `${blockKey}:row:${index}`,
-        fg: this.theme.colors.text.secondary,
-        hangingIndent: "    ",
-      }));
-    }
+    const lines = markdownTableToTerminalLines(token, {
+      key: blockKey,
+      width: this.width,
+      ...(this.usedPrefix ? {} : { prefix: "🌶️: " }),
+      hangingIndent: "    ",
+    }).map((line) => ({
+      key: line.key,
+      text: line.text,
+      fg: markdownFg(line.tone, this.theme),
+    }));
+    if (lines.length > 0) this.usedPrefix = true;
     this.pushBlock("table", lines);
   }
 
@@ -443,10 +434,6 @@ function blockPlainLines(token: Token): string[] {
   if ("tokens" in token && Array.isArray(token.tokens)) return token.tokens.flatMap((item) => blockPlainLines(item));
   if ("text" in token && typeof token.text === "string") return token.text.split("\n");
   return [token.raw ?? ""];
-}
-
-function tableRow(cells: readonly string[]): string {
-  return `| ${cells.map((cell) => cell.replace(/\s+/g, " ").trim()).join(" | ")} |`;
 }
 
 function stripHtml(value: string): string {

@@ -4,7 +4,7 @@ import { act } from "react";
 import type { ChatSessionView, ChatTranscriptItem } from "@chili/sdk";
 import type { MessageId, PartId, ToolCallId } from "@chili/protocol";
 import { resolveTuiTheme } from "../theme/index.js";
-import { markdownToTerminalLines, type MarkdownRenderOptions, type MarkdownTerminalLine } from "./markdown.js";
+import { charDisplayWidth, markdownToTerminalLines, type MarkdownRenderOptions, type MarkdownTerminalLine } from "./markdown.js";
 import { MessageList } from "./MessageList.js";
 import { buildChatDisplayItems } from "./presentation.js";
 import { HistoryRenderModel } from "./render-model.js";
@@ -39,7 +39,54 @@ test("assistant markdown renders readable terminal lines", () => {
   expect(text).toContain("const ok = true;");
   expect(text).toContain("> compact by default");
   expect(text).toContain("docs (https://example.test)");
-  expect(text).toContain("| A | B |");
+  expect(text).toContain("| A   | B   |");
+});
+
+test("assistant markdown renders aligned terminal tables", () => {
+  const markdown = [
+    "| Name | Count | State |",
+    "| :--- | ---: | :---: |",
+    "| alpha | 7 | ok |",
+    "| longer name | 1234 | hold |",
+  ].join("\n");
+
+  const lines = markdownToTerminalLines(markdown, {
+    key: "markdown-table",
+    width: 80,
+    prefix: "AI: ",
+    hangingIndent: "    ",
+  });
+  const text = lines.map((line) => line.text);
+
+  expect(text).toEqual([
+    "AI: | Name        | Count | State |",
+    "    | :---------- | ----: | :---: |",
+    "    | alpha       |     7 |  ok   |",
+    "    | longer name |  1234 | hold  |",
+  ]);
+  expect(lines[1]?.tone).toBe("muted");
+  expect(text.every((line) => displayWidth(line) <= 80)).toBe(true);
+});
+
+test("assistant markdown table falls back to readable rows when narrow", () => {
+  const markdown = [
+    "| Name | Count | State |",
+    "| :--- | ---: | :---: |",
+    "| alpha | 7 | ok |",
+  ].join("\n");
+
+  const text = markdownToTerminalLines(markdown, {
+    key: "markdown-table-narrow",
+    width: 22,
+    prefix: "AI: ",
+    hangingIndent: "    ",
+  }).map((line) => line.text);
+
+  expect(text).toEqual([
+    "AI: - Name: alpha",
+    "      Count: 7",
+    "      State: ok",
+  ]);
 });
 
 test("streaming assistant plain text keeps the active tail line separate", async () => {
@@ -665,6 +712,10 @@ function chatView(items: readonly ChatTranscriptItem[], options: { status?: Chat
 
 function occurrences(value: string, needle: string): number {
   return value.split(needle).length - 1;
+}
+
+function displayWidth(value: string): number {
+  return [...value].reduce((sum, char) => sum + charDisplayWidth(char), 0);
 }
 
 function countingMarkdownRenderer(calls: string[]): (text: string, options: MarkdownRenderOptions) => MarkdownTerminalLine[] {

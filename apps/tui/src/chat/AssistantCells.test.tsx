@@ -95,6 +95,42 @@ test("assistant markdown cell renders rich heading list code diff and quote bloc
   expect(diffBlock?.lines.find((line) => line.text.includes("-old"))?.fg).toBe(theme.colors.status.error);
 });
 
+test("assistant markdown cell renders rich aligned table blocks", async () => {
+  const text = [
+    "| Name | Count | State |",
+    "| :--- | ---: | :---: |",
+    "| alpha | 7 | ok |",
+    "| longer name | 1234 | hold |",
+  ].join("\n");
+  const fallbackLines = assistantTextCellLines({
+    key: "assistant:table",
+    text,
+    streaming: false,
+    width: 80,
+    theme,
+  });
+  const blocks = assistantMarkdownBlocks({
+    cellKey: "assistant:table",
+    text,
+    streaming: false,
+    width: 80,
+    theme,
+  });
+  const frame = await renderAssistantMarkdownCell({
+    cellKey: "assistant:table",
+    text,
+    streaming: false,
+    width: 80,
+    fallbackLines,
+  });
+
+  expect(blocks.map((block) => block.kind)).toEqual(["table"]);
+  expect(blocks[0]?.lines.map((line) => line.text)).toEqual(fallbackLines.map((line) => line.text));
+  expect(frame).toContain("🌶️: | Name        | Count | State |");
+  expect(frame).toContain("    | alpha       |     7 |  ok   |");
+  expect(blocks[0]?.lines[1]?.fg).toBe(theme.colors.text.muted);
+});
+
 test("assistant rich markdown cache hits for repeated completed content", () => {
   const input = {
     cellKey: "assistant:cache-hit",

@@ -20,6 +20,8 @@ export interface MarkdownRenderOptions {
   hangingIndent?: string;
 }
 
+type MarkdownTableAlign = "center" | "left" | "right" | null;
+
 const MAX_CACHE_ENTRIES = 80;
 const markdownLineCache = new Map<string, { source: string; lines: MarkdownTerminalLine[] }>();
 
@@ -139,6 +141,18 @@ export function charDisplayWidth(char: string): number {
   return 1;
 }
 
+export function markdownTableToTerminalLines(token: Tokens.Table, options: MarkdownRenderOptions): MarkdownTerminalLine[] {
+  return terminalTableLines({
+    key: options.key,
+    width: options.width,
+    ...(options.prefix === undefined ? {} : { prefix: options.prefix }),
+    ...(options.hangingIndent === undefined ? {} : { hangingIndent: options.hangingIndent }),
+    header: token.header.map((cell) => inlineText(cell.tokens, cell.text)),
+    align: token.align.length > 0 ? token.align : token.header.map((cell) => cell.align),
+    rows: token.rows.map((row) => row.map((cell) => inlineText(cell.tokens, cell.text))),
+  });
+}
+
 class MarkdownLineRenderer {
   readonly lines: MarkdownTerminalLine[] = [];
   private usedPrefix = false;
@@ -214,12 +228,16 @@ class MarkdownLineRenderer {
   }
 
   private renderTable(token: Tokens.Table): void {
-    const header = token.header.map((cell) => inlineText(cell.tokens, cell.text));
-    this.emit(tableRow(header), "text");
-    this.emit(tableRow(header.map((cell) => "-".repeat(Math.max(3, Math.min(12, cell.length))))), "muted");
-    for (const row of token.rows) {
-      this.emit(tableRow(row.map((cell) => inlineText(cell.tokens, cell.text))), "text");
-    }
+    const key = `${this.options.key}:md:${this.blockIndex}`;
+    this.blockIndex += 1;
+    const lines = markdownTableToTerminalLines(token, {
+      key,
+      width: this.options.width,
+      ...(this.usedPrefix || this.options.prefix === undefined ? {} : { prefix: this.options.prefix }),
+      ...(this.options.hangingIndent === undefined ? {} : { hangingIndent: this.options.hangingIndent }),
+    });
+    this.lines.push(...lines);
+    if (lines.length > 0) this.usedPrefix = true;
   }
 
   private emit(text: string, tone: MarkdownLineTone, hangingIndent = this.options.hangingIndent ?? ""): void {
@@ -273,12 +291,157 @@ function blockPlainLines(token: Token): string[] {
   return [token.raw ?? ""];
 }
 
-function tableRow(cells: readonly string[]): string {
-  return `| ${cells.map((cell) => cell.replace(/\s+/g, " ").trim()).join(" | ")} |`;
-}
-
 function stripHtml(value: string): string {
   return value.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+}
+
+interface TerminalTableInput {
+  key: string;
+  width: number;
+  prefix?: string;
+  hangingIndent?: string;
+  header: readonly string[];
+  align: readonly MarkdownTableAlign[];
+  rows: readonly (readonly string[])[];
+}
+
+function terminalTableLines(table: TerminalTableInput): MarkdownTerminalLine[] {
+  const columnCount = Math.max(table.header.length, table.align.length, ...table.rows.map((row) => row.length));
+  if (columnCount === 0) return [];
+
+  const header = normalizeTableRow(table.header, columnCount);
+  const rows = table.rows.map((row) => normalizeTableRow(row, columnCount));
+  const align = Array.from({ length: columnCount }, (_, index) => table.align[index] ?? null);
+  const firstPrefix = table.prefix ?? "";
+  const restPrefix = firstPrefix.length > 0 ? table.hangingIndent ?? "" : "";
+  const prefixWidth = Math.max(displayWidth(firstPrefix), displayWidth(restPrefix));
+  const contentWidth = Math.max(8, table.width - prefixWidth);
+  const columnWidths = fittedTableColumnWidths([header, ...rows], contentWidth);
+
+  const rendered = columnWidths
+    ? [
+      { text: renderTableRow(header, columnWidths, align, false), tone: "text" as const },
+      { text: renderTableRule(columnWidths, align), tone: "muted" as const },
+      ...rows.map((row) => ({ text: renderTableRow(row, columnWidths, align, false), tone: "text" as const })),
+    ]
+    : stackedTableRows(header, rows);
+
+  return rendered.flatMap((line, index) => wrapTerminalText(line.text, {
+    key: `${table.key}:table:${index}`,
+    width: table.width,
+    tone: line.tone,
+    ...(index === 0
+      ? (firstPrefix.length > 0 ? { prefix: firstPrefix } : {})
+      : (restPrefix.length > 0 ? { prefix: restPrefix } : {})),
+    ...(restPrefix.length > 0 ? { hangingIndent: restPrefix } : table.hangingIndent === undefined ? {} : { hangingIndent: table.hangingIndent }),
+  }));
+}
+
+function fittedTableColumnWidths(rows: readonly (readonly string[])[], width: number): number[] | undefined {
+  const columnCount = rows[0]?.length ?? 0;
+  if (columnCount === 0) return [];
+  const separatorWidth = 4 + Math.max(0, columnCount - 1) * 3;
+  const available = width - separatorWidth;
+  if (available < columnCount * 3) return undefined;
+
+  const widths = Array.from({ length: columnCount }, (_, index) => {
+    const desired = Math.max(3, ...rows.map((row) => displayWidth(row[index] ?? "")));
+    return desired;
+  });
+  while (widths.reduce((sum, item) => sum + item, separatorWidth) > width) {
+    let widestIndex = -1;
+    let widest = 3;
+    for (const [index, value] of widths.entries()) {
+      if (value > widest) {
+        widest = value;
+        widestIndex = index;
+      }
+    }
+    if (widestIndex < 0) return undefined;
+    widths[widestIndex] = widest - 1;
+  }
+  return widths;
+}
+
+function renderTableRow(
+  cells: readonly string[],
+  widths: readonly number[],
+  align: readonly MarkdownTableAlign[],
+  rule: boolean,
+): string {
+  return `| ${cells.map((cell, index) => {
+    if (rule) return cell;
+    return alignCell(cell, widths[index] ?? 3, align[index] ?? null);
+  }).join(" | ")} |`;
+}
+
+function renderTableRule(widths: readonly number[], align: readonly MarkdownTableAlign[]): string {
+  return renderTableRow(widths.map((width, index) => ruleCell(width, align[index] ?? null)), widths, align, true);
+}
+
+function ruleCell(width: number, align: MarkdownTableAlign): string {
+  const safeWidth = Math.max(3, width);
+  if (align === "right") return `${"-".repeat(safeWidth - 1)}:`;
+  if (align === "center") return `:${"-".repeat(safeWidth - 2)}:`;
+  if (align === "left") return `:${"-".repeat(safeWidth - 1)}`;
+  return "-".repeat(safeWidth);
+}
+
+function alignCell(value: string, width: number, align: MarkdownTableAlign): string {
+  const text = truncateDisplay(cleanTableCell(value), width);
+  const remaining = Math.max(0, width - displayWidth(text));
+  if (align === "right") return `${" ".repeat(remaining)}${text}`;
+  if (align === "center") {
+    const left = Math.floor(remaining / 2);
+    return `${" ".repeat(left)}${text}${" ".repeat(remaining - left)}`;
+  }
+  return `${text}${" ".repeat(remaining)}`;
+}
+
+function stackedTableRows(
+  header: readonly string[],
+  rows: readonly (readonly string[])[],
+): { text: string; tone: MarkdownLineTone }[] {
+  if (rows.length === 0) return [{ text: header.join(" | "), tone: "text" }];
+  return rows.flatMap((row) => row.map((cell, cellIndex) => ({
+    text: `${cellIndex === 0 ? "- " : "  "}${tableHeaderLabel(header[cellIndex], cellIndex)}: ${cleanTableCell(cell) || " "}`,
+    tone: "text" as const,
+  })));
+}
+
+function tableHeaderLabel(value: string | undefined, index: number): string {
+  const label = cleanTableCell(value ?? "");
+  return label.length > 0 ? label : `Column ${index + 1}`;
+}
+
+function normalizeTableRow(row: readonly string[], columnCount: number): string[] {
+  return Array.from({ length: columnCount }, (_, index) => cleanTableCell(row[index] ?? ""));
+}
+
+function cleanTableCell(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function displayWidth(value: string): number {
+  let width = 0;
+  for (const char of value) width += charDisplayWidth(char);
+  return width;
+}
+
+function truncateDisplay(value: string, width: number): string {
+  if (displayWidth(value) <= width) return value;
+  if (width <= 0) return "";
+  const suffix = width > 3 ? "..." : "";
+  const limit = Math.max(0, width - displayWidth(suffix));
+  let result = "";
+  let used = 0;
+  for (const char of value) {
+    const charWidth = charDisplayWidth(char);
+    if (used + charWidth > limit) break;
+    result += char;
+    used += charWidth;
+  }
+  return `${result}${suffix}`;
 }
 
 function markdownCacheKey(source: string, options: MarkdownRenderOptions): string {
