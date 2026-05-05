@@ -49,10 +49,38 @@ export interface ChiliToolExecutionContext extends ToolExecutionContext {
   visibleTools?: () => Promise<ChiliToolDefinition[]> | ChiliToolDefinition[];
 }
 
+export interface ToolRegistryEntry {
+  tool: ChiliToolDefinition;
+  source?: string;
+}
+
+export interface ToolRegistryRegisterOptions {
+  source?: string;
+  replace?: boolean;
+}
+
+export interface ToolRegistrySelector {
+  source?: string;
+  namePrefix?: string;
+}
+
+export interface ToolRegistryListOptions {
+  includeDeferred?: boolean;
+}
+
 export interface ToolRegistry {
-  register(tool: ChiliToolDefinition): void;
+  register(tool: ChiliToolDefinition, options?: ToolRegistryRegisterOptions): void;
   get(name: string): ChiliToolDefinition | undefined;
-  list(): ChiliToolDefinition[];
+  list(options?: ToolRegistryListOptions): ChiliToolDefinition[];
+  entries?(options?: ToolRegistryListOptions): ToolRegistryEntry[];
+}
+
+export interface MutableToolRegistry extends ToolRegistry {
+  unregister(name: string): boolean;
+  unregisterMatching(selector: ToolRegistrySelector): ChiliToolDefinition[];
+  unregisterSource(source: string): ChiliToolDefinition[];
+  replaceMatching(selector: ToolRegistrySelector, tools: readonly ChiliToolDefinition[], options?: ToolRegistryRegisterOptions): ChiliToolDefinition[];
+  replaceSource(source: string, tools: readonly ChiliToolDefinition[]): ChiliToolDefinition[];
 }
 
 export interface ToolEventSink {

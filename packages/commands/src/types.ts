@@ -1,4 +1,4 @@
-export type CommandSource = "project" | "user";
+export type CommandSource = "project" | "user" | "mcp";
 
 export type CommandArgumentMode = "none" | "optional" | "required" | "variadic";
 

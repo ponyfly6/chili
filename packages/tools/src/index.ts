@@ -7,6 +7,7 @@ export * from "./builtins/glob.js";
 export * from "./builtins/grep.js";
 export * from "./builtins/git-diff.js";
 export * from "./builtins/goal.js";
+export * from "./builtins/mcp-resources.js";
 export * from "./builtins/read-file.js";
 export * from "./builtins/task.js";
 export * from "./builtins/team.js";

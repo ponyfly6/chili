@@ -4,3 +4,4 @@ export * from "./resolve.js";
 export * from "./completion.js";
 export * from "./project-loader.js";
 export * from "./template.js";
+export * from "./mcp-prompts.js";
