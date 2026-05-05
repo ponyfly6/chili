@@ -184,3 +184,58 @@ test("parses skills commands", () => {
     skillName: "reviewer",
   });
 });
+
+test("parses mcp management commands", () => {
+  expect(parseArgs(["mcp"])).toMatchObject({
+    command: "mcp",
+    mcpAction: "list",
+  });
+  expect(parseArgs(["mcp", "status", "github", "--json"])).toMatchObject({
+    command: "mcp",
+    mcpAction: "status",
+    mcpServer: "github",
+    json: true,
+  });
+  expect(parseArgs(["mcp", "reload", "--json"])).toMatchObject({
+    command: "mcp",
+    mcpAction: "reload",
+    json: true,
+  });
+  expect(parseArgs([
+    "mcp",
+    "add",
+    "filesystem",
+    "--transport",
+    "stdio",
+    "--command",
+    "npx",
+    "--arg",
+    "-y",
+    "--arg",
+    "@modelcontextprotocol/server-filesystem",
+    "--env",
+    "ROOT=/repo",
+    "--disabled",
+  ])).toMatchObject({
+    command: "mcp",
+    mcpAction: "add",
+    mcpServer: "filesystem",
+    mcpTransport: "stdio",
+    mcpCommand: "npx",
+    mcpArgs: ["-y", "@modelcontextprotocol/server-filesystem"],
+    mcpEnv: { ROOT: "/repo" },
+    mcpEnabled: false,
+  });
+  expect(parseArgs(["mcp", "auth", "github", "--callback-url", "http://localhost/callback", "--scope", "repo"])).toMatchObject({
+    command: "mcp",
+    mcpAction: "auth",
+    mcpServer: "github",
+    mcpCallbackUrl: "http://localhost/callback",
+    mcpScopes: ["repo"],
+  });
+  expect(parseArgs(["mcp", "remove", "github"])).toMatchObject({
+    command: "mcp",
+    mcpAction: "remove",
+    mcpServer: "github",
+  });
+});

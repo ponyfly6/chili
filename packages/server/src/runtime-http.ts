@@ -8,6 +8,17 @@ import type {
   RuntimeInterruptResult,
   RuntimeModelConfig,
   RuntimeModelDescriptor,
+  RuntimeMcpAddServerRequest,
+  RuntimeMcpAuthRequest,
+  RuntimeMcpAuthResponse,
+  RuntimeMcpListResponse,
+  RuntimeMcpLogoutResponse,
+  RuntimeMcpReloadResponse,
+  RuntimeMcpRemoveServerResponse,
+  RuntimeMcpServerDescriptor,
+  RuntimeMcpStatusResponse,
+  RuntimeMcpToolsResponse,
+  RuntimeMcpTransport,
   RuntimePermissionConfig,
   RuntimePermissionProfileId,
   RuntimeApprovalResolveResult,
@@ -138,6 +149,18 @@ export interface RuntimeTeamMergeService {
   mergeTeamTasks(input: TeamMergeInput): Promise<TeamMergeSweepResult>;
 }
 
+export interface RuntimeMcpControlService {
+  list(): Promise<RuntimeMcpListResponse>;
+  status?(): Promise<RuntimeMcpStatusResponse>;
+  get?(server: string): Promise<RuntimeMcpServerDescriptor | undefined>;
+  reload?(): Promise<RuntimeMcpReloadResponse>;
+  add?(input: RuntimeMcpAddServerRequest): Promise<RuntimeMcpServerDescriptor>;
+  remove?(server: string): Promise<RuntimeMcpRemoveServerResponse>;
+  tools?(server: string): Promise<RuntimeMcpToolsResponse>;
+  auth?(server: string, input?: RuntimeMcpAuthRequest): Promise<RuntimeMcpAuthResponse>;
+  logout?(server: string): Promise<RuntimeMcpLogoutResponse>;
+}
+
 export interface RuntimeHttpHandlerOptions {
   service: RuntimeHttpService;
   store: EventStore & EventPublisher;
@@ -150,6 +173,7 @@ export interface RuntimeHttpHandlerOptions {
   approvals?: ApprovalResolver;
   permissions?: PermissionProfileControl;
   commands?: PromptCommandControl;
+  mcp?: RuntimeMcpControlService;
   maxBacklogEvents?: number;
   onBackgroundError?: (error: unknown) => void;
 }
@@ -217,6 +241,60 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "commandsReload") {
         return json(await requireCommandControl(options).reload());
+      }
+
+      if (route.name === "mcpList") {
+        return json(await requireMcpControl(options).list());
+      }
+
+      if (route.name === "mcpStatus") {
+        const mcp = requireMcpControl(options);
+        return json(mcp.status ? await mcp.status() : statusFromMcpList(await mcp.list()));
+      }
+
+      if (route.name === "mcpReload") {
+        const mcp = requireMcpControl(options);
+        if (!mcp.reload) return jsonError(501, "No MCP reload controller is configured");
+        return json(await mcp.reload());
+      }
+
+      if (route.name === "mcpAdd") {
+        const mcp = requireMcpControl(options);
+        if (!mcp.add) return jsonError(501, "No MCP add controller is configured");
+        const body = await readJson<McpAddBody>(request);
+        const input = mcpAddInput(body);
+        if (mcpAddCreatesStdioServer(input)) {
+          return jsonError(403, "Adding stdio MCP servers over HTTP is disabled because it can execute local commands.");
+        }
+        return json(await mcp.add(input), 201);
+      }
+
+      if (route.name === "mcpServer") {
+        return json(await mcpServerDescriptor(requireMcpControl(options), route.server));
+      }
+
+      if (route.name === "mcpRemove") {
+        const mcp = requireMcpControl(options);
+        if (!mcp.remove) return jsonError(501, "No MCP remove controller is configured");
+        return json(await mcp.remove(route.server));
+      }
+
+      if (route.name === "mcpTools") {
+        const mcp = requireMcpControl(options);
+        if (!mcp.tools) return jsonError(501, "No MCP tools controller is configured");
+        return json(await mcp.tools(route.server));
+      }
+
+      if (route.name === "mcpAuth") {
+        const mcp = requireMcpControl(options);
+        if (!mcp.auth) return jsonError(501, "No MCP auth controller is configured");
+        return json(await mcp.auth(route.server, mcpAuthInput(await readJson<McpAuthBody>(request))));
+      }
+
+      if (route.name === "mcpLogout") {
+        const mcp = requireMcpControl(options);
+        if (!mcp.logout) return jsonError(501, "No MCP logout controller is configured");
+        return json(await mcp.logout(route.server));
       }
 
       if (route.name === "listTasks") {
@@ -609,6 +687,15 @@ type Route =
   | { name: "setPermissions" }
   | { name: "commands" }
   | { name: "commandsReload" }
+  | { name: "mcpList" }
+  | { name: "mcpStatus" }
+  | { name: "mcpReload" }
+  | { name: "mcpAdd" }
+  | { name: "mcpServer"; server: string }
+  | { name: "mcpRemove"; server: string }
+  | { name: "mcpTools"; server: string }
+  | { name: "mcpAuth"; server: string }
+  | { name: "mcpLogout"; server: string }
   | { name: "agentTree" }
   | { name: "agentRuns" }
   | { name: "mailbox" }
@@ -694,6 +781,24 @@ interface GoalBody {
 
 interface PermissionsBody {
   profile?: unknown;
+}
+
+interface McpAddBody {
+  name?: unknown;
+  transport?: unknown;
+  command?: unknown;
+  args?: unknown;
+  env?: unknown;
+  cwd?: unknown;
+  url?: unknown;
+  headers?: unknown;
+  description?: unknown;
+  enabled?: unknown;
+}
+
+interface McpAuthBody {
+  callbackUrl?: unknown;
+  scopes?: unknown;
 }
 
 interface TaskFollowupBody {
@@ -853,9 +958,25 @@ function routeRequest(method: string, pathname: string): Route {
   if (method === "GET" && path === "/models") return { name: "models" };
   if (method === "GET" && path === "/commands") return { name: "commands" };
   if (method === "POST" && path === "/commands/reload") return { name: "commandsReload" };
+  if (method === "GET" && path === "/mcp") return { name: "mcpList" };
+  if (method === "POST" && path === "/mcp") return { name: "mcpAdd" };
+  if (method === "GET" && path === "/mcp/status") return { name: "mcpStatus" };
+  if (method === "POST" && path === "/mcp/reload") return { name: "mcpReload" };
   if (method === "GET" && path === "/tasks") return { name: "listTasks" };
   if (method === "POST" && path === "/tasks/reconcile_stale") return { name: "tasksReconcileStale" };
   if (method === "POST" && path === "/sessions") return { name: "createSession" };
+
+  const mcpRoute = /^\/mcp\/([^/]+)(?:\/([^/]+))?$/.exec(path);
+  if (mcpRoute) {
+    const server = decodeURIComponent(mcpRoute[1] ?? "");
+    const action = mcpRoute[2];
+    if (method === "GET" && !action) return { name: "mcpServer", server };
+    if (method === "DELETE" && !action) return { name: "mcpRemove", server };
+    if (method === "GET" && action === "tools") return { name: "mcpTools", server };
+    if (method === "POST" && action === "auth") return { name: "mcpAuth", server };
+    if (method === "POST" && action === "logout") return { name: "mcpLogout", server };
+    return { name: "notFound" };
+  }
 
   const mailboxRoute = /^\/mailbox\/([^/]+)\/consume$/.exec(path);
   if (method === "POST" && mailboxRoute) {
@@ -1037,6 +1158,28 @@ function optionalPositiveInteger(value: unknown, field: string): number | undefi
     throw badRequest(`${field} must be a positive integer`);
   }
   return value;
+}
+
+function stringField(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) throw badRequest(`${field} must be a non-empty string`);
+  return value.trim();
+}
+
+function stringArrayField(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) {
+    throw badRequest(`${field} must be an array of strings`);
+  }
+  return value;
+}
+
+function stringRecordField(value: unknown, field: string): Record<string, string> {
+  if (!isRecord(value) || Array.isArray(value)) throw badRequest(`${field} must be an object of strings`);
+  const result: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item !== "string") throw badRequest(`${field}.${key} must be a string`);
+    result[key] = item;
+  }
+  return result;
 }
 
 function parseSkillMentions(value: unknown): RuntimeSkillMention[] {
@@ -1396,6 +1539,32 @@ function requireCommandControl(options: RuntimeHttpHandlerOptions): PromptComman
   return options.commands;
 }
 
+function requireMcpControl(options: RuntimeHttpHandlerOptions): RuntimeMcpControlService {
+  if (!options.mcp) throw { status: 501, message: "No MCP control service is configured" } satisfies HttpError;
+  return options.mcp;
+}
+
+async function mcpServerDescriptor(control: RuntimeMcpControlService, server: string): Promise<RuntimeMcpServerDescriptor> {
+  const descriptor = control.get
+    ? await control.get(server)
+    : (await control.list()).servers.find((candidate) => candidate.name === server);
+  if (!descriptor) throw notFound(`MCP server not found: ${server}`);
+  return descriptor;
+}
+
+function statusFromMcpList(result: RuntimeMcpListResponse): RuntimeMcpStatusResponse {
+  return {
+    servers: result.servers,
+    summary: {
+      total: result.servers.length,
+      running: result.servers.filter((server) => server.status === "running").length,
+      disabled: result.servers.filter((server) => !server.enabled || server.status === "disabled").length,
+      authRequired: result.servers.filter((server) => server.status === "auth_required" || (server.auth?.required && !server.auth.authenticated)).length,
+      errored: result.servers.filter((server) => server.status === "error").length,
+    },
+  };
+}
+
 function requireAgentTree(options: RuntimeHttpHandlerOptions): RuntimeAgentTreeService {
   if (!options.agents) throw { status: 501, message: "No agent tree service is configured" } satisfies HttpError;
   return options.agents;
@@ -1429,6 +1598,42 @@ function teamContext(body: TeamContextBody): TeamEventContextInput {
 }
 
 type TeamEventContextInput = Pick<CreateTeamInput, "sessionId" | "threadId">;
+
+function mcpAddInput(body: McpAddBody): RuntimeMcpAddServerRequest {
+  if (typeof body.name !== "string" || body.name.trim().length === 0) throw badRequest("name is required");
+  const input: RuntimeMcpAddServerRequest = { name: body.name.trim() };
+  const transport = mcpTransport(body.transport);
+  if (transport) input.transport = transport;
+  if (body.command !== undefined) input.command = stringField(body.command, "command");
+  if (body.args !== undefined) input.args = stringArrayField(body.args, "args");
+  if (body.env !== undefined) input.env = stringRecordField(body.env, "env");
+  if (body.cwd !== undefined) input.cwd = stringField(body.cwd, "cwd");
+  if (body.url !== undefined) input.url = stringField(body.url, "url");
+  if (body.headers !== undefined) input.headers = stringRecordField(body.headers, "headers");
+  if (body.description !== undefined) input.description = stringField(body.description, "description");
+  if (body.enabled !== undefined) {
+    if (typeof body.enabled !== "boolean") throw badRequest("enabled must be a boolean");
+    input.enabled = body.enabled;
+  }
+  return input;
+}
+
+function mcpAddCreatesStdioServer(input: RuntimeMcpAddServerRequest): boolean {
+  return input.transport === "stdio" || input.command !== undefined;
+}
+
+function mcpAuthInput(body: McpAuthBody): RuntimeMcpAuthRequest {
+  const input: RuntimeMcpAuthRequest = {};
+  if (body.callbackUrl !== undefined) input.callbackUrl = stringField(body.callbackUrl, "callbackUrl");
+  if (body.scopes !== undefined) input.scopes = stringArrayField(body.scopes, "scopes");
+  return input;
+}
+
+function mcpTransport(value: unknown): RuntimeMcpTransport | undefined {
+  if (value === undefined) return undefined;
+  if (value === "stdio" || value === "http" || value === "sse") return value;
+  throw badRequest("transport must be stdio, http, or sse");
+}
 
 function teamCreateInput(body: TeamCreateBody): CreateTeamInput {
   const input: CreateTeamInput = {

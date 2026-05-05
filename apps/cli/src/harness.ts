@@ -19,11 +19,12 @@ import {
   chiliBasePromptFragment,
   createMemoryTool,
   defaultScopedWorkerPolicy,
+  mcpServerStatusPromptFragment,
   type PromptFragment,
   type RuntimePromptTurnContext,
   type WorkerToolPolicy,
 } from "@chili/core";
-import type { AgentPath, ApprovalDecision, EventEnvelope, ModelSelection, RuntimePermissionConfig, RuntimePermissionProfileId, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
+import type { AgentPath, ApprovalDecision, ChiliEvent, EventEnvelope, ModelSelection, RuntimePermissionConfig, RuntimePermissionProfileId, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
 import { ObservableEventStore, SessionTranscriptJsonlMirror, SqliteEventStore } from "@chili/store";
 import type { AgentMailboxRow, AgentTaskQuery, AgentTaskRow, TeamMemberRow, TeamMessageRow, TeamRow, TeamTaskRow } from "@chili/store";
 import {
@@ -49,6 +50,8 @@ import {
   createGoalTools,
   createGlobTool,
   createGrepTool,
+  createMcpResourceReadTool,
+  createMcpResourcesListTool,
   createReadFileTool,
   createTaskCloseTool,
   createTaskFollowupTool,
@@ -108,6 +111,7 @@ import { loadCliConfig, type CliConfig } from "./config.js";
 import { createIdFactory } from "./id.js";
 import type { CliModelName, CliReasoningLevel } from "./model.js";
 import { createCliModel, resolveCliRuntimeModelSelection } from "./model.js";
+import { createCliMcpRuntime, type CliMcpRuntime } from "./mcp-control.js";
 import { CliPrinter, PrintingEventStore } from "./printing-store.js";
 
 const DEV_MAX_TURNS = 128;
@@ -142,6 +146,7 @@ export interface CliHarness {
   teamRunner: TeamExecutionRunner;
   permissions: CliPermissionProfileControl;
   commands: PromptCommandControl;
+  mcp: import("@chili/server").RuntimeMcpControlService;
   recovery: SnapshotRecoveryService;
   defaultModelSelection?: ModelSelection;
   defaultReasoningLevel?: CliReasoningLevel;
@@ -160,7 +165,8 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
 
   const createId = createIdFactory();
   const chiliHome = options.chiliHome ?? defaultChiliHome();
-  const commands = createFilesystemPromptCommandControl({ cwd, chiliHome });
+  const baseCommands = createFilesystemPromptCommandControl({ cwd, chiliHome });
+  let commands: PromptCommandControl = baseCommands;
   let sqliteStore: SqliteEventStore;
   const sessionMirror = new SessionTranscriptJsonlMirror(join(chiliHome, "sessions"), {
     groupByCwd: true,
@@ -183,14 +189,22 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const permissions = createPermissionProfileControl(config, options.yes ? "full-access" : "default");
   const registry = createToolRegistry(skillRegistry);
   const childRegistry = createChildToolRegistry(skillRegistry);
-  const promptFragments = (context: { cwd: string; turn?: RuntimePromptTurnContext }) =>
-    buildCliPromptFragments({
+  let mcpRuntime: CliMcpRuntime | undefined;
+  const promptFragments = async (context: { cwd: string; turn?: RuntimePromptTurnContext }) => {
+    const fragments = await buildCliPromptFragments({
       cwd: context.cwd,
       skillRegistry,
       ...(context.turn ? { turn: context.turn } : {}),
     });
-  const childPromptFragments = (context: { sessionId: SessionId; threadId: ThreadId; cwd: string; turn?: RuntimePromptTurnContext }) =>
-    buildCliChildPromptFragments({
+    const mcpFragment = mcpRuntime ? mcpServerStatusPromptFragment((await mcpRuntime.control.status?.())?.servers.map((server) => ({
+      serverName: server.name,
+      status: server.status,
+      ...(server.error ? { detail: server.error } : {}),
+    })) ?? []) : undefined;
+    return mcpFragment ? [...fragments, mcpFragment] : fragments;
+  };
+  const childPromptFragments = async (context: { sessionId: SessionId; threadId: ThreadId; cwd: string; turn?: RuntimePromptTurnContext }) => {
+    const fragments = await buildCliChildPromptFragments({
       cwd: context.cwd,
       sessionId: context.sessionId,
       threadId: context.threadId,
@@ -198,6 +212,13 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
       store: eventStore,
       ...(context.turn ? { turn: context.turn } : {}),
     });
+    const mcpFragment = mcpRuntime ? mcpServerStatusPromptFragment((await mcpRuntime.control.status?.())?.servers.map((server) => ({
+      serverName: server.name,
+      status: server.status,
+      ...(server.error ? { detail: server.error } : {}),
+    })) ?? []) : undefined;
+    return mcpFragment ? [...fragments, mcpFragment] : fragments;
+  };
   const subagentPromptFragments = (context: { cwd: string }) => buildCliPromptFragments({ cwd: context.cwd, skillRegistry });
   const snapshotProvider = new FileSystemSnapshotProvider({
     rootDir: join(stateDir, "snapshots"),
@@ -205,7 +226,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   });
   const childToolExecutor = new ToolExecutor({
     registry: childRegistry,
-    events: { publish: (event) => eventStore.append(event) },
+    events: { publish: (event: ChiliEvent) => eventStore.append(event) },
     approvals: createApprovalBroker(options, config, permissions),
     policyResolver: childToolPolicyResolver,
     snapshotProvider,
@@ -390,6 +411,16 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   registerTeamTools(childRegistry, teamController);
   const teamDispatchController = createTeamTaskDispatchToolController(teamDispatcher);
   registerTeamDispatchTools(registry, teamDispatchController);
+  mcpRuntime = await createCliMcpRuntime({
+    cwd,
+    chiliHome,
+    registries: [registry, childRegistry],
+    events: { publish: (event: ChiliEvent) => eventStore.append(event) },
+    createId,
+  }, baseCommands);
+  commands = mcpRuntime.commands;
+  registerMcpResourceTools(registry, mcpRuntime);
+  registerMcpResourceTools(childRegistry, mcpRuntime);
 
   return {
     cwd,
@@ -406,15 +437,22 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     teamRunner,
     permissions,
     commands,
+    mcp: mcpRuntime.control,
     recovery,
     ...(runtimeModelSelection ? { defaultModelSelection: runtimeModelSelection } : {}),
     ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
     close: async () => {
       await mailboxPump.stop();
       await subagents.waitForBackgroundTasks();
+      await mcpRuntime?.close();
       sqliteStore.close();
     },
   };
+}
+
+function registerMcpResourceTools(registry: InMemoryToolRegistry, runtime: CliMcpRuntime): void {
+  registry.register(createMcpResourcesListTool(runtime.resources));
+  registry.register(createMcpResourceReadTool(runtime.resources));
 }
 
 export async function latestThreadId(store: SqliteEventStore, sessionId: SessionId): Promise<ThreadId | undefined> {

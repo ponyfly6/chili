@@ -2,7 +2,21 @@
 import { createInterface } from "node:readline/promises";
 import { addChiliMemoryEntry, loadChiliMemoryContext } from "@chili/core";
 import type { AgentTreeNode, TeamExecutionRunSummary, TeamMergeSweepResult, TeamSnapshot } from "@chili/core";
-import type { SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
+import type {
+  RuntimeMcpAddServerRequest,
+  RuntimeMcpAuthRequest,
+  RuntimeMcpAuthResponse,
+  RuntimeMcpListResponse,
+  RuntimeMcpLogoutResponse,
+  RuntimeMcpReloadResponse,
+  RuntimeMcpRemoveServerResponse,
+  RuntimeMcpServerDescriptor,
+  RuntimeMcpStatusResponse,
+  SessionId,
+  TaskId,
+  TeamId,
+  ThreadId,
+} from "@chili/protocol";
 import { ROOT_AGENT_PATH } from "@chili/protocol";
 import { startRuntimeHttpServer } from "@chili/server";
 import { loadSkillSettings, loadSkills, updateSkillDisabledSetting, type Skill } from "@chili/skills";
@@ -29,7 +43,7 @@ async function main(): Promise<void> {
   const harnessInput: Parameters<typeof createCliHarness>[0] = {
     cwd: args.cwd,
     yes: args.yes,
-    quiet: args.command === "sessions" || args.command === "prompt-debug" || args.json,
+    quiet: args.command === "sessions" || args.command === "prompt-debug" || args.command === "mcp" || args.json,
     ...(approvalQueue ? { approvalQueue } : {}),
   };
   if (args.provider !== undefined) harnessInput.provider = args.provider;
@@ -41,6 +55,11 @@ async function main(): Promise<void> {
     if (args.command === "serve") {
       if (!approvalQueue) throw new Error("approval queue was not initialized");
       await serve({ harness, approvalQueue, host: args.host, port: args.port });
+      return;
+    }
+
+    if (args.command === "mcp") {
+      await handleMcpCommand(harness, args);
       return;
     }
 
@@ -331,6 +350,7 @@ async function serve(input: {
   host: string;
   port: number;
 }): Promise<void> {
+  const mcp = mcpControl(input.harness);
   const server = startRuntimeHttpServer({
     service: input.harness.service,
     store: input.harness.events,
@@ -343,6 +363,7 @@ async function serve(input: {
     approvals: input.approvalQueue,
     permissions: input.harness.permissions,
     commands: input.harness.commands,
+    ...(mcp ? { mcp } : {}),
     hostname: input.host,
     port: input.port,
   });
@@ -360,6 +381,187 @@ async function serve(input: {
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
   });
+}
+
+interface CliMcpControl {
+  list(): Promise<RuntimeMcpListResponse>;
+  status?(): Promise<RuntimeMcpStatusResponse>;
+  reload?(): Promise<RuntimeMcpReloadResponse>;
+  add?(input: RuntimeMcpAddServerRequest): Promise<RuntimeMcpServerDescriptor>;
+  remove?(server: string): Promise<RuntimeMcpRemoveServerResponse>;
+  auth?(server: string, input?: RuntimeMcpAuthRequest): Promise<RuntimeMcpAuthResponse>;
+  logout?(server: string): Promise<RuntimeMcpLogoutResponse>;
+}
+
+async function handleMcpCommand(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  args: ReturnType<typeof parseArgs>,
+): Promise<void> {
+  const control = mcpControl(harness);
+  const action = args.mcpAction ?? "list";
+  if (!control) {
+    printMcpUnavailable(action, args.json);
+    return;
+  }
+
+  if (action === "list") {
+    const result = await control.list();
+    printMcpList(result, args.json);
+    return;
+  }
+  if (action === "status") {
+    const result = control.status ? await control.status() : statusFromMcpList(await control.list());
+    if (args.mcpServer) {
+      const server = result.servers.find((item) => item.name === args.mcpServer);
+      if (!server) throw new Error(`MCP server not found: ${args.mcpServer}`);
+      printMcpServer(server, args.json);
+      return;
+    }
+    printMcpStatus(result, args.json);
+    return;
+  }
+  if (action === "reload") {
+    if (!control.reload) throw new Error("MCP reload is not supported by the configured manager");
+    const result = await control.reload();
+    printMcpReload(result, args.json);
+    return;
+  }
+  if (action === "add") {
+    if (!control.add) throw new Error("MCP add is not supported by the configured manager");
+    const result = await control.add(mcpAddInput(args));
+    printMcpServer(result, args.json);
+    return;
+  }
+  if (action === "remove") {
+    if (!args.mcpServer) throw new Error("mcp remove requires a server name");
+    if (!control.remove) throw new Error("MCP remove is not supported by the configured manager");
+    const result = await control.remove(args.mcpServer);
+    printMcpMutation("remove", result, args.json);
+    return;
+  }
+  if (action === "auth") {
+    if (!args.mcpServer) throw new Error("mcp auth requires a server name");
+    if (!control.auth) throw new Error("MCP auth is not supported by the configured manager");
+    const result = await control.auth(args.mcpServer, mcpAuthInput(args));
+    printMcpMutation("auth", result, args.json);
+    return;
+  }
+  if (action === "logout") {
+    if (!args.mcpServer) throw new Error("mcp logout requires a server name");
+    if (!control.logout) throw new Error("MCP logout is not supported by the configured manager");
+    const result = await control.logout(args.mcpServer);
+    printMcpMutation("logout", result, args.json);
+  }
+}
+
+function mcpControl(harness: unknown): CliMcpControl | undefined {
+  if (!isRecord(harness)) return undefined;
+  const mcp = harness.mcp;
+  if (!isRecord(mcp) || typeof mcp.list !== "function") return undefined;
+  return mcp as unknown as CliMcpControl;
+}
+
+function printMcpUnavailable(action: string, asJson: boolean): void {
+  const message = "MCP manager is not configured. TODO: wire createCliHarness().mcp to the runtime MCP manager.";
+  if (asJson) {
+    console.log(jsonStringify({ action, supported: false, error: { message } }));
+    return;
+  }
+  console.log(`[mcp] ${message}`);
+}
+
+function printMcpList(result: RuntimeMcpListResponse, asJson: boolean): void {
+  if (asJson) {
+    console.log(jsonStringify(result));
+    return;
+  }
+  if (result.servers.length === 0) {
+    console.log("No MCP servers configured.");
+    return;
+  }
+  for (const server of result.servers) console.log(formatMcpServerLine(server));
+}
+
+function printMcpStatus(result: RuntimeMcpStatusResponse, asJson: boolean): void {
+  if (asJson) {
+    console.log(jsonStringify(result));
+    return;
+  }
+  const summary = result.summary;
+  console.log(
+    `[mcp] total=${summary.total}\trunning=${summary.running}\tdisabled=${summary.disabled}\tauth_required=${summary.authRequired}\terrored=${summary.errored}`,
+  );
+  for (const server of result.servers) console.log(formatMcpServerLine(server));
+}
+
+function printMcpReload(result: RuntimeMcpReloadResponse, asJson: boolean): void {
+  if (asJson) {
+    console.log(jsonStringify(result));
+    return;
+  }
+  console.log(`[mcp] reloaded=${result.reloaded}\tservers=${result.servers.length}\terrors=${result.errors.length}`);
+  for (const error of result.errors) console.log(`[mcp:error]\t${error.server ?? "-"}\t${error.message}`);
+  for (const server of result.servers) console.log(formatMcpServerLine(server));
+}
+
+function printMcpServer(server: RuntimeMcpServerDescriptor, asJson: boolean): void {
+  console.log(asJson ? jsonStringify(server) : formatMcpServerLine(server));
+}
+
+function printMcpMutation(label: string, value: unknown, asJson: boolean): void {
+  if (asJson) {
+    console.log(jsonStringify(value));
+    return;
+  }
+  if (isRecord(value) && typeof value.server === "string") {
+    console.log(`[mcp:${label}]\t${value.server}\t${JSON.stringify(value)}`);
+    return;
+  }
+  console.log(`[mcp:${label}]\t${JSON.stringify(value)}`);
+}
+
+function formatMcpServerLine(server: RuntimeMcpServerDescriptor): string {
+  return [
+    server.name,
+    server.status,
+    server.enabled ? "enabled" : "disabled",
+    server.transport ?? "-",
+    `auth=${server.auth?.required ? (server.auth.authenticated ? "authenticated" : "required") : "none"}`,
+    `tools=${server.toolCount ?? "?"}`,
+    server.url ?? server.command ?? "-",
+    server.error ?? "",
+  ].join("\t");
+}
+
+function statusFromMcpList(result: RuntimeMcpListResponse): RuntimeMcpStatusResponse {
+  const summary = {
+    total: result.servers.length,
+    running: result.servers.filter((server) => server.status === "running").length,
+    disabled: result.servers.filter((server) => !server.enabled || server.status === "disabled").length,
+    authRequired: result.servers.filter((server) => server.status === "auth_required" || server.auth?.required && !server.auth.authenticated).length,
+    errored: result.servers.filter((server) => server.status === "error").length,
+  };
+  return { servers: result.servers, summary };
+}
+
+function mcpAddInput(args: ReturnType<typeof parseArgs>): RuntimeMcpAddServerRequest {
+  if (!args.mcpServer) throw new Error("mcp add requires a server name");
+  const input: RuntimeMcpAddServerRequest = { name: args.mcpServer };
+  if (args.mcpTransport) input.transport = args.mcpTransport;
+  if (args.mcpCommand) input.command = args.mcpCommand;
+  if (args.mcpArgs) input.args = args.mcpArgs;
+  if (args.mcpEnv) input.env = args.mcpEnv;
+  if (args.mcpUrl) input.url = args.mcpUrl;
+  if (args.mcpDescription) input.description = args.mcpDescription;
+  if (args.mcpEnabled !== undefined) input.enabled = args.mcpEnabled;
+  return input;
+}
+
+function mcpAuthInput(args: ReturnType<typeof parseArgs>): RuntimeMcpAuthRequest {
+  const input: RuntimeMcpAuthRequest = {};
+  if (args.mcpCallbackUrl) input.callbackUrl = args.mcpCallbackUrl;
+  if (args.mcpScopes) input.scopes = args.mcpScopes;
+  return input;
 }
 
 async function printSessions(store: Awaited<ReturnType<typeof createCliHarness>>["store"]): Promise<void> {
@@ -811,6 +1013,10 @@ function memoryWriteScope(scope: MemoryScopeArg): "user" | "project" {
   if (!scope) return "project";
   if (scope === "user" || scope === "project") return scope;
   throw new Error("memory add requires --user or --project, not --all");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function jsonStringify(value: unknown): string {

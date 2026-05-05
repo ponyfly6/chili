@@ -44,6 +44,7 @@ import type { RuntimeAgentsSnapshot } from "./agent-projection.js";
 import type {
   RuntimeAgentTreeService,
   RuntimeHttpService,
+  RuntimeMcpControlService,
   RuntimeTaskControlService,
   RuntimeTeamDispatcherService,
   RuntimeTeamExecutionRunnerService,
@@ -724,6 +725,111 @@ test("serves prompt commands and submits expanded command prompts", async () => 
   });
 });
 
+test("serves MCP management routes through optional runtime control", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const mcp = new FakeMcpControlService();
+  const handler = createRuntimeHttpHandler({ service, store, mcp });
+
+  const listResponse = await handler(new Request("http://chili.test/mcp"));
+  expect(listResponse.status).toBe(200);
+  expect(await listResponse.json()).toMatchObject({
+    servers: [{ name: "github", status: "running", toolCount: 2 }],
+  });
+
+  const statusResponse = await handler(new Request("http://chili.test/mcp/status"));
+  expect(statusResponse.status).toBe(200);
+  expect(await statusResponse.json()).toMatchObject({
+    summary: { total: 1, running: 1, disabled: 0, authRequired: 0, errored: 0 },
+  });
+
+  const addResponse = await handler(
+    new Request("http://chili.test/mcp", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "remote_docs",
+        transport: "http",
+        url: "https://mcp.example/docs",
+        enabled: false,
+      }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  expect(addResponse.status).toBe(201);
+  expect(await addResponse.json()).toMatchObject({ name: "remote_docs", status: "disabled", enabled: false });
+  expect(mcp.added).toMatchObject({
+    name: "remote_docs",
+    transport: "http",
+    url: "https://mcp.example/docs",
+    enabled: false,
+  });
+
+  const stdioAddResponse = await handler(
+    new Request("http://chili.test/mcp", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "filesystem",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@modelcontextprotocol/server-filesystem"],
+      }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  expect(stdioAddResponse.status).toBe(403);
+
+  const serverResponse = await handler(new Request("http://chili.test/mcp/github"));
+  expect(serverResponse.status).toBe(200);
+  expect(await serverResponse.json()).toMatchObject({ name: "github", status: "running" });
+
+  const toolsResponse = await handler(new Request("http://chili.test/mcp/github/tools"));
+  expect(toolsResponse.status).toBe(200);
+  expect(await toolsResponse.json()).toEqual({
+    server: "github",
+    tools: [{ name: "search_issues", description: "Search issues" }],
+  });
+
+  const authResponse = await handler(
+    new Request("http://chili.test/mcp/github/auth", {
+      method: "POST",
+      body: JSON.stringify({ callbackUrl: "http://localhost/callback", scopes: ["repo"] }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  expect(authResponse.status).toBe(200);
+  expect(await authResponse.json()).toEqual({
+    server: "github",
+    status: "pending",
+    url: "https://auth.example/github",
+  });
+  expect(mcp.authInput).toEqual({ callbackUrl: "http://localhost/callback", scopes: ["repo"] });
+
+  const reloadResponse = await handler(new Request("http://chili.test/mcp/reload", { method: "POST" }));
+  expect(reloadResponse.status).toBe(200);
+  expect(await reloadResponse.json()).toMatchObject({ reloaded: true, errors: [] });
+
+  const logoutResponse = await handler(new Request("http://chili.test/mcp/github/logout", { method: "POST" }));
+  expect(logoutResponse.status).toBe(200);
+  expect(await logoutResponse.json()).toEqual({ server: "github", loggedOut: true });
+
+  const removeResponse = await handler(new Request("http://chili.test/mcp/github", { method: "DELETE" }));
+  expect(removeResponse.status).toBe(200);
+  expect(await removeResponse.json()).toEqual({ server: "github", removed: true });
+});
+
+test("returns not implemented for MCP routes without runtime control", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const handler = createRuntimeHttpHandler({ service, store });
+
+  const response = await handler(new Request("http://chili.test/mcp"));
+
+  expect(response.status).toBe(501);
+  expect(await response.json()).toEqual({ error: { message: "No MCP control service is configured" } });
+});
+
 test("rejects malformed approval resolve payloads before the runtime resolver", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
@@ -1111,6 +1217,66 @@ class FakePromptCommandControl implements PromptCommandControl {
   }
 }
 
+class FakeMcpControlService implements RuntimeMcpControlService {
+  added: Parameters<NonNullable<RuntimeMcpControlService["add"]>>[0] | undefined;
+  authInput: Parameters<NonNullable<RuntimeMcpControlService["auth"]>>[1] | undefined;
+
+  async list(): Promise<Awaited<ReturnType<RuntimeMcpControlService["list"]>>> {
+    return {
+      servers: [mcpServer()],
+    };
+  }
+
+  async reload(): Promise<Awaited<ReturnType<NonNullable<RuntimeMcpControlService["reload"]>>>> {
+    return {
+      reloaded: true,
+      servers: [mcpServer()],
+      errors: [],
+    };
+  }
+
+  async add(input: Parameters<NonNullable<RuntimeMcpControlService["add"]>>[0]): Promise<Awaited<ReturnType<NonNullable<RuntimeMcpControlService["add"]>>>> {
+    this.added = input;
+    const server: Awaited<ReturnType<NonNullable<RuntimeMcpControlService["add"]>>> = {
+      name: input.name,
+      status: input.enabled === false ? "disabled" : "running",
+      enabled: input.enabled ?? true,
+    };
+    if (input.transport) server.transport = input.transport;
+    if (input.command) server.command = input.command;
+    if (input.args) server.args = input.args;
+    if (input.url) server.url = input.url;
+    return server;
+  }
+
+  async remove(server: string): Promise<Awaited<ReturnType<NonNullable<RuntimeMcpControlService["remove"]>>>> {
+    return { server, removed: true };
+  }
+
+  async tools(server: string): Promise<Awaited<ReturnType<NonNullable<RuntimeMcpControlService["tools"]>>>> {
+    return {
+      server,
+      tools: [{ name: "search_issues", description: "Search issues" }],
+    };
+  }
+
+  async auth(
+    server: string,
+    input?: Parameters<NonNullable<RuntimeMcpControlService["auth"]>>[1],
+  ): Promise<Awaited<ReturnType<NonNullable<RuntimeMcpControlService["auth"]>>>> {
+    this.authInput = input;
+    return {
+      server,
+      status: "pending",
+      url: `https://auth.example/${server}`,
+    };
+  }
+
+  async logout(server: string): Promise<Awaited<ReturnType<NonNullable<RuntimeMcpControlService["logout"]>>>> {
+    return { server, loggedOut: true };
+  }
+}
+
 class FakeTaskControlService implements RuntimeTaskControlService {
   lastListStatus: string | undefined;
   lastFollowupText: string | undefined;
@@ -1421,6 +1587,22 @@ function localSubagentTaskRow(input: { status: "running" | "completed" | "failed
     childSessionId: "session_child_dispatch" as SessionId,
     childThreadId: "thread_child_dispatch" as ThreadId,
     status: input.status,
+  };
+}
+
+function mcpServer() {
+  return {
+    name: "github",
+    status: "running" as const,
+    enabled: true,
+    transport: "http" as const,
+    url: "https://mcp.example/github",
+    toolCount: 2,
+    auth: {
+      required: true,
+      authenticated: true,
+      provider: "github",
+    },
   };
 }
 

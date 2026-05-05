@@ -34,6 +34,7 @@ export interface CliArgs {
     | "memory-show"
     | "memory-add"
     | "memory-reload"
+    | "mcp"
     | "help";
   prompt?: string;
   cwd: string;
@@ -46,6 +47,17 @@ export interface CliArgs {
   teamId?: string;
   messageId?: string;
   memoryScope?: "user" | "project" | "all";
+  mcpAction?: "list" | "status" | "reload" | "add" | "remove" | "auth" | "logout";
+  mcpServer?: string;
+  mcpTransport?: "stdio" | "http" | "sse";
+  mcpCommand?: string;
+  mcpArgs?: string[];
+  mcpEnv?: Record<string, string>;
+  mcpUrl?: string;
+  mcpDescription?: string;
+  mcpEnabled?: boolean;
+  mcpCallbackUrl?: string;
+  mcpScopes?: string[];
   skillName?: string;
   skillScope?: "user" | "project";
   taskStatus?: Extract<AgentTaskStatus, "completed" | "failed" | "cancelled">;
@@ -199,6 +211,10 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     }
     if (arg === "memory") {
       parseMemoryCommand(result, args, prompt);
+      continue;
+    }
+    if (arg === "mcp") {
+      parseMcpCommand(result, args);
       continue;
     }
     if (arg === "prompt-debug") {
@@ -373,6 +389,13 @@ export function usage(): string {
     "  bun run chili -- memory show",
     "  bun run chili -- memory add [--user|--project] \"remember this\"",
     "  bun run chili -- memory reload",
+    "  bun run chili -- mcp list [--json]",
+    "  bun run chili -- mcp status [server-name] [--json]",
+    "  bun run chili -- mcp reload [--json]",
+    "  bun run chili -- mcp add <server-name> --command <cmd> [--arg <arg>] [--env KEY=VALUE]",
+    "  bun run chili -- mcp remove <server-name>",
+    "  bun run chili -- mcp auth <server-name>",
+    "  bun run chili -- mcp logout <server-name>",
     "  bun run chili -- prompt-debug [--resume <session-id>] [--thread <thread-id>] [--text <prompt>] [--content] [--json]",
     "  bun run chili -- consume <mailbox-message-id>",
     "  bun run chili -- task <task-id>",
@@ -413,6 +436,124 @@ export function usage(): string {
     "  --timeout-ms <n>    Task wait timeout in milliseconds",
     "  --stale-after-ms <n> Recover running background tasks older than this many milliseconds",
   ].join("\n");
+}
+
+function parseMcpCommand(result: CliArgs, args: string[]): void {
+  const action = args[0] && !args[0].startsWith("-") ? args.shift() : "list";
+  if (
+    action !== "list" &&
+    action !== "status" &&
+    action !== "reload" &&
+    action !== "add" &&
+    action !== "remove" &&
+    action !== "auth" &&
+    action !== "logout"
+  ) {
+    throw new Error(`Unknown mcp command: ${action}`);
+  }
+  result.command = "mcp";
+  result.mcpAction = action;
+
+  if (action === "add") {
+    result.mcpServer = requireValue("mcp add", args);
+    parseMcpAddFlags(result, args);
+    return;
+  }
+
+  if (action === "remove" || action === "auth" || action === "logout") {
+    result.mcpServer = requireValue(`mcp ${action}`, args);
+    parseMcpFlags(result, args);
+    return;
+  }
+
+  if (action === "status") {
+    const server = args[0];
+    if (server && !server.startsWith("-")) {
+      result.mcpServer = server;
+      args.shift();
+    }
+  }
+  parseMcpFlags(result, args);
+}
+
+function parseMcpAddFlags(result: CliArgs, args: string[]): void {
+  while (args.length > 0) {
+    const arg = args.shift();
+    if (!arg) continue;
+    if (arg === "--json") {
+      result.json = true;
+      continue;
+    }
+    if (arg === "--transport") {
+      result.mcpTransport = parseMcpTransport(requireValue(arg, args));
+      continue;
+    }
+    if (arg === "--command") {
+      result.mcpCommand = requireValue(arg, args);
+      continue;
+    }
+    if (arg === "--arg") {
+      result.mcpArgs = [...(result.mcpArgs ?? []), requireAnyValue(arg, args)];
+      continue;
+    }
+    if (arg === "--env") {
+      const env = parseKeyValue(requireValue(arg, args), arg);
+      result.mcpEnv = { ...(result.mcpEnv ?? {}), [env.key]: env.value };
+      continue;
+    }
+    if (arg === "--url") {
+      result.mcpUrl = requireValue(arg, args);
+      continue;
+    }
+    if (arg === "--description") {
+      result.mcpDescription = requireValue(arg, args);
+      continue;
+    }
+    if (arg === "--enable" || arg === "--enabled") {
+      result.mcpEnabled = true;
+      continue;
+    }
+    if (arg === "--disable" || arg === "--disabled") {
+      result.mcpEnabled = false;
+      continue;
+    }
+    if (arg.startsWith("-")) throw new Error(`Unknown mcp add option: ${arg}`);
+    throw new Error(`Unexpected mcp add argument: ${arg}`);
+  }
+}
+
+function parseMcpFlags(result: CliArgs, args: string[]): void {
+  while (args.length > 0) {
+    const arg = args.shift();
+    if (!arg) continue;
+    if (arg === "--json") {
+      result.json = true;
+      continue;
+    }
+    if (arg === "--callback-url") {
+      result.mcpCallbackUrl = requireValue(arg, args);
+      continue;
+    }
+    if (arg === "--scope") {
+      result.mcpScopes = [...(result.mcpScopes ?? []), requireValue(arg, args)];
+      continue;
+    }
+    if (arg.startsWith("-")) throw new Error(`Unknown mcp option: ${arg}`);
+    throw new Error(`Unexpected mcp argument: ${arg}`);
+  }
+}
+
+function parseMcpTransport(value: string): "stdio" | "http" | "sse" {
+  if (value === "stdio" || value === "http" || value === "sse") return value;
+  throw new Error("--transport must be stdio, http, or sse");
+}
+
+function parseKeyValue(value: string, flag: string): { key: string; value: string } {
+  const separator = value.indexOf("=");
+  if (separator <= 0) throw new Error(`${flag} must use KEY=VALUE`);
+  const key = value.slice(0, separator).trim();
+  if (!key) throw new Error(`${flag} must include a non-empty key`);
+  return { key, value: value.slice(separator + 1) };
 }
 
 function parseSkillsCommand(result: CliArgs, args: string[]): void {
@@ -548,5 +689,11 @@ function parseMemoryScope(value: string): "user" | "project" | "all" {
 function requireValue(flag: string, args: string[]): string {
   const value = args.shift();
   if (!value || value.startsWith("-")) throw new Error(`${flag} requires a value`);
+  return value;
+}
+
+function requireAnyValue(flag: string, args: string[]): string {
+  const value = args.shift();
+  if (!value) throw new Error(`${flag} requires a value`);
   return value;
 }

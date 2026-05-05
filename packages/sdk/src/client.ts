@@ -11,6 +11,16 @@ import type {
   RuntimeInterruptResult,
   RuntimeModelConfig,
   RuntimeModelDescriptor,
+  RuntimeMcpAddServerRequest,
+  RuntimeMcpAuthRequest,
+  RuntimeMcpAuthResponse,
+  RuntimeMcpListResponse,
+  RuntimeMcpLogoutResponse,
+  RuntimeMcpReloadResponse,
+  RuntimeMcpRemoveServerResponse,
+  RuntimeMcpServerDescriptor,
+  RuntimeMcpStatusResponse,
+  RuntimeMcpToolsResponse,
   RuntimePermissionConfig,
   RuntimePermissionProfileId,
   RuntimePromptCommandInvocation,
@@ -49,6 +59,15 @@ export interface RuntimeClient {
   clearGoal(input: ClearGoalRequest): Promise<ClearGoalResult>;
   listCommands(input?: ListCommandsRequest): Promise<RuntimePromptCommandList>;
   reloadCommands(input?: ReloadCommandsRequest): Promise<RuntimePromptCommandList>;
+  listMcpServers(input?: ListMcpServersRequest): Promise<RuntimeMcpListResponse>;
+  mcpStatus(input?: McpStatusRequest): Promise<RuntimeMcpStatusResponse>;
+  mcpServer(input: McpServerRequest): Promise<RuntimeMcpServerDescriptor>;
+  reloadMcp(input?: ReloadMcpRequest): Promise<RuntimeMcpReloadResponse>;
+  addMcpServer(input: AddMcpServerRequest): Promise<RuntimeMcpServerDescriptor>;
+  removeMcpServer(input: RemoveMcpServerRequest): Promise<RuntimeMcpRemoveServerResponse>;
+  listMcpTools(input: ListMcpToolsRequest): Promise<RuntimeMcpToolsResponse>;
+  authMcpServer(input: AuthMcpServerRequest): Promise<RuntimeMcpAuthResponse>;
+  logoutMcpServer(input: LogoutMcpServerRequest): Promise<RuntimeMcpLogoutResponse>;
   submitPrompt(input: SubmitPromptRequest): Promise<RuntimePromptResult>;
   submitPromptAsync(input: SubmitPromptRequest): Promise<RuntimePromptAccepted>;
   submitCommandAsync(input: SubmitCommandRequest): Promise<RuntimePromptAccepted>;
@@ -181,6 +200,47 @@ export interface ListCommandsRequest {
 }
 
 export interface ReloadCommandsRequest {
+  signal?: AbortSignal;
+}
+
+export interface ListMcpServersRequest {
+  signal?: AbortSignal;
+}
+
+export interface McpStatusRequest {
+  signal?: AbortSignal;
+}
+
+export interface McpServerRequest {
+  server: string;
+  signal?: AbortSignal;
+}
+
+export interface ReloadMcpRequest {
+  signal?: AbortSignal;
+}
+
+export interface AddMcpServerRequest extends RuntimeMcpAddServerRequest {
+  signal?: AbortSignal;
+}
+
+export interface RemoveMcpServerRequest {
+  server: string;
+  signal?: AbortSignal;
+}
+
+export interface ListMcpToolsRequest {
+  server: string;
+  signal?: AbortSignal;
+}
+
+export interface AuthMcpServerRequest extends RuntimeMcpAuthRequest {
+  server: string;
+  signal?: AbortSignal;
+}
+
+export interface LogoutMcpServerRequest {
+  server: string;
   signal?: AbortSignal;
 }
 
@@ -908,6 +968,44 @@ export class HttpRuntimeClient implements RuntimeClient {
 
   reloadCommands(input: ReloadCommandsRequest = {}): Promise<RuntimePromptCommandList> {
     return this.post("commands/reload", {}, input.signal);
+  }
+
+  listMcpServers(input: ListMcpServersRequest = {}): Promise<RuntimeMcpListResponse> {
+    return this.get("mcp", input.signal);
+  }
+
+  mcpStatus(input: McpStatusRequest = {}): Promise<RuntimeMcpStatusResponse> {
+    return this.get("mcp/status", input.signal);
+  }
+
+  mcpServer(input: McpServerRequest): Promise<RuntimeMcpServerDescriptor> {
+    return this.get(`mcp/${encodeURIComponent(input.server)}`, input.signal);
+  }
+
+  reloadMcp(input: ReloadMcpRequest = {}): Promise<RuntimeMcpReloadResponse> {
+    return this.post("mcp/reload", {}, input.signal);
+  }
+
+  addMcpServer(input: AddMcpServerRequest): Promise<RuntimeMcpServerDescriptor> {
+    const { signal, ...body } = input;
+    return this.post("mcp", body, signal);
+  }
+
+  removeMcpServer(input: RemoveMcpServerRequest): Promise<RuntimeMcpRemoveServerResponse> {
+    return this.delete(`mcp/${encodeURIComponent(input.server)}`, input.signal);
+  }
+
+  listMcpTools(input: ListMcpToolsRequest): Promise<RuntimeMcpToolsResponse> {
+    return this.get(`mcp/${encodeURIComponent(input.server)}/tools`, input.signal);
+  }
+
+  authMcpServer(input: AuthMcpServerRequest): Promise<RuntimeMcpAuthResponse> {
+    const { server, signal, ...body } = input;
+    return this.post(`mcp/${encodeURIComponent(server)}/auth`, body, signal);
+  }
+
+  logoutMcpServer(input: LogoutMcpServerRequest): Promise<RuntimeMcpLogoutResponse> {
+    return this.post(`mcp/${encodeURIComponent(input.server)}/logout`, {}, input.signal);
   }
 
   submitPrompt(input: SubmitPromptRequest): Promise<RuntimePromptResult> {
