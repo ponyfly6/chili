@@ -100,7 +100,7 @@ export function createDefaultSlashCommands(): SlashCommand[] {
     },
     {
       name: "mcp",
-      description: "Show and manage MCP servers",
+      description: "Open MCP commands",
       category: "mcp",
       argumentHint: "[status|tools|reload|add|remove|auth|logout]",
       isSafeConcurrent: true,
@@ -511,6 +511,7 @@ function mcpResult(args: string): SlashCommandResult {
   const tokens = parseMcpTokens(args);
   if (!tokens.ok) return localMcpError(tokens.error);
   const [rawAction, ...rest] = tokens.tokens;
+  if (!rawAction) return { type: "insert_prompt", text: "/mcp " };
   const action = (rawAction ?? "status").toLowerCase();
 
   if (action === "list") return noExtraMcpArgs(action, rest) ?? { type: "mcp_action", action: "list" };

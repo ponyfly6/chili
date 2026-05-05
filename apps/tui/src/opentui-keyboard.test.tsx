@@ -559,6 +559,36 @@ test("Tab accepts the strongest slash completion for a typed prefix", async () =
   }
 });
 
+test("/mcp opens the MCP command picker without writing status into the transcript", async () => {
+  const calls: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      refreshMcpStatus: async () => {
+        calls.push("status");
+        return {
+          summary: { total: 0, running: 0, disabled: 0, authRequired: 0, errored: 0 },
+          servers: [],
+        };
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/mcp");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(calls).toEqual([]);
+    expect(frame).toContain("> /mcp ");
+    expect(frame).toContain("/mcp status");
+    expect(frame).not.toContain("MCP servers:");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("/mcp status renders runtime MCP server state", async () => {
   const calls: string[] = [];
   const app = await mountShell(teamLiveFixture(), {
