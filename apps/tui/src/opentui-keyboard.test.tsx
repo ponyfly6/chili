@@ -559,6 +559,120 @@ test("Tab accepts the strongest slash completion for a typed prefix", async () =
   }
 });
 
+test("/mcp status renders runtime MCP server state", async () => {
+  const calls: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      refreshMcpStatus: async () => {
+        calls.push("status");
+        return {
+          summary: { total: 1, running: 1, disabled: 0, authRequired: 0, errored: 0 },
+          servers: [
+            {
+              name: "github",
+              status: "running",
+              enabled: true,
+              transport: "http",
+              url: "https://mcp.example.test",
+              toolCount: 2,
+              auth: { required: false },
+            },
+          ],
+        };
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/mcp status");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(calls).toEqual(["status"]);
+    expect(frame).toContain("MCP servers: total=1 running=1");
+    expect(frame).toContain("github");
+    expect(frame).toContain("https://mcp.example.test");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/mcp tools lists MCP tools without submitting a prompt", async () => {
+  const submissions: string[] = [];
+  const toolCalls: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async (text) => {
+        submissions.push(text);
+        return true;
+      },
+      listMcpTools: async (server) => {
+        toolCalls.push(server);
+        return {
+          server,
+          tools: [
+            { name: "search_issues", description: "Search issue titles and descriptions" },
+            { name: "create_issue" },
+          ],
+        };
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/mcp tools github");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(submissions).toEqual([]);
+    expect(toolCalls).toEqual(["github"]);
+    expect(frame).toContain("MCP tools for github: 2");
+    expect(frame).toContain("search_issues");
+    expect(frame).toContain("create_issue");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/mcp reload refreshes MCP config and prompt commands", async () => {
+  const calls: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      reloadMcp: async () => {
+        calls.push("mcp");
+        return {
+          reloaded: true,
+          servers: [],
+          errors: [{ server: "bad", message: "config failed" }],
+        };
+      },
+      reloadCommands: async () => {
+        calls.push("commands");
+        return { commands: [], diagnostics: [], directories: [], skippedConflicts: [] };
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/mcp reload");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(calls).toEqual(["mcp", "commands"]);
+    expect(frame).toContain("MCP reloaded: yes servers=0 errors=1");
+    expect(frame).toContain("error bad: config failed");
+    expect(frame).toContain("Prompt commands refreshed.");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("$ opens a skill picker and Tab inserts a path-bound skill mention", async () => {
   const submissions: Array<{ text: string; skillMentions?: unknown }> = [];
   const app = await mountShell(teamLiveFixture(), {

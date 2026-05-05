@@ -1,5 +1,6 @@
 import type { TeamLiveView } from "@chili/sdk";
 import type { SkillSettingsScope, SkillSummary } from "@chili/skills";
+import type { RuntimeMcpAddServerRequest, RuntimeMcpAuthRequest, RuntimeMcpServerDescriptor } from "@chili/protocol";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "../model-state.js";
 
 export type SlashCommandCategory =
@@ -9,6 +10,7 @@ export type SlashCommandCategory =
   | "model"
   | "policy"
   | "skills"
+  | "mcp"
   | "custom"
   | "view"
   | "debug";
@@ -31,7 +33,15 @@ export type SlashCommandResult =
   | { type: "set_reasoning"; level: ReasoningLevel }
   | { type: "set_hide_thinking"; hidden: boolean }
   | { type: "skills_action"; action: "enable" | "disable"; name: string; scope?: SkillSettingsScope }
+  | McpSlashCommandResult
   | { type: "sdk_action"; action: "team_run" | "team_merge" | "approve" | "reject"; payload?: unknown };
+
+export type McpSlashCommandResult =
+  | { type: "mcp_action"; action: "list" | "reload" }
+  | { type: "mcp_action"; action: "status"; server?: string }
+  | { type: "mcp_action"; action: "tools" | "remove" | "logout"; server: string }
+  | { type: "mcp_action"; action: "auth"; server: string; request?: RuntimeMcpAuthRequest }
+  | { type: "mcp_action"; action: "add"; input: RuntimeMcpAddServerRequest };
 
 export interface SlashCompletion {
   value: string;
@@ -48,6 +58,7 @@ export interface SlashCommandContext {
   modelCandidates?: readonly ModelCandidate[] | undefined;
   skills?: readonly SkillSummary[] | undefined;
   allSkills?: readonly SkillSummary[] | undefined;
+  mcpServers?: readonly RuntimeMcpServerDescriptor[] | undefined;
 }
 
 export type SlashCommand = {

@@ -1,4 +1,5 @@
 import type { SkillSettingsScope, SkillSummary } from "@chili/skills";
+import type { RuntimeMcpAddServerRequest, RuntimeMcpAuthRequest, RuntimeMcpTransport } from "@chili/protocol";
 import type { SlashCommand, SlashCommandContext, SlashCommandResult, SlashCompletion } from "./types.js";
 import {
   REASONING_LEVELS,
@@ -96,6 +97,15 @@ export function createDefaultSlashCommands(): SlashCommand[] {
       category: "custom",
       isSafeConcurrent: true,
       run: () => ({ type: "reload_commands" }),
+    },
+    {
+      name: "mcp",
+      description: "Show and manage MCP servers",
+      category: "mcp",
+      argumentHint: "[status|tools|reload|add|remove|auth|logout]",
+      isSafeConcurrent: true,
+      complete: mcpCompletions,
+      run: (_ctx, args) => mcpResult(args),
     },
     {
       name: "status",
@@ -443,6 +453,245 @@ function reasoningCompletions(_ctx: SlashCommandContext, input: string): SlashCo
       description: candidate.description,
       category: "model" as const,
     }));
+}
+
+const MCP_SUBCOMMANDS: Array<{ value: string; description: string }> = [
+  { value: "status", description: "Show server health and tool counts" },
+  { value: "list", description: "List configured MCP servers" },
+  { value: "tools", description: "List tools for one MCP server" },
+  { value: "reload", description: "Reload MCP configuration" },
+  { value: "auth", description: "Authenticate one MCP server" },
+  { value: "logout", description: "Clear MCP auth for one server" },
+  { value: "add", description: "Add a remote HTTP or SSE MCP server" },
+  { value: "remove", description: "Remove a user MCP server" },
+];
+
+function mcpCompletions(ctx: SlashCommandContext, input: string): SlashCompletion[] {
+  const query = commandArgument(input, "mcp");
+  if (query === undefined) return [];
+  const tokens = query.trimStart().split(/\s+/).filter(Boolean);
+  const action = tokens[0]?.toLowerCase();
+  const commandText = query.trimStart();
+
+  if (serverNameCompletingAction(action, commandText)) {
+    const serverQuery = query.endsWith(" ") ? "" : tokens[tokens.length - 1]?.toLowerCase() ?? "";
+    return (ctx.mcpServers ?? [])
+      .filter((server) => !serverQuery || fuzzyMatch(server.name.toLowerCase(), serverQuery))
+      .slice(0, 8)
+      .map((server) => ({
+        value: `/mcp ${action} ${server.name}`,
+        label: server.name,
+        description: `${server.status} ${server.transport ?? "mcp"} tools=${server.toolCount ?? "?"}`,
+        category: "mcp" as const,
+      }));
+  }
+
+  const normalized = query.trim().toLowerCase();
+  return MCP_SUBCOMMANDS
+    .filter((candidate) => !normalized || candidate.value.startsWith(normalized) || fuzzyMatch(candidate.value, normalized))
+    .map((candidate) => ({
+      value: `/mcp ${candidate.value}`,
+      label: `/mcp ${candidate.value}`,
+      description: candidate.description,
+      category: "mcp" as const,
+    }));
+}
+
+function serverNameCompletingAction(action: string | undefined, commandText: string): action is "status" | "tools" | "auth" | "logout" | "remove" {
+  return (
+    action === "status" ||
+    action === "tools" ||
+    action === "auth" ||
+    action === "logout" ||
+    action === "remove"
+  ) && (commandText.endsWith(" ") || commandText.split(/\s+/).length > 1);
+}
+
+function mcpResult(args: string): SlashCommandResult {
+  const tokens = parseMcpTokens(args);
+  if (!tokens.ok) return localMcpError(tokens.error);
+  const [rawAction, ...rest] = tokens.tokens;
+  const action = (rawAction ?? "status").toLowerCase();
+
+  if (action === "list") return noExtraMcpArgs(action, rest) ?? { type: "mcp_action", action: "list" };
+  if (action === "reload") return noExtraMcpArgs(action, rest) ?? { type: "mcp_action", action: "reload" };
+  if (action === "status" || action === "server" || action === "show") {
+    const parsed = parseOptionalServerAction("status", rest);
+    return parsed.ok ? { type: "mcp_action", action: "status", ...(parsed.server ? { server: parsed.server } : {}) } : localMcpError(parsed.error);
+  }
+  if (action === "tools") return requiredServerResult("tools", rest);
+  if (action === "remove") return requiredServerResult("remove", rest);
+  if (action === "logout") return requiredServerResult("logout", rest);
+  if (action === "auth" || action === "login") {
+    const parsed = parseMcpAuth(rest);
+    return parsed.ok
+      ? { type: "mcp_action", action: "auth", server: parsed.server, ...(parsed.request ? { request: parsed.request } : {}) }
+      : localMcpError(parsed.error);
+  }
+  if (action === "add") {
+    const parsed = parseMcpAdd(rest);
+    return parsed.ok ? { type: "mcp_action", action: "add", input: parsed.input } : localMcpError(parsed.error);
+  }
+
+  return localMcpError(`Unknown MCP command: ${rawAction}\nUsage: /mcp [status|list|tools|reload|add|remove|auth|logout]`);
+}
+
+function noExtraMcpArgs(action: string, rest: readonly string[]): SlashCommandResult | undefined {
+  if (rest.length === 0) return undefined;
+  return localMcpError(`Unexpected /mcp ${action} argument: ${rest.join(" ")}`);
+}
+
+function requiredServerResult(action: "tools" | "remove" | "logout", rest: readonly string[]): SlashCommandResult {
+  const parsed = parseRequiredServerAction(action, rest);
+  return parsed.ok ? { type: "mcp_action", action, server: parsed.server } : localMcpError(parsed.error);
+}
+
+function parseOptionalServerAction(action: string, rest: readonly string[]): { ok: true; server?: string } | { ok: false; error: string } {
+  if (rest.length > 1) return { ok: false, error: `Unexpected /mcp ${action} argument: ${rest.slice(1).join(" ")}` };
+  const server = rest[0];
+  return { ok: true, ...(server ? { server } : {}) };
+}
+
+function parseRequiredServerAction(action: string, rest: readonly string[]): { ok: true; server: string } | { ok: false; error: string } {
+  const server = rest[0];
+  if (!server) return { ok: false, error: `Usage: /mcp ${action} <server>` };
+  if (rest.length > 1) return { ok: false, error: `Unexpected /mcp ${action} argument: ${rest.slice(1).join(" ")}` };
+  return { ok: true, server };
+}
+
+function parseMcpAuth(rest: readonly string[]): { ok: true; server: string; request?: RuntimeMcpAuthRequest } | { ok: false; error: string } {
+  const server = rest[0];
+  if (!server) return { ok: false, error: "Usage: /mcp auth <server> [--callback-url <url>] [--scope <scope>]" };
+  const request: RuntimeMcpAuthRequest = {};
+  for (let index = 1; index < rest.length; index += 1) {
+    const token = rest[index] ?? "";
+    if (token === "--callback-url") {
+      const value = rest[index + 1];
+      if (!value) return { ok: false, error: "--callback-url requires a value" };
+      request.callbackUrl = value;
+      index += 1;
+      continue;
+    }
+    if (token === "--scope") {
+      const value = rest[index + 1];
+      if (!value) return { ok: false, error: "--scope requires a value" };
+      request.scopes = [...(request.scopes ?? []), value];
+      index += 1;
+      continue;
+    }
+    return { ok: false, error: token.startsWith("-") ? `Unknown /mcp auth option: ${token}` : `Unexpected /mcp auth argument: ${token}` };
+  }
+  return { ok: true, server, ...(Object.keys(request).length > 0 ? { request } : {}) };
+}
+
+function parseMcpAdd(rest: readonly string[]): { ok: true; input: RuntimeMcpAddServerRequest } | { ok: false; error: string } {
+  const name = rest[0];
+  if (!name) return { ok: false, error: "Usage: /mcp add <name> --url <url> [--transport http|sse] [--description <text>]" };
+  const input: RuntimeMcpAddServerRequest = { name };
+  const blockedStdioOptions: string[] = [];
+  for (let index = 1; index < rest.length; index += 1) {
+    const token = rest[index] ?? "";
+    if (token === "--transport") {
+      const value = rest[index + 1];
+      if (!value) return { ok: false, error: "--transport requires a value" };
+      const transport = parseMcpTransport(value);
+      if (!transport.ok) return transport;
+      input.transport = transport.value;
+      index += 1;
+      continue;
+    }
+    if (token === "--url") {
+      const value = rest[index + 1];
+      if (!value) return { ok: false, error: "--url requires a value" };
+      input.url = value;
+      index += 1;
+      continue;
+    }
+    if (token === "--description") {
+      const value = rest[index + 1];
+      if (!value) return { ok: false, error: "--description requires a value" };
+      input.description = value;
+      index += 1;
+      continue;
+    }
+    if (token === "--enable" || token === "--enabled") {
+      input.enabled = true;
+      continue;
+    }
+    if (token === "--disable" || token === "--disabled") {
+      input.enabled = false;
+      continue;
+    }
+    if (token === "--command" || token === "--arg" || token === "--env") {
+      blockedStdioOptions.push(token);
+      const next = rest[index + 1];
+      if (next && !next.startsWith("--")) index += 1;
+      continue;
+    }
+    return { ok: false, error: token.startsWith("-") ? `Unknown /mcp add option: ${token}` : `Unexpected /mcp add argument: ${token}` };
+  }
+
+  if (blockedStdioOptions.length > 0 || input.transport === "stdio") {
+    return {
+      ok: false,
+      error: "TUI can add remote HTTP/SSE MCP servers only. Use `chili mcp add ... --command ...` for local stdio servers.",
+    };
+  }
+  if (!input.url) return { ok: false, error: "/mcp add requires --url for remote MCP servers." };
+  if (!input.transport) input.transport = "http";
+  return { ok: true, input };
+}
+
+function parseMcpTransport(value: string): { ok: true; value: RuntimeMcpTransport } | { ok: false; error: string } {
+  if (value === "http" || value === "sse" || value === "stdio") return { ok: true, value };
+  return { ok: false, error: "--transport must be http or sse in the TUI" };
+}
+
+function parseMcpTokens(input: string): { ok: true; tokens: string[] } | { ok: false; error: string } {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: "\"" | "'" | undefined;
+  let escaped = false;
+
+  for (const char of input.trim()) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) {
+        quote = undefined;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+  if (escaped) current += "\\";
+  if (quote) return { ok: false, error: `Unclosed quote in /mcp arguments.` };
+  if (current) tokens.push(current);
+  return { ok: true, tokens };
+}
+
+function localMcpError(text: string): SlashCommandResult {
+  return { type: "local_message", level: "error", text };
 }
 
 function skillToggleCompletions(action: "enable" | "disable"): (ctx: SlashCommandContext, input: string) => SlashCompletion[] {

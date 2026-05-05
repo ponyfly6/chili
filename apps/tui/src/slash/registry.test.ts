@@ -48,6 +48,72 @@ test("resolves commands view and reload slash commands", async () => {
   });
 });
 
+test("resolves MCP slash commands and remote add arguments", async () => {
+  const commands = createDefaultSlashCommands();
+  const ctx = { model: {} } as SlashCommandContext;
+
+  expect(await resolveSlashCommand(commands, "/mcp")?.command.run(ctx, "")).toEqual({
+    type: "mcp_action",
+    action: "status",
+  });
+  expect(await resolveSlashCommand(commands, "/mcp status github")?.command.run(ctx, "status github")).toEqual({
+    type: "mcp_action",
+    action: "status",
+    server: "github",
+  });
+  expect(await resolveSlashCommand(commands, "/mcp tools github")?.command.run(ctx, "tools github")).toEqual({
+    type: "mcp_action",
+    action: "tools",
+    server: "github",
+  });
+  expect(await resolveSlashCommand(commands, "/mcp auth github --callback-url http://localhost/cb --scope repo --scope read:user")?.command.run(ctx, "auth github --callback-url http://localhost/cb --scope repo --scope read:user")).toEqual({
+    type: "mcp_action",
+    action: "auth",
+    server: "github",
+    request: {
+      callbackUrl: "http://localhost/cb",
+      scopes: ["repo", "read:user"],
+    },
+  });
+  expect(await resolveSlashCommand(commands, "/mcp add github --url https://example.test/mcp --transport sse --description \"GitHub MCP\" --disable")?.command.run(ctx, "add github --url https://example.test/mcp --transport sse --description \"GitHub MCP\" --disable")).toEqual({
+    type: "mcp_action",
+    action: "add",
+    input: {
+      name: "github",
+      url: "https://example.test/mcp",
+      transport: "sse",
+      description: "GitHub MCP",
+      enabled: false,
+    },
+  });
+});
+
+test("MCP slash command blocks local stdio add from the TUI", async () => {
+  const commands = createDefaultSlashCommands();
+  const ctx = { model: {} } as SlashCommandContext;
+
+  expect(await resolveSlashCommand(commands, "/mcp add local --command npx")?.command.run(ctx, "add local --command npx")).toEqual({
+    type: "local_message",
+    level: "error",
+    text: "TUI can add remote HTTP/SSE MCP servers only. Use `chili mcp add ... --command ...` for local stdio servers.",
+  });
+});
+
+test("completes MCP subcommands and server names", () => {
+  const commands = createDefaultSlashCommands();
+  const ctx = {
+    model: {},
+    mcpServers: [
+      { name: "github", status: "running", enabled: true, transport: "http", toolCount: 3 },
+      { name: "filesystem", status: "disabled", enabled: false, transport: "stdio", toolCount: 0 },
+    ],
+  } as unknown as SlashCommandContext;
+
+  expect(slashCompletions(commands, ctx, "/mcp t", 8).map((completion) => completion.value)).toContain("/mcp tools");
+  expect(slashCompletions(commands, ctx, "/mcp tools g", 8).map((completion) => completion.value)).toContain("/mcp tools github");
+  expect(slashCompletions(commands, ctx, "/mc", 8).map((completion) => completion.value)).toContain("/mcp");
+});
+
 test("resolves goal slash commands without lowercasing objectives", async () => {
   const commands = createDefaultSlashCommands();
   const ctx = { model: {} } as SlashCommandContext;

@@ -4,7 +4,27 @@ import {
   type ChatSessionView,
   type HttpRuntimeClient,
 } from "@chili/sdk";
-import type { ApprovalId, RuntimeApprovalResolveResult, RuntimeModelConfig, RuntimePermissionConfig, RuntimePermissionProfileId, RuntimePromptCommandList, RuntimeSkillMention, SessionId, ThreadGoal, ThreadId } from "@chili/protocol";
+import type {
+  ApprovalId,
+  RuntimeApprovalResolveResult,
+  RuntimeMcpAddServerRequest,
+  RuntimeMcpAuthRequest,
+  RuntimeMcpAuthResponse,
+  RuntimeMcpLogoutResponse,
+  RuntimeMcpReloadResponse,
+  RuntimeMcpRemoveServerResponse,
+  RuntimeMcpServerDescriptor,
+  RuntimeMcpStatusResponse,
+  RuntimeMcpToolsResponse,
+  RuntimeModelConfig,
+  RuntimePermissionConfig,
+  RuntimePermissionProfileId,
+  RuntimePromptCommandList,
+  RuntimeSkillMention,
+  SessionId,
+  ThreadGoal,
+  ThreadId,
+} from "@chili/protocol";
 import { useTeamLiveRuntime, type TeamLiveRuntimeState, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
 
@@ -24,6 +44,7 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
   modelConfig?: RuntimeModelConfig;
   permissionConfig?: RuntimePermissionConfig;
   commandList?: RuntimePromptCommandList;
+  mcpStatus?: RuntimeMcpStatusResponse;
   canSubmit: boolean;
   submitBlockedReason?: string;
   submitPrompt: (text: string, options?: ChatSubmitOptions) => Promise<boolean>;
@@ -33,6 +54,14 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
   refreshModelConfig?: () => Promise<void>;
   refreshPermissionConfig?: () => Promise<void>;
   reloadCommands?: () => Promise<RuntimePromptCommandList | undefined>;
+  refreshMcpStatus?: () => Promise<RuntimeMcpStatusResponse | undefined>;
+  getMcpServer?: (server: string) => Promise<RuntimeMcpServerDescriptor | undefined>;
+  reloadMcp?: () => Promise<RuntimeMcpReloadResponse | undefined>;
+  addMcpServer?: (input: RuntimeMcpAddServerRequest) => Promise<RuntimeMcpServerDescriptor | undefined>;
+  removeMcpServer?: (server: string) => Promise<RuntimeMcpRemoveServerResponse | undefined>;
+  listMcpTools?: (server: string) => Promise<RuntimeMcpToolsResponse | undefined>;
+  authMcpServer?: (server: string, request?: RuntimeMcpAuthRequest) => Promise<RuntimeMcpAuthResponse | undefined>;
+  logoutMcpServer?: (server: string) => Promise<RuntimeMcpLogoutResponse | undefined>;
   setRuntimePermissionProfile?: (profile: RuntimePermissionProfileId) => Promise<boolean>;
   setGoal: (input: { objective: string; tokenBudget?: number }) => Promise<ThreadGoal | undefined>;
   pauseGoal: () => Promise<ThreadGoal | undefined>;
@@ -77,6 +106,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   const [modelConfig, setModelConfig] = useState<RuntimeModelConfig | undefined>();
   const [permissionConfig, setPermissionConfig] = useState<RuntimePermissionConfig | undefined>();
   const [commandList, setCommandList] = useState<RuntimePromptCommandList | undefined>();
+  const [mcpStatus, setMcpStatus] = useState<RuntimeMcpStatusResponse | undefined>();
   const requestAbortRefs = useRef(new Set<AbortController>());
 
   useEffect(() => {
@@ -185,6 +215,108 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
       return undefined;
     }
   }, [client, options.baseUrl, withAbort]);
+
+  const refreshMcpStatus = useCallback(async (): Promise<RuntimeMcpStatusResponse | undefined> => {
+    try {
+      return await withAbort(async (signal) => {
+        const status = await client.mcpStatus({ signal });
+        if (!signal.aborted) setMcpStatus(status);
+        return status;
+      });
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return undefined;
+    }
+  }, [client, options.baseUrl, withAbort]);
+
+  const getMcpServer = useCallback(async (server: string): Promise<RuntimeMcpServerDescriptor | undefined> => {
+    try {
+      return await withAbort(async (signal) => {
+        const descriptor = await client.mcpServer({ server, signal });
+        if (!signal.aborted) setMcpStatus((current) => upsertMcpServer(current, descriptor));
+        return descriptor;
+      });
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return undefined;
+    }
+  }, [client, options.baseUrl, withAbort]);
+
+  const reloadMcp = useCallback(async (): Promise<RuntimeMcpReloadResponse | undefined> => {
+    setChatFeedback({ status: "pending", message: "reloading MCP" });
+    try {
+      const result = await withAbort(async (signal) => client.reloadMcp({ signal }));
+      setMcpStatus(statusFromMcpServers(result.servers));
+      setChatFeedback({ status: "success", message: "MCP reloaded" });
+      return result;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return undefined;
+    }
+  }, [client, options.baseUrl, withAbort]);
+
+  const addMcpServer = useCallback(async (server: RuntimeMcpAddServerRequest): Promise<RuntimeMcpServerDescriptor | undefined> => {
+    setChatFeedback({ status: "pending", message: "adding MCP server" });
+    try {
+      const descriptor = await withAbort(async (signal) => client.addMcpServer({ ...server, signal }));
+      setMcpStatus((current) => upsertMcpServer(current, descriptor));
+      setChatFeedback({ status: "success", message: "MCP server added" });
+      return descriptor;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return undefined;
+    }
+  }, [client, options.baseUrl, withAbort]);
+
+  const removeMcpServer = useCallback(async (server: string): Promise<RuntimeMcpRemoveServerResponse | undefined> => {
+    setChatFeedback({ status: "pending", message: "removing MCP server" });
+    try {
+      const result = await withAbort(async (signal) => client.removeMcpServer({ server, signal }));
+      if (result.removed) {
+        setMcpStatus((current) => removeMcpServerFromStatus(current, server));
+      }
+      setChatFeedback({ status: "success", message: result.removed ? "MCP server removed" : "MCP server was not found" });
+      return result;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return undefined;
+    }
+  }, [client, options.baseUrl, withAbort]);
+
+  const listMcpTools = useCallback(async (server: string): Promise<RuntimeMcpToolsResponse | undefined> => {
+    try {
+      return await withAbort(async (signal) => client.listMcpTools({ server, signal }));
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return undefined;
+    }
+  }, [client, options.baseUrl, withAbort]);
+
+  const authMcpServer = useCallback(async (server: string, request: RuntimeMcpAuthRequest = {}): Promise<RuntimeMcpAuthResponse | undefined> => {
+    setChatFeedback({ status: "pending", message: "authenticating MCP server" });
+    try {
+      const result = await withAbort(async (signal) => client.authMcpServer({ server, ...request, signal }));
+      setChatFeedback({ status: "success", message: result.status === "pending" ? "MCP auth pending" : `MCP auth ${result.status}` });
+      void refreshMcpStatus();
+      return result;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return undefined;
+    }
+  }, [client, options.baseUrl, refreshMcpStatus, withAbort]);
+
+  const logoutMcpServer = useCallback(async (server: string): Promise<RuntimeMcpLogoutResponse | undefined> => {
+    setChatFeedback({ status: "pending", message: "logging out MCP server" });
+    try {
+      const result = await withAbort(async (signal) => client.logoutMcpServer({ server, signal }));
+      setChatFeedback({ status: "success", message: result.loggedOut ? "MCP server logged out" : "MCP server had no auth session" });
+      void refreshMcpStatus();
+      return result;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return undefined;
+    }
+  }, [client, options.baseUrl, refreshMcpStatus, withAbort]);
 
   const ensureSession = useCallback(async (signal: AbortSignal): Promise<{ sessionId: SessionId; threadId: ThreadId }> => {
     let sessionId = activeSessionId ?? chatView.sessionId;
@@ -487,6 +619,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     ...(modelConfig ? { modelConfig } : {}),
     ...(permissionConfig ? { permissionConfig } : {}),
     ...(commandList ? { commandList } : {}),
+    ...(mcpStatus ? { mcpStatus } : {}),
     canSubmit,
     ...(submitBlockedReason ? { submitBlockedReason } : {}),
     submitPrompt,
@@ -496,6 +629,14 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     refreshModelConfig,
     refreshPermissionConfig,
     reloadCommands,
+    refreshMcpStatus,
+    getMcpServer,
+    reloadMcp,
+    addMcpServer,
+    removeMcpServer,
+    listMcpTools,
+    authMcpServer,
+    logoutMcpServer,
     setRuntimePermissionProfile,
     setGoal,
     pauseGoal,
@@ -505,7 +646,32 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     interruptActiveSession,
     approveApproval,
     rejectApproval,
-  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, permissionConfig, commandList, refreshModelConfig, refreshPermissionConfig, reloadCommands, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setGoal, pauseGoal, resumeGoal, clearGoal, startNewSession, submitBlockedReason, submitCommand, submitPrompt, teamRuntime]);
+  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, permissionConfig, commandList, mcpStatus, refreshModelConfig, refreshPermissionConfig, reloadCommands, refreshMcpStatus, getMcpServer, reloadMcp, addMcpServer, removeMcpServer, listMcpTools, authMcpServer, logoutMcpServer, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setGoal, pauseGoal, resumeGoal, clearGoal, startNewSession, submitBlockedReason, submitCommand, submitPrompt, teamRuntime]);
+}
+
+function upsertMcpServer(current: RuntimeMcpStatusResponse | undefined, server: RuntimeMcpServerDescriptor): RuntimeMcpStatusResponse {
+  const servers = current?.servers.filter((item) => item.name !== server.name) ?? [];
+  servers.push(server);
+  servers.sort((left, right) => left.name.localeCompare(right.name));
+  return statusFromMcpServers(servers);
+}
+
+function removeMcpServerFromStatus(current: RuntimeMcpStatusResponse | undefined, server: string): RuntimeMcpStatusResponse | undefined {
+  if (!current) return undefined;
+  return statusFromMcpServers(current.servers.filter((item) => item.name !== server));
+}
+
+function statusFromMcpServers(servers: readonly RuntimeMcpServerDescriptor[]): RuntimeMcpStatusResponse {
+  return {
+    servers: [...servers],
+    summary: {
+      total: servers.length,
+      running: servers.filter((server) => server.status === "running").length,
+      disabled: servers.filter((server) => !server.enabled || server.status === "disabled").length,
+      authRequired: servers.filter((server) => server.status === "auth_required" || server.auth?.required && !server.auth.authenticated).length,
+      errored: servers.filter((server) => server.status === "error").length,
+    },
+  };
 }
 
 async function resolveApproval(

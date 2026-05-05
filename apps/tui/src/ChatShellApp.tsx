@@ -2,7 +2,23 @@ import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, ty
 import { useAppContext, useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, MouseEvent, ScrollBoxRenderable, Selection } from "@opentui/core";
 import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
-import type { ApprovalId, RuntimePermissionProfileDescriptor, RuntimePermissionProfileId, RuntimeSkillMention, SessionId, TeamId, ThreadId } from "@chili/protocol";
+import type {
+  ApprovalId,
+  RuntimeMcpAuthResponse,
+  RuntimeMcpLogoutResponse,
+  RuntimeMcpReloadResponse,
+  RuntimeMcpRemoveServerResponse,
+  RuntimeMcpServerDescriptor,
+  RuntimeMcpStatusResponse,
+  RuntimeMcpToolDescriptor,
+  RuntimeMcpToolsResponse,
+  RuntimePermissionProfileDescriptor,
+  RuntimePermissionProfileId,
+  RuntimeSkillMention,
+  SessionId,
+  TeamId,
+  ThreadId,
+} from "@chili/protocol";
 import { FileAuthStorage, loginOpenAICodex, OPENAI_CODEX_PROVIDER_ID } from "@chili/providers";
 import { discoverSkills, updateSkillDisabledSetting, type SkillSettingsScope, type SkillSummary } from "@chili/skills";
 import { runProcess, type RunProcessResult } from "@chili/tools";
@@ -12,7 +28,7 @@ import { cleanClipboardText, promptClipboardText, systemClipboard, type Clipboar
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import { teamLiveModel, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
 import { useChatRuntime, type ChatApprovalGrantScope, type ChatRuntimeState } from "./useChatRuntime.js";
-import { findAction } from "./components/helpers.js";
+import { findAction, shorten } from "./components/helpers.js";
 import {
   DEFAULT_REASONING_LEVEL,
   REASONING_LEVELS,
@@ -285,7 +301,8 @@ export function ChatShellSurface(props: {
     modelCandidates,
     skills: props.skills ?? [],
     allSkills: props.allSkills ?? props.skills ?? [],
-  }), [cwd, modelCandidates, modelSelection, props.allSkills, props.model, props.skills, reasoningLevel]);
+    mcpServers: props.runtime.mcpStatus?.servers ?? [],
+  }), [cwd, modelCandidates, modelSelection, props.allSkills, props.model, props.runtime.mcpStatus?.servers, props.skills, reasoningLevel]);
   const completionSuppressed = acceptedCompletionPrompt !== undefined && prompt === acceptedCompletionPrompt;
   const skillTrigger = activeSkillMentionTrigger(prompt);
   const skillCompletionItems = skillTrigger && !prompt.startsWith("/") && !shellInputActive
@@ -1892,6 +1909,10 @@ async function applySlashResult(
     await performSkillsAction(result, actions);
     return;
   }
+  if (result.type === "mcp_action") {
+    await performMcpAction(result, runtime, actions.appendLocalItem);
+    return;
+  }
   if (result.type === "sdk_action") {
     const action = actionForSlashResult(result, model);
     if (action) runtime.executeAction(action);
@@ -1967,6 +1988,202 @@ async function performSkillsAction(
     const message = error instanceof Error ? error.message : String(error);
     actions.appendLocalItem("error", `Could not ${result.action} skill $${result.name}: ${message}`);
   }
+}
+
+async function performMcpAction(
+  result: Extract<SlashCommandResult, { type: "mcp_action" }>,
+  runtime: ChatRuntimeState,
+  appendLocalItem: AppendLocalItem,
+): Promise<void> {
+  if (result.action === "status" || result.action === "list") {
+    if (!runtime.refreshMcpStatus) {
+      appendLocalItem("error", "MCP control is not available from this runtime.");
+      return;
+    }
+    if (result.action === "status" && result.server) {
+      const server = runtime.getMcpServer
+        ? await runtime.getMcpServer(result.server)
+        : (await runtime.refreshMcpStatus())?.servers.find((item) => item.name === result.server);
+      appendLocalItem(server ? "info" : "error", server ? formatMcpServerDetail(server) : `MCP server not found: ${result.server}`, { persistent: true });
+      return;
+    }
+    const status = await runtime.refreshMcpStatus();
+    appendLocalItem(status ? "info" : "error", status ? formatMcpStatus(status) : "Could not load MCP status.", { persistent: true });
+    return;
+  }
+
+  if (result.action === "reload") {
+    if (!runtime.reloadMcp) {
+      appendLocalItem("error", "MCP reload is not available from this runtime.");
+      return;
+    }
+    const reloaded = await runtime.reloadMcp();
+    if (!reloaded) {
+      appendLocalItem("error", "Could not reload MCP configuration.", { persistent: true });
+      return;
+    }
+    await runtime.reloadCommands?.();
+    appendLocalItem("info", formatMcpReload(reloaded), { persistent: true });
+    return;
+  }
+
+  if (result.action === "tools") {
+    if (!runtime.listMcpTools) {
+      appendLocalItem("error", "MCP tools listing is not available from this runtime.");
+      return;
+    }
+    const tools = await runtime.listMcpTools(result.server);
+    appendLocalItem(tools ? "info" : "error", tools ? formatMcpTools(tools) : `Could not list tools for MCP server: ${result.server}`, { persistent: true });
+    return;
+  }
+
+  if (result.action === "add") {
+    if (!runtime.addMcpServer) {
+      appendLocalItem("error", "MCP add is not available from this runtime.");
+      return;
+    }
+    const server = await runtime.addMcpServer(result.input);
+    appendLocalItem(server ? "info" : "error", server ? `MCP server added:\n${formatMcpServerLine(server)}` : `Could not add MCP server: ${result.input.name}`, { persistent: true });
+    return;
+  }
+
+  if (result.action === "remove") {
+    if (!runtime.removeMcpServer) {
+      appendLocalItem("error", "MCP remove is not available from this runtime.");
+      return;
+    }
+    const removed = await runtime.removeMcpServer(result.server);
+    appendLocalItem(removed ? "info" : "error", removed ? formatMcpRemove(removed) : `Could not remove MCP server: ${result.server}`, { persistent: true });
+    return;
+  }
+
+  if (result.action === "auth") {
+    if (!runtime.authMcpServer) {
+      appendLocalItem("error", "MCP auth is not available from this runtime.");
+      return;
+    }
+    const auth = await runtime.authMcpServer(result.server, result.request);
+    if (!auth) {
+      appendLocalItem("error", `Could not authenticate MCP server: ${result.server}`, { persistent: true });
+      return;
+    }
+    appendLocalItem("info", formatMcpAuth(auth), { persistent: true });
+    if (auth.url) {
+      void openExternalUrl(auth.url).catch((error) => {
+        appendLocalItem("error", `Could not open MCP auth URL automatically: ${errorMessage(error)}`, { persistent: true });
+      });
+    }
+    return;
+  }
+
+  if (result.action === "logout") {
+    if (!runtime.logoutMcpServer) {
+      appendLocalItem("error", "MCP logout is not available from this runtime.");
+      return;
+    }
+    const logout = await runtime.logoutMcpServer(result.server);
+    appendLocalItem(logout ? "info" : "error", logout ? formatMcpLogout(logout) : `Could not log out MCP server: ${result.server}`, { persistent: true });
+  }
+}
+
+function formatMcpStatus(status: RuntimeMcpStatusResponse): string {
+  const summary = status.summary;
+  const lines = [
+    `MCP servers: total=${summary.total} running=${summary.running} disabled=${summary.disabled} auth_required=${summary.authRequired} errored=${summary.errored}`,
+  ];
+  if (status.servers.length === 0) {
+    lines.push("No MCP servers configured.");
+    return lines.join("\n");
+  }
+  for (const server of status.servers) lines.push(formatMcpServerLine(server));
+  return lines.join("\n");
+}
+
+function formatMcpServerDetail(server: RuntimeMcpServerDescriptor): string {
+  const lines = [
+    `MCP server: ${server.name}`,
+    `status: ${server.status}`,
+    `enabled: ${server.enabled ? "yes" : "no"}`,
+    `transport: ${server.transport ?? "unknown"}`,
+    `auth: ${mcpAuthLabel(server)}`,
+    `tools: ${server.toolCount ?? "?"}`,
+  ];
+  const endpoint = mcpEndpoint(server);
+  if (endpoint !== "-") lines.push(`endpoint: ${endpoint}`);
+  if (server.description) lines.push(`description: ${server.description}`);
+  if (server.error) lines.push(`error: ${server.error}`);
+  return lines.join("\n");
+}
+
+function formatMcpReload(result: RuntimeMcpReloadResponse): string {
+  const lines = [
+    `MCP reloaded: ${result.reloaded ? "yes" : "no"} servers=${result.servers.length} errors=${result.errors.length}`,
+  ];
+  for (const error of result.errors) lines.push(`error ${error.server ?? "-"}: ${error.message}`);
+  for (const server of result.servers) lines.push(formatMcpServerLine(server));
+  lines.push("Prompt commands refreshed.");
+  return lines.join("\n");
+}
+
+function formatMcpTools(result: RuntimeMcpToolsResponse): string {
+  const limit = 40;
+  const lines = [`MCP tools for ${result.server}: ${result.tools.length}`];
+  if (result.tools.length === 0) {
+    lines.push("No tools discovered.");
+    return lines.join("\n");
+  }
+  for (const tool of result.tools.slice(0, limit)) lines.push(formatMcpToolLine(tool));
+  if (result.tools.length > limit) lines.push(`Showing first ${limit} of ${result.tools.length} tools.`);
+  return lines.join("\n");
+}
+
+function formatMcpToolLine(tool: RuntimeMcpToolDescriptor): string {
+  const description = tool.description?.replace(/\s+/g, " ").trim();
+  return `- ${tool.name}${description ? `: ${shorten(description, 140)}` : ""}`;
+}
+
+function formatMcpRemove(result: RuntimeMcpRemoveServerResponse): string {
+  return result.removed
+    ? `MCP server removed: ${result.server}`
+    : `MCP server was not found in user config: ${result.server}`;
+}
+
+function formatMcpAuth(result: RuntimeMcpAuthResponse): string {
+  const lines = [`MCP auth ${result.server}: ${result.status}`];
+  if (result.message) lines.push(result.message);
+  if (result.url) lines.push(`Open: ${result.url}`);
+  return lines.join("\n");
+}
+
+function formatMcpLogout(result: RuntimeMcpLogoutResponse): string {
+  return result.loggedOut
+    ? `MCP server logged out: ${result.server}`
+    : `MCP server had no auth session: ${result.server}`;
+}
+
+function formatMcpServerLine(server: RuntimeMcpServerDescriptor): string {
+  return [
+    server.name,
+    server.status,
+    server.enabled ? "enabled" : "disabled",
+    server.transport ?? "-",
+    `auth=${mcpAuthLabel(server)}`,
+    `tools=${server.toolCount ?? "?"}`,
+    mcpEndpoint(server),
+    server.error ? `error=${server.error}` : "",
+  ].filter(Boolean).join("  ");
+}
+
+function mcpAuthLabel(server: RuntimeMcpServerDescriptor): string {
+  if (!server.auth?.required) return "none";
+  if (server.auth.authenticated) return "authenticated";
+  return "required";
+}
+
+function mcpEndpoint(server: RuntimeMcpServerDescriptor): string {
+  if (server.url) return server.url;
+  if (server.command) return [server.command, ...(server.args ?? [])].join(" ");
+  return "-";
 }
 
 async function performAuthAction(
