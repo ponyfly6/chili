@@ -53,8 +53,8 @@ test("resolves MCP slash commands and remote add arguments", async () => {
   const ctx = { model: {} } as SlashCommandContext;
 
   expect(await resolveSlashCommand(commands, "/mcp")?.command.run(ctx, "")).toEqual({
-    type: "insert_prompt",
-    text: "/mcp ",
+    type: "open_view",
+    view: "mcp",
   });
   expect(await resolveSlashCommand(commands, "/mcp status github")?.command.run(ctx, "status github")).toEqual({
     type: "mcp_action",

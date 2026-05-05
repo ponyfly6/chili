@@ -559,7 +559,7 @@ test("Tab accepts the strongest slash completion for a typed prefix", async () =
   }
 });
 
-test("/mcp opens the MCP command picker without writing status into the transcript", async () => {
+test("/mcp opens the MCP manager without writing status into the transcript", async () => {
   const calls: string[] = [];
   const app = await mountShell(teamLiveFixture(), {
     runtime: {
@@ -580,10 +580,109 @@ test("/mcp opens the MCP command picker without writing status into the transcri
     await app.renderOnce();
 
     const frame = app.captureCharFrame();
-    expect(calls).toEqual([]);
-    expect(frame).toContain("> /mcp ");
-    expect(frame).toContain("/mcp status");
+    expect(calls).toEqual(["status"]);
+    expect(frame).toContain("Manage MCP servers");
+    expect(frame).toContain("No MCP servers configured.");
+    expect(frame).toContain("Up/Down navigate");
     expect(frame).not.toContain("MCP servers:");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/mcp manager opens server tools with keyboard navigation", async () => {
+  const toolCalls: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      refreshMcpStatus: async () => ({
+        summary: { total: 1, running: 1, disabled: 0, authRequired: 0, errored: 0 },
+        servers: [
+          {
+            name: "MiniMax",
+            status: "running",
+            enabled: true,
+            transport: "stdio",
+            command: "uvx",
+            args: ["minimax-coding-plan-mcp", "-y"],
+            toolCount: 2,
+            auth: { required: false },
+          },
+        ],
+      }),
+      listMcpTools: async (server) => {
+        toolCalls.push(server);
+        return {
+          server,
+          tools: [
+            { name: "web_search", description: "Search the web" },
+            { name: "understand_image", description: "Analyze an image" },
+          ],
+        };
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/mcp");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+    expect(app.captureCharFrame()).toContain("> MiniMax");
+
+    await press(app, () => app.mockInput.pressEnter());
+    expect(app.captureCharFrame()).toContain("MiniMax MCP Server");
+    expect(app.captureCharFrame()).toContain("> View tools");
+
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(toolCalls).toEqual(["MiniMax"]);
+    expect(frame).toContain("Tools for MiniMax");
+    expect(frame).toContain("web_search");
+    expect(frame).toContain("understand_image");
+
+    await press(app, () => app.mockInput.pressEnter());
+    expect(app.captureCharFrame()).toContain("Tool name: web_search");
+
+    await press(app, () => app.mockInput.pressEscape());
+    expect(app.captureCharFrame()).toContain("Tools for MiniMax");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/mcp manager offers tools when tool count is unknown", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      refreshMcpStatus: async () => ({
+        summary: { total: 1, running: 1, disabled: 0, authRequired: 0, errored: 0 },
+        servers: [
+          {
+            name: "unknown-tools",
+            status: "running",
+            enabled: true,
+            transport: "http",
+            url: "https://mcp.example.test",
+            auth: { required: false },
+          },
+        ],
+      }),
+      listMcpTools: async (server) => ({ server, tools: [] }),
+    },
+  });
+
+  try {
+    await typeText(app, "/mcp");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    await press(app, () => app.mockInput.pressEnter());
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("Unknown-tools MCP Server");
+    expect(frame).toContain("> View tools - Fetch discovered tools");
   } finally {
     app.renderer.destroy();
   }

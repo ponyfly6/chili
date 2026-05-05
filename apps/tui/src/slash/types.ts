@@ -16,7 +16,7 @@ export type SlashCommandCategory =
   | "debug";
 
 export type SlashCommandResult =
-  | { type: "open_view"; view: "team" | "help" | "agents" | "status" }
+  | { type: "open_view"; view: "team" | "help" | "agents" | "status" | "mcp" }
   | { type: "open_permissions_picker" }
   | { type: "open_theme_picker" }
   | { type: "reload_commands" }

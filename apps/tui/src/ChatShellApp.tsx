@@ -48,6 +48,16 @@ import { BrandMark } from "./chat/BrandMark.js";
 import { charDisplayWidth } from "./chat/markdown.js";
 import { zedPathWithPosition, type FileLinkTarget } from "./chat/file-links.js";
 import { MessageList } from "./chat/MessageList.js";
+import {
+  McpManager,
+  initialMcpManagerState,
+  mcpServerMenuItems,
+  normalizeMcpManagerState,
+  selectedMcpServer,
+  type McpManagerMessage,
+  type McpManagerState,
+  type McpServerMenuAction,
+} from "./chat/McpManager.js";
 import { PROMPT_INPUT_HEIGHT, PROMPT_PLACEHOLDER, PromptComposer, promptComposerHeight } from "./chat/PromptComposer.js";
 import { StatusFooter, statusFooterHeight, type StatusFooterOptions } from "./chat/StatusFooter.js";
 import { buildTranscriptLines, buildTranscriptText } from "./chat/transcript.js";
@@ -67,7 +77,7 @@ import {
   type TuiThemeOption,
 } from "./theme/index.js";
 
-type ShellView = "chat" | "team" | "help" | "agents" | "status" | "transcript";
+type ShellView = "chat" | "team" | "help" | "agents" | "status" | "mcp" | "transcript";
 type AppendLocalItem = (level: "info" | "error", text: string, options?: { persistent?: boolean | undefined }) => void;
 type LocalShellItem = Extract<LocalTranscriptItem, { kind: "shell" }>;
 type AppendShellItem = (item: Omit<LocalShellItem, "id" | "kind">) => string;
@@ -82,6 +92,7 @@ interface SlashActions {
   startNewChatSession: () => Promise<void>;
   setPrompt: (value: string | ((current: string) => string)) => void;
   openThemePicker: () => void;
+  openMcpManager: () => void;
   setAuthManualPrompt: (value: AuthManualPrompt | undefined) => void;
   openModelPicker: (query?: string) => void;
   setModelSelection: (selection: ModelSelection, reasoningLevel?: ReasoningLevel) => Promise<void>;
@@ -220,6 +231,7 @@ export function ChatShellSurface(props: {
   const [modelPicker, setModelPicker] = useState<ModelPickerNavigation | undefined>(undefined);
   const [reasoningPicker, setReasoningPicker] = useState<ReasoningPickerNavigation | undefined>(undefined);
   const [permissionsPicker, setPermissionsPicker] = useState<PermissionsPickerNavigation | undefined>(undefined);
+  const [mcpManager, setMcpManager] = useState<McpManagerState>(() => initialMcpManagerState());
   const [transcriptScrollOffset, setTranscriptScrollOffset] = useState(0);
   const messageScrollBoxRef = useRef<ScrollBoxRenderable | null>(null);
   const [authManualPrompt, setAuthManualPromptState] = useState<AuthManualPrompt | undefined>(undefined);
@@ -439,6 +451,39 @@ export function ChatShellSurface(props: {
   const closePermissionsPicker = useCallback(() => {
     setPermissionsPicker(undefined);
   }, []);
+  const refreshMcpManager = useCallback(async (message?: McpManagerMessage) => {
+    if (!props.runtime.refreshMcpStatus) {
+      setMcpManager((current) => ({
+        ...current,
+        loading: false,
+        message: { level: "error", text: "MCP control is not available from this runtime." },
+      }));
+      return;
+    }
+    setMcpManager((current) => ({ ...current, loading: true, ...(message ? { message } : {}) }));
+    const status = await props.runtime.refreshMcpStatus();
+    setMcpManager((current) => normalizeMcpManagerState({
+      ...current,
+      loading: false,
+      ...(status ? { status } : {}),
+      ...(status ? {} : { message: { level: "error", text: "Could not load MCP status." } }),
+    }, status?.servers ?? props.runtime.mcpStatus?.servers ?? []));
+  }, [props.runtime]);
+  const openMcpManager = useCallback(() => {
+    setView("mcp");
+    setPaletteOpen(false);
+    setModelPicker(undefined);
+    setReasoningPicker(undefined);
+    setPermissionsPicker(undefined);
+    setThemePicker(undefined);
+    setPrompt("");
+    setMcpManager(initialMcpManagerState());
+    void refreshMcpManager();
+  }, [refreshMcpManager, setPrompt]);
+  const closeMcpManager = useCallback(() => {
+    setView("chat");
+    setMcpManager(initialMcpManagerState());
+  }, []);
   const setModelSelection = useCallback(async (selection: ModelSelection, nextReasoningLevel?: ReasoningLevel) => {
     const persisted = props.runtime.setRuntimeModel ? await props.runtime.setRuntimeModel(selection) : true;
     if (!persisted) {
@@ -534,6 +579,7 @@ export function ChatShellSurface(props: {
     startNewChatSession,
     setPrompt,
     openThemePicker,
+    openMcpManager,
     setAuthManualPrompt,
     openModelPicker,
     setModelSelection,
@@ -547,7 +593,7 @@ export function ChatShellSurface(props: {
       await props.onSkillsChanged?.();
     },
     reloadCommands,
-  }), [appendLocalItem, appendShellItem, cwd, ensureOpenAICodexDefaultModel, openModelPicker, openPermissionsPicker, openReasoningPicker, openThemePicker, props.onSkillsChanged, reloadCommands, setAuthManualPrompt, setHideThinking, setModelSelection, setPermissionProfile, setPrompt, setReasoningLevel, startNewChatSession, updateShellItem]);
+  }), [appendLocalItem, appendShellItem, cwd, ensureOpenAICodexDefaultModel, openMcpManager, openModelPicker, openPermissionsPicker, openReasoningPicker, openThemePicker, props.onSkillsChanged, reloadCommands, setAuthManualPrompt, setHideThinking, setModelSelection, setPermissionProfile, setPrompt, setReasoningLevel, startNewChatSession, updateShellItem]);
   const runSelectedSlashCompletion = useCallback(() => {
     if (!slashCompletionOpen) return false;
     const completion = slashCompletionItems[selectedCompletionIndex] ?? slashCompletionItems[0];
@@ -587,6 +633,143 @@ export function ChatShellSurface(props: {
     setCompletionIndex((current) => clampIndex(current, completions.length));
   }, [completions.length]);
 
+  const mcpServers = (mcpManager.status ?? props.runtime.mcpStatus)?.servers ?? [];
+  const setMcpManagerMessage = useCallback((message: McpManagerMessage) => {
+    setMcpManager((current) => ({ ...current, loading: false, message }));
+  }, []);
+  const loadMcpTools = useCallback(async (server: string) => {
+    if (!props.runtime.listMcpTools) {
+      setMcpManager((current) => ({
+        screen: "tools",
+        server,
+        selectedIndex: 0,
+        loading: false,
+        tools: [],
+        status: current.status,
+        message: { level: "error", text: "MCP tools listing is not available from this runtime." },
+      }));
+      return;
+    }
+    setMcpManager((current) => ({ screen: "tools", server, selectedIndex: 0, loading: true, tools: [], status: current.status }));
+    const result = await props.runtime.listMcpTools(server);
+    setMcpManager((current) => {
+      if (current.screen !== "tools" || current.server !== server) return current;
+      return {
+        ...current,
+        loading: false,
+        tools: result?.tools ?? [],
+        ...(result ? {} : { message: { level: "error" as const, text: `Could not list tools for MCP server: ${server}` } }),
+      };
+    });
+  }, [props.runtime]);
+  const reloadMcpFromManager = useCallback(async () => {
+    if (!props.runtime.reloadMcp) {
+      setMcpManagerMessage({ level: "error", text: "MCP reload is not available from this runtime." });
+      return;
+    }
+    setMcpManager((current) => ({ ...current, loading: true, message: { level: "info", text: "Reloading MCP..." } }));
+    const result = await props.runtime.reloadMcp();
+    if (!result) {
+      setMcpManagerMessage({ level: "error", text: "Could not reload MCP configuration." });
+      return;
+    }
+    await props.runtime.reloadCommands?.();
+    setMcpManager((current) => normalizeMcpManagerState({
+      ...current,
+      loading: false,
+      status: statusFromMcpServers(result.servers),
+      message: { level: result.errors.length > 0 ? "error" : "info", text: `MCP reloaded: ${result.servers.length} server${result.servers.length === 1 ? "" : "s"}, ${result.errors.length} error${result.errors.length === 1 ? "" : "s"}.` },
+    }, result.servers));
+  }, [props.runtime, setMcpManagerMessage]);
+  const authenticateMcpFromManager = useCallback(async (server: string) => {
+    if (!props.runtime.authMcpServer) {
+      setMcpManagerMessage({ level: "error", text: "MCP auth is not available from this runtime." });
+      return;
+    }
+    setMcpManager((current) => ({ ...current, loading: true, message: { level: "info", text: `Authenticating ${server}...` } }));
+    const result = await props.runtime.authMcpServer(server);
+    if (!result) {
+      setMcpManagerMessage({ level: "error", text: `Could not authenticate MCP server: ${server}` });
+      return;
+    }
+    const status = await props.runtime.refreshMcpStatus?.();
+    setMcpManager((current) => normalizeMcpManagerState({
+      ...current,
+      loading: false,
+      ...(status ? { status } : {}),
+      message: { level: result.status === "unsupported" ? "error" : "info", text: result.message ?? `MCP auth ${server}: ${result.status}` },
+    }, status?.servers ?? (current.status ?? props.runtime.mcpStatus)?.servers ?? []));
+    if (result.url) {
+      void openExternalUrl(result.url).catch((error) => {
+        setMcpManagerMessage({ level: "error", text: `Could not open MCP auth URL automatically: ${errorMessage(error)}` });
+      });
+    }
+  }, [props.runtime, setMcpManagerMessage]);
+  const logoutMcpFromManager = useCallback(async (server: string) => {
+    if (!props.runtime.logoutMcpServer) {
+      setMcpManagerMessage({ level: "error", text: "MCP logout is not available from this runtime." });
+      return;
+    }
+    setMcpManager((current) => ({ ...current, loading: true, message: { level: "info", text: `Clearing auth for ${server}...` } }));
+    const result = await props.runtime.logoutMcpServer(server);
+    const status = await props.runtime.refreshMcpStatus?.();
+    setMcpManager((current) => normalizeMcpManagerState({
+      ...current,
+      loading: false,
+      ...(status ? { status } : {}),
+      message: result
+        ? { level: result.loggedOut ? "info" : "error", text: result.loggedOut ? `MCP server logged out: ${server}` : `MCP server had no auth session: ${server}` }
+        : { level: "error", text: `Could not log out MCP server: ${server}` },
+    }, status?.servers ?? (current.status ?? props.runtime.mcpStatus)?.servers ?? []));
+  }, [props.runtime, setMcpManagerMessage]);
+  const removeMcpFromManager = useCallback(async (server: string) => {
+    if (!props.runtime.removeMcpServer) {
+      setMcpManagerMessage({ level: "error", text: "MCP remove is not available from this runtime." });
+      return;
+    }
+    setMcpManager((current) => ({ ...current, loading: true, message: { level: "info", text: `Removing ${server}...` } }));
+    const result = await props.runtime.removeMcpServer(server);
+    if (!result) {
+      setMcpManagerMessage({ level: "error", text: `Could not remove MCP server: ${server}` });
+      return;
+    }
+    const nextServers = ((mcpManager.status ?? props.runtime.mcpStatus)?.servers ?? []).filter((candidate) => candidate.name !== server);
+    setMcpManager({
+      screen: "list",
+      selectedIndex: 0,
+      loading: false,
+      status: statusFromMcpServers(nextServers),
+      message: {
+        level: result.removed ? "info" : "error",
+        text: result.removed ? `MCP server removed: ${server}` : `MCP server was not found in user config: ${server}`,
+      },
+    });
+    setMcpManager((current) => normalizeMcpManagerState(current, nextServers));
+  }, [mcpManager.status, props.runtime, setMcpManagerMessage]);
+  const runMcpManagerAction = useCallback((action: McpServerMenuAction, server: RuntimeMcpServerDescriptor) => {
+    if (action === "tools") {
+      void loadMcpTools(server.name);
+      return;
+    }
+    if (action === "reload") {
+      void reloadMcpFromManager();
+      return;
+    }
+    if (action === "auth") {
+      void authenticateMcpFromManager(server.name);
+      return;
+    }
+    if (action === "logout") {
+      void logoutMcpFromManager(server.name);
+      return;
+    }
+    if (action === "remove") {
+      setMcpManager((current) => ({ screen: "confirmRemove", server: server.name, selectedIndex: 0, status: current.status }));
+      return;
+    }
+    setMcpManager((current) => ({ screen: "list", selectedIndex: serverIndexByName(mcpServers, server.name), status: current.status }));
+  }, [authenticateMcpFromManager, loadMcpTools, logoutMcpFromManager, mcpServers, reloadMcpFromManager]);
+
   const selectorOpen = Boolean(modelPicker || reasoningPicker || permissionsPicker);
   const approvalShortcutsEnabled = view === "chat" && Boolean(firstApproval) && props.runtime.chatView.pendingApprovals.length > 0 && !authManualPrompt && !selectorOpen && !themePicker && !paletteOpen && !slashCompletionOpen && !skillCompletionOpen;
   const disabledReason = authManualPrompt
@@ -597,6 +780,8 @@ export function ChatShellSurface(props: {
     ? "Choose thinking level"
     : permissionsPicker
     ? "Choose permissions"
+    : view === "mcp"
+    ? "MCP manager open"
     : shellInputActive
     ? undefined
     : slashInputActive
@@ -679,6 +864,89 @@ export function ChatShellSurface(props: {
     }
     if (view === "team") {
       if (isEscape(key)) setView("chat");
+      return;
+    }
+    if (view === "mcp") {
+      const state = normalizeMcpManagerState(mcpManager, mcpServers);
+      const server = selectedMcpServer(state, mcpServers);
+      if (isEscape(key)) {
+        if (state.screen === "list") {
+          closeMcpManager();
+          return;
+        }
+        if (state.screen === "server" && server) {
+          setMcpManager({ screen: "list", selectedIndex: serverIndexByName(mcpServers, server.name), status: state.status });
+          return;
+        }
+        if ((state.screen === "tools" || state.screen === "confirmRemove") && server) {
+          setMcpManager({ screen: "server", server: server.name, selectedIndex: 0, status: state.status });
+          return;
+        }
+        if (state.screen === "tool" && server) {
+          setMcpManager({ screen: "tools", server: server.name, selectedIndex: state.toolIndex ?? 0, tools: state.tools, status: state.status });
+          return;
+        }
+        closeMcpManager();
+        return;
+      }
+      if (isPlainRefreshKey(key)) {
+        void refreshMcpManager();
+        return;
+      }
+      if (state.screen === "list") {
+        if (isArrowUp(key) || isArrowDown(key)) {
+          const delta = isArrowUp(key) ? -1 : 1;
+          setMcpManager((current) => ({ ...current, selectedIndex: clampIndex(current.selectedIndex + delta, mcpServers.length) }));
+          return;
+        }
+        if (isEnter(key)) {
+          const selected = mcpServers[clampIndex(state.selectedIndex, mcpServers.length)];
+          if (selected) setMcpManager({ screen: "server", server: selected.name, selectedIndex: 0, status: state.status });
+          return;
+        }
+        return;
+      }
+      if (state.screen === "server" && server) {
+        const items = mcpServerMenuItems(server);
+        if (isArrowUp(key) || isArrowDown(key)) {
+          const delta = isArrowUp(key) ? -1 : 1;
+          setMcpManager((current) => ({ ...current, selectedIndex: clampIndex(current.selectedIndex + delta, items.length) }));
+          return;
+        }
+        if (isEnter(key)) {
+          const item = items[clampIndex(state.selectedIndex, items.length)];
+          if (item) runMcpManagerAction(item.action, server);
+          return;
+        }
+        return;
+      }
+      if (state.screen === "tools" && server) {
+        const tools = state.tools ?? [];
+        if (isArrowUp(key) || isArrowDown(key)) {
+          const delta = isArrowUp(key) ? -1 : 1;
+          setMcpManager((current) => ({ ...current, selectedIndex: clampIndex(current.selectedIndex + delta, tools.length) }));
+          return;
+        }
+        if (isEnter(key)) {
+          const tool = tools[clampIndex(state.selectedIndex, tools.length)];
+          if (tool) setMcpManager({ screen: "tool", server: server.name, selectedIndex: 0, tools, toolIndex: clampIndex(state.selectedIndex, tools.length), status: state.status });
+          return;
+        }
+        return;
+      }
+      if (state.screen === "confirmRemove" && server) {
+        if (isArrowUp(key) || isArrowDown(key)) {
+          const delta = isArrowUp(key) ? -1 : 1;
+          setMcpManager((current) => ({ ...current, selectedIndex: clampIndex(current.selectedIndex + delta, 2) }));
+          return;
+        }
+        if (isEnter(key)) {
+          if (state.selectedIndex === 1) void removeMcpFromManager(server.name);
+          else setMcpManager({ screen: "server", server: server.name, selectedIndex: 0, status: state.status });
+          return;
+        }
+        return;
+      }
       return;
     }
     if (paletteOpen) {
@@ -959,6 +1227,7 @@ export function ChatShellSurface(props: {
           model={props.model}
           options={shellOptions}
           runtime={props.runtime}
+          mcpManager={mcpManager}
           showToolDetails={showToolDetails}
           hideThinking={hideThinking}
           transcriptActive={view === "transcript"}
@@ -1086,6 +1355,7 @@ function SessionScreen(props: {
   paletteIndex: number;
   model: TeamLiveView;
   runtime: ChatRuntimeState;
+  mcpManager: McpManagerState;
   options: StatusFooterOptions;
   showToolDetails: boolean;
   hideThinking: boolean;
@@ -1140,6 +1410,8 @@ function SessionScreen(props: {
           <HelpView commands={props.commands} theme={props.theme} showToolDetails={props.showToolDetails} />
         ) : props.view === "status" ? (
           <StatusView model={props.model} runtime={props.runtime} options={props.options} theme={props.theme} showToolDetails={props.showToolDetails} hideThinking={props.hideThinking} transcriptActive={props.transcriptActive} />
+        ) : props.view === "mcp" ? (
+          <McpManager state={props.mcpManager} runtime={props.runtime} theme={props.theme} />
         ) : props.view === "agents" ? (
           <AgentsView model={props.model} theme={props.theme} />
         ) : props.view === "transcript" ? (
@@ -1845,6 +2117,10 @@ async function applySlashResult(
   actions: SlashActions,
 ): Promise<void> {
   if (result.type === "open_view") {
+    if (result.view === "mcp") {
+      actions.openMcpManager();
+      return;
+    }
     actions.setView(result.view);
     return;
   }
@@ -2596,6 +2872,10 @@ function printableKey(key: KeyEvent): string | undefined {
   return undefined;
 }
 
+function isPlainRefreshKey(key: KeyEvent): boolean {
+  return printableKey(key)?.toLowerCase() === "r";
+}
+
 function numericShortcutIndex(key: KeyEvent): number | undefined {
   if (hasModifier(key)) return undefined;
   const value = key.sequence.length === 1 ? key.sequence : key.name;
@@ -2678,4 +2958,22 @@ function scrollStep(height: number): number {
 
 function clampIndex(index: number, length: number): number {
   return Math.min(Math.max(0, index), Math.max(0, length - 1));
+}
+
+function serverIndexByName(servers: readonly RuntimeMcpServerDescriptor[], name: string): number {
+  const index = servers.findIndex((server) => server.name === name);
+  return index < 0 ? 0 : index;
+}
+
+function statusFromMcpServers(servers: readonly RuntimeMcpServerDescriptor[]): RuntimeMcpStatusResponse {
+  return {
+    servers: [...servers],
+    summary: {
+      total: servers.length,
+      running: servers.filter((server) => server.status === "running").length,
+      disabled: servers.filter((server) => !server.enabled || server.status === "disabled").length,
+      authRequired: servers.filter((server) => server.status === "auth_required" || (server.auth?.required && !server.auth.authenticated)).length,
+      errored: servers.filter((server) => server.status === "error").length,
+    },
+  };
 }
