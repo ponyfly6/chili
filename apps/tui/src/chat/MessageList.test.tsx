@@ -144,7 +144,7 @@ test("streaming assistant text does not prematurely close unfinished code fences
   expect(frame).toContain("Intro");
   expect(frame).toContain("const ok");
   expect(frame).not.toContain("🌶️:");
-  expect(occurrences(frame, "```")).toBe(1);
+  expect(occurrences(frame, "```")).toBe(0);
 });
 
 test("hidden thinking masks reasoning text", async () => {
@@ -316,6 +316,65 @@ test("assistant markdown table uses native table rendering in the message list",
   expect(frame).toContain("│Name");
   expect(frame).toContain("│alpha");
   expect(frame).not.toContain("│ Name");
+  expect(frame).not.toContain("🌶️:");
+  expect(frame).not.toContain("| ---");
+});
+
+test("streaming assistant markdown table uses native table rendering", async () => {
+  const frame = await renderMessageList([
+    {
+      id: "msg_streaming_table" as MessageId,
+      kind: "message",
+      role: "assistant",
+      createdAt: 1,
+      parts: [
+        {
+          type: "text",
+          id: "part_streaming_table" as PartId,
+          text: "## Weather\n\n| Item | Detail |\n| --- | --- |\n| Condition | Clear |\n| Temperature | 24C |",
+        },
+      ],
+    },
+  ], { status: "running" });
+
+  expect(frame).toContain("Weather");
+  expect(frame).toContain("Condition");
+  expect(frame).toContain("Clear");
+  expect(frame).toContain("┌");
+  expect(frame).toContain("┬");
+  expect(frame).not.toContain("🌶️:");
+  expect(frame).not.toContain("| ---");
+});
+
+test("assistant markdown tables with dotted names and package scopes stay native", async () => {
+  const frame = await renderMessageList([
+    {
+      id: "msg_tech_stack_table" as MessageId,
+      kind: "message",
+      role: "assistant",
+      createdAt: 1,
+      parts: [
+        {
+          type: "text",
+          id: "part_tech_stack_table" as PartId,
+          text: [
+            "## 技术栈",
+            "",
+            "| 类别 | 技术 | 说明 |",
+            "| --- | --- | --- |",
+            "| 运行时 | Node.js | 要求 >= 18.0.0 |",
+            "| SOCKS5代理 | @pondwader/socks5-server | 网络过滤支持 |",
+          ].join("\n"),
+        },
+      ],
+    },
+  ], { status: "running" });
+
+  expect(frame).toContain("技术栈");
+  expect(frame).toContain("Node.js");
+  expect(frame).toContain("@pondwader/socks5-server");
+  expect(frame).toContain("┌");
+  expect(frame).toContain("┬");
   expect(frame).not.toContain("🌶️:");
   expect(frame).not.toContain("| ---");
 });

@@ -6,7 +6,6 @@ import type { TuiTheme } from "../theme/index.js";
 import { AssistantMarkdownCell, assistantTextCellLines } from "./AssistantCells.js";
 import { componentBackedCell, lineBackedCell, TranscriptCellView, type TranscriptCellModel } from "./cells.js";
 import { type OpenFileLinkHandler, type TranscriptLineModel, wrapLine } from "./lines.js";
-import { hasFileLinkText } from "./file-links.js";
 import { buildChatDisplayItems, type ChatDisplayItem } from "./presentation.js";
 import { ToolCell, ToolGroupCell, toolCellLines, toolGroupCellLines } from "./ToolCells.js";
 import type { LocalTranscriptItem } from "./types.js";
@@ -93,7 +92,6 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, 
   }
   if (item.kind === "assistant_text") {
     const key = `display:${item.kind}:${item.id}`;
-    const renderAsLines = item.streaming === true || hasFileLinkText(item.text);
     const lines = assistantTextCellLines({
       key,
       text: item.text,
@@ -101,11 +99,7 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, 
       width,
       theme,
       cwd,
-      ...(renderAsLines ? { prefix: "", hangingIndent: "" } : {}),
     });
-    if (renderAsLines) {
-      return lineBackedCell(key, lines);
-    }
     return componentBackedCell({
       key,
       render: () => (
