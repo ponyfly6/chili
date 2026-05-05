@@ -26,6 +26,9 @@
       "path": "./packages/commands"
     },
     {
+      "path": "./packages/mcp"
+    },
+    {
       "path": "./packages/core"
     },
     {

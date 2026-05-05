@@ -25,6 +25,9 @@
       "@chili/core": [
         "packages/core/src/index.ts"
       ],
+      "@chili/mcp": [
+        "packages/mcp/src/index.ts"
+      ],
       "@chili/policy": [
         "packages/policy/src/index.ts"
       ],

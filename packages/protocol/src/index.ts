@@ -4,4 +4,5 @@ export * from "./message.js";
 export * from "./tool.js";
 export * from "./goal.js";
 export * from "./runtime.js";
+export * from "./mcp.js";
 export * from "./event.js";

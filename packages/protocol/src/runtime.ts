@@ -72,7 +72,7 @@ export interface RuntimePermissionConfig {
   profiles: RuntimePermissionProfileDescriptor[];
 }
 
-export type RuntimePromptCommandSource = "project" | "user";
+export type RuntimePromptCommandSource = "project" | "user" | "mcp";
 
 export interface RuntimePromptCommandDescriptor {
   name: string;
@@ -102,6 +102,115 @@ export interface RuntimePromptCommandInvocation {
   name: string;
   args?: string;
   cwd?: string;
+}
+
+export type RuntimeMcpServerStatus =
+  | "unknown"
+  | "disabled"
+  | "stopped"
+  | "starting"
+  | "running"
+  | "error"
+  | "auth_required";
+
+export type RuntimeMcpTransport = "stdio" | "http" | "sse";
+
+export interface RuntimeMcpServerAuthState {
+  required: boolean;
+  authenticated?: boolean;
+  provider?: string;
+  scopes?: string[];
+  error?: string;
+}
+
+export interface RuntimeMcpServerDescriptor {
+  name: string;
+  status: RuntimeMcpServerStatus;
+  enabled: boolean;
+  transport?: RuntimeMcpTransport;
+  command?: string;
+  args?: string[];
+  url?: string;
+  description?: string;
+  auth?: RuntimeMcpServerAuthState;
+  toolCount?: number;
+  error?: string;
+  updatedAt?: number;
+}
+
+export interface RuntimeMcpSummary {
+  total: number;
+  running: number;
+  disabled: number;
+  authRequired: number;
+  errored: number;
+}
+
+export interface RuntimeMcpListResponse {
+  servers: RuntimeMcpServerDescriptor[];
+}
+
+export interface RuntimeMcpStatusResponse {
+  servers: RuntimeMcpServerDescriptor[];
+  summary: RuntimeMcpSummary;
+}
+
+export interface RuntimeMcpReloadResponse {
+  reloaded: boolean;
+  servers: RuntimeMcpServerDescriptor[];
+  errors: RuntimeMcpReloadError[];
+}
+
+export interface RuntimeMcpReloadError {
+  server?: string;
+  message: string;
+}
+
+export interface RuntimeMcpAddServerRequest {
+  name: string;
+  transport?: RuntimeMcpTransport;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+  url?: string;
+  headers?: Record<string, string>;
+  description?: string;
+  enabled?: boolean;
+}
+
+export interface RuntimeMcpRemoveServerResponse {
+  server: string;
+  removed: boolean;
+}
+
+export interface RuntimeMcpToolDescriptor {
+  name: string;
+  description?: string;
+  inputSchema?: unknown;
+  annotations?: Record<string, unknown>;
+}
+
+export interface RuntimeMcpToolsResponse {
+  server: string;
+  tools: RuntimeMcpToolDescriptor[];
+}
+
+export interface RuntimeMcpAuthRequest {
+  callbackUrl?: string;
+  scopes?: string[];
+}
+
+export interface RuntimeMcpAuthResponse {
+  server: string;
+  status: "authenticated" | "pending" | "unsupported";
+  url?: string;
+  message?: string;
+}
+
+export interface RuntimeMcpLogoutResponse {
+  server: string;
+  loggedOut: boolean;
 }
 
 export type RuntimeCommand =

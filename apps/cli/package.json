@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@chili/core": "workspace:*",
+    "@chili/mcp": "workspace:*",
     "@chili/policy": "workspace:*",
     "@chili/protocol": "workspace:*",
     "@chili/providers": "workspace:*",

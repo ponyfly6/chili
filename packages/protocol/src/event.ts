@@ -14,6 +14,14 @@ import type {
 import type { AgentPath } from "./agent-path.js";
 import type { ThreadGoal, ThreadGoalUpdateReason, ThreadGoalUsageDelta } from "./goal.js";
 import type { MessagePart } from "./message.js";
+import type {
+  McpDiagnosticPayload,
+  McpProgressPayload,
+  McpPromptsChangedPayload,
+  McpResourcesChangedPayload,
+  McpServerStatusChangedPayload,
+  McpToolsChangedPayload,
+} from "./mcp.js";
 import type { ModelSelection, ReasoningLevel, ModelMetadataPayload, RuntimeStatusPayload } from "./runtime.js";
 import type { ApprovalDecisionAction, ToolCallStatus, ToolOutputStream } from "./tool.js";
 
@@ -35,7 +43,8 @@ export type ChiliEvent =
   | GoalEvent
   | RecoveryEvent
   | AgentEvent
-  | TeamEvent;
+  | TeamEvent
+  | McpEvent;
 
 export type SessionEvent =
   | EventEnvelope<"session.created", { sessionId: SessionId; cwd: string }>
@@ -77,6 +86,14 @@ export type GoalEvent =
 export type RecoveryEvent =
   | EventEnvelope<"snapshot.created", { snapshotId: SnapshotId; callId?: ToolCallId; toolName?: string; paths: string[]; reason: string }>
   | EventEnvelope<"snapshot.reverted", { snapshotId: SnapshotId; status: "completed" | "failed"; paths: string[]; error?: string }>;
+
+export type McpEvent =
+  | EventEnvelope<"mcp.server_status_changed", McpServerStatusChangedPayload>
+  | EventEnvelope<"mcp.tools_changed", McpToolsChangedPayload>
+  | EventEnvelope<"mcp.prompts_changed", McpPromptsChangedPayload>
+  | EventEnvelope<"mcp.resources_changed", McpResourcesChangedPayload>
+  | EventEnvelope<"mcp.diagnostic", McpDiagnosticPayload>
+  | EventEnvelope<"mcp.progress", McpProgressPayload>;
 
 export type AgentTaskStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
 export type AgentTaskMode = "one_shot" | "resumable" | "background";

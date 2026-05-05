@@ -1,0 +1,21 @@
+{
+  "name": "@chili/mcp",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@chili/protocol": "workspace:*",
+    "@chili/tools": "workspace:*",
+    "zod": "^3.25.1 || ^4.0.0"
+  },
+  "scripts": {
+    "typecheck": "tsc -b"
+  }
+}
