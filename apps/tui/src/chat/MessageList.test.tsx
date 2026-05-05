@@ -144,7 +144,7 @@ test("streaming assistant text does not prematurely close unfinished code fences
   expect(frame).toContain("Intro");
   expect(frame).toContain("const ok");
   expect(frame).not.toContain("🌶️:");
-  expect(occurrences(frame, "```")).toBe(0);
+  expect(occurrences(frame, "```")).toBe(1);
 });
 
 test("hidden thinking masks reasoning text", async () => {

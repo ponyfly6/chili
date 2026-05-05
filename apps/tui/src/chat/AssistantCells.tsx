@@ -1,6 +1,7 @@
 import { CodeRenderable, RGBA, SyntaxStyle, type RenderNodeContext, type StyleDefinition } from "@opentui/core";
 import type { Token } from "marked";
 import type { TuiTheme } from "../theme/index.js";
+import { fileLinksForText } from "./file-links.js";
 import { TranscriptLines, type TranscriptLineModel } from "./lines.js";
 import type { MarkdownLineTone } from "./markdown.js";
 import { historyRenderModel } from "./render-model.js";
@@ -56,18 +57,22 @@ export function assistantTextCellLines(input: {
   streaming: boolean;
   width: number;
   theme: TuiTheme;
+  cwd?: string | undefined;
+  prefix?: string | undefined;
+  hangingIndent?: string | undefined;
 }): TranscriptLineModel[] {
   return historyRenderModel.assistantTextLines({
     key: input.key,
     text: input.text,
     streaming: input.streaming,
     width: input.width,
-    prefix: "🌶️: ",
-    hangingIndent: "    ",
+    prefix: input.prefix ?? "🌶️: ",
+    hangingIndent: input.hangingIndent ?? "    ",
   }).map((line) => ({
     key: line.key,
     text: line.text,
     fg: markdownFg(line.tone, input.theme),
+    ...(input.cwd === undefined ? {} : { fileLinks: fileLinksForText(line.text, input.cwd) }),
   }));
 }
 

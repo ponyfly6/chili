@@ -46,6 +46,7 @@ import {
 import { ApprovalDock, approvalDockHeight } from "./chat/ApprovalDock.js";
 import { BrandMark } from "./chat/BrandMark.js";
 import { charDisplayWidth } from "./chat/markdown.js";
+import { zedPathWithPosition, type FileLinkTarget } from "./chat/file-links.js";
 import { MessageList } from "./chat/MessageList.js";
 import { PROMPT_INPUT_HEIGHT, PROMPT_PLACEHOLDER, PromptComposer, promptComposerHeight } from "./chat/PromptComposer.js";
 import { StatusFooter, statusFooterHeight, type StatusFooterOptions } from "./chat/StatusFooter.js";
@@ -353,6 +354,12 @@ export function ChatShellSurface(props: {
   const scrollMessageToBottom = useCallback(() => {
     messageScrollBoxRef.current?.scrollTo(Number.MAX_SAFE_INTEGER);
   }, []);
+  const openFileLink = useCallback((target: FileLinkTarget) => {
+    void openLocalFileTarget(target).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      appendLocalItem("error", `Open file failed: ${message}`);
+    });
+  }, [appendLocalItem]);
   const startNewChatSession = useCallback(async () => {
     setView("chat");
     setAuthManualPrompt(undefined);
@@ -939,6 +946,7 @@ export function ChatShellSurface(props: {
           }}
           localItems={deferredLocalItems}
           messageScrollRef={messageScrollBoxRef}
+          onOpenFile={openFileLink}
           transcriptScrollOffset={transcriptScrollOffset}
           completions={completions}
           completionOpen={skillCompletionOpen || slashCompletionOpen}
@@ -1066,6 +1074,7 @@ function SessionScreen(props: {
   onTranscriptScroll: (event: MouseEvent) => void;
   localItems: readonly LocalTranscriptItem[];
   messageScrollRef: RefObject<ScrollBoxRenderable | null>;
+  onOpenFile: (target: FileLinkTarget) => void;
   transcriptScrollOffset: number;
   completions: readonly SlashCompletion[];
   completionOpen: boolean;
@@ -1148,6 +1157,8 @@ function SessionScreen(props: {
             localItems={props.localItems}
             width={messageWidth}
             scrollRef={props.messageScrollRef}
+            cwd={props.options.cwd}
+            onOpenFile={props.onOpenFile}
             theme={props.theme}
             showToolDetails={props.showToolDetails}
             hideThinking={props.hideThinking}
@@ -2256,6 +2267,17 @@ async function openExternalUrl(url: string): Promise<void> {
     return;
   }
   await execFileAsync("xdg-open", [url]);
+}
+
+async function openLocalFileTarget(target: FileLinkTarget): Promise<void> {
+  const zedTarget = zedPathWithPosition(target);
+  try {
+    await execFileAsync("zed", ["--existing", zedTarget]);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  await openExternalUrl(target.path);
 }
 
 function formatAuthTime(value: number): string {

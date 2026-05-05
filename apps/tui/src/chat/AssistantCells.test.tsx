@@ -123,6 +123,35 @@ test("assistant markdown cell keeps OpenTUI markdown as the native render path",
   expect(markdown?.props.renderNode).toBeFunction();
 });
 
+test("assistant fallback lines expose ctrl-click file link ranges", () => {
+  const text = [
+    "Changed [main file](src/main.ts:42) and [absolute](/repo/app.ts#L7C3).",
+    "Kept [external](https://example.test/app.ts:1) as a markdown link.",
+    "",
+    "```md",
+    "[raw](src/raw.ts:1)",
+    "```",
+  ].join("\n");
+  const fallbackLines = assistantTextCellLines({
+    key: "assistant:file-links",
+    text,
+    streaming: false,
+    width: 110,
+    theme,
+    cwd: "/repo",
+  });
+  const fallbackText = lineText(fallbackLines).join("\n");
+  const links = fallbackLines.flatMap((line) => line.fileLinks ?? []);
+
+  expect(fallbackText).toContain("main file (src/main.ts:42)");
+  expect(fallbackText).toContain("absolute (/repo/app.ts#L7C3)");
+  expect(fallbackText).toContain("external (https://example.test/app.ts:1)");
+  expect(fallbackText).toContain("[raw](src/raw.ts:1)");
+  expect(links.map((link) => link.target)).toContainEqual({ path: "/repo/src/main.ts", line: 42 });
+  expect(links.map((link) => link.target)).toContainEqual({ path: "/repo/app.ts", line: 7, column: 3 });
+  expect(links.some((link) => link.target.path.includes("example.test"))).toBe(false);
+});
+
 test("assistant markdown cell renders compact native table while partial fallback remains plain text", async () => {
   const text = [
     "| Name | Count | State |",

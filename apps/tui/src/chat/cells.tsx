@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { TranscriptLines, type TranscriptLineModel } from "./lines.js";
+import { TranscriptLines, type OpenFileLinkHandler, type TranscriptLineModel, type TranscriptSelectionColors } from "./lines.js";
 
 export type TranscriptCellModel = LineBackedTranscriptCellModel | ComponentBackedTranscriptCellModel;
 export type TranscriptCellLineSliceRenderer = (range: { startLine: number; endLine: number }) => ReactNode;
@@ -118,10 +118,14 @@ export function windowTranscriptCells(
   };
 }
 
-export function TranscriptCellSliceView(props: { slice: TranscriptCellSlice }) {
+export function TranscriptCellSliceView(props: {
+  slice: TranscriptCellSlice;
+  onOpenFile?: OpenFileLinkHandler | undefined;
+  selectionColors?: TranscriptSelectionColors | undefined;
+}) {
   const { cell, startLine, endLine } = props.slice;
   if (cell.kind === "lines") {
-    return <TranscriptLines lines={cell.lines.slice(startLine, endLine)} />;
+    return <TranscriptLines lines={cell.lines.slice(startLine, endLine)} onOpenFile={props.onOpenFile} selectionColors={props.selectionColors} />;
   }
 
   if (startLine === 0 && endLine === cell.lineCount) {
@@ -133,12 +137,16 @@ export function TranscriptCellSliceView(props: { slice: TranscriptCellSlice }) {
   if (cell.fallbackLines === undefined) {
     throw new Error("component-backed transcript cell requires renderLineSlice or fallbackLines for partial slices");
   }
-  return <TranscriptLines lines={cell.fallbackLines.slice(startLine, endLine)} />;
+  return <TranscriptLines lines={cell.fallbackLines.slice(startLine, endLine)} onOpenFile={props.onOpenFile} selectionColors={props.selectionColors} />;
 }
 
-export function TranscriptCellView(props: { cell: TranscriptCellModel }) {
+export function TranscriptCellView(props: {
+  cell: TranscriptCellModel;
+  onOpenFile?: OpenFileLinkHandler | undefined;
+  selectionColors?: TranscriptSelectionColors | undefined;
+}) {
   if (props.cell.kind === "lines") {
-    return <TranscriptLines lines={props.cell.lines} />;
+    return <TranscriptLines lines={props.cell.lines} onOpenFile={props.onOpenFile} selectionColors={props.selectionColors} />;
   }
   return <>{props.cell.render()}</>;
 }

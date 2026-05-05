@@ -5,7 +5,8 @@ import { shorten } from "../components/helpers.js";
 import type { TuiTheme } from "../theme/index.js";
 import { AssistantMarkdownCell, assistantTextCellLines } from "./AssistantCells.js";
 import { componentBackedCell, lineBackedCell, TranscriptCellView, type TranscriptCellModel } from "./cells.js";
-import { type TranscriptLineModel, wrapLine } from "./lines.js";
+import { type OpenFileLinkHandler, type TranscriptLineModel, wrapLine } from "./lines.js";
+import { hasFileLinkText } from "./file-links.js";
 import { buildChatDisplayItems, type ChatDisplayItem } from "./presentation.js";
 import { ToolCell, ToolGroupCell, toolCellLines, toolGroupCellLines } from "./ToolCells.js";
 import type { LocalTranscriptItem } from "./types.js";
@@ -17,6 +18,8 @@ export function MessageList(props: {
   scrollRef?: Ref<ScrollBoxRenderable> | undefined;
   showToolDetails?: boolean;
   hideThinking?: boolean;
+  cwd?: string | undefined;
+  onOpenFile?: OpenFileLinkHandler | undefined;
   theme: TuiTheme;
 }) {
   const allCells = transcriptCells(props.chatView.items, props.localItems, {
@@ -26,7 +29,12 @@ export function MessageList(props: {
     sessionStatus: props.chatView.status,
     activeToolCount: props.chatView.activeTools.length,
     theme: props.theme,
+    cwd: props.cwd ?? process.cwd(),
   });
+  const selectionColors = {
+    selectionBg: props.theme.colors.menu.selectedBackground,
+    selectionFg: props.theme.colors.menu.selectedText,
+  };
   return (
     <scrollbox
       {...(props.scrollRef === undefined ? {} : { ref: props.scrollRef })}
@@ -38,11 +46,20 @@ export function MessageList(props: {
       stickyStart="bottom"
       viewportCulling
       contentOptions={{ flexDirection: "column" }}
+      verticalScrollbarOptions={{ visible: false, width: 0 }}
+      horizontalScrollbarOptions={{ visible: false, height: 0 }}
     >
       {allCells.length === 0 ? (
         <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>{"Start a conversation from the prompt below."}</text>
       ) : (
-        allCells.map((cell) => <TranscriptCellView key={cell.key} cell={cell} />)
+        allCells.map((cell) => (
+          <TranscriptCellView
+            key={cell.key}
+            cell={cell}
+            onOpenFile={props.onOpenFile}
+            selectionColors={selectionColors}
+          />
+        ))
       )}
     </scrollbox>
   );
@@ -51,7 +68,7 @@ export function MessageList(props: {
 function transcriptCells(
   items: readonly ChatTranscriptItem[],
   localItems: readonly LocalTranscriptItem[],
-  options: { width: number; showToolDetails: boolean; hideThinking: boolean; sessionStatus: ChatSessionView["status"]; activeToolCount: number; theme: TuiTheme },
+  options: { width: number; showToolDetails: boolean; hideThinking: boolean; sessionStatus: ChatSessionView["status"]; activeToolCount: number; theme: TuiTheme; cwd: string },
 ): TranscriptCellModel[] {
   const displayItems = buildChatDisplayItems(items, {
     showToolDetails: options.showToolDetails,
@@ -60,12 +77,12 @@ function transcriptCells(
     activeToolCount: options.activeToolCount,
   });
   return [
-    ...displayItems.map((item) => displayItemCell(item, options.width, options.theme, options.hideThinking)),
+    ...displayItems.map((item) => displayItemCell(item, options.width, options.theme, options.hideThinking, options.cwd)),
     ...localItems.map((item) => localItemCell(item, options.width, options.theme)),
   ];
 }
 
-function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, hideThinking: boolean): TranscriptCellModel {
+function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, hideThinking: boolean, cwd: string): TranscriptCellModel {
   if (item.kind === "user_text") {
     return lineBackedCell(`display:${item.kind}:${item.id}`, wrapLine(`🥔: ${item.text || "..."}`, {
       key: `display:${item.kind}:${item.id}`,
@@ -76,13 +93,19 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, 
   }
   if (item.kind === "assistant_text") {
     const key = `display:${item.kind}:${item.id}`;
+    const renderAsLines = item.streaming === true || hasFileLinkText(item.text);
     const lines = assistantTextCellLines({
       key,
       text: item.text,
       streaming: item.streaming === true,
       width,
       theme,
+      cwd,
+      ...(renderAsLines ? { prefix: "", hangingIndent: "" } : {}),
     });
+    if (renderAsLines) {
+      return lineBackedCell(key, lines);
+    }
     return componentBackedCell({
       key,
       render: () => (
