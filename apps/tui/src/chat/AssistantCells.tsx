@@ -22,31 +22,34 @@ export function AssistantMarkdownCell(props: {
   const width = Math.max(1, Number.isFinite(props.width) ? Math.floor(props.width) : 80);
   if (content.trim().length === 0) return <AssistantTextCell lines={props.fallbackLines} />;
   return (
-    <box width={width} maxWidth={width} flexDirection="column" overflow="hidden">
-      <markdown
-        content={content}
-        width="100%"
-        maxWidth="100%"
-        fg={props.theme.colors.text.secondary}
-        syntaxStyle={assistantMarkdownSyntaxStyle(props.theme)}
-        conceal
-        concealCode={false}
-        streaming={props.streaming}
-        renderNode={renderAssistantMarkdownNode}
-        internalBlockMode="top-level"
-        tableOptions={{
-          style: "grid",
-          widthMode: "content",
-          columnFitter: "balanced",
-          wrapMode: "word",
-          cellPadding: 0,
-          borders: true,
-          outerBorder: true,
-          borderStyle: "single",
-          borderColor: props.theme.colors.border.default,
-          selectable: true,
-        }}
-      />
+    <box width={width} maxWidth={width} flexDirection="row" overflow="hidden">
+      <text fg={props.theme.colors.text.secondary} wrapMode="none">{"🌶️: "}</text>
+      <box flexGrow={1} flexShrink={1} minWidth={1} flexDirection="column" overflow="hidden">
+        <markdown
+          content={content}
+          width="100%"
+          maxWidth="100%"
+          fg={props.theme.colors.text.secondary}
+          syntaxStyle={assistantMarkdownSyntaxStyle(props.theme)}
+          conceal
+          concealCode={false}
+          streaming={props.streaming}
+          renderNode={renderAssistantMarkdownNode}
+          internalBlockMode="top-level"
+          tableOptions={{
+            style: "grid",
+            widthMode: "content",
+            columnFitter: "balanced",
+            wrapMode: "word",
+            cellPadding: 0,
+            borders: true,
+            outerBorder: true,
+            borderStyle: "single",
+            borderColor: props.theme.colors.border.default,
+            selectable: true,
+          }}
+        />
+      </box>
     </box>
   );
 }

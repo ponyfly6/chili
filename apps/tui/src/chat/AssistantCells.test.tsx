@@ -72,7 +72,7 @@ test("assistant markdown cell renders native heading list code diff and quote bl
   expect(frame).toContain("-old");
   expect(frame).toContain("+new");
   expect(frame).toContain("> compact by default");
-  expect(frame).not.toContain("🌶️:");
+  expect(frame).toContain("🌶️:");
   expect(frame).not.toContain("```ts");
   expect(frame).not.toContain("```diff");
 });
@@ -89,14 +89,20 @@ test("assistant markdown cell keeps OpenTUI markdown as the native render path",
     fallbackLines,
   });
   const markdown = findIntrinsicElement(element, "markdown");
+  const prefix = findIntrinsicElement(element, "text");
   const box = findIntrinsicElement(element, "box");
 
   expect(box?.props).toMatchObject({
     width: 72,
     maxWidth: 72,
-    flexDirection: "column",
+    flexDirection: "row",
     overflow: "hidden",
   });
+  expect(prefix?.props).toMatchObject({
+    fg: theme.colors.text.secondary,
+    wrapMode: "none",
+  });
+  expect(prefix?.props.children).toBe("🌶️: ");
   expect(markdown?.props).toMatchObject({
     content: text,
     width: "100%",
@@ -186,7 +192,7 @@ test("assistant markdown cell renders compact native table while partial fallbac
   expect(frame).toContain("│Name");
   expect(frame).toContain("│alpha");
   expect(frame).not.toContain("│ Name");
-  expect(frame).not.toContain("🌶️:");
+  expect(frame).toContain("🌶️:");
   expect(frame).not.toContain(":---");
 });
 
@@ -219,7 +225,7 @@ test("assistant markdown native table stays readable with narrow CJK and long ce
   expect(frame).toContain("┌");
   expect(frame).toContain("│名称");
   expect(frame).toContain("│火锅");
-  expect(frame).not.toContain("🌶️:");
+  expect(frame).toContain("🌶️:");
 });
 
 test("assistant markdown compact table conceals inline markdown markers", async () => {
@@ -253,7 +259,7 @@ test("assistant markdown compact table conceals inline markdown markers", async 
   expect(frame).not.toContain("**CLI 命令**");
   expect(frame).not.toContain("`srt`");
   expect(frame).not.toContain("`src/cli.ts`");
-  expect(frame).not.toContain("🌶️:");
+  expect(frame).toContain("🌶️:");
 });
 
 test("assistant text cell lines keep streaming stable and tail rendering", () => {
@@ -303,7 +309,7 @@ test("assistant text cell lines keep unfinished streaming code fences open", asy
 
   expect(frame).toContain("Intro");
   expect(frame).toContain("const ok");
-  expect(frame).not.toContain("🌶️:");
+  expect(frame).toContain("🌶️:");
   expect(occurrences(frame, "```")).toBe(0);
 });
 
@@ -402,7 +408,7 @@ test("assistant markdown component full render stays rich while partial slices u
   expect(fullFrame).toContain("# Rich visible");
   expect(fullFrame).toContain("- rendered component");
   expect(fullFrame).not.toContain("FALLBACK");
-  expect(fullFrame).not.toContain("🌶️:");
+  expect(fullFrame).toContain("🌶️:");
   expect(partialFrame).toContain("FALLBACK three");
   expect(partialFrame).not.toContain("# Rich visible");
 });

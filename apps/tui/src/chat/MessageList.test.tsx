@@ -143,7 +143,7 @@ test("streaming assistant text does not prematurely close unfinished code fences
 
   expect(frame).toContain("Intro");
   expect(frame).toContain("const ok");
-  expect(frame).not.toContain("🌶️:");
+  expect(frame).toContain("🌶️:");
   expect(occurrences(frame, "```")).toBe(0);
 });
 
@@ -287,7 +287,7 @@ test("completed assistant markdown keeps block rendering", async () => {
   expect(frame).toContain("# Done");
   expect(frame).toContain("- ship it");
   expect(frame).toContain("const ok = true;");
-  expect(frame).not.toContain("🌶️:");
+  expect(frame).toContain("🌶️:");
   expect(frame).not.toContain("```ts");
 });
 
@@ -316,7 +316,7 @@ test("assistant markdown table uses native table rendering in the message list",
   expect(frame).toContain("│Name");
   expect(frame).toContain("│alpha");
   expect(frame).not.toContain("│ Name");
-  expect(frame).not.toContain("🌶️:");
+  expect(frame).toContain("🌶️:");
   expect(frame).not.toContain("| ---");
 });
 
@@ -342,7 +342,7 @@ test("streaming assistant markdown table uses native table rendering", async () 
   expect(frame).toContain("Clear");
   expect(frame).toContain("┌");
   expect(frame).toContain("┬");
-  expect(frame).not.toContain("🌶️:");
+  expect(frame).toContain("🌶️:");
   expect(frame).not.toContain("| ---");
 });
 
@@ -375,7 +375,7 @@ test("assistant markdown tables with dotted names and package scopes stay native
   expect(frame).toContain("@pondwader/socks5-server");
   expect(frame).toContain("┌");
   expect(frame).toContain("┬");
-  expect(frame).not.toContain("🌶️:");
+  expect(frame).toContain("🌶️:");
   expect(frame).not.toContain("| ---");
 });
 
@@ -545,7 +545,7 @@ test("assistant tool parts stay out of default chat text while tool rows render 
 
   expect(frame).toContain("Done with");
   expect(frame).toContain("tests");
-  expect(frame).not.toContain("🌶️:");
+  expect(frame).toContain("🌶️:");
   expect(frame).toContain("Ran bun test");
   expect(occurrences(frame, "Ran bun test")).toBe(1);
   expect(frame).not.toContain("tool_call");
