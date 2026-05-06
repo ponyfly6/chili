@@ -7,6 +7,30 @@ export interface SystemPaletteInput {
   defaultBackground?: string | null | undefined;
 }
 
+export interface SystemThemePaletteRenderer {
+  clearPaletteCache?: (() => void) | undefined;
+  getPalette?: ((options?: { size?: number; timeout?: number }) => Promise<SystemPaletteInput>) | undefined;
+}
+
+export interface DetectSystemThemeOptions {
+  clearCache?: boolean | undefined;
+  size?: number | undefined;
+  timeout?: number | undefined;
+}
+
+export async function detectSystemTheme(
+  renderer: SystemThemePaletteRenderer,
+  options: DetectSystemThemeOptions = {},
+): Promise<TuiTheme | undefined> {
+  try {
+    if (options.clearCache) renderer.clearPaletteCache?.();
+    const palette = await renderer.getPalette?.({ size: options.size ?? 16, timeout: options.timeout ?? 300 });
+    return generateSystemTheme(palette);
+  } catch {
+    return undefined;
+  }
+}
+
 export function generateSystemTheme(input: SystemPaletteInput | null | undefined): TuiTheme | undefined {
   if (!input) return undefined;
 

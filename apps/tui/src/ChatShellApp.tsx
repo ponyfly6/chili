@@ -73,6 +73,8 @@ import {
   resolveTuiTheme,
   selectableTuiThemeOptions,
   SYSTEM_TUI_THEME_ID,
+  useLiveSystemTheme,
+  type SystemThemePaletteRenderer,
   type TuiTheme,
   type TuiThemeOption,
 } from "./theme/index.js";
@@ -119,6 +121,8 @@ export interface ChatShellOptions extends TeamLiveTuiOptions {
   gitBranch?: string;
   themeId?: string;
   systemTheme?: TuiTheme;
+  liveSystemTheme?: boolean;
+  systemThemeRefreshMs?: number;
 }
 
 export interface ChatShellExitInfo {
@@ -143,46 +147,53 @@ export function ChatShellApp(props: {
   options: ChatShellOptions;
   onExit: (info?: ChatShellExitInfo) => void;
 }) {
-  const chatOptions = useMemo(
+  const shellOptions = useMemo<ChatShellOptions>(
     () => ({
       ...props.options,
-      streamScope: props.options.sessionId ? "session" as const : "all" as const,
+      liveSystemTheme: props.options.liveSystemTheme ?? true,
     }),
     [props.options],
+  );
+  const chatOptions = useMemo(
+    () => ({
+      ...shellOptions,
+      streamScope: shellOptions.sessionId ? "session" as const : "all" as const,
+    }),
+    [shellOptions],
   );
   const runtime = useChatRuntime({ client: props.client, options: chatOptions });
   const allTeams = teamLiveModel(runtime.runtimeView, {
     connection: runtime.connection,
-    sessionId: props.options.sessionId,
+    sessionId: shellOptions.sessionId,
     limit: 48,
   });
-  const [selectedTeamId, setSelectedTeamId] = useState<TeamId | undefined>(props.options.teamId ?? allTeams.selectedTeamId);
-  const resolvedSelectedTeamId = props.options.teamId ?? validSelectedTeamId(allTeams, selectedTeamId);
+  const [selectedTeamId, setSelectedTeamId] = useState<TeamId | undefined>(shellOptions.teamId ?? allTeams.selectedTeamId);
+  const resolvedSelectedTeamId = shellOptions.teamId ?? validSelectedTeamId(allTeams, selectedTeamId);
   const model = teamLiveModel(runtime.runtimeView, {
     connection: runtime.connection,
     selectedTeamId: resolvedSelectedTeamId,
-    sessionId: props.options.sessionId,
+    sessionId: shellOptions.sessionId,
     limit: 64,
   });
-  const skillSummaries = useSkillSummaries(props.options.cwd ?? process.cwd());
+  const skillSummaries = useSkillSummaries(shellOptions.cwd ?? process.cwd());
 
   useEffect(() => {
-    if (props.options.teamId) {
-      setSelectedTeamId(props.options.teamId);
+    if (shellOptions.teamId) {
+      setSelectedTeamId(shellOptions.teamId);
       return;
     }
     if (!selectedTeamId || !allTeams.teams.some((team) => team.id === selectedTeamId)) {
       setSelectedTeamId(allTeams.selectedTeamId ?? allTeams.teams[0]?.id);
     }
-  }, [allTeams.selectedTeamId, allTeams.teams, props.options.teamId, selectedTeamId]);
+  }, [allTeams.selectedTeamId, allTeams.teams, shellOptions.teamId, selectedTeamId]);
 
   return (
     <ChatShellSurface
       model={model}
       runtime={runtime}
-      options={props.options}
+      options={shellOptions}
       selectedTeamId={resolvedSelectedTeamId}
-      selectedTeamLocked={Boolean(props.options.teamId)}
+      selectedTeamLocked={Boolean(shellOptions.teamId)}
       onSelectTeam={setSelectedTeamId}
       onExit={props.onExit}
       skills={skillSummaries.skills}
@@ -209,7 +220,7 @@ export function ChatShellSurface(props: {
 }) {
   const dimensions = useTerminalDimensions();
   const { keyHandler } = useAppContext();
-  const renderer = useRenderer() as ClipboardRenderer;
+  const renderer = useRenderer() as ClipboardRenderer & SystemThemePaletteRenderer;
   const [view, setView] = useState<ShellView>("chat");
   const [promptParts, setPromptParts] = useState<PromptPart[]>([{ type: "text", text: "" }]);
   const [skillMentionBindings, setSkillMentionBindings] = useState<RuntimeSkillMention[]>([]);
@@ -292,7 +303,11 @@ export function ChatShellSurface(props: {
   const shellInputActive = prompt.startsWith("!");
   const history = usePromptHistory();
   const authManualPromptRef = useRef<AuthManualPrompt | undefined>(undefined);
-  const systemTheme = props.options?.systemTheme;
+  const systemTheme = useLiveSystemTheme(renderer, {
+    enabled: Boolean(props.options?.liveSystemTheme) && themeId === SYSTEM_TUI_THEME_ID,
+    initialTheme: props.options?.systemTheme,
+    refreshMs: props.options?.systemThemeRefreshMs,
+  });
   const theme = resolveTuiTheme(themeId, undefined, { systemTheme });
   const themeOptions = selectableTuiThemeOptions;
   const systemThemeAvailable = Boolean(systemTheme);

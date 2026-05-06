@@ -3,7 +3,8 @@ import type { TuiTheme } from "./types.js";
 
 export type { TuiTheme } from "./types.js";
 export { chiliDarkTheme, chiliLightTheme, terminalDarkTheme, tuiThemes, warmLightTheme } from "./palettes.js";
-export { generateSystemTheme, normalizeHexColor, type SystemPaletteInput } from "./system.js";
+export { detectSystemTheme, generateSystemTheme, normalizeHexColor, type DetectSystemThemeOptions, type SystemPaletteInput, type SystemThemePaletteRenderer } from "./system.js";
+export { DEFAULT_SYSTEM_THEME_REFRESH_MS, useLiveSystemTheme, type LiveSystemThemeOptions } from "./useSystemTheme.js";
 
 export const SYSTEM_TUI_THEME_ID = "system";
 export const DEFAULT_TUI_THEME_ID = SYSTEM_TUI_THEME_ID;

@@ -1,9 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
-import { useKeyboard, useTerminalDimensions } from "@opentui/react";
+import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent } from "@opentui/core";
 import type { HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
 import type { TeamId } from "@chili/protocol";
-import type { TuiTheme } from "./theme/index.js";
+import {
+  initialTuiThemeId,
+  resolveTuiTheme,
+  SYSTEM_TUI_THEME_ID,
+  useLiveSystemTheme,
+  type SystemThemePaletteRenderer,
+  type TuiTheme,
+} from "./theme/index.js";
 import {
   teamLiveModel,
   useTeamLiveRuntime,
@@ -39,12 +46,26 @@ const INITIAL_SELECTION: SelectionState = {
   detail: 0,
 };
 
+export interface TeamLiveAppOptions extends TeamLiveTuiOptions {
+  themeId?: string;
+  systemTheme?: TuiTheme;
+  liveSystemTheme?: boolean;
+  systemThemeRefreshMs?: number;
+}
+
 export function TeamLiveApp(props: {
   client: HttpRuntimeClient;
-  options: TeamLiveTuiOptions;
+  options: TeamLiveAppOptions;
   onExit: () => void;
-  theme: TuiTheme;
 }) {
+  const renderer = useRenderer() as SystemThemePaletteRenderer;
+  const themeId = useMemo(() => initialTuiThemeId(props.options.themeId), [props.options.themeId]);
+  const systemTheme = useLiveSystemTheme(renderer, {
+    enabled: (props.options.liveSystemTheme ?? true) && themeId === SYSTEM_TUI_THEME_ID,
+    initialTheme: props.options.systemTheme,
+    refreshMs: props.options.systemThemeRefreshMs,
+  });
+  const theme = resolveTuiTheme(themeId, undefined, { systemTheme });
   const runtime = useTeamLiveRuntime({ client: props.client, options: props.options });
   const allTeams = teamLiveModel(runtime.runtimeView, {
     connection: runtime.connection,
@@ -78,7 +99,7 @@ export function TeamLiveApp(props: {
       selectedTeamLocked={Boolean(props.options.teamId)}
       onSelectTeam={setSelectedTeamId}
       onExit={props.onExit}
-      theme={props.theme}
+      theme={theme}
     />
   );
 }
