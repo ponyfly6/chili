@@ -3,7 +3,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { basename, join, relative } from "node:path";
 import type { SessionId, ThreadId } from "@chili/protocol";
 import { formatResumeCommand, parseArgs, teamLiveStreamInput } from "./index.js";
-import { generateSystemTheme, initialTuiThemeId, resolveTuiTheme } from "./theme/index.js";
+import { detectSystemTheme, generateSystemTheme, initialTuiThemeId, resolveTuiTheme } from "./theme/index.js";
 
 test("parses runtime flags and keeps Team Live stream unscoped for child-session events", () => {
   const controller = new AbortController();
@@ -167,6 +167,33 @@ test("generates a system TUI theme from a terminal palette", () => {
         success: "#50fa7b",
         warning: "#f1fa8c",
       },
+    },
+  });
+});
+
+test("detects system TUI theme with a fresh renderer palette", async () => {
+  const calls: string[] = [];
+  const theme = await detectSystemTheme({
+    clearPaletteCache: () => {
+      calls.push("clear");
+    },
+    getPalette: async (options) => {
+      calls.push(`palette:${options?.size}:${options?.timeout}`);
+      return {
+        defaultBackground: "#fdfdfd",
+        defaultForeground: "#101010",
+        palette: ["#000000", "#cc3333", "#33aa55", "#c9a227", "#357bd8", "#ad48d9", "#228f8f", "#222222"],
+      };
+    },
+  }, { clearCache: true, timeout: 42 });
+
+  expect(calls).toEqual(["clear", "palette:16:42"]);
+  expect(theme).toMatchObject({
+    id: "system",
+    colors: {
+      background: "#fdfdfd",
+      text: { primary: "#101010" },
+      accent: { primary: "#228f8f" },
     },
   });
 });
