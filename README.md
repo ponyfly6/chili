@@ -182,4 +182,4 @@ Prompt、memory/project context 和 skills 的维护说明见 [docs/prompt-skill
 
 ## License
 
-TBD
+Apache-2.0. See [LICENSE](LICENSE).
