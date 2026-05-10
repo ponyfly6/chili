@@ -49,8 +49,22 @@ export interface ToolOutputUpdate {
 export interface ToolResult {
   title: string;
   output: string;
+  content?: ToolResultContent[];
   metadata?: Record<string, unknown>;
   artifactIds?: ArtifactId[];
+}
+
+export type ToolResultContent = ToolResultTextContent | ToolResultImageContent;
+
+export interface ToolResultTextContent {
+  type: "text";
+  text: string;
+}
+
+export interface ToolResultImageContent {
+  type: "image";
+  data: string;
+  mimeType: string;
 }
 
 export interface ApprovalRequest {

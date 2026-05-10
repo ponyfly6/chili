@@ -6,6 +6,7 @@ import type {
   TimestampMs,
   ToolCallId,
 } from "./ids.js";
+import type { ToolResultContent } from "./tool.js";
 
 export type MessageRole = "system" | "user" | "assistant" | "tool";
 
@@ -20,6 +21,7 @@ export interface Message {
 
 export type MessagePart =
   | TextPart
+  | ImagePart
   | ReasoningPart
   | ToolCallPart
   | ToolResultPart
@@ -41,6 +43,18 @@ export interface TextPart extends BasePart {
   synthetic?: boolean;
 }
 
+export interface MessageImageContent {
+  data: string;
+  mimeType: string;
+  filename?: string;
+  sourcePath?: string;
+}
+
+export interface ImagePart extends BasePart, MessageImageContent {
+  type: "image";
+  displayText?: string;
+}
+
 export interface ReasoningPart extends BasePart {
   type: "reasoning";
   text: string;
@@ -59,6 +73,7 @@ export interface ToolResultPart extends BasePart {
   type: "tool_result";
   callId: ToolCallId;
   output: string;
+  content?: ToolResultContent[];
   error?: string;
   synthetic?: boolean;
   artifactIds?: ArtifactId[];
