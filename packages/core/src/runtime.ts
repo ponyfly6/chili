@@ -7,6 +7,7 @@ import type {
   ModelUsage as ProtocolModelUsage,
   ReasoningLevel,
   RuntimeModelDescriptor,
+  ServiceTier,
   SessionId,
   ThreadId,
   ToolDefinition,
@@ -59,6 +60,7 @@ export interface ModelStreamInput {
   promptDebug?: PromptDebugManifest;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
+  serviceTier?: ServiceTier;
   signal?: AbortSignal;
 }
 

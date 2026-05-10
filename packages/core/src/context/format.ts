@@ -40,6 +40,8 @@ function formatContextPart(part: Message["parts"][number], options: ContextMessa
   switch (part.type) {
     case "text":
       return part.text;
+    case "image":
+      return `[image ${part.mimeType}${part.filename ? ` ${part.filename}` : ""}${part.sourcePath ? ` ${part.sourcePath}` : ""}]`;
     case "reasoning":
       return `[reasoning]\n${part.text}`;
     case "tool_call": {

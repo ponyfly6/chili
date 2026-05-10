@@ -1,4 +1,4 @@
-import type { MessageId, ModelSelection, ModelUsage, ReasoningLevel, SessionId, ThreadId, TurnId } from "@chili/protocol";
+import type { MessageId, MessageImageContent, ModelSelection, ModelUsage, ReasoningLevel, ServiceTier, SessionId, ThreadId, TurnId } from "@chili/protocol";
 import type { ContextUsage } from "./context/index.js";
 import type { PromptDebugManifest } from "./prompt/index.js";
 
@@ -13,6 +13,7 @@ export interface AppendUserMessageInput {
   threadId: ThreadId;
   text: string;
   displayText?: string;
+  images?: readonly MessageImageContent[];
 }
 
 export interface RunTurnInput {
@@ -25,8 +26,11 @@ export interface RunTurnInput {
   contextualUser?: string[];
   promptDebug?: PromptDebugManifest;
   toolMode?: "auto" | "disabled";
+  suppressExternalImageTools?: boolean;
+  preferExternalImageTools?: boolean;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
+  serviceTier?: ServiceTier;
   signal?: AbortSignal;
 }
 

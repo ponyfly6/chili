@@ -257,6 +257,99 @@ test("surfaces model startup failures in the assistant message", async () => {
   );
 });
 
+test("suppresses MCP image understanding tools when direct image input is available", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const visibleToolNames: string[][] = [];
+  registry.register({
+    name: "read_image",
+    description: "Read an image from the workspace.",
+    risk: "read",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => ({ title: "read", output: "ok" }),
+  });
+  registry.register({
+    name: "mcp__minimax__understand_image",
+    description: "Analyze and describe image content.",
+    risk: "network",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => ({ title: "mcp", output: "ok" }),
+    mcp: {
+      rawServerName: "MiniMax",
+      rawToolName: "understand_image",
+      serverName: "minimax",
+      toolName: "understand_image",
+      modelName: "mcp__minimax__understand_image",
+    },
+  } as Parameters<InMemoryToolRegistry["register"]>[0] & { mcp: Record<string, unknown> });
+  const model: ModelRouter = {
+    async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+      visibleToolNames.push(input.tools.map((tool) => tool.name));
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_suppress_image_tools" as SessionId,
+    threadId: "thread_suppress_image_tools" as ThreadId,
+    cwd: "/repo",
+    suppressExternalImageTools: true,
+  });
+
+  expect(result.status).toBe("completed");
+  expect(visibleToolNames).toEqual([["read_image"]]);
+});
+
+test("prefers MCP image understanding tools over read_image for path-only image prompts", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const visibleToolNames: string[][] = [];
+  registry.register({
+    name: "read_image",
+    aliases: ["view_image", "image_read"],
+    description: "Read an image and return it as an image block.",
+    risk: "read",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => ({ title: "read", output: "ok" }),
+  });
+  registry.register({
+    name: "mcp__minimax__understand_image",
+    description: "Analyze and describe image content.",
+    risk: "network",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => ({ title: "mcp", output: "ok" }),
+    mcp: {
+      rawServerName: "MiniMax",
+      rawToolName: "understand_image",
+      serverName: "minimax",
+      toolName: "understand_image",
+      modelName: "mcp__minimax__understand_image",
+    },
+  } as Parameters<InMemoryToolRegistry["register"]>[0] & { mcp: Record<string, unknown> });
+  const model: ModelRouter = {
+    async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+      visibleToolNames.push(input.tools.map((tool) => tool.name));
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_prefer_external_image_tools" as SessionId,
+    threadId: "thread_prefer_external_image_tools" as ThreadId,
+    cwd: "/repo",
+    preferExternalImageTools: true,
+  });
+
+  expect(result.status).toBe("completed");
+  expect(visibleToolNames).toEqual([["mcp__minimax__understand_image"]]);
+});
+
 test("finishes live streaming tool rows as cancelled when aborted before tool_call_end", async () => {
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();

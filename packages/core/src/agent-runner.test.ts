@@ -5,9 +5,11 @@ import type {
   Message,
   MessageId,
   PartId,
+  RuntimeModelDescriptor,
   SessionId,
   ThreadId,
   TimestampMs,
+  ToolCallId,
   TurnId,
 } from "@chili/protocol";
 import type { ApprovalRow, EventQuery, EventStore, SessionRow } from "@chili/store";
@@ -69,6 +71,167 @@ test("RuntimeService accepts an AgentRunner implementation", async () => {
   expect(runner.turnInputs[0]?.system).toEqual(["be brief"]);
   expect(runner.turnInputs[0]?.signal?.aborted).toBe(false);
   expect(statuses(store)).toEqual(["idle", "running", "running", "idle"]);
+});
+
+test("RuntimeService rejects prompt images for text-only models before appending user messages", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const model = textOnlyModel();
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    models: [model],
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const result = await service.submitPrompt({
+    sessionId: "session_text_only_image" as SessionId,
+    threadId: "thread_text_only_image" as ThreadId,
+    text: "[Image #1] what is this?",
+    images: [{ data: "aW1hZ2U=", mimeType: "image/png" }],
+    modelSelection: { provider: model.provider, model: model.model },
+  });
+
+  expect(result.status).toBe("failed");
+  if (result.status === "completed") throw new Error("expected prompt to fail");
+  expect(result.error?.message).toContain("does not support image input");
+  expect(runner.userMessages).toEqual([]);
+  expect(runner.turnInputs).toEqual([]);
+  expect(statuses(store)).toEqual(["failed"]);
+});
+
+test("RuntimeService converts sourced prompt images to tool-readable text for text-only models", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const model = textOnlyModel();
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    models: [model],
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const result = await service.submitPrompt({
+    sessionId: "session_text_only_image_path" as SessionId,
+    threadId: "thread_text_only_image_path" as ThreadId,
+    text: "[Image #1] what is this?",
+    images: [{ data: "aW1hZ2U=", mimeType: "image/png", sourcePath: ".chili/clipboard-images/paste.png" }],
+    modelSelection: { provider: model.provider, model: model.model },
+  });
+
+  expect(result.status).toBe("completed");
+  expect(runner.userMessages).toHaveLength(1);
+  expect(runner.userMessages[0]?.text).toContain("[Image #1] what is this?");
+  expect(runner.userMessages[0]?.text).toContain("<pasted_image_files>");
+  expect(runner.userMessages[0]?.text).toContain("path=.chili/clipboard-images/paste.png");
+  expect(runner.userMessages[0]?.text).toContain("absolutePath=/repo/.chili/clipboard-images/paste.png");
+  expect(runner.userMessages[0]?.displayText).toBe("[Image #1] what is this?");
+  expect(runner.userMessages[0]?.images).toBeUndefined();
+  expect(runner.turnInputs).toHaveLength(1);
+  expect(runner.turnInputs[0]?.preferExternalImageTools).toBe(true);
+  expect(runner.turnInputs[0]?.system?.some((item) => item.includes("pasted image file path"))).toBe(true);
+  expect(runner.turnInputs[0]?.promptDebug?.fragments).toContainEqual(expect.objectContaining({
+    id: "runtime.path_image_input",
+  }));
+  expect(statuses(store)).toEqual(["running", "running", "idle"]);
+});
+
+test("RuntimeService prefers direct image input over external image tools for image-capable turns", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const result = await service.submitPrompt({
+    sessionId: "session_direct_image" as SessionId,
+    threadId: "thread_direct_image" as ThreadId,
+    text: "[Image #1] what is this?",
+    images: [{ data: "aW1hZ2U=", mimeType: "image/png", sourcePath: ".chili/clipboard-images/paste.png" }],
+  });
+
+  expect(result.status).toBe("completed");
+  expect(runner.userMessages[0]?.images).toHaveLength(1);
+  expect(runner.turnInputs[0]?.suppressExternalImageTools).toBe(true);
+  expect(runner.turnInputs[0]?.system?.some((item) => item.includes("direct image attachment"))).toBe(true);
+  expect(runner.turnInputs[0]?.promptDebug?.fragments).toContainEqual(expect.objectContaining({
+    id: "runtime.direct_image_input",
+    metadata: { imageCount: 1 },
+  }));
+});
+
+test("RuntimeService allows external image tools when the prompt explicitly asks for tools", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const result = await service.submitPrompt({
+    sessionId: "session_direct_image_tool" as SessionId,
+    threadId: "thread_direct_image_tool" as ThreadId,
+    text: "[Image #1] 用 MCP 工具识别",
+    images: [{ data: "aW1hZ2U=", mimeType: "image/png", sourcePath: ".chili/clipboard-images/paste.png" }],
+  });
+
+  expect(result.status).toBe("completed");
+  expect(runner.turnInputs[0]?.suppressExternalImageTools).toBeUndefined();
+});
+
+test("RuntimeService allows text-only model turns when retained tool history contains image content", async () => {
+  const sessionId = "session_text_only_tool_image" as SessionId;
+  const callId = "call_read_image" as ToolCallId;
+  const store = new MemoryEventStore();
+  store.messageRows.push({
+    id: "msg_tool_result_image_history" as MessageId,
+    sessionId,
+    role: "user",
+    createdAt: 1 as TimestampMs,
+    parts: [
+      {
+        id: "part_tool_result_image_history" as PartId,
+        messageId: "msg_tool_result_image_history" as MessageId,
+        sessionId,
+        type: "tool_result",
+        callId,
+        output: "MCP read image result text\n[image image/png 6 bytes]",
+        content: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
+      },
+    ],
+  });
+  const runner = new FakeAgentRunner();
+  const model = textOnlyModel();
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    models: [model],
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const result = await service.submitPrompt({
+    sessionId,
+    threadId: "thread_text_only_tool_image" as ThreadId,
+    text: "hi",
+    modelSelection: { provider: model.provider, model: model.model },
+  });
+
+  expect(result.status).toBe("completed");
+  expect(runner.userMessages).toHaveLength(1);
+  expect(runner.turnInputs).toHaveLength(1);
 });
 
 test("RuntimeService passes promptFragments by prompt layer", async () => {
@@ -553,6 +716,11 @@ test("RuntimeService uses the last persisted model config for new sessions", asy
     threadId: "thread_previous" as ThreadId,
     reasoningLevel: "high",
   });
+  await firstService.setServiceTier({
+    sessionId: "session_previous" as SessionId,
+    threadId: "thread_previous" as ThreadId,
+    serviceTier: "fast",
+  });
 
   const nextRunner = new FakeAgentRunner();
   const nextService = new RuntimeService({
@@ -572,6 +740,7 @@ test("RuntimeService uses the last persisted model config for new sessions", asy
   const config = await nextService.getModelConfig("session_next" as SessionId);
   expect(config.modelSelection).toEqual({ provider: "openai-codex", model: "gpt-5.5" });
   expect(config.reasoningLevel).toBe("high");
+  expect(config.serviceTier).toBe("fast");
 
   const result = await nextService.submitPrompt({
     sessionId: "session_next" as SessionId,
@@ -582,6 +751,7 @@ test("RuntimeService uses the last persisted model config for new sessions", asy
   expect(result.status).toBe("completed");
   expect(nextRunner.turnInputs[0]?.modelSelection).toEqual({ provider: "openai-codex", model: "gpt-5.5" });
   expect(nextRunner.turnInputs[0]?.reasoningLevel).toBe("high");
+  expect(nextRunner.turnInputs[0]?.serviceTier).toBe("fast");
 });
 
 test("RuntimeService still stops on Anthropic-style end_turn finish reason", async () => {
@@ -800,6 +970,14 @@ function textMessage(input: {
         text: input.text,
       },
     ],
+  };
+}
+
+function textOnlyModel(): RuntimeModelDescriptor {
+  return {
+    provider: "minimax",
+    model: "MiniMax-M2.7-highspeed",
+    inputCapabilities: ["text"],
   };
 }
 

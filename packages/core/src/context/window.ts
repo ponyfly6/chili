@@ -39,6 +39,7 @@ const DEFAULT_COMPACTED_TOOL_RESULT_CHARS = 2_400;
 const DEFAULT_THRESHOLD_RATIO = 0.85;
 const DEFAULT_PRESERVE_RECENT_MESSAGES = 4;
 const DEFAULT_PRESERVE_RECENT_TOOL_RESULTS = 3;
+const IMAGE_CONTEXT_ESTIMATE_CHARS = 4096;
 
 export class ContextWindowBuilder {
   private readonly maxInputChars: number;
@@ -210,8 +211,9 @@ export class ContextWindowBuilder {
   }
 
   private compactToolResult(part: ToolResultPart): ToolResultPart {
+    const { content: _content, ...rest } = part;
     const result: ToolResultPart = {
-      ...part,
+      ...rest,
       output: compactToolResultOutput(part.output, this.compactedToolResultChars),
       synthetic: part.synthetic ?? true,
     };
@@ -290,8 +292,10 @@ function estimatePart(part: MessagePart): number {
     case "text":
     case "reasoning":
       return part.text.length;
+    case "image":
+      return IMAGE_CONTEXT_ESTIMATE_CHARS + part.mimeType.length + (part.filename?.length ?? 0) + (part.sourcePath?.length ?? 0) + 64;
     case "tool_result":
-      return part.output.length + (part.error?.length ?? 0) + 64;
+      return part.output.length + (part.error?.length ?? 0) + estimateToolResultContent(part.content) + 64;
     case "tool_call":
       return JSON.stringify(part.input).length + part.toolName.length + 64;
     case "patch":
@@ -306,7 +310,14 @@ function estimatePart(part: MessagePart): number {
 }
 
 function estimateToolResultPayload(part: ToolResultPart): number {
-  return part.output.length + (part.error?.length ?? 0);
+  return part.output.length + (part.error?.length ?? 0) + estimateToolResultContent(part.content);
+}
+
+function estimateToolResultContent(content: ToolResultPart["content"]): number {
+  return (content ?? []).reduce((total, item) => {
+    if (item.type === "text") return total + item.text.length;
+    return total + IMAGE_CONTEXT_ESTIMATE_CHARS + item.mimeType.length + 64;
+  }, 0);
 }
 
 function compactToolResultOutput(output: string, maxChars: number): string {

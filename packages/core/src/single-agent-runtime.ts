@@ -134,15 +134,31 @@ export class SingleAgentRuntime implements AgentRunner {
       messageId,
       role: "user",
     });
-    const part: Extract<MessagePart, { type: "text" }> = {
-      id: this.id<PartId>("part"),
-      messageId,
-      sessionId: input.sessionId,
-      type: "text",
-      text: input.text,
-    };
-    if (input.displayText) part.displayText = input.displayText;
-    await this.appendPart(input, messageId, part);
+    const images = input.images ?? [];
+    if (input.text.length > 0 || images.length === 0) {
+      const part: Extract<MessagePart, { type: "text" }> = {
+        id: this.id<PartId>("part"),
+        messageId,
+        sessionId: input.sessionId,
+        type: "text",
+        text: input.text,
+      };
+      if (input.displayText) part.displayText = input.displayText;
+      await this.appendPart(input, messageId, part);
+    }
+    for (const image of images) {
+      const part: Extract<MessagePart, { type: "image" }> = {
+        id: this.id<PartId>("part"),
+        messageId,
+        sessionId: input.sessionId,
+        type: "image",
+        data: image.data,
+        mimeType: image.mimeType,
+      };
+      if (image.filename) part.filename = image.filename;
+      if (image.sourcePath) part.sourcePath = image.sourcePath;
+      await this.appendPart(input, messageId, part);
+    }
     return messageId;
   }
 
@@ -234,6 +250,7 @@ export class SingleAgentRuntime implements AgentRunner {
       if (input.promptDebug) modelInput.promptDebug = input.promptDebug;
       if (input.modelSelection) modelInput.modelSelection = input.modelSelection;
       if (input.reasoningLevel !== undefined) modelInput.reasoningLevel = input.reasoningLevel;
+      if (input.serviceTier !== undefined) modelInput.serviceTier = input.serviceTier;
       if (input.signal) modelInput.signal = input.signal;
 
       const guard = new DoomLoopGuard(this.options.doomLoopGuard);
@@ -322,7 +339,13 @@ export class SingleAgentRuntime implements AgentRunner {
       turnId,
       cwd: input.cwd,
     });
-    return filterToolsByPolicy(this.options.toolRegistry.list(), policy);
+    let tools = filterToolsByPolicy(this.options.toolRegistry.list(), policy);
+    if (input.preferExternalImageTools && tools.some(isExternalImageUnderstandingTool)) {
+      tools = tools.filter((tool) => !isDirectImageBlockTool(tool));
+      return tools;
+    }
+    if (!input.suppressExternalImageTools) return tools;
+    return tools.filter((tool) => !isExternalImageUnderstandingTool(tool));
   }
 
   private async consumeModelStream(
@@ -781,6 +804,9 @@ export class SingleAgentRuntime implements AgentRunner {
         callId: toolCall.callId,
         output: result.result.output,
       };
+      if (result.result.content) {
+        part.content = result.result.content;
+      }
       if (result.result.artifactIds) {
         part.artifactIds = result.result.artifactIds;
       }
@@ -915,6 +941,33 @@ function isContextLimitError(error: Error): boolean {
     message.includes("http 413") ||
     /\b413\b/.test(message)
   );
+}
+
+function isExternalImageUnderstandingTool(tool: { name: string; description: string; mcp?: unknown }): boolean {
+  if (!isMcpTool(tool)) return false;
+  const rawToolName = typeof tool.mcp.rawToolName === "string" ? tool.mcp.rawToolName : "";
+  const toolName = typeof tool.mcp.toolName === "string" ? tool.mcp.toolName : "";
+  const haystack = `${tool.name} ${rawToolName} ${toolName} ${tool.description}`.toLowerCase();
+  if (!/(?:image|vision|vlm|ocr|screenshot)/.test(haystack)) return false;
+  return /(?:understand|analy[sz]e|describe|extract|read|ocr|vision|vlm)/.test(haystack);
+}
+
+function isDirectImageBlockTool(tool: {
+  name: string;
+  aliases?: readonly string[];
+  description?: string;
+  searchHint?: string;
+  mcp?: unknown;
+}): boolean {
+  if (isMcpTool(tool)) return false;
+  const names = [tool.name, ...(tool.aliases ?? [])].map((name) => name.toLowerCase());
+  if (names.some((name) => name === "read_image" || name === "view_image" || name === "image_read")) return true;
+  const haystack = `${tool.name} ${tool.description ?? ""} ${tool.searchHint ?? ""}`.toLowerCase();
+  return /(?:image block|image content)/.test(haystack) && /(?:read|view|inspect)/.test(haystack);
+}
+
+function isMcpTool(tool: { mcp?: unknown }): tool is { mcp: Record<string, unknown> } {
+  return typeof tool.mcp === "object" && tool.mcp !== null;
 }
 
 function isAbortError(error: Error): boolean {

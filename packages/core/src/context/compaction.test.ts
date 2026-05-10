@@ -98,6 +98,30 @@ test("context builder microcompacts old tool results by total tool-output budget
   expect(outputs[2]).not.toContain("tool result compacted from context");
 });
 
+test("context builder estimates image tool content without counting base64 bytes as text", () => {
+  const sessionId = "session_tool_image_budget" as SessionId;
+  const callId = "image_call";
+  const imageTool = toolResultMessage("msg_tool_image", sessionId, callId, "Image read: screenshot.png");
+  const part = imageTool.parts[0];
+  if (part?.type !== "tool_result") throw new Error("expected tool result");
+  part.content = [{ type: "image", data: "a".repeat(3_500_000), mimeType: "image/png" }];
+
+  const built = new ContextWindowBuilder({
+    maxInputChars: 20_000,
+    compactionThresholdRatio: 0.85,
+  }).build([imageTool]);
+
+  expect(built.usage.contextChars).toBeLessThan(10_000);
+  expect(built.compactionBoundary).toBeUndefined();
+  expect(
+    built.messages.some((message) =>
+      message.parts.some((candidate) =>
+        candidate.type === "tool_result" && candidate.content?.some((item) => item.type === "image"),
+      ),
+    ),
+  ).toBe(true);
+});
+
 test("runtime auto-compacts before the main model request and sends the summary forward", async () => {
   const store = new ProjectingEventStore();
   const registry = new InMemoryToolRegistry();

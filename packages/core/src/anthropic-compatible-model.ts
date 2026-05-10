@@ -11,6 +11,7 @@ export interface AnthropicCompatibleModelOptions {
   maxTokens?: number;
   temperature?: number;
   fetch?: typeof fetch;
+  inputCapabilities?: readonly ("text" | "image")[];
 }
 
 export interface MiniMaxModelOptions {
@@ -29,8 +30,22 @@ interface AnthropicMessage {
 
 type AnthropicContentBlock =
   | { type: "text"; text: string }
+  | { type: "image"; source: AnthropicImageSource }
   | { type: "tool_use"; id: string; name: string; input: unknown }
-  | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean };
+  | { type: "tool_result"; tool_use_id: string; content: AnthropicToolResultContent; is_error?: boolean };
+
+interface AnthropicImageSource {
+  type: "base64";
+  media_type: string;
+  data: string;
+}
+
+type AnthropicToolResultContent =
+  | string
+  | Array<
+      | { type: "text"; text: string }
+      | { type: "image"; source: AnthropicImageSource }
+    >;
 
 interface AnthropicTool {
   name: string;
@@ -61,6 +76,14 @@ export class AnthropicCompatibleModelRouter implements ModelRouter {
   }
 
   async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+    if (
+      this.options.inputCapabilities &&
+      !this.options.inputCapabilities.includes("image") &&
+      messagesContainDirectImageInput(input.messages)
+    ) {
+      throw new Error(`${this.options.model} does not support image input. Switch to an image-capable model before sending images.`);
+    }
+
     const init: RequestInit = {
       method: "POST",
       headers: this.headers(),
@@ -92,10 +115,11 @@ export class AnthropicCompatibleModelRouter implements ModelRouter {
 
   private requestBody(input: ModelStreamInput): Record<string, unknown> {
     const messages = prependContextualUserMessage(input.messages, input.contextualUser);
+    const includeImageContent = supportsImageInput(this.options.inputCapabilities);
     const body: Record<string, unknown> = {
       model: this.options.model,
       max_tokens: this.options.maxTokens ?? 4096,
-      messages: toAnthropicMessages(messages),
+      messages: toAnthropicMessages(messages, includeImageContent),
       tools: toAnthropicTools(input.tools),
       stream: false,
     };
@@ -125,11 +149,18 @@ export function createMiniMaxM27HighspeedRouter(options: MiniMaxModelOptions = {
     baseUrl: options.baseUrl ?? process.env.ANTHROPIC_BASE_URL ?? process.env.MINIMAX_ANTHROPIC_BASE_URL ?? MINIMAX_ANTHROPIC_BASE_URL,
     apiKey: options.apiKey ?? process.env.ANTHROPIC_API_KEY ?? process.env.MINIMAX_API_KEY ?? "",
     authScheme: "bearer",
+    inputCapabilities: ["text"],
   };
   if (options.maxTokens !== undefined) routerOptions.maxTokens = options.maxTokens;
   if (options.temperature !== undefined) routerOptions.temperature = options.temperature;
   if (options.fetch !== undefined) routerOptions.fetch = options.fetch;
   return new AnthropicCompatibleModelRouter(routerOptions);
+}
+
+function messagesContainDirectImageInput(messages: readonly Message[]): boolean {
+  return messages.some((message) =>
+    message.parts.some((part) => part.type === "image"),
+  );
 }
 
 export function resolveMessagesUrl(baseUrl: string): string {
@@ -168,7 +199,7 @@ function prependContextualUserMessage(
   ];
 }
 
-function toAnthropicMessages(messages: readonly Message[]): AnthropicMessage[] {
+function toAnthropicMessages(messages: readonly Message[], includeImageContent = true): AnthropicMessage[] {
   const result: AnthropicMessage[] = [];
   for (const message of messages) {
     if (message.role === "system") continue;
@@ -180,6 +211,8 @@ function toAnthropicMessages(messages: readonly Message[]): AnthropicMessage[] {
       if (part.type === "text") {
         if (message.role === "assistant") assistantBlocks.push({ type: "text", text: part.text });
         else userBlocks.push({ type: "text", text: part.text });
+      } else if (part.type === "image" && includeImageContent) {
+        userBlocks.push(formatImageBlock(part));
       } else if (part.type === "tool_call") {
         assistantBlocks.push({
           type: "tool_use",
@@ -191,7 +224,7 @@ function toAnthropicMessages(messages: readonly Message[]): AnthropicMessage[] {
         const block: AnthropicContentBlock = {
           type: "tool_result",
           tool_use_id: part.callId,
-          content: formatToolResult(part),
+          content: formatToolResultContent(part, includeImageContent),
         };
         if (part.error) block.is_error = true;
         userBlocks.push(block);
@@ -233,9 +266,40 @@ function mergeAdjacentMessages(messages: AnthropicMessage[]): AnthropicMessage[]
   return result;
 }
 
+function formatImageBlock(part: Pick<Extract<MessagePart, { type: "image" }>, "data" | "mimeType">): Extract<AnthropicContentBlock, { type: "image" }> {
+  return {
+    type: "image",
+    source: {
+      type: "base64",
+      media_type: part.mimeType,
+      data: part.data,
+    },
+  };
+}
+
 function formatToolResult(part: Extract<MessagePart, { type: "tool_result" }>): string {
   if (part.error) return part.output ? `${part.output}\n\nError: ${part.error}` : `Error: ${part.error}`;
   return part.output;
+}
+
+function formatToolResultContent(part: Extract<MessagePart, { type: "tool_result" }>, includeImageContent = true): AnthropicToolResultContent {
+  if (part.error || !includeImageContent || !part.content?.some((item) => item.type === "image")) {
+    return formatToolResult(part);
+  }
+  const blocks: Exclude<AnthropicToolResultContent, string> = [];
+  if (part.output) blocks.push({ type: "text", text: part.output });
+  for (const item of part.content) {
+    if (item.type === "text") {
+      if (item.text) blocks.push({ type: "text", text: item.text });
+      continue;
+    }
+    blocks.push(formatImageBlock(item));
+  }
+  return blocks.length > 0 ? blocks : formatToolResult(part);
+}
+
+function supportsImageInput(inputCapabilities: readonly ("text" | "image")[] | undefined): boolean {
+  return inputCapabilities === undefined || inputCapabilities.includes("image");
 }
 
 function parseResponse(text: string): AnthropicResponse {
