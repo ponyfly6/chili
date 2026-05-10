@@ -35,9 +35,10 @@ export interface McpServerMenuItem {
   description: string;
 }
 
-const MCP_PANEL_WIDTH = "88%";
-const MCP_PANEL_MAX_WIDTH = 104;
+const MCP_PANEL_WIDTH = "82%";
+const MCP_PANEL_MAX_WIDTH = 112;
 const MCP_PANEL_VISIBLE_ITEMS = 12;
+const MCP_DETAIL_LABEL_WIDTH = 10;
 
 export function initialMcpManagerState(message?: McpManagerMessage): McpManagerState {
   return { screen: "list", selectedIndex: 0, ...(message ? { message } : {}) };
@@ -135,17 +136,7 @@ function McpServerListPanel(props: {
         ) : (
           visibleItems(props.servers, props.state.selectedIndex, MCP_PANEL_VISIBLE_ITEMS).map(({ item: server, index }) => {
             const selected = index === props.state.selectedIndex;
-            return (
-              <text
-                key={server.name}
-                fg={selected ? props.theme.colors.menu.selectedText : props.theme.colors.menu.text}
-                bg={selected ? props.theme.colors.menu.selectedBackground : props.theme.colors.menu.background}
-                wrapMode="none"
-                truncate
-              >
-                {`${selected ? ">" : " "} ${server.name}  ${statusGlyph(server)} ${statusLabel(server)}  ${server.transport ?? "mcp"}  tools=${server.toolCount ?? "?"}${serverEndpoint(server) ? `  ${serverEndpoint(server)}` : ""}`}
-              </text>
-            );
+            return <McpSelectableRow key={server.name} selected={selected} theme={props.theme} text={`${server.name}  ${statusPill(server)}  ${server.transport ?? "mcp"}  tools=${server.toolCount ?? "?"}${serverEndpoint(server) ? `  ${serverEndpoint(server)}` : ""}`} />;
           })
         )}
       </McpPanelFrame>
@@ -159,7 +150,8 @@ function McpServerPanel(props: { server: RuntimeMcpServerDescriptor; state: McpM
     <McpPanelLayout footer="Up/Down navigate  Enter select  Esc back" theme={props.theme}>
       <McpPanelFrame title={`${capitalize(props.server.name)} MCP Server`} subtitle={serverSubtitle(props.server)} theme={props.theme}>
         {props.state.message ? <McpMessage message={props.state.message} theme={props.theme} /> : null}
-        <McpDetail label="Status" value={`${statusGlyph(props.server)} ${statusLabel(props.server)}`} theme={props.theme} />
+        <McpSectionTitle text="Connection" theme={props.theme} />
+        <McpDetail label="Status" value={statusPill(props.server)} theme={props.theme} />
         <McpDetail label="Enabled" value={props.server.enabled ? "yes" : "no"} theme={props.theme} />
         <McpDetail label="Transport" value={props.server.transport ?? "unknown"} theme={props.theme} />
         <McpDetail label={props.server.url ? "URL" : "Command"} value={serverEndpoint(props.server) || "-"} theme={props.theme} />
@@ -168,19 +160,10 @@ function McpServerPanel(props: { server: RuntimeMcpServerDescriptor; state: McpM
         {props.server.description ? <McpDetail label="Description" value={props.server.description} theme={props.theme} /> : null}
         {props.server.error ? <McpDetail label="Error" value={props.server.error} level="error" theme={props.theme} /> : null}
         <box height={1} />
+        <McpSectionTitle text="Actions" theme={props.theme} />
         {items.map((item, index) => {
           const selected = index === props.state.selectedIndex;
-          return (
-            <text
-              key={item.action}
-              fg={selected ? props.theme.colors.menu.selectedText : props.theme.colors.menu.text}
-              bg={selected ? props.theme.colors.menu.selectedBackground : props.theme.colors.menu.background}
-              wrapMode="none"
-              truncate
-            >
-              {`${selected ? ">" : " "} ${item.label} - ${item.description}`}
-            </text>
-          );
+          return <McpSelectableRow key={item.action} selected={selected} theme={props.theme} text={`${item.label} - ${item.description}`} />;
         })}
       </McpPanelFrame>
     </McpPanelLayout>
@@ -200,17 +183,7 @@ function McpToolsPanel(props: { server: RuntimeMcpServerDescriptor; state: McpMa
         ) : (
           visibleItems(tools, props.state.selectedIndex, 12).map(({ item, index }) => {
             const selected = index === props.state.selectedIndex;
-            return (
-              <text
-                key={`${item.name}:${index}`}
-                fg={selected ? props.theme.colors.menu.selectedText : props.theme.colors.menu.text}
-                bg={selected ? props.theme.colors.menu.selectedBackground : props.theme.colors.menu.background}
-                wrapMode="none"
-                truncate
-              >
-                {`${selected ? ">" : " "} ${item.name}${toolAnnotationText(item)}${item.description ? ` - ${compactWhitespace(item.description)}` : ""}`}
-              </text>
-            );
+            return <McpSelectableRow key={`${item.name}:${index}`} selected={selected} theme={props.theme} text={`${item.name}${toolAnnotationText(item)}${item.description ? `  ${compactWhitespace(item.description)}` : ""}`} />;
           })
         )}
       </McpPanelFrame>
@@ -230,7 +203,7 @@ function McpToolDetailPanel(props: { server: RuntimeMcpServerDescriptor; state: 
             {tool.description ? <McpWrappedDetail label="Description" value={tool.description} theme={props.theme} /> : null}
             <McpDetail label="Annotations" value={toolAnnotationSummary(tool)} theme={props.theme} />
             <box height={1} />
-            <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Parameters"}</text>
+            <McpSectionTitle text="Parameters" theme={props.theme} />
             {schemaParameterLines(tool.inputSchema).length === 0 ? (
               <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"  No parameters declared."}</text>
             ) : (
@@ -256,17 +229,7 @@ function McpRemoveConfirmPanel(props: { server: RuntimeMcpServerDescriptor; stat
         <box height={1} />
         {options.map((option, index) => {
           const selected = index === props.state.selectedIndex;
-          return (
-            <text
-              key={option}
-              fg={selected ? props.theme.colors.menu.selectedText : props.theme.colors.menu.text}
-              bg={selected ? props.theme.colors.menu.selectedBackground : props.theme.colors.menu.background}
-              wrapMode="none"
-              truncate
-            >
-              {`${selected ? ">" : " "} ${option}`}
-            </text>
-          );
+          return <McpSelectableRow key={option} selected={selected} theme={props.theme} text={option} />;
         })}
       </McpPanelFrame>
     </McpPanelLayout>
@@ -286,7 +249,7 @@ function McpPanelLayout(props: { footer: string; theme: TuiTheme; children: Reac
 
 function McpPanelFrame(props: { title: string; subtitle: string; theme: TuiTheme; children: ReactNode }) {
   return (
-    <box width="100%" flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.focus} paddingX={1}>
+    <box width="100%" flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.focus} backgroundColor={props.theme.colors.panel} paddingX={2} paddingY={1}>
       <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{props.title}</text>
       <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{props.subtitle}</text>
       <box height={1} />
@@ -297,28 +260,26 @@ function McpPanelFrame(props: { title: string; subtitle: string; theme: TuiTheme
 
 function McpFooter(props: { text: string; theme: TuiTheme }) {
   return (
-    <box width="100%" height={1} paddingX={1}>
+    <box width="100%" height={1} paddingX={2}>
       <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>{props.text}</text>
     </box>
   );
 }
 
 function McpMessage(props: { message: McpManagerMessage; theme: TuiTheme }) {
+  const color = props.message.level === "error" ? props.theme.colors.status.error : props.theme.colors.status.info;
+  const label = props.message.level === "error" ? "Error" : "Info";
   return (
-    <text
-      fg={props.message.level === "error" ? props.theme.colors.status.error : props.theme.colors.status.info}
-      wrapMode="none"
-      truncate
-    >
-      {props.message.text}
-    </text>
+    <box width="100%" height={1} backgroundColor={props.theme.colors.menu.background}>
+      <text fg={color} wrapMode="none" truncate>{`${label}: ${props.message.text}`}</text>
+    </box>
   );
 }
 
 function McpDetail(props: { label: string; value: string; level?: "info" | "error"; theme: TuiTheme }) {
   return (
     <text fg={props.level === "error" ? props.theme.colors.status.error : props.theme.colors.text.secondary} wrapMode="none" truncate>
-      {`${props.label}: ${compactWhitespace(props.value)}`}
+      {`  ${padEnd(`${props.label}:`, MCP_DETAIL_LABEL_WIDTH)} ${compactWhitespace(props.value)}`}
     </text>
   );
 }
@@ -326,11 +287,30 @@ function McpDetail(props: { label: string; value: string; level?: "info" | "erro
 function McpWrappedDetail(props: { label: string; value: string; theme: TuiTheme }) {
   return (
     <>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`${props.label}:`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`  ${padEnd(`${props.label}:`, MCP_DETAIL_LABEL_WIDTH)}`}</text>
       {wrapText(compactWhitespace(props.value), 96).slice(0, 4).map((line) => (
-        <text key={line} fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`  ${line}`}</text>
+        <text key={line} fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`  ${" ".repeat(MCP_DETAIL_LABEL_WIDTH)} ${line}`}</text>
       ))}
     </>
+  );
+}
+
+function McpSectionTitle(props: { text: string; theme: TuiTheme }) {
+  return <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{props.text}</text>;
+}
+
+function McpSelectableRow(props: { selected: boolean; text: string; theme: TuiTheme }) {
+  const marker = props.selected ? ">" : " ";
+  return (
+    <box width="100%" height={1} backgroundColor={props.selected ? props.theme.colors.menu.selectedBackground : props.theme.colors.panel}>
+      <text
+        fg={props.selected ? props.theme.colors.menu.selectedText : props.theme.colors.menu.text}
+        wrapMode="none"
+        truncate
+      >
+        {`${marker} ${props.text}`}
+      </text>
+    </box>
   );
 }
 
@@ -358,6 +338,10 @@ function serverEndpoint(server: RuntimeMcpServerDescriptor): string {
 
 function serverSubtitle(server: RuntimeMcpServerDescriptor): string {
   return `${statusLabel(server)}  ${server.transport ?? "mcp"}  tools=${server.toolCount ?? "?"}`;
+}
+
+function statusPill(server: RuntimeMcpServerDescriptor): string {
+  return `${statusGlyph(server)} ${statusLabel(server)}`;
 }
 
 function mcpAuthDescription(server: RuntimeMcpServerDescriptor): string {
@@ -426,6 +410,10 @@ function compactWhitespace(value: string): string {
 
 function capitalize(value: string): string {
   return value.length > 0 ? `${value[0]?.toUpperCase() ?? ""}${value.slice(1)}` : value;
+}
+
+function padEnd(value: string, length: number): string {
+  return value.length >= length ? value : `${value}${" ".repeat(length - value.length)}`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
