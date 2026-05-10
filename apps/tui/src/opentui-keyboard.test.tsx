@@ -2024,9 +2024,10 @@ test("Ctrl+P opens the command palette", async () => {
     await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
     expect(app.captureCharFrame()).toContain("Command Palette");
     expect(app.captureCharFrame()).toContain("/team");
+    expect(app.captureCharFrame()).toContain("/model [provider/model] - Select model");
+    expect(app.captureCharFrame()).toContain("/thinking <off|minimal|low");
+    expect(app.captureCharFrame()).toContain("/fast <on|off|status> - Set Codex Fast mode");
     expect(app.captureCharFrame()).toContain("/theme - Switch theme");
-    expect(app.captureCharFrame()).toContain("/hide-thinking - Hide thinking traces");
-    expect(app.captureCharFrame()).toContain("/show-thinking - Show thinking traces");
   } finally {
     app.renderer.destroy();
   }
@@ -2110,9 +2111,7 @@ test("theme picker preserves an in-progress draft opened from the command palett
   try {
     await typeText(app, "draft before theme");
     await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
-    await press(app, () => app.mockInput.pressArrow("down"));
-    await press(app, () => app.mockInput.pressArrow("down"));
-    await press(app, () => app.mockInput.pressArrow("down"));
+    await selectPaletteCommand(app, "/theme");
     await press(app, () => app.mockInput.pressEnter());
 
     expect(app.captureCharFrame()).toContain("Theme");
@@ -2646,6 +2645,14 @@ async function typeText(app: TestRenderHarness, text: string): Promise<void> {
   });
   await Bun.sleep(60);
   await app.renderOnce();
+}
+
+async function selectPaletteCommand(app: TestRenderHarness, command: string): Promise<void> {
+  for (let index = 0; index < 64; index += 1) {
+    if (app.captureCharFrame().includes(`> ${command}`)) return;
+    await press(app, () => app.mockInput.pressArrow("down"));
+  }
+  expect(app.captureCharFrame()).toContain(`> ${command}`);
 }
 
 async function backspace(app: TestRenderHarness, count: number): Promise<void> {
