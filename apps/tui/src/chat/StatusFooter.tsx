@@ -1,4 +1,5 @@
 import type { ChatSessionView, TeamLiveView } from "@chili/sdk";
+import type { ServiceTier } from "@chili/protocol";
 import { basename } from "node:path";
 import { shorten } from "../components/helpers.js";
 import { modelSelectionLabel, type ModelSelection, type ReasoningLevel } from "../model-state.js";
@@ -10,6 +11,7 @@ export interface StatusFooterOptions {
   providerName: string;
   modelSelection?: ModelSelection | undefined;
   reasoningLevel?: ReasoningLevel | undefined;
+  serviceTier?: ServiceTier | undefined;
   cwd: string;
   gitBranch?: string | undefined;
 }
@@ -165,13 +167,21 @@ function modelText(chatView: ChatSessionView, options: StatusFooterOptions, comp
   const model = options.modelSelection?.model ?? chatView.latestModelMetadata?.model ?? options.modelName;
   const mode = options.modeName;
   const reasoning = options.reasoningLevel ? reasoningText(options.reasoningLevel) : undefined;
-  if (compact) return shorten(reasoning ? `${model} ${reasoning}` : model, 22);
+  const serviceTier = serviceTierText(options.serviceTier);
+  const compactModel = [model, reasoning, serviceTier].filter(Boolean).join(" ");
+  if (compact) return shorten(compactModel, 22);
   const modelLabel = options.modelSelection ? modelSelectionLabel(options.modelSelection) : `${provider}/${model}`;
-  return `${modelLabel} ${mode}${reasoning ? ` ${reasoning}` : ""}`;
+  return [modelLabel, mode, reasoning, serviceTier].filter(Boolean).join(" ");
 }
 
 function reasoningText(level: ReasoningLevel): string {
   return level === "off" ? "thinking off" : `thinking ${level}`;
+}
+
+function serviceTierText(serviceTier: ServiceTier | undefined): string | undefined {
+  if (serviceTier === "fast") return "fast";
+  if (serviceTier === "standard") return "standard";
+  return undefined;
 }
 
 function compactCwd(cwd: string): string {

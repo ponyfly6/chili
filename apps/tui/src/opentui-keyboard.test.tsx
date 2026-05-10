@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "bun:test";
@@ -1232,6 +1232,101 @@ test("Ctrl+V ignores decorative-only clipboard text", async () => {
     expect(app.captureCharFrame()).not.toContain("▝");
   } finally {
     app.renderer.destroy();
+  }
+});
+
+test("Ctrl+V saves clipboard images and submits them as prompt attachments", async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), "chili-tui-paste-image-"));
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lwOKGAAAAABJRU5ErkJggg==", "base64");
+  const submitted: Array<{ text: string; options: Parameters<ChatRuntimeState["submitPrompt"]>[1] }> = [];
+  const clipboard = fakeClipboard({
+    readImage: async () => ({ bytes: png, mimeType: "image/png", extension: "png" }),
+    readText: async () => {
+      throw new Error("text clipboard should not be read when an image is present");
+    },
+  });
+  const app = await mountShell(teamLiveFixture(), {
+    cwd,
+    clipboard,
+    runtime: {
+      submitPrompt: async (text, options) => {
+        submitted.push({ text, options });
+        return true;
+      },
+    },
+  });
+
+  try {
+    await press(app, () => app.mockInput.pressKey("v", { ctrl: true }));
+    expect(app.captureCharFrame()).toContain("Pasted image [Image #1]:");
+    expect(app.captureCharFrame()).toContain("[Image #1]");
+    expect(app.captureCharFrame()).toContain(".chili/clipboard-images/");
+
+    await press(app, () => app.mockInput.pressEnter());
+    expect(submitted).toHaveLength(1);
+    expect(submitted[0]?.text).toBe("[Image #1]");
+    expect(submitted[0]?.options?.images).toHaveLength(1);
+    expect(submitted[0]?.options?.images?.[0]).toMatchObject({ mimeType: "image/png" });
+    expect(Buffer.from(submitted[0]?.options?.images?.[0]?.data ?? "", "base64")).toEqual(png);
+    const pathMatch = /\.chili\/clipboard-images\/clipboard-[^\s]+\.png/.exec(submitted[0]?.options?.images?.[0]?.sourcePath ?? "");
+    expect(pathMatch?.[0]).toBeDefined();
+    expect(await readFile(path.join(cwd, pathMatch?.[0] ?? ""))).toEqual(png);
+  } finally {
+    app.renderer.destroy();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("Ctrl+V keeps image placeholders and submits tool-readable paths for known text-only models", async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), "chili-tui-paste-image-text-only-"));
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lwOKGAAAAABJRU5ErkJggg==", "base64");
+  const submitted: Array<{ text: string; options: Parameters<ChatRuntimeState["submitPrompt"]>[1] }> = [];
+  const textOnlyModel = { provider: "faux", model: "text-only", inputCapabilities: ["text"] };
+  const clipboard = fakeClipboard({
+    readImage: async () => ({ bytes: png, mimeType: "image/png", extension: "png" }),
+  });
+  const app = await mountShell(teamLiveFixture(), {
+    cwd,
+    clipboard,
+    runtime: {
+      modelCandidates: [textOnlyModel],
+      modelConfig: {
+        sessionId: "session_text_only" as SessionId,
+        models: [textOnlyModel],
+        availableReasoningLevels: ["off", "minimal", "low", "medium", "high", "xhigh"],
+        modelSelection: { provider: textOnlyModel.provider, model: textOnlyModel.model },
+      },
+      submitPrompt: async (text, options) => {
+        submitted.push({ text, options });
+        return true;
+      },
+    },
+  });
+
+  try {
+    await Bun.sleep(20);
+    await app.renderOnce();
+    await press(app, () => app.mockInput.pressKey("v", { ctrl: true }));
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("Pasted image [Image #1]:");
+    expect(frame).toContain(".chili/clipboard-images/");
+    expect(frame).toContain("[Image #1]");
+
+    await press(app, () => app.mockInput.pressEnter());
+    expect(submitted).toHaveLength(1);
+    expect(submitted[0]?.text).toContain("[Image #1]");
+    expect(submitted[0]?.text).toContain("<pasted_image_files>");
+    expect(submitted[0]?.text).toContain("path=.chili/clipboard-images/");
+    expect(submitted[0]?.text).toContain("MCP image-understanding or OCR tool");
+    expect(submitted[0]?.text).toContain("absolutePath=");
+    expect(submitted[0]?.options?.displayText).toBe("[Image #1]");
+    expect(submitted[0]?.options?.images).toBeUndefined();
+    const pathMatch = /\.chili\/clipboard-images\/clipboard-[^\s]+\.png/.exec(submitted[0]?.text ?? "");
+    expect(pathMatch?.[0]).toBeDefined();
+    expect(await readFile(path.join(cwd, pathMatch?.[0] ?? ""))).toEqual(png);
+  } finally {
+    app.renderer.destroy();
+    await rm(cwd, { recursive: true, force: true });
   }
 });
 
@@ -2484,6 +2579,7 @@ function chatRuntime(
 function fakeClipboard(overrides: Partial<ClipboardAccess> = {}): ClipboardAccess {
   return {
     readText: async () => "",
+    readImage: async () => undefined,
     writeText: async () => true,
     ...overrides,
   };

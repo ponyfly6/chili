@@ -115,6 +115,14 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, 
       fallbackLines: lines,
     });
   }
+  if (item.kind === "user_image") {
+    return lineBackedCell(`display:${item.kind}:${item.id}`, wrapLine(`image: ${item.label || "[image]"}`, {
+      key: `display:${item.kind}:${item.id}`,
+      fg: theme.colors.text.secondary,
+      width,
+      hangingIndent: "    ",
+    }));
+  }
   if (item.kind === "reasoning") return lineBackedCell(`display:${item.kind}:${item.id}`, reasoningLines(item, width, theme, hideThinking));
   if (item.kind === "tool_activity") {
     return componentBackedCell({

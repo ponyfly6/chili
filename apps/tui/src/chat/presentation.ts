@@ -21,6 +21,7 @@ import {
 
 export type ChatDisplayItem =
   | { kind: "user_text"; id: string; text: string }
+  | { kind: "user_image"; id: string; label: string }
   | { kind: "assistant_text"; id: string; text: string; streaming?: boolean }
   | { kind: "reasoning"; id: string; text: string; collapsed: true; active?: boolean }
   | { kind: "tool_activity"; id: string; activity: ToolActivityDisplay }
@@ -148,6 +149,12 @@ function messageDisplayItems(
       if (message.role === "user") output.push({ kind: "user_text", id, text: part.text });
       else if (message.role === "assistant") output.push({ kind: "assistant_text", id, text: part.text, ...(index === streamingTextPartIndex ? { streaming: true } : {}) });
       else output.push({ kind: "summary", id, text: `${message.role}: ${part.text}` });
+      continue;
+    }
+    if (part.type === "image") {
+      const label = part.displayText ?? part.sourcePath ?? part.filename ?? part.mimeType;
+      if (message.role === "user") output.push({ kind: "user_image", id, label });
+      else output.push({ kind: "summary", id, text: `image: ${label}` });
       continue;
     }
     if (part.type === "reasoning") {

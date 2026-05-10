@@ -84,6 +84,15 @@ export function modelSupportsReasoning(
   return candidate?.capabilities?.reasoning ?? true;
 }
 
+export function modelSupportsImages(
+  selection: ModelSelection | undefined,
+  candidates: readonly ModelCandidate[],
+): boolean {
+  if (!selection) return true;
+  const candidate = candidates.find((model) => model.provider === selection.provider && model.model === selection.model);
+  return candidate?.inputCapabilities?.includes("image") ?? true;
+}
+
 export function findExactModelSelection(
   reference: string,
   candidates: readonly ModelCandidate[],

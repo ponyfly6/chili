@@ -4,6 +4,7 @@ import type { KeyEvent, MouseEvent, ScrollBoxRenderable, Selection } from "@open
 import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
 import type {
   ApprovalId,
+  MessageImageContent,
   RuntimeMcpAuthResponse,
   RuntimeMcpLogoutResponse,
   RuntimeMcpReloadResponse,
@@ -15,6 +16,7 @@ import type {
   RuntimePermissionProfileDescriptor,
   RuntimePermissionProfileId,
   RuntimeSkillMention,
+  ServiceTier,
   SessionId,
   TeamId,
   ThreadId,
@@ -23,8 +25,10 @@ import { FileAuthStorage, loginOpenAICodex, OPENAI_CODEX_PROVIDER_ID } from "@ch
 import { discoverSkills, updateSkillDisabledSetting, type SkillSettingsScope, type SkillSummary } from "@chili/skills";
 import { runProcess, type RunProcessResult } from "@chili/tools";
 import { execFile } from "node:child_process";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { promisify } from "node:util";
-import { cleanClipboardText, promptClipboardText, systemClipboard, type ClipboardAccess } from "./clipboard.js";
+import { cleanClipboardText, promptClipboardText, systemClipboard, type ClipboardAccess, type ClipboardImage } from "./clipboard.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import { teamLiveModel, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
 import { useChatRuntime, type ChatApprovalGrantScope, type ChatRuntimeState } from "./useChatRuntime.js";
@@ -38,6 +42,7 @@ import {
   type ModelCandidate,
   modelDescriptorSelection,
   modelSelectionLabel,
+  modelSupportsImages,
   modelSupportsReasoning,
   sameModelSelection,
   type ModelSelection,
@@ -85,6 +90,11 @@ type LocalShellItem = Extract<LocalTranscriptItem, { kind: "shell" }>;
 type AppendShellItem = (item: Omit<LocalShellItem, "id" | "kind">) => string;
 type UpdateShellItem = (id: string, update: Partial<Omit<LocalShellItem, "id" | "kind">>) => void;
 
+interface PastedPromptImage extends MessageImageContent {
+  id: number;
+  absolutePath?: string | undefined;
+}
+
 interface SlashActions {
   cwd: string;
   setView: (view: ShellView) => void;
@@ -101,6 +111,7 @@ interface SlashActions {
   openReasoningPicker: () => void;
   openPermissionsPicker: () => void;
   setReasoningLevel: (level: ReasoningLevel) => Promise<void>;
+  setServiceTier: (serviceTier: ServiceTier) => Promise<void>;
   setPermissionProfile: (profile: RuntimePermissionProfileId) => Promise<void>;
   setHideThinking: (hidden: boolean) => void;
   ensureOpenAICodexDefaultModel: () => Promise<void>;
@@ -137,10 +148,12 @@ interface AuthManualPrompt {
 }
 
 const execFileAsync = promisify(execFile);
-const PROMPT_MENU_MAX_ITEMS = 6;
+const PROMPT_MENU_MAX_ITEMS = 8;
 const LOCAL_ITEM_TTL_MS = 4_000;
 const USER_SHELL_TIMEOUT_MS = 60 * 60 * 1_000;
 const USER_SHELL_OUTPUT_LIMIT_BYTES = 256_000;
+const MAX_PASTED_IMAGE_BASE64_CHARS = 20 * 1024 * 1024;
+const SLASH_COMPLETION_LIMIT = 64;
 export const CTRL_C_EXIT_CONFIRM_MS = 2_000;
 
 export function ChatShellApp(props: {
@@ -225,6 +238,8 @@ export function ChatShellSurface(props: {
   const [view, setView] = useState<ShellView>("chat");
   const [promptParts, setPromptParts] = useState<PromptPart[]>([{ type: "text", text: "" }]);
   const [promptInputResetKey, setPromptInputResetKey] = useState(0);
+  const [pastedImages, setPastedImages] = useState<Record<number, PastedPromptImage>>({});
+  const nextPastedImageIdRef = useRef(1);
   const [skillMentionBindings, setSkillMentionBindings] = useState<RuntimeSkillMention[]>([]);
   const [localItems, setLocalItems] = useState<LocalTranscriptItem[]>([]);
   const deferredLocalItems = useDeferredValue(localItems);
@@ -241,6 +256,7 @@ export function ChatShellSurface(props: {
   );
   const [modelSelection, setModelSelectionState] = useState<ModelSelection | undefined>(undefined);
   const [reasoningLevel, setReasoningLevelState] = useState<ReasoningLevel | undefined>(undefined);
+  const [serviceTier, setServiceTierState] = useState<ServiceTier | undefined>(undefined);
   const [modelPicker, setModelPicker] = useState<ModelPickerNavigation | undefined>(undefined);
   const [reasoningPicker, setReasoningPicker] = useState<ReasoningPickerNavigation | undefined>(undefined);
   const [permissionsPicker, setPermissionsPicker] = useState<PermissionsPickerNavigation | undefined>(undefined);
@@ -294,10 +310,12 @@ export function ChatShellSurface(props: {
     if (!config) return;
     setModelSelectionState(config.modelSelection);
     setReasoningLevelState(config.reasoningLevel);
+    setServiceTierState(config.serviceTier);
   }, [
     props.runtime.modelConfig?.modelSelection?.provider,
     props.runtime.modelConfig?.modelSelection?.model,
     props.runtime.modelConfig?.reasoningLevel,
+    props.runtime.modelConfig?.serviceTier,
     props.runtime.modelConfig,
   ]);
   const scrollEstimateWidth = Math.max(24, dimensions.width - 8);
@@ -330,11 +348,12 @@ export function ChatShellSurface(props: {
     cwd,
     ...(modelSelection ? { modelSelection } : {}),
     ...(reasoningLevel ? { reasoningLevel } : {}),
+    ...(serviceTier ? { serviceTier } : {}),
     modelCandidates,
     skills: props.skills ?? [],
     allSkills: props.allSkills ?? props.skills ?? [],
     mcpServers: props.runtime.mcpStatus?.servers ?? [],
-  }), [cwd, modelCandidates, modelSelection, props.allSkills, props.model, props.runtime.mcpStatus?.servers, props.skills, reasoningLevel]);
+  }), [cwd, modelCandidates, modelSelection, props.allSkills, props.model, props.runtime.mcpStatus?.servers, props.skills, reasoningLevel, serviceTier]);
   const completionSuppressed = acceptedCompletionPrompt !== undefined && prompt === acceptedCompletionPrompt;
   const skillTrigger = activeSkillMentionTrigger(prompt);
   const skillCompletionItems = skillTrigger && !prompt.startsWith("/") && !shellInputActive
@@ -342,14 +361,14 @@ export function ChatShellSurface(props: {
     : [];
   const skillCompletionOpen = Boolean(skillTrigger && !prompt.startsWith("/") && !shellInputActive);
   const slashCompletionItems = prompt.startsWith("/") && !completionSuppressed
-    ? slashCompletions(commands, slashContext, prompt)
+    ? slashCompletions(commands, slashContext, prompt, SLASH_COMPLETION_LIMIT)
     : [];
   const completions = skillCompletionOpen ? skillCompletionItems : slashCompletionItems;
   const resolvedSlashPrompt = prompt.startsWith("/") ? resolveSlashCommand(commands, prompt) : undefined;
   const slashInputActive = prompt.startsWith("/") && (prompt.trim() === "/" || completions.length > 0 || resolvedSlashPrompt !== undefined);
   const slashCompletionOpen = prompt.startsWith("/") && slashCompletionItems.length > 0;
   const selectedCompletionIndex = clampIndex(completionIndex, completions.length);
-  const paletteItems = slashCompletions(commands, slashContext, "/", 10);
+  const paletteItems = slashCompletions(commands, slashContext, "/", SLASH_COMPLETION_LIMIT);
   const firstApproval = props.runtime.chatView.pendingApprovals[0];
   const setPrompt = useMemo(() => setPromptText(setPromptParts), []);
   const historyPromptValueRef = useRef<string | undefined>(undefined);
@@ -364,6 +383,7 @@ export function ChatShellSurface(props: {
     history.resetNavigation();
     setCompletionIndex(0);
     setSkillMentionBindings([]);
+    setPastedImages({});
     setPrompt("");
     setPromptInputResetKey((current) => current + 1);
   }, [history, setPrompt, updateAcceptedCompletionPrompt]);
@@ -388,6 +408,9 @@ export function ChatShellSurface(props: {
   }, [history, setPrompt, updateAcceptedCompletionPrompt]);
   useEffect(() => {
     setSkillMentionBindings((current) => filterSkillMentionBindings(current, prompt));
+  }, [prompt]);
+  useEffect(() => {
+    setPastedImages((current) => filterPastedImagesByPrompt(current, prompt));
   }, [prompt]);
   const setPromptFromHistory = useCallback((value: string) => {
     updateAcceptedCompletionPrompt(undefined);
@@ -567,6 +590,17 @@ export function ChatShellSurface(props: {
     setReasoningPicker(undefined);
     appendLocalItem("info", `Thinking: ${level}`);
   }, [appendLocalItem, props.runtime]);
+
+  const setServiceTier = useCallback(async (nextServiceTier: ServiceTier) => {
+    const persisted = props.runtime.setRuntimeServiceTier ? await props.runtime.setRuntimeServiceTier(nextServiceTier) : true;
+    if (!persisted) {
+      appendLocalItem("error", `Fast mode unchanged: failed to persist ${nextServiceTier}`);
+      return;
+    }
+    setServiceTierState(nextServiceTier);
+    appendLocalItem("info", nextServiceTier === "fast" ? "Fast mode: on" : "Fast mode: off (standard)");
+  }, [appendLocalItem, props.runtime]);
+
   const setPermissionProfile = useCallback(async (profile: RuntimePermissionProfileId) => {
     const item = props.runtime.permissionConfig?.profiles.find((candidate) => candidate.id === profile);
     if (item?.disabledReason) {
@@ -626,6 +660,7 @@ export function ChatShellSurface(props: {
     openReasoningPicker,
     openPermissionsPicker,
     setReasoningLevel,
+    setServiceTier,
     setPermissionProfile,
     setHideThinking,
     ensureOpenAICodexDefaultModel,
@@ -633,7 +668,7 @@ export function ChatShellSurface(props: {
       await props.onSkillsChanged?.();
     },
     reloadCommands,
-  }), [appendLocalItem, appendShellItem, cwd, ensureOpenAICodexDefaultModel, openMcpManager, openModelPicker, openPermissionsPicker, openReasoningPicker, openThemePicker, props.onSkillsChanged, reloadCommands, setAuthManualPrompt, setHideThinking, setModelSelection, setPermissionProfile, setPrompt, setReasoningLevel, startNewChatSession, updateShellItem]);
+  }), [appendLocalItem, appendShellItem, cwd, ensureOpenAICodexDefaultModel, openMcpManager, openModelPicker, openPermissionsPicker, openReasoningPicker, openThemePicker, props.onSkillsChanged, reloadCommands, setAuthManualPrompt, setHideThinking, setModelSelection, setPermissionProfile, setPrompt, setReasoningLevel, setServiceTier, startNewChatSession, updateShellItem]);
   const runSelectedSlashCompletion = useCallback(() => {
     if (!slashCompletionOpen) return false;
     const completion = slashCompletionItems[selectedCompletionIndex] ?? slashCompletionItems[0];
@@ -838,13 +873,41 @@ export function ChatShellSurface(props: {
   const promptDisabled = Boolean(disabledReason);
   const clipboard = props.clipboard ?? systemClipboard;
   const readPromptClipboard = useCallback(async () => {
+    const image = await clipboard.readImage?.().catch(() => undefined);
+    if (image) {
+      try {
+        const pasted = await saveClipboardImage(cwd, image);
+        const data = Buffer.from(image.bytes).toString("base64");
+        if (data.length > MAX_PASTED_IMAGE_BASE64_CHARS) {
+          throw new Error(`image is too large for paste (${Math.ceil(data.length / 1024 / 1024)}MB base64)`);
+        }
+        const id = nextPastedImageIdRef.current++;
+        const placeholder = imagePlaceholder(id);
+        setPastedImages((current) => ({
+          ...current,
+          [id]: {
+            id,
+            data,
+            mimeType: image.mimeType,
+            filename: pasted.filename,
+            sourcePath: pasted.relativePath,
+            absolutePath: pasted.absolutePath,
+          },
+        }));
+        appendLocalItem("info", `Pasted image ${placeholder}: ${pasted.relativePath}`);
+        return placeholder;
+      } catch (error) {
+        appendLocalItem("error", `Clipboard image paste failed: ${errorMessage(error)}`);
+        return undefined;
+      }
+    }
     const pasted = promptClipboardText(await clipboard.readText().catch(() => "") ?? "");
     if (!pasted) {
       appendLocalItem("error", "Clipboard is empty.");
       return undefined;
     }
     return pasted;
-  }, [appendLocalItem, clipboard]);
+  }, [appendLocalItem, clipboard, cwd]);
   const handleCtrlCExitShortcut = useCallback(() => {
     const now = Date.now();
     if (isWithinCtrlCExitWindow(lastCtrlCPressMsRef.current, now)) {
@@ -1167,6 +1230,7 @@ export function ChatShellSurface(props: {
     providerName: props.options?.providerName ?? "runtime",
     ...(modelSelection ? { modelSelection } : {}),
     ...(reasoningLevel ? { reasoningLevel } : {}),
+    ...(serviceTier ? { serviceTier } : {}),
     cwd,
     ...(gitBranch ? { gitBranch } : {}),
   };
@@ -1215,7 +1279,7 @@ export function ChatShellSurface(props: {
             if (submitAuthManualInput()) return;
             if (runSelectedSkillCompletion()) return;
             if (runSelectedSlashCompletion()) return;
-            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings, props.skills ?? []);
+            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings, props.skills ?? [], pastedImages, () => setPastedImages({}));
           }}
           completions={completions}
           completionOpen={skillCompletionOpen || slashCompletionOpen}
@@ -1257,7 +1321,7 @@ export function ChatShellSurface(props: {
             if (runSelectedSkillCompletion()) return;
             if (runSelectedSlashCompletion()) return;
             scrollMessageToBottom();
-            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings, props.skills ?? []);
+            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings, props.skills ?? [], pastedImages, () => setPastedImages({}));
           }}
           onTranscriptScroll={(event) => {
             const direction = event.scroll?.direction;
@@ -2032,6 +2096,7 @@ function StatusView(props: {
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`mode: ${props.options.modeName}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`model: ${modelLabel}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thinking: ${props.options.reasoningLevel ?? "default"}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`service tier: ${props.options.serviceTier ?? "standard"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thinking traces: ${props.hideThinking ? "hidden" : "shown"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`details: ${props.showToolDetails ? "on" : "off"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`transcript: ${props.transcriptActive ? "on" : "off"}`}</text>
@@ -2070,11 +2135,14 @@ async function submitPrompt(
   onAccepted?: (text: string) => void,
   skillMentionBindings: readonly RuntimeSkillMention[] = [],
   skills: readonly SkillSummary[] = [],
+  pastedImages: Readonly<Record<number, PastedPromptImage>> = {},
+  clearPastedImages?: () => void,
 ): Promise<void> {
   const trimmed = prompt.trim();
   if (!trimmed) return;
   if (trimmed.startsWith("!")) {
     actions.setPrompt("");
+    clearPastedImages?.();
     const command = trimmed.slice(1).trim();
     if (!command) {
       actions.appendLocalItem("info", "Prefix a command with ! to run it locally\nExample: !ls", { persistent: true });
@@ -2088,6 +2156,7 @@ async function submitPrompt(
     const slashMatch = resolveSlashCommand(commands, trimmed);
     if (slashMatch) {
       actions.setPrompt("");
+      clearPastedImages?.();
       await runResolvedSlashCommand(slashMatch, ctx, model, runtime, actions);
       return;
     }
@@ -2103,14 +2172,24 @@ async function submitPrompt(
   for (const warning of localSkillMentionWarnings(trimmed, skills, skillMentionBindings)) {
     actions.appendLocalItem("info", warning);
   }
-  const accepted = await runtime.submitPrompt(trimmed, {
+  const images = promptImagesForSubmit(trimmed, pastedImages);
+  const modelCandidates = ctx.modelCandidates ?? [];
+  const supportsImages = modelSupportsImages(ctx.modelSelection, modelCandidates);
+  const text = images.length > 0 && !supportsImages
+    ? textWithImagePathContext(trimmed, promptReferencedImages(trimmed, pastedImages))
+    : trimmed;
+  const accepted = await runtime.submitPrompt(text, {
     ...(ctx.modelSelection ? { modelSelection: ctx.modelSelection } : {}),
     ...(ctx.reasoningLevel ? { reasoningLevel: ctx.reasoningLevel } : {}),
+    ...(ctx.serviceTier ? { serviceTier: ctx.serviceTier } : {}),
+    ...(text !== trimmed ? { displayText: trimmed } : {}),
+    ...(images.length > 0 && supportsImages ? { images } : {}),
     ...activeSkillMentionsOption(trimmed, skillMentionBindings),
   });
   if (accepted) {
     onAccepted?.(trimmed);
     actions.setPrompt("");
+    clearPastedImages?.();
   }
 }
 
@@ -2215,6 +2294,7 @@ async function applySlashResult(
     const accepted = await runtime.submitCommand(result.commandName, result.args, {
       ...(ctx.modelSelection ? { modelSelection: ctx.modelSelection } : {}),
       ...(ctx.reasoningLevel ? { reasoningLevel: ctx.reasoningLevel } : {}),
+      ...(ctx.serviceTier ? { serviceTier: ctx.serviceTier } : {}),
     });
     if (!accepted) actions.appendLocalItem("error", `/${result.commandName} did not submit.`);
     return;
@@ -2253,6 +2333,10 @@ async function applySlashResult(
   }
   if (result.type === "set_reasoning") {
     await actions.setReasoningLevel(result.level);
+    return;
+  }
+  if (result.type === "set_service_tier") {
+    await actions.setServiceTier(result.serviceTier);
     return;
   }
   if (result.type === "set_hide_thinking") {
@@ -2917,6 +3001,108 @@ function setPromptText(setPromptParts: (value: PromptPart[] | ((current: PromptP
 
 function promptText(parts: readonly PromptPart[]): string {
   return parts.map((part) => part.text).join("");
+}
+
+function imagePlaceholder(id: number): string {
+  return `[Image #${id}]`;
+}
+
+function imagePlaceholderIds(text: string): Set<number> {
+  const ids = new Set<number>();
+  for (const match of text.matchAll(/\[Image #(\d+)\]/g)) {
+    const value = Number(match[1]);
+    if (Number.isSafeInteger(value) && value > 0) ids.add(value);
+  }
+  return ids;
+}
+
+function filterPastedImagesByPrompt(
+  images: Readonly<Record<number, PastedPromptImage>>,
+  prompt: string,
+): Record<number, PastedPromptImage> {
+  const referenced = imagePlaceholderIds(prompt);
+  const entries = Object.entries(images).filter(([id]) => referenced.has(Number(id)));
+  if (entries.length === Object.keys(images).length) return images as Record<number, PastedPromptImage>;
+  return Object.fromEntries(entries) as Record<number, PastedPromptImage>;
+}
+
+function promptImagesForSubmit(prompt: string, images: Readonly<Record<number, PastedPromptImage>>): MessageImageContent[] {
+  const output: MessageImageContent[] = [];
+  for (const image of promptReferencedImages(prompt, images)) {
+    const item: MessageImageContent = {
+      data: image.data,
+      mimeType: image.mimeType,
+    };
+    if (image.filename) item.filename = image.filename;
+    if (image.sourcePath) item.sourcePath = image.sourcePath;
+    output.push(item);
+  }
+  return output;
+}
+
+function promptReferencedImages(prompt: string, images: Readonly<Record<number, PastedPromptImage>>): PastedPromptImage[] {
+  const referenced = imagePlaceholderIds(prompt);
+  const output: PastedPromptImage[] = [];
+  for (const id of referenced) {
+    const image = images[id];
+    if (image) output.push(image);
+  }
+  return output;
+}
+
+function textWithImagePathContext(prompt: string, images: readonly PastedPromptImage[]): string {
+  const lines = images
+    .map((image) => {
+      const path = image.sourcePath ?? image.filename ?? `Image #${image.id}`;
+      const absolute = image.absolutePath ? ` absolutePath=${image.absolutePath}` : "";
+      return `- [Image #${image.id}] path=${path}${absolute}`;
+    });
+  if (lines.length === 0) return prompt;
+  return [
+    prompt,
+    "",
+    "<pasted_image_files>",
+    ...lines,
+    "Direct image input is unavailable. Use an available MCP image-understanding or OCR tool that returns text with the matching absolutePath/path.",
+    "Do not use read_image unless no text-returning image MCP tool is available.",
+    "</pasted_image_files>",
+  ].join("\n");
+}
+
+async function saveClipboardImage(cwd: string, image: ClipboardImage): Promise<{ relativePath: string; absolutePath: string; filename: string }> {
+  const dir = join(cwd, ".chili", "clipboard-images");
+  await mkdir(dir, { recursive: true });
+  const extension = safeImageExtension(image.extension, image.mimeType);
+  const filename = `clipboard-${timestampForFilename(new Date())}-${process.hrtime.bigint().toString(36)}.${extension}`;
+  const absolutePath = join(dir, filename);
+  await writeFile(absolutePath, image.bytes);
+  return { relativePath: `.chili/clipboard-images/${filename}`, absolutePath, filename };
+}
+
+function safeImageExtension(extension: string, mimeType: string): string {
+  const normalized = extension.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (normalized === "png" || normalized === "jpg" || normalized === "jpeg" || normalized === "gif" || normalized === "webp") {
+    return normalized === "jpeg" ? "jpg" : normalized;
+  }
+  if (mimeType === "image/jpeg") return "jpg";
+  if (mimeType === "image/gif") return "gif";
+  if (mimeType === "image/webp") return "webp";
+  return "png";
+}
+
+function timestampForFilename(date: Date): string {
+  const pad = (value: number, length = 2) => String(value).padStart(length, "0");
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+    "-",
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds()),
+    "-",
+    pad(date.getMilliseconds(), 3),
+  ].join("");
 }
 
 function localItem(level: "info" | "error", text: string, persistent?: boolean | undefined): LocalTranscriptItem {

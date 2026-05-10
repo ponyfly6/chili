@@ -57,6 +57,15 @@ function messagePartLines(messageId: string, part: ChatMessagePart, index: numbe
       valueTone: "muted",
     });
   }
+  if (part.type === "image") {
+    return [
+      sourceLine(
+        `${key}:header`,
+        `  part image ${part.id} mimeType=${part.mimeType}${part.filename ? ` filename=${part.filename}` : ""}${part.sourcePath ? ` sourcePath=${part.sourcePath}` : ""}`,
+        "muted",
+      ),
+    ];
+  }
   if (part.type === "summary") {
     return blockLines({
       key,

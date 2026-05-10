@@ -6,6 +6,7 @@ import {
 } from "@chili/sdk";
 import type {
   ApprovalId,
+  MessageImageContent,
   RuntimeApprovalResolveResult,
   RuntimeMcpAddServerRequest,
   RuntimeMcpAuthRequest,
@@ -21,6 +22,7 @@ import type {
   RuntimePermissionProfileId,
   RuntimePromptCommandList,
   RuntimeSkillMention,
+  ServiceTier,
   SessionId,
   ThreadGoal,
   ThreadId,
@@ -51,6 +53,7 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
   submitCommand: (name: string, args: string, options?: ChatCommandSubmitOptions) => Promise<boolean>;
   setRuntimeModel?: (selection: ModelSelection) => Promise<boolean>;
   setRuntimeReasoning?: (level: ReasoningLevel) => Promise<boolean>;
+  setRuntimeServiceTier?: (serviceTier: ServiceTier) => Promise<boolean>;
   refreshModelConfig?: () => Promise<void>;
   refreshPermissionConfig?: () => Promise<void>;
   reloadCommands?: () => Promise<RuntimePromptCommandList | undefined>;
@@ -76,12 +79,16 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
 export interface ChatSubmitOptions {
   modelSelection?: ModelSelection | undefined;
   reasoningLevel?: ReasoningLevel | undefined;
+  serviceTier?: ServiceTier | undefined;
+  displayText?: string | undefined;
+  images?: readonly MessageImageContent[] | undefined;
   skillMentions?: readonly RuntimeSkillMention[] | undefined;
 }
 
 export interface ChatCommandSubmitOptions {
   modelSelection?: ModelSelection | undefined;
   reasoningLevel?: ReasoningLevel | undefined;
+  serviceTier?: ServiceTier | undefined;
 }
 
 export type ChatApprovalGrantScope = "once" | "session" | "persistent";
@@ -371,9 +378,12 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
           sessionId,
           threadId,
           text: trimmed,
+          ...(submitOptions.displayText ? { displayText: submitOptions.displayText } : {}),
           ...(options.cwd ? { cwd: options.cwd } : {}),
           ...(submitOptions.modelSelection ? { modelSelection: submitOptions.modelSelection } : {}),
           ...(submitOptions.reasoningLevel ? { reasoningLevel: submitOptions.reasoningLevel } : {}),
+          ...(submitOptions.serviceTier ? { serviceTier: submitOptions.serviceTier } : {}),
+          ...(submitOptions.images && submitOptions.images.length > 0 ? { images: [...submitOptions.images] } : {}),
           ...(submitOptions.skillMentions && submitOptions.skillMentions.length > 0 ? { skillMentions: [...submitOptions.skillMentions] } : {}),
           signal,
         };
@@ -430,6 +440,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
           ...(options.cwd ? { cwd: options.cwd } : {}),
           ...(submitOptions.modelSelection ? { modelSelection: submitOptions.modelSelection } : {}),
           ...(submitOptions.reasoningLevel ? { reasoningLevel: submitOptions.reasoningLevel } : {}),
+          ...(submitOptions.serviceTier ? { serviceTier: submitOptions.serviceTier } : {}),
           signal,
         });
       });
@@ -477,6 +488,27 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
         });
       });
       setChatFeedback({ status: "success", message: "thinking level selected" });
+      await refreshModelConfigForSession(updatedSessionId);
+      return true;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return false;
+    }
+  }, [client, ensureSession, options.baseUrl, refreshModelConfigForSession, withAbort]);
+
+  const setRuntimeServiceTier = useCallback(async (serviceTier: ServiceTier): Promise<boolean> => {
+    let updatedSessionId: SessionId | undefined;
+    try {
+      await withAbort(async (signal) => {
+        const session = await ensureSession(signal);
+        updatedSessionId = session.sessionId;
+        await client.setServiceTier({
+          ...session,
+          serviceTier,
+          signal,
+        });
+      });
+      setChatFeedback({ status: "success", message: serviceTier === "fast" ? "fast mode enabled" : "standard mode selected" });
       await refreshModelConfigForSession(updatedSessionId);
       return true;
     } catch (error) {
@@ -626,6 +658,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     submitCommand,
     setRuntimeModel,
     setRuntimeReasoning,
+    setRuntimeServiceTier,
     refreshModelConfig,
     refreshPermissionConfig,
     reloadCommands,
@@ -646,7 +679,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     interruptActiveSession,
     approveApproval,
     rejectApproval,
-  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, permissionConfig, commandList, mcpStatus, refreshModelConfig, refreshPermissionConfig, reloadCommands, refreshMcpStatus, getMcpServer, reloadMcp, addMcpServer, removeMcpServer, listMcpTools, authMcpServer, logoutMcpServer, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setGoal, pauseGoal, resumeGoal, clearGoal, startNewSession, submitBlockedReason, submitCommand, submitPrompt, teamRuntime]);
+  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, permissionConfig, commandList, mcpStatus, refreshModelConfig, refreshPermissionConfig, reloadCommands, refreshMcpStatus, getMcpServer, reloadMcp, addMcpServer, removeMcpServer, listMcpTools, authMcpServer, logoutMcpServer, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setRuntimeServiceTier, setGoal, pauseGoal, resumeGoal, clearGoal, startNewSession, submitBlockedReason, submitCommand, submitPrompt, teamRuntime]);
 }
 
 function upsertMcpServer(current: RuntimeMcpStatusResponse | undefined, server: RuntimeMcpServerDescriptor): RuntimeMcpStatusResponse {
