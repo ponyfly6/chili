@@ -16,6 +16,7 @@ node_modules/
 
 # Chili local state
 .chili/
+.claude
 
 # Build outputs
 dist/
