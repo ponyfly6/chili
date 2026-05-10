@@ -17,6 +17,10 @@ export const THINKING_LEVELS = REASONING_LEVELS;
 
 export type ThinkingLevel = ReasoningLevel;
 
+export const SERVICE_TIERS = ["standard", "fast"] as const;
+
+export type ServiceTier = (typeof SERVICE_TIERS)[number];
+
 export interface ModelSelection {
   provider: string;
   model: string;
@@ -53,6 +57,7 @@ export interface RuntimeModelConfig {
   models: RuntimeModelDescriptor[];
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
+  serviceTier?: ServiceTier;
 }
 
 export const RUNTIME_PERMISSION_PROFILE_IDS = ["default", "auto-review", "full-access"] as const;
@@ -236,6 +241,7 @@ export interface RuntimeSubmitPromptCommand {
   maxTurns?: number;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
+  serviceTier?: ServiceTier;
 }
 
 export interface RuntimeInterruptCommand {

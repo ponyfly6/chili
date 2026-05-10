@@ -22,7 +22,7 @@ import type {
   McpServerStatusChangedPayload,
   McpToolsChangedPayload,
 } from "./mcp.js";
-import type { ModelSelection, ReasoningLevel, ModelMetadataPayload, RuntimeStatusPayload } from "./runtime.js";
+import type { ModelSelection, ReasoningLevel, ServiceTier, ModelMetadataPayload, RuntimeStatusPayload } from "./runtime.js";
 import type { ApprovalDecisionAction, ToolCallStatus, ToolOutputStream } from "./tool.js";
 
 export interface EventEnvelope<TType extends string = string, TPayload = unknown> {
@@ -51,6 +51,7 @@ export type SessionEvent =
   | EventEnvelope<"session.status_changed", RuntimeStatusPayload>
   | EventEnvelope<"session.model_changed", { sessionId: SessionId; modelSelection: ModelSelection }>
   | EventEnvelope<"session.reasoning_changed", { sessionId: SessionId; reasoningLevel: ReasoningLevel }>
+  | EventEnvelope<"session.service_tier_changed", { sessionId: SessionId; serviceTier: ServiceTier }>
   | EventEnvelope<"session.archived", { sessionId: SessionId }>;
 
 export type TurnEvent =
