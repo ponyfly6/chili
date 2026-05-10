@@ -1,4 +1,4 @@
-import type { ToolRisk, ToolResult } from "@chili/protocol";
+import type { ToolResultContent, ToolRisk, ToolResult } from "@chili/protocol";
 import type { ChiliToolDefinition, ChiliToolExecutionContext, ToolApprovalSpec } from "@chili/tools";
 import type { McpServerConfig } from "./config.js";
 import type { McpCallToolResult, McpTool, McpToolAnnotations } from "./client.js";
@@ -33,7 +33,11 @@ export function createMcpChiliTool(options: McpToolAdapterOptions): McpChiliTool
 
   return {
     name: modelName,
-    description: options.tool.description ?? `MCP tool ${options.server.name}/${options.tool.name}`,
+    description: sanitizeMcpToolDescription(
+      options.tool.description ?? `MCP tool ${options.server.name}/${options.tool.name}`,
+      options.server.name,
+      options.tool.name,
+    ),
     risk: inferRisk(annotations),
     inputSchema: options.tool.inputSchema ?? { type: "object" },
     shouldDefer: true,
@@ -65,6 +69,7 @@ export function createMcpChiliTool(options: McpToolAdapterOptions): McpChiliTool
       return {
         title: `${options.server.name}/${options.tool.name}`,
         output: formatMcpToolOutput(result),
+        ...optionalContent(mcpToolResultContent(result)),
         metadata: {
           server: options.server.name,
           tool: options.tool.name,
@@ -75,6 +80,27 @@ export function createMcpChiliTool(options: McpToolAdapterOptions): McpChiliTool
       };
     },
   };
+}
+
+export function sanitizeMcpToolDescription(description: string, serverName: string, toolName: string): string {
+  const capability = description.trim() || `MCP tool ${serverName}/${toolName}`;
+  const sanitized = capability
+    .split(/\n\s*\n/g)
+    .map((paragraph) => paragraph.trim())
+    .filter((paragraph) => paragraph.length > 0 && !isToolUseDirectiveParagraph(paragraph))
+    .join("\n\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  const body = sanitized || `MCP tool ${serverName}/${toolName}.`;
+  return [
+    "Use this MCP tool only when it is relevant to the current task and higher-priority instructions do not already provide the needed information.",
+    body,
+  ].join("\n\n");
+}
+
+function isToolUseDirectiveParagraph(paragraph: string): boolean {
+  return /\b(?:you\s+)?must\s+use\s+this\s+tool\b/i.test(paragraph)
+    || /\buse\s+this\s+tool\s+whenever\b/i.test(paragraph);
 }
 
 export function createMcpChiliTools(
@@ -111,12 +137,35 @@ function formatMcpToolOutput(result: McpCallToolResult): string {
   return JSON.stringify(result, null, 2);
 }
 
+function optionalContent(content: ToolResultContent[] | undefined): { content?: ToolResultContent[] } {
+  return content ? { content } : {};
+}
+
+function mcpToolResultContent(result: McpCallToolResult): ToolResultContent[] | undefined {
+  const content = (result.content ?? []).flatMap((item) => mcpContentPart(item));
+  return content.length > 0 ? content : undefined;
+}
+
+function mcpContentPart(content: unknown): ToolResultContent[] {
+  if (!isRecord(content)) return [];
+  if (content.type === "text" && typeof content.text === "string") return [{ type: "text", text: content.text }];
+  if (content.type !== "image" || typeof content.data !== "string") return [];
+  const mimeType = typeof content.mimeType === "string" && content.mimeType.length > 0 ? content.mimeType : "image/png";
+  return [{ type: "image", data: content.data, mimeType }];
+}
+
 function renderContent(content: unknown): string {
   if (!isRecord(content)) return stringify(content);
   if (content.type === "text" && typeof content.text === "string") return content.text;
-  if (content.type === "image") return `[image${typeof content.mimeType === "string" ? ` ${content.mimeType}` : ""}]`;
+  if (content.type === "image") return imagePlaceholder(content);
   if (content.type === "resource") return stringify(content.resource ?? content);
   return stringify(content);
+}
+
+function imagePlaceholder(content: Record<string, unknown>): string {
+  const mime = typeof content.mimeType === "string" ? ` ${content.mimeType}` : "";
+  const bytes = typeof content.data === "string" ? ` ${Math.ceil(content.data.length * 3 / 4)} bytes` : "";
+  return `[image${mime}${bytes}]`;
 }
 
 function stringify(value: unknown): string {
