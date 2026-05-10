@@ -235,6 +235,28 @@ test("finishes live streaming tool rows as failed when the model errors before t
   ]);
 });
 
+test("surfaces model startup failures in the assistant message", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      throw new Error("Kimi provider requires MOONSHOT_API_KEY or KIMI_API_KEY");
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_model_startup_error" as SessionId,
+    threadId: "thread_model_startup_error" as ThreadId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("failed");
+  expect(textParts(store).map((part) => part.text)).toContain(
+    "Model request failed: Kimi provider requires MOONSHOT_API_KEY or KIMI_API_KEY",
+  );
+});
+
 test("finishes live streaming tool rows as cancelled when aborted before tool_call_end", async () => {
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();

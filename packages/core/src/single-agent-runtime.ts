@@ -282,6 +282,9 @@ export class SingleAgentRuntime implements AgentRunner {
     } catch (error) {
       const err = toError(error);
       const status = isAbortError(err) ? "cancelled" : "failed";
+      if (status === "failed" && assistantMessageId && !didAssistantMutate(err)) {
+        await this.appendModelFailureMessage(input, assistantMessageId, err);
+      }
       await this.append(input, "turn.completed", {
         turnId,
         status,
@@ -295,6 +298,20 @@ export class SingleAgentRuntime implements AgentRunner {
       if (contextUsage) result.contextUsage = contextUsage;
       return result;
     }
+  }
+
+  private async appendModelFailureMessage(
+    input: RunTurnInput,
+    assistantMessageId: MessageId,
+    error: Error,
+  ): Promise<void> {
+    await this.appendPart(input, assistantMessageId, {
+      id: this.id<PartId>("part"),
+      messageId: assistantMessageId,
+      sessionId: input.sessionId,
+      type: "text",
+      text: `Model request failed: ${error.message}`,
+    });
   }
 
   private async visibleTools(input: RunTurnInput, turnId: TurnId) {
