@@ -34,6 +34,58 @@ export function createDefaultSlashCommands(): SlashCommand[] {
       run: () => ({ type: "sdk_action", action: "team_merge" }),
     },
     {
+      name: "model",
+      description: "Select model",
+      category: "model",
+      argumentHint: "[provider/model]",
+      isSafeConcurrent: true,
+      complete: modelCompletions,
+      run: (ctx, args) => {
+        const match = parseModelCommand(args, modelCandidates(ctx));
+        if (match.selection) {
+          return {
+            type: "set_model",
+            selection: match.selection,
+            ...(match.reasoningLevel ? { reasoningLevel: match.reasoningLevel } : {}),
+          };
+        }
+        return {
+          type: "open_model_picker",
+          ...(match.query ? { query: match.query } : {}),
+        };
+      },
+    },
+    {
+      name: "thinking",
+      aliases: ["reasoning"],
+      description: "Set model reasoning level or visibility",
+      category: "model",
+      argumentHint: "<off|minimal|low|medium|high|xhigh|hide|show>",
+      isSafeConcurrent: true,
+      complete: reasoningCompletions,
+      run: (_ctx, args) => {
+        const level = args.trim().toLowerCase();
+        if (!level) return { type: "open_reasoning_picker" };
+        if (level === "hide") return { type: "set_hide_thinking", hidden: true };
+        if (level === "show") return { type: "set_hide_thinking", hidden: false };
+        if (isReasoningLevel(level)) return { type: "set_reasoning", level };
+        return {
+          type: "local_message",
+          level: "error",
+          text: `Unknown thinking option: ${args.trim() || "none"}`,
+        };
+      },
+    },
+    {
+      name: "fast",
+      description: "Set Codex Fast mode",
+      category: "model",
+      argumentHint: "<on|off|status>",
+      isSafeConcurrent: true,
+      complete: fastCompletions,
+      run: (ctx, args) => fastResult(ctx, args),
+    },
+    {
       name: "theme",
       description: "Switch theme",
       category: "view",
@@ -184,54 +236,34 @@ export function createDefaultSlashCommands(): SlashCommand[] {
       complete: skillToggleCompletions("disable"),
       run: (_ctx, args) => skillToggleResult("disable", args),
     },
-    {
-      name: "model",
-      description: "Select model",
-      category: "model",
-      argumentHint: "[provider/model]",
-      isSafeConcurrent: true,
-      complete: modelCompletions,
-      run: (ctx, args) => {
-        const match = parseModelCommand(args, modelCandidates(ctx));
-        if (match.selection) {
-          return {
-            type: "set_model",
-            selection: match.selection,
-            ...(match.reasoningLevel ? { reasoningLevel: match.reasoningLevel } : {}),
-          };
-        }
-        return {
-          type: "open_model_picker",
-          ...(match.query ? { query: match.query } : {}),
-        };
-      },
-    },
-    {
-      name: "thinking",
-      aliases: ["reasoning"],
-      description: "Set reasoning level or visibility",
-      category: "model",
-      argumentHint: "<off|minimal|low|medium|high|xhigh|hide|show>",
-      isSafeConcurrent: true,
-      complete: reasoningCompletions,
-      run: (_ctx, args) => {
-        const level = args.trim().toLowerCase();
-        if (!level) return { type: "open_reasoning_picker" };
-        if (level === "hide") return { type: "set_hide_thinking", hidden: true };
-        if (level === "show") return { type: "set_hide_thinking", hidden: false };
-        if (isReasoningLevel(level)) return { type: "set_reasoning", level };
-        return {
-          type: "local_message",
-          level: "error",
-          text: `Unknown thinking option: ${args.trim() || "none"}`,
-        };
-      },
-    },
   ];
 }
 
 function openPermissionsView(): SlashCommandResult {
   return { type: "open_permissions_picker" };
+}
+
+function fastResult(ctx: SlashCommandContext, args: string): SlashCommandResult {
+  const option = args.trim().toLowerCase();
+  if (!option || option === "status") {
+    const serviceTier = ctx.serviceTier ?? "standard";
+    return {
+      type: "local_message",
+      level: "info",
+      text: `Fast mode: ${serviceTier === "fast" ? "on" : "off"} (${serviceTier})`,
+    };
+  }
+  if (option === "on" || option === "enable" || option === "enabled" || option === "fast") {
+    return { type: "set_service_tier", serviceTier: "fast" };
+  }
+  if (option === "off" || option === "disable" || option === "disabled" || option === "standard") {
+    return { type: "set_service_tier", serviceTier: "standard" };
+  }
+  return {
+    type: "local_message",
+    level: "error",
+    text: `Unknown fast option: ${args.trim() || "none"}`,
+  };
 }
 
 export function resolveSlashCommand(
@@ -257,7 +289,7 @@ export function slashCompletions(
   commands: readonly SlashCommand[],
   ctx: SlashCommandContext,
   input: string,
-  limit = 8,
+  limit = 64,
 ): SlashCompletion[] {
   const body = normalizeInput(input);
   const custom = commands.flatMap((command) => command.complete?.(ctx, body) ?? []);
@@ -265,11 +297,10 @@ export function slashCompletions(
     .map((command, index) => ({ command, index, rank: commandMatchRank(command, body) }))
     .filter((candidate): candidate is { command: SlashCommand; index: number; rank: CommandMatchRank } => candidate.rank !== undefined)
     .sort((left, right) => compareCommandMatch(left.rank, right.rank) || left.index - right.index)
-    .map(({ command }) => command)
-    .filter((command) => !command.hidden)
-    .map((command) => ({
-      value: `/${command.name}`,
-      label: `/${command.name}${command.argumentHint ? ` ${command.argumentHint}` : ""}`,
+    .filter(({ command }) => !command.hidden)
+    .map(({ command, rank }) => ({
+      value: `/${rank.name}`,
+      label: `/${rank.name}${command.argumentHint ? ` ${command.argumentHint}` : ""}`,
       description: command.description,
       category: command.category,
     }));
@@ -288,6 +319,7 @@ function commandNames(command: SlashCommand): string[] {
 interface CommandMatchRank {
   kind: 0 | 1 | 2;
   nameLength: number;
+  name: string;
 }
 
 function commandMatchRank(command: SlashCommand, input: string): CommandMatchRank | undefined {
@@ -302,10 +334,10 @@ function commandMatchRank(command: SlashCommand, input: string): CommandMatchRan
 }
 
 function nameMatchRank(name: string, input: string): CommandMatchRank | undefined {
-  if (!input) return { kind: 0, nameLength: 0 };
-  if (name === input) return { kind: 0, nameLength: name.length };
-  if (name.startsWith(input)) return { kind: 1, nameLength: name.length };
-  if (fuzzyMatch(name, input)) return { kind: 2, nameLength: name.length };
+  if (!input) return { kind: 0, nameLength: 0, name };
+  if (name === input) return { kind: 0, nameLength: name.length, name };
+  if (name.startsWith(input)) return { kind: 1, nameLength: name.length, name };
+  if (fuzzyMatch(name, input)) return { kind: 2, nameLength: name.length, name };
   return undefined;
 }
 
@@ -411,7 +443,7 @@ function modelCompletions(ctx: SlashCommandContext, input: string): SlashComplet
   const normalized = query.trim().toLowerCase();
   const matches = candidates
     .filter((model) => !normalized || fuzzyMatch(`${model.provider} ${model.model} ${model.provider}/${model.model} ${model.displayName ?? ""}`.toLowerCase(), normalized))
-    .slice(0, 8);
+    .slice(0, 64);
   return matches.flatMap((model) => {
     const selection = modelDescriptorSelection(model);
     const canonical = modelSelectionLabel(selection);
@@ -449,6 +481,25 @@ function reasoningCompletions(_ctx: SlashCommandContext, input: string): SlashCo
     .filter((candidate) => !normalized || candidate.value.startsWith(normalized) || fuzzyMatch(candidate.value, normalized))
     .map((candidate) => ({
       value: `/${command} ${candidate.value}`,
+      label: candidate.value,
+      description: candidate.description,
+      category: "model" as const,
+    }));
+}
+
+function fastCompletions(_ctx: SlashCommandContext, input: string): SlashCompletion[] {
+  const query = commandArgument(input, "fast");
+  if (query === undefined) return [];
+  const normalized = query.trim().toLowerCase();
+  const candidates = [
+    { value: "on", description: "Enable Codex Fast mode" },
+    { value: "off", description: "Use Standard mode" },
+    { value: "status", description: "Show the current Fast mode setting" },
+  ];
+  return candidates
+    .filter((candidate) => !normalized || candidate.value.startsWith(normalized) || fuzzyMatch(candidate.value, normalized))
+    .map((candidate) => ({
+      value: `/fast ${candidate.value}`,
       label: candidate.value,
       description: candidate.description,
       category: "model" as const,

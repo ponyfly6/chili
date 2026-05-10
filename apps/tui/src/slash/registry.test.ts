@@ -35,6 +35,33 @@ test("sorts prefix slash completions before fuzzy matches", () => {
   expect(completions.map((completion) => completion.value)).toContain("/commands reload");
 });
 
+test("surfaces model and reasoning commands in the root slash list", () => {
+  const values = slashCompletions(createDefaultSlashCommands(), { model: {} } as SlashCommandContext, "/", 8)
+    .map((completion) => completion.value);
+  expect(values).toContain("/model");
+  expect(values).toContain("/thinking");
+});
+
+test("surfaces alias names when slash completion matches an alias", () => {
+  const values = slashCompletions(createDefaultSlashCommands(), { model: {} } as SlashCommandContext, "/rea", 8)
+    .map((completion) => completion.value);
+  expect(values[0]).toBe("/reasoning");
+});
+
+test("model completions include more than the first eight matching candidates", () => {
+  const ctx = {
+    model: {},
+    modelCandidates: Array.from({ length: 12 }, (_, index) => ({
+      provider: "test",
+      model: `gpt-test-${index + 1}`,
+    })),
+  } as unknown as SlashCommandContext;
+
+  const values = slashCompletions(createDefaultSlashCommands(), ctx, "/model gpt-test", 64)
+    .map((completion) => completion.value);
+  expect(values).toContain("/model test/gpt-test-12");
+});
+
 test("resolves commands view and reload slash commands", async () => {
   const commands = createDefaultSlashCommands();
   const ctx = { model: {} } as SlashCommandContext;
@@ -207,6 +234,27 @@ test("resolves thinking slash command and completions", async () => {
   expect(slashCompletions(commands, ctx, "/thinking h", 8).map((completion) => completion.value)).toContain("/thinking hide");
   expect(slashCompletions(commands, ctx, "/hide", 8).map((completion) => completion.value)).toContain("/hide-thinking");
   expect(slashCompletions(commands, ctx, "/show", 8).map((completion) => completion.value)).toContain("/show-thinking");
+});
+
+test("resolves fast mode slash command and completions", async () => {
+  const commands = createDefaultSlashCommands();
+  const ctx = { model: {}, serviceTier: "standard" } as SlashCommandContext;
+
+  expect(await resolveSlashCommand(commands, "/fast on")?.command.run(ctx, "on")).toEqual({
+    type: "set_service_tier",
+    serviceTier: "fast",
+  });
+  expect(await resolveSlashCommand(commands, "/fast off")?.command.run(ctx, "off")).toEqual({
+    type: "set_service_tier",
+    serviceTier: "standard",
+  });
+  expect(await resolveSlashCommand(commands, "/fast status")?.command.run(ctx, "status")).toEqual({
+    type: "local_message",
+    level: "info",
+    text: "Fast mode: off (standard)",
+  });
+  expect(slashCompletions(commands, ctx, "/fast o", 8).map((completion) => completion.value)).toContain("/fast on");
+  expect(slashCompletions(commands, ctx, "/fast o", 8).map((completion) => completion.value)).toContain("/fast off");
 });
 
 test("resolves skills enable and disable commands", async () => {

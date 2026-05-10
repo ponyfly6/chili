@@ -1,6 +1,6 @@
 import type { TeamLiveView } from "@chili/sdk";
 import type { SkillSettingsScope, SkillSummary } from "@chili/skills";
-import type { RuntimeMcpAddServerRequest, RuntimeMcpAuthRequest, RuntimeMcpServerDescriptor } from "@chili/protocol";
+import type { RuntimeMcpAddServerRequest, RuntimeMcpAuthRequest, RuntimeMcpServerDescriptor, ServiceTier } from "@chili/protocol";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "../model-state.js";
 
 export type SlashCommandCategory =
@@ -31,6 +31,7 @@ export type SlashCommandResult =
   | { type: "set_model"; selection: ModelSelection; reasoningLevel?: ReasoningLevel }
   | { type: "open_reasoning_picker" }
   | { type: "set_reasoning"; level: ReasoningLevel }
+  | { type: "set_service_tier"; serviceTier: ServiceTier }
   | { type: "set_hide_thinking"; hidden: boolean }
   | { type: "skills_action"; action: "enable" | "disable"; name: string; scope?: SkillSettingsScope }
   | McpSlashCommandResult
@@ -55,6 +56,7 @@ export interface SlashCommandContext {
   cwd?: string;
   modelSelection?: ModelSelection | undefined;
   reasoningLevel?: ReasoningLevel | undefined;
+  serviceTier?: ServiceTier | undefined;
   modelCandidates?: readonly ModelCandidate[] | undefined;
   skills?: readonly SkillSummary[] | undefined;
   allSkills?: readonly SkillSummary[] | undefined;
