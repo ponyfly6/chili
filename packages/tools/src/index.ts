@@ -9,6 +9,7 @@ export * from "./builtins/git-diff.js";
 export * from "./builtins/goal.js";
 export * from "./builtins/mcp-resources.js";
 export * from "./builtins/read-file.js";
+export * from "./builtins/read-image.js";
 export * from "./builtins/task.js";
 export * from "./builtins/team.js";
 export * from "./builtins/tool-search.js";

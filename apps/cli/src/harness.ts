@@ -53,6 +53,7 @@ import {
   createMcpResourceReadTool,
   createMcpResourcesListTool,
   createReadFileTool,
+  createReadImageTool,
   createTaskCloseTool,
   createTaskFollowupTool,
   createTaskListTool,
@@ -729,6 +730,7 @@ function shortHash(value: string): string {
 function createToolRegistry(skillRegistry: SkillRegistry): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool());
+  registry.register(createReadImageTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
   registry.register(createMemoryTool());
@@ -755,6 +757,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function createChildToolRegistry(skillRegistry: SkillRegistry): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool());
+  registry.register(createReadImageTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
   registry.register(createMemoryTool());

@@ -265,7 +265,7 @@ export function inputSummaryFromUnknown(toolName: string, input: unknown): ChatT
 
 export function explorationToolKind(toolName: string): ExplorationToolKind | undefined {
   const name = normalizeToolName(toolName);
-  if (name === "read" || name === "read_file") return "read";
+  if (name === "read" || name === "read_file" || name === "read_image" || name === "view_image" || name === "image_read") return "read";
   if (name === "grep" || name === "grep_search" || name === "search" || name === "rg") return "search";
   if (name === "glob" || name === "file_glob" || name === "list" || name === "list_files" || name === "ls") return "list";
   return undefined;

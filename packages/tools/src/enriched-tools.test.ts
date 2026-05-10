@@ -10,6 +10,7 @@ import { createEditTool } from "./builtins/edit.js";
 import { createGlobTool } from "./builtins/glob.js";
 import { createGrepTool } from "./builtins/grep.js";
 import { createReadFileTool } from "./builtins/read-file.js";
+import { createReadImageTool } from "./builtins/read-image.js";
 import { createToolSearchTool } from "./builtins/tool-search.js";
 import { createWriteFileTool } from "./builtins/write-file.js";
 import { InMemoryToolRegistry } from "./registry.js";
@@ -62,6 +63,25 @@ test("glob, grep, and tool_search expose repository discovery tools", async () =
     const search = await executor.execute(toolInput("tool_search", { query: "write file" }, workspace));
     expect(search.status).toBe("completed");
     if (search.status === "completed") expect(search.result.output).toContain("write:");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("read_image returns image content for vision-capable models", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-read-image-"));
+  try {
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lwOKGAAAAABJRU5ErkJggg==", "base64");
+    await writeFile(join(workspace, "pixel.png"), png);
+    const registry = registryWithCoreTools();
+    const executor = createExecutor(registry);
+
+    const result = await executor.execute(toolInput("read_image", { filePath: "pixel.png" }, workspace));
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") return;
+    expect(result.result.output).toContain("MIME type: image/png");
+    expect(result.result.content).toEqual([{ type: "image", data: png.toString("base64"), mimeType: "image/png" }]);
+    expect(result.result.metadata).toMatchObject({ path: "pixel.png", bytes: png.byteLength, mimeType: "image/png" });
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
@@ -450,6 +470,7 @@ test("scoped worker policy restricts team messages to the worker identity", asyn
 function registryWithCoreTools(): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool());
+  registry.register(createReadImageTool());
   registry.register(createEditTool());
   registry.register(createWriteFileTool());
   registry.register(createGlobTool());
