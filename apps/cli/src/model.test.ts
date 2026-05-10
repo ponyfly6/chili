@@ -280,9 +280,11 @@ test("CLI router passes core modelSelection and reasoningLevel through to provid
     ...emptyInput(),
     modelSelection: { provider: "openai-codex", model: "gpt-5.3-codex" },
     reasoningLevel: "high",
+    serviceTier: "fast",
   } as ModelStreamInput & {
     modelSelection: { provider: string; model: string };
     reasoningLevel: string;
+    serviceTier: "fast";
   }));
 
   expect(bodies).toHaveLength(2);
@@ -293,6 +295,7 @@ test("CLI router passes core modelSelection and reasoningLevel through to provid
   expect(bodies.at(1)).toMatchObject({
     model: "gpt-5.3-codex",
     reasoning: { effort: "high", summary: "auto" },
+    service_tier: "priority",
   });
 });
 

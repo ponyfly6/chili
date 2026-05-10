@@ -1,5 +1,5 @@
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "@chili/core";
-import type { ModelSelection, RuntimeModelDescriptor } from "@chili/protocol";
+import type { ModelSelection, RuntimeModelDescriptor, ServiceTier } from "@chili/protocol";
 import { createMiniMaxM27HighspeedRouter } from "@chili/core";
 import {
   DEEPSEEK_OPENAI_BASE_URL,
@@ -33,6 +33,7 @@ export interface CliModelSelection {
   provider?: string;
   model?: CliModelName;
   reasoningLevel?: CliReasoningLevel;
+  serviceTier?: ServiceTier;
 }
 
 interface ProviderRouterOptions {
@@ -46,6 +47,7 @@ interface ProviderRouterOptions {
   reasoning?: boolean;
   reasoningEffort?: CliReasoningLevel;
   reasoningSummary?: "auto" | "concise" | "detailed" | "off" | "on" | null;
+  serviceTier?: ServiceTier;
 }
 
 type CliModelOptions = ProviderRouterOptions & CliModelSelection;
@@ -66,6 +68,7 @@ interface ProviderModelStreamInput {
   system?: readonly string[];
   developer?: readonly string[];
   contextualUser?: readonly string[];
+  serviceTier?: ServiceTier;
   maxTokens?: number;
   temperature?: number;
   signal?: AbortSignal;
@@ -112,6 +115,7 @@ export async function createCliModel(selection?: CliModelName | CliModelSelectio
     baseOptions,
   };
   if (config.reasoningLevel !== undefined) routerOptions.defaultReasoningLevel = config.reasoningLevel;
+  if (config.serviceTier !== undefined) routerOptions.defaultServiceTier = config.serviceTier;
   return new CliProviderRouter(routerOptions);
 }
 
@@ -257,6 +261,7 @@ function normalizeCreateCliModelInput(
       if (parsed.reasoningLevel && merged.reasoningLevel === undefined) merged.reasoningLevel = parsed.reasoningLevel;
     }
     if (selection.reasoningLevel !== undefined) merged.reasoningLevel = selection.reasoningLevel;
+    if (selection.serviceTier !== undefined) merged.serviceTier = selection.serviceTier;
   }
   return merged;
 }
@@ -269,6 +274,7 @@ function providerBaseOptions(input: CliModelOptions): ProviderRouterOptions {
   if (input.temperature !== undefined) options.temperature = input.temperature;
   if (input.fetch !== undefined) options.fetch = input.fetch;
   if (input.headers !== undefined) options.headers = input.headers;
+  if (input.serviceTier !== undefined) options.serviceTier = input.serviceTier;
   return options;
 }
 
@@ -393,6 +399,7 @@ function isReasoningLevel(value: string): value is CliReasoningLevel {
 interface CliProviderRouterOptions {
   defaultSelection: Extract<ResolvedCliModelSelection, { kind: "provider" }>;
   defaultReasoningLevel?: CliReasoningLevel;
+  defaultServiceTier?: ServiceTier;
   baseOptions: ProviderRouterOptions;
 }
 
@@ -434,7 +441,8 @@ class CliProviderRouter implements ModelRouter {
     }
 
     const reasoningLevel = reasoningLevelForInput(extended, this.options.defaultReasoningLevel);
-    const providerOptions = this.optionsForProvider(selection, reasoningLevel);
+    const serviceTier = serviceTierForInput(extended, this.options.defaultServiceTier);
+    const providerOptions = this.optionsForProvider(selection, reasoningLevel, serviceTier);
     const factory = await this.factoryFor(selection.provider);
     const modelOrProvider = await factory(providerOptions);
     const model = modelFromFactoryResult(
@@ -451,11 +459,16 @@ class CliProviderRouter implements ModelRouter {
     return resolveCliModelSelection(override.provider, override.model);
   }
 
-  private optionsForProvider(selection: Extract<ResolvedCliModelSelection, { kind: "provider" }>, reasoningLevel: CliReasoningLevel | undefined): ProviderRouterOptions {
+  private optionsForProvider(
+    selection: Extract<ResolvedCliModelSelection, { kind: "provider" }>,
+    reasoningLevel: CliReasoningLevel | undefined,
+    serviceTier: ServiceTier | undefined,
+  ): ProviderRouterOptions {
     const input: ProviderRouterOptions = {
       ...this.options.baseOptions,
       ...(selection.model ? { model: selection.model } : {}),
     };
+    if (selection.provider === "openai-codex" && serviceTier !== undefined) input.serviceTier = serviceTier;
     const withEnv = readOptionsForProvider(selection.provider, input);
     applyReasoningOptions(withEnv, selection.provider, reasoningLevel);
     return withEnv;
@@ -476,6 +489,7 @@ type ExtendedModelStreamInput = ModelStreamInput & {
   provider?: unknown;
   reasoning?: unknown;
   reasoningLevel?: unknown;
+  serviceTier?: unknown;
   thinking?: unknown;
   maxTokens?: number;
   temperature?: number;
@@ -508,6 +522,13 @@ function reasoningLevelForInput(
     if (typeof candidate === "string" && isReasoningLevel(candidate)) return candidate;
   }
   return defaultReasoningLevel;
+}
+
+function serviceTierForInput(
+  input: ExtendedModelStreamInput,
+  defaultServiceTier: ServiceTier | undefined,
+): ServiceTier | undefined {
+  return input.serviceTier === "fast" || input.serviceTier === "standard" ? input.serviceTier : defaultServiceTier;
 }
 
 function stringProperty(record: Record<string, unknown>, key: string): string | undefined {
@@ -584,6 +605,7 @@ function readOpenAICodexOptionsFromEnv(input: CliModelOptions): ProviderRouterOp
   if (input.temperature !== undefined) options.temperature = input.temperature;
   if (input.fetch) options.fetch = input.fetch;
   if (input.headers !== undefined) options.headers = input.headers;
+  if (input.serviceTier !== undefined) options.serviceTier = input.serviceTier;
   return options;
 }
 
@@ -679,6 +701,7 @@ function toProviderInput(input: ModelStreamInput): ProviderModelStreamInput {
   if (input.developer !== undefined) providerInput.developer = input.developer;
   if (input.contextualUser !== undefined) providerInput.contextualUser = input.contextualUser;
   if (input.signal) providerInput.signal = input.signal;
+  if (input.serviceTier !== undefined) providerInput.serviceTier = input.serviceTier;
   if (extended.maxTokens !== undefined) providerInput.maxTokens = extended.maxTokens;
   if (extended.temperature !== undefined) providerInput.temperature = extended.temperature;
   return providerInput;
