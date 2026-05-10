@@ -234,7 +234,7 @@ export function ChatShellSurface(props: {
   const [themeId, setThemeId] = useState(() => initialTuiThemeId(props.options?.themeId));
   const [themePicker, setThemePicker] = useState<ThemePickerNavigation | undefined>(undefined);
   const modelCandidates = useMemo(
-    () => (props.runtime.modelCandidates ?? []).filter((candidate) => candidate.available !== false),
+    () => props.runtime.modelCandidates ?? [],
     [props.runtime.modelCandidates],
   );
   const [modelSelection, setModelSelectionState] = useState<ModelSelection | undefined>(undefined);
@@ -528,7 +528,9 @@ export function ChatShellSurface(props: {
     if (resolvedReasoning && reasoningPersisted) setReasoningLevelState(resolvedReasoning);
     setModelPicker(undefined);
     const reasoningText = resolvedReasoning && reasoningPersisted ? ` (thinking ${resolvedReasoning})` : "";
-    appendLocalItem("info", `Model: ${modelSelectionLabel(selection)}${reasoningText}`);
+    const selectedModel = modelCandidates.find((candidate) => sameModelSelection(selection, modelDescriptorSelection(candidate)));
+    const availabilityText = selectedModel?.available === false ? " (not configured)" : "";
+    appendLocalItem("info", `Model: ${modelSelectionLabel(selection)}${reasoningText}${availabilityText}`);
   }, [appendLocalItem, modelCandidates, props.runtime]);
 
   const setReasoningLevel = useCallback(async (level: ReasoningLevel) => {
@@ -1543,6 +1545,7 @@ interface ModelPickerItem {
   label: string;
   provider: string;
   displayName?: string | undefined;
+  available?: boolean | undefined;
   current: boolean;
 }
 
@@ -1643,7 +1646,7 @@ function ModelPicker(props: { model: ModelPickerModel; theme: TuiTheme }) {
       <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`Filter: ${props.model.query || "all"}`}</text>
       {visibleItems.map(({ item, index }) => {
         const selected = index === props.model.selectedIndex;
-        const suffix = item.current ? " *" : "";
+        const suffix = [item.available === false ? " not configured" : "", item.current ? " *" : ""].join("");
         return (
           <text
             key={modelSelectionLabel(item.selection)}
@@ -1721,6 +1724,7 @@ function modelPickerView(
     label: candidate.model,
     provider: candidate.provider,
     ...(candidate.displayName ? { displayName: candidate.displayName } : {}),
+    ...(candidate.available !== undefined ? { available: candidate.available } : {}),
     current: sameModelSelection(current, modelDescriptorSelection(candidate)),
   }));
   return {
@@ -1763,7 +1767,8 @@ function modelPickerDetail(model: ModelPickerModel): string {
   if (!selected) return "  No matching models";
   const count = model.total > 1 ? ` (${model.selectedIndex + 1}/${model.total})` : "";
   const displayName = selected.displayName && selected.displayName !== selected.label ? ` ${selected.displayName}` : "";
-  return `  ${modelSelectionLabel(selected.selection)}${displayName}${count}`;
+  const availability = selected.available === false ? " not configured" : "";
+  return `  ${modelSelectionLabel(selected.selection)}${displayName}${availability}${count}`;
 }
 
 function modelPickerIndex(

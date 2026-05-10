@@ -126,6 +126,14 @@ export function parseModelCommand(
     };
   }
 
+  const providerDefault = findProviderDefaultSelection(parsed.reference, candidates);
+  if (providerDefault) {
+    return {
+      selection: providerDefault,
+      ...(parsed.reasoningLevel ? { reasoningLevel: parsed.reasoningLevel } : {}),
+    };
+  }
+
   return { query: trimmed };
 }
 
@@ -165,6 +173,18 @@ function splitReasoningSuffix(value: string): { reference: string; reasoningLeve
     reference: value.slice(0, index).trim(),
     reasoningLevel: suffix,
   };
+}
+
+function findProviderDefaultSelection(
+  reference: string,
+  candidates: readonly ModelCandidate[],
+): ModelSelection | undefined {
+  const provider = reference.trim().toLowerCase();
+  if (!provider) return undefined;
+  const providerCandidates = candidates.filter((candidate) => candidate.provider.toLowerCase() === provider);
+  if (providerCandidates.length === 0) return undefined;
+  const selected = providerCandidates.find((candidate) => candidate.default) ?? providerCandidates[0];
+  return selected ? modelDescriptorSelection(selected) : undefined;
 }
 
 function modelSearchText(candidate: ModelCandidate): string {

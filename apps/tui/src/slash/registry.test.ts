@@ -157,6 +157,7 @@ test("resolves model slash command to model selection actions", async () => {
     modelCandidates: [
       { provider: "openai-codex", model: "gpt-5.5", displayName: "GPT-5.5" },
       { provider: "openai-codex", model: "gpt-5.3-codex", displayName: "GPT-5.3 Codex" },
+      { provider: "kimi", model: "kimi-k2.6", displayName: "Kimi K2.6", default: true },
     ],
   } as unknown as SlashCommandContext;
 
@@ -164,6 +165,11 @@ test("resolves model slash command to model selection actions", async () => {
     type: "set_model",
     selection: { provider: "openai-codex", model: "gpt-5.3-codex" },
     reasoningLevel: "high",
+  });
+  expect(await resolveSlashCommand(commands, "/model kimi:off")?.command.run(ctx, "kimi:off")).toEqual({
+    type: "set_model",
+    selection: { provider: "kimi", model: "kimi-k2.6" },
+    reasoningLevel: "off",
   });
   expect(await resolveSlashCommand(commands, "/model")?.command.run(ctx, "")).toEqual({
     type: "open_model_picker",
