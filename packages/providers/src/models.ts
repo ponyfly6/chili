@@ -9,6 +9,9 @@ export const DEEPSEEK_V4_PRO_MODEL = "deepseek-v4-pro";
 export const DEEPSEEK_V4_FLASH_MODEL = "deepseek-v4-flash";
 export const DEEPSEEK_OPENAI_BASE_URL = "https://api.deepseek.com";
 export const DEEPSEEK_ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic";
+export const KIMI_PROVIDER_ID = "kimi";
+export const KIMI_K26_MODEL = "kimi-k2.6";
+export const KIMI_OPENAI_BASE_URL = "https://api.moonshot.cn/v1";
 export const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
 export const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 export const OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.5";
@@ -110,6 +113,37 @@ const BUILTIN_MODELS = [
         maxTokensField: "max_tokens",
         requiresReasoningContentOnAssistantMessages: true,
         reasoningParameterStyle: "deepseek",
+        toolCallDeltaMode: "standard",
+      },
+    },
+  },
+  {
+    provider: KIMI_PROVIDER_ID,
+    model: KIMI_K26_MODEL,
+    displayName: "Kimi K2.6",
+    apiFamily: "openai-completions",
+    baseUrl: KIMI_OPENAI_BASE_URL,
+    default: true,
+    inputCapabilities: ["text"],
+    contextWindowTokens: 256000,
+    maxOutputTokens: 32768,
+    capabilities: {
+      streaming: true,
+      reasoning: true,
+      toolCalls: true,
+      toolCallDeltas: true,
+      usage: true,
+      responseId: true,
+    },
+    compatibility: {
+      chatCompletions: {
+        supportsStore: false,
+        supportsDeveloperRole: false,
+        supportsReasoningEffort: false,
+        supportsUsageInStreaming: true,
+        maxTokensField: "max_tokens",
+        requiresReasoningContentOnAssistantMessages: true,
+        reasoningParameterStyle: "moonshot",
         toolCallDeltaMode: "standard",
       },
     },

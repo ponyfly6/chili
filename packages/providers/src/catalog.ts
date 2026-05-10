@@ -2,6 +2,7 @@ import type { AuthStatus, FileAuthStorage } from "./auth.js";
 import { findConfiguredEnvironmentNames, readProviderEnvironment, type EnvironmentSource } from "./env.js";
 import {
   DEEPSEEK_PROVIDER_ID,
+  KIMI_PROVIDER_ID,
   listKnownModels,
   MINIMAX_PROVIDER_ID,
   OPENAI_CODEX_PROVIDER_ID,
@@ -37,6 +38,7 @@ export interface ProviderCatalogOptions {
 
 export const BUILTIN_PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   [DEEPSEEK_PROVIDER_ID]: "DeepSeek",
+  [KIMI_PROVIDER_ID]: "Kimi",
   [MINIMAX_PROVIDER_ID]: "MiniMax",
   [OPENAI_CODEX_PROVIDER_ID]: "ChatGPT Codex",
 };

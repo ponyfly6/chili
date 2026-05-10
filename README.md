@@ -119,6 +119,22 @@ DEEPSEEK_MODEL=deepseek-v4-pro
 
 可选模型为 `deepseek-v4-pro` 和 `deepseek-v4-flash`。官方 Anthropic 格式端点为 `https://api.deepseek.com/anthropic`，当前 CLI 默认使用 OpenAI 格式端点。
 
+Kimi 使用月之暗面 OpenAI-compatible 接入，默认模型为当前官方推荐的 `kimi-k2.6`：
+
+```bash
+MOONSHOT_API_KEY=... bun run chili -- --model kimi "总结这个仓库"
+```
+
+Kimi 配置优先使用这些环境变量：
+
+```bash
+MOONSHOT_API_KEY=
+MOONSHOT_BASE_URL=https://api.moonshot.cn/v1
+MOONSHOT_MODEL=kimi-k2.6
+```
+
+也兼容 `KIMI_API_KEY`、`KIMI_BASE_URL`、`KIMI_MODEL` 命名。可用 `--model kimi:off` 关闭 K2.6 thinking。
+
 ChatGPT 订阅里的 Codex 可以通过 TUI 斜杠命令登录：
 
 ```bash

@@ -7,6 +7,12 @@ const savedEnv = {
   DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY,
   DEEPSEEK_BASE_URL: process.env.DEEPSEEK_BASE_URL,
   DEEPSEEK_MODEL: process.env.DEEPSEEK_MODEL,
+  MOONSHOT_API_KEY: process.env.MOONSHOT_API_KEY,
+  MOONSHOT_BASE_URL: process.env.MOONSHOT_BASE_URL,
+  MOONSHOT_MODEL: process.env.MOONSHOT_MODEL,
+  KIMI_API_KEY: process.env.KIMI_API_KEY,
+  KIMI_BASE_URL: process.env.KIMI_BASE_URL,
+  KIMI_MODEL: process.env.KIMI_MODEL,
   OPENAI_CODEX_ACCESS_TOKEN: process.env.OPENAI_CODEX_ACCESS_TOKEN,
   OPENAI_CODEX_BASE_URL: process.env.OPENAI_CODEX_BASE_URL,
   OPENAI_CODEX_MODEL: process.env.OPENAI_CODEX_MODEL,
@@ -21,6 +27,12 @@ afterEach(() => {
   restoreEnv("DEEPSEEK_API_KEY", savedEnv.DEEPSEEK_API_KEY);
   restoreEnv("DEEPSEEK_BASE_URL", savedEnv.DEEPSEEK_BASE_URL);
   restoreEnv("DEEPSEEK_MODEL", savedEnv.DEEPSEEK_MODEL);
+  restoreEnv("MOONSHOT_API_KEY", savedEnv.MOONSHOT_API_KEY);
+  restoreEnv("MOONSHOT_BASE_URL", savedEnv.MOONSHOT_BASE_URL);
+  restoreEnv("MOONSHOT_MODEL", savedEnv.MOONSHOT_MODEL);
+  restoreEnv("KIMI_API_KEY", savedEnv.KIMI_API_KEY);
+  restoreEnv("KIMI_BASE_URL", savedEnv.KIMI_BASE_URL);
+  restoreEnv("KIMI_MODEL", savedEnv.KIMI_MODEL);
   restoreEnv("OPENAI_CODEX_ACCESS_TOKEN", savedEnv.OPENAI_CODEX_ACCESS_TOKEN);
   restoreEnv("OPENAI_CODEX_BASE_URL", savedEnv.OPENAI_CODEX_BASE_URL);
   restoreEnv("OPENAI_CODEX_MODEL", savedEnv.OPENAI_CODEX_MODEL);
@@ -72,6 +84,47 @@ test("CLI DeepSeek env resolution uses official V4 OpenAI-compatible endpoint an
   }));
 });
 
+test("CLI Kimi env resolution uses latest Moonshot OpenAI-compatible endpoint and model", async () => {
+  process.env.MOONSHOT_API_KEY = "env-key";
+  process.env.MOONSHOT_BASE_URL = "https://api.moonshot.cn/v1";
+  delete process.env.MOONSHOT_MODEL;
+
+  let url = "";
+  let body: Record<string, unknown> = {};
+  const fetchImpl = (async (input, init) => {
+    url = String(input);
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(
+      JSON.stringify({
+        id: "chatcmpl_kimi_cli",
+        model: "kimi-k2.6",
+        choices: [{ index: 0, finish_reason: "stop", message: { content: "ok" } }],
+      }),
+      {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      },
+    );
+  }) as typeof fetch;
+
+  const model = await createCliModel("kimi", { fetch: fetchImpl });
+  const events = await collect(model.stream(emptyInput()));
+
+  expect(url).toBe("https://api.moonshot.cn/v1/chat/completions");
+  expect(body).toMatchObject({
+    model: "kimi-k2.6",
+    max_tokens: 32768,
+  });
+  expect(body).not.toHaveProperty("thinking");
+  expect(events).toContainEqual(expect.objectContaining({
+    type: "metadata",
+    provider: "kimi",
+    model: "kimi-k2.6",
+    contextWindowTokens: 256000,
+    maxOutputTokens: 32768,
+  }));
+});
+
 test("CLI MiniMax env resolution prefers Anthropic-compatible base URL over generic MiniMax base URL", async () => {
   process.env.MINIMAX_API_KEY = "env-key";
   process.env.MINIMAX_BASE_URL = "https://api.minimaxi.com/v1";
@@ -107,6 +160,10 @@ test("CLI runtime model selection resolves explicit provider aliases to concrete
   expect(resolveCliRuntimeModelSelection({ provider: "deepseek" })).toEqual({
     provider: "deepseek",
     model: "deepseek-v4-flash",
+  });
+  expect(resolveCliRuntimeModelSelection({ model: "kimi" })).toEqual({
+    provider: "kimi",
+    model: "kimi-k2.6",
   });
   expect(resolveCliRuntimeModelSelection({ model: "fake" })).toBeUndefined();
 });
@@ -265,6 +322,37 @@ test("CLI DeepSeek reasoning off disables thinking", async () => {
 
   expect(body).toMatchObject({
     model: "deepseek-v4-pro",
+    thinking: { type: "disabled" },
+  });
+  expect(body).not.toHaveProperty("reasoning_effort");
+});
+
+test("CLI Kimi thinking off disables thinking with Moonshot's documented switch", async () => {
+  process.env.MOONSHOT_API_KEY = "env-key";
+  process.env.MOONSHOT_BASE_URL = "https://api.moonshot.cn/v1";
+  delete process.env.MOONSHOT_MODEL;
+
+  let body: Record<string, unknown> = {};
+  const fetchImpl = (async (_input, init) => {
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(
+      JSON.stringify({
+        id: "chatcmpl_kimi_cli",
+        model: "kimi-k2.6",
+        choices: [{ index: 0, finish_reason: "stop", message: { content: "ok" } }],
+      }),
+      {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      },
+    );
+  }) as typeof fetch;
+
+  const model = await createCliModel({ provider: "kimi", reasoningLevel: "off" }, { fetch: fetchImpl });
+  await collect(model.stream(emptyInput()));
+
+  expect(body).toMatchObject({
+    model: "kimi-k2.6",
     thinking: { type: "disabled" },
   });
   expect(body).not.toHaveProperty("reasoning_effort");

@@ -1,4 +1,4 @@
-import { DEEPSEEK_PROVIDER_ID, MINIMAX_PROVIDER_ID, OPENAI_CODEX_PROVIDER_ID } from "./models.js";
+import { DEEPSEEK_PROVIDER_ID, KIMI_PROVIDER_ID, MINIMAX_PROVIDER_ID, OPENAI_CODEX_PROVIDER_ID } from "./models.js";
 
 export type EnvironmentSource = Record<string, string | undefined>;
 
@@ -29,6 +29,12 @@ export const DEEPSEEK_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
   model: ["DEEPSEEK_MODEL"],
 };
 
+export const KIMI_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
+  apiKey: ["MOONSHOT_API_KEY", "KIMI_API_KEY"],
+  baseUrl: ["MOONSHOT_BASE_URL", "KIMI_BASE_URL"],
+  model: ["MOONSHOT_MODEL", "KIMI_MODEL"],
+};
+
 export const OPENAI_CODEX_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
   apiKey: ["OPENAI_CODEX_ACCESS_TOKEN"],
   baseUrl: ["OPENAI_CODEX_BASE_URL"],
@@ -37,6 +43,7 @@ export const OPENAI_CODEX_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
 
 const PROVIDER_ENVIRONMENT: Record<string, ProviderEnvironmentSpec> = {
   [DEEPSEEK_PROVIDER_ID]: DEEPSEEK_ENVIRONMENT,
+  [KIMI_PROVIDER_ID]: KIMI_ENVIRONMENT,
   [MINIMAX_PROVIDER_ID]: MINIMAX_ENVIRONMENT,
   [OPENAI_CODEX_PROVIDER_ID]: OPENAI_CODEX_ENVIRONMENT,
 };
@@ -56,6 +63,10 @@ export function readMiniMaxEnvironment(env: EnvironmentSource = currentEnvironme
 
 export function readDeepSeekEnvironment(env: EnvironmentSource = currentEnvironment()): ProviderEnvironment {
   return readEnvironmentSpec(DEEPSEEK_ENVIRONMENT, env);
+}
+
+export function readKimiEnvironment(env: EnvironmentSource = currentEnvironment()): ProviderEnvironment {
+  return readEnvironmentSpec(KIMI_ENVIRONMENT, env);
 }
 
 export function readOpenAICodexEnvironment(env: EnvironmentSource = currentEnvironment()): ProviderEnvironment {

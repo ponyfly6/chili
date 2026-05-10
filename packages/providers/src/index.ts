@@ -10,4 +10,5 @@ export * from "./openai-completions.js";
 export * from "./openai-codex.js";
 export * from "./oauth/openai-codex.js";
 export * from "./deepseek.js";
+export * from "./kimi.js";
 export * from "./minimax.js";

@@ -6,6 +6,9 @@ import {
   DEEPSEEK_V4_PRO_MODEL,
   findDefaultKnownModel,
   findKnownModel,
+  KIMI_K26_MODEL,
+  KIMI_OPENAI_BASE_URL,
+  KIMI_PROVIDER_ID,
   listKnownModels,
   MINIMAX_ANTHROPIC_BASE_URL,
   MINIMAX_M27_HIGHSPEED_MODEL,
@@ -15,6 +18,7 @@ import {
   OPENAI_CODEX_DEFAULT_MODEL,
   OPENAI_CODEX_PROVIDER_ID,
   readDeepSeekEnvironment,
+  readKimiEnvironment,
   readMiniMaxEnvironment,
   readOpenAICodexEnvironment,
 } from "./index.js";
@@ -50,6 +54,36 @@ test("catalog describes the built-in DeepSeek V4 OpenAI-compatible models", () =
   expect(findKnownModel(DEEPSEEK_PROVIDER_ID, DEEPSEEK_V4_FLASH_MODEL)).toMatchObject({
     model: DEEPSEEK_V4_FLASH_MODEL,
     apiFamily: "openai-completions",
+  });
+});
+
+test("catalog describes the built-in Kimi OpenAI-compatible model", () => {
+  const models = listKnownModels(KIMI_PROVIDER_ID);
+
+  expect(models.map((model) => model.model)).toEqual([KIMI_K26_MODEL]);
+  expect(findDefaultKnownModel(KIMI_PROVIDER_ID)).toMatchObject({
+    provider: KIMI_PROVIDER_ID,
+    model: KIMI_K26_MODEL,
+    apiFamily: "openai-completions",
+    baseUrl: KIMI_OPENAI_BASE_URL,
+    default: true,
+    inputCapabilities: ["text"],
+    contextWindowTokens: 256000,
+    maxOutputTokens: 32768,
+    capabilities: {
+      streaming: true,
+      reasoning: true,
+      toolCalls: true,
+      toolCallDeltas: true,
+      usage: true,
+      responseId: true,
+    },
+    compatibility: {
+      chatCompletions: {
+        maxTokensField: "max_tokens",
+        reasoningParameterStyle: "moonshot",
+      },
+    },
   });
 });
 
@@ -119,6 +153,26 @@ test("DeepSeek env resolution uses provider-specific variables", () => {
     baseUrlEnv: "DEEPSEEK_BASE_URL",
     model: "deepseek-v4-flash",
     modelEnv: "DEEPSEEK_MODEL",
+  });
+});
+
+test("Kimi env resolution uses Moonshot variables with Kimi fallbacks", () => {
+  expect(
+    readKimiEnvironment({
+      MOONSHOT_API_KEY: "moonshot-key",
+      KIMI_API_KEY: "kimi-key",
+      MOONSHOT_BASE_URL: "https://moonshot.test/v1",
+      KIMI_BASE_URL: "https://kimi.test/v1",
+      MOONSHOT_MODEL: "kimi-k2.6",
+      KIMI_MODEL: "kimi-k2.5",
+    }),
+  ).toEqual({
+    apiKey: "moonshot-key",
+    apiKeyEnv: "MOONSHOT_API_KEY",
+    baseUrl: "https://moonshot.test/v1",
+    baseUrlEnv: "MOONSHOT_BASE_URL",
+    model: "kimi-k2.6",
+    modelEnv: "MOONSHOT_MODEL",
   });
 });
 

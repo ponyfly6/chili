@@ -296,9 +296,9 @@ function applyReasoningOptions(
   compatibility: ChatCompletionsCompatibility,
   reasoning: boolean,
 ): void {
-  if (compatibility.reasoningParameterStyle !== "deepseek") return;
+  if (compatibility.reasoningParameterStyle !== "deepseek" && compatibility.reasoningParameterStyle !== "moonshot") return;
   body.thinking = { type: reasoning ? "enabled" : "disabled" };
-  if (reasoning && compatibility.supportsReasoningEffort) {
+  if (compatibility.reasoningParameterStyle === "deepseek" && reasoning && compatibility.supportsReasoningEffort) {
     body.reasoning_effort = compatibility.reasoningEffortMap.high ?? "high";
   }
 }

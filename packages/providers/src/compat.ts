@@ -1,5 +1,12 @@
 export type MaxTokensField = "max_tokens" | "max_completion_tokens";
-export type ReasoningParameterStyle = "native" | "openrouter" | "deepseek" | "zai" | "qwen" | "qwen-chat-template";
+export type ReasoningParameterStyle =
+  | "native"
+  | "openrouter"
+  | "deepseek"
+  | "moonshot"
+  | "zai"
+  | "qwen"
+  | "qwen-chat-template";
 export type ToolCallDeltaMode = "standard" | "zai-tool-stream";
 
 export interface MessagesCompatibility {
@@ -109,19 +116,20 @@ function detectChatCompletionsCompatibility(input: CompatibilityResolutionInput)
   const isXai = provider === "xai" || baseUrl.includes("api.x.ai");
   const isGroq = provider === "groq" || baseUrl.includes("groq.com");
   const isDeepSeek = provider === "deepseek" || baseUrl.includes("deepseek.com");
+  const isMoonshot = provider === "kimi" || provider === "moonshot" || baseUrl.includes("moonshot.cn") || baseUrl.includes("moonshot.ai");
   const isCerebras = provider === "cerebras" || baseUrl.includes("cerebras.ai");
   const isChutes = baseUrl.includes("chutes.ai");
-  const isNonStandard = isZai || isXai || isDeepSeek || isCerebras || isChutes;
+  const isNonStandard = isZai || isXai || isDeepSeek || isMoonshot || isCerebras || isChutes;
 
   return {
     supportsStore: !isNonStandard,
     supportsDeveloperRole: !isNonStandard,
-    supportsReasoningEffort: !isXai && !isZai,
+    supportsReasoningEffort: !isXai && !isZai && !isMoonshot,
     reasoningEffortMap: detectReasoningEffortMap(model, isDeepSeek, isGroq),
     supportsUsageInStreaming: true,
-    maxTokensField: isDeepSeek || isChutes ? "max_tokens" : "max_completion_tokens",
-    requiresReasoningContentOnAssistantMessages: isDeepSeek,
-    reasoningParameterStyle: detectReasoningParameterStyle(provider, baseUrl, isDeepSeek, isZai),
+    maxTokensField: isDeepSeek || isMoonshot || isChutes ? "max_tokens" : "max_completion_tokens",
+    requiresReasoningContentOnAssistantMessages: isDeepSeek || isMoonshot,
+    reasoningParameterStyle: detectReasoningParameterStyle(provider, baseUrl, isDeepSeek, isMoonshot, isZai),
     toolCallDeltaMode: isZai ? "zai-tool-stream" : "standard",
   };
 }
@@ -130,9 +138,11 @@ function detectReasoningParameterStyle(
   provider: string,
   baseUrl: string,
   isDeepSeek: boolean,
+  isMoonshot: boolean,
   isZai: boolean,
 ): ReasoningParameterStyle {
   if (isDeepSeek) return "deepseek";
+  if (isMoonshot) return "moonshot";
   if (isZai) return "zai";
   if (provider === "openrouter" || baseUrl.includes("openrouter.ai")) return "openrouter";
   return "native";

@@ -9,6 +9,14 @@ test("parses DeepSeek as a CLI model", () => {
   });
 });
 
+test("parses Kimi as a CLI model", () => {
+  expect(parseArgs(["--model", "kimi", "hello"])).toMatchObject({
+    command: "run",
+    model: "kimi",
+    prompt: "hello",
+  });
+});
+
 test("parses ChatGPT Codex as a CLI model", () => {
   expect(parseArgs(["--model", "codex", "hello"])).toMatchObject({
     command: "run",
@@ -23,7 +31,7 @@ test("parses ChatGPT Codex as a CLI model", () => {
 });
 
 test("keeps legacy model aliases parseable", () => {
-  for (const alias of ["fake", "minimax", "deepseek", "codex", "openai-codex", "legacy-minimax"]) {
+  for (const alias of ["fake", "minimax", "deepseek", "kimi", "moonshot", "codex", "openai-codex", "legacy-minimax"]) {
     expect(parseArgs(["--model", alias, "hello"])).toMatchObject({
       command: "run",
       model: alias,

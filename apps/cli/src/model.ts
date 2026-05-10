@@ -7,6 +7,9 @@ import {
   FileAuthStorage,
   DEEPSEEK_V4_PRO_MODEL,
   findKnownModel,
+  KIMI_K26_MODEL,
+  KIMI_OPENAI_BASE_URL,
+  KIMI_PROVIDER_ID,
   listModelCatalogFromStorage,
   listKnownModels,
   MINIMAX_ANTHROPIC_BASE_URL,
@@ -16,13 +19,14 @@ import {
   OPENAI_CODEX_DEFAULT_MODEL,
   OPENAI_CODEX_PROVIDER_ID,
   readDeepSeekEnvironment,
+  readKimiEnvironment,
   readMiniMaxEnvironment,
   readOpenAICodexEnvironment,
 } from "@chili/providers";
 import { FakeModelRouter } from "./fake-model.js";
 
 export type CliModelName = string;
-export type CliProviderName = "minimax" | "deepseek" | "openai-codex";
+export type CliProviderName = "minimax" | "deepseek" | "kimi" | "openai-codex";
 export type CliReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 export interface CliModelSelection {
@@ -80,11 +84,13 @@ type ProviderModelStreamEvent =
 
 const PROVIDERS_PACKAGE_NAME = "@chili/providers";
 const DEFAULT_DEEPSEEK_MAX_TOKENS = 128 * 1024;
+const DEFAULT_KIMI_MAX_TOKENS = 32 * 1024;
 const DEFAULT_MINIMAX_MAX_TOKENS = 32 * 1024;
 const DEFAULT_PROVIDER: CliProviderName = "minimax";
 const PROVIDER_DISPLAY_NAMES: Record<CliProviderName, string> = {
   minimax: "MiniMax",
   deepseek: "DeepSeek",
+  kimi: "Kimi",
   "openai-codex": "OpenAI Codex",
 };
 
@@ -121,7 +127,7 @@ export function resolveCliRuntimeModelSelection(selection: CliModelSelection): M
   return { provider: resolved.provider, model };
 }
 
-async function loadProvidersModule(providerName: "minimax" | "deepseek" | "codex"): Promise<Record<string, unknown>> {
+async function loadProvidersModule(providerName: "minimax" | "deepseek" | "kimi" | "codex"): Promise<Record<string, unknown>> {
   try {
     return (await import(PROVIDERS_PACKAGE_NAME)) as Record<string, unknown>;
   } catch (error) {
@@ -176,6 +182,29 @@ function resolveDeepSeekFactory(providers: Record<string, unknown>): ProviderRou
   const factory = candidates.find((candidate) => typeof candidate === "function");
   if (!factory) {
     throw new Error("@chili/providers must export createDeepSeekRouter(options) or another compatible DeepSeek factory");
+  }
+  return factory as ProviderRouterFactory;
+}
+
+function resolveKimiFactory(providers: Record<string, unknown>): ProviderRouterFactory {
+  const defaultExport = providers.default;
+  const defaultObject = isRecord(defaultExport) ? defaultExport : {};
+  const candidates = [
+    providers.createKimiRouter,
+    providers.createKimiModel,
+    providers.createKimiProvider,
+    providers.createMoonshotRouter,
+    providers.createMoonshotProvider,
+    defaultObject.createKimiRouter,
+    defaultObject.createKimiModel,
+    defaultObject.createKimiProvider,
+    defaultObject.createMoonshotRouter,
+    defaultObject.createMoonshotProvider,
+    typeof defaultExport === "function" ? defaultExport : undefined,
+  ];
+  const factory = candidates.find((candidate) => typeof candidate === "function");
+  if (!factory) {
+    throw new Error("@chili/providers must export createKimiRouter(options) or another compatible Kimi factory");
   }
   return factory as ProviderRouterFactory;
 }
@@ -287,6 +316,7 @@ function normalizeProviderName(value: string | undefined): CliProviderName | und
   const normalized = value.trim().toLowerCase();
   if (normalized === "minimax") return "minimax";
   if (normalized === "deepseek") return "deepseek";
+  if (normalized === "kimi" || normalized === "moonshot") return "kimi";
   if (normalized === "codex" || normalized === "openai-codex") return "openai-codex";
   throw new Error(`Unknown provider: ${value}`);
 }
@@ -302,6 +332,7 @@ function normalizeSpecialModelAlias(value: string): ResolvedCliModelSelection | 
 function normalizeProviderAlias(value: string): CliProviderName | undefined {
   if (value === "minimax") return "minimax";
   if (value === "deepseek") return "deepseek";
+  if (value === "kimi" || value === "moonshot") return "kimi";
   if (value === "codex" || value === "openai-codex") return "openai-codex";
   return undefined;
 }
@@ -327,12 +358,16 @@ function inferProviderFromBareModel(model: string): CliProviderName | undefined 
   const normalized = model.toLowerCase();
   if (normalized.startsWith("gpt-")) return "openai-codex";
   if (normalized.startsWith("deepseek-")) return "deepseek";
+  if (normalized.startsWith("kimi-") || normalized.startsWith("moonshot-")) return "kimi";
   if (normalized.startsWith("minimax-")) return "minimax";
   return undefined;
 }
 
 function isCliProviderName(provider: string): provider is CliProviderName {
-  return provider === MINIMAX_PROVIDER_ID || provider === DEEPSEEK_PROVIDER_ID || provider === OPENAI_CODEX_PROVIDER_ID;
+  return provider === MINIMAX_PROVIDER_ID
+    || provider === DEEPSEEK_PROVIDER_ID
+    || provider === KIMI_PROVIDER_ID
+    || provider === OPENAI_CODEX_PROVIDER_ID;
 }
 
 function splitReasoningSuffix(value: string): { model: string; reasoningLevel?: CliReasoningLevel } {
@@ -368,7 +403,7 @@ class CliProviderRouter implements ModelRouter {
 
   async listModels(): Promise<readonly RuntimeModelDescriptor[]> {
     const catalog = await listModelCatalogFromStorage(undefined, new FileAuthStorage());
-    return catalog.filter((model) => isCliProviderName(model.provider) && model.available).map((model) => ({
+    return catalog.filter((model) => isCliProviderName(model.provider)).map((model) => ({
       provider: model.provider,
       model: model.model,
       ...(model.displayName ? { displayName: model.displayName } : {}),
@@ -482,6 +517,7 @@ function stringProperty(record: Record<string, unknown>, key: string): string | 
 
 async function loadFactoryForProvider(provider: CliProviderName): Promise<ProviderRouterFactory> {
   if (provider === "deepseek") return resolveDeepSeekFactory(await loadProvidersModule("deepseek"));
+  if (provider === "kimi") return resolveKimiFactory(await loadProvidersModule("kimi"));
   if (provider === "openai-codex") return resolveOpenAICodexFactory(await loadProvidersModule("codex"));
   return resolveMiniMaxFactory(await loadProvidersModule("minimax"));
 }
@@ -518,6 +554,22 @@ function readDeepSeekOptionsFromEnv(input: CliModelOptions): ProviderRouterOptio
   return options;
 }
 
+function readKimiOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
+  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_KIMI_MAX_TOKENS };
+  const env = readKimiEnvironment();
+  const resolvedApiKey = input.apiKey ?? env.apiKey;
+  const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? KIMI_OPENAI_BASE_URL;
+  const resolvedModel = input.model ?? env.model ?? KIMI_K26_MODEL;
+
+  if (resolvedApiKey) options.apiKey = resolvedApiKey;
+  if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
+  if (resolvedModel) options.model = resolvedModel;
+  if (input.temperature !== undefined) options.temperature = input.temperature;
+  if (input.fetch) options.fetch = input.fetch;
+  if (input.headers !== undefined) options.headers = input.headers;
+  return options;
+}
+
 function readOpenAICodexOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
   const options: ProviderRouterOptions = {};
   const env = readOpenAICodexEnvironment();
@@ -537,6 +589,7 @@ function readOpenAICodexOptionsFromEnv(input: CliModelOptions): ProviderRouterOp
 
 function readOptionsForProvider(provider: CliProviderName, input: ProviderRouterOptions): ProviderRouterOptions {
   if (provider === "deepseek") return readDeepSeekOptionsFromEnv(input);
+  if (provider === "kimi") return readKimiOptionsFromEnv(input);
   if (provider === "openai-codex") return readOpenAICodexOptionsFromEnv(input);
   return readMiniMaxOptionsFromEnv(input);
 }
@@ -553,7 +606,7 @@ function applyReasoningOptions(
     options.reasoningSummary = "auto";
     return;
   }
-  if (provider === "deepseek") {
+  if (provider === "deepseek" || provider === "kimi") {
     options.reasoning = reasoningLevel !== "off";
   }
 }
