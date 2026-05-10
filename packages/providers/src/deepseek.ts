@@ -112,6 +112,7 @@ export function createDeepSeekV4Model(options: DeepSeekModelOptions = {}): OpenA
     reasoning: options.reasoning ?? true,
     maxTokens: options.maxTokens ?? DEFAULT_DEEPSEEK_MAX_TOKENS,
   };
+  if (descriptor?.inputCapabilities) modelOptions.inputCapabilities = descriptor.inputCapabilities;
   if (descriptor?.compatibility?.chatCompletions) modelOptions.compatibility = descriptor.compatibility.chatCompletions;
   if (options.temperature !== undefined) modelOptions.temperature = options.temperature;
   if (options.fetch !== undefined) modelOptions.fetch = options.fetch;

@@ -1,4 +1,4 @@
-import type { Message } from "@chili/protocol";
+import type { Message, ServiceTier } from "@chili/protocol";
 import type { ModelCompatibilityOverrides } from "./compat.js";
 
 export type ModelApiFamily = "anthropic-messages" | "openai-completions" | "openai-responses" | (string & {});
@@ -74,6 +74,7 @@ export interface ModelStreamInput {
   selection?: Partial<ModelSelection>;
   reasoning?: ReasoningLevel;
   thinking?: ThinkingLevel;
+  serviceTier?: ServiceTier;
   tools?: readonly ModelTool[];
   system?: readonly string[];
   developer?: readonly string[];

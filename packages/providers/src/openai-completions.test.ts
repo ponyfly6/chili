@@ -217,6 +217,87 @@ test("converts assistant-attached tool results into OpenAI tool messages", () =>
   ]);
 });
 
+test("OpenAI-compatible chat completions sends image tool results as text-only tool output", async () => {
+  const callId = "call_image" as ToolCallId;
+  let fetchCalled = false;
+  let body: Record<string, unknown> | undefined;
+  const model = new OpenAICompletionsModel({
+    provider: "openai",
+    model: "gpt-test",
+    apiKey: "test-key",
+    baseUrl: "https://api.test",
+    fetch: (async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      fetchCalled = true;
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        id: "chatcmpl_image_tool",
+        model: "gpt-test",
+        choices: [{ index: 0, message: { content: "ok" }, finish_reason: "stop" }],
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch,
+  });
+
+  const events = await collect(model.stream({
+    messages: [
+      message("assistant", [
+        { type: "tool_call", callId, toolName: "read_image", input: { filePath: "pixel.png" }, status: "completed" },
+      ]),
+      message("user", [
+        {
+          type: "tool_result",
+          callId,
+          output: "Image read: pixel.png",
+          content: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
+        },
+      ]),
+    ],
+    tools: [],
+    system: [],
+  }));
+
+  expect(fetchCalled).toBe(true);
+  expect((body?.messages as unknown[]).at(-1)).toEqual({
+    role: "tool",
+    tool_call_id: callId,
+    content: "Image read: pixel.png",
+  });
+  expect(JSON.stringify(body)).not.toContain("input_image");
+  expect(events.at(-1)).toMatchObject({ type: "finish", reason: "stop" });
+});
+
+test("OpenAI-compatible chat completions rejects pasted user images before request", async () => {
+  let fetchCalled = false;
+  const model = new OpenAICompletionsModel({
+    provider: "openai",
+    model: "gpt-test",
+    apiKey: "test-key",
+    baseUrl: "https://api.test",
+    fetch: (async () => {
+      fetchCalled = true;
+      return new Response("{}");
+    }) as unknown as typeof fetch,
+  });
+
+  await expect(
+    collect(
+      model.stream({
+        messages: [
+          message("user", [
+            { type: "text", text: "What is in this image? [Image #1]" },
+            { type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
+          ]),
+        ],
+        tools: [],
+        system: [],
+      }),
+    ),
+  ).rejects.toThrow("does not support image input");
+  expect(fetchCalled).toBe(false);
+});
+
 test("resolves chat completions URL variants", () => {
   expect(resolveChatCompletionsUrl("https://api.test")).toBe("https://api.test/v1/chat/completions");
   expect(resolveChatCompletionsUrl("https://api.test/v1")).toBe("https://api.test/v1/chat/completions");

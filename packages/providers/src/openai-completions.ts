@@ -1,8 +1,9 @@
 import type { Message, MessagePart } from "@chili/protocol";
 import { resolveChatCompletionsCompatibility, type ChatCompletionsCompatibility } from "./compat.js";
+import { assertImageInputSupported } from "./image-input.js";
 import { readSseEvents } from "./sse.js";
 import { prependContextualUserMessage, transformModelMessages } from "./transform-messages.js";
-import type { ChiliModel, ModelStreamEvent, ModelStreamInput, ModelTool, ModelUsage } from "./types.js";
+import type { ChiliModel, ModelInputCapability, ModelStreamEvent, ModelStreamInput, ModelTool, ModelUsage } from "./types.js";
 
 export interface OpenAICompletionsModelOptions {
   provider?: string;
@@ -15,6 +16,7 @@ export interface OpenAICompletionsModelOptions {
   headers?: Record<string, string>;
   reasoning?: boolean;
   compatibility?: Partial<ChatCompletionsCompatibility>;
+  inputCapabilities?: readonly ModelInputCapability[];
 }
 
 export interface OpenAICompletionsRequestBuildOptions {
@@ -128,6 +130,12 @@ export class OpenAICompletionsModel implements ChiliModel {
   }
 
   async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+    assertImageInputSupported(input, {
+      provider: this.provider,
+      model: this.options.model,
+      inputCapabilities: this.options.inputCapabilities ?? ["text"],
+    });
+
     const requestOptions: OpenAICompletionsRequestBuildOptions = {
       provider: this.provider,
       model: this.options.model,

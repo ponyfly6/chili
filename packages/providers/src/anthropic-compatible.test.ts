@@ -124,6 +124,129 @@ test("normalizes Anthropic tool ids and synthesizes missing tool results in requ
   ]);
 });
 
+test("converts image tool results into Anthropic image blocks", () => {
+  const callId = "toolcall_image" as ToolCallId;
+  const body = buildAnthropicRequestBody(
+    {
+      messages: [
+        message("assistant", [
+          { type: "tool_call", callId, toolName: "read_image", input: { filePath: "pixel.png" }, status: "completed" },
+        ]),
+        message("user", [
+          {
+            type: "tool_result",
+            callId,
+            output: "Image read: pixel.png",
+            content: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
+          },
+        ]),
+      ],
+      tools: [],
+      system: [],
+    },
+    {
+      model: "test-model",
+      stream: true,
+    },
+  );
+
+  expect((body.messages as unknown[]).at(-1)).toEqual({
+    role: "user",
+    content: [
+      {
+        type: "tool_result",
+        tool_use_id: callId,
+        content: [
+          { type: "text", text: "Image read: pixel.png" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2U=" } },
+        ],
+      },
+    ],
+  });
+});
+
+test("converts pasted user images into Anthropic image blocks", () => {
+  const body = buildAnthropicRequestBody(
+    {
+      messages: [
+        message("user", [
+          { type: "text", text: "What is in this image? [Image #1]" },
+          { type: "image", data: "aW1hZ2U=", mimeType: "image/png", filename: "pixel.png" },
+        ]),
+      ],
+      tools: [],
+      system: [],
+    },
+    {
+      model: "test-model",
+      stream: true,
+    },
+  );
+
+  expect(body.messages).toEqual([
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "What is in this image? [Image #1]" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2U=" } },
+      ],
+    },
+  ]);
+});
+
+test("MiniMax treats image tool results as text-only context", async () => {
+  const callId = "toolcall_image" as ToolCallId;
+  let fetchCalled = false;
+  let body: Record<string, unknown> | undefined;
+  const model = createMiniMaxM27HighspeedModel({
+    apiKey: "test-key",
+    fetch: (async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      fetchCalled = true;
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        id: "msg_text",
+        model: MINIMAX_M27_HIGHSPEED_MODEL,
+        content: [{ type: "text", text: "ok" }],
+        stop_reason: "end_turn",
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch,
+  });
+
+  const events = await collect(model.stream({
+    messages: [
+      message("assistant", [
+        { type: "tool_call", callId, toolName: "read_image", input: { filePath: "pixel.png" }, status: "completed" },
+      ]),
+      message("user", [
+        {
+          type: "tool_result",
+          callId,
+          output: "Image read: pixel.png",
+          content: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
+        },
+      ]),
+    ],
+    tools: [],
+    system: [],
+  }));
+
+  expect(fetchCalled).toBe(true);
+  expect((body?.messages as unknown[]).at(-1)).toEqual({
+    role: "user",
+    content: [
+      {
+        type: "tool_result",
+        tool_use_id: callId,
+        content: "Image read: pixel.png",
+      },
+    ],
+  });
+  expect(events.at(-1)).toMatchObject({ type: "finish", reason: "end_turn" });
+});
+
 test("adds developer fragments to system and contextual fragments as synthetic user context", () => {
   const body = buildAnthropicRequestBody(
     {

@@ -105,6 +105,135 @@ test("adds developer fragments to instructions and contextual fragments to input
   });
 });
 
+test("sets Codex service tier only for fast mode", () => {
+  const fastBody = buildOpenAICodexResponsesRequestBody(
+    {
+      messages: [message("user", [{ type: "text", text: "hello" }])],
+      tools: [],
+      system: [],
+    },
+    {
+      model: "gpt-5.5",
+      serviceTier: "fast",
+    },
+  );
+  expect(fastBody.service_tier).toBe("priority");
+
+  const standardBody = buildOpenAICodexResponsesRequestBody(
+    {
+      messages: [message("user", [{ type: "text", text: "hello" }])],
+      tools: [],
+      system: [],
+    },
+    {
+      model: "gpt-5.5",
+      serviceTier: "standard",
+    },
+  );
+  expect(standardBody).not.toHaveProperty("service_tier");
+});
+
+test("adds image tool results as Codex input images", () => {
+  const callId = "call_image" as ToolCallId;
+  const body = buildOpenAICodexResponsesRequestBody(
+    {
+      messages: [
+        message("assistant", [
+          { type: "tool_call", callId, toolName: "read_image", input: { filePath: "pixel.png" }, status: "completed" },
+        ]),
+        message("user", [
+          {
+            type: "tool_result",
+            callId,
+            output: "Image read: pixel.png",
+            content: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
+          },
+        ]),
+      ],
+      tools: [],
+      system: [],
+    },
+    {
+      model: "gpt-5.5",
+    },
+  );
+
+  expect(body.input).toContainEqual({
+    type: "function_call_output",
+    call_id: callId,
+    output: "Image read: pixel.png",
+  });
+  expect(body.input).toContainEqual({
+    role: "user",
+    content: [
+      { type: "input_text", text: `Image returned by tool call ${callId}.` },
+      { type: "input_image", image_url: "data:image/png;base64,aW1hZ2U=" },
+    ],
+  });
+});
+
+test("adds pasted user images as Codex input images", () => {
+  const body = buildOpenAICodexResponsesRequestBody(
+    {
+      messages: [
+        message("user", [
+          { type: "text", text: "What is in this image? [Image #1]" },
+          { type: "image", data: "aW1hZ2U=", mimeType: "image/png", filename: "pixel.png" },
+        ]),
+      ],
+      tools: [],
+      system: [],
+    },
+    {
+      model: "gpt-5.5",
+    },
+  );
+
+  expect(body.input).toEqual([
+    {
+      role: "user",
+      content: [
+        { type: "input_text", text: "What is in this image? [Image #1]" },
+        { type: "input_image", image_url: "data:image/png;base64,aW1hZ2U=" },
+      ],
+    },
+  ]);
+});
+
+test("omits image tool result blocks for text-only Codex request bodies", () => {
+  const callId = "call_image" as ToolCallId;
+  const body = buildOpenAICodexResponsesRequestBody(
+    {
+      messages: [
+        message("assistant", [
+          { type: "tool_call", callId, toolName: "read_image", input: { filePath: "pixel.png" }, status: "completed" },
+        ]),
+        message("user", [
+          {
+            type: "tool_result",
+            callId,
+            output: "Image read: pixel.png",
+            content: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
+          },
+        ]),
+      ],
+      tools: [],
+      system: [],
+    },
+    {
+      model: "gpt-5.3-codex-spark",
+      inputCapabilities: ["text"],
+    },
+  );
+
+  expect(body.input).toContainEqual({
+    type: "function_call_output",
+    call_id: callId,
+    output: "Image read: pixel.png",
+  });
+  expect(JSON.stringify(body.input)).not.toContain("input_image");
+});
+
 test("resolves Codex Responses URL variants", () => {
   expect(resolveOpenAICodexResponsesUrl()).toBe("https://chatgpt.com/backend-api/codex/responses");
   expect(resolveOpenAICodexResponsesUrl("https://chatgpt.com/backend-api")).toBe("https://chatgpt.com/backend-api/codex/responses");

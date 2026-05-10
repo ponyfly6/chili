@@ -1,5 +1,5 @@
 import { platform, release, arch } from "node:os";
-import type { Message, MessagePart } from "@chili/protocol";
+import type { Message, MessagePart, ServiceTier } from "@chili/protocol";
 import { FileAuthStorage, type OAuthCredentials } from "./auth.js";
 import { type EnvironmentSource, readOpenAICodexEnvironment } from "./env.js";
 import {
@@ -15,12 +15,14 @@ import {
   extractOpenAICodexAccountId,
   refreshOpenAICodexToken,
 } from "./oauth/openai-codex.js";
+import { assertImageInputSupported } from "./image-input.js";
 import { readSseEvents } from "./sse.js";
 import { prependContextualUserMessage, transformModelMessages } from "./transform-messages.js";
 import type {
   ChiliModel,
   ChiliModelProvider,
   ModelDescriptor,
+  ModelInputCapability,
   ModelStreamEvent,
   ModelStreamInput,
   ModelTool,
@@ -50,6 +52,7 @@ export interface OpenAICodexModelOptions {
   env?: EnvironmentSource;
   reasoningEffort?: ReasoningLevel;
   reasoningSummary?: "auto" | "concise" | "detailed" | "off" | "on" | null;
+  serviceTier?: ServiceTier;
   textVerbosity?: "low" | "medium" | "high";
 }
 
@@ -60,13 +63,19 @@ export interface OpenAICodexRequestBuildOptions {
   sessionId?: string;
   reasoningEffort?: ReasoningLevel;
   reasoningSummary?: OpenAICodexModelOptions["reasoningSummary"];
+  serviceTier?: ServiceTier;
   textVerbosity?: OpenAICodexModelOptions["textVerbosity"];
+  inputCapabilities?: readonly ModelInputCapability[];
 }
+
+type CodexResponseMessageContent =
+  | { type: "input_text" | "output_text"; text: string }
+  | { type: "input_image"; image_url: string };
 
 type CodexResponseInputItem =
   | {
       role: "user" | "assistant";
-      content: Array<{ type: "input_text" | "output_text"; text: string }>;
+      content: CodexResponseMessageContent[];
     }
   | {
       type: "function_call";
@@ -203,9 +212,14 @@ export class OpenAICodexResponsesModel implements ChiliModel {
   }
 
   async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
-    const credentials = await this.resolveCredentials();
     const env = readOpenAICodexEnvironment(this.options.env);
     const requestOptions = resolveOpenAICodexStreamRequestOptions(input, this.options);
+    assertImageInputSupported(input, {
+      provider: this.provider,
+      model: requestOptions.model,
+      inputCapabilities: requestOptions.inputCapabilities,
+    });
+    const credentials = await this.resolveCredentials();
 
     const init: RequestInit = {
       method: "POST",
@@ -391,15 +405,19 @@ export function resolveOpenAICodexStreamRequestOptions(
   }
 
   const model = selection.model ?? options.model ?? env.model ?? OPENAI_CODEX_DEFAULT_MODEL;
+  const descriptor = findKnownModel(OPENAI_CODEX_PROVIDER_ID, model);
   const maxTokens = input.maxTokens ?? options.maxTokens;
   const temperature = input.temperature ?? options.temperature;
   const requestOptions: OpenAICodexRequestBuildOptions = { model };
+  if (descriptor?.inputCapabilities) requestOptions.inputCapabilities = descriptor.inputCapabilities;
   const sessionId = metadataString(input.metadata, "sessionId");
   const reasoningEffort = selection.reasoning ?? options.reasoningEffort;
+  const serviceTier = input.serviceTier ?? options.serviceTier ?? metadataServiceTier(input.metadata);
   if (sessionId) requestOptions.sessionId = sessionId;
   if (options.textVerbosity !== undefined) requestOptions.textVerbosity = options.textVerbosity;
   if (reasoningEffort !== undefined) requestOptions.reasoningEffort = reasoningEffort;
   if (options.reasoningSummary !== undefined) requestOptions.reasoningSummary = options.reasoningSummary;
+  if (serviceTier !== undefined) requestOptions.serviceTier = serviceTier;
   if (maxTokens !== undefined) requestOptions.maxTokens = maxTokens;
   if (temperature !== undefined) requestOptions.temperature = temperature;
   return requestOptions;
@@ -425,7 +443,7 @@ export function buildOpenAICodexResponsesRequestBody(
     model: options.model,
     store: false,
     stream: true,
-    input: toResponsesInput(messages),
+    input: toResponsesInput(messages, supportsImageInput(options.inputCapabilities)),
     text: { verbosity: options.textVerbosity ?? "medium" },
     include: ["reasoning.encrypted_content"],
     tool_choice: "auto",
@@ -437,6 +455,8 @@ export function buildOpenAICodexResponsesRequestBody(
   if (options.maxTokens !== undefined) body.max_output_tokens = options.maxTokens;
   if (options.temperature !== undefined) body.temperature = options.temperature;
   if (options.sessionId) body.prompt_cache_key = options.sessionId;
+  const serviceTier = openAICodexWireServiceTier(options.serviceTier);
+  if (serviceTier) body.service_tier = serviceTier;
   const effort = resolveOpenAICodexReasoningEffort(options.model, options.reasoningEffort);
   if (effort !== undefined || options.reasoningSummary !== undefined) {
     const reasoning: Record<string, string> = {};
@@ -450,7 +470,7 @@ export function buildOpenAICodexResponsesRequestBody(
   return body;
 }
 
-function toResponsesInput(messages: readonly Message[]): CodexResponseInputItem[] {
+function toResponsesInput(messages: readonly Message[], includeImageContent = true): CodexResponseInputItem[] {
   const output: CodexResponseInputItem[] = [];
   for (const message of messages) {
     if (message.role === "system") continue;
@@ -469,8 +489,8 @@ function toResponsesInput(messages: readonly Message[]): CodexResponseInputItem[
       continue;
     }
 
-    const text = messageText(message.parts, "text");
-    if (text) output.push({ role: "user", content: [{ type: "input_text", text }] });
+    const content = userMessageContent(message.parts, includeImageContent);
+    if (content.length > 0) output.push({ role: "user", content });
     for (const part of message.parts) {
       if (part.type !== "tool_result") continue;
       output.push({
@@ -478,9 +498,26 @@ function toResponsesInput(messages: readonly Message[]): CodexResponseInputItem[
         call_id: normalizeResponsesId(String(part.callId)),
         output: formatToolResult(part),
       });
+      const imageContent = toolResultImageContent(part, includeImageContent);
+      if (imageContent.length > 0) output.push({ role: "user", content: imageContent });
     }
   }
   return output;
+}
+
+function userMessageContent(parts: readonly MessagePart[], includeImageContent = true): CodexResponseMessageContent[] {
+  const content: CodexResponseMessageContent[] = [];
+  const text = messageText(parts, "text");
+  if (text) content.push({ type: "input_text", text });
+  if (!includeImageContent) return content;
+  for (const part of parts) {
+    if (part.type !== "image") continue;
+    content.push({
+      type: "input_image",
+      image_url: imageDataUrl(part),
+    });
+  }
+  return content;
 }
 
 function instructionText(messages: readonly Message[], system: readonly string[], developer: readonly string[]): string {
@@ -706,9 +743,44 @@ function formatToolResult(part: Extract<MessagePart, { type: "tool_result" }>): 
   return part.output;
 }
 
+function toolResultImageContent(
+  part: Extract<MessagePart, { type: "tool_result" }>,
+  includeImageContent = true,
+): CodexResponseMessageContent[] {
+  if (part.error || !includeImageContent) return [];
+  const images = (part.content ?? []).filter((item) => item.type === "image");
+  if (images.length === 0) return [];
+  return [
+    { type: "input_text", text: `Image returned by tool call ${String(part.callId)}.` },
+    ...images.map((image) => ({
+      type: "input_image" as const,
+      image_url: imageDataUrl(image),
+    })),
+  ];
+}
+
+function imageDataUrl(image: Pick<Extract<MessagePart, { type: "image" }>, "data" | "mimeType">): string {
+  return `data:${image.mimeType};base64,${image.data}`;
+}
+
+function supportsImageInput(inputCapabilities: readonly ModelInputCapability[] | undefined): boolean {
+  return inputCapabilities === undefined || inputCapabilities.includes("image");
+}
+
 function metadataString(metadata: Record<string, unknown> | undefined, key: string): string | undefined {
   const value = metadata?.[key];
   return typeof value === "string" && value ? value : undefined;
+}
+
+function metadataServiceTier(metadata: Record<string, unknown> | undefined): ServiceTier | undefined {
+  const value = metadataString(metadata, "serviceTier") ?? metadataString(metadata, "service_tier");
+  if (value === "fast" || value === "standard") return value;
+  return undefined;
+}
+
+function openAICodexWireServiceTier(serviceTier: ServiceTier | undefined): string | undefined {
+  if (serviceTier === "fast") return "priority";
+  return undefined;
 }
 
 function parseJson<T>(text: string, fallback: T | undefined): T | undefined {

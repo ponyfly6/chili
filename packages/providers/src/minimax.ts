@@ -111,6 +111,7 @@ export function createMiniMaxM27HighspeedModel(options: MiniMaxModelOptions = {}
     authScheme: options.authScheme ?? "bearer",
     maxTokens: options.maxTokens ?? DEFAULT_MINIMAX_MAX_TOKENS,
   };
+  if (descriptor?.inputCapabilities) modelOptions.inputCapabilities = descriptor.inputCapabilities;
   if (options.temperature !== undefined) modelOptions.temperature = options.temperature;
   if (options.fetch !== undefined) modelOptions.fetch = options.fetch;
   if (options.headers !== undefined) modelOptions.headers = options.headers;
