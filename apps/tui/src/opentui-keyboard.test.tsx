@@ -7,7 +7,7 @@ import { act, useState, type Dispatch, type SetStateAction } from "react";
 import { createRuntimeView, type ChatTranscriptItem, type HttpRuntimeClient, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
 import type { ApprovalId, ChiliEvent, MessageId, PartId, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import type { ClipboardAccess } from "./clipboard.js";
-import { ChatShellApp, ChatShellSurface } from "./ChatShellApp.js";
+import { CTRL_C_EXIT_CONFIRM_MS, ChatShellApp, ChatShellSurface, isWithinCtrlCExitWindow, type ChatShellExitInfo } from "./ChatShellApp.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import type { ChatApproveOptions, ChatRuntimeState } from "./useChatRuntime.js";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
@@ -84,6 +84,36 @@ test("Chinese prompt submits through native input without text drift", async () 
   } finally {
     app.renderer.destroy();
   }
+});
+
+test("ctrl+c clears the prompt before a quick second press exits", async () => {
+  const exits: ChatShellExitInfo[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    onExit: (info) => exits.push(info ?? {}),
+  });
+
+  try {
+    await typeText(app, "draft prompt");
+    await press(app, () => app.mockInput.pressKey("c", { ctrl: true }));
+
+    const frame = app.captureCharFrame();
+    expect(exits).toHaveLength(0);
+    expect(frame).not.toContain("draft prompt");
+    expect(frame).toContain("Input cleared. Press Ctrl+C again to exit.");
+
+    await press(app, () => app.mockInput.pressKey("c", { ctrl: true }));
+    expect(exits).toHaveLength(1);
+    expect(exits[0]).toMatchObject({ cwd: "/repo/chili" });
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("ctrl+c exit confirmation expires outside the quick-press window", () => {
+  const firstPressMs = 10_000;
+
+  expect(isWithinCtrlCExitWindow(firstPressMs, firstPressMs + CTRL_C_EXIT_CONFIRM_MS)).toBe(true);
+  expect(isWithinCtrlCExitWindow(firstPressMs, firstPressMs + CTRL_C_EXIT_CONFIRM_MS + 1)).toBe(false);
 });
 
 test("bang prompt runs a local shell command without submitting to the runtime", async () => {
@@ -2313,6 +2343,7 @@ async function mountShell(
     skills?: readonly SkillSummary[];
     allSkills?: readonly SkillSummary[];
     onSkillsChanged?: () => Promise<void> | void;
+    onExit?: (info?: ChatShellExitInfo) => void;
   } = {},
 ) {
   const runtime: ChatRuntimeState = {
@@ -2353,7 +2384,7 @@ async function mountShell(
       selectedTeamId={model.selectedTeamId}
       selectedTeamLocked={false}
       onSelectTeam={() => undefined}
-      onExit={() => undefined}
+      onExit={options.onExit ?? (() => undefined)}
       options={{ cwd: options.cwd ?? "/repo/chili", modeName: "Build", modelName: "test-model", providerName: "test-provider" }}
       clipboard={options.clipboard}
       localMessageTtlMs={options.localMessageTtlMs}

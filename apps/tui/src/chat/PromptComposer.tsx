@@ -1,5 +1,5 @@
 import type { InputRenderable, KeyEvent, PasteEvent } from "@opentui/core";
-import { useCallback, useRef } from "react";
+import { useCallback, useLayoutEffect, useRef } from "react";
 import type { ChatRequestStatus } from "../useChatRuntime.js";
 import type { SlashCompletion } from "../slash/types.js";
 import type { TuiTheme } from "../theme/index.js";
@@ -12,6 +12,7 @@ export const PROMPT_INPUT_HEIGHT = 3;
 export function PromptComposer(props: {
   width: number;
   prompt: string;
+  resetKey?: number | undefined;
   disabled: boolean;
   disabledReason?: string | undefined;
   completions: readonly SlashCompletion[];
@@ -24,6 +25,7 @@ export function PromptComposer(props: {
   focused: boolean;
   onPromptChange: (value: string) => void;
   onSubmit: () => void;
+  onExitShortcut?: (() => void) | undefined;
   onPasteShortcut?: (() => Promise<string | undefined>) | undefined;
   feedback?: { status: ChatRequestStatus | string; message: string } | undefined;
   completionIndex: number;
@@ -40,6 +42,12 @@ export function PromptComposer(props: {
   const borderColor = props.disabled ? colors.input.disabledBorder : shellMode ? colors.status.info : colors.border.default;
   const inputTextColor = shellMode ? colors.accent.primary : colors.input.text;
   const placeholder = props.disabled && props.disabledReason ? props.disabledReason : PROMPT_PLACEHOLDER;
+  useLayoutEffect(() => {
+    const input = inputRef.current;
+    if (!input || input.value === promptValue) return;
+    input.value = promptValue;
+    correctTrailingUnicodeCursor(input, promptValue);
+  }, [promptValue]);
   const externalPromptValue = useCallback((value: string) => {
     if (shellModeRef.current && !value.startsWith("!")) return `!${value}`;
     return value;
@@ -65,19 +73,27 @@ export function PromptComposer(props: {
     insertPromptText(pasted);
   }, [insertPromptText]);
   const handlePromptKeyDown = useCallback((key: KeyEvent) => {
+    if (key.eventType !== "press") return;
+    if (key.ctrl && key.name === "c" && !key.shift && props.onExitShortcut) {
+      key.preventDefault();
+      key.stopPropagation();
+      if (promptValue.length > 0 && inputRef.current) inputRef.current.value = "";
+      props.onExitShortcut();
+      return;
+    }
     if (shellMode && promptValue.length === 0 && isShellModeExitKey(key)) {
       key.preventDefault();
       key.stopPropagation();
       props.onPromptChange("");
       return;
     }
-    if (!props.onPasteShortcut || key.eventType !== "press" || !key.ctrl || key.name !== "v") return;
+    if (!props.onPasteShortcut || !key.ctrl || key.name !== "v") return;
     key.preventDefault();
     key.stopPropagation();
     void props.onPasteShortcut().then((pasted) => {
       if (pasted) insertPromptText(pasted);
     });
-  }, [insertPromptText, promptValue.length, props.onPasteShortcut, props.onPromptChange, shellMode]);
+  }, [insertPromptText, promptValue, props.onExitShortcut, props.onPasteShortcut, props.onPromptChange, shellMode]);
   const maxCommandItems = props.maxCommandItems ?? DEFAULT_COMMAND_LIST_MAX_ITEMS;
   const compactCommands = props.width < 72;
   const height = promptComposerHeight({
@@ -109,6 +125,7 @@ export function PromptComposer(props: {
           <text fg={colors.input.disabledText} wrapMode="none" truncate>{promptValue || placeholder}</text>
         ) : (
           <input
+            key={props.resetKey ?? 0}
             ref={inputRef}
             width={Math.max(1, props.width - 6)}
             value={promptValue}

@@ -141,6 +141,7 @@ const PROMPT_MENU_MAX_ITEMS = 6;
 const LOCAL_ITEM_TTL_MS = 4_000;
 const USER_SHELL_TIMEOUT_MS = 60 * 60 * 1_000;
 const USER_SHELL_OUTPUT_LIMIT_BYTES = 256_000;
+export const CTRL_C_EXIT_CONFIRM_MS = 2_000;
 
 export function ChatShellApp(props: {
   client: HttpRuntimeClient;
@@ -223,6 +224,7 @@ export function ChatShellSurface(props: {
   const renderer = useRenderer() as ClipboardRenderer & SystemThemePaletteRenderer;
   const [view, setView] = useState<ShellView>("chat");
   const [promptParts, setPromptParts] = useState<PromptPart[]>([{ type: "text", text: "" }]);
+  const [promptInputResetKey, setPromptInputResetKey] = useState(0);
   const [skillMentionBindings, setSkillMentionBindings] = useState<RuntimeSkillMention[]>([]);
   const [localItems, setLocalItems] = useState<LocalTranscriptItem[]>([]);
   const deferredLocalItems = useDeferredValue(localItems);
@@ -248,6 +250,8 @@ export function ChatShellSurface(props: {
   const [authManualPrompt, setAuthManualPromptState] = useState<AuthManualPrompt | undefined>(undefined);
   const [showToolDetails, setShowToolDetails] = useState(false);
   const [hideThinking, setHideThinkingState] = useState(false);
+  const lastCtrlCPressMsRef = useRef<number | undefined>(undefined);
+  const clearedPromptTextRef = useRef<string | undefined>(undefined);
   const localMessageTtlMs = props.localMessageTtlMs ?? LOCAL_ITEM_TTL_MS;
   const localItemTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const dismissLocalItem = useCallback((id: string) => {
@@ -353,7 +357,26 @@ export function ChatShellSurface(props: {
     acceptedCompletionPromptRef.current = value;
     setAcceptedCompletionPrompt(value);
   }, []);
+  const clearPromptInput = useCallback((clearedText: string) => {
+    clearedPromptTextRef.current = clearedText;
+    updateAcceptedCompletionPrompt(undefined);
+    historyPromptValueRef.current = undefined;
+    history.resetNavigation();
+    setCompletionIndex(0);
+    setSkillMentionBindings([]);
+    setPrompt("");
+    setPromptInputResetKey((current) => current + 1);
+  }, [history, setPrompt, updateAcceptedCompletionPrompt]);
   const handlePromptChange = useCallback((value: string) => {
+    const clearedText = clearedPromptTextRef.current;
+    if (clearedText !== undefined) {
+      if (value.length === 0 || value === clearedText) {
+        setPrompt("");
+        return;
+      }
+      clearedPromptTextRef.current = undefined;
+    }
+    if (value.length > 0) lastCtrlCPressMsRef.current = undefined;
     if (value !== acceptedCompletionPromptRef.current) updateAcceptedCompletionPrompt(undefined);
     if (historyPromptValueRef.current === value) {
       setPrompt(value);
@@ -822,6 +845,18 @@ export function ChatShellSurface(props: {
     }
     return pasted;
   }, [appendLocalItem, clipboard]);
+  const handleCtrlCExitShortcut = useCallback(() => {
+    const now = Date.now();
+    if (isWithinCtrlCExitWindow(lastCtrlCPressMsRef.current, now)) {
+      lastCtrlCPressMsRef.current = undefined;
+      props.onExit?.(chatShellExitInfo(props.runtime, cwd));
+      return;
+    }
+    lastCtrlCPressMsRef.current = now;
+    const hadPrompt = prompt.length > 0;
+    if (hadPrompt) clearPromptInput(prompt);
+    appendLocalItem("info", hadPrompt ? "Input cleared. Press Ctrl+C again to exit." : "Press Ctrl+C again to exit.");
+  }, [appendLocalItem, clearPromptInput, cwd, prompt, props.onExit, props.runtime]);
 
   useEffect(() => {
     const previous = previousTranscriptLineCount.current;
@@ -845,6 +880,8 @@ export function ChatShellSurface(props: {
 
   useKeyboard((key) => {
     if (key.eventType !== "press") return;
+    const ctrlCExitShortcut = key.ctrl && key.name === "c" && !key.shift;
+    if (!ctrlCExitShortcut) lastCtrlCPressMsRef.current = undefined;
     if (isCopyShortcut(key)) {
       key.preventDefault();
       key.stopPropagation();
@@ -858,8 +895,10 @@ export function ChatShellSurface(props: {
       });
       return;
     }
-    if (key.ctrl && key.name === "c" && !key.shift) {
-      props.onExit?.(chatShellExitInfo(props.runtime, props.options?.cwd));
+    if (ctrlCExitShortcut) {
+      key.preventDefault();
+      key.stopPropagation();
+      handleCtrlCExitShortcut();
       return;
     }
     if (key.ctrl && key.name === "x") {
@@ -1167,8 +1206,10 @@ export function ChatShellSurface(props: {
           width={dimensions.width}
           height={dimensions.height}
           prompt={prompt}
+          promptInputResetKey={promptInputResetKey}
           focused={view === "chat" && !paletteOpen && !themePicker && !modelPicker && !reasoningPicker && !permissionsPicker && !disabledReason}
           onPromptChange={handlePromptChange}
+          onExitShortcut={handleCtrlCExitShortcut}
           onPasteShortcut={readPromptClipboard}
           onSubmit={() => {
             if (submitAuthManualInput()) return;
@@ -1206,8 +1247,10 @@ export function ChatShellSurface(props: {
           height={dimensions.height}
           view={view}
           prompt={prompt}
+          promptInputResetKey={promptInputResetKey}
           focused={view === "chat" && !paletteOpen && !themePicker && !modelPicker && !reasoningPicker && !permissionsPicker && !disabledReason}
           onPromptChange={handlePromptChange}
+          onExitShortcut={handleCtrlCExitShortcut}
           onPasteShortcut={readPromptClipboard}
           onSubmit={() => {
             if (submitAuthManualInput()) return;
@@ -1269,8 +1312,10 @@ function HomeScreen(props: {
   width: number;
   height: number;
   prompt: string;
+  promptInputResetKey: number;
   focused: boolean;
   onPromptChange: (value: string) => void;
+  onExitShortcut: () => void;
   onPasteShortcut: () => Promise<string | undefined>;
   onSubmit: () => void;
   completions: readonly SlashCompletion[];
@@ -1323,10 +1368,12 @@ function HomeScreen(props: {
         <PromptComposer
           width={promptWidth}
           prompt={props.prompt}
+          resetKey={props.promptInputResetKey}
           disabled={Boolean(props.disabledReason)}
           disabledReason={props.disabledReason}
           focused={props.focused}
           onPromptChange={props.onPromptChange}
+          onExitShortcut={props.onExitShortcut}
           onPasteShortcut={props.onPasteShortcut}
           onSubmit={props.onSubmit}
           completions={props.completions}
@@ -1353,8 +1400,10 @@ function SessionScreen(props: {
   height: number;
   view: Exclude<ShellView, "team">;
   prompt: string;
+  promptInputResetKey: number;
   focused: boolean;
   onPromptChange: (value: string) => void;
+  onExitShortcut: () => void;
   onPasteShortcut: () => Promise<string | undefined>;
   onSubmit: () => void;
   onTranscriptScroll: (event: MouseEvent) => void;
@@ -1469,10 +1518,12 @@ function SessionScreen(props: {
         <PromptComposer
           width={promptWidth}
           prompt={props.prompt}
+          resetKey={props.promptInputResetKey}
           disabled={Boolean(props.disabledReason)}
           disabledReason={props.disabledReason}
           focused={props.focused}
           onPromptChange={props.onPromptChange}
+          onExitShortcut={props.onExitShortcut}
           onPasteShortcut={props.onPasteShortcut}
           onSubmit={props.onSubmit}
           completions={props.completions}
@@ -1953,7 +2004,7 @@ function HelpView(props: { commands: readonly SlashCommand[]; theme: TuiTheme; s
       ))}
       <box height={1} />
       <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"!cmd runs a local shell command without asking the model."}</text>
-      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`Esc closes views. Ctrl+P opens commands. Ctrl+O toggles tool details (${detailsText}). Ctrl+T opens transcript. Ctrl+V pastes. Ctrl+Shift+C copies selection or latest reply.`}</text>
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`Esc closes views. Ctrl+C clears input; press again quickly to exit. Ctrl+P opens commands. Ctrl+O toggles tool details (${detailsText}). Ctrl+T opens transcript. Ctrl+V pastes. Ctrl+Shift+C copies.`}</text>
     </box>
   );
 }
@@ -2846,6 +2897,12 @@ function useGitBranch(cwd: string, explicitBranch: string | undefined): string |
     };
   }, [cwd, explicitBranch]);
   return branch;
+}
+
+export function isWithinCtrlCExitWindow(previousPressMs: number | undefined, nowMs: number): boolean {
+  if (previousPressMs === undefined) return false;
+  const elapsedMs = nowMs - previousPressMs;
+  return elapsedMs >= 0 && elapsedMs <= CTRL_C_EXIT_CONFIRM_MS;
 }
 
 function setPromptText(setPromptParts: (value: PromptPart[] | ((current: PromptPart[]) => PromptPart[])) => void) {
