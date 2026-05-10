@@ -5,6 +5,7 @@ import type {
   AgentTaskMode,
   AgentTaskStatus,
   Message,
+  MessageImageContent,
   ApprovalId,
   ApprovalDecisionAction,
   RuntimeApprovalResolveResult,
@@ -31,6 +32,7 @@ import type {
   RuntimeSkillMention,
   ModelSelection,
   ReasoningLevel,
+  ServiceTier,
   SessionId,
   TaskId,
   TeamId,
@@ -51,6 +53,7 @@ export interface RuntimeClient {
   getModelConfig(input: GetModelConfigRequest): Promise<RuntimeModelConfig>;
   setModel(input: SetModelRequest): Promise<RuntimeModelConfig>;
   setReasoning(input: SetReasoningRequest): Promise<RuntimeModelConfig>;
+  setServiceTier(input: SetServiceTierRequest): Promise<RuntimeModelConfig>;
   getPermissionConfig(input?: GetPermissionConfigRequest): Promise<RuntimePermissionConfig>;
   setPermissionProfile(input: SetPermissionProfileRequest): Promise<RuntimePermissionConfig>;
   getGoal(input: GetGoalRequest): Promise<ThreadGoal | undefined>;
@@ -120,11 +123,14 @@ export interface SubmitPromptRequest {
   sessionId: SessionId;
   threadId: ThreadId;
   text: string;
+  displayText?: string;
+  images?: MessageImageContent[];
   skillMentions?: RuntimeSkillMention[];
   cwd?: string;
   maxTurns?: number;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
+  serviceTier?: ServiceTier;
   signal?: AbortSignal;
 }
 
@@ -148,6 +154,13 @@ export interface SetReasoningRequest {
   sessionId: SessionId;
   threadId?: ThreadId;
   reasoningLevel: ReasoningLevel;
+  signal?: AbortSignal;
+}
+
+export interface SetServiceTierRequest {
+  sessionId: SessionId;
+  threadId?: ThreadId;
+  serviceTier: ServiceTier;
   signal?: AbortSignal;
 }
 
@@ -249,6 +262,7 @@ export interface SubmitCommandRequest extends RuntimePromptCommandInvocation {
   threadId: ThreadId;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
+  serviceTier?: ServiceTier;
   signal?: AbortSignal;
 }
 
@@ -931,6 +945,13 @@ export class HttpRuntimeClient implements RuntimeClient {
     return this.post(`sessions/${encodeURIComponent(input.sessionId)}/reasoning`, {
       threadId: input.threadId,
       reasoningLevel: input.reasoningLevel,
+    }, input.signal);
+  }
+
+  setServiceTier(input: SetServiceTierRequest): Promise<RuntimeModelConfig> {
+    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/service-tier`, {
+      threadId: input.threadId,
+      serviceTier: input.serviceTier,
     }, input.signal);
   }
 

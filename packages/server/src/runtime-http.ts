@@ -19,6 +19,7 @@ import type {
   RuntimeMcpStatusResponse,
   RuntimeMcpToolsResponse,
   RuntimeMcpTransport,
+  MessageImageContent,
   RuntimePermissionConfig,
   RuntimePermissionProfileId,
   RuntimeApprovalResolveResult,
@@ -29,6 +30,7 @@ import type {
   RuntimeSkillMention,
   ModelSelection,
   ReasoningLevel,
+  ServiceTier,
   SessionId,
   ThreadId,
   TaskId,
@@ -94,6 +96,7 @@ export interface RuntimeHttpService {
   getModelConfig?(sessionId: SessionId): Promise<RuntimeModelConfig>;
   setModel?(input: { sessionId: SessionId; threadId?: ThreadId; modelSelection: ModelSelection }): Promise<RuntimeModelConfig>;
   setReasoning?(input: { sessionId: SessionId; threadId?: ThreadId; reasoningLevel: ReasoningLevel }): Promise<RuntimeModelConfig>;
+  setServiceTier?(input: { sessionId: SessionId; threadId?: ThreadId; serviceTier: ServiceTier }): Promise<RuntimeModelConfig>;
   getGoal?(input: { sessionId: SessionId; threadId: ThreadId }): Promise<ThreadGoal | undefined>;
   setGoal?(input: { sessionId: SessionId; threadId: ThreadId; objective: string; tokenBudget?: number; replace?: boolean }): Promise<ThreadGoal>;
   updateGoal?(input: { sessionId: SessionId; threadId: ThreadId; status?: ThreadGoalStatus; objective?: string; tokenBudget?: number }): Promise<ThreadGoal>;
@@ -535,6 +538,19 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         }));
       }
 
+      if (route.name === "setServiceTier") {
+        await requireSession(options.store, route.sessionId);
+        const body = await readJson<ServiceTierBody>(request);
+        if (!isServiceTier(body.serviceTier)) {
+          throw badRequest("serviceTier must be standard or fast");
+        }
+        return json(await requireServiceTierControl(options).setServiceTier({
+          sessionId: route.sessionId,
+          ...(body.threadId ? { threadId: body.threadId } : {}),
+          serviceTier: body.serviceTier,
+        }));
+      }
+
       if (route.name === "goal") {
         await requireSession(options.store, route.sessionId);
         const goals = requireGoalControl(options);
@@ -563,10 +579,11 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         const body = await readJson<PromptBody>(request);
         rejectLegacySystemField(body);
         if (!body.threadId) throw badRequest("threadId is required");
-        if (!body.text) throw badRequest("text is required");
+        const promptImages = parsePromptImages(body.images);
+        if (!body.text && promptImages.length === 0) throw badRequest("text is required");
         await requireSession(options.store, route.sessionId);
 
-        const input = buildSubmitPromptInput(route.sessionId, body);
+        const input = buildSubmitPromptInput(route.sessionId, body, promptImages);
 
         if (route.name === "prompt") {
           return json(serializeSubmitPromptResult(await options.service.submitPrompt(input)));
@@ -604,6 +621,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
           ...(body.cwd ? { cwd: body.cwd } : {}),
           ...(body.modelSelection ? { modelSelection: body.modelSelection } : {}),
           ...(body.reasoningLevel ? { reasoningLevel: body.reasoningLevel } : {}),
+          ...(body.serviceTier ? { serviceTier: body.serviceTier } : {}),
         });
         options.service.submitPromptAsync(input, options.onBackgroundError);
         const accepted: RuntimePromptAccepted = {
@@ -726,6 +744,7 @@ type Route =
   | { name: "modelConfig"; sessionId: SessionId }
   | { name: "setModel"; sessionId: SessionId }
   | { name: "setReasoning"; sessionId: SessionId }
+  | { name: "setServiceTier"; sessionId: SessionId }
   | { name: "goal"; sessionId: SessionId }
   | { name: "prompt"; sessionId: SessionId }
   | { name: "promptAsync"; sessionId: SessionId }
@@ -745,11 +764,13 @@ interface PromptBody {
   threadId?: ThreadId;
   text?: string;
   displayText?: string;
+  images?: unknown;
   skillMentions?: unknown;
   cwd?: string;
   maxTurns?: number;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
+  serviceTier?: ServiceTier;
 }
 
 interface CommandPromptBody {
@@ -759,6 +780,7 @@ interface CommandPromptBody {
   cwd?: string;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
+  serviceTier?: ServiceTier;
 }
 
 interface ModelBody {
@@ -769,6 +791,11 @@ interface ModelBody {
 interface ReasoningBody {
   threadId?: ThreadId;
   reasoningLevel?: unknown;
+}
+
+interface ServiceTierBody {
+  threadId?: ThreadId;
+  serviceTier?: unknown;
 }
 
 interface GoalBody {
@@ -1055,6 +1082,7 @@ function routeRequest(method: string, pathname: string): Route {
   if (method === "GET" && action === "model") return { name: "modelConfig", sessionId };
   if (method === "POST" && action === "model") return { name: "setModel", sessionId };
   if (method === "POST" && action === "reasoning") return { name: "setReasoning", sessionId };
+  if (method === "POST" && (action === "service-tier" || action === "service_tier" || action === "fast")) return { name: "setServiceTier", sessionId };
   if ((method === "GET" || method === "POST" || method === "PATCH" || method === "DELETE") && action === "goal") return { name: "goal", sessionId };
   if (method === "POST" && action === "prompt") return { name: "prompt", sessionId };
   if (method === "POST" && action === "prompt_async") return { name: "promptAsync", sessionId };
@@ -1064,19 +1092,22 @@ function routeRequest(method: string, pathname: string): Route {
   return { name: "notFound" };
 }
 
-function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody): SubmitPromptInput {
+function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody, parsedImages?: readonly MessageImageContent[]): SubmitPromptInput {
   const input: SubmitPromptInput = {
     sessionId,
     threadId: body.threadId as ThreadId,
     text: body.text ?? "",
   };
   if (body.displayText) input.displayText = body.displayText;
+  const images = parsedImages ?? parsePromptImages(body.images);
+  if (images.length > 0) input.images = images;
   if (body.cwd) input.cwd = body.cwd;
   const skillMentions = parseSkillMentions(body.skillMentions);
   if (skillMentions.length > 0) input.skillMentions = skillMentions;
   if (body.maxTurns !== undefined) input.maxTurns = body.maxTurns;
   if (isModelSelection(body.modelSelection)) input.modelSelection = body.modelSelection;
   if (isReasoningLevel(body.reasoningLevel)) input.reasoningLevel = body.reasoningLevel;
+  if (isServiceTier(body.serviceTier)) input.serviceTier = body.serviceTier;
   return input;
 }
 
@@ -1200,6 +1231,39 @@ function parseSkillMentions(value: unknown): RuntimeSkillMention[] {
     mentions.push(mention);
   }
   return mentions;
+}
+
+function parsePromptImages(value: unknown): MessageImageContent[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw badRequest("images must be an array");
+  const images: MessageImageContent[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) throw badRequest("images entries must be objects");
+    if (typeof item.data !== "string" || item.data.length === 0) {
+      throw badRequest("images entries require non-empty base64 data");
+    }
+    if (typeof item.mimeType !== "string" || !item.mimeType.startsWith("image/")) {
+      throw badRequest("images entries require an image mimeType");
+    }
+    const image: MessageImageContent = {
+      data: item.data,
+      mimeType: item.mimeType,
+    };
+    if (item.filename !== undefined) {
+      if (typeof item.filename !== "string" || item.filename.trim().length === 0) {
+        throw badRequest("images filename must be a non-empty string when provided");
+      }
+      image.filename = item.filename;
+    }
+    if (item.sourcePath !== undefined) {
+      if (typeof item.sourcePath !== "string" || item.sourcePath.trim().length === 0) {
+        throw badRequest("images sourcePath must be a non-empty string when provided");
+      }
+      image.sourcePath = item.sourcePath;
+    }
+    images.push(image);
+  }
+  return images;
 }
 
 function parseResolveApprovalBody(approvalId: import("@chili/protocol").ApprovalId, body: unknown): {
@@ -1491,6 +1555,16 @@ function requireModelControl(options: RuntimeHttpHandlerOptions): Required<Pick<
   };
 }
 
+function requireServiceTierControl(options: RuntimeHttpHandlerOptions): Required<Pick<RuntimeHttpService, "setServiceTier">> {
+  const service = options.service;
+  if (!service.setServiceTier) {
+    throw { status: 501, message: "No service tier control service is configured" } satisfies HttpError;
+  }
+  return {
+    setServiceTier: service.setServiceTier.bind(service),
+  };
+}
+
 function requireGoalControl(options: RuntimeHttpHandlerOptions): Required<Pick<RuntimeHttpService, "getGoal" | "setGoal" | "updateGoal" | "clearGoal">> {
   const service = options.service;
   if (!service.getGoal || !service.setGoal || !service.updateGoal || !service.clearGoal) {
@@ -1519,6 +1593,10 @@ function isReasoningLevel(value: unknown): value is ReasoningLevel {
     || value === "medium"
     || value === "high"
     || value === "xhigh";
+}
+
+function isServiceTier(value: unknown): value is ServiceTier {
+  return value === "standard" || value === "fast";
 }
 
 function isRuntimePermissionProfileId(value: unknown): value is RuntimePermissionProfileId {

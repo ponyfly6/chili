@@ -195,7 +195,7 @@ async function appendJsonLine(path: string, value: unknown): Promise<void> {
 function sessionIdForEvent(event: ChiliEvent): SessionId | undefined {
   if (event.sessionId) return event.sessionId;
   if (event.type === "session.created" || event.type === "session.archived") return event.payload.sessionId;
-  if (event.type === "session.model_changed" || event.type === "session.reasoning_changed") {
+  if (event.type === "session.model_changed" || event.type === "session.reasoning_changed" || event.type === "session.service_tier_changed") {
     return event.payload.sessionId;
   }
   return undefined;
@@ -219,6 +219,7 @@ function messageText(parts: readonly MessagePart[]): string {
   return parts
     .map((part) => {
       if (part.type === "text") return part.displayText ?? part.text;
+      if (part.type === "image") return part.displayText ?? `[image ${part.mimeType}${part.filename ? ` ${part.filename}` : ""}]`;
       if (part.type === "reasoning") return part.text;
       if (part.type === "tool_call") return `[${part.toolName}]`;
       if (part.type === "tool_result") return part.output || part.error || "";

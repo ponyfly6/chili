@@ -644,9 +644,10 @@ export interface ChatMessageRow {
 
 export type ChatMessagePart =
   | { type: "text"; id: PartId; text: string; rawText?: string; synthetic?: boolean }
+  | { type: "image"; id: PartId; mimeType: string; filename?: string; sourcePath?: string; displayText?: string }
   | { type: "reasoning"; id: PartId; text: string; redacted?: boolean }
   | { type: "tool_call"; id: PartId; callId: ToolCallId; toolName: string; status: ToolPartStatus; input?: unknown; displayStatus?: ChatToolDisplayStatus }
-  | { type: "tool_result"; id: PartId; callId: ToolCallId; output: string; error?: string; synthetic?: boolean }
+  | { type: "tool_result"; id: PartId; callId: ToolCallId; output: string; content?: Extract<MessagePart, { type: "tool_result" }>["content"]; error?: string; synthetic?: boolean }
   | { type: "summary"; id: PartId; text: string };
 
 export type ChatToolDisplayStatus =
@@ -1193,6 +1194,13 @@ function chatMessagePart(part: MessagePart): ChatMessagePart {
     assignOptional(output, "synthetic", part.synthetic);
     return output;
   }
+  if (part.type === "image") {
+    const output: ChatMessagePart = { type: "image", id: part.id, mimeType: part.mimeType };
+    assignOptional(output, "filename", part.filename);
+    assignOptional(output, "sourcePath", part.sourcePath);
+    assignOptional(output, "displayText", part.displayText);
+    return output;
+  }
   if (part.type === "reasoning") {
     const output: ChatMessagePart = { type: "reasoning", id: part.id, text: part.text };
     assignOptional(output, "redacted", part.redacted);
@@ -1211,6 +1219,7 @@ function chatMessagePart(part: MessagePart): ChatMessagePart {
   }
   if (part.type === "tool_result") {
     const output: ChatMessagePart = { type: "tool_result", id: part.id, callId: part.callId, output: part.output };
+    assignOptional(output, "content", part.content);
     assignOptional(output, "error", part.error);
     assignOptional(output, "synthetic", part.synthetic);
     return output;

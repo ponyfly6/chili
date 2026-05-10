@@ -32,6 +32,7 @@ import type {
   RuntimePromptCommandInvocation,
   RuntimePromptCommandList,
   RuntimeSessionRef,
+  ServiceTier,
   SessionId,
   TaskId,
   TeamId,
@@ -956,6 +957,14 @@ test("serves model control routes and prompt model overrides", async () => {
   expect(setReasoningResponse.status).toBe(200);
   expect(service.reasoningLevel).toBe("high");
 
+  const setServiceTierResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/service-tier`, {
+    method: "POST",
+    body: JSON.stringify({ threadId: session.threadId, serviceTier: "fast" }),
+    headers: { "content-type": "application/json" },
+  }));
+  expect(setServiceTierResponse.status).toBe(200);
+  expect(service.serviceTier).toBe("fast");
+
   const promptResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/prompt_async`, {
     method: "POST",
     body: JSON.stringify({
@@ -964,6 +973,7 @@ test("serves model control routes and prompt model overrides", async () => {
       skillMentions: [{ name: "reviewer", path: "/repo/.chili/skills/reviewer/SKILL.md" }],
       modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
       reasoningLevel: "xhigh",
+      serviceTier: "fast",
     }),
     headers: { "content-type": "application/json" },
   }));
@@ -972,6 +982,7 @@ test("serves model control routes and prompt model overrides", async () => {
     skillMentions: [{ name: "reviewer", path: "/repo/.chili/skills/reviewer/SKILL.md" }],
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
     reasoningLevel: "xhigh",
+    serviceTier: "fast",
   });
 
   const legacyPromptResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/prompt_async`, {
@@ -1073,6 +1084,7 @@ test("cleans up SSE subscriptions when the stream reader is cancelled", async ()
 class FakeRuntimeService implements RuntimeHttpService {
   modelSelection: ModelSelection | undefined;
   reasoningLevel: ReasoningLevel | undefined;
+  serviceTier: ServiceTier | undefined;
   lastPrompt: SubmitPromptInput | undefined;
   goal: ThreadGoal | undefined;
 
@@ -1111,6 +1123,7 @@ class FakeRuntimeService implements RuntimeHttpService {
       models: await this.listModels(),
       ...(this.modelSelection ? { modelSelection: this.modelSelection } : {}),
       ...(this.reasoningLevel ? { reasoningLevel: this.reasoningLevel } : {}),
+      ...(this.serviceTier ? { serviceTier: this.serviceTier } : {}),
     };
   }
 
@@ -1121,6 +1134,11 @@ class FakeRuntimeService implements RuntimeHttpService {
 
   async setReasoning(input: { sessionId: SessionId; reasoningLevel: ReasoningLevel }): Promise<RuntimeModelConfig> {
     this.reasoningLevel = input.reasoningLevel;
+    return this.getModelConfig(input.sessionId);
+  }
+
+  async setServiceTier(input: { sessionId: SessionId; serviceTier: ServiceTier }): Promise<RuntimeModelConfig> {
+    this.serviceTier = input.serviceTier;
     return this.getModelConfig(input.sessionId);
   }
 
