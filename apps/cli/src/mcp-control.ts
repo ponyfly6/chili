@@ -51,6 +51,7 @@ export interface CliMcpRuntimeOptions {
   registries: readonly MutableToolRegistry[];
   events?: { publish(event: ChiliEvent): Promise<void> };
   createId?: (prefix: string) => string;
+  deferConnect?: boolean;
 }
 
 export interface CliMcpRuntime {
@@ -73,6 +74,7 @@ class CliMcpRuntimeImpl implements CliMcpRuntime, RuntimeMcpControlService, McpR
   private loadErrors: RuntimeMcpReloadError[] = [];
   private registeredToolSources = new Set<string>();
   private generation = 0;
+  private closed = false;
 
   constructor(
     private readonly options: CliMcpRuntimeOptions,
@@ -98,11 +100,14 @@ class CliMcpRuntimeImpl implements CliMcpRuntime, RuntimeMcpControlService, McpR
   }
 
   async start(): Promise<void> {
+    this.closed = false;
     const loaded = await loadMcpConfig(this.options.cwd, this.options.chiliHome);
-    await this.applyLoadedConfig(loaded);
+    await this.applyLoadedConfig(loaded, { deferConnect: this.options.deferConnect === true });
   }
 
   async close(): Promise<void> {
+    this.closed = true;
+    this.generation += 1;
     await this.manager.disconnect();
   }
 
@@ -206,18 +211,41 @@ class CliMcpRuntimeImpl implements CliMcpRuntime, RuntimeMcpControlService, McpR
     return createMcpPromptCommands(this.manager.listPrompts().map(toPromptDefinition), this);
   }
 
-  private async applyLoadedConfig(loaded: LoadedMcpConfig): Promise<void> {
+  private async applyLoadedConfig(
+    loaded: LoadedMcpConfig,
+    options: { deferConnect?: boolean } = {},
+  ): Promise<void> {
     await this.manager.disconnect();
     this.diagnostics = loaded.diagnostics;
     this.loadErrors = loaded.errors;
     const generation = this.generation + 1;
     this.generation = generation;
     this.manager = this.createManager(loaded.config, loaded.diagnostics, generation);
+    if (options.deferConnect) {
+      this.registerAllMcpTools();
+      this.connectManagerInBackground(this.manager, generation);
+      return;
+    }
     try {
       await this.manager.connect();
     } finally {
       this.registerAllMcpTools();
     }
+  }
+
+  private connectManagerInBackground(manager: McpClientManager, generation: number): void {
+    void manager.connect()
+      .catch((error: unknown) => {
+        if (generation !== this.generation || this.closed) return;
+        this.loadErrors = [...this.loadErrors, { message: errorMessage(error) }];
+      })
+      .finally(() => {
+        if (generation !== this.generation || this.closed || this.manager !== manager) {
+          void manager.disconnect().catch(() => undefined);
+          return;
+        }
+        this.registerAllMcpTools();
+      });
   }
 
   private createManager(config: McpConfig, diagnostics: readonly McpDiagnostic[], generation = this.generation): McpClientManager {

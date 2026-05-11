@@ -44,6 +44,7 @@ async function main(): Promise<void> {
     cwd: args.cwd,
     yes: args.yes,
     quiet: args.command === "sessions" || args.command === "prompt-debug" || args.command === "mcp" || args.json,
+    deferMcpConnect: args.command === "serve",
     ...(approvalQueue ? { approvalQueue } : {}),
   };
   if (args.provider !== undefined) harnessInput.provider = args.provider;

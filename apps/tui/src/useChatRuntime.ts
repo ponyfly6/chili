@@ -115,6 +115,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   const [commandList, setCommandList] = useState<RuntimePromptCommandList | undefined>();
   const [mcpStatus, setMcpStatus] = useState<RuntimeMcpStatusResponse | undefined>();
   const requestAbortRefs = useRef(new Set<AbortController>());
+  const refreshedForStreamingRef = useRef(false);
 
   useEffect(() => {
     setActiveSessionId(options.sessionId);
@@ -235,6 +236,20 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
       return undefined;
     }
   }, [client, options.baseUrl, withAbort]);
+
+  useEffect(() => {
+    if (teamRuntime.connection.status !== "streaming") {
+      refreshedForStreamingRef.current = false;
+      return;
+    }
+    if (refreshedForStreamingRef.current) return;
+    refreshedForStreamingRef.current = true;
+    setChatFeedback((current) => current?.status === "error" ? undefined : current);
+    void refreshModelConfig();
+    void refreshPermissionConfig();
+    void refreshCommands();
+    void refreshMcpStatus();
+  }, [refreshCommands, refreshMcpStatus, refreshModelConfig, refreshPermissionConfig, teamRuntime.connection.status]);
 
   const getMcpServer = useCallback(async (server: string): Promise<RuntimeMcpServerDescriptor | undefined> => {
     try {
