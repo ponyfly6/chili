@@ -509,6 +509,23 @@ test("slash completion selection uses Up and Down without switching prompt histo
   }
 });
 
+test("slash completion Up wraps from the first item to the last item", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "/");
+
+    await press(app, () => app.mockInput.pressArrow("up"));
+    expect(app.captureCharFrame()).toContain("> /skills disable [--user|--project] <name> - Disable a skill");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("Enter executes the selected slash completion without Tab", async () => {
   const executed: TeamLiveAction[] = [];
   const app = await mountShell(withRunLoopReady(teamLiveFixture()), { executed });

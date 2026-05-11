@@ -1117,7 +1117,7 @@ export function ChatShellSurface(props: {
     }
     if ((slashCompletionOpen || skillCompletionOpen) && !key.shift && (isArrowUp(key) || isArrowDown(key))) {
       const delta = isArrowUp(key) ? -1 : 1;
-      setCompletionIndex((current) => clampIndex(current + delta, completions.length));
+      setCompletionIndex((current) => wrapIndex(current + delta, completions.length));
       return;
     }
     if (skillCompletionOpen && isTab(key)) {
@@ -3221,6 +3221,11 @@ function scrollStep(height: number): number {
 
 function clampIndex(index: number, length: number): number {
   return Math.min(Math.max(0, index), Math.max(0, length - 1));
+}
+
+function wrapIndex(index: number, length: number): number {
+  if (length <= 0) return 0;
+  return ((index % length) + length) % length;
 }
 
 function serverIndexByName(servers: readonly RuntimeMcpServerDescriptor[], name: string): number {
