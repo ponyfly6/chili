@@ -3,12 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
 import { chiliBasePromptFragment, type PromptFragment } from "@chili/core";
-import type { AgentPath, SessionId, TaskId, ThreadId } from "@chili/protocol";
+import type { AgentPath, ChiliEvent, SessionId, TaskId, ThreadId, TimestampMs } from "@chili/protocol";
 import { SkillRegistry, type Skill } from "@chili/skills";
-import type { AgentTaskRow } from "@chili/store";
+import { SqliteEventStore, type AgentTaskRow } from "@chili/store";
 import { buildCliChildPromptFragments, buildCliPromptFragments, createCliHarness, type CliHarness } from "./harness.js";
 import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
 import { runPrompt } from "./runner.js";
+import { readUserModelSelection, writeUserModelSelection } from "./user-model-state.js";
 
 test("CLI prompt fragments include base, memory/project context, and skills catalog", async () => {
   const root = await mkdtempName();
@@ -67,6 +68,110 @@ test("CLI harness promptFragments provider includes chili.base", async () => {
       cwd: repo,
     });
     expect(fragments?.some((fragment) => fragment.id === "chili.base")).toBe(true);
+  } finally {
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI harness uses the user last model for new workspaces without forcing a prompt override", async () => {
+  const root = await mkdtempName();
+  const home = join(root, "home");
+  const repo = join(root, "repo");
+  let harness: CliHarness | undefined;
+  try {
+    await mkdir(repo, { recursive: true });
+    await writeUserModelSelection(
+      { provider: "openai-codex", model: "gpt-5.5" },
+      { chiliHome: home, now: () => 1 },
+    );
+
+    harness = await createCliHarness({
+      cwd: repo,
+      chiliHome: home,
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+    });
+    const session = await harness.service.createSession({
+      sessionId: "session_user_model" as SessionId,
+      threadId: "thread_user_model" as ThreadId,
+    });
+    const config = await harness.service.getModelConfig(session.sessionId);
+
+    expect(config.modelSelection).toEqual({ provider: "openai-codex", model: "gpt-5.5" });
+    expect(harness.defaultModelSelection).toBeUndefined();
+  } finally {
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI harness prefers workspace model history over user last model", async () => {
+  const root = await mkdtempName();
+  const home = join(root, "home");
+  const repo = join(root, "repo");
+  let harness: CliHarness | undefined;
+  try {
+    await mkdir(join(repo, ".chili"), { recursive: true });
+    await writeUserModelSelection(
+      { provider: "openai-codex", model: "gpt-5.5" },
+      { chiliHome: home, now: () => 1 },
+    );
+    await writeWorkspaceModelEvent(repo, {
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+    });
+
+    harness = await createCliHarness({
+      cwd: repo,
+      chiliHome: home,
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+    });
+    const session = await harness.service.createSession({
+      sessionId: "session_workspace_model" as SessionId,
+      threadId: "thread_workspace_model" as ThreadId,
+    });
+    const config = await harness.service.getModelConfig(session.sessionId);
+
+    expect(config.modelSelection).toEqual({ provider: "deepseek", model: "deepseek-v4-pro" });
+  } finally {
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI harness persists setModel to the user last model state", async () => {
+  const root = await mkdtempName();
+  const home = join(root, "home");
+  const repo = join(root, "repo");
+  let harness: CliHarness | undefined;
+  try {
+    await mkdir(repo, { recursive: true });
+    harness = await createCliHarness({
+      cwd: repo,
+      chiliHome: home,
+      model: "fake",
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+    });
+    const session = await harness.service.createSession({
+      sessionId: "session_set_model" as SessionId,
+      threadId: "thread_set_model" as ThreadId,
+    });
+
+    await harness.service.setModel({
+      ...session,
+      modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
+    });
+
+    expect(await readUserModelSelection({ chiliHome: home })).toEqual({
+      provider: "openai-codex",
+      model: "gpt-5.5",
+    });
   } finally {
     await harness?.close();
     await rm(root, { recursive: true, force: true });
@@ -278,6 +383,38 @@ test("CLI child prompt fragments only inject follow-up context for the matching 
 
 async function mkdtempName(): Promise<string> {
   return mkdtemp(join(tmpdir(), "chili-harness-"));
+}
+
+async function writeWorkspaceModelEvent(
+  repo: string,
+  modelSelection: { provider: string; model: string },
+): Promise<void> {
+  const sessionId = "session_previous_model" as SessionId;
+  const threadId = "thread_previous_model" as ThreadId;
+  const store = new SqliteEventStore(join(repo, ".chili", "chili.sqlite"));
+  const events: ChiliEvent[] = [
+    {
+      id: "event_previous_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: repo },
+    },
+    {
+      id: "event_previous_model",
+      type: "session.model_changed",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, modelSelection },
+    },
+  ];
+  try {
+    for (const event of events) await store.append(event);
+  } finally {
+    store.close();
+  }
 }
 
 function skill(name: string, source: Skill["source"] = "project", baseDir?: string): Skill {

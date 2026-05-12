@@ -114,6 +114,7 @@ import type { CliModelName, CliReasoningLevel } from "./model.js";
 import { createCliModel, resolveCliRuntimeModelSelection } from "./model.js";
 import { createCliMcpRuntime, type CliMcpRuntime } from "./mcp-control.js";
 import { CliPrinter, PrintingEventStore } from "./printing-store.js";
+import { readUserModelSelection, writeUserModelSelection } from "./user-model-state.js";
 
 const DEV_MAX_TURNS = 128;
 const DEV_MAX_REPEATED_TOOL_CALLS = 20;
@@ -184,9 +185,19 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   if (options.provider !== undefined) cliModelInput.provider = options.provider;
   if (options.model !== undefined) cliModelInput.model = options.model;
   if (options.reasoningLevel !== undefined) cliModelInput.reasoningLevel = options.reasoningLevel;
-  const model = await createCliModel(cliModelInput);
   const explicitModelSelection = options.provider !== undefined || options.model !== undefined;
+  const persistedUserModelSelection = explicitModelSelection ? undefined : await readPersistedUserModelSelection(chiliHome);
+  const modelInput = { ...cliModelInput };
+  if (!explicitModelSelection && persistedUserModelSelection) {
+    modelInput.provider = persistedUserModelSelection.provider;
+    modelInput.model = persistedUserModelSelection.model;
+  }
+  const model = await createCliModel(modelInput);
   const runtimeModelSelection = explicitModelSelection ? resolveCliRuntimeModelSelection(cliModelInput) : undefined;
+  const serviceDefaultModelSelection = runtimeModelSelection ?? persistedUserModelSelection;
+  const persistUserModelSelection = async (input: { modelSelection: ModelSelection }): Promise<void> => {
+    await writeUserModelSelection(input.modelSelection, { chiliHome }).catch(() => undefined);
+  };
   const skillRegistry = await discoverSkills({ cwd });
   const config = await loadCliConfig(cwd, { chiliHome });
   const permissions = createPermissionProfileControl(config, options.yes ? "full-access" : "default");
@@ -267,8 +278,9 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     maxTurns: DEV_MAX_TURNS,
     contextBudget: childContextBudget,
     promptFragments: childPromptFragments,
-    ...(runtimeModelSelection ? { defaultModelSelection: runtimeModelSelection } : {}),
+    ...(serviceDefaultModelSelection ? { defaultModelSelection: serviceDefaultModelSelection } : {}),
     ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
+    onModelChanged: persistUserModelSelection,
   });
   const subagents = new LocalSubagentManager({
     store: eventStore,
@@ -370,8 +382,9 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     maxTurns: DEV_MAX_TURNS,
     contextBudget: runtimeContextBudget,
     promptFragments,
-    ...(runtimeModelSelection ? { defaultModelSelection: runtimeModelSelection } : {}),
+    ...(serviceDefaultModelSelection ? { defaultModelSelection: serviceDefaultModelSelection } : {}),
     ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
+    onModelChanged: persistUserModelSelection,
   });
   for (const tool of createGoalTools(createGoalToolController(service))) {
     registry.register(tool);
@@ -452,6 +465,16 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
       sqliteStore.close();
     },
   };
+}
+
+async function readPersistedUserModelSelection(chiliHome: string): Promise<ModelSelection | undefined> {
+  const selection = await readUserModelSelection({ chiliHome });
+  if (!selection) return undefined;
+  try {
+    return resolveCliRuntimeModelSelection(selection);
+  } catch {
+    return undefined;
+  }
 }
 
 function registerMcpResourceTools(registry: InMemoryToolRegistry, runtime: CliMcpRuntime): void {

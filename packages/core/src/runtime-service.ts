@@ -69,8 +69,15 @@ export interface RuntimeServiceOptions {
   defaultModelSelection?: ModelSelection;
   defaultReasoningLevel?: ReasoningLevel;
   defaultServiceTier?: ServiceTier;
+  onModelChanged?: (input: RuntimeModelChangedInput) => Promise<void> | void;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
+}
+
+export interface RuntimeModelChangedInput {
+  sessionId: SessionId;
+  threadId?: ThreadId;
+  modelSelection: ModelSelection;
 }
 
 export type RuntimePromptFragmentsProvider = (input: {
@@ -240,6 +247,11 @@ export class RuntimeService {
     await this.append(input, "session.model_changed", {
       sessionId: input.sessionId,
       modelSelection,
+    });
+    await this.options.onModelChanged?.({
+      sessionId: input.sessionId,
+      ...(input.threadId ? { threadId: input.threadId } : {}),
+      modelSelection: cloneModelSelection(modelSelection),
     });
     return this.buildModelConfig(input.sessionId, state);
   }

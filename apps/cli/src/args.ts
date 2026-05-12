@@ -429,7 +429,7 @@ export function usage(): string {
     "  --resume, -r <id>   Resume a session",
     "  --thread <id>       Select a thread for prompt-debug",
     "  --provider <name>   Provider name: minimax | deepseek | kimi | codex | openai-codex",
-    "  --model <pattern>   Provider alias, provider/model, or bare model id; default minimax",
+    "  --model <pattern>   Provider alias, provider/model, or bare model id; default last selected model, then minimax",
     "  --thinking <level>  Thinking level: off | minimal | low | medium | high | xhigh",
     "  --reasoning <level> Alias for --thinking",
     "  --yes, -y           Auto-approve tool permissions",
