@@ -1594,6 +1594,301 @@ test("decorative-only terminal selection is not copied", async () => {
   }
 });
 
+test("left double click selects a transcript word", async () => {
+  const copied: string[] = [];
+  const clipboard = fakeClipboard({
+    writeText: async (text) => {
+      copied.push(text);
+      return true;
+    },
+  });
+  const app = await mountShell(teamLiveFixture(), {
+    width: 90,
+    height: 18,
+    useMouse: true,
+    clipboard,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: [requireFirst(chatMessages(1))],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    },
+  });
+
+  try {
+    const target = frameTextPosition(app.captureCharFrame(), "message");
+    await act(async () => {
+      await app.mockMouse.doubleClick(target.x + 2, target.y);
+      await Bun.sleep(80);
+      await app.renderOnce();
+    });
+
+    expect(app.renderer.getSelection()?.getSelectedText()).toBe("message");
+    expect(copied.at(-1)).toBe("message");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("left double click selects an assistant markdown path token", async () => {
+  const copied: string[] = [];
+  const clipboard = fakeClipboard({
+    writeText: async (text) => {
+      copied.push(text);
+      return true;
+    },
+  });
+  const pathToken = "/repo/chili/apps/tui/src/lines.tsx:42";
+  const app = await mountShell(teamLiveFixture(), {
+    width: 100,
+    height: 18,
+    useMouse: true,
+    clipboard,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: [
+          {
+            id: "msg_assistant_double_click" as MessageId,
+            kind: "message",
+            role: "assistant",
+            createdAt: 1,
+            parts: [
+              { type: "text", id: "part_assistant_double_click" as PartId, text: `Open ${pathToken} now` },
+            ],
+          },
+        ],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    },
+  });
+
+  try {
+    const target = frameTextPosition(app.captureCharFrame(), pathToken);
+    await act(async () => {
+      await app.mockMouse.doubleClick(target.x + 8, target.y);
+      await Bun.sleep(80);
+      await app.renderOnce();
+    });
+
+    expect(app.renderer.getSelection()?.getSelectedText()).toBe(pathToken);
+    expect(copied.at(-1)).toBe(pathToken);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("left double click selects a concealed markdown word", async () => {
+  const copied: string[] = [];
+  const clipboard = fakeClipboard({
+    writeText: async (text) => {
+      copied.push(text);
+      return true;
+    },
+  });
+  const word = "fantastic";
+  const app = await mountShell(teamLiveFixture(), {
+    width: 100,
+    height: 18,
+    useMouse: true,
+    clipboard,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: [
+          {
+            id: "msg_assistant_bold_double_click" as MessageId,
+            kind: "message",
+            role: "assistant",
+            createdAt: 1,
+            parts: [
+              { type: "text", id: "part_assistant_bold_double_click" as PartId, text: `This is **${word}** now` },
+            ],
+          },
+        ],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    },
+  });
+
+  try {
+    const target = frameTextPosition(app.captureCharFrame(), word);
+    await act(async () => {
+      await app.mockMouse.doubleClick(target.x + 3, target.y);
+      await Bun.sleep(80);
+      await app.renderOnce();
+    });
+
+    expect(app.renderer.getSelection()?.getSelectedText()).toBe(word);
+    expect(copied.at(-1)).toBe(word);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("left double click selects a wrapped assistant markdown word", async () => {
+  const copied: string[] = [];
+  const clipboard = fakeClipboard({
+    writeText: async (text) => {
+      copied.push(text);
+      return true;
+    },
+  });
+  const word = "supercalifragilisticexpialidocious";
+  const app = await mountShell(teamLiveFixture(), {
+    width: 36,
+    height: 18,
+    useMouse: true,
+    clipboard,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: [
+          {
+            id: "msg_assistant_wrapped_double_click" as MessageId,
+            kind: "message",
+            role: "assistant",
+            createdAt: 1,
+            parts: [
+              { type: "text", id: "part_assistant_wrapped_double_click" as PartId, text: `Token ${word} done` },
+            ],
+          },
+        ],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    },
+  });
+
+  try {
+    const target = frameTextPosition(app.captureCharFrame(), "fragilistic");
+    await act(async () => {
+      await app.mockMouse.doubleClick(target.x + 3, target.y);
+      await Bun.sleep(80);
+      await app.renderOnce();
+    });
+
+    expect(app.renderer.getSelection()?.getSelectedText()).toBe(word);
+    expect(copied.at(-1)).toBe(word);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("left double click selects only a final assistant markdown word", async () => {
+  const copied: string[] = [];
+  const clipboard = fakeClipboard({
+    writeText: async (text) => {
+      copied.push(text);
+      return true;
+    },
+  });
+  const sentence = "I told my wife she was drawing her eyebrows too high.";
+  const app = await mountShell(teamLiveFixture(), {
+    width: 100,
+    height: 18,
+    useMouse: true,
+    clipboard,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: [
+          {
+            id: "msg_assistant_final_word_double_click" as MessageId,
+            kind: "message",
+            role: "assistant",
+            createdAt: 1,
+            parts: [
+              { type: "text", id: "part_assistant_final_word_double_click" as PartId, text: `英文：\n${sentence}` },
+            ],
+          },
+        ],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    },
+  });
+
+  try {
+    const frame = app.captureCharFrame();
+    const lineStart = frameTextPosition(frame, "I told");
+    const target = frameTextPosition(frame, "high");
+    await act(async () => {
+      await app.mockMouse.doubleClick(target.x + 2, target.y);
+      await Bun.sleep(80);
+      await app.renderOnce();
+    });
+
+    expect(selectionBgAt(app, target.x, target.y)).toBe(true);
+    expect(selectionBgAt(app, target.x + "high".length, target.y)).toBe(false);
+    expect(selectionBgAt(app, lineStart.x, lineStart.y)).toBe(false);
+    expect(copied.at(-1)).toBe("high");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("left triple click selects an assistant markdown line", async () => {
+  const copied: string[] = [];
+  const clipboard = fakeClipboard({
+    writeText: async (text) => {
+      copied.push(text);
+      return true;
+    },
+  });
+  const pathToken = "/repo/chili/apps/tui/src/lines.tsx:42";
+  const lineText = `Open ${pathToken} now`;
+  const app = await mountShell(teamLiveFixture(), {
+    width: 100,
+    height: 18,
+    useMouse: true,
+    clipboard,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: [
+          {
+            id: "msg_assistant_triple_click" as MessageId,
+            kind: "message",
+            role: "assistant",
+            createdAt: 1,
+            parts: [
+              { type: "text", id: "part_assistant_triple_click" as PartId, text: lineText },
+            ],
+          },
+        ],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    },
+  });
+
+  try {
+    const target = frameTextPosition(app.captureCharFrame(), pathToken);
+    await act(async () => {
+      await app.mockMouse.doubleClick(target.x + 8, target.y);
+      await app.mockMouse.click(target.x + 8, target.y);
+      await Bun.sleep(80);
+      await app.renderOnce();
+    });
+
+    expect(app.renderer.getSelection()?.getSelectedText()).toBe(lineText);
+    expect(copied.at(-1)).toBe(lineText);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("Shift+Up and Shift+Down scroll the transcript instead of prompt history", async () => {
   const app = await mountShell(teamLiveFixture(), {
     width: 120,
@@ -2449,6 +2744,7 @@ async function mountShell(
     runtime?: Partial<ChatRuntimeState>;
     clipboard?: ClipboardAccess;
     kittyKeyboard?: boolean;
+    useMouse?: boolean;
     localMessageTtlMs?: number;
     cwd?: string;
     skills?: readonly SkillSummary[];
@@ -2487,6 +2783,7 @@ async function mountShell(
     height: options.height ?? 40,
     exitOnCtrlC: false,
     ...(options.kittyKeyboard === undefined ? {} : { kittyKeyboard: options.kittyKeyboard }),
+    ...(options.useMouse === undefined ? {} : { useMouse: options.useMouse }),
   };
   const app = await testRender(
     <ChatShellSurface
@@ -2617,6 +2914,34 @@ function skillSummary(name: string, options: Partial<Pick<SkillSummary, "source"
 
 function emitSelection(renderer: { emit: (event: string, ...args: unknown[]) => boolean }, text: string): void {
   renderer.emit("selection", { getSelectedText: () => text });
+}
+
+function frameTextPosition(frame: string, text: string): { x: number; y: number } {
+  const lines = frame.split("\n");
+  for (const [y, line] of lines.entries()) {
+    const index = line.indexOf(text);
+    if (index >= 0) return { x: Bun.stringWidth(line.slice(0, index)), y };
+  }
+  throw new Error(`Frame did not include ${text}`);
+}
+
+function selectionBgAt(app: { renderer: { currentRenderBuffer: { width: number; buffers: { bg: Float32Array } } } }, x: number, y: number): boolean {
+  const width = app.renderer.currentRenderBuffer.width;
+  const bg = app.renderer.currentRenderBuffer.buffers.bg;
+  const offset = (y * width + x) * 4;
+  const [r, g, b, a] = hexRgba(chiliDarkTheme.colors.menu.selectedBackground);
+  return Math.abs((bg[offset] ?? 0) - r) < 0.001
+    && Math.abs((bg[offset + 1] ?? 0) - g) < 0.001
+    && Math.abs((bg[offset + 2] ?? 0) - b) < 0.001
+    && Math.abs((bg[offset + 3] ?? 0) - a) < 0.001;
+}
+
+function hexRgba(hex: string): [number, number, number, number] {
+  const value = hex.replace(/^#/, "");
+  const r = Number.parseInt(value.slice(0, 2), 16) / 255;
+  const g = Number.parseInt(value.slice(2, 4), 16) / 255;
+  const b = Number.parseInt(value.slice(4, 6), 16) / 255;
+  return [r, g, b, 1];
 }
 
 async function mountChatApp(
