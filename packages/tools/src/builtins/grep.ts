@@ -1,3 +1,4 @@
+import { stat } from "node:fs/promises";
 import { relative, resolve } from "node:path";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
 import { runProcess } from "../process.js";
@@ -7,6 +8,7 @@ export type GrepOutputMode = "content" | "files_with_matches" | "count";
 export interface GrepInput {
   pattern: string;
   path?: string;
+  paths?: string[];
   glob?: string;
   outputMode?: GrepOutputMode;
   beforeContext?: number;
@@ -24,8 +26,8 @@ export function createGrepTool(): ChiliToolDefinition<GrepInput> {
   return {
     name: "grep",
     aliases: ["grep_search"],
-    searchHint: "Search file contents with ripgrep, optional glob/type filters, context lines, counts, or file names.",
-    description: "Search workspace file contents using ripgrep.",
+    searchHint: "Search file contents with ripgrep, optional path/paths, glob/type filters, context lines, counts, or file names.",
+    description: "Search workspace file contents using ripgrep. Use paths for multiple search roots.",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,
@@ -36,6 +38,7 @@ export function createGrepTool(): ChiliToolDefinition<GrepInput> {
       properties: {
         pattern: { type: "string" },
         path: { type: "string" },
+        paths: { type: "array", items: { type: "string" } },
         glob: { type: "string" },
         outputMode: { type: "string", enum: ["content", "files_with_matches", "count"] },
         output_mode: { type: "string", enum: ["content", "files_with_matches", "count"] },
@@ -82,11 +85,21 @@ export function createGrepTool(): ChiliToolDefinition<GrepInput> {
 
       const value: GrepInput = { pattern, outputMode };
       const path = input.path;
+      const paths = input.paths;
       const glob = input.glob;
       const type = input.type;
       if (path !== undefined) {
         if (typeof path !== "string" || path.trim().length === 0) return { ok: false, message: "path must be a non-empty string" };
         value.path = path;
+      }
+      if (paths !== undefined) {
+        if (!Array.isArray(paths) || paths.length === 0) return { ok: false, message: "paths must be a non-empty array" };
+        const parsedPaths: string[] = [];
+        for (const item of paths) {
+          if (typeof item !== "string" || item.trim().length === 0) return { ok: false, message: "paths entries must be non-empty strings" };
+          parsedPaths.push(item);
+        }
+        value.paths = parsedPaths;
       }
       if (glob !== undefined) {
         if (typeof glob !== "string" || glob.trim().length === 0) return { ok: false, message: "glob must be a non-empty string" };
@@ -125,10 +138,11 @@ export function createGrepTool(): ChiliToolDefinition<GrepInput> {
     approval(input) {
       return {
         permission: "grep",
-        patterns: [input.path ?? "*"],
+        patterns: input.paths ?? splitSearchPathList(input.path) ?? ["*"],
         metadata: {
           pattern: input.pattern,
           path: input.path,
+          paths: input.paths,
           glob: input.glob,
           outputMode: input.outputMode ?? "content",
         },
@@ -136,8 +150,8 @@ export function createGrepTool(): ChiliToolDefinition<GrepInput> {
     },
     async execute(input, context) {
       const workspace = resolve(context.cwd);
-      const searchPath = input.path ? resolveWorkspacePath(workspace, input.path) : { absolutePath: workspace, relativePath: "." };
-      const args = buildRipgrepArgs(input, searchPath.relativePath === "." ? "." : searchPath.relativePath);
+      const searchPaths = await resolveSearchPaths(workspace, input);
+      const args = buildRipgrepArgs(input, searchPaths.map((path) => path.relativePath));
       const result = await runProcess("rg", args, {
         cwd: workspace,
         signal: context.signal,
@@ -163,6 +177,7 @@ export function createGrepTool(): ChiliToolDefinition<GrepInput> {
         metadata: {
           pattern: input.pattern,
           path: input.path,
+          paths: input.paths,
           glob: input.glob,
           outputMode: input.outputMode ?? "content",
           lineCount: visible.length,
@@ -176,7 +191,7 @@ export function createGrepTool(): ChiliToolDefinition<GrepInput> {
   };
 }
 
-function buildRipgrepArgs(input: GrepInput, searchPath: string): string[] {
+function buildRipgrepArgs(input: GrepInput, searchPaths: string[]): string[] {
   const args = ["--color=never", "--no-heading", "--max-columns", "500"];
   const outputMode = input.outputMode ?? "content";
   if (outputMode === "content" && input.lineNumbers !== false) args.push("--line-number");
@@ -191,17 +206,49 @@ function buildRipgrepArgs(input: GrepInput, searchPath: string): string[] {
     if (input.beforeContext !== undefined) args.push("--before-context", String(input.beforeContext));
     if (input.afterContext !== undefined) args.push("--after-context", String(input.afterContext));
   }
-  args.push("--", input.pattern, searchPath);
+  args.push("--", input.pattern, ...searchPaths);
   return args;
 }
 
 function resolveWorkspacePath(workspace: string, path: string): { absolutePath: string; relativePath: string } {
   const absolutePath = resolve(workspace, path);
   const relativePath = relative(workspace, absolutePath);
+  if (relativePath === "") {
+    return { absolutePath, relativePath: "." };
+  }
   if (!isSafeRelativePath(relativePath)) {
     throw new Error(`Path must stay inside the workspace: ${path}`);
   }
   return { absolutePath, relativePath: relativePath.split(/[\\/]/).join("/") };
+}
+
+async function resolveSearchPaths(workspace: string, input: GrepInput): Promise<Array<{ absolutePath: string; relativePath: string }>> {
+  const rawPaths = input.paths ?? await normalizePathString(workspace, input.path);
+  return rawPaths.map((path) => resolveWorkspacePath(workspace, path));
+}
+
+async function normalizePathString(workspace: string, path: string | undefined): Promise<string[]> {
+  if (path === undefined) return ["."];
+  const split = splitSearchPathList(path);
+  if (!split || split.length <= 1) return [path];
+  if (await pathExists(resolve(workspace, path))) return [path];
+  return split;
+}
+
+function splitSearchPathList(path: string | undefined): string[] | undefined {
+  if (path === undefined) return undefined;
+  const parts = path.trim().split(/\s+/).filter(Boolean);
+  return parts.length > 1 ? parts : [path];
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch (error) {
+    if (isRecord(error) && error.code === "ENOENT") return false;
+    return true;
+  }
 }
 
 function isSafeRelativePath(path: string): boolean {

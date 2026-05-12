@@ -142,6 +142,9 @@ function globToRegex(pattern: string): string {
 function resolveWorkspacePath(workspace: string, path: string): { absolutePath: string; relativePath: string } {
   const absolutePath = resolve(workspace, path);
   const relativePath = relative(workspace, absolutePath);
+  if (relativePath === "") {
+    return { absolutePath, relativePath: "." };
+  }
   if (!isSafeRelativePath(relativePath)) {
     throw new Error(`Path must stay inside the workspace: ${path}`);
   }

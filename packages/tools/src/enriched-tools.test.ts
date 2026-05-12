@@ -47,8 +47,12 @@ test("write tools require a fresh full read before modifying existing files", as
 test("glob, grep, and tool_search expose repository discovery tools", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-tools-search-"));
   try {
+    await mkdir(join(workspace, "apps", "cli", "src"), { recursive: true });
+    await mkdir(join(workspace, "packages", "mcp", "src"), { recursive: true });
     await writeFile(join(workspace, "alpha.ts"), "export const alpha = 1;\n", "utf8");
     await writeFile(join(workspace, "beta.md"), "alpha notes\n", "utf8");
+    await writeFile(join(workspace, "apps", "cli", "src", "runner.ts"), "export const chiliNeedle = 'cli';\n", "utf8");
+    await writeFile(join(workspace, "packages", "mcp", "src", "client.ts"), "export const chiliNeedle = 'mcp';\n", "utf8");
     const registry = registryWithCoreTools();
     const executor = createExecutor(registry);
 
@@ -56,9 +60,35 @@ test("glob, grep, and tool_search expose repository discovery tools", async () =
     expect(glob.status).toBe("completed");
     if (glob.status === "completed") expect(glob.result.output).toContain("alpha.ts");
 
+    const rootGlob = await executor.execute(toolInput("glob", { pattern: "**/*.ts", path: "." }, workspace));
+    expect(rootGlob.status).toBe("completed");
+    if (rootGlob.status === "completed") expect(rootGlob.result.output).toContain("alpha.ts");
+
     const grep = await executor.execute(toolInput("grep", { pattern: "alpha", headLimit: 5 }, workspace));
     expect(grep.status).toBe("completed");
     if (grep.status === "completed") expect(grep.result.output).toContain("alpha");
+
+    const rootGrep = await executor.execute(toolInput("grep", { pattern: "alpha", path: ".", headLimit: 5 }, workspace));
+    expect(rootGrep.status).toBe("completed");
+    if (rootGrep.status === "completed") expect(rootGrep.result.output).toContain("alpha");
+
+    const splitPathsGrep = await executor.execute(
+      toolInput("grep", { pattern: "chiliNeedle", path: "apps/cli/src packages/mcp/src", headLimit: 10 }, workspace),
+    );
+    expect(splitPathsGrep.status).toBe("completed");
+    if (splitPathsGrep.status === "completed") {
+      expect(splitPathsGrep.result.output).toContain("apps/cli/src/runner.ts");
+      expect(splitPathsGrep.result.output).toContain("packages/mcp/src/client.ts");
+    }
+
+    const pathsGrep = await executor.execute(
+      toolInput("grep", { pattern: "chiliNeedle", paths: ["apps/cli/src", "packages/mcp/src"], headLimit: 10 }, workspace),
+    );
+    expect(pathsGrep.status).toBe("completed");
+    if (pathsGrep.status === "completed") {
+      expect(pathsGrep.result.output).toContain("apps/cli/src/runner.ts");
+      expect(pathsGrep.result.output).toContain("packages/mcp/src/client.ts");
+    }
 
     const search = await executor.execute(toolInput("tool_search", { query: "write file" }, workspace));
     expect(search.status).toBe("completed");
