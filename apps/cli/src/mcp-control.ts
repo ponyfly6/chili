@@ -52,6 +52,7 @@ export interface CliMcpRuntimeOptions {
   events?: { publish(event: ChiliEvent): Promise<void> };
   createId?: (prefix: string) => string;
   deferConnect?: boolean;
+  connectMode?: "eager" | "background" | "manual";
 }
 
 export interface CliMcpRuntime {
@@ -102,7 +103,8 @@ class CliMcpRuntimeImpl implements CliMcpRuntime, RuntimeMcpControlService, McpR
   async start(): Promise<void> {
     this.closed = false;
     const loaded = await loadMcpConfig(this.options.cwd, this.options.chiliHome);
-    await this.applyLoadedConfig(loaded, { deferConnect: this.options.deferConnect === true });
+    const connectMode = this.options.connectMode ?? (this.options.deferConnect === true ? "background" : "eager");
+    await this.applyLoadedConfig(loaded, { connectMode });
   }
 
   async close(): Promise<void> {
@@ -213,7 +215,7 @@ class CliMcpRuntimeImpl implements CliMcpRuntime, RuntimeMcpControlService, McpR
 
   private async applyLoadedConfig(
     loaded: LoadedMcpConfig,
-    options: { deferConnect?: boolean } = {},
+    options: { connectMode?: "eager" | "background" | "manual" } = {},
   ): Promise<void> {
     await this.manager.disconnect();
     this.diagnostics = loaded.diagnostics;
@@ -221,7 +223,12 @@ class CliMcpRuntimeImpl implements CliMcpRuntime, RuntimeMcpControlService, McpR
     const generation = this.generation + 1;
     this.generation = generation;
     this.manager = this.createManager(loaded.config, loaded.diagnostics, generation);
-    if (options.deferConnect) {
+    const connectMode = options.connectMode ?? "eager";
+    if (connectMode === "manual") {
+      this.registerAllMcpTools();
+      return;
+    }
+    if (connectMode === "background") {
       this.registerAllMcpTools();
       this.connectManagerInBackground(this.manager, generation);
       return;

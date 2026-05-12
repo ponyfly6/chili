@@ -56,6 +56,7 @@ export interface CliArgs {
   mcpUrl?: string;
   mcpDescription?: string;
   mcpEnabled?: boolean;
+  mcpMode?: "eager" | "off";
   mcpCallbackUrl?: string;
   mcpScopes?: string[];
   skillName?: string;
@@ -306,6 +307,14 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       result.json = true;
       continue;
     }
+    if (arg === "--mcp") {
+      result.mcpMode = "eager";
+      continue;
+    }
+    if (arg === "--no-mcp") {
+      result.mcpMode = "off";
+      continue;
+    }
     if (arg === "--content") {
       result.content = true;
       continue;
@@ -424,6 +433,8 @@ export function usage(): string {
     "  --thinking <level>  Thinking level: off | minimal | low | medium | high | xhigh",
     "  --reasoning <level> Alias for --thinking",
     "  --yes, -y           Auto-approve tool permissions",
+    "  --mcp               Connect configured MCP servers for this CLI run",
+    "  --no-mcp            Do not connect configured MCP servers",
     "  --json              Print machine-readable JSON for supported read commands",
     "  --user              Use user scope for memory or skills commands",
     "  --project           Use project scope for memory or skills commands",

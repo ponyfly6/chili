@@ -149,6 +149,10 @@ export function createSdkMcpTransport(server: McpServerConfig): Transport {
     return new StdioClientTransport({
       command: server.command,
       args: server.args,
+      // MCP stdio uses stdout for protocol messages; server diagnostics commonly go to stderr.
+      // Keep child stderr out of Chili's CLI/TUI output so noisy MCP startups (for example uv/uvx
+      // dependency resolution or Python logging) do not pollute user-visible agent responses.
+      stderr: "ignore",
       ...(server.env ? { env: server.env } : {}),
       ...(server.cwd ? { cwd: server.cwd } : {}),
     }) as unknown as Transport;

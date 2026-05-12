@@ -40,11 +40,16 @@ async function main(): Promise<void> {
   }
 
   const approvalQueue = args.command === "serve" ? new DeferredApprovalQueue() : undefined;
+  const mcpConnectMode: "eager" | "background" | "manual" = args.command === "mcp"
+    ? "eager"
+    : args.command === "serve"
+      ? args.mcpMode === "off" ? "manual" : "background"
+      : args.mcpMode === "eager" ? "eager" : "manual";
   const harnessInput: Parameters<typeof createCliHarness>[0] = {
     cwd: args.cwd,
     yes: args.yes,
     quiet: args.command === "sessions" || args.command === "prompt-debug" || args.command === "mcp" || args.json,
-    deferMcpConnect: args.command === "serve",
+    mcpConnectMode,
     ...(approvalQueue ? { approvalQueue } : {}),
   };
   if (args.provider !== undefined) harnessInput.provider = args.provider;

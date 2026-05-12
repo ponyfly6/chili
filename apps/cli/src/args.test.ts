@@ -78,6 +78,19 @@ test("parses thinking and reasoning levels", () => {
   });
 });
 
+test("parses MCP startup flags for CLI runs", () => {
+  expect(parseArgs(["--mcp", "hello"])).toMatchObject({
+    command: "run",
+    mcpMode: "eager",
+    prompt: "hello",
+  });
+  expect(parseArgs(["--no-mcp", "hello"])).toMatchObject({
+    command: "run",
+    mcpMode: "off",
+    prompt: "hello",
+  });
+});
+
 test("parses team status and nested team view commands", () => {
   expect(parseArgs(["team", "status", "team_1", "--json"])).toMatchObject({
     command: "team",

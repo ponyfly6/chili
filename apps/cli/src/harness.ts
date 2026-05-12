@@ -131,6 +131,7 @@ export interface CliHarnessOptions {
   approvalQueue?: DeferredApprovalQueue;
   chiliHome?: string;
   deferMcpConnect?: boolean;
+  mcpConnectMode?: "eager" | "background" | "manual";
 }
 
 export interface CliHarness {
@@ -419,7 +420,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     registries: [registry, childRegistry],
     events: { publish: (event: ChiliEvent) => eventStore.append(event) },
     createId,
-    deferConnect: options.deferMcpConnect === true,
+    connectMode: options.mcpConnectMode ?? (options.deferMcpConnect === true ? "background" : "eager"),
   }, baseCommands);
   commands = mcpRuntime.commands;
   registerMcpResourceTools(registry, mcpRuntime);
