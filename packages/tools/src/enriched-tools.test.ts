@@ -15,14 +15,16 @@ import { createToolSearchTool } from "./builtins/tool-search.js";
 import { createWriteFileTool } from "./builtins/write-file.js";
 import { InMemoryToolRegistry } from "./registry.js";
 import { ToolExecutor } from "./executor.js";
+import { FileReadStateStore } from "./file-read-state.js";
 import type { ExecuteToolInput, ToolAccessPolicyResolver } from "./types.js";
 import type { SnapshotProvider, SnapshotRecord, SnapshotRevertResult } from "./types.js";
 
-test("write tools require a fresh full read before modifying existing files", async () => {
+test("write tools require observed target text or a fresh full read before modifying existing files", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-tools-read-state-"));
   try {
     await writeFile(join(workspace, "a.txt"), "old\n", "utf8");
     const registry = registryWithCoreTools();
+    registry.register(createApplyPatchTool());
     const executor = createExecutor(registry);
 
     const unreadEdit = await executor.execute(toolInput("edit", { filePath: "a.txt", oldString: "old", newString: "new" }, workspace));
@@ -39,6 +41,87 @@ test("write tools require a fresh full read before modifying existing files", as
     const staleWrite = await executor.execute(toolInput("write", { filePath: "a.txt", content: "next\n" }, workspace));
     expect(staleWrite.status).toBe("failed");
     if (staleWrite.status === "failed") expect(staleWrite.error.message).toContain("File changed since it was read");
+
+    await writeFile(join(workspace, "b.txt"), "before\nneedle\nother\n", "utf8");
+    const partialRead = await executor.execute(toolInput("read", { filePath: "b.txt", offset: 2, limit: 1 }, workspace));
+    expect(partialRead.status).toBe("completed");
+    const partialEdit = await executor.execute(toolInput("edit", { filePath: "b.txt", oldString: "needle", newString: "changed" }, workspace));
+    expect(partialEdit.status).toBe("completed");
+    expect(await readFile(join(workspace, "b.txt"), "utf8")).toBe("before\nchanged\nother\n");
+
+    await writeFile(join(workspace, "c.txt"), "first\nsecond\nthird\n", "utf8");
+    const unrelatedRead = await executor.execute(toolInput("read", { filePath: "c.txt", offset: 1, limit: 1 }, workspace));
+    expect(unrelatedRead.status).toBe("completed");
+    const unseenEdit = await executor.execute(toolInput("edit", { filePath: "c.txt", oldString: "third", newString: "changed" }, workspace));
+    expect(unseenEdit.status).toBe("failed");
+    if (unseenEdit.status === "failed") expect(unseenEdit.error.message).toContain("Read the target text");
+
+    await writeFile(join(workspace, "d.txt"), "before\nneedle\nother\n", "utf8");
+    const staleRangeRead = await executor.execute(toolInput("read", { filePath: "d.txt", offset: 2, limit: 1 }, workspace));
+    expect(staleRangeRead.status).toBe("completed");
+    await writeFile(join(workspace, "d.txt"), "before\nneedle\nother\nextra\n", "utf8");
+    const staleRangeEdit = await executor.execute(toolInput("edit", { filePath: "d.txt", oldString: "needle", newString: "changed" }, workspace));
+    expect(staleRangeEdit.status).toBe("failed");
+    if (staleRangeEdit.status === "failed") expect(staleRangeEdit.error.message).toContain("File changed since the target text was read");
+
+    await writeFile(join(workspace, "e.txt"), "old\n", "utf8");
+    const partialWriteRead = await executor.execute(toolInput("read", { filePath: "e.txt", offset: 1, limit: 1 }, workspace));
+    expect(partialWriteRead.status).toBe("completed");
+    const partialWrite = await executor.execute(toolInput("write", { filePath: "e.txt", content: "new\n" }, workspace));
+    expect(partialWrite.status).toBe("failed");
+    if (partialWrite.status === "failed") expect(partialWrite.error.message).toContain("Read e.txt before modifying");
+
+    await writeFile(join(workspace, "f.txt"), "alpha\nneedle\nomega\n", "utf8");
+    const patchRead = await executor.execute(toolInput("read", { filePath: "f.txt", offset: 2, limit: 1 }, workspace));
+    expect(patchRead.status).toBe("completed");
+    const patch = await executor.execute(
+      toolInput(
+        "apply_patch",
+        {
+          operations: [{ type: "replace", path: "f.txt", oldText: "needle", newText: "patched" }],
+        },
+        workspace,
+      ),
+    );
+    expect(patch.status).toBe("completed");
+    expect(await readFile(join(workspace, "f.txt"), "utf8")).toBe("alpha\npatched\nomega\n");
+
+    const largeLines = Array.from({ length: 1200 }, (_, index) => `line-${index + 1}`);
+    largeLines[1099] = "deep-needle";
+    await writeFile(join(workspace, "large.txt"), `${largeLines.join("\n")}\n`, "utf8");
+    const deepRead = await executor.execute(toolInput("read", { filePath: "large.txt", offset: 1100, limit: 1, maxBytes: 64 }, workspace));
+    expect(deepRead.status).toBe("completed");
+    if (deepRead.status === "completed") {
+      expect(deepRead.result.output).toContain("deep-needle");
+      expect(deepRead.result.metadata?.truncated).toBe(false);
+    }
+    const deepEdit = await executor.execute(
+      toolInput("edit", { filePath: "large.txt", oldString: "deep-needle", newString: "deep-changed" }, workspace),
+    );
+    expect(deepEdit.status).toBe("completed");
+    expect(await readFile(join(workspace, "large.txt"), "utf8")).toContain("deep-changed");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("file read state evicts old range snapshots by content budget", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-read-state-lru-"));
+  try {
+    const first = join(workspace, "first.txt");
+    const second = join(workspace, "second.txt");
+    await writeFile(first, "alpha-first\n", "utf8");
+    await writeFile(second, "beta-second\n", "utf8");
+    const state = new FileReadStateStore({ maxRecords: 10, maxRangeContentBytes: 12 });
+
+    await state.recordTextRangeRead(workspace, first, "alpha-first");
+    await state.recordTextRangeRead(workspace, second, "beta-second");
+
+    await expectRejectsWith(
+      state.assertObservedText(workspace, first, "alpha-first"),
+      "Read first.txt before modifying",
+    );
+    await state.assertObservedText(workspace, second, "beta-second");
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
@@ -563,6 +646,17 @@ function toolInput(toolName: string, input: unknown, cwd: string, callId?: ToolC
 function createSequentialId(): (prefix: string) => string {
   let index = 0;
   return (prefix) => `${prefix}_${++index}`;
+}
+
+async function expectRejectsWith(promise: Promise<unknown>, message: string): Promise<void> {
+  try {
+    await promise;
+  } catch (error) {
+    expect(error).toBeInstanceOf(Error);
+    if (error instanceof Error) expect(error.message).toContain(message);
+    return;
+  }
+  throw new Error(`Expected promise to reject with ${message}`);
 }
 
 function failingSnapshotProvider(): SnapshotProvider {

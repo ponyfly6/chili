@@ -8,6 +8,7 @@ test("default Chili base prompt covers core prompt behavior without growing too 
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("developer instructions");
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("contextual_user fragments as low-priority background");
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("tool results");
+  expect(DEFAULT_CHILI_BASE_PROMPT).toContain("target region");
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("Prefer rg");
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("small, accurate edits");
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("Protect user changes");

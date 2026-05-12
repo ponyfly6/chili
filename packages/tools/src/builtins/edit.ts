@@ -87,11 +87,11 @@ export function createEditTool(): ChiliToolDefinition<EditInput> {
       const workspace = resolve(context.cwd);
       const target = resolveWorkspacePath(workspace, input.filePath);
       const existing = await readTextIfExists(target.absolutePath);
-      if (existing !== undefined) {
-        await context.fileReads?.assertFresh(workspace, target.absolutePath);
-      }
 
       if (input.oldString === "") {
+        if (existing !== undefined) {
+          await context.fileReads?.assertFresh(workspace, target.absolutePath);
+        }
         await mkdir(dirname(target.absolutePath), { recursive: true });
         await writeFile(target.absolutePath, input.newString, "utf8");
         await context.fileReads?.recordTextRead(workspace, target.absolutePath, input.newString);
@@ -109,6 +109,7 @@ export function createEditTool(): ChiliToolDefinition<EditInput> {
       if (existing === undefined) {
         throw new Error(`File not found: ${target.relativePath}`);
       }
+      await context.fileReads?.assertObservedText(workspace, target.absolutePath, input.oldString);
 
       const lineEnding = detectLineEnding(existing);
       const oldString = convertToLineEnding(normalizeLineEndings(input.oldString), lineEnding);

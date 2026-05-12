@@ -343,7 +343,19 @@ async function assertPatchReadState(
     return;
   }
 
-  await fileReads.assertFresh(workspace, target.absolutePath);
+  if (operation.type === "replace") {
+    await fileReads.assertObservedText(workspace, target.absolutePath, operation.oldText);
+    return;
+  }
+
+  if (operation.type === "delete") {
+    await fileReads.assertFresh(workspace, target.absolutePath);
+    return;
+  }
+
+  for (const chunk of operation.chunks) {
+    await fileReads.assertObservedText(workspace, target.absolutePath, chunk.oldLines.join("\n"));
+  }
   if (operation.type === "raw_update" && operation.movePath) {
     const outputPath = resolveWorkspacePath(workspace, operation.movePath);
     if (outputPath.absolutePath !== target.absolutePath) {

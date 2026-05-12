@@ -1,5 +1,7 @@
-import { readFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { open, stat } from "node:fs/promises";
 import { resolve, relative } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
 
 export interface ReadFileInput {
@@ -77,14 +79,22 @@ export function createReadFileTool(): ChiliToolDefinition<ReadFileInput> {
         throw new Error(`read only supports files inside the workspace: ${input.filePath}`);
       }
 
-      const buffer = await readFile(target);
       const maxBytes = input.maxBytes ?? 256_000;
-      const truncated = buffer.byteLength > maxBytes;
-      const rawContent = buffer.subarray(0, maxBytes).toString("utf8");
-      const content = sliceLines(rawContent, input.offset, input.limit);
+      const rangeOptions: { offset?: number; limit?: number; maxBytes: number } = { maxBytes };
+      if (input.offset !== undefined) rangeOptions.offset = input.offset;
+      if (input.limit !== undefined) rangeOptions.limit = input.limit;
+      const selection = input.offset === undefined && input.limit === undefined
+        ? await readPrefix(target, maxBytes)
+        : await readLineRange(target, rangeOptions);
+      const { content, truncated, bytes } = selection;
       const fullRead = !truncated && input.offset === undefined && input.limit === undefined;
       if (fullRead) {
-        await context.fileReads?.recordTextRead(workspace, target, rawContent);
+        await context.fileReads?.recordTextRead(workspace, target, content);
+      } else {
+        await context.fileReads?.recordTextRangeRead(workspace, target, content, {
+          ...(input.offset !== undefined ? { offset: input.offset } : {}),
+          ...(input.limit !== undefined ? { limit: input.limit } : {}),
+        });
       }
 
       return {
@@ -92,7 +102,7 @@ export function createReadFileTool(): ChiliToolDefinition<ReadFileInput> {
         output: truncated ? `${content}\n[truncated after ${maxBytes} bytes]` : content,
         metadata: {
           path: rel,
-          bytes: buffer.byteLength,
+          bytes,
           truncated,
         },
       };
@@ -116,10 +126,108 @@ function isPositiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value > 0;
 }
 
-function sliceLines(content: string, offset = 1, limit?: number): string {
-  if (offset === 1 && limit === undefined) return content;
-  const lines = content.split("\n");
-  const start = offset - 1;
-  const end = limit === undefined ? undefined : start + limit;
-  return lines.slice(start, end).join("\n");
+interface ReadSelection {
+  content: string;
+  bytes: number;
+  truncated: boolean;
+}
+
+async function readPrefix(path: string, maxBytes: number): Promise<ReadSelection> {
+  const info = await stat(path);
+  const bytesToRead = Math.min(info.size, maxBytes);
+  if (bytesToRead === 0) {
+    return { content: "", bytes: info.size, truncated: false };
+  }
+
+  const file = await open(path, "r");
+  try {
+    const buffer = Buffer.alloc(bytesToRead);
+    const { bytesRead } = await file.read(buffer, 0, bytesToRead, 0);
+    return {
+      content: buffer.subarray(0, bytesRead).toString("utf8"),
+      bytes: info.size,
+      truncated: info.size > maxBytes,
+    };
+  } finally {
+    await file.close();
+  }
+}
+
+async function readLineRange(
+  path: string,
+  options: { offset?: number; limit?: number; maxBytes: number },
+): Promise<ReadSelection> {
+  const info = await stat(path);
+  const startLine = options.offset ?? 1;
+  const endLineExclusive = options.limit === undefined ? Number.POSITIVE_INFINITY : startLine + options.limit;
+  const stream = createReadStream(path);
+  const decoder = new StringDecoder("utf8");
+  let pending = "";
+  let lineNumber = 1;
+  let output = "";
+  let outputBytes = 0;
+  let selectedLines = 0;
+  let truncated = false;
+  let stop = false;
+  let endedWithNewline = false;
+
+  const appendLine = (line: string): void => {
+    if (lineNumber >= startLine && lineNumber < endLineExclusive) {
+      const prefix = selectedLines > 0 ? "\n" : "";
+      const appended = appendLimited(output, outputBytes, `${prefix}${line}`, options.maxBytes);
+      output = appended.output;
+      outputBytes = appended.outputBytes;
+      truncated = truncated || appended.truncated;
+      selectedLines += 1;
+    }
+    lineNumber += 1;
+    if (truncated || lineNumber >= endLineExclusive) stop = true;
+  };
+
+  try {
+    for await (const chunk of stream) {
+      if (stop) break;
+      const text = decoder.write(chunk as Buffer);
+      endedWithNewline = text.endsWith("\n");
+      const lines = `${pending}${text}`.split("\n");
+      pending = lines.pop() ?? "";
+      for (const line of lines) {
+        appendLine(line);
+        if (stop) break;
+      }
+    }
+    if (!stop) {
+      const tail = decoder.end();
+      const finalText = `${pending}${tail}`;
+      if (finalText.length > 0 || endedWithNewline) appendLine(finalText);
+    }
+  } finally {
+    stream.destroy();
+  }
+
+  return { content: output, bytes: info.size, truncated };
+}
+
+function appendLimited(
+  output: string,
+  outputBytes: number,
+  next: string,
+  maxBytes: number,
+): { output: string; outputBytes: number; truncated: boolean } {
+  if (next.length === 0) return { output, outputBytes, truncated: false };
+  const remaining = maxBytes - outputBytes;
+  if (remaining <= 0) return { output, outputBytes, truncated: true };
+  const nextBuffer = Buffer.from(next, "utf8");
+  if (nextBuffer.byteLength <= remaining) {
+    return {
+      output: `${output}${next}`,
+      outputBytes: outputBytes + nextBuffer.byteLength,
+      truncated: false,
+    };
+  }
+  return {
+    output: `${output}${nextBuffer.subarray(0, remaining).toString("utf8")}`,
+    outputBytes: maxBytes,
+    truncated: true,
+  };
 }

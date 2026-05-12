@@ -10,6 +10,7 @@ export const DEFAULT_CHILI_BASE_PROMPT = [
   "",
   "Code work:",
   "- Read the relevant code before editing. Follow existing patterns, names, and local helper APIs.",
+  "- Before modifying an existing file, read the exact target region first; use grep plus partial reads for large files, and full reads for full-file rewrites.",
   "- Prefer rg for search. Use small, accurate edits and keep unrelated refactors out of scope.",
   "- Protect user changes. Do not overwrite work you did not make, and do not use destructive git commands unless explicitly asked.",
   "",
