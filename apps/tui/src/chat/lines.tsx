@@ -1,6 +1,9 @@
 import { StyledText, type MouseEvent, type TextChunk } from "@opentui/core";
+import { useRenderer } from "@opentui/react";
+import { useRef } from "react";
 import { fileLinksForText, fileUrlWithPosition, type FileLinkRange, type FileLinkTarget } from "./file-links.js";
 import { wrapTerminalText } from "./markdown.js";
+import { selectTextOnMultiClick, type TextClickState } from "./text-selection.js";
 
 export interface TranscriptLineModel {
   key: string;
@@ -21,6 +24,8 @@ export function TranscriptLine(props: {
   onOpenFile?: OpenFileLinkHandler | undefined;
   selectionColors?: TranscriptSelectionColors | undefined;
 }) {
+  const renderer = useRenderer();
+  const lastClickRef = useRef<TextClickState | null>(null);
   const content = linkedLineContent(props.line);
   return (
     <text
@@ -32,10 +37,15 @@ export function TranscriptLine(props: {
       {...(props.selectionColors?.selectionFg === undefined ? {} : { selectionFg: props.selectionColors.selectionFg })}
       onMouseDown={(event: MouseEvent) => {
         const link = fileLinkAtMouseColumn(props.line.fileLinks, event);
-        if (!link || !props.onOpenFile) return;
+        if (link && props.onOpenFile) {
+          event.preventDefault();
+          event.stopPropagation();
+          props.onOpenFile(link.target);
+          return;
+        }
+        if (!selectTextOnMultiClick(renderer, lastClickRef, { key: props.line.key, text: props.line.text, event })) return;
         event.preventDefault();
         event.stopPropagation();
-        props.onOpenFile(link.target);
       }}
     />
   );

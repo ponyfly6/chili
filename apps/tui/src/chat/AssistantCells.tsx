@@ -1,10 +1,13 @@
-import { CodeRenderable, RGBA, SyntaxStyle, type RenderNodeContext, type StyleDefinition } from "@opentui/core";
+import { CodeRenderable, RGBA, SyntaxStyle, type MouseEvent, type RenderNodeContext, type StyleDefinition } from "@opentui/core";
 import type { Token } from "marked";
 import type { TuiTheme } from "../theme/index.js";
 import { fileLinksForText } from "./file-links.js";
 import { TranscriptLines, type TranscriptLineModel } from "./lines.js";
 import type { MarkdownLineTone } from "./markdown.js";
 import { historyRenderModel } from "./render-model.js";
+import { selectTextOnMultiClick, type TextClickState } from "./text-selection.js";
+
+const assistantMarkdownClickRef: { current: TextClickState | null } = { current: null };
 
 export function AssistantTextCell(props: { lines: readonly TranscriptLineModel[] }) {
   return <TranscriptLines lines={props.lines} />;
@@ -18,11 +21,23 @@ export function AssistantMarkdownCell(props: {
   theme: TuiTheme;
   fallbackLines: readonly TranscriptLineModel[];
 }) {
+  const renderNode = assistantMarkdownRenderNode(props.theme);
   const content = props.text.trim().length === 0 ? "..." : props.text;
   const width = Math.max(1, Number.isFinite(props.width) ? Math.floor(props.width) : 80);
   if (content.trim().length === 0) return <AssistantTextCell lines={props.fallbackLines} />;
   return (
-    <box width={width} maxWidth={width} flexDirection="row" overflow="hidden">
+    <box
+      width={width}
+      maxWidth={width}
+      flexDirection="row"
+      overflow="hidden"
+      onMouseDown={(event: MouseEvent) => {
+        const renderer = event.target?.ctx;
+        if (!renderer || !selectTextOnMultiClick(renderer, assistantMarkdownClickRef, { event })) return;
+        event.preventDefault();
+        event.stopPropagation();
+      }}
+    >
       <text fg={props.theme.colors.text.secondary} wrapMode="none">{"🌶️: "}</text>
       <box flexGrow={1} flexShrink={1} minWidth={1} flexDirection="column" overflow="hidden">
         <markdown
@@ -34,7 +49,7 @@ export function AssistantMarkdownCell(props: {
           conceal
           concealCode={false}
           streaming={props.streaming}
-          renderNode={renderAssistantMarkdownNode}
+          renderNode={renderNode}
           internalBlockMode="top-level"
           tableOptions={{
             style: "grid",
@@ -79,10 +94,16 @@ export function assistantTextCellLines(input: {
   }));
 }
 
-function renderAssistantMarkdownNode(_token: Token, context: RenderNodeContext) {
-  const renderable = context.defaultRender();
-  if (renderable instanceof CodeRenderable) renderable.drawUnstyledText = true;
-  return renderable;
+function assistantMarkdownRenderNode(theme: TuiTheme): (token: Token, context: RenderNodeContext) => ReturnType<RenderNodeContext["defaultRender"]> {
+  return (_token: Token, context: RenderNodeContext) => {
+    const renderable = context.defaultRender();
+    if (renderable instanceof CodeRenderable) {
+      renderable.drawUnstyledText = true;
+      renderable.selectionBg = theme.colors.menu.selectedBackground;
+      renderable.selectionFg = theme.colors.menu.selectedText;
+    }
+    return renderable;
+  };
 }
 
 const assistantMarkdownSyntaxStyleCache = new Map<string, SyntaxStyle>();
