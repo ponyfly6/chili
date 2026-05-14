@@ -196,6 +196,7 @@ test("dispatches independent team tasks concurrently with a bounded fan-out", as
     expect(maxRunning).toBe(2);
     expect(summary).toMatchObject({
       stopReason: "once",
+      maxConcurrentDispatches: 2,
       errors: [],
     });
     expect(summary.dispatched).toEqual(expect.arrayContaining([

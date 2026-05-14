@@ -1345,7 +1345,7 @@ function teamTaskReconcileToolResult(result: TeamTaskReconcileRecord): TeamToolR
 
 function teamRunLoopToolResult(result: TeamRunLoopRecord): TeamToolResult {
   return {
-    title: `team_run_loop ${result.teamId} stop=${result.stopReason} dispatched=${result.dispatched.length} running=${result.stillRunning.length}`,
+    title: `team_run_loop ${result.teamId} stop=${result.stopReason} fanout=${result.maxConcurrentDispatches ?? "default"} dispatched=${result.dispatched.length} running=${result.stillRunning.length}`,
     output: JSON.stringify(teamRunLoopOutput(result)),
     metadata: {
       team_id: result.teamId,
@@ -1353,6 +1353,8 @@ function teamRunLoopToolResult(result: TeamRunLoopRecord): TeamToolResult {
       stop_reason: result.stopReason,
       stopReason: result.stopReason,
       cycles: result.cycles,
+      max_concurrent_dispatches: result.maxConcurrentDispatches,
+      maxConcurrentDispatches: result.maxConcurrentDispatches,
       dispatched: result.dispatched.length,
       completed: result.completed.length,
       accepted: result.accepted.length,
@@ -1581,6 +1583,8 @@ function teamRunLoopOutput(result: TeamRunLoopRecord): Record<string, unknown> {
     startedAt: result.startedAt,
     ended_at: result.endedAt,
     endedAt: result.endedAt,
+    max_concurrent_dispatches: result.maxConcurrentDispatches,
+    maxConcurrentDispatches: result.maxConcurrentDispatches,
     dispatched: result.dispatched.map(teamRunTaskOutput),
     completed: result.completed.map(teamRunTaskOutput),
     accepted: result.accepted.map(teamRunTaskOutput),

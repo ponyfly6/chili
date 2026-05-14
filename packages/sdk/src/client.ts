@@ -756,6 +756,7 @@ export interface RuntimeTeamExecutionRunSummary {
   stopReason: RuntimeTeamExecutionStopReason;
   startedAt: number;
   endedAt: number;
+  maxConcurrentDispatches?: number;
   dispatched: RuntimeTeamExecutionDispatchedTask[];
   completed: RuntimeTeamExecutionFinalTask[];
   accepted: RuntimeTeamExecutionFinalTask[];

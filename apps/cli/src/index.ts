@@ -800,6 +800,7 @@ function printTeamRunLoopSummary(summary: TeamExecutionRunSummary): void {
       `[team-run-loop] ${summary.teamId}`,
       `stop=${summary.stopReason}`,
       `cycles=${summary.cycles}`,
+      `fanout=${summary.maxConcurrentDispatches}`,
       `dispatched=${summary.dispatched.length}`,
       `completed=${summary.completed.length}`,
       `accepted=${summary.accepted.length}`,

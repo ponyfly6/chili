@@ -418,6 +418,7 @@ export interface TeamRunLoopRecord {
   stopReason: string;
   startedAt: number;
   endedAt: number;
+  maxConcurrentDispatches?: number;
   dispatched: TeamRunLoopDispatchedTaskRecord[];
   completed: TeamRunLoopFinalTaskRecord[];
   accepted: TeamRunLoopFinalTaskRecord[];

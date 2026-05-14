@@ -1700,6 +1700,7 @@ test("client preserves team dispatcher JSON shapes for dispatch, sync, and recon
     stopReason: "once",
     startedAt: 100,
     endedAt: 110,
+    maxConcurrentDispatches: 4,
     dispatched: [{ teamId, taskId, ownerPath, agentTaskId: agentTask.taskId, status: "running" }],
     completed: [],
     accepted: [],

@@ -94,6 +94,7 @@ export interface TeamExecutionRunSummary {
   stopReason: TeamExecutionStopReason;
   startedAt: number;
   endedAt: number;
+  maxConcurrentDispatches: number;
   dispatched: TeamExecutionDispatchedTask[];
   completed: TeamExecutionFinalTask[];
   accepted: TeamExecutionFinalTask[];
@@ -246,6 +247,7 @@ export class TeamExecutionRunner {
       stopReason: "drained",
       startedAt,
       endedAt: startedAt,
+      maxConcurrentDispatches,
       dispatched: [],
       completed: [],
       accepted: [],

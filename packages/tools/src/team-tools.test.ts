@@ -455,12 +455,14 @@ test("team run loop tool schedules scoped team work through the runner", async (
     expect(JSON.parse(result.result.output)).toMatchObject({
       team_id: "team_core",
       stop_reason: "cycle_limit",
+      max_concurrent_dispatches: 6,
       dispatched: [{ task_id: "task_team", owner_path: "/worker", agent_task_id: "agent_task" }],
       still_running: [{ task_id: "task_team", title: "Implement team tools" }],
     });
     expect(result.result.metadata).toMatchObject({
       team_id: "team_core",
       stop_reason: "cycle_limit",
+      max_concurrent_dispatches: 6,
       dispatched: 1,
       still_running: 1,
     });
@@ -750,6 +752,7 @@ class FakeTeamToolController implements TeamToolController, TeamTaskDispatchTool
       stopReason: input.once === false ? "drained" : "cycle_limit",
       startedAt: 1,
       endedAt: 2,
+      maxConcurrentDispatches: input.maxConcurrentDispatches ?? 4,
       dispatched: [
         { teamId: input.teamId, taskId: "task_team", ownerPath: "/worker", agentTaskId: "agent_task", status: "running" },
       ],

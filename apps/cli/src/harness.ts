@@ -1353,6 +1353,7 @@ function toTeamRunLoopRecord(result: Awaited<ReturnType<TeamExecutionRunner["run
     stopReason: result.stopReason,
     startedAt: result.startedAt,
     endedAt: result.endedAt,
+    maxConcurrentDispatches: result.maxConcurrentDispatches,
     dispatched: result.dispatched,
     completed: result.completed,
     accepted: result.accepted,
