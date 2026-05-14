@@ -65,6 +65,7 @@ export interface CliArgs {
   timeoutMs?: number;
   staleAfterMs?: number;
   maxCycles?: number;
+  maxConcurrentDispatches?: number;
   provider?: string;
   model?: CliModelName;
   reasoningLevel?: CliReasoningLevel;
@@ -337,6 +338,13 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       if (!Number.isInteger(result.maxCycles) || result.maxCycles <= 0) throw new Error("--max-cycles must be a positive integer");
       continue;
     }
+    if (arg === "--max-concurrent-dispatches") {
+      result.maxConcurrentDispatches = Number.parseInt(requireValue(arg, args), 10);
+      if (!Number.isInteger(result.maxConcurrentDispatches) || result.maxConcurrentDispatches <= 0) {
+        throw new Error("--max-concurrent-dispatches must be a positive integer");
+      }
+      continue;
+    }
     if (arg === "--status") {
       const status = requireValue(arg, args);
       if (status !== "completed" && status !== "failed" && status !== "cancelled") {
@@ -389,7 +397,7 @@ export function usage(): string {
     "  bun run chili -- team-messages <team-id>",
     "  bun run chili -- team-dispatch <team-id> <task-id>",
     "  bun run chili -- team-run <team-id> <task-id>",
-    "  bun run chili -- team-run-loop <team-id> --once --max-cycles 10 --timeout-ms 30000",
+    "  bun run chili -- team-run-loop <team-id> --once --max-cycles 10 --timeout-ms 30000 --max-concurrent-dispatches 4",
     "  bun run chili -- team-merge <team-id> [--task <task-id>] [--json]",
     "  bun run chili -- team-sync <team-id> <task-id>",
     "  bun run chili -- team-reconcile [team-id]",

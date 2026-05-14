@@ -147,6 +147,7 @@ async function main(): Promise<void> {
       };
       if (args.maxCycles !== undefined) input.maxCycles = args.maxCycles;
       if (args.timeoutMs !== undefined) input.timeoutMs = args.timeoutMs;
+      if (args.maxConcurrentDispatches !== undefined) input.maxConcurrentDispatches = args.maxConcurrentDispatches;
       const result = await harness.teamRunner.run(input);
       if (args.json) console.log(jsonStringify(result));
       else printTeamRunLoopSummary(result);

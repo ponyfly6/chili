@@ -128,12 +128,24 @@ test("keeps legacy team command aliases working", () => {
 });
 
 test("parses team run loop command and runner flags", () => {
-  expect(parseArgs(["team-run-loop", "team_1", "--once", "--max-cycles", "3", "--timeout-ms", "5000", "--json"])).toMatchObject({
+  expect(parseArgs([
+    "team-run-loop",
+    "team_1",
+    "--once",
+    "--max-cycles",
+    "3",
+    "--timeout-ms",
+    "5000",
+    "--max-concurrent-dispatches",
+    "6",
+    "--json",
+  ])).toMatchObject({
     command: "team-run-loop",
     teamId: "team_1",
     once: true,
     maxCycles: 3,
     timeoutMs: 5000,
+    maxConcurrentDispatches: 6,
     json: true,
   });
   expect(parseArgs(["team", "run-loop", "team_1"])).toMatchObject({
