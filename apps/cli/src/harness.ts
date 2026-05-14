@@ -55,6 +55,7 @@ import {
   createReadFileTool,
   createReadImageTool,
   createTaskCloseTool,
+  createTaskBatchTool,
   createTaskFollowupTool,
   createTaskListTool,
   createTaskTool,
@@ -338,6 +339,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     },
   };
   registry.register(createTaskTool(subagents));
+  registry.register(createTaskBatchTool(subagents));
   childRegistry.register(createCompleteTaskTool(completeTaskController));
   const toolExecutor = new ToolExecutor({
     registry,

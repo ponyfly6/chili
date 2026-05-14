@@ -6,20 +6,24 @@ import { InMemoryToolRegistry } from "./registry.js";
 import type {
   MailboxConsumeToolInput,
   MailboxListToolInput,
+  SubagentController,
   SubagentControlController,
   SubagentMailboxRecord,
   SubagentTaskRecord,
+  TaskToolInput,
   TaskCloseToolInput,
   TaskFollowupToolInput,
   TaskListToolInput,
   TaskWaitToolInput,
 } from "./subagent.js";
 import {
+  createTaskBatchTool,
   createMailboxConsumeTool,
   createMailboxListTool,
   createTaskCloseTool,
   createTaskFollowupTool,
   createTaskListTool,
+  createTaskTool,
   createTaskWaitTool,
 } from "./builtins/task.js";
 
@@ -88,6 +92,52 @@ test("agent control mailbox tools normalize inputs and return mailbox records", 
   expect(approvals[0]?.patterns).toEqual(["event_mailbox"]);
 });
 
+test("task tools mark only background spawn calls concurrency-safe", async () => {
+  const controller = new FakeSubagentController();
+  const registry = new InMemoryToolRegistry();
+  registry.register(createTaskTool(controller));
+  registry.register(createTaskBatchTool(controller));
+  const executor = createExecutor(registry, []);
+
+  await expect(executor.canRunConcurrently("task", { description: "one", prompt: "run" })).resolves.toBe(false);
+  await expect(executor.canRunConcurrently("task", { description: "one", prompt: "run", mode: "background" })).resolves.toBe(true);
+  await expect(executor.canRunConcurrently("task_batch", { tasks: [{ description: "one", prompt: "run" }] })).resolves.toBe(true);
+});
+
+test("task_batch launches background subagents with bounded parallelism", async () => {
+  const controller = new FakeSubagentController();
+  const registry = new InMemoryToolRegistry();
+  registry.register(createTaskBatchTool(controller));
+  const executor = createExecutor(registry, []);
+
+  const result = await executor.execute(toolInput("task_batch", {
+    max_concurrency: 2,
+    tasks: [
+      { description: "first", prompt: "read first" },
+      { description: "second", prompt: "read second" },
+      { description: "third", prompt: "read third" },
+    ],
+  }));
+
+  expect(result.status).toBe("completed");
+  expect(controller.maxRunning).toBe(2);
+  expect(controller.spawnInputs).toEqual([
+    { description: "first", prompt: "read first", mode: "background" },
+    { description: "second", prompt: "read second", mode: "background" },
+    { description: "third", prompt: "read third", mode: "background" },
+  ]);
+  if (result.status === "completed") {
+    expect(JSON.parse(result.result.output)).toMatchObject({
+      count: 3,
+      tasks: [
+        { task_id: "task_1", status: "running" },
+        { task_id: "task_2", status: "running" },
+        { task_id: "task_3", status: "running" },
+      ],
+    });
+  }
+});
+
 function registryWithTaskTools(controller: SubagentControlController): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createTaskListTool(controller));
@@ -124,6 +174,34 @@ function toolInput(toolName: string, input: unknown, callId?: ToolCallId): Execu
   };
   if (callId) value.callId = callId;
   return value;
+}
+
+class FakeSubagentController implements SubagentController {
+  spawnInputs: TaskToolInput[] = [];
+  running = 0;
+  maxRunning = 0;
+
+  async spawnTask(input: TaskToolInput) {
+    this.spawnInputs.push(input);
+    const taskId = `task_${this.spawnInputs.length}`;
+    this.running += 1;
+    this.maxRunning = Math.max(this.maxRunning, this.running);
+    await sleepMs(input.description === "first" ? 20 : 1);
+    this.running -= 1;
+    return {
+      taskId,
+      status: "running" as const,
+      summary: "",
+    };
+  }
+
+  async completeTask() {
+    return {
+      taskId: "task_done",
+      status: "completed" as const,
+      summary: "done",
+    };
+  }
 }
 
 class FakeSubagentControlController implements SubagentControlController {
@@ -202,4 +280,8 @@ function mailboxRecord(status: SubagentMailboxRecord["status"]): SubagentMailbox
 function createSequentialId(): (prefix: string) => string {
   let index = 0;
   return (prefix) => `${prefix}_${++index}`;
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

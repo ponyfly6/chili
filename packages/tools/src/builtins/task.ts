@@ -12,6 +12,7 @@ import type {
   SubagentTaskHandle,
   SubagentTaskRecord,
   SubagentTaskStatus,
+  TaskBatchToolInput,
   TaskToolInput,
   TaskCloseToolInput,
   TaskFollowupToolInput,
@@ -30,6 +31,9 @@ export interface SubagentToolMetadata extends Record<string, unknown> {
 export interface SubagentToolResult extends ToolResult {
   metadata: Record<string, unknown>;
 }
+
+const DEFAULT_TASK_BATCH_CONCURRENCY = 8;
+const MAX_TASK_BATCH_CONCURRENCY = 32;
 
 export function createTaskTool(controller: SubagentController): ChiliToolDefinition<TaskToolInput, SubagentToolResult> {
   return {
@@ -50,6 +54,9 @@ export function createTaskTool(controller: SubagentController): ChiliToolDefinit
     },
     validate(input): ValidationResult<TaskToolInput> {
       return validateTaskInput(input);
+    },
+    isConcurrencySafe(input) {
+      return isBackgroundTaskInput(input);
     },
     approval(input) {
       return {
@@ -72,6 +79,68 @@ export function createTaskTool(controller: SubagentController): ChiliToolDefinit
 
       const task = await controller.spawnTask(input, context);
       return taskToolResult(task, input.mode);
+    },
+  };
+}
+
+export function createTaskBatchTool(controller: SubagentController): ChiliToolDefinition<TaskBatchToolInput, SubagentToolResult> {
+  return {
+    name: "task_batch",
+    aliases: ["agent_batch", "spawn_tasks", "spawn_agents"],
+    description:
+      "Spawn multiple ad-hoc local background subagent tasks in parallel. Use this for independent sidecar work; persistent team tasks should use team_task_dispatch.",
+    risk: "execute",
+    isConcurrencySafe: true,
+    inputSchema: {
+      type: "object",
+      required: ["tasks"],
+      properties: {
+        tasks: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["description", "prompt"],
+            properties: {
+              description: { type: "string" },
+              prompt: { type: "string" },
+              mode: { type: "string", enum: ["background"] },
+              subagent_type: { type: "string", enum: ["background"] },
+            },
+          },
+        },
+        maxConcurrency: { type: "number" },
+        max_concurrency: { type: "number" },
+      },
+    },
+    validate(input): ValidationResult<TaskBatchToolInput> {
+      return validateTaskBatchInput(input);
+    },
+    approval(input) {
+      return {
+        permission: "task",
+        patterns: ["batch", `count:${input.tasks.length}`, `concurrency:${input.maxConcurrency ?? DEFAULT_TASK_BATCH_CONCURRENCY}`],
+        metadata: {
+          count: input.tasks.length,
+          maxConcurrency: input.maxConcurrency ?? DEFAULT_TASK_BATCH_CONCURRENCY,
+          tasks: input.tasks.map((task) => ({
+            description: task.description,
+            promptPreview: preview(task.prompt),
+          })),
+        },
+      };
+    },
+    async execute(input, context) {
+      const maxConcurrency = input.maxConcurrency ?? DEFAULT_TASK_BATCH_CONCURRENCY;
+      await context.metadata({
+        metadata: {
+          count: input.tasks.length,
+          maxConcurrency,
+          mode: "background",
+        },
+      });
+
+      const tasks = await runTaskBatch(input.tasks, maxConcurrency, (task) => controller.spawnTask(task, context));
+      return taskBatchToolResult(tasks, maxConcurrency);
     },
   };
 }
@@ -376,6 +445,33 @@ function validateTaskInput(input: unknown): ValidationResult<TaskToolInput> {
   return { ok: true, value };
 }
 
+function validateTaskBatchInput(input: unknown): ValidationResult<TaskBatchToolInput> {
+  if (!isRecord(input)) return { ok: false, message: "expected an object" };
+  if (!Array.isArray(input.tasks)) return { ok: false, message: "tasks must be an array" };
+  if (input.tasks.length === 0) return { ok: false, message: "tasks must contain at least one task" };
+
+  const maxConcurrency = optionalPositiveInteger(input.maxConcurrency ?? input.max_concurrency, "maxConcurrency");
+  if (!maxConcurrency.ok) return maxConcurrency;
+  if (maxConcurrency.value !== undefined && maxConcurrency.value > MAX_TASK_BATCH_CONCURRENCY) {
+    return { ok: false, message: `maxConcurrency must be ${MAX_TASK_BATCH_CONCURRENCY} or less` };
+  }
+
+  const tasks: TaskToolInput[] = [];
+  for (const [index, item] of input.tasks.entries()) {
+    const task = validateTaskInput(item);
+    if (!task.ok) return { ok: false, message: `tasks[${index}]: ${task.message}` };
+    const mode = normalizeTaskMode(task.value.mode);
+    if (mode !== undefined && mode !== "background") {
+      return { ok: false, message: `tasks[${index}].mode must be background` };
+    }
+    tasks.push({ ...task.value, mode: "background" });
+  }
+
+  const value: TaskBatchToolInput = { tasks };
+  if (maxConcurrency.value !== undefined) value.maxConcurrency = maxConcurrency.value;
+  return { ok: true, value };
+}
+
 function validateCompleteTaskInput(input: unknown): ValidationResult<CompleteTaskToolInput> {
   if (!isRecord(input)) return { ok: false, message: "expected an object" };
 
@@ -513,6 +609,30 @@ function taskToolResult(task: SubagentTaskHandle, mode?: string): SubagentToolRe
     title: `task ${task.taskId}`,
     output: JSON.stringify({ task_id: task.taskId, summary: task.summary, status: task.status }),
     metadata,
+  };
+}
+
+function taskBatchToolResult(tasks: readonly SubagentTaskHandle[], maxConcurrency: number): SubagentToolResult {
+  return {
+    title: `task_batch ${tasks.length}`,
+    output: JSON.stringify({
+      count: tasks.length,
+      max_concurrency: maxConcurrency,
+      tasks: tasks.map((task) => ({
+        task_id: task.taskId,
+        taskId: task.taskId,
+        summary: task.summary,
+        status: task.status,
+      })),
+    }),
+    metadata: {
+      count: tasks.length,
+      maxConcurrency,
+      task_ids: tasks.map((task) => task.taskId),
+      taskIds: tasks.map((task) => task.taskId),
+      status: tasks.every((task) => task.status === "running") ? "running" : "mixed",
+      mode: "background",
+    },
   };
 }
 
@@ -732,6 +852,39 @@ function optionalBoolean(value: unknown, name: string): ValidationResult<boolean
   if (value === undefined) return { ok: true, value: undefined };
   if (typeof value !== "boolean") return { ok: false, message: `${name} must be a boolean` };
   return { ok: true, value };
+}
+
+async function runTaskBatch(
+  tasks: readonly TaskToolInput[],
+  maxConcurrency: number,
+  spawn: (task: TaskToolInput) => Promise<SubagentTaskHandle>,
+): Promise<SubagentTaskHandle[]> {
+  const results: SubagentTaskHandle[] = new Array(tasks.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(maxConcurrency, tasks.length);
+
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < tasks.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const task = tasks[index];
+      if (!task) throw new Error(`Missing task at index ${index}`);
+      results[index] = await spawn(task);
+    }
+  }));
+
+  return results;
+}
+
+function isBackgroundTaskInput(input: unknown): boolean {
+  if (!isRecord(input)) return false;
+  const mode = pickOptionalString(input, ["mode", "subagent_type", "subagentType", "agentType", "type"]);
+  if (!mode.ok) return false;
+  return normalizeTaskMode(mode.value) === "background";
+}
+
+function normalizeTaskMode(value: string | undefined): string | undefined {
+  return nonEmptyString(value)?.toLowerCase();
 }
 
 function pickOptionalString(

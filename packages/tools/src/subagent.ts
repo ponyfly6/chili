@@ -12,6 +12,11 @@ export interface TaskToolInput {
   mode?: string;
 }
 
+export interface TaskBatchToolInput {
+  tasks: TaskToolInput[];
+  maxConcurrency?: number;
+}
+
 export interface CompleteTaskToolInput {
   taskId: string;
   summary: string;
