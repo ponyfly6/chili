@@ -28,15 +28,23 @@ import type {
   TeamTaskSyncToolInput,
   TeamTaskUpdateToolInput,
   TeamToolController,
+  TeamToolContext,
   TeamMemberStatus,
   TeamMessageDelivery,
   TeamMessageKind,
+  TeamTaskDispatchBatchErrorRecord,
+  TeamTaskDispatchBatchRecord,
+  TeamTaskDispatchBatchToolInput,
   TeamTaskStatus,
 } from "../team.js";
 
 export interface TeamToolResult extends ToolResult {
   metadata: Record<string, unknown>;
 }
+
+const DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY = 8;
+const MAX_TEAM_DISPATCH_BATCH_CONCURRENCY = 32;
+const MAX_TEAM_DISPATCH_BATCH_TASKS = 64;
 
 export function createTeamCreateTool(controller: TeamToolController): ChiliToolDefinition<TeamCreateToolInput, TeamToolResult> {
   return {
@@ -366,6 +374,9 @@ export function createTeamTaskDispatchTool(
     aliases: ["dispatch_team_task", "team_dispatch"],
     description: "Dispatch a persistent team task to its assigned local subagent.",
     risk: "execute",
+    isConcurrencySafe(input) {
+      return isBackgroundDispatchInput(input);
+    },
     inputSchema: {
       type: "object",
       required: ["teamId", "taskId"],
@@ -410,6 +421,90 @@ export function createTeamTaskDispatchTool(
         },
       });
       return teamTaskDispatchToolResult(await controller.dispatchTask(input, context));
+    },
+  };
+}
+
+export function createTeamTaskDispatchBatchTool(
+  controller: TeamTaskDispatchToolController,
+): ChiliToolDefinition<TeamTaskDispatchBatchToolInput, TeamToolResult> {
+  return {
+    name: "team_task_dispatch_batch",
+    aliases: ["dispatch_team_tasks", "team_dispatch_batch"],
+    description: "Dispatch multiple persistent team tasks to background local subagents in parallel.",
+    risk: "execute",
+    isConcurrencySafe: true,
+    inputSchema: {
+      type: "object",
+      required: ["teamId"],
+      properties: {
+        teamId: { type: "string" },
+        team_id: { type: "string" },
+        tasks: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["taskId"],
+            properties: {
+              taskId: { type: "string" },
+              task_id: { type: "string" },
+              id: { type: "string" },
+              ownerPath: { type: "string" },
+              owner_path: { type: "string" },
+              prompt: { type: "string" },
+              message: { type: "string" },
+            },
+          },
+        },
+        taskIds: { type: "array", items: { type: "string" } },
+        task_ids: { type: "array", items: { type: "string" } },
+        mode: { type: "string", enum: ["background"] },
+        maxConcurrency: { type: "number" },
+        max_concurrency: { type: "number" },
+      },
+    },
+    validate: validateTeamTaskDispatchBatchInput,
+    approval(input) {
+      return {
+        permission: "team_task_dispatch",
+        patterns: [input.teamId, `count:${input.tasks.length}`, `concurrency:${input.maxConcurrency ?? DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY}`, "background"],
+        metadata: {
+          teamId: input.teamId,
+          team_id: input.teamId,
+          taskIds: input.tasks.map((task) => task.taskId),
+          task_ids: input.tasks.map((task) => task.taskId),
+          mode: "background",
+          count: input.tasks.length,
+          maxConcurrency: input.maxConcurrency ?? DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY,
+          max_concurrency: input.maxConcurrency ?? DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY,
+        },
+      };
+    },
+    async execute(input, context) {
+      await context.metadata({
+        metadata: {
+          teamId: input.teamId,
+          team_id: input.teamId,
+          taskIds: input.tasks.map((task) => task.taskId),
+          task_ids: input.tasks.map((task) => task.taskId),
+          count: input.tasks.length,
+          maxConcurrency: input.maxConcurrency ?? DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY,
+          max_concurrency: input.maxConcurrency ?? DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY,
+        },
+      });
+      const result = await runTeamTaskDispatchBatch(input, context, (task) =>
+        controller.dispatchTask(
+          {
+            teamId: input.teamId,
+            taskId: task.taskId,
+            ...(task.ownerPath ? { ownerPath: task.ownerPath } : {}),
+            mode: "background",
+            ...(task.prompt ? { prompt: task.prompt } : {}),
+          },
+          context,
+        )
+      );
+      return teamTaskDispatchBatchToolResult(result);
     },
   };
 }
@@ -735,6 +830,35 @@ function validateTeamTaskDispatchInput(input: unknown): ValidationResult<TeamTas
   return { ok: true, value };
 }
 
+function validateTeamTaskDispatchBatchInput(input: unknown): ValidationResult<TeamTaskDispatchBatchToolInput> {
+  if (!isRecord(input)) return { ok: false, message: "expected an object" };
+  const teamId = requiredString(input, ["teamId", "team_id"], "teamId");
+  if (!teamId.ok) return teamId;
+  const mode = normalizeDispatchMode(input.mode);
+  if (!mode.ok) return mode;
+  if (mode.value && mode.value !== "background") {
+    return { ok: false, message: "mode must be background for team_task_dispatch_batch" };
+  }
+  const tasks = normalizeDispatchBatchTasks(input.tasks ?? input.taskIds ?? input.task_ids);
+  if (!tasks.ok) return tasks;
+  if (tasks.value.length === 0) return { ok: false, message: "tasks must include at least one task" };
+  if (tasks.value.length > MAX_TEAM_DISPATCH_BATCH_TASKS) {
+    return { ok: false, message: `tasks cannot include more than ${MAX_TEAM_DISPATCH_BATCH_TASKS} tasks` };
+  }
+  const maxConcurrency = optionalPositiveInteger(input.maxConcurrency ?? input.max_concurrency, "maxConcurrency");
+  if (!maxConcurrency.ok) return maxConcurrency;
+  if (maxConcurrency.value !== undefined && maxConcurrency.value > MAX_TEAM_DISPATCH_BATCH_CONCURRENCY) {
+    return { ok: false, message: `maxConcurrency cannot exceed ${MAX_TEAM_DISPATCH_BATCH_CONCURRENCY}` };
+  }
+  const value: TeamTaskDispatchBatchToolInput = {
+    teamId: teamId.value,
+    tasks: tasks.value,
+    mode: "background",
+  };
+  if (maxConcurrency.value !== undefined) value.maxConcurrency = maxConcurrency.value;
+  return { ok: true, value };
+}
+
 function validateTeamTaskSyncInput(input: unknown): ValidationResult<TeamTaskSyncToolInput> {
   if (!isRecord(input)) return { ok: false, message: "expected an object" };
   const teamId = requiredString(input, ["teamId", "team_id"], "teamId");
@@ -909,6 +1033,31 @@ function teamTaskDispatchToolResult(result: TeamTaskDispatchRecord): TeamToolRes
   };
 }
 
+function teamTaskDispatchBatchToolResult(result: TeamTaskDispatchBatchRecord): TeamToolResult {
+  const output = {
+    count: result.count,
+    dispatched: result.dispatched.map(teamTaskDispatchOutput),
+    errors: result.errors.map((error) => pruneUndefined({
+      task_id: error.taskId,
+      taskId: error.taskId,
+      owner_path: error.ownerPath,
+      ownerPath: error.ownerPath,
+      error: error.error,
+    })),
+  };
+  return {
+    title: `team_task_dispatch_batch dispatched=${result.dispatched.length} errors=${result.errors.length}`,
+    output: JSON.stringify(output),
+    metadata: {
+      count: result.count,
+      dispatched: result.dispatched.length,
+      errors: result.errors.length,
+      task_ids: result.dispatched.map((item) => item.teamTask.taskId),
+      taskIds: result.dispatched.map((item) => item.teamTask.taskId),
+    },
+  };
+}
+
 function teamTaskSyncToolResult(result: TeamTaskSyncRecord): TeamToolResult {
   const output = teamTaskSyncOutput(result);
   return {
@@ -965,6 +1114,43 @@ function teamMessageListToolResult(messages: readonly TeamMessageRecord[]): Team
     title: `team_message_list ${messages.length}`,
     output: JSON.stringify({ count: messages.length, messages: messages.map(teamMessageRecordOutput) }),
     metadata: { count: messages.length },
+  };
+}
+
+async function runTeamTaskDispatchBatch(
+  input: TeamTaskDispatchBatchToolInput,
+  context: TeamToolContext,
+  dispatch: (task: TeamTaskDispatchBatchToolInput["tasks"][number]) => Promise<TeamTaskDispatchRecord>,
+): Promise<TeamTaskDispatchBatchRecord> {
+  const maxConcurrency = input.maxConcurrency ?? DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY;
+  const dispatched = new Array<TeamTaskDispatchRecord | undefined>(input.tasks.length);
+  const errors = new Array<TeamTaskDispatchBatchErrorRecord | undefined>(input.tasks.length);
+  let next = 0;
+
+  const workerCount = Math.min(maxConcurrency, input.tasks.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (next < input.tasks.length) {
+      throwIfAborted(context.signal);
+      const index = next++;
+      const task = input.tasks[index];
+      if (!task) continue;
+      try {
+        dispatched[index] = await dispatch(task);
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        errors[index] = {
+          taskId: task.taskId,
+          ...(task.ownerPath ? { ownerPath: task.ownerPath } : {}),
+          error: toErrorMessage(error),
+        };
+      }
+    }
+  }));
+
+  return {
+    count: input.tasks.length,
+    dispatched: dispatched.filter((item): item is TeamTaskDispatchRecord => item !== undefined),
+    errors: errors.filter((item): item is TeamTaskDispatchBatchErrorRecord => item !== undefined),
   };
 }
 
@@ -1299,6 +1485,36 @@ function normalizeDispatchMode(value: unknown): ValidationResult<TeamTaskDispatc
   }
 }
 
+function isBackgroundDispatchInput(input: unknown): boolean {
+  if (!isRecord(input)) return false;
+  const mode = normalizeDispatchMode(input.mode);
+  if (!mode.ok) return false;
+  return (mode.value ?? "background") === "background";
+}
+
+function normalizeDispatchBatchTasks(value: unknown): ValidationResult<TeamTaskDispatchBatchToolInput["tasks"]> {
+  if (!Array.isArray(value)) return { ok: false, message: "tasks must be an array" };
+  const tasks: TeamTaskDispatchBatchToolInput["tasks"] = [];
+  for (const item of value) {
+    if (typeof item === "string") {
+      const taskId = item.trim();
+      if (taskId.length === 0) return { ok: false, message: "tasks must include non-empty task ids" };
+      tasks.push({ taskId });
+      continue;
+    }
+    if (!isRecord(item)) return { ok: false, message: "tasks must contain task ids or objects" };
+    const taskId = requiredString(item, ["taskId", "task_id", "id"], "taskId");
+    if (!taskId.ok) return taskId;
+    const ownerPath = optionalPath(item, ["ownerPath", "owner_path"], "ownerPath");
+    if (!ownerPath.ok) return ownerPath;
+    const task: TeamTaskDispatchBatchToolInput["tasks"][number] = { taskId: taskId.value };
+    if (ownerPath.value) task.ownerPath = ownerPath.value;
+    assignString(task, "prompt", pickString(item, ["prompt", "message"]));
+    tasks.push(task);
+  }
+  return { ok: true, value: tasks };
+}
+
 function normalizeMessageKind(value: unknown): ValidationResult<TeamMessageKind | undefined> {
   if (value === undefined) return { ok: true, value: undefined };
   if (typeof value !== "string") return { ok: false, message: "message kind must be a string" };
@@ -1383,4 +1599,23 @@ function pruneUndefined<T>(value: T): T {
 
 function preview(value: string, max = 200): string {
   return value.length <= max ? value : `${value.slice(0, max)}...`;
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw abortError("Team task dispatch batch aborted");
+}
+
+function abortError(message: string): Error {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortError(error: unknown): boolean {
+  const err = error instanceof Error ? error : new Error(String(error));
+  return err.name === "AbortError" || err.message.toLowerCase().includes("aborted");
+}
+
+function toErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

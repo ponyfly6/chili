@@ -23,6 +23,7 @@ import {
   createTeamTaskAssignTool,
   createTeamTaskClaimTool,
   createTeamTaskCreateTool,
+  createTeamTaskDispatchBatchTool,
   createTeamTaskDispatchTool,
   createTeamTaskListTool,
   createTeamTaskReconcileTool,
@@ -46,6 +47,7 @@ import type {
   TeamTaskClaimRecord,
   TeamTaskClaimToolInput,
   TeamTaskCreateToolInput,
+  TeamTaskDispatchBatchToolInput,
   TeamTaskDispatchRecord,
   TeamTaskDispatchToolController,
   TeamTaskDispatchToolInput,
@@ -295,6 +297,11 @@ test("team dispatch tools expose subagent dispatch, sync, and reconcile", async 
   const approvals: ApprovalBrokerRequest[] = [];
   const executor = createExecutor(registryWithTeamTools(controller), approvals);
 
+  await expect(executor.canRunConcurrently("team_task_dispatch", { team_id: "team_core", task_id: "task_team" })).resolves.toBe(true);
+  await expect(
+    executor.canRunConcurrently("team_task_dispatch", { team_id: "team_core", task_id: "task_team", mode: "one_shot" }),
+  ).resolves.toBe(false);
+
   const dispatched = await executor.execute(
     toolInput("team_dispatch", {
       team_id: "team_core",
@@ -351,6 +358,59 @@ test("team dispatch tools expose subagent dispatch, sync, and reconcile", async 
   expect(controller.taskReconcileInputs).toEqual([{ teamId: "team_core", limit: 10 }]);
 });
 
+test("team dispatch batch launches background tasks with bounded parallelism", async () => {
+  const controller = new FakeTeamToolController();
+  controller.dispatchDelayMs = 20;
+  const approvals: ApprovalBrokerRequest[] = [];
+  const executor = createExecutor(registryWithTeamTools(controller), approvals);
+
+  await expect(executor.canRunConcurrently("team_task_dispatch_batch", {
+    team_id: "team_core",
+    task_ids: ["task_one"],
+  })).resolves.toBe(true);
+
+  const result = await executor.execute(toolInput("team_dispatch_batch", {
+    team_id: "team_core",
+    max_concurrency: 2,
+    tasks: [
+      { task_id: "task_one", owner_path: "/worker-a", prompt: "Implement one." },
+      { task_id: "task_two", owner_path: "/worker-b" },
+      "task_three",
+    ],
+  }));
+
+  expect(result.status).toBe("completed");
+  expect(controller.maxRunningDispatches).toBe(2);
+  expect(controller.taskDispatchInputs).toEqual([
+    { teamId: "team_core", taskId: "task_one", ownerPath: "/worker-a", mode: "background", prompt: "Implement one." },
+    { teamId: "team_core", taskId: "task_two", ownerPath: "/worker-b", mode: "background" },
+    { teamId: "team_core", taskId: "task_three", mode: "background" },
+  ]);
+  if (result.status === "completed") {
+    expect(JSON.parse(result.result.output)).toMatchObject({
+      count: 3,
+      dispatched: [
+        { status: "running", team_task: { task_id: "task_one", owner_path: "/worker-a" } },
+        { status: "running", team_task: { task_id: "task_two", owner_path: "/worker-b" } },
+        { status: "running", team_task: { task_id: "task_three" } },
+      ],
+      errors: [],
+    });
+  }
+  expect(approvals).toHaveLength(1);
+  expect(approvals[0]).toMatchObject({
+    permission: "team_task_dispatch",
+    patterns: ["team_core", "count:3", "concurrency:2", "background"],
+  });
+
+  const rejected = await executor.execute(toolInput("team_dispatch_batch", {
+    team_id: "team_core",
+    mode: "one_shot",
+    task_ids: ["task_one"],
+  }));
+  expect(rejected.status).toBe("failed");
+});
+
 test("team tools reject non-absolute agent paths", async () => {
   const controller = new FakeTeamToolController();
   const executor = createExecutor(registryWithTeamTools(controller), []);
@@ -379,6 +439,7 @@ function registryWithTeamTools(controller: TeamToolController & TeamTaskDispatch
   registry.register(createTeamTaskClaimTool(controller));
   registry.register(createTeamTaskUpdateTool(controller));
   registry.register(createTeamTaskDispatchTool(controller));
+  registry.register(createTeamTaskDispatchBatchTool(controller));
   registry.register(createTeamTaskSyncTool(controller));
   registry.register(createTeamTaskReconcileTool(controller));
   registry.register(createTeamMessageSendTool(controller));
@@ -413,6 +474,10 @@ function toolInput(toolName: string, input: unknown, callId?: ToolCallId): Execu
   return value;
 }
 
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 class FakeTeamToolController implements TeamToolController, TeamTaskDispatchToolController {
   createTeamInputs: TeamCreateToolInput[] = [];
   teamListInputs: TeamListToolInput[] = [];
@@ -425,10 +490,14 @@ class FakeTeamToolController implements TeamToolController, TeamTaskDispatchTool
   taskClaimInputs: TeamTaskClaimToolInput[] = [];
   taskUpdateInputs: TeamTaskUpdateToolInput[] = [];
   taskDispatchInputs: TeamTaskDispatchToolInput[] = [];
+  taskDispatchBatchInputs: TeamTaskDispatchBatchToolInput[] = [];
   taskSyncInputs: TeamTaskSyncToolInput[] = [];
   taskReconcileInputs: TeamTaskReconcileToolInput[] = [];
   messageSendInputs: TeamMessageSendToolInput[] = [];
   messageListInputs: TeamMessageListToolInput[] = [];
+  dispatchDelayMs = 0;
+  runningDispatches = 0;
+  maxRunningDispatches = 0;
 
   async createTeam(input: TeamCreateToolInput, _context: TeamToolContext): Promise<TeamRecord> {
     this.createTeamInputs.push(input);
@@ -481,28 +550,35 @@ class FakeTeamToolController implements TeamToolController, TeamTaskDispatchTool
   }
 
   async dispatchTask(input: TeamTaskDispatchToolInput): Promise<TeamTaskDispatchRecord> {
+    this.runningDispatches++;
+    this.maxRunningDispatches = Math.max(this.maxRunningDispatches, this.runningDispatches);
     this.taskDispatchInputs.push(input);
-    const status = input.mode === "one_shot" ? "completed" : "running";
-    const teamTaskInput: Partial<TeamTaskCreateToolInput & TeamTaskAssignToolInput & TeamTaskClaimToolInput & TeamTaskUpdateToolInput> = {
-      teamId: input.teamId,
-      taskId: input.taskId,
-      status: "in_progress",
-    };
-    if (input.ownerPath) teamTaskInput.ownerPath = input.ownerPath;
-    const agentTask: TeamDispatchAgentTaskRecord = {
-      taskId: "agent_task",
-      path: input.ownerPath ?? "/worker",
-      runId: "run_team",
-      childSessionId: "session_child",
-      childThreadId: "thread_child",
-      status,
-    };
-    if (status === "completed") agentTask.summary = "done";
-    return {
-      status,
-      teamTask: taskRecord(teamTaskInput),
-      agentTask,
-    };
+    try {
+      if (this.dispatchDelayMs > 0) await sleepMs(this.dispatchDelayMs);
+      const status = input.mode === "one_shot" ? "completed" : "running";
+      const teamTaskInput: Partial<TeamTaskCreateToolInput & TeamTaskAssignToolInput & TeamTaskClaimToolInput & TeamTaskUpdateToolInput> = {
+        teamId: input.teamId,
+        taskId: input.taskId,
+        status: "in_progress",
+      };
+      if (input.ownerPath) teamTaskInput.ownerPath = input.ownerPath;
+      const agentTask: TeamDispatchAgentTaskRecord = {
+        taskId: "agent_task",
+        path: input.ownerPath ?? "/worker",
+        runId: "run_team",
+        childSessionId: "session_child",
+        childThreadId: "thread_child",
+        status,
+      };
+      if (status === "completed") agentTask.summary = "done";
+      return {
+        status,
+        teamTask: taskRecord(teamTaskInput),
+        agentTask,
+      };
+    } finally {
+      this.runningDispatches--;
+    }
   }
 
   async syncTask(input: TeamTaskSyncToolInput): Promise<TeamTaskSyncRecord> {

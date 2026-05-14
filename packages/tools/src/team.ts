@@ -232,6 +232,19 @@ export interface TeamTaskDispatchToolInput {
   prompt?: string;
 }
 
+export interface TeamTaskDispatchBatchItemInput {
+  taskId: string;
+  ownerPath?: string;
+  prompt?: string;
+}
+
+export interface TeamTaskDispatchBatchToolInput {
+  teamId: string;
+  tasks: TeamTaskDispatchBatchItemInput[];
+  mode?: "background";
+  maxConcurrency?: number;
+}
+
 export interface TeamTaskSyncToolInput {
   teamId: string;
   taskId: string;
@@ -258,6 +271,18 @@ export interface TeamTaskDispatchRecord {
   teamTask: TeamTaskRecord;
   agentTask?: TeamDispatchAgentTaskRecord;
   reason?: string;
+}
+
+export interface TeamTaskDispatchBatchErrorRecord {
+  taskId: TaskId | string;
+  ownerPath?: AgentPath | string;
+  error: string;
+}
+
+export interface TeamTaskDispatchBatchRecord {
+  count: number;
+  dispatched: TeamTaskDispatchRecord[];
+  errors: TeamTaskDispatchBatchErrorRecord[];
 }
 
 export interface TeamTaskSyncRecord {

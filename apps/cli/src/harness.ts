@@ -70,6 +70,7 @@ import {
   createTeamTaskAssignTool,
   createTeamTaskClaimTool,
   createTeamTaskCreateTool,
+  createTeamTaskDispatchBatchTool,
   createTeamTaskDispatchTool,
   createTeamTaskListTool,
   createTeamTaskReconcileTool,
@@ -824,6 +825,7 @@ function registerTeamTools(registry: InMemoryToolRegistry, controller: TeamToolC
 
 function registerTeamDispatchTools(registry: InMemoryToolRegistry, controller: TeamTaskDispatchToolController): void {
   registry.register(createTeamTaskDispatchTool(controller));
+  registry.register(createTeamTaskDispatchBatchTool(controller));
   registry.register(createTeamTaskSyncTool(controller));
   registry.register(createTeamTaskReconcileTool(controller));
 }
