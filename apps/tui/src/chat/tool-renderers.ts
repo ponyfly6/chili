@@ -539,6 +539,8 @@ function teamRunLoopSummary(output: string | undefined): string | undefined {
   const parts: string[] = [];
   const stopReason = firstString(record, ["stopReason", "stop_reason"]);
   if (stopReason) parts.push(`stop=${stopReason}`);
+  const fanout = firstNumber(record, ["maxConcurrentDispatches", "max_concurrent_dispatches"]);
+  if (fanout !== undefined) parts.push(`fanout=${fanout}`);
   appendCountPart(parts, "dispatched", countArrayField(record, ["dispatched"]));
   appendCountPart(parts, "completed", countArrayField(record, ["completed", "accepted", "merged"]));
   appendCountPart(parts, "running", countArrayField(record, ["stillRunning", "still_running"]));
@@ -562,6 +564,14 @@ function countArrayField(record: Record<string, unknown>, keys: readonly string[
     count += value.length;
   }
   return found ? count : undefined;
+}
+
+function firstNumber(record: Record<string, unknown>, keys: readonly string[]): number | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+  }
+  return undefined;
 }
 
 function teamMessagePastVerb(toolName: string): string {

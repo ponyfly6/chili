@@ -282,6 +282,7 @@ test("team renderers label batched tasks and summarize run loop output", () => {
     input: { team_id: "team_core" },
     output: JSON.stringify({
       stop_reason: "once",
+      max_concurrent_dispatches: 4,
       dispatched: [{ task_id: "task_a" }, { task_id: "task_b" }],
       completed: [],
       accepted: [{ task_id: "task_done" }],
@@ -303,7 +304,7 @@ test("team renderers label batched tasks and summarize run loop output", () => {
   expect(runLoop).toMatchObject({
     label: "Ran team loop team_core",
     mode: "inline",
-    summary: "stop=once, dispatched=2, completed=1, running=1, blocked=1",
+    summary: "stop=once, fanout=4, dispatched=2, completed=1, running=1, blocked=1",
   });
 });
 
