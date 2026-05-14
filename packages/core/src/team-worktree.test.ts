@@ -126,6 +126,58 @@ test("different writing tasks can run with different task worktrees", async () =
   }
 });
 
+test("concurrent dispatch claims before creating task worktrees", async () => {
+  const dir = await mkGitRepo("chili-team-worktree-claim-first-");
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 1325 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const sessionId = "session_team_worktree_claim_first" as SessionId;
+  const runner = new CapturingRunner();
+  let ensureCalls = 0;
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const worktrees: TeamTaskWorktreeManager = {
+      async ensureTaskWorktree(input) {
+        ensureCalls++;
+        await sleepMs(25);
+        const path = join(dir, ".chili", "worktrees", String(input.taskId));
+        const task = await teams.updateTask({
+          teamId: input.teamId,
+          taskId: input.taskId,
+          sessionId,
+          metadata: {
+            writeScope: ["packages/core"],
+            worktree: { path, baseRef: "HEAD", createdAt: Number(now()), status: "active" },
+          },
+        });
+        return { path, baseRef: "HEAD", createdAt: Number(now()), status: "active", created: true, task };
+      },
+    };
+    const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, worktrees, cwd: dir, now });
+    const team = await teams.createTeam({ sessionId, name: "worktree-claim-first", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer", writeScope: ["packages/core"] });
+    const first = await teams.createTask({ sessionId, teamId: team.id, title: "First write", ownerPath: workerPath, metadata: { writeScope: ["packages/core"] } });
+    const second = await teams.createTask({ sessionId, teamId: team.id, title: "Second write", ownerPath: workerPath, metadata: { writeScope: ["packages/core"] } });
+
+    const results = await Promise.all([
+      dispatcher.dispatchTask({ teamId: team.id, taskId: first.id, mode: "one_shot", sessionId, cwd: dir }),
+      dispatcher.dispatchTask({ teamId: team.id, taskId: second.id, mode: "one_shot", sessionId, cwd: dir }),
+    ]);
+
+    expect(ensureCalls).toBe(1);
+    expect(runner.runs).toHaveLength(1);
+    expect(results.map((result) => result.status).sort()).toEqual(["completed", "skipped"]);
+    expect(results.find((result) => result.status === "skipped")).toMatchObject({ reason: "member_unavailable" });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("worktree creation failure blocks the task with a clear error", async () => {
   const dir = await mkGitRepo("chili-team-worktree-failure-");
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -156,6 +208,9 @@ test("worktree creation failure blocks the task with a clear error", async () =>
       reason: "blocked",
       teamTask: { id: task.id, status: "blocked", error: "worktree_failed: git worktree add failed" },
     });
+    const storedMember = (await teams.members(team.id)).find((member) => member.path === workerPath);
+    expect(storedMember).toMatchObject({ path: workerPath, status: "idle" });
+    expect(storedMember?.currentTaskId).toBeUndefined();
     expect(runner.runs).toEqual([]);
   } finally {
     store.close();
@@ -203,6 +258,9 @@ test("abort during worktree creation does not block the task", async () => {
     expect(storedTask).toMatchObject({ id: task.id, status: "pending" });
     expect(storedTask?.error ?? "").toBe("");
     expect(worktreeMetadata(storedTask?.metadata)).toBeUndefined();
+    const storedMember = (await teams.members(team.id)).find((member) => member.path === workerPath);
+    expect(storedMember).toMatchObject({ path: workerPath, status: "idle" });
+    expect(storedMember?.currentTaskId).toBeUndefined();
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -413,6 +471,10 @@ async function mkGitRepo(prefix: string): Promise<string> {
 async function git(cwd: string, args: readonly string[]): Promise<void> {
   const result = await runProcess("git", args, { cwd, timeoutMs: 30_000, maxOutputBytes: 128_000 });
   if (result.exitCode !== 0) throw new Error(result.stderr || `git ${args.join(" ")} failed`);
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function createSequentialId(): (prefix: string) => string {

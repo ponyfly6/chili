@@ -394,7 +394,7 @@ export class TeamControlService implements TeamRuntime {
         }),
       ),
     ];
-    if (ownerPath && input.status && isFinalTeamTaskStatus(input.status)) {
+    if (ownerPath && input.status && input.status !== "in_progress") {
       events.push(
         this.teamEvent(
           input,

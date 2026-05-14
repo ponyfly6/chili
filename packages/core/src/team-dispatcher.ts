@@ -168,36 +168,6 @@ export class TeamTaskDispatchService {
       return { status: "skipped", reason: dispatchPolicy.reason, teamTask: blockedTask };
     }
 
-    let dispatchTask = task;
-    let worktree: TeamWorktreeEnsureResult | undefined;
-    if (this.options.worktrees && taskNeedsWorktree(task)) {
-      try {
-        worktree = await this.ensureWorktree({
-          teamId: input.teamId,
-          taskId: input.taskId,
-          cwd: input.cwd ?? this.options.cwd,
-          sessionId: parentSessionId,
-          ...(input.threadId ? { threadId: input.threadId } : {}),
-          ...(input.signal ? { signal: input.signal } : {}),
-        });
-        dispatchTask = worktree.task;
-      } catch (error) {
-        if (isSignalAbort(error, input.signal)) throw error;
-        const err = toError(error);
-        const blockedTask = await this.options.teams.updateTask({
-          teamId: input.teamId,
-          taskId: input.taskId,
-          status: "blocked",
-          error: `worktree_failed: ${err.message}`,
-          metadata: mergeDispatchMetadata(task.metadata, { policy: dispatchPolicy }),
-          sessionId: parentSessionId,
-          ...(input.threadId ? { threadId: input.threadId } : {}),
-        });
-        return { status: "skipped", reason: "blocked", teamTask: blockedTask };
-      }
-      throwIfAborted(input.signal);
-    }
-
     const claim = await this.options.teams.claimTask({
       teamId: input.teamId,
       taskId: input.taskId,
@@ -215,10 +185,48 @@ export class TeamTaskDispatchService {
     }
 
     const claimedTask = claim.task ?? (await this.requireTeamTask(input.teamId, input.taskId));
-    const claimedMetadata = claimedTask.metadata ?? {};
-    const taskForPrompt: TeamTaskRow = worktree && !claimedMetadata.worktree
-      ? { ...claimedTask, metadata: dispatchTask.metadata ?? {} }
-      : claimedTask;
+    let dispatchTask = claimedTask;
+    let worktree: TeamWorktreeEnsureResult | undefined;
+    if (this.options.worktrees && taskNeedsWorktree(claimedTask)) {
+      try {
+        worktree = await this.ensureWorktree({
+          teamId: input.teamId,
+          taskId: input.taskId,
+          cwd: input.cwd ?? this.options.cwd,
+          sessionId: parentSessionId,
+          ...(input.threadId ? { threadId: input.threadId } : {}),
+          ...(input.signal ? { signal: input.signal } : {}),
+        });
+        dispatchTask = worktree.task;
+      } catch (error) {
+        if (isSignalAbort(error, input.signal)) {
+          await this.options.teams.updateTask({
+            teamId: input.teamId,
+            taskId: input.taskId,
+            status: "pending",
+            error: "",
+            sessionId: parentSessionId,
+            ...(claimedTask.metadata ? { metadata: claimedTask.metadata } : {}),
+            ...(input.threadId ? { threadId: input.threadId } : {}),
+          });
+          throw error;
+        }
+        const err = toError(error);
+        const blockedTask = await this.options.teams.updateTask({
+          teamId: input.teamId,
+          taskId: input.taskId,
+          status: "blocked",
+          error: `worktree_failed: ${err.message}`,
+          metadata: mergeDispatchMetadata(claimedTask.metadata, { policy: dispatchPolicy }),
+          sessionId: parentSessionId,
+          ...(input.threadId ? { threadId: input.threadId } : {}),
+        });
+        return { status: "skipped", reason: "blocked", teamTask: blockedTask };
+      }
+      throwIfAborted(input.signal);
+    }
+
+    const taskForPrompt: TeamTaskRow = dispatchTask;
     try {
       const mode = input.mode ?? "background";
       const taskCwd = worktree?.path ?? input.cwd ?? this.options.cwd;
