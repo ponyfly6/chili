@@ -88,7 +88,7 @@ export interface TeamMessageDeliveryRecord {
 export interface TeamTaskClaimRecord {
   applied: boolean;
   task?: TeamTaskRecord;
-  reason?: "not_found" | "already_claimed" | "already_resolved" | "blocked";
+  reason?: "not_found" | "already_claimed" | "already_resolved" | "blocked" | "member_unavailable" | "write_conflict";
 }
 
 export interface TeamSnapshotMemberRecord extends TeamMemberRecord {

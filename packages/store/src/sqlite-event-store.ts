@@ -239,6 +239,7 @@ interface TeamTaskStateRow {
   status: TeamTaskRow["status"];
   owner_path: string | null;
   depends_on_json: string | null;
+  metadata_json: string | null;
 }
 
 interface TeamMessageProjectionRow {
@@ -811,6 +812,12 @@ export class SqliteEventStore
       }
       if (current.status !== "pending" || (current.owner_path && current.owner_path !== item.ownerPath)) {
         return { applied: false, reason: "already_claimed" as const, events: [] as ChiliEvent[] };
+      }
+      if (this.teamMemberUnavailableForClaim(item.teamId, item.ownerPath, item.taskId)) {
+        return { applied: false, reason: "member_unavailable" as const, events: [] as ChiliEvent[] };
+      }
+      if (this.teamTaskHasRunningWriteConflict(current)) {
+        return { applied: false, reason: "write_conflict" as const, events: [] as ChiliEvent[] };
       }
 
       const event = this.teamTaskClaimedEvent(item, current);
@@ -2088,12 +2095,42 @@ export class SqliteEventStore
   private teamTaskState(teamId: TeamId, taskId: TaskId): TeamTaskStateRow | undefined {
     const row = this.db
       .query<TeamTaskStateRow, [string, string]>(
-        `select id, team_id, status, owner_path, depends_on_json
+        `select id, team_id, status, owner_path, depends_on_json, metadata_json
          from team_tasks
          where team_id = ? and id = ?`,
       )
       .get(teamId, taskId);
     return row ?? undefined;
+  }
+
+  private teamMemberUnavailableForClaim(teamId: TeamId, ownerPath: AgentPath, taskId: TaskId): boolean {
+    const row = this.db
+      .query<{ status: TeamMemberRow["status"]; current_task_id: string | null }, [string, string]>(
+        `select status, current_task_id
+         from team_members
+         where team_id = ? and path = ?`,
+      )
+      .get(teamId, ownerPath);
+    if (!row) return false;
+    if (row.status === "closed" || row.status === "blocked") return true;
+    return row.status === "running" && row.current_task_id !== taskId;
+  }
+
+  private teamTaskHasRunningWriteConflict(task: TeamTaskStateRow): boolean {
+    const writeScope = teamTaskWriteScope(task.metadata_json);
+    if (writeScope.length === 0) return false;
+
+    const running = this.db
+      .query<{ id: string; metadata_json: string | null }, [string, string]>(
+        `select id, metadata_json
+         from team_tasks
+         where team_id = ? and status = 'in_progress' and id <> ?`,
+      )
+      .all(task.team_id, task.id);
+    return running.some((candidate) => {
+      const candidateWriteScope = teamTaskWriteScope(candidate.metadata_json);
+      return candidateWriteScope.length > 0 && scopesOverlap(writeScope, candidateWriteScope);
+    });
   }
 
   private teamTaskDependenciesComplete(task: TeamTaskStateRow): boolean {
@@ -2567,6 +2604,40 @@ function teamTaskFromRow(row: TeamTaskProjectionRow): TeamTaskRow {
   if (row.metadata_json) task.metadata = decodeJson<Record<string, unknown>>(row.metadata_json, {});
   if (row.completed_at) task.completedAt = row.completed_at;
   return task;
+}
+
+function teamTaskWriteScope(metadataJson: string | null): string[] {
+  if (!metadataJson) return [];
+  const metadata = decodeJson<Record<string, unknown>>(metadataJson, {});
+  return metadataStringArray(metadata, ["writeScope", "write_scope", "writeScopes", "write_scopes"]) ?? [];
+}
+
+function metadataStringArray(metadata: Record<string, unknown>, keys: readonly string[]): string[] | undefined {
+  for (const key of keys) {
+    const value = metadata[key];
+    if (!Array.isArray(value)) continue;
+    const items = value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
+    return items.length > 0 ? items : [];
+  }
+  return undefined;
+}
+
+function scopesOverlap(left: readonly string[], right: readonly string[]): boolean {
+  return left.some((leftItem) => right.some((rightItem) => pathScopeContains(leftItem, rightItem) || pathScopeContains(rightItem, leftItem)));
+}
+
+function pathScopeContains(scope: string, item: string): boolean {
+  const normalizedScope = normalizePathScope(scope);
+  const normalizedItem = normalizePathScope(item);
+  if (normalizedScope === "*" || normalizedScope === "." || normalizedScope === "/") return true;
+  return normalizedItem === normalizedScope || normalizedItem.startsWith(`${normalizedScope}/`);
+}
+
+function normalizePathScope(value: string): string {
+  let normalized = value.trim().replaceAll("\\", "/");
+  while (normalized.startsWith("./")) normalized = normalized.slice(2);
+  while (normalized.length > 1 && normalized.endsWith("/")) normalized = normalized.slice(0, -1);
+  return normalized || ".";
 }
 
 function teamMessageFromRow(row: TeamMessageProjectionRow): TeamMessageRow {

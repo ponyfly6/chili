@@ -1365,6 +1365,9 @@ test("claims team tasks with dependency-aware CAS", async () => {
   const otherPath = "/root/other" as AgentPath;
   const setupTaskId = "task_claim_setup" as TaskId;
   const readyTaskId = "task_claim_ready" as TaskId;
+  const busyTaskId = "task_claim_busy" as TaskId;
+  const runningWriteTaskId = "task_claim_running_write" as TaskId;
+  const conflictingWriteTaskId = "task_claim_conflicting_write" as TaskId;
   const blockedTaskId = "task_claim_blocked" as TaskId;
   const failedDependencyTaskId = "task_claim_failed_dependency" as TaskId;
   const waitsOnFailedTaskId = "task_claim_waits_on_failed" as TaskId;
@@ -1389,9 +1392,17 @@ test("claims team tasks with dependency-aware CAS", async () => {
         payload: { teamId, path: workerPath, name: "worker", role: "implementer" },
       },
       {
+        id: "event_team_claim_other",
+        type: "team.member_added",
+        time: 4 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { teamId, path: otherPath, name: "other", role: "implementer" },
+      },
+      {
         id: "event_team_claim_setup",
         type: "team.task_created",
-        time: 4 as TimestampMs,
+        time: 5 as TimestampMs,
         sessionId,
         threadId,
         payload: { teamId, taskId: setupTaskId, title: "setup", status: "completed" },
@@ -1399,15 +1410,51 @@ test("claims team tasks with dependency-aware CAS", async () => {
       {
         id: "event_team_claim_ready",
         type: "team.task_created",
-        time: 5 as TimestampMs,
+        time: 6 as TimestampMs,
         sessionId,
         threadId,
         payload: { teamId, taskId: readyTaskId, title: "ready", dependsOn: [setupTaskId] },
       },
       {
+        id: "event_team_claim_busy",
+        type: "team.task_created",
+        time: 7 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { teamId, taskId: busyTaskId, title: "busy" },
+      },
+      {
+        id: "event_team_claim_running_write",
+        type: "team.task_created",
+        time: 8 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          taskId: runningWriteTaskId,
+          title: "running write",
+          status: "in_progress",
+          ownerPath: leadPath,
+          metadata: { writeScope: ["packages/core"] },
+        },
+      },
+      {
+        id: "event_team_claim_conflicting_write",
+        type: "team.task_created",
+        time: 9 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          teamId,
+          taskId: conflictingWriteTaskId,
+          title: "conflicting write",
+          metadata: { writeScope: ["packages/core/src"] },
+        },
+      },
+      {
         id: "event_team_claim_blocked",
         type: "team.task_created",
-        time: 6 as TimestampMs,
+        time: 10 as TimestampMs,
         sessionId,
         threadId,
         payload: { teamId, taskId: blockedTaskId, title: "blocked", dependsOn: ["task_missing" as TaskId] },
@@ -1415,7 +1462,7 @@ test("claims team tasks with dependency-aware CAS", async () => {
       {
         id: "event_team_claim_failed_dependency",
         type: "team.task_created",
-        time: 7 as TimestampMs,
+        time: 11 as TimestampMs,
         sessionId,
         threadId,
         payload: { teamId, taskId: failedDependencyTaskId, title: "failed dependency", status: "failed" },
@@ -1423,7 +1470,7 @@ test("claims team tasks with dependency-aware CAS", async () => {
       {
         id: "event_team_claim_waits_on_failed",
         type: "team.task_created",
-        time: 8 as TimestampMs,
+        time: 12 as TimestampMs,
         sessionId,
         threadId,
         payload: { teamId, taskId: waitsOnFailedTaskId, title: "waits on failed", dependsOn: [failedDependencyTaskId] },
@@ -1465,6 +1512,38 @@ test("claims team tasks with dependency-aware CAS", async () => {
         id: readyTaskId,
         status: "in_progress",
         ownerPath: workerPath,
+      },
+    });
+
+    const memberUnavailable = await store.claimTeamTask({
+      teamId,
+      taskId: busyTaskId,
+      ownerPath: workerPath,
+      eventId: "event_team_claim_member_unavailable",
+      time: 11,
+    });
+    expect(memberUnavailable).toMatchObject({
+      applied: false,
+      reason: "member_unavailable",
+      task: {
+        id: busyTaskId,
+        status: "pending",
+      },
+    });
+
+    const writeConflict = await store.claimTeamTask({
+      teamId,
+      taskId: conflictingWriteTaskId,
+      ownerPath: otherPath,
+      eventId: "event_team_claim_write_conflict",
+      time: 12,
+    });
+    expect(writeConflict).toMatchObject({
+      applied: false,
+      reason: "write_conflict",
+      task: {
+        id: conflictingWriteTaskId,
+        status: "pending",
       },
     });
 

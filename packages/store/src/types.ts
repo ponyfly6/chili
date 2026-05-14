@@ -396,7 +396,7 @@ export interface TeamTaskMutationResult {
   applied: boolean;
   task?: TeamTaskRow;
   events: ChiliEvent[];
-  reason?: "not_found" | "already_claimed" | "already_resolved" | "blocked";
+  reason?: "not_found" | "already_claimed" | "already_resolved" | "blocked" | "member_unavailable" | "write_conflict";
 }
 
 export interface EventStore {
