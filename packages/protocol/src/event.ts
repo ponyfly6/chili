@@ -312,6 +312,7 @@ export interface TeamRunStartedPayload {
   maxCycles: number;
   timeoutMs: number;
   pollIntervalMs: number;
+  maxConcurrentDispatches?: number;
 }
 
 export interface TeamRunProgressPayload {

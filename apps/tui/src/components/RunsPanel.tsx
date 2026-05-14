@@ -23,11 +23,16 @@ export function RunsPanel(props: PanelProps) {
       {runs.length === 0 ? (
         <text fg={theme.colors.text.muted} truncate wrapMode="none">{"  run: none"}</text>
       ) : (
-        runWindow.rows.map(({ item: run, index }) => (
-          <text key={run.id} fg={index === props.selectedIndex ? theme.colors.text.primary : theme.colors.text.secondary} truncate wrapMode="none">
-            {`${rowMarker(props.focused, index === props.selectedIndex)} ${run.phase ?? run.status} ${shorten(run.id, 12)} c:${run.cycle} ${countsCompact(run.counts)}`}
-          </text>
-        ))
+        runWindow.rows.map(({ item: run, index }) => {
+          const runLabel = run.maxConcurrentDispatches
+            ? `${run.phase ?? run.status} fan:${run.maxConcurrentDispatches}`
+            : `${run.phase ?? run.status} ${shorten(run.id, 12)} c:${run.cycle}`;
+          return (
+            <text key={run.id} fg={index === props.selectedIndex ? theme.colors.text.primary : theme.colors.text.secondary} truncate wrapMode="none">
+              {`${rowMarker(props.focused, index === props.selectedIndex)} ${runLabel} ${countsCompact(run.counts)}`}
+            </text>
+          );
+        })
       )}
       {tools.slice(0, VISIBLE_LIMITS.activeTools).map((tool) => (
         <text key={tool.id} fg={tool.waitingForApproval ? theme.colors.status.warning : theme.colors.status.success} truncate wrapMode="none">

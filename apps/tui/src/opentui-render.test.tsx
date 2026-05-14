@@ -644,6 +644,7 @@ test("renders active run and active tool", async () => {
   const frame = await renderFrame(teamLiveFixture(), { width: 120, height: 40 });
 
   expect(frame).toContain("dispatch");
+  expect(frame).toContain("fan:4");
   expect(frame).toContain("read_file");
 });
 

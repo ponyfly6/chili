@@ -1065,6 +1065,7 @@ test("projects team run lifecycle events into run view models", () => {
           maxCycles: 5,
           timeoutMs: 1000,
           pollIntervalMs: 50,
+          maxConcurrentDispatches: 6,
         },
       },
       {
@@ -1106,6 +1107,7 @@ test("projects team run lifecycle events into run view models", () => {
     stopReason: "once",
     startedAt: 2,
     endedAt: 4,
+    maxConcurrentDispatches: 6,
     counts: { dispatched: 2, completed: 2 },
   });
 });

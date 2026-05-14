@@ -42,6 +42,7 @@ function detailLines(model: TeamLiveView, focus: FocusRegion, selection: Selecti
     return [
       `run:${run.id}`,
       `status:${run.phase ?? run.status} cycle:${run.cycle}`,
+      `mode:${run.mode ?? "unknown"} once:${String(run.once ?? false)} fanout:${run.maxConcurrentDispatches ?? "default"}`,
       `counts:${countsCompact(run.counts)}`,
       `stop:${run.stopReason ?? "none"}`,
     ];

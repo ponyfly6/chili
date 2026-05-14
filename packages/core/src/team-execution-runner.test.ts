@@ -259,6 +259,7 @@ test("emits team run lifecycle events", async () => {
         mode: "one_shot",
         once: false,
         maxCycles: 3,
+        maxConcurrentDispatches: 4,
       },
     });
     const runIds = new Set(lifecycleEvents.map((event) => (isRecord(event.payload) ? event.payload.runId : undefined)));

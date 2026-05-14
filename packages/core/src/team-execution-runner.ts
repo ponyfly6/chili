@@ -266,6 +266,7 @@ export class TeamExecutionRunner {
       maxCycles,
       timeoutMs,
       pollIntervalMs,
+      maxConcurrentDispatches,
     });
     if (initialState.team.status !== "active") {
       summary.stopReason = "team_inactive";
@@ -753,7 +754,7 @@ export class TeamExecutionRunner {
     sessionState: SessionState,
     team: TeamRow,
     runId: string,
-    options: { maxCycles: number; timeoutMs: number; pollIntervalMs: number },
+    options: { maxCycles: number; timeoutMs: number; pollIntervalMs: number; maxConcurrentDispatches: number },
   ): Promise<void> {
     await this.appendRunEvent(input, sessionState, team, "team.run_started", {
       teamId: input.teamId,
@@ -763,6 +764,7 @@ export class TeamExecutionRunner {
       maxCycles: options.maxCycles,
       timeoutMs: options.timeoutMs,
       pollIntervalMs: options.pollIntervalMs,
+      maxConcurrentDispatches: options.maxConcurrentDispatches,
     });
   }
 
