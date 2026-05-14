@@ -15,6 +15,10 @@ import {
 import { SqliteEventStore, type TeamTaskRow } from "../packages/store/src/index.js";
 import {
   createTeamTaskCreateBatchTool,
+  createTeamRunLoopTool,
+  type TeamRunLoopRecord,
+  type TeamRunLoopToolController,
+  type TeamRunLoopToolInput,
   type TeamTaskCreateToolInput,
   type TeamTaskRecord,
   type TeamToolController,
@@ -66,13 +70,10 @@ try {
 
     await createScopedTasksWithTool(teams, team.id, sessionId, threadId, workspace);
 
-    const dispatch = await execution.run({
+    const dispatch = await runTeamLoopWithTool(execution, team.id, sessionId, threadId, workspace, {
       teamId: team.id,
-      sessionId,
-      threadId,
       once: true,
       maxConcurrentDispatches: 2,
-      timeoutMs: 10_000,
     });
     assert.equal(dispatch.errors.length, 0, JSON.stringify(dispatch.errors));
     assert.deepEqual(dispatch.blocked, []);
@@ -86,13 +87,10 @@ try {
     assert.ok(runner.runs.some((run) => run.taskName === "Core implementation" && run.workerPolicy?.allowedTools?.includes("edit")));
     assert.ok(runner.runs.some((run) => run.taskName === "Docs implementation" && run.workerPolicy?.writeScope?.includes("docs")));
 
-    const reconciled = await execution.run({
+    const reconciled = await runTeamLoopWithTool(execution, team.id, sessionId, threadId, workspace, {
       teamId: team.id,
-      sessionId,
-      threadId,
       once: true,
       maxConcurrentDispatches: 2,
-      timeoutMs: 10_000,
     });
     assert.equal(reconciled.errors.length, 0, JSON.stringify(reconciled.errors));
     assert.ok(reconciled.completed.some((item) => item.taskId === "task_core"));
@@ -107,6 +105,37 @@ try {
   }
 } finally {
   await rm(workspace, { recursive: true, force: true });
+}
+
+async function runTeamLoopWithTool(
+  execution: TeamExecutionRunner,
+  teamId: TeamId,
+  sessionId: SessionId,
+  threadId: ThreadId,
+  cwd: string,
+  input: TeamRunLoopToolInput,
+): Promise<TeamRunLoopRecord> {
+  const controller = {
+    async runTeam(runInput: TeamRunLoopToolInput): Promise<TeamRunLoopRecord> {
+      return execution.run({
+        teamId: runInput.teamId as TeamId,
+        sessionId,
+        threadId,
+        cwd,
+        once: runInput.once,
+        mode: runInput.mode,
+        maxCycles: runInput.maxCycles,
+        timeoutMs: runInput.timeoutMs,
+        pollIntervalMs: runInput.pollIntervalMs,
+        maxConcurrentDispatches: runInput.maxConcurrentDispatches,
+      });
+    },
+  } as TeamRunLoopToolController;
+  const tool = createTeamRunLoopTool(controller);
+  const validated = await tool.validate?.({ ...input, team_id: teamId, timeout_ms: 10_000 });
+  assert.ok(validated?.ok, validated && "message" in validated ? validated.message : "validation failed");
+  const result = await tool.execute(validated.value, toolContext(sessionId, threadId, cwd));
+  return JSON.parse(result.output) as TeamRunLoopRecord;
 }
 
 async function createScopedTasksWithTool(

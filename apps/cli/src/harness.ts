@@ -75,6 +75,7 @@ import {
   createTeamTaskDispatchTool,
   createTeamTaskListTool,
   createTeamTaskReconcileTool,
+  createTeamRunLoopTool,
   createTeamTaskSyncTool,
   createTeamTaskUpdateTool,
   createToolSearchTool,
@@ -87,6 +88,8 @@ import {
   type TeamMemberRecord,
   type TeamMessageRecord,
   type TeamRecord,
+  type TeamRunLoopRecord,
+  type TeamRunLoopToolController,
   type TeamSnapshotRecord,
   type TeamTaskClaimRecord,
   type TeamTaskDispatchRecord,
@@ -431,6 +434,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   registerTeamTools(childRegistry, teamController);
   const teamDispatchController = createTeamTaskDispatchToolController(teamDispatcher);
   registerTeamDispatchTools(registry, teamDispatchController);
+  registry.register(createTeamRunLoopTool(createTeamRunLoopToolController(teamRunner)));
   mcpRuntime = await createCliMcpRuntime({
     cwd,
     chiliHome,
@@ -1160,6 +1164,27 @@ function createTeamTaskDispatchToolController(dispatcher: TeamTaskDispatchServic
   };
 }
 
+function createTeamRunLoopToolController(teamRunner: TeamExecutionRunner): TeamRunLoopToolController {
+  return {
+    async runTeam(input, context) {
+      const runInput: Parameters<TeamExecutionRunner["run"]>[0] = {
+        teamId: input.teamId as TeamId,
+        sessionId: context.sessionId,
+        cwd: context.cwd,
+        once: input.once ?? true,
+        signal: context.signal,
+      };
+      if (context.threadId) runInput.threadId = context.threadId;
+      if (input.mode) runInput.mode = input.mode;
+      if (input.maxCycles !== undefined) runInput.maxCycles = input.maxCycles;
+      if (input.timeoutMs !== undefined) runInput.timeoutMs = input.timeoutMs;
+      if (input.pollIntervalMs !== undefined) runInput.pollIntervalMs = input.pollIntervalMs;
+      if (input.maxConcurrentDispatches !== undefined) runInput.maxConcurrentDispatches = input.maxConcurrentDispatches;
+      return toTeamRunLoopRecord(await teamRunner.run(runInput));
+    },
+  };
+}
+
 function mailboxTaskLimit(input: MailboxListToolInput): number {
   return Math.max(input.limit ?? 500, 500);
 }
@@ -1318,6 +1343,29 @@ function toTeamTaskReconcileRecord(
       taskId: error.taskId,
       error: error.error,
     })),
+  };
+}
+
+function toTeamRunLoopRecord(result: Awaited<ReturnType<TeamExecutionRunner["run"]>>): TeamRunLoopRecord {
+  return {
+    teamId: result.teamId,
+    cycles: result.cycles,
+    stopReason: result.stopReason,
+    startedAt: result.startedAt,
+    endedAt: result.endedAt,
+    dispatched: result.dispatched,
+    completed: result.completed,
+    accepted: result.accepted,
+    reopened: result.reopened,
+    merged: result.merged,
+    mergeFailed: result.mergeFailed,
+    mergeConflicted: result.mergeConflicted,
+    mergeSkipped: result.mergeSkipped,
+    failed: result.failed,
+    blocked: result.blocked,
+    skipped: result.skipped,
+    stillRunning: result.stillRunning,
+    errors: result.errors,
   };
 }
 

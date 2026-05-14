@@ -28,6 +28,7 @@ import {
   createTeamTaskDispatchTool,
   createTeamTaskListTool,
   createTeamTaskReconcileTool,
+  createTeamRunLoopTool,
   createTeamTaskSyncTool,
   createTeamTaskUpdateTool,
 } from "./builtins/team.js";
@@ -42,6 +43,9 @@ import type {
   TeamMessageRecord,
   TeamMessageSendToolInput,
   TeamRecord,
+  TeamRunLoopRecord,
+  TeamRunLoopToolController,
+  TeamRunLoopToolInput,
   TeamSnapshotRecord,
   TeamSnapshotToolInput,
   TeamTaskAssignToolInput,
@@ -427,6 +431,53 @@ test("team dispatch tools expose subagent dispatch, sync, and reconcile", async 
   expect(controller.taskReconcileInputs).toEqual([{ teamId: "team_core", limit: 10 }]);
 });
 
+test("team run loop tool schedules scoped team work through the runner", async () => {
+  const controller = new FakeTeamToolController();
+  const approvals: ApprovalBrokerRequest[] = [];
+  const executor = createExecutor(registryWithTeamTools(controller), approvals);
+
+  const result = await executor.execute(toolInput("team_run", {
+    team_id: "team_core",
+    max_concurrent_dispatches: 6,
+    timeout_ms: 5000,
+  }));
+
+  expect(result.status).toBe("completed");
+  expect(controller.teamRunLoopInputs).toEqual([
+    {
+      teamId: "team_core",
+      once: true,
+      timeoutMs: 5000,
+      maxConcurrentDispatches: 6,
+    },
+  ]);
+  if (result.status === "completed") {
+    expect(JSON.parse(result.result.output)).toMatchObject({
+      team_id: "team_core",
+      stop_reason: "cycle_limit",
+      dispatched: [{ task_id: "task_team", owner_path: "/worker", agent_task_id: "agent_task" }],
+      still_running: [{ task_id: "task_team", title: "Implement team tools" }],
+    });
+    expect(result.result.metadata).toMatchObject({
+      team_id: "team_core",
+      stop_reason: "cycle_limit",
+      dispatched: 1,
+      still_running: 1,
+    });
+  }
+  expect(approvals).toHaveLength(1);
+  expect(approvals[0]).toMatchObject({
+    permission: "team_run_loop",
+    patterns: ["team_core", "once:true", "concurrency:6", "background"],
+  });
+
+  const rejected = await executor.execute(toolInput("team_run_loop", {
+    team_id: "team_core",
+    max_concurrent_dispatches: 65,
+  }));
+  expect(rejected.status).toBe("failed");
+});
+
 test("team dispatch batch launches background tasks with bounded parallelism", async () => {
   const controller = new FakeTeamToolController();
   controller.dispatchDelayMs = 20;
@@ -495,7 +546,7 @@ test("team tools reject non-absolute agent paths", async () => {
   expect(controller.memberAddInputs).toEqual([]);
 });
 
-function registryWithTeamTools(controller: TeamToolController & TeamTaskDispatchToolController): InMemoryToolRegistry {
+function registryWithTeamTools(controller: TeamToolController & TeamTaskDispatchToolController & TeamRunLoopToolController): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createTeamCreateTool(controller));
   registry.register(createTeamListTool(controller));
@@ -512,6 +563,7 @@ function registryWithTeamTools(controller: TeamToolController & TeamTaskDispatch
   registry.register(createTeamTaskDispatchBatchTool(controller));
   registry.register(createTeamTaskSyncTool(controller));
   registry.register(createTeamTaskReconcileTool(controller));
+  registry.register(createTeamRunLoopTool(controller));
   registry.register(createTeamMessageSendTool(controller));
   registry.register(createTeamMessageListTool(controller));
   return registry;
@@ -548,7 +600,7 @@ function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-class FakeTeamToolController implements TeamToolController, TeamTaskDispatchToolController {
+class FakeTeamToolController implements TeamToolController, TeamTaskDispatchToolController, TeamRunLoopToolController {
   createTeamInputs: TeamCreateToolInput[] = [];
   teamListInputs: TeamListToolInput[] = [];
   snapshotInputs: TeamSnapshotToolInput[] = [];
@@ -563,6 +615,7 @@ class FakeTeamToolController implements TeamToolController, TeamTaskDispatchTool
   taskDispatchBatchInputs: TeamTaskDispatchBatchToolInput[] = [];
   taskSyncInputs: TeamTaskSyncToolInput[] = [];
   taskReconcileInputs: TeamTaskReconcileToolInput[] = [];
+  teamRunLoopInputs: TeamRunLoopToolInput[] = [];
   messageSendInputs: TeamMessageSendToolInput[] = [];
   messageListInputs: TeamMessageListToolInput[] = [];
   dispatchDelayMs = 0;
@@ -684,6 +737,34 @@ class FakeTeamToolController implements TeamToolController, TeamTaskDispatchTool
           teamTask: taskRecord({ teamId: input.teamId ?? "team_core", taskId: "task_running", status: "in_progress" }),
           agentTask: { taskId: "agent_running", status: "running" },
         },
+      ],
+      errors: [],
+    };
+  }
+
+  async runTeam(input: TeamRunLoopToolInput): Promise<TeamRunLoopRecord> {
+    this.teamRunLoopInputs.push(input);
+    return {
+      teamId: input.teamId,
+      cycles: input.once === false ? 3 : 1,
+      stopReason: input.once === false ? "drained" : "cycle_limit",
+      startedAt: 1,
+      endedAt: 2,
+      dispatched: [
+        { teamId: input.teamId, taskId: "task_team", ownerPath: "/worker", agentTaskId: "agent_task", status: "running" },
+      ],
+      completed: [],
+      accepted: [],
+      reopened: [],
+      merged: [],
+      mergeFailed: [],
+      mergeConflicted: [],
+      mergeSkipped: [],
+      failed: [],
+      blocked: [],
+      skipped: [],
+      stillRunning: [
+        { teamId: input.teamId, taskId: "task_team", ownerPath: "/worker", title: "Implement team tools", agentTaskId: "agent_task" },
       ],
       errors: [],
     };

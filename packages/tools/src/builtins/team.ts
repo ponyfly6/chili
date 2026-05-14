@@ -38,6 +38,9 @@ import type {
   TeamTaskDispatchBatchRecord,
   TeamTaskDispatchBatchToolInput,
   TeamTaskStatus,
+  TeamRunLoopRecord,
+  TeamRunLoopToolController,
+  TeamRunLoopToolInput,
 } from "../team.js";
 
 export interface TeamToolResult extends ToolResult {
@@ -48,6 +51,7 @@ const MAX_TEAM_TASK_CREATE_BATCH_TASKS = 64;
 const DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY = 8;
 const MAX_TEAM_DISPATCH_BATCH_CONCURRENCY = 32;
 const MAX_TEAM_DISPATCH_BATCH_TASKS = 64;
+const MAX_TEAM_RUN_LOOP_CONCURRENCY = 64;
 
 export function createTeamCreateTool(controller: TeamToolController): ChiliToolDefinition<TeamCreateToolInput, TeamToolResult> {
   return {
@@ -633,6 +637,75 @@ export function createTeamTaskReconcileTool(
   };
 }
 
+export function createTeamRunLoopTool(
+  controller: TeamRunLoopToolController,
+): ChiliToolDefinition<TeamRunLoopToolInput, TeamToolResult> {
+  return {
+    name: "team_run_loop",
+    aliases: ["run_team", "team_run"],
+    description:
+      "Run the persistent team scheduler: reconcile running tasks, auto-assign scoped pending tasks, dispatch eligible tasks in parallel, and verify or merge completed work. Defaults to one scheduling cycle.",
+    risk: "execute",
+    inputSchema: {
+      type: "object",
+      required: ["teamId"],
+      properties: {
+        teamId: { type: "string" },
+        team_id: { type: "string" },
+        mode: { type: "string", enum: ["one_shot", "resumable", "background"] },
+        once: { type: "boolean" },
+        maxCycles: { type: "number" },
+        max_cycles: { type: "number" },
+        timeoutMs: { type: "number" },
+        timeout_ms: { type: "number" },
+        pollIntervalMs: { type: "number" },
+        poll_interval_ms: { type: "number" },
+        maxConcurrentDispatches: { type: "number" },
+        max_concurrent_dispatches: { type: "number" },
+      },
+    },
+    validate: validateTeamRunLoopInput,
+    approval(input) {
+      return {
+        permission: "team_run_loop",
+        patterns: [
+          input.teamId,
+          `once:${input.once ?? true}`,
+          `concurrency:${input.maxConcurrentDispatches ?? "default"}`,
+          input.mode ?? "background",
+        ],
+        metadata: {
+          teamId: input.teamId,
+          team_id: input.teamId,
+          mode: input.mode ?? "background",
+          once: input.once ?? true,
+          maxCycles: input.maxCycles,
+          max_cycles: input.maxCycles,
+          timeoutMs: input.timeoutMs,
+          timeout_ms: input.timeoutMs,
+          pollIntervalMs: input.pollIntervalMs,
+          poll_interval_ms: input.pollIntervalMs,
+          maxConcurrentDispatches: input.maxConcurrentDispatches,
+          max_concurrent_dispatches: input.maxConcurrentDispatches,
+        },
+      };
+    },
+    async execute(input, context) {
+      await context.metadata({
+        metadata: {
+          teamId: input.teamId,
+          team_id: input.teamId,
+          mode: input.mode ?? "background",
+          once: input.once ?? true,
+          maxConcurrentDispatches: input.maxConcurrentDispatches,
+          max_concurrent_dispatches: input.maxConcurrentDispatches,
+        },
+      });
+      return teamRunLoopToolResult(await controller.runTeam(input, context));
+    },
+  };
+}
+
 export function createTeamMessageSendTool(
   controller: TeamToolController,
 ): ChiliToolDefinition<TeamMessageSendToolInput, TeamToolResult> {
@@ -1001,6 +1074,41 @@ function validateTeamTaskReconcileInput(input: unknown): ValidationResult<TeamTa
   return { ok: true, value };
 }
 
+function validateTeamRunLoopInput(input: unknown): ValidationResult<TeamRunLoopToolInput> {
+  if (!isRecord(input)) return { ok: false, message: "expected an object" };
+  const teamId = requiredString(input, ["teamId", "team_id"], "teamId");
+  if (!teamId.ok) return teamId;
+  const mode = normalizeDispatchMode(input.mode);
+  if (!mode.ok) return mode;
+  const once = optionalBoolean(input.once, "once");
+  if (!once.ok) return once;
+  const maxCycles = optionalPositiveInteger(input.maxCycles ?? input.max_cycles, "maxCycles");
+  if (!maxCycles.ok) return maxCycles;
+  const timeoutMs = optionalPositiveInteger(input.timeoutMs ?? input.timeout_ms, "timeoutMs");
+  if (!timeoutMs.ok) return timeoutMs;
+  const pollIntervalMs = optionalPositiveInteger(input.pollIntervalMs ?? input.poll_interval_ms, "pollIntervalMs");
+  if (!pollIntervalMs.ok) return pollIntervalMs;
+  const maxConcurrentDispatches = optionalPositiveInteger(
+    input.maxConcurrentDispatches ?? input.max_concurrent_dispatches,
+    "maxConcurrentDispatches",
+  );
+  if (!maxConcurrentDispatches.ok) return maxConcurrentDispatches;
+  if (maxConcurrentDispatches.value !== undefined && maxConcurrentDispatches.value > MAX_TEAM_RUN_LOOP_CONCURRENCY) {
+    return { ok: false, message: `maxConcurrentDispatches cannot exceed ${MAX_TEAM_RUN_LOOP_CONCURRENCY}` };
+  }
+
+  const value: TeamRunLoopToolInput = {
+    teamId: teamId.value,
+    once: once.value ?? true,
+  };
+  if (mode.value) value.mode = mode.value;
+  if (maxCycles.value !== undefined) value.maxCycles = maxCycles.value;
+  if (timeoutMs.value !== undefined) value.timeoutMs = timeoutMs.value;
+  if (pollIntervalMs.value !== undefined) value.pollIntervalMs = pollIntervalMs.value;
+  if (maxConcurrentDispatches.value !== undefined) value.maxConcurrentDispatches = maxConcurrentDispatches.value;
+  return { ok: true, value };
+}
+
 function validateTeamMessageSendInput(input: unknown): ValidationResult<TeamMessageSendToolInput> {
   if (!isRecord(input)) return { ok: false, message: "expected an object" };
   const teamId = requiredString(input, ["teamId", "team_id"], "teamId");
@@ -1235,6 +1343,37 @@ function teamTaskReconcileToolResult(result: TeamTaskReconcileRecord): TeamToolR
   };
 }
 
+function teamRunLoopToolResult(result: TeamRunLoopRecord): TeamToolResult {
+  return {
+    title: `team_run_loop ${result.teamId} stop=${result.stopReason} dispatched=${result.dispatched.length} running=${result.stillRunning.length}`,
+    output: JSON.stringify(teamRunLoopOutput(result)),
+    metadata: {
+      team_id: result.teamId,
+      teamId: result.teamId,
+      stop_reason: result.stopReason,
+      stopReason: result.stopReason,
+      cycles: result.cycles,
+      dispatched: result.dispatched.length,
+      completed: result.completed.length,
+      accepted: result.accepted.length,
+      reopened: result.reopened.length,
+      merged: result.merged.length,
+      merge_failed: result.mergeFailed.length,
+      mergeFailed: result.mergeFailed.length,
+      merge_conflicted: result.mergeConflicted.length,
+      mergeConflicted: result.mergeConflicted.length,
+      merge_skipped: result.mergeSkipped.length,
+      mergeSkipped: result.mergeSkipped.length,
+      failed: result.failed.length,
+      blocked: result.blocked.length,
+      skipped: result.skipped.length,
+      still_running: result.stillRunning.length,
+      stillRunning: result.stillRunning.length,
+      errors: result.errors.length,
+    },
+  };
+}
+
 function teamMessageRecordToolResult(title: string, message: TeamMessageRecord): TeamToolResult {
   return {
     title: `${title} ${message.messageId}`,
@@ -1428,6 +1567,58 @@ function teamTaskSyncOutput(result: TeamTaskSyncRecord): Record<string, unknown>
     teamTask: teamTaskRecordOutput(result.teamTask),
     agent_task: result.agentTask ? agentTaskRecordOutput(result.agentTask) : undefined,
     agentTask: result.agentTask ? agentTaskRecordOutput(result.agentTask) : undefined,
+  });
+}
+
+function teamRunLoopOutput(result: TeamRunLoopRecord): Record<string, unknown> {
+  return {
+    team_id: result.teamId,
+    teamId: result.teamId,
+    cycles: result.cycles,
+    stop_reason: result.stopReason,
+    stopReason: result.stopReason,
+    started_at: result.startedAt,
+    startedAt: result.startedAt,
+    ended_at: result.endedAt,
+    endedAt: result.endedAt,
+    dispatched: result.dispatched.map(teamRunTaskOutput),
+    completed: result.completed.map(teamRunTaskOutput),
+    accepted: result.accepted.map(teamRunTaskOutput),
+    reopened: result.reopened.map(teamRunTaskOutput),
+    merged: result.merged.map(teamRunTaskOutput),
+    merge_failed: result.mergeFailed.map(teamRunTaskOutput),
+    mergeFailed: result.mergeFailed.map(teamRunTaskOutput),
+    merge_conflicted: result.mergeConflicted.map(teamRunTaskOutput),
+    mergeConflicted: result.mergeConflicted.map(teamRunTaskOutput),
+    merge_skipped: result.mergeSkipped.map(teamRunTaskOutput),
+    mergeSkipped: result.mergeSkipped.map(teamRunTaskOutput),
+    failed: result.failed.map(teamRunTaskOutput),
+    blocked: result.blocked.map(teamRunTaskOutput),
+    skipped: result.skipped.map(teamRunTaskOutput),
+    still_running: result.stillRunning.map(teamRunTaskOutput),
+    stillRunning: result.stillRunning.map(teamRunTaskOutput),
+    errors: result.errors.map(teamRunTaskOutput),
+  };
+}
+
+function teamRunTaskOutput(task: object): Record<string, unknown> {
+  const record = task as Record<string, unknown>;
+  return pruneUndefined({
+    ...record,
+    team_id: record.teamId,
+    teamId: record.teamId,
+    task_id: record.taskId,
+    taskId: record.taskId,
+    owner_path: record.ownerPath,
+    ownerPath: record.ownerPath,
+    agent_task_id: record.agentTaskId,
+    agentTaskId: record.agentTaskId,
+    verifier_task_id: record.verifierTaskId,
+    verifierTaskId: record.verifierTaskId,
+    diff_summary: record.diffSummary,
+    diffSummary: record.diffSummary,
+    blocked_by: record.blockedBy,
+    blockedBy: record.blockedBy,
   });
 }
 
@@ -1726,6 +1917,12 @@ function optionalPositiveInteger(value: unknown, name: string): ValidationResult
   if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
     return { ok: false, message: `${name} must be a positive integer` };
   }
+  return { ok: true, value };
+}
+
+function optionalBoolean(value: unknown, name: string): ValidationResult<boolean | undefined> {
+  if (value === undefined) return { ok: true, value: undefined };
+  if (typeof value !== "boolean") return { ok: false, message: `${name} must be a boolean` };
   return { ok: true, value };
 }
 

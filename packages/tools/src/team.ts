@@ -335,6 +335,104 @@ export interface TeamTaskReconcileRecord {
   errors: TeamTaskReconcileErrorRecord[];
 }
 
+export interface TeamRunLoopToolInput {
+  teamId: string;
+  mode?: TeamTaskDispatchMode;
+  once?: boolean;
+  maxCycles?: number;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+  maxConcurrentDispatches?: number;
+}
+
+export interface TeamRunLoopDispatchedTaskRecord {
+  teamId: TeamId | string;
+  taskId: TaskId | string;
+  ownerPath?: AgentPath | string;
+  agentTaskId?: TaskId | string;
+  status: TeamTaskDispatchStatus;
+}
+
+export interface TeamRunLoopFinalTaskRecord {
+  teamId: TeamId | string;
+  taskId: TaskId | string;
+  ownerPath?: AgentPath | string;
+  status: Extract<TeamTaskStatus, "completed" | "failed" | "cancelled">;
+  summary?: string;
+  error?: string;
+  agentTaskId?: TaskId | string;
+}
+
+export interface TeamRunLoopVerificationTaskRecord {
+  teamId: TeamId | string;
+  taskId: TaskId | string;
+  ownerPath?: AgentPath | string;
+  status: "passed" | "failed";
+  feedback?: string;
+  verifierTaskId?: TaskId | string;
+}
+
+export interface TeamRunLoopMergeTaskRecord {
+  teamId: TeamId | string;
+  taskId: TaskId | string;
+  ownerPath?: AgentPath | string;
+  status: "applied" | "failed" | "conflicted";
+  diffSummary?: unknown;
+  error?: string;
+  conflicts?: string[];
+}
+
+export interface TeamRunLoopMergeSkippedTaskRecord {
+  teamId: TeamId | string;
+  taskId: TaskId | string;
+  ownerPath?: AgentPath | string;
+  reason: string;
+  error?: string;
+}
+
+export interface TeamRunLoopSkippedTaskRecord {
+  teamId: TeamId | string;
+  taskId: TaskId | string;
+  ownerPath?: AgentPath | string;
+  reason: string;
+  blockedBy?: (TaskId | string)[];
+}
+
+export interface TeamRunLoopRunningTaskRecord {
+  teamId: TeamId | string;
+  taskId: TaskId | string;
+  ownerPath?: AgentPath | string;
+  title: string;
+  agentTaskId?: TaskId | string;
+}
+
+export interface TeamRunLoopErrorRecord {
+  teamId: TeamId | string;
+  taskId?: TaskId | string;
+  error: string;
+}
+
+export interface TeamRunLoopRecord {
+  teamId: TeamId | string;
+  cycles: number;
+  stopReason: string;
+  startedAt: number;
+  endedAt: number;
+  dispatched: TeamRunLoopDispatchedTaskRecord[];
+  completed: TeamRunLoopFinalTaskRecord[];
+  accepted: TeamRunLoopFinalTaskRecord[];
+  reopened: TeamRunLoopVerificationTaskRecord[];
+  merged: TeamRunLoopMergeTaskRecord[];
+  mergeFailed: TeamRunLoopMergeTaskRecord[];
+  mergeConflicted: TeamRunLoopMergeTaskRecord[];
+  mergeSkipped: TeamRunLoopMergeSkippedTaskRecord[];
+  failed: TeamRunLoopFinalTaskRecord[];
+  blocked: TeamRunLoopSkippedTaskRecord[];
+  skipped: TeamRunLoopSkippedTaskRecord[];
+  stillRunning: TeamRunLoopRunningTaskRecord[];
+  errors: TeamRunLoopErrorRecord[];
+}
+
 export interface TeamMessageSendToolInput {
   teamId: string;
   messageId?: string;
@@ -376,4 +474,8 @@ export interface TeamTaskDispatchToolController {
   dispatchTask(input: TeamTaskDispatchToolInput, context: TeamToolContext): Promise<TeamTaskDispatchRecord>;
   syncTask(input: TeamTaskSyncToolInput, context: TeamToolContext): Promise<TeamTaskSyncRecord>;
   reconcileTasks(input: TeamTaskReconcileToolInput, context: TeamToolContext): Promise<TeamTaskReconcileRecord>;
+}
+
+export interface TeamRunLoopToolController {
+  runTeam(input: TeamRunLoopToolInput, context: TeamToolContext): Promise<TeamRunLoopRecord>;
 }
