@@ -22,6 +22,7 @@
     "smoke:p2-control": "bun run scripts/smoke-p2-task-control.ts",
     "smoke:p3": "bun run scripts/smoke-p3-agent-tree.ts",
     "smoke:p3-background": "bun run scripts/smoke-p3-background.ts",
+    "smoke:p3-team-model": "bun run scripts/smoke-p3-team-model.ts",
     "smoke:p3-team-parallel": "bun run scripts/smoke-p3-team-parallel.ts",
     "test:index": "bun run scripts/test-index.ts",
     "typecheck": "tsc -b"
