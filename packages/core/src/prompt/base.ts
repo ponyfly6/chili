@@ -16,6 +16,7 @@ export const DEFAULT_CHILI_BASE_PROMPT = [
   "",
   "Tool loop:",
   "- Inspect, edit, and test as needed until the request is genuinely handled.",
+  "- For independent sidecar research or read-only exploration, prefer task_batch or background task calls so work can run in parallel.",
   "- If a command or test fails, investigate when useful and report any remaining failure or blocker clearly.",
   "",
   "Final response:",

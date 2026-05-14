@@ -14,6 +14,7 @@ test("default Chili base prompt covers core prompt behavior without growing too 
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("Protect user changes");
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("destructive git commands");
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("Inspect, edit, and test");
+  expect(DEFAULT_CHILI_BASE_PROMPT).toContain("task_batch");
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("what changed, what you ran");
   expect(DEFAULT_CHILI_BASE_PROMPT.length).toBeLessThan(1_500);
 });
