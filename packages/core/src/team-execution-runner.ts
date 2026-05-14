@@ -350,16 +350,15 @@ export class TeamExecutionRunner {
           continue;
         }
 
-        if (!task.ownerPath) {
-          pushUniqueSkipped(summary.skipped, {
-            teamId: input.teamId,
-            taskId: task.id,
-            reason: "missing_owner",
-          });
+        const ownerSelection = task.ownerPath ? { ownerPath: task.ownerPath } : selectDispatchOwner(task, state.members, reservations);
+        const ownerPath = ownerSelection.ownerPath;
+        if (!ownerPath) {
+          this.collectDispatchSkip(input.teamId, task, ownerSelection.reason ?? "missing_owner", summary);
           continue;
         }
+        const dispatchTask = task.ownerPath ? task : { ...task, ownerPath };
 
-        if (!this.currentSessionId(state.team, task, sessionState, input)) {
+        if (!this.currentSessionId(state.team, dispatchTask, sessionState, input)) {
           let ensured: SessionState;
           try {
             ensured = await this.ensureSession(input, sessionState);
@@ -377,7 +376,7 @@ export class TeamExecutionRunner {
             pushUniqueSkipped(summary.skipped, {
               teamId: input.teamId,
               taskId: task.id,
-              ownerPath: task.ownerPath,
+              ownerPath,
               reason: "missing_session",
             });
             continue;
@@ -385,9 +384,9 @@ export class TeamExecutionRunner {
           if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
         }
 
-        const reserved = reserveDispatchResources(task, reservations);
+        const reserved = reserveDispatchResources(dispatchTask, reservations);
         if (!reserved.allowed) {
-          this.collectDispatchSkip(input.teamId, task, reserved.reason, summary);
+          this.collectDispatchSkip(input.teamId, dispatchTask, reserved.reason, summary);
           continue;
         }
 
@@ -397,12 +396,13 @@ export class TeamExecutionRunner {
           mode: input.mode ?? "background",
           cwd: input.cwd ?? this.options.cwd,
         };
-        const sessionId = sessionState.sessionId ?? task.sessionId ?? state.team.sessionId;
+        dispatchInput.ownerPath = ownerPath;
+        const sessionId = sessionState.sessionId ?? dispatchTask.sessionId ?? state.team.sessionId;
         if (sessionId) dispatchInput.sessionId = sessionId;
         const threadId = sessionState.threadId ?? input.threadId;
         if (threadId) dispatchInput.threadId = threadId;
         if (input.signal) dispatchInput.signal = input.signal;
-        dispatches.push({ task, input: dispatchInput });
+        dispatches.push({ task: dispatchTask, input: dispatchInput });
       }
 
       for (const batch of chunk(dispatches, maxConcurrentDispatches)) {
@@ -884,6 +884,46 @@ function dispatchReservationsForRunningTasks(tasks: readonly TeamTaskRow[]): Dis
   return reservations;
 }
 
+function selectDispatchOwner(
+  task: TeamTaskRow,
+  members: readonly TeamMemberRow[],
+  reservations: DispatchReservations,
+): { ownerPath: AgentPath; reason?: never } | { ownerPath?: never; reason: TeamExecutionSkipReason } {
+  if (members.length === 0) return { reason: "missing_member" };
+  const writeScope = teamTaskWriteScope(task);
+  const requiredTools = teamTaskRequiredTools(task);
+  if (writeScope.length === 0 && requiredTools.length === 0) return { reason: "missing_owner" };
+  let sawScopeCandidate = false;
+  let sawBusyCandidate = false;
+  const candidates = [...members].sort((left, right) => memberDispatchRank(left) - memberDispatchRank(right));
+
+  for (const member of candidates) {
+    if (!scopeAllowsAll(member.writeScope, writeScope) || !toolScopeAllowsAll(member.toolScope, requiredTools)) continue;
+    sawScopeCandidate = true;
+    if (member.status === "closed" || member.status === "blocked") {
+      sawBusyCandidate = true;
+      continue;
+    }
+    if (member.status === "running" && member.currentTaskId !== task.id) {
+      sawBusyCandidate = true;
+      continue;
+    }
+    if (reservations.owners.has(member.path)) {
+      sawBusyCandidate = true;
+      continue;
+    }
+    return { ownerPath: member.path };
+  }
+
+  if (sawBusyCandidate) return { reason: "member_unavailable" };
+  if (!sawScopeCandidate && (writeScope.length > 0 || requiredTools.length > 0)) return { reason: "scope_mismatch" };
+  return { reason: "missing_owner" };
+}
+
+function memberDispatchRank(member: TeamMemberRow): number {
+  return member.role.trim().toLowerCase() === "leader" ? 1 : 0;
+}
+
 function reserveDispatchResources(
   task: TeamTaskRow,
   reservations: DispatchReservations,
@@ -913,6 +953,10 @@ function teamTaskWriteScope(task: TeamTaskRow): string[] {
   return metadataStringArray(task.metadata, ["writeScope", "write_scope", "writeScopes", "write_scopes"]) ?? [];
 }
 
+function teamTaskRequiredTools(task: TeamTaskRow): string[] {
+  return metadataStringArray(task.metadata, ["requiredTools", "required_tools", "toolScope", "tool_scope"]) ?? [];
+}
+
 function metadataStringArray(metadata: Record<string, unknown> | undefined, keys: readonly string[]): string[] | undefined {
   if (!metadata) return undefined;
   for (const key of keys) {
@@ -922,6 +966,33 @@ function metadataStringArray(metadata: Record<string, unknown> | undefined, keys
     return items.length > 0 ? items : [];
   }
   return undefined;
+}
+
+function scopeAllowsAll(allowed: readonly string[] | undefined, required: readonly string[] | undefined): boolean {
+  if (!required || required.length === 0) return true;
+  if (!allowed) return true;
+  if (allowed.length === 0) return false;
+  return required.every((item) => allowed.some((scope) => pathScopeContains(scope, item)));
+}
+
+function toolScopeAllowsAll(allowed: readonly string[] | undefined, required: readonly string[] | undefined): boolean {
+  if (!required || required.length === 0) return true;
+  if (!allowed) return true;
+  if (allowed.length === 0) return false;
+  const normalizedAllowed = allowed.map(normalizeToolName);
+  return required.every((item) => normalizedAllowed.includes("*") || normalizedAllowed.includes(normalizeToolName(item)));
+}
+
+function normalizeToolName(value: string): string {
+  switch (value.trim().toLowerCase()) {
+    case "shell":
+    case "run":
+      return "bash";
+    case "write_file":
+      return "write";
+    default:
+      return value.trim().toLowerCase();
+  }
 }
 
 function scopesOverlap(left: readonly string[], right: readonly string[]): boolean {
@@ -959,12 +1030,14 @@ function runnablePendingTasks(
   canCreateSession: boolean,
   requireAcceptedDependencies = false,
 ): TeamTaskRow[] {
+  const reservations = dispatchReservationsForRunningTasks(state.tasks);
   return state.tasks.filter((task) => {
     if (task.status !== "pending") return false;
-    if (!task.ownerPath) return false;
     if (incompleteDependencies(task, state.tasks, requireAcceptedDependencies).length > 0) return false;
+    const ownerPath = task.ownerPath ?? selectDispatchOwner(task, state.members, reservations).ownerPath;
+    if (!ownerPath) return false;
     if (!Boolean(sessionState.sessionId ?? input.sessionId ?? task.sessionId ?? state.team.sessionId ?? canCreateSession)) return false;
-    const member = state.members.find((item) => item.path === task.ownerPath);
+    const member = state.members.find((item) => item.path === ownerPath);
     if (!member) return true;
     return member.status !== "closed" && member.status !== "blocked" && !(member.status === "running" && member.currentTaskId !== task.id);
   });

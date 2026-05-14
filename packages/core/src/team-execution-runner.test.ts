@@ -291,6 +291,73 @@ test("emits team run lifecycle events", async () => {
   }
 });
 
+test("auto-assigns scoped unowned tasks to compatible idle members", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-auto-assign-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 625 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const sessionId = "session_team_runner_auto_assign" as SessionId;
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const team = await teams.createTeam({ sessionId, name: "runner-auto-assign", leadPath });
+    const coreWorker = "/root/core" as AgentPath;
+    const docsWorker = "/root/docs" as AgentPath;
+    await teams.addMember({ sessionId, teamId: team.id, path: coreWorker, name: "core", role: "implementer", writeScope: ["packages/core"], toolScope: ["edit"] });
+    await teams.addMember({ sessionId, teamId: team.id, path: docsWorker, name: "docs", role: "implementer", writeScope: ["docs"], toolScope: ["edit"] });
+    const coreTask = await teams.createTask({
+      sessionId,
+      teamId: team.id,
+      title: "Core task",
+      metadata: { writeScope: ["packages/core/src"], requiredTools: ["edit"] },
+    });
+    const docsTask = await teams.createTask({
+      sessionId,
+      teamId: team.id,
+      title: "Docs task",
+      metadata: { writeScope: ["docs"], requiredTools: ["edit"] },
+    });
+    const unscopedTask = await teams.createTask({ sessionId, teamId: team.id, title: "Needs explicit owner" });
+
+    const dispatcher = {
+      async reconcileTasks() {
+        return emptyReconcileResult();
+      },
+      async dispatchTask(input: Parameters<TeamTaskDispatchService["dispatchTask"]>[0]): Promise<TeamTaskDispatchResult> {
+        const task = (await teams.tasks(input.teamId)).find((item) => item.id === input.taskId);
+        if (!task) throw new Error(`missing task ${input.taskId}`);
+        const teamTask: TeamTaskDispatchResult["teamTask"] = { ...task, status: "in_progress" };
+        if (input.ownerPath) teamTask.ownerPath = input.ownerPath;
+        return {
+          status: "running",
+          teamTask,
+        };
+      },
+    };
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher: dispatcher as unknown as TeamTaskDispatchService,
+      cwd: dir,
+      now,
+    });
+
+    const summary = await execution.run({ teamId: team.id, sessionId, once: true, maxConcurrentDispatches: 4 });
+
+    expect(summary.dispatched).toEqual(expect.arrayContaining([
+      expect.objectContaining({ taskId: coreTask.id, ownerPath: coreWorker, status: "running" }),
+      expect.objectContaining({ taskId: docsTask.id, ownerPath: docsWorker, status: "running" }),
+    ]));
+    expect(summary.skipped).toEqual(expect.arrayContaining([
+      expect.objectContaining({ taskId: unscopedTask.id, reason: "missing_owner" }),
+    ]));
+    expect(summary.blocked).toEqual([]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("records dispatcher policy blocks in the runner summary", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-policy-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
