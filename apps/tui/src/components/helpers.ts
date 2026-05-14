@@ -2,6 +2,22 @@ import type { TeamLiveAction, TeamLiveActivityItem, TeamLiveTeamSummary } from "
 import type { TeamId, TeamRunSummaryCounts } from "@chili/protocol";
 import { actionKey } from "../useTeamLiveRuntime.js";
 
+const COUNT_LABELS: ReadonlyArray<readonly [keyof TeamRunSummaryCounts, string]> = [
+  ["dispatched", "disp"],
+  ["completed", "done"],
+  ["accepted", "accept"],
+  ["reopened", "reopen"],
+  ["merged", "merge"],
+  ["mergeFailed", "mergeFail"],
+  ["mergeConflicted", "conflict"],
+  ["mergeSkipped", "mergeSkip"],
+  ["failed", "fail"],
+  ["blocked", "block"],
+  ["skipped", "skip"],
+  ["stillRunning", "run"],
+  ["errors", "err"],
+];
+
 export function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
@@ -34,9 +50,12 @@ export function compactId(value: string | undefined, max = 18): string {
 }
 
 export function countsCompact(counts: TeamRunSummaryCounts): string {
-  const items = Object.entries(counts).filter(([, value]) => typeof value === "number" && value > 0);
+  const items = COUNT_LABELS.flatMap(([key, label]) => {
+    const value = counts[key];
+    return typeof value === "number" && value > 0 ? [`${label}:${value}`] : [];
+  });
   if (items.length === 0) return "none";
-  return items.slice(0, 8).map(([key, value]) => `${key}:${value}`).join(" ");
+  return items.slice(0, 8).join(" ");
 }
 
 export function activityLine(item: TeamLiveActivityItem): string {
