@@ -16,6 +16,8 @@ import type {
   TeamTaskAssignToolInput,
   TeamTaskClaimRecord,
   TeamTaskClaimToolInput,
+  TeamTaskCreateBatchRecord,
+  TeamTaskCreateBatchToolInput,
   TeamTaskCreateToolInput,
   TeamTaskDispatchRecord,
   TeamTaskDispatchToolController,
@@ -42,6 +44,7 @@ export interface TeamToolResult extends ToolResult {
   metadata: Record<string, unknown>;
 }
 
+const MAX_TEAM_TASK_CREATE_BATCH_TASKS = 64;
 const DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY = 8;
 const MAX_TEAM_DISPATCH_BATCH_CONCURRENCY = 32;
 const MAX_TEAM_DISPATCH_BATCH_TASKS = 64;
@@ -200,7 +203,7 @@ export function createTeamTaskCreateTool(
   return {
     name: "team_task_create",
     aliases: ["create_team_task"],
-    description: "Create a task on a persistent team task board.",
+    description: "Create a task on a persistent team task board. Declare writeScope, executeScope, and requiredTools when they are known so independent tasks can run in parallel safely.",
     risk: "write",
     inputSchema: {
       type: "object",
@@ -220,6 +223,14 @@ export function createTeamTaskCreateTool(
         depends_on: { type: "array", items: { type: "string" } },
         status: { type: "string" },
         metadata: { type: "object" },
+        writeScope: { type: "array", items: { type: "string" } },
+        write_scope: { type: "array", items: { type: "string" } },
+        executeScope: { type: "array", items: { type: "string" } },
+        execute_scope: { type: "array", items: { type: "string" } },
+        requiredTools: { type: "array", items: { type: "string" } },
+        required_tools: { type: "array", items: { type: "string" } },
+        suggestedTestCommands: { type: "array", items: { type: "string" } },
+        suggested_test_commands: { type: "array", items: { type: "string" } },
       },
     },
     validate: validateTeamTaskCreateInput,
@@ -227,6 +238,66 @@ export function createTeamTaskCreateTool(
     async execute(input, context) {
       await context.metadata({ metadata: { teamId: input.teamId, team_id: input.teamId, title: input.title } });
       return teamTaskRecordToolResult("team_task_create", await controller.createTask(input, context));
+    },
+  };
+}
+
+export function createTeamTaskCreateBatchTool(
+  controller: TeamToolController,
+): ChiliToolDefinition<TeamTaskCreateBatchToolInput, TeamToolResult> {
+  return {
+    name: "team_task_create_batch",
+    aliases: ["create_team_tasks", "team_tasks_create"],
+    description: "Create multiple persistent team tasks in one call. Prefer this when planning independent slices; include writeScope, executeScope, and requiredTools for each task.",
+    risk: "write",
+    inputSchema: {
+      type: "object",
+      required: ["teamId", "tasks"],
+      properties: {
+        teamId: { type: "string" },
+        team_id: { type: "string" },
+        createdBy: { type: "string" },
+        created_by: { type: "string" },
+        tasks: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["title"],
+            properties: {
+              taskId: { type: "string" },
+              task_id: { type: "string" },
+              title: { type: "string" },
+              description: { type: "string" },
+              createdBy: { type: "string" },
+              created_by: { type: "string" },
+              ownerPath: { type: "string" },
+              owner_path: { type: "string" },
+              dependsOn: { type: "array", items: { type: "string" } },
+              depends_on: { type: "array", items: { type: "string" } },
+              status: { type: "string" },
+              metadata: { type: "object" },
+              writeScope: { type: "array", items: { type: "string" } },
+              write_scope: { type: "array", items: { type: "string" } },
+              executeScope: { type: "array", items: { type: "string" } },
+              execute_scope: { type: "array", items: { type: "string" } },
+              requiredTools: { type: "array", items: { type: "string" } },
+              required_tools: { type: "array", items: { type: "string" } },
+              suggestedTestCommands: { type: "array", items: { type: "string" } },
+              suggested_test_commands: { type: "array", items: { type: "string" } },
+            },
+          },
+        },
+      },
+    },
+    validate: validateTeamTaskCreateBatchInput,
+    approval: () => false,
+    async execute(input, context) {
+      await context.metadata({ metadata: { teamId: input.teamId, team_id: input.teamId, count: input.tasks.length } });
+      const tasks: TeamTaskRecord[] = [];
+      for (const task of input.tasks) {
+        tasks.push(await controller.createTask({ ...task, teamId: input.teamId }, context));
+      }
+      return teamTaskCreateBatchToolResult({ count: tasks.length, tasks });
     },
   };
 }
@@ -719,7 +790,42 @@ function validateTeamTaskCreateInput(input: unknown): ValidationResult<TeamTaskC
   if (!isRecord(input)) return { ok: false, message: "expected an object" };
   const teamId = requiredString(input, ["teamId", "team_id"], "teamId");
   if (!teamId.ok) return teamId;
-  const title = requiredString(input, ["title", "subject"], "title");
+  const task = validateTeamTaskCreateFields(input, "task");
+  if (!task.ok) return task;
+  return { ok: true, value: { ...task.value, teamId: teamId.value } };
+}
+
+function validateTeamTaskCreateBatchInput(input: unknown): ValidationResult<TeamTaskCreateBatchToolInput> {
+  if (!isRecord(input)) return { ok: false, message: "expected an object" };
+  const teamId = requiredString(input, ["teamId", "team_id"], "teamId");
+  if (!teamId.ok) return teamId;
+  const createdBy = optionalPath(input, ["createdBy", "created_by"], "createdBy");
+  if (!createdBy.ok) return createdBy;
+  if (!Array.isArray(input.tasks)) return { ok: false, message: "tasks must be an array" };
+  if (input.tasks.length === 0) return { ok: false, message: "tasks must include at least one task" };
+  if (input.tasks.length > MAX_TEAM_TASK_CREATE_BATCH_TASKS) {
+    return { ok: false, message: `tasks cannot include more than ${MAX_TEAM_TASK_CREATE_BATCH_TASKS} tasks` };
+  }
+
+  const tasks: TeamTaskCreateBatchToolInput["tasks"] = [];
+  for (let index = 0; index < input.tasks.length; index++) {
+    const raw = input.tasks[index];
+    if (!isRecord(raw)) return { ok: false, message: `tasks[${index}] must be an object` };
+    const task = validateTeamTaskCreateFields(raw, `tasks[${index}]`);
+    if (!task.ok) return task;
+    tasks.push(createdBy.value && !task.value.createdBy ? { ...task.value, createdBy: createdBy.value } : task.value);
+  }
+
+  const value: TeamTaskCreateBatchToolInput = { teamId: teamId.value, tasks };
+  if (createdBy.value) value.createdBy = createdBy.value;
+  return { ok: true, value };
+}
+
+function validateTeamTaskCreateFields(
+  input: Record<string, unknown>,
+  name: string,
+): ValidationResult<Omit<TeamTaskCreateToolInput, "teamId">> {
+  const title = requiredString(input, ["title", "subject"], `${name}.title`);
   if (!title.ok) return title;
   const createdBy = optionalPath(input, ["createdBy", "created_by"], "createdBy");
   if (!createdBy.ok) return createdBy;
@@ -731,15 +837,31 @@ function validateTeamTaskCreateInput(input: unknown): ValidationResult<TeamTaskC
   if (!status.ok) return status;
   const metadata = optionalPlainObject(input.metadata, "metadata");
   if (!metadata.ok) return metadata;
+  const writeScope = optionalStringArray(input.writeScope ?? input.write_scope, "writeScope");
+  if (!writeScope.ok) return writeScope;
+  const executeScope = optionalStringArray(input.executeScope ?? input.execute_scope, "executeScope");
+  if (!executeScope.ok) return executeScope;
+  const requiredTools = optionalStringArray(input.requiredTools ?? input.required_tools, "requiredTools");
+  if (!requiredTools.ok) return requiredTools;
+  const suggestedTestCommands = optionalStringArray(
+    input.suggestedTestCommands ?? input.suggested_test_commands,
+    "suggestedTestCommands",
+  );
+  if (!suggestedTestCommands.ok) return suggestedTestCommands;
 
-  const value: TeamTaskCreateToolInput = { teamId: teamId.value, title: title.value };
+  const value: Omit<TeamTaskCreateToolInput, "teamId"> = { title: title.value };
   assignString(value, "taskId", pickString(input, ["taskId", "task_id"]));
   assignString(value, "description", pickString(input, ["description"]));
   if (createdBy.value) value.createdBy = createdBy.value;
   if (ownerPath.value) value.ownerPath = ownerPath.value;
   if (dependsOn.value) value.dependsOn = dependsOn.value;
   if (status.value) value.status = status.value;
-  if (metadata.value) value.metadata = metadata.value;
+  if (writeScope.value) value.writeScope = writeScope.value;
+  if (executeScope.value) value.executeScope = executeScope.value;
+  if (requiredTools.value) value.requiredTools = requiredTools.value;
+  if (suggestedTestCommands.value) value.suggestedTestCommands = suggestedTestCommands.value;
+  const scopedMetadata = taskMetadataWithScopes(metadata.value, value);
+  if (scopedMetadata) value.metadata = scopedMetadata;
   return { ok: true, value };
 }
 
@@ -986,6 +1108,18 @@ function teamTaskRecordToolResult(title: string, task: TeamTaskRecord): TeamTool
     title: `${title} ${task.taskId}`,
     output: JSON.stringify(teamTaskRecordOutput(task)),
     metadata: { team_id: task.teamId, teamId: task.teamId, task_id: task.taskId, taskId: task.taskId, status: task.status },
+  };
+}
+
+function teamTaskCreateBatchToolResult(result: TeamTaskCreateBatchRecord): TeamToolResult {
+  return {
+    title: `team_task_create_batch ${result.count}`,
+    output: JSON.stringify({ count: result.count, tasks: result.tasks.map(teamTaskRecordOutput) }),
+    metadata: {
+      count: result.count,
+      task_ids: result.tasks.map((task) => task.taskId),
+      taskIds: result.tasks.map((task) => task.taskId),
+    },
   };
 }
 
@@ -1513,6 +1647,31 @@ function normalizeDispatchBatchTasks(value: unknown): ValidationResult<TeamTaskD
     tasks.push(task);
   }
   return { ok: true, value: tasks };
+}
+
+function taskMetadataWithScopes(
+  metadata: Record<string, unknown> | undefined,
+  input: Pick<TeamTaskCreateToolInput, "writeScope" | "executeScope" | "requiredTools" | "suggestedTestCommands">,
+): Record<string, unknown> | undefined {
+  const output = metadata ? { ...metadata } : {};
+  let changed = false;
+  if (input.writeScope) {
+    output.writeScope = input.writeScope;
+    changed = true;
+  }
+  if (input.executeScope) {
+    output.executeScope = input.executeScope;
+    changed = true;
+  }
+  if (input.requiredTools) {
+    output.requiredTools = input.requiredTools;
+    changed = true;
+  }
+  if (input.suggestedTestCommands) {
+    output.suggestedTestCommands = input.suggestedTestCommands;
+    changed = true;
+  }
+  return changed || metadata ? output : undefined;
 }
 
 function normalizeMessageKind(value: unknown): ValidationResult<TeamMessageKind | undefined> {

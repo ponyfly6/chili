@@ -22,6 +22,7 @@ import {
   createTeamSnapshotTool,
   createTeamTaskAssignTool,
   createTeamTaskClaimTool,
+  createTeamTaskCreateBatchTool,
   createTeamTaskCreateTool,
   createTeamTaskDispatchBatchTool,
   createTeamTaskDispatchTool,
@@ -121,6 +122,10 @@ test("team write tools normalize inputs and return durable board records", async
       depends_on: ["task_dep"],
       status: "running",
       metadata: { priority: "p1" },
+      write_scope: [" packages/tools/src "],
+      execute_scope: ["scripts"],
+      required_tools: ["edit", "bash"],
+      suggested_test_commands: ["bun test packages/tools/src/team-tools.test.ts"],
     }),
   );
   expect(task.status).toBe("completed");
@@ -133,7 +138,71 @@ test("team write tools normalize inputs and return durable board records", async
       ownerPath: "/worker",
       dependsOn: ["task_dep"],
       status: "in_progress",
-      metadata: { priority: "p1" },
+      metadata: {
+        priority: "p1",
+        writeScope: ["packages/tools/src"],
+        executeScope: ["scripts"],
+        requiredTools: ["edit", "bash"],
+        suggestedTestCommands: ["bun test packages/tools/src/team-tools.test.ts"],
+      },
+      writeScope: ["packages/tools/src"],
+      executeScope: ["scripts"],
+      requiredTools: ["edit", "bash"],
+      suggestedTestCommands: ["bun test packages/tools/src/team-tools.test.ts"],
+    },
+  ]);
+
+  const batch = await executor.execute(
+    toolInput("team_task_create_batch", {
+      team_id: "team_core",
+      created_by: "/lead",
+      tasks: [
+        {
+          task_id: "task_core",
+          title: "Update core runtime",
+          owner_path: "/worker",
+          write_scope: ["packages/core"],
+          required_tools: ["edit"],
+        },
+        {
+          task_id: "task_docs",
+          title: "Update docs",
+          depends_on: ["task_core"],
+          metadata: { priority: "p2" },
+          write_scope: ["docs"],
+        },
+      ],
+    }),
+  );
+  expect(batch.status).toBe("completed");
+  if (batch.status === "completed") {
+    expect(JSON.parse(batch.result.output)).toMatchObject({
+      count: 2,
+      tasks: [
+        { task_id: "task_core", metadata: { writeScope: ["packages/core"], requiredTools: ["edit"] } },
+        { task_id: "task_docs", metadata: { priority: "p2", writeScope: ["docs"] } },
+      ],
+    });
+  }
+  expect(controller.taskCreateInputs.slice(1)).toEqual([
+    {
+      teamId: "team_core",
+      taskId: "task_core",
+      title: "Update core runtime",
+      createdBy: "/lead",
+      ownerPath: "/worker",
+      metadata: { writeScope: ["packages/core"], requiredTools: ["edit"] },
+      writeScope: ["packages/core"],
+      requiredTools: ["edit"],
+    },
+    {
+      teamId: "team_core",
+      taskId: "task_docs",
+      title: "Update docs",
+      createdBy: "/lead",
+      dependsOn: ["task_core"],
+      metadata: { priority: "p2", writeScope: ["docs"] },
+      writeScope: ["docs"],
     },
   ]);
 
@@ -434,6 +503,7 @@ function registryWithTeamTools(controller: TeamToolController & TeamTaskDispatch
   registry.register(createTeamMemberAddTool(controller));
   registry.register(createTeamMemberListTool(controller));
   registry.register(createTeamTaskCreateTool(controller));
+  registry.register(createTeamTaskCreateBatchTool(controller));
   registry.register(createTeamTaskListTool(controller));
   registry.register(createTeamTaskAssignTool(controller));
   registry.register(createTeamTaskClaimTool(controller));

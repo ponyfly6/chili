@@ -182,6 +182,31 @@ export interface TeamTaskCreateToolInput {
   dependsOn?: string[];
   status?: TeamTaskStatus;
   metadata?: Record<string, unknown>;
+  writeScope?: string[];
+  executeScope?: string[];
+  requiredTools?: string[];
+  suggestedTestCommands?: string[];
+}
+
+export interface TeamTaskCreateBatchItemInput {
+  taskId?: string;
+  title: string;
+  description?: string;
+  createdBy?: string;
+  ownerPath?: string;
+  dependsOn?: string[];
+  status?: TeamTaskStatus;
+  metadata?: Record<string, unknown>;
+  writeScope?: string[];
+  executeScope?: string[];
+  requiredTools?: string[];
+  suggestedTestCommands?: string[];
+}
+
+export interface TeamTaskCreateBatchToolInput {
+  teamId: string;
+  createdBy?: string;
+  tasks: TeamTaskCreateBatchItemInput[];
 }
 
 export interface TeamTaskListToolInput {
@@ -271,6 +296,11 @@ export interface TeamTaskDispatchRecord {
   teamTask: TeamTaskRecord;
   agentTask?: TeamDispatchAgentTaskRecord;
   reason?: string;
+}
+
+export interface TeamTaskCreateBatchRecord {
+  count: number;
+  tasks: TeamTaskRecord[];
 }
 
 export interface TeamTaskDispatchBatchErrorRecord {
