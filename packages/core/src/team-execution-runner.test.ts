@@ -5,7 +5,7 @@ import { expect, test } from "bun:test";
 import type { AgentPath, AgentRunId, SessionId, TaskId, TeamId, TimestampMs, ThreadId } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import { LocalSubagentManager, type LocalSubagentRunInput, type LocalSubagentRunResult, type LocalSubagentRunner } from "./subagent.js";
-import { TeamTaskDispatchService } from "./team-dispatcher.js";
+import { TeamTaskDispatchService, type TeamTaskDispatchResult } from "./team-dispatcher.js";
 import { TeamExecutionRunner, type TeamTaskMerger, type TeamTaskVerifier } from "./team-execution-runner.js";
 import type { TeamMergeResultStatus, TeamMergeSweepResult } from "./team-merge.js";
 import { TeamControlService } from "./team.js";
@@ -133,6 +133,77 @@ test("runs one cycle and reports still-running background tasks", async () => {
   } finally {
     runner.completeAll();
     await subagents?.waitForBackgroundTasks();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("dispatches independent team tasks concurrently with a bounded fan-out", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-concurrent-dispatch-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 620 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const sessionId = "session_team_runner_concurrent" as SessionId;
+  let running = 0;
+  let maxRunning = 0;
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const team = await teams.createTeam({ sessionId, name: "runner-concurrent", leadPath });
+    const workerA = "/root/a" as AgentPath;
+    const workerB = "/root/b" as AgentPath;
+    const workerC = "/root/c" as AgentPath;
+    await teams.addMember({ sessionId, teamId: team.id, path: workerA, name: "a", role: "implementer" });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerB, name: "b", role: "implementer" });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerC, name: "c", role: "implementer" });
+    const first = await teams.createTask({ sessionId, teamId: team.id, title: "First", ownerPath: workerA });
+    const second = await teams.createTask({ sessionId, teamId: team.id, title: "Second", ownerPath: workerB });
+    const third = await teams.createTask({ sessionId, teamId: team.id, title: "Third", ownerPath: workerC });
+    const tasksById = new Map([first, second, third].map((task) => [task.id, task]));
+
+    const dispatcher = {
+      async reconcileTasks() {
+        return emptyReconcileResult();
+      },
+      async dispatchTask(input: Parameters<TeamTaskDispatchService["dispatchTask"]>[0]): Promise<TeamTaskDispatchResult> {
+        const task = tasksById.get(input.taskId);
+        if (!task) throw new Error(`missing task ${input.taskId}`);
+        running += 1;
+        maxRunning = Math.max(maxRunning, running);
+        await delay(task.id === first.id ? 20 : 1);
+        running -= 1;
+        return {
+          status: "running",
+          teamTask: { ...task, status: "in_progress" },
+        };
+      },
+    };
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher: dispatcher as unknown as TeamTaskDispatchService,
+      cwd: dir,
+      now,
+    });
+
+    const summary = await execution.run({
+      teamId: team.id,
+      sessionId,
+      once: true,
+      maxConcurrentDispatches: 2,
+    });
+
+    expect(maxRunning).toBe(2);
+    expect(summary).toMatchObject({
+      stopReason: "once",
+      errors: [],
+    });
+    expect(summary.dispatched).toEqual(expect.arrayContaining([
+      expect.objectContaining({ taskId: first.id, status: "running", ownerPath: workerA }),
+      expect.objectContaining({ taskId: second.id, status: "running", ownerPath: workerB }),
+      expect.objectContaining({ taskId: third.id, status: "running", ownerPath: workerC }),
+    ]));
+  } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
   }

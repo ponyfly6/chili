@@ -84,6 +84,7 @@ export interface TeamExecutionRunInput {
   maxCycles?: number;
   timeoutMs?: number;
   pollIntervalMs?: number;
+  maxConcurrentDispatches?: number;
   signal?: AbortSignal;
 }
 
@@ -203,9 +204,27 @@ interface SessionState {
   threadId?: ThreadId;
 }
 
+interface TeamDispatchWork {
+  task: TeamTaskRow;
+  input: Parameters<TeamTaskDispatchService["dispatchTask"]>[0];
+}
+
+interface DispatchReservations {
+  owners: Set<AgentPath>;
+  writeScopes: TeamDispatchWriteReservation[];
+}
+
+interface TeamDispatchWriteReservation {
+  taskId: TaskId;
+  ownerPath?: AgentPath;
+  writeScope: string[];
+}
+
 const DEFAULT_MAX_CYCLES = 50;
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_POLL_INTERVAL_MS = 250;
+const DEFAULT_MAX_CONCURRENT_DISPATCHES = 4;
+const MAX_CONCURRENT_DISPATCHES = 64;
 
 export class TeamExecutionRunner {
   constructor(private readonly options: TeamExecutionRunnerOptions) {}
@@ -216,6 +235,7 @@ export class TeamExecutionRunner {
     const maxCycles = input.once ? 1 : input.maxCycles ?? DEFAULT_MAX_CYCLES;
     const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const pollIntervalMs = input.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    const maxConcurrentDispatches = normalizeMaxConcurrentDispatches(input.maxConcurrentDispatches);
     const startedMonotonic = Date.now();
     const sessionState: SessionState = {};
     if (input.sessionId) sessionState.sessionId = input.sessionId;
@@ -311,6 +331,8 @@ export class TeamExecutionRunner {
         state = await this.loadState(input.teamId);
       }
 
+      const dispatches: TeamDispatchWork[] = [];
+      const reservations = dispatchReservationsForRunningTasks(state.tasks);
       for (const task of state.tasks) {
         if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
         if (task.status !== "pending") continue;
@@ -363,28 +385,46 @@ export class TeamExecutionRunner {
           if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
         }
 
-        try {
-          const dispatchInput: Parameters<TeamTaskDispatchService["dispatchTask"]>[0] = {
-            teamId: input.teamId,
-            taskId: task.id,
-            mode: input.mode ?? "background",
-            cwd: input.cwd ?? this.options.cwd,
-          };
-          const sessionId = sessionState.sessionId ?? task.sessionId ?? state.team.sessionId;
-          if (sessionId) dispatchInput.sessionId = sessionId;
-          const threadId = sessionState.threadId ?? input.threadId;
-          if (threadId) dispatchInput.threadId = threadId;
-          if (input.signal) dispatchInput.signal = input.signal;
+        const reserved = reserveDispatchResources(task, reservations);
+        if (!reserved.allowed) {
+          this.collectDispatchSkip(input.teamId, task, reserved.reason, summary);
+          continue;
+        }
 
-          const dispatched = await this.options.dispatcher.dispatchTask(dispatchInput);
-          this.collectDispatch(dispatched, summary);
-          if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
-        } catch (error) {
+        const dispatchInput: Parameters<TeamTaskDispatchService["dispatchTask"]>[0] = {
+          teamId: input.teamId,
+          taskId: task.id,
+          mode: input.mode ?? "background",
+          cwd: input.cwd ?? this.options.cwd,
+        };
+        const sessionId = sessionState.sessionId ?? task.sessionId ?? state.team.sessionId;
+        if (sessionId) dispatchInput.sessionId = sessionId;
+        const threadId = sessionState.threadId ?? input.threadId;
+        if (threadId) dispatchInput.threadId = threadId;
+        if (input.signal) dispatchInput.signal = input.signal;
+        dispatches.push({ task, input: dispatchInput });
+      }
+
+      for (const batch of chunk(dispatches, maxConcurrentDispatches)) {
+        if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
+        const results = await Promise.all(batch.map(async (work) => {
+          try {
+            return { work, result: await this.options.dispatcher.dispatchTask(work.input) };
+          } catch (error) {
+            return { work, error };
+          }
+        }));
+
+        for (const item of results) {
+          if ("result" in item) {
+            this.collectDispatch(item.result, summary);
+            continue;
+          }
           if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
           summary.errors.push({
             teamId: input.teamId,
-            taskId: task.id,
-            error: toError(error).message,
+            taskId: item.work.task.id,
+            error: toError(item.error).message,
           });
         }
       }
@@ -632,6 +672,25 @@ export class TeamExecutionRunner {
     else pushUniqueFinal(summary.failed, final);
   }
 
+  private collectDispatchSkip(
+    teamId: TeamId,
+    task: TeamTaskRow,
+    reason: TeamExecutionSkipReason,
+    summary: TeamExecutionRunSummary,
+  ): void {
+    const item: TeamExecutionSkippedTask = {
+      teamId,
+      taskId: task.id,
+      reason,
+    };
+    if (task.ownerPath) item.ownerPath = task.ownerPath;
+    if (reason === "blocked" || reason === "scope_mismatch" || reason === "write_conflict" || reason === "missing_member") {
+      pushUniqueSkipped(summary.blocked, item);
+    } else {
+      pushUniqueSkipped(summary.skipped, item);
+    }
+  }
+
   private currentSessionId(
     team: TeamRow,
     task: TeamTaskRow,
@@ -789,6 +848,98 @@ export class TeamExecutionRunner {
       );
     });
   }
+}
+
+function normalizeMaxConcurrentDispatches(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_MAX_CONCURRENT_DISPATCHES;
+  if (!Number.isInteger(value) || value <= 0) return DEFAULT_MAX_CONCURRENT_DISPATCHES;
+  return Math.min(value, MAX_CONCURRENT_DISPATCHES);
+}
+
+function chunk<T>(items: readonly T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function dispatchReservationsForRunningTasks(tasks: readonly TeamTaskRow[]): DispatchReservations {
+  const reservations: DispatchReservations = {
+    owners: new Set<AgentPath>(),
+    writeScopes: [],
+  };
+  for (const task of tasks) {
+    if (task.status !== "in_progress") continue;
+    if (task.ownerPath) reservations.owners.add(task.ownerPath);
+    const writeScope = teamTaskWriteScope(task);
+    if (writeScope.length === 0) continue;
+    const reservation: TeamDispatchWriteReservation = {
+      taskId: task.id,
+      writeScope,
+    };
+    if (task.ownerPath) reservation.ownerPath = task.ownerPath;
+    reservations.writeScopes.push(reservation);
+  }
+  return reservations;
+}
+
+function reserveDispatchResources(
+  task: TeamTaskRow,
+  reservations: DispatchReservations,
+): { allowed: true } | { allowed: false; reason: TeamExecutionSkipReason } {
+  if (task.ownerPath && reservations.owners.has(task.ownerPath)) {
+    return { allowed: false, reason: "member_unavailable" };
+  }
+
+  const writeScope = teamTaskWriteScope(task);
+  if (writeScope.length > 0 && reservations.writeScopes.some((item) => scopesOverlap(writeScope, item.writeScope))) {
+    return { allowed: false, reason: "write_conflict" };
+  }
+
+  if (task.ownerPath) reservations.owners.add(task.ownerPath);
+  if (writeScope.length > 0) {
+    const reservation: TeamDispatchWriteReservation = {
+      taskId: task.id,
+      writeScope,
+    };
+    if (task.ownerPath) reservation.ownerPath = task.ownerPath;
+    reservations.writeScopes.push(reservation);
+  }
+  return { allowed: true };
+}
+
+function teamTaskWriteScope(task: TeamTaskRow): string[] {
+  return metadataStringArray(task.metadata, ["writeScope", "write_scope", "writeScopes", "write_scopes"]) ?? [];
+}
+
+function metadataStringArray(metadata: Record<string, unknown> | undefined, keys: readonly string[]): string[] | undefined {
+  if (!metadata) return undefined;
+  for (const key of keys) {
+    const value = metadata[key];
+    if (!Array.isArray(value)) continue;
+    const items = value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
+    return items.length > 0 ? items : [];
+  }
+  return undefined;
+}
+
+function scopesOverlap(left: readonly string[], right: readonly string[]): boolean {
+  return left.some((leftItem) => right.some((rightItem) => pathScopeContains(leftItem, rightItem) || pathScopeContains(rightItem, leftItem)));
+}
+
+function pathScopeContains(scope: string, item: string): boolean {
+  const normalizedScope = normalizePathScope(scope);
+  const normalizedItem = normalizePathScope(item);
+  if (normalizedScope === "*" || normalizedScope === "." || normalizedScope === "/") return true;
+  return normalizedItem === normalizedScope || normalizedItem.startsWith(`${normalizedScope}/`);
+}
+
+function normalizePathScope(value: string): string {
+  let normalized = value.trim().replaceAll("\\", "/");
+  while (normalized.startsWith("./")) normalized = normalized.slice(2);
+  while (normalized.length > 1 && normalized.endsWith("/")) normalized = normalized.slice(0, -1);
+  return normalized || ".";
 }
 
 function incompleteDependencies(task: TeamTaskRow, tasks: readonly TeamTaskRow[], requireAccepted = false): TaskId[] {
