@@ -202,12 +202,15 @@ const taskRenderer: ToolRenderer = {
 const teamRenderer: ToolRenderer = {
   name: "team",
   match: (toolName) => normalizeToolName(toolName).startsWith("team_"),
+  mode: (input) => normalizeToolName(input.toolName) === "team_run_loop" && !input.showToolDetails ? "inline" : defaultToolMode(input),
+  summary: (input) => normalizeToolName(input.toolName) === "team_run_loop" ? teamRunLoopSummary(input.output) : defaultSummary(input),
   label: (input) => {
     const name = normalizeToolName(input.toolName);
     const target = teamTarget(input);
     if (name === "team_create") return labelWithTarget(statusVerb(input.displayStatus, "Created team", "Creating team"), stringFromInput(input.input, "name") ?? target);
     if (name === "team_list") return statusVerb(input.displayStatus, "Listed teams", "Listing teams");
     if (name === "team_snapshot") return labelWithTarget(statusVerb(input.displayStatus, "Read team snapshot", "Reading team snapshot"), target);
+    if (name === "team_run_loop") return labelWithTarget(statusVerb(input.displayStatus, "Ran team loop", "Running team loop"), target);
     if (name.startsWith("team_task_")) return labelWithTarget(statusVerb(input.displayStatus, teamTaskPastVerb(name), teamTaskActiveVerb(name)), stringFromInput(input.input, "title") ?? target);
     if (name.startsWith("team_message_")) return labelWithTarget(statusVerb(input.displayStatus, teamMessagePastVerb(name), teamMessageActiveVerb(name)), target);
     if (name.startsWith("team_member_")) return labelWithTarget(statusVerb(input.displayStatus, "Updated team member", "Updating team member"), stringFromInput(input.input, "path", "name") ?? target);
@@ -511,6 +514,8 @@ function teamTarget(input: ToolRenderInput): string | undefined {
 }
 
 function teamTaskPastVerb(toolName: string): string {
+  if (toolName.endsWith("_create_batch")) return "Created team tasks";
+  if (toolName.endsWith("_dispatch_batch")) return "Dispatched team tasks";
   if (toolName.endsWith("_create")) return "Created team task";
   if (toolName.endsWith("_list")) return "Listed team tasks";
   if (toolName.endsWith("_assign")) return "Assigned team task";
@@ -523,7 +528,40 @@ function teamTaskPastVerb(toolName: string): string {
 }
 
 function teamTaskActiveVerb(toolName: string): string {
+  if (toolName.endsWith("_create_batch")) return "Creating team tasks";
+  if (toolName.endsWith("_dispatch_batch")) return "Dispatching team tasks";
   return teamTaskPastVerb(toolName).replace(/ed\b/, "ing");
+}
+
+function teamRunLoopSummary(output: string | undefined): string | undefined {
+  const record = parseJsonObject(output);
+  if (!record) return undefined;
+  const parts: string[] = [];
+  const stopReason = firstString(record, ["stopReason", "stop_reason"]);
+  if (stopReason) parts.push(`stop=${stopReason}`);
+  appendCountPart(parts, "dispatched", countArrayField(record, ["dispatched"]));
+  appendCountPart(parts, "completed", countArrayField(record, ["completed", "accepted", "merged"]));
+  appendCountPart(parts, "running", countArrayField(record, ["stillRunning", "still_running"]));
+  appendCountPart(parts, "blocked", countArrayField(record, ["blocked"]));
+  appendCountPart(parts, "errors", countArrayField(record, ["errors"]));
+  return parts.length > 0 ? parts.join(", ") : undefined;
+}
+
+function appendCountPart(parts: string[], label: string, count: number | undefined): void {
+  if (count === undefined || count === 0) return;
+  parts.push(`${label}=${count}`);
+}
+
+function countArrayField(record: Record<string, unknown>, keys: readonly string[]): number | undefined {
+  let found = false;
+  let count = 0;
+  for (const key of keys) {
+    const value = record[key];
+    if (!Array.isArray(value)) continue;
+    found = true;
+    count += value.length;
+  }
+  return found ? count : undefined;
 }
 
 function teamMessagePastVerb(toolName: string): string {
@@ -561,6 +599,15 @@ function formatInput(input: unknown): string {
 function previewUnknown(value: unknown, maxLength: number): string | undefined {
   if (value === undefined) return undefined;
   return shortenLine(formatInput(value).replace(/\s+/g, " ").trim(), maxLength);
+}
+
+function parseJsonObject(value: string | undefined): Record<string, unknown> | undefined {
+  if (!value) return undefined;
+  try {
+    return recordValue(JSON.parse(value));
+  } catch {
+    return undefined;
+  }
 }
 
 function firstString(record: Record<string, unknown>, keys: readonly string[]): string | undefined {

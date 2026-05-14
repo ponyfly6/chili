@@ -265,6 +265,48 @@ test("file-changing and diff tools are block-ready while fallback stays inline",
   expect(unknown.mode).toBe("inline");
 });
 
+test("team renderers label batched tasks and summarize run loop output", () => {
+  const created = renderToolActivity(toolInput({
+    toolName: "team_task_create_batch",
+    inputSummary: { title: "team_task_create_batch" },
+    input: { team_id: "team_core" },
+  }));
+  const dispatched = renderToolActivity(toolInput({
+    toolName: "team_task_dispatch_batch",
+    inputSummary: { title: "team_task_dispatch_batch" },
+    input: { team_id: "team_core" },
+  }));
+  const runLoop = renderToolActivity(toolInput({
+    toolName: "team_run_loop",
+    inputSummary: { title: "team_run_loop" },
+    input: { team_id: "team_core" },
+    output: JSON.stringify({
+      stop_reason: "once",
+      dispatched: [{ task_id: "task_a" }, { task_id: "task_b" }],
+      completed: [],
+      accepted: [{ task_id: "task_done" }],
+      merged: [],
+      still_running: [{ task_id: "task_a" }],
+      blocked: [{ task_id: "task_blocked" }],
+      errors: [],
+    }),
+  }));
+
+  expect(created).toMatchObject({
+    label: "Created team tasks team_core",
+    mode: "inline",
+  });
+  expect(dispatched).toMatchObject({
+    label: "Dispatched team tasks team_core",
+    mode: "inline",
+  });
+  expect(runLoop).toMatchObject({
+    label: "Ran team loop team_core",
+    mode: "inline",
+    summary: "stop=once, dispatched=2, completed=1, running=1, blocked=1",
+  });
+});
+
 function toolInput(overrides: Partial<ToolRenderInput> & { toolName: string }): ToolRenderInput {
   return {
     id: overrides.id ?? `tool_${overrides.toolName}`,
