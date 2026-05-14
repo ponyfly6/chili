@@ -2176,7 +2176,15 @@ function teamRecentActivity(
   const items: TeamLiveActivityItem[] = [];
   for (const run of teamRunsForTeam(view, team.id)) {
     const label = run.phase ? `run ${run.phase}` : `run ${run.status}`;
-    items.push(activityItem({ id: run.id, kind: "run", time: run.updatedAt, label, status: run.stopReason ?? run.status, teamId: team.id }));
+    items.push(activityItem({
+      id: run.id,
+      kind: "run",
+      time: run.updatedAt,
+      label,
+      status: run.stopReason ?? run.status,
+      detail: teamRunActivityDetail(run),
+      teamId: team.id,
+    }));
   }
   for (const messageId of team.messageIds) {
     const message = view.teamMessages[messageId];
@@ -2238,6 +2246,24 @@ function teamRecentActivity(
     }));
   }
   return items.sort((left, right) => right.time - left.time).slice(0, limit);
+}
+
+function teamRunActivityDetail(run: RuntimeTeamRunView): string {
+  const parts = [`cycle:${run.cycle}`];
+  if (run.maxConcurrentDispatches) parts.push(`fanout:${run.maxConcurrentDispatches}`);
+  appendActivityCount(parts, "dispatched", run.counts.dispatched);
+  appendActivityCount(parts, "completed", run.counts.completed);
+  appendActivityCount(parts, "accepted", run.counts.accepted);
+  appendActivityCount(parts, "merged", run.counts.merged);
+  appendActivityCount(parts, "failed", run.counts.failed);
+  appendActivityCount(parts, "blocked", run.counts.blocked);
+  appendActivityCount(parts, "running", run.counts.stillRunning);
+  appendActivityCount(parts, "errors", run.counts.errors);
+  return parts.join(" ");
+}
+
+function appendActivityCount(parts: string[], label: string, value: number): void {
+  if (value > 0) parts.push(`${label}:${value}`);
 }
 
 function applyTeamProjectionEvent(view: ChiliRuntimeView, event: EventEnvelope): void {

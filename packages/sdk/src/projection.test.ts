@@ -1328,6 +1328,7 @@ test("derives Team Live cockpit view from team projection state", () => {
           maxCycles: 4,
           timeoutMs: 1000,
           pollIntervalMs: 100,
+          maxConcurrentDispatches: 4,
         },
       },
       {
@@ -1428,6 +1429,10 @@ test("derives Team Live cockpit view from team projection state", () => {
   expect(cockpit.toolCounts).toEqual([{ toolName: "read_file", total: 1, running: 1, completed: 0, failed: 0 }]);
   expect(cockpit.metadata.worktrees).toHaveLength(1);
   expect(cockpit.recentActivity.map((item) => item.kind)).toContain("run");
+  expect(cockpit.recentActivity.find((item) => item.kind === "run")).toMatchObject({
+    label: "run dispatch",
+    detail: "cycle:1 fanout:4 dispatched:1",
+  });
   expect(cockpit.recentActivity.map((item) => item.kind)).toContain("tool");
   expect(cockpit.recentActivity.map((item) => item.id)).toContain(childApprovalId);
   expect(teamLiveCockpit(view, { teamId: otherTeamId, sessionId }).team).toBeUndefined();
