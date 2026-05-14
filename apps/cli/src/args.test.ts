@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { parseArgs } from "./args.js";
+import { parseArgs, usage } from "./args.js";
 
 test("parses DeepSeek as a CLI model", () => {
   expect(parseArgs(["--model", "deepseek", "hello"])).toMatchObject({
@@ -152,6 +152,10 @@ test("parses team run loop command and runner flags", () => {
     command: "team-run-loop",
     teamId: "team_1",
   });
+});
+
+test("usage documents team run loop fan-out flag", () => {
+  expect(usage()).toContain("--max-concurrent-dispatches <n>");
 });
 
 test("parses team merge command", () => {

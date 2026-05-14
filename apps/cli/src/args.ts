@@ -451,6 +451,7 @@ export function usage(): string {
     "  --once              Run one team execution cycle",
     "  --max-turns <n>     Max automatic tool-use continuation turns before final answer, default 128",
     "  --max-cycles <n>    Max team execution runner cycles",
+    "  --max-concurrent-dispatches <n>  Max parallel team dispatch fan-out",
     "  --status <status>   Task close status: completed | failed | cancelled",
     "  --task <task-id>     Limit team merge to one task",
     "  --timeout-ms <n>    Task wait timeout in milliseconds",
