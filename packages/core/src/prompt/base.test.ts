@@ -17,6 +17,7 @@ test("default Chili base prompt covers core prompt behavior without growing too 
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("task_batch");
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("team_task_create_batch");
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("team_run_loop");
+  expect(DEFAULT_CHILI_BASE_PROMPT).toContain("until_drained:true");
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("max_concurrent_dispatches");
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("max_concurrent_verifications");
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("what changed, what you ran");

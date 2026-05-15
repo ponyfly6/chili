@@ -74,6 +74,7 @@ export interface CliArgs {
   json: boolean;
   content: boolean;
   once: boolean;
+  untilDrained?: boolean;
   maxTurns: number;
 }
 
@@ -329,6 +330,11 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       result.once = true;
       continue;
     }
+    if (arg === "--until-drained") {
+      result.once = false;
+      result.untilDrained = true;
+      continue;
+    }
     if (arg === "--max-turns") {
       result.maxTurns = Number.parseInt(requireValue(arg, args), 10);
       if (!Number.isInteger(result.maxTurns) || result.maxTurns <= 0) throw new Error("--max-turns must be a positive integer");
@@ -405,7 +411,7 @@ export function usage(): string {
     "  bun run chili -- team-messages <team-id>",
     "  bun run chili -- team-dispatch <team-id> <task-id>",
     "  bun run chili -- team-run <team-id> <task-id>",
-    "  bun run chili -- team-run-loop <team-id> --once --max-cycles 10 --timeout-ms 30000 --max-concurrent-dispatches 4 --max-concurrent-verifications 2",
+    "  bun run chili -- team-run-loop <team-id> --until-drained --max-cycles 10 --timeout-ms 30000 --max-concurrent-dispatches 4 --max-concurrent-verifications 2",
     "  bun run chili -- team-merge <team-id> [--task <task-id>] [--json]",
     "  bun run chili -- team-sync <team-id> <task-id>",
     "  bun run chili -- team-reconcile [team-id]",
@@ -457,6 +463,7 @@ export function usage(): string {
     "  --text <prompt>     Assemble prompt-debug as if this current-turn text were submitted",
     "  --content           Include prompt fragment content for prompt-debug",
     "  --once              Run one team execution cycle",
+    "  --until-drained     Run team execution until drained, max cycles, or timeout",
     "  --max-turns <n>     Max automatic tool-use continuation turns before final answer, default 128",
     "  --max-cycles <n>    Max team execution runner cycles",
     "  --max-concurrent-dispatches <n>  Max parallel team dispatch fan-out",

@@ -645,7 +645,7 @@ export function createTeamRunLoopTool(
     name: "team_run_loop",
     aliases: ["run_team", "team_run"],
     description:
-      "Run the persistent team scheduler: reconcile running tasks, auto-assign scoped pending tasks, dispatch eligible tasks in parallel, and verify or merge completed work. Defaults to one scheduling cycle.",
+      "Run the persistent team scheduler: reconcile running tasks, auto-assign scoped pending tasks, dispatch eligible tasks in parallel, and verify or merge completed work. Defaults to one scheduling cycle; set until_drained to run until stable.",
     risk: "execute",
     inputSchema: {
       type: "object",
@@ -655,6 +655,8 @@ export function createTeamRunLoopTool(
         team_id: { type: "string" },
         mode: { type: "string", enum: ["one_shot", "resumable", "background"] },
         once: { type: "boolean" },
+        untilDrained: { type: "boolean" },
+        until_drained: { type: "boolean" },
         maxCycles: { type: "number" },
         max_cycles: { type: "number" },
         timeoutMs: { type: "number" },
@@ -674,6 +676,7 @@ export function createTeamRunLoopTool(
         patterns: [
           input.teamId,
           `once:${input.once ?? true}`,
+          `drain:${input.untilDrained ?? input.once === false}`,
           `concurrency:${input.maxConcurrentDispatches ?? "default"}`,
           `verify:${input.maxConcurrentVerifications ?? "default"}`,
           input.mode ?? "background",
@@ -683,6 +686,8 @@ export function createTeamRunLoopTool(
           team_id: input.teamId,
           mode: input.mode ?? "background",
           once: input.once ?? true,
+          untilDrained: input.untilDrained ?? input.once === false,
+          until_drained: input.untilDrained ?? input.once === false,
           maxCycles: input.maxCycles,
           max_cycles: input.maxCycles,
           timeoutMs: input.timeoutMs,
@@ -703,6 +708,8 @@ export function createTeamRunLoopTool(
           team_id: input.teamId,
           mode: input.mode ?? "background",
           once: input.once ?? true,
+          untilDrained: input.untilDrained ?? input.once === false,
+          until_drained: input.untilDrained ?? input.once === false,
           maxConcurrentDispatches: input.maxConcurrentDispatches,
           max_concurrent_dispatches: input.maxConcurrentDispatches,
           maxConcurrentVerifications: input.maxConcurrentVerifications,
@@ -1090,6 +1097,11 @@ function validateTeamRunLoopInput(input: unknown): ValidationResult<TeamRunLoopT
   if (!mode.ok) return mode;
   const once = optionalBoolean(input.once, "once");
   if (!once.ok) return once;
+  const untilDrained = optionalBoolean(input.untilDrained ?? input.until_drained, "untilDrained");
+  if (!untilDrained.ok) return untilDrained;
+  if (untilDrained.value === true && once.value === true) {
+    return { ok: false, message: "untilDrained cannot be combined with once:true" };
+  }
   const maxCycles = optionalPositiveInteger(input.maxCycles ?? input.max_cycles, "maxCycles");
   if (!maxCycles.ok) return maxCycles;
   const timeoutMs = optionalPositiveInteger(input.timeoutMs ?? input.timeout_ms, "timeoutMs");
@@ -1115,8 +1127,9 @@ function validateTeamRunLoopInput(input: unknown): ValidationResult<TeamRunLoopT
 
   const value: TeamRunLoopToolInput = {
     teamId: teamId.value,
-    once: once.value ?? true,
+    once: untilDrained.value === true || once.value === false ? false : once.value ?? true,
   };
+  if (untilDrained.value === true || once.value === false) value.untilDrained = true;
   if (mode.value) value.mode = mode.value;
   if (maxCycles.value !== undefined) value.maxCycles = maxCycles.value;
   if (timeoutMs.value !== undefined) value.timeoutMs = timeoutMs.value;

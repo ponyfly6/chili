@@ -339,6 +339,7 @@ export interface TeamRunLoopToolInput {
   teamId: string;
   mode?: TeamTaskDispatchMode;
   once?: boolean;
+  untilDrained?: boolean;
   maxCycles?: number;
   timeoutMs?: number;
   pollIntervalMs?: number;

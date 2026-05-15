@@ -131,7 +131,7 @@ test("parses team run loop command and runner flags", () => {
   expect(parseArgs([
     "team-run-loop",
     "team_1",
-    "--once",
+    "--until-drained",
     "--max-cycles",
     "3",
     "--timeout-ms",
@@ -144,7 +144,8 @@ test("parses team run loop command and runner flags", () => {
   ])).toMatchObject({
     command: "team-run-loop",
     teamId: "team_1",
-    once: true,
+    once: false,
+    untilDrained: true,
     maxCycles: 3,
     timeoutMs: 5000,
     maxConcurrentDispatches: 6,
@@ -158,6 +159,7 @@ test("parses team run loop command and runner flags", () => {
 });
 
 test("usage documents team run loop fan-out flag", () => {
+  expect(usage()).toContain("--until-drained");
   expect(usage()).toContain("--max-concurrent-dispatches <n>");
   expect(usage()).toContain("--max-concurrent-verifications <n>");
 });

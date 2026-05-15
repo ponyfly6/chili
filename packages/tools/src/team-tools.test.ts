@@ -474,8 +474,26 @@ test("team run loop tool schedules scoped team work through the runner", async (
   expect(approvals).toHaveLength(1);
   expect(approvals[0]).toMatchObject({
     permission: "team_run_loop",
-    patterns: ["team_core", "once:true", "concurrency:6", "verify:3", "background"],
+    patterns: ["team_core", "once:true", "drain:false", "concurrency:6", "verify:3", "background"],
   });
+
+  const drained = await executor.execute(toolInput("team_run_loop", {
+    team_id: "team_core",
+    until_drained: true,
+    max_cycles: 5,
+  }));
+  expect(drained.status).toBe("completed");
+  expect(controller.teamRunLoopInputs.at(-1)).toMatchObject({
+    teamId: "team_core",
+    once: false,
+    untilDrained: true,
+    maxCycles: 5,
+  });
+  if (drained.status === "completed") {
+    expect(JSON.parse(drained.result.output)).toMatchObject({
+      stop_reason: "drained",
+    });
+  }
 
   const rejected = await executor.execute(toolInput("team_run_loop", {
     team_id: "team_core",
@@ -488,6 +506,13 @@ test("team run loop tool schedules scoped team work through the runner", async (
     max_concurrent_verifications: 5,
   }));
   expect(rejectedVerifier.status).toBe("failed");
+
+  const rejectedConflict = await executor.execute(toolInput("team_run_loop", {
+    team_id: "team_core",
+    once: true,
+    until_drained: true,
+  }));
+  expect(rejectedConflict.status).toBe("failed");
 });
 
 test("team dispatch batch launches background tasks with bounded parallelism", async () => {
