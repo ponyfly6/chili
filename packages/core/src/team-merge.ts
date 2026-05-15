@@ -11,6 +11,7 @@ import { mergeMergeMetadata, taskMergeMetadata, worktreeMetadata, type TeamTaskM
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000;
 const DEFAULT_MERGE_PATCH_MAX_BYTES = 5_000_000;
+const DEFAULT_MAX_CONCURRENT_MERGE_PRECHECKS = 4;
 const MAX_SUMMARY_PATHS = 100;
 
 export type TeamMergeResultStatus = "applied" | "failed" | "conflicted" | "skipped";
@@ -94,6 +95,24 @@ interface WorktreePatch {
   summary: TeamMergeDiffSummary;
 }
 
+interface PreparedMergeTask {
+  status: "prepared";
+  task: TeamTaskRow;
+  merge: TeamTaskMergeMetadata;
+  cwd: string;
+  patch: WorktreePatch;
+  mainHead?: string;
+  worktreeHead?: string;
+}
+
+type MergePreparationResult = PreparedMergeTask | TeamMergeTaskResult | TeamMergeTaskSkipped;
+
+interface PatchCheckResult {
+  ok: boolean;
+  error?: string;
+  conflicts?: string[];
+}
+
 interface FinalizeMergeInput {
   task: TeamTaskRow;
   merge: TeamTaskMergeMetadata;
@@ -125,6 +144,7 @@ export class TeamMergeService {
       errors: [],
     };
 
+    const pending: TeamTaskRow[] = [];
     for (const task of selected) {
       const skipReason = pendingMergeSkipReason(task);
       if (skipReason) {
@@ -135,17 +155,42 @@ export class TeamMergeService {
       }
 
       result.scanned++;
+      pending.push(task);
+    }
+
+    const ready: PreparedMergeTask[] = [];
+    for (const batch of chunk(pending, DEFAULT_MAX_CONCURRENT_MERGE_PRECHECKS)) {
+      const prepared = await Promise.all(batch.map(async (task) => {
+        try {
+          return { task, result: await this.prepareMergeTask(input, task) };
+        } catch (error) {
+          if (isSignalAbort(error, input.signal)) throw error;
+          return { task, error };
+        }
+      }));
+
+      for (const item of prepared) {
+        if ("error" in item) {
+          result.errors.push({
+            teamId: input.teamId,
+            taskId: item.task.id,
+            error: toError(item.error).message,
+          });
+          continue;
+        }
+        if (item.result.status === "prepared") ready.push(item.result);
+        else collectMergeResult(result, item.result);
+      }
+    }
+
+    for (const item of ready) {
       try {
-        const merged = await this.mergeTask(input, task);
-        if (merged.status === "applied") result.applied.push(merged);
-        else if (merged.status === "failed") result.failed.push(merged);
-        else if (merged.status === "conflicted") result.conflicted.push(merged);
-        else if (merged.status === "skipped") result.skipped.push(merged);
+        collectMergeResult(result, await this.applyPreparedMergeTask(input, item));
       } catch (error) {
         if (isSignalAbort(error, input.signal)) throw error;
         result.errors.push({
           teamId: input.teamId,
-          taskId: task.id,
+          taskId: item.task.id,
           error: toError(error).message,
         });
       }
@@ -154,7 +199,7 @@ export class TeamMergeService {
     return result;
   }
 
-  private async mergeTask(input: TeamMergeInput, task: TeamTaskRow): Promise<TeamMergeTaskResult | TeamMergeTaskSkipped> {
+  private async prepareMergeTask(input: TeamMergeInput, task: TeamTaskRow): Promise<MergePreparationResult> {
     const merge = taskMergeMetadata(task.metadata);
     if (!merge || merge.status !== "pending") {
       return { status: "skipped", teamTask: task, reason: merge ? "not_pending" : "missing_merge_metadata" };
@@ -228,32 +273,94 @@ export class TeamMergeService {
       return { status: "conflicted", teamTask: updated, diffSummary: patch.summary, conflicts };
     }
 
+    const checked = await this.checkPatch(cwd, patch.patch, input.signal);
+    if (!checked.ok) {
+      const updated = await this.finalizeMerge({
+        task,
+        merge,
+        status: "conflicted",
+        diff: patch.patch,
+        summary: patch.summary,
+        mergedAt,
+        ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+        ...(input.threadId ? { threadId: input.threadId } : {}),
+        ...(checked.error ? { error: checked.error } : {}),
+        ...(checked.conflicts ? { conflicts: checked.conflicts } : {}),
+        ...(mainHead ? { mainHead } : {}),
+        ...(worktreeHead ? { worktreeHead } : {}),
+      });
+      return {
+        status: "conflicted",
+        teamTask: updated,
+        diffSummary: patch.summary,
+        ...(checked.error ? { error: checked.error } : {}),
+        ...(checked.conflicts ? { conflicts: checked.conflicts } : {}),
+      };
+    }
+
+    const prepared: PreparedMergeTask = {
+      status: "prepared",
+      task,
+      merge,
+      cwd,
+      patch,
+    };
+    if (mainHead) prepared.mainHead = mainHead;
+    if (worktreeHead) prepared.worktreeHead = worktreeHead;
+    return prepared;
+  }
+
+  private async applyPreparedMergeTask(input: TeamMergeInput, prepared: PreparedMergeTask): Promise<TeamMergeTaskResult> {
+    const { task, merge, cwd, patch, mainHead, worktreeHead } = prepared;
+    const mergedAt = Number(this.now());
+
+    const dirtyPaths = await this.dirtyMainPaths(cwd, patch.paths, input.signal);
+    if (dirtyPaths.length > 0) {
+      const conflicts = dirtyPaths.map((path) => `Main workspace has local changes at ${path}`);
+      const updated = await this.finalizeMerge({
+        task,
+        merge,
+        status: "conflicted",
+        diff: patch.patch,
+        summary: patch.summary,
+        mergedAt,
+        ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+        ...(input.threadId ? { threadId: input.threadId } : {}),
+        error: "Main workspace has local changes in files touched by the task patch",
+        conflicts,
+        ...(mainHead ? { mainHead } : {}),
+        ...(worktreeHead ? { worktreeHead } : {}),
+      });
+      return { status: "conflicted", teamTask: updated, diffSummary: patch.summary, conflicts };
+    }
+
+    const checked = await this.checkPatch(cwd, patch.patch, input.signal);
+    if (!checked.ok) {
+      const updated = await this.finalizeMerge({
+        task,
+        merge,
+        status: "conflicted",
+        diff: patch.patch,
+        summary: patch.summary,
+        mergedAt,
+        ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+        ...(input.threadId ? { threadId: input.threadId } : {}),
+        ...(checked.error ? { error: checked.error } : {}),
+        ...(checked.conflicts ? { conflicts: checked.conflicts } : {}),
+        ...(mainHead ? { mainHead } : {}),
+        ...(worktreeHead ? { worktreeHead } : {}),
+      });
+      return {
+        status: "conflicted",
+        teamTask: updated,
+        diffSummary: patch.summary,
+        ...(checked.error ? { error: checked.error } : {}),
+        ...(checked.conflicts ? { conflicts: checked.conflicts } : {}),
+      };
+    }
+
     const patchFile = await this.writeTemporaryPatch(patch.patch);
     try {
-      const checked = await this.git({
-        cwd,
-        args: ["apply", "--check", "--whitespace=nowarn", patchFile],
-        ...(input.signal ? { signal: input.signal } : {}),
-      });
-      if (checked.exitCode !== 0) {
-        const conflicts = conflictLines(checked.stderr || checked.stdout || `git apply --check exited with ${checked.exitCode}`);
-        const updated = await this.finalizeMerge({
-          task,
-          merge,
-          status: "conflicted",
-          diff: patch.patch,
-          summary: patch.summary,
-          mergedAt,
-          ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-          ...(input.threadId ? { threadId: input.threadId } : {}),
-          error: checked.stderr || `git apply --check exited with ${checked.exitCode}`,
-          conflicts,
-          ...(mainHead ? { mainHead } : {}),
-          ...(worktreeHead ? { worktreeHead } : {}),
-        });
-        return { status: "conflicted", teamTask: updated, diffSummary: patch.summary, error: checked.stderr, conflicts };
-      }
-
       const applied = await this.git({
         cwd,
         args: ["apply", "--whitespace=nowarn", patchFile],
@@ -370,6 +477,26 @@ export class TeamMergeService {
       .filter(Boolean);
   }
 
+  private async checkPatch(cwd: string, patch: string, signal: AbortSignal | undefined): Promise<PatchCheckResult> {
+    const patchFile = await this.writeTemporaryPatch(patch);
+    try {
+      const checked = await this.git({
+        cwd,
+        args: ["apply", "--check", "--whitespace=nowarn", patchFile],
+        ...(signal ? { signal } : {}),
+      });
+      if (checked.exitCode === 0) return { ok: true };
+      const error = checked.stderr || `git apply --check exited with ${checked.exitCode}`;
+      return {
+        ok: false,
+        error,
+        conflicts: conflictLines(checked.stderr || checked.stdout || error),
+      };
+    } finally {
+      await rm(dirname(patchFile), { recursive: true, force: true });
+    }
+  }
+
   private async revParseHead(cwd: string, signal: AbortSignal | undefined): Promise<string | undefined> {
     const result = await this.git({
       cwd,
@@ -447,6 +574,31 @@ function pendingMergeSkipReason(task: TeamTaskRow): TeamMergeSkippedReason | und
   if (!merge) return "missing_merge_metadata";
   if (merge.status !== "pending") return "not_pending";
   return undefined;
+}
+
+function collectMergeResult(result: TeamMergeSweepResult, item: TeamMergeTaskResult | TeamMergeTaskSkipped): void {
+  switch (item.status) {
+    case "applied":
+      result.applied.push(item);
+      return;
+    case "failed":
+      result.failed.push(item);
+      return;
+    case "conflicted":
+      result.conflicted.push(item);
+      return;
+    case "skipped":
+      result.skipped.push(item);
+      return;
+  }
+}
+
+function chunk<T>(items: readonly T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
 }
 
 async function isDirectory(path: string): Promise<boolean> {

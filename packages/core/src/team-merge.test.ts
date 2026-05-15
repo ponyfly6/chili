@@ -5,7 +5,7 @@ import { expect, test } from "bun:test";
 import type { AgentPath, SessionId, TimestampMs } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import { runProcess } from "@chili/tools";
-import { TeamMergeService } from "./team-merge.js";
+import { TeamMergeService, type TeamMergeGitRunnerResult } from "./team-merge.js";
 import { TeamControlService } from "./team.js";
 import { taskMergeMetadata, TeamWorktreeService } from "./team-worktree.js";
 
@@ -141,6 +141,87 @@ test("applies staged and untracked worktree changes in the merge diff", async ()
   }
 });
 
+test("prechecks pending merge patches concurrently before serial apply", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-precheck-");
+  const now = () => 2000 as TimestampMs;
+  let runningDiffs = 0;
+  let maxRunningDiffs = 0;
+
+  try {
+    const worktrees = new TeamWorktreeService({ teams: context.teams, cwd: context.dir, now });
+    const second = await context.teams.createTask({
+      sessionId: context.sessionId,
+      teamId: context.teamId,
+      title: "Merge docs worktree",
+      ownerPath: "/root/worker" as AgentPath,
+      metadata: { writeScope: ["docs"] },
+    });
+    const secondWorktree = await worktrees.ensureTaskWorktree({
+      teamId: context.teamId,
+      taskId: second.id,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    });
+    await context.teams.updateTask({
+      sessionId: context.sessionId,
+      teamId: context.teamId,
+      taskId: second.id,
+      status: "completed",
+      summary: "Docs completed",
+      metadata: {
+        ...(secondWorktree.task.metadata ?? {}),
+        verification: { status: "passed", gitDiff: "(pending merge)" },
+        merge: {
+          status: "pending",
+          createdAt: 2000,
+          worktreePath: secondWorktree.path,
+          baseRef: secondWorktree.baseRef,
+          diff: "(pending merge)",
+        },
+      },
+    });
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    await writeFile(join(secondWorktree.path, "docs/readme.md"), "# docs\n\nmerged docs\n");
+
+    const merger = new TeamMergeService({
+      teams: context.teams,
+      cwd: context.dir,
+      now,
+      runGit: async (input): Promise<TeamMergeGitRunnerResult> => {
+        const isWorktreeHeadDiff = input.args[0] === "diff" && input.args.includes("HEAD") && input.cwd.includes(".chili/worktrees");
+        if (isWorktreeHeadDiff) {
+          runningDiffs++;
+          maxRunningDiffs = Math.max(maxRunningDiffs, runningDiffs);
+          await delay(20);
+        }
+        try {
+          return await runProcess("git", input.args, {
+            cwd: input.cwd,
+            ...(input.signal ? { signal: input.signal } : {}),
+            timeoutMs: input.timeoutMs ?? 30_000,
+            maxOutputBytes: input.maxOutputBytes ?? 5_000_000,
+          });
+        } finally {
+          if (isWorktreeHeadDiff) runningDiffs--;
+        }
+      },
+    });
+
+    const result = await merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    });
+
+    expect(result.applied.map((item) => item.teamTask.id).sort()).toEqual([context.taskId, second.id].sort());
+    expect(result.conflicted).toEqual([]);
+    expect(result.errors).toEqual([]);
+    expect(maxRunningDiffs).toBeGreaterThan(1);
+  } finally {
+    await context.close();
+  }
+});
+
 async function createPendingMergeContext(prefix: string): Promise<{
   dir: string;
   store: SqliteEventStore;
@@ -229,4 +310,8 @@ async function git(cwd: string, args: readonly string[]): Promise<void> {
 function createSequentialId(): (prefix: string) => string {
   let next = 0;
   return (prefix: string) => `${prefix}_${++next}`;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
