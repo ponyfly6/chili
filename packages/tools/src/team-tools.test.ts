@@ -457,6 +457,7 @@ test("team run loop tool schedules scoped team work through the runner", async (
     expect(JSON.parse(result.result.output)).toMatchObject({
       team_id: "team_core",
       stop_reason: "cycle_limit",
+      bottleneck: "workers-running",
       max_concurrent_dispatches: 6,
       max_concurrent_verifications: 3,
       dispatched: [{ task_id: "task_team", owner_path: "/worker", agent_task_id: "agent_task" }],
@@ -465,6 +466,7 @@ test("team run loop tool schedules scoped team work through the runner", async (
     expect(result.result.metadata).toMatchObject({
       team_id: "team_core",
       stop_reason: "cycle_limit",
+      bottleneck: "workers-running",
       max_concurrent_dispatches: 6,
       max_concurrent_verifications: 3,
       dispatched: 1,

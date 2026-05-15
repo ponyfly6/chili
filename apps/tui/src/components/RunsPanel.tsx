@@ -1,6 +1,6 @@
 import type { PanelProps } from "./types.js";
 import { VISIBLE_LIMITS } from "./types.js";
-import { countsCompact, focusLabel, rowMarker, shorten, visibleWindow } from "./helpers.js";
+import { focusLabel, rowMarker, runBottleneckLabel, runBottleneckShortLabel, shorten, visibleWindow } from "./helpers.js";
 
 export function RunsPanel(props: PanelProps) {
   const selected = props.model.selected;
@@ -24,12 +24,13 @@ export function RunsPanel(props: PanelProps) {
         <text fg={theme.colors.text.muted} truncate wrapMode="none">{"  run: none"}</text>
       ) : (
         runWindow.rows.map(({ item: run, index }) => {
+          const bottleneck = runBottleneckShortLabel(runBottleneckLabel(run));
           const runLabel = run.maxConcurrentDispatches
-            ? `${run.phase ?? run.status} fan:${run.maxConcurrentDispatches}`
-            : `${run.phase ?? run.status} ${shorten(run.id, 12)} c:${run.cycle}`;
+            ? `fan:${run.maxConcurrentDispatches} b:${bottleneck} ${run.phase ?? run.status}`
+            : `${run.phase ?? run.status} ${shorten(run.id, 12)} c:${run.cycle} b:${bottleneck}`;
           return (
             <text key={run.id} fg={index === props.selectedIndex ? theme.colors.text.primary : theme.colors.text.secondary} truncate wrapMode="none">
-              {`${rowMarker(props.focused, index === props.selectedIndex)} ${runLabel} ${countsCompact(run.counts)}`}
+              {`${rowMarker(props.focused, index === props.selectedIndex)} ${runLabel} ${runCountsBrief(run.counts)}`}
             </text>
           );
         })
@@ -41,4 +42,15 @@ export function RunsPanel(props: PanelProps) {
       ))}
     </box>
   );
+}
+
+function runCountsBrief(counts: { dispatched: number; completed: number; blocked: number; stillRunning: number; errors: number }): string {
+  const parts = [
+    counts.dispatched > 0 ? `d:${counts.dispatched}` : undefined,
+    counts.completed > 0 ? `c:${counts.completed}` : undefined,
+    counts.blocked > 0 ? `b:${counts.blocked}` : undefined,
+    counts.stillRunning > 0 ? `r:${counts.stillRunning}` : undefined,
+    counts.errors > 0 ? `e:${counts.errors}` : undefined,
+  ].filter((item): item is string => item !== undefined);
+  return parts.length > 0 ? parts.join(" ") : "none";
 }

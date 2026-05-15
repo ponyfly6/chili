@@ -800,6 +800,7 @@ function printTeamRunLoopSummary(summary: TeamExecutionRunSummary): void {
     [
       `[team-run-loop] ${summary.teamId}`,
       `stop=${summary.stopReason}`,
+      `bottleneck=${teamRunLoopBottleneck(summary)}`,
       `cycles=${summary.cycles}`,
       `fanout=${summary.maxConcurrentDispatches}`,
       `verify=${summary.maxConcurrentVerifications}`,
@@ -857,6 +858,23 @@ function printTeamRunLoopSummary(summary: TeamExecutionRunSummary): void {
   for (const item of summary.errors) {
     console.log(["[error]", item.taskId ?? "-", item.error].join("\t"));
   }
+}
+
+function teamRunLoopBottleneck(summary: TeamExecutionRunSummary): string {
+  if (summary.errors.length > 0) return "errors";
+  if (summary.mergeConflicted.length > 0) return "merge-conflict";
+  if (summary.mergeFailed.length > 0) return "merge-failed";
+  if (summary.reopened.length > 0) return "verify-failed";
+  if (summary.blocked.some((item) => item.reason !== "dependency_incomplete")) return "blocked";
+  if (summary.stillRunning.length >= summary.maxConcurrentDispatches && summary.maxConcurrentDispatches > 0) return "fanout-full";
+  if (summary.stillRunning.length > 0) return "workers-running";
+  if (summary.blocked.length > 0) return "waiting-dependencies";
+  if (summary.completed.length > 0 && summary.accepted.length === 0 && summary.merged.length === 0) return "verify-pending";
+  if (summary.stopReason === "timeout") return "timeout";
+  if (summary.stopReason === "max_cycles") return "max-cycles";
+  if (summary.stopReason === "drained") return "drained";
+  if (summary.stopReason === "once") return "one-cycle";
+  return summary.stopReason;
 }
 
 function printTeamMergeSummary(result: TeamMergeSweepResult): void {

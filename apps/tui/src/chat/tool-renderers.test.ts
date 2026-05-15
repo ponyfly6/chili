@@ -305,7 +305,7 @@ test("team renderers label batched tasks and summarize run loop output", () => {
   expect(runLoop).toMatchObject({
     label: "Ran team loop team_core",
     mode: "inline",
-    summary: "stop=once, fanout=4, verify=2, dispatched=2, completed=1, running=1, blocked=1",
+    summary: "stop=once, bottleneck=blocked, fanout=4, verify=2, dispatched=2, completed=1, running=1, blocked=1",
   });
 });
 

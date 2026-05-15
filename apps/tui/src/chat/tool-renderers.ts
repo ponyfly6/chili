@@ -539,6 +539,8 @@ function teamRunLoopSummary(output: string | undefined): string | undefined {
   const parts: string[] = [];
   const stopReason = firstString(record, ["stopReason", "stop_reason"]);
   if (stopReason) parts.push(`stop=${stopReason}`);
+  const bottleneck = firstString(record, ["bottleneck"]) ?? teamRunLoopBottleneck(record, stopReason);
+  if (bottleneck) parts.push(`bottleneck=${bottleneck}`);
   const fanout = firstNumber(record, ["maxConcurrentDispatches", "max_concurrent_dispatches"]);
   if (fanout !== undefined) parts.push(`fanout=${fanout}`);
   const verifierFanout = firstNumber(record, ["maxConcurrentVerifications", "max_concurrent_verifications"]);
@@ -551,9 +553,50 @@ function teamRunLoopSummary(output: string | undefined): string | undefined {
   return parts.length > 0 ? parts.join(", ") : undefined;
 }
 
+function teamRunLoopBottleneck(record: Record<string, unknown>, stopReason: string | undefined): string | undefined {
+  const errors = countArrayField(record, ["errors"]) ?? 0;
+  if (errors > 0) return "errors";
+  const mergeConflicted = countArrayField(record, ["mergeConflicted", "merge_conflicted"]) ?? 0;
+  if (mergeConflicted > 0) return "merge-conflict";
+  const mergeFailed = countArrayField(record, ["mergeFailed", "merge_failed"]) ?? 0;
+  if (mergeFailed > 0) return "merge-failed";
+  const reopened = countArrayField(record, ["reopened"]) ?? 0;
+  if (reopened > 0) return "verify-failed";
+  const blocked = arrayField(record, ["blocked"]);
+  if (blocked.some((item) => recordString(item, "reason") !== "dependency_incomplete")) return "blocked";
+  const fanout = firstNumber(record, ["maxConcurrentDispatches", "max_concurrent_dispatches"]);
+  const running = countArrayField(record, ["stillRunning", "still_running"]) ?? 0;
+  if (fanout !== undefined && fanout > 0 && running >= fanout) return "fanout-full";
+  if (running > 0) return "workers-running";
+  if (blocked.length > 0) return "waiting-dependencies";
+  const completed = countArrayField(record, ["completed"]) ?? 0;
+  const accepted = countArrayField(record, ["accepted"]) ?? 0;
+  const merged = countArrayField(record, ["merged"]) ?? 0;
+  if (completed > 0 && accepted === 0 && merged === 0) return "verify-pending";
+  if (stopReason === "timeout") return "timeout";
+  if (stopReason === "max_cycles") return "max-cycles";
+  if (stopReason === "drained") return "drained";
+  if (stopReason === "once") return "one-cycle";
+  return stopReason;
+}
+
 function appendCountPart(parts: string[], label: string, count: number | undefined): void {
   if (count === undefined || count === 0) return;
   parts.push(`${label}=${count}`);
+}
+
+function arrayField(record: Record<string, unknown>, keys: readonly string[]): Record<string, unknown>[] {
+  for (const key of keys) {
+    const value = record[key];
+    if (!Array.isArray(value)) continue;
+    return value.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null && !Array.isArray(item));
+  }
+  return [];
+}
+
+function recordString(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" ? value : undefined;
 }
 
 function countArrayField(record: Record<string, unknown>, keys: readonly string[]): number | undefined {

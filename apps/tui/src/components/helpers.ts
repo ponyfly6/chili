@@ -1,4 +1,4 @@
-import type { TeamLiveAction, TeamLiveActivityItem, TeamLiveTeamSummary } from "@chili/sdk";
+import type { TeamLiveAction, TeamLiveActivityItem, TeamLiveRunSummary, TeamLiveTeamSummary } from "@chili/sdk";
 import type { TeamId, TeamRunSummaryCounts } from "@chili/protocol";
 import { actionKey } from "../useTeamLiveRuntime.js";
 
@@ -56,6 +56,58 @@ export function countsCompact(counts: TeamRunSummaryCounts): string {
   });
   if (items.length === 0) return "none";
   return items.slice(0, 8).join(" ");
+}
+
+export function runBottleneckLabel(run: TeamLiveRunSummary): string {
+  const counts = run.counts;
+  if (counts.errors > 0) return "errors";
+  if (counts.mergeConflicted > 0) return "merge-conflict";
+  if (counts.mergeFailed > 0) return "merge-failed";
+  if (counts.reopened > 0) return "verify-failed";
+  if (counts.blocked > 0) return "blocked";
+  if (
+    run.maxConcurrentDispatches !== undefined &&
+    run.maxConcurrentDispatches > 0 &&
+    counts.stillRunning >= run.maxConcurrentDispatches
+  ) {
+    return "fanout-full";
+  }
+  if (counts.stillRunning > 0) return "workers-running";
+  if (counts.completed > 0 && counts.accepted === 0 && counts.merged === 0) return "verify-pending";
+  if (run.stopReason === "timeout") return "timeout";
+  if (run.stopReason === "max_cycles") return "max-cycles";
+  if (run.stopReason === "drained") return "drained";
+  if (run.stopReason === "once") return "one-cycle";
+  return run.phase ?? run.status;
+}
+
+export function runBottleneckShortLabel(label: string): string {
+  switch (label) {
+    case "errors":
+      return "err";
+    case "merge-conflict":
+      return "mconf";
+    case "merge-failed":
+      return "mfail";
+    case "verify-failed":
+      return "vfail";
+    case "blocked":
+      return "block";
+    case "fanout-full":
+      return "full";
+    case "workers-running":
+      return "run";
+    case "waiting-dependencies":
+      return "deps";
+    case "verify-pending":
+      return "verify";
+    case "max-cycles":
+      return "max";
+    case "one-cycle":
+      return "once";
+    default:
+      return label;
+  }
 }
 
 export function activityLine(item: TeamLiveActivityItem): string {

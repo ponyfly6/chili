@@ -1374,14 +1374,16 @@ function teamTaskReconcileToolResult(result: TeamTaskReconcileRecord): TeamToolR
 }
 
 function teamRunLoopToolResult(result: TeamRunLoopRecord): TeamToolResult {
+  const bottleneck = teamRunLoopBottleneck(result);
   return {
-    title: `team_run_loop ${result.teamId} stop=${result.stopReason} fanout=${result.maxConcurrentDispatches ?? "default"} verify=${result.maxConcurrentVerifications ?? "default"} dispatched=${result.dispatched.length} running=${result.stillRunning.length}`,
+    title: `team_run_loop ${result.teamId} stop=${result.stopReason} bottleneck=${bottleneck} fanout=${result.maxConcurrentDispatches ?? "default"} verify=${result.maxConcurrentVerifications ?? "default"} dispatched=${result.dispatched.length} running=${result.stillRunning.length}`,
     output: JSON.stringify(teamRunLoopOutput(result)),
     metadata: {
       team_id: result.teamId,
       teamId: result.teamId,
       stop_reason: result.stopReason,
       stopReason: result.stopReason,
+      bottleneck,
       cycles: result.cycles,
       max_concurrent_dispatches: result.maxConcurrentDispatches,
       maxConcurrentDispatches: result.maxConcurrentDispatches,
@@ -1406,6 +1408,29 @@ function teamRunLoopToolResult(result: TeamRunLoopRecord): TeamToolResult {
       errors: result.errors.length,
     },
   };
+}
+
+function teamRunLoopBottleneck(result: TeamRunLoopRecord): string {
+  if (result.errors.length > 0) return "errors";
+  if (result.mergeConflicted.length > 0) return "merge-conflict";
+  if (result.mergeFailed.length > 0) return "merge-failed";
+  if (result.reopened.length > 0) return "verify-failed";
+  if (result.blocked.some((item) => item.reason !== "dependency_incomplete")) return "blocked";
+  if (
+    result.maxConcurrentDispatches !== undefined &&
+    result.maxConcurrentDispatches > 0 &&
+    result.stillRunning.length >= result.maxConcurrentDispatches
+  ) {
+    return "fanout-full";
+  }
+  if (result.stillRunning.length > 0) return "workers-running";
+  if (result.blocked.length > 0) return "waiting-dependencies";
+  if (result.completed.length > 0 && result.accepted.length === 0 && result.merged.length === 0) return "verify-pending";
+  if (result.stopReason === "timeout") return "timeout";
+  if (result.stopReason === "max_cycles") return "max-cycles";
+  if (result.stopReason === "drained") return "drained";
+  if (result.stopReason === "once") return "one-cycle";
+  return result.stopReason;
 }
 
 function teamMessageRecordToolResult(title: string, message: TeamMessageRecord): TeamToolResult {
@@ -1611,6 +1636,7 @@ function teamRunLoopOutput(result: TeamRunLoopRecord): Record<string, unknown> {
     cycles: result.cycles,
     stop_reason: result.stopReason,
     stopReason: result.stopReason,
+    bottleneck: teamRunLoopBottleneck(result),
     started_at: result.startedAt,
     startedAt: result.startedAt,
     ended_at: result.endedAt,

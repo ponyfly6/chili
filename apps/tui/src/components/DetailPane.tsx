@@ -1,7 +1,7 @@
 import type { TeamLiveView } from "@chili/sdk";
 import type { TuiTheme } from "../theme/index.js";
 import type { FocusRegion, SelectionState } from "./types.js";
-import { countsCompact, focusLabel, shorten } from "./helpers.js";
+import { countsCompact, focusLabel, runBottleneckLabel, shorten } from "./helpers.js";
 
 export function DetailPane(props: {
   model: TeamLiveView;
@@ -42,6 +42,7 @@ function detailLines(model: TeamLiveView, focus: FocusRegion, selection: Selecti
     return [
       `run:${run.id}`,
       `status:${run.phase ?? run.status} cycle:${run.cycle}`,
+      `bottleneck:${runBottleneckLabel(run)}`,
       `mode:${run.mode ?? "unknown"} once:${String(run.once ?? false)} fanout:${run.maxConcurrentDispatches ?? "default"} verify:${run.maxConcurrentVerifications ?? "default"}`,
       `counts:${countsCompact(run.counts)}`,
       `stop:${run.stopReason ?? "none"}`,
