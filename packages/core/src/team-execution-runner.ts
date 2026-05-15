@@ -228,6 +228,16 @@ interface TeamDispatchWriteReservation {
   writeScope: string[];
 }
 
+interface TeamDispatchCandidate {
+  task: TeamTaskRow;
+  index: number;
+  priority: number;
+  retryRank: number;
+  downstreamDependents: number;
+  ownerRank: number;
+  writeScopeSpecificity: number;
+}
+
 const DEFAULT_MAX_CYCLES = 50;
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_POLL_INTERVAL_MS = 250;
@@ -348,7 +358,7 @@ export class TeamExecutionRunner {
 
       const dispatches: TeamDispatchWork[] = [];
       const reservations = dispatchReservationsForRunningTasks(state.tasks);
-      for (const task of state.tasks) {
+      for (const task of sortedDispatchCandidates(state.tasks)) {
         if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
         if (task.status !== "pending") continue;
 
@@ -921,6 +931,65 @@ function dispatchReservationsForRunningTasks(tasks: readonly TeamTaskRow[]): Dis
   return reservations;
 }
 
+function sortedDispatchCandidates(tasks: readonly TeamTaskRow[]): TeamTaskRow[] {
+  const downstreamDependents = pendingDependentCounts(tasks);
+  return tasks
+    .map((task, index): TeamDispatchCandidate => ({
+      task,
+      index,
+      priority: teamTaskPriority(task),
+      retryRank: isReopenedAfterFailedVerification(task) ? 0 : 1,
+      downstreamDependents: downstreamDependents.get(task.id) ?? 0,
+      ownerRank: task.ownerPath ? 0 : 1,
+      writeScopeSpecificity: teamTaskWriteScopeSpecificity(task),
+    }))
+    .sort(compareDispatchCandidates)
+    .map((candidate) => candidate.task);
+}
+
+function compareDispatchCandidates(left: TeamDispatchCandidate, right: TeamDispatchCandidate): number {
+  const priorityDelta = left.priority - right.priority;
+  if (priorityDelta !== 0) return priorityDelta;
+  const retryDelta = left.retryRank - right.retryRank;
+  if (retryDelta !== 0) return retryDelta;
+  const downstreamDelta = right.downstreamDependents - left.downstreamDependents;
+  if (downstreamDelta !== 0) return downstreamDelta;
+  const ownerDelta = left.ownerRank - right.ownerRank;
+  if (ownerDelta !== 0) return ownerDelta;
+  const scopeDelta = right.writeScopeSpecificity - left.writeScopeSpecificity;
+  if (scopeDelta !== 0) return scopeDelta;
+  return left.index - right.index;
+}
+
+function pendingDependentCounts(tasks: readonly TeamTaskRow[]): Map<TaskId, number> {
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  const dependents = new Map<TaskId, TaskId[]>();
+  for (const task of tasks) {
+    if (task.status !== "pending") continue;
+    for (const dependency of task.dependsOn) {
+      const list = dependents.get(dependency) ?? [];
+      list.push(task.id);
+      dependents.set(dependency, list);
+    }
+  }
+
+  const counts = new Map<TaskId, number>();
+  for (const task of tasks) {
+    const seen = new Set<TaskId>();
+    const stack = [...(dependents.get(task.id) ?? [])];
+    while (stack.length > 0) {
+      const dependentId = stack.pop();
+      if (!dependentId || seen.has(dependentId)) continue;
+      seen.add(dependentId);
+      const dependent = byId.get(dependentId);
+      if (!dependent || dependent.status !== "pending") continue;
+      for (const next of dependents.get(dependentId) ?? []) stack.push(next);
+    }
+    counts.set(task.id, seen.size);
+  }
+  return counts;
+}
+
 function selectDispatchOwner(
   task: TeamTaskRow,
   members: readonly TeamMemberRow[],
@@ -992,6 +1061,47 @@ function teamTaskWriteScope(task: TeamTaskRow): string[] {
 
 function teamTaskRequiredTools(task: TeamTaskRow): string[] {
   return metadataStringArray(task.metadata, ["requiredTools", "required_tools", "toolScope", "tool_scope"]) ?? [];
+}
+
+function teamTaskPriority(task: TeamTaskRow): number {
+  const value = task.metadata?.priority;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return 100;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return 100;
+  const pMatch = /^p([0-9]+)$/.exec(normalized);
+  if (pMatch) return Number(pMatch[1]);
+  const numeric = Number(normalized);
+  if (Number.isFinite(numeric)) return numeric;
+  switch (normalized) {
+    case "critical":
+    case "urgent":
+    case "highest":
+      return 0;
+    case "high":
+      return 1;
+    case "medium":
+    case "normal":
+      return 2;
+    case "low":
+      return 3;
+    case "lowest":
+      return 4;
+    default:
+      return 100;
+  }
+}
+
+function teamTaskWriteScopeSpecificity(task: TeamTaskRow): number {
+  const scopes = teamTaskWriteScope(task);
+  if (scopes.length === 0) return 0;
+  return Math.min(...scopes.map(writeScopeSpecificity));
+}
+
+function writeScopeSpecificity(scope: string): number {
+  const normalized = normalizePathScope(scope);
+  if (normalized === "*" || normalized === "." || normalized === "/") return 1;
+  return normalized.split("/").filter(Boolean).join("/").length + 1;
 }
 
 function metadataStringArray(metadata: Record<string, unknown> | undefined, keys: readonly string[]): string[] | undefined {

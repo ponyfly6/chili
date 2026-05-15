@@ -210,6 +210,143 @@ test("dispatches independent team tasks concurrently with a bounded fan-out", as
   }
 });
 
+test("orders runnable dispatches by task priority before creation order", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-priority-dispatch-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 623 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const sessionId = "session_team_runner_priority" as SessionId;
+  const dispatchOrder: TaskId[] = [];
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const team = await teams.createTeam({ sessionId, name: "runner-priority", leadPath });
+    const lowWorker = "/root/low" as AgentPath;
+    const highWorker = "/root/high" as AgentPath;
+    await teams.addMember({ sessionId, teamId: team.id, path: lowWorker, name: "low", role: "implementer" });
+    await teams.addMember({ sessionId, teamId: team.id, path: highWorker, name: "high", role: "implementer" });
+    const low = await teams.createTask({
+      sessionId,
+      teamId: team.id,
+      title: "Low priority first",
+      ownerPath: lowWorker,
+      metadata: { priority: "p3" },
+    });
+    const high = await teams.createTask({
+      sessionId,
+      teamId: team.id,
+      title: "High priority second",
+      ownerPath: highWorker,
+      metadata: { priority: "p0" },
+    });
+
+    const dispatcher = {
+      async reconcileTasks() {
+        return emptyReconcileResult();
+      },
+      async dispatchTask(input: Parameters<TeamTaskDispatchService["dispatchTask"]>[0]): Promise<TeamTaskDispatchResult> {
+        const task = (await teams.tasks(input.teamId)).find((item) => item.id === input.taskId);
+        if (!task) throw new Error(`missing task ${input.taskId}`);
+        dispatchOrder.push(input.taskId);
+        return {
+          status: "running",
+          teamTask: { ...task, status: "in_progress" },
+        };
+      },
+    };
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher: dispatcher as unknown as TeamTaskDispatchService,
+      cwd: dir,
+      now,
+    });
+
+    await execution.run({ teamId: team.id, sessionId, once: true, maxConcurrentDispatches: 1 });
+
+    expect(dispatchOrder).toEqual([high.id, low.id]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("prioritizes critical-path narrow writes over broad write reservations", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-critical-path-dispatch-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 624 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const sessionId = "session_team_runner_critical_path" as SessionId;
+  const dispatchOrder: TaskId[] = [];
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const team = await teams.createTeam({ sessionId, name: "runner-critical-path", leadPath });
+    const broadWorker = "/root/broad" as AgentPath;
+    const coreWorker = "/root/core" as AgentPath;
+    const leafWorker = "/root/leaf" as AgentPath;
+    await teams.addMember({ sessionId, teamId: team.id, path: broadWorker, name: "broad", role: "implementer" });
+    await teams.addMember({ sessionId, teamId: team.id, path: coreWorker, name: "core", role: "implementer" });
+    await teams.addMember({ sessionId, teamId: team.id, path: leafWorker, name: "leaf", role: "implementer" });
+    const broad = await teams.createTask({
+      sessionId,
+      teamId: team.id,
+      title: "Broad write created first",
+      ownerPath: broadWorker,
+      metadata: { priority: "p2", writeScope: ["."] },
+    });
+    const setup = await teams.createTask({
+      sessionId,
+      teamId: team.id,
+      title: "Critical setup",
+      ownerPath: coreWorker,
+      metadata: { priority: "p2", writeScope: ["packages/core/src"] },
+    });
+    const leaf = await teams.createTask({
+      sessionId,
+      teamId: team.id,
+      title: "Leaf depends on setup",
+      ownerPath: leafWorker,
+      dependsOn: [setup.id],
+      metadata: { priority: "p2", writeScope: ["packages/core/tests"] },
+    });
+
+    const dispatcher = {
+      async reconcileTasks() {
+        return emptyReconcileResult();
+      },
+      async dispatchTask(input: Parameters<TeamTaskDispatchService["dispatchTask"]>[0]): Promise<TeamTaskDispatchResult> {
+        const task = (await teams.tasks(input.teamId)).find((item) => item.id === input.taskId);
+        if (!task) throw new Error(`missing task ${input.taskId}`);
+        dispatchOrder.push(input.taskId);
+        return {
+          status: "running",
+          teamTask: { ...task, status: "in_progress" },
+        };
+      },
+    };
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher: dispatcher as unknown as TeamTaskDispatchService,
+      cwd: dir,
+      now,
+    });
+
+    const summary = await execution.run({ teamId: team.id, sessionId, once: true, maxConcurrentDispatches: 4 });
+
+    expect(dispatchOrder).toEqual([setup.id]);
+    expect(summary.dispatched).toEqual([expect.objectContaining({ taskId: setup.id, status: "running", ownerPath: coreWorker })]);
+    expect(summary.blocked).toEqual(expect.arrayContaining([
+      expect.objectContaining({ taskId: broad.id, reason: "write_conflict" }),
+      expect.objectContaining({ taskId: leaf.id, reason: "dependency_incomplete", blockedBy: [setup.id] }),
+    ]));
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("emits team run lifecycle events", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-lifecycle-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
