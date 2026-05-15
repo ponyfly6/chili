@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { AgentPath, AgentRunId, SessionId, TaskId, TeamId, ThreadId, TimestampMs } from "@chili/protocol";
 import { timestampNow } from "@chili/protocol";
 import type { TeamMemberRow, TeamRow, TeamTaskRow } from "@chili/store";
@@ -10,13 +11,22 @@ import type { WorkerToolPolicyTemplate } from "./worker-policy.js";
 
 const VERIFICATION_METADATA_KEY = "verification";
 const DEFAULT_GIT_DIFF_MAX_BYTES = 200_000;
+const DEFAULT_MAX_CONCURRENT_VERIFICATIONS = 2;
+const MAX_CONCURRENT_VERIFICATIONS = 4;
+const VERIFICATION_PENDING_TTL_MS = 15 * 60_000;
 
 export type TeamTaskVerificationStatus = "pending" | "passed" | "failed";
 export type TeamTaskVerifierResultStatus = "passed" | "failed" | "skipped";
-export type TeamTaskVerifierSkipReason = "missing_owner" | "missing_session" | "not_completed" | "already_passed";
+export type TeamTaskVerifierSkipReason =
+  | "missing_owner"
+  | "missing_session"
+  | "not_completed"
+  | "already_passed"
+  | "verification_pending";
 
 export interface TeamTaskVerificationMetadata {
   status: TeamTaskVerificationStatus;
+  claimId?: string;
   verifierTaskId?: TaskId;
   verifierRunId?: AgentRunId;
   verifierPath?: AgentPath;
@@ -48,6 +58,7 @@ export interface TeamTaskVerifierSweepInput {
   sessionId?: SessionId;
   threadId?: ThreadId;
   cwd?: string;
+  maxConcurrentVerifications?: number;
   signal?: AbortSignal;
 }
 
@@ -57,6 +68,7 @@ export interface TeamTaskVerifierTaskInput extends TeamTaskVerifierSweepInput {
 
 export interface TeamTaskVerifierSweepResult {
   scanned: number;
+  maxConcurrentVerifications: number;
   verified: TeamTaskVerifierVerifiedResult[];
   skipped: TeamTaskVerifierSkipped[];
   errors: TeamTaskVerifierError[];
@@ -95,26 +107,36 @@ export class TeamTaskVerificationService {
       this.options.teams.tasks(input.teamId),
       this.options.teams.members(input.teamId),
     ]);
+    const maxConcurrentVerifications = normalizeMaxConcurrentVerifications(input.maxConcurrentVerifications);
     const result: TeamTaskVerifierSweepResult = {
       scanned: 0,
+      maxConcurrentVerifications,
       verified: [],
       skipped: [],
       errors: [],
     };
 
-    for (const task of tasks) {
-      if (!isCompletedButUnverifiedTeamTask(task)) continue;
-      result.scanned++;
-      try {
-        const verified = await this.verifyTaskWithState({ ...input, taskId: task.id }, team, task, members);
-        if (verified.status === "skipped") result.skipped.push(verified);
-        else result.verified.push(verified);
-      } catch (error) {
-        if (isSignalAbort(error, input.signal)) throw error;
+    const candidates = tasks.filter((task) => isVerificationCandidate(task, Number(this.now())));
+    result.scanned = candidates.length;
+    for (const batch of chunk(candidates, maxConcurrentVerifications)) {
+      const verifiedBatch = await Promise.all(batch.map(async (task) => {
+        try {
+          return { task, result: await this.verifyTaskWithState({ ...input, taskId: task.id }, team, task, members) };
+        } catch (error) {
+          if (isSignalAbort(error, input.signal)) throw error;
+          return { task, error };
+        }
+      }));
+      for (const item of verifiedBatch) {
+        if ("result" in item) {
+          if (item.result.status === "skipped") result.skipped.push(item.result);
+          else result.verified.push(item.result);
+          continue;
+        }
         result.errors.push({
           teamId: input.teamId,
-          taskId: task.id,
-          error: toError(error).message,
+          taskId: item.task.id,
+          error: toError(item.error).message,
         });
       }
     }
@@ -145,6 +167,9 @@ export class TeamTaskVerificationService {
     if (isAcceptedTeamTask(task)) {
       return { status: "skipped", reason: "already_passed", teamTask: task };
     }
+    if (isFreshPendingVerification(task, Number(this.now()))) {
+      return { status: "skipped", reason: "verification_pending", teamTask: task };
+    }
     if (!task.ownerPath) {
       return { status: "skipped", reason: "missing_owner", teamTask: task };
     }
@@ -158,18 +183,51 @@ export class TeamTaskVerificationService {
     const cwd = worktree?.path ?? input.cwd ?? this.options.cwd;
     const member = members.find((item) => item.path === task.ownerPath);
     throwIfAborted(input.signal);
+    const startedAt = Number(this.now());
+    const claimId = randomUUID();
+    const pendingMetadata = mergeVerificationMetadata(task.metadata, verificationFields({
+      status: "pending",
+      claimId,
+      startedAt,
+      workerSummary: task.summary,
+    }));
+    const pendingClaim = await this.options.teams.claimTaskVerification({
+      teamId: task.teamId,
+      taskId: task.id,
+      metadata: pendingMetadata,
+      sessionId: parentSessionId,
+      stalePendingBefore: startedAt - VERIFICATION_PENDING_TTL_MS,
+      ...(input.threadId ? { threadId: input.threadId } : {}),
+    });
+    if (!pendingClaim.applied) {
+      return {
+        status: "skipped",
+        reason: verifierClaimSkipReason(pendingClaim.reason),
+        teamTask: pendingClaim.task ?? task,
+      };
+    }
+    const pendingTask = pendingClaim.task ?? task;
+    throwIfAborted(input.signal);
     const gitDiffInput: TeamTaskVerifierGitDiffInput = { team, task, cwd };
     if (member) gitDiffInput.member = member;
     if (input.signal) gitDiffInput.signal = input.signal;
-    const gitDiff = await this.gitDiff(gitDiffInput);
-    throwIfAborted(input.signal);
+    let gitDiff: string;
+    try {
+      gitDiff = await this.gitDiff(gitDiffInput);
+      throwIfAborted(input.signal);
+    } catch (error) {
+      if (isSignalAbort(error, input.signal)) {
+        await this.clearPendingVerificationClaim(task, claimId, parentSessionId, input.threadId);
+      }
+      throw error;
+    }
     const testCommands = verifierTestCommands(task.metadata);
-    const startedAt = Number(this.now());
-    const pendingTask = await this.options.teams.updateTask({
+    await this.options.teams.updateTask({
       teamId: task.teamId,
       taskId: task.id,
-      metadata: mergeVerificationMetadata(task.metadata, verificationFields({
+      metadata: mergeVerificationMetadata(pendingTask.metadata, verificationFields({
         status: "pending",
+        claimId,
         startedAt,
         workerSummary: task.summary,
         gitDiff,
@@ -250,6 +308,24 @@ export class TeamTaskVerificationService {
       ...(input.threadId ? { threadId: input.threadId } : {}),
     });
     return { status: "failed", teamTask: reopenedTask, verifierTask, feedback };
+  }
+
+  private async clearPendingVerificationClaim(
+    task: TeamTaskRow,
+    claimId: string,
+    sessionId: SessionId,
+    threadId: ThreadId | undefined,
+  ): Promise<void> {
+    const current = (await this.options.teams.tasks(task.teamId)).find((item) => item.id === task.id);
+    if (!current || verificationMetadata(current.metadata)?.status !== "pending") return;
+    if (verificationMetadata(current.metadata)?.claimId !== claimId) return;
+    await this.options.teams.updateTask({
+      teamId: task.teamId,
+      taskId: task.id,
+      metadata: restoreVerificationMetadata(current.metadata, task.metadata),
+      sessionId,
+      ...(threadId ? { threadId } : {}),
+    });
   }
 
   private async requireTeam(teamId: TeamId): Promise<TeamRow> {
@@ -336,11 +412,30 @@ export function isAcceptedTeamTask(task: TeamTaskRow): boolean {
 export function isCompletedButUnverifiedTeamTask(task: TeamTaskRow): boolean {
   if (task.status !== "completed") return false;
   const status = verificationMetadata(task.metadata)?.status;
-  return status !== "passed";
+  return status !== "passed" && status !== "pending";
+}
+
+export function isPendingVerificationTeamTask(task: TeamTaskRow): boolean {
+  return task.status === "completed" && verificationMetadata(task.metadata)?.status === "pending";
 }
 
 export function isReopenedAfterFailedVerification(task: TeamTaskRow): boolean {
   return task.status === "pending" && verificationMetadata(task.metadata)?.status === "failed";
+}
+
+function isVerificationCandidate(task: TeamTaskRow, now: number): boolean {
+  return isCompletedButUnverifiedTeamTask(task) || isStalePendingVerification(task, now);
+}
+
+function isFreshPendingVerification(task: TeamTaskRow, now: number): boolean {
+  return isPendingVerificationTeamTask(task) && !isStalePendingVerification(task, now);
+}
+
+function isStalePendingVerification(task: TeamTaskRow, now: number): boolean {
+  const verification = verificationMetadata(task.metadata);
+  if (task.status !== "completed" || verification?.status !== "pending") return false;
+  const startedAt = typeof verification.startedAt === "number" ? verification.startedAt : undefined;
+  return startedAt === undefined || now - startedAt >= VERIFICATION_PENDING_TTL_MS;
 }
 
 function verifierPrompt(input: {
@@ -407,8 +502,15 @@ function verifierVerdict(task: LocalSubagentTaskResult): { status: Exclude<TeamT
   };
 }
 
+function verifierClaimSkipReason(reason: string | undefined): TeamTaskVerifierSkipReason {
+  if (reason === "already_verified") return "already_passed";
+  if (reason === "verification_pending" || reason === "stale") return "verification_pending";
+  return "not_completed";
+}
+
 function verificationFields(input: {
   status: TeamTaskVerificationStatus;
+  claimId?: string;
   verifierTaskId?: TaskId;
   verifierRunId?: AgentRunId;
   verifierPath?: AgentPath;
@@ -416,12 +518,13 @@ function verificationFields(input: {
   startedAt?: number;
   feedback?: string;
   workerSummary: string | undefined;
-  gitDiff: string;
+  gitDiff?: string;
 }): TeamTaskVerificationMetadata {
   const output: TeamTaskVerificationMetadata = {
     status: input.status,
-    gitDiff: input.gitDiff,
   };
+  if (input.claimId) output.claimId = input.claimId;
+  if (input.gitDiff !== undefined) output.gitDiff = input.gitDiff;
   if (input.verifierTaskId) output.verifierTaskId = input.verifierTaskId;
   if (input.verifierRunId) output.verifierRunId = input.verifierRunId;
   if (input.verifierPath) output.verifierPath = input.verifierPath;
@@ -432,19 +535,48 @@ function verificationFields(input: {
   return output;
 }
 
+function restoreVerificationMetadata(
+  currentMetadata: Record<string, unknown> | undefined,
+  previousMetadata: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const output: Record<string, unknown> = { ...(currentMetadata ?? {}) };
+  const previousVerification = previousMetadata?.[VERIFICATION_METADATA_KEY];
+  if (previousVerification === undefined) delete output[VERIFICATION_METADATA_KEY];
+  else output[VERIFICATION_METADATA_KEY] = previousVerification;
+  return output;
+}
+
 function mergeVerificationMetadata(
   metadata: Record<string, unknown> | undefined,
   verification: TeamTaskVerificationMetadata,
 ): Record<string, unknown> {
   const current = metadata ?? {};
   const previous = isRecord(current[VERIFICATION_METADATA_KEY]) ? current[VERIFICATION_METADATA_KEY] : {};
+  const merged = {
+    ...previous,
+    ...verification,
+  };
+  if (verification.status !== "pending" && verification.claimId === undefined) {
+    delete (merged as Record<string, unknown>).claimId;
+  }
   return {
     ...current,
-    [VERIFICATION_METADATA_KEY]: pruneUndefined({
-      ...previous,
-      ...verification,
-    }),
+    [VERIFICATION_METADATA_KEY]: pruneUndefined(merged),
   };
+}
+
+function normalizeMaxConcurrentVerifications(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_MAX_CONCURRENT_VERIFICATIONS;
+  if (!Number.isInteger(value) || value <= 0) return DEFAULT_MAX_CONCURRENT_VERIFICATIONS;
+  return Math.min(value, MAX_CONCURRENT_VERIFICATIONS);
+}
+
+function chunk<T>(items: readonly T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
 }
 
 function metadataStringArray(metadata: Record<string, unknown> | undefined, keys: readonly string[]): string[] | undefined {

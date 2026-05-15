@@ -261,6 +261,7 @@ test("emits team run lifecycle events", async () => {
         once: false,
         maxCycles: 3,
         maxConcurrentDispatches: 4,
+        maxConcurrentVerifications: 2,
       },
     });
     const runIds = new Set(lifecycleEvents.map((event) => (isRecord(event.payload) ? event.payload.runId : undefined)));
@@ -1006,6 +1007,7 @@ class PendingMergeVerifier implements TeamTaskVerifier {
     const tasks = await this.teams.tasks(input.teamId);
     const result: Awaited<ReturnType<TeamTaskVerifier["verifyCompletedTasks"]>> = {
       scanned: 0,
+      maxConcurrentVerifications: input.maxConcurrentVerifications ?? 2,
       verified: [],
       skipped: [],
       errors: [],

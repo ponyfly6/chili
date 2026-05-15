@@ -66,6 +66,7 @@ export interface CliArgs {
   staleAfterMs?: number;
   maxCycles?: number;
   maxConcurrentDispatches?: number;
+  maxConcurrentVerifications?: number;
   provider?: string;
   model?: CliModelName;
   reasoningLevel?: CliReasoningLevel;
@@ -345,6 +346,13 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       }
       continue;
     }
+    if (arg === "--max-concurrent-verifications") {
+      result.maxConcurrentVerifications = Number.parseInt(requireValue(arg, args), 10);
+      if (!Number.isInteger(result.maxConcurrentVerifications) || result.maxConcurrentVerifications <= 0 || result.maxConcurrentVerifications > 4) {
+        throw new Error("--max-concurrent-verifications must be an integer from 1 to 4");
+      }
+      continue;
+    }
     if (arg === "--status") {
       const status = requireValue(arg, args);
       if (status !== "completed" && status !== "failed" && status !== "cancelled") {
@@ -397,7 +405,7 @@ export function usage(): string {
     "  bun run chili -- team-messages <team-id>",
     "  bun run chili -- team-dispatch <team-id> <task-id>",
     "  bun run chili -- team-run <team-id> <task-id>",
-    "  bun run chili -- team-run-loop <team-id> --once --max-cycles 10 --timeout-ms 30000 --max-concurrent-dispatches 4",
+    "  bun run chili -- team-run-loop <team-id> --once --max-cycles 10 --timeout-ms 30000 --max-concurrent-dispatches 4 --max-concurrent-verifications 2",
     "  bun run chili -- team-merge <team-id> [--task <task-id>] [--json]",
     "  bun run chili -- team-sync <team-id> <task-id>",
     "  bun run chili -- team-reconcile [team-id]",
@@ -452,6 +460,7 @@ export function usage(): string {
     "  --max-turns <n>     Max automatic tool-use continuation turns before final answer, default 128",
     "  --max-cycles <n>    Max team execution runner cycles",
     "  --max-concurrent-dispatches <n>  Max parallel team dispatch fan-out",
+    "  --max-concurrent-verifications <n>  Max parallel team verifier fan-out, 1-4",
     "  --status <status>   Task close status: completed | failed | cancelled",
     "  --task <task-id>     Limit team merge to one task",
     "  --timeout-ms <n>    Task wait timeout in milliseconds",

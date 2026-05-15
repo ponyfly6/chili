@@ -283,6 +283,7 @@ export interface RuntimeTeamRunView {
   timeoutMs?: number;
   pollIntervalMs?: number;
   maxConcurrentDispatches?: number;
+  maxConcurrentVerifications?: number;
   phase?: TeamRunLifecyclePhase;
   stopReason?: TeamRunStopReason;
   startedAt?: number;
@@ -580,6 +581,7 @@ export interface TeamLiveRunSummary {
   mode?: AgentTaskMode;
   once?: boolean;
   maxConcurrentDispatches?: number;
+  maxConcurrentVerifications?: number;
 }
 
 export type TeamLiveHealthStatus = "ok" | "attention" | "blocked" | "error";
@@ -1869,6 +1871,7 @@ function teamRunSummary(run: RuntimeTeamRunView): TeamLiveRunSummary {
   assignOptional(summary, "mode", run.mode);
   assignOptional(summary, "once", run.once);
   assignOptional(summary, "maxConcurrentDispatches", run.maxConcurrentDispatches);
+  assignOptional(summary, "maxConcurrentVerifications", run.maxConcurrentVerifications);
   return summary;
 }
 
@@ -2251,6 +2254,7 @@ function teamRecentActivity(
 function teamRunActivityDetail(run: RuntimeTeamRunView): string {
   const parts = [`cycle:${run.cycle}`];
   if (run.maxConcurrentDispatches) parts.push(`fanout:${run.maxConcurrentDispatches}`);
+  if (run.maxConcurrentVerifications) parts.push(`verify:${run.maxConcurrentVerifications}`);
   appendActivityCount(parts, "dispatched", run.counts.dispatched);
   appendActivityCount(parts, "completed", run.counts.completed);
   appendActivityCount(parts, "accepted", run.counts.accepted);
@@ -2413,6 +2417,7 @@ function applyTeamProjectionEvent(view: ChiliRuntimeView, event: EventEnvelope):
     assignOptional(run, "timeoutMs", finiteNumberValue(payload.timeoutMs));
     assignOptional(run, "pollIntervalMs", finiteNumberValue(payload.pollIntervalMs));
     assignOptional(run, "maxConcurrentDispatches", finiteNumberValue(payload.maxConcurrentDispatches));
+    assignOptional(run, "maxConcurrentVerifications", finiteNumberValue(payload.maxConcurrentVerifications));
     delete run.phase;
     delete run.stopReason;
     delete run.endedAt;

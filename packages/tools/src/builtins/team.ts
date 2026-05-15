@@ -52,6 +52,7 @@ const DEFAULT_TEAM_DISPATCH_BATCH_CONCURRENCY = 8;
 const MAX_TEAM_DISPATCH_BATCH_CONCURRENCY = 32;
 const MAX_TEAM_DISPATCH_BATCH_TASKS = 64;
 const MAX_TEAM_RUN_LOOP_CONCURRENCY = 64;
+const MAX_TEAM_RUN_LOOP_VERIFICATIONS = 4;
 
 export function createTeamCreateTool(controller: TeamToolController): ChiliToolDefinition<TeamCreateToolInput, TeamToolResult> {
   return {
@@ -662,6 +663,8 @@ export function createTeamRunLoopTool(
         poll_interval_ms: { type: "number" },
         maxConcurrentDispatches: { type: "number" },
         max_concurrent_dispatches: { type: "number" },
+        maxConcurrentVerifications: { type: "number" },
+        max_concurrent_verifications: { type: "number" },
       },
     },
     validate: validateTeamRunLoopInput,
@@ -672,6 +675,7 @@ export function createTeamRunLoopTool(
           input.teamId,
           `once:${input.once ?? true}`,
           `concurrency:${input.maxConcurrentDispatches ?? "default"}`,
+          `verify:${input.maxConcurrentVerifications ?? "default"}`,
           input.mode ?? "background",
         ],
         metadata: {
@@ -687,6 +691,8 @@ export function createTeamRunLoopTool(
           poll_interval_ms: input.pollIntervalMs,
           maxConcurrentDispatches: input.maxConcurrentDispatches,
           max_concurrent_dispatches: input.maxConcurrentDispatches,
+          maxConcurrentVerifications: input.maxConcurrentVerifications,
+          max_concurrent_verifications: input.maxConcurrentVerifications,
         },
       };
     },
@@ -699,6 +705,8 @@ export function createTeamRunLoopTool(
           once: input.once ?? true,
           maxConcurrentDispatches: input.maxConcurrentDispatches,
           max_concurrent_dispatches: input.maxConcurrentDispatches,
+          maxConcurrentVerifications: input.maxConcurrentVerifications,
+          max_concurrent_verifications: input.maxConcurrentVerifications,
         },
       });
       return teamRunLoopToolResult(await controller.runTeam(input, context));
@@ -1096,6 +1104,14 @@ function validateTeamRunLoopInput(input: unknown): ValidationResult<TeamRunLoopT
   if (maxConcurrentDispatches.value !== undefined && maxConcurrentDispatches.value > MAX_TEAM_RUN_LOOP_CONCURRENCY) {
     return { ok: false, message: `maxConcurrentDispatches cannot exceed ${MAX_TEAM_RUN_LOOP_CONCURRENCY}` };
   }
+  const maxConcurrentVerifications = optionalPositiveInteger(
+    input.maxConcurrentVerifications ?? input.max_concurrent_verifications,
+    "maxConcurrentVerifications",
+  );
+  if (!maxConcurrentVerifications.ok) return maxConcurrentVerifications;
+  if (maxConcurrentVerifications.value !== undefined && maxConcurrentVerifications.value > MAX_TEAM_RUN_LOOP_VERIFICATIONS) {
+    return { ok: false, message: `maxConcurrentVerifications cannot exceed ${MAX_TEAM_RUN_LOOP_VERIFICATIONS}` };
+  }
 
   const value: TeamRunLoopToolInput = {
     teamId: teamId.value,
@@ -1106,6 +1122,7 @@ function validateTeamRunLoopInput(input: unknown): ValidationResult<TeamRunLoopT
   if (timeoutMs.value !== undefined) value.timeoutMs = timeoutMs.value;
   if (pollIntervalMs.value !== undefined) value.pollIntervalMs = pollIntervalMs.value;
   if (maxConcurrentDispatches.value !== undefined) value.maxConcurrentDispatches = maxConcurrentDispatches.value;
+  if (maxConcurrentVerifications.value !== undefined) value.maxConcurrentVerifications = maxConcurrentVerifications.value;
   return { ok: true, value };
 }
 
@@ -1345,7 +1362,7 @@ function teamTaskReconcileToolResult(result: TeamTaskReconcileRecord): TeamToolR
 
 function teamRunLoopToolResult(result: TeamRunLoopRecord): TeamToolResult {
   return {
-    title: `team_run_loop ${result.teamId} stop=${result.stopReason} fanout=${result.maxConcurrentDispatches ?? "default"} dispatched=${result.dispatched.length} running=${result.stillRunning.length}`,
+    title: `team_run_loop ${result.teamId} stop=${result.stopReason} fanout=${result.maxConcurrentDispatches ?? "default"} verify=${result.maxConcurrentVerifications ?? "default"} dispatched=${result.dispatched.length} running=${result.stillRunning.length}`,
     output: JSON.stringify(teamRunLoopOutput(result)),
     metadata: {
       team_id: result.teamId,
@@ -1355,6 +1372,8 @@ function teamRunLoopToolResult(result: TeamRunLoopRecord): TeamToolResult {
       cycles: result.cycles,
       max_concurrent_dispatches: result.maxConcurrentDispatches,
       maxConcurrentDispatches: result.maxConcurrentDispatches,
+      max_concurrent_verifications: result.maxConcurrentVerifications,
+      maxConcurrentVerifications: result.maxConcurrentVerifications,
       dispatched: result.dispatched.length,
       completed: result.completed.length,
       accepted: result.accepted.length,
@@ -1585,6 +1604,8 @@ function teamRunLoopOutput(result: TeamRunLoopRecord): Record<string, unknown> {
     endedAt: result.endedAt,
     max_concurrent_dispatches: result.maxConcurrentDispatches,
     maxConcurrentDispatches: result.maxConcurrentDispatches,
+    max_concurrent_verifications: result.maxConcurrentVerifications,
+    maxConcurrentVerifications: result.maxConcurrentVerifications,
     dispatched: result.dispatched.map(teamRunTaskOutput),
     completed: result.completed.map(teamRunTaskOutput),
     accepted: result.accepted.map(teamRunTaskOutput),

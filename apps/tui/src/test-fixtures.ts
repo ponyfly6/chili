@@ -112,6 +112,7 @@ export function teamLiveFixture(): TeamLiveView {
           mode: "background",
           once: true,
           maxConcurrentDispatches: 4,
+          maxConcurrentVerifications: 2,
           counts: counts({ dispatched: 1, stillRunning: 1 }),
           updatedAt: 10,
         },

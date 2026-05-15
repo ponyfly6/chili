@@ -399,6 +399,24 @@ export interface TeamTaskMutationResult {
   reason?: "not_found" | "already_claimed" | "already_resolved" | "blocked" | "member_unavailable" | "write_conflict";
 }
 
+export interface TeamTaskVerificationClaimInput {
+  teamId: TeamId;
+  taskId: TaskId;
+  eventId: string;
+  metadata: Record<string, unknown>;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  stalePendingBefore?: number;
+  time?: number;
+}
+
+export interface TeamTaskVerificationClaimResult {
+  applied: boolean;
+  task?: TeamTaskRow;
+  events: ChiliEvent[];
+  reason?: "not_found" | "not_completed" | "already_verified" | "verification_pending" | "stale";
+}
+
 export interface EventStore {
   append(event: ChiliEvent): Promise<void>;
   appendMany(events: readonly ChiliEvent[]): Promise<void>;
@@ -447,6 +465,10 @@ export interface TeamProjectionStore {
 
 export interface TeamTaskClaimStore {
   claimTeamTask(input: TeamTaskClaimInput): Promise<TeamTaskMutationResult>;
+}
+
+export interface TeamTaskVerificationClaimStore {
+  claimTeamTaskVerification(input: TeamTaskVerificationClaimInput): Promise<TeamTaskVerificationClaimResult>;
 }
 
 export interface EventMirror {

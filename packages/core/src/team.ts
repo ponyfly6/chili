@@ -25,6 +25,8 @@ import type {
   TeamTaskClaimStore,
   TeamTaskMutationResult,
   TeamTaskRow,
+  TeamTaskVerificationClaimResult,
+  TeamTaskVerificationClaimStore,
 } from "@chili/store";
 
 export type TeamMemberStatus = ProtocolTeamMemberStatus;
@@ -36,13 +38,14 @@ export interface TeamRuntime {
   createTask(input: CreateTeamTaskInput): Promise<TeamTaskRow>;
   assignTask(input: AssignTeamTaskInput): Promise<TeamTaskRow>;
   claimTask(input: ClaimTeamTaskInput): Promise<TeamTaskMutationResult>;
+  claimTaskVerification(input: ClaimTeamTaskVerificationInput): Promise<TeamTaskVerificationClaimResult>;
   updateTask(input: UpdateTeamTaskInput): Promise<TeamTaskRow>;
   sendMessage(input: SendTeamMessageInput): Promise<TeamMessageRow>;
   snapshot(teamId: TeamId): Promise<TeamSnapshot>;
 }
 
 export interface TeamControlServiceOptions {
-  store: EventStore & TeamProjectionStore & Partial<TeamTaskClaimStore>;
+  store: EventStore & TeamProjectionStore & Partial<TeamTaskClaimStore> & Partial<TeamTaskVerificationClaimStore>;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
 }
@@ -103,6 +106,13 @@ export interface ClaimTeamTaskInput extends TeamEventContext {
   taskId: TaskId;
   ownerPath: AgentPath;
   claimedBy?: AgentPath;
+}
+
+export interface ClaimTeamTaskVerificationInput extends TeamEventContext {
+  teamId: TeamId;
+  taskId: TaskId;
+  metadata: Record<string, unknown>;
+  stalePendingBefore?: number;
 }
 
 export interface UpdateTeamTaskInput extends TeamEventContext {
@@ -365,6 +375,29 @@ export class TeamControlService implements TeamRuntime {
       ...(input.claimedBy ? { claimedBy: input.claimedBy } : {}),
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
       ...(input.threadId ? { threadId: input.threadId } : {}),
+      time: this.now(),
+    });
+    if (!result.applied && result.reason === "not_found") {
+      throw new TeamTaskNotFoundError(input.teamId, input.taskId);
+    }
+    return result;
+  }
+
+  async claimTaskVerification(input: ClaimTeamTaskVerificationInput): Promise<TeamTaskVerificationClaimResult> {
+    await this.requireTeam(input.teamId);
+    const claimStore = this.options.store.claimTeamTaskVerification;
+    if (!claimStore) {
+      throw new Error("Team task verification CAS store is not available");
+    }
+
+    const result = await claimStore.call(this.options.store, {
+      teamId: input.teamId,
+      taskId: input.taskId,
+      metadata: input.metadata,
+      eventId: this.id("event"),
+      ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      ...(input.threadId ? { threadId: input.threadId } : {}),
+      ...(input.stalePendingBefore !== undefined ? { stalePendingBefore: input.stalePendingBefore } : {}),
       time: this.now(),
     });
     if (!result.applied && result.reason === "not_found") {

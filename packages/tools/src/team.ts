@@ -343,6 +343,7 @@ export interface TeamRunLoopToolInput {
   timeoutMs?: number;
   pollIntervalMs?: number;
   maxConcurrentDispatches?: number;
+  maxConcurrentVerifications?: number;
 }
 
 export interface TeamRunLoopDispatchedTaskRecord {
@@ -419,6 +420,7 @@ export interface TeamRunLoopRecord {
   startedAt: number;
   endedAt: number;
   maxConcurrentDispatches?: number;
+  maxConcurrentVerifications?: number;
   dispatched: TeamRunLoopDispatchedTaskRecord[];
   completed: TeamRunLoopFinalTaskRecord[];
   accepted: TeamRunLoopFinalTaskRecord[];

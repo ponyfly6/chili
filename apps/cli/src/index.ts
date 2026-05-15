@@ -148,6 +148,7 @@ async function main(): Promise<void> {
       if (args.maxCycles !== undefined) input.maxCycles = args.maxCycles;
       if (args.timeoutMs !== undefined) input.timeoutMs = args.timeoutMs;
       if (args.maxConcurrentDispatches !== undefined) input.maxConcurrentDispatches = args.maxConcurrentDispatches;
+      if (args.maxConcurrentVerifications !== undefined) input.maxConcurrentVerifications = args.maxConcurrentVerifications;
       const result = await harness.teamRunner.run(input);
       if (args.json) console.log(jsonStringify(result));
       else printTeamRunLoopSummary(result);
@@ -801,6 +802,7 @@ function printTeamRunLoopSummary(summary: TeamExecutionRunSummary): void {
       `stop=${summary.stopReason}`,
       `cycles=${summary.cycles}`,
       `fanout=${summary.maxConcurrentDispatches}`,
+      `verify=${summary.maxConcurrentVerifications}`,
       `dispatched=${summary.dispatched.length}`,
       `completed=${summary.completed.length}`,
       `accepted=${summary.accepted.length}`,

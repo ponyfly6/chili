@@ -541,6 +541,8 @@ function teamRunLoopSummary(output: string | undefined): string | undefined {
   if (stopReason) parts.push(`stop=${stopReason}`);
   const fanout = firstNumber(record, ["maxConcurrentDispatches", "max_concurrent_dispatches"]);
   if (fanout !== undefined) parts.push(`fanout=${fanout}`);
+  const verifierFanout = firstNumber(record, ["maxConcurrentVerifications", "max_concurrent_verifications"]);
+  if (verifierFanout !== undefined) parts.push(`verify=${verifierFanout}`);
   appendCountPart(parts, "dispatched", countArrayField(record, ["dispatched"]));
   appendCountPart(parts, "completed", countArrayField(record, ["completed", "accepted", "merged"]));
   appendCountPart(parts, "running", countArrayField(record, ["stillRunning", "still_running"]));

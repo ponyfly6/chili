@@ -40,6 +40,9 @@ import type {
   TeamTaskMutationResult,
   TeamTaskQuery,
   TeamTaskRow,
+  TeamTaskVerificationClaimInput,
+  TeamTaskVerificationClaimResult,
+  TeamTaskVerificationClaimStore,
   ThreadGoalQuery,
   ThreadGoalRow,
 } from "./types.js";
@@ -58,7 +61,8 @@ export class ObservableEventStore
     AgentTaskFinalizationStore,
     AgentMailboxDeliveryStore,
     TeamProjectionStore,
-    TeamTaskClaimStore
+    TeamTaskClaimStore,
+    TeamTaskVerificationClaimStore
 {
   private readonly listeners = new Set<(event: ChiliEvent) => void>();
 
@@ -188,6 +192,13 @@ export class ObservableEventStore
     return result;
   }
 
+  async claimTeamTaskVerification(input: TeamTaskVerificationClaimInput): Promise<TeamTaskVerificationClaimResult> {
+    const result = await (this.teamTaskVerificationClaimStore()?.claimTeamTaskVerification(input) ??
+      Promise.resolve({ applied: false, reason: "not_found" as const, events: [] }));
+    for (const event of result.events) this.emit(event);
+    return result;
+  }
+
   subscribe(listener: (event: ChiliEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -249,6 +260,14 @@ export class ObservableEventStore
     const inner = this.inner as EventStore & Partial<TeamTaskClaimStore>;
     if (inner.claimTeamTask) {
       return inner as EventStore & TeamTaskClaimStore;
+    }
+    return undefined;
+  }
+
+  private teamTaskVerificationClaimStore(): TeamTaskVerificationClaimStore | undefined {
+    const inner = this.inner as EventStore & Partial<TeamTaskVerificationClaimStore>;
+    if (inner.claimTeamTaskVerification) {
+      return inner as EventStore & TeamTaskVerificationClaimStore;
     }
     return undefined;
   }

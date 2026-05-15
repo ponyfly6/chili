@@ -313,6 +313,7 @@ export interface TeamRunStartedPayload {
   timeoutMs: number;
   pollIntervalMs: number;
   maxConcurrentDispatches?: number;
+  maxConcurrentVerifications?: number;
 }
 
 export interface TeamRunProgressPayload {

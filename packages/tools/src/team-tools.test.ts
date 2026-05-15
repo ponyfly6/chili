@@ -439,6 +439,7 @@ test("team run loop tool schedules scoped team work through the runner", async (
   const result = await executor.execute(toolInput("team_run", {
     team_id: "team_core",
     max_concurrent_dispatches: 6,
+    max_concurrent_verifications: 3,
     timeout_ms: 5000,
   }));
 
@@ -449,6 +450,7 @@ test("team run loop tool schedules scoped team work through the runner", async (
       once: true,
       timeoutMs: 5000,
       maxConcurrentDispatches: 6,
+      maxConcurrentVerifications: 3,
     },
   ]);
   if (result.status === "completed") {
@@ -456,6 +458,7 @@ test("team run loop tool schedules scoped team work through the runner", async (
       team_id: "team_core",
       stop_reason: "cycle_limit",
       max_concurrent_dispatches: 6,
+      max_concurrent_verifications: 3,
       dispatched: [{ task_id: "task_team", owner_path: "/worker", agent_task_id: "agent_task" }],
       still_running: [{ task_id: "task_team", title: "Implement team tools" }],
     });
@@ -463,6 +466,7 @@ test("team run loop tool schedules scoped team work through the runner", async (
       team_id: "team_core",
       stop_reason: "cycle_limit",
       max_concurrent_dispatches: 6,
+      max_concurrent_verifications: 3,
       dispatched: 1,
       still_running: 1,
     });
@@ -470,7 +474,7 @@ test("team run loop tool schedules scoped team work through the runner", async (
   expect(approvals).toHaveLength(1);
   expect(approvals[0]).toMatchObject({
     permission: "team_run_loop",
-    patterns: ["team_core", "once:true", "concurrency:6", "background"],
+    patterns: ["team_core", "once:true", "concurrency:6", "verify:3", "background"],
   });
 
   const rejected = await executor.execute(toolInput("team_run_loop", {
@@ -478,6 +482,12 @@ test("team run loop tool schedules scoped team work through the runner", async (
     max_concurrent_dispatches: 65,
   }));
   expect(rejected.status).toBe("failed");
+
+  const rejectedVerifier = await executor.execute(toolInput("team_run_loop", {
+    team_id: "team_core",
+    max_concurrent_verifications: 5,
+  }));
+  expect(rejectedVerifier.status).toBe("failed");
 });
 
 test("team dispatch batch launches background tasks with bounded parallelism", async () => {
@@ -753,6 +763,7 @@ class FakeTeamToolController implements TeamToolController, TeamTaskDispatchTool
       startedAt: 1,
       endedAt: 2,
       maxConcurrentDispatches: input.maxConcurrentDispatches ?? 4,
+      maxConcurrentVerifications: input.maxConcurrentVerifications ?? 2,
       dispatched: [
         { teamId: input.teamId, taskId: "task_team", ownerPath: "/worker", agentTaskId: "agent_task", status: "running" },
       ],

@@ -190,6 +190,85 @@ test("abort during verifier setup does not mark verification pending or reopen t
   }
 });
 
+test("verifier sweep runs completed tasks with bounded parallelism", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-verifier-parallel-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 1180 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const workerA = "/root/a" as AgentPath;
+  const workerB = "/root/b" as AgentPath;
+  const workerC = "/root/c" as AgentPath;
+  const sessionId = "session_team_verifier_parallel" as SessionId;
+  const runner = new DelayedVerifierRunner();
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+    const verifier = new TeamTaskVerificationService({ teams, subagents, cwd: dir, now, gitDiff: async () => "(no diff)" });
+    const team = await teams.createTeam({ sessionId, name: "verifier-parallel", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerA, name: "a", role: "implementer" });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerB, name: "b", role: "implementer" });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerC, name: "c", role: "implementer" });
+    const first = await teams.createTask({ sessionId, teamId: team.id, title: "Verify first", ownerPath: workerA });
+    const second = await teams.createTask({ sessionId, teamId: team.id, title: "Verify second", ownerPath: workerB });
+    const third = await teams.createTask({ sessionId, teamId: team.id, title: "Verify third", ownerPath: workerC });
+    for (const task of [first, second, third]) {
+      await teams.updateTask({ sessionId, teamId: team.id, taskId: task.id, status: "completed", summary: `Done ${task.title}` });
+    }
+
+    const result = await verifier.verifyCompletedTasks({ teamId: team.id, sessionId, maxConcurrentVerifications: 2 });
+
+    expect(result.maxConcurrentVerifications).toBe(2);
+    expect(result.verified).toHaveLength(3);
+    expect(result.errors).toEqual([]);
+    expect(runner.maxRunning).toBe(2);
+    expect(runner.runs.map((run) => run.taskName).sort()).toEqual([
+      "Verify Verify first",
+      "Verify Verify second",
+      "Verify Verify third",
+    ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("verifier sweep skips a task already claimed by another verifier", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-verifier-claim-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 1190 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const sessionId = "session_team_verifier_claim" as SessionId;
+  const runner = new BlockingVerifierRunner();
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+    const verifier = new TeamTaskVerificationService({ teams, subagents, cwd: dir, now, gitDiff: async () => "(no diff)" });
+    const team = await teams.createTeam({ sessionId, name: "verifier-claim", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const task = await teams.createTask({ sessionId, teamId: team.id, title: "Claim once", ownerPath: workerPath });
+    await teams.updateTask({ sessionId, teamId: team.id, taskId: task.id, status: "completed", summary: "Done" });
+
+    const first = verifier.verifyCompletedTasks({ teamId: team.id, sessionId });
+    await runner.started;
+    const second = await verifier.verifyCompletedTasks({ teamId: team.id, sessionId });
+    runner.release();
+    const firstResult = await first;
+
+    expect(second).toMatchObject({ scanned: 0, verified: [], skipped: [], errors: [] });
+    expect(firstResult.verified).toHaveLength(1);
+    expect(runner.runs).toHaveLength(1);
+  } finally {
+    runner.release();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("verifier policy is read-only and denies write tools", async () => {
   const policy = verifierWorkerPolicy({
     teamId: "team_policy" as TeamId,
@@ -346,9 +425,51 @@ class FixedVerifierRunner implements LocalSubagentRunner {
   }
 }
 
+class DelayedVerifierRunner implements LocalSubagentRunner {
+  readonly runs: LocalSubagentRunInput[] = [];
+  running = 0;
+  maxRunning = 0;
+
+  async run(input: LocalSubagentRunInput): Promise<LocalSubagentRunResult> {
+    this.runs.push(input);
+    this.running++;
+    this.maxRunning = Math.max(this.maxRunning, this.running);
+    await delay(input.taskName.endsWith("first") ? 20 : 1);
+    this.running--;
+    return { status: "completed", summary: "VERDICT: passed\nLooks good." };
+  }
+}
+
+class BlockingVerifierRunner implements LocalSubagentRunner {
+  readonly runs: LocalSubagentRunInput[] = [];
+  private releaseRun!: () => void;
+  private readonly released = new Promise<void>((resolve) => {
+    this.releaseRun = resolve;
+  });
+  private startedRun!: () => void;
+  readonly started = new Promise<void>((resolve) => {
+    this.startedRun = resolve;
+  });
+
+  async run(input: LocalSubagentRunInput): Promise<LocalSubagentRunResult> {
+    this.runs.push(input);
+    this.startedRun();
+    await this.released;
+    return { status: "completed", summary: "VERDICT: passed\nLooks good." };
+  }
+
+  release(): void {
+    this.releaseRun();
+  }
+}
+
 function createSequentialId(): (prefix: string) => string {
   let next = 0;
   return (prefix: string) => `${prefix}_${++next}`;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function actualReadOnly<Input>(

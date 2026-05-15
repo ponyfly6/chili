@@ -1180,6 +1180,7 @@ function createTeamRunLoopToolController(teamRunner: TeamExecutionRunner): TeamR
       if (input.timeoutMs !== undefined) runInput.timeoutMs = input.timeoutMs;
       if (input.pollIntervalMs !== undefined) runInput.pollIntervalMs = input.pollIntervalMs;
       if (input.maxConcurrentDispatches !== undefined) runInput.maxConcurrentDispatches = input.maxConcurrentDispatches;
+      if (input.maxConcurrentVerifications !== undefined) runInput.maxConcurrentVerifications = input.maxConcurrentVerifications;
       return toTeamRunLoopRecord(await teamRunner.run(runInput));
     },
   };
@@ -1354,6 +1355,7 @@ function toTeamRunLoopRecord(result: Awaited<ReturnType<TeamExecutionRunner["run
     startedAt: result.startedAt,
     endedAt: result.endedAt,
     maxConcurrentDispatches: result.maxConcurrentDispatches,
+    maxConcurrentVerifications: result.maxConcurrentVerifications,
     dispatched: result.dispatched,
     completed: result.completed,
     accepted: result.accepted,

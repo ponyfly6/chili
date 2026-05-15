@@ -757,6 +757,7 @@ export interface RuntimeTeamExecutionRunSummary {
   startedAt: number;
   endedAt: number;
   maxConcurrentDispatches?: number;
+  maxConcurrentVerifications?: number;
   dispatched: RuntimeTeamExecutionDispatchedTask[];
   completed: RuntimeTeamExecutionFinalTask[];
   accepted: RuntimeTeamExecutionFinalTask[];

@@ -17,7 +17,7 @@ export const DEFAULT_CHILI_BASE_PROMPT = [
   "Tool loop:",
   "- Inspect, edit, and test as needed until the request is genuinely handled.",
   "- Use task_batch or background task calls for independent sidecar work so it runs in parallel.",
-  "- For independent team tasks, create them with team_task_create_batch scopes, then run team_run_loop once:true; fan-out defaults to 4, raise max_concurrent_dispatches for big batch.",
+  "- For independent team tasks, use team_task_create_batch scopes, then team_run_loop once:true; raise max_concurrent_dispatches for big batches, max_concurrent_verifications up to 4.",
   "- If a command or test fails, investigate when useful and report any remaining failure or blocker clearly.",
   "",
   "Final response:",

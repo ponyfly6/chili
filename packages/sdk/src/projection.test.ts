@@ -1066,6 +1066,7 @@ test("projects team run lifecycle events into run view models", () => {
           timeoutMs: 1000,
           pollIntervalMs: 50,
           maxConcurrentDispatches: 6,
+          maxConcurrentVerifications: 3,
         },
       },
       {
@@ -1108,6 +1109,7 @@ test("projects team run lifecycle events into run view models", () => {
     startedAt: 2,
     endedAt: 4,
     maxConcurrentDispatches: 6,
+    maxConcurrentVerifications: 3,
     counts: { dispatched: 2, completed: 2 },
   });
 });
@@ -1329,6 +1331,7 @@ test("derives Team Live cockpit view from team projection state", () => {
           timeoutMs: 1000,
           pollIntervalMs: 100,
           maxConcurrentDispatches: 4,
+          maxConcurrentVerifications: 2,
         },
       },
       {
@@ -1431,7 +1434,7 @@ test("derives Team Live cockpit view from team projection state", () => {
   expect(cockpit.recentActivity.map((item) => item.kind)).toContain("run");
   expect(cockpit.recentActivity.find((item) => item.kind === "run")).toMatchObject({
     label: "run dispatch",
-    detail: "cycle:1 fanout:4 dispatched:1",
+    detail: "cycle:1 fanout:4 verify:2 dispatched:1",
   });
   expect(cockpit.recentActivity.map((item) => item.kind)).toContain("tool");
   expect(cockpit.recentActivity.map((item) => item.id)).toContain(childApprovalId);
@@ -1701,6 +1704,7 @@ test("client preserves team dispatcher JSON shapes for dispatch, sync, and recon
     startedAt: 100,
     endedAt: 110,
     maxConcurrentDispatches: 4,
+    maxConcurrentVerifications: 2,
     dispatched: [{ teamId, taskId, ownerPath, agentTaskId: agentTask.taskId, status: "running" }],
     completed: [],
     accepted: [],

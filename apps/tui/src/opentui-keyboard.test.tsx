@@ -3139,6 +3139,7 @@ function fakeChatClient(
       stopReason: "once",
       startedAt: 0,
       endedAt: 0,
+      maxConcurrentVerifications: 2,
       dispatched: [],
       completed: [],
       accepted: [],

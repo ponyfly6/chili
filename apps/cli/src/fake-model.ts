@@ -83,6 +83,7 @@ export class FakeModelRouter implements ModelRouter {
             once: true,
             timeout_ms: 10_000,
             max_concurrent_dispatches: 2,
+            max_concurrent_verifications: 2,
           },
         };
         yield { type: "finish", reason: "tool_use" };

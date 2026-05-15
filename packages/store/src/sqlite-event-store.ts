@@ -75,6 +75,9 @@ import type {
   TeamTaskMutationResult,
   TeamTaskQuery,
   TeamTaskRow,
+  TeamTaskVerificationClaimInput,
+  TeamTaskVerificationClaimResult,
+  TeamTaskVerificationClaimStore,
   ThreadGoalQuery,
   ThreadGoalRow,
 } from "./types.js";
@@ -291,7 +294,8 @@ export class SqliteEventStore
     AgentTaskFinalizationStore,
     AgentMailboxDeliveryStore,
     TeamProjectionStore,
-    TeamTaskClaimStore
+    TeamTaskClaimStore,
+    TeamTaskVerificationClaimStore
 {
   private readonly db: Database;
 
@@ -840,6 +844,58 @@ export class SqliteEventStore
           time: event.time,
         });
       if (cas.changes === 0) return { applied: false, reason: "already_claimed" as const, events: [] as ChiliEvent[] };
+      this.writeTransactionEvents([event]);
+      return { applied: true, events: [event] };
+    });
+    const result = this.runWithWriteRetry(() => run(input));
+
+    await this.writeMirrors(result.events);
+    const task = (await this.teamTasks({ teamId: input.teamId, taskId: input.taskId, limit: 1 }))[0];
+    return { ...result, ...(task ? { task } : {}) };
+  }
+
+  async claimTeamTaskVerification(input: TeamTaskVerificationClaimInput): Promise<TeamTaskVerificationClaimResult> {
+    const run = this.db.transaction((item: TeamTaskVerificationClaimInput) => {
+      const current = this.teamTaskState(item.teamId, item.taskId);
+      if (!current) return { applied: false, reason: "not_found" as const, events: [] as ChiliEvent[] };
+      const currentVerification = verificationStatus(current.metadata_json);
+      if (current.status !== "completed") return { applied: false, reason: "not_completed" as const, events: [] as ChiliEvent[] };
+      if (currentVerification === "passed") return { applied: false, reason: "already_verified" as const, events: [] as ChiliEvent[] };
+      if (currentVerification === "pending" && !isStalePendingVerification(current.metadata_json, item.stalePendingBefore)) {
+        return { applied: false, reason: "verification_pending" as const, events: [] as ChiliEvent[] };
+      }
+
+      const metadata = verificationClaimMetadata(current.metadata_json, item.metadata);
+      const event = this.teamTaskVerificationClaimedEvent(item, current, metadata);
+      const cas = this.db
+        .query(
+          `update team_tasks
+           set metadata_json = $metadata,
+               updated_at = $time
+           where id = $taskId
+             and team_id = $teamId
+             and status = 'completed'
+             and (($currentMetadata is null and metadata_json is null) or metadata_json = $currentMetadata)`,
+        )
+        .run({
+          teamId: item.teamId,
+          taskId: item.taskId,
+          metadata: encodeJson(metadata),
+          currentMetadata: current.metadata_json,
+          time: event.time,
+        });
+      if (cas.changes === 0) {
+        const latest = this.teamTaskState(item.teamId, item.taskId);
+        if (!latest) return { applied: false, reason: "not_found" as const, events: [] as ChiliEvent[] };
+        const latestVerification = verificationStatus(latest.metadata_json);
+        if (latest.status !== "completed") return { applied: false, reason: "not_completed" as const, events: [] as ChiliEvent[] };
+        if (latestVerification === "passed") return { applied: false, reason: "already_verified" as const, events: [] as ChiliEvent[] };
+        if (latestVerification === "pending" && !isStalePendingVerification(latest.metadata_json, item.stalePendingBefore)) {
+          return { applied: false, reason: "verification_pending" as const, events: [] as ChiliEvent[] };
+        }
+        return { applied: false, reason: "stale" as const, events: [] as ChiliEvent[] };
+      }
+
       this.writeTransactionEvents([event]);
       return { applied: true, events: [event] };
     });
@@ -2172,6 +2228,27 @@ export class SqliteEventStore
     return event;
   }
 
+  private teamTaskVerificationClaimedEvent(
+    input: TeamTaskVerificationClaimInput,
+    current: TeamTaskStateRow,
+    metadata: Record<string, unknown>,
+  ): Extract<ChiliEvent, { type: "team.task_updated" }> {
+    const event: Extract<ChiliEvent, { type: "team.task_updated" }> = {
+      id: input.eventId,
+      type: "team.task_updated",
+      time: (input.time ?? Date.now()) as EventEnvelope["time"],
+      payload: {
+        teamId: input.teamId,
+        taskId: input.taskId,
+        metadata,
+      },
+    };
+    const sessionId = input.sessionId ?? this.sessionIdForTeamTask(current.id);
+    if (sessionId) event.sessionId = sessionId as SessionId;
+    if (input.threadId) event.threadId = input.threadId;
+    return event;
+  }
+
   private sessionIdForTeamTask(taskId: string): string | undefined {
     return this.db
       .query<{ session_id: string | null }, [string]>(`select session_id from team_tasks where id = ?`)
@@ -2729,6 +2806,32 @@ function isFinalTaskStatus(status: string): boolean {
 
 function isFinalTeamTaskStatus(status: string): boolean {
   return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+function verificationStatus(metadataJson: string | null): string | undefined {
+  if (!metadataJson) return undefined;
+  const metadata = decodeJson<Record<string, unknown>>(metadataJson, {});
+  const verification = metadata.verification;
+  if (!verification || typeof verification !== "object" || Array.isArray(verification)) return undefined;
+  const status = (verification as Record<string, unknown>).status;
+  return typeof status === "string" ? status : undefined;
+}
+
+function isStalePendingVerification(metadataJson: string | null, stalePendingBefore: number | undefined): boolean {
+  if (stalePendingBefore === undefined || verificationStatus(metadataJson) !== "pending") return false;
+  const metadata = decodeJson<Record<string, unknown>>(metadataJson ?? "{}", {});
+  const verification = metadata.verification;
+  if (!verification || typeof verification !== "object" || Array.isArray(verification)) return false;
+  const startedAt = (verification as Record<string, unknown>).startedAt;
+  return typeof startedAt !== "number" || startedAt <= stalePendingBefore;
+}
+
+function verificationClaimMetadata(metadataJson: string | null, claimMetadata: Record<string, unknown>): Record<string, unknown> {
+  const current = decodeJson<Record<string, unknown>>(metadataJson ?? "{}", {});
+  return {
+    ...current,
+    verification: claimMetadata.verification,
+  };
 }
 
 function isSqliteBusyError(error: unknown): boolean {

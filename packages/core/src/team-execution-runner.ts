@@ -34,7 +34,12 @@ import type {
   TeamTaskVerifierSweepResult,
   TeamTaskVerifierVerifiedResult,
 } from "./team-verifier.js";
-import { isAcceptedTeamTask, isCompletedButUnverifiedTeamTask, isReopenedAfterFailedVerification } from "./team-verifier.js";
+import {
+  isAcceptedTeamTask,
+  isCompletedButUnverifiedTeamTask,
+  isPendingVerificationTeamTask,
+  isReopenedAfterFailedVerification,
+} from "./team-verifier.js";
 import { taskMergeMetadata } from "./team-worktree.js";
 import type { TeamControlService } from "./team.js";
 
@@ -85,6 +90,7 @@ export interface TeamExecutionRunInput {
   timeoutMs?: number;
   pollIntervalMs?: number;
   maxConcurrentDispatches?: number;
+  maxConcurrentVerifications?: number;
   signal?: AbortSignal;
 }
 
@@ -95,6 +101,7 @@ export interface TeamExecutionRunSummary {
   startedAt: number;
   endedAt: number;
   maxConcurrentDispatches: number;
+  maxConcurrentVerifications: number;
   dispatched: TeamExecutionDispatchedTask[];
   completed: TeamExecutionFinalTask[];
   accepted: TeamExecutionFinalTask[];
@@ -226,6 +233,8 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_POLL_INTERVAL_MS = 250;
 const DEFAULT_MAX_CONCURRENT_DISPATCHES = 4;
 const MAX_CONCURRENT_DISPATCHES = 64;
+const DEFAULT_MAX_CONCURRENT_VERIFICATIONS = 2;
+const MAX_CONCURRENT_VERIFICATIONS = 4;
 
 export class TeamExecutionRunner {
   constructor(private readonly options: TeamExecutionRunnerOptions) {}
@@ -237,6 +246,7 @@ export class TeamExecutionRunner {
     const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const pollIntervalMs = input.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     const maxConcurrentDispatches = normalizeMaxConcurrentDispatches(input.maxConcurrentDispatches);
+    const maxConcurrentVerifications = normalizeMaxConcurrentVerifications(input.maxConcurrentVerifications);
     const startedMonotonic = Date.now();
     const sessionState: SessionState = {};
     if (input.sessionId) sessionState.sessionId = input.sessionId;
@@ -248,6 +258,7 @@ export class TeamExecutionRunner {
       startedAt,
       endedAt: startedAt,
       maxConcurrentDispatches,
+      maxConcurrentVerifications,
       dispatched: [],
       completed: [],
       accepted: [],
@@ -269,6 +280,7 @@ export class TeamExecutionRunner {
       timeoutMs,
       pollIntervalMs,
       maxConcurrentDispatches,
+      maxConcurrentVerifications,
     });
     if (initialState.team.status !== "active") {
       summary.stopReason = "team_inactive";
@@ -462,19 +474,21 @@ export class TeamExecutionRunner {
       const unverified = this.unverifiedTasks(postCycle.tasks);
       const reopened = this.reopenedTasks(postCycle.tasks);
       const pendingMerge = this.pendingMergeTasks(postCycle.tasks);
+      const pendingVerification = this.pendingVerificationTasks(postCycle.tasks);
       if (
         stillRunning.length === 0 &&
         runnable.length === 0 &&
         unverified.length === 0 &&
         reopened.length === 0 &&
-        pendingMerge.length === 0
+        pendingMerge.length === 0 &&
+        pendingVerification.length === 0
       ) {
         summary.stopReason = "drained";
         await this.publishRunProgress(input, sessionState, postCycle.team, runId, summary, "drain", "drained");
         break;
       }
 
-      if (stillRunning.length > 0 && !input.signal?.aborted) {
+      if ((stillRunning.length > 0 || pendingVerification.length > 0) && !input.signal?.aborted) {
         await this.publishRunProgress(input, sessionState, postCycle.team, runId, summary, "wait");
         await this.sleep(Math.min(pollIntervalMs, remainingDelay(timeoutMs, startedMonotonic)), input.signal);
       }
@@ -554,6 +568,7 @@ export class TeamExecutionRunner {
       const verifierInput: TeamTaskVerifierSweepInput = {
         teamId: input.teamId,
         cwd: input.cwd ?? this.options.cwd,
+        maxConcurrentVerifications: summary.maxConcurrentVerifications,
       };
       const sessionId = sessionState.sessionId ?? input.sessionId;
       const threadId = sessionState.threadId ?? input.threadId;
@@ -733,6 +748,11 @@ export class TeamExecutionRunner {
     return tasks.filter(isCompletedButUnverifiedTeamTask);
   }
 
+  private pendingVerificationTasks(tasks: readonly TeamTaskRow[]): TeamTaskRow[] {
+    if (!this.options.verifier) return [];
+    return tasks.filter(isPendingVerificationTeamTask);
+  }
+
   private reopenedTasks(tasks: readonly TeamTaskRow[]): TeamTaskRow[] {
     if (!this.options.verifier) return [];
     return tasks.filter(isReopenedAfterFailedVerification);
@@ -756,7 +776,13 @@ export class TeamExecutionRunner {
     sessionState: SessionState,
     team: TeamRow,
     runId: string,
-    options: { maxCycles: number; timeoutMs: number; pollIntervalMs: number; maxConcurrentDispatches: number },
+    options: {
+      maxCycles: number;
+      timeoutMs: number;
+      pollIntervalMs: number;
+      maxConcurrentDispatches: number;
+      maxConcurrentVerifications: number;
+    },
   ): Promise<void> {
     await this.appendRunEvent(input, sessionState, team, "team.run_started", {
       teamId: input.teamId,
@@ -767,6 +793,7 @@ export class TeamExecutionRunner {
       timeoutMs: options.timeoutMs,
       pollIntervalMs: options.pollIntervalMs,
       maxConcurrentDispatches: options.maxConcurrentDispatches,
+      maxConcurrentVerifications: options.maxConcurrentVerifications,
     });
   }
 
@@ -858,6 +885,12 @@ function normalizeMaxConcurrentDispatches(value: number | undefined): number {
   if (value === undefined) return DEFAULT_MAX_CONCURRENT_DISPATCHES;
   if (!Number.isInteger(value) || value <= 0) return DEFAULT_MAX_CONCURRENT_DISPATCHES;
   return Math.min(value, MAX_CONCURRENT_DISPATCHES);
+}
+
+function normalizeMaxConcurrentVerifications(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_MAX_CONCURRENT_VERIFICATIONS;
+  if (!Number.isInteger(value) || value <= 0) return DEFAULT_MAX_CONCURRENT_VERIFICATIONS;
+  return Math.min(value, MAX_CONCURRENT_VERIFICATIONS);
 }
 
 function chunk<T>(items: readonly T[], size: number): T[][] {
@@ -1160,6 +1193,7 @@ function syncSkipReason(reason: TeamTaskSyncResult["reason"]): TeamExecutionSkip
 function verifierSkipReason(reason: TeamTaskVerifierSkipReason): TeamExecutionSkipReason {
   if (reason === "missing_owner" || reason === "missing_session") return reason;
   if (reason === "already_passed") return "already_resolved";
+  if (reason === "verification_pending") return "already_claimed";
   return "blocked";
 }
 

@@ -1524,6 +1524,7 @@ function teamRunLoopResultJson(teamId: TeamId): Awaited<ReturnType<RuntimeTeamEx
     startedAt: 100,
     endedAt: 110,
     maxConcurrentDispatches: 4,
+    maxConcurrentVerifications: 2,
     dispatched: [
       {
         teamId,
