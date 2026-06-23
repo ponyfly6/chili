@@ -22,6 +22,7 @@ import { startRuntimeHttpServer } from "@chili/server";
 import { loadSkillSettings, loadSkills, updateSkillDisabledSetting, type Skill } from "@chili/skills";
 import { DeferredApprovalQueue } from "@chili/tools";
 import { parseArgs, usage } from "./args.js";
+import { cliEnvironmentDefaults } from "./environment-defaults.js";
 import { createCliHarness } from "./harness.js";
 import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
 import { runPrompt } from "./runner.js";
@@ -52,9 +53,14 @@ async function main(): Promise<void> {
     mcpConnectMode,
     ...(approvalQueue ? { approvalQueue } : {}),
   };
+  const envDefaults = cliEnvironmentDefaults(process.env);
   if (args.provider !== undefined) harnessInput.provider = args.provider;
+  else if (envDefaults.provider !== undefined) harnessInput.provider = envDefaults.provider;
   if (args.model !== undefined) harnessInput.model = args.model;
+  else if (envDefaults.model !== undefined) harnessInput.model = envDefaults.model;
   if (args.reasoningLevel !== undefined) harnessInput.reasoningLevel = args.reasoningLevel;
+  else if (envDefaults.reasoningLevel !== undefined) harnessInput.reasoningLevel = envDefaults.reasoningLevel;
+  if (envDefaults.serviceTier !== undefined) harnessInput.serviceTier = envDefaults.serviceTier;
   const harness = await createCliHarness(harnessInput);
 
   try {
@@ -287,6 +293,7 @@ async function main(): Promise<void> {
         maxTurns: args.maxTurns,
         ...(harness.defaultModelSelection ? { modelSelection: harness.defaultModelSelection } : {}),
         ...(harness.defaultReasoningLevel !== undefined ? { reasoningLevel: harness.defaultReasoningLevel } : {}),
+        ...(harness.defaultServiceTier !== undefined ? { serviceTier: harness.defaultServiceTier } : {}),
         signal: controller.signal,
       });
       return;
@@ -1158,6 +1165,7 @@ async function repl(input: {
         maxTurns: input.maxTurns,
         ...(input.harness.defaultModelSelection ? { modelSelection: input.harness.defaultModelSelection } : {}),
         ...(input.harness.defaultReasoningLevel !== undefined ? { reasoningLevel: input.harness.defaultReasoningLevel } : {}),
+        ...(input.harness.defaultServiceTier !== undefined ? { serviceTier: input.harness.defaultServiceTier } : {}),
         signal: controller.signal,
       });
     }

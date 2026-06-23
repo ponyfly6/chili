@@ -107,6 +107,38 @@ test("CLI harness uses the user last model for new workspaces without forcing a 
   }
 });
 
+test("CLI harness applies default reasoning and service tier", async () => {
+  const root = await mkdtempName();
+  const repo = join(root, "repo");
+  let harness: CliHarness | undefined;
+  try {
+    await mkdir(repo, { recursive: true });
+
+    harness = await createCliHarness({
+      cwd: repo,
+      model: "fake",
+      reasoningLevel: "xhigh",
+      serviceTier: "fast",
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+    });
+    const session = await harness.service.createSession({
+      sessionId: "session_default_tier" as SessionId,
+      threadId: "thread_default_tier" as ThreadId,
+    });
+    const config = await harness.service.getModelConfig(session.sessionId);
+
+    expect(config.reasoningLevel).toBe("xhigh");
+    expect(config.serviceTier).toBe("fast");
+    expect(harness.defaultReasoningLevel).toBe("xhigh");
+    expect(harness.defaultServiceTier).toBe("fast");
+  } finally {
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("CLI harness prefers workspace model history over user last model", async () => {
   const root = await mkdtempName();
   const home = join(root, "home");

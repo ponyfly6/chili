@@ -241,6 +241,12 @@ test("resolves Codex Responses URL variants", () => {
   expect(resolveOpenAICodexResponsesUrl("https://chatgpt.com/backend-api/codex/responses")).toBe(
     "https://chatgpt.com/backend-api/codex/responses",
   );
+  expect(resolveOpenAICodexResponsesUrl("https://api.codexapi.space/v1")).toBe(
+    "https://api.codexapi.space/v1/responses",
+  );
+  expect(resolveOpenAICodexResponsesUrl("https://api.codexapi.space/v1/responses")).toBe(
+    "https://api.codexapi.space/v1/responses",
+  );
 });
 
 test("resolves per-stream Codex model and reasoning request options", () => {
@@ -453,6 +459,46 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
     responseId: "resp_1",
     usage: { inputTokens: 5, outputTokens: 7, cacheReadInputTokens: 2, totalTokens: 12 },
   });
+});
+
+test("sends OpenAI-compatible Codex requests without ChatGPT account headers", async () => {
+  let url = "";
+  let headers = new Headers();
+  let body: Record<string, unknown> = {};
+  const fetchImpl = (async (input, init) => {
+    url = String(input);
+    headers = new Headers(init?.headers);
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(streamText([
+      data({ type: "response.created", response: { id: "resp_gateway", model: "gpt-5.5" } }),
+      data({ type: "response.output_text.delta", output_index: 0, delta: "ok" }),
+      data({ type: "response.completed", response: { id: "resp_gateway", model: "gpt-5.5", status: "completed" } }),
+    ].join("")), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as typeof fetch;
+
+  const model = new OpenAICodexResponsesModel({
+    model: "gpt-5.5",
+    apiKey: "codexapi-key",
+    baseUrl: "https://api.codexapi.space/v1",
+    reasoningEffort: "xhigh",
+    serviceTier: "fast",
+    fetch: fetchImpl,
+  });
+  const events = await collect(model.stream({ messages: [], tools: [], system: [] }));
+
+  expect(url).toBe("https://api.codexapi.space/v1/responses");
+  expect(headers.get("authorization")).toBe("Bearer codexapi-key");
+  expect(headers.get("chatgpt-account-id")).toBeNull();
+  expect(headers.get("openai-beta")).toBeNull();
+  expect(body).toMatchObject({
+    model: "gpt-5.5",
+    reasoning: { effort: "xhigh", summary: "auto" },
+    service_tier: "priority",
+  });
+  expect(events).toContainEqual({ type: "text_delta", text: "ok", index: 0 });
 });
 
 async function collect(stream: AsyncIterable<ModelStreamEvent>): Promise<ModelStreamEvent[]> {

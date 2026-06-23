@@ -24,7 +24,7 @@ import {
   type RuntimePromptTurnContext,
   type WorkerToolPolicy,
 } from "@chili/core";
-import type { AgentPath, ApprovalDecision, ChiliEvent, EventEnvelope, ModelSelection, RuntimePermissionConfig, RuntimePermissionProfileId, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
+import type { AgentPath, ApprovalDecision, ChiliEvent, EventEnvelope, ModelSelection, RuntimePermissionConfig, RuntimePermissionProfileId, ServiceTier, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
 import { ObservableEventStore, SessionTranscriptJsonlMirror, SqliteEventStore } from "@chili/store";
 import type { AgentMailboxRow, AgentTaskQuery, AgentTaskRow, TeamMemberRow, TeamMessageRow, TeamRow, TeamTaskRow } from "@chili/store";
 import {
@@ -133,6 +133,7 @@ export interface CliHarnessOptions {
   provider?: string;
   model?: CliModelName;
   reasoningLevel?: CliReasoningLevel;
+  serviceTier?: ServiceTier;
   yes?: boolean;
   quiet?: boolean;
   approvalQueue?: DeferredApprovalQueue;
@@ -160,6 +161,7 @@ export interface CliHarness {
   recovery: SnapshotRecoveryService;
   defaultModelSelection?: ModelSelection;
   defaultReasoningLevel?: CliReasoningLevel;
+  defaultServiceTier?: ServiceTier;
   close(): Promise<void>;
 }
 
@@ -187,10 +189,11 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const printableStore = options.quiet ? sqliteStore : new PrintingEventStore(sqliteStore, printer);
   const eventStore = new ObservableEventStore(printableStore);
   const childToolPolicyResolver = createWorkerToolPolicyResolver(eventStore);
-  const cliModelInput: { provider?: string; model?: CliModelName; reasoningLevel?: CliReasoningLevel } = {};
+  const cliModelInput: { provider?: string; model?: CliModelName; reasoningLevel?: CliReasoningLevel; serviceTier?: ServiceTier } = {};
   if (options.provider !== undefined) cliModelInput.provider = options.provider;
   if (options.model !== undefined) cliModelInput.model = options.model;
   if (options.reasoningLevel !== undefined) cliModelInput.reasoningLevel = options.reasoningLevel;
+  if (options.serviceTier !== undefined) cliModelInput.serviceTier = options.serviceTier;
   const explicitModelSelection = options.provider !== undefined || options.model !== undefined;
   const persistedUserModelSelection = explicitModelSelection ? undefined : await readPersistedUserModelSelection(chiliHome);
   const modelInput = { ...cliModelInput };
@@ -286,6 +289,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     promptFragments: childPromptFragments,
     ...(serviceDefaultModelSelection ? { defaultModelSelection: serviceDefaultModelSelection } : {}),
     ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
+    ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
     onModelChanged: persistUserModelSelection,
   });
   const subagents = new LocalSubagentManager({
@@ -391,6 +395,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     promptFragments,
     ...(serviceDefaultModelSelection ? { defaultModelSelection: serviceDefaultModelSelection } : {}),
     ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
+    ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
     onModelChanged: persistUserModelSelection,
   });
   for (const tool of createGoalTools(createGoalToolController(service))) {
@@ -466,6 +471,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     recovery,
     ...(runtimeModelSelection ? { defaultModelSelection: runtimeModelSelection } : {}),
     ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
+    ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
     close: async () => {
       await mailboxPump.stop();
       await subagents.waitForBackgroundTasks();

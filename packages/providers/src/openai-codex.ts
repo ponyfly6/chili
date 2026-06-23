@@ -128,7 +128,7 @@ interface CodexUsage {
 
 interface ResolvedCodexCredentials {
   access: string;
-  accountId: string;
+  accountId?: string;
 }
 
 interface ToolStreamState {
@@ -241,10 +241,14 @@ export class OpenAICodexResponsesModel implements ChiliModel {
     const env = readOpenAICodexEnvironment(this.options.env);
     const directAccess = this.options.apiKey ?? env.apiKey;
     if (directAccess) {
-      return {
-        access: directAccess,
-        accountId: this.options.accountId ?? extractOpenAICodexAccountId(directAccess),
-      };
+      const accountId = this.options.accountId ?? tryExtractOpenAICodexAccountId(directAccess);
+      if (!accountId && requiresChatGptCodexAccountId(this.options.baseUrl ?? env.baseUrl)) {
+        throw new Error(
+          "OPENAI_CODEX_ACCESS_TOKEN must be a ChatGPT Codex access token for the default ChatGPT backend, "
+          + "or set OPENAI_CODEX_BASE_URL to an OpenAI-compatible Responses API base URL.",
+        );
+      }
+      return accountId ? { access: directAccess, accountId } : { access: directAccess };
     }
 
     const stored = await this.authStorage.getOAuthCredentials(this.provider);
@@ -263,16 +267,19 @@ export class OpenAICodexResponsesModel implements ChiliModel {
   }
 
   private headers(credentials: ResolvedCodexCredentials, sessionId: string | undefined): HeadersInit {
+    const env = readOpenAICodexEnvironment(this.options.env);
     const headers: Record<string, string> = {
       accept: "text/event-stream",
       "content-type": "application/json",
       authorization: `Bearer ${credentials.access}`,
-      "chatgpt-account-id": credentials.accountId,
       originator: "chili",
       "user-agent": `chili (${platform()} ${release()}; ${arch()})`,
-      "openai-beta": "responses=experimental",
       ...this.options.headers,
     };
+    if (credentials.accountId) headers["chatgpt-account-id"] = credentials.accountId;
+    if (requiresChatGptCodexAccountId(this.options.baseUrl ?? env.baseUrl)) {
+      headers["openai-beta"] = "responses=experimental";
+    }
     if (sessionId) {
       headers.session_id = sessionId;
       headers["x-client-request-id"] = sessionId;
@@ -426,9 +433,27 @@ export function resolveOpenAICodexStreamRequestOptions(
 export function resolveOpenAICodexResponsesUrl(baseUrl?: string): string {
   const raw = baseUrl && baseUrl.trim().length > 0 ? baseUrl : OPENAI_CODEX_BASE_URL;
   const normalized = raw.replace(/\/+$/, "");
-  if (normalized.endsWith("/codex/responses")) return normalized;
+  if (normalized.endsWith("/responses")) return normalized;
   if (normalized.endsWith("/codex")) return `${normalized}/responses`;
+  if (normalized.endsWith("/v1")) return `${normalized}/responses`;
   return `${normalized}/codex/responses`;
+}
+
+function tryExtractOpenAICodexAccountId(token: string): string | undefined {
+  try {
+    return extractOpenAICodexAccountId(token);
+  } catch {
+    return undefined;
+  }
+}
+
+function requiresChatGptCodexAccountId(baseUrl?: string): boolean {
+  const raw = baseUrl && baseUrl.trim().length > 0 ? baseUrl : OPENAI_CODEX_BASE_URL;
+  try {
+    return new URL(raw).hostname === "chatgpt.com";
+  } catch {
+    return raw.includes("chatgpt.com");
+  }
 }
 
 export function buildOpenAICodexResponsesRequestBody(
