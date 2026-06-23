@@ -1,4 +1,4 @@
-import type { ModelSelection, ReasoningLevel, SessionId, ThreadId } from "@chili/protocol";
+import type { ModelSelection, ReasoningLevel, ServiceTier, SessionId, ThreadId } from "@chili/protocol";
 import type { CliHarness } from "./harness.js";
 
 export interface RunPromptOptions {
@@ -9,6 +9,7 @@ export interface RunPromptOptions {
   maxTurns: number;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
+  serviceTier?: ServiceTier;
   signal?: AbortSignal;
 }
 
@@ -21,6 +22,7 @@ export async function runPrompt(options: RunPromptOptions): Promise<void> {
   };
   if (options.modelSelection) Object.assign(input, { modelSelection: options.modelSelection });
   if (options.reasoningLevel !== undefined) Object.assign(input, { reasoningLevel: options.reasoningLevel });
+  if (options.serviceTier !== undefined) Object.assign(input, { serviceTier: options.serviceTier });
   const result = await options.harness.service.submitPrompt(
     options.signal ? { ...input, signal: options.signal } : input,
   );
