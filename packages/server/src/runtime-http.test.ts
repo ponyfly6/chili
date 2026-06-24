@@ -723,6 +723,10 @@ test("serves prompt commands and submits expanded command prompts", async () => 
     displayText: "/joke typescript",
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
     reasoningLevel: "high",
+    toolPolicy: {
+      allowedTools: ["read", "write"],
+      writeScope: ["AGENTS.md"],
+    },
   });
 });
 
@@ -1231,6 +1235,12 @@ class FakePromptCommandControl implements PromptCommandControl {
     return {
       prompt: `Tell a short joke about ${input.args ?? "coding"}.`,
       command: promptCommandList().commands[0]!,
+      metadata: {
+        commandName: "joke",
+        source: "project",
+        allowedTools: ["read", "write"],
+        writeScope: ["AGENTS.md"],
+      },
     };
   }
 }

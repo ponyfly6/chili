@@ -16,6 +16,8 @@ test("project loader reads markdown commands with frontmatter", async () => {
       "argumentHint: <files>",
       "model: chili-reviewer",
       "allowedTools: [Read, Grep]",
+      "writeScope: [AGENTS.md]",
+      "executeScope: [bun test]",
       "subtask: true",
       "category: quality",
       "hidden: false",
@@ -39,6 +41,8 @@ test("project loader reads markdown commands with frontmatter", async () => {
   expect(command?.metadata).toMatchObject({
     model: "chili-reviewer",
     allowedTools: ["Read", "Grep"],
+    writeScope: ["AGENTS.md"],
+    executeScope: ["bun test"],
     subtask: true,
   });
 });

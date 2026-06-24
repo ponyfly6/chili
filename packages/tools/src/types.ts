@@ -133,6 +133,7 @@ export interface ExecuteToolInput {
   toolName: string;
   input: unknown;
   cwd: string;
+  policy?: ToolAccessPolicy;
   signal?: AbortSignal;
 }
 

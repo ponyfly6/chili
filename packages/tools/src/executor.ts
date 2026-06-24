@@ -25,6 +25,7 @@ import type {
   ExecuteToolResult,
   ApprovalPreflightDecision,
   SnapshotRecord,
+  ToolAccessPolicy,
   ToolApprovalSpec,
   ToolExecutorOptions,
 } from "./types.js";
@@ -55,15 +56,16 @@ export class ToolExecutor {
       await this.update(input, callId, "validating");
       const validated = await this.validate(tool, input.input);
       const spec = this.approvalSpec(tool, validated);
-      const policy = await this.policy(input);
-      await authorizeToolByPolicy({
-        tool,
-        executeInput: input,
-        validatedInput: validated,
-        approvalSpec: spec === false ? { permission: tool.name, patterns: ["*"], metadata: {} } : spec,
-        policy,
-        isReadOnly: (definition, toolInput) => this.resolvePredicate(definition.isReadOnly, toolInput),
-      });
+      for (const policy of await this.policies(input)) {
+        await authorizeToolByPolicy({
+          tool,
+          executeInput: input,
+          validatedInput: validated,
+          approvalSpec: spec === false ? { permission: tool.name, patterns: ["*"], metadata: {} } : spec,
+          policy,
+          isReadOnly: (definition, toolInput) => this.resolvePredicate(definition.isReadOnly, toolInput),
+        });
+      }
 
       const approval = await this.requestLifecycleApproval(tool, input, callId, spec);
       if (!isApprovalDecisionAction(approval.action)) {
@@ -354,11 +356,19 @@ export class ToolExecutor {
   }
 
   private async visibleTools(input: ExecuteToolInput): Promise<ChiliToolDefinition[]> {
-    return filterToolsByPolicy(this.options.registry.list(), await this.policy(input));
+    const policies = await this.policies(input);
+    return policies.reduce(
+      (tools, policy) => filterToolsByPolicy(tools, policy),
+      this.options.registry.list(),
+    );
   }
 
-  private async policy(input: ExecuteToolInput) {
-    return this.options.policyResolver?.resolve(toolPolicyContext(input));
+  private async policies(input: ExecuteToolInput): Promise<ToolAccessPolicy[]> {
+    const policies: ToolAccessPolicy[] = [];
+    if (input.policy) policies.push(input.policy);
+    const resolved = await this.options.policyResolver?.resolve(toolPolicyContext(input));
+    if (resolved) policies.push(resolved);
+    return policies;
   }
 
   private async update(

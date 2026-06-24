@@ -38,6 +38,8 @@ export interface ProjectCommandFrontmatter {
   argumentHint?: string;
   model?: string;
   allowedTools?: readonly string[];
+  writeScope?: readonly string[];
+  executeScope?: readonly string[];
   subtask?: boolean | string;
   category?: string;
   hidden?: boolean;
@@ -188,6 +190,8 @@ function promptMetadata(
 
   if (frontmatter.model !== undefined) metadata.model = frontmatter.model;
   if (frontmatter.allowedTools !== undefined) metadata.allowedTools = frontmatter.allowedTools;
+  if (frontmatter.writeScope !== undefined) metadata.writeScope = frontmatter.writeScope;
+  if (frontmatter.executeScope !== undefined) metadata.executeScope = frontmatter.executeScope;
   if (frontmatter.subtask !== undefined) metadata.subtask = frontmatter.subtask;
   return metadata;
 }
@@ -259,6 +263,18 @@ function coerceFrontmatter(values: ReadonlyMap<string, unknown>):
         const list = coerceStringList(value);
         if (!list) return invalidType(key, "string list");
         frontmatter.allowedTools = list;
+        break;
+      }
+      case "writeScope": {
+        const list = coerceStringList(value);
+        if (!list) return invalidType(key, "string list");
+        frontmatter.writeScope = list;
+        break;
+      }
+      case "executeScope": {
+        const list = coerceStringList(value);
+        if (!list) return invalidType(key, "string list");
+        frontmatter.executeScope = list;
         break;
       }
       case "subtask": {

@@ -1,9 +1,11 @@
 import {
+  builtinCommands,
   createCommandRegistry,
   loadProjectCommands,
   loadUserCommands,
   resolveCommand,
   type CommandDefinition,
+  type PromptCommandMetadata,
   type ProjectCommandDiagnostic,
   type ProjectCommandsLoadResult,
 } from "@chili/commands";
@@ -23,6 +25,7 @@ export interface PromptCommandControl {
 export interface PromptCommandRunResult {
   prompt: string;
   command: RuntimePromptCommandDescriptor;
+  metadata: PromptCommandMetadata;
 }
 
 export interface FilesystemPromptCommandControlOptions {
@@ -61,6 +64,7 @@ export function createFilesystemPromptCommandControl(
     ]);
     const registry = createCommandRegistry(project.commands);
     const userResults = registry.registerMany(user.commands);
+    registry.registerMany(builtinCommands);
     const skippedConflicts = userResults
       .filter((result) => result.status === "skipped")
       .map((result) => result.name);
@@ -103,6 +107,7 @@ export function createFilesystemPromptCommandControl(
       return {
         prompt: result.prompt,
         command: descriptorForCommand(resolved.command),
+        metadata: result.metadata,
       };
     },
   };
