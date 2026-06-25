@@ -94,7 +94,7 @@ MiniMax 配置优先使用这些环境变量：
 ```bash
 MINIMAX_API_KEY=...
 MINIMAX_BASE_URL=https://api.minimaxi.com/anthropic
-MINIMAX_MODEL=MiniMax-M2.7-highspeed
+MINIMAX_MODEL=MiniMax-M3[1m]
 ```
 
 也兼容旧的 `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`、`ANTHROPIC_MODEL` 命名。需要临时回退到 core 里的旧路由时：

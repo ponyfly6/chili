@@ -13,6 +13,7 @@ import {
   MINIMAX_ANTHROPIC_BASE_URL,
   MINIMAX_M27_HIGHSPEED_MODEL,
   MINIMAX_M27_MODEL,
+  MINIMAX_M3_MODEL,
   MINIMAX_PROVIDER_ID,
   OPENAI_CODEX_BASE_URL,
   OPENAI_CODEX_DEFAULT_MODEL,
@@ -90,16 +91,16 @@ test("catalog describes the built-in Kimi OpenAI-compatible model", () => {
 test("catalog describes the built-in MiniMax Anthropic-family models", () => {
   const models = listKnownModels(MINIMAX_PROVIDER_ID);
 
-  expect(models.map((model) => model.model)).toEqual([MINIMAX_M27_HIGHSPEED_MODEL, MINIMAX_M27_MODEL]);
+  expect(models.map((model) => model.model)).toEqual([MINIMAX_M3_MODEL, MINIMAX_M27_HIGHSPEED_MODEL, MINIMAX_M27_MODEL]);
   expect(findDefaultKnownModel(MINIMAX_PROVIDER_ID)).toMatchObject({
     provider: MINIMAX_PROVIDER_ID,
-    model: MINIMAX_M27_HIGHSPEED_MODEL,
+    model: MINIMAX_M3_MODEL,
     apiFamily: "anthropic-messages",
     baseUrl: MINIMAX_ANTHROPIC_BASE_URL,
     default: true,
-    inputCapabilities: ["text"],
-    contextWindowTokens: 204800,
-    maxOutputTokens: 131072,
+    inputCapabilities: ["text", "image"],
+    contextWindowTokens: 1000000,
+    maxOutputTokens: 32768,
     capabilities: {
       streaming: true,
       reasoning: true,

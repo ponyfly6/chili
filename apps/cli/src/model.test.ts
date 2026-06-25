@@ -21,6 +21,7 @@ const savedEnv = {
   MINIMAX_ANTHROPIC_BASE_URL: process.env.MINIMAX_ANTHROPIC_BASE_URL,
   MINIMAX_MODEL: process.env.MINIMAX_MODEL,
   ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
+  ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL,
 };
 
 afterEach(() => {
@@ -41,6 +42,7 @@ afterEach(() => {
   restoreEnv("MINIMAX_ANTHROPIC_BASE_URL", savedEnv.MINIMAX_ANTHROPIC_BASE_URL);
   restoreEnv("MINIMAX_MODEL", savedEnv.MINIMAX_MODEL);
   restoreEnv("ANTHROPIC_BASE_URL", savedEnv.ANTHROPIC_BASE_URL);
+  restoreEnv("ANTHROPIC_MODEL", savedEnv.ANTHROPIC_MODEL);
 });
 
 test("CLI DeepSeek env resolution uses official V4 OpenAI-compatible endpoint and model", async () => {
@@ -151,11 +153,12 @@ test("CLI MiniMax env resolution prefers Anthropic-compatible base URL over gene
 
 test("CLI runtime model selection resolves explicit provider aliases to concrete defaults", () => {
   delete process.env.MINIMAX_MODEL;
+  delete process.env.ANTHROPIC_MODEL;
   process.env.DEEPSEEK_MODEL = "deepseek-v4-flash";
 
   expect(resolveCliRuntimeModelSelection({ model: "minimax" })).toEqual({
     provider: "minimax",
-    model: "MiniMax-M2.7-highspeed",
+    model: "MiniMax-M3[1m]",
   });
   expect(resolveCliRuntimeModelSelection({ provider: "deepseek" })).toEqual({
     provider: "deepseek",

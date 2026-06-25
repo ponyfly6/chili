@@ -75,7 +75,7 @@ test("MiniMax provider lists a configured custom default model without dropping 
     baseUrl: "https://custom.minimax.test/anthropic",
     default: true,
   });
-  expect(models.some((model) => model.model === "MiniMax-M2.7-highspeed")).toBe(true);
+  expect(models.some((model) => model.model === "MiniMax-M3[1m]")).toBe(true);
   expect(models.filter((model) => model.default)).toHaveLength(1);
 });
 
@@ -94,7 +94,7 @@ test("MiniMax provider marks an env-selected catalog model as default", () => {
     baseUrl: "https://catalog.minimax.test/anthropic",
     default: true,
   });
-  expect(models.find((model) => model.model === "MiniMax-M2.7-highspeed")?.default).toBeUndefined();
+  expect(models.find((model) => model.model === "MiniMax-M3[1m]")?.default).toBeUndefined();
   expect(models.filter((model) => model.default)).toHaveLength(1);
 });
 

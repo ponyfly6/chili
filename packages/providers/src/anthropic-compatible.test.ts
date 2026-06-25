@@ -331,6 +331,7 @@ test("passes AbortSignal through to fetch and requests streaming", async () => {
   const model = createMiniMaxM27HighspeedModel({
     apiKey: "test-key",
     baseUrl: MINIMAX_ANTHROPIC_BASE_URL,
+    env: {},
     fetch: fetchImpl,
     maxTokens: 64,
   });
