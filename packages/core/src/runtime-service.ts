@@ -21,6 +21,7 @@ import type {
 } from "@chili/protocol";
 import { REASONING_LEVELS, SERVICE_TIERS, timestampNow } from "@chili/protocol";
 import type { EventStore } from "@chili/store";
+import type { ToolAccessPolicy } from "@chili/tools";
 import { resolve } from "node:path";
 import {
   ContextWindowBuilder,
@@ -115,6 +116,7 @@ export interface SubmitPromptInput {
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
   serviceTier?: ServiceTier;
+  toolPolicy?: ToolAccessPolicy;
   signal?: AbortSignal;
 }
 
@@ -782,6 +784,7 @@ export class RuntimeService {
     if (input.prompt.contextualUser.length > 0) runInput.contextualUser = input.prompt.contextualUser;
     runInput.promptDebug = input.prompt.debug;
     if (input.toolMode) runInput.toolMode = input.toolMode;
+    if (input.input.toolPolicy) runInput.toolPolicy = input.input.toolPolicy;
     if (shouldSuppressExternalImageTools(input.input)) runInput.suppressExternalImageTools = true;
     if (shouldPreferExternalImageTools(input.input)) runInput.preferExternalImageTools = true;
     if (input.modelState.modelSelection) runInput.modelSelection = input.modelState.modelSelection;

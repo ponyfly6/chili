@@ -1,4 +1,4 @@
-export type CommandSource = "project" | "user" | "mcp";
+export type CommandSource = "project" | "user" | "mcp" | "builtin";
 
 export type CommandArgumentMode = "none" | "optional" | "required" | "variadic";
 
@@ -20,6 +20,8 @@ export interface PromptCommandMetadata {
   filePath?: string;
   model?: string;
   allowedTools?: readonly string[];
+  writeScope?: readonly string[];
+  executeScope?: readonly string[];
   subtask?: boolean | string;
 }
 

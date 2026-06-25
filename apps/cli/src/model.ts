@@ -14,6 +14,7 @@ import {
   listKnownModels,
   MINIMAX_ANTHROPIC_BASE_URL,
   MINIMAX_M27_HIGHSPEED_MODEL,
+  MINIMAX_M3_MODEL,
   MINIMAX_PROVIDER_ID,
   OPENAI_CODEX_BASE_URL,
   OPENAI_CODEX_DEFAULT_MODEL,
@@ -548,7 +549,7 @@ function readMiniMaxOptionsFromEnv(input: CliModelOptions): ProviderRouterOption
   const env = readMiniMaxEnvironment();
   const resolvedApiKey = input.apiKey ?? env.apiKey;
   const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? MINIMAX_ANTHROPIC_BASE_URL;
-  const resolvedModel = input.model ?? env.model ?? MINIMAX_M27_HIGHSPEED_MODEL;
+  const resolvedModel = input.model ?? env.model ?? MINIMAX_M3_MODEL;
 
   if (resolvedApiKey) options.apiKey = resolvedApiKey;
   if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;

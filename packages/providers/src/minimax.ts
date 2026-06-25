@@ -11,10 +11,11 @@ import {
   listKnownModels,
   MINIMAX_ANTHROPIC_BASE_URL,
   MINIMAX_M27_HIGHSPEED_MODEL,
+  MINIMAX_M3_MODEL,
   MINIMAX_PROVIDER_ID,
 } from "./models.js";
 
-export { MINIMAX_ANTHROPIC_BASE_URL, MINIMAX_M27_HIGHSPEED_MODEL, MINIMAX_PROVIDER_ID } from "./models.js";
+export { MINIMAX_ANTHROPIC_BASE_URL, MINIMAX_M27_HIGHSPEED_MODEL, MINIMAX_M3_MODEL, MINIMAX_PROVIDER_ID } from "./models.js";
 
 export interface MiniMaxModelOptions {
   apiKey?: string;
@@ -75,7 +76,7 @@ export class MiniMaxAnthropicProvider implements ChiliModelProvider {
 
   private defaultModel(): string {
     const env = readMiniMaxEnvironment(this.options.env);
-    return this.options.model ?? env.model ?? MINIMAX_M27_HIGHSPEED_MODEL;
+    return this.options.model ?? env.model ?? MINIMAX_M3_MODEL;
   }
 
   private defaultBaseUrl(): string {
@@ -111,7 +112,14 @@ export function createMiniMaxM27HighspeedModel(options: MiniMaxModelOptions = {}
     authScheme: options.authScheme ?? "bearer",
     maxTokens: options.maxTokens ?? DEFAULT_MINIMAX_MAX_TOKENS,
   };
-  if (descriptor?.inputCapabilities) modelOptions.inputCapabilities = descriptor.inputCapabilities;
+  // The M2.7-highspeed entry is text-only by design, even when the caller lets
+  // env pick a different catalog model. Pin input capabilities here so legacy
+  // "highspeed is text-only" callers keep their existing behavior.
+  if (model === MINIMAX_M27_HIGHSPEED_MODEL) {
+    modelOptions.inputCapabilities = ["text"];
+  } else if (descriptor?.inputCapabilities) {
+    modelOptions.inputCapabilities = descriptor.inputCapabilities;
+  }
   if (options.temperature !== undefined) modelOptions.temperature = options.temperature;
   if (options.fetch !== undefined) modelOptions.fetch = options.fetch;
   if (options.headers !== undefined) modelOptions.headers = options.headers;

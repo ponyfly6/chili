@@ -1,6 +1,7 @@
 import type { ModelCost, ModelDescriptor } from "./types.js";
 
 export const MINIMAX_PROVIDER_ID = "minimax";
+export const MINIMAX_M3_MODEL = "MiniMax-M3[1m]";
 export const MINIMAX_M27_MODEL = "MiniMax-M2.7";
 export const MINIMAX_M27_HIGHSPEED_MODEL = "MiniMax-M2.7-highspeed";
 export const MINIMAX_ANTHROPIC_BASE_URL = "https://api.minimaxi.com/anthropic";
@@ -150,11 +151,34 @@ const BUILTIN_MODELS = [
   },
   {
     provider: MINIMAX_PROVIDER_ID,
+    model: MINIMAX_M3_MODEL,
+    displayName: "MiniMax M3 1M",
+    apiFamily: "anthropic-messages",
+    baseUrl: MINIMAX_ANTHROPIC_BASE_URL,
+    default: true,
+    inputCapabilities: ["text", "image"],
+    contextWindowTokens: 1000000,
+    maxOutputTokens: 32768,
+    capabilities: {
+      streaming: true,
+      reasoning: true,
+      toolCalls: true,
+      toolCallDeltas: true,
+      usage: true,
+      responseId: true,
+    },
+    compatibility: {
+      messages: {
+        supportsEagerToolInputStreaming: true,
+      },
+    },
+  },
+  {
+    provider: MINIMAX_PROVIDER_ID,
     model: MINIMAX_M27_HIGHSPEED_MODEL,
     displayName: MINIMAX_M27_HIGHSPEED_MODEL,
     apiFamily: "anthropic-messages",
     baseUrl: MINIMAX_ANTHROPIC_BASE_URL,
-    default: true,
     inputCapabilities: ["text"],
     contextWindowTokens: 204800,
     maxOutputTokens: 131072,

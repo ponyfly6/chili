@@ -96,8 +96,9 @@ interface CodexStreamPayload {
     status?: string;
     usage?: CodexUsage;
     model?: string;
-    error?: { message?: string; code?: string };
+    error?: CodexErrorPayload;
   };
+  error?: CodexErrorPayload | string;
   item?: CodexOutputItem;
   delta?: string;
   arguments?: string;
@@ -105,6 +106,17 @@ interface CodexStreamPayload {
   item_id?: string;
   code?: string;
   message?: string;
+}
+
+interface CodexErrorPayload {
+  message?: string;
+  code?: string;
+  type?: string;
+  param?: string;
+  request_id?: string;
+  requestId?: string;
+  plan_type?: string;
+  resets_at?: number;
 }
 
 interface CodexOutputItem {
@@ -302,13 +314,14 @@ export class OpenAICodexResponsesModel implements ChiliModel {
     for await (const event of readSseEvents(body, signal)) {
       if (event.data === "[DONE]") break;
       const payload = parseJson<CodexStreamPayload>(event.data, undefined);
+
+      if (event.event === "error" || payload?.type === "error") {
+        throw new Error(formatCodexStreamError(payload, event.data, "OpenAI Codex stream error"));
+      }
       if (!payload?.type) continue;
 
-      if (payload.type === "error") {
-        throw new Error(payload.message || payload.code || "OpenAI Codex stream error");
-      }
       if (payload.type === "response.failed") {
-        throw new Error(payload.response?.error?.message || "OpenAI Codex response failed");
+        throw new Error(formatCodexStreamError(payload, event.data, "OpenAI Codex response failed"));
       }
 
       if (payload.type === "response.created") {
@@ -678,7 +691,7 @@ function mapCodexFinishReason(status: string | undefined, sawToolCall: boolean):
 async function parseCodexErrorResponse(response: Response): Promise<string> {
   const raw = await response.text().catch(() => "");
   try {
-    const parsed = JSON.parse(raw) as { error?: { code?: string; type?: string; message?: string; plan_type?: string; resets_at?: number } };
+    const parsed = JSON.parse(raw) as { error?: CodexErrorPayload };
     const error = parsed.error;
     if (error) {
       const code = error.code || error.type || "";
@@ -688,12 +701,69 @@ async function parseCodexErrorResponse(response: Response): Promise<string> {
         const retry = minutes !== undefined ? ` Try again in ~${minutes} min.` : "";
         return `You have hit your ChatGPT usage limit${plan}.${retry}`.trim();
       }
-      return error.message || raw || `OpenAI Codex request failed with HTTP ${response.status}`;
+      return formatCodexError(error) || raw || `OpenAI Codex request failed with HTTP ${response.status}`;
     }
   } catch {
     // Fall back to raw text below.
   }
   return raw || `OpenAI Codex request failed with HTTP ${response.status}`;
+}
+
+function formatCodexStreamError(
+  payload: CodexStreamPayload | undefined,
+  raw: string,
+  fallback: string,
+): string {
+  return codexPayloadErrorMessage(payload) ?? rawCodexErrorMessage(raw) ?? fallback;
+}
+
+function codexPayloadErrorMessage(payload: CodexStreamPayload | undefined): string | undefined {
+  if (!payload) return undefined;
+  return firstNonEmptyString(
+    formatCodexError(payload.error),
+    formatCodexError(payload.response?.error),
+    payload.message,
+    payload.code,
+  );
+}
+
+function formatCodexError(error: CodexErrorPayload | string | undefined): string | undefined {
+  if (!error) return undefined;
+  if (typeof error === "string") return nonEmptyString(error);
+
+  const message = nonEmptyString(error.message);
+  const code = nonEmptyString(error.code);
+  const type = nonEmptyString(error.type);
+  const param = nonEmptyString(error.param);
+  const requestId = nonEmptyString(error.request_id ?? error.requestId);
+  const primary = message ?? code ?? type;
+  if (!primary) return undefined;
+
+  const details: string[] = [];
+  if (code && code !== primary && !primary.includes(code)) details.push(`code: ${code}`);
+  if (type && type !== primary && type !== code && !primary.includes(type)) details.push(`type: ${type}`);
+  if (param && !primary.includes(param)) details.push(`param: ${param}`);
+  if (requestId && !primary.includes(requestId)) details.push(`request id: ${requestId}`);
+  return details.length > 0 ? `${primary} (${details.join(", ")})` : primary;
+}
+
+function rawCodexErrorMessage(raw: string): string | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === "[DONE]") return undefined;
+  return trimmed;
+}
+
+function firstNonEmptyString(...values: Array<string | undefined>): string | undefined {
+  for (const value of values) {
+    const normalized = nonEmptyString(value);
+    if (normalized) return normalized;
+  }
+  return undefined;
+}
+
+function nonEmptyString(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 export function resolveOpenAICodexReasoningEffort(

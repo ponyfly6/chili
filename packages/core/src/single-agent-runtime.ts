@@ -15,7 +15,7 @@ import type {
 } from "@chili/protocol";
 import { timestampNow } from "@chili/protocol";
 import type { EventStore } from "@chili/store";
-import type { ToolAccessPolicyResolver, ToolRegistry } from "@chili/tools";
+import type { ChiliToolDefinition, ToolAccessPolicy, ToolAccessPolicyResolver, ToolRegistry } from "@chili/tools";
 import { ToolExecutor, filterToolsByPolicy } from "@chili/tools";
 import {
   ContextCompactionService,
@@ -333,13 +333,13 @@ export class SingleAgentRuntime implements AgentRunner {
 
   private async visibleTools(input: RunTurnInput, turnId: TurnId) {
     if (input.toolMode === "disabled") return [];
-    const policy = await this.options.toolPolicyResolver?.resolve({
+    const resolvedPolicy = await this.options.toolPolicyResolver?.resolve({
       sessionId: input.sessionId,
       threadId: input.threadId,
       turnId,
       cwd: input.cwd,
     });
-    let tools = filterToolsByPolicy(this.options.toolRegistry.list(), policy);
+    let tools = filterToolsByPolicies(this.options.toolRegistry.list(), input.toolPolicy, resolvedPolicy);
     if (input.preferExternalImageTools && tools.some(isExternalImageUnderstandingTool)) {
       tools = tools.filter((tool) => !isDirectImageBlockTool(tool));
       return tools;
@@ -789,6 +789,9 @@ export class SingleAgentRuntime implements AgentRunner {
       input: toolCall.input,
       cwd: input.cwd,
     };
+    if (input.toolPolicy) {
+      Object.assign(executeInput, { policy: input.toolPolicy });
+    }
     if (input.signal) {
       Object.assign(executeInput, { signal: input.signal });
     }
@@ -988,6 +991,16 @@ function isModelMetadataEvent(
   event: Extract<ModelStreamEvent, { type: "metadata" | "finish" }>,
 ): event is Extract<ModelStreamEvent, { type: "metadata" }> {
   return "type" in event && event.type === "metadata";
+}
+
+function filterToolsByPolicies(
+  tools: readonly ChiliToolDefinition[],
+  ...policies: readonly (ToolAccessPolicy | undefined)[]
+): ChiliToolDefinition[] {
+  return policies.reduce(
+    (current, policy) => filterToolsByPolicy(current, policy),
+    [...tools],
+  );
 }
 
 function renderContextSummary(result: ContextCompactionResult): string {

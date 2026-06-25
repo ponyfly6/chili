@@ -437,7 +437,7 @@ function resolveMcpCommand(commands: readonly CommandDefinition[], name: string,
   if (resolved.status !== "matched") return undefined;
   const run = async (): Promise<PromptCommandRunResult> => {
     const result = await resolved.command.run({}, resolved.args);
-    return { prompt: result.prompt, command: descriptorForCommand(resolved.command) };
+    return { prompt: result.prompt, command: descriptorForCommand(resolved.command), metadata: result.metadata };
   };
   return run();
 }

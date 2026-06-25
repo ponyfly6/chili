@@ -1,4 +1,5 @@
 import type { MessageId, MessageImageContent, ModelSelection, ModelUsage, ReasoningLevel, ServiceTier, SessionId, ThreadId, TurnId } from "@chili/protocol";
+import type { ToolAccessPolicy } from "@chili/tools";
 import type { ContextUsage } from "./context/index.js";
 import type { PromptDebugManifest } from "./prompt/index.js";
 
@@ -25,6 +26,7 @@ export interface RunTurnInput {
   developer?: string[];
   contextualUser?: string[];
   promptDebug?: PromptDebugManifest;
+  toolPolicy?: ToolAccessPolicy;
   toolMode?: "auto" | "disabled";
   suppressExternalImageTools?: boolean;
   preferExternalImageTools?: boolean;

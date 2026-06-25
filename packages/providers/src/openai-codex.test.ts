@@ -412,6 +412,7 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
     reasoningEffort: "medium",
     apiKey: token,
     fetch: fetchImpl,
+    env: {},
   });
   const events = await collect(
     model.stream({
@@ -501,6 +502,81 @@ test("sends OpenAI-compatible Codex requests without ChatGPT account headers", a
   expect(events).toContainEqual({ type: "text_delta", text: "ok", index: 0 });
 });
 
+test("surfaces nested OpenAI Codex SSE error details", async () => {
+  const model = new OpenAICodexResponsesModel({
+    model: "gpt-test",
+    apiKey: jwtWithAccount("acct_test"),
+    fetch: sseFetch([
+      data({ type: "response.created", response: { id: "resp_error", model: "gpt-test" } }),
+      data({
+        type: "error",
+        error: {
+          message: "Request too large for model",
+          code: "context_length_exceeded",
+          type: "invalid_request_error",
+          param: "input",
+          request_id: "req_sse_1",
+        },
+      }),
+    ]),
+    env: {},
+  });
+
+  await expect(collect(model.stream({ messages: [], tools: [], system: [] }))).rejects.toThrow(
+    "Request too large for model (code: context_length_exceeded, type: invalid_request_error, param: input, request id: req_sse_1)",
+  );
+});
+
+test("surfaces OpenAI Codex response.failed error details", async () => {
+  const model = new OpenAICodexResponsesModel({
+    model: "gpt-test",
+    apiKey: jwtWithAccount("acct_test"),
+    fetch: sseFetch([
+      data({
+        type: "response.failed",
+        response: {
+          id: "resp_failed",
+          model: "gpt-test",
+          status: "failed",
+          error: {
+            message: "Rate limit reached",
+            code: "rate_limit_exceeded",
+            request_id: "req_failed_1",
+          },
+        },
+      }),
+    ]),
+    env: {},
+  });
+
+  await expect(collect(model.stream({ messages: [], tools: [], system: [] }))).rejects.toThrow(
+    "Rate limit reached (code: rate_limit_exceeded, request id: req_failed_1)",
+  );
+});
+
+test("surfaces OpenAI Codex HTTP error details", async () => {
+  const model = new OpenAICodexResponsesModel({
+    model: "gpt-test",
+    apiKey: jwtWithAccount("acct_test"),
+    fetch: (async () =>
+      new Response(JSON.stringify({
+        error: {
+          message: "Invalid token",
+          code: "invalid_api_key",
+          request_id: "req_http_1",
+        },
+      }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch,
+    env: {},
+  });
+
+  await expect(collect(model.stream({ messages: [], tools: [], system: [] }))).rejects.toThrow(
+    "Invalid token (code: invalid_api_key, request id: req_http_1)",
+  );
+});
+
 async function collect(stream: AsyncIterable<ModelStreamEvent>): Promise<ModelStreamEvent[]> {
   const events: ModelStreamEvent[] = [];
   for await (const event of stream) events.push(event);
@@ -525,6 +601,14 @@ function message(role: Message["role"], parts: Array<Record<string, unknown>>): 
 
 function data(payload: unknown): string {
   return `data: ${JSON.stringify(payload)}\n\n`;
+}
+
+function sseFetch(events: string[]): typeof fetch {
+  return (async () =>
+    new Response(streamText(events.join("")), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    })) as unknown as typeof fetch;
 }
 
 function streamText(text: string): ReadableStream<Uint8Array> {

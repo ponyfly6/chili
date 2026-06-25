@@ -1227,10 +1227,12 @@ test("Ctrl+V pastes clipboard text into the prompt", async () => {
 
   try {
     await press(app, () => app.mockInput.pressKey("v", { ctrl: true }));
-    expect(app.captureCharFrame()).toContain("from clipboard");
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("from");
+    expect(frame).toContain("clipboard");
 
     await press(app, () => app.mockInput.pressEnter());
-    expect(submitted).toEqual(["from clipboard"]);
+    expect(submitted).toEqual(["from\nclipboard"]);
   } finally {
     app.renderer.destroy();
   }
@@ -1365,10 +1367,68 @@ test("terminal bracketed paste inserts text into the prompt", async () => {
     await Bun.sleep(60);
     await app.renderOnce();
 
-    expect(app.captureCharFrame()).toContain("terminal paste");
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("terminal");
+    expect(frame).toContain("paste");
 
     await press(app, () => app.mockInput.pressEnter());
-    expect(submitted).toEqual(["terminal paste"]);
+    expect(submitted).toEqual(["terminal\npaste"]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("large multiline paste uses a prompt placeholder but submits and displays the original text", async () => {
+  const pasted = Array.from({ length: 12 }, (_, index) => `line ${index + 1}`).join("\n");
+  const submitted: Array<{ text: string; options: Parameters<ChatRuntimeState["submitPrompt"]>[1] }> = [];
+  const clipboard = fakeClipboard({
+    readText: async () => pasted,
+  });
+  const app = await mountShell(teamLiveFixture(), {
+    clipboard,
+    runtime: {
+      submitPrompt: async (text, options) => {
+        submitted.push({ text, options });
+        return true;
+      },
+    },
+  });
+
+  try {
+    await press(app, () => app.mockInput.pressKey("v", { ctrl: true }));
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("[Pasted ~12 lines]");
+    expect(frame).not.toContain("line 12");
+
+    await typeText(app, "评价一下");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(submitted).toHaveLength(1);
+    expect(submitted[0]?.text).toBe(`${pasted}评价一下`);
+    expect(submitted[0]?.options?.displayText).toBeUndefined();
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("Ctrl+J inserts a newline in the prompt", async () => {
+  const submitted: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async (text) => {
+        submitted.push(text);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "first");
+    await press(app, () => app.mockInput.pressKey("j", { ctrl: true }));
+    await typeText(app, "second");
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(submitted).toEqual(["first\nsecond"]);
   } finally {
     app.renderer.destroy();
   }

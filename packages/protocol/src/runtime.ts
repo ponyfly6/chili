@@ -77,7 +77,7 @@ export interface RuntimePermissionConfig {
   profiles: RuntimePermissionProfileDescriptor[];
 }
 
-export type RuntimePromptCommandSource = "project" | "user" | "mcp";
+export type RuntimePromptCommandSource = "project" | "user" | "mcp" | "builtin";
 
 export interface RuntimePromptCommandDescriptor {
   name: string;

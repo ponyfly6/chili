@@ -28,7 +28,7 @@ import { execFile } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { cleanClipboardText, promptClipboardText, systemClipboard, type ClipboardAccess, type ClipboardImage } from "./clipboard.js";
+import { cleanClipboardText, systemClipboard, type ClipboardAccess, type ClipboardImage } from "./clipboard.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import { teamLiveModel, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
 import { useChatRuntime, type ChatApprovalGrantScope, type ChatRuntimeState } from "./useChatRuntime.js";
@@ -153,6 +153,8 @@ const LOCAL_ITEM_TTL_MS = 4_000;
 const USER_SHELL_TIMEOUT_MS = 60 * 60 * 1_000;
 const USER_SHELL_OUTPUT_LIMIT_BYTES = 256_000;
 const MAX_PASTED_IMAGE_BASE64_CHARS = 20 * 1024 * 1024;
+const PROMPT_TEXT_PASTE_LINE_THRESHOLD = 8;
+const PROMPT_TEXT_PASTE_CHAR_THRESHOLD = 1_000;
 const SLASH_COMPLETION_LIMIT = 64;
 export const CTRL_C_EXIT_CONFIRM_MS = 2_000;
 
@@ -239,6 +241,8 @@ export function ChatShellSurface(props: {
   const [promptParts, setPromptParts] = useState<PromptPart[]>([{ type: "text", text: "" }]);
   const [promptInputResetKey, setPromptInputResetKey] = useState(0);
   const [pastedImages, setPastedImages] = useState<Record<number, PastedPromptImage>>({});
+  const pastedTextByMarkerRef = useRef<Map<string, string>>(new Map());
+  const nextPastedTextMarkerIdRef = useRef(2);
   const nextPastedImageIdRef = useRef(1);
   const [skillMentionBindings, setSkillMentionBindings] = useState<RuntimeSkillMention[]>([]);
   const [localItems, setLocalItems] = useState<LocalTranscriptItem[]>([]);
@@ -322,6 +326,7 @@ export function ChatShellSurface(props: {
   const transcriptLineCount = useMemo(() => estimatedTranscriptLineCount(props.runtime.chatView.items, deferredLocalItems, scrollEstimateWidth), [deferredLocalItems, props.runtime.chatView.items, scrollEstimateWidth]);
   const previousTranscriptLineCount = useRef<number | undefined>(undefined);
   const prompt = promptText(promptParts);
+  const expandedPrompt = expandedPromptText(promptParts);
   const shellInputActive = prompt.startsWith("!");
   const history = usePromptHistory();
   const authManualPromptRef = useRef<AuthManualPrompt | undefined>(undefined);
@@ -370,11 +375,15 @@ export function ChatShellSurface(props: {
   const selectedCompletionIndex = clampIndex(completionIndex, completions.length);
   const paletteItems = slashCompletions(commands, slashContext, "/", SLASH_COMPLETION_LIMIT);
   const firstApproval = props.runtime.chatView.pendingApprovals[0];
-  const setPrompt = useMemo(() => setPromptText(setPromptParts), []);
+  const setPrompt = useMemo(() => setPromptText(setPromptParts, pastedTextByMarkerRef), []);
   const historyPromptValueRef = useRef<string | undefined>(undefined);
   const updateAcceptedCompletionPrompt = useCallback((value: string | undefined) => {
     acceptedCompletionPromptRef.current = value;
     setAcceptedCompletionPrompt(value);
+  }, []);
+  const clearPromptAttachments = useCallback(() => {
+    pastedTextByMarkerRef.current.clear();
+    setPastedImages({});
   }, []);
   const clearPromptInput = useCallback((clearedText: string) => {
     clearedPromptTextRef.current = clearedText;
@@ -383,10 +392,10 @@ export function ChatShellSurface(props: {
     history.resetNavigation();
     setCompletionIndex(0);
     setSkillMentionBindings([]);
-    setPastedImages({});
+    clearPromptAttachments();
     setPrompt("");
     setPromptInputResetKey((current) => current + 1);
-  }, [history, setPrompt, updateAcceptedCompletionPrompt]);
+  }, [clearPromptAttachments, history, setPrompt, updateAcceptedCompletionPrompt]);
   const handlePromptChange = useCallback((value: string) => {
     const clearedText = clearedPromptTextRef.current;
     if (clearedText !== undefined) {
@@ -446,14 +455,15 @@ export function ChatShellSurface(props: {
   const submitAuthManualInput = useCallback(() => {
     const manual = authManualPromptRef.current;
     if (!manual) return false;
-    const value = prompt.trim();
+    const value = expandedPrompt.trim();
     if (!value) return true;
     manual.resolve(value);
     setAuthManualPrompt(undefined);
     setPrompt("");
+    clearPromptAttachments();
     appendLocalItem("info", "Using pasted OpenAI authorization response...");
     return true;
-  }, [appendLocalItem, prompt, setAuthManualPrompt, setPrompt]);
+  }, [appendLocalItem, clearPromptAttachments, expandedPrompt, setAuthManualPrompt, setPrompt]);
   const openThemePicker = useCallback(() => {
     const index = themeOptionIndex(themeOptions, themeId);
     setModelPicker(undefined);
@@ -673,12 +683,23 @@ export function ChatShellSurface(props: {
     if (!slashCompletionOpen) return false;
     const completion = slashCompletionItems[selectedCompletionIndex] ?? slashCompletionItems[0];
     if (!completion) return false;
+    const promptAtSelection = prompt;
+    let promptUpdated = false;
+    const trackedSlashActions: SlashActions = {
+      ...slashActions,
+      setPrompt: (value) => {
+        promptUpdated = true;
+        slashActions.setPrompt(value);
+      },
+    };
     updateAcceptedCompletionPrompt(undefined);
     history.resetNavigation();
-    setPrompt("");
-    void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, slashActions);
+    void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, trackedSlashActions)
+      .then(() => {
+        if (!promptUpdated) setPrompt((current) => current === promptAtSelection ? "" : current);
+      });
     return true;
-  }, [commands, history, props.model, props.runtime, selectedCompletionIndex, setPrompt, slashActions, slashCompletionItems, slashCompletionOpen, slashContext, updateAcceptedCompletionPrompt]);
+  }, [commands, history, prompt, props.model, props.runtime, selectedCompletionIndex, setPrompt, slashActions, slashCompletionItems, slashCompletionOpen, slashContext, updateAcceptedCompletionPrompt]);
   const runSelectedSkillCompletion = useCallback(() => {
     if (!skillCompletionOpen || !skillTrigger) return false;
     const completion = skillCompletionItems[selectedCompletionIndex] ?? skillCompletionItems[0];
@@ -872,6 +893,18 @@ export function ChatShellSurface(props: {
           : undefined;
   const promptDisabled = Boolean(disabledReason);
   const clipboard = props.clipboard ?? systemClipboard;
+  const registerPromptTextPaste = useCallback((value: string) => {
+    const text = cleanClipboardText(value) ?? "";
+    if (!text) return "";
+    if (!shouldCollapsePromptTextPaste(text)) return text;
+    const marker = uniquePromptTextPasteMarker(
+      promptTextPasteMarker(text),
+      pastedTextByMarkerRef.current,
+      nextPastedTextMarkerIdRef,
+    );
+    pastedTextByMarkerRef.current.set(marker, text);
+    return marker;
+  }, []);
   const readPromptClipboard = useCallback(async () => {
     const image = await clipboard.readImage?.().catch(() => undefined);
     if (image) {
@@ -901,7 +934,7 @@ export function ChatShellSurface(props: {
         return undefined;
       }
     }
-    const pasted = promptClipboardText(await clipboard.readText().catch(() => "") ?? "");
+    const pasted = cleanClipboardText(await clipboard.readText().catch(() => "") ?? "") ?? "";
     if (!pasted) {
       appendLocalItem("error", "Clipboard is empty.");
       return undefined;
@@ -1275,11 +1308,12 @@ export function ChatShellSurface(props: {
           onPromptChange={handlePromptChange}
           onExitShortcut={handleCtrlCExitShortcut}
           onPasteShortcut={readPromptClipboard}
+          onTextPaste={registerPromptTextPaste}
           onSubmit={() => {
             if (submitAuthManualInput()) return;
             if (runSelectedSkillCompletion()) return;
             if (runSelectedSlashCompletion()) return;
-            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings, props.skills ?? [], pastedImages, () => setPastedImages({}));
+            void submitPrompt(prompt, expandedPrompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings, props.skills ?? [], pastedImages, clearPromptAttachments);
           }}
           completions={completions}
           completionOpen={skillCompletionOpen || slashCompletionOpen}
@@ -1316,12 +1350,13 @@ export function ChatShellSurface(props: {
           onPromptChange={handlePromptChange}
           onExitShortcut={handleCtrlCExitShortcut}
           onPasteShortcut={readPromptClipboard}
+          onTextPaste={registerPromptTextPaste}
           onSubmit={() => {
             if (submitAuthManualInput()) return;
             if (runSelectedSkillCompletion()) return;
             if (runSelectedSlashCompletion()) return;
             scrollMessageToBottom();
-            void submitPrompt(prompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings, props.skills ?? [], pastedImages, () => setPastedImages({}));
+            void submitPrompt(prompt, expandedPrompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings, props.skills ?? [], pastedImages, clearPromptAttachments);
           }}
           onTranscriptScroll={(event) => {
             const direction = event.scroll?.direction;
@@ -1381,6 +1416,7 @@ function HomeScreen(props: {
   onPromptChange: (value: string) => void;
   onExitShortcut: () => void;
   onPasteShortcut: () => Promise<string | undefined>;
+  onTextPaste: (value: string) => string;
   onSubmit: () => void;
   completions: readonly SlashCompletion[];
   completionOpen: boolean;
@@ -1439,6 +1475,7 @@ function HomeScreen(props: {
           onPromptChange={props.onPromptChange}
           onExitShortcut={props.onExitShortcut}
           onPasteShortcut={props.onPasteShortcut}
+          onTextPaste={props.onTextPaste}
           onSubmit={props.onSubmit}
           completions={props.completions}
           completionOpen={props.completionOpen}
@@ -1469,6 +1506,7 @@ function SessionScreen(props: {
   onPromptChange: (value: string) => void;
   onExitShortcut: () => void;
   onPasteShortcut: () => Promise<string | undefined>;
+  onTextPaste: (value: string) => string;
   onSubmit: () => void;
   onTranscriptScroll: (event: MouseEvent) => void;
   localItems: readonly LocalTranscriptItem[];
@@ -1522,6 +1560,8 @@ function SessionScreen(props: {
     feedback,
     maxCommandItems,
     shellMode: props.prompt.startsWith("!"),
+    prompt: props.prompt.startsWith("!") ? props.prompt.slice(1) : props.prompt,
+    width: promptWidth,
   });
   const messagePaneHeight = Math.max(1, props.height - approvalHeight - themePickerHeight - selectorHeight - promptHeight - footerHeight);
   const transcriptChrome = props.height < 16 ? 6 : 3;
@@ -1589,6 +1629,7 @@ function SessionScreen(props: {
           onPromptChange={props.onPromptChange}
           onExitShortcut={props.onExitShortcut}
           onPasteShortcut={props.onPasteShortcut}
+          onTextPaste={props.onTextPaste}
           onSubmit={props.onSubmit}
           completions={props.completions}
           completionOpen={props.completionOpen}
@@ -2127,6 +2168,7 @@ function AgentsView(props: { model: TeamLiveView; theme: TuiTheme }) {
 
 async function submitPrompt(
   prompt: string,
+  expandedPrompt: string,
   commands: readonly SlashCommand[],
   ctx: SlashCommandContext,
   model: TeamLiveView,
@@ -2136,13 +2178,15 @@ async function submitPrompt(
   skillMentionBindings: readonly RuntimeSkillMention[] = [],
   skills: readonly SkillSummary[] = [],
   pastedImages: Readonly<Record<number, PastedPromptImage>> = {},
-  clearPastedImages?: () => void,
+  clearPromptAttachments?: () => void,
 ): Promise<void> {
-  const trimmed = prompt.trim();
-  if (!trimmed) return;
-  if (trimmed.startsWith("!")) {
+  const visibleTrimmed = prompt.trim();
+  const trimmed = expandedPrompt.trim();
+  if (!visibleTrimmed && !trimmed) return;
+  const commandPrompt = visibleTrimmed || trimmed;
+  if (commandPrompt.startsWith("!")) {
     actions.setPrompt("");
-    clearPastedImages?.();
+    clearPromptAttachments?.();
     const command = trimmed.slice(1).trim();
     if (!command) {
       actions.appendLocalItem("info", "Prefix a command with ! to run it locally\nExample: !ls", { persistent: true });
@@ -2152,16 +2196,16 @@ async function submitPrompt(
     await runUserShellCommand(command, actions.cwd, actions);
     return;
   }
-  if (trimmed.startsWith("/")) {
-    const slashMatch = resolveSlashCommand(commands, trimmed);
+  if (commandPrompt.startsWith("/")) {
+    const slashMatch = resolveSlashCommand(commands, commandPrompt);
     if (slashMatch) {
       actions.setPrompt("");
-      clearPastedImages?.();
+      clearPromptAttachments?.();
       await runResolvedSlashCommand(slashMatch, ctx, model, runtime, actions);
       return;
     }
-    if (isSlashCommandCandidate(commands, ctx, trimmed)) {
-      actions.appendLocalItem("error", `Unknown command: ${trimmed}`);
+    if (isSlashCommandCandidate(commands, ctx, commandPrompt)) {
+      actions.appendLocalItem("error", `Unknown command: ${commandPrompt}`);
       return;
     }
   }
@@ -2169,27 +2213,27 @@ async function submitPrompt(
     actions.appendLocalItem("error", runtime.submitBlockedReason ?? "Session is not ready for another prompt.");
     return;
   }
-  for (const warning of localSkillMentionWarnings(trimmed, skills, skillMentionBindings)) {
+  for (const warning of localSkillMentionWarnings(visibleTrimmed, skills, skillMentionBindings)) {
     actions.appendLocalItem("info", warning);
   }
-  const images = promptImagesForSubmit(trimmed, pastedImages);
+  const images = promptImagesForSubmit(visibleTrimmed, pastedImages);
   const modelCandidates = ctx.modelCandidates ?? [];
   const supportsImages = modelSupportsImages(ctx.modelSelection, modelCandidates);
   const text = images.length > 0 && !supportsImages
-    ? textWithImagePathContext(trimmed, promptReferencedImages(trimmed, pastedImages))
+    ? textWithImagePathContext(trimmed, promptReferencedImages(visibleTrimmed, pastedImages))
     : trimmed;
   const accepted = await runtime.submitPrompt(text, {
     ...(ctx.modelSelection ? { modelSelection: ctx.modelSelection } : {}),
     ...(ctx.reasoningLevel ? { reasoningLevel: ctx.reasoningLevel } : {}),
     ...(ctx.serviceTier ? { serviceTier: ctx.serviceTier } : {}),
-    ...(text !== trimmed ? { displayText: trimmed } : {}),
+    ...(text !== trimmed ? { displayText: visibleTrimmed } : {}),
     ...(images.length > 0 && supportsImages ? { images } : {}),
-    ...activeSkillMentionsOption(trimmed, skillMentionBindings),
+    ...activeSkillMentionsOption(visibleTrimmed, skillMentionBindings),
   });
   if (accepted) {
     onAccepted?.(trimmed);
     actions.setPrompt("");
-    clearPastedImages?.();
+    clearPromptAttachments?.();
   }
 }
 
@@ -2989,18 +3033,84 @@ export function isWithinCtrlCExitWindow(previousPressMs: number | undefined, now
   return elapsedMs >= 0 && elapsedMs <= CTRL_C_EXIT_CONFIRM_MS;
 }
 
-function setPromptText(setPromptParts: (value: PromptPart[] | ((current: PromptPart[]) => PromptPart[])) => void) {
+function setPromptText(
+  setPromptParts: (value: PromptPart[] | ((current: PromptPart[]) => PromptPart[])) => void,
+  pastedTextByMarkerRef: { current: Map<string, string> },
+) {
   return (value: string | ((current: string) => string)) => {
     setPromptParts((current) => {
       const currentText = promptText(current);
       const next = typeof value === "function" ? value(currentText) : value;
-      return [{ type: "text", text: next }];
+      const nextParts = reconcilePromptParts(next, pastedTextByMarkerRef.current);
+      prunePromptPasteMarkers(pastedTextByMarkerRef.current, nextParts);
+      return nextParts;
     });
   };
 }
 
 function promptText(parts: readonly PromptPart[]): string {
+  return parts.map((part) => part.type === "paste" ? part.marker : part.text).join("");
+}
+
+function expandedPromptText(parts: readonly PromptPart[]): string {
   return parts.map((part) => part.text).join("");
+}
+
+function reconcilePromptParts(text: string, pastedTextByMarker: ReadonlyMap<string, string>): PromptPart[] {
+  if (text.length === 0) return [{ type: "text", text: "" }];
+  const markers = Array.from(pastedTextByMarker.keys()).sort((left, right) => right.length - left.length);
+  if (markers.length === 0) return [{ type: "text", text }];
+
+  const parts: PromptPart[] = [];
+  let buffer = "";
+  let index = 0;
+  while (index < text.length) {
+    const marker = markers.find((candidate) => text.startsWith(candidate, index));
+    if (!marker) {
+      buffer += text[index] ?? "";
+      index += 1;
+      continue;
+    }
+    if (buffer) {
+      parts.push({ type: "text", text: buffer });
+      buffer = "";
+    }
+    parts.push({ type: "paste", marker, text: pastedTextByMarker.get(marker) ?? marker });
+    index += marker.length;
+  }
+  if (buffer) parts.push({ type: "text", text: buffer });
+  return parts.length > 0 ? parts : [{ type: "text", text: "" }];
+}
+
+function prunePromptPasteMarkers(pastedTextByMarker: Map<string, string>, parts: readonly PromptPart[]): void {
+  const active = new Set(parts.flatMap((part) => part.type === "paste" ? [part.marker] : []));
+  for (const marker of pastedTextByMarker.keys()) {
+    if (!active.has(marker)) pastedTextByMarker.delete(marker);
+  }
+}
+
+function shouldCollapsePromptTextPaste(text: string): boolean {
+  const lineCount = text.split("\n").length;
+  return lineCount >= PROMPT_TEXT_PASTE_LINE_THRESHOLD || text.length >= PROMPT_TEXT_PASTE_CHAR_THRESHOLD;
+}
+
+function promptTextPasteMarker(text: string): string {
+  const lineCount = text.split("\n").length;
+  if (lineCount >= PROMPT_TEXT_PASTE_LINE_THRESHOLD) return `[Pasted ~${lineCount} lines]`;
+  return `[Pasted ~${text.length} chars]`;
+}
+
+function uniquePromptTextPasteMarker(
+  marker: string,
+  pastedTextByMarker: ReadonlyMap<string, string>,
+  nextIdRef: { current: number },
+): string {
+  if (!pastedTextByMarker.has(marker)) return marker;
+  let next: string;
+  do {
+    next = marker.replace(/\]$/, ` #${nextIdRef.current++}]`);
+  } while (pastedTextByMarker.has(next));
+  return next;
 }
 
 function imagePlaceholder(id: number): string {

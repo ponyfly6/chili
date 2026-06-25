@@ -73,7 +73,7 @@ import type {
   UpdateTeamTaskInput,
 } from "@chili/core";
 import type { EventPublisher, EventStore } from "@chili/store";
-import type { PromptCommandControl } from "./commands.js";
+import type { PromptCommandControl, PromptCommandRunResult } from "./commands.js";
 import { PromptCommandAmbiguousError, PromptCommandNotFoundError } from "./commands.js";
 import type {
   AgentMailboxQuery,
@@ -623,6 +623,8 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
           ...(body.reasoningLevel ? { reasoningLevel: body.reasoningLevel } : {}),
           ...(body.serviceTier ? { serviceTier: body.serviceTier } : {}),
         });
+        const toolPolicy = commandToolPolicy(command.metadata);
+        if (toolPolicy) input.toolPolicy = toolPolicy;
         options.service.submitPromptAsync(input, options.onBackgroundError);
         const accepted: RuntimePromptAccepted = {
           status: "accepted",
@@ -1109,6 +1111,24 @@ function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody, parsedIm
   if (isReasoningLevel(body.reasoningLevel)) input.reasoningLevel = body.reasoningLevel;
   if (isServiceTier(body.serviceTier)) input.serviceTier = body.serviceTier;
   return input;
+}
+
+function commandToolPolicy(metadata: PromptCommandRunResult["metadata"]): SubmitPromptInput["toolPolicy"] | undefined {
+  const allowedTools = metadataStringArray(metadata.allowedTools);
+  const writeScope = metadataStringArray(metadata.writeScope);
+  const executeScope = metadataStringArray(metadata.executeScope);
+  if (!allowedTools && !writeScope && !executeScope) return undefined;
+  return {
+    ...(allowedTools ? { allowedTools } : {}),
+    ...(writeScope ? { writeScope } : {}),
+    ...(executeScope ? { executeScope } : {}),
+  };
+}
+
+function metadataStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const strings = value.map((item) => typeof item === "string" ? item.trim() : "").filter(Boolean);
+  return strings.length > 0 ? strings : undefined;
 }
 
 function goalSetInput(sessionId: SessionId, body: GoalBody): {
