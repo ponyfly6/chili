@@ -1,7 +1,6 @@
-export interface PromptPart {
-  type: "text";
-  text: string;
-}
+export type PromptPart =
+  | { type: "text"; text: string }
+  | { type: "paste"; marker: string; text: string };
 
 export type LocalTranscriptItem =
   | { id: string; kind: "local"; level: "info" | "error"; text: string; persistent?: boolean | undefined }
