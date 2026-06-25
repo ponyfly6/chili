@@ -1,13 +1,26 @@
-import type { InputRenderable, KeyEvent, PasteEvent } from "@opentui/core";
+import { decodePasteBytes, type KeyBinding, type KeyEvent, type PasteEvent, type TextareaRenderable } from "@opentui/core";
 import { useCallback, useLayoutEffect, useRef } from "react";
 import type { ChatRequestStatus } from "../useChatRuntime.js";
 import type { SlashCompletion } from "../slash/types.js";
 import type { TuiTheme } from "../theme/index.js";
-import { promptPasteBytes } from "../clipboard.js";
+import { cleanClipboardText } from "../clipboard.js";
 import { commandListHeight, DEFAULT_COMMAND_LIST_MAX_ITEMS, CommandList } from "./CommandList.js";
 
 export const PROMPT_PLACEHOLDER = 'Ask anything... "fix failing tests"';
 export const PROMPT_INPUT_HEIGHT = 3;
+const PROMPT_TEXTAREA_MIN_ROWS = 1;
+const PROMPT_TEXTAREA_MAX_ROWS = 3;
+const PROMPT_BORDER_HEIGHT = 2;
+const PROMPT_PREFIX_WIDTH = 3;
+const PROMPT_HORIZONTAL_PADDING = 2;
+const PROMPT_TEXTAREA_KEY_BINDINGS: KeyBinding[] = [
+  { name: "return", action: "submit" },
+  { name: "linefeed", action: "newline" },
+  { name: "j", ctrl: true, action: "newline" },
+  { name: "return", shift: true, action: "newline" },
+  { name: "return", ctrl: true, action: "newline" },
+  { name: "return", meta: true, action: "newline" },
+];
 
 export function PromptComposer(props: {
   width: number;
@@ -27,12 +40,13 @@ export function PromptComposer(props: {
   onSubmit: () => void;
   onExitShortcut?: (() => void) | undefined;
   onPasteShortcut?: (() => Promise<string | undefined>) | undefined;
+  onTextPaste?: ((value: string) => string) | undefined;
   feedback?: { status: ChatRequestStatus | string; message: string } | undefined;
   completionIndex: number;
   theme: TuiTheme;
   maxCommandItems?: number | undefined;
 }) {
-  const inputRef = useRef<InputRenderable | null>(null);
+  const inputRef = useRef<TextareaRenderable | null>(null);
   const colors = props.theme.colors;
   const shellMode = props.prompt.startsWith("!");
   const shellModeRef = useRef(shellMode);
@@ -42,17 +56,22 @@ export function PromptComposer(props: {
   const borderColor = props.disabled ? colors.input.disabledBorder : shellMode ? colors.status.info : colors.border.default;
   const inputTextColor = shellMode ? colors.accent.primary : colors.input.text;
   const placeholder = props.disabled && props.disabledReason ? props.disabledReason : PROMPT_PLACEHOLDER;
+  const inputWidth = Math.max(1, props.width - PROMPT_PREFIX_WIDTH - PROMPT_HORIZONTAL_PADDING - 1);
+  const promptRows = promptTextareaRows(promptValue, inputWidth);
+  const promptBoxHeight = promptRows + PROMPT_BORDER_HEIGHT;
   useLayoutEffect(() => {
     const input = inputRef.current;
-    if (!input || input.value === promptValue) return;
-    input.value = promptValue;
+    if (!input || input.plainText === promptValue) return;
+    input.setText(promptValue);
+    input.gotoBufferEnd();
     correctTrailingUnicodeCursor(input, promptValue);
   }, [promptValue]);
   const externalPromptValue = useCallback((value: string) => {
     if (shellModeRef.current && !value.startsWith("!")) return `!${value}`;
     return value;
   }, []);
-  const handlePromptInput = useCallback((value: string) => {
+  const handlePromptContentChange = useCallback(() => {
+    const value = inputRef.current?.plainText ?? "";
     props.onPromptChange(externalPromptValue(value));
     correctTrailingUnicodeCursor(inputRef.current, value);
   }, [externalPromptValue, props.onPromptChange]);
@@ -60,24 +79,39 @@ export function PromptComposer(props: {
     const input = inputRef.current;
     if (input) {
       input.insertText(value);
-      correctTrailingUnicodeCursor(input, input.value);
+      props.onPromptChange(externalPromptValue(input.plainText));
+      correctTrailingUnicodeCursor(input, input.plainText);
       return;
     }
     props.onPromptChange(externalPromptValue(`${promptValue}${value}`));
   }, [externalPromptValue, promptValue, props.onPromptChange]);
+  const preparePastedText = useCallback((value: string) => {
+    const cleaned = cleanClipboardText(value);
+    if (!cleaned) return "";
+    return props.onTextPaste?.(cleaned) ?? cleaned;
+  }, [props.onTextPaste]);
   const handlePromptPaste = useCallback((event: PasteEvent) => {
     event.preventDefault();
     event.stopPropagation();
-    const pasted = promptPasteBytes(event.bytes);
+    const pasted = preparePastedText(decodePasteBytes(event.bytes));
     if (!pasted) return;
     insertPromptText(pasted);
-  }, [insertPromptText]);
+  }, [insertPromptText, preparePastedText]);
+  useLayoutEffect(() => {
+    const input = inputRef.current;
+    if (!input) return;
+    const originalHandlePaste = input.handlePaste.bind(input);
+    input.handlePaste = handlePromptPaste;
+    return () => {
+      input.handlePaste = originalHandlePaste;
+    };
+  }, [handlePromptPaste]);
   const handlePromptKeyDown = useCallback((key: KeyEvent) => {
     if (key.eventType !== "press") return;
     if (key.ctrl && key.name === "c" && !key.shift && props.onExitShortcut) {
       key.preventDefault();
       key.stopPropagation();
-      if (promptValue.length > 0 && inputRef.current) inputRef.current.value = "";
+      if (promptValue.length > 0 && inputRef.current) inputRef.current.setText("");
       props.onExitShortcut();
       return;
     }
@@ -91,9 +125,10 @@ export function PromptComposer(props: {
     key.preventDefault();
     key.stopPropagation();
     void props.onPasteShortcut().then((pasted) => {
-      if (pasted) insertPromptText(pasted);
+      const prepared = pasted ? preparePastedText(pasted) : "";
+      if (prepared) insertPromptText(prepared);
     });
-  }, [insertPromptText, promptValue, props.onExitShortcut, props.onPasteShortcut, props.onPromptChange, shellMode]);
+  }, [insertPromptText, preparePastedText, promptValue, props.onExitShortcut, props.onPasteShortcut, props.onPromptChange, shellMode]);
   const maxCommandItems = props.maxCommandItems ?? DEFAULT_COMMAND_LIST_MAX_ITEMS;
   const compactCommands = props.width < 72;
   const height = promptComposerHeight({
@@ -103,6 +138,8 @@ export function PromptComposer(props: {
     paletteItems: props.paletteItems,
     feedback: props.feedback,
     maxCommandItems,
+    prompt: promptValue,
+    width: props.width,
   });
   return (
     <box width={props.width} height={height} flexDirection="column">
@@ -119,19 +156,21 @@ export function PromptComposer(props: {
       {shellMode ? (
         <text fg={colors.status.info} wrapMode="none" truncate>{"Shell"}</text>
       ) : null}
-      <box width="100%" height={PROMPT_INPUT_HEIGHT} border borderStyle="single" borderColor={borderColor} paddingX={1} alignItems="center">
+      <box width="100%" height={promptBoxHeight} border borderStyle="single" borderColor={borderColor} paddingX={1} alignItems="center">
         <text fg={props.disabled ? colors.input.disabledText : shellMode ? colors.status.info : colors.input.text} wrapMode="none" truncate>{promptPrefix}</text>
         {props.disabled ? (
           <text fg={colors.input.disabledText} wrapMode="none" truncate>{promptValue || placeholder}</text>
         ) : (
-          <input
+          <textarea
             key={props.resetKey ?? 0}
             ref={inputRef}
-            width={Math.max(1, props.width - 6)}
-            value={promptValue}
+            width={inputWidth}
+            height={promptRows}
+            initialValue={promptValue}
             placeholder={placeholder}
             focused={props.focused}
             showCursor={props.focused}
+            wrapMode="word"
             textColor={inputTextColor}
             focusedTextColor={inputTextColor}
             backgroundColor={colors.input.background}
@@ -139,10 +178,9 @@ export function PromptComposer(props: {
             placeholderColor={colors.input.placeholder}
             cursorColor={colors.input.cursor}
             cursorStyle={{ style: "block", blinking: true }}
-            onInput={handlePromptInput}
-            onPaste={handlePromptPaste}
+            keyBindings={PROMPT_TEXTAREA_KEY_BINDINGS}
+            onContentChange={handlePromptContentChange}
             onKeyDown={handlePromptKeyDown}
-            onChange={(value) => props.onPromptChange(externalPromptValue(value))}
             onSubmit={props.onSubmit}
           />
         )}
@@ -159,17 +197,32 @@ export function promptComposerHeight(input: {
   feedback?: unknown;
   maxCommandItems?: number | undefined;
   shellMode?: boolean | undefined;
+  prompt?: string | undefined;
+  width?: number | undefined;
 }): number {
   const maxCommandItems = input.maxCommandItems ?? DEFAULT_COMMAND_LIST_MAX_ITEMS;
   const commandItems = input.paletteOpen ? input.paletteItems : input.completions;
   const commandHeight = input.paletteOpen || input.completionOpen || input.completions.length > 0
     ? commandListHeight(commandItems, maxCommandItems)
     : 0;
-  return PROMPT_INPUT_HEIGHT + commandHeight + (input.feedback ? 1 : 0) + (input.shellMode ? 1 : 0);
+  const inputWidth = Math.max(1, (input.width ?? 80) - PROMPT_PREFIX_WIDTH - PROMPT_HORIZONTAL_PADDING - 1);
+  const promptRows = promptTextareaRows(input.prompt ?? "", inputWidth);
+  return promptRows + PROMPT_BORDER_HEIGHT + commandHeight + (input.feedback ? 1 : 0) + (input.shellMode ? 1 : 0);
 }
 
-function correctTrailingUnicodeCursor(input: InputRenderable | null, value: string): void {
-  if (!input || !value) return;
+function promptTextareaRows(value: string, width: number): number {
+  const normalizedWidth = Math.max(1, width);
+  const lines = value.length === 0 ? [""] : value.split("\n");
+  let rows = 0;
+  for (const line of lines) {
+    const lineWidth = terminalDisplayWidth(line);
+    rows += Math.max(1, Math.ceil(lineWidth / normalizedWidth));
+  }
+  return Math.min(PROMPT_TEXTAREA_MAX_ROWS, Math.max(PROMPT_TEXTAREA_MIN_ROWS, rows));
+}
+
+function correctTrailingUnicodeCursor(input: TextareaRenderable | null, value: string): void {
+  if (!input || !value || value.includes("\n")) return;
 
   // OpenTUI's input reports cursor offsets as UTF-16 positions after text input.
   // For wide Unicode graphemes (emoji, CJK), that places the native terminal
