@@ -54,6 +54,47 @@ test("does not retry aborted model requests", async () => {
   expect(store.items.some((event) => event.type === "turn.retry_scheduled")).toBe(false);
 });
 
+test("retries transient socket failures before assistant output", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  let modelCalls = 0;
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      modelCalls++;
+      yield { type: "metadata", provider: "openai-codex", model: "gpt-5.5" };
+      if (modelCalls === 1) {
+        throw new Error("The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()");
+      }
+      yield { type: "text_delta", text: "ok" };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+    }),
+    retryPolicy: { maxAttempts: 2, initialDelayMs: 0 },
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const result = await runtime.runTurn({
+    sessionId: "session_socket_retry" as SessionId,
+    threadId: "thread_socket_retry" as ThreadId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(modelCalls).toBe(2);
+  expect(textParts(store).map((part) => part.text).join("")).toBe("ok");
+  expect(store.items.some((event) => event.type === "turn.retry_scheduled" && event.payload.reason.includes("socket connection"))).toBe(true);
+});
+
 test("consumes rich model streams and executes tool calls after the stream finishes", async () => {
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();
