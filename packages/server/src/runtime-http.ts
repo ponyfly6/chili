@@ -1373,11 +1373,13 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
 
       const query = {
         limit: options.maxBacklogEvents,
+        tail: !options.afterEventId,
       } as {
         sessionId?: SessionId;
         threadId?: ThreadId;
         afterEventId?: string;
         limit: number;
+        tail: boolean;
       };
       if (options.sessionId) query.sessionId = options.sessionId;
       if (options.threadId) query.threadId = options.threadId;

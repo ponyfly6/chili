@@ -40,6 +40,7 @@ import type {
   ThreadGoalStatus,
   ThreadId,
   TimestampMs,
+  TurnId,
 } from "@chili/protocol";
 import type { RuntimeAgentsSnapshot } from "./agent-projection.js";
 import type {
@@ -89,6 +90,85 @@ test("serves sessions and event backlog over the runtime HTTP handler", async ()
   reader.releaseLock();
 
   expect(new TextDecoder().decode(chunk.value)).toContain("session.created");
+});
+
+test("event backlog includes tail events for long resumed sessions", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-runtime-tail-backlog-"));
+  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const handler = createRuntimeHttpHandler({ service, store, maxBacklogEvents: 5 });
+  const sessionId = "session_tail_backlog" as SessionId;
+  const threadId = "thread_tail_backlog" as ThreadId;
+
+  try {
+    await store.appendMany([
+      {
+        id: "event_tail_session",
+        type: "session.created",
+        time: 1 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { sessionId, cwd: "/repo" },
+      },
+      ...Array.from({ length: 5 }, (_, index): ChiliEvent => ({
+        id: `event_tail_started_${index}`,
+        type: "turn.started",
+        time: (2 + index) as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { turnId: `turn_tail_${index}` as TurnId },
+      })),
+      {
+        id: "event_tail_completed",
+        type: "turn.completed",
+        time: 10 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { turnId: "turn_tail_final" as TurnId, status: "failed" },
+      },
+      {
+        id: "event_tail_failed_status",
+        type: "session.status_changed",
+        time: 11 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          sessionId,
+          status: "failed",
+          turnId: "turn_tail_final" as TurnId,
+          reason: "unexpected EOF",
+        },
+      },
+    ]);
+
+    const controller = new AbortController();
+    const eventsResponse = await handler(
+      new Request(`http://chili.test/events?sessionId=${sessionId}&threadId=${threadId}`, {
+        signal: controller.signal,
+      }),
+    );
+    expect(eventsResponse.status).toBe(200);
+    const reader = eventsResponse.body?.getReader();
+    if (!reader) throw new Error("expected event stream body");
+
+    const chunks: string[] = [];
+    const decoder = new TextDecoder();
+    for (let index = 0; index < 5; index++) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      chunks.push(decoder.decode(chunk.value));
+    }
+    controller.abort();
+    reader.releaseLock();
+
+    const text = chunks.join("");
+    expect(text).toContain("event_tail_failed_status");
+    expect(text).toContain("unexpected EOF");
+  } finally {
+    baseStore.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("serves subagent runs and tasks through an event replay projection", async () => {
