@@ -362,13 +362,24 @@ export class SqliteEventStore
     const limit = query.limit ?? 500;
     params.limit = limit;
 
+    const orderAndLimit = query.tail && !query.afterEventId
+      ? `from (
+           select seq, id, type, time, session_id, thread_id, payload_json
+           from events
+           ${where}
+           order by seq desc
+           limit $limit
+         )
+         order by seq asc`
+      : `from events
+         ${where}
+         order by seq asc
+         limit $limit`;
+
     const rows = this.db
       .query<StoredEventRow, any>(
         `select seq, id, type, time, session_id, thread_id, payload_json
-         from events
-         ${where}
-         order by seq asc
-         limit $limit`,
+         ${orderAndLimit}`,
       )
       .all(params);
 

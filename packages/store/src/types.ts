@@ -30,6 +30,7 @@ export interface EventQuery {
   type?: string;
   afterEventId?: string;
   limit?: number;
+  tail?: boolean;
 }
 
 export interface SessionRow {

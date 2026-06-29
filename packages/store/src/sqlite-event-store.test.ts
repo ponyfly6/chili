@@ -38,6 +38,26 @@ test("orders event replay and afterEventId cursors by insertion sequence", async
   }
 });
 
+test("tail event replay returns the latest bounded window in insertion order", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-tail-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const sessionId = "session_tail" as SessionId;
+  const threadId = "thread_tail" as ThreadId;
+
+  try {
+    await store.append(sessionEvent("event_1", sessionId, threadId, 1 as TimestampMs));
+    await store.append(sessionEvent("event_2", sessionId, threadId, 2 as TimestampMs));
+    await store.append(sessionEvent("event_3", sessionId, threadId, 3 as TimestampMs));
+    await store.append(sessionEvent("event_4", sessionId, threadId, 4 as TimestampMs));
+
+    expect((await store.events({ sessionId, limit: 2 })).map((event) => event.id)).toEqual(["event_1", "event_2"]);
+    expect((await store.events({ sessionId, limit: 2, tail: true })).map((event) => event.id)).toEqual(["event_3", "event_4"]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("reconciles stale turns without completion events", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-stale-turn-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
