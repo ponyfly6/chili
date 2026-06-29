@@ -26,6 +26,7 @@ import {
   type ContextCompactionResult,
   type ContextUsage,
 } from "./context/index.js";
+import { messagesForContext } from "./cancelled-turn-context.js";
 import { DoomLoopError, DoomLoopGuard, type DoomLoopGuardOptions } from "./doom-loop-guard.js";
 import { normalizeRetryPolicy, retryDelay, sleep, type RetryPolicy } from "./retry.js";
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.js";
@@ -133,6 +134,7 @@ export class SingleAgentRuntime implements AgentRunner {
     await this.append(input, "message.created", {
       messageId,
       role: "user",
+      ...(input.turnId ? { turnId: input.turnId } : {}),
     });
     const images = input.images ?? [];
     if (input.text.length > 0 || images.length === 0) {
@@ -168,7 +170,7 @@ export class SingleAgentRuntime implements AgentRunner {
     let boundary: CompactionBoundary | undefined;
     try {
       await this.append(input, "turn.started", { turnId });
-      const rawMessages = await this.options.store.messages(input.sessionId);
+      const rawMessages = await messagesForContext(this.options.store, input.sessionId);
       boundary = this.contextBuilder().compactionBoundary(rawMessages, reason);
       if (!boundary) {
         await this.append(input, "turn.completed", { turnId, status: "completed" });
@@ -213,7 +215,7 @@ export class SingleAgentRuntime implements AgentRunner {
     try {
       await this.append(input, "turn.started", { turnId });
 
-      const rawMessages = await this.options.store.messages(input.sessionId);
+      const rawMessages = await messagesForContext(this.options.store, input.sessionId);
       let context = this.contextBuilder().build(rawMessages);
       contextUsage = context.usage;
       if (context.compactionBoundary) {
@@ -226,7 +228,7 @@ export class SingleAgentRuntime implements AgentRunner {
         });
         const compacted = await this.tryCompactMessages(input, turnId, rawMessages, context.compactionBoundary);
         if (compacted) {
-          context = this.contextBuilder().build(await this.options.store.messages(input.sessionId));
+          context = this.contextBuilder().build(await messagesForContext(this.options.store, input.sessionId));
           contextUsage = context.usage;
         }
       }
@@ -235,6 +237,7 @@ export class SingleAgentRuntime implements AgentRunner {
       await this.append(input, "message.created", {
         messageId: assistantMessageId,
         role: "assistant",
+        turnId,
       });
 
       let modelInput: ModelStreamInput = {
@@ -260,7 +263,7 @@ export class SingleAgentRuntime implements AgentRunner {
       } catch (error) {
         const err = toError(error);
         if (!this.canRecoverWithCompaction(err)) throw err;
-        const recoveryMessages = await this.options.store.messages(input.sessionId);
+        const recoveryMessages = await messagesForContext(this.options.store, input.sessionId);
         const recoveryBoundary = this.contextBuilder().compactionBoundary(recoveryMessages, "recovery");
         if (!recoveryBoundary) throw err;
         await this.append(input, "turn.compaction_requested", {
@@ -272,7 +275,7 @@ export class SingleAgentRuntime implements AgentRunner {
         });
         const recovered = await this.tryCompactMessages(input, turnId, recoveryMessages, recoveryBoundary);
         if (!recovered) throw err;
-        const recoveredContext = this.contextBuilder().build(await this.options.store.messages(input.sessionId));
+        const recoveredContext = this.contextBuilder().build(await messagesForContext(this.options.store, input.sessionId));
         contextUsage = recoveredContext.usage;
         modelInput = {
           ...modelInput,
@@ -554,7 +557,7 @@ export class SingleAgentRuntime implements AgentRunner {
     if (input.instructions !== undefined) compactInput.instructions = input.instructions;
     if (input.signal !== undefined) compactInput.signal = input.signal;
     const result = await this.compactor().compact(compactInput);
-    const messageId = await this.appendCompactionMessage(input, result);
+    const messageId = await this.appendCompactionMessage(input, turnId, result);
     await this.append(input, "turn.compaction_completed", {
       turnId,
       messageId,
@@ -567,11 +570,12 @@ export class SingleAgentRuntime implements AgentRunner {
     return { messageId, boundaryMessageId: result.boundary.boundaryMessageId, summaryChars: result.summary.length };
   }
 
-  private async appendCompactionMessage(input: EventContext, result: ContextCompactionResult): Promise<MessageId> {
+  private async appendCompactionMessage(input: EventContext, turnId: TurnId, result: ContextCompactionResult): Promise<MessageId> {
     const messageId = this.id<MessageId>("msg");
     await this.append(input, "message.created", {
       messageId,
       role: "user",
+      turnId,
     });
 
     const summaryText = renderContextSummary(result);

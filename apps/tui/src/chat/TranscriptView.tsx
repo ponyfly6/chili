@@ -1,5 +1,6 @@
-import type { ChatSessionView } from "@chili/sdk";
+import type { ChatSessionView, ChatTranscriptItem } from "@chili/sdk";
 import type { TuiTheme } from "../theme/index.js";
+import { chronologicalTranscriptEntries } from "./local-transcript.js";
 import { wrapTerminalText } from "./markdown.js";
 import { buildTranscriptLines, type TranscriptLineTone, type TranscriptSourceLine } from "./transcript.js";
 import type { LocalTranscriptItem } from "./types.js";
@@ -13,10 +14,7 @@ export function TranscriptView(props: {
   theme: TuiTheme;
 }) {
   const width = Math.max(24, props.width ?? 80);
-  const sourceLines = [
-    ...buildTranscriptLines(props.chatView.items),
-    ...props.localItems.flatMap(localTranscriptSourceLines),
-  ];
+  const sourceLines = transcriptSourceLines(props.chatView.items, props.localItems);
   const allLines = sourceLines.flatMap((line) => wrapSourceLine(line, width, props.theme));
   const limit = Math.max(1, props.visibleLimit ?? 18);
   const bodyLimit = Math.max(1, limit - 1);
@@ -39,6 +37,28 @@ export function TranscriptView(props: {
       )}
     </box>
   );
+}
+
+function transcriptSourceLines(items: readonly ChatTranscriptItem[], localItems: readonly LocalTranscriptItem[]): TranscriptSourceLine[] {
+  if (localItems.length === 0) return buildTranscriptLines(items);
+  const output: TranscriptSourceLine[] = [];
+  let pendingChatItems: ChatTranscriptItem[] = [];
+  const flushChatItems = () => {
+    if (pendingChatItems.length === 0) return;
+    output.push(...buildTranscriptLines(pendingChatItems));
+    pendingChatItems = [];
+  };
+
+  for (const entry of chronologicalTranscriptEntries(items, localItems)) {
+    if (entry.kind === "chat") {
+      pendingChatItems.push(entry.item);
+      continue;
+    }
+    flushChatItems();
+    output.push(...localTranscriptSourceLines(entry.item));
+  }
+  flushChatItems();
+  return output;
 }
 
 function localTranscriptSourceLines(item: LocalTranscriptItem): TranscriptSourceLine[] {

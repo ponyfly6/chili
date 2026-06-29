@@ -20,14 +20,14 @@ import {
 } from "./tool-renderers.js";
 
 export type ChatDisplayItem =
-  | { kind: "user_text"; id: string; text: string }
-  | { kind: "user_image"; id: string; label: string }
-  | { kind: "assistant_text"; id: string; text: string; streaming?: boolean }
-  | { kind: "reasoning"; id: string; text: string; collapsed: true; active?: boolean }
-  | { kind: "tool_activity"; id: string; activity: ToolActivityDisplay }
-  | { kind: "tool_group"; id: string; label: string; tone: ToolActivityTone; metadata: ToolGroupMetadata; activities: ToolActivityDisplay[] }
-  | { kind: "approval"; id: string; approval: ChatApprovalRow }
-  | { kind: "summary"; id: string; text: string };
+  | { kind: "user_text"; id: string; text: string; time?: number }
+  | { kind: "user_image"; id: string; label: string; time?: number }
+  | { kind: "assistant_text"; id: string; text: string; streaming?: boolean; time?: number }
+  | { kind: "reasoning"; id: string; text: string; collapsed: true; active?: boolean; time?: number }
+  | { kind: "tool_activity"; id: string; activity: ToolActivityDisplay; time?: number }
+  | { kind: "tool_group"; id: string; label: string; tone: ToolActivityTone; metadata: ToolGroupMetadata; activities: ToolActivityDisplay[]; time?: number }
+  | { kind: "approval"; id: string; approval: ChatApprovalRow; time?: number }
+  | { kind: "summary"; id: string; text: string; time?: number };
 
 export type ToolActivityTone = "muted" | "pending" | "error";
 
@@ -72,6 +72,7 @@ interface BuildOptions {
   hideThinking?: boolean;
   sessionStatus?: ChatSessionView["status"];
   activeToolCount?: number;
+  groupExplorationTools?: boolean;
 }
 
 interface ToolCallPartInfo {
@@ -111,13 +112,14 @@ export function buildChatDisplayItems(items: readonly ChatTranscriptItem[], opti
         kind: "tool_activity",
         id: `tool:${item.id}`,
         activity: toolActivityFromRow(item, showToolDetails),
+        time: item.updatedAt,
       });
       continue;
     }
-    output.push({ kind: "approval", id: `approval:${item.id}`, approval: item });
+    output.push({ kind: "approval", id: `approval:${item.id}`, approval: item, time: item.resolvedAt ?? item.createdAt });
   }
 
-  return groupExplorationTools(output);
+  return options.groupExplorationTools === false ? output : groupExplorationTools(output);
 }
 
 function messageDisplayItems(
@@ -135,7 +137,7 @@ function messageDisplayItems(
   let hiddenTraceShown = false;
   const showHiddenTrace = (active: boolean) => {
     if (hiddenTraceShown) return;
-    output.push({ kind: "reasoning", id: `${message.id}:hidden-thinking`, text: "", collapsed: true, ...(active ? { active } : {}) });
+    output.push({ kind: "reasoning", id: `${message.id}:hidden-thinking`, text: "", collapsed: true, time: message.createdAt, ...(active ? { active } : {}) });
     hiddenTraceShown = true;
   };
 
@@ -146,15 +148,15 @@ function messageDisplayItems(
         showHiddenTrace(hideStreamingAssistantText);
         continue;
       }
-      if (message.role === "user") output.push({ kind: "user_text", id, text: part.text });
-      else if (message.role === "assistant") output.push({ kind: "assistant_text", id, text: part.text, ...(index === streamingTextPartIndex ? { streaming: true } : {}) });
-      else output.push({ kind: "summary", id, text: `${message.role}: ${part.text}` });
+      if (message.role === "user") output.push({ kind: "user_text", id, text: part.text, time: message.createdAt });
+      else if (message.role === "assistant") output.push({ kind: "assistant_text", id, text: part.text, time: message.createdAt, ...(index === streamingTextPartIndex ? { streaming: true } : {}) });
+      else output.push({ kind: "summary", id, text: `${message.role}: ${part.text}`, time: message.createdAt });
       continue;
     }
     if (part.type === "image") {
       const label = part.displayText ?? part.sourcePath ?? part.filename ?? part.mimeType;
-      if (message.role === "user") output.push({ kind: "user_image", id, label });
-      else output.push({ kind: "summary", id, text: `image: ${label}` });
+      if (message.role === "user") output.push({ kind: "user_image", id, label, time: message.createdAt });
+      else output.push({ kind: "summary", id, text: `image: ${label}`, time: message.createdAt });
       continue;
     }
     if (part.type === "reasoning") {
@@ -162,11 +164,11 @@ function messageDisplayItems(
         if (part.text.trim()) showHiddenTrace(hideStreamingAssistantText);
         continue;
       }
-      output.push({ kind: "reasoning", id, text: part.text, collapsed: true, ...(streaming ? { active: true } : {}) });
+      output.push({ kind: "reasoning", id, text: part.text, collapsed: true, time: message.createdAt, ...(streaming ? { active: true } : {}) });
       continue;
     }
     if (part.type === "summary") {
-      output.push({ kind: "summary", id, text: part.text });
+      output.push({ kind: "summary", id, text: part.text, time: message.createdAt });
       continue;
     }
     if (part.type === "tool_result") {
@@ -175,6 +177,7 @@ function messageDisplayItems(
           kind: "tool_activity",
           id: `tool-result:${id}`,
           activity: fallbackToolResultActivity(part, toolCallParts.get(part.callId), showToolDetails),
+          time: message.createdAt,
         });
       }
       continue;
@@ -280,7 +283,7 @@ function toolActivity(input: {
   };
 }
 
-function groupExplorationTools(items: readonly ChatDisplayItem[]): ChatDisplayItem[] {
+export function groupExplorationTools(items: readonly ChatDisplayItem[]): ChatDisplayItem[] {
   const output: ChatDisplayItem[] = [];
   let pending: Extract<ChatDisplayItem, { kind: "tool_activity" }>[] = [];
   const flush = () => {
@@ -301,6 +304,7 @@ function groupExplorationTools(items: readonly ChatDisplayItem[]): ChatDisplayIt
       tone: groupTone(activities),
       metadata: explorationGroupMetadata(activities),
       activities,
+      ...(pending[0]?.time === undefined ? {} : { time: pending[0].time }),
     });
     pending = [];
   };

@@ -3,6 +3,7 @@ import { createCliRenderer, type CliRendererConfig } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { HttpRuntimeClient } from "@chili/sdk";
 import type { SessionId, TeamId, ThreadId } from "@chili/protocol";
+import { basename, resolve } from "node:path";
 import { ChatShellApp, type ChatShellExitInfo, type ChatShellOptions } from "./ChatShellApp.js";
 import { TeamLiveApp } from "./TeamLiveApp.js";
 import { detectSystemTheme } from "./theme/index.js";
@@ -112,6 +113,23 @@ function usage(): string {
   ].join("\n");
 }
 
+export function formatTerminalTitle(cwd: string, appName = "🌶️"): string {
+  const directory = basename(resolve(cwd)) || "root";
+  return sanitizeTerminalTitle(`${appName}-${directory}`);
+}
+
+export function terminalTitleSequence(title: string): string {
+  return `\x1b]0;${sanitizeTerminalTitle(title)}\x07`;
+}
+
+function setTerminalTitle(title: string): void {
+  process.stdout.write(terminalTitleSequence(title));
+}
+
+function sanitizeTerminalTitle(title: string): string {
+  return title.replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+}
+
 function requireValue(argv: readonly string[], index: number, flag: string): string {
   const value = argv[index];
   if (!value) throw new Error(`${flag} requires a value`);
@@ -140,6 +158,8 @@ async function main(): Promise<void> {
     console.log(usage());
     return;
   }
+
+  setTerminalTitle(formatTerminalTitle(options.cwd ?? process.cwd()));
 
   const client = new HttpRuntimeClient({ baseUrl: options.baseUrl });
   const renderer = await createCliRenderer(rendererConfig());

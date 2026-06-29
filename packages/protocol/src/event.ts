@@ -66,7 +66,7 @@ export type TurnEvent =
   | EventEnvelope<"turn.guard_triggered", { turnId: TurnId; reason: "repeated_tool_call" | "tool_call_limit"; toolName?: string; count: number }>;
 
 export type MessageEvent =
-  | EventEnvelope<"message.created", { messageId: MessageId; role: "system" | "user" | "assistant" | "tool" }>
+  | EventEnvelope<"message.created", { messageId: MessageId; role: "system" | "user" | "assistant" | "tool"; turnId?: TurnId }>
   | EventEnvelope<"message.part_added", { messageId: MessageId; part: MessagePart }>
   | EventEnvelope<"message.part_delta", { messageId: MessageId; partId: string; field: string; delta: string }>;
 

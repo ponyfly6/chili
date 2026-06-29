@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { expect, test } from "bun:test";
 import type {
   ChiliEvent,
@@ -12,7 +15,7 @@ import type {
   ToolCallId,
   TurnId,
 } from "@chili/protocol";
-import type { ApprovalRow, EventQuery, EventStore, SessionRow } from "@chili/store";
+import { SqliteEventStore, type ApprovalRow, type EventQuery, type EventStore, type SessionRow } from "@chili/store";
 import { InMemoryToolRegistry, ToolExecutor } from "@chili/tools";
 import type { AgentRunner, AppendUserMessageInput, CreateSessionInput, RunTurnInput, RunTurnResult } from "./runner.js";
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.js";
@@ -62,11 +65,12 @@ test("RuntimeService accepts an AgentRunner implementation", async () => {
     threadId,
     cwd: "/workspace",
   });
-  expect(runner.userMessages[0]).toEqual({
+  expect(runner.userMessages[0]).toMatchObject({
     sessionId,
     threadId,
     text: "hello",
   });
+  expect(runner.userMessages[0]?.turnId).toBe(runner.turnInputs[0]?.turnId);
   expect(runner.turnInputs[0]?.cwd).toBe("/workspace/subdir");
   expect(runner.turnInputs[0]?.system).toEqual(["be brief"]);
   expect(runner.turnInputs[0]?.signal?.aborted).toBe(false);
@@ -375,15 +379,11 @@ test("RuntimeService assembles turn prompt after appending submitted user messag
   });
 
   expect(result.status).toBe("completed");
-  expect(observedUserMessages).toEqual([
-    [
-      {
-        sessionId,
-        threadId,
-        text: "what changed?",
-      },
-    ],
-  ]);
+  expect(observedUserMessages[0]?.[0]).toMatchObject({
+    sessionId,
+    threadId,
+    text: "what changed?",
+  });
   expect(runner.turnInputs[0]?.contextualUser).toEqual(["latest user: what changed?"]);
 });
 
@@ -858,6 +858,86 @@ test("SingleAgentRuntime satisfies AgentRunner without changing aborted turn beh
   expect(store.items.some((event) => event.type === "turn.retry_scheduled")).toBe(false);
 });
 
+test("RuntimeService excludes cancelled prompt with no assistant output from subsequent model context", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-core-cancelled-prompt-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const registry = new InMemoryToolRegistry();
+  const createId = createSequentialId();
+  let now = 0;
+  const modelInputs: ModelStreamInput[] = [];
+  const firstCallStarted = deferred<void>();
+  const model: ModelRouter = {
+    async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+      modelInputs.push(input);
+      if (modelInputs.length === 1) {
+        firstCallStarted.resolve();
+        await new Promise<void>((resolve) => {
+          if (input.signal?.aborted) {
+            resolve();
+            return;
+          }
+          input.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        throw abortError("provider aborted");
+      }
+      yield { type: "text_delta", text: "ok" };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+    }),
+    createId,
+    now: () => ++now as TimestampMs,
+  });
+  const service = new RuntimeService({
+    runtime,
+    store,
+    cwd: "/repo",
+    createId,
+    now: () => ++now as TimestampMs,
+  });
+  const sessionId = "session_cancelled_prompt_context" as SessionId;
+  const threadId = "thread_cancelled_prompt_context" as ThreadId;
+
+  try {
+    const cancelled = service.submitPrompt({
+      sessionId,
+      threadId,
+      text: "理解一下这个幕落",
+    });
+    await firstCallStarted.promise;
+    await service.interrupt(sessionId, "user_interrupt");
+
+    const cancelledResult = await cancelled;
+    expect(cancelledResult.status).toBe("cancelled");
+
+    const completedResult = await service.submitPrompt({
+      sessionId,
+      threadId,
+      text: "理解一下这个目录",
+    });
+
+    expect(completedResult.status).toBe("completed");
+    expect(modelInputs).toHaveLength(2);
+    const secondContext = messageTextContent(modelInputs[1]?.messages ?? []);
+    expect(secondContext).not.toContain("理解一下这个幕落");
+    expect(secondContext).toContain("理解一下这个目录");
+
+    const transcriptText = messageTextContent(await store.messages(sessionId));
+    expect(transcriptText).toContain("理解一下这个幕落");
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 class FakeAgentRunner implements AgentRunner {
   readonly createInputs: CreateSessionInput[] = [];
   readonly userMessages: AppendUserMessageInput[] = [];
@@ -971,6 +1051,13 @@ function textMessage(input: {
       },
     ],
   };
+}
+
+function messageTextContent(messages: readonly Message[]): string {
+  return messages
+    .flatMap((message) => message.parts)
+    .flatMap((part) => (part.type === "text" ? [part.text] : []))
+    .join("\n");
 }
 
 function textOnlyModel(): RuntimeModelDescriptor {

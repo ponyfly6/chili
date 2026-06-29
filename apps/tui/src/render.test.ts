@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { readdir, readFile } from "node:fs/promises";
 import { basename, join, relative } from "node:path";
 import type { SessionId, ThreadId } from "@chili/protocol";
-import { formatResumeCommand, parseArgs, teamLiveStreamInput } from "./index.js";
+import { formatResumeCommand, formatTerminalTitle, parseArgs, terminalTitleSequence, teamLiveStreamInput } from "./index.js";
 import { detectSystemTheme, generateSystemTheme, initialTuiThemeId, resolveTuiTheme } from "./theme/index.js";
 
 test("parses runtime flags and keeps Team Live stream unscoped for child-session events", () => {
@@ -59,6 +59,35 @@ test("formats a resume command when a chat session and thread are available", ()
   expect(formatResumeCommand({
     sessionId: "session_resume" as SessionId,
   })).toBeUndefined();
+});
+
+test("formats terminal title from the active cwd", () => {
+  expect(formatTerminalTitle("/Users/pony/Code/company")).toBe("🌶️-company");
+  expect(formatTerminalTitle("/")).toBe("🌶️-root");
+  expect(formatTerminalTitle("/tmp/bad\u001b]0;owned\u0007name")).toBe("🌶️-bad]0;ownedname");
+});
+
+test("formats OSC terminal title sequence without raw control characters in the title", () => {
+  expect(terminalTitleSequence("🌶️-company")).toBe("\x1b]0;🌶️-company\x07");
+  expect(terminalTitleSequence("bad\u001btitle\u0007")).toBe("\x1b]0;badtitle\x07");
+});
+
+test("help output does not emit a terminal title sequence", async () => {
+  const proc = Bun.spawn([process.execPath, join(tuiSourceRoot(), "index.tsx"), "--help"], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+
+  expect(code).toBe(0);
+  expect(stderr).toBe("");
+  expect(stdout).toContain("Usage:");
+  expect(stdout).not.toContain("\x1b]0;");
 });
 
 test("apps/tui source does not import core, server, or store packages", async () => {

@@ -47,6 +47,7 @@ export const SQLITE_SCHEMA = [
     id text primary key,
     session_id text not null,
     thread_id text,
+    turn_id text,
     role text not null,
     parent_id text,
     created_at integer not null

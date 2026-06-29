@@ -5,6 +5,7 @@ import type {
   SessionId,
   TimestampMs,
   ToolCallId,
+  TurnId,
 } from "./ids.js";
 import type { ToolResultContent } from "./tool.js";
 
@@ -16,6 +17,7 @@ export interface Message {
   role: MessageRole;
   parts: MessagePart[];
   parentId?: MessageId;
+  turnId?: TurnId;
   createdAt: TimestampMs;
 }
 

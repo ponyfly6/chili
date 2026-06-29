@@ -11,6 +11,7 @@ import { buildChatDisplayItems } from "./presentation.js";
 import { HistoryRenderModel } from "./render-model.js";
 import { splitStreamingMarkdown } from "./streaming.js";
 import { renderToolActivity } from "./tool-renderers.js";
+import type { LocalTranscriptItem } from "./types.js";
 
 test("assistant markdown renders readable terminal lines", () => {
   const markdown = [
@@ -759,6 +760,31 @@ test("failed tools show a compact error summary", async () => {
   expect(details).toContain("fifth failure");
 });
 
+test("local shell commands keep their chronological position in chat", async () => {
+  const frame = await renderMessageList([
+    chatMessage("msg_before_shell", "user", "before shell", 1),
+    chatMessage("msg_after_shell", "assistant", "after shell", 3),
+  ], {
+    localItems: [{
+      id: "2:shell:pwd",
+      kind: "shell",
+      command: "pwd",
+      cwd: "/repo",
+      status: "completed",
+      output: "/repo",
+      exitCode: 0,
+      durationMs: 12,
+    }],
+  });
+
+  const beforeIndex = frame.indexOf("before shell");
+  const shellIndex = frame.indexOf("! pwd");
+  const afterIndex = frame.indexOf("after shell");
+  expect(beforeIndex).toBeGreaterThanOrEqual(0);
+  expect(shellIndex).toBeGreaterThan(beforeIndex);
+  expect(afterIndex).toBeGreaterThan(shellIndex);
+});
+
 test("unknown tools use the fallback renderer label", () => {
   const rendered = renderToolActivity({
     id: "tool_unknown",
@@ -776,7 +802,7 @@ test("unknown tools use the fallback renderer label", () => {
 
 async function renderMessageList(
   items: readonly ChatTranscriptItem[],
-  options: { showToolDetails?: boolean; hideThinking?: boolean; width?: number; height?: number; status?: ChatSessionView["status"]; activeTools?: ChatSessionView["activeTools"] } = {},
+  options: MessageListTestOptions = {},
 ): Promise<string> {
   const app = await renderMessageListApp(items, options);
   try {
@@ -788,7 +814,7 @@ async function renderMessageList(
 
 async function renderMessageListApp(
   items: readonly ChatTranscriptItem[],
-  options: { showToolDetails?: boolean; hideThinking?: boolean; width?: number; height?: number; status?: ChatSessionView["status"]; activeTools?: ChatSessionView["activeTools"] } = {},
+  options: MessageListTestOptions = {},
 ): Promise<{
   frame: () => string;
   scrollBy: (delta: number) => Promise<void>;
@@ -798,7 +824,7 @@ async function renderMessageListApp(
   const app = await testRender(
     <MessageList
       chatView={chatView(items, options)}
-      localItems={[]}
+      localItems={options.localItems ?? []}
       width={options.width ?? 110}
       scrollRef={scrollRef}
       showToolDetails={options.showToolDetails === true}
@@ -828,6 +854,16 @@ async function renderMessageListApp(
   }
 }
 
+interface MessageListTestOptions {
+  showToolDetails?: boolean;
+  hideThinking?: boolean;
+  width?: number;
+  height?: number;
+  status?: ChatSessionView["status"];
+  activeTools?: ChatSessionView["activeTools"];
+  localItems?: readonly LocalTranscriptItem[];
+}
+
 function chatView(items: readonly ChatTranscriptItem[], options: { status?: ChatSessionView["status"]; activeTools?: ChatSessionView["activeTools"] } = {}): ChatSessionView {
   return {
     status: options.status ?? "idle",
@@ -835,6 +871,19 @@ function chatView(items: readonly ChatTranscriptItem[], options: { status?: Chat
     pendingApprovals: [],
     activeTools: options.activeTools ?? [],
     generatedAt: "1970-01-01T00:00:00.000Z",
+  };
+}
+
+function chatMessage(id: string, role: "user" | "assistant", text: string, createdAt: number): Extract<ChatTranscriptItem, { kind: "message" }> {
+  return {
+    id: id as MessageId,
+    kind: "message",
+    role,
+    createdAt,
+    completedAt: createdAt + 1,
+    parts: [
+      { type: "text", id: `${id}:part` as PartId, text },
+    ],
   };
 }
 

@@ -270,6 +270,54 @@ test("migrates older approval tables and reads approval metadata", async () => {
   }
 });
 
+test("migrates older message tables without turn_id before creating turn indexes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-message-turn-migration-"));
+  const dbPath = join(dir, "events.sqlite");
+  const db = new Database(dbPath, { create: true, strict: true });
+  db.exec(`
+    create table messages (
+      id text primary key,
+      session_id text not null,
+      thread_id text,
+      role text not null,
+      parent_id text,
+      created_at integer not null
+    )
+  `);
+  db.close();
+
+  const store = new SqliteEventStore(dbPath);
+  const sessionId = "session_message_turn_migration" as SessionId;
+  const threadId = "thread_message_turn_migration" as ThreadId;
+  const turnId = "turn_message_turn_migration" as TurnId;
+  const messageId = "message_message_turn_migration" as MessageId;
+
+  try {
+    await store.append({
+      id: "event_message_turn_migration",
+      type: "message.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId, role: "user", turnId },
+    });
+
+    expect(await store.messages(sessionId)).toEqual([
+      {
+        id: messageId,
+        sessionId,
+        role: "user",
+        parts: [],
+        turnId,
+        createdAt: 1 as TimestampMs,
+      },
+    ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("projects persistent thread goals and clears them", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-goal-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
