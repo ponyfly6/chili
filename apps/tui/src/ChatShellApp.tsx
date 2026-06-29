@@ -87,8 +87,8 @@ import {
 type ShellView = "chat" | "team" | "help" | "agents" | "status" | "mcp" | "transcript";
 type AppendLocalItem = (level: "info" | "error", text: string, options?: { persistent?: boolean | undefined }) => void;
 type LocalShellItem = Extract<LocalTranscriptItem, { kind: "shell" }>;
-type AppendShellItem = (item: Omit<LocalShellItem, "id" | "kind">) => string;
-type UpdateShellItem = (id: string, update: Partial<Omit<LocalShellItem, "id" | "kind">>) => void;
+type AppendShellItem = (item: Omit<LocalShellItem, "id" | "kind" | "createdAt">) => string;
+type UpdateShellItem = (id: string, update: Partial<Omit<LocalShellItem, "id" | "kind" | "createdAt">>) => void;
 
 interface PastedPromptImage extends MessageImageContent {
   id: number;
@@ -288,8 +288,9 @@ export function ChatShellSurface(props: {
     localItemTimersRef.current.set(item.id, timer);
   }, [dismissLocalItem, localMessageTtlMs]);
   const appendShellItem = useCallback<AppendShellItem>((item) => {
-    const id = `${Date.now()}:shell:${item.command}`;
-    setLocalItems((current) => [...current, { id, kind: "shell", ...item }]);
+    const createdAt = Date.now();
+    const id = `${createdAt}:shell:${item.command}`;
+    setLocalItems((current) => [...current, { id, kind: "shell", createdAt, ...item }]);
     return id;
   }, []);
   const updateShellItem = useCallback<UpdateShellItem>((id, update) => {
@@ -3216,7 +3217,8 @@ function timestampForFilename(date: Date): string {
 }
 
 function localItem(level: "info" | "error", text: string, persistent?: boolean | undefined): LocalTranscriptItem {
-  return { id: `${Date.now()}:${level}:${text}`, kind: "local", level, text, ...(persistent ? { persistent } : {}) };
+  const createdAt = Date.now();
+  return { id: `${createdAt}:${level}:${text}`, kind: "local", level, text, createdAt, ...(persistent ? { persistent } : {}) };
 }
 
 function clearLocalItemTimers(timers: Map<string, ReturnType<typeof setTimeout>>): void {

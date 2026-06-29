@@ -6,7 +6,8 @@ import type { TuiTheme } from "../theme/index.js";
 import { AssistantMarkdownCell, assistantTextCellLines } from "./AssistantCells.js";
 import { componentBackedCell, lineBackedCell, TranscriptCellView, type TranscriptCellModel } from "./cells.js";
 import { type OpenFileLinkHandler, type TranscriptLineModel, wrapLine } from "./lines.js";
-import { buildChatDisplayItems, type ChatDisplayItem } from "./presentation.js";
+import { localTranscriptItemTime } from "./local-transcript.js";
+import { buildChatDisplayItems, groupExplorationTools, type ChatDisplayItem } from "./presentation.js";
 import { ToolCell, ToolGroupCell, toolCellLines, toolGroupCellLines } from "./ToolCells.js";
 import type { LocalTranscriptItem } from "./types.js";
 
@@ -74,11 +75,67 @@ function transcriptCells(
     hideThinking: options.hideThinking,
     sessionStatus: options.sessionStatus,
     activeToolCount: options.activeToolCount,
+    groupExplorationTools: localItems.length === 0,
   });
+  if (localItems.length === 0) {
+    return displayItems.map((item) => displayItemCell(item, options.width, options.theme, options.hideThinking, options.cwd));
+  }
+
+  const output: TranscriptCellModel[] = [];
+  let pendingDisplayItems: ChatDisplayItem[] = [];
+  const flushDisplayItems = () => {
+    if (pendingDisplayItems.length === 0) return;
+    output.push(...groupExplorationTools(pendingDisplayItems).map((item) => displayItemCell(item, options.width, options.theme, options.hideThinking, options.cwd)));
+    pendingDisplayItems = [];
+  };
+
+  for (const entry of chronologicalDisplayEntries(displayItems, localItems)) {
+    if (entry.kind === "display") {
+      pendingDisplayItems.push(entry.item);
+      continue;
+    }
+    flushDisplayItems();
+    output.push(localItemCell(entry.item, options.width, options.theme));
+  }
+  flushDisplayItems();
+  return output;
+}
+
+type ChronologicalDisplayEntry =
+  | { kind: "display"; item: ChatDisplayItem; index: number }
+  | { kind: "local"; item: LocalTranscriptItem; index: number };
+
+type SortableDisplayEntry = ChronologicalDisplayEntry & {
+  time: number;
+  sourceOrder: number;
+};
+
+function chronologicalDisplayEntries(
+  displayItems: readonly ChatDisplayItem[],
+  localItems: readonly LocalTranscriptItem[],
+): ChronologicalDisplayEntry[] {
   return [
-    ...displayItems.map((item) => displayItemCell(item, options.width, options.theme, options.hideThinking, options.cwd)),
-    ...localItems.map((item) => localItemCell(item, options.width, options.theme)),
-  ];
+    ...displayItems.map((item, index): SortableDisplayEntry => ({
+      kind: "display",
+      item,
+      index,
+      time: chatDisplayItemTime(item),
+      sourceOrder: 0,
+    })),
+    ...localItems.map((item, index): SortableDisplayEntry => ({
+      kind: "local",
+      item,
+      index,
+      time: localTranscriptItemTime(item),
+      sourceOrder: 1,
+    })),
+  ]
+    .sort((left, right) => left.time - right.time || left.sourceOrder - right.sourceOrder || left.index - right.index)
+    .map(({ kind, item, index }) => ({ kind, item, index }) as ChronologicalDisplayEntry);
+}
+
+function chatDisplayItemTime(item: ChatDisplayItem): number {
+  return typeof item.time === "number" && Number.isFinite(item.time) ? item.time : Number.MAX_SAFE_INTEGER;
 }
 
 function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, hideThinking: boolean, cwd: string): TranscriptCellModel {
