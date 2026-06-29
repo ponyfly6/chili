@@ -12,6 +12,7 @@ export interface CreateSessionInput {
 export interface AppendUserMessageInput {
   sessionId: SessionId;
   threadId: ThreadId;
+  turnId?: TurnId;
   text: string;
   displayText?: string;
   images?: readonly MessageImageContent[];

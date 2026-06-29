@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, appendFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import type { ChiliEvent, MessageId, MessagePart, MessageRole, SessionId, ThreadId, TimestampMs } from "@chili/protocol";
+import type { ChiliEvent, MessageId, MessagePart, MessageRole, SessionId, ThreadId, TimestampMs, TurnId } from "@chili/protocol";
 import type { EventMirror } from "./types.js";
 
 export class JsonlMirror implements EventMirror {
@@ -99,6 +99,7 @@ interface TranscriptMessageState {
   messageId: MessageId;
   sessionId: SessionId;
   threadId?: ThreadId;
+  turnId?: TurnId;
   role: MessageRole;
   createdAt: TimestampMs;
   updatedAt: TimestampMs;
@@ -132,6 +133,7 @@ export class SessionTranscriptJsonlMirror implements EventMirror {
         flushed: false,
       };
       if (event.threadId) state.threadId = event.threadId;
+      if (event.payload.turnId) state.turnId = event.payload.turnId;
       this.messages.set(event.payload.messageId, state);
       return;
     }
@@ -177,6 +179,7 @@ export class SessionTranscriptJsonlMirror implements EventMirror {
       type: "message",
       sessionId: message.sessionId,
       ...(message.threadId ? { threadId: message.threadId } : {}),
+      ...(message.turnId ? { turnId: message.turnId } : {}),
       messageId: message.messageId,
       role: message.role,
       text: messageText(message.parts),

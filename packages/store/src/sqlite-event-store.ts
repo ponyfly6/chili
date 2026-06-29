@@ -96,6 +96,7 @@ interface MessageRow {
   id: string;
   session_id: string;
   thread_id: string | null;
+  turn_id: string | null;
   role: "system" | "user" | "assistant" | "tool";
   parent_id: string | null;
   created_at: number;
@@ -313,6 +314,7 @@ export class SqliteEventStore
       this.db.exec(statement);
     }
     this.migrateApprovalSchema();
+    this.migrateMessageSchema();
     this.migrateGoalSchema();
     this.migrateSubagentSchema();
     this.migrateTeamSchema();
@@ -401,7 +403,7 @@ export class SqliteEventStore
   async messages(sessionId: Message["sessionId"]): Promise<Message[]> {
     const messages = this.db
       .query<MessageRow, [string]>(
-        `select id, session_id, thread_id, role, parent_id, created_at
+        `select id, session_id, thread_id, turn_id, role, parent_id, created_at
          from messages
          where session_id = ?
          order by created_at asc, id asc`,
@@ -428,6 +430,9 @@ export class SqliteEventStore
       };
       if (message.parent_id) {
         result.parentId = message.parent_id as MessageId;
+      }
+      if (message.turn_id) {
+        result.turnId = message.turn_id as TurnId;
       }
       return result;
     });
@@ -1445,6 +1450,11 @@ export class SqliteEventStore
     this.addColumnIfMissing("approvals", "metadata_json", "text");
   }
 
+  private migrateMessageSchema(): void {
+    this.addColumnIfMissing("messages", "turn_id", "text");
+    this.db.exec(`create index if not exists messages_turn_idx on messages(turn_id)`);
+  }
+
   private migrateGoalSchema(): void {
     this.db.exec(`
       create table if not exists thread_goals (
@@ -1579,11 +1589,11 @@ export class SqliteEventStore
       }
       this.db
         .query(
-          `insert into messages (id, session_id, thread_id, role, parent_id, created_at)
-           values (?, ?, ?, ?, null, ?)
+          `insert into messages (id, session_id, thread_id, turn_id, role, parent_id, created_at)
+           values (?, ?, ?, ?, ?, null, ?)
            on conflict(id) do nothing`,
         )
-        .run(event.payload.messageId, event.sessionId, event.threadId ?? null, event.payload.role, event.time);
+        .run(event.payload.messageId, event.sessionId, event.threadId ?? null, event.payload.turnId ?? null, event.payload.role, event.time);
       return;
     }
 

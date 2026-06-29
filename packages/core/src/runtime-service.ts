@@ -28,6 +28,7 @@ import {
   conversationPromptFragment,
   type ContextBudgetOptions,
 } from "./context/index.js";
+import { messagesForContext } from "./cancelled-turn-context.js";
 import {
   PromptAssembler,
   type PromptAssembly,
@@ -225,7 +226,7 @@ export class RuntimeService {
     return { sessionId, threadId };
   }
 
-  appendUserMessage(input: { sessionId: SessionId; threadId: ThreadId; text: string; displayText?: string; images?: readonly MessageImageContent[] }): Promise<MessageId> {
+  appendUserMessage(input: { sessionId: SessionId; threadId: ThreadId; turnId?: TurnId; text: string; displayText?: string; images?: readonly MessageImageContent[] }): Promise<MessageId> {
     return this.options.runtime.appendUserMessage(input);
   }
 
@@ -438,9 +439,11 @@ export class RuntimeService {
         reason: "prompt_submitted",
       });
 
+      const promptTurnId = this.id<TurnId>("turn");
       await this.options.runtime.appendUserMessage({
         sessionId: promptInput.sessionId,
         threadId: promptInput.threadId,
+        turnId: promptTurnId,
         text: promptInput.text,
         ...(promptInput.displayText ? { displayText: promptInput.displayText } : {}),
         ...(promptInput.images && promptInput.images.length > 0 ? { images: promptInput.images } : {}),
@@ -448,7 +451,7 @@ export class RuntimeService {
 
       for (let index = 0; index < maxTurns; index++) {
         if (controller.signal.aborted) {
-          return await this.cancelledPrompt(promptInput, turns, "Prompt aborted");
+          return await this.cancelledPrompt(promptInput, turns, "Prompt aborted", promptTurnId);
         }
 
         const prompt = await this.resolvePromptAssembly({
@@ -467,6 +470,7 @@ export class RuntimeService {
           prompt,
           signal: controller.signal,
           modelState: promptModelState,
+          ...(index === 0 ? { turnId: promptTurnId } : {}),
         });
         const startedAt = this.now();
         const result = await this.options.runtime.runTurn(runInput);
@@ -483,7 +487,7 @@ export class RuntimeService {
         }
 
         if (controller.signal.aborted) {
-          return await this.cancelledPrompt(promptInput, turns, "Prompt aborted");
+          return await this.cancelledPrompt(promptInput, turns, "Prompt aborted", promptTurnId);
         }
 
         if (!isToolUseFinishReason(result.finishReason)) {
@@ -492,7 +496,7 @@ export class RuntimeService {
       }
 
       if (controller.signal.aborted) {
-        return await this.cancelledPrompt(promptInput, turns, "Prompt aborted");
+        return await this.cancelledPrompt(promptInput, turns, "Prompt aborted", promptTurnId);
       }
 
       const prompt = await this.resolvePromptAssembly({
@@ -528,7 +532,7 @@ export class RuntimeService {
       }
 
       if (controller.signal.aborted) {
-        return await this.cancelledPrompt(promptInput, turns, "Prompt aborted");
+        return await this.cancelledPrompt(promptInput, turns, "Prompt aborted", promptTurnId);
       }
 
       if (!isToolUseFinishReason(finalResult.finishReason)) {
@@ -772,6 +776,7 @@ export class RuntimeService {
     signal: AbortSignal;
     modelState: RuntimeSessionModelState;
     toolMode?: "auto" | "disabled";
+    turnId?: TurnId;
   }): RunTurnInput {
     const runInput: RunTurnInput = {
       sessionId: input.input.sessionId,
@@ -780,6 +785,7 @@ export class RuntimeService {
       system: input.prompt.system,
       signal: input.signal,
     };
+    if (input.turnId) runInput.turnId = input.turnId;
     if (input.prompt.developer.length > 0) runInput.developer = input.prompt.developer;
     if (input.prompt.contextualUser.length > 0) runInput.contextualUser = input.prompt.contextualUser;
     runInput.promptDebug = input.prompt.debug;
@@ -885,7 +891,7 @@ export class RuntimeService {
     turn?: RuntimePromptTurnContext;
     previewTurnInConversation?: boolean;
   }): Promise<PromptFragment | undefined> {
-    const messages = await this.options.store.messages(input.sessionId);
+    const messages = await messagesForContext(this.options.store, input.sessionId);
     const conversationMessages =
       input.turn && input.previewTurnInConversation
         ? [...messages, this.syntheticInspectUserMessage(input.sessionId, input.turn.text)]
@@ -1108,12 +1114,15 @@ export class RuntimeService {
     input: SubmitPromptInput,
     turns: RunTurnResult[],
     reason: string,
+    pendingTurnId?: TurnId,
   ): Promise<SubmitPromptResult> {
     const error = abortError(reason);
+    const turnId = turns.at(-1)?.turnId ?? pendingTurnId;
     await this.publishStatus({
       sessionId: input.sessionId,
       threadId: input.threadId,
       status: "cancelled",
+      ...(turnId ? { turnId } : {}),
       reason,
     });
     return {

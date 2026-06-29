@@ -85,6 +85,7 @@ export interface RuntimeMessageView {
   parts: MessagePart[];
   createdAt: number;
   threadId?: ThreadId;
+  turnId?: TurnId;
   completedAt?: number;
 }
 
@@ -834,6 +835,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
           createdAt: event.time,
         };
         assignOptional(message, "threadId", event.threadId);
+        assignOptional(message, "turnId", event.payload.turnId);
         view.messages[message.id] = message;
         session.messageIds.push(message.id);
       }
