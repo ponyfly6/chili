@@ -20,11 +20,13 @@ export interface RunProcessOptions {
   onOutput?: (chunk: RunProcessOutputChunk) => void | Promise<void>;
   outputFlushIntervalMs?: number;
   outputFlushBytes?: number;
+  maxLiveOutputBytes?: number;
 }
 
 const DEFAULT_OUTPUT_FLUSH_INTERVAL_MS = 75;
 const DEFAULT_LIVE_OUTPUT_PENDING_BYTES = 64 * 1024;
 const DEFAULT_LIVE_OUTPUT_DELTA_BYTES = 8 * 1024;
+const DEFAULT_LIVE_OUTPUT_TOTAL_BYTES = 64 * 1024;
 
 export interface RunProcessResult {
   exitCode: number | null;
@@ -67,6 +69,7 @@ export async function runProcess(
         flushIntervalMs: options.outputFlushIntervalMs ?? DEFAULT_OUTPUT_FLUSH_INTERVAL_MS,
         maxPendingBytes: DEFAULT_LIVE_OUTPUT_PENDING_BYTES,
         maxDeltaBytes: Math.max(1024, options.outputFlushBytes ?? DEFAULT_LIVE_OUTPUT_DELTA_BYTES),
+        maxTotalBytes: Math.max(0, options.maxLiveOutputBytes ?? DEFAULT_LIVE_OUTPUT_TOTAL_BYTES),
       })
     : undefined;
 
@@ -190,11 +193,16 @@ class OutputDeltaDispatcher {
 
   constructor(
     private readonly onOutput: (chunk: RunProcessOutputChunk) => void | Promise<void>,
-    private readonly options: { flushIntervalMs: number; maxPendingBytes: number; maxDeltaBytes: number },
+    private readonly options: { flushIntervalMs: number; maxPendingBytes: number; maxDeltaBytes: number; maxTotalBytes: number },
   ) {}
 
   push(stream: RunProcessOutputStream, chunk: Buffer, truncated: boolean): void {
     const state = this.state(stream);
+    if (state.liveLimitReached) {
+      state.decoder.write(chunk);
+      return;
+    }
+
     const delta = state.decoder.write(chunk);
     state.pending += delta;
     state.truncated = state.truncated || truncated;
@@ -232,16 +240,29 @@ class OutputDeltaDispatcher {
     if (state.pending.length === 0) {
       return;
     }
+    if (state.publishedBytes >= this.options.maxTotalBytes) {
+      state.pending = "";
+      state.truncated = true;
+      state.liveLimitReached = true;
+      return;
+    }
 
     const delta = utf8Tail(state.pending, this.options.maxDeltaBytes);
+    const remainingBytes = this.options.maxTotalBytes - state.publishedBytes;
+    const bounded = utf8Head(delta.text, remainingBytes);
+    const deltaBytes = Buffer.byteLength(bounded.text, "utf8");
     const update: RunProcessOutputChunk = {
       stream,
-      delta: delta.text,
-      bytes: Buffer.byteLength(delta.text, "utf8"),
-      ...(state.truncated || delta.truncated ? { truncated: true } : {}),
+      delta: bounded.text,
+      bytes: deltaBytes,
+      ...(state.truncated || delta.truncated || bounded.truncated ? { truncated: true } : {}),
     };
     state.pending = "";
     state.truncated = false;
+    state.publishedBytes += deltaBytes;
+    if (bounded.truncated || state.publishedBytes >= this.options.maxTotalBytes) {
+      state.liveLimitReached = true;
+    }
     if (update.delta.length === 0) return;
 
     this.publishQueue = this.publishQueue.then(async () => {
@@ -271,6 +292,8 @@ interface OutputState {
   pending: string;
   truncated: boolean;
   timer: NodeJS.Timeout | undefined;
+  publishedBytes: number;
+  liveLimitReached: boolean;
 }
 
 function createOutputState(): OutputState {
@@ -279,6 +302,22 @@ function createOutputState(): OutputState {
     pending: "",
     truncated: false,
     timer: undefined,
+    publishedBytes: 0,
+    liveLimitReached: false,
+  };
+}
+
+function utf8Head(value: string, maxBytes: number): { text: string; truncated: boolean } {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.byteLength <= maxBytes) return { text: value, truncated: false };
+  if (maxBytes <= 0) return { text: "", truncated: true };
+  let end = Math.min(maxBytes, bytes.byteLength);
+  while (end > 0 && ((bytes[end] ?? 0) & 0b1100_0000) === 0b1000_0000) {
+    end -= 1;
+  }
+  return {
+    text: bytes.subarray(0, end).toString("utf8"),
+    truncated: true,
   };
 }
 

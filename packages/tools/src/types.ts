@@ -121,6 +121,8 @@ export interface ToolExecutorOptions {
   snapshotPolicy?: SnapshotPolicy;
   fileReadState?: FileReadStateStore;
   maxResultOutputBytes?: number;
+  maxPersistedOutputBytes?: number;
+  maxPersistedOutputDirectoryBytes?: number;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
 }

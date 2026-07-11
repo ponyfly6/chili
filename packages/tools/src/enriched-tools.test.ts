@@ -16,7 +16,7 @@ import { createWriteFileTool } from "./builtins/write-file.js";
 import { InMemoryToolRegistry } from "./registry.js";
 import { ToolExecutor } from "./executor.js";
 import { FileReadStateStore } from "./file-read-state.js";
-import type { ExecuteToolInput, ToolAccessPolicyResolver } from "./types.js";
+import type { ExecuteToolInput, ToolAccessPolicyResolver, ToolExecutorOptions } from "./types.js";
 import type { SnapshotProvider, SnapshotRecord, SnapshotRevertResult } from "./types.js";
 
 test("write tools require observed target text or a fresh full read before modifying existing files", async () => {
@@ -319,6 +319,170 @@ test("tool executor applies per-tool output limits and persists full output", as
     expect(await readFile(join(workspace, ".chili", "tool-results", "toolcall_large.txt"), "utf8")).toBe("abcdefgh");
   } finally {
     await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("tool executor caps persisted large output sidecars", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-output-sidecar-"));
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register({
+      name: "large",
+      description: "Emit a large result.",
+      risk: "read",
+      inputSchema: { type: "object" },
+      approval: () => false,
+      maxResultOutputBytes: 4,
+      isReadOnly: true,
+      isConcurrencySafe: true,
+      execute: async () => ({ title: "large", output: "abcdefghij" }),
+    });
+    const executor = createExecutor(registry, undefined, undefined, undefined, { maxPersistedOutputBytes: 6 });
+
+    const result = await executor.execute(toolInput("large", {}, workspace, "toolcall_large_capped" as ToolCallId));
+
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") return;
+    expect(result.result.output).toContain("first 6 of 10 bytes saved");
+    expect(result.result.metadata).toMatchObject({
+      outputTruncated: true,
+      outputBytes: 10,
+      outputLimitBytes: 4,
+      outputPersistedBytes: 6,
+      outputPersistedLimitBytes: 6,
+      outputPersistedTruncated: true,
+      outputPath: join(".chili", "tool-results", "toolcall_large_capped.txt"),
+    });
+    expect(await readFile(join(workspace, ".chili", "tool-results", "toolcall_large_capped.txt"), "utf8")).toBe("abcdef");
+    expect((await stat(join(workspace, ".chili", "tool-results", "toolcall_large_capped.txt"))).size).toBe(6);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("tool executor keeps persisted output within byte limits at UTF-8 boundaries", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-output-sidecar-utf8-"));
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register({
+      name: "large_utf8",
+      description: "Emit multibyte output.",
+      risk: "read",
+      inputSchema: { type: "object" },
+      approval: () => false,
+      maxResultOutputBytes: 1,
+      isReadOnly: true,
+      isConcurrencySafe: true,
+      execute: async () => ({ title: "large utf8", output: "ééé" }),
+    });
+    const executor = createExecutor(registry, undefined, undefined, undefined, { maxPersistedOutputBytes: 3 });
+
+    const result = await executor.execute(toolInput("large_utf8", {}, workspace, "toolcall_large_utf8" as ToolCallId));
+
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") return;
+    const sidecar = join(workspace, ".chili", "tool-results", "toolcall_large_utf8.txt");
+    expect(await readFile(sidecar, "utf8")).toBe("é");
+    expect((await stat(sidecar)).size).toBeLessThanOrEqual(3);
+    expect(result.result.output).not.toContain("�");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("tool executor evicts old sidecars to enforce a directory byte budget", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-output-retention-"));
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register({
+      name: "large",
+      description: "Emit a large result.",
+      risk: "read",
+      inputSchema: { type: "object" },
+      approval: () => false,
+      maxResultOutputBytes: 4,
+      isReadOnly: true,
+      isConcurrencySafe: true,
+      execute: async () => ({ title: "large", output: "abcdefgh" }),
+    });
+    const executor = createExecutor(registry, undefined, undefined, undefined, {
+      maxPersistedOutputBytes: 6,
+      maxPersistedOutputDirectoryBytes: 8,
+    });
+
+    await executor.execute(toolInput("large", {}, workspace, "toolcall_old" as ToolCallId));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await executor.execute(toolInput("large", {}, workspace, "toolcall_new" as ToolCallId));
+
+    await expectRejectsWith(readFile(join(workspace, ".chili", "tool-results", "toolcall_old.txt"), "utf8"), "ENOENT");
+    expect(await readFile(join(workspace, ".chili", "tool-results", "toolcall_new.txt"), "utf8")).toBe("abcdef");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("tool executor refuses sidecar writes through an out-of-workspace symlink", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-tools-output-symlink-"));
+  const workspace = join(root, "workspace");
+  const outside = join(root, "outside");
+  try {
+    await mkdir(join(workspace, ".chili"), { recursive: true });
+    await mkdir(outside, { recursive: true });
+    await symlink(outside, join(workspace, ".chili", "tool-results"), "dir");
+    const registry = new InMemoryToolRegistry();
+    registry.register({
+      name: "large",
+      description: "Emit a large result.",
+      risk: "read",
+      inputSchema: { type: "object" },
+      approval: () => false,
+      maxResultOutputBytes: 4,
+      isReadOnly: true,
+      isConcurrencySafe: true,
+      execute: async () => ({ title: "large", output: "abcdefgh" }),
+    });
+    const executor = createExecutor(registry);
+
+    const result = await executor.execute(toolInput("large", {}, workspace, "toolcall_symlink" as ToolCallId));
+
+    expect(result.status).toBe("failed");
+    await expectRejectsWith(readFile(join(outside, "toolcall_symlink.txt"), "utf8"), "ENOENT");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("tool executor sanitizes large output sidecar filenames from call ids", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-tools-output-sidecar-path-"));
+  const workspace = join(root, "workspace");
+  try {
+    await mkdir(workspace, { recursive: true });
+    const registry = new InMemoryToolRegistry();
+    registry.register({
+      name: "large",
+      description: "Emit a large result.",
+      risk: "read",
+      inputSchema: { type: "object" },
+      approval: () => false,
+      maxResultOutputBytes: 4,
+      isReadOnly: true,
+      isConcurrencySafe: true,
+      execute: async () => ({ title: "large", output: "abcdefgh" }),
+    });
+    const executor = createExecutor(registry);
+
+    const result = await executor.execute(toolInput("large", {}, workspace, "../../../escape" as ToolCallId));
+
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") return;
+    const outputPath = String(result.result.metadata?.outputPath);
+    expect(outputPath).toStartWith(join(".chili", "tool-results"));
+    expect(outputPath).not.toContain("..");
+    expect(outputPath.split(/[\\/]/).at(-1)).toMatch(/^toolcall_[a-f0-9]{16}\.txt$/);
+    expect(await readFile(join(workspace, outputPath), "utf8")).toBe("abcdefgh");
+    await expectRejectsWith(readFile(join(root, "escape.txt"), "utf8"), "ENOENT");
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -713,6 +877,7 @@ function createExecutor(
   policyResolver?: ToolAccessPolicyResolver,
   snapshotProvider?: SnapshotProvider,
   events?: ChiliEvent[],
+  outputOptions?: Pick<ToolExecutorOptions, "maxPersistedOutputBytes" | "maxPersistedOutputDirectoryBytes">,
 ): ToolExecutor {
   return new ToolExecutor({
     registry,
@@ -722,6 +887,7 @@ function createExecutor(
     ...(snapshotProvider ? { snapshotProvider } : {}),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
+    ...outputOptions,
   });
 }
 

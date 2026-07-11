@@ -170,6 +170,48 @@ test("runProcess bounds verbose live output while keeping a fresh tail", async (
   }
 });
 
+test("runProcess caps cumulative live output across repeated flushes", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-process-live-total-budget-"));
+  const deltas: { delta: string; truncated?: boolean }[] = [];
+  try {
+    const script = `
+      let writes = 0;
+      const chunk = "x".repeat(4096);
+      const timer = setInterval(() => {
+        process.stdout.write(chunk);
+        writes += 1;
+        if (writes >= 20) clearInterval(timer);
+      }, 10);
+    `;
+    const result = await runProcess("node", ["-e", script], {
+      cwd: workspace,
+      maxOutputBytes: 16,
+      maxLiveOutputBytes: 10 * 1024,
+      outputFlushIntervalMs: 1,
+      outputFlushBytes: 4096,
+      onOutput: (chunk) => {
+        if (chunk.stream === "stdout") {
+          deltas.push({
+            delta: chunk.delta,
+            ...(chunk.truncated !== undefined ? { truncated: chunk.truncated } : {}),
+          });
+        }
+      },
+    });
+
+    const liveBytes = deltas.reduce((total, delta) => total + Buffer.byteLength(delta.delta, "utf8"), 0);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("x".repeat(16));
+    expect(result.stdoutTruncated).toBe(true);
+    expect(result.stdoutBytes).toBe(20 * 4096);
+    expect(liveBytes).toBeLessThanOrEqual(10 * 1024);
+    expect(deltas.some((delta) => delta.truncated === true)).toBe(true);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("runProcess flushes pending output before abort rejection", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-process-abort-"));
   const controller = new AbortController();
