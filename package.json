@@ -16,6 +16,7 @@
     "tui": "bun run apps/tui/src/index.tsx",
     "probe:minimax": "bun run scripts/probe-minimax.ts",
     "smoke": "bun run scripts/smoke.ts",
+    "smoke:all": "bun run scripts/smoke-all.ts",
     "smoke:p0": "bun run scripts/smoke.ts",
     "smoke:cli": "bun run scripts/smoke-cli.ts",
     "smoke:p0p1": "bun run scripts/smoke-p0-p1.ts",

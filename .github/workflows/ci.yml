@@ -50,14 +50,8 @@ jobs:
       - name: Unit tests
         run: bun test --only-failures
 
-      - name: P0 smoke tests
-        run: bun run smoke
-
-      - name: Team model smoke test
-        run: bun run smoke:p3-team-model
-
-      - name: Team parallel smoke test
-        run: bun run smoke:p3-team-parallel
+      - name: Fake-model smoke gate
+        run: bun run smoke:all
 
       - name: Dependency audit
         run: bun run audit

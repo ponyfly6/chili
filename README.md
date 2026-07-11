@@ -163,16 +163,16 @@ OPENAI_CODEX_ACCESS_TOKEN=...
 ```bash
 bun run typecheck
 bun test
-bun run smoke
-bun run smoke:p0p1
-bun run smoke:cli
+bun run smoke:all
 bun run test:index
 bun run scripts/probe-minimax.ts --mock
 ```
 
-`bun run smoke` 是本地 fake-model P0 smoke 汇总入口，不需要 API key。它会在系统临时目录创建 fixture workspace，覆盖 CLI fake model 基础工具循环、`--resume`、runtime `read`/`glob`/`grep`/`edit`/`apply_patch`/`bash` 工具面，以及最小 context compaction 路径。通过的 fixture 会清理；失败的 fixture 会保留并打印路径。需要保留全部 fixture 时可设置 `CHILI_SMOKE_KEEP_WORKSPACE=1`。
+`bun run smoke:all` 是 CI 和提交前唯一推荐的完整 fake-model smoke 入口。它会顺序运行全部 smoke suites，不需要 API key 或网络访问。
 
-已有分层 smoke 仍可单独运行：`smoke:cli`、`smoke:p0p1`、`smoke:p2`、`smoke:p2-control`、`smoke:p3`、`smoke:p3-background`。`bun run test:index` 会输出当前 smoke 脚本和按 workspace 分组的 `*.test.ts` 清单，便于后续 worker 快速选择验证范围。
+局部开发验证可单独运行 `smoke`、`smoke:cli`、`smoke:p0p1`、`smoke:p2`、`smoke:p2-control`、`smoke:p3`、`smoke:p3-background`、`smoke:p3-team-model` 或 `smoke:p3-team-parallel`。`smoke:p0` 是 `smoke` 的别名。`bun run smoke` 会在系统临时目录创建 fixture workspace，覆盖 CLI fake model 基础工具循环、`--resume`、runtime `read`/`glob`/`grep`/`edit`/`apply_patch`/`bash` 工具面，以及最小 context compaction 路径。通过的 fixture 会清理；失败的 fixture 会保留并打印路径。需要保留全部 fixture 时可设置 `CHILI_SMOKE_KEEP_WORKSPACE=1`。
+
+`bun run test:index` 会输出当前 smoke 脚本和按 workspace 分组的 `*.test.ts` 清单，便于后续 worker 快速选择验证范围。
 
 配置好真实 MiniMax key 后，可以运行 `bun run probe:minimax` 做端到端探针。
 
