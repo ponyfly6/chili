@@ -4,8 +4,11 @@ import type {
   Message,
   MessageId,
   MessagePart,
+  ModelSelection,
   ModelUsage,
   RuntimeModelDescriptor,
+  ReasoningLevel,
+  ServiceTier,
   PartId,
   SessionId,
   ThreadId,
@@ -19,11 +22,13 @@ import type { ChiliToolDefinition, ToolAccessPolicy, ToolAccessPolicyResolver, T
 import { ToolExecutor, filterToolsByPolicy } from "@chili/tools";
 import {
   ContextCompactionService,
+  ContextWindowExceededError,
   ContextWindowBuilder,
   type CompactionBoundary,
   type ContextBudgetOptions,
   type ContextCompactionOptions,
   type ContextCompactionResult,
+  type ContextRequestSurface,
   type ContextUsage,
 } from "./context/index.js";
 import { messagesForContext } from "./cancelled-turn-context.js";
@@ -88,6 +93,9 @@ export interface CompactContextInput {
   turnId?: TurnId;
   reason?: "manual" | "token_budget" | "recovery";
   instructions?: string;
+  modelSelection?: ModelSelection;
+  reasoningLevel?: ReasoningLevel;
+  serviceTier?: ServiceTier;
   signal?: AbortSignal;
 }
 
@@ -216,8 +224,27 @@ export class SingleAgentRuntime implements AgentRunner {
     try {
       await this.append(input, "turn.started", { turnId });
 
+      const visibleTools = await this.visibleTools(input, turnId);
+      const requestLimits = await this.options.model.resolveRequestLimits?.({
+        ...(input.modelSelection ? { modelSelection: input.modelSelection } : {}),
+        ...(input.reasoningLevel !== undefined ? { reasoningLevel: input.reasoningLevel } : {}),
+        ...(input.serviceTier !== undefined ? { serviceTier: input.serviceTier } : {}),
+      });
+      const contextSurface: ContextRequestSurface = {
+        ...(requestLimits?.contextWindowTokens !== undefined
+          ? { contextWindowTokens: requestLimits.contextWindowTokens }
+          : {}),
+        ...(requestLimits?.requestMaxOutputTokens !== undefined
+          ? { requestMaxOutputTokens: requestLimits.requestMaxOutputTokens }
+          : {}),
+        system: input.system ?? [],
+        developer: input.developer ?? [],
+        contextualUser: input.contextualUser ?? [],
+        tools: visibleTools,
+      };
       const rawMessages = await messagesForContext(this.options.store, input.sessionId);
-      let context = this.contextBuilder().build(rawMessages);
+      let context = this.contextBuilder().build(rawMessages, contextSurface);
+      if (context.overflow) throw new ContextWindowExceededError(context.overflow);
       contextUsage = context.usage;
       if (context.compactionBoundary) {
         await this.append(input, "turn.compaction_requested", {
@@ -229,7 +256,11 @@ export class SingleAgentRuntime implements AgentRunner {
         });
         const compacted = await this.tryCompactMessages(input, turnId, rawMessages, context.compactionBoundary);
         if (compacted) {
-          context = this.contextBuilder().build(await messagesForContext(this.options.store, input.sessionId));
+          context = this.contextBuilder().build(
+            await messagesForContext(this.options.store, input.sessionId),
+            contextSurface,
+          );
+          if (context.overflow) throw new ContextWindowExceededError(context.overflow);
           contextUsage = context.usage;
         }
       }
@@ -246,7 +277,7 @@ export class SingleAgentRuntime implements AgentRunner {
         threadId: input.threadId,
         turnId,
         messages: context.messages,
-        tools: await this.visibleTools(input, turnId),
+        tools: visibleTools,
         system: input.system ?? [],
       };
       if (input.developer && input.developer.length > 0) modelInput.developer = input.developer;
@@ -276,7 +307,11 @@ export class SingleAgentRuntime implements AgentRunner {
         });
         const recovered = await this.tryCompactMessages(input, turnId, recoveryMessages, recoveryBoundary);
         if (!recovered) throw err;
-        const recoveredContext = this.contextBuilder().build(await messagesForContext(this.options.store, input.sessionId));
+        const recoveredContext = this.contextBuilder().build(
+          await messagesForContext(this.options.store, input.sessionId),
+          contextSurface,
+        );
+        if (recoveredContext.overflow) throw new ContextWindowExceededError(recoveredContext.overflow);
         contextUsage = recoveredContext.usage;
         modelInput = {
           ...modelInput,
@@ -561,6 +596,9 @@ export class SingleAgentRuntime implements AgentRunner {
       messages: readonly Message[];
       boundary: CompactionBoundary;
       instructions?: string;
+      modelSelection?: ModelSelection;
+      reasoningLevel?: ReasoningLevel;
+      serviceTier?: ServiceTier;
       signal?: AbortSignal;
     } = {
       sessionId: input.sessionId,
@@ -570,6 +608,9 @@ export class SingleAgentRuntime implements AgentRunner {
       boundary,
     };
     if (input.instructions !== undefined) compactInput.instructions = input.instructions;
+    if (input.modelSelection !== undefined) compactInput.modelSelection = input.modelSelection;
+    if (input.reasoningLevel !== undefined) compactInput.reasoningLevel = input.reasoningLevel;
+    if (input.serviceTier !== undefined) compactInput.serviceTier = input.serviceTier;
     if (input.signal !== undefined) compactInput.signal = input.signal;
     const result = await this.compactor().compact(compactInput);
     const messageId = await this.appendCompactionMessage(input, turnId, result);

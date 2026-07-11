@@ -1,4 +1,10 @@
-import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "@chili/core";
+import type {
+  ModelRequestLimits,
+  ModelRequestLimitsInput,
+  ModelRouter,
+  ModelStreamEvent,
+  ModelStreamInput,
+} from "@chili/core";
 import type { ModelSelection, RuntimeModelDescriptor, ServiceTier } from "@chili/protocol";
 import { createMiniMaxM27HighspeedRouter } from "@chili/core";
 import {
@@ -90,6 +96,7 @@ const PROVIDERS_PACKAGE_NAME = "@chili/providers";
 const DEFAULT_DEEPSEEK_MAX_TOKENS = 128 * 1024;
 const DEFAULT_KIMI_MAX_TOKENS = 32 * 1024;
 const DEFAULT_MINIMAX_MAX_TOKENS = 32 * 1024;
+const DEFAULT_CODEX_MAX_TOKENS = 32 * 1024;
 const DEFAULT_PROVIDER: CliProviderName = "minimax";
 const PROVIDER_DISPLAY_NAMES: Record<CliProviderName, string> = {
   minimax: "MiniMax",
@@ -454,6 +461,26 @@ class CliProviderRouter implements ModelRouter {
     yield* new ProviderModelRouterAdapter(model).stream(input);
   }
 
+  resolveRequestLimits(input: ModelRequestLimitsInput): ModelRequestLimits | undefined {
+    const extended = input as ExtendedModelStreamInput;
+    const selection = this.selectionForInput(extended);
+    if (selection.kind === "fake") return undefined;
+    if (selection.kind === "legacy-minimax") {
+      const providerOptions = readMiniMaxOptionsFromEnv({
+        ...this.options.baseOptions,
+        ...(selection.model ? { model: selection.model } : {}),
+      });
+      return requestLimitsForProvider(MINIMAX_PROVIDER_ID, providerOptions);
+    }
+
+    const reasoningLevel = reasoningLevelForInput(extended, this.options.defaultReasoningLevel);
+    const serviceTier = serviceTierForInput(extended, this.options.defaultServiceTier);
+    return requestLimitsForProvider(
+      selection.provider,
+      this.optionsForProvider(selection, reasoningLevel, serviceTier),
+    );
+  }
+
   private selectionForInput(input: ExtendedModelStreamInput): ResolvedCliModelSelection {
     const override = modelSelectionForInput(input);
     if (!override) return this.options.defaultSelection;
@@ -593,7 +620,7 @@ function readKimiOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
 }
 
 function readOpenAICodexOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
-  const options: ProviderRouterOptions = {};
+  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_CODEX_MAX_TOKENS };
   const env = readOpenAICodexEnvironment();
   const resolvedApiKey = input.apiKey ?? env.apiKey;
   const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? OPENAI_CODEX_BASE_URL;
@@ -602,7 +629,6 @@ function readOpenAICodexOptionsFromEnv(input: CliModelOptions): ProviderRouterOp
   if (resolvedApiKey) options.apiKey = resolvedApiKey;
   if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
   if (resolvedModel) options.model = resolvedModel;
-  if (input.maxTokens !== undefined) options.maxTokens = input.maxTokens;
   if (input.temperature !== undefined) options.temperature = input.temperature;
   if (input.fetch) options.fetch = input.fetch;
   if (input.headers !== undefined) options.headers = input.headers;
@@ -615,6 +641,21 @@ function readOptionsForProvider(provider: CliProviderName, input: ProviderRouter
   if (provider === "kimi") return readKimiOptionsFromEnv(input);
   if (provider === "openai-codex") return readOpenAICodexOptionsFromEnv(input);
   return readMiniMaxOptionsFromEnv(input);
+}
+
+function requestLimitsForProvider(
+  provider: CliProviderName,
+  options: ProviderRouterOptions,
+): ModelRequestLimits | undefined {
+  const descriptor = options.model ? findKnownModel(provider, options.model) : undefined;
+  const limits: ModelRequestLimits = {};
+  if (descriptor?.contextWindowTokens !== undefined) {
+    limits.contextWindowTokens = descriptor.contextWindowTokens;
+  }
+  if (options.maxTokens !== undefined) {
+    limits.requestMaxOutputTokens = options.maxTokens;
+  }
+  return Object.keys(limits).length > 0 ? limits : undefined;
 }
 
 function applyReasoningOptions(

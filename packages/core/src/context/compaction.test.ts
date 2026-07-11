@@ -8,6 +8,7 @@ import type {
   SessionId,
   ThreadId,
   TimestampMs,
+  ToolDefinition,
 } from "@chili/protocol";
 import type { ApprovalRow, EventQuery, EventStore, SessionRow } from "@chili/store";
 import { InMemoryToolRegistry, ToolExecutor } from "@chili/tools";
@@ -122,6 +123,91 @@ test("context builder estimates image tool content without counting base64 bytes
   ).toBe(true);
 });
 
+test("context builder reserves model output and fixed prompt surface", () => {
+  const sessionId = "session_surface_budget" as SessionId;
+  const message = textMessage("msg_surface_budget", sessionId, "user", "m".repeat(200));
+  const tool: ToolDefinition = {
+    name: "lookup",
+    description: "d".repeat(80),
+    risk: "read",
+    inputSchema: { type: "object", properties: { query: { type: "string" } } },
+    async execute() {
+      return { title: "lookup", output: "done" };
+    },
+  };
+  const builder = new ContextWindowBuilder({
+    maxInputChars: 10_000,
+    framingSafetyTokens: 0,
+    preserveRecentMessages: 4,
+  });
+
+  const withoutFixedSurface = builder.build([message], {
+    contextWindowTokens: 100,
+    requestMaxOutputTokens: 20,
+  });
+  const withFixedSurface = builder.build([message], {
+    contextWindowTokens: 100,
+    requestMaxOutputTokens: 20,
+    system: ["s".repeat(160)],
+    tools: [tool],
+  });
+
+  expect(withoutFixedSurface.overflow).toBeUndefined();
+  expect(withFixedSurface.overflow).toMatchObject({ reason: "fixed_input_exceeds_window" });
+  expect(withFixedSurface.usage.fixedInputTokens).toBeGreaterThan(40);
+  expect(withFixedSurface.usage.outputReserveTokens).toBe(20);
+  expect(withFixedSurface.usage.budgetTokens).toBeLessThan(40);
+});
+
+test("runtime fails before model streaming when fixed input exhausts the model window", async () => {
+  const store = new ProjectingEventStore();
+  const registry = new InMemoryToolRegistry();
+  let modelCalls = 0;
+  const model: ModelRouter = {
+    resolveRequestLimits() {
+      return { contextWindowTokens: 64, requestMaxOutputTokens: 16 };
+    },
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      modelCalls++;
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+    }),
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+    contextBudget: {
+      maxInputChars: 10_000,
+      framingSafetyTokens: 0,
+    },
+  });
+
+  const sessionId = await runtime.createSession({ threadId: "thread_surface_overflow" as ThreadId, cwd: "/repo" });
+  await runtime.appendUserMessage({
+    sessionId,
+    threadId: "thread_surface_overflow" as ThreadId,
+    text: "u".repeat(100),
+  });
+  const result = await runtime.runTurn({
+    sessionId,
+    threadId: "thread_surface_overflow" as ThreadId,
+    cwd: "/repo",
+    system: ["s".repeat(200)],
+  });
+
+  expect(result.status).toBe("failed");
+  if (result.status === "completed") throw new Error("expected context overflow failure");
+  expect(result.error?.name).toBe("ContextWindowExceededError");
+  expect(modelCalls).toBe(0);
+});
+
 test("runtime auto-compacts before the main model request and sends the summary forward", async () => {
   const store = new ProjectingEventStore();
   const registry = new InMemoryToolRegistry();
@@ -184,11 +270,16 @@ test("runtime auto-compacts before the main model request and sends the summary 
     sessionId,
     threadId: "thread_auto_compact" as ThreadId,
     cwd: "/repo",
+    modelSelection: { provider: "openai-codex", model: "gpt-5.3-codex-spark" },
   });
 
   expect(result.status).toBe("completed");
   expect(modelInputs).toHaveLength(3);
   expect(modelInputs.slice(0, 2).every((modelInput) => modelInput.system.join("\n").includes("context compression engine"))).toBe(true);
+  expect(modelInputs.every((modelInput) => (
+    modelInput.modelSelection?.provider === "openai-codex"
+    && modelInput.modelSelection.model === "gpt-5.3-codex-spark"
+  ))).toBe(true);
   const mainInputText = modelInputs.at(-1)?.messages.flatMap((message) => message.parts).map(modelVisiblePartText).join("\n") ?? "";
   expect(mainInputText).toContain("<context_summary");
   expect(mainInputText).toContain("Current goal: keep the important old request after verification.");

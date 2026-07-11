@@ -69,6 +69,7 @@ test("CLI DeepSeek env resolution uses official V4 OpenAI-compatible endpoint an
   }) as typeof fetch;
 
   const model = await createCliModel("deepseek", { fetch: fetchImpl });
+  const limits = await model.resolveRequestLimits?.({});
   const events = await collect(model.stream(emptyInput()));
 
   expect(url).toBe("https://api.deepseek.com/chat/completions");
@@ -77,6 +78,7 @@ test("CLI DeepSeek env resolution uses official V4 OpenAI-compatible endpoint an
     max_tokens: 131072,
     thinking: { type: "enabled" },
   });
+  expect(limits).toEqual({ contextWindowTokens: 1048576, requestMaxOutputTokens: 131072 });
   expect(events).toContainEqual(expect.objectContaining({
     type: "metadata",
     provider: "deepseek",
@@ -204,6 +206,7 @@ test("CLI Codex env resolution uses ChatGPT Codex endpoint and session metadata"
   }) as typeof fetch;
 
   const model = await createCliModel("codex", { fetch: fetchImpl });
+  const limits = await model.resolveRequestLimits?.({});
   const events = await collect(model.stream(emptyInput()));
 
   expect(url).toBe("https://chatgpt.test/backend-api/codex/responses");
@@ -212,8 +215,9 @@ test("CLI Codex env resolution uses ChatGPT Codex endpoint and session metadata"
   expect(body).toMatchObject({
     model: "gpt-5.3-codex",
     prompt_cache_key: "session_cli_model",
+    max_output_tokens: 32768,
   });
-  expect(body).not.toHaveProperty("max_output_tokens");
+  expect(limits).toEqual({ contextWindowTokens: 272000, requestMaxOutputTokens: 32768 });
   expect(events).toContainEqual(expect.objectContaining({
     type: "metadata",
     provider: "openai-codex",
@@ -221,6 +225,18 @@ test("CLI Codex env resolution uses ChatGPT Codex endpoint and session metadata"
     contextWindowTokens: 272000,
     maxOutputTokens: 128000,
   }));
+});
+
+test("CLI Codex request limits follow a per-request model override", async () => {
+  process.env.OPENAI_CODEX_ACCESS_TOKEN = jwtWithAccount("acct_cli");
+  process.env.OPENAI_CODEX_MODEL = "gpt-5.3-codex";
+
+  const model = await createCliModel("codex");
+  const limits = await model.resolveRequestLimits?.({
+    modelSelection: { provider: "openai-codex", model: "gpt-5.3-codex-spark" },
+  });
+
+  expect(limits).toEqual({ contextWindowTokens: 128000, requestMaxOutputTokens: 32768 });
 });
 
 test("CLI Codex supports bare concrete model ids with thinking", async () => {

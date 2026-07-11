@@ -338,6 +338,9 @@ export class RuntimeService {
         threadId: ThreadId;
         reason: "manual";
         instructions?: string;
+        modelSelection?: ModelSelection;
+        reasoningLevel?: ReasoningLevel;
+        serviceTier?: ServiceTier;
         signal?: AbortSignal;
       }) => Promise<CompactContextResult>;
     };
@@ -347,6 +350,7 @@ export class RuntimeService {
 
     const controller = this.createRunController({ ...input, text: "" }, "compaction");
     try {
+      const modelState = await this.resolveSessionModelState(input.sessionId);
       await this.publishStatus({
         sessionId: input.sessionId,
         threadId: input.threadId,
@@ -358,6 +362,9 @@ export class RuntimeService {
         threadId: ThreadId;
         reason: "manual";
         instructions?: string;
+        modelSelection?: ModelSelection;
+        reasoningLevel?: ReasoningLevel;
+        serviceTier?: ServiceTier;
         signal?: AbortSignal;
       } = {
         sessionId: input.sessionId,
@@ -366,6 +373,9 @@ export class RuntimeService {
         signal: controller.signal,
       };
       if (input.instructions) compactInput.instructions = input.instructions;
+      if (modelState.modelSelection) compactInput.modelSelection = modelState.modelSelection;
+      if (modelState.reasoningLevel !== undefined) compactInput.reasoningLevel = modelState.reasoningLevel;
+      if (modelState.serviceTier !== undefined) compactInput.serviceTier = modelState.serviceTier;
       const result = await runtime.compactContext(compactInput);
       await this.publishStatus({
         sessionId: input.sessionId,

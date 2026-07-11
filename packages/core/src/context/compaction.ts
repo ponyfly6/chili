@@ -1,4 +1,15 @@
-import type { Message, MessageId, PartId, SessionId, ThreadId, TimestampMs, TurnId } from "@chili/protocol";
+import type {
+  Message,
+  MessageId,
+  ModelSelection,
+  PartId,
+  ReasoningLevel,
+  ServiceTier,
+  SessionId,
+  ThreadId,
+  TimestampMs,
+  TurnId,
+} from "@chili/protocol";
 import { formatCompactionSourceMessages } from "./format.js";
 import { compactedMessageView, estimateMessages, type CompactionBoundary } from "./window.js";
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "../runtime.js";
@@ -18,6 +29,9 @@ export interface ContextCompactionInput {
   messages: readonly Message[];
   boundary: CompactionBoundary;
   instructions?: string;
+  modelSelection?: ModelSelection;
+  reasoningLevel?: ReasoningLevel;
+  serviceTier?: ServiceTier;
   signal?: AbortSignal;
 }
 
@@ -151,6 +165,9 @@ export class ContextCompactionService {
       tools: [],
       system: [COMPACTION_SYSTEM_PROMPT],
     };
+    if (input.modelSelection) modelInput.modelSelection = input.modelSelection;
+    if (input.reasoningLevel !== undefined) modelInput.reasoningLevel = input.reasoningLevel;
+    if (input.serviceTier !== undefined) modelInput.serviceTier = input.serviceTier;
     if (input.signal) modelInput.signal = input.signal;
 
     let text = "";

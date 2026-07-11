@@ -46,6 +46,20 @@ export interface ToolRegistry {
 export interface ModelRouter {
   stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent>;
   listModels?(): Promise<readonly RuntimeModelDescriptor[]> | readonly RuntimeModelDescriptor[];
+  resolveRequestLimits?(
+    input: ModelRequestLimitsInput,
+  ): Promise<ModelRequestLimits | undefined> | ModelRequestLimits | undefined;
+}
+
+export interface ModelRequestLimitsInput {
+  modelSelection?: ModelSelection;
+  reasoningLevel?: ReasoningLevel;
+  serviceTier?: ServiceTier;
+}
+
+export interface ModelRequestLimits {
+  contextWindowTokens?: number;
+  requestMaxOutputTokens?: number;
 }
 
 export interface ModelStreamInput {
