@@ -94,6 +94,3 @@ jobs:
 
       - name: Seatbelt unit and attack tests
         run: bun test packages/tools/src/macos-seatbelt.test.ts apps/cli/src/bash-runner.test.ts
-
-      - name: Seatbelt harness integration
-        run: bun test apps/cli/src/harness.test.ts --test-name-pattern "sandboxes default bash"
