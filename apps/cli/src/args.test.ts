@@ -91,6 +91,15 @@ test("parses MCP startup flags for CLI runs", () => {
   });
 });
 
+test("parses the read-only store doctor command", () => {
+  expect(parseArgs(["store", "doctor"])).toMatchObject({ command: "store-doctor" });
+  expect(parseArgs(["store", "doctor", "--json"])).toMatchObject({
+    command: "store-doctor",
+    json: true,
+  });
+  expect(() => parseArgs(["store", "recover"])).toThrow("Unknown store command: recover");
+});
+
 test("parses team status and nested team view commands", () => {
   expect(parseArgs(["team", "status", "team_1", "--json"])).toMatchObject({
     command: "team",

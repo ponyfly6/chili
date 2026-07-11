@@ -34,6 +34,7 @@ export interface CliArgs {
     | "memory-show"
     | "memory-add"
     | "memory-reload"
+    | "store-doctor"
     | "mcp"
     | "help";
   prompt?: string;
@@ -215,6 +216,12 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     }
     if (arg === "memory") {
       parseMemoryCommand(result, args, prompt);
+      continue;
+    }
+    if (arg === "store") {
+      const action = requireValue(arg, args);
+      if (action !== "doctor") throw new Error(`Unknown store command: ${action}`);
+      result.command = "store-doctor";
       continue;
     }
     if (arg === "mcp") {
@@ -420,6 +427,7 @@ export function usage(): string {
     "  bun run chili -- memory show",
     "  bun run chili -- memory add [--user|--project] \"remember this\"",
     "  bun run chili -- memory reload",
+    "  bun run chili -- store doctor [--json]",
     "  bun run chili -- mcp list [--json]",
     "  bun run chili -- mcp status [server-name] [--json]",
     "  bun run chili -- mcp reload [--json]",

@@ -1,4 +1,6 @@
 #!/usr/bin/env bun
+import { stat } from "node:fs/promises";
+import { join, resolve as resolvePath } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { addChiliMemoryEntry, loadChiliMemoryContext } from "@chili/core";
 import type { AgentTreeNode, TeamExecutionRunSummary, TeamMergeSweepResult, TeamSnapshot } from "@chili/core";
@@ -20,6 +22,7 @@ import type {
 import { ROOT_AGENT_PATH } from "@chili/protocol";
 import { startRuntimeHttpServer } from "@chili/server";
 import { loadSkillSettings, loadSkills, updateSkillDisabledSetting, type Skill } from "@chili/skills";
+import { inspectSqliteEventStore } from "@chili/store";
 import { DeferredApprovalQueue } from "@chili/tools";
 import { parseArgs, usage } from "./args.js";
 import { applyCliEnvironmentDefaults, cliEnvironmentDefaults } from "./environment-defaults.js";
@@ -27,6 +30,7 @@ import { createCliHarness } from "./harness.js";
 import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
 import { runPrompt } from "./runner.js";
 import { resolveSession } from "./session.js";
+import { formatStoreDoctorText } from "./store-doctor.js";
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
@@ -37,6 +41,11 @@ async function main(): Promise<void> {
 
   if (args.command === "skills-list" || args.command === "skills-enable" || args.command === "skills-disable") {
     await handleSkillsCommand(args);
+    return;
+  }
+
+  if (args.command === "store-doctor") {
+    await handleStoreDoctorCommand(args);
     return;
   }
 
@@ -592,6 +601,18 @@ async function printSessions(store: Awaited<ReturnType<typeof createCliHarness>>
   }
 }
 
+async function handleStoreDoctorCommand(args: ReturnType<typeof parseArgs>): Promise<void> {
+  const dbPath = join(resolvePath(args.cwd), ".chili", "chili.sqlite");
+  if (!(await fileExists(dbPath))) {
+    const missing = { path: dbPath, exists: false };
+    console.log(args.json ? jsonStringify(missing) : `No store database found at ${dbPath}`);
+    return;
+  }
+
+  const report = await inspectSqliteEventStore(dbPath);
+  console.log(args.json ? jsonStringify(report) : formatStoreDoctorText(report));
+}
+
 async function printTasks(harness: Awaited<ReturnType<typeof createCliHarness>>): Promise<void> {
   const tasks = await harness.tasks.listTasks();
   if (tasks.length === 0) {
@@ -1054,6 +1075,10 @@ function memoryWriteScope(scope: MemoryScopeArg): "user" | "project" {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  return stat(path).then(() => true, () => false);
 }
 
 function jsonStringify(value: unknown): string {
