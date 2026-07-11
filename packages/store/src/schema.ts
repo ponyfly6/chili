@@ -11,6 +11,7 @@ export const SQLITE_SCHEMA = [
   `create unique index if not exists events_id_idx on events(id)`,
   `create index if not exists events_seq_idx on events(seq)`,
   `create index if not exists events_session_seq_idx on events(session_id, seq)`,
+  `create index if not exists events_session_type_seq_idx on events(session_id, type, seq)`,
   `create index if not exists events_thread_seq_idx on events(thread_id, seq)`,
   `create index if not exists events_type_seq_idx on events(type, seq)`,
   `create index if not exists events_session_time_idx on events(session_id, time, id)`,

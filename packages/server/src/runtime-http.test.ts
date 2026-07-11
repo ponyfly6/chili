@@ -92,7 +92,7 @@ test("serves sessions and event backlog over the runtime HTTP handler", async ()
   expect(new TextDecoder().decode(chunk.value)).toContain("session.created");
 });
 
-test("event backlog stays bounded initially and pages complete resumed history", async () => {
+test("event backlog stays bounded and oversized resume cursors require a tail resync", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-runtime-tail-backlog-"));
   const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
   const store = new ObservableEventStore(baseStore);
@@ -167,14 +167,96 @@ test("event backlog stays bounded initially and pages complete resumed history",
     expect(text).toContain("event_tail_failed_status");
     expect(text).toContain("unexpected EOF");
 
+    const oversizedResume = await handler(new Request(
+      `http://chili.test/events?sessionId=${sessionId}&threadId=${threadId}&afterEventId=event_tail_started_0`,
+    ));
+    expect(oversizedResume.status).toBe(409);
+    expect(await oversizedResume.json()).toMatchObject({
+      error: {
+        message: "Event backlog exceeds the 5-event replay limit. Reconnect without afterEventId to resync from the latest events.",
+      },
+    });
+
     const resumed = await collectEventStreamText(
       handler,
-      `http://chili.test/events?sessionId=${sessionId}&threadId=${threadId}&afterEventId=event_tail_started_0`,
+      `http://chili.test/events?sessionId=${sessionId}&threadId=${threadId}&afterEventId=event_tail_started_1`,
     );
     expect(resumed).not.toContain("event_tail_session");
-    expect(resumed).not.toContain('"id":"event_tail_started_0"');
+    expect(resumed).not.toContain('"id":"event_tail_started_1"');
     expect(resumed).toContain("event_tail_started_4");
     expect(resumed).toContain("event_tail_failed_status");
+  } finally {
+    baseStore.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("rejects unknown SSE cursors but keeps a known tip cursor live without transient ids", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-runtime-event-cursor-"));
+  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const handler = createRuntimeHttpHandler({ service, store, maxBacklogEvents: 5 });
+  const sessionId = "session_event_cursor" as SessionId;
+  const threadId = "thread_event_cursor" as ThreadId;
+
+  try {
+    await store.append({
+      id: "event_cursor_tip",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    });
+
+    const unknown = await handler(new Request(
+      `http://chili.test/events?sessionId=${sessionId}&threadId=${threadId}&afterEventId=event_cursor_missing`,
+    ));
+    expect(unknown.status).toBe(409);
+    expect(await unknown.json()).toMatchObject({
+      error: { message: expect.stringContaining("Unknown event cursor") },
+    });
+
+    const controller = new AbortController();
+    const response = await handler(new Request(
+      `http://chili.test/events?sessionId=${sessionId}&threadId=${threadId}&afterEventId=event_cursor_tip`,
+      { signal: controller.signal },
+    ));
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("expected event stream body");
+
+    await store.append({
+      id: "event_cursor_transient",
+      type: "tool.output_delta",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        callId: "toolcall_cursor" as import("@chili/protocol").ToolCallId,
+        stream: "stdout",
+        delta: "live",
+      },
+    });
+    const transientChunk = await reader.read();
+    const transientText = new TextDecoder().decode(transientChunk.value);
+    expect(transientText).toContain('"id":"event_cursor_transient"');
+    expect(transientText).not.toContain("id: event_cursor_transient");
+
+    await store.append({
+      id: "event_cursor_durable",
+      type: "turn.started",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_cursor" as TurnId },
+    });
+    const durableChunk = await reader.read();
+    expect(new TextDecoder().decode(durableChunk.value)).toContain("id: event_cursor_durable");
+
+    controller.abort();
+    reader.releaseLock();
   } finally {
     baseStore.close();
     await rm(dir, { recursive: true, force: true });

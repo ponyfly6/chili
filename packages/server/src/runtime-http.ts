@@ -1,4 +1,4 @@
-import { RUNTIME_PERMISSION_PROFILE_IDS } from "@chili/protocol";
+import { isTransientEvent, RUNTIME_PERMISSION_PROFILE_IDS } from "@chili/protocol";
 import type {
   ChiliEvent,
   AgentPath,
@@ -72,6 +72,7 @@ import type {
   TeamSnapshot,
   UpdateTeamTaskInput,
 } from "@chili/core";
+import { UnknownEventCursorError } from "@chili/store";
 import type { EventPublisher, EventStore } from "@chili/store";
 import type { PromptCommandControl, PromptCommandRunResult } from "./commands.js";
 import { PromptCommandAmbiguousError, PromptCommandNotFoundError } from "./commands.js";
@@ -670,7 +671,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         if (sessionId) streamOptions.sessionId = sessionId;
         if (threadId) streamOptions.threadId = threadId;
         if (afterEventId) streamOptions.afterEventId = afterEventId;
-        return eventStream(streamOptions);
+        return await eventStream(streamOptions);
       }
 
       return jsonError(404, "Not found");
@@ -1324,13 +1325,14 @@ function rejectLegacySystemField(body: unknown): void {
 
 async function eventStream(options: EventStreamOptions): Promise<Response> {
   const encoder = new TextEncoder();
-  const sentIds = new Set<string>();
   const pending: ChiliEvent[] = [];
+  const maxBacklogEvents = Math.max(1, Math.trunc(options.maxBacklogEvents));
   let backlogDone = false;
   let closed = false;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let unsubscribe: (() => void) | undefined;
   let closeController: (() => void) | undefined;
+  let sendLive: ((event: ChiliEvent) => void) | undefined;
 
   const cleanup = (): void => {
     if (closed) return;
@@ -1342,25 +1344,74 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
     closeController?.();
   };
 
+  type BacklogQuery = {
+    sessionId?: SessionId;
+    threadId?: ThreadId;
+    afterEventId?: string;
+    limit: number;
+    tail: boolean;
+  };
+  const query = (input: { afterEventId?: string; limit: number; tail: boolean }): BacklogQuery => ({
+    ...input,
+    ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+    ...(options.threadId ? { threadId: options.threadId } : {}),
+  });
+
+  unsubscribe = options.store.subscribe((event) => {
+    if (!matchesEvent(event, options)) return;
+    if (backlogDone) {
+      sendLive?.(event);
+    } else {
+      pending.push(event);
+    }
+  });
+  options.request.signal.addEventListener("abort", cleanup, { once: true });
+
+  let backlog: ChiliEvent[];
+  try {
+    if (options.afterEventId) {
+      const resumed = await options.store.events(query({
+        afterEventId: options.afterEventId,
+        limit: maxBacklogEvents + 1,
+        tail: false,
+      }));
+      if (resumed.length > maxBacklogEvents) {
+        throw {
+          status: 409,
+          message: `Event backlog exceeds the ${maxBacklogEvents}-event replay limit. Reconnect without afterEventId to resync from the latest events.`,
+        } satisfies HttpError;
+      }
+      backlog = resumed as ChiliEvent[];
+    } else {
+      backlog = await options.store.events(query({
+        limit: maxBacklogEvents,
+        tail: true,
+      })) as ChiliEvent[];
+    }
+  } catch (error) {
+    cleanup();
+    if (error instanceof UnknownEventCursorError) {
+      throw {
+        status: 409,
+        message: `Unknown event cursor ${JSON.stringify(error.eventId)}. Reconnect without afterEventId to resync from the latest events.`,
+      } satisfies HttpError;
+    }
+    throw error;
+  }
+
+  const backlogIds = new Set(backlog.map((event) => event.id));
+
   const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
+    start(controller) {
       const send = (event: ChiliEvent): void => {
-        if (closed || sentIds.has(event.id) || !matchesEvent(event, options)) return;
-        if (!backlogDone) sentIds.add(event.id);
+        if (closed || !matchesEvent(event, options)) return;
         try {
           controller.enqueue(encoder.encode(formatSse(event)));
         } catch {
           cleanup();
         }
       };
-
-      unsubscribe = options.store.subscribe((event) => {
-        if (backlogDone) {
-          send(event);
-        } else {
-          pending.push(event);
-        }
-      });
+      sendLive = send;
 
       closeController = (): void => {
         try {
@@ -1370,7 +1421,10 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
         }
       };
 
-      options.request.signal.addEventListener("abort", cleanup, { once: true });
+      if (closed) {
+        closeController();
+        return;
+      }
       heartbeat = setInterval(() => {
         if (closed) return;
         try {
@@ -1379,43 +1433,13 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
           cleanup();
         }
       }, 5_000);
-
-      type BacklogQuery = {
-        sessionId?: SessionId;
-        threadId?: ThreadId;
-        afterEventId?: string;
-        limit: number;
-        tail: boolean;
-      };
-      const query = (input: { afterEventId?: string; limit: number; tail: boolean }): BacklogQuery => ({
-        ...input,
-        ...(options.sessionId ? { sessionId: options.sessionId } : {}),
-        ...(options.threadId ? { threadId: options.threadId } : {}),
-      });
-
-      if (!options.afterEventId) {
-        const backlog = await options.store.events(query({
-          limit: Math.max(1, options.maxBacklogEvents),
-          tail: true,
-        }));
-        for (const event of backlog) send(event as ChiliEvent);
-      } else {
-        const pageSize = Math.max(1, options.maxBacklogEvents);
-        const anchor = (await options.store.events(query({ limit: 1, tail: true }))).at(-1);
-        let cursor: string | undefined = options.afterEventId;
-        while (!closed && anchor) {
-          const page = await options.store.events(query({ afterEventId: cursor, limit: pageSize, tail: false }));
-          if (page.length === 0) break;
-          for (const event of page) send(event as ChiliEvent);
-          if (page.some((event) => event.id === anchor.id)) break;
-          const nextCursor = page.at(-1)?.id;
-          if (page.length < pageSize || !nextCursor || nextCursor === cursor) break;
-          cursor = nextCursor;
-        }
+      for (const event of backlog) send(event);
+      for (const event of pending) {
+        if (!backlogIds.has(event.id)) send(event);
       }
-      for (const event of pending.splice(0)) send(event);
+      pending.length = 0;
       backlogDone = true;
-      sentIds.clear();
+      backlogIds.clear();
     },
     cancel() {
       cleanup();
@@ -1439,7 +1463,13 @@ function matchesEvent(event: ChiliEvent, options: EventStreamOptions): boolean {
 }
 
 function formatSse(event: ChiliEvent): string {
-  return [`id: ${event.id}`, "event: chili.event", `data: ${JSON.stringify(event)}`, "", ""].join("\n");
+  return [
+    ...(!isTransientEvent(event) ? [`id: ${event.id}`] : []),
+    "event: chili.event",
+    `data: ${JSON.stringify(event)}`,
+    "",
+    "",
+  ].join("\n");
 }
 
 function serializeSubmitPromptResult(result: SubmitPromptResult): RuntimePromptResult {

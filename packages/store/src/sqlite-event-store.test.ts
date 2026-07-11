@@ -27,9 +27,12 @@ test("configures SQLite for bounded WAL maintenance", async () => {
   try {
     const db = sqliteDatabase(store);
     expect(pragmaString(db, "journal_mode")).toBe("wal");
-    expect(pragmaNumber(db, "synchronous")).toBe(1);
+    expect(pragmaNumber(db, "synchronous")).toBe(2);
     expect(pragmaNumber(db, "wal_autocheckpoint")).toBe(256);
     expect(pragmaNumber(db, "journal_size_limit")).toBe(16 * 1024 * 1024);
+    expect(db.query<{ name: string }, []>(
+      "select name from sqlite_master where type = 'index' and name = 'events_session_type_seq_idx'",
+    ).get()?.name).toBe("events_session_type_seq_idx");
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -645,6 +648,123 @@ test("migrates older eager message projections without replaying historical delt
     expect((await store.messages("session_legacy_delta" as SessionId))[0]?.parts).toMatchObject([
       { id: "part_legacy_delta", text: "hello" },
     ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("finishes checkpoint backfill when the column exists without a migration marker", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-part-delta-resumed-migration-"));
+  const dbPath = join(dir, "events.sqlite");
+  const db = new Database(dbPath, { create: true, strict: true });
+  db.exec(`
+    create table events (
+      seq integer primary key autoincrement,
+      id text not null unique,
+      type text not null,
+      time integer not null,
+      session_id text,
+      thread_id text,
+      payload_json text not null
+    );
+    create table messages (
+      id text primary key,
+      session_id text not null,
+      thread_id text,
+      turn_id text,
+      role text not null,
+      parent_id text,
+      created_at integer not null
+    );
+    create table message_parts (
+      id text primary key,
+      message_id text not null,
+      session_id text not null,
+      type text not null,
+      ordinal integer not null,
+      data_json text not null,
+      delta_event_seq integer not null default 0,
+      created_at integer not null
+    );
+    insert into messages
+      (id, session_id, thread_id, turn_id, role, created_at)
+    values
+      ('message_interrupted_delta', 'session_interrupted_delta', 'thread_interrupted_delta',
+       'turn_interrupted_delta', 'assistant', 1);
+    insert into message_parts
+      (id, message_id, session_id, type, ordinal, data_json, delta_event_seq, created_at)
+    values
+      ('part_interrupted_delta', 'message_interrupted_delta', 'session_interrupted_delta', 'text', 0,
+       '{"id":"part_interrupted_delta","messageId":"message_interrupted_delta","sessionId":"session_interrupted_delta","type":"text","text":"hello"}', 0, 1);
+    insert into events
+      (id, type, time, session_id, thread_id, payload_json)
+    values
+      ('event_interrupted_delta', 'message.part_delta', 2, 'session_interrupted_delta', 'thread_interrupted_delta',
+       '{"messageId":"message_interrupted_delta","partId":"part_interrupted_delta","field":"text","delta":"lo"}');
+  `);
+  db.close();
+
+  let store = new SqliteEventStore(dbPath);
+  try {
+    const migratedDb = sqliteDatabase(store);
+    expect(migratedDb
+      .query<{ delta_event_seq: number }, []>(
+        "select delta_event_seq from message_parts where id = 'part_interrupted_delta'",
+      )
+      .get()?.delta_event_seq).toBe(1);
+    expect(migratedDb
+      .query<{ name: string }, []>(
+        "select name from schema_migrations where name = 'message_part_delta_checkpoints_v1'",
+      )
+      .get()?.name).toBe("message_part_delta_checkpoints_v1");
+
+    const sessionId = "session_after_checkpoint_marker" as SessionId;
+    const threadId = "thread_after_checkpoint_marker" as ThreadId;
+    const messageId = "message_after_checkpoint_marker" as MessageId;
+    const partId = "part_after_checkpoint_marker" as PartId;
+    const turnId = "turn_after_checkpoint_marker" as TurnId;
+    await store.appendMany([
+      {
+        id: "event_message_after_checkpoint_marker",
+        type: "message.created",
+        time: 3 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { messageId, role: "assistant", turnId },
+      },
+      {
+        id: "event_part_after_checkpoint_marker",
+        type: "message.part_added",
+        time: 4 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          messageId,
+          part: { id: partId, messageId, sessionId, type: "text", text: "new" },
+        },
+      },
+      {
+        id: "event_delta_after_checkpoint_marker",
+        type: "message.part_delta",
+        time: 5 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { messageId, partId, field: "text", delta: "!" },
+      },
+    ]);
+    store.close();
+
+    store = new SqliteEventStore(dbPath);
+    const reopenedDb = sqliteDatabase(store);
+    const pendingProjection = reopenedDb
+      .query<{ data_json: string; delta_event_seq: number }, [string]>(
+        "select data_json, delta_event_seq from message_parts where id = ?",
+      )
+      .get(partId);
+    expect(JSON.parse(pendingProjection?.data_json ?? "{}").text).toBe("new");
+    expect(pendingProjection?.delta_event_seq).toBe(0);
+    expect((await store.messages(sessionId))[0]?.parts).toMatchObject([{ id: partId, text: "new!" }]);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });

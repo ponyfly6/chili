@@ -290,6 +290,14 @@ interface TeamMessageDeliveryProjectionRow {
 export const SQLITE_WAL_AUTO_CHECKPOINT_PAGES = 256;
 export const SQLITE_JOURNAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024;
 
+export class UnknownEventCursorError extends Error {
+  override readonly name = "UnknownEventCursorError";
+
+  constructor(readonly eventId: string) {
+    super(`Unknown event cursor: ${eventId}`);
+  }
+}
+
 export interface SqliteEventStoreOptions {
   mirror?: EventMirror;
   onMirrorError?: (error: unknown, event: ChiliEvent) => void;
@@ -316,7 +324,7 @@ export class SqliteEventStore
     this.db = new Database(path, { create: true, strict: true });
     try {
       this.db.exec("pragma journal_mode = WAL");
-      this.db.exec("pragma synchronous = NORMAL");
+      this.db.exec("pragma synchronous = FULL");
       this.db.exec(`pragma wal_autocheckpoint = ${SQLITE_WAL_AUTO_CHECKPOINT_PAGES}`);
       this.db.exec(`pragma journal_size_limit = ${SQLITE_JOURNAL_SIZE_LIMIT_BYTES}`);
       this.db.exec(`pragma busy_timeout = ${Math.max(0, Math.trunc(options.busyTimeoutMs ?? 10_000))}`);
@@ -386,6 +394,22 @@ export class SqliteEventStore
       params.type = query.type;
     }
     if (query.afterEventId) {
+      const cursorClauses = ["id = $afterEventId"];
+      const cursorParams: Record<string, unknown> = { afterEventId: query.afterEventId };
+      if (query.sessionId) {
+        cursorClauses.push("session_id = $sessionId");
+        cursorParams.sessionId = query.sessionId;
+      }
+      if (query.threadId) {
+        cursorClauses.push("thread_id = $threadId");
+        cursorParams.threadId = query.threadId;
+      }
+      const cursor = this.db
+        .query<{ found: number }, any>(
+          `select 1 as found from events where ${cursorClauses.join(" and ")} limit 1`,
+        )
+        .get(cursorParams);
+      if (!cursor) throw new UnknownEventCursorError(query.afterEventId);
       clauses.push("seq > (select seq from events where id = $afterEventId)");
       params.afterEventId = query.afterEventId;
     }
@@ -1472,6 +1496,7 @@ export class SqliteEventStore
     this.db.exec(`create unique index if not exists events_seq_idx on events(seq)`);
     this.db.exec(`create unique index if not exists events_id_idx on events(id)`);
     this.db.exec(`create index if not exists events_session_seq_idx on events(session_id, seq)`);
+    this.db.exec(`create index if not exists events_session_type_seq_idx on events(session_id, type, seq)`);
     this.db.exec(`create index if not exists events_thread_seq_idx on events(thread_id, seq)`);
     this.db.exec(`create index if not exists events_type_seq_idx on events(type, seq)`);
   }
@@ -1502,24 +1527,39 @@ export class SqliteEventStore
   }
 
   private migrateMessageSchema(): void {
-    this.addColumnIfMissing("messages", "turn_id", "text");
-    const addedDeltaCheckpoint = this.addColumnIfMissing(
-      "message_parts",
-      "delta_event_seq",
-      "integer not null default 0",
-    );
-    if (addedDeltaCheckpoint) {
+    const migrate = this.db.transaction(() => {
       this.db.exec(`
-        update message_parts
-           set delta_event_seq = coalesce((
-             select max(events.seq)
-               from events
-              where events.type = 'message.part_delta'
-                and json_extract(events.payload_json, '$.partId') = message_parts.id
-           ), 0)
+        create table if not exists schema_migrations (
+          name text primary key
+        )
       `);
-    }
-    this.db.exec(`create index if not exists messages_turn_idx on messages(turn_id)`);
+      this.addColumnIfMissing("messages", "turn_id", "text");
+      this.addColumnIfMissing(
+        "message_parts",
+        "delta_event_seq",
+        "integer not null default 0",
+      );
+      const deltaCheckpointMigration = "message_part_delta_checkpoints_v1";
+      const checkpointBackfilled = this.db
+        .query<{ found: number }, [string]>(
+          `select 1 as found from schema_migrations where name = ? limit 1`,
+        )
+        .get(deltaCheckpointMigration);
+      if (!checkpointBackfilled) {
+        this.db.exec(`
+          update message_parts
+             set delta_event_seq = coalesce((
+               select max(events.seq)
+                 from events
+                where events.type = 'message.part_delta'
+                  and json_extract(events.payload_json, '$.partId') = message_parts.id
+             ), 0)
+        `);
+        this.db.query(`insert into schema_migrations (name) values (?)`).run(deltaCheckpointMigration);
+      }
+      this.db.exec(`create index if not exists messages_turn_idx on messages(turn_id)`);
+    });
+    migrate();
   }
 
   private migrateGoalSchema(): void {
