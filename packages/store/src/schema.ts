@@ -61,6 +61,7 @@ export const SQLITE_SCHEMA = [
     type text not null,
     ordinal integer not null,
     data_json text not null,
+    delta_event_seq integer not null default 0,
     created_at integer not null
   )`,
   `create index if not exists message_parts_message_ordinal_idx on message_parts(message_id, ordinal)`,

@@ -31,6 +31,7 @@ import type {
   ToolEvent,
   TurnId,
 } from "@chili/protocol";
+import { isTransientEvent } from "@chili/protocol";
 import { decodeJson, encodeJson } from "./json.js";
 import { SQLITE_SCHEMA } from "./schema.js";
 import type {
@@ -104,6 +105,13 @@ interface MessageRow {
 
 interface PartRow {
   data_json: string;
+  delta_event_seq: number;
+}
+
+interface PendingPartDeltaRow {
+  seq: number;
+  part_id: string;
+  payload_json: string;
 }
 
 interface ThreadGoalProjectionRow {
@@ -279,6 +287,9 @@ interface TeamMessageDeliveryProjectionRow {
   delivered_at: number | null;
 }
 
+export const SQLITE_WAL_AUTO_CHECKPOINT_PAGES = 256;
+export const SQLITE_JOURNAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024;
+
 export interface SqliteEventStoreOptions {
   mirror?: EventMirror;
   onMirrorError?: (error: unknown, event: ChiliEvent) => void;
@@ -299,40 +310,61 @@ export class SqliteEventStore
     TeamTaskVerificationClaimStore
 {
   private readonly db: Database;
+  private closed = false;
 
   constructor(path = ".chili/chili.sqlite", private readonly options: SqliteEventStoreOptions = {}) {
     this.db = new Database(path, { create: true, strict: true });
-    this.db.exec("pragma journal_mode = WAL");
-    this.db.exec(`pragma busy_timeout = ${Math.max(0, Math.trunc(options.busyTimeoutMs ?? 10_000))}`);
-    this.db.exec("pragma foreign_keys = ON");
-    const [eventTableStatement, ...remainingStatements] = SQLITE_SCHEMA;
-    if (eventTableStatement) {
-      this.db.exec(eventTableStatement);
+    try {
+      this.db.exec("pragma journal_mode = WAL");
+      this.db.exec("pragma synchronous = NORMAL");
+      this.db.exec(`pragma wal_autocheckpoint = ${SQLITE_WAL_AUTO_CHECKPOINT_PAGES}`);
+      this.db.exec(`pragma journal_size_limit = ${SQLITE_JOURNAL_SIZE_LIMIT_BYTES}`);
+      this.db.exec(`pragma busy_timeout = ${Math.max(0, Math.trunc(options.busyTimeoutMs ?? 10_000))}`);
+      this.db.exec("pragma foreign_keys = ON");
+      const [eventTableStatement, ...remainingStatements] = SQLITE_SCHEMA;
+      if (eventTableStatement) {
+        this.db.exec(eventTableStatement);
+      }
+      this.migrateEventSequence();
+      for (const statement of remainingStatements) {
+        this.db.exec(statement);
+      }
+      this.migrateApprovalSchema();
+      this.migrateMessageSchema();
+      this.migrateGoalSchema();
+      this.migrateSubagentSchema();
+      this.migrateTeamSchema();
+    } catch (error) {
+      try {
+        this.db.close();
+      } catch {
+        // Preserve the initialization error that explains why the store is unavailable.
+      }
+      throw error;
     }
-    this.migrateEventSequence();
-    for (const statement of remainingStatements) {
-      this.db.exec(statement);
-    }
-    this.migrateApprovalSchema();
-    this.migrateMessageSchema();
-    this.migrateGoalSchema();
-    this.migrateSubagentSchema();
-    this.migrateTeamSchema();
   }
 
   close(): void {
-    this.db.close();
+    if (this.closed) return;
+    try {
+      this.db.exec("pragma wal_checkpoint(TRUNCATE)");
+    } finally {
+      this.closed = true;
+      this.db.close();
+    }
   }
 
   async append(event: ChiliEvent): Promise<void> {
+    if (isTransientEvent(event)) return;
     this.writeTransaction([event]);
     await this.writeMirror(event);
   }
 
   async appendMany(events: readonly ChiliEvent[]): Promise<void> {
-    if (events.length === 0) return;
-    this.writeTransaction(events);
-    for (const event of events) {
+    const durableEvents = events.filter((event) => !isTransientEvent(event));
+    if (durableEvents.length === 0) return;
+    this.writeTransaction(durableEvents);
+    for (const event of durableEvents) {
       await this.writeMirror(event);
     }
   }
@@ -420,17 +452,25 @@ export class SqliteEventStore
          order by created_at asc, id asc`,
       )
       .all(sessionId);
+    const pendingDeltas = this.pendingMessagePartDeltas(sessionId);
 
     return messages.map((message) => {
       const parts = this.db
         .query<PartRow, [string]>(
-          `select data_json
+          `select data_json, delta_event_seq
            from message_parts
            where message_id = ?
            order by ordinal asc`,
         )
         .all(message.id)
-        .map((row) => decodeJson<MessagePart>(row.data_json, {} as MessagePart));
+        .map((row) => {
+          let part = decodeJson<MessagePart>(row.data_json, {} as MessagePart);
+          for (const delta of pendingDeltas.get(part.id) ?? []) {
+            if (delta.seq <= row.delta_event_seq) continue;
+            part = applyPartDelta(part, delta.field, delta.delta);
+          }
+          return part;
+        });
 
       const result: Message = {
         id: message.id as Message["id"],
@@ -1463,6 +1503,22 @@ export class SqliteEventStore
 
   private migrateMessageSchema(): void {
     this.addColumnIfMissing("messages", "turn_id", "text");
+    const addedDeltaCheckpoint = this.addColumnIfMissing(
+      "message_parts",
+      "delta_event_seq",
+      "integer not null default 0",
+    );
+    if (addedDeltaCheckpoint) {
+      this.db.exec(`
+        update message_parts
+           set delta_event_seq = coalesce((
+             select max(events.seq)
+               from events
+              where events.type = 'message.part_delta'
+                and json_extract(events.payload_json, '$.partId') = message_parts.id
+           ), 0)
+      `);
+    }
     this.db.exec(`create index if not exists messages_turn_idx on messages(turn_id)`);
   }
 
@@ -1529,11 +1585,13 @@ export class SqliteEventStore
     this.db.exec(`create index if not exists team_message_deliveries_status_idx on team_message_deliveries(status, updated_at)`);
   }
 
-  private addColumnIfMissing(table: string, column: string, definition: string): void {
+  private addColumnIfMissing(table: string, column: string, definition: string): boolean {
     const columns = this.db.query<{ name: string }, []>(`pragma table_info(${table})`).all();
     if (!columns.some((item) => item.name === column)) {
       this.db.exec(`alter table ${table} add column ${column} ${definition}`);
+      return true;
     }
+    return false;
   }
 
   private nextEventSeq(): number {
@@ -1542,6 +1600,10 @@ export class SqliteEventStore
   }
 
   private applyProjection(event: ChiliEvent): void {
+    if (event.type === "turn.completed") {
+      this.compactTurnMessagePartDeltas(event.payload.turnId);
+      return;
+    }
     if (event.type.startsWith("session.")) {
       this.applySessionEvent(event as SessionEvent);
       return;
@@ -1622,19 +1684,73 @@ export class SqliteEventStore
     }
 
     if (event.type === "message.part_delta") {
-      const row = this.db
-        .query<PartRow, [string]>(`select data_json from message_parts where id = ?`)
-        .get(event.payload.partId);
-      if (!row) return;
+      return;
+    }
+  }
 
-      const part = applyPartDelta(
-        decodeJson<MessagePart>(row.data_json, {} as MessagePart),
-        event.payload.field,
-        event.payload.delta,
-      );
-      this.db
-        .query(`update message_parts set data_json = ? where id = ?`)
-        .run(encodeJson(part), event.payload.partId);
+  private pendingMessagePartDeltas(
+    sessionId: SessionId,
+  ): Map<string, { seq: number; field: string; delta: string }[]> {
+    const rows = this.db
+      .query<PendingPartDeltaRow, [string]>(
+        `select events.seq,
+                json_extract(events.payload_json, '$.partId') as part_id,
+                events.payload_json
+           from events
+           join message_parts on message_parts.id = json_extract(events.payload_json, '$.partId')
+          where events.session_id = ?
+            and events.type = 'message.part_delta'
+            and events.seq > message_parts.delta_event_seq
+          order by events.seq asc`,
+      )
+      .all(sessionId);
+    const deltas = new Map<string, { seq: number; field: string; delta: string }[]>();
+    for (const row of rows) {
+      const payload = decodeJson<{ field?: unknown; delta?: unknown }>(row.payload_json, {});
+      if (typeof payload.field !== "string" || typeof payload.delta !== "string") continue;
+      const items = deltas.get(row.part_id) ?? [];
+      items.push({ seq: row.seq, field: payload.field, delta: payload.delta });
+      deltas.set(row.part_id, items);
+    }
+    return deltas;
+  }
+
+  private compactTurnMessagePartDeltas(turnId: TurnId): void {
+    const rows = this.db
+      .query<PendingPartDeltaRow & PartRow, [string]>(
+        `select events.seq,
+                message_parts.id as part_id,
+                events.payload_json,
+                message_parts.data_json,
+                message_parts.delta_event_seq
+           from events
+           join message_parts on message_parts.id = json_extract(events.payload_json, '$.partId')
+           join messages on messages.id = message_parts.message_id
+          where events.type = 'message.part_delta'
+            and messages.turn_id = ?
+            and events.seq > message_parts.delta_event_seq
+          order by events.seq asc`,
+      )
+      .all(turnId);
+    const compacted = new Map<string, { part: MessagePart; seq: number }>();
+    for (const row of rows) {
+      const payload = decodeJson<{ field?: unknown; delta?: unknown }>(row.payload_json, {});
+      if (typeof payload.field !== "string" || typeof payload.delta !== "string") continue;
+      const current = compacted.get(row.part_id) ?? {
+        part: decodeJson<MessagePart>(row.data_json, {} as MessagePart),
+        seq: row.delta_event_seq,
+      };
+      current.part = applyPartDelta(current.part, payload.field, payload.delta);
+      current.seq = row.seq;
+      compacted.set(row.part_id, current);
+    }
+    const update = this.db.query(
+      `update message_parts
+          set data_json = ?, delta_event_seq = ?
+        where id = ?`,
+    );
+    for (const [partId, item] of compacted) {
+      update.run(encodeJson(item.part), item.seq, partId);
     }
   }
 

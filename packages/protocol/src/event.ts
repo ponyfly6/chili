@@ -46,6 +46,10 @@ export type ChiliEvent =
   | TeamEvent
   | McpEvent;
 
+export function isTransientEvent(event: Pick<EventEnvelope, "type">): boolean {
+  return event.type === "tool.output_delta";
+}
+
 export type SessionEvent =
   | EventEnvelope<"session.created", { sessionId: SessionId; cwd: string }>
   | EventEnvelope<"session.status_changed", RuntimeStatusPayload>

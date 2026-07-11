@@ -51,6 +51,10 @@ export interface EventPublisher {
   subscribe(listener: (event: ChiliEvent) => void): () => void;
 }
 
+export interface ObservableEventStoreOptions {
+  onListenerError?: (error: unknown, event: ChiliEvent) => void;
+}
+
 export class ObservableEventStore
   implements
     EventStore,
@@ -66,7 +70,10 @@ export class ObservableEventStore
 {
   private readonly listeners = new Set<(event: ChiliEvent) => void>();
 
-  constructor(private readonly inner: EventStore) {}
+  constructor(
+    private readonly inner: EventStore,
+    private readonly options: ObservableEventStoreOptions = {},
+  ) {}
 
   async append(event: ChiliEvent): Promise<void> {
     await this.inner.append(event);
@@ -205,7 +212,18 @@ export class ObservableEventStore
   }
 
   private emit(event: ChiliEvent): void {
-    for (const listener of this.listeners) listener(event);
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch (error) {
+        this.listeners.delete(listener);
+        try {
+          this.options.onListenerError?.(error, event);
+        } catch {
+          // Diagnostics must not change the outcome of an already committed event.
+        }
+      }
+    }
   }
 
   private subagentStore(): SubagentProjectionStore | undefined {

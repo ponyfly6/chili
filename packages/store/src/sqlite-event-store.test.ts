@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -19,6 +19,110 @@ import type {
 } from "@chili/protocol";
 import { ObservableEventStore } from "./observable-event-store.js";
 import { SqliteEventStore } from "./sqlite-event-store.js";
+
+test("configures SQLite for bounded WAL maintenance", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-wal-pragmas-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+
+  try {
+    const db = sqliteDatabase(store);
+    expect(pragmaString(db, "journal_mode")).toBe("wal");
+    expect(pragmaNumber(db, "synchronous")).toBe(1);
+    expect(pragmaNumber(db, "wal_autocheckpoint")).toBe(256);
+    expect(pragmaNumber(db, "journal_size_limit")).toBe(16 * 1024 * 1024);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("close checkpoints and truncates the WAL file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-wal-close-"));
+  const dbPath = join(dir, "events.sqlite");
+  const store = new SqliteEventStore(dbPath);
+
+  try {
+    const events = Array.from({ length: 1_000 }, (_, index) => sessionEvent(
+      `event_wal_${index}`,
+      `session_wal_${index}` as SessionId,
+      "thread_wal" as ThreadId,
+      index as TimestampMs,
+    ));
+    await store.appendMany(events);
+    expect(await fileSize(`${dbPath}-wal`)).toBeGreaterThan(0);
+    store.close();
+    expect(await fileSize(`${dbPath}-wal`)).toBe(0);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("broadcasts transient tool output deltas without persisting or mirroring them", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-transient-tool-output-"));
+  const mirrored: ChiliEvent[] = [];
+  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"), {
+    mirror: { write: async (event) => { mirrored.push(event); } },
+  });
+  const store = new ObservableEventStore(baseStore);
+  const emitted: ChiliEvent[] = [];
+  const unsubscribe = store.subscribe((event) => emitted.push(event));
+  const event: ChiliEvent = {
+    id: "event_tool_output_delta_transient",
+    type: "tool.output_delta",
+    time: 1 as TimestampMs,
+    sessionId: "session_tool_output_delta" as SessionId,
+    threadId: "thread_tool_output_delta" as ThreadId,
+    payload: {
+      callId: "toolcall_tool_output_delta" as import("@chili/protocol").ToolCallId,
+      stream: "stdout",
+      delta: "live output",
+      bytes: 11,
+      sequence: 1,
+    },
+  };
+
+  try {
+    await store.append(event);
+    expect(emitted).toEqual([event]);
+    expect(await baseStore.events({ type: "tool.output_delta", limit: 10 })).toEqual([]);
+    expect(mirrored).toEqual([]);
+  } finally {
+    unsubscribe();
+    baseStore.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("isolates observable listener failures after the durable commit", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-observer-failure-"));
+  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
+  const listenerErrors: unknown[] = [];
+  const store = new ObservableEventStore(baseStore, {
+    onListenerError: (error) => listenerErrors.push(error),
+  });
+  const delivered: ChiliEvent[] = [];
+  store.subscribe(() => {
+    throw new Error("subscriber exploded");
+  });
+  store.subscribe((event) => delivered.push(event));
+  const event = sessionEvent(
+    "event_observer_failure",
+    "session_observer_failure" as SessionId,
+    "thread_observer_failure" as ThreadId,
+    1 as TimestampMs,
+  );
+
+  try {
+    await expect(store.append(event)).resolves.toBeUndefined();
+    expect((await baseStore.events({ limit: 10 })).map((item) => item.id)).toEqual([event.id]);
+    expect(delivered).toEqual([event]);
+    expect(listenerErrors).toHaveLength(1);
+  } finally {
+    baseStore.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("orders event replay and afterEventId cursors by insertion sequence", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-seq-"));
@@ -391,13 +495,14 @@ test("projects persistent thread goals and clears them", async () => {
   }
 });
 
-test("replays message part deltas into stored messages", async () => {
+test("replays message part deltas without rewriting the full projection until turn completion", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-part-delta-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const sessionId = "session_delta" as SessionId;
   const threadId = "thread_delta" as ThreadId;
   const messageId = "message_delta" as MessageId;
   const partId = "part_delta" as PartId;
+  const turnId = "turn_delta" as TurnId;
   const time = 1 as TimestampMs;
 
   try {
@@ -408,7 +513,7 @@ test("replays message part deltas into stored messages", async () => {
       time,
       sessionId,
       threadId,
-      payload: { messageId, role: "assistant" },
+      payload: { messageId, role: "assistant", turnId },
     });
     await store.append({
       id: "event_part",
@@ -436,6 +541,15 @@ test("replays message part deltas into stored messages", async () => {
       payload: { messageId, partId, field: "text", delta: "lo" },
     });
 
+    const db = sqliteDatabase(store);
+    const beforeCompletion = db
+      .query<{ data_json: string; delta_event_seq: number }, [string]>(
+        "select data_json, delta_event_seq from message_parts where id = ?",
+      )
+      .get(partId);
+    expect(JSON.parse(beforeCompletion?.data_json ?? "{}").text).toBe("hel");
+    expect(beforeCompletion?.delta_event_seq).toBe(0);
+
     const messages = await store.messages(sessionId);
     expect(messages[0]?.parts).toEqual([
       {
@@ -446,9 +560,165 @@ test("replays message part deltas into stored messages", async () => {
         text: "hello",
       },
     ]);
+    expect(await store.events({ type: "message.part_delta", limit: 10 })).toHaveLength(1);
+
+    await store.append({
+      id: "event_turn_completed",
+      type: "turn.completed",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId, status: "completed" },
+    });
+
+    const afterCompletion = db
+      .query<{ data_json: string; delta_event_seq: number }, [string]>(
+        "select data_json, delta_event_seq from message_parts where id = ?",
+      )
+      .get(partId);
+    expect(JSON.parse(afterCompletion?.data_json ?? "{}").text).toBe("hello");
+    expect(afterCompletion?.delta_event_seq).toBeGreaterThan(0);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("migrates older eager message projections without replaying historical deltas twice", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-part-delta-migration-"));
+  const dbPath = join(dir, "events.sqlite");
+  const db = new Database(dbPath, { create: true, strict: true });
+  db.exec(`
+    create table events (
+      seq integer primary key autoincrement,
+      id text not null unique,
+      type text not null,
+      time integer not null,
+      session_id text,
+      thread_id text,
+      payload_json text not null
+    );
+    create table messages (
+      id text primary key,
+      session_id text not null,
+      thread_id text,
+      turn_id text,
+      role text not null,
+      parent_id text,
+      created_at integer not null
+    );
+    create table message_parts (
+      id text primary key,
+      message_id text not null,
+      session_id text not null,
+      type text not null,
+      ordinal integer not null,
+      data_json text not null,
+      created_at integer not null
+    );
+    insert into messages
+      (id, session_id, thread_id, turn_id, role, created_at)
+    values
+      ('message_legacy_delta', 'session_legacy_delta', 'thread_legacy_delta', 'turn_legacy_delta', 'assistant', 1);
+    insert into message_parts
+      (id, message_id, session_id, type, ordinal, data_json, created_at)
+    values
+      ('part_legacy_delta', 'message_legacy_delta', 'session_legacy_delta', 'text', 0,
+       '{"id":"part_legacy_delta","messageId":"message_legacy_delta","sessionId":"session_legacy_delta","type":"text","text":"hello"}', 1);
+    insert into events
+      (id, type, time, session_id, thread_id, payload_json)
+    values
+      ('event_legacy_delta', 'message.part_delta', 2, 'session_legacy_delta', 'thread_legacy_delta',
+       '{"messageId":"message_legacy_delta","partId":"part_legacy_delta","field":"text","delta":"lo"}');
+  `);
+  db.close();
+
+  const store = new SqliteEventStore(dbPath);
+  try {
+    const migrated = sqliteDatabase(store)
+      .query<{ data_json: string; delta_event_seq: number }, []>(
+        "select data_json, delta_event_seq from message_parts where id = 'part_legacy_delta'",
+      )
+      .get();
+    expect(JSON.parse(migrated?.data_json ?? "{}").text).toBe("hello");
+    expect(migrated?.delta_event_seq).toBe(1);
+    expect((await store.messages("session_legacy_delta" as SessionId))[0]?.parts).toMatchObject([
+      { id: "part_legacy_delta", text: "hello" },
+    ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("writes a growing message projection once instead of once per streamed delta", async () => {
+  const store = new SqliteEventStore(":memory:");
+  const sessionId = "session_delta_amplification" as SessionId;
+  const threadId = "thread_delta_amplification" as ThreadId;
+  const turnId = "turn_delta_amplification" as TurnId;
+  const messageId = "message_delta_amplification" as MessageId;
+  const partId = "part_delta_amplification" as PartId;
+
+  try {
+    await store.appendMany([
+      sessionEvent("event_delta_amplification_session", sessionId, threadId, 1 as TimestampMs),
+      {
+        id: "event_delta_amplification_message",
+        type: "message.created",
+        time: 2 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { messageId, role: "assistant", turnId },
+      },
+      {
+        id: "event_delta_amplification_part",
+        type: "message.part_added",
+        time: 3 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          messageId,
+          part: { id: partId, messageId, sessionId, type: "text", text: "seed" },
+        },
+      },
+    ]);
+
+    const db = sqliteDatabase(store);
+    db.exec(`
+      create temp table message_part_update_count (count integer not null);
+      insert into message_part_update_count values (0);
+      create temp trigger count_message_part_data_updates
+      after update of data_json on message_parts
+      begin
+        update message_part_update_count set count = count + 1;
+      end;
+    `);
+    const chunk = "x".repeat(1_024);
+    const deltas: ChiliEvent[] = Array.from({ length: 128 }, (_, index) => ({
+      id: `event_delta_amplification_${index}`,
+      type: "message.part_delta",
+      time: (4 + index) as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId, partId, field: "text", delta: chunk },
+    }));
+    await store.appendMany(deltas);
+
+    expect(db.query<{ count: number }, []>("select count from message_part_update_count").get()?.count).toBe(0);
+    const streamedPart = (await store.messages(sessionId))[0]?.parts[0];
+    expect(streamedPart?.type === "text" ? streamedPart.text.length : 0).toBe(4 + 128 * chunk.length);
+
+    await store.append({
+      id: "event_delta_amplification_completed",
+      type: "turn.completed",
+      time: 200 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId, status: "completed" },
+    });
+    expect(db.query<{ count: number }, []>("select count from message_part_update_count").get()?.count).toBe(1);
+  } finally {
+    store.close();
   }
 });
 
@@ -1653,6 +1923,29 @@ test("claims team tasks with dependency-aware CAS", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+function sqliteDatabase(store: SqliteEventStore): Database {
+  return (store as unknown as { db: Database }).db;
+}
+
+function pragmaNumber(db: Database, name: string): number {
+  return Number(pragmaValue(db, name));
+}
+
+function pragmaString(db: Database, name: string): string {
+  return String(pragmaValue(db, name));
+}
+
+function pragmaValue(db: Database, name: string): unknown {
+  const row = db.query<Record<string, unknown>, []>(`pragma ${name}`).get();
+  const value = row ? Object.values(row)[0] : undefined;
+  if (value === undefined) throw new Error(`Missing PRAGMA value: ${name}`);
+  return value;
+}
+
+async function fileSize(path: string): Promise<number> {
+  return (await stat(path).catch(() => ({ size: 0 }))).size;
+}
 
 async function appendRunningTask(
   store: SqliteEventStore,
