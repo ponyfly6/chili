@@ -906,6 +906,23 @@ export interface StreamEventsRequest {
   signal?: AbortSignal;
 }
 
+export class EventCursorResyncRequiredError extends Error {
+  readonly code = "EVENT_CURSOR_RESYNC_REQUIRED";
+  readonly status = 409;
+
+  constructor(
+    message: string,
+    readonly afterEventId: string,
+  ) {
+    super(message);
+    this.name = "EventCursorResyncRequiredError";
+  }
+}
+
+export function isEventCursorResyncRequiredError(error: unknown): error is EventCursorResyncRequiredError {
+  return error instanceof EventCursorResyncRequiredError;
+}
+
 export interface HttpRuntimeClientOptions {
   baseUrl: string;
   fetch?: typeof fetch;
@@ -1258,7 +1275,11 @@ export class HttpRuntimeClient implements RuntimeClient {
     if (input.signal) init.signal = input.signal;
     const response = await this.fetchImpl(url, init);
     if (!response.ok || !response.body) {
-      throw await responseError(response);
+      const error = await responseError(response);
+      if (response.status === 409 && input.afterEventId) {
+        throw new EventCursorResyncRequiredError(error.message, input.afterEventId);
+      }
+      throw error;
     }
 
     const reader = response.body.getReader();

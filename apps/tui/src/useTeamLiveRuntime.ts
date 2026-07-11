@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   applyRuntimeEvent,
   createRuntimeView,
+  isEventCursorResyncRequiredError,
   teamLiveView,
   type ChiliRuntimeView,
   type HttpRuntimeClient,
@@ -120,6 +121,13 @@ export function useTeamLiveRuntime(input: UseTeamLiveRuntimeInput): TeamLiveRunt
         setSafeConnection(connectionState("offline", undefined, runtimeViewRef.current.lastEventId), "stream ended");
       } catch (error) {
         if (!mountedRef.current || controller.signal.aborted || version !== streamVersionRef.current) return;
+        if (isEventCursorResyncRequiredError(error)) {
+          runtimeViewRef.current = createRuntimeView();
+          setRevision((current) => current + 1);
+          setSafeConnection(connectionState("reconnecting", undefined, undefined), "resyncing event stream");
+          startStream("reconnecting");
+          return;
+        }
         const messageText = toError(error).message;
         setSafeConnection(connectionState("error", messageText, runtimeViewRef.current.lastEventId), messageText);
         reconnectTimerRef.current = setTimeout(() => {
