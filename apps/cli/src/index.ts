@@ -22,7 +22,7 @@ import { startRuntimeHttpServer } from "@chili/server";
 import { loadSkillSettings, loadSkills, updateSkillDisabledSetting, type Skill } from "@chili/skills";
 import { DeferredApprovalQueue } from "@chili/tools";
 import { parseArgs, usage } from "./args.js";
-import { cliEnvironmentDefaults } from "./environment-defaults.js";
+import { applyCliEnvironmentDefaults, cliEnvironmentDefaults } from "./environment-defaults.js";
 import { createCliHarness } from "./harness.js";
 import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
 import { runPrompt } from "./runner.js";
@@ -54,13 +54,15 @@ async function main(): Promise<void> {
     ...(approvalQueue ? { approvalQueue } : {}),
   };
   const envDefaults = cliEnvironmentDefaults(process.env);
-  if (args.provider !== undefined) harnessInput.provider = args.provider;
-  else if (envDefaults.provider !== undefined) harnessInput.provider = envDefaults.provider;
-  if (args.model !== undefined) harnessInput.model = args.model;
-  else if (envDefaults.model !== undefined) harnessInput.model = envDefaults.model;
-  if (args.reasoningLevel !== undefined) harnessInput.reasoningLevel = args.reasoningLevel;
-  else if (envDefaults.reasoningLevel !== undefined) harnessInput.reasoningLevel = envDefaults.reasoningLevel;
-  if (envDefaults.serviceTier !== undefined) harnessInput.serviceTier = envDefaults.serviceTier;
+  const modelDefaults = applyCliEnvironmentDefaults({
+    ...(args.provider !== undefined ? { provider: args.provider } : {}),
+    ...(args.model !== undefined ? { model: args.model } : {}),
+    ...(args.reasoningLevel !== undefined ? { reasoningLevel: args.reasoningLevel } : {}),
+  }, envDefaults);
+  if (modelDefaults.provider !== undefined) harnessInput.provider = modelDefaults.provider;
+  if (modelDefaults.model !== undefined) harnessInput.model = modelDefaults.model;
+  if (modelDefaults.reasoningLevel !== undefined) harnessInput.reasoningLevel = modelDefaults.reasoningLevel;
+  if (modelDefaults.serviceTier !== undefined) harnessInput.serviceTier = modelDefaults.serviceTier;
   const harness = await createCliHarness(harnessInput);
 
   try {

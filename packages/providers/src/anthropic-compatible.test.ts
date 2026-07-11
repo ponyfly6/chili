@@ -200,6 +200,7 @@ test("MiniMax treats image tool results as text-only context", async () => {
   let body: Record<string, unknown> | undefined;
   const model = createMiniMaxM27HighspeedModel({
     apiKey: "test-key",
+    model: MINIMAX_M27_HIGHSPEED_MODEL,
     fetch: (async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       fetchCalled = true;
       body = JSON.parse(String(init?.body)) as Record<string, unknown>;

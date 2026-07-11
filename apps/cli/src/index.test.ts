@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { cliEnvironmentDefaults } from "./environment-defaults.js";
+import { applyCliEnvironmentDefaults, cliEnvironmentDefaults } from "./environment-defaults.js";
 
 test("CLI environment defaults configure Codex model, reasoning, and fast tier", () => {
   expect(cliEnvironmentDefaults({
@@ -22,5 +22,16 @@ test("CLI environment defaults accept OpenAI Codex aliases", () => {
   })).toEqual({
     reasoningLevel: "high",
     serviceTier: "standard",
+  });
+});
+
+test("explicit CLI model ignores environment provider default", () => {
+  expect(applyCliEnvironmentDefaults(
+    { model: "fake" },
+    { provider: "minimax", model: "MiniMax-M3", reasoningLevel: "high", serviceTier: "fast" },
+  )).toEqual({
+    model: "fake",
+    reasoningLevel: "high",
+    serviceTier: "fast",
   });
 });
