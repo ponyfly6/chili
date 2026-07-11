@@ -61,12 +61,15 @@ test("retries transient socket failures before assistant output", async () => {
   const model: ModelRouter = {
     async *stream(): AsyncIterable<ModelStreamEvent> {
       modelCalls++;
-      yield { type: "metadata", provider: "openai-codex", model: "gpt-5.5" };
+      const usage = modelCalls === 1
+        ? { inputTokens: 4, outputTokens: 1, totalTokens: 5 }
+        : { inputTokens: 6, outputTokens: 2, totalTokens: 8 };
+      yield { type: "metadata", provider: "openai-codex", model: "gpt-5.5", usage };
       if (modelCalls === 1) {
         throw new Error("The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()");
       }
       yield { type: "text_delta", text: "ok" };
-      yield { type: "finish", reason: "stop" };
+      yield { type: "finish", reason: "stop", usage };
     },
   };
   const runtime = new SingleAgentRuntime({
@@ -90,6 +93,7 @@ test("retries transient socket failures before assistant output", async () => {
   });
 
   expect(result.status).toBe("completed");
+  expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 3, totalTokens: 13 });
   expect(modelCalls).toBe(2);
   expect(textParts(store).map((part) => part.text).join("")).toBe("ok");
   expect(store.items.some((event) => event.type === "turn.retry_scheduled" && event.payload.reason.includes("socket connection"))).toBe(true);
@@ -835,6 +839,86 @@ test("clears the reserved runtime when the initial running status write fails", 
     }),
   ).rejects.toThrow("status write failed");
   expect(service.isRunning(sessionId)).toBe(false);
+});
+
+test("accounts failed model event usage against an active goal", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const createId = createSequentialId();
+  const sessionId = "session_goal_model_error" as SessionId;
+  const threadId = "thread_goal_model_error" as ThreadId;
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield {
+        type: "error",
+        error: new Error("provider charged then failed"),
+        responseId: "response_charged_failure",
+        usage: {
+          inputTokens: 20,
+          outputTokens: 2,
+          cacheReadInputTokens: 3,
+          totalTokens: 25,
+        },
+      };
+    },
+  };
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+    }),
+    createId,
+    now: () => 1 as TimestampMs,
+  });
+  const service = new RuntimeService({
+    runtime,
+    store,
+    cwd: "/repo",
+    createId,
+    now: () => 1 as TimestampMs,
+  });
+  await store.append({
+    id: "event_goal_model_error_seed",
+    type: "goal.updated",
+    time: 1 as TimestampMs,
+    sessionId,
+    threadId,
+    payload: {
+      reason: "set",
+      goal: {
+        sessionId,
+        threadId,
+        objective: "account all provider usage",
+        status: "active",
+        tokenBudget: 1_000,
+        tokensUsed: 0,
+        timeUsedSeconds: 0,
+        createdAt: 1 as TimestampMs,
+        updatedAt: 1 as TimestampMs,
+      },
+    },
+  });
+
+  const result = await service.submitPrompt({ sessionId, threadId, text: "run once" });
+
+  expect(result.status).toBe("failed");
+  expect(result.turns[0]?.usage).toEqual({
+    inputTokens: 20,
+    outputTokens: 2,
+    cacheReadInputTokens: 3,
+    totalTokens: 25,
+  });
+  const goalEvents = store.items.filter(
+    (event): event is Extract<ChiliEvent, { type: "goal.updated" }> => event.type === "goal.updated",
+  );
+  expect(goalEvents.at(-1)?.payload.goal.tokensUsed).toBe(25);
+  expect(store.items.some(
+    (event) => event.type === "turn.model_metadata" && event.payload.responseId === "response_charged_failure",
+  )).toBe(true);
 });
 
 test("continues an active persistent goal and lets update_goal complete it", async () => {

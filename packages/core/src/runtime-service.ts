@@ -5,6 +5,7 @@ import type {
   MessageImageContent,
   MessageId,
   ModelSelection,
+  ModelUsage,
   PartId,
   ReasoningLevel,
   RuntimeModelConfig,
@@ -376,7 +377,9 @@ export class RuntimeService {
       if (modelState.modelSelection) compactInput.modelSelection = modelState.modelSelection;
       if (modelState.reasoningLevel !== undefined) compactInput.reasoningLevel = modelState.reasoningLevel;
       if (modelState.serviceTier !== undefined) compactInput.serviceTier = modelState.serviceTier;
+      const startedAt = this.now();
       const result = await runtime.compactContext(compactInput);
+      await this.accountGoalUsage(input, result.turnId, result.usage, startedAt);
       await this.publishStatus({
         sessionId: input.sessionId,
         threadId: input.threadId,
@@ -814,14 +817,23 @@ export class RuntimeService {
     result: RunTurnResult,
     startedAt: TimestampMs,
   ): Promise<AccountGoalUsageResult | undefined> {
+    return this.accountGoalUsage(input, result.turnId, result.usage, startedAt);
+  }
+
+  private async accountGoalUsage(
+    input: { sessionId: SessionId; threadId: ThreadId },
+    turnId: TurnId,
+    usage: ModelUsage | undefined,
+    startedAt: TimestampMs,
+  ): Promise<AccountGoalUsageResult | undefined> {
     const elapsedSeconds = Math.max(0, (Number(this.now()) - Number(startedAt)) / 1000);
     const accountInput: Parameters<GoalService["accountUsage"]>[0] = {
       sessionId: input.sessionId,
       threadId: input.threadId,
-      turnId: result.turnId,
+      turnId,
       timeSeconds: elapsedSeconds,
     };
-    if (result.usage) accountInput.usage = result.usage;
+    if (usage) accountInput.usage = usage;
     return this.goals.accountUsage(accountInput);
   }
 

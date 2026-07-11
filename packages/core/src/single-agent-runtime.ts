@@ -33,6 +33,7 @@ import {
 } from "./context/index.js";
 import { messagesForContext } from "./cancelled-turn-context.js";
 import { DoomLoopError, DoomLoopGuard, type DoomLoopGuardOptions } from "./doom-loop-guard.js";
+import { addModelUsage, attachModelUsage, takeModelUsage } from "./model-usage.js";
 import { normalizeRetryPolicy, retryDelay, sleep, type RetryPolicy } from "./retry.js";
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.js";
 import type { AgentRunner, AppendUserMessageInput, CreateSessionInput, RunTurnInput, RunTurnResult } from "./runner.js";
@@ -87,6 +88,11 @@ interface AssistantStreamResult {
   usage?: ModelUsage;
 }
 
+interface CompactionAttemptResult {
+  completed: boolean;
+  usage?: ModelUsage;
+}
+
 export interface CompactContextInput {
   sessionId: SessionId;
   threadId: ThreadId;
@@ -106,16 +112,19 @@ export type CompactContextResult =
       messageId: MessageId;
       boundaryMessageId: MessageId;
       summaryChars: number;
+      usage?: ModelUsage;
     }
   | {
       status: "skipped";
       turnId: TurnId;
       reason: string;
+      usage?: ModelUsage;
     }
   | {
       status: "failed" | "cancelled";
       turnId: TurnId;
       error: Error;
+      usage?: ModelUsage;
     };
 
 export class SingleAgentRuntime implements AgentRunner {
@@ -177,6 +186,7 @@ export class SingleAgentRuntime implements AgentRunner {
     const turnId = input.turnId ?? this.id<TurnId>("turn");
     const reason = input.reason ?? "manual";
     let boundary: CompactionBoundary | undefined;
+    let usage: ModelUsage | undefined;
     try {
       await this.append(input, "turn.started", { turnId });
       const rawMessages = await messagesForContext(this.options.store, input.sessionId);
@@ -194,16 +204,20 @@ export class SingleAgentRuntime implements AgentRunner {
         budgetChars: boundary.budgetChars,
       });
       const result = await this.compactMessages(input, turnId, rawMessages, boundary);
+      usage = addModelUsage(usage, result.usage);
       await this.append(input, "turn.completed", { turnId, status: "completed" });
-      return {
+      const completed: Extract<CompactContextResult, { status: "completed" }> = {
         status: "completed",
         turnId,
         messageId: result.messageId,
         boundaryMessageId: result.boundaryMessageId,
         summaryChars: result.summaryChars,
       };
+      if (usage) completed.usage = usage;
+      return completed;
     } catch (error) {
       const err = toError(error);
+      usage = addModelUsage(usage, takeModelUsage(err));
       const status = isAbortError(err) ? "cancelled" : "failed";
       await this.append(input, "turn.compaction_failed", {
         turnId,
@@ -212,7 +226,13 @@ export class SingleAgentRuntime implements AgentRunner {
         error: err.message,
       });
       await this.append(input, "turn.completed", { turnId, status });
-      return { status, turnId, error: err };
+      const failed: Extract<CompactContextResult, { status: "failed" | "cancelled" }> = {
+        status,
+        turnId,
+        error: err,
+      };
+      if (usage) failed.usage = usage;
+      return failed;
     }
   }
 
@@ -220,6 +240,7 @@ export class SingleAgentRuntime implements AgentRunner {
     const turnId = input.turnId ?? this.id<TurnId>("turn");
     let assistantMessageId: MessageId | undefined;
     let contextUsage: ContextUsage | undefined;
+    let turnUsage: ModelUsage | undefined;
 
     try {
       await this.append(input, "turn.started", { turnId });
@@ -255,7 +276,8 @@ export class SingleAgentRuntime implements AgentRunner {
           budgetChars: context.compactionBoundary.budgetChars,
         });
         const compacted = await this.tryCompactMessages(input, turnId, rawMessages, context.compactionBoundary);
-        if (compacted) {
+        turnUsage = addModelUsage(turnUsage, compacted.usage);
+        if (compacted.completed) {
           context = this.contextBuilder().build(
             await messagesForContext(this.options.store, input.sessionId),
             contextSurface,
@@ -295,6 +317,7 @@ export class SingleAgentRuntime implements AgentRunner {
       } catch (error) {
         const err = toError(error);
         if (!this.canRecoverWithCompaction(err)) throw err;
+        turnUsage = addModelUsage(turnUsage, takeModelUsage(err));
         const recoveryMessages = await messagesForContext(this.options.store, input.sessionId);
         const recoveryBoundary = this.contextBuilder().compactionBoundary(recoveryMessages, "recovery");
         if (!recoveryBoundary) throw err;
@@ -306,7 +329,8 @@ export class SingleAgentRuntime implements AgentRunner {
           budgetChars: recoveryBoundary.budgetChars,
         });
         const recovered = await this.tryCompactMessages(input, turnId, recoveryMessages, recoveryBoundary);
-        if (!recovered) throw err;
+        turnUsage = addModelUsage(turnUsage, recovered.usage);
+        if (!recovered.completed) throw err;
         const recoveredContext = this.contextBuilder().build(
           await messagesForContext(this.options.store, input.sessionId),
           contextSurface,
@@ -319,6 +343,7 @@ export class SingleAgentRuntime implements AgentRunner {
         };
         streamResult = await this.consumeModelStream(input, turnId, assistantMessageId, modelInput, guard);
       }
+      turnUsage = addModelUsage(turnUsage, streamResult.usage);
       let finishReason = streamResult.finishReason;
       if (isOutputLimitFinishReason(streamResult.finishReason) && streamResult.toolCalls.length > 0) {
         await this.failOutputLimitedToolCalls(
@@ -344,11 +369,12 @@ export class SingleAgentRuntime implements AgentRunner {
         assistantMessageId,
       };
       if (contextUsage) result.contextUsage = contextUsage;
-      if (streamResult.usage) result.usage = streamResult.usage;
+      if (turnUsage) result.usage = turnUsage;
       if (finishReason) result.finishReason = finishReason;
       return result;
     } catch (error) {
       const err = toError(error);
+      turnUsage = addModelUsage(turnUsage, takeModelUsage(err));
       const status = isAbortError(err) ? "cancelled" : "failed";
       if (status === "failed" && assistantMessageId && !didAssistantMutate(err)) {
         await this.appendModelFailureMessage(input, assistantMessageId, err);
@@ -364,6 +390,7 @@ export class SingleAgentRuntime implements AgentRunner {
       };
       if (assistantMessageId) result.assistantMessageId = assistantMessageId;
       if (contextUsage) result.contextUsage = contextUsage;
+      if (turnUsage) result.usage = turnUsage;
       return result;
     }
   }
@@ -408,6 +435,7 @@ export class SingleAgentRuntime implements AgentRunner {
   ): Promise<AssistantStreamResult> {
     const retryPolicy = normalizeRetryPolicy(this.options.retryPolicy);
     let attempt = 1;
+    let previousAttemptUsage: ModelUsage | undefined;
 
     while (true) {
       let assistantMutated = false;
@@ -512,7 +540,8 @@ export class SingleAgentRuntime implements AgentRunner {
               await this.appendModelMetadata(input, turnId, event);
             }
             await this.finishUnfinishedStreamingToolCalls(input, state, "failed", "Tool call stream ended before tool_call_end");
-            return { finishReason: event.reason, toolCalls: state.toolCalls, ...(latestUsage ? { usage: latestUsage } : {}) };
+            const usage = addModelUsage(previousAttemptUsage, latestUsage);
+            return { finishReason: event.reason, toolCalls: state.toolCalls, ...(usage ? { usage } : {}) };
           }
 
           if (event.type === "metadata") {
@@ -521,15 +550,24 @@ export class SingleAgentRuntime implements AgentRunner {
             continue;
           }
 
+          if (event.usage) latestUsage = event.usage;
+          if (event.responseId || event.usage) {
+            await this.appendModelMetadata(input, turnId, event);
+          }
           throw toError(event.error);
         }
         await this.finishUnfinishedStreamingToolCalls(input, state, "failed", "Tool call stream ended before tool_call_end");
-        return { toolCalls: state.toolCalls, ...(latestUsage ? { usage: latestUsage } : {}) };
+        const usage = addModelUsage(previousAttemptUsage, latestUsage);
+        return { toolCalls: state.toolCalls, ...(usage ? { usage } : {}) };
       } catch (error) {
         const err = toError(error);
+        previousAttemptUsage = addModelUsage(
+          previousAttemptUsage,
+          addModelUsage(latestUsage, takeModelUsage(err)),
+        );
         if (input.signal?.aborted || isAbortError(err)) {
           await this.finishUnfinishedStreamingToolCalls(input, state, "cancelled", err.message);
-          throw err;
+          throw attachModelUsage(err, previousAttemptUsage);
         }
         await this.finishUnfinishedStreamingToolCalls(input, state, "failed", err.message);
         if (!assistantMutated && attempt < retryPolicy.maxAttempts && retryPolicy.retryable(err)) {
@@ -545,7 +583,7 @@ export class SingleAgentRuntime implements AgentRunner {
           continue;
         }
         markAssistantMutation(err, assistantMutated);
-        throw err;
+        throw attachModelUsage(err, previousAttemptUsage);
       }
     }
   }
@@ -561,18 +599,20 @@ export class SingleAgentRuntime implements AgentRunner {
     turnId: TurnId,
     messages: readonly Message[],
     boundary: CompactionBoundary,
-  ): Promise<boolean> {
+  ): Promise<CompactionAttemptResult> {
     try {
-      await this.compactMessages(input, turnId, messages, boundary);
-      return true;
+      const result = await this.compactMessages(input, turnId, messages, boundary);
+      return { completed: true, ...(result.usage ? { usage: result.usage } : {}) };
     } catch (error) {
+      const err = toError(error);
+      const usage = takeModelUsage(err);
       await this.append(input, "turn.compaction_failed", {
         turnId,
         reason: boundary.reason,
         boundaryMessageId: boundary.boundaryMessageId,
-        error: toError(error).message,
+        error: err.message,
       });
-      return false;
+      return { completed: false, ...(usage ? { usage } : {}) };
     }
   }
 
@@ -581,7 +621,7 @@ export class SingleAgentRuntime implements AgentRunner {
     turnId: TurnId,
     messages: readonly Message[],
     boundary: CompactionBoundary,
-  ): Promise<{ messageId: MessageId; boundaryMessageId: MessageId; summaryChars: number }> {
+  ): Promise<{ messageId: MessageId; boundaryMessageId: MessageId; summaryChars: number; usage?: ModelUsage }> {
     await this.append(input, "turn.compaction_started", {
       turnId,
       reason: boundary.reason,
@@ -623,7 +663,12 @@ export class SingleAgentRuntime implements AgentRunner {
       estimatedCharsBefore: result.estimatedCharsBefore,
       estimatedCharsAfter: result.estimatedCharsAfter,
     });
-    return { messageId, boundaryMessageId: result.boundary.boundaryMessageId, summaryChars: result.summary.length };
+    return {
+      messageId,
+      boundaryMessageId: result.boundary.boundaryMessageId,
+      summaryChars: result.summary.length,
+      ...(result.usage ? { usage: result.usage } : {}),
+    };
   }
 
   private async appendCompactionMessage(input: EventContext, turnId: TurnId, result: ContextCompactionResult): Promise<MessageId> {
@@ -993,7 +1038,7 @@ export class SingleAgentRuntime implements AgentRunner {
   private async appendModelMetadata(
     input: EventContext,
     turnId: TurnId,
-    metadata: Extract<ModelStreamEvent, { type: "metadata" | "finish" }>,
+    metadata: Extract<ModelStreamEvent, { type: "metadata" | "finish" | "error" }>,
   ): Promise<void> {
     await this.append(input, "turn.model_metadata", {
       turnId,
@@ -1130,7 +1175,7 @@ function isOutputLimitFinishReason(reason: string | undefined): boolean {
 }
 
 function isModelMetadataEvent(
-  event: Extract<ModelStreamEvent, { type: "metadata" | "finish" }>,
+  event: Extract<ModelStreamEvent, { type: "metadata" | "finish" | "error" }>,
 ): event is Extract<ModelStreamEvent, { type: "metadata" }> {
   return "type" in event && event.type === "metadata";
 }

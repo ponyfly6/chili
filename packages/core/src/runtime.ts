@@ -75,6 +75,7 @@ export interface ModelStreamInput {
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
   serviceTier?: ServiceTier;
+  maxTokens?: number;
   signal?: AbortSignal;
 }
 

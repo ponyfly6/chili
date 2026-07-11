@@ -9,10 +9,13 @@ import type {
   ThreadId,
   TimestampMs,
   ToolDefinition,
+  TurnId,
 } from "@chili/protocol";
 import type { ApprovalRow, EventQuery, EventStore, SessionRow } from "@chili/store";
 import { InMemoryToolRegistry, ToolExecutor } from "@chili/tools";
 import { ContextWindowBuilder, compactedMessageView } from "./window.js";
+import { ContextCompactionService } from "./compaction.js";
+import { takeModelUsage } from "../model-usage.js";
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "../runtime.js";
 import { SingleAgentRuntime } from "../single-agent-runtime.js";
 
@@ -226,6 +229,165 @@ test("runtime fails before model streaming when fixed input exhausts the model w
   expect(modelCalls).toBe(0);
 });
 
+test("compaction fits draft and verification requests to the selected model limits", async () => {
+  const sessionId = "session_compaction_limits" as SessionId;
+  const threadId = "thread_compaction_limits" as ThreadId;
+  const turnId = "turn_compaction_limits" as TurnId;
+  const source = textMessage("msg_compaction_limits", sessionId, "user", `old context ${"x".repeat(80_000)}`);
+  const modelInputs: ModelStreamInput[] = [];
+  let limitSelection: unknown;
+  const model: ModelRouter = {
+    resolveRequestLimits(input) {
+      limitSelection = input.modelSelection;
+      return { contextWindowTokens: 8_192, requestMaxOutputTokens: 1_024 };
+    },
+    async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+      modelInputs.push(input);
+      const fitted = new ContextWindowBuilder({
+        maxInputChars: Number.MAX_SAFE_INTEGER,
+        compactionThresholdRatio: 1,
+        preserveRecentMessages: 1,
+      }).build(input.messages, {
+        contextWindowTokens: 8_192,
+        ...(input.maxTokens !== undefined ? { requestMaxOutputTokens: input.maxTokens } : {}),
+        system: input.system,
+      });
+      expect(fitted.overflow).toBeUndefined();
+      expect(fitted.messages).toHaveLength(1);
+      const verification = input.messages[0]?.parts.some(
+        (part) => part.type === "text" && part.text.includes("<draft_summary>"),
+      ) ?? false;
+      yield {
+        type: "text_delta",
+        text: verification
+          ? "<context_summary>verified compact handoff</context_summary>"
+          : "<context_summary>draft compact handoff</context_summary>",
+      };
+      yield {
+        type: "finish",
+        reason: "stop",
+        usage: verification
+          ? { inputTokens: 90, outputTokens: 30, totalTokens: 120 }
+          : { inputTokens: 100, outputTokens: 20, cacheReadInputTokens: 10, totalTokens: 130 },
+      };
+    },
+  };
+  const compactor = new ContextCompactionService({
+    model,
+    maxSummaryChars: 2_000,
+    now: () => 1 as TimestampMs,
+  });
+
+  const result = await compactor.compact({
+    sessionId,
+    threadId,
+    turnId,
+    messages: [source],
+    boundary: {
+      boundaryMessageId: source.id,
+      reason: "manual",
+      estimatedChars: 80_000,
+      budgetChars: 160_000,
+    },
+    modelSelection: { provider: "openai-codex", model: "gpt-selected" },
+  });
+
+  expect(limitSelection).toEqual({ provider: "openai-codex", model: "gpt-selected" });
+  expect(modelInputs).toHaveLength(2);
+  expect(modelInputs.every((input) => input.maxTokens === 1_024)).toBe(true);
+  expect(modelInputs.every((input) => {
+    const text = input.messages[0]?.parts.find((part) => part.type === "text");
+    return text?.type === "text" && text.text.length < 80_000;
+  })).toBe(true);
+  expect(result.usage).toEqual({
+    inputTokens: 190,
+    outputTokens: 50,
+    cacheReadInputTokens: 10,
+    totalTokens: 250,
+  });
+});
+
+test("compaction preserves usage when an empty model summary fails validation", async () => {
+  const sessionId = "session_compaction_empty" as SessionId;
+  const source = textMessage("msg_compaction_empty", sessionId, "user", "context to summarize");
+  const compactor = new ContextCompactionService({
+    model: {
+      async *stream(): AsyncIterable<ModelStreamEvent> {
+        yield { type: "finish", reason: "stop", usage: { inputTokens: 8, outputTokens: 1, totalTokens: 9 } };
+      },
+    },
+    verifySummary: false,
+  });
+
+  try {
+    await compactor.compact({
+      sessionId,
+      threadId: "thread_compaction_empty" as ThreadId,
+      turnId: "turn_compaction_empty" as TurnId,
+      messages: [source],
+      boundary: {
+        boundaryMessageId: source.id,
+        reason: "manual",
+        estimatedChars: 100,
+        budgetChars: 1_000,
+      },
+    });
+    throw new Error("expected empty compaction to fail");
+  } catch (error) {
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("empty summary");
+    expect(takeModelUsage(error as Error)).toEqual({ inputTokens: 8, outputTokens: 1, totalTokens: 9 });
+  }
+});
+
+test("compaction preserves draft and verifier usage when verification fails", async () => {
+  const sessionId = "session_compaction_verify_error" as SessionId;
+  const source = textMessage("msg_compaction_verify_error", sessionId, "user", "context to summarize");
+  let calls = 0;
+  const compactor = new ContextCompactionService({
+    model: {
+      async *stream(): AsyncIterable<ModelStreamEvent> {
+        calls++;
+        if (calls === 1) {
+          yield { type: "text_delta", text: "<context_summary>draft</context_summary>" };
+          yield { type: "finish", reason: "stop", usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 } };
+          return;
+        }
+        yield {
+          type: "error",
+          error: new Error("verification failed"),
+          usage: { inputTokens: 7, outputTokens: 1, cacheReadInputTokens: 2, totalTokens: 10 },
+        };
+      },
+    },
+  });
+
+  try {
+    await compactor.compact({
+      sessionId,
+      threadId: "thread_compaction_verify_error" as ThreadId,
+      turnId: "turn_compaction_verify_error" as TurnId,
+      messages: [source],
+      boundary: {
+        boundaryMessageId: source.id,
+        reason: "manual",
+        estimatedChars: 100,
+        budgetChars: 1_000,
+      },
+    });
+    throw new Error("expected verification to fail");
+  } catch (error) {
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("verification failed");
+    expect(takeModelUsage(error as Error)).toEqual({
+      inputTokens: 17,
+      outputTokens: 3,
+      cacheReadInputTokens: 2,
+      totalTokens: 22,
+    });
+  }
+});
+
 test("runtime auto-compacts before the main model request and sends the summary forward", async () => {
   const store = new ProjectingEventStore();
   const registry = new InMemoryToolRegistry();
@@ -252,12 +414,18 @@ test("runtime auto-compacts before the main model request and sends the summary 
                 "</context_summary>",
               ].join("\n"),
         };
-        yield { type: "finish", reason: "stop" };
+        yield {
+          type: "finish",
+          reason: "stop",
+          usage: isVerification
+            ? { inputTokens: 12, outputTokens: 3, totalTokens: 15 }
+            : { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+        };
         return;
       }
 
       yield { type: "text_delta", text: "done" };
-      yield { type: "finish", reason: "stop" };
+      yield { type: "finish", reason: "stop", usage: { inputTokens: 5, outputTokens: 1, totalTokens: 6 } };
     },
   };
   const runtime = new SingleAgentRuntime({
@@ -292,6 +460,7 @@ test("runtime auto-compacts before the main model request and sends the summary 
   });
 
   expect(result.status).toBe("completed");
+  expect(result.usage).toEqual({ inputTokens: 27, outputTokens: 6, totalTokens: 33 });
   expect(modelInputs).toHaveLength(3);
   expect(modelInputs.slice(0, 2).every((modelInput) => modelInput.system.join("\n").includes("context compression engine"))).toBe(true);
   expect(modelInputs.every((modelInput) => (
