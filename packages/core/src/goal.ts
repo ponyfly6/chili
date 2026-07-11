@@ -171,6 +171,9 @@ export class GoalService {
     if (input.usage?.inputTokens !== undefined) usageDelta.inputTokens = input.usage.inputTokens;
     if (input.usage?.outputTokens !== undefined) usageDelta.outputTokens = input.usage.outputTokens;
     if (input.usage?.cacheReadInputTokens !== undefined) usageDelta.cacheReadInputTokens = input.usage.cacheReadInputTokens;
+    if (input.usage?.cacheCreationInputTokens !== undefined) {
+      usageDelta.cacheCreationInputTokens = input.usage.cacheCreationInputTokens;
+    }
     if (input.usage?.totalTokens !== undefined) usageDelta.totalTokens = input.usage.totalTokens;
 
     const tokensUsed = existing.tokensUsed + tokenDelta;
@@ -241,13 +244,13 @@ export class GoalService {
 
 export function goalTokenDelta(usage: ModelUsage | undefined): number {
   if (!usage) return 0;
+  const totalTokens = finitePositive(usage.totalTokens);
+  if (totalTokens !== undefined) return totalTokens;
   const inputTokens = finitePositive(usage.inputTokens) ?? 0;
   const cacheReadInputTokens = finitePositive(usage.cacheReadInputTokens) ?? 0;
+  const cacheCreationInputTokens = finitePositive(usage.cacheCreationInputTokens) ?? 0;
   const outputTokens = finitePositive(usage.outputTokens) ?? 0;
-  const nonCachedInput = Math.max(0, inputTokens - cacheReadInputTokens);
-  const direct = nonCachedInput + outputTokens;
-  if (direct > 0) return direct;
-  return finitePositive(usage.totalTokens) ?? 0;
+  return inputTokens + cacheReadInputTokens + cacheCreationInputTokens + outputTokens;
 }
 
 export function cloneGoal(goal: ThreadGoal): ThreadGoal {

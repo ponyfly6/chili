@@ -363,7 +363,7 @@ test("parses OpenAI-compatible SSE text, reasoning, tool deltas, and usage", asy
           prompt_tokens: 3,
           completion_tokens: 4,
           total_tokens: 7,
-          prompt_tokens_details: { cached_tokens: 1 },
+          prompt_tokens_details: { cached_tokens: 1, cache_write_tokens: 1 },
         },
       }),
       "data: [DONE]\n\n",
@@ -405,7 +405,13 @@ test("parses OpenAI-compatible SSE text, reasoning, tool deltas, and usage", asy
     type: "finish",
     reason: "tool_use",
     responseId: "chatcmpl_1",
-    usage: { inputTokens: 3, outputTokens: 4, cacheReadInputTokens: 1, totalTokens: 7 },
+    usage: {
+      inputTokens: 1,
+      outputTokens: 4,
+      cacheReadInputTokens: 1,
+      cacheCreationInputTokens: 1,
+      totalTokens: 7,
+    },
   });
 });
 

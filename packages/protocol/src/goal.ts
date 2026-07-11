@@ -36,5 +36,6 @@ export interface ThreadGoalUsageDelta {
   inputTokens?: number;
   outputTokens?: number;
   cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
   totalTokens?: number;
 }

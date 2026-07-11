@@ -270,6 +270,7 @@ export interface RuntimeStatusPayload {
 }
 
 export interface ModelUsage {
+  /** Non-cached input tokens. Cached reads and writes are reported separately. */
   inputTokens?: number;
   outputTokens?: number;
   cacheReadInputTokens?: number;

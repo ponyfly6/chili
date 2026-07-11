@@ -100,6 +100,7 @@ interface OpenAIUsage {
   prompt_cache_miss_tokens?: number | null;
   prompt_tokens_details?: {
     cached_tokens?: number | null;
+    cache_write_tokens?: number | null;
   };
 }
 
@@ -551,22 +552,32 @@ function mergeUsage(previous: ModelUsage | undefined, usage: OpenAIUsage | undef
       next.totalTokens ??
       (next.inputTokens ?? previous?.inputTokens ?? 0) +
         (next.outputTokens ?? previous?.outputTokens ?? 0) +
-        (next.cacheReadInputTokens ?? previous?.cacheReadInputTokens ?? 0),
+        (next.cacheReadInputTokens ?? previous?.cacheReadInputTokens ?? 0) +
+        (next.cacheCreationInputTokens ?? previous?.cacheCreationInputTokens ?? 0),
   };
 }
 
 function toModelUsage(usage: OpenAIUsage | undefined): ModelUsage | undefined {
   if (!usage) return undefined;
   const modelUsage: ModelUsage = { raw: usage };
-  if (usage.prompt_tokens != null) modelUsage.inputTokens = usage.prompt_tokens;
-  if (usage.completion_tokens != null) modelUsage.outputTokens = usage.completion_tokens;
-  if (usage.prompt_tokens_details?.cached_tokens != null) {
-    modelUsage.cacheReadInputTokens = usage.prompt_tokens_details.cached_tokens;
+  const cacheReadInputTokens = usage.prompt_cache_hit_tokens
+    ?? usage.prompt_tokens_details?.cached_tokens
+    ?? 0;
+  const cacheCreationInputTokens = usage.prompt_tokens_details?.cache_write_tokens ?? 0;
+  const reportedNonCachedInput = usage.prompt_cache_miss_tokens
+    ?? (usage.prompt_tokens == null ? undefined : usage.prompt_tokens - cacheReadInputTokens);
+  if (reportedNonCachedInput !== undefined) {
+    modelUsage.inputTokens = Math.max(0, reportedNonCachedInput - cacheCreationInputTokens);
   }
-  if (usage.prompt_cache_hit_tokens != null) modelUsage.cacheReadInputTokens = usage.prompt_cache_hit_tokens;
+  if (usage.completion_tokens != null) modelUsage.outputTokens = usage.completion_tokens;
+  if (cacheReadInputTokens > 0) modelUsage.cacheReadInputTokens = cacheReadInputTokens;
+  if (cacheCreationInputTokens > 0) modelUsage.cacheCreationInputTokens = cacheCreationInputTokens;
   modelUsage.totalTokens =
     usage.total_tokens ??
-    (modelUsage.inputTokens ?? 0) + (modelUsage.outputTokens ?? 0) + (modelUsage.cacheReadInputTokens ?? 0);
+    (modelUsage.inputTokens ?? 0) +
+      (modelUsage.outputTokens ?? 0) +
+      (modelUsage.cacheReadInputTokens ?? 0) +
+      (modelUsage.cacheCreationInputTokens ?? 0);
   return modelUsage;
 }
 

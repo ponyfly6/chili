@@ -135,6 +135,7 @@ interface CodexUsage {
   total_tokens?: number | null;
   input_tokens_details?: {
     cached_tokens?: number | null;
+    cache_write_tokens?: number | null;
   };
 }
 
@@ -666,14 +667,20 @@ function finishToolEvent(tool: ToolStreamState): ModelStreamEvent {
 function toModelUsage(usage: CodexUsage | undefined): ModelUsage | undefined {
   if (!usage) return undefined;
   const modelUsage: ModelUsage = { raw: usage };
-  if (usage.input_tokens != null) modelUsage.inputTokens = usage.input_tokens;
-  if (usage.output_tokens != null) modelUsage.outputTokens = usage.output_tokens;
-  if (usage.input_tokens_details?.cached_tokens != null) {
-    modelUsage.cacheReadInputTokens = usage.input_tokens_details.cached_tokens;
+  const cacheReadInputTokens = usage.input_tokens_details?.cached_tokens ?? 0;
+  const cacheCreationInputTokens = usage.input_tokens_details?.cache_write_tokens ?? 0;
+  if (usage.input_tokens != null) {
+    modelUsage.inputTokens = Math.max(0, usage.input_tokens - cacheReadInputTokens - cacheCreationInputTokens);
   }
+  if (usage.output_tokens != null) modelUsage.outputTokens = usage.output_tokens;
+  if (cacheReadInputTokens > 0) modelUsage.cacheReadInputTokens = cacheReadInputTokens;
+  if (cacheCreationInputTokens > 0) modelUsage.cacheCreationInputTokens = cacheCreationInputTokens;
   modelUsage.totalTokens =
     usage.total_tokens ??
-    (modelUsage.inputTokens ?? 0) + (modelUsage.outputTokens ?? 0) + (modelUsage.cacheReadInputTokens ?? 0);
+    (modelUsage.inputTokens ?? 0) +
+      (modelUsage.outputTokens ?? 0) +
+      (modelUsage.cacheReadInputTokens ?? 0) +
+      (modelUsage.cacheCreationInputTokens ?? 0);
   return modelUsage;
 }
 

@@ -398,7 +398,12 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
           id: "resp_1",
           model: "gpt-test",
           status: "completed",
-          usage: { input_tokens: 5, output_tokens: 7, total_tokens: 12, input_tokens_details: { cached_tokens: 2 } },
+          usage: {
+            input_tokens: 5,
+            output_tokens: 7,
+            total_tokens: 12,
+            input_tokens_details: { cached_tokens: 2, cache_write_tokens: 1 },
+          },
         },
       }),
     ].join("")), {
@@ -458,7 +463,13 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
     type: "finish",
     reason: "tool_use",
     responseId: "resp_1",
-    usage: { inputTokens: 5, outputTokens: 7, cacheReadInputTokens: 2, totalTokens: 12 },
+    usage: {
+      inputTokens: 2,
+      outputTokens: 7,
+      cacheReadInputTokens: 2,
+      cacheCreationInputTokens: 1,
+      totalTokens: 12,
+    },
   });
 });
 
