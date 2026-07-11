@@ -35,3 +35,14 @@ test("explicit CLI model ignores environment provider default", () => {
     serviceTier: "fast",
   });
 });
+
+test("explicit CLI provider ignores an environment model from another provider", () => {
+  expect(applyCliEnvironmentDefaults(
+    { provider: "openai-codex" },
+    { provider: "minimax", model: "MiniMax-M3", reasoningLevel: "high", serviceTier: "fast" },
+  )).toEqual({
+    provider: "openai-codex",
+    reasoningLevel: "high",
+    serviceTier: "fast",
+  });
+});

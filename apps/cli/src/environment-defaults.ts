@@ -35,7 +35,7 @@ export function applyCliEnvironmentDefaults(
   }
 
   if (explicit.model !== undefined) selection.model = explicit.model;
-  else if (defaults.model !== undefined) selection.model = defaults.model;
+  else if (explicit.provider === undefined && defaults.model !== undefined) selection.model = defaults.model;
 
   if (explicit.reasoningLevel !== undefined) selection.reasoningLevel = explicit.reasoningLevel;
   else if (defaults.reasoningLevel !== undefined) selection.reasoningLevel = defaults.reasoningLevel;
