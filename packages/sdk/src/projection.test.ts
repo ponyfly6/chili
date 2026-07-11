@@ -366,6 +366,7 @@ test("projects live tool output deltas without duplicating final output", () => 
     expect.objectContaining({ stream: "stderr", delta: "warn\n", sequence: 2 }),
   ]);
   expect(running.activeTools).toHaveLength(1);
+  expect(runningView.lastEventId).toBe("event_live_output_started");
 
   const finalOutput = "pass 1\n\n[stderr]\nwarn\n";
   const completedView = reduceRuntimeEvents(

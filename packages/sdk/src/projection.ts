@@ -30,6 +30,7 @@ import type {
   ToolOutputStream,
   TurnId,
 } from "@chili/protocol";
+import { isTransientEvent } from "@chili/protocol";
 
 type ToolPartStatus = Extract<MessagePart, { type: "tool_call" }>["status"];
 
@@ -767,7 +768,7 @@ export function reduceRuntimeEvents(
 }
 
 export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvelope): ChiliRuntimeView {
-  view.lastEventId = inputEvent.id;
+  if (!isTransientEvent(inputEvent)) view.lastEventId = inputEvent.id;
   applyTeamProjectionEvent(view, inputEvent);
   applySubagentProjectionEvent(view, inputEvent);
 

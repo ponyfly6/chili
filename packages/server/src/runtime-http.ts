@@ -1346,8 +1346,12 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
     async start(controller) {
       const send = (event: ChiliEvent): void => {
         if (closed || sentIds.has(event.id) || !matchesEvent(event, options)) return;
-        sentIds.add(event.id);
-        controller.enqueue(encoder.encode(formatSse(event)));
+        if (!backlogDone) sentIds.add(event.id);
+        try {
+          controller.enqueue(encoder.encode(formatSse(event)));
+        } catch {
+          cleanup();
+        }
       };
 
       unsubscribe = options.store.subscribe((event) => {
@@ -1368,26 +1372,50 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
 
       options.request.signal.addEventListener("abort", cleanup, { once: true });
       heartbeat = setInterval(() => {
-        if (!closed) controller.enqueue(encoder.encode(": heartbeat\n\n"));
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(": heartbeat\n\n"));
+        } catch {
+          cleanup();
+        }
       }, 5_000);
 
-      const query = {
-        limit: options.maxBacklogEvents,
-        tail: !options.afterEventId,
-      } as {
+      type BacklogQuery = {
         sessionId?: SessionId;
         threadId?: ThreadId;
         afterEventId?: string;
         limit: number;
         tail: boolean;
       };
-      if (options.sessionId) query.sessionId = options.sessionId;
-      if (options.threadId) query.threadId = options.threadId;
-      if (options.afterEventId) query.afterEventId = options.afterEventId;
-      const backlog = await options.store.events(query);
-      for (const event of backlog) send(event as ChiliEvent);
-      backlogDone = true;
+      const query = (input: { afterEventId?: string; limit: number; tail: boolean }): BacklogQuery => ({
+        ...input,
+        ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+        ...(options.threadId ? { threadId: options.threadId } : {}),
+      });
+
+      if (!options.afterEventId) {
+        const backlog = await options.store.events(query({
+          limit: Math.max(1, options.maxBacklogEvents),
+          tail: true,
+        }));
+        for (const event of backlog) send(event as ChiliEvent);
+      } else {
+        const pageSize = Math.max(1, options.maxBacklogEvents);
+        const anchor = (await options.store.events(query({ limit: 1, tail: true }))).at(-1);
+        let cursor: string | undefined = options.afterEventId;
+        while (!closed && anchor) {
+          const page = await options.store.events(query({ afterEventId: cursor, limit: pageSize, tail: false }));
+          if (page.length === 0) break;
+          for (const event of page) send(event as ChiliEvent);
+          if (page.some((event) => event.id === anchor.id)) break;
+          const nextCursor = page.at(-1)?.id;
+          if (page.length < pageSize || !nextCursor || nextCursor === cursor) break;
+          cursor = nextCursor;
+        }
+      }
       for (const event of pending.splice(0)) send(event);
+      backlogDone = true;
+      sentIds.clear();
     },
     cancel() {
       cleanup();

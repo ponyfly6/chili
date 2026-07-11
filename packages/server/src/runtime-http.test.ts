@@ -92,7 +92,7 @@ test("serves sessions and event backlog over the runtime HTTP handler", async ()
   expect(new TextDecoder().decode(chunk.value)).toContain("session.created");
 });
 
-test("event backlog includes tail events for long resumed sessions", async () => {
+test("event backlog stays bounded initially and pages complete resumed history", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-runtime-tail-backlog-"));
   const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
   const store = new ObservableEventStore(baseStore);
@@ -163,8 +163,18 @@ test("event backlog includes tail events for long resumed sessions", async () =>
     reader.releaseLock();
 
     const text = chunks.join("");
+    expect(text).not.toContain("event_tail_session");
     expect(text).toContain("event_tail_failed_status");
     expect(text).toContain("unexpected EOF");
+
+    const resumed = await collectEventStreamText(
+      handler,
+      `http://chili.test/events?sessionId=${sessionId}&threadId=${threadId}&afterEventId=event_tail_started_0`,
+    );
+    expect(resumed).not.toContain("event_tail_session");
+    expect(resumed).not.toContain('"id":"event_tail_started_0"');
+    expect(resumed).toContain("event_tail_started_4");
+    expect(resumed).toContain("event_tail_failed_status");
   } finally {
     baseStore.close();
     await rm(dir, { recursive: true, force: true });
@@ -1781,6 +1791,32 @@ function mailboxRow(input: { status: AgentMailboxRow["status"] }): AgentMailboxR
 function createSequentialId(): (prefix: string) => string {
   let next = 0;
   return (prefix: string) => `${prefix}_${++next}`;
+}
+
+async function collectEventStreamText(
+  handler: (request: Request) => Promise<Response>,
+  url: string,
+): Promise<string> {
+  const controller = new AbortController();
+  const response = await handler(new Request(url, { signal: controller.signal }));
+  expect(response.status).toBe(200);
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("expected event stream body");
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  const abortTimer = setTimeout(() => controller.abort(), 50);
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      chunks.push(decoder.decode(chunk.value, { stream: true }));
+    }
+  } finally {
+    clearTimeout(abortTimer);
+    controller.abort();
+    reader.releaseLock();
+  }
+  return chunks.join("") + decoder.decode();
 }
 
 function permissionConfig(profile: RuntimePermissionProfileId): RuntimePermissionConfig {
