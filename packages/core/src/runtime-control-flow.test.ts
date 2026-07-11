@@ -212,6 +212,101 @@ test("consumes rich model streams and executes tool calls after the stream finis
   expect(toolStartedIndex).toBeGreaterThan(toolCallPartIndex);
 });
 
+test("does not execute tool calls from output-limited model responses", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  let executed = false;
+  registry.register({
+    name: "write_file",
+    description: "Write a file.",
+    risk: "write",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => {
+      executed = true;
+      return { title: "write_file", output: "should not run" };
+    },
+  });
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "tool_call", name: "write_file", input: { filePath: "danger.txt", content: "partial" } };
+      yield { type: "finish", reason: "length" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_output_limited" as SessionId,
+    threadId: "thread_output_limited" as ThreadId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("completed");
+  if (result.status === "completed") expect(result.finishReason).toBe("tool_use");
+  expect(executed).toBe(false);
+  expect(toolFinishedPayloads(store)).toContainEqual(expect.objectContaining({
+    status: "failed",
+    synthetic: true,
+    error: expect.stringContaining("output token limit"),
+  }));
+  expect(toolResultParts(store)[0]).toMatchObject({
+    type: "tool_result",
+    output: "",
+    synthetic: true,
+    error: expect.stringContaining("finish reason: length"),
+  });
+});
+
+test("does not execute tool calls when the provider reports invalid JSON arguments", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  let executed = false;
+  registry.register({
+    name: "write_file",
+    description: "Write a file.",
+    risk: "write",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => {
+      executed = true;
+      return { title: "write_file", output: "should not run" };
+    },
+  });
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "tool_call_start", toolCallId: "tool_invalid", name: "write_file" };
+      yield {
+        type: "tool_call_end",
+        toolCallId: "tool_invalid",
+        name: "write_file",
+        input: {},
+        inputParseError: "Tool call arguments were not valid JSON: Unexpected end of JSON input",
+      };
+      yield { type: "finish", reason: "tool_use" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_invalid_tool_args" as SessionId,
+    threadId: "thread_invalid_tool_args" as ThreadId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(executed).toBe(false);
+  expect(toolFinishedPayloads(store)).toContainEqual(expect.objectContaining({
+    status: "failed",
+    synthetic: true,
+    error: expect.stringContaining("not valid JSON"),
+  }));
+  expect(toolResultParts(store)[0]).toMatchObject({
+    output: "",
+    synthetic: true,
+    error: expect.stringContaining("not valid JSON"),
+  });
+});
+
 test("keeps live tool output deltas out of model-facing tool result parts", async () => {
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();
@@ -564,6 +659,50 @@ test("runtime hides all tools when tool mode is disabled", async () => {
 
   expect(result.status).toBe("completed");
   expect(seenTools).toEqual([[]]);
+});
+
+test("runtime refuses model-emitted tool calls when tool mode is disabled", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  let executed = false;
+  registry.register({
+    name: "read",
+    description: "Read",
+    risk: "read",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => {
+      executed = true;
+      return { title: "read", output: "should not run" };
+    },
+  });
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "tool_call", name: "read", input: { filePath: "secret.txt" } };
+      yield { type: "finish", reason: "tool_use" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_no_tool_execution" as SessionId,
+    threadId: "thread_no_tool_execution" as ThreadId,
+    cwd: "/repo",
+    toolMode: "disabled",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(executed).toBe(false);
+  expect(toolFinishedPayloads(store)).toContainEqual(expect.objectContaining({
+    status: "failed",
+    synthetic: true,
+    error: expect.stringContaining("Tool use is disabled"),
+  }));
+  expect(toolResultParts(store)[0]).toMatchObject({
+    output: "",
+    synthetic: true,
+    error: expect.stringContaining("Tool use is disabled"),
+  });
 });
 
 test("runtime applies per-turn tool policy to visible and executed tools", async () => {

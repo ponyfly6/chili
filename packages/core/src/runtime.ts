@@ -121,6 +121,7 @@ export interface ModelToolCallEndEvent {
   toolCallId: string;
   name: string;
   input: unknown;
+  inputParseError?: string;
   index?: number;
 }
 
@@ -128,6 +129,7 @@ export interface ModelLegacyToolCallEvent {
   type: "tool_call";
   name: string;
   input: unknown;
+  inputParseError?: string;
 }
 
 export interface ModelFinishEvent {

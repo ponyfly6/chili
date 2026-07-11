@@ -460,6 +460,56 @@ test("parses Anthropic SSE text and tool deltas", async () => {
   });
 });
 
+test("marks invalid Anthropic streaming tool arguments", async () => {
+  const model = new AnthropicCompatibleModel({
+    provider: "minimax",
+    model: "test-model",
+    apiKey: "test-key",
+    baseUrl: "https://model.test",
+    fetch: sseFetch([
+      event("message_start", {
+        type: "message_start",
+        message: {
+          id: "msg_invalid_args",
+          model: "test-model",
+          usage: { input_tokens: 3, output_tokens: 0 },
+        },
+      }),
+      event("content_block_start", {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_invalid", name: "bash", input: {} },
+      }),
+      event("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: "{\"cmd\":" },
+      }),
+      event("content_block_stop", {
+        type: "content_block_stop",
+        index: 0,
+      }),
+      event("message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: "tool_use" },
+        usage: { output_tokens: 7 },
+      }),
+      event("message_stop", { type: "message_stop" }),
+    ]),
+  });
+
+  const events = await collect(model.stream({ messages: [], tools: [], system: [] }));
+
+  expect(events.find((streamEvent) => streamEvent.type === "tool_call_end")).toMatchObject({
+    type: "tool_call_end",
+    toolCallId: "toolu_invalid",
+    name: "bash",
+    input: {},
+    inputParseError: expect.stringContaining("not valid JSON"),
+    index: 0,
+  });
+});
+
 test("falls back to non-streaming JSON responses", async () => {
   const model = new AnthropicCompatibleModel({
     provider: "minimax",

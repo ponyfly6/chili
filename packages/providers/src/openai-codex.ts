@@ -153,6 +153,11 @@ interface ToolStreamState {
   ended: boolean;
 }
 
+interface FinalToolInput {
+  input: unknown;
+  inputParseError?: string;
+}
+
 const TOKEN_REFRESH_SKEW_MS = 60_000;
 
 export class OpenAICodexProvider implements ChiliModelProvider {
@@ -389,7 +394,10 @@ export class OpenAICodexResponsesModel implements ChiliModel {
       if (payload.type === "response.completed" || payload.type === "response.done" || payload.type === "response.incomplete") {
         responseId = payload.response?.id ?? responseId;
         usage = toModelUsage(payload.response?.usage) ?? usage;
-        finishReason = mapCodexFinishReason(payload.response?.status, sawToolCall);
+        finishReason = mapCodexFinishReason(
+          payload.response?.status ?? (payload.type === "response.incomplete" ? "incomplete" : undefined),
+          sawToolCall,
+        );
         if (responseId || usage) yield metadataEvent(this.provider, payload.response?.model ?? requestModel, responseId, usage);
         break;
       }
@@ -643,12 +651,14 @@ function toolDeltaEvent(tool: ToolStreamState, delta: string, partialInput: unkn
 }
 
 function finishToolEvent(tool: ToolStreamState): ModelStreamEvent {
+  const finalInput = finalToolInput(tool.partialJson);
   const event: ModelStreamEvent = {
     type: "tool_call_end",
     toolCallId: tool.toolCallId,
     name: tool.name,
-    input: finalToolInput(tool.partialJson),
+    input: finalInput.input,
   };
+  if (finalInput.inputParseError) event.inputParseError = finalInput.inputParseError;
   if (tool.index !== undefined) event.index = tool.index;
   return event;
 }
@@ -682,9 +692,9 @@ function finishEvent(reason: string, responseId: string | undefined, usage: Mode
 }
 
 function mapCodexFinishReason(status: string | undefined, sawToolCall: boolean): string {
-  if (sawToolCall) return "tool_use";
   if (status === "incomplete") return "length";
   if (status === "failed" || status === "cancelled") return "error";
+  if (sawToolCall) return "tool_use";
   return "stop";
 }
 
@@ -828,9 +838,23 @@ function stringifyToolInput(input: unknown): string {
   }
 }
 
-function finalToolInput(value: string): unknown {
-  if (!value) return {};
-  return parseJson(value, {});
+function finalToolInput(value: string): FinalToolInput {
+  if (!value) return { input: {} };
+  try {
+    return { input: JSON.parse(value) as unknown };
+  } catch (error) {
+    return {
+      input: {},
+      inputParseError: formatToolInputParseError(error),
+    };
+  }
+}
+
+function formatToolInputParseError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message
+    ? `Tool call arguments were not valid JSON: ${message}`
+    : "Tool call arguments were not valid JSON.";
 }
 
 function formatToolResult(part: Extract<MessagePart, { type: "tool_result" }>): string {

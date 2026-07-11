@@ -462,6 +462,76 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
   });
 });
 
+test("maps incomplete Codex tool-call responses to length", async () => {
+  const model = new OpenAICodexResponsesModel({
+    model: "gpt-test",
+    apiKey: jwtWithAccount("acct_test"),
+    fetch: sseFetch([
+      data({ type: "response.created", response: { id: "resp_incomplete", model: "gpt-test" } }),
+      data({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "function_call", id: "fc_incomplete", call_id: "call_incomplete", name: "write_file", arguments: "" },
+      }),
+      data({
+        type: "response.output_item.done",
+        output_index: 0,
+        item: { type: "function_call", id: "fc_incomplete", call_id: "call_incomplete", name: "write_file", arguments: "{\"filePath\":\"a.txt\"" },
+      }),
+      data({
+        type: "response.incomplete",
+        response: { id: "resp_incomplete", model: "gpt-test" },
+      }),
+    ]),
+    env: {},
+  });
+
+  const events = await collect(model.stream({ messages: [], tools: [], system: [] }));
+
+  expect(events.map((event) => event.type)).toContain("tool_call_end");
+  expect(events.at(-1)).toMatchObject({ type: "finish", reason: "length" });
+});
+
+test("marks invalid Codex tool arguments", async () => {
+  const model = new OpenAICodexResponsesModel({
+    model: "gpt-test",
+    apiKey: jwtWithAccount("acct_test"),
+    fetch: sseFetch([
+      data({ type: "response.created", response: { id: "resp_invalid_args", model: "gpt-test" } }),
+      data({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "function_call", id: "fc_invalid", call_id: "call_invalid", name: "lookup", arguments: "" },
+      }),
+      data({
+        type: "response.function_call_arguments.done",
+        item_id: "fc_invalid",
+        arguments: "{\"q\":" ,
+      }),
+      data({
+        type: "response.output_item.done",
+        output_index: 0,
+        item: { type: "function_call", id: "fc_invalid", call_id: "call_invalid", name: "lookup", arguments: "{\"q\":" },
+      }),
+      data({
+        type: "response.completed",
+        response: { id: "resp_invalid_args", model: "gpt-test", status: "completed" },
+      }),
+    ]),
+    env: {},
+  });
+
+  const events = await collect(model.stream({ messages: [], tools: [], system: [] }));
+
+  expect(events.find((event) => event.type === "tool_call_end")).toMatchObject({
+    type: "tool_call_end",
+    toolCallId: "call_invalid",
+    name: "lookup",
+    input: {},
+    inputParseError: expect.stringContaining("not valid JSON"),
+  });
+});
+
 test("sends OpenAI-compatible Codex requests without ChatGPT account headers", async () => {
   let url = "";
   let headers = new Headers();

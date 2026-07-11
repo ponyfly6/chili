@@ -119,6 +119,11 @@ interface ToolBlockState {
   initialInput: unknown;
 }
 
+interface FinalToolInput {
+  input: unknown;
+  inputParseError?: string;
+}
+
 export class AnthropicCompatibleModel implements ChiliModel {
   readonly provider: string;
   readonly model: string;
@@ -248,13 +253,16 @@ export class AnthropicCompatibleModel implements ChiliModel {
         const tool = toolBlocks.get(payload.index);
         if (tool) {
           toolBlocks.delete(payload.index);
-          yield {
+          const finalInput = finalToolInput(tool);
+          const event: ModelStreamEvent = {
             type: "tool_call_end",
             toolCallId: tool.toolCallId,
             name: tool.name,
-            input: finalToolInput(tool),
+            input: finalInput.input,
             index: payload.index,
           };
+          if (finalInput.inputParseError) event.inputParseError = finalInput.inputParseError;
+          yield event;
         }
         continue;
       }
@@ -489,9 +497,23 @@ function toolCallDeltaEvent(
   return event;
 }
 
-function finalToolInput(tool: ToolBlockState): unknown {
-  if (!tool.partialJson) return tool.initialInput;
-  return parseJson(tool.partialJson, tool.initialInput);
+function finalToolInput(tool: ToolBlockState): FinalToolInput {
+  if (!tool.partialJson) return { input: tool.initialInput };
+  try {
+    return { input: JSON.parse(tool.partialJson) as unknown };
+  } catch (error) {
+    return {
+      input: tool.initialInput,
+      inputParseError: formatToolInputParseError(error),
+    };
+  }
+}
+
+function formatToolInputParseError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message
+    ? `Tool call arguments were not valid JSON: ${message}`
+    : "Tool call arguments were not valid JSON.";
 }
 
 function mergeUsage(previous: ModelUsage | undefined, usage: AnthropicUsage | undefined): ModelUsage | undefined {

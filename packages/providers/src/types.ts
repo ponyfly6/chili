@@ -148,6 +148,7 @@ export interface ModelToolCallEndEvent {
   toolCallId: string;
   name: string;
   input: unknown;
+  inputParseError?: string;
   index?: number;
 }
 

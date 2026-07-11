@@ -115,6 +115,11 @@ interface ToolStreamState {
   started: boolean;
 }
 
+interface FinalToolInput {
+  input: unknown;
+  inputParseError?: string;
+}
+
 export class OpenAICompletionsModel implements ChiliModel {
   readonly provider: string;
   readonly model: string;
@@ -480,18 +485,35 @@ function toolCallDeltaEvent(
 }
 
 function finishToolCallEvent(tool: ToolStreamState, index: number): ModelStreamEvent {
-  return {
+  const finalInput = finalToolInput(tool);
+  const event: ModelStreamEvent = {
     type: "tool_call_end",
     toolCallId: tool.toolCallId,
     name: tool.name,
-    input: finalToolInput(tool),
+    input: finalInput.input,
     index,
   };
+  if (finalInput.inputParseError) event.inputParseError = finalInput.inputParseError;
+  return event;
 }
 
-function finalToolInput(tool: ToolStreamState): unknown {
-  if (!tool.partialJson) return {};
-  return parseJson(tool.partialJson, {});
+function finalToolInput(tool: ToolStreamState): FinalToolInput {
+  if (!tool.partialJson) return { input: {} };
+  try {
+    return { input: JSON.parse(tool.partialJson) as unknown };
+  } catch (error) {
+    return {
+      input: {},
+      inputParseError: formatToolInputParseError(error),
+    };
+  }
+}
+
+function formatToolInputParseError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message
+    ? `Tool call arguments were not valid JSON: ${message}`
+    : "Tool call arguments were not valid JSON.";
 }
 
 function stringifyToolInput(input: unknown): string {

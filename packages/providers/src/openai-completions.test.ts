@@ -409,6 +409,113 @@ test("parses OpenAI-compatible SSE text, reasoning, tool deltas, and usage", asy
   });
 });
 
+test("marks invalid OpenAI-compatible streaming tool arguments", async () => {
+  const model = new OpenAICompletionsModel({
+    provider: "openai",
+    model: "gpt-test",
+    apiKey: "test-key",
+    baseUrl: "https://api.test",
+    fetch: sseFetch([
+      data({
+        id: "chatcmpl_invalid_args",
+        model: "gpt-test",
+        choices: [{
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "call_invalid",
+              type: "function",
+              function: { name: "lookup", arguments: "{\"query\":" },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }],
+      }),
+      "data: [DONE]\n\n",
+    ]),
+  });
+
+  const events = await collect(model.stream({ messages: [], tools: [], system: [] }));
+
+  expect(events.find((event) => event.type === "tool_call_end")).toMatchObject({
+    type: "tool_call_end",
+    toolCallId: "call_invalid",
+    name: "lookup",
+    input: {},
+    inputParseError: expect.stringContaining("not valid JSON"),
+  });
+});
+
+test("marks invalid non-streaming OpenAI-compatible tool arguments", async () => {
+  const model = new OpenAICompletionsModel({
+    provider: "openai",
+    model: "gpt-test",
+    apiKey: "test-key",
+    baseUrl: "https://api.test",
+    fetch: jsonFetch({
+      id: "chatcmpl_invalid_json",
+      model: "gpt-test",
+      choices: [{
+        index: 0,
+        message: {
+          tool_calls: [{
+            id: "call_invalid_json",
+            type: "function",
+            function: { name: "edit", arguments: "{\"filePath\":" },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }],
+    }),
+  });
+
+  const events = await collect(model.stream({ messages: [], tools: [], system: [] }));
+
+  expect(events.at(-2)).toMatchObject({
+    type: "tool_call_end",
+    toolCallId: "call_invalid_json",
+    name: "edit",
+    input: {},
+    inputParseError: expect.stringContaining("not valid JSON"),
+    index: 0,
+  });
+});
+
+test("keeps empty OpenAI-compatible tool arguments as empty input", async () => {
+  const model = new OpenAICompletionsModel({
+    provider: "openai",
+    model: "gpt-test",
+    apiKey: "test-key",
+    baseUrl: "https://api.test",
+    fetch: jsonFetch({
+      id: "chatcmpl_empty_json",
+      model: "gpt-test",
+      choices: [{
+        index: 0,
+        message: {
+          tool_calls: [{
+            id: "call_empty_json",
+            type: "function",
+            function: { name: "noop", arguments: "" },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }],
+    }),
+  });
+
+  const events = await collect(model.stream({ messages: [], tools: [], system: [] }));
+
+  expect(events.at(-2)).toEqual({
+    type: "tool_call_end",
+    toolCallId: "call_empty_json",
+    name: "noop",
+    input: {},
+    index: 0,
+  });
+});
+
 test("falls back to non-streaming OpenAI-compatible JSON responses", async () => {
   const model = new OpenAICompletionsModel({
     provider: "openai",
