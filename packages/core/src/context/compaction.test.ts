@@ -159,6 +159,24 @@ test("context builder reserves model output and fixed prompt surface", () => {
   expect(withFixedSurface.usage.budgetTokens).toBeLessThan(40);
 });
 
+test("context builder rejects an oversized fixed prompt without message history", () => {
+  const built = new ContextWindowBuilder({
+    maxInputChars: 10_000,
+    framingSafetyTokens: 0,
+  }).build([], {
+    contextWindowTokens: 16,
+    requestMaxOutputTokens: 4,
+    system: ["s".repeat(80)],
+  });
+
+  expect(built.messages).toEqual([]);
+  expect(built.overflow).toMatchObject({
+    reason: "fixed_input_exceeds_window",
+    budgetTokens: 16,
+  });
+  expect(built.overflow?.estimatedTokens).toBeGreaterThan(16);
+});
+
 test("runtime fails before model streaming when fixed input exhausts the model window", async () => {
   const store = new ProjectingEventStore();
   const registry = new InMemoryToolRegistry();

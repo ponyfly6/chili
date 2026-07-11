@@ -108,6 +108,32 @@ export class ContextWindowBuilder {
     const truncatedChars = estimateMessages(budgeted);
     const surfaceBudget = resolveSurfaceBudget(surface, this.framingSafetyTokens);
     const truncatedTokens = surfaceBudget ? estimateMessagesTokens(budgeted) : undefined;
+    const fixedInputExceedsWindow = surfaceBudget
+      ? surfaceBudget.fixedInputTokens
+        + surfaceBudget.outputReserveTokens
+        + surfaceBudget.framingSafetyTokens > surfaceBudget.contextWindowTokens
+      : false;
+    if (surfaceBudget && fixedInputExceedsWindow) {
+      return {
+        messages: [],
+        usage: this.contextUsage({
+          rawChars,
+          contextChars: 0,
+          contextTokens: 0,
+          surfaceBudget,
+          truncatedToolResults,
+          compactedToolResults: toolCompacted.compactedToolResults,
+          omittedMessages: compactedMessagesOmitted + budgeted.length,
+        }),
+        overflow: {
+          reason: "fixed_input_exceeds_window",
+          estimatedTokens: surfaceBudget.fixedInputTokens
+            + surfaceBudget.outputReserveTokens
+            + surfaceBudget.framingSafetyTokens,
+          budgetTokens: surfaceBudget.contextWindowTokens,
+        },
+      };
+    }
     const withinTokenBudget = !surfaceBudget || (truncatedTokens ?? 0) <= surfaceBudget.historyBudgetTokens;
 
     if (truncatedChars <= this.maxInputChars && withinTokenBudget) {
@@ -175,9 +201,7 @@ export class ContextWindowBuilder {
       const currentMessage = budgeted.at(-1);
       const currentTokens = currentMessage ? estimateMessageTokens(currentMessage) : 0;
       result.overflow = {
-        reason: surfaceBudget.historyBudgetTokens <= 0
-          ? "fixed_input_exceeds_window"
-          : "current_message_too_large",
+        reason: "current_message_too_large",
         estimatedTokens: currentTokens
           + surfaceBudget.fixedInputTokens
           + surfaceBudget.outputReserveTokens
