@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { access, link, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
@@ -117,6 +117,32 @@ macOsTest("macOS Seatbelt permits workspace writes and blocks metadata and paren
     expect(await readFile(gitConfig, "utf8")).toBe("original-git\n");
     expect(await readFile(chiliState, "utf8")).toBe("original-chili\n");
     await expect(readFile(outside, "utf8")).rejects.toThrow();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+macOsTest("macOS Seatbelt refuses pre-existing hard-link aliases of protected metadata", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-seatbelt-hardlink-"));
+  const runner = createMacOsSeatbeltBashRunner();
+  try {
+    for (const protectedDirectory of [".git", ".chili"]) {
+      const workspace = join(root, protectedDirectory.slice(1));
+      const protectedPath = join(workspace, protectedDirectory, "state");
+      const aliasPath = join(workspace, "metadata-alias");
+      await mkdir(join(workspace, protectedDirectory), { recursive: true });
+      await writeFile(protectedPath, "original\n", "utf8");
+      await link(protectedPath, aliasPath);
+
+      await expect(runner.run(bashRequest(
+        workspace,
+        "printf launched > launched.txt; printf hacked > metadata-alias",
+      ))).rejects.toThrow("protected metadata file");
+
+      expect(await readFile(protectedPath, "utf8")).toBe("original\n");
+      expect(await readFile(aliasPath, "utf8")).toBe("original\n");
+      await expect(readFile(join(workspace, "launched.txt"), "utf8")).rejects.toThrow();
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

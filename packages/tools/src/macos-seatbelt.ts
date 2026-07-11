@@ -1,11 +1,12 @@
-import { readFileSync, realpathSync, statSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { readFileSync, realpathSync, statSync, type Stats } from "node:fs";
+import { lstat, mkdtemp, opendir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { BashRunner } from "./builtins/bash.js";
 import { runProcess, type RunProcessOptions, type RunProcessResult } from "./process.js";
 
 export const MACOS_SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
+const MAX_PROTECTED_METADATA_ENTRIES = 100_000;
 
 export interface MacOsSeatbeltBashRunnerOptions {
   processRunner?: (
@@ -86,16 +87,24 @@ export function createMacOsSeatbeltBashRunner(options: MacOsSeatbeltBashRunnerOp
       const workspaceRoot = realpathSync.native(resolve(request.workspaceRoot));
       assertCwdInsideWorkspace(workspaceRoot, request.cwd);
       const profile = buildMacOsSeatbeltProfile(workspaceRoot);
-      const temporaryRoot = realpathSync.native(await mkdtemp(join(tmpdir(), "chili-seatbelt-")));
       const gitPath = join(workspaceRoot, ".git");
       const chiliPath = join(workspaceRoot, ".chili");
+      const gitTarget = resolveGitMetadataTarget(gitPath);
+      const chiliTarget = canonicalPathOrLogical(chiliPath);
+      await assertProtectedMetadataTreesHaveNoHardLinks([
+        { label: ".git", path: gitPath },
+        { label: ".git target", path: gitTarget },
+        { label: ".chili", path: chiliPath },
+        { label: ".chili target", path: chiliTarget },
+      ]);
+      const temporaryRoot = realpathSync.native(await mkdtemp(join(tmpdir(), "chili-seatbelt-")));
       const definitions = [
         `-DWORKSPACE_ROOT=${workspaceRoot}`,
         `-DTEMP_ROOT=${temporaryRoot}`,
         `-DPROTECTED_GIT=${gitPath}`,
-        `-DPROTECTED_GIT_TARGET=${resolveGitMetadataTarget(gitPath)}`,
+        `-DPROTECTED_GIT_TARGET=${gitTarget}`,
         `-DPROTECTED_CHILI=${chiliPath}`,
-        `-DPROTECTED_CHILI_TARGET=${canonicalPathOrLogical(chiliPath)}`,
+        `-DPROTECTED_CHILI_TARGET=${chiliTarget}`,
       ];
       const processOptions: RunProcessOptions = {
         cwd: request.cwd,
@@ -125,6 +134,99 @@ export function createMacOsSeatbeltBashRunner(options: MacOsSeatbeltBashRunnerOp
       }
     },
   };
+}
+
+interface ProtectedMetadataRoot {
+  label: string;
+  path: string;
+}
+
+async function assertProtectedMetadataTreesHaveNoHardLinks(
+  roots: readonly ProtectedMetadataRoot[],
+): Promise<void> {
+  const visited = new Set<string>();
+  for (const root of roots) {
+    const path = resolve(root.path);
+    if (visited.has(path)) continue;
+    visited.add(path);
+    await assertProtectedMetadataTreeHasNoHardLinks({ ...root, path });
+  }
+}
+
+async function assertProtectedMetadataTreeHasNoHardLinks(root: ProtectedMetadataRoot): Promise<void> {
+  const rootInfo = await inspectProtectedMetadataPath(root, root.path, true);
+  if (!rootInfo) return;
+  assertProtectedMetadataFileHasNoAliases(root, root.path, rootInfo);
+  if (!rootInfo.isDirectory()) return;
+
+  let inspectedEntries = 1;
+  const pendingDirectories = [root.path];
+  while (pendingDirectories.length > 0) {
+    const directory = pendingDirectories.pop();
+    if (!directory) continue;
+    let handle;
+    try {
+      handle = await opendir(directory);
+    } catch (error) {
+      throw protectedMetadataInspectionError(root, directory, error);
+    }
+    try {
+      for await (const entry of handle) {
+        inspectedEntries += 1;
+        if (inspectedEntries > MAX_PROTECTED_METADATA_ENTRIES) {
+          throw new Error(
+            `Refusing to launch macOS Seatbelt: protected metadata tree ${root.path} `
+            + `exceeds ${MAX_PROTECTED_METADATA_ENTRIES} entries; hard-link safety cannot be verified.`,
+          );
+        }
+        const entryPath = join(directory, entry.name);
+        const info = await inspectProtectedMetadataPath(root, entryPath, false);
+        if (!info || info.isSymbolicLink()) continue;
+        assertProtectedMetadataFileHasNoAliases(root, entryPath, info);
+        if (info.isDirectory()) pendingDirectories.push(entryPath);
+      }
+    } catch (error) {
+      if (isProtectedMetadataSafetyError(error)) throw error;
+      throw protectedMetadataInspectionError(root, directory, error);
+    }
+  }
+}
+
+async function inspectProtectedMetadataPath(
+  root: ProtectedMetadataRoot,
+  path: string,
+  allowMissing: boolean,
+): Promise<Stats | undefined> {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if (allowMissing && isNotFound(error)) return undefined;
+    throw protectedMetadataInspectionError(root, path, error);
+  }
+}
+
+function assertProtectedMetadataFileHasNoAliases(
+  root: ProtectedMetadataRoot,
+  path: string,
+  info: Stats,
+): void {
+  if (!info.isFile() || info.nlink <= 1) return;
+  throw new Error(
+    `Refusing to launch macOS Seatbelt: protected metadata file ${path} (${root.label}) `
+    + `has ${info.nlink} hard links; remove its aliases before running sandboxed commands.`,
+  );
+}
+
+function protectedMetadataInspectionError(root: ProtectedMetadataRoot, path: string, error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  return new Error(
+    `Refusing to launch macOS Seatbelt: cannot safely inspect protected metadata path `
+    + `${path} (${root.label}): ${message}`,
+  );
+}
+
+function isProtectedMetadataSafetyError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith("Refusing to launch macOS Seatbelt:");
 }
 
 function assertCwdInsideWorkspace(workspaceRoot: string, cwd: string): void {

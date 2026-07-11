@@ -448,10 +448,12 @@ test("tool executor evicts old sidecars to enforce a directory byte budget", asy
   }
 });
 
-test("tool executor refuses sidecar writes through an out-of-workspace symlink", async () => {
+test("tool executor preserves a completed side effect when sidecar persistence is unsafe", async () => {
   const root = await mkdtemp(join(tmpdir(), "chili-tools-output-symlink-"));
   const workspace = join(root, "workspace");
   const outside = join(root, "outside");
+  const sideEffectMarker = join(workspace, "side-effect.txt");
+  const events: ChiliEvent[] = [];
   try {
     await mkdir(join(workspace, ".chili"), { recursive: true });
     await mkdir(outside, { recursive: true });
@@ -466,13 +468,28 @@ test("tool executor refuses sidecar writes through an out-of-workspace symlink",
       maxResultOutputBytes: 4,
       isReadOnly: true,
       isConcurrencySafe: true,
-      execute: async () => ({ title: "large", output: "abcdefgh" }),
+      execute: async () => {
+        await writeFile(sideEffectMarker, "completed\n", "utf8");
+        return { title: "large", output: "abcdSECRET_REMAINDER" };
+      },
     });
-    const executor = createExecutor(registry);
+    const executor = createExecutor(registry, undefined, undefined, events);
 
     const result = await executor.execute(toolInput("large", {}, workspace, "toolcall_symlink" as ToolCallId));
 
-    expect(result.status).toBe("failed");
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") return;
+    expect(await readFile(sideEffectMarker, "utf8")).toBe("completed\n");
+    expect(result.result.output).toStartWith("abcd\n[tool output truncated after 4 bytes;");
+    expect(result.result.output).not.toContain("SECRET_REMAINDER");
+    expect(result.result.metadata?.outputTruncated).toBe(true);
+    expect(result.result.metadata?.outputPersistenceError).toContain("stay inside the workspace");
+    expect(result.result.metadata?.outputPath).toBeUndefined();
+    const finished = events.find(
+      (event): event is Extract<ChiliEvent, { type: "tool.call_finished" }> => event.type === "tool.call_finished",
+    );
+    expect(finished?.payload.status).toBe("completed");
+    expect(finished?.payload.output).not.toContain("SECRET_REMAINDER");
     await expectRejectsWith(readFile(join(outside, "toolcall_symlink.txt"), "utf8"), "ENOENT");
   } finally {
     await rm(root, { recursive: true, force: true });

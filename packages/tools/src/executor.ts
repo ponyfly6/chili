@@ -36,6 +36,15 @@ const DEFAULT_MAX_PERSISTED_OUTPUT_BYTES = 1024 * 1024;
 const DEFAULT_MAX_PERSISTED_OUTPUT_DIRECTORY_BYTES = 64 * 1024 * 1024;
 const sidecarDirectoryLocks = new Map<string, Promise<void>>();
 
+interface PersistedOutput {
+  relativePath: string;
+  absolutePath: string;
+  bytes: number;
+  originalBytes: number;
+  limitBytes: number;
+  truncated: boolean;
+}
+
 export class ToolExecutor {
   private readonly fileReads: FileReadStateStore;
 
@@ -216,7 +225,23 @@ export class ToolExecutor {
     const truncated = truncateUtf8(result.output, maxBytes);
     if (!truncated.truncated) return result;
 
-    const persisted = await this.persistLargeOutput(input.cwd, callId, result.output);
+    let persisted: PersistedOutput;
+    try {
+      persisted = await this.persistLargeOutput(input.cwd, callId, result.output);
+    } catch (error) {
+      const persistenceError = toError(error);
+      return {
+        ...result,
+        output: `${truncated.text}\n[tool output truncated after ${maxBytes} bytes; remaining output could not be safely persisted]`,
+        metadata: {
+          ...result.metadata,
+          outputTruncated: true,
+          outputBytes: truncated.bytes,
+          outputLimitBytes: maxBytes,
+          outputPersistenceError: persistenceError.message,
+        },
+      };
+    }
     const savedDescription = persisted.truncated
       ? `first ${persisted.bytes} of ${persisted.originalBytes} bytes saved to ${persisted.relativePath}`
       : `full output saved to ${persisted.relativePath}`;
@@ -464,14 +489,7 @@ export class ToolExecutor {
     cwd: string,
     callId: ToolCallId,
     output: string,
-  ): Promise<{
-    relativePath: string;
-    absolutePath: string;
-    bytes: number;
-    originalBytes: number;
-    limitBytes: number;
-    truncated: boolean;
-  }> {
+  ): Promise<PersistedOutput> {
     const limitBytes = this.options.maxPersistedOutputBytes ?? DEFAULT_MAX_PERSISTED_OUTPUT_BYTES;
     const persisted = truncateUtf8(output, limitBytes);
     const relativePath = join(".chili", "tool-results", toolResultFilename(callId));
