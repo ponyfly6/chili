@@ -1134,7 +1134,12 @@ function modelUsageSummary(metadata: readonly RuntimeModelMetadataView[]): Model
 }
 
 function usageTokenTotal(usage: ModelUsage): number | undefined {
-  const parts = [usage.inputTokens, usage.outputTokens].filter(isFiniteNumber);
+  const parts = [
+    usage.inputTokens,
+    usage.outputTokens,
+    usage.cacheReadInputTokens,
+    usage.cacheCreationInputTokens,
+  ].filter(isFiniteNumber);
   if (parts.length === 0) return undefined;
   return parts.reduce((total, value) => total + value, 0);
 }

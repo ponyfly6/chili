@@ -38,7 +38,13 @@ export async function runPrompt(options: RunPromptOptions): Promise<void> {
     return;
   }
 
-  if (result.finishReason === "max_tokens") {
-    console.error("[warning] model stopped at max_tokens");
+  if (isOutputLimitFinishReason(result.finishReason)) {
+    console.error(`[warning] model stopped at ${result.finishReason}; response may be truncated`);
   }
+}
+
+function isOutputLimitFinishReason(reason: string | undefined): boolean {
+  if (!reason) return false;
+  const normalized = reason.toLowerCase();
+  return normalized === "length" || normalized === "max_tokens" || normalized === "max_output_tokens";
 }

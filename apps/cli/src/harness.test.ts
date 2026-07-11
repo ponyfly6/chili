@@ -308,6 +308,41 @@ test("CLI runPrompt leaves system prompt selection to the harness service", asyn
   expect(submitted[0]).not.toHaveProperty("system");
 });
 
+test("CLI runPrompt warns for every output-limit finish reason", async () => {
+  let finishReason = "length";
+  const harness = {
+    service: {
+      submitPrompt: async () => ({ status: "completed", turns: [], finishReason }),
+    },
+  } as unknown as CliHarness;
+  const warnings: string[] = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  try {
+    console.log = () => undefined;
+    console.error = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+    for (const reason of ["length", "max_tokens", "max_output_tokens"]) {
+      finishReason = reason;
+      await runPrompt({
+        harness,
+        sessionId: "session_output_limit_warning" as SessionId,
+        threadId: "thread_output_limit_warning" as ThreadId,
+        prompt: "hello",
+        maxTurns: 1,
+      });
+    }
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+
+  expect(warnings).toEqual([
+    "[warning] model stopped at length; response may be truncated",
+    "[warning] model stopped at max_tokens; response may be truncated",
+    "[warning] model stopped at max_output_tokens; response may be truncated",
+  ]);
+});
+
 test("CLI prompt-debug text output shows manifest without content by default", () => {
   const output = promptDebugOutput(false);
   const text = formatPromptDebugText(output);

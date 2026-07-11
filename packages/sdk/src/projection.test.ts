@@ -710,7 +710,7 @@ test("projects latest model metadata and stable usage summaries for chat session
     inputTokens: 85,
     outputTokens: 70,
     cacheReadInputTokens: 2,
-    totalTokens: 155,
+    totalTokens: 157,
   });
 });
 
