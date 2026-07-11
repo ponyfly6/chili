@@ -80,6 +80,7 @@ import {
   createTeamTaskUpdateTool,
   createToolSearchTool,
   createWriteFileTool,
+  type BashRunner,
   type GoalToolController,
   type MailboxListToolInput,
   type SubagentMailboxRecord,
@@ -114,6 +115,7 @@ import {
 import { defaultChiliHome } from "@chili/providers";
 import { createFilesystemPromptCommandControl, type PromptCommandControl } from "@chili/server";
 import { createCliApprovalBroker, createCliApprovalRulesets, dangerousShellCommandsForProfile, persistAllowAlwaysDecision, runtimePermissionConfig } from "./approval.js";
+import { createCliBashRunner } from "./bash-runner.js";
 import { loadCliConfig, type CliConfig } from "./config.js";
 import { createIdFactory } from "./id.js";
 import type { CliModelName, CliReasoningLevel } from "./model.js";
@@ -127,6 +129,8 @@ const DEV_MAX_REPEATED_TOOL_CALLS = 20;
 const DEV_MAX_TOOL_CALLS_PER_TURN = 200;
 const DEV_MAX_CONCURRENT_TOOL_CALLS = 32;
 const STALE_TURN_RECOVERY_MS = 30 * 60 * 1000;
+const CLI_DEFAULT_READ_MAX_BYTES = 32 * 1024;
+const CLI_READ_MAX_BYTES_LIMIT = 256 * 1024;
 
 export interface CliHarnessOptions {
   cwd: string;
@@ -140,6 +144,7 @@ export interface CliHarnessOptions {
   chiliHome?: string;
   deferMcpConnect?: boolean;
   mcpConnectMode?: "eager" | "background" | "manual";
+  bashRunner?: BashRunner;
 }
 
 export interface CliHarness {
@@ -210,8 +215,11 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const skillRegistry = await discoverSkills({ cwd });
   const config = await loadCliConfig(cwd, { chiliHome });
   const permissions = createPermissionProfileControl(config, options.yes ? "full-access" : "default");
-  const registry = createToolRegistry(skillRegistry);
-  const childRegistry = createChildToolRegistry(skillRegistry);
+  const bashRunner = options.bashRunner ?? createCliBashRunner({
+    permissionProfile: () => permissions.get().profile,
+  });
+  const registry = createToolRegistry(skillRegistry, bashRunner);
+  const childRegistry = createChildToolRegistry(skillRegistry, bashRunner);
   let mcpRuntime: CliMcpRuntime | undefined;
   const promptFragments = async (context: { cwd: string; turn?: RuntimePromptTurnContext }) => {
     const fragments = await buildCliPromptFragments({
@@ -767,9 +775,9 @@ function shortHash(value: string): string {
   return (hash >>> 0).toString(16).padStart(8, "0").slice(0, 8);
 }
 
-function createToolRegistry(skillRegistry: SkillRegistry): InMemoryToolRegistry {
+function createToolRegistry(skillRegistry: SkillRegistry, bashRunner: BashRunner): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
-  registry.register(createReadFileTool());
+  registry.register(createReadFileTool({ defaultMaxBytes: CLI_DEFAULT_READ_MAX_BYTES, maxBytesLimit: CLI_READ_MAX_BYTES_LIMIT }));
   registry.register(createReadImageTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
@@ -778,7 +786,7 @@ function createToolRegistry(skillRegistry: SkillRegistry): InMemoryToolRegistry 
   registry.register(createEditTool());
   registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());
-  registry.register(createBashTool());
+  registry.register(createBashTool({ runner: bashRunner }));
   registerGitTools(registry);
   registry.register(createToolSearchTool(registry));
   return registry;
@@ -794,9 +802,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function createChildToolRegistry(skillRegistry: SkillRegistry): InMemoryToolRegistry {
+function createChildToolRegistry(skillRegistry: SkillRegistry, bashRunner: BashRunner): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
-  registry.register(createReadFileTool());
+  registry.register(createReadFileTool({ defaultMaxBytes: CLI_DEFAULT_READ_MAX_BYTES, maxBytesLimit: CLI_READ_MAX_BYTES_LIMIT }));
   registry.register(createReadImageTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
@@ -805,7 +813,7 @@ function createChildToolRegistry(skillRegistry: SkillRegistry): InMemoryToolRegi
   registry.register(createEditTool());
   registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());
-  registry.register(createBashTool());
+  registry.register(createBashTool({ runner: bashRunner }));
   registerGitTools(registry);
   registry.register(createToolSearchTool(registry));
   return registry;
@@ -903,9 +911,9 @@ function createApprovalBroker(
   broker = new PolicyApprovalBroker({
     rulesets: permissions?.rulesets() ?? createCliApprovalRulesets(options.yes ?? false, config),
     ...(permissions ? { dangerousShellCommands: permissions.dangerousShellCommands() } : {}),
-    ask: async (request) => {
+    ask: async (request, signal) => {
       const decision: ApprovalDecision = options.approvalQueue
-        ? await options.approvalQueue.ask(request)
+        ? await options.approvalQueue.ask(request, signal)
         : { action: "deny", feedback: "Approval queue is unavailable." };
       return persistAllowAlwaysDecision(request, decision, options.chiliHome ? { chiliHome: options.chiliHome } : {});
     },

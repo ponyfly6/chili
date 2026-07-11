@@ -291,17 +291,30 @@ export class ToolExecutor {
       ...metadataPayload(approvalRequestMetadata(spec, preflight)),
     });
 
-    const rawDecision = await this.options.approvals.decide({
-      approvalId,
-      sessionId: input.sessionId,
-      ...(input.threadId ? { threadId: input.threadId } : {}),
-      callId,
-      toolName: tool.name,
-      risk: tool.risk,
-      permission: spec.permission,
-      patterns: spec.patterns,
-      metadata: spec.metadata,
-    });
+    let rawDecision: ApprovalDecision;
+    try {
+      rawDecision = await withAbort(this.options.approvals.decide({
+        approvalId,
+        sessionId: input.sessionId,
+        ...(input.threadId ? { threadId: input.threadId } : {}),
+        callId,
+        toolName: tool.name,
+        risk: tool.risk,
+        permission: spec.permission,
+        patterns: spec.patterns,
+        metadata: spec.metadata,
+      }, input.signal), input.signal);
+      throwIfAborted(input.signal);
+    } catch (error) {
+      if (input.signal?.aborted || isAbortError(error)) {
+        await this.publish("approval.resolved", input, {
+          approvalId,
+          decision: "deny",
+          feedback: "Approval cancelled because tool execution was aborted.",
+        });
+      }
+      throw error;
+    }
     const decision = normalizeApprovalDecision(rawDecision);
 
     await this.publish("approval.resolved", input, {
@@ -536,6 +549,41 @@ function normalizeApprovalDecision(decision: ApprovalDecision): ApprovalDecision
 
 function defaultCreateId(prefix: string): string {
   return `${prefix}_${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  throw abortReason(signal);
+}
+
+function withAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      reject(abortReason(signal));
+    };
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
+function abortReason(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason;
+  const error = new Error("Tool execution aborted");
+  error.name = "AbortError";
+  return error;
 }
 
 function toolResultFilename(callId: ToolCallId): string {

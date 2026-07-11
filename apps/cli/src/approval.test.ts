@@ -34,7 +34,7 @@ test("--yes keeps configured denies while bypassing configured asks", () => {
 test("permission profiles expose Codex-style default and full-access semantics", async () => {
   const defaultRulesets = createCliApprovalRulesets("default");
   expect(evaluatePolicy("edit", "src/app.ts", defaultRulesets).action).toBe("allow");
-  expect(evaluatePolicy("bash", "npm test", defaultRulesets).action).toBe("allow");
+  expect(evaluatePolicy("bash", "npm test", defaultRulesets).action).toBe("ask");
 
   const fullAccessBroker = createCliApprovalBroker({ yes: true });
   expect(await fullAccessBroker.preflight(approvalRequest("sudo echo ok"))).toMatchObject({
@@ -44,6 +44,8 @@ test("permission profiles expose Codex-style default and full-access semantics",
   const config = runtimePermissionConfig("default");
   expect(config.profiles.map((profile) => profile.label)).toEqual(["Default", "Auto-review", "Full Access"]);
   expect(config.profiles.find((profile) => profile.id === "auto-review")?.disabledReason).toContain("not implemented");
+  expect(config.profiles.find((profile) => profile.id === "default")?.description).toContain("macOS sandbox");
+  expect(config.profiles.find((profile) => profile.id === "full-access")?.description).toContain("without the OS sandbox");
 });
 
 test("allow_always decisions persist user-level grants", async () => {

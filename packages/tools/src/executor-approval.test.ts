@@ -126,6 +126,68 @@ test("allow_always preflights later matching requests in the same session", asyn
   )).toBe(false);
 });
 
+test("aborting while waiting for approval cancels the tool and ignores a late allow", async () => {
+  const events: ChiliEvent[] = [];
+  const controller = new AbortController();
+  let executed = 0;
+  let resolveDecision!: (decision: { action: "allow_once" }) => void;
+  const decision = new Promise<{ action: "allow_once" }>((resolve) => {
+    resolveDecision = resolve;
+  });
+  const tool: ChiliToolDefinition = {
+    ...fakeTool({ permission: "bash", patterns: ["npm test"] }),
+    execute: async () => {
+      executed += 1;
+      return { title: "fake", output: "ok" };
+    },
+  };
+  const executor = createExecutor({
+    events,
+    tool,
+    broker: {
+      preflight: async () => ({ action: "ask", source: "test", reason: "test ask", metadata: {} }),
+      decide: async () => decision,
+    },
+  });
+
+  const execution = executor.execute({ ...toolInput("fake"), signal: controller.signal });
+  await waitForEvent(events, (event) => event.type === "approval.requested");
+  controller.abort(new DOMException("Tool approval aborted", "AbortError"));
+  setTimeout(() => resolveDecision({ action: "allow_once" }), 20);
+
+  const result = await execution;
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  expect(result.status).toBe("cancelled");
+  expect(executed).toBe(0);
+  expect(events.filter((event) => event.type === "approval.resolved")).toHaveLength(1);
+  expect(events.filter((event) => event.type === "tool.call_finished")).toMatchObject([
+    { payload: { status: "cancelled" } },
+  ]);
+});
+
+test("aborting a deferred approval removes it from the queue", async () => {
+  const events: ChiliEvent[] = [];
+  const queue = new DeferredApprovalQueue();
+  const controller = new AbortController();
+  const executor = createExecutor({
+    events,
+    tool: fakeTool({ permission: "bash", patterns: ["npm test"] }),
+    broker: new PolicyApprovalBroker({
+      ask: (request, signal) => queue.ask(request, signal),
+    }),
+  });
+
+  const execution = executor.execute({ ...toolInput("fake"), signal: controller.signal });
+  await waitForPending(queue, 1);
+  const approvalId = queue.list()[0]!.approvalId;
+  controller.abort(new DOMException("Deferred approval aborted", "AbortError"));
+
+  expect((await execution).status).toBe("cancelled");
+  expect(queue.list()).toHaveLength(0);
+  expect(queue.resolve({ approvalId, decision: "allow_once" })).toBe(false);
+});
+
 test("policy ask preflight creates an approval request", async () => {
   const events: ChiliEvent[] = [];
   let asked = 0;
@@ -270,4 +332,12 @@ async function waitForPending(queue: DeferredApprovalQueue, count: number): Prom
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   throw new Error(`Timed out waiting for ${count} pending approvals`);
+}
+
+async function waitForEvent(events: ChiliEvent[], predicate: (event: ChiliEvent) => boolean): Promise<void> {
+  for (let index = 0; index < 50; index += 1) {
+    if (events.some(predicate)) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("Timed out waiting for tool event");
 }

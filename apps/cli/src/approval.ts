@@ -20,7 +20,7 @@ export function createCliApprovalBroker(options: CliApprovalOptions = {}): Polic
   return new PolicyApprovalBroker({
     rulesets: createCliApprovalRulesets(profile, options.config),
     dangerousShellCommands: dangerousShellCommandsForProfile(profile),
-    ask: async (request) => askApproval(request, options),
+    ask: async (request, signal) => askApproval(request, options, signal),
   });
 }
 
@@ -47,7 +47,7 @@ export function createCliPermissionRules(profile: RuntimePermissionProfileId | b
     { permission: "grep", pattern: "*", action: "allow", source },
     { permission: "edit", pattern: "*", action: "allow", source },
     { permission: "write", pattern: "*", action: "allow", source },
-    { permission: "bash", pattern: "*", action: "allow", source },
+    { permission: "bash", pattern: "*", action: "ask", source },
     { permission: "git_status", pattern: "*", action: "allow", source },
     { permission: "git_diff", pattern: "*", action: "allow", source },
   ];
@@ -68,20 +68,20 @@ export function runtimePermissionConfig(profile: RuntimePermissionProfileId): Ru
       {
         id: "default",
         label: "Default",
-        description: "Chili can read and edit files in the current workspace, and run commands. Project/user deny rules still apply.",
+        description: "Chili can read and edit files in the current workspace. Shell commands require approval unless explicitly allowed and run in a macOS sandbox when available.",
         current: profile === "default",
       },
       {
         id: "auto-review",
         label: "Auto-review",
-        description: "Same workspace-write permissions as Default, but eligible approvals are routed through an auto-reviewer subagent.",
+        description: "Same workspace and macOS sandbox permissions as Default, but eligible approvals are routed through an auto-reviewer subagent.",
         current: profile === "auto-review",
         disabledReason: "Auto-reviewer approval routing is not implemented in Chili yet.",
       },
       {
         id: "full-access",
         label: "Full Access",
-        description: "Chili can use all tools without asking for approval. Exercise caution when using.",
+        description: "Chili can use all tools without asking for approval and without the OS sandbox. Exercise caution when using.",
         current: profile === "full-access",
       },
     ],
@@ -116,7 +116,7 @@ export async function persistAllowAlwaysDecision(
   }
 }
 
-async function askApproval(request: ApprovalBrokerRequest, options: CliApprovalOptions): Promise<ApprovalDecision> {
+async function askApproval(request: ApprovalBrokerRequest, options: CliApprovalOptions, signal?: AbortSignal): Promise<ApprovalDecision> {
   const ownReadline = options.readline ? undefined : createInterface({ input: process.stdin, output: process.stdout });
   const rl = options.readline ?? ownReadline;
   if (!rl) return { action: "deny", feedback: "No approval interface available" };
@@ -131,7 +131,8 @@ async function askApproval(request: ApprovalBrokerRequest, options: CliApprovalO
     }
 
     while (true) {
-      const answer = (await rl.question("Allow? [y]es / [s]ession / [a]lways / [n]o > ")).trim().toLowerCase();
+      const prompt = "Allow? [y]es / [s]ession / [a]lways / [n]o > ";
+      const answer = (signal ? await rl.question(prompt, { signal }) : await rl.question(prompt)).trim().toLowerCase();
       if (answer === "y" || answer === "yes" || answer === "") return { action: "allow_once" };
       if (answer === "s" || answer === "session") return { action: "allow_session" };
       if (answer === "a" || answer === "always") {

@@ -109,7 +109,7 @@ export interface ApprovalPreflightRequest extends Omit<ApprovalBrokerRequest, "a
 
 export interface ApprovalBroker {
   preflight?(request: ApprovalPreflightRequest): Promise<ApprovalPreflightDecision>;
-  decide(request: ApprovalBrokerRequest): Promise<ApprovalDecision>;
+  decide(request: ApprovalBrokerRequest, signal?: AbortSignal): Promise<ApprovalDecision>;
 }
 
 export interface ToolExecutorOptions {

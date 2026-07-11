@@ -181,6 +181,28 @@ test("workspace file tools reject symlink escapes", async () => {
 
     const registry = registryWithCoreTools();
     registry.register(createApplyPatchTool());
+    let bashRan = false;
+    registry.register(createBashTool({
+      runner: {
+        async run(request) {
+          bashRan = true;
+          return {
+            exitCode: 0,
+            signal: null,
+            stdout: request.cwd,
+            stderr: "",
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            stdoutBytes: request.cwd.length,
+            stderrBytes: 0,
+            outputLimitBytes: request.maxOutputBytes,
+            durationMs: 1,
+            timedOut: false,
+            aborted: false,
+          };
+        },
+      },
+    }));
     const executor = createExecutor(registry);
 
     const read = await executor.execute(toolInput("read", { filePath: "link/secret.txt" }, workspace));
@@ -212,6 +234,11 @@ test("workspace file tools reject symlink escapes", async () => {
     const grep = await executor.execute(toolInput("grep", { pattern: "outside-secret", path: "link", headLimit: 1 }, workspace));
     expect(grep.status).toBe("failed");
     if (grep.status === "failed") expect(grep.error.message).toContain("inside the workspace");
+
+    const bash = await executor.execute(toolInput("bash", { command: "pwd", cwd: "link" }, workspace));
+    expect(bash.status).toBe("failed");
+    if (bash.status === "failed") expect(bash.error.message).toContain("inside the workspace");
+    expect(bashRan).toBe(false);
 
     await expectRejectsWith(readFile(join(outside, "write.txt"), "utf8"), "ENOENT");
     await expectRejectsWith(readFile(join(outside, "edit.txt"), "utf8"), "ENOENT");
@@ -692,6 +719,7 @@ test("bash runner injection receives resolved request and formats process output
     expect(result.status).toBe("completed");
     expect(seen).toMatchObject({
       command: "printf fake",
+      workspaceRoot: workspace,
       cwd: join(workspace, "subdir"),
       env: { CHILI_TEST_ENV: "ok" },
       timeoutMs: 123,

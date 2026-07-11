@@ -1,7 +1,8 @@
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
-import { relative, resolve } from "node:path";
+import { resolve } from "node:path";
 import { runProcess, type RunProcessOptions, type RunProcessResult } from "../process.js";
 import { classifyDangerousShellCommand, commandPrefix, isReadOnlyShellCommand } from "../shell-safety.js";
+import { assertExistingPathInsideWorkspace, resolveWorkspacePath, type WorkspacePath } from "../workspace-path.js";
 
 export interface BashInput {
   command: string;
@@ -14,6 +15,7 @@ export interface BashInput {
 
 export interface BashRunRequest {
   command: string;
+  workspaceRoot: string;
   cwd: string;
   env?: Record<string, string>;
   timeoutMs: number;
@@ -22,8 +24,12 @@ export interface BashRunRequest {
   onOutput: RunProcessOptions["onOutput"];
 }
 
+export interface BashRunResult extends RunProcessResult {
+  sandbox?: "macos-seatbelt";
+}
+
 export interface BashRunner {
-  run(request: BashRunRequest): Promise<RunProcessResult>;
+  run(request: BashRunRequest): Promise<BashRunResult>;
 }
 
 export interface BashToolOptions {
@@ -43,6 +49,10 @@ const DEFAULT_BASH_RUNNER: BashRunner = {
     return runProcess("bash", ["-lc", request.command], processOptions);
   },
 };
+
+export function createUnsandboxedBashRunner(): BashRunner {
+  return DEFAULT_BASH_RUNNER;
+}
 
 export function createBashTool(options: BashToolOptions = {}): ChiliToolDefinition<BashInput> {
   const runner = options.runner ?? DEFAULT_BASH_RUNNER;
@@ -121,7 +131,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       };
     },
     async execute(input, context) {
-      const cwd = input.cwd ? resolveWorkspaceDirectory(context.cwd, input.cwd).absolutePath : resolve(context.cwd);
+      const cwd = input.cwd ? (await resolveWorkspaceDirectory(context.cwd, input.cwd)).absolutePath : resolve(context.cwd);
       await context.metadata({
         metadata: {
           command: input.command,
@@ -133,6 +143,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       const maxOutputBytes = input.maxOutputBytes ?? 256_000;
       const runRequest: BashRunRequest = {
         command: input.command,
+        workspaceRoot: resolve(context.cwd),
         cwd,
         signal: context.signal,
         timeoutMs,
@@ -141,6 +152,9 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       };
       if (input.env) runRequest.env = input.env;
       const result = await runner.run(runRequest);
+      if (result.sandbox) {
+        await context.metadata({ metadata: { sandbox: result.sandbox } });
+      }
 
       const output = formatCommandOutput(result, timeoutMs);
 
@@ -161,6 +175,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
           stdoutBytes: result.stdoutBytes,
           stderrBytes: result.stderrBytes,
           outputLimitBytes: result.outputLimitBytes,
+          ...(result.sandbox ? { sandbox: result.sandbox } : {}),
         },
       };
     },
@@ -216,16 +231,15 @@ function isValidEnvName(key: string): boolean {
   return key.length > 0 && !key.includes("=") && !key.includes("\0");
 }
 
-function resolveWorkspaceDirectory(workspaceInput: string, path: string): { absolutePath: string; relativePath: string } {
-  const workspace = resolve(workspaceInput);
-  const absolutePath = resolve(workspace, path);
-  const relativePath = relative(workspace, absolutePath);
-  if (relativePath && !isSafeRelativePath(relativePath)) {
-    throw new Error(`cwd must stay inside the workspace: ${path}`);
+async function resolveWorkspaceDirectory(workspaceInput: string, path: string): Promise<WorkspacePath> {
+  try {
+    const target = resolveWorkspacePath(workspaceInput, path, { allowWorkspaceRoot: true });
+    await assertExistingPathInsideWorkspace(workspaceInput, target, path);
+    return target;
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("inside the workspace")) {
+      throw new Error(`cwd must stay inside the workspace: ${path}`);
+    }
+    throw error;
   }
-  return { absolutePath, relativePath: relativePath || "." };
-}
-
-function isSafeRelativePath(path: string): boolean {
-  return path.length > 0 && !path.startsWith("/") && !path.split(/[\\/]/).includes("..");
 }

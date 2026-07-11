@@ -5,7 +5,7 @@ import type { ApprovalBroker, ApprovalBrokerRequest, ApprovalPreflightDecision, 
 
 export interface PolicyApprovalBrokerOptions {
   rulesets?: readonly (readonly PermissionRule[])[];
-  ask?: (request: ApprovalBrokerRequest) => Promise<ApprovalDecision>;
+  ask?: (request: ApprovalBrokerRequest, signal?: AbortSignal) => Promise<ApprovalDecision>;
   onSessionGrant?: (grant: SessionApprovalGrant) => Promise<void> | void;
   dangerousShellCommands?: "ask" | "allow";
 }
@@ -35,7 +35,7 @@ export class PolicyApprovalBroker implements ApprovalBroker {
     return this.evaluate(request).decision;
   }
 
-  async decide(request: ApprovalBrokerRequest): Promise<ApprovalDecision> {
+  async decide(request: ApprovalBrokerRequest, signal?: AbortSignal): Promise<ApprovalDecision> {
     const evaluated = this.evaluate(request);
     if (evaluated.decision.action === "deny") {
       return denyDecision(evaluated.decision);
@@ -45,7 +45,7 @@ export class PolicyApprovalBroker implements ApprovalBroker {
     }
 
     if (this.options.ask) {
-      const decision = normalizeApprovalDecision(await this.options.ask(requestWithPreflight(request, evaluated.risks, evaluated.decision)));
+      const decision = normalizeApprovalDecision(await this.options.ask(requestWithPreflight(request, evaluated.risks, evaluated.decision), signal));
       const rechecked = this.evaluate(request).decision;
       if (rechecked.action === "deny") return denyDecision(rechecked);
       if (decision.action === "allow_session" || decision.action === "allow_always") {

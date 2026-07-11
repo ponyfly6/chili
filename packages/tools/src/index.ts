@@ -18,6 +18,7 @@ export * from "./deferred-approval.js";
 export * from "./errors.js";
 export * from "./executor.js";
 export * from "./file-read-state.js";
+export * from "./macos-seatbelt.js";
 export * from "./process.js";
 export * from "./registry.js";
 export * from "./snapshot.js";
