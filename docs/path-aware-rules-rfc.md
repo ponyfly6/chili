@@ -52,6 +52,10 @@ v1 **must** use exactly these activation candidates:
 
 `contextPaths` is added to `RuntimePromptTurnContext` and to the public submit/inspect inputs that create that context. The caller, not Chili's language model and not a text parser, is responsible for declaring that a path is relevant.
 
+`RuntimeContextPath` is a canonical wire type owned by `@chili/protocol`, not a core-only type. Core `SubmitPromptInput`/`InspectPromptInput`, the HTTP prompt body, and SDK `SubmitPromptRequest` reuse that protocol type so direct, HTTP, and SDK callers have one contract. Synchronous and asynchronous prompt endpoints must preserve the list unchanged until core normalization.
+
+Untyped boundaries validate structure before activation: `contextPaths` must be an array, every item must be an object with a string `path` and exactly `kind: "file" | "directory"`, and malformed shapes are HTTP `400`/input-validation errors. Typed core entry points still validate at runtime rather than trusting casts. A structurally valid item whose path is lexically invalid follows section 5: it is omitted with a path diagnostic and does not invalidate valid sibling candidates, except that exceeding the 256-item limit is a blocking input error.
+
 v1 never derives a path from `RuntimePromptTurnContext.text`, conversation messages, pasted content, tool output, rule descriptions, or model prose. `cwd` is a useful default candidate, but documentation and debug output must call it `cwd` context, not touched-file or active-file awareness.
 
 Rule discovery remains the current project-root-to-cwd, non-recursive discovery process. `contextPaths` participates in activation only; it does not discover additional nested `AGENTS.md`, `CHILI.md`, or `.chili/rules` directories. Thus, root startup plus `contextPaths` fixes matching for scoped rules discovered at the root, but does not discover a rule stored under an otherwise undiscovered nested `.chili/rules`. A caller that needs that nested instruction hierarchy must use the nested `cwd`. This limitation is explicit v1 behavior, not an unspecified edge case.
@@ -312,8 +316,8 @@ The implementation should be split into four independently revertible commits.
 
 ### Commit C: runtime and child/subagent context propagation
 
-- Allowed files: `packages/core/src/runtime-service.ts`, `packages/core/src/subagent.ts`, `packages/core/src/runner.ts`, `packages/core/src/agent-runner.test.ts`, `packages/core/src/subagent.test.ts`, `apps/cli/src/harness.ts`, and `apps/cli/src/harness.test.ts`.
-- Tests: first turn, consecutive tool turns, same-run goal continuation, later goal continuation, resume, child runtime, local subagent non-inheritance, and zero model calls on blocking budget error.
+- Allowed files: `packages/protocol/src/runtime.ts`, `packages/protocol/src/index.ts`, `packages/core/src/runtime-service.ts`, `packages/core/src/subagent.ts`, `packages/core/src/runner.ts`, `packages/core/src/agent-runner.test.ts`, `packages/core/src/subagent.test.ts`, `packages/server/src/runtime-http.ts`, `packages/server/src/runtime-http.test.ts`, `packages/sdk/src/client.ts`, `packages/sdk/src/client.test.ts`, `apps/cli/src/harness.ts`, and `apps/cli/src/harness.test.ts`.
+- Tests: first turn, consecutive tool turns, same-run goal continuation, later goal continuation, resume, child runtime, local subagent non-inheritance, direct/HTTP/SDK `contextPaths` round trips, malformed wire-item rejection, and zero model calls on blocking budget error.
 - Rollback point: remove the optional `contextPaths` plumbing while leaving the pure matcher and diagnostics unused.
 - Non-goals: deriving paths from tools, persisting paths in events/goals, permissions/approval/sandbox changes.
 
