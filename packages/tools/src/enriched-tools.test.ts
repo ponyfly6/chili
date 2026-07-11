@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChiliEvent, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
@@ -124,6 +124,100 @@ test("file read state evicts old range snapshots by content budget", async () =>
     await state.assertObservedText(workspace, second, "beta-second");
   } finally {
     await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("read tool supports a configurable default byte limit", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-read-default-limit-"));
+  try {
+    await writeFile(join(workspace, "large.txt"), "abcdefghij", "utf8");
+    const registry = new InMemoryToolRegistry();
+    registry.register(createReadFileTool({ defaultMaxBytes: 4 }));
+    const executor = createExecutor(registry);
+
+    const result = await executor.execute(toolInput("read", { filePath: "large.txt" }, workspace));
+
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") return;
+    expect(result.result.output).toBe("abcd\n[truncated after 4 bytes]");
+    expect(result.result.metadata).toMatchObject({
+      path: "large.txt",
+      bytes: 10,
+      truncated: true,
+    });
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("read tool rejects explicit byte limits above the configured ceiling", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-read-max-limit-"));
+  try {
+    await writeFile(join(workspace, "large.txt"), "abcdefghij", "utf8");
+    const registry = new InMemoryToolRegistry();
+    registry.register(createReadFileTool({ defaultMaxBytes: 4, maxBytesLimit: 8 }));
+    const executor = createExecutor(registry);
+
+    const result = await executor.execute(toolInput("read", { filePath: "large.txt", maxBytes: 20 }, workspace));
+
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") expect(result.error.message).toContain("maxBytes must be <= 8");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("workspace file tools reject symlink escapes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-tools-symlink-"));
+  const workspace = join(root, "workspace");
+  const outside = join(root, "outside");
+  try {
+    await mkdir(workspace, { recursive: true });
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, "secret.txt"), "outside-secret\n", "utf8");
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lwOKGAAAAABJRU5ErkJggg==", "base64");
+    await writeFile(join(outside, "pixel.png"), png);
+    await symlink(outside, join(workspace, "link"), "dir");
+
+    const registry = registryWithCoreTools();
+    registry.register(createApplyPatchTool());
+    const executor = createExecutor(registry);
+
+    const read = await executor.execute(toolInput("read", { filePath: "link/secret.txt" }, workspace));
+    expect(read.status).toBe("failed");
+    if (read.status === "failed") expect(read.error.message).toContain("inside the workspace");
+
+    const readImage = await executor.execute(toolInput("read_image", { filePath: "link/pixel.png" }, workspace));
+    expect(readImage.status).toBe("failed");
+    if (readImage.status === "failed") expect(readImage.error.message).toContain("inside the workspace");
+
+    const write = await executor.execute(toolInput("write", { filePath: "link/write.txt", content: "escaped\n" }, workspace));
+    expect(write.status).toBe("failed");
+    if (write.status === "failed") expect(write.error.message).toContain("inside the workspace");
+
+    const edit = await executor.execute(toolInput("edit", { filePath: "link/edit.txt", oldString: "", newString: "escaped\n" }, workspace));
+    expect(edit.status).toBe("failed");
+    if (edit.status === "failed") expect(edit.error.message).toContain("inside the workspace");
+
+    const patch = await executor.execute(
+      toolInput("apply_patch", { operations: [{ type: "create", path: "link/patch.txt", content: "escaped\n" }] }, workspace),
+    );
+    expect(patch.status).toBe("failed");
+    if (patch.status === "failed") expect(patch.error.message).toContain("inside the workspace");
+
+    const glob = await executor.execute(toolInput("glob", { pattern: "**/*.txt", path: "link" }, workspace));
+    expect(glob.status).toBe("failed");
+    if (glob.status === "failed") expect(glob.error.message).toContain("inside the workspace");
+
+    const grep = await executor.execute(toolInput("grep", { pattern: "outside-secret", path: "link", headLimit: 1 }, workspace));
+    expect(grep.status).toBe("failed");
+    if (grep.status === "failed") expect(grep.error.message).toContain("inside the workspace");
+
+    await expectRejectsWith(readFile(join(outside, "write.txt"), "utf8"), "ENOENT");
+    await expectRejectsWith(readFile(join(outside, "edit.txt"), "utf8"), "ENOENT");
+    await expectRejectsWith(readFile(join(outside, "patch.txt"), "utf8"), "ENOENT");
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

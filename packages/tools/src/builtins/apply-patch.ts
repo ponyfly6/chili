@@ -1,6 +1,13 @@
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { dirname, relative, resolve } from "node:path";
+import { dirname } from "node:path";
 import type { ChiliToolDefinition, ChiliToolExecutionContext, ValidationResult } from "../types.js";
+import {
+  assertExistingPathInsideWorkspace,
+  assertWritablePathInsideWorkspace,
+  isSafeRelativePath,
+  resolveWorkspacePath,
+  type WorkspacePath,
+} from "../workspace-path.js";
 
 export interface ApplyPatchInput {
   patchText?: string;
@@ -115,11 +122,12 @@ export function createApplyPatchTool(): ChiliToolDefinition<ApplyPatchInput> {
       };
     },
     async execute(input, context) {
-      const workspace = resolve(context.cwd);
+      const workspace = context.cwd;
       const applied: AppliedOperation[] = [];
 
       for (const operation of input.operations) {
         const target = resolveWorkspacePath(workspace, operation.path);
+        await assertPatchWorkspacePath(workspace, target, operation);
         await assertPatchReadState(workspace, target, operation, context.fileReads);
         if (operation.type === "create") {
           applied.push(await createFile(target, operation));
@@ -151,6 +159,23 @@ export function createApplyPatchTool(): ChiliToolDefinition<ApplyPatchInput> {
       };
     },
   };
+}
+
+async function assertPatchWorkspacePath(
+  workspace: string,
+  target: WorkspacePath,
+  operation: ApplyPatchOperation,
+): Promise<void> {
+  if (operation.type === "create") {
+    await assertWritablePathInsideWorkspace(workspace, target, operation.path);
+    return;
+  }
+
+  await assertExistingPathInsideWorkspace(workspace, target, operation.path);
+  if (operation.type === "raw_update" && operation.movePath) {
+    const outputPath = resolveWorkspacePath(workspace, operation.movePath);
+    await assertWritablePathInsideWorkspace(workspace, outputPath, operation.movePath);
+  }
 }
 
 function parseOperation(raw: unknown, index: number): ValidationResult<ApplyPatchOperation> {
@@ -462,24 +487,6 @@ function applyRawChunk(content: string, chunk: RawPatchChunk, path: string): str
   }
 
   throw new Error(`Patch chunk did not match ${path}`);
-}
-
-interface WorkspacePath {
-  absolutePath: string;
-  relativePath: string;
-}
-
-function resolveWorkspacePath(workspace: string, path: string): WorkspacePath {
-  const absolutePath = resolve(workspace, path);
-  const relativePath = relative(workspace, absolutePath);
-  if (!isSafeRelativePath(relativePath)) {
-    throw new Error(`Path must stay inside the workspace: ${path}`);
-  }
-  return { absolutePath, relativePath };
-}
-
-function isSafeRelativePath(path: string): boolean {
-  return path.length > 0 && !path.startsWith("/") && !path.split(/[\\/]/).includes("..");
 }
 
 async function readTextIfExists(path: string): Promise<string | undefined> {

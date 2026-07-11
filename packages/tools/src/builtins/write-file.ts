@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, relative, resolve } from "node:path";
+import { dirname } from "node:path";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
+import { assertWritablePathInsideWorkspace, resolveWorkspacePath } from "../workspace-path.js";
 
 export interface WriteFileInput {
   filePath: string;
@@ -61,8 +62,9 @@ export function createWriteFileTool(): ChiliToolDefinition<WriteFileInput> {
       };
     },
     async execute(input, context) {
-      const workspace = resolve(context.cwd);
+      const workspace = context.cwd;
       const target = resolveWorkspacePath(workspace, input.filePath);
+      await assertWritablePathInsideWorkspace(workspace, target, input.filePath);
       const existing = await readTextIfExists(target.absolutePath);
       if (existing !== undefined) {
         await context.fileReads?.assertFresh(workspace, target.absolutePath);
@@ -83,24 +85,6 @@ export function createWriteFileTool(): ChiliToolDefinition<WriteFileInput> {
       };
     },
   };
-}
-
-interface WorkspacePath {
-  absolutePath: string;
-  relativePath: string;
-}
-
-function resolveWorkspacePath(workspace: string, path: string): WorkspacePath {
-  const absolutePath = resolve(workspace, path);
-  const relativePath = relative(workspace, absolutePath);
-  if (!isSafeRelativePath(relativePath)) {
-    throw new Error(`Path must stay inside the workspace: ${path}`);
-  }
-  return { absolutePath, relativePath };
-}
-
-function isSafeRelativePath(path: string): boolean {
-  return path.length > 0 && !path.startsWith("/") && !path.split(/[\\/]/).includes("..");
 }
 
 async function readTextIfExists(path: string): Promise<string | undefined> {

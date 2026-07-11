@@ -1,7 +1,8 @@
 import { stat } from "node:fs/promises";
-import { relative, resolve } from "node:path";
+import { resolve } from "node:path";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
 import { runProcess } from "../process.js";
+import { assertExistingPathInsideWorkspace, resolveWorkspacePath, type WorkspacePath } from "../workspace-path.js";
 
 export type GrepOutputMode = "content" | "files_with_matches" | "count";
 
@@ -210,21 +211,15 @@ function buildRipgrepArgs(input: GrepInput, searchPaths: string[]): string[] {
   return args;
 }
 
-function resolveWorkspacePath(workspace: string, path: string): { absolutePath: string; relativePath: string } {
-  const absolutePath = resolve(workspace, path);
-  const relativePath = relative(workspace, absolutePath);
-  if (relativePath === "") {
-    return { absolutePath, relativePath: "." };
-  }
-  if (!isSafeRelativePath(relativePath)) {
-    throw new Error(`Path must stay inside the workspace: ${path}`);
-  }
-  return { absolutePath, relativePath: relativePath.split(/[\\/]/).join("/") };
-}
-
-async function resolveSearchPaths(workspace: string, input: GrepInput): Promise<Array<{ absolutePath: string; relativePath: string }>> {
+async function resolveSearchPaths(workspace: string, input: GrepInput): Promise<WorkspacePath[]> {
   const rawPaths = input.paths ?? await normalizePathString(workspace, input.path);
-  return rawPaths.map((path) => resolveWorkspacePath(workspace, path));
+  const searchPaths: WorkspacePath[] = [];
+  for (const path of rawPaths) {
+    const target = resolveWorkspacePath(workspace, path, { allowWorkspaceRoot: true });
+    await assertExistingPathInsideWorkspace(workspace, target, path);
+    searchPaths.push(target);
+  }
+  return searchPaths;
 }
 
 async function normalizePathString(workspace: string, path: string | undefined): Promise<string[]> {
@@ -249,10 +244,6 @@ async function pathExists(path: string): Promise<boolean> {
     if (isRecord(error) && error.code === "ENOENT") return false;
     return true;
   }
-}
-
-function isSafeRelativePath(path: string): boolean {
-  return path.length > 0 && !path.startsWith("/") && !path.split(/[\\/]/).includes("..");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
