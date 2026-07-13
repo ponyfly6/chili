@@ -65,7 +65,7 @@ export function PromptComposer(props: {
     input.setText(promptValue);
     input.gotoBufferEnd();
     correctTrailingUnicodeCursor(input, promptValue);
-  }, [promptValue]);
+  }, [promptValue, props.disabled, props.resetKey]);
   const externalPromptValue = useCallback((value: string) => {
     if (shellModeRef.current && !value.startsWith("!")) return `!${value}`;
     return value;
@@ -166,7 +166,7 @@ export function PromptComposer(props: {
             ref={inputRef}
             width={inputWidth}
             height={promptRows}
-            initialValue={promptValue}
+            initialValue=""
             placeholder={placeholder}
             focused={props.focused}
             showCursor={props.focused}

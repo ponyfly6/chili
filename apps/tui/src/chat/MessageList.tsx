@@ -208,7 +208,7 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, 
 
 function localItemCell(item: LocalTranscriptItem, width: number, theme: TuiTheme): TranscriptCellModel {
   if (item.kind === "shell") return lineBackedCell(item.id, shellItemLines(item, width, theme));
-  return lineBackedCell(item.id, wrapLine(`${item.level}: ${item.text}`, {
+  return lineBackedCell(item.id, wrapLine(item.bare ? item.text : `${item.level}: ${item.text}`, {
     key: item.id,
     fg: item.level === "error" ? theme.colors.status.error : theme.colors.text.muted,
     width,

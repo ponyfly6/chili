@@ -144,6 +144,145 @@ test("replays session, message, tool, and approval events into a runtime view", 
   expect(pendingApprovals(view, sessionId)).toHaveLength(0);
 });
 
+test("chat view hides output-free cancelled turns but keeps interrupted visible output", () => {
+  const sessionId = "session_cancelled_chat" as SessionId;
+  const threadId = "thread_cancelled_chat" as ThreadId;
+  const emptyTurnId = "turn_cancelled_empty" as TurnId;
+  const visibleTurnId = "turn_cancelled_visible" as TurnId;
+  const emptyUserId = "msg_cancelled_empty_user" as MessageId;
+  const emptyAssistantId = "msg_cancelled_empty_assistant" as MessageId;
+  const visibleUserId = "msg_cancelled_visible_user" as MessageId;
+  const visibleAssistantId = "msg_cancelled_visible_assistant" as MessageId;
+  const events: ChiliEvent[] = [
+    {
+      id: "event_cancelled_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_cancelled_empty_started",
+      type: "turn.started",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: emptyTurnId },
+    },
+    {
+      id: "event_cancelled_empty_user",
+      type: "message.created",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: emptyUserId, role: "user", turnId: emptyTurnId },
+    },
+    {
+      id: "event_cancelled_empty_user_part",
+      type: "message.part_added",
+      time: 4 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        messageId: emptyUserId,
+        part: { id: "part_cancelled_empty_user" as PartId, messageId: emptyUserId, sessionId, type: "text", text: "hi" },
+      },
+    },
+    {
+      id: "event_cancelled_empty_assistant",
+      type: "message.created",
+      time: 5 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: emptyAssistantId, role: "assistant", turnId: emptyTurnId },
+    },
+    {
+      id: "event_cancelled_empty_reasoning",
+      type: "message.part_added",
+      time: 6 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        messageId: emptyAssistantId,
+        part: { id: "part_cancelled_empty_reasoning" as PartId, messageId: emptyAssistantId, sessionId, type: "reasoning", text: "Thinking" },
+      },
+    },
+    {
+      id: "event_cancelled_empty_completed",
+      type: "turn.completed",
+      time: 7 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: emptyTurnId, status: "cancelled" },
+    },
+    {
+      id: "event_cancelled_visible_started",
+      type: "turn.started",
+      time: 8 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: visibleTurnId },
+    },
+    {
+      id: "event_cancelled_visible_user",
+      type: "message.created",
+      time: 9 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: visibleUserId, role: "user", turnId: visibleTurnId },
+    },
+    {
+      id: "event_cancelled_visible_user_part",
+      type: "message.part_added",
+      time: 10 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        messageId: visibleUserId,
+        part: { id: "part_cancelled_visible_user" as PartId, messageId: visibleUserId, sessionId, type: "text", text: "explain" },
+      },
+    },
+    {
+      id: "event_cancelled_visible_assistant",
+      type: "message.created",
+      time: 11 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: visibleAssistantId, role: "assistant", turnId: visibleTurnId },
+    },
+    {
+      id: "event_cancelled_visible_assistant_part",
+      type: "message.part_added",
+      time: 12 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        messageId: visibleAssistantId,
+        part: { id: "part_cancelled_visible_assistant" as PartId, messageId: visibleAssistantId, sessionId, type: "text", text: "partial answer" },
+      },
+    },
+    {
+      id: "event_cancelled_visible_completed",
+      type: "turn.completed",
+      time: 13 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: visibleTurnId, status: "cancelled" },
+    },
+  ];
+
+  const view = reduceRuntimeEvents(events, createRuntimeView());
+  const chat = chatSessionView(view, { sessionId, threadId });
+
+  expect(view.turnStatuses).toMatchObject({
+    [emptyTurnId]: "cancelled",
+    [visibleTurnId]: "cancelled",
+  });
+  expect(sessionMessages(view, sessionId)).toHaveLength(4);
+  expect(chat.items.map((item) => item.id)).toEqual([visibleUserId, visibleAssistantId]);
+});
+
 test("projects persistent goals into chat session views", () => {
   const sessionId = "session_goal_projection" as SessionId;
   const threadId = "thread_goal_projection" as ThreadId;

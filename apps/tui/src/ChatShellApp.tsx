@@ -85,7 +85,7 @@ import {
 } from "./theme/index.js";
 
 type ShellView = "chat" | "team" | "help" | "agents" | "status" | "mcp" | "transcript";
-type AppendLocalItem = (level: "info" | "error", text: string, options?: { persistent?: boolean | undefined }) => void;
+type AppendLocalItem = (level: "info" | "error", text: string, options?: { persistent?: boolean | undefined; bare?: boolean | undefined }) => void;
 type LocalShellItem = Extract<LocalTranscriptItem, { kind: "shell" }>;
 type AppendShellItem = (item: Omit<LocalShellItem, "id" | "kind" | "createdAt">) => string;
 type UpdateShellItem = (id: string, update: Partial<Omit<LocalShellItem, "id" | "kind" | "createdAt">>) => void;
@@ -93,6 +93,20 @@ type UpdateShellItem = (id: string, update: Partial<Omit<LocalShellItem, "id" | 
 interface PastedPromptImage extends MessageImageContent {
   id: number;
   absolutePath?: string | undefined;
+}
+
+interface InterruptedPromptCandidate {
+  promptParts: PromptPart[];
+  pastedTextByMarker: Array<[string, string]>;
+  pastedImages: Record<number, PastedPromptImage>;
+  skillMentionBindings: RuntimeSkillMention[];
+  baselineOutput: Map<string, string>;
+  sawActiveStatus: boolean;
+  interruptOutcome?: "restored" | "discarded" | undefined;
+}
+
+interface PendingInterruptRequest {
+  candidate?: InterruptedPromptCandidate | undefined;
 }
 
 interface SlashActions {
@@ -161,6 +175,7 @@ const PROMPT_TEXT_PASTE_LINE_THRESHOLD = 8;
 const PROMPT_TEXT_PASTE_CHAR_THRESHOLD = 1_000;
 const SLASH_COMPLETION_LIMIT = 64;
 export const CTRL_C_EXIT_CONFIRM_MS = 2_000;
+export const CONVERSATION_INTERRUPTED_NOTICE = "■ Conversation interrupted - tell the model what to do differently.";
 
 export function ChatShellApp(props: {
   client: HttpRuntimeClient;
@@ -278,6 +293,8 @@ export function ChatShellSurface(props: {
   const [authManualPrompt, setAuthManualPromptState] = useState<AuthManualPrompt | undefined>(undefined);
   const [showToolDetails, setShowToolDetails] = useState(false);
   const [hideThinking, setHideThinkingState] = useState(false);
+  const interruptedPromptCandidateRef = useRef<InterruptedPromptCandidate | undefined>(undefined);
+  const [pendingInterrupt, setPendingInterrupt] = useState<PendingInterruptRequest | undefined>(undefined);
   const lastCtrlCPressMsRef = useRef<number | undefined>(undefined);
   const clearedPromptTextRef = useRef<string | undefined>(undefined);
   const localMessageTtlMs = props.localMessageTtlMs ?? LOCAL_ITEM_TTL_MS;
@@ -289,7 +306,7 @@ export function ChatShellSurface(props: {
     setLocalItems((current) => current.filter((item) => item.id !== id));
   }, []);
   const appendLocalItem = useCallback<AppendLocalItem>((level, text, itemOptions) => {
-    const item = localItem(level, text, itemOptions?.persistent);
+    const item = localItem(level, text, itemOptions?.persistent, itemOptions?.bare);
     setLocalItems((current) => [...current, item]);
     if (itemOptions?.persistent || localMessageTtlMs <= 0) return;
     const timer = setTimeout(() => dismissLocalItem(item.id), localMessageTtlMs);
@@ -316,6 +333,8 @@ export function ChatShellSurface(props: {
   useEffect(() => {
     if (previousSessionKey.current === sessionKey) return;
     previousSessionKey.current = sessionKey;
+    interruptedPromptCandidateRef.current = undefined;
+    setPendingInterrupt(undefined);
     clearLocalItems();
   }, [clearLocalItems, sessionKey]);
   useEffect(() => {
@@ -456,6 +475,8 @@ export function ChatShellSurface(props: {
     setAuthManualPrompt(undefined);
     setResumePicker(undefined);
     setRenamePrompt(undefined);
+    interruptedPromptCandidateRef.current = undefined;
+    setPendingInterrupt(undefined);
     setPrompt("");
     history.clear();
     clearLocalItems();
@@ -466,6 +487,8 @@ export function ChatShellSurface(props: {
   const prepareForSessionSwitch = useCallback(() => {
     setView("chat");
     setAuthManualPrompt(undefined);
+    interruptedPromptCandidateRef.current = undefined;
+    setPendingInterrupt(undefined);
     setPrompt("");
     history.clear();
     clearLocalItems();
@@ -833,6 +856,30 @@ export function ChatShellSurface(props: {
     });
     return true;
   }, [history, prompt, selectedCompletionIndex, setPrompt, skillCompletionItems, skillCompletionOpen, skillTrigger, updateAcceptedCompletionPrompt]);
+  const submitCurrentChatPrompt = useCallback(() => {
+    const candidate = interruptedPromptCandidate(
+      promptParts,
+      pastedTextByMarkerRef.current,
+      pastedImages,
+      skillMentionBindings,
+      props.runtime.chatView.items,
+    );
+    void submitPrompt(
+      prompt,
+      expandedPrompt,
+      commands,
+      slashContext,
+      props.model,
+      props.runtime,
+      slashActions,
+      history.record,
+      skillMentionBindings,
+      props.skills ?? [],
+      pastedImages,
+      clearPromptAttachments,
+      (state) => trackInterruptedPromptCandidate(interruptedPromptCandidateRef, candidate, state),
+    );
+  }, [clearPromptAttachments, commands, expandedPrompt, history.record, pastedImages, prompt, promptParts, props.model, props.runtime, props.skills, skillMentionBindings, slashActions, slashContext]);
   useEffect(() => {
     setCompletionIndex(0);
   }, [prompt]);
@@ -1009,13 +1056,15 @@ export function ChatShellSurface(props: {
     ? undefined
     : props.runtime.chatView.pendingApprovals.length > 0
       ? "Resolve approval to continue"
-      : props.runtime.chatView.status === "running"
-        ? "Session running - ctrl+x interrupt"
-        : props.runtime.submitBlockedReason
-          ? props.runtime.submitBlockedReason
-        : !props.runtime.canSubmit
-          ? "Waiting for runtime"
-          : undefined;
+      : props.runtime.chatView.status === "cancelling"
+        ? "Cancelling session..."
+        : props.runtime.chatView.status === "running"
+          ? "Session running - Esc or Ctrl+X to interrupt"
+          : props.runtime.submitBlockedReason
+            ? props.runtime.submitBlockedReason
+            : !props.runtime.canSubmit
+              ? "Waiting for runtime"
+              : undefined;
   const promptDisabled = Boolean(disabledReason);
   const clipboard = props.clipboard ?? systemClipboard;
   const registerPromptTextPaste = useCallback((value: string) => {
@@ -1079,6 +1128,62 @@ export function ChatShellSurface(props: {
     appendLocalItem("info", hadPrompt ? "Input cleared. Press Ctrl+C again to exit." : "Press Ctrl+C again to exit.");
   }, [appendLocalItem, clearPromptInput, cwd, prompt, props.onExit, props.runtime]);
 
+  const restoreInterruptedPrompt = useCallback((candidate: InterruptedPromptCandidate) => {
+    clearedPromptTextRef.current = undefined;
+    updateAcceptedCompletionPrompt(undefined);
+    historyPromptValueRef.current = undefined;
+    history.resetNavigation();
+    pastedTextByMarkerRef.current.clear();
+    for (const [marker, text] of candidate.pastedTextByMarker) {
+      pastedTextByMarkerRef.current.set(marker, text);
+    }
+    setPromptParts(candidate.promptParts.map((part) => ({ ...part })));
+    setPastedImages({ ...candidate.pastedImages });
+    setSkillMentionBindings(candidate.skillMentionBindings.map((binding) => ({ ...binding })));
+    setPromptInputResetKey((current) => current + 1);
+  }, [history, updateAcceptedCompletionPrompt]);
+
+  const requestActiveSessionInterrupt = useCallback(() => {
+    if (!isInterruptInFlight(props.runtime.chatView.status) || pendingInterrupt) return;
+    setPendingInterrupt({ candidate: interruptedPromptCandidateRef.current });
+    void props.runtime.interruptActiveSession();
+  }, [pendingInterrupt, props.runtime]);
+
+  useEffect(() => {
+    const status = props.runtime.chatView.status;
+    const active = isInterruptInFlight(status);
+    const candidate = interruptedPromptCandidateRef.current;
+    if (active && candidate) candidate.sawActiveStatus = true;
+
+    if (pendingInterrupt) {
+      if (active) return;
+      const interruptedCandidate = pendingInterrupt.candidate;
+      if (interruptedCandidate && !hasVisibleOutputSince(interruptedCandidate, props.runtime.chatView.items)) {
+        interruptedCandidate.interruptOutcome = "restored";
+        restoreInterruptedPrompt(interruptedCandidate);
+      } else {
+        if (interruptedCandidate) interruptedCandidate.interruptOutcome = "discarded";
+        appendLocalItem("error", CONVERSATION_INTERRUPTED_NOTICE, { persistent: true, bare: true });
+      }
+      interruptedPromptCandidateRef.current = undefined;
+      setPendingInterrupt(undefined);
+      return;
+    }
+
+    if (
+      candidate
+      && !active
+      && (
+        candidate.sawActiveStatus
+        || status === "cancelled"
+        || status === "failed"
+        || hasVisibleOutputSince(candidate, props.runtime.chatView.items)
+      )
+    ) {
+      interruptedPromptCandidateRef.current = undefined;
+    }
+  }, [appendLocalItem, pendingInterrupt, props.runtime.chatView.items, props.runtime.chatView.status, restoreInterruptedPrompt]);
+
   useEffect(() => {
     const previous = previousTranscriptLineCount.current;
     previousTranscriptLineCount.current = transcriptLineCount;
@@ -1123,7 +1228,9 @@ export function ChatShellSurface(props: {
       return;
     }
     if (key.ctrl && key.name === "x") {
-      void props.runtime.interruptActiveSession();
+      key.preventDefault();
+      key.stopPropagation();
+      requestActiveSessionInterrupt();
       return;
     }
     if (resumePicker) {
@@ -1359,8 +1466,8 @@ export function ChatShellSurface(props: {
     }
     if (isEscape(key)) {
       // Interrupt the active session if running
-      if (props.runtime.chatView.status === "running") {
-        void props.runtime.interruptActiveSession();
+      if (isInterruptInFlight(props.runtime.chatView.status)) {
+        requestActiveSessionInterrupt();
         return;
       }
       // Close theme picker if open
@@ -1508,7 +1615,7 @@ export function ChatShellSurface(props: {
             if (submitAuthManualInput()) return;
             if (runSelectedSkillCompletion()) return;
             if (runSelectedSlashCompletion()) return;
-            void submitPrompt(prompt, expandedPrompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings, props.skills ?? [], pastedImages, clearPromptAttachments);
+            submitCurrentChatPrompt();
           }}
           completions={completions}
           completionOpen={skillCompletionOpen || slashCompletionOpen}
@@ -1553,7 +1660,7 @@ export function ChatShellSurface(props: {
             if (runSelectedSkillCompletion()) return;
             if (runSelectedSlashCompletion()) return;
             scrollMessageToBottom();
-            void submitPrompt(prompt, expandedPrompt, commands, slashContext, props.model, props.runtime, slashActions, history.record, skillMentionBindings, props.skills ?? [], pastedImages, clearPromptAttachments);
+            submitCurrentChatPrompt();
           }}
           onTranscriptScroll={(event) => {
             const direction = event.scroll?.direction;
@@ -1863,7 +1970,7 @@ function estimatedTranscriptLineCount(items: readonly ChatTranscriptItem[], loca
 }
 
 function localTranscriptEstimateText(item: LocalTranscriptItem): string {
-  if (item.kind === "local") return `${item.level}: ${item.text}`;
+  if (item.kind === "local") return item.bare ? item.text : `${item.level}: ${item.text}`;
   const status = item.status === "running"
     ? `running in ${item.cwd}`
     : item.exitCode !== undefined
@@ -2616,6 +2723,7 @@ async function submitPrompt(
   skills: readonly SkillSummary[] = [],
   pastedImages: Readonly<Record<number, PastedPromptImage>> = {},
   clearPromptAttachments?: () => void,
+  onPromptSubmissionState?: (state: "pending" | "accepted" | "rejected") => boolean | void,
 ): Promise<void> {
   const visibleTrimmed = prompt.trim();
   const trimmed = expandedPrompt.trim();
@@ -2659,6 +2767,7 @@ async function submitPrompt(
   const text = images.length > 0 && !supportsImages
     ? textWithImagePathContext(trimmed, promptReferencedImages(visibleTrimmed, pastedImages))
     : trimmed;
+  onPromptSubmissionState?.("pending");
   const accepted = await runtime.submitPrompt(text, {
     ...(ctx.modelSelection ? { modelSelection: ctx.modelSelection } : {}),
     ...(ctx.reasoningLevel ? { reasoningLevel: ctx.reasoningLevel } : {}),
@@ -2668,9 +2777,14 @@ async function submitPrompt(
     ...activeSkillMentionsOption(visibleTrimmed, skillMentionBindings),
   });
   if (accepted) {
+    const applyAcceptedState = onPromptSubmissionState?.("accepted") !== false;
     onAccepted?.(trimmed);
-    actions.setPrompt("");
-    clearPromptAttachments?.();
+    if (applyAcceptedState) {
+      actions.setPrompt("");
+      clearPromptAttachments?.();
+    }
+  } else {
+    onPromptSubmissionState?.("rejected");
   }
 }
 
@@ -3680,9 +3794,87 @@ function timestampForFilename(date: Date): string {
   ].join("");
 }
 
-function localItem(level: "info" | "error", text: string, persistent?: boolean | undefined): LocalTranscriptItem {
+function interruptedPromptCandidate(
+  promptParts: readonly PromptPart[],
+  pastedTextByMarker: ReadonlyMap<string, string>,
+  pastedImages: Readonly<Record<number, PastedPromptImage>>,
+  skillMentionBindings: readonly RuntimeSkillMention[],
+  items: readonly ChatTranscriptItem[],
+): InterruptedPromptCandidate {
+  return {
+    promptParts: promptParts.map((part) => ({ ...part })),
+    pastedTextByMarker: [...pastedTextByMarker.entries()],
+    pastedImages: Object.fromEntries(
+      Object.entries(pastedImages).map(([id, image]) => [id, { ...image }]),
+    ),
+    skillMentionBindings: skillMentionBindings.map((binding) => ({ ...binding })),
+    baselineOutput: visibleOutputFingerprints(items),
+    sawActiveStatus: false,
+  };
+}
+
+function trackInterruptedPromptCandidate(
+  candidateRef: { current: InterruptedPromptCandidate | undefined },
+  candidate: InterruptedPromptCandidate,
+  state: "pending" | "accepted" | "rejected",
+): boolean {
+  if (state === "rejected") {
+    if (candidateRef.current === candidate) candidateRef.current = undefined;
+  } else if (!candidate.interruptOutcome) {
+    candidateRef.current = candidate;
+  }
+  return state !== "accepted" || candidate.interruptOutcome !== "restored";
+}
+
+function hasVisibleOutputSince(
+  candidate: InterruptedPromptCandidate,
+  items: readonly ChatTranscriptItem[],
+): boolean {
+  for (const [key, fingerprint] of visibleOutputFingerprints(items)) {
+    if (candidate.baselineOutput.get(key) !== fingerprint) return true;
+  }
+  return false;
+}
+
+function visibleOutputFingerprints(items: readonly ChatTranscriptItem[]): Map<string, string> {
+  const output = new Map<string, string>();
+  for (const item of items) {
+    const fingerprint = visibleOutputFingerprint(item);
+    if (fingerprint) output.set(`${item.kind}:${item.id}`, fingerprint);
+  }
+  return output;
+}
+
+function visibleOutputFingerprint(item: ChatTranscriptItem): string | undefined {
+  if (item.kind === "tool" || item.kind === "approval") return item.id;
+  if (item.role === "user") return undefined;
+  const visibleParts = item.parts.flatMap((part) => {
+    if (part.type === "reasoning") return [];
+    if (part.type === "text") return part.text.trim() ? [`text:${part.id}:${part.text}`] : [];
+    if (part.type === "tool_result") {
+      const visible = part.output.trim() || part.error?.trim() || (part.content?.length ?? 0) > 0;
+      return visible ? [`tool_result:${part.id}:${part.output}:${part.error ?? ""}:${part.content?.length ?? 0}`] : [];
+    }
+    return [`${part.type}:${part.id}`];
+  });
+  return visibleParts.length > 0 ? visibleParts.join("\0") : undefined;
+}
+
+function isInterruptInFlight(status: ChatSessionView["status"]): boolean {
+  return status === "running" || status === "waiting_for_approval" || status === "cancelling";
+}
+
+function localItem(level: "info" | "error", text: string, persistent?: boolean | undefined, bare?: boolean | undefined): LocalTranscriptItem {
   const createdAt = Date.now();
-  return { id: `${createdAt}:${level}:${text}`, kind: "local", level, text, createdAt, ...(persistent ? { persistent } : {}) };
+  return {
+    id: `${createdAt}:${level}:${text}`,
+    kind: "local",
+    level,
+    text,
+    createdAt,
+    ...(persistent ? { persistent } : {}),
+    ...(bare ? { bare } : {}),
+  };
 }
 
 function clearLocalItemTimers(timers: Map<string, ReturnType<typeof setTimeout>>): void {

@@ -7,7 +7,7 @@ import { act, useState, type Dispatch, type SetStateAction } from "react";
 import { createRuntimeView, type ChatTranscriptItem, type HttpRuntimeClient, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
 import type { ApprovalId, ChiliEvent, MessageId, PartId, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import type { ClipboardAccess } from "./clipboard.js";
-import { CTRL_C_EXIT_CONFIRM_MS, ChatShellApp, ChatShellSurface, isWithinCtrlCExitWindow, type ChatShellExitInfo } from "./ChatShellApp.js";
+import { CONVERSATION_INTERRUPTED_NOTICE, CTRL_C_EXIT_CONFIRM_MS, ChatShellApp, ChatShellSurface, isWithinCtrlCExitWindow, type ChatShellExitInfo } from "./ChatShellApp.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import type { ChatApproveOptions, ChatRuntimeState } from "./useChatRuntime.js";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
@@ -382,7 +382,141 @@ test("running session blocks a second prompt submit", async () => {
     await press(app, () => app.mockInput.pressEnter());
 
     expect(submitted).toHaveLength(0);
-    expect(app.captureCharFrame()).toContain("Session running - ctrl+x interrupt");
+    expect(app.captureCharFrame()).toContain("Ctrl+X to interrupt");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("Escape restores an output-free interrupted prompt for editing", async () => {
+  const submitted: string[] = [];
+  let resolveFirstSubmit: ((accepted: boolean) => void) | undefined;
+  let interrupted = 0;
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async (text) => {
+        submitted.push(text);
+        if (submitted.length === 1) {
+          return new Promise<boolean>((resolve) => {
+            resolveFirstSubmit = resolve;
+          });
+        }
+        return true;
+      },
+      interruptActiveSession: async () => {
+        interrupted += 1;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "hi");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(submitted).toEqual(["hi"]);
+
+    await act(async () => {
+      app.setRuntime((current) => ({
+        ...current,
+        canSubmit: false,
+        chatView: {
+          ...current.chatView,
+          status: "running",
+          items: [chatTextMessage("msg_interrupt_user", "user", "hi", 1)],
+        },
+      }));
+    });
+    await app.renderOnce();
+
+    await press(app, () => app.mockInput.pressEscape());
+    expect(interrupted).toBe(1);
+
+    await act(async () => {
+      app.setRuntime((current) => ({
+        ...current,
+        canSubmit: true,
+        chatView: {
+          ...current.chatView,
+          status: "cancelled",
+          items: [],
+        },
+      }));
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    const restoredFrame = app.captureCharFrame();
+    expect(restoredFrame).toContain("hi");
+    expect(restoredFrame).not.toContain(CONVERSATION_INTERRUPTED_NOTICE);
+
+    resolveFirstSubmit?.(true);
+    await Bun.sleep(60);
+    await app.renderOnce();
+    expect(app.captureCharFrame()).toContain("hi");
+
+    await typeText(app, " there");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(submitted).toEqual(["hi", "hi there"]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("Escape keeps visible output and adds a persistent red interruption notice", async () => {
+  let interrupted = 0;
+  const interruptedItems = [
+    chatTextMessage("msg_interrupt_visible_user", "user", "explain", 1),
+    chatTextMessage("msg_interrupt_visible_assistant", "assistant", "partial answer", 2),
+  ];
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async () => true,
+      interruptActiveSession: async () => {
+        interrupted += 1;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "explain");
+    await press(app, () => app.mockInput.pressEnter());
+
+    await act(async () => {
+      app.setRuntime((current) => ({
+        ...current,
+        canSubmit: false,
+        chatView: {
+          ...current.chatView,
+          status: "running",
+          items: interruptedItems,
+        },
+      }));
+    });
+    await app.renderOnce();
+
+    await press(app, () => app.mockInput.pressEscape());
+    expect(interrupted).toBe(1);
+
+    await act(async () => {
+      app.setRuntime((current) => ({
+        ...current,
+        canSubmit: true,
+        chatView: {
+          ...current.chatView,
+          status: "cancelled",
+          items: interruptedItems,
+        },
+      }));
+    });
+    await Bun.sleep(60);
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("partial answer");
+    expect(frame).toContain(CONVERSATION_INTERRUPTED_NOTICE);
+    expect(frame).not.toContain(`error: ${CONVERSATION_INTERRUPTED_NOTICE}`);
+    expect(frame.match(/explain/g)).toHaveLength(1);
+    const noticePosition = frameTextPosition(frame, CONVERSATION_INTERRUPTED_NOTICE);
+    expect(foregroundMatches(app, noticePosition.x, noticePosition.y, chiliDarkTheme.colors.status.error)).toBe(true);
   } finally {
     app.renderer.destroy();
   }
@@ -2136,7 +2270,7 @@ test("running disabled composer does not switch to prompt history", async () => 
 
     await press(app, () => app.mockInput.pressArrow("up"));
     const frame = app.captureCharFrame();
-    expect(frame).toContain("Session running - ctrl+x interrupt");
+    expect(frame).toContain("Ctrl+X to interrupt");
     expect(frame).not.toContain("saved prompt");
   } finally {
     app.renderer.destroy();
@@ -3179,6 +3313,22 @@ function selectionBgAt(app: { renderer: { currentRenderBuffer: { width: number; 
     && Math.abs((bg[offset + 3] ?? 0) - a) < 0.001;
 }
 
+function foregroundMatches(
+  app: { renderer: { currentRenderBuffer: { width: number; buffers: { fg: Float32Array } } } },
+  x: number,
+  y: number,
+  color: string,
+): boolean {
+  const width = app.renderer.currentRenderBuffer.width;
+  const fg = app.renderer.currentRenderBuffer.buffers.fg;
+  const offset = (y * width + x) * 4;
+  const [r, g, b, a] = hexRgba(color);
+  return Math.abs((fg[offset] ?? 0) - r) < 0.001
+    && Math.abs((fg[offset + 1] ?? 0) - g) < 0.001
+    && Math.abs((fg[offset + 2] ?? 0) - b) < 0.001
+    && Math.abs((fg[offset + 3] ?? 0) - a) < 0.001;
+}
+
 function hexRgba(hex: string): [number, number, number, number] {
   const value = hex.replace(/^#/, "");
   const r = Number.parseInt(value.slice(0, 2), 16) / 255;
@@ -3474,6 +3624,21 @@ function chatMessages(count: number): ChatTranscriptItem[] {
       ],
     };
   });
+}
+
+function chatTextMessage(
+  id: string,
+  role: "user" | "assistant",
+  text: string,
+  createdAt: number,
+): Extract<ChatTranscriptItem, { kind: "message" }> {
+  return {
+    id: id as MessageId,
+    kind: "message",
+    role,
+    createdAt,
+    parts: [{ type: "text", id: `${id}_part` as PartId, text }],
+  };
 }
 
 function rawOutputToolItems(lineCount: number): ChatTranscriptItem[] {

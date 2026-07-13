@@ -3,7 +3,7 @@ export type PromptPart =
   | { type: "paste"; marker: string; text: string };
 
 export type LocalTranscriptItem =
-  | { id: string; kind: "local"; level: "info" | "error"; text: string; createdAt?: number | undefined; persistent?: boolean | undefined }
+  | { id: string; kind: "local"; level: "info" | "error"; text: string; createdAt?: number | undefined; persistent?: boolean | undefined; bare?: boolean | undefined }
   | {
       id: string;
       kind: "shell";

@@ -157,7 +157,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     if (!activeThreadId && chatView.threadId) setActiveThreadId(chatView.threadId);
   }, [activeSessionId, activeThreadId, chatView.sessionId, chatView.threadId]);
 
-  const running = chatView.status === "running" || chatView.status === "waiting_for_approval";
+  const running = chatView.status === "running" || chatView.status === "waiting_for_approval" || chatView.status === "cancelling";
   const resolvedThreadId = activeThreadId ?? chatView.threadId;
   const resumeThreadMissing = Boolean(activeSessionId && !resolvedThreadId);
   const submitBlockedReason = resumeThreadMissing

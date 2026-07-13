@@ -37,6 +37,7 @@ type ToolPartStatus = Extract<MessagePart, { type: "tool_call" }>["status"];
 export interface ChiliRuntimeView {
   sessionIds: SessionId[];
   sessions: Record<string, RuntimeSessionView>;
+  turnStatuses: Record<string, RuntimeTurnStatus>;
   messages: Record<string, RuntimeMessageView>;
   toolCalls: Record<string, RuntimeToolCallView>;
   approvals: Record<string, RuntimeApprovalView>;
@@ -62,6 +63,8 @@ export interface ChiliRuntimeView {
   partIndex: Record<string, RuntimePartIndexEntry>;
   lastEventId?: string;
 }
+
+export type RuntimeTurnStatus = "running" | "completed" | "failed" | "cancelled";
 
 export interface RuntimeSessionView {
   id: SessionId;
@@ -732,6 +735,7 @@ export function createRuntimeView(): ChiliRuntimeView {
   return {
     sessionIds: [],
     sessions: {},
+    turnStatuses: {},
     messages: {},
     toolCalls: {},
     approvals: {},
@@ -795,6 +799,9 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       session.updatedAt = event.time;
       assignOptional(session, "currentTurnId", event.payload.turnId);
       assignOptional(session, "statusReason", event.payload.reason);
+      if (event.payload.turnId && event.payload.status === "cancelled") {
+        view.turnStatuses[event.payload.turnId] = "cancelled";
+      }
       break;
     }
     case "session.archived": {
@@ -804,6 +811,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       break;
     }
     case "turn.started": {
+      view.turnStatuses[event.payload.turnId] = "running";
       if (event.sessionId) {
         const session = upsertSession(view, event.sessionId, event.time);
         session.status = "running";
@@ -813,6 +821,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       break;
     }
     case "turn.completed": {
+      view.turnStatuses[event.payload.turnId] = event.payload.status;
       if (event.sessionId) {
         const session = upsertSession(view, event.sessionId, event.time);
         session.status = event.payload.status === "completed" ? "idle" : event.payload.status;
@@ -1018,17 +1027,18 @@ export function chatSessionView(view: ChiliRuntimeView, input: ChatSessionInput 
   const limit = Math.max(1, input.limit ?? 80);
   const session = input.sessionId ? view.sessions[input.sessionId] : input.requireSession ? undefined : latestSession(view);
   const sessionId = input.sessionId ?? session?.id;
+  const hiddenTurnIds = session ? outputFreeCancelledTurnIds(view, session, input.threadId) : new Set<string>();
   const messages = session
     ? session.messageIds.flatMap((messageId) => {
       const message = view.messages[messageId];
-      if (!message || !matchesThread(message.threadId, input.threadId)) return [];
+      if (!message || !matchesThread(message.threadId, input.threadId) || (message.turnId && hiddenTurnIds.has(message.turnId))) return [];
       return [chatMessageRow(message)];
     })
     : [];
   const tools = session
     ? session.toolCallIds.flatMap((callId) => {
       const toolCall = view.toolCalls[callId];
-      if (!toolCall || !matchesThread(toolCall.threadId, input.threadId)) return [];
+      if (!toolCall || !matchesThread(toolCall.threadId, input.threadId) || (toolCall.turnId && hiddenTurnIds.has(toolCall.turnId))) return [];
       return [chatToolCallRow(view, toolCall)];
     })
     : [];
@@ -1036,6 +1046,8 @@ export function chatSessionView(view: ChiliRuntimeView, input: ChatSessionInput 
     ? session.approvalIds.flatMap((approvalId) => {
       const approval = view.approvals[approvalId];
       if (!approval || !matchesThread(approval.threadId, input.threadId)) return [];
+      const turnId = approval.callId ? view.toolCalls[approval.callId]?.turnId : undefined;
+      if (turnId && hiddenTurnIds.has(turnId)) return [];
       return [chatApprovalRow(view, approval)];
     })
     : [];
@@ -1063,6 +1075,56 @@ export function chatSessionView(view: ChiliRuntimeView, input: ChatSessionInput 
   assignOptional(output, "usageSummary", usageSummary);
   assignOptional(output, "lastEventId", view.lastEventId);
   return output;
+}
+
+function outputFreeCancelledTurnIds(
+  view: ChiliRuntimeView,
+  session: RuntimeSessionView,
+  threadId: ThreadId | undefined,
+): Set<string> {
+  const cancelledTurnIds = new Set(
+    Object.entries(view.turnStatuses)
+      .filter(([, status]) => status === "cancelled")
+      .map(([turnId]) => turnId),
+  );
+  if (session.status === "cancelled" && session.currentTurnId) {
+    cancelledTurnIds.add(session.currentTurnId);
+  }
+  if (cancelledTurnIds.size === 0) return cancelledTurnIds;
+
+  for (const messageId of session.messageIds) {
+    const message = view.messages[messageId];
+    if (
+      !message?.turnId
+      || message.role === "user"
+      || !cancelledTurnIds.has(message.turnId)
+      || !matchesThread(message.threadId, threadId)
+    ) {
+      continue;
+    }
+    if (message.parts.some(isMeaningfulAssistantOutput)) cancelledTurnIds.delete(message.turnId);
+  }
+  for (const callId of session.toolCallIds) {
+    const toolCall = view.toolCalls[callId];
+    if (toolCall?.turnId && matchesThread(toolCall.threadId, threadId)) {
+      cancelledTurnIds.delete(toolCall.turnId);
+    }
+  }
+  return cancelledTurnIds;
+}
+
+function isMeaningfulAssistantOutput(part: MessagePart): boolean {
+  if (part.type === "reasoning") return false;
+  if (part.type === "text") return part.text.trim().length > 0;
+  if (part.type === "tool_result") {
+    return (
+      part.output.trim().length > 0
+      || (part.error?.trim().length ?? 0) > 0
+      || (part.content?.length ?? 0) > 0
+      || (part.artifactIds?.length ?? 0) > 0
+    );
+  }
+  return true;
 }
 
 function latestSession(view: ChiliRuntimeView): RuntimeSessionView | undefined {
