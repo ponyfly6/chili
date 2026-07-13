@@ -80,6 +80,8 @@ export interface RuntimeClient {
   rejectApproval(input: RejectApprovalRequest): Promise<RuntimeApprovalResolveResult>;
   archiveSession(sessionId: SessionId): Promise<void>;
   listSessions(): Promise<RuntimeSessionSummary[]>;
+  sessionEvents(input: SessionEventsRequest): Promise<ChiliEvent[]>;
+  renameSession(input: RenameSessionRequest): Promise<RuntimeSessionSummary>;
   listAgents(input?: ListAgentsRequest): Promise<RuntimeAgentsSnapshot>;
   agentTree(input?: AgentTreeRequest): Promise<RuntimeAgentTreeSnapshot>;
   listAgentRuns(input?: ListAgentRunsRequest): Promise<RuntimeAgentRunRecord[]>;
@@ -298,9 +300,23 @@ export interface RuntimeSessionSummary {
   id: SessionId;
   cwd: string;
   title?: string;
+  threadId?: ThreadId;
+  preview?: string;
   status: "active" | "archived";
   createdAt: number;
   updatedAt: number;
+}
+
+export interface SessionEventsRequest {
+  sessionId: SessionId;
+  limit?: number;
+  signal?: AbortSignal;
+}
+
+export interface RenameSessionRequest {
+  sessionId: SessionId;
+  title: string;
+  signal?: AbortSignal;
 }
 
 export interface ListAgentsRequest {
@@ -1100,6 +1116,17 @@ export class HttpRuntimeClient implements RuntimeClient {
 
   listSessions(): Promise<RuntimeSessionSummary[]> {
     return this.get("sessions");
+  }
+
+  sessionEvents(input: SessionEventsRequest): Promise<ChiliEvent[]> {
+    const params = new URLSearchParams();
+    if (input.limit !== undefined) params.set("limit", String(input.limit));
+    const query = params.toString();
+    return this.get(`sessions/${encodeURIComponent(input.sessionId)}/events${query ? `?${query}` : ""}`, input.signal);
+  }
+
+  renameSession(input: RenameSessionRequest): Promise<RuntimeSessionSummary> {
+    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/rename`, { title: input.title }, input.signal);
   }
 
   listAgents(input: ListAgentsRequest = {}): Promise<RuntimeAgentsSnapshot> {

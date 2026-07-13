@@ -448,19 +448,46 @@ export class SqliteEventStore
         id: string;
         cwd: string;
         title: string | null;
+        thread_id: string | null;
+        preview: string | null;
         status: "active" | "archived";
         created_at: number;
         updated_at: number;
       }, []>(
-        `select id, cwd, title, status, created_at, updated_at
-         from sessions
-         order by updated_at desc, id desc`,
+        `select s.id, s.cwd, s.title, s.status, s.created_at, s.updated_at,
+                coalesce(
+                  (select e.thread_id
+                   from events e
+                   where e.session_id = s.id and e.thread_id is not null
+                   order by e.seq asc
+                   limit 1),
+                  (select m.thread_id
+                   from messages m
+                   where m.session_id = s.id and m.thread_id is not null
+                   order by m.created_at asc, m.id asc
+                   limit 1)
+                ) as thread_id,
+                (select coalesce(
+                          nullif(json_extract(mp.data_json, '$.displayText'), ''),
+                          nullif(json_extract(mp.data_json, '$.text'), '')
+                        )
+                 from messages m
+                 join message_parts mp on mp.message_id = m.id
+                 where m.session_id = s.id
+                   and m.role = 'user'
+                   and mp.type = 'text'
+                 order by m.created_at desc, mp.ordinal asc
+                 limit 1) as preview
+         from sessions s
+         order by s.updated_at desc, s.id desc`,
       )
       .all()
       .map((row) => ({
         id: row.id as SessionRow["id"],
         cwd: row.cwd,
         ...(row.title ? { title: row.title } : {}),
+        ...(row.thread_id ? { threadId: row.thread_id as ThreadId } : {}),
+        ...(row.preview ? { preview: row.preview } : {}),
         status: row.status,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
@@ -1692,6 +1719,13 @@ export class SqliteEventStore
       this.db
         .query(`update sessions set status = 'archived', updated_at = ? where id = ?`)
         .run(event.time, event.payload.sessionId);
+      return;
+    }
+
+    if (event.type === "session.renamed") {
+      this.db
+        .query(`update sessions set title = ?, updated_at = ? where id = ?`)
+        .run(event.payload.title, event.time, event.payload.sessionId);
     }
   }
 

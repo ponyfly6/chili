@@ -127,6 +127,62 @@ test("isolates observable listener failures after the durable commit", async () 
   }
 });
 
+test("session summaries include the resumable thread, recent prompt preview, and renamed title", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-session-summary-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const sessionId = "session_summary" as SessionId;
+  const threadId = "thread_summary" as ThreadId;
+  const messageId = "message_summary" as MessageId;
+  const partId = "part_summary" as PartId;
+
+  try {
+    await store.appendMany([
+      sessionEvent("event_summary_created", sessionId, threadId, 1 as TimestampMs),
+      {
+        id: "event_summary_message",
+        type: "message.created",
+        time: 2 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { messageId, role: "user" },
+      },
+      {
+        id: "event_summary_part",
+        type: "message.part_added",
+        time: 3 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          messageId,
+          part: { id: partId, messageId, sessionId, type: "text", text: "internal prompt", displayText: "Visible saved prompt" },
+        },
+      },
+      {
+        id: "event_summary_renamed",
+        type: "session.renamed",
+        time: 4 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { sessionId, title: "Important work" },
+      },
+    ]);
+
+    expect(await store.sessions()).toEqual([{
+      id: sessionId,
+      cwd: "/repo",
+      title: "Important work",
+      threadId,
+      preview: "Visible saved prompt",
+      status: "active",
+      createdAt: 1,
+      updatedAt: 4,
+    }]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("orders event replay and afterEventId cursors by insertion sequence", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-seq-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));

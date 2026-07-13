@@ -1132,6 +1132,19 @@ export class RuntimeService {
     await this.append({ sessionId }, "session.archived", { sessionId });
   }
 
+  async renameSession(sessionId: SessionId, title: string): Promise<void> {
+    const normalized = title.trim().replace(/\s+/g, " ");
+    if (!normalized) throw new Error("Session title cannot be empty.");
+    if (normalized.length > 120) throw new Error("Session title must be 120 characters or fewer.");
+    const session = (await this.options.store.sessions()).find((item) => item.id === sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    await this.append(
+      { sessionId, ...(session.threadId ? { threadId: session.threadId } : {}) },
+      "session.renamed",
+      { sessionId, title: normalized },
+    );
+  }
+
   private async cancelledPrompt(
     input: SubmitPromptInput,
     turns: RunTurnResult[],

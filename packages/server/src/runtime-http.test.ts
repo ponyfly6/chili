@@ -92,6 +92,32 @@ test("serves sessions and event backlog over the runtime HTTP handler", async ()
   expect(new TextDecoder().decode(chunk.value)).toContain("session.created");
 });
 
+test("loads resumable session events and renames a saved session", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const handler = createRuntimeHttpHandler({ service, store });
+  const session = await service.createSession({ cwd: "/repo" });
+
+  const eventsResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/events`));
+  expect(eventsResponse.status).toBe(200);
+  expect((await eventsResponse.json()) as ChiliEvent[]).toEqual(expect.arrayContaining([
+    expect.objectContaining({ type: "session.created", sessionId: session.sessionId }),
+  ]));
+
+  const renameResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/rename`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ title: "  Saved   investigation  " }),
+  }));
+  expect(renameResponse.status).toBe(200);
+  expect(await renameResponse.json()).toMatchObject({
+    id: session.sessionId,
+    title: "Saved investigation",
+    threadId: session.threadId,
+  });
+});
+
 test("event backlog stays bounded and oversized resume cursors require a tail resync", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-runtime-tail-backlog-"));
   const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -1377,6 +1403,16 @@ class FakeRuntimeService implements RuntimeHttpService {
       payload: { sessionId },
     });
   }
+
+  async renameSession(sessionId: SessionId, title: string): Promise<void> {
+    await this.store.append({
+      id: "event_session_renamed",
+      type: "session.renamed",
+      time: 3 as TimestampMs,
+      sessionId,
+      payload: { sessionId, title },
+    });
+  }
 }
 
 class BusyRuntimeService extends FakeRuntimeService {
@@ -1942,10 +1978,16 @@ class MemoryEventStore implements EventStore {
         id: event.payload.sessionId,
         cwd: event.payload.cwd,
         title: "repo",
+        ...(event.threadId ? { threadId: event.threadId } : {}),
         status: "active",
         createdAt: event.time,
         updatedAt: event.time,
       });
+      return;
+    }
+    if (event.type === "session.renamed") {
+      const session = this.sessionRows.get(event.payload.sessionId);
+      if (session) this.sessionRows.set(event.payload.sessionId, { ...session, title: event.payload.title, updatedAt: event.time });
     }
   }
 

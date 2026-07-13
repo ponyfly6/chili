@@ -37,6 +37,8 @@ export interface SessionRow {
   id: SessionId;
   cwd: string;
   title?: string;
+  threadId?: ThreadId;
+  preview?: string;
   status: "active" | "archived";
   createdAt: number;
   updatedAt: number;

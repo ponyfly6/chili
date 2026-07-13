@@ -197,7 +197,7 @@ async function appendJsonLine(path: string, value: unknown): Promise<void> {
 
 function sessionIdForEvent(event: ChiliEvent): SessionId | undefined {
   if (event.sessionId) return event.sessionId;
-  if (event.type === "session.created" || event.type === "session.archived") return event.payload.sessionId;
+  if (event.type === "session.created" || event.type === "session.renamed" || event.type === "session.archived") return event.payload.sessionId;
   if (event.type === "session.model_changed" || event.type === "session.reasoning_changed" || event.type === "session.service_tier_changed") {
     return event.payload.sessionId;
   }

@@ -52,6 +52,7 @@ export function isTransientEvent(event: Pick<EventEnvelope, "type">): boolean {
 
 export type SessionEvent =
   | EventEnvelope<"session.created", { sessionId: SessionId; cwd: string }>
+  | EventEnvelope<"session.renamed", { sessionId: SessionId; title: string }>
   | EventEnvelope<"session.status_changed", RuntimeStatusPayload>
   | EventEnvelope<"session.model_changed", { sessionId: SessionId; modelSelection: ModelSelection }>
   | EventEnvelope<"session.reasoning_changed", { sessionId: SessionId; reasoningLevel: ReasoningLevel }>

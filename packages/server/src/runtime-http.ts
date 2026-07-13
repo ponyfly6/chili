@@ -106,6 +106,7 @@ export interface RuntimeHttpService {
   submitPromptAsync(input: SubmitPromptInput, onError?: RuntimeBackgroundErrorHandler): void;
   interrupt(sessionId: SessionId, reason?: string): Promise<boolean>;
   archiveSession(sessionId: SessionId): Promise<void>;
+  renameSession?(sessionId: SessionId, title: string): Promise<void>;
 }
 
 export interface RuntimeTaskControlService {
@@ -510,6 +511,33 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         return json(await options.store.messages(route.sessionId));
       }
 
+      if (route.name === "sessionEvents") {
+        await requireSession(options.store, route.sessionId);
+        const requestedLimit = Number(url.searchParams.get("limit") ?? "5000");
+        const limit = Number.isFinite(requestedLimit)
+          ? Math.max(1, Math.min(5_000, Math.trunc(requestedLimit)))
+          : 5_000;
+        const [created, tail] = await Promise.all([
+          options.store.events({ sessionId: route.sessionId, type: "session.created", limit: 1 }),
+          options.store.events({ sessionId: route.sessionId, limit, tail: true }),
+        ]);
+        const seen = new Set(created.map((event) => event.id));
+        return json([...created, ...tail.filter((event) => !seen.has(event.id))]);
+      }
+
+      if (route.name === "renameSession") {
+        await requireSession(options.store, route.sessionId);
+        if (!options.service.renameSession) return jsonError(501, "Session rename is not available from this runtime");
+        const body = await readJson<RenameSessionBody>(request);
+        const title = body.title?.trim().replace(/\s+/g, " ") ?? "";
+        if (!title) throw badRequest("title is required");
+        if (title.length > 120) throw badRequest("title must be 120 characters or fewer");
+        await options.service.renameSession(route.sessionId, title);
+        const renamed = (await options.store.sessions()).find((session) => session.id === route.sessionId);
+        if (!renamed) throw notFound(`Session not found: ${route.sessionId}`);
+        return json(renamed);
+      }
+
       if (route.name === "modelConfig") {
         await requireSession(options.store, route.sessionId);
         return json(await requireModelControl(options).getModelConfig(route.sessionId));
@@ -744,6 +772,8 @@ type Route =
   | { name: "taskClose"; taskId: TaskId }
   | { name: "createSession" }
   | { name: "messages"; sessionId: SessionId }
+  | { name: "sessionEvents"; sessionId: SessionId }
+  | { name: "renameSession"; sessionId: SessionId }
   | { name: "modelConfig"; sessionId: SessionId }
   | { name: "setModel"; sessionId: SessionId }
   | { name: "setReasoning"; sessionId: SessionId }
@@ -761,6 +791,10 @@ interface CreateSessionBody {
   sessionId?: SessionId;
   threadId?: ThreadId;
   cwd?: string;
+}
+
+interface RenameSessionBody {
+  title?: string;
 }
 
 interface PromptBody {
@@ -1082,6 +1116,8 @@ function routeRequest(method: string, pathname: string): Route {
   const action = sessionRoute[2];
   if (method === "GET" && action === "agents") return { name: "agents", sessionId };
   if (method === "GET" && action === "messages") return { name: "messages", sessionId };
+  if (method === "GET" && action === "events") return { name: "sessionEvents", sessionId };
+  if ((method === "POST" || method === "PATCH") && action === "rename") return { name: "renameSession", sessionId };
   if (method === "GET" && action === "model") return { name: "modelConfig", sessionId };
   if (method === "POST" && action === "model") return { name: "setModel", sessionId };
   if (method === "POST" && action === "reasoning") return { name: "setReasoning", sessionId };

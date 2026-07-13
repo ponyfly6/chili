@@ -66,6 +66,7 @@ export interface ChiliRuntimeView {
 export interface RuntimeSessionView {
   id: SessionId;
   cwd: string;
+  title?: string;
   lifecycle: "active" | "archived";
   status: RuntimeSessionStatus;
   messageIds: MessageId[];
@@ -780,6 +781,12 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       session.lifecycle = "active";
       session.updatedAt = event.time;
       assignOptional(session, "threadId", event.threadId);
+      break;
+    }
+    case "session.renamed": {
+      const session = upsertSession(view, event.payload.sessionId, event.time);
+      session.title = event.payload.title;
+      session.updatedAt = event.time;
       break;
     }
     case "session.status_changed": {
