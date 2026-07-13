@@ -302,6 +302,7 @@ export interface RuntimeSessionSummary {
   title?: string;
   threadId?: ThreadId;
   preview?: string;
+  source?: "interactive" | "subagent";
   status: "active" | "archived";
   createdAt: number;
   updatedAt: number;

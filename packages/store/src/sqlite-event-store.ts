@@ -450,11 +450,19 @@ export class SqliteEventStore
         title: string | null;
         thread_id: string | null;
         preview: string | null;
+        source: "interactive" | "subagent";
         status: "active" | "archived";
         created_at: number;
         updated_at: number;
       }, []>(
         `select s.id, s.cwd, s.title, s.status, s.created_at, s.updated_at,
+                case
+                  when exists (select 1 from agent_tasks t where t.child_session_id = s.id)
+                    or exists (select 1 from agent_runs r where r.child_session_id = s.id)
+                    or exists (select 1 from team_members m where m.child_session_id = s.id)
+                  then 'subagent'
+                  else 'interactive'
+                end as source,
                 coalesce(
                   (select e.thread_id
                    from events e
@@ -488,6 +496,7 @@ export class SqliteEventStore
         ...(row.title ? { title: row.title } : {}),
         ...(row.thread_id ? { threadId: row.thread_id as ThreadId } : {}),
         ...(row.preview ? { preview: row.preview } : {}),
+        source: row.source,
         status: row.status,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
@@ -1644,6 +1653,7 @@ export class SqliteEventStore
     this.db.exec(`create index if not exists team_tasks_owner_status_idx on team_tasks(owner_path, status)`);
     this.db.exec(`create index if not exists team_members_team_status_idx on team_members(team_id, status)`);
     this.db.exec(`create index if not exists team_members_path_idx on team_members(path)`);
+    this.db.exec(`create index if not exists team_members_child_session_idx on team_members(child_session_id)`);
     this.db.exec(`create index if not exists team_messages_team_time_idx on team_messages(team_id, created_at)`);
     this.db.exec(`create index if not exists team_messages_to_time_idx on team_messages(to_path, created_at)`);
     this.db.exec(`create index if not exists team_messages_task_idx on team_messages(task_id, created_at)`);

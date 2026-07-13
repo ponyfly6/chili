@@ -202,6 +202,7 @@ export const SQLITE_SCHEMA = [
   )`,
   `create index if not exists team_members_team_status_idx on team_members(team_id, status)`,
   `create index if not exists team_members_path_idx on team_members(path)`,
+  `create index if not exists team_members_child_session_idx on team_members(child_session_id)`,
 
   `create table if not exists team_tasks (
     id text primary key,

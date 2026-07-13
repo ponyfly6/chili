@@ -173,10 +173,53 @@ test("session summaries include the resumable thread, recent prompt preview, and
       title: "Important work",
       threadId,
       preview: "Visible saved prompt",
+      source: "interactive",
       status: "active",
       createdAt: 1,
       updatedAt: 4,
     }]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("classifies persisted child agent sessions as subagents", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-session-source-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const parentSessionId = "session_source_parent" as SessionId;
+  const parentThreadId = "thread_source_parent" as ThreadId;
+  const childSessionId = "session_source_child" as SessionId;
+  const childThreadId = "thread_source_child" as ThreadId;
+
+  try {
+    await store.appendMany([
+      sessionEvent("event_source_parent", parentSessionId, parentThreadId, 1 as TimestampMs),
+      sessionEvent("event_source_child", childSessionId, childThreadId, 2 as TimestampMs),
+      {
+        id: "event_source_task",
+        type: "agent.task_created",
+        time: 3 as TimestampMs,
+        sessionId: parentSessionId,
+        threadId: parentThreadId,
+        payload: {
+          taskId: "task_source_child" as TaskId,
+          path: "/root/task_source_child" as AgentPath,
+          parentPath: "/root" as AgentPath,
+          parentSessionId,
+          parentThreadId,
+          childSessionId,
+          childThreadId,
+          taskName: "worker",
+          cwd: "/repo",
+          prompt: "inspect the repository",
+        },
+      },
+    ]);
+
+    const sessions = await store.sessions();
+    expect(sessions.find((session) => session.id === parentSessionId)?.source).toBe("interactive");
+    expect(sessions.find((session) => session.id === childSessionId)?.source).toBe("subagent");
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
