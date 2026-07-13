@@ -2276,6 +2276,7 @@ function filteredResumeSessions(
 ): RuntimeSessionSummary[] {
   const normalizedQuery = query.trim().toLowerCase();
   return sessions
+    .filter(isInteractiveSession)
     .filter((session) => session.status === "active")
     .filter((session) => showAll || samePath(session.cwd, cwd))
     .filter((session) => {
@@ -2294,13 +2295,19 @@ function resolveResumeTarget(
   const active = sessions.filter((session) => session.status === "active");
   const exactId = active.find((session) => String(session.id).toLowerCase() === normalized);
   if (exactId) return exactId;
-  const exactTitles = active.filter((session) => session.title?.toLowerCase() === normalized);
+  const interactive = active.filter(isInteractiveSession);
+  const exactTitles = interactive.filter((session) => session.title?.toLowerCase() === normalized);
   if (exactTitles.length === 1) return exactTitles[0]!;
   if (exactTitles.length > 1) return `More than one saved chat is named "${target}". Use /resume and select one, or pass its session ID.`;
-  const idPrefixes = active.filter((session) => String(session.id).toLowerCase().startsWith(normalized));
+  const idPrefixes = interactive.filter((session) => String(session.id).toLowerCase().startsWith(normalized));
   if (idPrefixes.length === 1) return idPrefixes[0]!;
   if (idPrefixes.length > 1) return `Session ID prefix "${target}" is ambiguous.`;
   return `Saved chat not found: ${target}`;
+}
+
+function isInteractiveSession(session: RuntimeSessionSummary): boolean {
+  // Older runtimes do not expose source; preserve their previous interactive behavior.
+  return session.source !== "subagent";
 }
 
 function sessionDisplayTitle(session: RuntimeSessionSummary): string {

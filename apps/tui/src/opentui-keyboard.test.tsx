@@ -2453,6 +2453,7 @@ test("/resume opens a searchable project-scoped picker and switches sessions", a
       cwd: "/repo/chili",
       title: "Fix resume flow",
       preview: "Wire the saved conversation picker",
+      source: "interactive" as const,
       status: "active" as const,
       createdAt: 2,
       updatedAt: 3,
@@ -2462,9 +2463,20 @@ test("/resume opens a searchable project-scoped picker and switches sessions", a
       threadId: "thread_other" as ThreadId,
       cwd: "/repo/other",
       title: "Other project",
+      source: "interactive" as const,
       status: "active" as const,
       createdAt: 2,
       updatedAt: 4,
+    },
+    {
+      id: "session_worker" as SessionId,
+      threadId: "thread_worker" as ThreadId,
+      cwd: "/repo/chili",
+      title: "Internal worker",
+      source: "subagent" as const,
+      status: "active" as const,
+      createdAt: 2,
+      updatedAt: 5,
     },
   ];
   const app = await mountShell(teamLiveFixture(), {
@@ -2498,10 +2510,12 @@ test("/resume opens a searchable project-scoped picker and switches sessions", a
     expect(frame).toContain("Resume saved chat");
     expect(frame).toContain("Fix resume flow");
     expect(frame).not.toContain("Other project");
+    expect(frame).not.toContain("Internal worker");
 
     await press(app, () => app.mockInput.pressKey("a", { ctrl: true }));
     frame = app.captureCharFrame();
     expect(frame).toContain("Other project");
+    expect(frame).not.toContain("Internal worker");
 
     await typeText(app, "Fix resume");
     await press(app, () => app.mockInput.pressEnter());
