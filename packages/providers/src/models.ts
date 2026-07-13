@@ -15,7 +15,7 @@ export const KIMI_K26_MODEL = "kimi-k2.6";
 export const KIMI_OPENAI_BASE_URL = "https://api.moonshot.cn/v1";
 export const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
 export const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
-export const OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.5";
+export const OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.6-sol";
 export const OPENAI_CODEX_MODELS = [
   "gpt-5.1",
   "gpt-5.1-codex-max",
@@ -26,7 +26,10 @@ export const OPENAI_CODEX_MODELS = [
   "gpt-5.3-codex-spark",
   "gpt-5.4",
   "gpt-5.4-mini",
+  "gpt-5.5",
   OPENAI_CODEX_DEFAULT_MODEL,
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
 ] as const;
 
 const OPENAI_CODEX_MODEL_COSTS = {
@@ -40,6 +43,9 @@ const OPENAI_CODEX_MODEL_COSTS = {
   "gpt-5.4": { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
   "gpt-5.4-mini": { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
   "gpt-5.5": { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
+  "gpt-5.6-sol": { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
+  "gpt-5.6-terra": { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 3.125 },
+  "gpt-5.6-luna": { input: 1, output: 6, cacheRead: 0.1, cacheWrite: 1.25 },
 } satisfies Record<(typeof OPENAI_CODEX_MODELS)[number], ModelCost>;
 
 const BUILTIN_MODELS = [
@@ -282,6 +288,7 @@ function openAICodexDisplayName(model: string): string {
 }
 
 function openAICodexModelDescriptor(model: (typeof OPENAI_CODEX_MODELS)[number]): ModelDescriptor {
+  const isGpt56 = model.startsWith("gpt-5.6-");
   return {
     provider: OPENAI_CODEX_PROVIDER_ID,
     model,
@@ -290,7 +297,7 @@ function openAICodexModelDescriptor(model: (typeof OPENAI_CODEX_MODELS)[number])
     baseUrl: OPENAI_CODEX_BASE_URL,
     default: model === OPENAI_CODEX_DEFAULT_MODEL,
     inputCapabilities: model === "gpt-5.3-codex-spark" ? ["text"] : ["text", "image"],
-    contextWindowTokens: model === "gpt-5.3-codex-spark" ? 128000 : 272000,
+    contextWindowTokens: model === "gpt-5.3-codex-spark" ? 128000 : isGpt56 ? 1050000 : 272000,
     maxOutputTokens: 128000,
     cost: OPENAI_CODEX_MODEL_COSTS[model],
     capabilities: {

@@ -127,7 +127,7 @@ test("catalog describes the built-in ChatGPT Codex Responses models", () => {
     baseUrl: OPENAI_CODEX_BASE_URL,
     default: true,
     inputCapabilities: ["text", "image"],
-    contextWindowTokens: 272000,
+    contextWindowTokens: 1050000,
     maxOutputTokens: 128000,
     capabilities: {
       streaming: true,
@@ -137,6 +137,19 @@ test("catalog describes the built-in ChatGPT Codex Responses models", () => {
       usage: true,
       responseId: true,
     },
+  });
+
+  expect(findKnownModel(OPENAI_CODEX_PROVIDER_ID, "gpt-5.6-terra")).toMatchObject({
+    displayName: "GPT-5.6 Terra",
+    contextWindowTokens: 1050000,
+    maxOutputTokens: 128000,
+    cost: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 3.125 },
+  });
+  expect(findKnownModel(OPENAI_CODEX_PROVIDER_ID, "gpt-5.6-luna")).toMatchObject({
+    displayName: "GPT-5.6 Luna",
+    contextWindowTokens: 1050000,
+    maxOutputTokens: 128000,
+    cost: { input: 1, output: 6, cacheRead: 0.1, cacheWrite: 1.25 },
   });
 });
 

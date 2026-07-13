@@ -797,7 +797,7 @@ export function clampOpenAICodexReasoningEffort(
 ): OpenAICodexReasoningEffort {
   const id = model.includes("/") ? model.split("/").at(-1) ?? model : model;
   if (
-    (id.startsWith("gpt-5.2") || id.startsWith("gpt-5.3") || id.startsWith("gpt-5.4") || id.startsWith("gpt-5.5")) &&
+    (id.startsWith("gpt-5.2") || id.startsWith("gpt-5.3") || id.startsWith("gpt-5.4") || id.startsWith("gpt-5.5") || id.startsWith("gpt-5.6")) &&
     effort === "minimal"
   ) {
     return "low";

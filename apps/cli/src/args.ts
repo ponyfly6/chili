@@ -447,7 +447,7 @@ export function usage(): string {
     "  bun run chili -- --model deepseek \"hello\"",
     "  bun run chili -- --model kimi \"hello\"",
     "  bun run chili -- --model codex \"hello\"",
-    "  bun run chili -- --provider openai-codex --model gpt-5.5 \"hello\"",
+    "  bun run chili -- --provider openai-codex --model gpt-5.6-sol \"hello\"",
     "  bun run chili -- --model openai-codex/gpt-5.3-codex \"hello\"",
     "  bun run chili -- --model gpt-5.3-codex --thinking high \"hello\"",
     "  bun run chili -- --model legacy-minimax \"hello\"",

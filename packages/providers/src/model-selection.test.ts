@@ -41,7 +41,7 @@ test("resolves model selection patterns against descriptors", () => {
     {
       provider: OPENAI_CODEX_PROVIDER_ID,
       model: OPENAI_CODEX_DEFAULT_MODEL,
-      displayName: "GPT-5.5",
+      displayName: "GPT-5.6 Sol",
       capabilities: { streaming: true, reasoning: true },
     },
     {
@@ -52,7 +52,7 @@ test("resolves model selection patterns against descriptors", () => {
     },
   ];
 
-  expect(resolveModelSelectionPattern("openai-codex/gpt-5.5:xhigh", models)).toMatchObject({
+  expect(resolveModelSelectionPattern("openai-codex/gpt-5.6-sol:xhigh", models)).toMatchObject({
     selection: {
       provider: OPENAI_CODEX_PROVIDER_ID,
       model: OPENAI_CODEX_DEFAULT_MODEL,
@@ -95,13 +95,13 @@ test("catalog exposes display names, auth state, and Codex model metadata", () =
   });
   expect(catalog.find((model) => model.model === OPENAI_CODEX_DEFAULT_MODEL)).toMatchObject({
     providerDisplayName: "ChatGPT Codex",
-    displayName: "GPT-5.5",
+    displayName: "GPT-5.6 Sol",
     available: true,
     cost: {
       input: 5,
       output: 30,
       cacheRead: 0.5,
-      cacheWrite: 0,
+      cacheWrite: 6.25,
     },
   });
 
@@ -115,6 +115,9 @@ test("catalog exposes display names, auth state, and Codex model metadata", () =
     "gpt-5.3-codex-spark",
     "gpt-5.4",
     "gpt-5.4-mini",
+    "gpt-5.5",
     OPENAI_CODEX_DEFAULT_MODEL,
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
   ]);
 });
