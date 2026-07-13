@@ -218,7 +218,7 @@ test("resume session and thread submit without creating a new session", async ()
   }
 });
 
-test("resume session and thread hydrate the chat stream with scoped history", async () => {
+test("resumed chat keeps the stream global so /resume can switch sessions", async () => {
   const records = chatClientRecords();
   const client = fakeChatClient(records);
   const app = await mountChatApp(client, {
@@ -230,10 +230,8 @@ test("resume session and thread hydrate the chat stream with scoped history", as
     await Bun.sleep(80);
     await app.renderOnce();
 
-    expect(records.stream[0]).toMatchObject({
-      sessionId: "session_resume",
-      threadId: "thread_resume",
-    });
+    expect(records.stream[0]?.sessionId).toBeUndefined();
+    expect(records.stream[0]?.threadId).toBeUndefined();
   } finally {
     app.renderer.destroy();
   }
@@ -2437,6 +2435,132 @@ test("/theme opens the theme picker", async () => {
   }
 });
 
+test("/resume opens a searchable project-scoped picker and switches sessions", async () => {
+  const resumed: string[] = [];
+  const sessions = [
+    {
+      id: "session_current" as SessionId,
+      threadId: "thread_current" as ThreadId,
+      cwd: "/repo/chili",
+      title: "Current chat",
+      status: "active" as const,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: "session_saved" as SessionId,
+      threadId: "thread_saved" as ThreadId,
+      cwd: "/repo/chili",
+      title: "Fix resume flow",
+      preview: "Wire the saved conversation picker",
+      status: "active" as const,
+      createdAt: 2,
+      updatedAt: 3,
+    },
+    {
+      id: "session_other" as SessionId,
+      threadId: "thread_other" as ThreadId,
+      cwd: "/repo/other",
+      title: "Other project",
+      status: "active" as const,
+      createdAt: 2,
+      updatedAt: 4,
+    },
+  ];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      activeSessionId: "session_current" as SessionId,
+      activeThreadId: "thread_current" as ThreadId,
+      chatView: {
+        sessionId: "session_current" as SessionId,
+        threadId: "thread_current" as ThreadId,
+        status: "idle",
+        items: [],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      listSessions: async () => sessions,
+      resumeSession: async (session) => {
+        resumed.push(session.id);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/resume");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(40);
+    await app.renderOnce();
+
+    let frame = app.captureCharFrame();
+    expect(frame).toContain("Resume saved chat");
+    expect(frame).toContain("Fix resume flow");
+    expect(frame).not.toContain("Other project");
+
+    await press(app, () => app.mockInput.pressKey("a", { ctrl: true }));
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Other project");
+
+    await typeText(app, "Fix resume");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(resumed).toEqual(["session_saved"]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/rename edits and saves the current chat title", async () => {
+  const renamed: string[] = [];
+  const sessionId = "session_rename" as SessionId;
+  const threadId = "thread_rename" as ThreadId;
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      activeSessionId: sessionId,
+      activeThreadId: threadId,
+      chatView: {
+        sessionId,
+        threadId,
+        status: "idle",
+        items: [],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      listSessions: async () => [{
+        id: sessionId,
+        threadId,
+        cwd: "/repo/chili",
+        title: "Old",
+        status: "active",
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      renameSession: async (title) => {
+        renamed.push(title);
+        return { id: sessionId, threadId, cwd: "/repo/chili", title, status: "active", createdAt: 1, updatedAt: 2 };
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/rename");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(40);
+    await app.renderOnce();
+    expect(app.captureCharFrame()).toContain("Rename chat");
+    expect(app.captureCharFrame()).toContain("> Old");
+
+    await backspace(app, 3);
+    await typeText(app, "Investigation");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(renamed).toEqual(["Investigation"]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("theme picker Up and Down preview the selected theme", async () => {
   const app = await mountShell(teamLiveFixture());
 
@@ -2860,6 +2984,7 @@ async function mountShell(
       options.executed?.push(action);
     },
     clearActionFeedback: () => undefined,
+    hydrateEvents: () => undefined,
     chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
     canSubmit: true,
     submitPrompt: async () => true,
@@ -2869,6 +2994,9 @@ async function mountShell(
     resumeGoal: async () => undefined,
     clearGoal: async () => false,
     startNewSession: async () => undefined,
+    listSessions: async () => [],
+    resumeSession: async () => true,
+    renameSession: async () => undefined,
     interruptActiveSession: async () => undefined,
     approveApproval: async () => undefined,
     rejectApproval: async () => undefined,
@@ -2970,6 +3098,7 @@ function chatRuntime(
       options.executed?.push(action);
     },
     clearActionFeedback: () => undefined,
+    hydrateEvents: () => undefined,
     chatView: { status: "idle", items: [], pendingApprovals: [], activeTools: [], generatedAt: "1970-01-01T00:00:00.000Z" },
     canSubmit: true,
     submitPrompt: async () => true,
@@ -2979,6 +3108,9 @@ function chatRuntime(
     resumeGoal: async () => undefined,
     clearGoal: async () => false,
     startNewSession: async () => undefined,
+    listSessions: async () => [],
+    resumeSession: async () => true,
+    renameSession: async () => undefined,
     interruptActiveSession: async () => undefined,
     approveApproval: async () => undefined,
     rejectApproval: async () => undefined,
@@ -3189,6 +3321,16 @@ function fakeChatClient(
       const suffix = index === 1 ? "" : `_${index}`;
       return { sessionId: `session_created${suffix}` as SessionId, threadId: `thread_created${suffix}` as ThreadId };
     },
+    sessionEvents: async (input: Record<string, unknown>) => events.filter((event) => event.sessionId === input.sessionId),
+    listSessions: async () => [],
+    renameSession: async (input: Record<string, unknown>) => ({
+      id: input.sessionId as SessionId,
+      cwd: "/repo/chili",
+      title: input.title as string,
+      status: "active" as const,
+      createdAt: 1,
+      updatedAt: 2,
+    }),
     submitPromptAsync: async (input: Record<string, unknown>) => {
       records.submit.push(input);
       return { status: "accepted", sessionId: input.sessionId as SessionId, threadId: input.threadId as ThreadId };

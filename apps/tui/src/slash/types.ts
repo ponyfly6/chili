@@ -22,6 +22,10 @@ export type SlashCommandResult =
   | { type: "reload_commands" }
   | { type: "close_view" }
   | { type: "new_session" }
+  | { type: "open_resume_picker" }
+  | { type: "resume_session"; target: string }
+  | { type: "open_rename_prompt" }
+  | { type: "rename_session"; title: string }
   | { type: "goal_action"; action: "show" | "set" | "pause" | "resume" | "clear"; objective?: string; tokenBudget?: number }
   | { type: "submit_command"; commandName: string; args: string }
   | { type: "insert_prompt"; text: string }

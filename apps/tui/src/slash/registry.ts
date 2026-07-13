@@ -130,6 +130,28 @@ export function createDefaultSlashCommands(): SlashCommand[] {
       run: () => ({ type: "new_session" }),
     },
     {
+      name: "resume",
+      description: "Resume a saved chat",
+      category: "session",
+      argumentHint: "[session-id-or-title]",
+      isSafeConcurrent: false,
+      run: (_ctx, args) => {
+        const target = args.trim();
+        return target ? { type: "resume_session", target } : { type: "open_resume_picker" };
+      },
+    },
+    {
+      name: "rename",
+      description: "Rename the current chat",
+      category: "session",
+      argumentHint: "[new title]",
+      isSafeConcurrent: true,
+      run: (_ctx, args) => {
+        const title = args.trim().replace(/\s+/g, " ");
+        return title ? { type: "rename_session", title } : { type: "open_rename_prompt" };
+      },
+    },
+    {
       name: "help",
       description: "Show commands and shortcuts",
       category: "view",

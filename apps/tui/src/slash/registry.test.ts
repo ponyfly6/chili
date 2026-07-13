@@ -163,6 +163,26 @@ test("resolves goal slash commands without lowercasing objectives", async () => 
   });
 });
 
+test("resolves resume and rename session commands", async () => {
+  const commands = createDefaultSlashCommands();
+  const ctx = { model: {} } as SlashCommandContext;
+
+  expect(await resolveSlashCommand(commands, "/resume")?.command.run(ctx, "")).toEqual({
+    type: "open_resume_picker",
+  });
+  expect(await resolveSlashCommand(commands, "/resume session_saved")?.command.run(ctx, "session_saved")).toEqual({
+    type: "resume_session",
+    target: "session_saved",
+  });
+  expect(await resolveSlashCommand(commands, "/rename")?.command.run(ctx, "")).toEqual({
+    type: "open_rename_prompt",
+  });
+  expect(await resolveSlashCommand(commands, "/rename  Important   work ")?.command.run(ctx, " Important   work ")).toEqual({
+    type: "rename_session",
+    title: "Important work",
+  });
+});
+
 test("resolves permissions slash commands to the permissions picker", async () => {
   const commands = createDefaultSlashCommands();
   const ctx = { model: {} } as SlashCommandContext;

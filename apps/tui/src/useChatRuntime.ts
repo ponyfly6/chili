@@ -3,6 +3,7 @@ import {
   chatSessionView,
   type ChatSessionView,
   type HttpRuntimeClient,
+  type RuntimeSessionSummary,
 } from "@chili/sdk";
 import type {
   ApprovalId,
@@ -71,6 +72,9 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
   resumeGoal: () => Promise<ThreadGoal | undefined>;
   clearGoal: () => Promise<boolean>;
   startNewSession: () => Promise<void>;
+  listSessions: () => Promise<RuntimeSessionSummary[]>;
+  resumeSession: (session: Pick<RuntimeSessionSummary, "id" | "threadId">) => Promise<boolean>;
+  renameSession: (title: string) => Promise<RuntimeSessionSummary | undefined>;
   interruptActiveSession: () => Promise<void>;
   approveApproval: (approvalId: ApprovalId, options?: ChatApproveOptions) => Promise<void>;
   rejectApproval: (approvalId: ApprovalId) => Promise<void>;
@@ -121,6 +125,25 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     setActiveSessionId(options.sessionId);
     setActiveThreadId(options.threadId);
   }, [options.sessionId, options.threadId]);
+
+  useEffect(() => {
+    const sessionId = options.sessionId;
+    if (!sessionId) return;
+    const controller = new AbortController();
+    void client.sessionEvents({ sessionId, limit: 5_000, signal: controller.signal })
+      .then((events) => {
+        if (controller.signal.aborted) return;
+        teamRuntime.hydrateEvents(events);
+        if (!options.threadId) {
+          const threadId = events.find((event) => event.threadId)?.threadId;
+          if (threadId) setActiveThreadId(threadId);
+        }
+      })
+      .catch((error) => {
+        if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      });
+    return () => controller.abort();
+  }, [client, options.baseUrl, options.sessionId, options.threadId, teamRuntime.hydrateEvents]);
 
   const chatView = useMemo(() => {
     const request: Parameters<typeof chatSessionView>[1] = { limit: 120, requireSession: true };
@@ -643,6 +666,60 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     }
   }, [client, options.baseUrl, options.cwd, withAbort]);
 
+  const listSessions = useCallback(async (): Promise<RuntimeSessionSummary[]> => {
+    try {
+      return await client.listSessions();
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      throw error;
+    }
+  }, [client, options.baseUrl]);
+
+  const resumeSession = useCallback(async (
+    session: Pick<RuntimeSessionSummary, "id" | "threadId">,
+  ): Promise<boolean> => {
+    if (running) {
+      setChatFeedback({ status: "error", message: "Cannot resume another session while the current session is running." });
+      return false;
+    }
+    setChatFeedback({ status: "pending", message: "loading saved chat" });
+    try {
+      const events = await withAbort((signal) => client.sessionEvents({
+        sessionId: session.id,
+        limit: 5_000,
+        signal,
+      }));
+      const threadId = session.threadId ?? events.find((event) => event.threadId)?.threadId;
+      if (!threadId) throw new Error(`Session ${session.id} has no resumable thread.`);
+      teamRuntime.hydrateEvents(events);
+      setSubmitPending(false);
+      setActiveSessionId(session.id);
+      setActiveThreadId(threadId);
+      setChatFeedback({ status: "success", message: "saved chat resumed" });
+      return true;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return false;
+    }
+  }, [client, options.baseUrl, running, teamRuntime.hydrateEvents, withAbort]);
+
+  const renameSession = useCallback(async (title: string): Promise<RuntimeSessionSummary | undefined> => {
+    const sessionId = activeSessionId ?? chatView.sessionId;
+    if (!sessionId) {
+      setChatFeedback({ status: "error", message: "Start a session before renaming it." });
+      return undefined;
+    }
+    setChatFeedback({ status: "pending", message: "renaming saved chat" });
+    try {
+      const renamed = await withAbort((signal) => client.renameSession({ sessionId, title, signal }));
+      setChatFeedback({ status: "success", message: `renamed to ${renamed.title ?? title}` });
+      return renamed;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return undefined;
+    }
+  }, [activeSessionId, chatView.sessionId, client, options.baseUrl, withAbort]);
+
   const approveApproval = useCallback(async (approvalId: ApprovalId, approveOptions: ChatApproveOptions = {}) => {
     await resolveApproval("approve", approvalId, client, withAbort, setChatFeedback, approveOptions);
   }, [client, withAbort]);
@@ -691,10 +768,13 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     resumeGoal,
     clearGoal,
     startNewSession,
+    listSessions,
+    resumeSession,
+    renameSession,
     interruptActiveSession,
     approveApproval,
     rejectApproval,
-  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, permissionConfig, commandList, mcpStatus, refreshModelConfig, refreshPermissionConfig, reloadCommands, refreshMcpStatus, getMcpServer, reloadMcp, addMcpServer, removeMcpServer, listMcpTools, authMcpServer, logoutMcpServer, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setRuntimeServiceTier, setGoal, pauseGoal, resumeGoal, clearGoal, startNewSession, submitBlockedReason, submitCommand, submitPrompt, teamRuntime]);
+  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, permissionConfig, commandList, mcpStatus, refreshModelConfig, refreshPermissionConfig, reloadCommands, refreshMcpStatus, getMcpServer, reloadMcp, addMcpServer, removeMcpServer, listMcpTools, authMcpServer, logoutMcpServer, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setRuntimeServiceTier, setGoal, pauseGoal, resumeGoal, clearGoal, startNewSession, listSessions, resumeSession, renameSession, submitBlockedReason, submitCommand, submitPrompt, teamRuntime]);
 }
 
 function upsertMcpServer(current: RuntimeMcpStatusResponse | undefined, server: RuntimeMcpServerDescriptor): RuntimeMcpStatusResponse {

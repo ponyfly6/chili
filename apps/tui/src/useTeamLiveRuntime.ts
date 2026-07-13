@@ -13,7 +13,7 @@ import {
   type TeamLiveConnectionState,
   type TeamLiveView,
 } from "@chili/sdk";
-import type { ApprovalId, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
+import type { ApprovalId, ChiliEvent, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
 
 export interface TeamLiveTuiOptions {
   baseUrl: string;
@@ -69,6 +69,7 @@ export interface TeamLiveRuntimeState {
   reconnect: () => void;
   executeAction: (action: TeamLiveAction) => void;
   clearActionFeedback: () => void;
+  hydrateEvents: (events: readonly ChiliEvent[]) => void;
 }
 
 export interface UseTeamLiveRuntimeInput {
@@ -141,6 +142,13 @@ export function useTeamLiveRuntime(input: UseTeamLiveRuntimeInput): TeamLiveRunt
     setActionFeedback(undefined);
     startStream("reconnecting");
   }, [startStream]);
+
+  const hydrateEvents = useCallback((events: readonly ChiliEvent[]) => {
+    const liveCursor = runtimeViewRef.current.lastEventId;
+    for (const event of events) applyRuntimeEvent(runtimeViewRef.current, event);
+    if (liveCursor) runtimeViewRef.current.lastEventId = liveCursor;
+    setRevision((current) => current + 1);
+  }, []);
 
   const runTeamLoop = useCallback((teamId: TeamId, signal?: AbortSignal) => {
     const request: RunTeamLoopRequest = {
@@ -238,7 +246,8 @@ export function useTeamLiveRuntime(input: UseTeamLiveRuntimeInput): TeamLiveRunt
     reconnect,
     executeAction,
     clearActionFeedback: () => setActionFeedback(undefined),
-  }), [actionFeedback, connection, executeAction, message, reconnect, revision]);
+    hydrateEvents,
+  }), [actionFeedback, connection, executeAction, hydrateEvents, message, reconnect, revision]);
 }
 
 export function teamLiveModel(

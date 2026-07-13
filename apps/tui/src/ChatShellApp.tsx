@@ -1,7 +1,7 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type Dispatch, type RefObject, type SetStateAction } from "react";
 import { useAppContext, useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, MouseEvent, ScrollBoxRenderable, Selection } from "@opentui/core";
-import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, TeamLiveAction, TeamLiveView } from "@chili/sdk";
+import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, RuntimeSessionSummary, TeamLiveAction, TeamLiveView } from "@chili/sdk";
 import type {
   ApprovalId,
   MessageImageContent,
@@ -102,6 +102,10 @@ interface SlashActions {
   appendShellItem: AppendShellItem;
   updateShellItem: UpdateShellItem;
   startNewChatSession: () => Promise<void>;
+  openResumePicker: () => void;
+  resumeSessionByTarget: (target: string) => Promise<void>;
+  openRenamePrompt: () => void;
+  renameChatSession: (title: string) => Promise<void>;
   setPrompt: (value: string | ((current: string) => string)) => void;
   openThemePicker: () => void;
   openMcpManager: () => void;
@@ -173,7 +177,9 @@ export function ChatShellApp(props: {
   const chatOptions = useMemo(
     () => ({
       ...shellOptions,
-      streamScope: shellOptions.sessionId ? "session" as const : "all" as const,
+      // /resume can switch sessions in-process, so keep the live stream global.
+      // Older transcript history is hydrated on demand when a session is selected.
+      streamScope: "all" as const,
     }),
     [shellOptions],
   );
@@ -264,6 +270,8 @@ export function ChatShellSurface(props: {
   const [modelPicker, setModelPicker] = useState<ModelPickerNavigation | undefined>(undefined);
   const [reasoningPicker, setReasoningPicker] = useState<ReasoningPickerNavigation | undefined>(undefined);
   const [permissionsPicker, setPermissionsPicker] = useState<PermissionsPickerNavigation | undefined>(undefined);
+  const [resumePicker, setResumePicker] = useState<ResumePickerNavigation | undefined>(undefined);
+  const [renamePrompt, setRenamePrompt] = useState<RenamePromptNavigation | undefined>(undefined);
   const [mcpManager, setMcpManager] = useState<McpManagerState>(() => initialMcpManagerState());
   const [transcriptScrollOffset, setTranscriptScrollOffset] = useState(0);
   const messageScrollBoxRef = useRef<ScrollBoxRenderable | null>(null);
@@ -446,6 +454,8 @@ export function ChatShellSurface(props: {
   const startNewChatSession = useCallback(async () => {
     setView("chat");
     setAuthManualPrompt(undefined);
+    setResumePicker(undefined);
+    setRenamePrompt(undefined);
     setPrompt("");
     history.clear();
     clearLocalItems();
@@ -453,6 +463,99 @@ export function ChatShellSurface(props: {
     setTranscriptScrollOffset(0);
     await props.runtime.startNewSession();
   }, [clearLocalItems, history, props.runtime, scrollMessageToBottom, setAuthManualPrompt, setPrompt]);
+  const prepareForSessionSwitch = useCallback(() => {
+    setView("chat");
+    setAuthManualPrompt(undefined);
+    setPrompt("");
+    history.clear();
+    clearLocalItems();
+    scrollMessageToBottom();
+    setTranscriptScrollOffset(0);
+  }, [clearLocalItems, history, scrollMessageToBottom, setAuthManualPrompt, setPrompt]);
+  const resumeChatSession = useCallback(async (session: RuntimeSessionSummary) => {
+    if (session.status === "archived") {
+      appendLocalItem("error", "Archived sessions cannot be resumed yet.");
+      return;
+    }
+    setResumePicker(undefined);
+    const resumed = await props.runtime.resumeSession(session);
+    if (resumed) prepareForSessionSwitch();
+  }, [appendLocalItem, prepareForSessionSwitch, props.runtime]);
+  const openResumePicker = useCallback(() => {
+    if (props.runtime.chatView.status === "running" || props.runtime.chatView.status === "waiting_for_approval") {
+      appendLocalItem("error", "Finish or interrupt the current session before resuming another chat.");
+      return;
+    }
+    setPaletteOpen(false);
+    setModelPicker(undefined);
+    setReasoningPicker(undefined);
+    setPermissionsPicker(undefined);
+    setThemePicker(undefined);
+    setRenamePrompt(undefined);
+    setResumePicker({ query: "", selectedIndex: 0, sessions: [], loading: true, showAll: false });
+    void props.runtime.listSessions()
+      .then((sessions) => {
+        setResumePicker((current) => current ? { ...current, sessions, loading: false, selectedIndex: 0 } : current);
+      })
+      .catch((error) => {
+        setResumePicker((current) => current ? { ...current, loading: false, error: errorMessage(error) } : current);
+      });
+  }, [appendLocalItem, props.runtime]);
+  const resumeSessionByTarget = useCallback(async (target: string) => {
+    if (props.runtime.chatView.status === "running" || props.runtime.chatView.status === "waiting_for_approval") {
+      appendLocalItem("error", "Finish or interrupt the current session before resuming another chat.");
+      return;
+    }
+    let sessions: RuntimeSessionSummary[];
+    try {
+      sessions = await props.runtime.listSessions();
+    } catch {
+      return;
+    }
+    const match = resolveResumeTarget(sessions, target);
+    if (typeof match === "string") {
+      appendLocalItem("error", match);
+      return;
+    }
+    await resumeChatSession(match);
+  }, [appendLocalItem, props.runtime, resumeChatSession]);
+  const openRenamePrompt = useCallback(() => {
+    const sessionId = props.runtime.activeSessionId ?? props.runtime.chatView.sessionId;
+    if (!sessionId) {
+      appendLocalItem("error", "Start a chat before renaming it.");
+      return;
+    }
+    setPaletteOpen(false);
+    setModelPicker(undefined);
+    setReasoningPicker(undefined);
+    setPermissionsPicker(undefined);
+    setThemePicker(undefined);
+    setResumePicker(undefined);
+    setRenamePrompt({ value: "", loading: true, submitting: false });
+    void props.runtime.listSessions()
+      .then((sessions) => {
+        const title = sessions.find((session) => session.id === sessionId)?.title ?? "";
+        setRenamePrompt((current) => current ? { ...current, value: title, loading: false } : current);
+      })
+      .catch(() => {
+        setRenamePrompt((current) => current ? { ...current, loading: false } : current);
+      });
+  }, [appendLocalItem, props.runtime]);
+  const renameChatSession = useCallback(async (title: string) => {
+    const normalized = title.trim().replace(/\s+/g, " ");
+    if (!normalized) {
+      appendLocalItem("error", "Session title cannot be empty.");
+      return;
+    }
+    if (normalized.length > 120) {
+      appendLocalItem("error", "Session title must be 120 characters or fewer.");
+      return;
+    }
+    setRenamePrompt((current) => current ? { ...current, submitting: true } : current);
+    const renamed = await props.runtime.renameSession(normalized);
+    if (renamed) setRenamePrompt(undefined);
+    else setRenamePrompt((current) => current ? { ...current, submitting: false } : current);
+  }, [appendLocalItem, props.runtime]);
   const submitAuthManualInput = useCallback(() => {
     const manual = authManualPromptRef.current;
     if (!manual) return false;
@@ -467,6 +570,8 @@ export function ChatShellSurface(props: {
   }, [appendLocalItem, clearPromptAttachments, expandedPrompt, setAuthManualPrompt, setPrompt]);
   const openThemePicker = useCallback(() => {
     const index = themeOptionIndex(themeOptions, themeId);
+    setResumePicker(undefined);
+    setRenamePrompt(undefined);
     setModelPicker(undefined);
     setReasoningPicker(undefined);
     setPermissionsPicker(undefined);
@@ -493,6 +598,8 @@ export function ChatShellSurface(props: {
   const openModelPicker = useCallback((query = "") => {
     void props.runtime.refreshModelConfig?.();
     const index = modelPickerIndex(modelCandidates, query, modelSelection, undefined);
+    setResumePicker(undefined);
+    setRenamePrompt(undefined);
     setReasoningPicker(undefined);
     setPermissionsPicker(undefined);
     setThemePicker(undefined);
@@ -503,6 +610,8 @@ export function ChatShellSurface(props: {
   }, []);
   const openReasoningPicker = useCallback(() => {
     const selectedIndex = Math.max(0, REASONING_LEVELS.indexOf(reasoningLevel ?? DEFAULT_REASONING_LEVEL));
+    setResumePicker(undefined);
+    setRenamePrompt(undefined);
     setModelPicker(undefined);
     setPermissionsPicker(undefined);
     setThemePicker(undefined);
@@ -515,6 +624,8 @@ export function ChatShellSurface(props: {
     void props.runtime.refreshPermissionConfig?.();
     const profiles = props.runtime.permissionConfig?.profiles ?? [];
     const selectedIndex = Math.max(0, profiles.findIndex((profile) => profile.current));
+    setResumePicker(undefined);
+    setRenamePrompt(undefined);
     setModelPicker(undefined);
     setReasoningPicker(undefined);
     setThemePicker(undefined);
@@ -548,6 +659,8 @@ export function ChatShellSurface(props: {
     setReasoningPicker(undefined);
     setPermissionsPicker(undefined);
     setThemePicker(undefined);
+    setResumePicker(undefined);
+    setRenamePrompt(undefined);
     setPrompt("");
     setMcpManager(initialMcpManagerState());
     void refreshMcpManager();
@@ -662,6 +775,10 @@ export function ChatShellSurface(props: {
     appendShellItem,
     updateShellItem,
     startNewChatSession,
+    openResumePicker,
+    resumeSessionByTarget,
+    openRenamePrompt,
+    renameChatSession,
     setPrompt,
     openThemePicker,
     openMcpManager,
@@ -679,7 +796,7 @@ export function ChatShellSurface(props: {
       await props.onSkillsChanged?.();
     },
     reloadCommands,
-  }), [appendLocalItem, appendShellItem, cwd, ensureOpenAICodexDefaultModel, openMcpManager, openModelPicker, openPermissionsPicker, openReasoningPicker, openThemePicker, props.onSkillsChanged, reloadCommands, setAuthManualPrompt, setHideThinking, setModelSelection, setPermissionProfile, setPrompt, setReasoningLevel, setServiceTier, startNewChatSession, updateShellItem]);
+  }), [appendLocalItem, appendShellItem, cwd, ensureOpenAICodexDefaultModel, openMcpManager, openModelPicker, openPermissionsPicker, openReasoningPicker, openRenamePrompt, openResumePicker, openThemePicker, props.onSkillsChanged, reloadCommands, renameChatSession, resumeSessionByTarget, setAuthManualPrompt, setHideThinking, setModelSelection, setPermissionProfile, setPrompt, setReasoningLevel, setServiceTier, startNewChatSession, updateShellItem]);
   const runSelectedSlashCompletion = useCallback(() => {
     if (!slashCompletionOpen) return false;
     const completion = slashCompletionItems[selectedCompletionIndex] ?? slashCompletionItems[0];
@@ -867,7 +984,10 @@ export function ChatShellSurface(props: {
     setMcpManager((current) => ({ screen: "list", selectedIndex: serverIndexByName(mcpServers, server.name), status: current.status }));
   }, [authenticateMcpFromManager, loadMcpTools, logoutMcpFromManager, mcpServers, reloadMcpFromManager]);
 
-  const selectorOpen = Boolean(modelPicker || reasoningPicker || permissionsPicker);
+  const resumePickerItems = resumePicker
+    ? filteredResumeSessions(resumePicker.sessions, resumePicker.query, cwd, resumePicker.showAll)
+    : [];
+  const selectorOpen = Boolean(modelPicker || reasoningPicker || permissionsPicker || resumePicker || renamePrompt);
   const approvalShortcutsEnabled = view === "chat" && Boolean(firstApproval) && props.runtime.chatView.pendingApprovals.length > 0 && !authManualPrompt && !selectorOpen && !themePicker && !paletteOpen && !slashCompletionOpen && !skillCompletionOpen;
   const disabledReason = authManualPrompt
     ? undefined
@@ -877,6 +997,10 @@ export function ChatShellSurface(props: {
     ? "Choose thinking level"
     : permissionsPicker
     ? "Choose permissions"
+    : resumePicker
+    ? "Choose a saved chat"
+    : renamePrompt
+    ? "Rename the current chat"
     : view === "mcp"
     ? "MCP manager open"
     : shellInputActive
@@ -1000,6 +1124,72 @@ export function ChatShellSurface(props: {
     }
     if (key.ctrl && key.name === "x") {
       void props.runtime.interruptActiveSession();
+      return;
+    }
+    if (resumePicker) {
+      if (isEscape(key)) {
+        setResumePicker(undefined);
+        return;
+      }
+      if (key.ctrl && key.name === "a") {
+        setResumePicker((current) => current ? { ...current, showAll: !current.showAll, selectedIndex: 0 } : current);
+        return;
+      }
+      if (isArrowUp(key) || isArrowDown(key)) {
+        const delta = isArrowUp(key) ? -1 : 1;
+        setResumePicker((current) => current ? {
+          ...current,
+          selectedIndex: clampIndex(current.selectedIndex + delta, resumePickerItems.length),
+        } : current);
+        return;
+      }
+      if (isEnter(key)) {
+        const selected = resumePickerItems[clampIndex(resumePicker.selectedIndex, resumePickerItems.length)];
+        if (selected) void resumeChatSession(selected);
+        return;
+      }
+      if (isBackspace(key)) {
+        setResumePicker((current) => current ? { ...current, query: current.query.slice(0, -1), selectedIndex: 0 } : current);
+        return;
+      }
+      if (isPasteShortcut(key)) {
+        void clipboard.readText().then((value) => {
+          const pasted = cleanClipboardText(value ?? "")?.replace(/\s+/g, " ") ?? "";
+          if (pasted) setResumePicker((current) => current ? { ...current, query: `${current.query}${pasted}`, selectedIndex: 0 } : current);
+        });
+        return;
+      }
+      const printable = printableKey(key);
+      if (printable) {
+        setResumePicker((current) => current ? { ...current, query: `${current.query}${printable}`, selectedIndex: 0 } : current);
+      }
+      return;
+    }
+    if (renamePrompt) {
+      if (isEscape(key)) {
+        setRenamePrompt(undefined);
+        return;
+      }
+      if (renamePrompt.loading || renamePrompt.submitting) return;
+      if (isEnter(key)) {
+        void renameChatSession(renamePrompt.value);
+        return;
+      }
+      if (isBackspace(key)) {
+        setRenamePrompt((current) => current ? { ...current, value: current.value.slice(0, -1) } : current);
+        return;
+      }
+      if (isPasteShortcut(key)) {
+        void clipboard.readText().then((value) => {
+          const pasted = cleanClipboardText(value ?? "")?.replace(/\s+/g, " ") ?? "";
+          if (pasted) setRenamePrompt((current) => current ? { ...current, value: `${current.value}${pasted}`.slice(0, 120) } : current);
+        });
+        return;
+      }
+      const printable = printableKey(key);
+      if (printable) {
+        setRenamePrompt((current) => current ? { ...current, value: `${current.value}${printable}`.slice(0, 120) } : current);
+      }
       return;
     }
     if (key.ctrl && key.name === "p") {
@@ -1277,6 +1467,10 @@ export function ChatShellSurface(props: {
   const permissionsPickerModel = permissionsPicker
     ? permissionsPickerView(permissionsPicker, props.runtime.permissionConfig?.profiles ?? [])
     : undefined;
+  const resumePickerModel = resumePicker
+    ? resumePickerView(resumePicker, resumePickerItems, props.runtime.activeSessionId)
+    : undefined;
+  const renamePromptModel = renamePrompt;
 
   if (view === "team") {
     return (
@@ -1305,7 +1499,7 @@ export function ChatShellSurface(props: {
           height={dimensions.height}
           prompt={prompt}
           promptInputResetKey={promptInputResetKey}
-          focused={view === "chat" && !paletteOpen && !themePicker && !modelPicker && !reasoningPicker && !permissionsPicker && !disabledReason}
+          focused={view === "chat" && !paletteOpen && !themePicker && !modelPicker && !reasoningPicker && !permissionsPicker && !resumePicker && !renamePrompt && !disabledReason}
           onPromptChange={handlePromptChange}
           onExitShortcut={handleCtrlCExitShortcut}
           onPasteShortcut={readPromptClipboard}
@@ -1339,6 +1533,8 @@ export function ChatShellSurface(props: {
           modelPicker={modelPickerModel}
           reasoningPicker={reasoningPickerModel}
           permissionsPicker={permissionsPickerModel}
+          resumePicker={resumePickerModel}
+          renamePrompt={renamePromptModel}
         />
       ) : (
         <SessionScreen
@@ -1347,7 +1543,7 @@ export function ChatShellSurface(props: {
           view={view}
           prompt={prompt}
           promptInputResetKey={promptInputResetKey}
-          focused={view === "chat" && !paletteOpen && !themePicker && !modelPicker && !reasoningPicker && !permissionsPicker && !disabledReason}
+          focused={view === "chat" && !paletteOpen && !themePicker && !modelPicker && !reasoningPicker && !permissionsPicker && !resumePicker && !renamePrompt && !disabledReason}
           onPromptChange={handlePromptChange}
           onExitShortcut={handleCtrlCExitShortcut}
           onPasteShortcut={readPromptClipboard}
@@ -1402,6 +1598,8 @@ export function ChatShellSurface(props: {
           modelPicker={modelPickerModel}
           reasoningPicker={reasoningPickerModel}
           permissionsPicker={permissionsPickerModel}
+          resumePicker={resumePickerModel}
+          renamePrompt={renamePromptModel}
         />
       )}
     </box>
@@ -1438,13 +1636,15 @@ function HomeScreen(props: {
   modelPicker?: ModelPickerModel | undefined;
   reasoningPicker?: ReasoningPickerModel | undefined;
   permissionsPicker?: PermissionsPickerModel | undefined;
+  resumePicker?: ResumePickerModel | undefined;
+  renamePrompt?: RenamePromptNavigation | undefined;
 }) {
   const promptWidth = Math.min(76, Math.max(42, props.width - 12));
   const compactBrand = props.width < 92 || props.height < 32;
   const feedback = currentFeedback(props.runtime);
   const footerHeight = statusFooterHeight(props.width);
   const themePickerHeight = props.themePicker ? pickerHeight(props.themePicker.items.length) : 0;
-  const selectorHeight = selectorPickerHeight(props.modelPicker, props.reasoningPicker, props.permissionsPicker);
+  const selectorHeight = selectorPickerHeight(props.modelPicker, props.reasoningPicker, props.permissionsPicker, props.resumePicker, props.renamePrompt);
   const maxCommandItems = promptMenuItemLimit({
     height: props.height,
     footerHeight,
@@ -1466,6 +1666,8 @@ function HomeScreen(props: {
         {props.modelPicker ? <ModelPicker model={props.modelPicker} theme={props.theme} /> : null}
         {props.reasoningPicker ? <ReasoningPicker model={props.reasoningPicker} theme={props.theme} /> : null}
         {props.permissionsPicker ? <PermissionsPicker model={props.permissionsPicker} theme={props.theme} /> : null}
+        {props.resumePicker ? <ResumePicker model={props.resumePicker} theme={props.theme} /> : null}
+        {props.renamePrompt ? <RenamePrompt model={props.renamePrompt} theme={props.theme} /> : null}
         <PromptComposer
           width={promptWidth}
           prompt={props.prompt}
@@ -1536,6 +1738,8 @@ function SessionScreen(props: {
   modelPicker?: ModelPickerModel | undefined;
   reasoningPicker?: ReasoningPickerModel | undefined;
   permissionsPicker?: PermissionsPickerModel | undefined;
+  resumePicker?: ResumePickerModel | undefined;
+  renamePrompt?: RenamePromptNavigation | undefined;
 }) {
   const promptWidth = Math.min(96, Math.max(42, props.width - 8));
   const messageWidth = Math.max(24, props.width - 8);
@@ -1543,7 +1747,7 @@ function SessionScreen(props: {
   const feedback = currentFeedback(props.runtime);
   const footerHeight = statusFooterHeight(props.width);
   const themePickerHeight = props.themePicker ? pickerHeight(props.themePicker.items.length) : 0;
-  const selectorHeight = selectorPickerHeight(props.modelPicker, props.reasoningPicker, props.permissionsPicker);
+  const selectorHeight = selectorPickerHeight(props.modelPicker, props.reasoningPicker, props.permissionsPicker, props.resumePicker, props.renamePrompt);
   const maxCommandItems = promptMenuItemLimit({
     height: props.height,
     footerHeight,
@@ -1620,6 +1824,8 @@ function SessionScreen(props: {
         {props.modelPicker ? <ModelPicker model={props.modelPicker} theme={props.theme} /> : null}
         {props.reasoningPicker ? <ReasoningPicker model={props.reasoningPicker} theme={props.theme} /> : null}
         {props.permissionsPicker ? <PermissionsPicker model={props.permissionsPicker} theme={props.theme} /> : null}
+        {props.resumePicker ? <ResumePicker model={props.resumePicker} theme={props.theme} /> : null}
+        {props.renamePrompt ? <RenamePrompt model={props.renamePrompt} theme={props.theme} /> : null}
         <PromptComposer
           width={promptWidth}
           prompt={props.prompt}
@@ -1741,6 +1947,31 @@ interface PermissionsPickerModel {
   selectedIndex: number;
 }
 
+interface ResumePickerNavigation {
+  query: string;
+  selectedIndex: number;
+  sessions: readonly RuntimeSessionSummary[];
+  loading: boolean;
+  showAll: boolean;
+  error?: string;
+}
+
+interface ResumePickerModel {
+  query: string;
+  items: readonly RuntimeSessionSummary[];
+  selectedIndex: number;
+  loading: boolean;
+  showAll: boolean;
+  currentSessionId?: SessionId;
+  error?: string;
+}
+
+interface RenamePromptNavigation {
+  value: string;
+  loading: boolean;
+  submitting: boolean;
+}
+
 interface SkillMentionTrigger {
   start: number;
   query: string;
@@ -1756,10 +1987,14 @@ function selectorPickerHeight(
   modelPicker: ModelPickerModel | undefined,
   reasoningPicker: ReasoningPickerModel | undefined,
   permissionsPicker: PermissionsPickerModel | undefined,
+  resumePicker: ResumePickerModel | undefined,
+  renamePrompt: RenamePromptNavigation | undefined,
 ): number {
   if (modelPicker) return Math.min(modelPicker.items.length, 8) + 6;
   if (reasoningPicker) return reasoningPicker.items.length + 3;
   if (permissionsPicker) return permissionsPicker.items.length + 3;
+  if (resumePicker) return Math.min(resumePicker.items.length, 8) + 6;
+  if (renamePrompt) return 5;
   return 0;
 }
 
@@ -1887,6 +2122,55 @@ function PermissionsPicker(props: { model: PermissionsPickerModel; theme: TuiThe
   );
 }
 
+function ResumePicker(props: { model: ResumePickerModel; theme: TuiTheme }) {
+  const visibleItems = visiblePickerItems(props.model.items, props.model.selectedIndex, 8);
+  const scope = props.model.showAll ? "all projects" : "current project";
+  return (
+    <box width="100%" flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.focus} paddingX={1}>
+      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Resume saved chat"}</text>
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`Search: ${props.model.query || "type to filter"}  Scope: ${scope}`}</text>
+      {props.model.loading ? (
+        <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"  Loading sessions..."}</text>
+      ) : props.model.error ? (
+        <text fg={props.theme.colors.status.error} wrapMode="none" truncate>{`  ${props.model.error}`}</text>
+      ) : visibleItems.length === 0 ? (
+        <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{props.model.showAll ? "  No matching saved chats" : "  No matching chats in this project"}</text>
+      ) : visibleItems.map(({ item, index }) => {
+        const selected = index === props.model.selectedIndex;
+        const current = item.id === props.model.currentSessionId ? " (current)" : "";
+        const preview = sessionDisplayPreview(item);
+        return (
+          <text
+            key={item.id}
+            fg={selected ? props.theme.colors.menu.selectedText : props.theme.colors.menu.text}
+            bg={selected ? props.theme.colors.menu.selectedBackground : props.theme.colors.menu.background}
+            wrapMode="none"
+            truncate
+          >
+            {`${selected ? ">" : " "} ${sessionDisplayTitle(item)}${current}  ${relativeSessionTime(item.updatedAt)}${preview ? `  ${preview}` : ""}`}
+          </text>
+        );
+      })}
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"  ↑/↓ navigate  enter resume  ctrl+a all projects  esc close"}</text>
+    </box>
+  );
+}
+
+function RenamePrompt(props: { model: RenamePromptNavigation; theme: TuiTheme }) {
+  const status = props.model.loading
+    ? "Loading current name..."
+    : props.model.submitting
+      ? "Saving..."
+      : props.model.value || "Type a name";
+  return (
+    <box width="100%" flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.focus} paddingX={1}>
+      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Rename chat"}</text>
+      <text fg={props.model.value ? props.theme.colors.input.text : props.theme.colors.input.placeholder} wrapMode="none" truncate>{`> ${status}`}</text>
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"  enter save  esc cancel"}</text>
+    </box>
+  );
+}
+
 function modelPickerView(
   picker: ModelPickerNavigation,
   candidates: readonly ModelCandidate[],
@@ -1966,6 +2250,96 @@ function permissionsPickerView(
     items: profiles,
     selectedIndex: clampIndex(picker.selectedIndex, profiles.length),
   };
+}
+
+function resumePickerView(
+  picker: ResumePickerNavigation,
+  items: readonly RuntimeSessionSummary[],
+  currentSessionId: SessionId | undefined,
+): ResumePickerModel {
+  return {
+    query: picker.query,
+    items,
+    selectedIndex: clampIndex(picker.selectedIndex, items.length),
+    loading: picker.loading,
+    showAll: picker.showAll,
+    ...(currentSessionId ? { currentSessionId } : {}),
+    ...(picker.error ? { error: picker.error } : {}),
+  };
+}
+
+function filteredResumeSessions(
+  sessions: readonly RuntimeSessionSummary[],
+  query: string,
+  cwd: string,
+  showAll: boolean,
+): RuntimeSessionSummary[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  return sessions
+    .filter((session) => session.status === "active")
+    .filter((session) => showAll || samePath(session.cwd, cwd))
+    .filter((session) => {
+      if (!normalizedQuery) return true;
+      const text = [session.id, session.title, session.preview, session.cwd].filter(Boolean).join(" ").toLowerCase();
+      return text.includes(normalizedQuery) || fuzzyMatchText(text, normalizedQuery);
+    })
+    .sort((left, right) => right.updatedAt - left.updatedAt || String(right.id).localeCompare(String(left.id)));
+}
+
+function resolveResumeTarget(
+  sessions: readonly RuntimeSessionSummary[],
+  target: string,
+): RuntimeSessionSummary | string {
+  const normalized = target.trim().toLowerCase();
+  const active = sessions.filter((session) => session.status === "active");
+  const exactId = active.find((session) => String(session.id).toLowerCase() === normalized);
+  if (exactId) return exactId;
+  const exactTitles = active.filter((session) => session.title?.toLowerCase() === normalized);
+  if (exactTitles.length === 1) return exactTitles[0]!;
+  if (exactTitles.length > 1) return `More than one saved chat is named "${target}". Use /resume and select one, or pass its session ID.`;
+  const idPrefixes = active.filter((session) => String(session.id).toLowerCase().startsWith(normalized));
+  if (idPrefixes.length === 1) return idPrefixes[0]!;
+  if (idPrefixes.length > 1) return `Session ID prefix "${target}" is ambiguous.`;
+  return `Saved chat not found: ${target}`;
+}
+
+function sessionDisplayTitle(session: RuntimeSessionSummary): string {
+  const automaticTitle = session.cwd.split("/").filter(Boolean).at(-1) ?? "Untitled";
+  const title = session.title?.trim();
+  if (title && title !== automaticTitle) return shorten(title, 44);
+  const preview = firstDisplayLine(session.preview);
+  if (preview) return shorten(preview, 44);
+  return shorten(title || String(session.id), 44);
+}
+
+function sessionDisplayPreview(session: RuntimeSessionSummary): string {
+  const title = sessionDisplayTitle(session);
+  const preview = firstDisplayLine(session.preview);
+  if (!preview || title === shorten(preview, 44)) {
+    return session.cwd.split("/").filter(Boolean).at(-1) ?? session.cwd;
+  }
+  return shorten(preview, 54);
+}
+
+function firstDisplayLine(value: string | undefined): string {
+  return value?.replace(/\s+/g, " ").trim() ?? "";
+}
+
+function relativeSessionTime(time: number, now = Date.now()): string {
+  const seconds = Math.max(0, Math.floor((now - time) / 1_000));
+  if (seconds < 60) return "now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d`;
+  return new Date(time).toISOString().slice(0, 10);
+}
+
+function samePath(left: string, right: string): boolean {
+  const normalize = (value: string) => value.replace(/\/+$/, "") || "/";
+  return normalize(left) === normalize(right);
 }
 
 function visiblePickerItems<T>(items: readonly T[], selectedIndex: number, maxVisible: number): Array<{ item: T; index: number }> {
@@ -2405,6 +2779,22 @@ async function applySlashResult(
   }
   if (result.type === "new_session") {
     await actions.startNewChatSession();
+    return;
+  }
+  if (result.type === "open_resume_picker") {
+    actions.openResumePicker();
+    return;
+  }
+  if (result.type === "resume_session") {
+    await actions.resumeSessionByTarget(result.target);
+    return;
+  }
+  if (result.type === "open_rename_prompt") {
+    actions.openRenamePrompt();
+    return;
+  }
+  if (result.type === "rename_session") {
+    await actions.renameChatSession(result.title);
     return;
   }
   if (result.type === "goal_action") {
