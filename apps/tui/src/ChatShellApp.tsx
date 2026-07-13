@@ -492,11 +492,11 @@ export function ChatShellSurface(props: {
   }, []);
   const openModelPicker = useCallback((query = "") => {
     void props.runtime.refreshModelConfig?.();
-    const index = modelPickerIndex(modelCandidates, query, modelSelection);
+    const index = modelPickerIndex(modelCandidates, query, modelSelection, undefined);
     setReasoningPicker(undefined);
     setPermissionsPicker(undefined);
     setThemePicker(undefined);
-    setModelPicker({ query, selectedIndex: index });
+    setModelPicker({ query, selectedIndex: index, provider: undefined });
   }, [modelCandidates, modelSelection, props.runtime]);
   const closeModelPicker = useCallback(() => {
     setModelPicker(undefined);
@@ -1688,6 +1688,7 @@ interface ThemePickerModel {
 interface ModelPickerNavigation {
   query: string;
   selectedIndex: number;
+  provider: string | undefined;
 }
 
 interface ModelPickerModel {
@@ -1695,15 +1696,25 @@ interface ModelPickerModel {
   items: readonly ModelPickerItem[];
   selectedIndex: number;
   total: number;
+  provider: ModelPickerProvider;
+  providerIndex: number;
+  providerTotal: number;
 }
 
 interface ModelPickerItem {
   selection: ModelSelection;
   label: string;
   provider: string;
+  providerLabel: string;
   displayName?: string | undefined;
   available?: boolean | undefined;
   current: boolean;
+}
+
+interface ModelPickerProvider {
+  id: string | undefined;
+  label: string;
+  modelCount: number;
 }
 
 interface ReasoningPickerNavigation {
@@ -1746,7 +1757,7 @@ function selectorPickerHeight(
   reasoningPicker: ReasoningPickerModel | undefined,
   permissionsPicker: PermissionsPickerModel | undefined,
 ): number {
-  if (modelPicker) return Math.min(modelPicker.items.length, 8) + 4;
+  if (modelPicker) return Math.min(modelPicker.items.length, 8) + 6;
   if (reasoningPicker) return reasoningPicker.items.length + 3;
   if (permissionsPicker) return permissionsPicker.items.length + 3;
   return 0;
@@ -1800,10 +1811,14 @@ function ModelPicker(props: { model: ModelPickerModel; theme: TuiTheme }) {
   return (
     <box width="100%" flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.focus} paddingX={1}>
       <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Model"}</text>
-      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`Filter: ${props.model.query || "all"}`}</text>
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>
+        {`Provider: ${props.model.provider.label} (${props.model.provider.modelCount})  ${props.model.providerIndex + 1}/${props.model.providerTotal}  ←/→ switch`}
+      </text>
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`Search: ${props.model.query || "type to filter models"}`}</text>
       {visibleItems.map(({ item, index }) => {
         const selected = index === props.model.selectedIndex;
         const suffix = [item.available === false ? " not configured" : "", item.current ? " *" : ""].join("");
+        const provider = props.model.provider.id ? "" : ` [${item.providerLabel}]`;
         return (
           <text
             key={modelSelectionLabel(item.selection)}
@@ -1812,7 +1827,7 @@ function ModelPicker(props: { model: ModelPickerModel; theme: TuiTheme }) {
             wrapMode="none"
             truncate
           >
-            {`${selected ? ">" : " "} ${item.label} [${item.provider}]${suffix}`}
+            {`${selected ? ">" : " "} ${item.label}${provider}${suffix}`}
           </text>
         );
       })}
@@ -1821,6 +1836,7 @@ function ModelPicker(props: { model: ModelPickerModel; theme: TuiTheme }) {
       ) : (
         <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{modelPickerDetail(props.model)}</text>
       )}
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"  ↑/↓ navigate  enter select  esc close"}</text>
     </box>
   );
 }
@@ -1876,10 +1892,14 @@ function modelPickerView(
   candidates: readonly ModelCandidate[],
   current: ModelSelection | undefined,
 ): ModelPickerModel {
-  const items = filterModelCandidates(candidates, picker.query, current).map((candidate) => ({
+  const providers = modelPickerProviders(candidates, current);
+  const providerIndex = Math.max(0, providers.findIndex((provider) => provider.id === picker.provider));
+  const provider = providers[providerIndex] ?? providers[0]!;
+  const items = modelPickerCandidates(candidates, picker.query, current, provider.id).map((candidate) => ({
     selection: modelDescriptorSelection(candidate),
     label: candidate.model,
     provider: candidate.provider,
+    providerLabel: candidate.providerDisplayName ?? candidate.provider,
     ...(candidate.displayName ? { displayName: candidate.displayName } : {}),
     ...(candidate.available !== undefined ? { available: candidate.available } : {}),
     current: sameModelSelection(current, modelDescriptorSelection(candidate)),
@@ -1889,7 +1909,41 @@ function modelPickerView(
     items,
     selectedIndex: clampIndex(picker.selectedIndex, items.length),
     total: items.length,
+    provider,
+    providerIndex,
+    providerTotal: providers.length,
   };
+}
+
+function modelPickerProviders(
+  candidates: readonly ModelCandidate[],
+  current: ModelSelection | undefined,
+): ModelPickerProvider[] {
+  const providers = new Map<string, ModelPickerProvider>();
+  for (const candidate of candidates) {
+    const existing = providers.get(candidate.provider);
+    providers.set(candidate.provider, {
+      id: candidate.provider,
+      label: candidate.providerDisplayName ?? existing?.label ?? candidate.provider,
+      modelCount: (existing?.modelCount ?? 0) + 1,
+    });
+  }
+  const sorted = [...providers.values()].sort((left, right) => {
+    if (left.id === current?.provider && right.id !== current?.provider) return -1;
+    if (right.id === current?.provider && left.id !== current?.provider) return 1;
+    return left.label.localeCompare(right.label);
+  });
+  return [{ id: undefined, label: "All providers", modelCount: candidates.length }, ...sorted];
+}
+
+function modelPickerCandidates(
+  candidates: readonly ModelCandidate[],
+  query: string,
+  current: ModelSelection | undefined,
+  provider: string | undefined,
+): ModelCandidate[] {
+  const scoped = provider ? candidates.filter((candidate) => candidate.provider === provider) : candidates;
+  return filterModelCandidates(scoped, query, current);
 }
 
 function reasoningPickerView(picker: ReasoningPickerNavigation, current: ReasoningLevel): ReasoningPickerModel {
@@ -1932,8 +1986,9 @@ function modelPickerIndex(
   candidates: readonly ModelCandidate[],
   query: string,
   current: ModelSelection | undefined,
+  provider: string | undefined,
 ): number {
-  const items = filterModelCandidates(candidates, query, current);
+  const items = modelPickerCandidates(candidates, query, current, provider);
   if (items.length === 0) return 0;
   const currentIndex = current
     ? items.findIndex((item) => sameModelSelection(current, modelDescriptorSelection(item)))
@@ -2817,7 +2872,19 @@ function handleModelPickerKey(
     actions.cancel();
     return;
   }
-  const items = filterModelCandidates(candidates, picker.query, current);
+  const providers = modelPickerProviders(candidates, current);
+  if (isArrowLeft(key) || isArrowRight(key)) {
+    const currentProviderIndex = Math.max(0, providers.findIndex((provider) => provider.id === picker.provider));
+    const delta = isArrowLeft(key) ? -1 : 1;
+    const provider = providers[wrapIndex(currentProviderIndex + delta, providers.length)]?.id;
+    actions.setModelPicker((state) => state ? {
+      ...state,
+      provider,
+      selectedIndex: modelPickerIndex(candidates, state.query, current, provider),
+    } : state);
+    return;
+  }
+  const items = modelPickerCandidates(candidates, picker.query, current, picker.provider);
   if (isArrowUp(key) || isArrowDown(key)) {
     const delta = isArrowUp(key) ? -1 : 1;
     actions.setModelPicker((state) => state ? { ...state, selectedIndex: clampIndex(state.selectedIndex + delta, items.length) } : state);
@@ -2832,7 +2899,7 @@ function handleModelPickerKey(
     actions.setModelPicker((state) => {
       if (!state) return state;
       const query = state.query.slice(0, -1);
-      return { query, selectedIndex: modelPickerIndex(candidates, query, current) };
+      return { ...state, query, selectedIndex: modelPickerIndex(candidates, query, current, state.provider) };
     });
     return;
   }
@@ -2841,7 +2908,7 @@ function handleModelPickerKey(
     actions.setModelPicker((state) => {
       if (!state) return state;
       const query = `${state.query}${printable}`;
-      return { query, selectedIndex: modelPickerIndex(candidates, query, current) };
+      return { ...state, query, selectedIndex: modelPickerIndex(candidates, query, current, state.provider) };
     });
   }
 }
@@ -3305,6 +3372,14 @@ function isArrowUp(key: KeyEvent): boolean {
 
 function isArrowDown(key: KeyEvent): boolean {
   return key.name === "down" || key.name === "arrow_down";
+}
+
+function isArrowLeft(key: KeyEvent): boolean {
+  return key.name === "left" || key.name === "arrow_left";
+}
+
+function isArrowRight(key: KeyEvent): boolean {
+  return key.name === "right" || key.name === "arrow_right";
 }
 
 function isPlainArrowUp(key: KeyEvent): boolean {

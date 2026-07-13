@@ -2555,6 +2555,43 @@ test("/model uses runtime catalog and persists the selected model", async () => 
   }
 });
 
+test("/model filters by provider and exposes direct search", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: [
+        { provider: "test-provider", providerDisplayName: "Test Provider", model: "test-model" },
+        { provider: "anthropic", providerDisplayName: "Anthropic", model: "claude-opus-4.1" },
+        { provider: "openai", providerDisplayName: "OpenAI", model: "gpt-5.5" },
+      ],
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+
+    let frame = app.captureCharFrame();
+    expect(frame).toContain("Provider: All providers (3)");
+    expect(frame).toContain("Search: type to filter models");
+    expect(frame).toContain("←/→ switch");
+
+    await press(app, () => app.mockInput.pressArrow("right"));
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Provider: Anthropic (1)");
+    expect(frame).toContain("claude-opus-4.1");
+    expect(frame).not.toContain("test-model [Test Provider]");
+
+    await typeText(app, "opus");
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Provider: Anthropic (1)");
+    expect(frame).toContain("Search: opus");
+    expect(frame).toContain("claude-opus-4.1");
+    expect(frame).not.toContain("gpt-5.5");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("/model keeps the old UI state when persistence fails", async () => {
   const app = await mountShell(teamLiveFixture(), {
     runtime: {
