@@ -20,8 +20,7 @@ import {
 } from "./tool-renderers.js";
 
 export type ChatDisplayItem =
-  | { kind: "user_text"; id: string; text: string; time?: number }
-  | { kind: "user_image"; id: string; label: string; time?: number }
+  | { kind: "user_message"; id: string; text: string; imageLabels: string[]; time?: number }
   | { kind: "assistant_text"; id: string; text: string; streaming?: boolean; time?: number }
   | { kind: "reasoning"; id: string; text: string; collapsed: true; active?: boolean; time?: number }
   | { kind: "tool_activity"; id: string; activity: ToolActivityDisplay; time?: number }
@@ -130,6 +129,20 @@ function messageDisplayItems(
   hideThinking: boolean,
   streaming: boolean,
 ): ChatDisplayItem[] {
+  if (message.role === "user") {
+    const text = message.parts
+      .filter((part): part is Extract<ChatMessagePart, { type: "text" }> => part.type === "text")
+      .map((part) => part.text)
+      .join("\n")
+      .trimEnd();
+    const imageLabels = message.parts.flatMap((part) => {
+      if (part.type !== "image") return [];
+      return [part.displayText ?? part.sourcePath ?? part.filename ?? part.mimeType];
+    });
+    if (!text && imageLabels.length === 0) return [];
+    return [{ kind: "user_message", id: message.id, text, imageLabels, time: message.createdAt }];
+  }
+
   const output: ChatDisplayItem[] = [];
   const streamingTextPartIndex = streaming ? lastTextPartIndex(message.parts) : -1;
   const hideStreamingAssistantText = hideThinking && message.role === "assistant" && streaming;
@@ -148,15 +161,13 @@ function messageDisplayItems(
         showHiddenTrace(hideStreamingAssistantText);
         continue;
       }
-      if (message.role === "user") output.push({ kind: "user_text", id, text: part.text, time: message.createdAt });
-      else if (message.role === "assistant") output.push({ kind: "assistant_text", id, text: part.text, time: message.createdAt, ...(index === streamingTextPartIndex ? { streaming: true } : {}) });
+      if (message.role === "assistant") output.push({ kind: "assistant_text", id, text: part.text, time: message.createdAt, ...(index === streamingTextPartIndex ? { streaming: true } : {}) });
       else output.push({ kind: "summary", id, text: `${message.role}: ${part.text}`, time: message.createdAt });
       continue;
     }
     if (part.type === "image") {
       const label = part.displayText ?? part.sourcePath ?? part.filename ?? part.mimeType;
-      if (message.role === "user") output.push({ kind: "user_image", id, label, time: message.createdAt });
-      else output.push({ kind: "summary", id, text: `image: ${label}`, time: message.createdAt });
+      output.push({ kind: "summary", id, text: `image: ${label}`, time: message.createdAt });
       continue;
     }
     if (part.type === "reasoning") {

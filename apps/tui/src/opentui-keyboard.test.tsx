@@ -1587,8 +1587,9 @@ test("Ctrl+V pastes without scrolling the transcript down", async () => {
   });
 
   try {
-    await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
-    await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
+    for (let index = 0; index < 4; index += 1) {
+      await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
+    }
     expect(app.captureCharFrame()).toContain("message 01");
 
     await press(app, () => app.mockInput.pressKey("v", { ctrl: true }));
@@ -2104,13 +2105,15 @@ test("Shift+Up and Shift+Down scroll the transcript instead of prompt history", 
     expect(app.captureCharFrame()).toContain("message 30");
     expect(app.captureCharFrame()).not.toContain("message 01");
 
-    await press(app, () => app.mockInput.pressArrow("up", { shift: true }));
-    await press(app, () => app.mockInput.pressArrow("up", { shift: true }));
+    for (let index = 0; index < 4; index += 1) {
+      await press(app, () => app.mockInput.pressArrow("up", { shift: true }));
+    }
     expect(app.captureCharFrame()).toContain("message 01");
     expect(app.captureCharFrame()).not.toContain("scroll history");
 
-    await press(app, () => app.mockInput.pressArrow("down", { shift: true }));
-    await press(app, () => app.mockInput.pressArrow("down", { shift: true }));
+    for (let index = 0; index < 4; index += 1) {
+      await press(app, () => app.mockInput.pressArrow("down", { shift: true }));
+    }
     expect(app.captureCharFrame()).toContain("message 30");
     expect(app.captureCharFrame()).not.toContain("scroll history");
   } finally {
@@ -2135,8 +2138,9 @@ test("chat scroll stays on history when new messages arrive above the bottom", a
   });
 
   try {
-    await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
-    await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
+    for (let index = 0; index < 4; index += 1) {
+      await press(app, () => app.mockInput.pressKey("y", { ctrl: true }));
+    }
     expect(app.captureCharFrame()).toContain("message 01");
     expect(app.captureCharFrame()).not.toContain("message 30");
 

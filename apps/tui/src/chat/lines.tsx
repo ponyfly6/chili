@@ -9,6 +9,7 @@ export interface TranscriptLineModel {
   key: string;
   text: string;
   fg: string;
+  bg?: string | undefined;
   fileLinks?: FileLinkRange[];
 }
 
@@ -30,6 +31,7 @@ export function TranscriptLine(props: {
   return (
     <text
       fg={props.line.fg}
+      {...(props.line.bg === undefined ? {} : { bg: props.line.bg, width: "100%" })}
       content={content}
       wrapMode="none"
       truncate
@@ -70,7 +72,7 @@ export function TranscriptLines(props: {
   );
 }
 
-export function wrapLine(text: string, options: { key: string; fg: string; width: number; hangingIndent?: string; cwd?: string }): TranscriptLineModel[] {
+export function wrapLine(text: string, options: { key: string; fg: string; bg?: string; width: number; hangingIndent?: string; cwd?: string }): TranscriptLineModel[] {
   return wrapTerminalText(text, {
     key: options.key,
     width: options.width,
@@ -79,6 +81,7 @@ export function wrapLine(text: string, options: { key: string; fg: string; width
     key: line.key,
     text: line.text,
     fg: options.fg,
+    ...(options.bg === undefined ? {} : { bg: options.bg }),
     ...(options.cwd === undefined ? {} : { fileLinks: fileLinksForText(line.text, options.cwd) }),
   }));
 }

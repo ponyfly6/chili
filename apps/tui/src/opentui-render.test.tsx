@@ -174,8 +174,7 @@ test("renders chat transcript as a scrollable window", async () => {
     expect(app.captureCharFrame()).not.toContain("message 01");
 
     act(() => {
-      app.mockInput.pressKey("y", { ctrl: true });
-      app.mockInput.pressKey("y", { ctrl: true });
+      for (let index = 0; index < 4; index += 1) app.mockInput.pressKey("y", { ctrl: true });
     });
     await Bun.sleep(60);
     await app.renderOnce();
@@ -588,7 +587,7 @@ test("mouse wheel scrolls the chat transcript", async () => {
     expect(app.captureCharFrame()).not.toContain("message 01");
 
     await act(async () => {
-      for (let index = 0; index < 16; index += 1) {
+      for (let index = 0; index < 48; index += 1) {
         await app.mockMouse.scroll(10, 3, "up");
       }
     });
@@ -599,7 +598,7 @@ test("mouse wheel scrolls the chat transcript", async () => {
     expect(app.captureCharFrame()).not.toContain("message 30");
 
     await act(async () => {
-      for (let index = 0; index < 16; index += 1) {
+      for (let index = 0; index < 48; index += 1) {
         await app.mockMouse.scroll(10, 3, "down");
       }
     });

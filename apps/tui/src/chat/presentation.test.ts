@@ -3,6 +3,27 @@ import type { MessageId, PartId, ToolCallId } from "@chili/protocol";
 import type { ChatTranscriptItem } from "@chili/sdk";
 import { buildChatDisplayItems } from "./presentation.js";
 
+test("user message presentation keeps text and images in one card", () => {
+  const display = buildChatDisplayItems([{
+    id: "msg_user_card" as MessageId,
+    kind: "message",
+    role: "user",
+    createdAt: 1,
+    parts: [
+      { type: "text", id: "part_user_text" as PartId, text: "inspect this" },
+      { type: "image", id: "part_user_image" as PartId, mimeType: "image/png", displayText: "[Image #1]" },
+    ],
+  }]);
+
+  expect(display).toEqual([{
+    kind: "user_message",
+    id: "msg_user_card",
+    text: "inspect this",
+    imageLabels: ["[Image #1]"],
+    time: 1,
+  }]);
+});
+
 test("tool activity presentation carries renderer cell fields", () => {
   const display = buildChatDisplayItems([
     chatTool("git_diff_1" as ToolCallId, "git_diff", "completed", "succeeded", { title: "git_diff", detail: "src/example.ts" }, {

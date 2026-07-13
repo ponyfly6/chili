@@ -6,6 +6,7 @@ import type { TuiTheme } from "../theme/index.js";
 import { AssistantMarkdownCell, assistantTextCellLines } from "./AssistantCells.js";
 import { componentBackedCell, lineBackedCell, TranscriptCellView, type TranscriptCellModel } from "./cells.js";
 import { type OpenFileLinkHandler, type TranscriptLineModel, wrapLine } from "./lines.js";
+import { charDisplayWidth } from "./markdown.js";
 import { localTranscriptItemTime } from "./local-transcript.js";
 import { buildChatDisplayItems, groupExplorationTools, type ChatDisplayItem } from "./presentation.js";
 import { ToolCell, ToolGroupCell, toolCellLines, toolGroupCellLines } from "./ToolCells.js";
@@ -139,13 +140,8 @@ function chatDisplayItemTime(item: ChatDisplayItem): number {
 }
 
 function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, hideThinking: boolean, cwd: string): TranscriptCellModel {
-  if (item.kind === "user_text") {
-    return lineBackedCell(`display:${item.kind}:${item.id}`, wrapLine(`🥔: ${item.text || "..."}`, {
-      key: `display:${item.kind}:${item.id}`,
-      fg: theme.colors.text.primary,
-      width,
-      hangingIndent: "    ",
-    }));
+  if (item.kind === "user_message") {
+    return lineBackedCell(`display:${item.kind}:${item.id}`, userMessageLines(item, width, theme));
   }
   if (item.kind === "assistant_text") {
     const key = `display:${item.kind}:${item.id}`;
@@ -172,14 +168,6 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, 
       fallbackLines: lines,
     });
   }
-  if (item.kind === "user_image") {
-    return lineBackedCell(`display:${item.kind}:${item.id}`, wrapLine(`image: ${item.label || "[image]"}`, {
-      key: `display:${item.kind}:${item.id}`,
-      fg: theme.colors.text.secondary,
-      width,
-      hangingIndent: "    ",
-    }));
-  }
   if (item.kind === "reasoning") return lineBackedCell(`display:${item.kind}:${item.id}`, reasoningLines(item, width, theme, hideThinking));
   if (item.kind === "tool_activity") {
     return componentBackedCell({
@@ -204,6 +192,66 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, 
     }));
   }
   return lineBackedCell(`${item.approval.kind}:${item.approval.id}`, approvalLines(item.approval, width, theme));
+}
+
+function userMessageLines(
+  item: Extract<ChatDisplayItem, { kind: "user_message" }>,
+  width: number,
+  theme: TuiTheme,
+): TranscriptLineModel[] {
+  const key = `display:${item.kind}:${item.id}`;
+  const background = theme.colors.message.userBackground;
+  const contentWidth = Math.max(1, width - 1);
+  const lines: TranscriptLineModel[] = [
+    {
+      key: `${key}:before`,
+      text: " ",
+      fg: theme.colors.text.primary,
+    },
+  ];
+
+  item.imageLabels.forEach((label, index) => {
+    lines.push(...wrapLine(`    image: ${label || "[image]"}`, {
+      key: `${key}:image:${index}`,
+      fg: theme.colors.accent.secondary,
+      bg: background,
+      width: contentWidth,
+      hangingIndent: "    ",
+    }));
+  });
+  if (item.imageLabels.length > 0 && item.text) {
+    lines.push({
+      key: `${key}:image-text-spacer`,
+      text: " ",
+      fg: theme.colors.text.primary,
+      bg: background,
+    });
+  }
+  if (item.text) {
+    item.text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").forEach((text, index) => {
+      lines.push(...wrapLine(`${index === 0 ? "🥔: " : "    "}${text || " "}`, {
+        key: `${key}:text:${index}`,
+        fg: theme.colors.text.primary,
+        bg: background,
+        width: contentWidth,
+        hangingIndent: "    ",
+      }));
+    });
+  }
+
+  lines.push({
+    key: `${key}:after`,
+    text: " ",
+    fg: theme.colors.text.primary,
+  });
+  return lines.map((line) => line.bg
+    ? { ...line, text: padLineToWidth(line.text, contentWidth) }
+    : line);
+}
+
+function padLineToWidth(text: string, width: number): string {
+  const currentWidth = [...text].reduce((total, char) => total + charDisplayWidth(char), 0);
+  return `${text}${" ".repeat(Math.max(0, width - currentWidth))}`;
 }
 
 function localItemCell(item: LocalTranscriptItem, width: number, theme: TuiTheme): TranscriptCellModel {

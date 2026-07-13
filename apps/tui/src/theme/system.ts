@@ -49,6 +49,7 @@ export function generateSystemTheme(input: SystemPaletteInput | null | undefined
   const border = mix(background, foreground, 0.22);
   const subtleBorder = mix(background, foreground, 0.12);
   const selectedBackground = mix(background, accent, 0.2);
+  const userBackground = mix(background, foreground, colorBrightness(background) > colorBrightness(foreground) ? 0.04 : 0.12);
 
   return {
     id: "system",
@@ -57,6 +58,9 @@ export function generateSystemTheme(input: SystemPaletteInput | null | undefined
       background,
       panel,
       overlay,
+      message: {
+        userBackground,
+      },
       text: {
         primary: foreground,
         secondary: mix(foreground, background, 0.18),
@@ -139,6 +143,11 @@ function hexToRgb(hex: string): { r: number; g: number; b: number } {
     g: Number.parseInt(normalized.slice(3, 5), 16),
     b: Number.parseInt(normalized.slice(5, 7), 16),
   };
+}
+
+function colorBrightness(hex: string): number {
+  const { r, g, b } = hexToRgb(hex);
+  return r * 0.299 + g * 0.587 + b * 0.114;
 }
 
 function rgbToHex(rgb: { r: number; g: number; b: number }): string {

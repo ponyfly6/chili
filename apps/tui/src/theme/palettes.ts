@@ -7,6 +7,9 @@ export const chiliDarkTheme: TuiTheme = {
     background: "#050505",
     panel: "#0b0f14",
     overlay: "#0b0f14",
+    message: {
+      userBackground: "#222221",
+    },
     text: {
       primary: "#f8f8f2",
       secondary: "#d8dee9",
@@ -58,6 +61,9 @@ export const terminalDarkTheme: TuiTheme = {
     background: "#000000",
     panel: "#0a0a0a",
     overlay: "#101010",
+    message: {
+      userBackground: "#1d1d1d",
+    },
     text: {
       primary: "#eeeeee",
       secondary: "#c7c7c7",
@@ -109,6 +115,9 @@ export const chiliLightTheme: TuiTheme = {
     background: "#fbfbf8",
     panel: "#f2f4f7",
     overlay: "#ffffff",
+    message: {
+      userBackground: "#f2f2f0",
+    },
     text: {
       primary: "#1f2328",
       secondary: "#3f4652",
@@ -160,6 +169,9 @@ export const warmLightTheme: TuiTheme = {
     background: "#faf6ee",
     panel: "#f1eadf",
     overlay: "#fffaf2",
+    message: {
+      userBackground: "#f2eee6",
+    },
     text: {
       primary: "#292524",
       secondary: "#57534e",

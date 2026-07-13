@@ -189,6 +189,7 @@ test("generates a system TUI theme from a terminal palette", () => {
     name: "System",
     colors: {
       background: "#101820",
+      message: { userBackground: "#2c3339" },
       text: { primary: "#f8f8f2" },
       accent: { primary: "#7ee7c8" },
       status: {
@@ -221,6 +222,7 @@ test("detects system TUI theme with a fresh renderer palette", async () => {
     id: "system",
     colors: {
       background: "#fdfdfd",
+      message: { userBackground: "#f4f4f4" },
       text: { primary: "#101010" },
       accent: { primary: "#228f8f" },
     },

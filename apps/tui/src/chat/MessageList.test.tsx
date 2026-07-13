@@ -4,7 +4,7 @@ import type { ScrollBoxRenderable } from "@opentui/core";
 import { act, createRef } from "react";
 import type { ChatSessionView, ChatTranscriptItem } from "@chili/sdk";
 import type { MessageId, PartId, ToolCallId } from "@chili/protocol";
-import { resolveTuiTheme } from "../theme/index.js";
+import { chiliDarkTheme, resolveTuiTheme } from "../theme/index.js";
 import { charDisplayWidth, markdownToTerminalLines, type MarkdownRenderOptions, type MarkdownTerminalLine } from "./markdown.js";
 import { MessageList } from "./MessageList.js";
 import { buildChatDisplayItems } from "./presentation.js";
@@ -12,6 +12,27 @@ import { HistoryRenderModel } from "./render-model.js";
 import { splitStreamingMarkdown } from "./streaming.js";
 import { renderToolActivity } from "./tool-renderers.js";
 import type { LocalTranscriptItem } from "./types.js";
+
+test("user messages render as compact cards with one outer row of vertical spacing", async () => {
+  const width = 36;
+  const app = await renderMessageListApp([
+    chatMessage("msg_user_card", "user", "第一行人类消息\n第二行仍然在同一张卡片里", 1),
+  ], { width, height: 12 });
+
+  try {
+    const frame = app.frame();
+    expect(frame).toContain("🥔: 第一行人类消息");
+    expect(frame).toContain("    第二行仍然在同一张卡片里");
+    const messagePosition = frameTextPosition(frame, "🥔: 第一行人类消息");
+    const secondLinePosition = frameTextPosition(frame, "    第二行仍然在同一张卡片里");
+    expect(app.backgroundMatches(messagePosition.x, messagePosition.y, chiliDarkTheme.colors.message.userBackground)).toBe(true);
+    expect(app.backgroundMatches(width - 2, messagePosition.y, chiliDarkTheme.colors.message.userBackground)).toBe(true);
+    expect(app.backgroundMatches(0, messagePosition.y - 1, chiliDarkTheme.colors.message.userBackground)).toBe(false);
+    expect(app.backgroundMatches(0, secondLinePosition.y + 1, chiliDarkTheme.colors.message.userBackground)).toBe(false);
+  } finally {
+    app.destroy();
+  }
+});
 
 test("assistant markdown renders readable terminal lines", () => {
   const markdown = [
@@ -817,6 +838,7 @@ async function renderMessageListApp(
   options: MessageListTestOptions = {},
 ): Promise<{
   frame: () => string;
+  backgroundMatches: (x: number, y: number, color: string) => boolean;
   scrollBy: (delta: number) => Promise<void>;
   destroy: () => void;
 }> {
@@ -840,6 +862,7 @@ async function renderMessageListApp(
     });
     return {
       frame: () => app.captureCharFrame(),
+      backgroundMatches: (x, y, color) => renderBufferColorMatches(app.renderer.currentRenderBuffer.buffers.bg, app.renderer.currentRenderBuffer.width, x, y, color),
       scrollBy: async (delta: number) => {
         await act(async () => {
           scrollRef.current?.scrollBy(delta);
@@ -893,6 +916,26 @@ function occurrences(value: string, needle: string): number {
 
 function displayWidth(value: string): number {
   return [...value].reduce((sum, char) => sum + charDisplayWidth(char), 0);
+}
+
+function frameTextPosition(frame: string, text: string): { x: number; y: number } {
+  for (const [y, line] of frame.split("\n").entries()) {
+    const index = line.indexOf(text);
+    if (index >= 0) return { x: displayWidth(line.slice(0, index)), y };
+  }
+  throw new Error(`Frame did not include ${text}`);
+}
+
+function renderBufferColorMatches(buffer: Float32Array, width: number, x: number, y: number, color: string): boolean {
+  const offset = (y * width + x) * 4;
+  const value = color.replace(/^#/, "");
+  const expected = [
+    Number.parseInt(value.slice(0, 2), 16) / 255,
+    Number.parseInt(value.slice(2, 4), 16) / 255,
+    Number.parseInt(value.slice(4, 6), 16) / 255,
+    1,
+  ];
+  return expected.every((channel, index) => Math.abs((buffer[offset + index] ?? 0) - channel) < 0.001);
 }
 
 function countingMarkdownRenderer(calls: string[]): (text: string, options: MarkdownRenderOptions) => MarkdownTerminalLine[] {
