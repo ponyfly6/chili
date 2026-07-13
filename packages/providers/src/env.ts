@@ -1,4 +1,10 @@
-import { DEEPSEEK_PROVIDER_ID, KIMI_PROVIDER_ID, MINIMAX_PROVIDER_ID, OPENAI_CODEX_PROVIDER_ID } from "./models.js";
+import {
+  DEEPSEEK_PROVIDER_ID,
+  KIMI_PROVIDER_ID,
+  MINIMAX_PROVIDER_ID,
+  OPENAI_CODEX_PROVIDER_ID,
+  ZAI_PROVIDER_ID,
+} from "./models.js";
 
 export type EnvironmentSource = Record<string, string | undefined>;
 
@@ -35,6 +41,12 @@ export const KIMI_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
   model: ["MOONSHOT_MODEL", "KIMI_MODEL"],
 };
 
+export const ZAI_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
+  apiKey: ["ZAI_API_KEY"],
+  baseUrl: ["ZAI_BASE_URL"],
+  model: ["ZAI_MODEL"],
+};
+
 export const OPENAI_CODEX_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
   apiKey: ["OPENAI_CODEX_ACCESS_TOKEN"],
   baseUrl: ["OPENAI_CODEX_BASE_URL"],
@@ -46,6 +58,7 @@ const PROVIDER_ENVIRONMENT: Record<string, ProviderEnvironmentSpec> = {
   [KIMI_PROVIDER_ID]: KIMI_ENVIRONMENT,
   [MINIMAX_PROVIDER_ID]: MINIMAX_ENVIRONMENT,
   [OPENAI_CODEX_PROVIDER_ID]: OPENAI_CODEX_ENVIRONMENT,
+  [ZAI_PROVIDER_ID]: ZAI_ENVIRONMENT,
 };
 
 export function readProviderEnvironment(
@@ -67,6 +80,10 @@ export function readDeepSeekEnvironment(env: EnvironmentSource = currentEnvironm
 
 export function readKimiEnvironment(env: EnvironmentSource = currentEnvironment()): ProviderEnvironment {
   return readEnvironmentSpec(KIMI_ENVIRONMENT, env);
+}
+
+export function readZaiEnvironment(env: EnvironmentSource = currentEnvironment()): ProviderEnvironment {
+  return readEnvironmentSpec(ZAI_ENVIRONMENT, env);
 }
 
 export function readOpenAICodexEnvironment(env: EnvironmentSource = currentEnvironment()): ProviderEnvironment {

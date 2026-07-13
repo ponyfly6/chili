@@ -6,6 +6,7 @@ import {
   listKnownModels,
   MINIMAX_PROVIDER_ID,
   OPENAI_CODEX_PROVIDER_ID,
+  ZAI_PROVIDER_ID,
 } from "./models.js";
 import type { ModelDescriptor } from "./types.js";
 
@@ -41,6 +42,7 @@ export const BUILTIN_PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   [KIMI_PROVIDER_ID]: "Kimi",
   [MINIMAX_PROVIDER_ID]: "MiniMax",
   [OPENAI_CODEX_PROVIDER_ID]: "ChatGPT Codex",
+  [ZAI_PROVIDER_ID]: "Z.ai",
 };
 
 export function getProviderDisplayName(provider: string, overrides: Record<string, string> = {}): string {

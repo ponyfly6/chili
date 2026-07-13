@@ -22,6 +22,11 @@ import {
   readKimiEnvironment,
   readMiniMaxEnvironment,
   readOpenAICodexEnvironment,
+  readZaiEnvironment,
+  ZAI_GLM_52_MODEL,
+  ZAI_GLM_52_1M_MODEL,
+  ZAI_OPENAI_BASE_URL,
+  ZAI_PROVIDER_ID,
 } from "./index.js";
 
 test("catalog describes the built-in DeepSeek V4 OpenAI-compatible models", () => {
@@ -85,6 +90,41 @@ test("catalog describes the built-in Kimi OpenAI-compatible model", () => {
         reasoningParameterStyle: "moonshot",
       },
     },
+  });
+});
+
+test("catalog describes the built-in Z.ai GLM-5.2 model", () => {
+  expect(listKnownModels(ZAI_PROVIDER_ID).map((model) => model.model)).toEqual([
+    ZAI_GLM_52_MODEL,
+    ZAI_GLM_52_1M_MODEL,
+  ]);
+  expect(findDefaultKnownModel(ZAI_PROVIDER_ID)).toMatchObject({
+    provider: ZAI_PROVIDER_ID,
+    model: ZAI_GLM_52_MODEL,
+    displayName: "GLM-5.2",
+    apiFamily: "openai-completions",
+    baseUrl: ZAI_OPENAI_BASE_URL,
+    default: true,
+    inputCapabilities: ["text"],
+    contextWindowTokens: 1000000,
+    maxOutputTokens: 131072,
+    cost: { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
+    compatibility: {
+      chatCompletions: {
+        supportsReasoningEffort: true,
+        maxTokensField: "max_tokens",
+        reasoningParameterStyle: "zai",
+        toolCallDeltaMode: "zai-tool-stream",
+      },
+    },
+  });
+  expect(findKnownModel(ZAI_PROVIDER_ID, ZAI_GLM_52_1M_MODEL)).toMatchObject({
+    model: ZAI_GLM_52_1M_MODEL,
+    displayName: "GLM-5.2 1M",
+    apiFamily: "anthropic-messages",
+    baseUrl: "https://api.z.ai/api/anthropic",
+    contextWindowTokens: 1000000,
+    maxOutputTokens: 131072,
   });
 });
 
@@ -187,6 +227,23 @@ test("Kimi env resolution uses Moonshot variables with Kimi fallbacks", () => {
     baseUrlEnv: "MOONSHOT_BASE_URL",
     model: "kimi-k2.6",
     modelEnv: "MOONSHOT_MODEL",
+  });
+});
+
+test("Z.ai env resolution uses provider-specific variables", () => {
+  expect(
+    readZaiEnvironment({
+      ZAI_API_KEY: "zai-key",
+      ZAI_BASE_URL: "https://api.z.ai/api/coding/paas/v4",
+      ZAI_MODEL: "glm-5.2",
+    }),
+  ).toEqual({
+    apiKey: "zai-key",
+    apiKeyEnv: "ZAI_API_KEY",
+    baseUrl: "https://api.z.ai/api/coding/paas/v4",
+    baseUrlEnv: "ZAI_BASE_URL",
+    model: "glm-5.2",
+    modelEnv: "ZAI_MODEL",
   });
 });
 

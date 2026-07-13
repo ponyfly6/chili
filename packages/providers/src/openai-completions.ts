@@ -3,7 +3,15 @@ import { resolveChatCompletionsCompatibility, type ChatCompletionsCompatibility 
 import { assertImageInputSupported } from "./image-input.js";
 import { readSseEvents } from "./sse.js";
 import { prependContextualUserMessage, transformModelMessages } from "./transform-messages.js";
-import type { ChiliModel, ModelInputCapability, ModelStreamEvent, ModelStreamInput, ModelTool, ModelUsage } from "./types.js";
+import type {
+  ChiliModel,
+  ModelInputCapability,
+  ModelStreamEvent,
+  ModelStreamInput,
+  ModelTool,
+  ModelUsage,
+  ReasoningLevel,
+} from "./types.js";
 
 export interface OpenAICompletionsModelOptions {
   provider?: string;
@@ -15,6 +23,7 @@ export interface OpenAICompletionsModelOptions {
   fetch?: typeof fetch;
   headers?: Record<string, string>;
   reasoning?: boolean;
+  reasoningEffort?: ReasoningLevel;
   compatibility?: Partial<ChatCompletionsCompatibility>;
   inputCapabilities?: readonly ModelInputCapability[];
 }
@@ -27,6 +36,7 @@ export interface OpenAICompletionsRequestBuildOptions {
   temperature?: number;
   stream?: boolean;
   reasoning?: boolean;
+  reasoningEffort?: ReasoningLevel;
   compatibility?: Partial<ChatCompletionsCompatibility>;
 }
 
@@ -149,6 +159,7 @@ export class OpenAICompletionsModel implements ChiliModel {
       stream: true,
     };
     if (this.options.reasoning !== undefined) requestOptions.reasoning = this.options.reasoning;
+    if (this.options.reasoningEffort !== undefined) requestOptions.reasoningEffort = this.options.reasoningEffort;
     if (this.options.compatibility !== undefined) requestOptions.compatibility = this.options.compatibility;
     const maxTokens = input.maxTokens ?? this.options.maxTokens;
     const temperature = input.temperature ?? this.options.temperature;
@@ -298,10 +309,17 @@ export function buildOpenAICompletionsRequestBody(
   if ((options.stream ?? true) && compatibility.supportsUsageInStreaming) {
     body.stream_options = { include_usage: true };
   }
-  if (options.reasoning !== undefined) applyReasoningOptions(body, compatibility, options.reasoning);
+  if (options.reasoning !== undefined) {
+    applyReasoningOptions(body, compatibility, options.reasoning, options.reasoningEffort);
+  }
 
   const tools = toOpenAITools(input.tools ?? []);
-  if (tools.length > 0) body.tools = tools;
+  if (tools.length > 0) {
+    body.tools = tools;
+    if ((options.stream ?? true) && compatibility.toolCallDeltaMode === "zai-tool-stream") {
+      body.tool_stream = true;
+    }
+  }
   return body;
 }
 
@@ -309,18 +327,26 @@ function applyReasoningOptions(
   body: Record<string, unknown>,
   compatibility: ChatCompletionsCompatibility,
   reasoning: boolean,
+  reasoningEffort?: ReasoningLevel,
 ): void {
-  if (compatibility.reasoningParameterStyle !== "deepseek" && compatibility.reasoningParameterStyle !== "moonshot") return;
+  if (
+    compatibility.reasoningParameterStyle !== "deepseek"
+    && compatibility.reasoningParameterStyle !== "moonshot"
+    && compatibility.reasoningParameterStyle !== "zai"
+  ) return;
   body.thinking = { type: reasoning ? "enabled" : "disabled" };
-  if (compatibility.reasoningParameterStyle === "deepseek" && reasoning && compatibility.supportsReasoningEffort) {
-    body.reasoning_effort = compatibility.reasoningEffortMap.high ?? "high";
+  if (reasoning && compatibility.supportsReasoningEffort) {
+    const requestedEffort = reasoningEffort ?? (compatibility.reasoningParameterStyle === "deepseek" ? "high" : undefined);
+    if (requestedEffort) {
+      body.reasoning_effort = compatibility.reasoningEffortMap[requestedEffort] ?? requestedEffort;
+    }
   }
 }
 
 export function resolveChatCompletionsUrl(baseUrl: string): string {
   const clean = baseUrl.replace(/\/+$/, "");
   if (clean.endsWith("/chat/completions")) return clean;
-  if (clean.endsWith("/v1")) return `${clean}/chat/completions`;
+  if (clean.endsWith("/v1") || clean.endsWith("/v4")) return `${clean}/chat/completions`;
   return `${clean}/v1/chat/completions`;
 }
 

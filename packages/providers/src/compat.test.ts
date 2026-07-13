@@ -78,6 +78,30 @@ test("detects chat completions differences from provider and baseUrl", () => {
   ).toMatchObject({
     reasoningParameterStyle: "openrouter",
   });
+
+  expect(
+    resolveChatCompletionsCompatibility({
+      provider: "zai",
+      model: "glm-5.2",
+      apiFamily: "openai-completions",
+      baseUrl: "https://api.z.ai/api/paas/v4",
+    }),
+  ).toMatchObject({
+    supportsStore: false,
+    supportsDeveloperRole: false,
+    supportsReasoningEffort: true,
+    requiresReasoningContentOnAssistantMessages: true,
+    maxTokensField: "max_tokens",
+    reasoningParameterStyle: "zai",
+    reasoningEffortMap: {
+      minimal: "high",
+      low: "high",
+      medium: "high",
+      high: "high",
+      xhigh: "max",
+    },
+    toolCallDeltaMode: "zai-tool-stream",
+  });
 });
 
 test("chat completions overrides win over detected values", () => {

@@ -7,6 +7,7 @@ import {
   OPENAI_CODEX_PROVIDER_ID,
   parseModelSelectionPattern,
   resolveModelSelectionPattern,
+  ZAI_PROVIDER_ID,
 } from "./index.js";
 import type { ModelDescriptor } from "./types.js";
 
@@ -27,6 +28,28 @@ test("parses provider/model patterns with optional reasoning suffixes", () => {
     model: "gpt-5.5",
     reasoning: "low",
     thinking: "low",
+  });
+});
+
+test("catalog exposes configured Z.ai GLM-5.2", () => {
+  const catalog = listModelCatalog(ZAI_PROVIDER_ID, { env: { ZAI_API_KEY: "token" } });
+  expect(catalog.find((model) => model.model === "glm-5.2")).toMatchObject({
+    provider: ZAI_PROVIDER_ID,
+    model: "glm-5.2",
+    displayName: "GLM-5.2",
+    providerDisplayName: "Z.ai",
+    available: true,
+  });
+  expect(catalog.find((model) => model.model === "glm-5.2[1m]")).toMatchObject({
+    apiFamily: "anthropic-messages",
+    available: true,
+  });
+  expect(resolveModelSelectionPattern("zai/glm-5.2:xhigh", catalog)).toMatchObject({
+    selection: {
+      provider: ZAI_PROVIDER_ID,
+      model: "glm-5.2",
+      reasoning: "xhigh",
+    },
   });
 });
 

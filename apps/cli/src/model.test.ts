@@ -13,6 +13,9 @@ const savedEnv = {
   KIMI_API_KEY: process.env.KIMI_API_KEY,
   KIMI_BASE_URL: process.env.KIMI_BASE_URL,
   KIMI_MODEL: process.env.KIMI_MODEL,
+  ZAI_API_KEY: process.env.ZAI_API_KEY,
+  ZAI_BASE_URL: process.env.ZAI_BASE_URL,
+  ZAI_MODEL: process.env.ZAI_MODEL,
   OPENAI_CODEX_ACCESS_TOKEN: process.env.OPENAI_CODEX_ACCESS_TOKEN,
   OPENAI_CODEX_BASE_URL: process.env.OPENAI_CODEX_BASE_URL,
   OPENAI_CODEX_MODEL: process.env.OPENAI_CODEX_MODEL,
@@ -34,6 +37,9 @@ afterEach(() => {
   restoreEnv("KIMI_API_KEY", savedEnv.KIMI_API_KEY);
   restoreEnv("KIMI_BASE_URL", savedEnv.KIMI_BASE_URL);
   restoreEnv("KIMI_MODEL", savedEnv.KIMI_MODEL);
+  restoreEnv("ZAI_API_KEY", savedEnv.ZAI_API_KEY);
+  restoreEnv("ZAI_BASE_URL", savedEnv.ZAI_BASE_URL);
+  restoreEnv("ZAI_MODEL", savedEnv.ZAI_MODEL);
   restoreEnv("OPENAI_CODEX_ACCESS_TOKEN", savedEnv.OPENAI_CODEX_ACCESS_TOKEN);
   restoreEnv("OPENAI_CODEX_BASE_URL", savedEnv.OPENAI_CODEX_BASE_URL);
   restoreEnv("OPENAI_CODEX_MODEL", savedEnv.OPENAI_CODEX_MODEL);
@@ -129,6 +135,47 @@ test("CLI Kimi env resolution uses latest Moonshot OpenAI-compatible endpoint an
   }));
 });
 
+test("CLI Z.ai env resolution uses GLM-5.2 and maps xhigh to max effort", async () => {
+  process.env.ZAI_API_KEY = "env-key";
+  process.env.ZAI_BASE_URL = "https://api.z.ai/api/paas/v4";
+  delete process.env.ZAI_MODEL;
+
+  let url = "";
+  let body: Record<string, unknown> = {};
+  const fetchImpl = (async (input, init) => {
+    url = String(input);
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(
+      JSON.stringify({
+        id: "chatcmpl_zai_cli",
+        model: "glm-5.2",
+        choices: [{ index: 0, finish_reason: "stop", message: { content: "ok" } }],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as typeof fetch;
+
+  const model = await createCliModel("glm-5.2:xhigh", { fetch: fetchImpl });
+  const limits = await model.resolveRequestLimits?.({});
+  const events = await collect(model.stream(emptyInput()));
+
+  expect(url).toBe("https://api.z.ai/api/paas/v4/chat/completions");
+  expect(body).toMatchObject({
+    model: "glm-5.2",
+    max_tokens: 131072,
+    thinking: { type: "enabled" },
+    reasoning_effort: "max",
+  });
+  expect(limits).toEqual({ contextWindowTokens: 1000000, requestMaxOutputTokens: 131072 });
+  expect(events).toContainEqual(expect.objectContaining({
+    type: "metadata",
+    provider: "zai",
+    model: "glm-5.2",
+    contextWindowTokens: 1000000,
+    maxOutputTokens: 131072,
+  }));
+});
+
 test("CLI MiniMax env resolution prefers Anthropic-compatible base URL over generic MiniMax base URL", async () => {
   process.env.MINIMAX_API_KEY = "env-key";
   process.env.MINIMAX_BASE_URL = "https://api.minimaxi.com/v1";
@@ -169,6 +216,10 @@ test("CLI runtime model selection resolves explicit provider aliases to concrete
   expect(resolveCliRuntimeModelSelection({ model: "kimi" })).toEqual({
     provider: "kimi",
     model: "kimi-k2.6",
+  });
+  expect(resolveCliRuntimeModelSelection({ model: "glm" })).toEqual({
+    provider: "zai",
+    model: "glm-5.2",
   });
   expect(resolveCliRuntimeModelSelection({ model: "fake" })).toBeUndefined();
 });

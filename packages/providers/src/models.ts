@@ -13,6 +13,11 @@ export const DEEPSEEK_ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic";
 export const KIMI_PROVIDER_ID = "kimi";
 export const KIMI_K26_MODEL = "kimi-k2.6";
 export const KIMI_OPENAI_BASE_URL = "https://api.moonshot.cn/v1";
+export const ZAI_PROVIDER_ID = "zai";
+export const ZAI_GLM_52_MODEL = "glm-5.2";
+export const ZAI_GLM_52_1M_MODEL = "glm-5.2[1m]";
+export const ZAI_OPENAI_BASE_URL = "https://api.z.ai/api/paas/v4";
+export const ZAI_ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic";
 export const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
 export const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 export const OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.6-sol";
@@ -152,6 +157,68 @@ const BUILTIN_MODELS = [
         requiresReasoningContentOnAssistantMessages: true,
         reasoningParameterStyle: "moonshot",
         toolCallDeltaMode: "standard",
+      },
+    },
+  },
+  {
+    provider: ZAI_PROVIDER_ID,
+    model: ZAI_GLM_52_MODEL,
+    displayName: "GLM-5.2",
+    apiFamily: "openai-completions",
+    baseUrl: ZAI_OPENAI_BASE_URL,
+    default: true,
+    inputCapabilities: ["text"],
+    contextWindowTokens: 1000000,
+    maxOutputTokens: 131072,
+    cost: { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
+    capabilities: {
+      streaming: true,
+      reasoning: true,
+      toolCalls: true,
+      toolCallDeltas: true,
+      usage: true,
+      responseId: true,
+    },
+    compatibility: {
+      chatCompletions: {
+        supportsStore: false,
+        supportsDeveloperRole: false,
+        supportsReasoningEffort: true,
+        reasoningEffortMap: {
+          minimal: "high",
+          low: "high",
+          medium: "high",
+          high: "high",
+          xhigh: "max",
+        },
+        supportsUsageInStreaming: true,
+        maxTokensField: "max_tokens",
+        requiresReasoningContentOnAssistantMessages: true,
+        reasoningParameterStyle: "zai",
+        toolCallDeltaMode: "zai-tool-stream",
+      },
+    },
+  },
+  {
+    provider: ZAI_PROVIDER_ID,
+    model: ZAI_GLM_52_1M_MODEL,
+    displayName: "GLM-5.2 1M",
+    apiFamily: "anthropic-messages",
+    baseUrl: ZAI_ANTHROPIC_BASE_URL,
+    inputCapabilities: ["text"],
+    contextWindowTokens: 1000000,
+    maxOutputTokens: 131072,
+    capabilities: {
+      streaming: true,
+      reasoning: true,
+      toolCalls: true,
+      toolCallDeltas: true,
+      usage: true,
+      responseId: true,
+    },
+    compatibility: {
+      messages: {
+        supportsEagerToolInputStreaming: true,
       },
     },
   },

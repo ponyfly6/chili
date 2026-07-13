@@ -124,11 +124,11 @@ function detectChatCompletionsCompatibility(input: CompatibilityResolutionInput)
   return {
     supportsStore: !isNonStandard,
     supportsDeveloperRole: !isNonStandard,
-    supportsReasoningEffort: !isXai && !isZai && !isMoonshot,
-    reasoningEffortMap: detectReasoningEffortMap(model, isDeepSeek, isGroq),
+    supportsReasoningEffort: !isXai && !isMoonshot,
+    reasoningEffortMap: detectReasoningEffortMap(model, isDeepSeek, isGroq, isZai),
     supportsUsageInStreaming: true,
-    maxTokensField: isDeepSeek || isMoonshot || isChutes ? "max_tokens" : "max_completion_tokens",
-    requiresReasoningContentOnAssistantMessages: isDeepSeek || isMoonshot,
+    maxTokensField: isDeepSeek || isMoonshot || isZai || isChutes ? "max_tokens" : "max_completion_tokens",
+    requiresReasoningContentOnAssistantMessages: isDeepSeek || isMoonshot || isZai,
     reasoningParameterStyle: detectReasoningParameterStyle(provider, baseUrl, isDeepSeek, isMoonshot, isZai),
     toolCallDeltaMode: isZai ? "zai-tool-stream" : "standard",
   };
@@ -152,8 +152,19 @@ function detectReasoningEffortMap(
   model: string,
   isDeepSeek: boolean,
   isGroq: boolean,
+  isZai: boolean,
 ): Partial<Record<string, string>> {
   if (isDeepSeek) {
+    return {
+      minimal: "high",
+      low: "high",
+      medium: "high",
+      high: "high",
+      xhigh: "max",
+    };
+  }
+
+  if (isZai) {
     return {
       minimal: "high",
       low: "high",

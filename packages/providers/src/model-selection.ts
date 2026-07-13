@@ -169,6 +169,7 @@ export function supportsXHighReasoning(model: ModelDescriptor | string | undefin
     id.includes("gpt-5.4") ||
     id.includes("gpt-5.5") ||
     id.includes("gpt-5.6") ||
+    id.includes("glm-5.2") ||
     id.includes("deepseek-v4-pro") ||
     id.includes("deepseek-v4-flash") ||
     id.includes("opus-4-6") ||
