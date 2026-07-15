@@ -54,6 +54,8 @@ export class ProcessOutputAccumulator {
   private outputFile: StreamingToolOutputFile | undefined;
   private persisted: PersistedOutput | undefined;
   private lastRenderedStream: RunProcessOutputStream | undefined;
+  private tailStartStream: RunProcessOutputStream | undefined;
+  private sawStreamTransition = false;
   private renderedEndsWithNewline = true;
   private operationQueue: Promise<void> = Promise.resolve();
   private finished: ProcessOutputSnapshot | undefined;
@@ -89,9 +91,7 @@ export class ProcessOutputAccumulator {
     });
     await this.operationQueue;
 
-    const preview = this.isTruncated()
-      ? takeLastBytes(takeLastLines(this.tail, this.maxLines), this.maxBytes)
-      : this.pending;
+    const preview = this.isTruncated() ? this.boundedPreview() : this.pending;
     const linesExceeded = this.totalLines() > this.maxLines;
     const bytesExceeded = this.totalBytes > this.maxBytes;
     this.finished = {
@@ -130,10 +130,14 @@ export class ProcessOutputAccumulator {
   private async processText(stream: RunProcessOutputStream, text: string): Promise<void> {
     updateLineState(this.lineStates[stream], text);
     const rendered = this.renderText(stream, text);
-    this.tail = takeLastBytes(
-      takeLastLines(this.tail + rendered, multiplyLimit(this.maxLines, 2)),
+    const combinedTail = this.tail + rendered;
+    const nextTail = takeLastBytes(
+      takeLastLines(combinedTail, multiplyLimit(this.maxLines, 2)),
       multiplyLimit(this.maxBytes, 2),
     );
+    const initialStream = this.tailStartStream ?? stream;
+    this.tailStartStream = streamAtOffset(combinedTail, initialStream, combinedTail.length - nextTail.length);
+    this.tail = nextTail;
 
     if (!this.persistenceAttempted) {
       this.pending += rendered;
@@ -157,6 +161,7 @@ export class ProcessOutputAccumulator {
       if (this.lastRenderedStream === undefined) {
         if (stream === "stderr") prefix = "[stderr]\n";
       } else {
+        this.sawStreamTransition = true;
         prefix = `${this.renderedEndsWithNewline ? "" : "\n"}[${stream}]\n`;
       }
       this.lastRenderedStream = stream;
@@ -164,6 +169,27 @@ export class ProcessOutputAccumulator {
     const rendered = prefix + text;
     this.renderedEndsWithNewline = rendered.endsWith("\n");
     return rendered;
+  }
+
+  private boundedPreview(): string {
+    let body = takeLastBytes(takeLastLines(this.tail, this.maxLines), this.maxBytes);
+    let stream = streamAtOffset(
+      this.tail,
+      this.tailStartStream ?? this.lastRenderedStream ?? "stdout",
+      this.tail.length - body.length,
+    );
+    if (stream === "stdout" && !this.sawStreamTransition) return body;
+
+    const bodyLines = subtractLimit(this.maxLines, 1);
+    const markerBytes = Buffer.byteLength(`[${stream}]\n`, "utf8");
+    body = takeLastBytes(takeLastLines(this.tail, bodyLines), subtractLimit(this.maxBytes, markerBytes));
+    stream = streamAtOffset(
+      this.tail,
+      this.tailStartStream ?? stream,
+      this.tail.length - body.length,
+    );
+    const marker = `[${stream}]\n`;
+    return body.startsWith(marker) ? body : marker + body;
   }
 
   private async startPersistence(): Promise<void> {
@@ -246,6 +272,23 @@ function normalizeLimit(value: number): number {
 
 function multiplyLimit(value: number, multiplier: number): number {
   return value === Infinity ? Infinity : value * multiplier;
+}
+
+function subtractLimit(value: number, amount: number): number {
+  return value === Infinity ? Infinity : Math.max(0, value - amount);
+}
+
+function streamAtOffset(
+  text: string,
+  initialStream: RunProcessOutputStream,
+  offset: number,
+): RunProcessOutputStream {
+  let stream = initialStream;
+  const marker = /\[(stdout|stderr)\]\n/g;
+  for (let match = marker.exec(text); match && match.index <= offset; match = marker.exec(text)) {
+    stream = match[1] as RunProcessOutputStream;
+  }
+  return stream;
 }
 
 function errorMessage(error: unknown): string {

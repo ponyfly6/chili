@@ -783,6 +783,53 @@ test("bash persists complete verbose output beyond the legacy capture cap", asyn
   }
 });
 
+test("bash reports partial artifacts without comparing formatted and raw byte counts", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-bash-artifact-bytes-"));
+  try {
+    const chunk = Buffer.alloc(8 * 1024, 120);
+    const chunks = 140;
+    const runner: BashRunner = {
+      async run(request) {
+        for (let index = 0; index < chunks; index += 1) {
+          await request.onRawOutput?.({
+            stream: index % 2 === 0 ? "stdout" : "stderr",
+            chunk,
+          });
+        }
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: "",
+          stderr: "",
+          stdoutTruncated: true,
+          stderrTruncated: true,
+          stdoutBytes: (chunks / 2) * chunk.byteLength,
+          stderrBytes: (chunks / 2) * chunk.byteLength,
+          outputLimitBytes: 256_000,
+          durationMs: 1,
+          timedOut: false,
+          aborted: false,
+        };
+      },
+    };
+    const registry = new InMemoryToolRegistry();
+    registry.register(createBashTool({ runner }));
+    const executor = createExecutor(registry);
+
+    const result = await executor.execute(
+      toolInput("bash", { command: "printf fake" }, workspace, "toolcall_bash_artifact_bytes" as ToolCallId),
+    );
+
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") return;
+    expect(result.result.metadata?.outputPersistedTruncated).toBe(true);
+    expect(result.result.output).toContain("artifact bytes saved");
+    expect(result.result.output).not.toContain("first 1048576 of");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("bash runner injection receives resolved request and formats process output", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-tools-bash-runner-"));
   const events: ChiliEvent[] = [];

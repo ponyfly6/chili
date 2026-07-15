@@ -226,11 +226,11 @@ function formatTruncatedCommandOutput(
 ): string {
   const savedDescription = snapshot.outputPath
     ? snapshot.persistedTruncated
-      ? `first ${snapshot.persistedBytes ?? 0} of ${snapshot.totalBytes} bytes saved to ${snapshot.outputPath}`
+      ? `partial output saved to ${snapshot.outputPath} (${snapshot.persistedBytes ?? 0} artifact bytes saved; artifact limit reached)`
       : `full output saved to ${snapshot.outputPath}`
     : `output could not be persisted: ${snapshot.persistenceError ?? "unknown error"}`;
   const sections = [
-    `[command output truncated: showing the final ${snapshot.previewLines} of ${snapshot.totalLines} lines / ${snapshot.totalBytes} bytes; ${savedDescription}]\n${snapshot.preview}`,
+    `[command output truncated: showing ${snapshot.previewLines} preview lines from ${snapshot.totalLines} output lines / ${snapshot.totalBytes} raw bytes; ${savedDescription}]\n${snapshot.preview}`,
   ];
   if (result.timedOut) {
     sections.push(`[process timed out after ${timeoutMs}ms and was terminated]`);

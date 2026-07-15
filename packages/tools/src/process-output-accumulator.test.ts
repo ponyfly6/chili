@@ -43,7 +43,7 @@ test("process output accumulator keeps a UTF-8-safe interleaved tail and caps it
       cwd: workspace,
       callId: "toolcall_utf8" as ToolCallId,
       maxLines: 100,
-      maxBytes: 18,
+      maxBytes: 24,
       maxPersistedBytes: 12,
     });
     const stdout = Buffer.from("开头\n中间\n结尾🙂\n");
@@ -56,7 +56,7 @@ test("process output accumulator keeps a UTF-8-safe interleaved tail and caps it
 
     expect(snapshot.truncated).toBe(true);
     expect(snapshot.truncatedBy).toBe("bytes");
-    expect(snapshot.previewBytes).toBeLessThanOrEqual(18);
+    expect(snapshot.previewBytes).toBeLessThanOrEqual(24);
     expect(snapshot.preview).toContain("结尾🙂");
     expect(snapshot.preview).not.toContain("�");
     expect(snapshot.persistedBytes).toBeLessThanOrEqual(12);
@@ -86,6 +86,30 @@ test("process output accumulator preserves stdout and stderr identity", async ()
     expect(await readFile(join(workspace, snapshot.outputPath!), "utf8")).toBe(
       "out-one\n[stderr]\nerr-one\n[stdout]\nout-tail\n",
     );
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("process output accumulator keeps stderr identity when the preview starts mid-stream", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-output-stderr-tail-"));
+  try {
+    const accumulator = new ProcessOutputAccumulator({
+      cwd: workspace,
+      callId: "toolcall_stderr_tail" as ToolCallId,
+      maxLines: 100,
+      maxBytes: 32,
+    });
+    await accumulator.append({
+      stream: "stderr",
+      chunk: Buffer.from(`${"e".repeat(100)}\nFINAL_STDERR_MARKER\n`),
+    });
+
+    const snapshot = await accumulator.finish();
+
+    expect(snapshot.preview).toStartWith("[stderr]\n");
+    expect(snapshot.preview).toContain("FINAL_STDERR_MARKER");
+    expect(snapshot.previewBytes).toBeLessThanOrEqual(32);
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
