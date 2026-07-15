@@ -7,6 +7,7 @@ import {
   OPENAI_CODEX_PROVIDER_ID,
   parseModelSelectionPattern,
   resolveModelSelectionPattern,
+  supportsXHighReasoning,
   ZAI_PROVIDER_ID,
 } from "./index.js";
 import type { ModelDescriptor } from "./types.js";
@@ -29,6 +30,12 @@ test("parses provider/model patterns with optional reasoning suffixes", () => {
     reasoning: "low",
     thinking: "low",
   });
+});
+
+test("limits GPT xhigh reasoning detection to supported model generations", () => {
+  expect(supportsXHighReasoning("gpt-5.5")).toBe(true);
+  expect(supportsXHighReasoning("gpt-5.6-sol")).toBe(true);
+  expect(supportsXHighReasoning("gpt-5.4")).toBe(false);
 });
 
 test("catalog exposes configured Z.ai GLM-5.2", () => {
@@ -57,8 +64,8 @@ test("resolves model selection patterns against descriptors", () => {
   const models: ModelDescriptor[] = [
     {
       provider: OPENAI_CODEX_PROVIDER_ID,
-      model: "gpt-5.1",
-      displayName: "GPT-5.1",
+      model: "gpt-5.5",
+      displayName: "GPT-5.5",
       capabilities: { streaming: true, reasoning: true },
     },
     {
@@ -91,11 +98,11 @@ test("resolves model selection patterns against descriptors", () => {
     },
   });
 
-  expect(resolveModelSelectionPattern("openai-codex/gpt-5.1:xhigh", models)).toMatchObject({
+  expect(resolveModelSelectionPattern("openai-codex/gpt-5.5:xhigh", models)).toMatchObject({
     selection: {
       provider: OPENAI_CODEX_PROVIDER_ID,
-      model: "gpt-5.1",
-      reasoning: "high",
+      model: "gpt-5.5",
+      reasoning: "xhigh",
     },
   });
 });

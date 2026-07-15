@@ -203,14 +203,14 @@ test("resolves model slash command to model selection actions", async () => {
     model: {},
     modelCandidates: [
       { provider: "openai-codex", model: "gpt-5.5", displayName: "GPT-5.5" },
-      { provider: "openai-codex", model: "gpt-5.3-codex", displayName: "GPT-5.3 Codex" },
+      { provider: "openai-codex", model: "gpt-5.6-terra", displayName: "GPT-5.6 Terra" },
       { provider: "kimi", model: "kimi-k2.6", displayName: "Kimi K2.6", default: true },
     ],
   } as unknown as SlashCommandContext;
 
-  expect(await resolveSlashCommand(commands, "/model openai-codex/gpt-5.3-codex:high")?.command.run(ctx, "openai-codex/gpt-5.3-codex:high")).toEqual({
+  expect(await resolveSlashCommand(commands, "/model openai-codex/gpt-5.6-terra:high")?.command.run(ctx, "openai-codex/gpt-5.6-terra:high")).toEqual({
     type: "set_model",
-    selection: { provider: "openai-codex", model: "gpt-5.3-codex" },
+    selection: { provider: "openai-codex", model: "gpt-5.6-terra" },
     reasoningLevel: "high",
   });
   expect(await resolveSlashCommand(commands, "/model kimi:off")?.command.run(ctx, "kimi:off")).toEqual({

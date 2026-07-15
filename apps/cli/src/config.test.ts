@@ -145,7 +145,7 @@ test("persistent grants preserve unrelated user config tables", async () => {
         'ask = ["bash(*)"]',
         "",
         "[profiles.fast]",
-        'model = "gpt-5.4"',
+        'model = "gpt-5.6-terra"',
         "",
       ].join("\n"),
       "utf8",
@@ -162,7 +162,7 @@ test("persistent grants preserve unrelated user config tables", async () => {
         'allow = ["bash(npm test)"]',
         'ask = ["bash(*)"]',
         "[profiles.fast]",
-        'model = "gpt-5.4"',
+        'model = "gpt-5.6-terra"',
         "",
       ].join("\n"),
     );

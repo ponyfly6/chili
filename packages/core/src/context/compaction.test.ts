@@ -456,7 +456,7 @@ test("runtime auto-compacts before the main model request and sends the summary 
     sessionId,
     threadId: "thread_auto_compact" as ThreadId,
     cwd: "/repo",
-    modelSelection: { provider: "openai-codex", model: "gpt-5.3-codex-spark" },
+    modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
   });
 
   expect(result.status).toBe("completed");
@@ -465,7 +465,7 @@ test("runtime auto-compacts before the main model request and sends the summary 
   expect(modelInputs.slice(0, 2).every((modelInput) => modelInput.system.join("\n").includes("context compression engine"))).toBe(true);
   expect(modelInputs.every((modelInput) => (
     modelInput.modelSelection?.provider === "openai-codex"
-    && modelInput.modelSelection.model === "gpt-5.3-codex-spark"
+    && modelInput.modelSelection.model === "gpt-5.5"
   ))).toBe(true);
   const mainInputText = modelInputs.at(-1)?.messages.flatMap((message) => message.parts).map(modelVisiblePartText).join("\n") ?? "";
   expect(mainInputText).toContain("<context_summary");

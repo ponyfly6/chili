@@ -55,9 +55,9 @@ test("parses provider and concrete model references", () => {
     model: "gpt-5.5",
     prompt: "hello",
   });
-  expect(parseArgs(["--model", "openai-codex/gpt-5.3-codex", "hello"])).toMatchObject({
+  expect(parseArgs(["--model", "openai-codex/gpt-5.6-terra", "hello"])).toMatchObject({
     command: "run",
-    model: "openai-codex/gpt-5.3-codex",
+    model: "openai-codex/gpt-5.6-terra",
     prompt: "hello",
   });
   expect(parseArgs(["--model", "gpt-5.5", "hello"])).toMatchObject({
@@ -68,9 +68,9 @@ test("parses provider and concrete model references", () => {
 });
 
 test("parses thinking and reasoning levels", () => {
-  expect(parseArgs(["--model", "gpt-5.3-codex:high", "hello"])).toMatchObject({
+  expect(parseArgs(["--model", "gpt-5.6-luna:high", "hello"])).toMatchObject({
     command: "run",
-    model: "gpt-5.3-codex",
+    model: "gpt-5.6-luna",
     reasoningLevel: "high",
     prompt: "hello",
   });

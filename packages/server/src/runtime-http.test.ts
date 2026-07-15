@@ -1144,12 +1144,12 @@ test("serves model control routes and prompt model overrides", async () => {
     method: "POST",
     body: JSON.stringify({
       threadId: session.threadId,
-      modelSelection: { provider: "openai-codex", model: "gpt-5.3-codex" },
+      modelSelection: { provider: "openai-codex", model: "gpt-5.6-terra" },
     }),
     headers: { "content-type": "application/json" },
   }));
   expect(setModelResponse.status).toBe(200);
-  expect(service.modelSelection).toEqual({ provider: "openai-codex", model: "gpt-5.3-codex" });
+  expect(service.modelSelection).toEqual({ provider: "openai-codex", model: "gpt-5.6-terra" });
 
   const setReasoningResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/reasoning`, {
     method: "POST",

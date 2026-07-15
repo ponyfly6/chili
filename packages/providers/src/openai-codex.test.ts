@@ -304,7 +304,7 @@ test("resolves per-stream Codex model and reasoning request options", () => {
 });
 
 test("clamps and omits Codex reasoning levels for the request body", () => {
-  expect(clampOpenAICodexReasoningEffort("gpt-5.1", "xhigh")).toBe("high");
+  expect(clampOpenAICodexReasoningEffort("gpt-5.4", "minimal")).toBe("minimal");
   expect(clampOpenAICodexReasoningEffort("gpt-5.5", "minimal")).toBe("low");
   expect(clampOpenAICodexReasoningEffort("gpt-5.6-sol", "minimal")).toBe("low");
 

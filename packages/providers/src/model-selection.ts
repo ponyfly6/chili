@@ -164,9 +164,6 @@ export function supportsXHighReasoning(model: ModelDescriptor | string | undefin
   if (!modelId) return false;
   const id = modelId.toLowerCase();
   return (
-    id.includes("gpt-5.2") ||
-    id.includes("gpt-5.3") ||
-    id.includes("gpt-5.4") ||
     id.includes("gpt-5.5") ||
     id.includes("gpt-5.6") ||
     id.includes("glm-5.2") ||

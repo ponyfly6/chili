@@ -299,14 +299,14 @@ test("OpenAI Codex env resolution uses provider-specific variables", () => {
     readOpenAICodexEnvironment({
       OPENAI_CODEX_ACCESS_TOKEN: "token",
       OPENAI_CODEX_BASE_URL: "https://chatgpt.test/backend-api",
-      OPENAI_CODEX_MODEL: "gpt-5.3-codex",
+      OPENAI_CODEX_MODEL: "gpt-5.6-terra",
     }),
   ).toEqual({
     apiKey: "token",
     apiKeyEnv: "OPENAI_CODEX_ACCESS_TOKEN",
     baseUrl: "https://chatgpt.test/backend-api",
     baseUrlEnv: "OPENAI_CODEX_BASE_URL",
-    model: "gpt-5.3-codex",
+    model: "gpt-5.6-terra",
     modelEnv: "OPENAI_CODEX_MODEL",
   });
 });
