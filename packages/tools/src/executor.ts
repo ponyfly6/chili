@@ -13,13 +13,10 @@ import type {
   TurnId,
 } from "@chili/protocol";
 import { timestampNow } from "@chili/protocol";
-import { createHash } from "node:crypto";
-import { mkdir, readdir, stat, unlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import { ToolDeniedError, ToolValidationError, UnknownToolError, isAbortError, toError } from "./errors.js";
 import { FileReadStateStore } from "./file-read-state.js";
 import { authorizeToolByPolicy, filterToolsByPolicy, toolPolicyContext } from "./tool-policy.js";
-import { assertExistingPathInsideWorkspace, assertWritablePathInsideWorkspace, resolveWorkspacePath } from "./workspace-path.js";
+import { persistToolOutput, truncateUtf8, type PersistedOutput } from "./tool-output-storage.js";
 import type {
   ChiliToolDefinition,
   ChiliToolExecutionContext,
@@ -31,19 +28,6 @@ import type {
   ToolApprovalSpec,
   ToolExecutorOptions,
 } from "./types.js";
-
-const DEFAULT_MAX_PERSISTED_OUTPUT_BYTES = 1024 * 1024;
-const DEFAULT_MAX_PERSISTED_OUTPUT_DIRECTORY_BYTES = 64 * 1024 * 1024;
-const sidecarDirectoryLocks = new Map<string, Promise<void>>();
-
-interface PersistedOutput {
-  relativePath: string;
-  absolutePath: string;
-  bytes: number;
-  originalBytes: number;
-  limitBytes: number;
-  truncated: boolean;
-}
 
 export class ToolExecutor {
   private readonly fileReads: FileReadStateStore;
@@ -224,6 +208,28 @@ export class ToolExecutor {
     if (maxBytes === Infinity) return result;
     const truncated = truncateUtf8(result.output, maxBytes);
     if (!truncated.truncated) return result;
+
+    const existingOutputPath = typeof result.metadata?.outputPath === "string"
+      ? result.metadata.outputPath
+      : undefined;
+    if (existingOutputPath) {
+      const persistedBytes = numericMetadata(result.metadata?.outputPersistedBytes);
+      const originalBytes = numericMetadata(result.metadata?.outputBytes) ?? truncated.bytes;
+      const persistedTruncated = result.metadata?.outputPersistedTruncated === true;
+      const savedDescription = persistedTruncated && persistedBytes !== undefined
+        ? `first ${persistedBytes} of ${originalBytes} bytes saved to ${existingOutputPath}`
+        : `full output saved to ${existingOutputPath}`;
+      return {
+        ...result,
+        output: `${truncated.text}\n[tool output truncated after ${maxBytes} bytes; ${savedDescription}]`,
+        metadata: {
+          ...result.metadata,
+          outputTruncated: true,
+          outputBytes: originalBytes,
+          outputLimitBytes: maxBytes,
+        },
+      };
+    }
 
     let persisted: PersistedOutput;
     try {
@@ -490,31 +496,13 @@ export class ToolExecutor {
     callId: ToolCallId,
     output: string,
   ): Promise<PersistedOutput> {
-    const limitBytes = this.options.maxPersistedOutputBytes ?? DEFAULT_MAX_PERSISTED_OUTPUT_BYTES;
-    const persisted = truncateUtf8(output, limitBytes);
-    const relativePath = join(".chili", "tool-results", toolResultFilename(callId));
-    const directoryTarget = resolveWorkspacePath(cwd, join(".chili", "tool-results"));
-    const fileTarget = resolveWorkspacePath(cwd, relativePath);
-    await assertWritablePathInsideWorkspace(cwd, fileTarget, relativePath);
-    return withSidecarDirectoryLock(directoryTarget.absolutePath, async () => {
-      await mkdir(directoryTarget.absolutePath, { recursive: true });
-      await assertExistingPathInsideWorkspace(cwd, directoryTarget, join(".chili", "tool-results"));
-      await assertWritablePathInsideWorkspace(cwd, fileTarget, relativePath);
-      await writeFile(fileTarget.absolutePath, persisted.text, "utf8");
-      const bytes = Buffer.byteLength(persisted.text, "utf8");
-      await enforceSidecarDirectoryBudget(
-        directoryTarget.absolutePath,
-        fileTarget.absolutePath,
-        this.options.maxPersistedOutputDirectoryBytes ?? DEFAULT_MAX_PERSISTED_OUTPUT_DIRECTORY_BYTES,
-      );
-      return {
-        relativePath,
-        absolutePath: fileTarget.absolutePath,
-        bytes,
-        originalBytes: persisted.bytes,
-        limitBytes,
-        truncated: persisted.truncated,
-      };
+    return persistToolOutput(cwd, callId, output, {
+      ...(this.options.maxPersistedOutputBytes !== undefined
+        ? { maxBytes: this.options.maxPersistedOutputBytes }
+        : {}),
+      ...(this.options.maxPersistedOutputDirectoryBytes !== undefined
+        ? { maxDirectoryBytes: this.options.maxPersistedOutputDirectoryBytes }
+        : {}),
     });
   }
 }
@@ -604,74 +592,8 @@ function abortReason(signal: AbortSignal): Error {
   return error;
 }
 
-function toolResultFilename(callId: ToolCallId): string {
-  const value = String(callId);
-  if (/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value) && !value.includes("..")) {
-    return `${value}.txt`;
-  }
-  const hash = createHash("sha256").update(value).digest("hex").slice(0, 16);
-  return `toolcall_${hash}.txt`;
-}
-
-async function enforceSidecarDirectoryBudget(directory: string, currentPath: string, maxBytes: number): Promise<void> {
-  if (maxBytes === Infinity) return;
-  const entries = await readdir(directory, { withFileTypes: true });
-  const files = await Promise.all(entries.filter((entry) => entry.isFile()).map(async (entry) => {
-    const path = join(directory, entry.name);
-    const info = await stat(path);
-    return { path, bytes: info.size, modifiedAt: info.mtimeMs };
-  }));
-  let totalBytes = files.reduce((total, file) => total + file.bytes, 0);
-  const current = files.find((file) => file.path === currentPath);
-  const effectiveLimit = Math.max(0, Math.trunc(maxBytes), current?.bytes ?? 0);
-  files.sort((left, right) => {
-    if (left.path === currentPath) return 1;
-    if (right.path === currentPath) return -1;
-    return left.modifiedAt - right.modifiedAt || left.path.localeCompare(right.path);
-  });
-  for (const file of files) {
-    if (totalBytes <= effectiveLimit || file.path === currentPath) break;
-    await unlink(file.path).catch((error) => {
-      if (!isNotFoundError(error)) throw error;
-    });
-    totalBytes -= file.bytes;
-  }
-}
-
-async function withSidecarDirectoryLock<T>(directory: string, operation: () => Promise<T>): Promise<T> {
-  const previous = sidecarDirectoryLocks.get(directory) ?? Promise.resolve();
-  let release!: () => void;
-  const current = new Promise<void>((resolveLock) => {
-    release = resolveLock;
-  });
-  const tail = previous.then(() => current);
-  sidecarDirectoryLocks.set(directory, tail);
-  await previous;
-  try {
-    return await operation();
-  } finally {
-    release();
-    if (sidecarDirectoryLocks.get(directory) === tail) sidecarDirectoryLocks.delete(directory);
-  }
-}
-
-function isNotFoundError(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-}
-
-function truncateUtf8(text: string, maxBytes: number): { text: string; bytes: number; truncated: boolean } {
-  const buffer = Buffer.from(text, "utf8");
-  const bytes = buffer.byteLength;
-  if (bytes <= maxBytes) return { text, bytes, truncated: false };
-  let end = Math.max(0, Math.min(Math.trunc(maxBytes), bytes));
-  while (end > 0 && ((buffer[end] ?? 0) & 0b1100_0000) === 0b1000_0000) {
-    end -= 1;
-  }
-  return {
-    text: buffer.subarray(0, end).toString("utf8"),
-    bytes,
-    truncated: true,
-  };
+function numericMetadata(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function denyDecision(decision: ApprovalPreflightDecision): ApprovalDecision {

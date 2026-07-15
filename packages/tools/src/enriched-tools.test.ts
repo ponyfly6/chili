@@ -349,6 +349,46 @@ test("tool executor applies per-tool output limits and persists full output", as
   }
 });
 
+test("tool executor preserves an existing streamed output sidecar", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-streamed-output-"));
+  const relativePath = join(".chili", "tool-results", "toolcall_streamed.txt");
+  try {
+    await mkdir(join(workspace, ".chili", "tool-results"), { recursive: true });
+    await writeFile(join(workspace, relativePath), "COMPLETE_STREAMED_OUTPUT\n", "utf8");
+    const registry = new InMemoryToolRegistry();
+    registry.register({
+      name: "streamed_large",
+      description: "Emit a preview for already-persisted output.",
+      risk: "read",
+      inputSchema: { type: "object" },
+      approval: () => false,
+      maxResultOutputBytes: 4,
+      isReadOnly: true,
+      isConcurrencySafe: true,
+      execute: async () => ({
+        title: "streamed large",
+        output: "preview-only",
+        metadata: {
+          outputPath: relativePath,
+          outputPersistedBytes: 25,
+          outputPersistedLimitBytes: 1024,
+          outputPersistedTruncated: false,
+        },
+      }),
+    });
+    const executor = createExecutor(registry);
+
+    const result = await executor.execute(toolInput("streamed_large", {}, workspace, "toolcall_streamed" as ToolCallId));
+
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") return;
+    expect(result.result.metadata?.outputPath).toBe(relativePath);
+    expect(await readFile(join(workspace, relativePath), "utf8")).toBe("COMPLETE_STREAMED_OUTPUT\n");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("tool executor caps persisted large output sidecars", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-tools-output-sidecar-"));
   try {
