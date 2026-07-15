@@ -32,6 +32,7 @@ import {
   FileSystemSnapshotProvider,
   InMemoryToolRegistry,
   PolicyApprovalBroker,
+  PolicyApprovalState,
   type SubagentController,
   type SubagentControlController,
   ToolExecutor,
@@ -214,7 +215,17 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   };
   const skillRegistry = await discoverSkills({ cwd });
   const config = await loadCliConfig(cwd, { chiliHome });
-  const permissions = createPermissionProfileControl(config, options.yes ? "full-access" : "default");
+  const approvalState = new PolicyApprovalState();
+  for (const event of await eventStore.events({ type: "agent.spawned", limit: 10_000 })) {
+    linkApprovalSessionsFromEvent(approvalState, event);
+  }
+  eventStore.subscribe((event) => linkApprovalSessionsFromEvent(approvalState, event));
+  const sandboxedShell = options.bashRunner === undefined && process.platform === "darwin";
+  const permissions = createPermissionProfileControl(
+    config,
+    options.yes ? "full-access" : "default",
+    sandboxedShell,
+  );
   const bashRunner = options.bashRunner ?? createCliBashRunner({
     permissionProfile: () => permissions.get().profile,
   });
@@ -258,7 +269,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const childToolExecutor = new ToolExecutor({
     registry: childRegistry,
     events: { publish: (event: ChiliEvent) => eventStore.append(event) },
-    approvals: createApprovalBroker(options, config, permissions),
+    approvals: createApprovalBroker(options, config, approvalState, permissions),
     policyResolver: childToolPolicyResolver,
     snapshotProvider,
     createId,
@@ -361,7 +372,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const toolExecutor = new ToolExecutor({
     registry,
     events: { publish: (event) => eventStore.append(event) },
-    approvals: createApprovalBroker(options, config, permissions),
+    approvals: createApprovalBroker(options, config, approvalState, permissions),
     snapshotProvider,
     createId,
     maxResultOutputBytes: 256_000,
@@ -859,6 +870,7 @@ interface MutableCliPermissionProfileControl extends CliPermissionProfileControl
 function createPermissionProfileControl(
   config: CliConfig,
   initialProfile: RuntimePermissionProfileId,
+  sandboxedShell: boolean,
 ): MutableCliPermissionProfileControl {
   let profile = initialProfile;
   const brokers = new Set<PolicyApprovalBroker>();
@@ -883,7 +895,7 @@ function createPermissionProfileControl(
       broker.setDangerousShellCommands(control.dangerousShellCommands());
     },
     rulesets() {
-      return createCliApprovalRulesets(profile, config);
+      return createCliApprovalRulesets(profile, config, { sandboxedShell });
     },
     dangerousShellCommands() {
       return dangerousShellCommandsForProfile(profile);
@@ -895,13 +907,17 @@ function createPermissionProfileControl(
 function createApprovalBroker(
   options: CliHarnessOptions,
   config: CliConfig,
+  approvalState: PolicyApprovalState,
   permissions?: MutableCliPermissionProfileControl,
 ): PolicyApprovalBroker {
+  const sandboxedShell = options.bashRunner === undefined && process.platform === "darwin";
   if (!options.approvalQueue) {
     const broker = createCliApprovalBroker({
       ...(options.yes === undefined ? {} : { yes: options.yes }),
       config,
       ...(options.chiliHome ? { chiliHome: options.chiliHome } : {}),
+      sandboxedShell,
+      approvalState,
     });
     permissions?.register(broker);
     return broker;
@@ -909,13 +925,20 @@ function createApprovalBroker(
 
   let broker: PolicyApprovalBroker;
   broker = new PolicyApprovalBroker({
-    rulesets: permissions?.rulesets() ?? createCliApprovalRulesets(options.yes ?? false, config),
+    rulesets: permissions?.rulesets() ?? createCliApprovalRulesets(options.yes ?? false, config, { sandboxedShell }),
     ...(permissions ? { dangerousShellCommands: permissions.dangerousShellCommands() } : {}),
+    state: approvalState,
     ask: async (request, signal) => {
       const decision: ApprovalDecision = options.approvalQueue
         ? await options.approvalQueue.ask(request, signal)
         : { action: "deny", feedback: "Approval queue is unavailable." };
-      return persistAllowAlwaysDecision(request, decision, options.chiliHome ? { chiliHome: options.chiliHome } : {});
+      return persistAllowAlwaysDecision(request, decision, {
+        ...(options.chiliHome ? { chiliHome: options.chiliHome } : {}),
+        onPersisted: (persistedRequest) => approvalState.addPersistentGrant({
+          permission: persistedRequest.permission,
+          patterns: persistedRequest.patterns,
+        }),
+      });
     },
     onSessionGrant: async () => {
       await options.approvalQueue?.recheckPending((request) => broker.preflight(request));
@@ -923,6 +946,16 @@ function createApprovalBroker(
   });
   permissions?.register(broker);
   return broker;
+}
+
+export function linkApprovalSessionsFromEvent(state: PolicyApprovalState, event: EventEnvelope): void {
+  if (event.type !== "agent.task_created" && event.type !== "agent.spawned") return;
+  const { parentSessionId, childSessionId } = event.payload as {
+    parentSessionId?: SessionId;
+    childSessionId?: SessionId;
+  };
+  if (!parentSessionId || !childSessionId) return;
+  state.linkSession(parentSessionId, childSessionId);
 }
 
 function createSubagentControlController(

@@ -1,6 +1,6 @@
 import { createInterface, type Interface } from "node:readline/promises";
 import type { ApprovalDecision, RuntimePermissionConfig, RuntimePermissionProfileId } from "@chili/protocol";
-import { PolicyApprovalBroker, type ApprovalBrokerRequest } from "@chili/tools";
+import { PolicyApprovalBroker, PolicyApprovalState, type ApprovalBrokerRequest } from "@chili/tools";
 import type { PermissionRule } from "@chili/policy";
 import {
   addPersistentPermissionGrants,
@@ -13,20 +13,37 @@ export interface CliApprovalOptions {
   readline?: Interface;
   config?: CliConfig;
   chiliHome?: string;
+  sandboxedShell?: boolean;
+  approvalState?: PolicyApprovalState;
+}
+
+export interface CliApprovalRulesetOptions {
+  sandboxedShell?: boolean;
+}
+
+export interface PersistAllowAlwaysDecisionOptions extends AddPersistentPermissionGrantOptions {
+  onPersisted?: (request: ApprovalBrokerRequest) => Promise<void> | void;
 }
 
 export function createCliApprovalBroker(options: CliApprovalOptions = {}): PolicyApprovalBroker {
   const profile = options.yes ? "full-access" : "default";
   return new PolicyApprovalBroker({
-    rulesets: createCliApprovalRulesets(profile, options.config),
+    rulesets: createCliApprovalRulesets(profile, options.config, {
+      sandboxedShell: options.sandboxedShell ?? false,
+    }),
     dangerousShellCommands: dangerousShellCommandsForProfile(profile),
+    ...(options.approvalState ? { state: options.approvalState } : {}),
     ask: async (request, signal) => askApproval(request, options, signal),
   });
 }
 
-export function createCliApprovalRulesets(profile: RuntimePermissionProfileId | boolean, config?: CliConfig): readonly (readonly PermissionRule[])[] {
+export function createCliApprovalRulesets(
+  profile: RuntimePermissionProfileId | boolean,
+  config?: CliConfig,
+  options: CliApprovalRulesetOptions = {},
+): readonly (readonly PermissionRule[])[] {
   const resolvedProfile = typeof profile === "boolean" ? (profile ? "full-access" : "default") : profile;
-  const rulesets: PermissionRule[][] = [createCliPermissionRules(resolvedProfile)];
+  const rulesets: PermissionRule[][] = [createCliPermissionRules(resolvedProfile, options)];
   const userPermissions = configuredRulesForMode(resolvedProfile, config?.userPermissions ?? []);
   const projectPermissions = configuredRulesForMode(resolvedProfile, config?.projectPermissions ?? []);
   if (userPermissions.length) rulesets.push(userPermissions);
@@ -34,7 +51,10 @@ export function createCliApprovalRulesets(profile: RuntimePermissionProfileId | 
   return rulesets;
 }
 
-export function createCliPermissionRules(profile: RuntimePermissionProfileId | boolean): PermissionRule[] {
+export function createCliPermissionRules(
+  profile: RuntimePermissionProfileId | boolean,
+  options: CliApprovalRulesetOptions = {},
+): PermissionRule[] {
   const resolvedProfile = typeof profile === "boolean" ? (profile ? "full-access" : "default") : profile;
   if (resolvedProfile === "full-access") {
     return [{ permission: "*", pattern: "*", action: "allow", source: "permission_profile:full-access" }];
@@ -47,7 +67,8 @@ export function createCliPermissionRules(profile: RuntimePermissionProfileId | b
     { permission: "grep", pattern: "*", action: "allow", source },
     { permission: "edit", pattern: "*", action: "allow", source },
     { permission: "write", pattern: "*", action: "allow", source },
-    { permission: "bash", pattern: "*", action: "ask", source },
+    { permission: "bash", pattern: "*", action: options.sandboxedShell ? "allow" : "ask", source },
+    { permission: "task", pattern: "spawn", action: "allow", source },
     { permission: "git_status", pattern: "*", action: "allow", source },
     { permission: "git_diff", pattern: "*", action: "allow", source },
   ];
@@ -68,7 +89,7 @@ export function runtimePermissionConfig(profile: RuntimePermissionProfileId): Ru
       {
         id: "default",
         label: "Default",
-        description: "Chili can read and edit files in the current workspace. Shell commands require approval unless explicitly allowed and run in a macOS sandbox when available.",
+        description: "Chili can read, edit, and run ordinary shell commands inside the macOS sandbox for the workspace. Dangerous or unsandboxed shell commands still require approval.",
         current: profile === "default",
       },
       {
@@ -101,11 +122,12 @@ export async function persistApprovalGrantForRequest(
 export async function persistAllowAlwaysDecision(
   request: ApprovalBrokerRequest,
   decision: ApprovalDecision,
-  options: AddPersistentPermissionGrantOptions = {},
+  options: PersistAllowAlwaysDecisionOptions = {},
 ): Promise<ApprovalDecision> {
   if (decision.action !== "allow_always") return decision;
   try {
-    await persistApprovalGrantForRequest(request, options);
+    await persistApprovalGrantForRequest(request, options.chiliHome ? { chiliHome: options.chiliHome } : {});
+    await options.onPersisted?.(request);
     return decision;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -136,7 +158,17 @@ async function askApproval(request: ApprovalBrokerRequest, options: CliApprovalO
       if (answer === "y" || answer === "yes" || answer === "") return { action: "allow_once" };
       if (answer === "s" || answer === "session") return { action: "allow_session" };
       if (answer === "a" || answer === "always") {
-        return persistAllowAlwaysDecision(request, { action: "allow_always" }, options.chiliHome ? { chiliHome: options.chiliHome } : {});
+        return persistAllowAlwaysDecision(request, { action: "allow_always" }, {
+          ...(options.chiliHome ? { chiliHome: options.chiliHome } : {}),
+          ...(options.approvalState
+            ? {
+                onPersisted: (persistedRequest: ApprovalBrokerRequest) => options.approvalState?.addPersistentGrant({
+                  permission: persistedRequest.permission,
+                  patterns: persistedRequest.patterns,
+                }),
+              }
+            : {}),
+        });
       }
       if (answer === "n" || answer === "no") return { action: "deny", feedback: "Denied from CLI" };
     }

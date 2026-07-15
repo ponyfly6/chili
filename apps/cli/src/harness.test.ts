@@ -3,10 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
 import { chiliBasePromptFragment, type PromptFragment } from "@chili/core";
-import type { AgentPath, ChiliEvent, SessionId, TaskId, ThreadId, TimestampMs } from "@chili/protocol";
+import type { AgentPath, ApprovalId, ChiliEvent, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId } from "@chili/protocol";
 import { SkillRegistry, type Skill } from "@chili/skills";
 import { SqliteEventStore, type AgentTaskRow } from "@chili/store";
-import { buildCliChildPromptFragments, buildCliPromptFragments, createCliHarness, type CliHarness } from "./harness.js";
+import { PolicyApprovalBroker, PolicyApprovalState, type ApprovalBrokerRequest } from "@chili/tools";
+import { buildCliChildPromptFragments, buildCliPromptFragments, createCliHarness, linkApprovalSessionsFromEvent, type CliHarness } from "./harness.js";
 import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
 import { runPrompt } from "./runner.js";
 import { readUserModelSelection, writeUserModelSelection } from "./user-model-state.js";
@@ -72,6 +73,45 @@ test("CLI harness promptFragments provider includes chili.base", async () => {
     await harness?.close();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("CLI harness approval session linker joins spawned children to the parent grant scope", async () => {
+  const state = new PolicyApprovalState();
+  const parentSessionId = "session_approval_parent" as SessionId;
+  const childSessionId = "session_approval_child" as SessionId;
+  const parentBroker = new PolicyApprovalBroker({
+    state,
+    ask: async () => ({ action: "allow_session" }),
+  });
+  const childBroker = new PolicyApprovalBroker({ state });
+  const request: ApprovalBrokerRequest = {
+    approvalId: "approval_harness" as ApprovalId,
+    sessionId: parentSessionId,
+    callId: "toolcall_harness" as ToolCallId,
+    toolName: "bash",
+    risk: "execute",
+    permission: "bash",
+    patterns: ["bun test"],
+  };
+
+  linkApprovalSessionsFromEvent(state, {
+    id: "event_approval_spawn",
+    type: "agent.spawned",
+    time: 1 as TimestampMs,
+    sessionId: childSessionId,
+    threadId: "thread_approval_child" as ThreadId,
+    payload: {
+      runId: "run_approval_child" as never,
+      path: "/root/child" as AgentPath,
+      taskName: "child",
+      parentSessionId,
+      childSessionId,
+    },
+  });
+  await parentBroker.decide(request);
+
+  const { approvalId: _approvalId, ...childRequest } = { ...request, sessionId: childSessionId };
+  expect(await childBroker.preflight(childRequest)).toMatchObject({ action: "allow", source: "session_grant" });
 });
 
 test("CLI harness uses the user last model for new workspaces without forcing a prompt override", async () => {

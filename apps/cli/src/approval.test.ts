@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { expect, test } from "bun:test";
 import type { ApprovalId, SessionId, ToolCallId } from "@chili/protocol";
 import { evaluatePolicy } from "@chili/policy";
-import type { ApprovalBrokerRequest } from "@chili/tools";
+import { PolicyApprovalBroker, PolicyApprovalState, type ApprovalBrokerRequest } from "@chili/tools";
 import { createCliApprovalBroker, createCliApprovalRulesets, persistAllowAlwaysDecision, runtimePermissionConfig } from "./approval.js";
 
 test("CLI approval rules layer defaults, user config, then project config", () => {
@@ -46,6 +46,37 @@ test("permission profiles expose Codex-style default and full-access semantics",
   expect(config.profiles.find((profile) => profile.id === "auto-review")?.disabledReason).toContain("not implemented");
   expect(config.profiles.find((profile) => profile.id === "default")?.description).toContain("macOS sandbox");
   expect(config.profiles.find((profile) => profile.id === "full-access")?.description).toContain("without the OS sandbox");
+});
+
+test("default profile allows ordinary shell only when the shell runner is sandboxed", async () => {
+  const sandboxed = createCliApprovalRulesets("default", undefined, { sandboxedShell: true });
+  const unsandboxed = createCliApprovalRulesets("default", undefined, { sandboxedShell: false });
+
+  expect(evaluatePolicy("bash", "rg -n approval packages", sandboxed).action).toBe("allow");
+  expect(evaluatePolicy("bash", "rg -n approval packages", unsandboxed).action).toBe("ask");
+  expect(evaluatePolicy("task", "spawn", sandboxed).action).toBe("allow");
+  expect(evaluatePolicy("task", "task_existing", sandboxed).action).toBe("ask");
+
+  let asked = 0;
+  const broker = createCliApprovalBroker({
+    sandboxedShell: true,
+    readline: {
+      question: async () => {
+        asked += 1;
+        return "yes";
+      },
+    } as never,
+  });
+  const originalLog = console.log;
+  console.log = () => undefined;
+  try {
+    expect(await broker.decide(approvalRequest("rg -n approval packages"))).toMatchObject({ action: "allow_once" });
+    expect(asked).toBe(0);
+    expect(await broker.decide(approvalRequest("rm -rf *"))).toMatchObject({ action: "allow_once" });
+    expect(asked).toBe(1);
+  } finally {
+    console.log = originalLog;
+  }
 });
 
 test("allow_always decisions persist user-level grants", async () => {
@@ -112,6 +143,34 @@ test("CLI broker persists interactive always approvals through CLI helper", asyn
     expect(await readFile(join(root, "config.toml"), "utf8")).toBe(
       '[permissions]\nallow = ["bash(git status --short)"]\n',
     );
+  } finally {
+    console.log = originalLog;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI broker installs always approvals into shared runtime policy immediately", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-approval-hot-"));
+  const originalLog = console.log;
+  try {
+    console.log = () => undefined;
+    const state = new PolicyApprovalState();
+    const broker = createCliApprovalBroker({
+      chiliHome: root,
+      sandboxedShell: false,
+      approvalState: state,
+      readline: { question: async () => "always" } as never,
+    });
+    const peer = new PolicyApprovalBroker({ state });
+
+    expect((await broker.decide(approvalRequest("git status --short"))).action).toBe("allow_always");
+    expect(await peer.preflight({
+      ...approvalRequest("git status --short"),
+      sessionId: "session_peer" as SessionId,
+    })).toMatchObject({
+      action: "allow",
+      matchedRule: { source: "user config.toml permissions.allow" },
+    });
   } finally {
     console.log = originalLog;
     await rm(root, { recursive: true, force: true });
