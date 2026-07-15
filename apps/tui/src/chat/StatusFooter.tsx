@@ -1,8 +1,7 @@
 import type { ChatSessionView, TeamLiveView } from "@chili/sdk";
 import type { ServiceTier } from "@chili/protocol";
 import { basename } from "node:path";
-import { shorten } from "../components/helpers.js";
-import { modelSelectionLabel, type ModelSelection, type ReasoningLevel } from "../model-state.js";
+import type { ModelSelection, ReasoningLevel } from "../model-state.js";
 import type { TuiTheme } from "../theme/index.js";
 
 export interface StatusFooterOptions {
@@ -36,61 +35,50 @@ export function StatusFooter(props: {
   showToolDetails: boolean;
   transcriptActive: boolean;
 }) {
-  const compact = isCompactFooter(props.width);
-  const cwd = compact ? compactCwd(props.options.cwd) : shorten(props.options.cwd, 54);
-  const branch = props.options.gitBranch ?? "--";
-  const usage = usageText(props.chatView);
+  const left = [
+    modelText(props.chatView, props.options),
+    contextText(props.chatView.latestModelMetadata?.usage, contextWindowFor(props.chatView)),
+    workspaceText(props.options),
+  ].filter(Boolean).join(" · ");
   const status = sessionStatusText(props.chatView, props.canSubmit, props.model);
-  const model = modelText(props.chatView, props.options, compact);
-  const details = props.showToolDetails ? "Details on" : "Details off";
-  const transcript = props.transcriptActive ? "Transcript on" : "Transcript";
-  const actionHint = compact ? "/commands" : "/ commands";
-
-  if (compact) {
-    return (
-      <box width="100%" height={1} flexDirection="row" paddingX={1}>
-        <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>{`${cwd} ${branch}  ${usage}  ${status}  ${model}  ${details}  Ctrl+T ${transcript}  ${actionHint}`}</text>
-      </box>
-    );
-  }
+  const right = [
+    props.options.modeName,
+    props.showToolDetails ? "Details on" : undefined,
+    props.transcriptActive ? "Transcript on" : undefined,
+  ].filter(Boolean).join(" · ");
 
   return (
-    <box width="100%" height={2} flexDirection="column" paddingX={2}>
-      <box width="100%" height={1} flexDirection="row">
-        <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>{cwd}</text>
-        <box flexGrow={1} />
-        <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>{branch}</text>
-        <box flexGrow={1} />
-        <text fg={statusColor(status, props.theme)} wrapMode="none" truncate>{status}</text>
+    <box width="100%" height={1} flexDirection="row" paddingX={2}>
+      <box flexGrow={1} flexShrink={1} minWidth={1} overflow="hidden">
+        <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>{left}</text>
       </box>
-      <box width="100%" height={1} flexDirection="row">
-        <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{usage}</text>
-        <box flexGrow={1} />
-        <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>{`${model}     Ctrl+O ${details}     Ctrl+T ${transcript}     ${actionHint}`}</text>
+      <box flexShrink={0} flexDirection="row">
+        <text fg={props.theme.colors.text.disabled} wrapMode="none" truncate>{right}</text>
+        {status ? (
+          <>
+            <text fg={props.theme.colors.text.disabled}>{" · "}</text>
+            <text fg={statusColor(status, props.theme)} wrapMode="none" truncate>{status}</text>
+          </>
+        ) : null}
       </box>
     </box>
   );
 }
 
-export function statusFooterHeight(width: number): number {
-  return isCompactFooter(width) ? 1 : 2;
+export function statusFooterHeight(_width: number): number {
+  return 1;
 }
 
-function isCompactFooter(width: number): boolean {
-  return width < 84;
-}
-
-function sessionStatusText(chatView: ChatSessionView, canSubmit: boolean, model: TeamLiveView): string {
+function sessionStatusText(chatView: ChatSessionView, canSubmit: boolean, model: TeamLiveView): string | undefined {
   const session = chatView.status === "waiting_for_approval"
     ? "approval"
     : chatView.status === "running"
       ? "running"
-      : canSubmit
-        ? "idle"
-        : "waiting";
+      : canSubmit ? undefined : "waiting";
   const goal = goalStatusText(chatView);
   const team = teamStatusText(model);
-  return [session, goal, team].filter(Boolean).join(" | ");
+  const status = [session, goal, team].filter(Boolean).join(" · ");
+  return status || undefined;
 }
 
 function goalStatusText(chatView: ChatSessionView): string | undefined {
@@ -115,24 +103,13 @@ function teamStatusText(model: TeamLiveView): string | undefined {
   return parts.length > 0 ? `team ${parts.join(" ")}` : undefined;
 }
 
-function usageText(chatView: ChatSessionView): string {
-  const context = contextText(chatView.latestModelMetadata?.usage, contextWindowFor(chatView));
-  const used = usedText(chatView.usageSummary ?? chatView.latestModelMetadata?.usage);
-  return used ? `${context}  ${used}` : context;
-}
-
-function contextText(usage: NonNullable<ChatSessionView["latestModelMetadata"]>["usage"] | undefined, contextWindowTokens: number | undefined): string {
+function contextText(usage: NonNullable<ChatSessionView["latestModelMetadata"]>["usage"] | undefined, contextWindowTokens: number | undefined): string | undefined {
   const contextTokens = contextInputTokens(usage);
-  if (!contextTokens) return "ctx --";
-  if (!contextWindowTokens) return `ctx ${formatTokenCount(contextTokens)}`;
+  if (!contextTokens) return undefined;
+  if (!contextWindowTokens) return `${formatTokenCount(contextTokens)} ctx`;
 
-  const percent = Math.max(0, Math.round((contextTokens / contextWindowTokens) * 100));
-  return `ctx ${formatTokenCount(contextTokens)}/${formatTokenCount(contextWindowTokens)} ${percent}%`;
-}
-
-function usedText(usage: NonNullable<ChatSessionView["usageSummary"]> | undefined): string | undefined {
-  const used = usage?.totalTokens ?? cumulativeTokenTotal(usage);
-  return used ? `used ${formatTokenCount(used)}` : undefined;
+  const remaining = Math.max(0, Math.round((1 - contextTokens / contextWindowTokens) * 100));
+  return `${remaining}% ctx left`;
 }
 
 function contextInputTokens(usage: NonNullable<ChatSessionView["usageSummary"]> | undefined): number | undefined {
@@ -144,34 +121,15 @@ function contextInputTokens(usage: NonNullable<ChatSessionView["usageSummary"]> 
   return total > 0 ? total : undefined;
 }
 
-function cumulativeTokenTotal(usage: NonNullable<ChatSessionView["usageSummary"]> | undefined): number | undefined {
-  if (!usage) return undefined;
-  let total = 0;
-  for (const value of [
-    usage.inputTokens,
-    usage.outputTokens,
-    usage.cacheReadInputTokens,
-    usage.cacheCreationInputTokens,
-  ]) {
-    total += finiteTokenCount(value) ?? 0;
-  }
-  return total > 0 ? total : undefined;
-}
-
 function contextWindowFor(chatView: ChatSessionView): number | undefined {
   return finiteTokenCount(chatView.latestModelMetadata?.contextWindowTokens);
 }
 
-function modelText(chatView: ChatSessionView, options: StatusFooterOptions, compact: boolean): string {
-  const provider = options.modelSelection?.provider ?? chatView.latestModelMetadata?.provider ?? options.providerName;
+function modelText(chatView: ChatSessionView, options: StatusFooterOptions): string {
   const model = options.modelSelection?.model ?? chatView.latestModelMetadata?.model ?? options.modelName;
-  const mode = options.modeName;
   const reasoning = options.reasoningLevel ? reasoningText(options.reasoningLevel) : undefined;
   const serviceTier = serviceTierText(options.serviceTier);
-  const compactModel = [model, reasoning, serviceTier].filter(Boolean).join(" ");
-  if (compact) return shorten(compactModel, 22);
-  const modelLabel = options.modelSelection ? modelSelectionLabel(options.modelSelection) : `${provider}/${model}`;
-  return [modelLabel, mode, reasoning, serviceTier].filter(Boolean).join(" ");
+  return [model, reasoning, serviceTier].filter(Boolean).join(" · ");
 }
 
 function reasoningText(level: ReasoningLevel): string {
@@ -184,9 +142,9 @@ function serviceTierText(serviceTier: ServiceTier | undefined): string | undefin
   return undefined;
 }
 
-function compactCwd(cwd: string): string {
-  const leaf = basename(cwd);
-  return leaf ? `~/${leaf}` : shorten(cwd, 24);
+function workspaceText(options: StatusFooterOptions): string {
+  const workspace = basename(options.cwd) || options.cwd;
+  return options.gitBranch ? `${workspace} (${options.gitBranch})` : workspace;
 }
 
 function statusColor(status: string, theme: TuiTheme): string {

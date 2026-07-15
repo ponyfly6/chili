@@ -39,19 +39,21 @@ test("chat prompt exposes a native renderer cursor", async () => {
   }
 });
 
-test("renders fielded chat footer with cwd status model and usage fallback", async () => {
-  const frame = await renderShellFrame(teamLiveFixture(), { width: 120, height: 24 });
+test("renders a restrained one-line chat footer", async () => {
+  const frame = await renderShellFrame(emptyTeamLiveFixture("streaming"), { width: 120, height: 24 });
+  const footerLine = frame.split("\n").find((line) => line.includes("test-model")) ?? "";
 
-  expect(frame).toContain("/repo/chili");
-  expect(frame).toContain("idle");
-  expect(frame).toContain("ctx --");
-  expect(frame).toContain("test-provider/test-model Build");
-  expect(frame).toContain("Details off");
-  expect(frame).toContain("Ctrl+T Transcript");
+  expect(footerLine).toContain("chili");
+  expect(footerLine).toContain("Build");
+  expect(frame).not.toContain("test-provider/");
+  expect(frame).not.toContain("idle");
+  expect(frame).not.toContain("ctx --");
+  expect(frame).not.toContain("Details off");
+  expect(frame).not.toContain("Ctrl+T Transcript");
 });
 
-test("renders token usage and known context when model metadata is available", async () => {
-  const frame = await renderShellFrame(teamLiveFixture(), {
+test("renders remaining context without cumulative token usage", async () => {
+  const frame = await renderShellFrame(emptyTeamLiveFixture("streaming"), {
     width: 120,
     height: 24,
     runtime: fakeChatRuntime({
@@ -73,13 +75,14 @@ test("renders token usage and known context when model metadata is available", a
     }),
   });
 
-  expect(frame).toContain("ctx 20.0k/205k 10%");
-  expect(frame).toContain("used 75.0k");
-  expect(frame).toContain("minimax/MiniMax-M2.7 Build");
+  expect(frame).toContain("90% ctx left");
+  expect(frame).toContain("MiniMax-M2.7");
+  expect(frame).not.toContain("used 75.0k");
+  expect(frame).not.toContain("minimax/");
 });
 
-test("renders latest context tokens without a percentage when the model limit is unavailable", async () => {
-  const frame = await renderShellFrame(teamLiveFixture(), {
+test("renders compact context tokens when the model limit is unavailable", async () => {
+  const frame = await renderShellFrame(emptyTeamLiveFixture("streaming"), {
     width: 120,
     height: 24,
     runtime: fakeChatRuntime({
@@ -100,13 +103,13 @@ test("renders latest context tokens without a percentage when the model limit is
     }),
   });
 
-  expect(frame).toContain("ctx 20.0k  used 75.0k");
-  expect(frame).not.toContain("ctx 20.0k/");
-  expect(frame).not.toContain("10%");
+  expect(frame).toContain("20.0k ctx");
+  expect(frame).not.toContain("used 75.0k");
+  expect(frame).not.toContain("custom/");
 });
 
 test("keeps the input visible in a short narrow chat frame", async () => {
-  const frame = await renderShellFrame(teamLiveFixture(), {
+  const frame = await renderShellFrame(emptyTeamLiveFixture("streaming"), {
     width: 64,
     height: 12,
     runtime: fakeChatRuntime({
@@ -121,7 +124,8 @@ test("keeps the input visible in a short narrow chat frame", async () => {
   });
 
   expect(frame).toContain("Ask anything");
-  expect(frame).toContain("ctx --");
+  expect(frame).toContain("test-model");
+  expect(frame).not.toContain("ctx --");
   expect(lineCount(frame)).toBe(12);
 });
 
@@ -155,7 +159,7 @@ test("renders chat shell action feedback", async () => {
 });
 
 test("renders chat transcript as a scrollable window", async () => {
-  const app = await renderShell(teamLiveFixture(), {
+  const app = await renderShell(emptyTeamLiveFixture("streaming"), {
     width: 120,
     height: 24,
     runtime: fakeChatRuntime({
@@ -300,7 +304,7 @@ test("ctrl+o toggles tool details and footer status", async () => {
   });
 
   try {
-    expect(app.captureCharFrame()).toContain("Details off");
+    expect(app.captureCharFrame()).not.toContain("Details on");
     expect(app.captureCharFrame()).toContain("output hidden (12 lines, details available)");
     expect(app.captureCharFrame()).not.toContain("line_01");
 
@@ -323,7 +327,7 @@ test("ctrl+o toggles tool details and footer status", async () => {
 
 test("ctrl+t opens transcript view with raw tool and approval details, and escape returns to chat", async () => {
   const items = rawTranscriptItems();
-  const app = await renderShell(teamLiveFixture(), {
+  const app = await renderShell(emptyTeamLiveFixture("streaming"), {
     width: 120,
     height: 54,
     runtime: fakeChatRuntime({
@@ -349,7 +353,7 @@ test("ctrl+t opens transcript view with raw tool and approval details, and escap
     await app.renderOnce();
 
     expect(app.captureCharFrame()).toContain("Transcript");
-    expect(app.captureCharFrame()).toContain("Ctrl+T Transcript on");
+    expect(app.captureCharFrame()).toContain("Transcript on");
     expect(app.captureCharFrame()).toContain("tool bash failed tool_raw");
     expect(app.captureCharFrame()).toContain("\"command\": \"bun test\"");
     expect(app.captureCharFrame()).toContain("RAW_TOOL_OUTPUT_LINE_1");
@@ -563,7 +567,8 @@ test("folds long approval details without hiding the prompt", async () => {
   expect(frame).toContain("Approval required");
   expect(frame).toContain("...");
   expect(frame).toContain("Resolve approval to continue");
-  expect(frame).toContain("commands");
+  expect(frame).toContain("test-model · chili");
+  expect(frame).toContain("Build · approval");
 });
 
 test("mouse wheel scrolls the chat transcript", async () => {

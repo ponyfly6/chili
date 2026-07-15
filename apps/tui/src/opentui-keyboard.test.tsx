@@ -2825,7 +2825,9 @@ test("/model uses runtime catalog and persists the selected model", async () => 
       threadId: "thread_created",
       modelSelection: { provider: "minimax", model: "MiniMax-M2.7-highspeed" },
     });
-    expect(app.captureCharFrame()).toContain("minimax/MiniMax-M2.7-highspeed Build");
+    const footerLine = app.captureCharFrame().split("\n").find((line) => line.includes("MiniMax-M2.7-highspeed") && line.includes("Build")) ?? "";
+    expect(footerLine).toContain("MiniMax-M2.7-highspeed");
+    expect(footerLine).not.toContain("minimax/");
   } finally {
     app.renderer.destroy();
   }
@@ -2886,7 +2888,7 @@ test("/model keeps the old UI state when persistence fails", async () => {
 
     const frame = app.captureCharFrame();
     expect(frame).toContain("Model unchanged: failed to persist openai-codex/gpt-5.5");
-    expect(frame).toContain("test-provider/test-model Build");
+    expect(frame.split("\n").some((line) => line.includes("test-model") && line.includes("Build"))).toBe(true);
     expect(frame).not.toContain("openai-codex/gpt-5.5 Build");
   } finally {
     app.renderer.destroy();
