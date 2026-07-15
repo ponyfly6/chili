@@ -20,6 +20,7 @@ const createdAt = 1 as TimestampMs;
 test("accepts only cataloged OpenAI Codex models", () => {
   for (const model of OPENAI_CODEX_MODELS) {
     expect(() => createOpenAICodexModel({ model })).not.toThrow();
+    expect(() => createOpenAICodexProvider({ model })).not.toThrow();
   }
 
   expect(() => createOpenAICodexModel({ model: "gpt-5.4" })).toThrow(
@@ -28,9 +29,12 @@ test("accepts only cataloged OpenAI Codex models", () => {
   expect(() => createOpenAICodexModel({
     env: { OPENAI_CODEX_MODEL: "gpt-5.3-codex" },
   })).toThrow('Unsupported OpenAI Codex model "gpt-5.3-codex"');
+  expect(() => createOpenAICodexProvider({ model: "gpt-5.4" })).toThrow(
+    'Unsupported OpenAI Codex model "gpt-5.4"',
+  );
   expect(() => createOpenAICodexProvider({
     env: { OPENAI_CODEX_MODEL: "gpt-5.2" },
-  }).models()).toThrow('Unsupported OpenAI Codex model "gpt-5.2"');
+  })).toThrow('Unsupported OpenAI Codex model "gpt-5.2"');
   expect(() => resolveOpenAICodexStreamRequestOptions(
     { messages: [], model: "gpt-5.1" },
     { model: "gpt-5.5" },

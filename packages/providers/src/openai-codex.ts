@@ -166,7 +166,9 @@ export class OpenAICodexProvider implements ChiliModelProvider {
   readonly id = OPENAI_CODEX_PROVIDER_ID;
   readonly name = "ChatGPT Codex";
 
-  constructor(private readonly options: OpenAICodexModelOptions = {}) {}
+  constructor(private readonly options: OpenAICodexModelOptions = {}) {
+    this.defaultModel();
+  }
 
   models(): readonly ModelDescriptor[] {
     const models = listKnownModels(this.id);
