@@ -102,6 +102,42 @@ test("context builder microcompacts old tool results by total tool-output budget
   expect(outputs[2]).not.toContain("tool result compacted from context");
 });
 
+test("context builder preserves tool result head and tail", () => {
+  const sessionId = "session_tool_head_tail" as SessionId;
+  const output = `HEAD_MARKER\n${"x".repeat(300)}DROP_MIDDLE_MARKER${"y".repeat(300)}\nartifact path: .chili/tool-results/call.txt`;
+  const message = toolResultMessage("msg_tool_head_tail", sessionId, "head_tail", output);
+
+  const built = new ContextWindowBuilder({
+    maxInputChars: 10_000,
+    maxToolResultChars: 120,
+    maxTotalToolResultChars: 10_000,
+  }).build([message]);
+
+  const part = built.messages[0]?.parts[0];
+  if (part?.type !== "tool_result") throw new Error("expected tool result");
+  expect(part.output).toContain("HEAD_MARKER");
+  expect(part.output).toContain("artifact path: .chili/tool-results/call.txt");
+  expect(part.output).not.toContain("DROP_MIDDLE_MARKER");
+  expect(part.output.length).toBeLessThanOrEqual(120);
+});
+
+test("context builder does not split surrogate pairs while truncating tool results", () => {
+  const sessionId = "session_tool_surrogate" as SessionId;
+  const output = `1234567890🙂${"x".repeat(100)}🙂${"z".repeat(32)}`;
+  const message = toolResultMessage("msg_tool_surrogate", sessionId, "surrogate", output);
+
+  const built = new ContextWindowBuilder({
+    maxInputChars: 10_000,
+    maxToolResultChars: 80,
+    maxTotalToolResultChars: 10_000,
+  }).build([message]);
+
+  const part = built.messages[0]?.parts[0];
+  if (part?.type !== "tool_result") throw new Error("expected tool result");
+  expect(Buffer.from(part.output, "utf8").toString("utf8")).toBe(part.output);
+  expect(part.output.length).toBeLessThanOrEqual(80);
+});
+
 test("context builder estimates image tool content without counting base64 bytes as text", () => {
   const sessionId = "session_tool_image_budget" as SessionId;
   const callId = "image_call";

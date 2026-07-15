@@ -262,7 +262,7 @@ export class ContextWindowBuilder {
     if (part.output.length <= this.maxToolResultChars) return part;
     const result: ToolResultPart = {
       ...part,
-      output: `${part.output.slice(0, this.maxToolResultChars)}\n[tool result omitted from context after ${this.maxToolResultChars} chars]`,
+      output: truncateTextHeadTail(part.output, this.maxToolResultChars),
     };
     if (part.synthetic !== undefined) result.synthetic = part.synthetic;
     return result;
@@ -352,6 +352,37 @@ export class ContextWindowBuilder {
       budgetChars: this.maxInputChars,
     };
   }
+}
+
+function truncateTextHeadTail(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const limit = Math.max(0, Math.trunc(maxChars));
+  const marker = "\n[tool result omitted from context]\n";
+  if (limit <= marker.length) return sliceHeadWithoutBrokenSurrogate(marker, limit);
+  const available = limit - marker.length;
+  const headChars = Math.floor(available * 0.25);
+  const tailChars = available - headChars;
+  return `${sliceHeadWithoutBrokenSurrogate(text, headChars)}${marker}${sliceTailWithoutBrokenSurrogate(text, tailChars)}`;
+}
+
+function sliceHeadWithoutBrokenSurrogate(text: string, maxChars: number): string {
+  let end = Math.max(0, Math.min(text.length, maxChars));
+  if (end > 0 && isHighSurrogate(text.charCodeAt(end - 1))) end -= 1;
+  return text.slice(0, end);
+}
+
+function sliceTailWithoutBrokenSurrogate(text: string, maxChars: number): string {
+  let start = Math.max(0, text.length - Math.max(0, maxChars));
+  if (start < text.length && isLowSurrogate(text.charCodeAt(start))) start += 1;
+  return text.slice(start);
+}
+
+function isHighSurrogate(value: number): boolean {
+  return value >= 0xd800 && value <= 0xdbff;
+}
+
+function isLowSurrogate(value: number): boolean {
+  return value >= 0xdc00 && value <= 0xdfff;
 }
 
 function wouldCompactOnlySummary(messages: readonly Message[], boundaryIndex: number): boolean {
