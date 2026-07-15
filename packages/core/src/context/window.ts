@@ -101,7 +101,12 @@ export class ContextWindowBuilder {
     const compactedMessages = compactedMessageView(messages).filter(hasContextParts);
     const compactedMessagesOmitted = messages.length - compactedMessages.length;
     const truncated = compactedMessages.map((message) => this.truncateMessage(message));
-    const truncatedToolResults = truncated.reduce((count, message) => count + countTruncatedToolResults(message), 0);
+    const truncatedToolResults = compactedMessages.reduce(
+      (count, message) => count + message.parts.filter(
+        (part) => part.type === "tool_result" && part.output.length > this.maxToolResultChars,
+      ).length,
+      0,
+    );
     const toolCompacted = this.compactToolResultsByBudget(truncated);
     const budgeted = toolCompacted.messages;
     const threshold = Math.floor(this.maxInputChars * this.compactionThresholdRatio);
@@ -357,8 +362,8 @@ export class ContextWindowBuilder {
 function truncateTextHeadTail(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
   const limit = Math.max(0, Math.trunc(maxChars));
-  const marker = "\n[tool result omitted from context]\n";
-  if (limit <= marker.length) return sliceHeadWithoutBrokenSurrogate(marker, limit);
+  const marker = "\n[tool result omitted from context after truncation]\n";
+  if (limit <= marker.length) return sliceHeadWithoutBrokenSurrogate("tool result omitted", limit);
   const available = limit - marker.length;
   const headChars = Math.floor(available * 0.25);
   const tailChars = available - headChars;
@@ -592,10 +597,6 @@ function findLatestCompaction(messages: readonly Message[]): { messageIndex: num
     }
   }
   return undefined;
-}
-
-function countTruncatedToolResults(message: Message): number {
-  return message.parts.filter((part) => part.type === "tool_result" && part.output.includes("[tool result omitted from context")).length;
 }
 
 function countToolResults(messages: readonly Message[]): number {

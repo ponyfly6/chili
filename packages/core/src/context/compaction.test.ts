@@ -119,6 +119,7 @@ test("context builder preserves tool result head and tail", () => {
   expect(part.output).toContain("artifact path: .chili/tool-results/call.txt");
   expect(part.output).not.toContain("DROP_MIDDLE_MARKER");
   expect(part.output.length).toBeLessThanOrEqual(120);
+  expect(built.usage.truncatedToolResults).toBe(1);
 });
 
 test("context builder does not split surrogate pairs while truncating tool results", () => {
