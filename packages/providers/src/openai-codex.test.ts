@@ -3,7 +3,10 @@ import type { Message, MessageId, PartId, SessionId, TimestampMs, ToolCallId } f
 import {
   buildOpenAICodexResponsesRequestBody,
   clampOpenAICodexReasoningEffort,
+  createOpenAICodexModel,
+  createOpenAICodexProvider,
   exchangeOpenAICodexAuthorizationCode,
+  OPENAI_CODEX_MODELS,
   OpenAICodexResponsesModel,
   refreshOpenAICodexToken,
   resolveOpenAICodexStreamRequestOptions,
@@ -13,6 +16,26 @@ import type { ModelStreamEvent, ModelTool } from "./types.js";
 
 const sessionId = "session_codex" as SessionId;
 const createdAt = 1 as TimestampMs;
+
+test("accepts only cataloged OpenAI Codex models", () => {
+  for (const model of OPENAI_CODEX_MODELS) {
+    expect(() => createOpenAICodexModel({ model })).not.toThrow();
+  }
+
+  expect(() => createOpenAICodexModel({ model: "gpt-5.4" })).toThrow(
+    'Unsupported OpenAI Codex model "gpt-5.4"',
+  );
+  expect(() => createOpenAICodexModel({
+    env: { OPENAI_CODEX_MODEL: "gpt-5.3-codex" },
+  })).toThrow('Unsupported OpenAI Codex model "gpt-5.3-codex"');
+  expect(() => createOpenAICodexProvider({
+    env: { OPENAI_CODEX_MODEL: "gpt-5.2" },
+  }).models()).toThrow('Unsupported OpenAI Codex model "gpt-5.2"');
+  expect(() => resolveOpenAICodexStreamRequestOptions(
+    { messages: [], model: "gpt-5.1" },
+    { model: "gpt-5.5" },
+  )).toThrow('Unsupported OpenAI Codex model "gpt-5.1"');
+});
 
 test("converts Chili messages and tools into a Codex Responses body", () => {
   const callId = "call_weather" as ToolCallId;
@@ -221,7 +244,7 @@ test("omits image tool result blocks for text-only Codex request bodies", () => 
       system: [],
     },
     {
-      model: "gpt-5.3-codex-spark",
+      model: "text-only-codex-fixture",
       inputCapabilities: ["text"],
     },
   );
@@ -254,14 +277,14 @@ test("resolves per-stream Codex model and reasoning request options", () => {
     resolveOpenAICodexStreamRequestOptions(
       {
         messages: [],
-        model: "openai-codex/gpt-5.1:xhigh",
+        model: "openai-codex/gpt-5.6-terra:xhigh",
         reasoning: "low",
         metadata: { sessionId: "session_2" },
       },
       { model: "gpt-5.5", reasoningEffort: "medium" },
     ),
   ).toMatchObject({
-    model: "gpt-5.1",
+    model: "gpt-5.6-terra",
     reasoningEffort: "low",
     sessionId: "session_2",
   });
@@ -270,12 +293,12 @@ test("resolves per-stream Codex model and reasoning request options", () => {
     resolveOpenAICodexStreamRequestOptions(
       {
         messages: [],
-        model: "openai-codex/gpt-5.1:xhigh",
+        model: "openai-codex/gpt-5.6-terra:xhigh",
       },
       { model: "gpt-5.5", reasoningEffort: "medium" },
     ),
   ).toMatchObject({
-    model: "gpt-5.1",
+    model: "gpt-5.6-terra",
     reasoningEffort: "xhigh",
   });
 });
@@ -378,7 +401,7 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
     headers = new Headers(init?.headers);
     body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     return new Response(streamText([
-      data({ type: "response.created", response: { id: "resp_1", model: "gpt-test" } }),
+      data({ type: "response.created", response: { id: "resp_1", model: "gpt-5.5" } }),
       data({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: "msg_1" } }),
       data({ type: "response.output_text.delta", output_index: 0, delta: "hello" }),
       data({
@@ -397,7 +420,7 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
         type: "response.completed",
         response: {
           id: "resp_1",
-          model: "gpt-test",
+          model: "gpt-5.5",
           status: "completed",
           usage: {
             input_tokens: 5,
@@ -414,7 +437,7 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
   }) as typeof fetch;
 
   const model = new OpenAICodexResponsesModel({
-    model: "gpt-test",
+    model: "gpt-5.5",
     reasoningEffort: "medium",
     apiKey: token,
     fetch: fetchImpl,
@@ -423,7 +446,7 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
   const events = await collect(
     model.stream({
       messages: [],
-      model: "openai-codex/gpt-dynamic:high",
+      model: "openai-codex/gpt-5.6-terra:high",
       tools: [],
       system: [],
       metadata: { sessionId: "session_1" },
@@ -437,7 +460,7 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
   expect(headers.get("openai-beta")).toBe("responses=experimental");
   expect(headers.get("session_id")).toBe("session_1");
   expect(body).toMatchObject({
-    model: "gpt-dynamic",
+    model: "gpt-5.6-terra",
     prompt_cache_key: "session_1",
     reasoning: { effort: "high", summary: "auto" },
   });
@@ -476,10 +499,10 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
 
 test("maps incomplete Codex tool-call responses to length", async () => {
   const model = new OpenAICodexResponsesModel({
-    model: "gpt-test",
+    model: "gpt-5.5",
     apiKey: jwtWithAccount("acct_test"),
     fetch: sseFetch([
-      data({ type: "response.created", response: { id: "resp_incomplete", model: "gpt-test" } }),
+      data({ type: "response.created", response: { id: "resp_incomplete", model: "gpt-5.5" } }),
       data({
         type: "response.output_item.added",
         output_index: 0,
@@ -492,7 +515,7 @@ test("maps incomplete Codex tool-call responses to length", async () => {
       }),
       data({
         type: "response.incomplete",
-        response: { id: "resp_incomplete", model: "gpt-test" },
+        response: { id: "resp_incomplete", model: "gpt-5.5" },
       }),
     ]),
     env: {},
@@ -506,10 +529,10 @@ test("maps incomplete Codex tool-call responses to length", async () => {
 
 test("marks invalid Codex tool arguments", async () => {
   const model = new OpenAICodexResponsesModel({
-    model: "gpt-test",
+    model: "gpt-5.5",
     apiKey: jwtWithAccount("acct_test"),
     fetch: sseFetch([
-      data({ type: "response.created", response: { id: "resp_invalid_args", model: "gpt-test" } }),
+      data({ type: "response.created", response: { id: "resp_invalid_args", model: "gpt-5.5" } }),
       data({
         type: "response.output_item.added",
         output_index: 0,
@@ -527,7 +550,7 @@ test("marks invalid Codex tool arguments", async () => {
       }),
       data({
         type: "response.completed",
-        response: { id: "resp_invalid_args", model: "gpt-test", status: "completed" },
+        response: { id: "resp_invalid_args", model: "gpt-5.5", status: "completed" },
       }),
     ]),
     env: {},
@@ -586,10 +609,10 @@ test("sends OpenAI-compatible Codex requests without ChatGPT account headers", a
 
 test("surfaces nested OpenAI Codex SSE error details", async () => {
   const model = new OpenAICodexResponsesModel({
-    model: "gpt-test",
+    model: "gpt-5.5",
     apiKey: jwtWithAccount("acct_test"),
     fetch: sseFetch([
-      data({ type: "response.created", response: { id: "resp_error", model: "gpt-test" } }),
+      data({ type: "response.created", response: { id: "resp_error", model: "gpt-5.5" } }),
       data({
         type: "error",
         error: {
@@ -611,14 +634,14 @@ test("surfaces nested OpenAI Codex SSE error details", async () => {
 
 test("surfaces OpenAI Codex response.failed error details", async () => {
   const model = new OpenAICodexResponsesModel({
-    model: "gpt-test",
+    model: "gpt-5.5",
     apiKey: jwtWithAccount("acct_test"),
     fetch: sseFetch([
       data({
         type: "response.failed",
         response: {
           id: "resp_failed",
-          model: "gpt-test",
+          model: "gpt-5.5",
           status: "failed",
           error: {
             message: "Rate limit reached",
@@ -638,7 +661,7 @@ test("surfaces OpenAI Codex response.failed error details", async () => {
 
 test("surfaces OpenAI Codex HTTP error details", async () => {
   const model = new OpenAICodexResponsesModel({
-    model: "gpt-test",
+    model: "gpt-5.5",
     apiKey: jwtWithAccount("acct_test"),
     fetch: (async () =>
       new Response(JSON.stringify({

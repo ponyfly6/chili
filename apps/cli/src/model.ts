@@ -8,6 +8,7 @@ import type {
 import type { ModelSelection, RuntimeModelDescriptor, ServiceTier } from "@chili/protocol";
 import { createMiniMaxM27HighspeedRouter } from "@chili/core";
 import {
+  assertOpenAICodexModel,
   DEEPSEEK_OPENAI_BASE_URL,
   DEEPSEEK_PROVIDER_ID,
   FileAuthStorage,
@@ -336,16 +337,24 @@ function resolveCliModelSelection(providerInput: string | undefined, modelInput:
     if (split && split.provider !== provider) {
       throw new Error(`--model ${model} conflicts with --provider ${provider}`);
     }
-    return { kind: "provider", provider, model: split?.model ?? model };
+    const resolvedModel = split?.model ?? model;
+    assertCliProviderModel(provider, resolvedModel);
+    return { kind: "provider", provider, model: resolvedModel };
   }
 
-  if (split) return { kind: "provider", provider: split.provider, model: split.model };
+  if (split) {
+    assertCliProviderModel(split.provider, split.model);
+    return { kind: "provider", provider: split.provider, model: split.model };
+  }
 
   const exact = findKnownModelByBareId(model);
   if (exact) return { kind: "provider", provider: exact.provider, model: exact.model };
 
   const heuristicProvider = inferProviderFromBareModel(model);
-  if (heuristicProvider) return { kind: "provider", provider: heuristicProvider, model };
+  if (heuristicProvider) {
+    assertCliProviderModel(heuristicProvider, model);
+    return { kind: "provider", provider: heuristicProvider, model };
+  }
 
   return { kind: "provider", provider: DEFAULT_PROVIDER, model };
 }
@@ -411,6 +420,10 @@ function isCliProviderName(provider: string): provider is CliProviderName {
     || provider === KIMI_PROVIDER_ID
     || provider === ZAI_PROVIDER_ID
     || provider === OPENAI_CODEX_PROVIDER_ID;
+}
+
+function assertCliProviderModel(provider: CliProviderName, model: string | undefined): void {
+  if (provider === OPENAI_CODEX_PROVIDER_ID && model) assertOpenAICodexModel(model);
 }
 
 function splitReasoningSuffix(value: string): { model: string; reasoningLevel?: CliReasoningLevel } {
@@ -686,7 +699,11 @@ function readOptionsForProvider(provider: CliProviderName, input: ProviderRouter
   if (provider === "deepseek") return readDeepSeekOptionsFromEnv(input);
   if (provider === "kimi") return readKimiOptionsFromEnv(input);
   if (provider === "zai") return readZaiOptionsFromEnv(input);
-  if (provider === "openai-codex") return readOpenAICodexOptionsFromEnv(input);
+  if (provider === "openai-codex") {
+    const options = readOpenAICodexOptionsFromEnv(input);
+    assertCliProviderModel(provider, options.model);
+    return options;
+  }
   return readMiniMaxOptionsFromEnv(input);
 }
 

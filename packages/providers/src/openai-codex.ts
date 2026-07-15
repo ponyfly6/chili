@@ -3,6 +3,7 @@ import type { Message, MessagePart, ServiceTier } from "@chili/protocol";
 import { FileAuthStorage, type OAuthCredentials } from "./auth.js";
 import { type EnvironmentSource, readOpenAICodexEnvironment } from "./env.js";
 import {
+  assertOpenAICodexModel,
   findDefaultKnownModel,
   findKnownModel,
   listKnownModels,
@@ -206,7 +207,9 @@ export class OpenAICodexProvider implements ChiliModelProvider {
 
   private defaultModel(): string {
     const env = readOpenAICodexEnvironment(this.options.env);
-    return this.options.model ?? env.model ?? OPENAI_CODEX_DEFAULT_MODEL;
+    const model = this.options.model ?? env.model ?? OPENAI_CODEX_DEFAULT_MODEL;
+    assertOpenAICodexModel(model);
+    return model;
   }
 
   private defaultBaseUrl(): string {
@@ -225,6 +228,7 @@ export class OpenAICodexResponsesModel implements ChiliModel {
   constructor(private readonly options: OpenAICodexModelOptions = {}) {
     const env = readOpenAICodexEnvironment(options.env);
     this.model = options.model ?? env.model ?? OPENAI_CODEX_DEFAULT_MODEL;
+    assertOpenAICodexModel(this.model);
     this.fetchImpl = options.fetch ?? fetch;
     this.authStorage = options.authStorage ?? new FileAuthStorage(options.authPath);
   }
@@ -434,6 +438,7 @@ export function resolveOpenAICodexStreamRequestOptions(
   }
 
   const model = selection.model ?? options.model ?? env.model ?? OPENAI_CODEX_DEFAULT_MODEL;
+  assertOpenAICodexModel(model);
   const descriptor = findKnownModel(OPENAI_CODEX_PROVIDER_ID, model);
   const maxTokens = input.maxTokens ?? options.maxTokens;
   const temperature = input.temperature ?? options.temperature;

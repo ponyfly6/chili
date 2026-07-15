@@ -224,10 +224,22 @@ test("CLI runtime model selection resolves explicit provider aliases to concrete
   expect(resolveCliRuntimeModelSelection({ model: "fake" })).toBeUndefined();
 });
 
+test("CLI runtime model selection rejects unsupported Codex models", () => {
+  delete process.env.OPENAI_CODEX_MODEL;
+  expect(() => resolveCliRuntimeModelSelection({ model: "gpt-5.4" })).toThrow(
+    'Unsupported OpenAI Codex model "gpt-5.4"',
+  );
+
+  process.env.OPENAI_CODEX_MODEL = "gpt-5.3-codex";
+  expect(() => resolveCliRuntimeModelSelection({ model: "codex" })).toThrow(
+    'Unsupported OpenAI Codex model "gpt-5.3-codex"',
+  );
+});
+
 test("CLI Codex env resolution uses ChatGPT Codex endpoint and session metadata", async () => {
   process.env.OPENAI_CODEX_ACCESS_TOKEN = jwtWithAccount("acct_cli");
   process.env.OPENAI_CODEX_BASE_URL = "https://chatgpt.test/backend-api";
-  process.env.OPENAI_CODEX_MODEL = "gpt-5.3-codex";
+  process.env.OPENAI_CODEX_MODEL = "gpt-5.5";
 
   let url = "";
   let headers = new Headers();
@@ -238,12 +250,12 @@ test("CLI Codex env resolution uses ChatGPT Codex endpoint and session metadata"
     body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     return new Response(
       streamText([
-        data({ type: "response.created", response: { id: "resp_cli", model: "gpt-5.3-codex" } }),
+        data({ type: "response.created", response: { id: "resp_cli", model: "gpt-5.5" } }),
         data({
           type: "response.completed",
           response: {
             id: "resp_cli",
-            model: "gpt-5.3-codex",
+            model: "gpt-5.5",
             status: "completed",
             usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3 },
           },
@@ -264,7 +276,7 @@ test("CLI Codex env resolution uses ChatGPT Codex endpoint and session metadata"
   expect(headers.get("chatgpt-account-id")).toBe("acct_cli");
   expect(headers.get("session_id")).toBe("session_cli_model");
   expect(body).toMatchObject({
-    model: "gpt-5.3-codex",
+    model: "gpt-5.5",
     prompt_cache_key: "session_cli_model",
     max_output_tokens: 32768,
   });
@@ -272,7 +284,7 @@ test("CLI Codex env resolution uses ChatGPT Codex endpoint and session metadata"
   expect(events).toContainEqual(expect.objectContaining({
     type: "metadata",
     provider: "openai-codex",
-    model: "gpt-5.3-codex",
+    model: "gpt-5.5",
     contextWindowTokens: 272000,
     maxOutputTokens: 128000,
   }));
@@ -280,14 +292,14 @@ test("CLI Codex env resolution uses ChatGPT Codex endpoint and session metadata"
 
 test("CLI Codex request limits follow a per-request model override", async () => {
   process.env.OPENAI_CODEX_ACCESS_TOKEN = jwtWithAccount("acct_cli");
-  process.env.OPENAI_CODEX_MODEL = "gpt-5.3-codex";
+  process.env.OPENAI_CODEX_MODEL = "gpt-5.5";
 
   const model = await createCliModel("codex");
   const limits = await model.resolveRequestLimits?.({
-    modelSelection: { provider: "openai-codex", model: "gpt-5.3-codex-spark" },
+    modelSelection: { provider: "openai-codex", model: "gpt-5.6-luna" },
   });
 
-  expect(limits).toEqual({ contextWindowTokens: 128000, requestMaxOutputTokens: 32768 });
+  expect(limits).toEqual({ contextWindowTokens: 1050000, requestMaxOutputTokens: 32768 });
 });
 
 test("CLI Codex supports bare concrete model ids with thinking", async () => {
@@ -301,11 +313,11 @@ test("CLI Codex supports bare concrete model ids with thinking", async () => {
     return codexResponse(String(body.model));
   }) as typeof fetch;
 
-  const model = await createCliModel("gpt-5.3-codex:high", { fetch: fetchImpl });
+  const model = await createCliModel("gpt-5.6-terra:high", { fetch: fetchImpl });
   await collect(model.stream(emptyInput()));
 
   expect(body).toMatchObject({
-    model: "gpt-5.3-codex",
+    model: "gpt-5.6-terra",
     reasoning: { effort: "high", summary: "auto" },
   });
 });
@@ -348,7 +360,7 @@ test("CLI router passes core modelSelection and reasoningLevel through to provid
   await collect(model.stream(emptyInput()));
   await collect(model.stream({
     ...emptyInput(),
-    modelSelection: { provider: "openai-codex", model: "gpt-5.3-codex" },
+    modelSelection: { provider: "openai-codex", model: "gpt-5.6-luna" },
     reasoningLevel: "high",
     serviceTier: "fast",
   } as ModelStreamInput & {
@@ -363,7 +375,7 @@ test("CLI router passes core modelSelection and reasoningLevel through to provid
     reasoning: { effort: "low", summary: "auto" },
   });
   expect(bodies.at(1)).toMatchObject({
-    model: "gpt-5.3-codex",
+    model: "gpt-5.6-luna",
     reasoning: { effort: "high", summary: "auto" },
     service_tier: "priority",
   });
