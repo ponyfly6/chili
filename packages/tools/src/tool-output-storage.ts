@@ -1,8 +1,9 @@
 import type { ToolCallId } from "@chili/protocol";
+import { dlopen, FFIType } from "bun:ffi";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
-import { lstat, mkdir, open, readdir, rename, stat, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, rename, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
 import {
   assertExistingPathInsideWorkspace,
@@ -14,9 +15,12 @@ export const DEFAULT_MAX_PERSISTED_OUTPUT_BYTES = 1024 * 1024;
 export const DEFAULT_MAX_PERSISTED_OUTPUT_DIRECTORY_BYTES = 64 * 1024 * 1024;
 
 const sidecarDirectoryLocks = new Map<string, Promise<void>>();
+const FILESYSTEM_LOCK_TIMEOUT_MS = 2_000;
 const FILESYSTEM_LOCK_RETRY_MS = 10;
-const FILESYSTEM_LOCK_ATTEMPTS = 200;
-const FILESYSTEM_LOCK_STALE_MS = 30_000;
+const FILESYSTEM_LOCK_FILENAME = ".sidecar.lock";
+const LOCK_EXCLUSIVE = 2;
+const LOCK_NONBLOCKING = 4;
+const LOCK_UNLOCK = 8;
 
 export interface PersistedOutput {
   relativePath: string;
@@ -39,24 +43,25 @@ export async function persistToolOutput(
   options: ToolOutputStorageOptions = {},
 ): Promise<PersistedOutput> {
   const target = await prepareOutputTarget(cwd, callId);
-  const limitBytes = options.maxBytes ?? DEFAULT_MAX_PERSISTED_OUTPUT_BYTES;
+  const maxDirectoryBytes = options.maxDirectoryBytes ?? DEFAULT_MAX_PERSISTED_OUTPUT_DIRECTORY_BYTES;
+  const limitBytes = effectiveOutputLimit(
+    options.maxBytes ?? DEFAULT_MAX_PERSISTED_OUTPUT_BYTES,
+    maxDirectoryBytes,
+  );
   const persisted = truncateUtf8(output, limitBytes);
   return withOutputDirectoryLock(target.directoryPath, async () => {
     await validateOutputTarget(cwd, target);
-    const temporary = await openTemporaryOutput(target);
+    const bytes = Buffer.byteLength(persisted.text, "utf8");
+    await ensureSidecarDirectoryCapacity(target.directoryPath, bytes, maxDirectoryBytes);
+    const temporary = await openTemporaryOutput(target, bytes);
     try {
       await temporary.handle.writeFile(persisted.text, "utf8");
+      await temporary.handle.truncate(bytes);
       await validateTemporaryHandle(temporary.handle);
       await temporary.handle.sync();
       await temporary.handle.close();
       await validateOutputTarget(cwd, target);
       await rename(temporary.path, target.absolutePath);
-      const bytes = Buffer.byteLength(persisted.text, "utf8");
-      await enforceSidecarDirectoryBudget(
-        target.directoryPath,
-        target.absolutePath,
-        options.maxDirectoryBytes ?? DEFAULT_MAX_PERSISTED_OUTPUT_DIRECTORY_BYTES,
-      );
       return {
         relativePath: target.relativePath,
         absolutePath: target.absolutePath,
@@ -87,7 +92,6 @@ export class StreamingToolOutputFile {
     private readonly temporaryPath: string,
     private readonly handle: FileHandle,
     private readonly limitBytes: number,
-    private readonly maxDirectoryBytes: number,
   ) {}
 
   static async open(
@@ -96,17 +100,23 @@ export class StreamingToolOutputFile {
     options: ToolOutputStorageOptions = {},
   ): Promise<StreamingToolOutputFile> {
     const target = await prepareOutputTarget(cwd, callId);
+    const maxDirectoryBytes = options.maxDirectoryBytes ?? DEFAULT_MAX_PERSISTED_OUTPUT_DIRECTORY_BYTES;
+    const limitBytes = effectiveOutputLimit(
+      options.maxBytes ?? DEFAULT_MAX_PERSISTED_OUTPUT_BYTES,
+      maxDirectoryBytes,
+    );
+    const reservationBytes = Number.isFinite(limitBytes) ? limitBytes : 0;
     const temporary = await withOutputDirectoryLock(target.directoryPath, async () => {
       await validateOutputTarget(cwd, target);
-      return openTemporaryOutput(target);
+      await ensureSidecarDirectoryCapacity(target.directoryPath, reservationBytes, maxDirectoryBytes);
+      return openTemporaryOutput(target, reservationBytes);
     });
     return new StreamingToolOutputFile(
       cwd,
       target,
       temporary.path,
       temporary.handle,
-      options.maxBytes ?? DEFAULT_MAX_PERSISTED_OUTPUT_BYTES,
-      options.maxDirectoryBytes ?? DEFAULT_MAX_PERSISTED_OUTPUT_DIRECTORY_BYTES,
+      limitBytes,
     );
   }
 
@@ -119,7 +129,7 @@ export class StreamingToolOutputFile {
       if (remaining === 0 || bytes === 0) return;
       const bounded = truncateUtf8(text, remaining).text;
       if (bounded.length === 0) return;
-      await this.handle.write(bounded, null, "utf8");
+      await this.handle.writeFile(bounded, "utf8");
       this.persistedBytes += Buffer.byteLength(bounded, "utf8");
     });
     return this.writeQueue;
@@ -130,17 +140,13 @@ export class StreamingToolOutputFile {
     this.closed = true;
     try {
       await this.writeQueue;
+      await this.handle.truncate(this.persistedBytes);
       await validateTemporaryHandle(this.handle);
       await this.handle.sync();
       await this.handle.close();
       await withOutputDirectoryLock(this.target.directoryPath, async () => {
         await validateOutputTarget(this.cwd, this.target);
         await rename(this.temporaryPath, this.target.absolutePath);
-        await enforceSidecarDirectoryBudget(
-          this.target.directoryPath,
-          this.target.absolutePath,
-          this.maxDirectoryBytes,
-        );
       });
     } catch (error) {
       await this.handle.close().catch(() => undefined);
@@ -208,7 +214,7 @@ async function validateOutputTarget(cwd: string, target: OutputTarget): Promise<
   await assertWritablePathInsideWorkspace(cwd, file, target.relativePath);
 }
 
-async function openTemporaryOutput(target: OutputTarget): Promise<TemporaryOutput> {
+async function openTemporaryOutput(target: OutputTarget, reservationBytes: number): Promise<TemporaryOutput> {
   const path = join(
     target.directoryPath,
     `.${basename(target.absolutePath)}.${process.pid}.${randomUUID()}.tmp`,
@@ -223,6 +229,7 @@ async function openTemporaryOutput(target: OutputTarget): Promise<TemporaryOutpu
   );
   try {
     await validateTemporaryHandle(handle);
+    await handle.truncate(reservationBytes);
     return { path, handle };
   } catch (error) {
     await handle.close().catch(() => undefined);
@@ -247,71 +254,182 @@ function toolResultFilename(callId: ToolCallId): string {
   return `toolcall_${hash}.txt`;
 }
 
-async function enforceSidecarDirectoryBudget(directory: string, currentPath: string, maxBytes: number): Promise<void> {
+async function ensureSidecarDirectoryCapacity(
+  directory: string,
+  incomingBytes: number,
+  maxBytes: number,
+): Promise<void> {
   if (maxBytes === Infinity) return;
   const entries = await readdir(directory, { withFileTypes: true });
-  const files = await Promise.all(entries.filter((entry) => entry.isFile() && entry.name.endsWith(".txt")).map(async (entry) => {
-    const path = join(directory, entry.name);
-    const info = await stat(path);
-    return { path, bytes: info.size, modifiedAt: info.mtimeMs };
-  }));
+  const files = (await Promise.all(entries
+    .filter((entry) => entry.isFile() && (entry.name.endsWith(".txt") || isTemporaryOutputName(entry.name)))
+    .map(async (entry) => {
+      const path = join(directory, entry.name);
+      const info = await lstat(path);
+      if (!info.isFile() || info.nlink !== 1) {
+        throw new Error(`Cannot safely account for tool output directory entry: ${entry.name}`);
+      }
+      return {
+        path,
+        bytes: info.size,
+        modifiedAt: info.mtimeMs,
+        temporary: isTemporaryOutputName(entry.name),
+      };
+    }))).filter((file) => file !== undefined);
   let totalBytes = files.reduce((total, file) => total + file.bytes, 0);
-  const current = files.find((file) => file.path === currentPath);
-  const effectiveLimit = Math.max(0, Math.trunc(maxBytes), current?.bytes ?? 0);
+  const effectiveLimit = Math.max(0, Math.trunc(maxBytes));
+  const temporaryBytes = files.reduce(
+    (total, file) => total + (file.temporary ? file.bytes : 0),
+    0,
+  );
+  if (temporaryBytes + incomingBytes > effectiveLimit) {
+    throw new Error(
+      `Tool output directory byte budget exhausted: ${temporaryBytes} reserved + ${incomingBytes} requested > ${effectiveLimit}`,
+    );
+  }
   files.sort((left, right) => {
-    if (left.path === currentPath) return 1;
-    if (right.path === currentPath) return -1;
+    if (left.temporary !== right.temporary) return left.temporary ? 1 : -1;
     return left.modifiedAt - right.modifiedAt || left.path.localeCompare(right.path);
   });
   for (const file of files) {
-    if (totalBytes <= effectiveLimit || file.path === currentPath) break;
+    if (totalBytes + incomingBytes <= effectiveLimit) break;
+    if (file.temporary) continue;
     await unlink(file.path).catch((error) => {
       if (!isNotFoundError(error)) throw error;
     });
     totalBytes -= file.bytes;
   }
+  if (totalBytes + incomingBytes > effectiveLimit) {
+    throw new Error(
+      `Tool output directory byte budget exhausted: ${totalBytes} existing + ${incomingBytes} requested > ${effectiveLimit}`,
+    );
+  }
+}
+
+function effectiveOutputLimit(maxBytes: number, maxDirectoryBytes: number): number {
+  const outputLimit = maxBytes === Infinity ? Infinity : Math.max(0, Math.trunc(maxBytes));
+  const directoryLimit = maxDirectoryBytes === Infinity
+    ? Infinity
+    : Math.max(0, Math.trunc(maxDirectoryBytes));
+  return Math.min(outputLimit, directoryLimit);
+}
+
+function isTemporaryOutputName(name: string): boolean {
+  return /^\..+\.txt\.\d+\.[0-9a-f-]{36}\.tmp$/i.test(name);
 }
 
 async function withFilesystemDirectoryLock<T>(directory: string, operation: () => Promise<T>): Promise<T> {
-  const lockPath = join(directory, ".sidecar.lock");
-  let handle: FileHandle | undefined;
-  for (let attempt = 0; attempt < FILESYSTEM_LOCK_ATTEMPTS; attempt += 1) {
-    try {
-      handle = await open(
-        lockPath,
-        fsConstants.O_WRONLY
-          | fsConstants.O_CREAT
-          | fsConstants.O_EXCL
-          | (fsConstants.O_NOFOLLOW ?? 0),
-        0o600,
-      );
-      break;
-    } catch (error) {
-      if (!isAlreadyExistsError(error)) throw error;
-      const stale = await lstat(lockPath)
-        .then((info) => Date.now() - info.mtimeMs > FILESYSTEM_LOCK_STALE_MS)
-        .catch((statError) => {
-          if (isNotFoundError(statError)) return false;
-          throw statError;
-        });
-      if (stale) {
-        await unlink(lockPath).catch((unlinkError) => {
-          if (!isNotFoundError(unlinkError)) throw unlinkError;
-        });
-      } else {
-        await delay(FILESYSTEM_LOCK_RETRY_MS);
-      }
-    }
-  }
-  if (!handle) throw new Error(`Timed out waiting for tool output directory lock: ${directory}`);
+  const path = join(directory, FILESYSTEM_LOCK_FILENAME);
+  const handle = await open(
+    path,
+    fsConstants.O_RDWR | fsConstants.O_CREAT | (fsConstants.O_NOFOLLOW ?? 0),
+    0o600,
+  );
   try {
-    await handle.writeFile(`${process.pid}\n`, "utf8");
-    return await operation();
+    const [handleInfo, pathInfo] = await Promise.all([handle.stat(), lstat(path)]);
+    validatePrivateRegularFile(handleInfo, "Tool output directory lock");
+    if (pathInfo.dev !== handleInfo.dev || pathInfo.ino !== handleInfo.ino) {
+      throw new Error("Tool output directory lock changed while opening");
+    }
+    await acquireFilesystemLock(handle.fd, directory);
+    try {
+      const lockedInfo = await lstat(path);
+      if (lockedInfo.dev !== handleInfo.dev || lockedInfo.ino !== handleInfo.ino) {
+        throw new Error("Tool output directory lock changed while acquiring");
+      }
+      return await operation();
+    } finally {
+      nativeFlock(handle.fd, LOCK_UNLOCK);
+    }
   } finally {
     await handle.close().catch(() => undefined);
-    await unlink(lockPath).catch((error) => {
-      if (!isNotFoundError(error)) throw error;
+  }
+}
+
+async function acquireFilesystemLock(fd: number, directory: string): Promise<void> {
+  const deadline = Date.now() + FILESYSTEM_LOCK_TIMEOUT_MS;
+  while (nativeFlock(fd, LOCK_EXCLUSIVE | LOCK_NONBLOCKING) !== 0) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for tool output directory lock: ${directory}`);
+    }
+    await delay(FILESYSTEM_LOCK_RETRY_MS);
+  }
+}
+
+interface NativeFileLockBackend {
+  tryLock(fd: number): number;
+  unlock(fd: number): number;
+}
+
+function loadNativeFileLockBackend(): NativeFileLockBackend {
+  if (process.platform === "win32") {
+    const library = dlopen("msvcrt.dll", {
+      _locking: {
+        args: [FFIType.i32, FFIType.i32, FFIType.i32],
+        returns: FFIType.i32,
+      },
     });
+    return {
+      tryLock: (fd) => library.symbols._locking(fd, 2, 1),
+      unlock: (fd) => library.symbols._locking(fd, 0, 1),
+    };
+  }
+
+  const candidates = process.platform === "darwin"
+    ? ["/usr/lib/libSystem.B.dylib"]
+    : process.platform === "linux"
+      ? linuxLibcCandidates()
+      : [];
+  for (const path of candidates) {
+    try {
+      const library = dlopen(path, {
+        flock: {
+          args: [FFIType.i32, FFIType.i32],
+          returns: FFIType.i32,
+        },
+      });
+      return {
+        tryLock: (fd) => library.symbols.flock(fd, LOCK_EXCLUSIVE | LOCK_NONBLOCKING),
+        unlock: (fd) => library.symbols.flock(fd, LOCK_UNLOCK),
+      };
+    } catch {
+      // Try the next libc name; musl and glibc expose different loader paths.
+    }
+  }
+  throw new Error(`Tool output directory locking is unsupported on ${process.platform}/${process.arch}`);
+}
+
+function linuxLibcCandidates(): string[] {
+  const muslArch = process.arch === "x64"
+    ? "x86_64"
+    : process.arch === "arm64"
+      ? "aarch64"
+      : process.arch;
+  return [
+    "libc.so.6",
+    "libc.so",
+    `/lib/libc.musl-${muslArch}.so.1`,
+    `/usr/lib/libc.musl-${muslArch}.so.1`,
+    `/lib/ld-musl-${muslArch}.so.1`,
+  ];
+}
+
+let nativeFileLockBackend: NativeFileLockBackend | undefined;
+
+function nativeFlock(fd: number, operation: number): number {
+  nativeFileLockBackend ??= loadNativeFileLockBackend();
+  return operation === LOCK_UNLOCK
+    ? nativeFileLockBackend.unlock(fd)
+    : nativeFileLockBackend.tryLock(fd);
+}
+
+function validatePrivateRegularFile(
+  info: Awaited<ReturnType<FileHandle["stat"]>>,
+  label: string,
+): void {
+  const unsafePermissions = process.platform !== "win32" && (Number(info.mode) & 0o077) !== 0;
+  if (!info.isFile() || info.nlink !== 1 || unsafePermissions) {
+    throw new Error(`${label} is not a private regular file`);
   }
 }
 
@@ -338,10 +456,6 @@ async function withSidecarDirectoryLock<T>(directory: string, operation: () => P
 
 function isNotFoundError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-}
-
-function isAlreadyExistsError(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
 }
 
 function delay(ms: number): Promise<void> {

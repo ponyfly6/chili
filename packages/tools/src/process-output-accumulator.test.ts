@@ -83,9 +83,53 @@ test("process output accumulator preserves stdout and stderr identity", async ()
     const snapshot = await accumulator.finish();
 
     expect(snapshot.truncated).toBe(true);
+    expect(snapshot.previewBytes).toBeLessThanOrEqual(5);
+    expect(snapshot.previewLines).toBeLessThanOrEqual(100);
     expect(await readFile(join(workspace, snapshot.outputPath!), "utf8")).toBe(
       "out-one\n[stderr]\nerr-one\n[stdout]\nout-tail\n",
     );
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("process output accumulator removes partial internal stream markers", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-output-partial-stream-marker-"));
+  try {
+    const accumulator = new ProcessOutputAccumulator({
+      cwd: workspace,
+      callId: "toolcall_partial_stream_marker" as ToolCallId,
+      maxLines: 100,
+      maxBytes: 15,
+    });
+    await accumulator.append({ stream: "stdout", chunk: Buffer.from("x".repeat(20)) });
+    await accumulator.append({ stream: "stderr", chunk: Buffer.from("TAIL") });
+
+    const snapshot = await accumulator.finish();
+
+    expect(snapshot.preview).toBe("[stderr]\nTAIL");
+    expect(snapshot.preview).not.toContain("[stderr]\nderr]\n");
+    expect(snapshot.previewBytes).toBeLessThanOrEqual(15);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("process output accumulator honors a zero-line preview budget", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-output-zero-lines-"));
+  try {
+    const accumulator = new ProcessOutputAccumulator({
+      cwd: workspace,
+      callId: "toolcall_zero_lines" as ToolCallId,
+      maxLines: 0,
+      maxBytes: 100,
+    });
+    await accumulator.append({ stream: "stderr", chunk: Buffer.from("hidden") });
+
+    const snapshot = await accumulator.finish();
+
+    expect(snapshot.preview).toBe("");
+    expect(snapshot.previewLines).toBe(0);
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
@@ -110,6 +154,53 @@ test("process output accumulator keeps stderr identity when the preview starts m
     expect(snapshot.preview).toStartWith("[stderr]\n");
     expect(snapshot.preview).toContain("FINAL_STDERR_MARKER");
     expect(snapshot.previewBytes).toBeLessThanOrEqual(32);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("literal stream markers in payload do not change preview identity", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-output-literal-stream-marker-"));
+  try {
+    const accumulator = new ProcessOutputAccumulator({
+      cwd: workspace,
+      callId: "toolcall_literal_stream_marker" as ToolCallId,
+      maxLines: 100,
+      maxBytes: 32,
+    });
+    await accumulator.append({
+      stream: "stderr",
+      chunk: Buffer.from(`${"x".repeat(100)}[stdout]\nTAIL_MARKER_12`),
+    });
+
+    const snapshot = await accumulator.finish();
+
+    expect(snapshot.preview).toBe("[stderr]\n[stdout]\nTAIL_MARKER_12");
+    expect(snapshot.previewBytes).toBeLessThanOrEqual(32);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("literal stderr markers in stdout remain payload", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-output-literal-stderr-marker-"));
+  try {
+    const accumulator = new ProcessOutputAccumulator({
+      cwd: workspace,
+      callId: "toolcall_literal_stderr_marker" as ToolCallId,
+      maxLines: 100,
+      maxBytes: 24,
+    });
+    await accumulator.append({
+      stream: "stdout",
+      chunk: Buffer.from(`${"x".repeat(100)}[stderr]\nSTDOUT_TAIL`),
+    });
+
+    const snapshot = await accumulator.finish();
+
+    expect(snapshot.preview).toEndWith("[stderr]\nSTDOUT_TAIL");
+    expect(snapshot.preview).not.toStartWith("[stderr]\n");
+    expect(snapshot.previewBytes).toBeLessThanOrEqual(24);
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }

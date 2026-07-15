@@ -52,8 +52,10 @@ Sidecar names use the existing sanitized tool-call naming rules and remain insid
 
 - maximum persisted output per call: 1 MiB;
 - maximum sidecar directory size: 64 MiB;
-- oldest sidecars evicted first;
-- current sidecar retained even when it alone exceeds the directory target;
+- oldest finalized sidecars evicted first;
+- streaming writers reserve their maximum artifact size in private temporary files, so live and crashed writers count toward the directory cap;
+- if reservations exhaust the directory cap, persistence stops with bounded error metadata while the command result and bounded preview still return normally;
+- a platform-native kernel lock (`flock` on macOS/Linux, `_locking` on Windows) held on the validated lock-file descriptor serializes cross-process publication and eviction, and is released automatically if a process exits;
 - symlink and workspace-escape checks fail closed.
 
 If the command produces more than the configured persisted-output limit, the file contains the first persisted limit bytes and the model notice must say `first N of M bytes saved`, never `full output saved`. If persistence cannot be established safely, execution still completes with a bounded preview and a clear persistence-failure warning.

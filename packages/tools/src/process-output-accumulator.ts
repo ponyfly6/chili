@@ -35,6 +35,18 @@ interface StreamLineState {
   endsWithNewline: boolean;
 }
 
+interface TailTransition {
+  offset: number;
+  endOffset: number;
+  stream: RunProcessOutputStream;
+}
+
+interface RenderedOutput {
+  text: string;
+  transitionOffset?: number;
+  transitionEndOffset?: number;
+}
+
 export class ProcessOutputAccumulator {
   private readonly maxLines: number;
   private readonly maxBytes: number;
@@ -48,6 +60,7 @@ export class ProcessOutputAccumulator {
   };
   private pending = "";
   private tail = "";
+  private tailTransitions: TailTransition[] = [];
   private totalBytes = 0;
   private persistenceAttempted = false;
   private persistenceError: string | undefined;
@@ -130,23 +143,41 @@ export class ProcessOutputAccumulator {
   private async processText(stream: RunProcessOutputStream, text: string): Promise<void> {
     updateLineState(this.lineStates[stream], text);
     const rendered = this.renderText(stream, text);
-    const combinedTail = this.tail + rendered;
+    const combinedTail = this.tail + rendered.text;
+    const combinedTransitions = rendered.transitionOffset === undefined
+      ? this.tailTransitions
+      : [
+          ...this.tailTransitions,
+          {
+            offset: this.tail.length + rendered.transitionOffset,
+            endOffset: this.tail.length + rendered.transitionEndOffset!,
+            stream,
+          },
+        ];
     const nextTail = takeLastBytes(
       takeLastLines(combinedTail, multiplyLimit(this.maxLines, 2)),
       multiplyLimit(this.maxBytes, 2),
     );
+    const removedCharacters = combinedTail.length - nextTail.length;
     const initialStream = this.tailStartStream ?? stream;
-    this.tailStartStream = streamAtOffset(combinedTail, initialStream, combinedTail.length - nextTail.length);
+    this.tailStartStream = streamAtOffset(initialStream, combinedTransitions, removedCharacters);
+    this.tailTransitions = combinedTransitions
+      .filter((transition) => transition.endOffset > removedCharacters)
+      .map((transition) => ({
+        offset: transition.offset - removedCharacters,
+        endOffset: transition.endOffset - removedCharacters,
+        stream: transition.stream,
+      }));
     this.tail = nextTail;
 
     if (!this.persistenceAttempted) {
-      this.pending += rendered;
+      this.pending += rendered.text;
       return;
     }
     if (this.outputFile) {
       const outputFile = this.outputFile;
       try {
-        await outputFile.append(rendered);
+        await outputFile.append(rendered.text);
       } catch (error) {
         this.persistenceError = errorMessage(error);
         this.outputFile = undefined;
@@ -155,41 +186,59 @@ export class ProcessOutputAccumulator {
     }
   }
 
-  private renderText(stream: RunProcessOutputStream, text: string): string {
+  private renderText(stream: RunProcessOutputStream, text: string): RenderedOutput {
     let prefix = "";
+    let transitionOffset: number | undefined;
+    let transitionEndOffset: number | undefined;
     if (stream !== this.lastRenderedStream) {
       if (this.lastRenderedStream === undefined) {
-        if (stream === "stderr") prefix = "[stderr]\n";
+        if (stream === "stderr") {
+          prefix = "[stderr]\n";
+          transitionOffset = 0;
+          transitionEndOffset = prefix.length;
+        }
       } else {
         this.sawStreamTransition = true;
         prefix = `${this.renderedEndsWithNewline ? "" : "\n"}[${stream}]\n`;
+        transitionOffset = this.renderedEndsWithNewline ? 0 : 1;
+        transitionEndOffset = prefix.length;
       }
       this.lastRenderedStream = stream;
     }
     const rendered = prefix + text;
     this.renderedEndsWithNewline = rendered.endsWith("\n");
-    return rendered;
+    return transitionOffset !== undefined && transitionEndOffset !== undefined
+      ? { text: rendered, transitionOffset, transitionEndOffset }
+      : { text: rendered };
   }
 
   private boundedPreview(): string {
+    if (this.maxLines === 0 || this.maxBytes === 0) return "";
     let body = takeLastBytes(takeLastLines(this.tail, this.maxLines), this.maxBytes);
+    body = removePartialMarkerPrefix(this.tail, this.tailTransitions, body);
     let stream = streamAtOffset(
-      this.tail,
       this.tailStartStream ?? this.lastRenderedStream ?? "stdout",
+      this.tailTransitions,
       this.tail.length - body.length,
     );
     if (stream === "stdout" && !this.sawStreamTransition) return body;
 
     const bodyLines = subtractLimit(this.maxLines, 1);
     const markerBytes = Buffer.byteLength(`[${stream}]\n`, "utf8");
+    if (this.maxBytes < markerBytes) return "";
     body = takeLastBytes(takeLastLines(this.tail, bodyLines), subtractLimit(this.maxBytes, markerBytes));
+    body = removePartialMarkerPrefix(this.tail, this.tailTransitions, body);
+    const bodyStart = this.tail.length - body.length;
     stream = streamAtOffset(
-      this.tail,
       this.tailStartStream ?? stream,
-      this.tail.length - body.length,
+      this.tailTransitions,
+      bodyStart,
     );
     const marker = `[${stream}]\n`;
-    return body.startsWith(marker) ? body : marker + body;
+    const startsAtInternalMarker = this.tailTransitions.some(
+      (transition) => transition.offset === bodyStart && transition.stream === stream,
+    );
+    return startsAtInternalMarker ? body : marker + body;
   }
 
   private async startPersistence(): Promise<void> {
@@ -279,16 +328,28 @@ function subtractLimit(value: number, amount: number): number {
 }
 
 function streamAtOffset(
-  text: string,
   initialStream: RunProcessOutputStream,
+  transitions: TailTransition[],
   offset: number,
 ): RunProcessOutputStream {
   let stream = initialStream;
-  const marker = /\[(stdout|stderr)\]\n/g;
-  for (let match = marker.exec(text); match && match.index <= offset; match = marker.exec(text)) {
-    stream = match[1] as RunProcessOutputStream;
+  for (const transition of transitions) {
+    if (transition.offset > offset) break;
+    stream = transition.stream;
   }
   return stream;
+}
+
+function removePartialMarkerPrefix(
+  tail: string,
+  transitions: TailTransition[],
+  body: string,
+): string {
+  const bodyStart = tail.length - body.length;
+  const partial = transitions.find(
+    (transition) => transition.offset < bodyStart && bodyStart < transition.endOffset,
+  );
+  return partial ? tail.slice(partial.endOffset) : body;
 }
 
 function errorMessage(error: unknown): string {
