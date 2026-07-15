@@ -10,6 +10,11 @@ export interface RunProcessOutputChunk {
   truncated?: boolean;
 }
 
+export interface RunProcessRawOutputChunk {
+  stream: RunProcessOutputStream;
+  chunk: Buffer;
+}
+
 export interface RunProcessOptions {
   cwd: string;
   env?: Record<string, string | undefined>;
@@ -18,6 +23,7 @@ export interface RunProcessOptions {
   killGraceMs?: number;
   maxOutputBytes?: number;
   onOutput?: (chunk: RunProcessOutputChunk) => void | Promise<void>;
+  onRawOutput?: (chunk: RunProcessRawOutputChunk) => void | Promise<void>;
   outputFlushIntervalMs?: number;
   outputFlushBytes?: number;
   maxLiveOutputBytes?: number;
@@ -98,8 +104,8 @@ export async function runProcess(
 
   try {
     const [stdout, stderr, status] = await Promise.all([
-      collect(child.stdout, maxOutputBytes, "stdout", outputDispatcher),
-      collect(child.stderr, maxOutputBytes, "stderr", outputDispatcher),
+      collect(child.stdout, maxOutputBytes, "stdout", outputDispatcher, options.onRawOutput),
+      collect(child.stderr, maxOutputBytes, "stderr", outputDispatcher, options.onRawOutput),
       waitForExit(child),
     ]);
     exited = true;
@@ -156,6 +162,7 @@ async function collect(
   maxBytes: number,
   outputStream: RunProcessOutputStream,
   outputDispatcher: OutputDeltaDispatcher | undefined,
+  onRawOutput: RunProcessOptions["onRawOutput"],
 ): Promise<{ text: string; bytes: number; truncated: boolean }> {
   const chunks: Buffer[] = [];
   let storedBytes = 0;
@@ -164,6 +171,7 @@ async function collect(
 
   for await (const chunk of stream) {
     outputDispatcher?.push(outputStream, chunk, false);
+    await onRawOutput?.({ stream: outputStream, chunk });
     bytes += chunk.byteLength;
     if (storedBytes >= maxBytes) {
       truncated = true;

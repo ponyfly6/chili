@@ -26,6 +26,49 @@ test("runProcess reports output truncation with byte metadata", async () => {
   }
 });
 
+test("runProcess exposes raw output after final capture is truncated", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-process-raw-output-"));
+  const raw: Buffer[] = [];
+  try {
+    const marker = "FINAL_CAPTURE_MARKER";
+    const script = `process.stdout.write("x".repeat(300000)); process.stdout.write("${marker}");`;
+    const result = await runProcess("node", ["-e", script], {
+      cwd: workspace,
+      maxOutputBytes: 16,
+      onRawOutput: ({ stream, chunk }) => {
+        if (stream === "stdout") raw.push(Buffer.from(chunk));
+      },
+    });
+
+    expect(result.stdout).toBe("x".repeat(16));
+    expect(result.stdoutTruncated).toBe(true);
+    expect(Buffer.concat(raw).toString("utf8")).toEndWith(marker);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("runProcess awaits async raw output backpressure", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-process-raw-backpressure-"));
+  const raw: Buffer[] = [];
+  try {
+    const result = await runProcess("node", ["-e", `process.stdout.write("a".repeat(100000));`], {
+      cwd: workspace,
+      maxOutputBytes: 8,
+      onRawOutput: async ({ stream, chunk }) => {
+        if (stream !== "stdout") return;
+        await sleep(1);
+        raw.push(Buffer.from(chunk));
+      },
+    });
+
+    expect(result.stdoutBytes).toBe(100000);
+    expect(Buffer.concat(raw).byteLength).toBe(100000);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("runProcess timeout terminates background children in the process group", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-process-timeout-"));
   const marker = join(workspace, "survived.txt");
