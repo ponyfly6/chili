@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
 import type { ApprovalDecision, ApprovalId, SessionId, ToolCallId, TurnId } from "@chili/protocol";
 import type { PermissionRule } from "@chili/policy";
-import { PolicyApprovalBroker } from "./approval.js";
+import { PolicyApprovalBroker, PolicyApprovalState } from "./approval.js";
+import { DeferredApprovalQueue } from "./deferred-approval.js";
 import type { ApprovalBrokerRequest } from "./types.js";
 
 test("approval denies catastrophic bash commands even when a broad allow rule exists", async () => {
@@ -143,6 +144,82 @@ test("allow_session grants only the current session", async () => {
     sessionId: "session_other" as SessionId,
   }));
   expect(otherSession.action).toBe("ask");
+});
+
+test("shared approval state grants the whole parent-child session tree", async () => {
+  const state = new PolicyApprovalState();
+  const parentSessionId = "session_parent" as SessionId;
+  const childSessionId = "session_child" as SessionId;
+  const siblingSessionId = "session_sibling" as SessionId;
+  state.linkSession(parentSessionId, childSessionId);
+  state.linkSession(parentSessionId, siblingSessionId);
+
+  const parentBroker = new PolicyApprovalBroker({
+    state,
+    ask: async (): Promise<ApprovalDecision> => ({ action: "allow_session" }),
+  });
+  const childBroker = new PolicyApprovalBroker({ state });
+
+  await parentBroker.decide(approvalRequest("npm test", parentSessionId));
+
+  expect(await childBroker.preflight(preflightRequest(approvalRequest("npm test", childSessionId)))).toMatchObject({
+    action: "allow",
+    source: "session_grant",
+  });
+  expect(await childBroker.preflight(preflightRequest(approvalRequest("npm test", siblingSessionId)))).toMatchObject({
+    action: "allow",
+    source: "session_grant",
+  });
+  expect(await childBroker.preflight(preflightRequest(approvalRequest("npm test", "session_unrelated" as SessionId)))).toMatchObject({
+    action: "ask",
+  });
+});
+
+test("shared approval state exposes runtime persistent grants to every broker", async () => {
+  const state = new PolicyApprovalState();
+  const firstBroker = new PolicyApprovalBroker({ state });
+  const secondBroker = new PolicyApprovalBroker({ state });
+
+  state.addPersistentGrant({ permission: "bash", patterns: ["git status --short"] });
+
+  expect(await firstBroker.preflight(preflightRequest(approvalRequest("git status --short")))).toMatchObject({
+    action: "allow",
+    matchedRule: { source: "user config.toml permissions.allow" },
+  });
+  expect(await secondBroker.preflight(preflightRequest(approvalRequest(
+    "git status --short",
+    "session_other" as SessionId,
+  )))).toMatchObject({ action: "allow" });
+});
+
+test("a tree-scoped grant rechecks pending approvals from another broker", async () => {
+  const state = new PolicyApprovalState();
+  const queue = new DeferredApprovalQueue();
+  const parentSessionId = "session_parent" as SessionId;
+  const childSessionId = "session_child" as SessionId;
+  state.linkSession(parentSessionId, childSessionId);
+
+  let grantingBroker: PolicyApprovalBroker;
+  grantingBroker = new PolicyApprovalBroker({
+    state,
+    ask: async (): Promise<ApprovalDecision> => ({ action: "allow_session" }),
+    onSessionGrant: async () => {
+      await queue.recheckPending((pendingRequest) => grantingBroker.preflight(pendingRequest));
+    },
+  });
+  const pendingBroker = new PolicyApprovalBroker({
+    state,
+    ask: (request, signal) => queue.ask(request, signal),
+  });
+
+  const pending = pendingBroker.decide(approvalRequest("npm test", childSessionId));
+  await Promise.resolve();
+  expect(queue.list()).toHaveLength(1);
+
+  await grantingBroker.decide(approvalRequest("npm test", parentSessionId));
+
+  expect(await pending).toEqual({ action: "allow_once" });
+  expect(queue.list()).toHaveLength(0);
 });
 
 test("allow_always also seeds an immediate session grant", async () => {

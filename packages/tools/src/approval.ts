@@ -8,6 +8,7 @@ export interface PolicyApprovalBrokerOptions {
   ask?: (request: ApprovalBrokerRequest, signal?: AbortSignal) => Promise<ApprovalDecision>;
   onSessionGrant?: (grant: SessionApprovalGrant) => Promise<void> | void;
   dangerousShellCommands?: "ask" | "allow";
+  state?: PolicyApprovalState;
 }
 
 export interface SessionApprovalGrant {
@@ -18,10 +19,84 @@ export interface SessionApprovalGrant {
   metadata?: Record<string, unknown>;
 }
 
-export class PolicyApprovalBroker implements ApprovalBroker {
-  private readonly sessionGrants = new Map<SessionId, PermissionRule[]>();
+export interface PersistentApprovalGrant {
+  permission: string;
+  patterns: string[];
+  source?: string;
+}
 
-  constructor(private readonly options: PolicyApprovalBrokerOptions = {}) {}
+/** Shared mutable approval state for every broker in one runtime harness. */
+export class PolicyApprovalState {
+  private readonly parentSessions = new Map<SessionId, SessionId>();
+  private readonly sessionGrants = new Map<SessionId, PermissionRule[]>();
+  private readonly persistentGrants: PermissionRule[] = [];
+
+  linkSession(parentSessionId: SessionId, childSessionId: SessionId): void {
+    const parentRoot = this.rootSession(parentSessionId);
+    const childRoot = this.rootSession(childSessionId);
+    if (parentRoot === childRoot) return;
+
+    this.parentSessions.set(childRoot, parentRoot);
+    const childGrants = this.sessionGrants.get(childRoot);
+    if (!childGrants?.length) return;
+    const parentGrants = this.sessionGrants.get(parentRoot) ?? [];
+    parentGrants.push(...childGrants);
+    this.sessionGrants.set(parentRoot, parentGrants);
+    this.sessionGrants.delete(childRoot);
+  }
+
+  addSessionGrant(grant: SessionApprovalGrant): void {
+    const rootSessionId = this.rootSession(grant.sessionId);
+    const rules = this.sessionGrants.get(rootSessionId) ?? [];
+    for (const pattern of grant.patterns) {
+      pushUniqueRule(rules, {
+        permission: grant.permission,
+        pattern,
+        action: "allow",
+        source: sessionGrantSource(grant.source),
+      });
+    }
+    this.sessionGrants.set(rootSessionId, rules);
+  }
+
+  addPersistentGrant(grant: PersistentApprovalGrant): void {
+    for (const pattern of grant.patterns) {
+      pushUniqueRule(this.persistentGrants, {
+        permission: grant.permission,
+        pattern,
+        action: "allow",
+        source: grant.source ?? "user config.toml permissions.allow",
+      });
+    }
+  }
+
+  rulesetsFor(sessionId: SessionId): readonly (readonly PermissionRule[])[] {
+    const rulesets: PermissionRule[][] = [];
+    if (this.persistentGrants.length > 0) rulesets.push(this.persistentGrants);
+    const sessionRules = this.sessionGrants.get(this.rootSession(sessionId));
+    if (sessionRules?.length) rulesets.push(sessionRules);
+    return rulesets;
+  }
+
+  private rootSession(sessionId: SessionId): SessionId {
+    let current = sessionId;
+    const visited = new Set<SessionId>();
+    while (!visited.has(current)) {
+      visited.add(current);
+      const parent = this.parentSessions.get(current);
+      if (!parent) return current;
+      current = parent;
+    }
+    return sessionId;
+  }
+}
+
+export class PolicyApprovalBroker implements ApprovalBroker {
+  private readonly state: PolicyApprovalState;
+
+  constructor(private readonly options: PolicyApprovalBrokerOptions = {}) {
+    this.state = options.state ?? new PolicyApprovalState();
+  }
 
   setRulesets(rulesets: readonly (readonly PermissionRule[])[]): void {
     this.options.rulesets = rulesets;
@@ -189,23 +264,12 @@ export class PolicyApprovalBroker implements ApprovalBroker {
         ...(feedback ? { feedback } : {}),
       },
     };
-    const rules = this.sessionGrants.get(request.sessionId) ?? [];
-    for (const pattern of grant.patterns) {
-      rules.push({
-        permission: grant.permission,
-        pattern,
-        action: "allow",
-        source: sessionGrantSource(source),
-      });
-    }
-    this.sessionGrants.set(request.sessionId, rules);
+    this.state.addSessionGrant(grant);
     return grant;
   }
 
   private rulesetsFor(request: ApprovalPreflightRequest): readonly (readonly PermissionRule[])[] {
-    const grants = this.sessionGrants.get(request.sessionId);
-    if (!grants || grants.length === 0) return this.options.rulesets ?? [];
-    return [...(this.options.rulesets ?? []), grants];
+    return [...(this.options.rulesets ?? []), ...this.state.rulesetsFor(request.sessionId)];
   }
 }
 
@@ -329,6 +393,15 @@ function denyDecision(decision: ApprovalPreflightDecision): ApprovalDecision {
 
 function sessionGrantSource(source: string): string {
   return `session:${source}`;
+}
+
+function pushUniqueRule(rules: PermissionRule[], rule: PermissionRule): void {
+  if (rules.some((existing) =>
+    existing.permission === rule.permission
+    && existing.pattern === rule.pattern
+    && existing.action === rule.action
+    && existing.source === rule.source)) return;
+  rules.push(rule);
 }
 
 function isExplicitApprovalRule(rule: PermissionRule | undefined): boolean {
