@@ -61,7 +61,7 @@ export function createTaskTool(controller: SubagentController): ChiliToolDefinit
     approval(input) {
       return {
         permission: "task",
-        patterns: [input.mode ?? "default"],
+        patterns: ["spawn"],
         metadata: {
           description: input.description,
           mode: input.mode ?? "default",
@@ -118,7 +118,7 @@ export function createTaskBatchTool(controller: SubagentController): ChiliToolDe
     approval(input) {
       return {
         permission: "task",
-        patterns: ["batch", `count:${input.tasks.length}`, `concurrency:${input.maxConcurrency ?? DEFAULT_TASK_BATCH_CONCURRENCY}`],
+        patterns: ["spawn"],
         metadata: {
           count: input.tasks.length,
           maxConcurrency: input.maxConcurrency ?? DEFAULT_TASK_BATCH_CONCURRENCY,

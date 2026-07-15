@@ -108,7 +108,8 @@ test("task_batch launches background subagents with bounded parallelism", async 
   const controller = new FakeSubagentController();
   const registry = new InMemoryToolRegistry();
   registry.register(createTaskBatchTool(controller));
-  const executor = createExecutor(registry, []);
+  const approvals: ApprovalBrokerRequest[] = [];
+  const executor = createExecutor(registry, approvals);
 
   const result = await executor.execute(toolInput("task_batch", {
     max_concurrency: 2,
@@ -126,6 +127,7 @@ test("task_batch launches background subagents with bounded parallelism", async 
     { description: "second", prompt: "read second", mode: "background" },
     { description: "third", prompt: "read third", mode: "background" },
   ]);
+  expect(approvals.map((request) => request.patterns)).toEqual([["spawn"]]);
   if (result.status === "completed") {
     expect(JSON.parse(result.result.output)).toMatchObject({
       count: 3,
