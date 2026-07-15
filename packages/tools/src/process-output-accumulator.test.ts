@@ -67,6 +67,30 @@ test("process output accumulator keeps a UTF-8-safe interleaved tail and caps it
   }
 });
 
+test("process output accumulator preserves stdout and stderr identity", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-output-streams-"));
+  try {
+    const accumulator = new ProcessOutputAccumulator({
+      cwd: workspace,
+      callId: "toolcall_streams" as ToolCallId,
+      maxLines: 100,
+      maxBytes: 5,
+    });
+    await accumulator.append({ stream: "stdout", chunk: Buffer.from("out-one\n") });
+    await accumulator.append({ stream: "stderr", chunk: Buffer.from("err-one\n") });
+    await accumulator.append({ stream: "stdout", chunk: Buffer.from("out-tail\n") });
+
+    const snapshot = await accumulator.finish();
+
+    expect(snapshot.truncated).toBe(true);
+    expect(await readFile(join(workspace, snapshot.outputPath!), "utf8")).toBe(
+      "out-one\n[stderr]\nerr-one\n[stdout]\nout-tail\n",
+    );
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("process output accumulator remains bounded when sidecar creation is unsafe", async () => {
   const root = await mkdtemp(join(tmpdir(), "chili-output-unsafe-"));
   const workspace = join(root, "workspace");

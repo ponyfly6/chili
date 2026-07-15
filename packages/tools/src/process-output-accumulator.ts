@@ -53,6 +53,8 @@ export class ProcessOutputAccumulator {
   private persistenceError: string | undefined;
   private outputFile: StreamingToolOutputFile | undefined;
   private persisted: PersistedOutput | undefined;
+  private lastRenderedStream: RunProcessOutputStream | undefined;
+  private renderedEndsWithNewline = true;
   private operationQueue: Promise<void> = Promise.resolve();
   private finished: ProcessOutputSnapshot | undefined;
 
@@ -127,25 +129,41 @@ export class ProcessOutputAccumulator {
 
   private async processText(stream: RunProcessOutputStream, text: string): Promise<void> {
     updateLineState(this.lineStates[stream], text);
+    const rendered = this.renderText(stream, text);
     this.tail = takeLastBytes(
-      takeLastLines(this.tail + text, multiplyLimit(this.maxLines, 2)),
+      takeLastLines(this.tail + rendered, multiplyLimit(this.maxLines, 2)),
       multiplyLimit(this.maxBytes, 2),
     );
 
     if (!this.persistenceAttempted) {
-      this.pending += text;
+      this.pending += rendered;
       return;
     }
     if (this.outputFile) {
       const outputFile = this.outputFile;
       try {
-        await outputFile.append(text);
+        await outputFile.append(rendered);
       } catch (error) {
         this.persistenceError = errorMessage(error);
         this.outputFile = undefined;
         await outputFile.close().catch(() => undefined);
       }
     }
+  }
+
+  private renderText(stream: RunProcessOutputStream, text: string): string {
+    let prefix = "";
+    if (stream !== this.lastRenderedStream) {
+      if (this.lastRenderedStream === undefined) {
+        if (stream === "stderr") prefix = "[stderr]\n";
+      } else {
+        prefix = `${this.renderedEndsWithNewline ? "" : "\n"}[${stream}]\n`;
+      }
+      this.lastRenderedStream = stream;
+    }
+    const rendered = prefix + text;
+    this.renderedEndsWithNewline = rendered.endsWith("\n");
+    return rendered;
   }
 
   private async startPersistence(): Promise<void> {
