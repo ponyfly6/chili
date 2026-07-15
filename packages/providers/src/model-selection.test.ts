@@ -129,15 +129,6 @@ test("catalog exposes display names, auth state, and Codex model metadata", () =
   });
 
   expect(listKnownModels(OPENAI_CODEX_PROVIDER_ID).map((model) => model.model)).toEqual([
-    "gpt-5.1",
-    "gpt-5.1-codex-max",
-    "gpt-5.1-codex-mini",
-    "gpt-5.2",
-    "gpt-5.2-codex",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
-    "gpt-5.4",
-    "gpt-5.4-mini",
     "gpt-5.5",
     OPENAI_CODEX_DEFAULT_MODEL,
     "gpt-5.6-terra",

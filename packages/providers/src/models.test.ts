@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  assertOpenAICodexModel,
   DEEPSEEK_OPENAI_BASE_URL,
   DEEPSEEK_PROVIDER_ID,
   DEEPSEEK_V4_FLASH_MODEL,
@@ -18,6 +19,7 @@ import {
   OPENAI_CODEX_BASE_URL,
   OPENAI_CODEX_DEFAULT_MODEL,
   OPENAI_CODEX_PROVIDER_ID,
+  isOpenAICodexModel,
   readDeepSeekEnvironment,
   readKimiEnvironment,
   readMiniMaxEnvironment,
@@ -159,7 +161,19 @@ test("catalog describes the built-in MiniMax Anthropic-family models", () => {
 test("catalog describes the built-in ChatGPT Codex Responses models", () => {
   const models = listKnownModels(OPENAI_CODEX_PROVIDER_ID);
 
-  expect(models.map((model) => model.model)).toContain(OPENAI_CODEX_DEFAULT_MODEL);
+  expect(models.map((model) => model.model)).toEqual([
+    "gpt-5.5",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+  ]);
+  expect(findKnownModel(OPENAI_CODEX_PROVIDER_ID, "gpt-5.4")).toBeUndefined();
+  expect(isOpenAICodexModel("gpt-5.5")).toBe(true);
+  expect(isOpenAICodexModel("gpt-5.6-luna")).toBe(true);
+  expect(isOpenAICodexModel("gpt-5.4")).toBe(false);
+  expect(() => assertOpenAICodexModel("gpt-5.4")).toThrow(
+    'Unsupported OpenAI Codex model "gpt-5.4"',
+  );
   expect(findDefaultKnownModel(OPENAI_CODEX_PROVIDER_ID)).toMatchObject({
     provider: OPENAI_CODEX_PROVIDER_ID,
     model: OPENAI_CODEX_DEFAULT_MODEL,
