@@ -122,6 +122,7 @@ export function createMacOsSeatbeltBashRunner(options: MacOsSeatbeltBashRunnerOp
         },
       };
       if (request.onOutput) processOptions.onOutput = request.onOutput;
+      if (request.onRawOutput) processOptions.onRawOutput = request.onRawOutput;
       try {
         const result = await processRunner(
           MACOS_SANDBOX_EXEC_PATH,

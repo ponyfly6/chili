@@ -23,6 +23,7 @@ test("macOS Seatbelt runner uses a fixed executable and forwards process control
   });
   const controller = new AbortController();
   const onOutput = () => undefined;
+  const onRawOutput = () => undefined;
 
   const result = await runner.run({
     command: "printf ok",
@@ -33,6 +34,7 @@ test("macOS Seatbelt runner uses a fixed executable and forwards process control
     maxOutputBytes: 456,
     signal: controller.signal,
     onOutput,
+    onRawOutput,
   });
 
   expect(seen?.command).toBe(MACOS_SANDBOX_EXEC_PATH);
@@ -51,6 +53,7 @@ test("macOS Seatbelt runner uses a fixed executable and forwards process control
     maxOutputBytes: 456,
     signal: controller.signal,
     onOutput,
+    onRawOutput,
   });
   expect(result.sandbox).toBe("macos-seatbelt");
 });

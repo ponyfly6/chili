@@ -1,6 +1,7 @@
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
 import { resolve } from "node:path";
 import { runProcess, type RunProcessOptions, type RunProcessResult } from "../process.js";
+import { ProcessOutputAccumulator, type ProcessOutputSnapshot } from "../process-output-accumulator.js";
 import { classifyDangerousShellCommand, commandPrefix, isReadOnlyShellCommand } from "../shell-safety.js";
 import { assertExistingPathInsideWorkspace, resolveWorkspacePath, type WorkspacePath } from "../workspace-path.js";
 
@@ -22,6 +23,7 @@ export interface BashRunRequest {
   maxOutputBytes: number;
   signal: AbortSignal;
   onOutput: RunProcessOptions["onOutput"];
+  onRawOutput?: RunProcessOptions["onRawOutput"];
 }
 
 export interface BashRunResult extends RunProcessResult {
@@ -46,6 +48,7 @@ const DEFAULT_BASH_RUNNER: BashRunner = {
     };
     if (request.env) processOptions.env = request.env;
     if (request.onOutput) processOptions.onOutput = request.onOutput;
+    if (request.onRawOutput) processOptions.onRawOutput = request.onRawOutput;
     return runProcess("bash", ["-lc", request.command], processOptions);
   },
 };
@@ -66,7 +69,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
     isConcurrencySafe: (input) => isReadOnlyShellCommand(input.command),
     isDestructive: (input) => !isReadOnlyShellCommand(input.command),
     interruptBehavior: "cancel",
-    maxResultOutputBytes: 30_000,
+    maxResultOutputBytes: 64 * 1024,
     inputSchema: {
       type: "object",
       required: ["command"],
@@ -141,6 +144,10 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
 
       const timeoutMs = input.timeoutMs ?? 30_000;
       const maxOutputBytes = input.maxOutputBytes ?? 256_000;
+      const outputAccumulator = new ProcessOutputAccumulator({
+        cwd: context.cwd,
+        callId: context.callId,
+      });
       const runRequest: BashRunRequest = {
         command: input.command,
         workspaceRoot: resolve(context.cwd),
@@ -149,14 +156,24 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
         timeoutMs,
         maxOutputBytes,
         onOutput: (chunk) => context.streamOutput(chunk),
+        onRawOutput: (chunk) => outputAccumulator.append(chunk),
       };
       if (input.env) runRequest.env = input.env;
-      const result = await runner.run(runRequest);
+      let result: BashRunResult;
+      try {
+        result = await runner.run(runRequest);
+      } catch (error) {
+        await outputAccumulator.finish();
+        throw error;
+      }
+      const outputSnapshot = await outputAccumulator.finish();
       if (result.sandbox) {
         await context.metadata({ metadata: { sandbox: result.sandbox } });
       }
 
-      const output = formatCommandOutput(result, timeoutMs);
+      const output = outputSnapshot.truncated
+        ? formatTruncatedCommandOutput(outputSnapshot, result, timeoutMs)
+        : formatCommandOutput(result, timeoutMs);
 
       return {
         title: result.timedOut ? `timed out after ${timeoutMs}ms` : `exit ${result.exitCode ?? "signal"}`,
@@ -175,11 +192,50 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
           stdoutBytes: result.stdoutBytes,
           stderrBytes: result.stderrBytes,
           outputLimitBytes: result.outputLimitBytes,
+          ...(outputSnapshot.truncated
+            ? {
+                outputTruncated: true,
+                outputBytes: outputSnapshot.totalBytes,
+                outputLines: outputSnapshot.totalLines,
+                outputPreviewBytes: outputSnapshot.previewBytes,
+                outputPreviewLines: outputSnapshot.previewLines,
+                outputTruncatedBy: outputSnapshot.truncatedBy,
+                ...(outputSnapshot.outputPath ? { outputPath: outputSnapshot.outputPath } : {}),
+                ...(outputSnapshot.persistedBytes !== undefined
+                  ? { outputPersistedBytes: outputSnapshot.persistedBytes }
+                  : {}),
+                ...(outputSnapshot.persistedTruncated !== undefined
+                  ? { outputPersistedTruncated: outputSnapshot.persistedTruncated }
+                  : {}),
+                ...(outputSnapshot.persistenceError
+                  ? { outputPersistenceError: outputSnapshot.persistenceError }
+                  : {}),
+              }
+            : {}),
           ...(result.sandbox ? { sandbox: result.sandbox } : {}),
         },
       };
     },
   };
+}
+
+function formatTruncatedCommandOutput(
+  snapshot: ProcessOutputSnapshot,
+  result: RunProcessResult,
+  timeoutMs: number,
+): string {
+  const savedDescription = snapshot.outputPath
+    ? snapshot.persistedTruncated
+      ? `first ${snapshot.persistedBytes ?? 0} of ${snapshot.totalBytes} bytes saved to ${snapshot.outputPath}`
+      : `full output saved to ${snapshot.outputPath}`
+    : `output could not be persisted: ${snapshot.persistenceError ?? "unknown error"}`;
+  const sections = [
+    `[command output truncated: showing the final ${snapshot.previewLines} of ${snapshot.totalLines} lines / ${snapshot.totalBytes} bytes; ${savedDescription}]\n${snapshot.preview}`,
+  ];
+  if (result.timedOut) {
+    sections.push(`[process timed out after ${timeoutMs}ms and was terminated]`);
+  }
+  return sections.join("\n\n");
 }
 
 function formatCommandOutput(result: RunProcessResult, timeoutMs: number): string {

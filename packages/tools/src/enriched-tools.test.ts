@@ -726,6 +726,63 @@ test("bash publishes live stdout and stderr tool output deltas", async () => {
   }
 });
 
+test("bash limits verbose output by line count and persists complete output", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-bash-lines-"));
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register(createBashTool());
+    const executor = createExecutor(registry);
+
+    const result = await executor.execute(
+      toolInput("bash", { command: "seq 3000" }, workspace, "toolcall_bash_lines" as ToolCallId),
+    );
+
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") return;
+    expect(result.result.output).toStartWith("[command output truncated:");
+    expect(result.result.output).toContain("1001\n");
+    expect(result.result.output).toContain("2999\n3000\n");
+    expect(result.result.output).not.toContain("\n1\n2\n3\n");
+    expect(result.result.output.split("\n").length).toBeLessThanOrEqual(2_010);
+    const outputPath = String(result.result.metadata?.outputPath);
+    expect(outputPath).toStartWith(join(".chili", "tool-results"));
+    const sidecar = await readFile(join(workspace, outputPath), "utf8");
+    expect(sidecar).toStartWith("1\n2\n3\n");
+    expect(sidecar).toEndWith("2998\n2999\n3000\n");
+    expect(result.result.metadata).toMatchObject({
+      outputTruncated: true,
+      outputLines: 3_000,
+      outputPreviewLines: 2_000,
+      outputPersistedTruncated: false,
+    });
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("bash persists complete verbose output beyond the legacy capture cap", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-bash-bytes-"));
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register(createBashTool());
+    const executor = createExecutor(registry);
+    const command = `node -e 'process.stdout.write("x".repeat(300000)); process.stdout.write("\\nFINAL_CAPTURE_MARKER\\n")'`;
+
+    const result = await executor.execute(
+      toolInput("bash", { command }, workspace, "toolcall_bash_bytes" as ToolCallId),
+    );
+
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") return;
+    expect(result.result.output).toContain("FINAL_CAPTURE_MARKER");
+    expect(Number(result.result.metadata?.outputBytes)).toBeGreaterThan(256_000);
+    const outputPath = String(result.result.metadata?.outputPath);
+    expect(await readFile(join(workspace, outputPath), "utf8")).toEndWith("FINAL_CAPTURE_MARKER\n");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("bash runner injection receives resolved request and formats process output", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-tools-bash-runner-"));
   const events: ChiliEvent[] = [];
