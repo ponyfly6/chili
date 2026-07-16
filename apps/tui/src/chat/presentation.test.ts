@@ -83,7 +83,7 @@ test("live tool rows render partial input labels without exposing assistant tool
   expect(display.some((item) => item.kind === "summary" && item.text.includes("tool_call"))).toBe(false);
 });
 
-test("exploration groups expose compact metadata without changing labels", () => {
+test("exploration groups expose one semantic failure with an exact failed count", () => {
   const display = buildChatDisplayItems([
     chatTool("read_running" as ToolCallId, "read", "running", "running", { title: "read", path: "package.json", detail: "package.json" }),
     chatTool("grep_failed" as ToolCallId, "grep", "failed", "failed", { title: "grep", pattern: "TODO", scope: "apps/tui", detail: "TODO in apps/tui" }, {
@@ -100,7 +100,7 @@ test("exploration groups expose compact metadata without changing labels", () =>
   if (item?.kind !== "tool_group") throw new Error("expected a tool group");
 
   expect(item).toMatchObject({
-    label: "Exploring 1 file, searched 1 pattern, listed 1 path with errors",
+    label: "Exploring 1 file, searched 1 pattern, listed 1 path · 1 failed",
     tone: "error",
     metadata: {
       activeHint: "Reading package.json",
@@ -111,11 +111,13 @@ test("exploration groups expose compact metadata without changing labels", () =>
       listCount: 1,
       activeCount: 1,
       errorCount: 1,
+      failedCount: 1,
+      compactFailureLines: ["Search failed: apps/tui (Ctrl+O for details)"],
     },
   });
   expect(item.activities.every((activity) => activity.mode === "inline")).toBe(true);
   expect(item.activities.every((activity) => activity.bodyLines.length === 0)).toBe(true);
-  expect(item.activities.find((activity) => activity.toolName === "grep")?.compactErrorLines).toEqual(["grep failed"]);
+  expect(item.activities.find((activity) => activity.toolName === "grep")?.compactErrorLines).toEqual(["Search failed: apps/tui"]);
 });
 
 function chatTool(

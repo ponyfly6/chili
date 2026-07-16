@@ -2,7 +2,7 @@ import { RGBA, SyntaxStyle } from "@opentui/core";
 import type { TuiTheme } from "../theme/index.js";
 import { detailPreviewLines, TranscriptLines, type TranscriptLineModel, wrapLine } from "./lines.js";
 import type { ChatDisplayItem, ToolActivityDisplay } from "./presentation.js";
-import type { ToolActivityDetail } from "./tool-renderers.js";
+import { isExplorationTool, type ToolActivityDetail } from "./tool-renderers.js";
 
 type ToolGroupDisplay = Extract<ChatDisplayItem, { kind: "tool_group" }>;
 type ToolCellBaseProps = { width: number; theme: TuiTheme; keyPrefix?: string | undefined };
@@ -66,10 +66,15 @@ export function toolGroupCellLines(group: ToolGroupDisplay, width: number, theme
     width,
     hangingIndent: "  ",
   });
+  for (const [index, failure] of (group.metadata.compactFailureLines ?? []).entries()) {
+    lines.push(...wrapLine(`  ↳ ${failure}`, {
+      key: `${keyPrefix}:${group.id}:failure:${index}`,
+      fg: theme.colors.status.error,
+      width,
+      hangingIndent: "    ",
+    }));
+  }
   for (const activity of group.activities) {
-    if (activity.compactErrorLines?.length) {
-      lines.push(...detailPreviewLines(`${keyPrefix}:${group.id}:${activity.id}:error`, "error", activity.compactErrorLines, false, width, theme.colors.status.error));
-    }
     if (activity.details.length > 0 || activity.bodyLines.length > 0) {
       lines.push(...wrapLine(`  ${activity.label}`, {
         key: `${keyPrefix}:${group.id}:${activity.id}:label`,
@@ -120,7 +125,20 @@ function toolCompactSupplementLines(key: string, activity: ToolActivityDisplay, 
     }));
   }
   if (activity.compactErrorLines?.length) {
-    lines.push(...detailPreviewLines(`${key}:compact-error`, "error", activity.compactErrorLines, false, width, theme.colors.status.error));
+    if (isExplorationTool(activity.toolName)) {
+      const [first] = activity.compactErrorLines;
+      if (first) {
+        const hint = first.includes("Ctrl+O") ? first : `${first} (Ctrl+O for details)`;
+        lines.push(...wrapLine(`  ↳ ${hint}`, {
+          key: `${key}:compact-error`,
+          fg: theme.colors.status.error,
+          width,
+          hangingIndent: "    ",
+        }));
+      }
+    } else {
+      lines.push(...detailPreviewLines(`${key}:compact-error`, "error", activity.compactErrorLines, false, width, theme.colors.status.error));
+    }
   }
   return lines;
 }

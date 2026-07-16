@@ -177,6 +177,7 @@ test("tool group cell keeps compact metadata label and expands child details", (
       listCount: 0,
       activeCount: 1,
       errorCount: 0,
+      failedCount: 0,
     },
     activities: [
       toolActivity({
@@ -199,6 +200,63 @@ test("tool group cell keeps compact metadata label and expands child details", (
   expect(lines).toContain("  Reading package.json");
   expect(lines).toContain("  output:");
   expect(lines).toContain("    FILE_LINE_1");
+});
+
+test("tool group cell renders only the first compact failure and a remainder hint", () => {
+  const group = {
+    kind: "tool_group",
+    id: "group_failed_explore",
+    label: "Explored 1 file, searched 1 pattern, listed 1 path · 3 failed",
+    tone: "error",
+    metadata: {
+      hasErrors: true,
+      collapsedCount: 3,
+      readCount: 1,
+      searchCount: 1,
+      listCount: 1,
+      activeCount: 0,
+      errorCount: 3,
+      failedCount: 3,
+      compactFailureLines: [
+        "File not found: app/first.php",
+        "+2 more failures (Ctrl+O for details)",
+      ],
+    },
+    activities: [
+      toolActivity({
+        id: "read_failed",
+        toolName: "read",
+        label: "Failed app/first.php",
+        displayStatus: "failed",
+        tone: "error",
+        compactErrorLines: ["File not found: app/first.php"],
+      }),
+      toolActivity({
+        id: "grep_failed",
+        toolName: "grep",
+        label: "Failed app/second.php",
+        displayStatus: "failed",
+        tone: "error",
+        compactErrorLines: ["File not found: app/second.php"],
+      }),
+      toolActivity({
+        id: "glob_failed",
+        toolName: "glob",
+        label: "Failed app/third.php",
+        displayStatus: "failed",
+        tone: "error",
+        compactErrorLines: ["File not found: app/third.php"],
+      }),
+    ],
+  } as Extract<ChatDisplayItem, { kind: "tool_group" }>;
+
+  const lines = lineText(toolGroupCellLines(group, 96, theme));
+
+  expect(lines).toContain("  ↳ File not found: app/first.php");
+  expect(lines).toContain("  ↳ +2 more failures (Ctrl+O for details)");
+  expect(lines).not.toContain("    File not found: app/second.php");
+  expect(lines).not.toContain("    File not found: app/third.php");
+  expect(lines).not.toContain("  error:");
 });
 
 test("live partial input row stays a compact running label", () => {

@@ -621,7 +621,7 @@ test("exploration group labels pending and failed runs naturally", () => {
   });
   expect(failed[0]).toMatchObject({
     kind: "tool_group",
-    label: "Explored 1 file, searched 1 pattern with errors",
+    label: "Explored 1 file, searched 1 pattern · 1 failed",
     tone: "error",
   });
 });
@@ -658,6 +658,34 @@ test("exploration tool groups hide raw output when compact and expand in details
   expect(details).toContain("GLOB_RAW_PATH_1");
   expect(details).not.toContain("output hidden");
   expect(occurrences(details, "output:")).toBe(3);
+});
+
+test("exploration group failures stay compact while details retain every raw diagnostic", async () => {
+  const failed = [
+    chatTool("read_group_failed" as ToolCallId, "read", "failed", "failed", { title: "read", path: "/repo/app/first.php" }, {
+      error: "ENOENT: no such file or directory, lstat '/repo/app/first.php'",
+    }),
+    chatTool("grep_group_failed" as ToolCallId, "grep", "failed", "failed", { title: "grep", path: "/repo/app/second.php", scope: "/repo/app/second.php" }, {
+      error: "ENOENT: no such file or directory, lstat '/repo/app/second.php'",
+    }),
+    chatTool("glob_group_failed" as ToolCallId, "glob", "failed", "failed", { title: "glob", path: "/repo/app/third.php" }, {
+      error: "ENOENT: no such file or directory, lstat '/repo/app/third.php'",
+    }),
+  ];
+
+  const compact = await renderMessageList(failed, { cwd: "/repo", height: 16 });
+  const details = await renderMessageList(failed, { cwd: "/repo", showToolDetails: true, height: 40 });
+
+  expect(compact).toContain("Explored 1 file, searched 1 pattern, listed 1 path · 3 failed");
+  expect(compact).toContain("File not found: app/first.php");
+  expect(compact).toContain("+2 more failures (Ctrl+O for details)");
+  expect(compact).not.toContain("ENOENT");
+  expect(compact).not.toContain("/repo/app/second.php");
+  expect(compact).not.toContain("/repo/app/third.php");
+  expect(occurrences(compact, "error:")).toBe(0);
+  expect(details).toContain("ENOENT: no such file or directory, lstat '/repo/app/first.php'");
+  expect(details).toContain("ENOENT: no such file or directory, lstat '/repo/app/second.php'");
+  expect(details).toContain("ENOENT: no such file or directory, lstat '/repo/app/third.php'");
 });
 
 test("large tool output is hidden by default and truncated in details mode", async () => {
@@ -851,6 +879,7 @@ async function renderMessageListApp(
       scrollRef={scrollRef}
       showToolDetails={options.showToolDetails === true}
       hideThinking={options.hideThinking === true}
+      cwd={options.cwd}
       theme={resolveTuiTheme("chili-dark", {})}
     />,
     { width: options.width ?? 120, height: options.height ?? 24, exitOnCtrlC: false },
@@ -885,6 +914,7 @@ interface MessageListTestOptions {
   status?: ChatSessionView["status"];
   activeTools?: ChatSessionView["activeTools"];
   localItems?: readonly LocalTranscriptItem[];
+  cwd?: string;
 }
 
 function chatView(items: readonly ChatTranscriptItem[], options: { status?: ChatSessionView["status"]; activeTools?: ChatSessionView["activeTools"] } = {}): ChatSessionView {

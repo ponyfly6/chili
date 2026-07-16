@@ -64,6 +64,8 @@ export interface ToolGroupMetadata {
   listCount: number;
   activeCount: number;
   errorCount: number;
+  failedCount: number;
+  compactFailureLines?: string[];
 }
 
 interface BuildOptions {
@@ -72,6 +74,7 @@ interface BuildOptions {
   sessionStatus?: ChatSessionView["status"];
   activeToolCount?: number;
   groupExplorationTools?: boolean;
+  cwd?: string;
 }
 
 interface ToolCallPartInfo {
@@ -81,6 +84,7 @@ interface ToolCallPartInfo {
 
 export function buildChatDisplayItems(items: readonly ChatTranscriptItem[], options: BuildOptions = {}): ChatDisplayItem[] {
   const showToolDetails = options.showToolDetails === true;
+  const cwd = options.cwd ?? process.cwd();
   const streamingMessageId = streamingAssistantMessageId(items, options);
   const toolRowsById = new Set<string>();
   const toolCallParts = new Map<string, ToolCallPartInfo>();
@@ -103,14 +107,14 @@ export function buildChatDisplayItems(items: readonly ChatTranscriptItem[], opti
   const output: ChatDisplayItem[] = [];
   for (const item of items) {
     if (item.kind === "message") {
-      output.push(...messageDisplayItems(item, toolRowsById, toolCallParts, showToolDetails, options.hideThinking === true, item.id === streamingMessageId));
+      output.push(...messageDisplayItems(item, toolRowsById, toolCallParts, showToolDetails, options.hideThinking === true, item.id === streamingMessageId, cwd));
       continue;
     }
     if (item.kind === "tool") {
       output.push({
         kind: "tool_activity",
         id: `tool:${item.id}`,
-        activity: toolActivityFromRow(item, showToolDetails),
+        activity: toolActivityFromRow(item, showToolDetails, cwd),
         time: item.updatedAt,
       });
       continue;
@@ -128,6 +132,7 @@ function messageDisplayItems(
   showToolDetails: boolean,
   hideThinking: boolean,
   streaming: boolean,
+  cwd: string,
 ): ChatDisplayItem[] {
   if (message.role === "user") {
     const text = message.parts
@@ -187,7 +192,7 @@ function messageDisplayItems(
         output.push({
           kind: "tool_activity",
           id: `tool-result:${id}`,
-          activity: fallbackToolResultActivity(part, toolCallParts.get(part.callId), showToolDetails),
+          activity: fallbackToolResultActivity(part, toolCallParts.get(part.callId), showToolDetails, cwd),
           time: message.createdAt,
         });
       }
@@ -200,7 +205,7 @@ function messageDisplayItems(
   return output;
 }
 
-function toolActivityFromRow(row: ChatToolCallRow, showToolDetails: boolean): ToolActivityDisplay {
+function toolActivityFromRow(row: ChatToolCallRow, showToolDetails: boolean, cwd: string): ToolActivityDisplay {
   return toolActivity({
     id: row.id,
     callId: row.id,
@@ -209,6 +214,7 @@ function toolActivityFromRow(row: ChatToolCallRow, showToolDetails: boolean): To
     displayStatus: row.displayStatus,
     source: "row",
     inputSummary: row.inputSummary,
+    cwd,
     showToolDetails,
     ...(row.input === undefined ? {} : { input: row.input }),
     ...(row.output === undefined ? {} : { output: row.output }),
@@ -221,6 +227,7 @@ function fallbackToolResultActivity(
   part: Extract<ChatMessagePart, { type: "tool_result" }>,
   call: ToolCallPartInfo | undefined,
   showToolDetails: boolean,
+  cwd: string,
 ): ToolActivityDisplay {
   const toolName = call?.toolName ?? "tool";
   return toolActivity({
@@ -231,6 +238,7 @@ function fallbackToolResultActivity(
     displayStatus: part.error ? "failed" : "succeeded",
     source: "fallback",
     inputSummary: inputSummaryFromUnknown(toolName, call?.input),
+    cwd,
     output: part.output,
     showToolDetails,
     ...(call?.input === undefined ? {} : { input: call.input }),
@@ -246,6 +254,7 @@ function toolActivity(input: {
   displayStatus: ChatToolDisplayStatus;
   source: "row" | "fallback";
   showToolDetails: boolean;
+  cwd?: string;
   inputSummary?: ChatToolInputSummary;
   input?: unknown;
   output?: string;
@@ -262,6 +271,7 @@ function toolActivity(input: {
     source: input.source,
     inputSummary: summary,
     showToolDetails: input.showToolDetails,
+    ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
     ...(input.input === undefined ? {} : { input: input.input }),
     ...(input.output === undefined ? {} : { output: input.output }),
     ...(input.error === undefined ? {} : { error: input.error }),
@@ -341,16 +351,27 @@ function explorationGroupLabel(activities: readonly ToolActivityDisplay[]): stri
   if (searches > 0) parts.push(`searched ${searches} ${plural(searches, "pattern", "patterns")}`);
   if (lists > 0) parts.push(`listed ${lists} ${plural(lists, "path", "paths")}`);
   const verb = activities.some((activity) => activity.tone === "pending") ? "Exploring" : "Explored";
-  const suffix = activities.some((activity) => activity.tone === "error") ? " with errors" : "";
+  const statusParts = [
+    countStatus(activities, "failed", "failed"),
+    countStatus(activities, "rejected", "rejected"),
+    countStatus(activities, "cancelled", "cancelled"),
+  ].filter((part): part is string => part !== undefined);
+  const suffix = statusParts.length > 0 ? ` · ${statusParts.join(", ")}` : "";
   return parts.length > 0 ? `${verb} ${parts.join(", ")}${suffix}` : `${verb} ${activities.length} tools${suffix}`;
 }
 
 function explorationGroupMetadata(activities: readonly ToolActivityDisplay[]): ToolGroupMetadata {
   const active = activities.filter((activity) => activity.tone === "pending");
   const errors = activities.filter((activity) => activity.tone === "error");
+  const failed = activities.filter((activity) => activity.displayStatus === "failed");
   const readCount = activities.filter((activity) => explorationToolKind(activity.toolName) === "read").length;
   const searchCount = activities.filter((activity) => explorationToolKind(activity.toolName) === "search").length;
   const listCount = activities.filter((activity) => explorationToolKind(activity.toolName) === "list").length;
+  const compactFailureLines = failed.flatMap((activity) => activity.compactErrorLines ?? []).slice(0, 1);
+  if (compactFailureLines[0]) {
+    if (failed.length === 1) compactFailureLines[0] = `${compactFailureLines[0]} (Ctrl+O for details)`;
+    else compactFailureLines.push(`+${failed.length - 1} more failures (Ctrl+O for details)`);
+  }
   return {
     ...(active.length > 0 ? { activeHint: active.length === 1 ? active[0]?.label ?? "Tool running" : `${active.length} tools running` } : {}),
     hasErrors: errors.length > 0,
@@ -360,7 +381,14 @@ function explorationGroupMetadata(activities: readonly ToolActivityDisplay[]): T
     listCount,
     activeCount: active.length,
     errorCount: errors.length,
+    failedCount: failed.length,
+    ...(compactFailureLines.length === 0 ? {} : { compactFailureLines }),
   };
+}
+
+function countStatus(activities: readonly ToolActivityDisplay[], status: ChatToolDisplayStatus, label: string): string | undefined {
+  const count = activities.filter((activity) => activity.displayStatus === status).length;
+  return count > 0 ? `${count} ${label}` : undefined;
 }
 
 function groupTone(activities: readonly ToolActivityDisplay[]): ToolActivityTone {

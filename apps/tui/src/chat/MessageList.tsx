@@ -77,6 +77,7 @@ function transcriptCells(
     sessionStatus: options.sessionStatus,
     activeToolCount: options.activeToolCount,
     groupExplorationTools: localItems.length === 0,
+    cwd: options.cwd,
   });
   if (localItems.length === 0) {
     return displayItems.map((item) => displayItemCell(item, options.width, options.theme, options.hideThinking, options.cwd));
