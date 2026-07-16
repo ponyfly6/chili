@@ -292,8 +292,8 @@ export function normalizeToolName(toolName: string): string {
 function defaultToolDetails(input: ToolRenderInput, options: { maxOutputLines?: number; maxLiveOutputLines?: number } = {}): ToolActivityDetail[] {
   const details: ToolActivityDetail[] = [];
   if (input.input !== undefined) {
-    const preview = previewTextLines(formatInput(input.input), { maxLines: 8, maxLineLength: 180 });
-    details.push({ label: "input", tone: "muted", lines: preview.lines, truncated: preview.truncated, maxVisibleRows: 8 });
+    const preview = previewTextLines(formatInput(input.input), { maxLines: 5, maxLineLength: 180, preserveTail: true });
+    details.push({ label: "input", tone: "muted", lines: preview.lines, truncated: preview.truncated, maxVisibleRows: 5 });
   }
   const liveOutput = liveOutputDetail(input, options.maxLiveOutputLines ?? 16);
   if (liveOutput) details.push(liveOutput);
@@ -302,8 +302,9 @@ function defaultToolDetails(input: ToolRenderInput, options: { maxOutputLines?: 
     details.push({ label: "error", tone: "error", lines: preview.lines, truncated: preview.truncated, maxVisibleRows: 5 });
   }
   if (input.output) {
+    const maxOutputLines = options.maxOutputLines ?? 5;
     const preview = previewTextLines(input.output, {
-      maxLines: options.maxOutputLines ?? 8,
+      maxLines: maxOutputLines,
       maxLineLength: 180,
       preserveTail: true,
     });
@@ -312,16 +313,14 @@ function defaultToolDetails(input: ToolRenderInput, options: { maxOutputLines?: 
       tone: "muted",
       lines: preview.lines,
       truncated: preview.truncated,
-      maxVisibleRows: options.maxOutputLines ?? 8,
+      maxVisibleRows: maxOutputLines,
     });
   }
   return details;
 }
 
 function compactLiveOutputDetails(input: ToolRenderInput): ToolActivityDetail[] {
-  if (isExplorationTool(input.toolName) && (isFailedDisplayStatus(input.displayStatus) || input.error)) {
-    return [];
-  }
+  if (isExplorationTool(input.toolName)) return [];
   const liveOutput = liveOutputDetail(input, 5);
   return liveOutput ? [liveOutput] : [];
 }

@@ -118,6 +118,27 @@ test("running command tools expose live output tail without mixing it into final
   expect(completed.details).toEqual([]);
 });
 
+test("exploration tools keep running live output out of compact semantic summaries", () => {
+  for (const toolName of ["read", "grep", "glob"]) {
+    const base = toolInput({
+      toolName,
+      status: "running",
+      displayStatus: "running",
+      inputSummary: { title: toolName, path: "/repo/app/example.php", scope: "/repo/app/example.php" },
+      liveOutput: [
+        { stream: "stderr", delta: "RAW_EXPLORATION_PROGRESS\n", time: 1 },
+      ],
+    });
+
+    const compact = renderToolActivity(base);
+    const details = renderToolActivity({ ...base, showToolDetails: true });
+
+    expect(compact.details).toEqual([]);
+    expect(compact.bodyLines).toEqual([]);
+    expect(details.details.find((detail) => detail.label === "live output")?.lines).toEqual(["RAW_EXPLORATION_PROGRESS"]);
+  }
+});
+
 test("running stderr-only live output stays a live output text body", () => {
   const rendered = renderToolActivity(toolInput({
     toolName: "bash",

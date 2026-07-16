@@ -5,6 +5,7 @@ import { act } from "react";
 import type { ChatDisplayItem, ToolActivityDisplay } from "./presentation.js";
 import { resolveTuiTheme } from "../theme/index.js";
 import { ToolCell, toolCellLines, toolGroupCellLines, toolRichBodyRenderableId } from "./ToolCells.js";
+import { renderToolActivity, type ToolRenderInput } from "./tool-renderers.js";
 
 const theme = resolveTuiTheme("chili-dark", {});
 
@@ -347,6 +348,58 @@ test("tool detail previews budget wrapped visual rows while preserving head and 
   expect(detailRows.join("")).toContain("HEAD_");
   expect(detailRows.join("").replace(/\s+/g, "")).toContain("_TAIL");
   expect(detailRows.some((line) => line.includes("… +"))).toBe(true);
+});
+
+test("renderer-backed ordinary details keep five visual rows and preserve head and tail", () => {
+  const input: ToolRenderInput = {
+    id: "tool_renderer_budget",
+    callId: "call_renderer_budget",
+    toolName: "custom_probe",
+    status: "completed",
+    displayStatus: "succeeded",
+    inputSummary: { title: "custom_probe", detail: "budget" },
+    input: {
+      first: "one",
+      second: "two",
+      third: "three",
+      fourth: "four",
+      fifth: "five",
+      sixth: "six",
+      last: "seven",
+    },
+    output: Array.from({ length: 7 }, (_, index) => `line_${index + 1}`).join("\n"),
+    showToolDetails: true,
+    source: "row",
+  };
+  const rendered = renderToolActivity(input);
+  const activity: ToolActivityDisplay = {
+    ...rendered,
+    id: input.id,
+    callId: input.callId,
+    toolName: input.toolName,
+    status: input.status,
+    displayStatus: input.displayStatus,
+    tone: "muted",
+    source: input.source,
+    inputSummary: input.inputSummary,
+    input: input.input,
+    output: input.output!,
+  };
+  const lines = lineText(toolCellLines(activity, 24, theme));
+  const outputLabelIndex = lines.findIndex((line) => line.includes("output"));
+  const inputLabelIndex = lines.findIndex((line) => line.includes("input"));
+  const outputRows = lines.slice(outputLabelIndex + 1, inputLabelIndex);
+  const inputRows = lines.slice(inputLabelIndex + 1);
+
+  expect(outputRows.length).toBeLessThanOrEqual(5);
+  expect(outputRows.join("\n")).toContain("line_1");
+  expect(outputRows.join("\n")).toContain("line_7");
+  expect(outputRows.some((line) => line.includes("… +"))).toBe(true);
+  expect(inputRows.length).toBeLessThanOrEqual(5);
+  expect(inputRows.join("\n")).toContain("first");
+  expect(inputRows.join("\n")).toContain("last");
+  expect(inputRows.join("\n")).toContain("}");
+  expect(inputRows.some((line) => line.includes("… +"))).toBe(true);
 });
 
 function toolActivity(overrides: Partial<ToolActivityDisplay> & { id: string; label: string }): ToolActivityDisplay {
