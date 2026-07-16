@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { renderToolActivity, type ToolRenderInput } from "./tool-renderers.js";
 
 test("tool renderers expose inline and block cell modes without compact raw output", () => {
@@ -187,6 +189,64 @@ test("failed command tools keep compact error summary when live output exists", 
   expect(failed.details.find((detail) => detail.label === "live output")?.lines).toEqual(["installing"]);
   expect(failed.details.find((detail) => detail.label === "live output")?.lineTones).toEqual(["error"]);
   expect(failed.compactErrorLines).toEqual(["command failed"]);
+});
+
+test("exploration failures use semantic compact copy while details keep raw diagnostics", () => {
+  for (const toolName of ["read", "grep", "glob"]) {
+    const error = "ENOENT: no such file or directory, lstat '/repo/app/example.php'";
+    const base = {
+      ...toolInput({
+        toolName,
+        status: "failed",
+        displayStatus: "failed",
+        inputSummary: {
+          title: toolName,
+          path: "/repo/app/example.php",
+          scope: "/repo/app/example.php",
+        },
+        error,
+      }),
+      cwd: "/repo",
+    } as ToolRenderInput;
+
+    const compact = renderToolActivity(base);
+    const details = renderToolActivity({ ...base, showToolDetails: true });
+
+    expect(compact.compactErrorLines).toEqual(["File not found: app/example.php"]);
+    expect(compact.compactErrorLines?.join("\n")).not.toContain("ENOENT");
+    expect(details.compactErrorLines).toBeUndefined();
+    expect(details.details.find((detail) => detail.label === "error")?.lines.join("\n")).toContain(error);
+  }
+});
+
+test("semantic exploration failures shorten home and long paths without losing filenames", () => {
+  const homeTarget = join(homedir(), "Code", "outside-workspace.php");
+  const homeFailure = renderToolActivity({
+    ...toolInput({
+      toolName: "read",
+      status: "failed",
+      displayStatus: "failed",
+      inputSummary: { title: "read", path: homeTarget },
+      error: `EACCES: permission denied, open '${homeTarget}'`,
+    }),
+    cwd: "/repo",
+  } as ToolRenderInput);
+  const longTarget = `/repo/${Array.from({ length: 18 }, (_, index) => `segment-${index}`).join("/")}/final-target.php`;
+  const longFailure = renderToolActivity({
+    ...toolInput({
+      toolName: "read",
+      status: "failed",
+      displayStatus: "failed",
+      inputSummary: { title: "read", path: longTarget },
+      error: `ENOENT: no such file or directory, lstat '${longTarget}'`,
+    }),
+    cwd: "/repo",
+  } as ToolRenderInput);
+
+  expect(homeFailure.compactErrorLines).toEqual(["Permission denied: ~/Code/outside-workspace.php"]);
+  expect(longFailure.compactErrorLines?.[0]).toContain("…");
+  expect(longFailure.compactErrorLines?.[0]).toEndWith("/final-target.php");
+  expect(longFailure.compactErrorLines?.[0]?.length).toBeLessThanOrEqual(112);
 });
 
 test("live output always renders as text even for diff-oriented tools", () => {

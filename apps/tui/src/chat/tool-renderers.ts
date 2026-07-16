@@ -1,3 +1,5 @@
+import { homedir } from "node:os";
+import { isAbsolute, relative, resolve } from "node:path";
 import type { ChatToolDisplayStatus, ChatToolInputSummary, RuntimeToolOutputDelta } from "@chili/sdk";
 
 export interface ToolActivityDetail {
@@ -32,6 +34,7 @@ export interface ToolRenderInput {
   output?: string;
   error?: string;
   liveOutput?: readonly RuntimeToolOutputDelta[];
+  cwd?: string;
   showToolDetails: boolean;
   source: "row" | "fallback";
 }
@@ -115,6 +118,7 @@ const readRenderer: ToolRenderer = {
   match: (toolName) => explorationToolKind(toolName) === "read",
   mode: () => "inline",
   label: (input) => labelWithTarget(statusVerb(input.displayStatus, "Read", "Reading"), displayPath(input.inputSummary.path ?? input.inputSummary.detail ?? input.inputSummary.scope ?? "file")),
+  compactErrorLines: (input) => explorationCompactErrorLines(input, "Read"),
 };
 
 const searchRenderer: ToolRenderer = {
@@ -127,6 +131,7 @@ const searchRenderer: ToolRenderer = {
       : input.inputSummary.detail ?? input.inputSummary.scope ?? "pattern";
     return labelWithTarget(statusVerb(input.displayStatus, "Searched", "Searching"), target);
   },
+  compactErrorLines: (input) => explorationCompactErrorLines(input, "Search"),
 };
 
 const listRenderer: ToolRenderer = {
@@ -139,6 +144,7 @@ const listRenderer: ToolRenderer = {
       : input.inputSummary.path ?? input.inputSummary.detail ?? input.inputSummary.scope ?? "paths";
     return labelWithTarget(statusVerb(input.displayStatus, "Listed", "Listing"), target);
   },
+  compactErrorLines: (input) => explorationCompactErrorLines(input, "List"),
 };
 
 const editRenderer: ToolRenderer = {
@@ -370,6 +376,26 @@ function defaultCompactErrorLines(input: ToolRenderInput): string[] | undefined 
   const value = input.error ?? (input.displayStatus === "failed" ? input.output : undefined);
   if (!value) return undefined;
   return previewTextLines(value, { maxLines: 4, maxLineLength: 180 }).lines;
+}
+
+function explorationCompactErrorLines(input: ToolRenderInput, action: "Read" | "Search" | "List"): string[] | undefined {
+  if (!isFailedDisplayStatus(input.displayStatus) && !input.error) return undefined;
+  const target = displayToolPath(
+    input.inputSummary.path
+      ?? input.inputSummary.scope
+      ?? input.inputSummary.pattern
+      ?? input.inputSummary.detail
+      ?? "target",
+    input.cwd,
+  );
+  if (input.displayStatus === "rejected") return [`${action} rejected: ${target}`];
+  if (input.displayStatus === "cancelled") return [`${action} cancelled: ${target}`];
+
+  const error = input.error ?? input.output ?? "";
+  if (/\bENOENT\b|no such file or directory/i.test(error)) return [`File not found: ${target}`];
+  if (/\b(?:EACCES|EPERM)\b|permission denied/i.test(error)) return [`Permission denied: ${target}`];
+  if (/timed?\s*out|timeout/i.test(error)) return [`${action} timed out: ${target}`];
+  return [`${action} failed: ${target}`];
 }
 
 function previewTextLines(value: string, options: { maxLines: number; maxLineLength: number }): { lines: string[]; truncated: boolean } {
@@ -640,6 +666,43 @@ function displayPath(path: string): string {
   const normalized = path.replace(/\\/g, "/");
   const parts = normalized.split("/").filter(Boolean);
   return parts.at(-1) ?? path;
+}
+
+function displayToolPath(value: string, cwd: string | undefined, maxLength = 96): string {
+  const normalized = value.replace(/\\/g, "/");
+  let display = normalized;
+  if (isAbsolute(value)) {
+    const absolute = resolve(value);
+    const workspaceRelative = relative(resolve(cwd ?? process.cwd()), absolute);
+    if (workspaceRelative === "") {
+      display = ".";
+    } else if (isContainedRelativePath(workspaceRelative)) {
+      display = workspaceRelative.replace(/\\/g, "/");
+    } else {
+      const homeRelative = relative(resolve(homedir()), absolute);
+      display = isContainedRelativePath(homeRelative)
+        ? `~/${homeRelative.replace(/\\/g, "/")}`
+        : normalized;
+    }
+  }
+  return middleElidePath(display, maxLength);
+}
+
+function isContainedRelativePath(value: string): boolean {
+  return value !== ".." && !value.startsWith("../") && !value.startsWith("..\\") && !isAbsolute(value);
+}
+
+function middleElidePath(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  const slash = value.lastIndexOf("/");
+  if (slash > 0) {
+    const suffix = value.slice(slash);
+    const headLength = maxLength - suffix.length - 1;
+    if (headLength >= 8) return `${value.slice(0, headLength).replace(/\/+$/, "")}…${suffix}`;
+  }
+  const headLength = Math.max(1, Math.floor((maxLength - 1) / 2));
+  const tailLength = Math.max(1, maxLength - headLength - 1);
+  return `${value.slice(0, headLength)}…${value.slice(-tailLength)}`;
 }
 
 function formatInput(input: unknown): string {
