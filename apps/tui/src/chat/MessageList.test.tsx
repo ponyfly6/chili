@@ -701,6 +701,9 @@ test("exploration group failures stay compact while details retain every raw dia
   const failed = [
     chatTool("read_group_failed" as ToolCallId, "read", "failed", "failed", { title: "read", path: "/repo/app/first.php" }, {
       error: "ENOENT: no such file or directory, lstat '/repo/app/first.php'",
+      liveOutput: [
+        { stream: "stderr", delta: "RAW_LIVE_ENOENT: lstat '/repo/app/first.php'\n", time: 1 },
+      ],
     }),
     chatTool("grep_group_failed" as ToolCallId, "grep", "failed", "failed", { title: "grep", path: "/repo/app/second.php", scope: "/repo/app/second.php" }, {
       error: "ENOENT: no such file or directory, lstat '/repo/app/second.php'",
@@ -717,10 +720,12 @@ test("exploration group failures stay compact while details retain every raw dia
   expect(compact).toContain("File not found: app/first.php");
   expect(compact).toContain("+2 more failures (Ctrl+O for details)");
   expect(compact).not.toContain("ENOENT");
+  expect(compact).not.toContain("RAW_LIVE_ENOENT");
   expect(compact).not.toContain("/repo/app/second.php");
   expect(compact).not.toContain("/repo/app/third.php");
   expect(occurrences(compact, "error:")).toBe(0);
   expect(details).toContain("ENOENT: no such file or directory, lstat '/repo/app/first.php'");
+  expect(details).toContain("RAW_LIVE_ENOENT: lstat '/repo/app/first.php'");
   expect(details).toContain("ENOENT: no such file or directory, lstat '/repo/app/second.php'");
   expect(details).toContain("ENOENT: no such file or directory, lstat '/repo/app/third.php'");
 });

@@ -319,6 +319,9 @@ function defaultToolDetails(input: ToolRenderInput, options: { maxOutputLines?: 
 }
 
 function compactLiveOutputDetails(input: ToolRenderInput): ToolActivityDetail[] {
+  if (isExplorationTool(input.toolName) && (isFailedDisplayStatus(input.displayStatus) || input.error)) {
+    return [];
+  }
   const liveOutput = liveOutputDetail(input, 5);
   return liveOutput ? [liveOutput] : [];
 }
