@@ -216,6 +216,44 @@ test("consumes rich model streams and executes tool calls after the stream finis
   expect(toolStartedIndex).toBeGreaterThan(toolCallPartIndex);
 });
 
+test("keeps indexed reasoning sections in separate message parts", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "reasoning_delta", index: 0, text: "**Inspecting " };
+      yield { type: "reasoning_delta", index: 0, text: "core**" };
+      yield { type: "reasoning_delta", index: 1, text: "**Checking " };
+      yield { type: "reasoning_delta", index: 1, text: "schema**" };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+    }),
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const result = await runtime.runTurn({
+    sessionId: "session_reasoning_sections" as SessionId,
+    threadId: "thread_reasoning_sections" as ThreadId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(reasoningParts(store).map((part) => part.text)).toEqual([
+    "**Inspecting core**",
+    "**Checking schema**",
+  ]);
+});
+
 test("does not execute tool calls from output-limited model responses", async () => {
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();

@@ -104,6 +104,7 @@ interface CodexStreamPayload {
   delta?: string;
   arguments?: string;
   output_index?: number;
+  summary_index?: number;
   item_id?: string;
   code?: string;
   message?: string;
@@ -321,6 +322,7 @@ export class OpenAICodexResponsesModel implements ChiliModel {
     let finishReason = "stop";
     let sawToolCall = false;
     const toolCalls = new Map<string, ToolStreamState>();
+    const reasoningSectionIndexes = new Map<string, number>();
     let activeToolKey: string | undefined;
 
     for await (const event of readSseEvents(body, signal)) {
@@ -355,7 +357,11 @@ export class OpenAICodexResponsesModel implements ChiliModel {
       }
 
       if (payload.type === "response.reasoning_summary_text.delta" && payload.delta) {
-        yield { type: "reasoning_delta", text: payload.delta, index: payload.output_index ?? 0 };
+        yield {
+          type: "reasoning_delta",
+          text: payload.delta,
+          index: reasoningSectionEventIndex(payload, reasoningSectionIndexes),
+        };
         continue;
       }
 
@@ -602,6 +608,16 @@ function toResponsesTools(tools: readonly ModelTool[]): Array<Record<string, unk
     parameters: tool.inputSchema,
     strict: null,
   }));
+}
+
+function reasoningSectionEventIndex(payload: CodexStreamPayload, indexes: Map<string, number>): number {
+  const itemKey = payload.item_id ?? `output:${payload.output_index ?? 0}`;
+  const key = `${itemKey}\0${payload.summary_index ?? 0}`;
+  const existing = indexes.get(key);
+  if (existing !== undefined) return existing;
+  const index = indexes.size;
+  indexes.set(key, index);
+  return index;
 }
 
 function createToolState(item: CodexOutputItem, index: number | undefined): ToolStreamState {

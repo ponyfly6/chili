@@ -501,6 +501,29 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
   });
 });
 
+test("preserves reasoning summary sections from Codex Responses streams", async () => {
+  const model = new OpenAICodexResponsesModel({
+    model: "gpt-5.5",
+    apiKey: jwtWithAccount("acct_test"),
+    fetch: sseFetch([
+      data({ type: "response.created", response: { id: "resp_reasoning", model: "gpt-5.5" } }),
+      data({ type: "response.reasoning_summary_text.delta", item_id: "reasoning_1", output_index: 0, summary_index: 0, delta: "**Inspecting " }),
+      data({ type: "response.reasoning_summary_text.delta", item_id: "reasoning_1", output_index: 0, summary_index: 0, delta: "core**" }),
+      data({ type: "response.reasoning_summary_text.delta", item_id: "reasoning_1", output_index: 0, summary_index: 1, delta: "**Checking " }),
+      data({ type: "response.reasoning_summary_text.delta", item_id: "reasoning_1", output_index: 0, summary_index: 1, delta: "schema**" }),
+      data({ type: "response.completed", response: { id: "resp_reasoning", model: "gpt-5.5", status: "completed" } }),
+    ]),
+    env: {},
+  });
+
+  const events = await collect(model.stream({ messages: [], tools: [], system: [] }));
+  const reasoning = events.filter((event) => event.type === "reasoning_delta");
+
+  expect(reasoning.map((event) => event.index)).toEqual([0, 0, 1, 1]);
+  expect(reasoning.filter((event) => event.index === 0).map((event) => event.text).join("")).toBe("**Inspecting core**");
+  expect(reasoning.filter((event) => event.index === 1).map((event) => event.text).join("")).toBe("**Checking schema**");
+});
+
 test("maps incomplete Codex tool-call responses to length", async () => {
   const model = new OpenAICodexResponsesModel({
     model: "gpt-5.5",

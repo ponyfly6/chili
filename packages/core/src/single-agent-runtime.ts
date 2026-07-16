@@ -77,7 +77,7 @@ interface StreamingToolCall {
 
 interface AssistantStreamState {
   textPartId?: PartId;
-  reasoningPartId?: PartId;
+  reasoningPartIds: Map<number, PartId>;
   toolCalls: PendingToolCall[];
   streamingToolCalls: Map<string, StreamingToolCall>;
 }
@@ -459,6 +459,7 @@ export class SingleAgentRuntime implements AgentRunner {
       let assistantMutated = false;
       let latestUsage: ModelUsage | undefined;
       const state: AssistantStreamState = {
+        reasoningPartIds: new Map(),
         toolCalls: [],
         streamingToolCalls: new Map(),
       };
@@ -473,7 +474,7 @@ export class SingleAgentRuntime implements AgentRunner {
 
           if (event.type === "reasoning_delta") {
             assistantMutated = true;
-            await this.appendReasoningDelta(input, assistantMessageId, state, event.text, event.redacted);
+            await this.appendReasoningDelta(input, assistantMessageId, state, event.text, event.index, event.redacted);
             continue;
           }
 
@@ -747,12 +748,16 @@ export class SingleAgentRuntime implements AgentRunner {
     assistantMessageId: MessageId,
     state: AssistantStreamState,
     text: string,
+    index?: number,
     redacted?: boolean,
   ): Promise<void> {
-    if (!state.reasoningPartId) {
-      state.reasoningPartId = this.id<PartId>("part");
+    const reasoningIndex = index ?? 0;
+    const existingPartId = state.reasoningPartIds.get(reasoningIndex);
+    if (!existingPartId) {
+      const partId = this.id<PartId>("part");
+      state.reasoningPartIds.set(reasoningIndex, partId);
       await this.appendPart(input, assistantMessageId, {
-        id: state.reasoningPartId,
+        id: partId,
         messageId: assistantMessageId,
         sessionId: input.sessionId,
         type: "reasoning",
@@ -762,7 +767,7 @@ export class SingleAgentRuntime implements AgentRunner {
       return;
     }
 
-    await this.appendPartDelta(input, assistantMessageId, state.reasoningPartId, "text", text);
+    await this.appendPartDelta(input, assistantMessageId, existingPartId, "text", text);
   }
 
   private async queueToolCall(
