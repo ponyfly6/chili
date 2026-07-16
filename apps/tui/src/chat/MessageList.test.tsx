@@ -740,7 +740,7 @@ test("large tool output is hidden by default and truncated in details mode", asy
   expect(details).toContain("output (truncated):");
   expect(details).not.toContain("output hidden");
   expect(details).toContain("line_01");
-  expect(details).toContain("line_05");
+  expect(details).toContain("line_20");
   expect(details).not.toContain("line_06");
 });
 
@@ -800,7 +800,7 @@ test("tool details scroll as a full component in the native scrollbox", async ()
   const app = await renderMessageListApp([item], { showToolDetails: true, height: 5, width: 120 });
 
   try {
-    expect(app.frame()).toContain("slice_line_05");
+    expect(app.frame()).toContain("slice_line_20");
     expect(app.frame()).not.toContain("Ran bun test");
 
     await app.scrollBy(-3);

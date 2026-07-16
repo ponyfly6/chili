@@ -8,6 +8,7 @@ export interface ToolActivityDetail {
   tone: "muted" | "error";
   lineTones?: ("muted" | "error")[];
   truncated: boolean;
+  maxVisibleRows?: number;
 }
 
 export type ToolRenderMode = "inline" | "block";
@@ -292,20 +293,27 @@ function defaultToolDetails(input: ToolRenderInput, options: { maxOutputLines?: 
   const details: ToolActivityDetail[] = [];
   if (input.input !== undefined) {
     const preview = previewTextLines(formatInput(input.input), { maxLines: 8, maxLineLength: 180 });
-    details.push({ label: "input", tone: "muted", lines: preview.lines, truncated: preview.truncated });
+    details.push({ label: "input", tone: "muted", lines: preview.lines, truncated: preview.truncated, maxVisibleRows: 8 });
   }
   const liveOutput = liveOutputDetail(input, options.maxLiveOutputLines ?? 16);
   if (liveOutput) details.push(liveOutput);
   if (input.error) {
-    const preview = previewTextLines(input.error, { maxLines: 5, maxLineLength: 180 });
-    details.push({ label: "error", tone: "error", lines: preview.lines, truncated: preview.truncated });
+    const preview = previewTextLines(input.error, { maxLines: 5, maxLineLength: 180, preserveTail: true });
+    details.push({ label: "error", tone: "error", lines: preview.lines, truncated: preview.truncated, maxVisibleRows: 5 });
   }
   if (input.output) {
     const preview = previewTextLines(input.output, {
       maxLines: options.maxOutputLines ?? 8,
       maxLineLength: 180,
+      preserveTail: true,
     });
-    details.push({ label: "output", tone: "muted", lines: preview.lines, truncated: preview.truncated });
+    details.push({
+      label: "output",
+      tone: "muted",
+      lines: preview.lines,
+      truncated: preview.truncated,
+      maxVisibleRows: options.maxOutputLines ?? 8,
+    });
   }
   return details;
 }
@@ -329,6 +337,7 @@ function liveOutputDetail(input: ToolRenderInput, maxLines: number): ToolActivit
     lines: preview.lines,
     lineTones: preview.lineTones,
     truncated: preview.truncated,
+    maxVisibleRows: maxLines,
   };
 }
 
@@ -398,12 +407,31 @@ function explorationCompactErrorLines(input: ToolRenderInput, action: "Read" | "
   return [`${action} failed: ${target}`];
 }
 
-function previewTextLines(value: string, options: { maxLines: number; maxLineLength: number }): { lines: string[]; truncated: boolean } {
+function previewTextLines(
+  value: string,
+  options: { maxLines: number; maxLineLength: number; preserveTail?: boolean },
+): { lines: string[]; truncated: boolean } {
   const normalized = value.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimEnd();
   const sourceLines = normalized.length > 0 ? normalized.split("\n") : [""];
-  const lines = sourceLines.slice(0, options.maxLines).map((line) => shortenLine(line, options.maxLineLength));
-  const truncated = sourceLines.length > options.maxLines || lines.some((line, index) => line !== sourceLines[index]);
+  const selected = options.preserveTail === true
+    ? headTailLines(sourceLines, options.maxLines)
+    : sourceLines.slice(0, options.maxLines);
+  const lines = selected.map((line) => shortenLine(line, options.maxLineLength));
+  const truncated = sourceLines.length > options.maxLines || lines.some((line, index) => line !== selected[index]);
   return { lines, truncated };
+}
+
+function headTailLines(sourceLines: readonly string[], maxLines: number): string[] {
+  if (sourceLines.length <= maxLines) return [...sourceLines];
+  if (maxLines <= 1) return [`… +${sourceLines.length} lines`];
+  const headCount = Math.ceil((maxLines - 1) / 2);
+  const tailCount = Math.max(0, maxLines - headCount - 1);
+  const hiddenCount = sourceLines.length - headCount - tailCount;
+  return [
+    ...sourceLines.slice(0, headCount),
+    `… +${hiddenCount} lines`,
+    ...(tailCount > 0 ? sourceLines.slice(-tailCount) : []),
+  ];
 }
 
 function isLargeOutput(value: string): boolean {

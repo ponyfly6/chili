@@ -60,7 +60,7 @@ test("tool renderers expose inline and block cell modes without compact raw outp
   expect(unknown.outputHint).toBe("output hidden (2 lines, details available)");
 });
 
-test("details mode promotes truncated preview lines into the cell body", () => {
+test("details mode preserves the head and tail of truncated preview lines", () => {
   const output = Array.from({ length: 7 }, (_, index) => `line_${String(index + 1).padStart(2, "0")}`).join("\n");
   const rendered = renderToolActivity(toolInput({
     toolName: "bash",
@@ -73,13 +73,13 @@ test("details mode promotes truncated preview lines into the cell body", () => {
   expect(rendered).toMatchObject({
     mode: "block",
     bodyKind: "text",
-    bodyLines: ["line_01", "line_02", "line_03", "line_04", "line_05"],
+    bodyLines: ["line_01", "line_02", "… +3 lines", "line_06", "line_07"],
     bodyTruncated: true,
   });
   expect(rendered.outputHint).toBeUndefined();
   expect(rendered.details.find((detail) => detail.label === "output")).toMatchObject({
     truncated: true,
-    lines: ["line_01", "line_02", "line_03", "line_04", "line_05"],
+    lines: ["line_01", "line_02", "… +3 lines", "line_06", "line_07"],
   });
 });
 

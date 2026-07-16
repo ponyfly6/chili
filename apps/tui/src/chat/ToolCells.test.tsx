@@ -324,6 +324,31 @@ test("failed tool keeps red compact error summary while live output stays labele
   expect(lines).not.toContainEqual(expect.objectContaining({ text: "  error:", fg: theme.colors.text.muted }));
 });
 
+test("tool detail previews budget wrapped visual rows while preserving head and tail", () => {
+  const longError = `HEAD_${"x".repeat(180)}_TAIL`;
+  const lines = lineText(toolCellLines(toolActivity({
+    id: "tool_wrapped_error",
+    label: "Failed narrow command",
+    status: "failed",
+    displayStatus: "failed",
+    tone: "error",
+    mode: "block",
+    bodyKind: "error",
+    bodyLines: [longError],
+    details: [
+      { label: "error", lines: [longError], tone: "error", truncated: false },
+    ],
+  }), 24, theme));
+  const detailLabelIndex = lines.findIndex((line) => line.includes("error"));
+  const detailRows = lines.slice(detailLabelIndex + 1);
+
+  expect(lines[detailLabelIndex]).toContain("(truncated)");
+  expect(detailRows.length).toBeLessThanOrEqual(5);
+  expect(detailRows.join("")).toContain("HEAD_");
+  expect(detailRows.join("").replace(/\s+/g, "")).toContain("_TAIL");
+  expect(detailRows.some((line) => line.includes("… +"))).toBe(true);
+});
+
 function toolActivity(overrides: Partial<ToolActivityDisplay> & { id: string; label: string }): ToolActivityDisplay {
   return {
     id: overrides.id,

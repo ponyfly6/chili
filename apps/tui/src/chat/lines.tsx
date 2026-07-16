@@ -93,24 +93,53 @@ export function detailPreviewLines(
   truncated: boolean,
   width: number,
   fg: string,
+  maxContentRows = 5,
 ): TranscriptLineModel[] {
-  const output: TranscriptLineModel[] = [];
-  const suffix = truncated ? " (truncated)" : "";
-  output.push(...wrapLine(`  ${label}${suffix}:`, {
-    key: `${key}:label`,
+  const contentRows = lines.flatMap((line, index) => wrapLine(`    ${line || " "}`, {
+    key: `${key}:line:${index}`,
     fg,
     width,
     hangingIndent: "    ",
   }));
-  for (const [index, line] of lines.entries()) {
-    output.push(...wrapLine(`    ${line || " "}`, {
-      key: `${key}:line:${index}`,
-      fg,
-      width,
-      hangingIndent: "    ",
-    }));
+  const clipped = clipTranscriptRows(contentRows, maxContentRows, `${key}:rows`, fg);
+  const suffix = truncated || clipped.truncated ? " (truncated)" : "";
+  return [
+    ...wrapLine(`  ${label}${suffix}:`, {
+    key: `${key}:label`,
+    fg,
+    width,
+    hangingIndent: "    ",
+    }),
+    ...clipped.lines,
+  ];
+}
+
+export function clipTranscriptRows(
+  rows: readonly TranscriptLineModel[],
+  maxRows: number,
+  key: string,
+  fg: string,
+): { lines: TranscriptLineModel[]; truncated: boolean } {
+  if (!Number.isFinite(maxRows) || rows.length <= maxRows) return { lines: [...rows], truncated: false };
+  const budget = Math.max(1, Math.floor(maxRows));
+  if (budget === 1) {
+    return {
+      lines: [{ key: `${key}:omitted`, text: `    … +${rows.length} lines`, fg }],
+      truncated: true,
+    };
   }
-  return output;
+  const retainedRows = budget - 1;
+  const headCount = Math.ceil(retainedRows / 2);
+  const tailCount = retainedRows - headCount;
+  const hiddenCount = rows.length - headCount - tailCount;
+  return {
+    lines: [
+      ...rows.slice(0, headCount),
+      { key: `${key}:omitted`, text: `    … +${hiddenCount} lines`, fg },
+      ...(tailCount > 0 ? rows.slice(-tailCount) : []),
+    ],
+    truncated: true,
+  };
 }
 
 function fileLinkAtMouseColumn(links: readonly FileLinkRange[] | undefined, event: MouseEvent): FileLinkRange | undefined {

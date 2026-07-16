@@ -1,6 +1,6 @@
 import { RGBA, SyntaxStyle } from "@opentui/core";
 import type { TuiTheme } from "../theme/index.js";
-import { detailPreviewLines, TranscriptLines, type TranscriptLineModel, wrapLine } from "./lines.js";
+import { clipTranscriptRows, detailPreviewLines, TranscriptLines, type TranscriptLineModel, wrapLine } from "./lines.js";
 import type { ChatDisplayItem, ToolActivityDisplay } from "./presentation.js";
 import { isExplorationTool, type ToolActivityDetail } from "./tool-renderers.js";
 
@@ -166,10 +166,10 @@ function toolBodyLines(
   if (activity.bodyKind === "diff") return diffBodyLines(key, activity, width, theme);
   if (activity.bodyKind === "code") return codeBodyLines(key, activity, width, theme);
   if (activity.bodyKind === "error") {
-    return detailPreviewLinesWithTones(key, "error", activity.bodyLines, activity.bodyTruncated, detail?.lineTones, width, theme);
+    return detailPreviewLinesWithTones(key, "error", activity.bodyLines, activity.bodyTruncated, detail?.lineTones, width, theme, "error", detail?.maxVisibleRows);
   }
   if (activity.bodyKind === "text") {
-    return detailPreviewLinesWithTones(key, detail?.label ?? "output", activity.bodyLines, activity.bodyTruncated, detail?.lineTones, width, theme);
+    return detailPreviewLinesWithTones(key, detail?.label ?? "output", activity.bodyLines, activity.bodyTruncated, detail?.lineTones, width, theme, "muted", detail?.maxVisibleRows);
   }
   return [];
 }
@@ -252,12 +252,12 @@ function richBodyLabelLines(key: string, label: "code" | "diff", truncated: bool
 
 function diffBodyLines(key: string, activity: ToolActivityDisplay, width: number, theme: TuiTheme): TranscriptLineModel[] {
   // Text fallback for transcript/copy paths and partial scroll slices.
-  return detailPreviewLines(key, "diff", activity.bodyLines, activity.bodyTruncated, width, theme.colors.text.muted);
+  return detailPreviewLines(key, "diff", activity.bodyLines, activity.bodyTruncated, width, theme.colors.text.muted, Number.POSITIVE_INFINITY);
 }
 
 function codeBodyLines(key: string, activity: ToolActivityDisplay, width: number, theme: TuiTheme): TranscriptLineModel[] {
   // Text fallback for transcript/copy paths and partial scroll slices.
-  return detailPreviewLines(key, "code", activity.bodyLines, activity.bodyTruncated, width, theme.colors.text.muted);
+  return detailPreviewLines(key, "code", activity.bodyLines, activity.bodyTruncated, width, theme.colors.text.muted, Number.POSITIVE_INFINITY);
 }
 
 function canRenderNativeDiff(content: string): boolean {
@@ -325,7 +325,7 @@ function bodyDetailForActivity(activity: ToolActivityDisplay): ToolActivityDetai
 }
 
 function toolDetailLines(key: string, detail: ToolActivityDetail, width: number, theme: TuiTheme): TranscriptLineModel[] {
-  return detailPreviewLinesWithTones(key, detail.label, detail.lines, detail.truncated, detail.lineTones, width, theme, detail.tone);
+  return detailPreviewLinesWithTones(key, detail.label, detail.lines, detail.truncated, detail.lineTones, width, theme, detail.tone, detail.maxVisibleRows);
 }
 
 function detailPreviewLinesWithTones(
@@ -337,29 +337,30 @@ function detailPreviewLinesWithTones(
   width: number,
   theme: TuiTheme,
   fallbackTone: "muted" | "error" = "muted",
+  maxContentRows = 5,
 ): TranscriptLineModel[] {
   if (!lineTones?.length) {
     const fg = fallbackTone === "error" ? theme.colors.status.error : theme.colors.text.muted;
-    return detailPreviewLines(key, label, lines, truncated, width, fg);
+    return detailPreviewLines(key, label, lines, truncated, width, fg, maxContentRows);
   }
-  const output: TranscriptLineModel[] = [];
   const labelFg = fallbackTone === "error" ? theme.colors.status.error : theme.colors.text.muted;
-  const suffix = truncated ? " (truncated)" : "";
-  output.push(...wrapLine(`  ${label}${suffix}:`, {
+  const contentRows = lines.flatMap((line, index) => wrapLine(`    ${line || " "}`, {
+    key: `${key}:line:${index}`,
+    fg: lineTones[index] === "error" ? theme.colors.status.error : theme.colors.text.muted,
+    width,
+    hangingIndent: "    ",
+  }));
+  const clipped = clipTranscriptRows(contentRows, maxContentRows, `${key}:rows`, labelFg);
+  const suffix = truncated || clipped.truncated ? " (truncated)" : "";
+  return [
+    ...wrapLine(`  ${label}${suffix}:`, {
     key: `${key}:label`,
     fg: labelFg,
     width,
     hangingIndent: "    ",
-  }));
-  for (const [index, line] of lines.entries()) {
-    output.push(...wrapLine(`    ${line || " "}`, {
-      key: `${key}:line:${index}`,
-      fg: lineTones[index] === "error" ? theme.colors.status.error : theme.colors.text.muted,
-      width,
-      hangingIndent: "    ",
-    }));
-  }
-  return output;
+    }),
+    ...clipped.lines,
+  ];
 }
 
 function sameLines(left: readonly string[], right: readonly string[]): boolean {
