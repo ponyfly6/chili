@@ -13,10 +13,16 @@ import type {
   TurnId,
 } from "@chili/protocol";
 import { timestampNow } from "@chili/protocol";
+import { randomUUID } from "node:crypto";
 import { ToolDeniedError, ToolValidationError, UnknownToolError, isAbortError, toError } from "./errors.js";
 import { FileReadStateStore } from "./file-read-state.js";
 import { authorizeToolByPolicy, filterToolsByPolicy, toolPolicyContext } from "./tool-policy.js";
-import { persistToolOutput, truncateUtf8, type PersistedOutput } from "./tool-output-storage.js";
+import {
+  persistToolOutput,
+  truncateUtf8,
+  validatePersistedToolOutput,
+  type PersistedOutput,
+} from "./tool-output-storage.js";
 import type {
   ChiliToolDefinition,
   ChiliToolExecutionContext,
@@ -27,10 +33,12 @@ import type {
   ToolAccessPolicy,
   ToolApprovalSpec,
   ToolExecutorOptions,
+  PersistedToolOutputRegistration,
 } from "./types.js";
 
 export class ToolExecutor {
   private readonly fileReads: FileReadStateStore;
+  private readonly activeCallIds = new Set<string>();
 
   constructor(private readonly options: ToolExecutorOptions) {
     this.fileReads = options.fileReadState ?? new FileReadStateStore();
@@ -38,6 +46,8 @@ export class ToolExecutor {
 
   async execute(input: ExecuteToolInput): Promise<ExecuteToolResult> {
     const callId = input.callId ?? this.id<ToolCallId>("toolcall");
+    const outputArtifactId = `tooloutput_${randomUUID()}` as ToolCallId;
+    const activeCallKey = [input.cwd, input.sessionId, input.turnId, callId].join("\0");
     const tool = this.options.registry.get(input.toolName);
 
     await this.publish("tool.call_started", input, {
@@ -47,51 +57,102 @@ export class ToolExecutor {
       input: input.input,
     });
 
-    if (!tool) {
-      return this.fail(input, callId, new UnknownToolError(input.toolName));
+    if (this.activeCallIds.has(activeCallKey)) {
+      return this.fail(input, callId, new Error(`Tool call id is already active: ${callId}`));
     }
+    this.activeCallIds.add(activeCallKey);
 
     try {
-      await this.update(input, callId, "validating");
-      const validated = await this.validate(tool, input.input);
-      const spec = this.approvalSpec(tool, validated);
-      for (const policy of await this.policies(input)) {
-        await authorizeToolByPolicy({
+      if (!tool) {
+        return await this.fail(input, callId, new UnknownToolError(input.toolName));
+      }
+      try {
+        await this.update(input, callId, "validating");
+        const validated = await this.validate(tool, input.input);
+        const spec = this.approvalSpec(tool, validated);
+        for (const policy of await this.policies(input)) {
+          await authorizeToolByPolicy({
+            tool,
+            executeInput: input,
+            validatedInput: validated,
+            approvalSpec: spec === false ? { permission: tool.name, patterns: ["*"], metadata: {} } : spec,
+            policy,
+            isReadOnly: (definition, toolInput) => this.resolvePredicate(definition.isReadOnly, toolInput),
+          });
+        }
+
+        const approval = await this.requestLifecycleApproval(tool, input, callId, spec);
+        if (!isApprovalDecisionAction(approval.action)) {
+          throw new ToolDeniedError(tool.name, `Invalid approval decision action: ${String(approval.action)}`);
+        }
+        if (approval.action === "deny") {
+          throw new ToolDeniedError(tool.name, approval.feedback);
+        }
+
+        await this.createSnapshotIfNeeded(tool, input, callId, validated, spec);
+
+        await this.update(input, callId, "running");
+        let registeredOutput: PersistedOutput | undefined;
+        let invalidRegisteredOutputError: Error | undefined;
+        let outputRegistrationClaimed = false;
+        const registerPersistedOutput = async (registration: PersistedToolOutputRegistration): Promise<void> => {
+          if (outputRegistrationClaimed) {
+            throw new Error("Tool output sidecar has already been registered for this call");
+          }
+          outputRegistrationClaimed = true;
+          try {
+            registeredOutput = await validatePersistedToolOutput(
+              input.cwd,
+              outputArtifactId,
+              registration,
+              this.persistedOutputOptions(),
+            );
+          } catch (error) {
+            invalidRegisteredOutputError = toError(error);
+            throw error;
+          }
+        };
+        const rawResult = await tool.execute(
+          validated,
+          this.context(tool, input, callId, outputArtifactId, registerPersistedOutput),
+        );
+        if (registeredOutput) {
+          try {
+            registeredOutput = await validatePersistedToolOutput(
+              input.cwd,
+              outputArtifactId,
+              registeredOutput,
+              this.persistedOutputOptions(),
+            );
+          } catch (error) {
+            invalidRegisteredOutputError = toError(error);
+            registeredOutput = undefined;
+          }
+        }
+        const result = await this.processResult(
           tool,
-          executeInput: input,
-          validatedInput: validated,
-          approvalSpec: spec === false ? { permission: tool.name, patterns: ["*"], metadata: {} } : spec,
-          policy,
-          isReadOnly: (definition, toolInput) => this.resolvePredicate(definition.isReadOnly, toolInput),
+          input,
+          outputArtifactId,
+          rawResult,
+          registeredOutput,
+          invalidRegisteredOutputError,
+        );
+
+        await this.publish("tool.call_finished", input, {
+          callId,
+          status: "completed",
+          output: result.output,
         });
+
+        return { status: "completed", callId, result };
+      } catch (error) {
+        if (isAbortError(error)) {
+          return this.cancel(input, callId, toError(error));
+        }
+        return this.fail(input, callId, toError(error));
       }
-
-      const approval = await this.requestLifecycleApproval(tool, input, callId, spec);
-      if (!isApprovalDecisionAction(approval.action)) {
-        throw new ToolDeniedError(tool.name, `Invalid approval decision action: ${String(approval.action)}`);
-      }
-      if (approval.action === "deny") {
-        throw new ToolDeniedError(tool.name, approval.feedback);
-      }
-
-      await this.createSnapshotIfNeeded(tool, input, callId, validated, spec);
-
-      await this.update(input, callId, "running");
-      const rawResult = await tool.execute(validated, this.context(tool, input, callId));
-      const result = await this.processResult(tool, input, callId, rawResult);
-
-      await this.publish("tool.call_finished", input, {
-        callId,
-        status: "completed",
-        output: result.output,
-      });
-
-      return { status: "completed", callId, result };
-    } catch (error) {
-      if (isAbortError(error)) {
-        return this.cancel(input, callId, toError(error));
-      }
-      return this.fail(input, callId, toError(error));
+    } finally {
+      this.activeCallIds.delete(activeCallKey);
     }
   }
 
@@ -201,31 +262,51 @@ export class ToolExecutor {
   private async processResult(
     tool: ChiliToolDefinition,
     input: ExecuteToolInput,
-    callId: ToolCallId,
+    outputArtifactId: ToolCallId,
     result: ToolResult,
+    registeredOutput?: PersistedOutput,
+    invalidRegisteredOutputError?: Error,
   ): Promise<ToolResult> {
+    const normalizedResult = withRegisteredOutput(stripUntrustedOutputPathMetadata(result), registeredOutput);
     const maxBytes = tool.maxResultOutputBytes ?? this.options.maxResultOutputBytes ?? 256_000;
-    if (maxBytes === Infinity) return result;
-    const truncated = truncateUtf8(result.output, maxBytes);
-    if (!truncated.truncated) return result;
-
-    const existingOutputPath = typeof result.metadata?.outputPath === "string"
-      ? result.metadata.outputPath
-      : undefined;
-    if (existingOutputPath) {
-      const persistedBytes = numericMetadata(result.metadata?.outputPersistedBytes);
-      const originalBytes = numericMetadata(result.metadata?.outputBytes) ?? truncated.bytes;
-      const persistedTruncated = result.metadata?.outputPersistedTruncated === true;
-      const savedDescription = persistedTruncated && persistedBytes !== undefined
-        ? `first ${persistedBytes} of ${originalBytes} bytes saved to ${existingOutputPath}`
-        : `full output saved to ${existingOutputPath}`;
+    const truncated = truncateUtf8(normalizedResult.output, maxBytes);
+    if (invalidRegisteredOutputError) {
+      const unavailable = `registered output artifact unavailable: ${invalidRegisteredOutputError.message}`;
       return {
-        ...result,
+        ...normalizedResult,
+        output: truncated.truncated
+          ? `${truncated.text}\n[tool output truncated after ${maxBytes} bytes; ${unavailable}]`
+          : `${normalizedResult.output}${normalizedResult.output ? "\n" : ""}[${unavailable}]`,
+        metadata: {
+          ...normalizedResult.metadata,
+          ...(truncated.truncated
+            ? {
+                outputTruncated: true,
+                outputBytes: truncated.bytes,
+                outputLimitBytes: maxBytes,
+              }
+            : {}),
+          outputPersistenceError: invalidRegisteredOutputError.message,
+        },
+      };
+    }
+    if (!truncated.truncated) {
+      return registeredOutput
+        ? appendRegisteredOutputNotice(normalizedResult, registeredOutput)
+        : normalizedResult;
+    }
+
+    if (registeredOutput) {
+      const savedDescription = registeredOutput.truncated
+        ? `first ${registeredOutput.bytes} of ${registeredOutput.originalBytes} bytes saved to ${registeredOutput.relativePath}`
+        : `full output saved to ${registeredOutput.relativePath}`;
+      return {
+        ...normalizedResult,
         output: `${truncated.text}\n[tool output truncated after ${maxBytes} bytes; ${savedDescription}]`,
         metadata: {
-          ...result.metadata,
+          ...normalizedResult.metadata,
           outputTruncated: true,
-          outputBytes: originalBytes,
+          outputBytes: registeredOutput.originalBytes,
           outputLimitBytes: maxBytes,
         },
       };
@@ -233,14 +314,14 @@ export class ToolExecutor {
 
     let persisted: PersistedOutput;
     try {
-      persisted = await this.persistLargeOutput(input.cwd, callId, result.output);
+      persisted = await this.persistLargeOutput(input.cwd, outputArtifactId, normalizedResult.output);
     } catch (error) {
       const persistenceError = toError(error);
       return {
-        ...result,
+        ...normalizedResult,
         output: `${truncated.text}\n[tool output truncated after ${maxBytes} bytes; remaining output could not be safely persisted]`,
         metadata: {
-          ...result.metadata,
+          ...normalizedResult.metadata,
           outputTruncated: true,
           outputBytes: truncated.bytes,
           outputLimitBytes: maxBytes,
@@ -253,10 +334,10 @@ export class ToolExecutor {
       : `full output saved to ${persisted.relativePath}`;
 
     return {
-      ...result,
+      ...normalizedResult,
       output: `${truncated.text}\n[tool output truncated after ${maxBytes} bytes; ${savedDescription}]`,
       metadata: {
-        ...result.metadata,
+        ...normalizedResult.metadata,
         outputTruncated: true,
         outputBytes: truncated.bytes,
         outputLimitBytes: maxBytes,
@@ -268,17 +349,33 @@ export class ToolExecutor {
     };
   }
 
-  private context(tool: ChiliToolDefinition, input: ExecuteToolInput, callId: ToolCallId): ChiliToolExecutionContext {
+  private context(
+    tool: ChiliToolDefinition,
+    input: ExecuteToolInput,
+    callId: ToolCallId,
+    outputArtifactId: ToolCallId,
+    registerPersistedOutput: (output: PersistedToolOutputRegistration) => Promise<void>,
+  ): ChiliToolExecutionContext {
     let outputSequence = 0;
     return {
       sessionId: input.sessionId,
       ...(input.threadId ? { threadId: input.threadId } : {}),
       turnId: input.turnId,
       callId,
+      outputArtifactId,
       signal: input.signal ?? new AbortController().signal,
       cwd: input.cwd,
       fileReads: this.fileReads,
       visibleTools: () => this.visibleTools(input),
+      persistedOutputLimits: {
+        ...(this.options.maxPersistedOutputBytes !== undefined
+          ? { maxBytes: this.options.maxPersistedOutputBytes }
+          : {}),
+        ...(this.options.maxPersistedOutputDirectoryBytes !== undefined
+          ? { maxDirectoryBytes: this.options.maxPersistedOutputDirectoryBytes }
+          : {}),
+      },
+      registerPersistedOutput,
       metadata: (update) => this.metadata(input, callId, update),
       streamOutput: (update) => {
         outputSequence += 1;
@@ -496,14 +593,21 @@ export class ToolExecutor {
     callId: ToolCallId,
     output: string,
   ): Promise<PersistedOutput> {
-    return persistToolOutput(cwd, callId, output, {
+    return persistToolOutput(cwd, callId, output, this.persistedOutputOptions());
+  }
+
+  private persistedOutputOptions(): {
+    maxBytes?: number;
+    maxDirectoryBytes?: number;
+  } {
+    return {
       ...(this.options.maxPersistedOutputBytes !== undefined
         ? { maxBytes: this.options.maxPersistedOutputBytes }
         : {}),
       ...(this.options.maxPersistedOutputDirectoryBytes !== undefined
         ? { maxDirectoryBytes: this.options.maxPersistedOutputDirectoryBytes }
         : {}),
-    });
+    };
   }
 }
 
@@ -592,8 +696,44 @@ function abortReason(signal: AbortSignal): Error {
   return error;
 }
 
-function numericMetadata(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+function stripUntrustedOutputPathMetadata(result: ToolResult): ToolResult {
+  if (!result.metadata) return result;
+  const metadata = { ...result.metadata };
+  delete metadata.outputPath;
+  delete metadata.outputPersistedBytes;
+  delete metadata.outputPersistedLimitBytes;
+  delete metadata.outputPersistedTruncated;
+  return { ...result, metadata };
+}
+
+function withRegisteredOutput(
+  result: ToolResult,
+  registeredOutput: PersistedOutput | undefined,
+): ToolResult {
+  if (!registeredOutput) return result;
+  return {
+    ...result,
+    metadata: {
+      ...result.metadata,
+      outputPath: registeredOutput.relativePath,
+      outputPersistedBytes: registeredOutput.bytes,
+      outputPersistedLimitBytes: registeredOutput.limitBytes,
+      outputPersistedTruncated: registeredOutput.truncated,
+    },
+  };
+}
+
+function appendRegisteredOutputNotice(
+  result: ToolResult,
+  registeredOutput: PersistedOutput,
+): ToolResult {
+  const savedDescription = registeredOutput.truncated
+    ? `first ${registeredOutput.bytes} of ${registeredOutput.originalBytes} bytes saved to ${registeredOutput.relativePath}`
+    : `full output saved to ${registeredOutput.relativePath}`;
+  return {
+    ...result,
+    output: `${result.output}${result.output ? "\n" : ""}[${savedDescription}]`,
+  };
 }
 
 function denyDecision(decision: ApprovalPreflightDecision): ApprovalDecision {

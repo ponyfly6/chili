@@ -17,6 +17,7 @@ export interface ProcessOutputSnapshot {
   outputPath?: string;
   persistedBytes?: number;
   persistedTruncated?: boolean;
+  persistedOutput?: PersistedOutput;
   persistenceError?: string;
 }
 
@@ -126,6 +127,7 @@ export class ProcessOutputAccumulator {
             outputPath: this.persisted.relativePath,
             persistedBytes: this.persisted.bytes,
             persistedTruncated: this.persisted.truncated,
+            persistedOutput: this.persisted,
           }
         : {}),
       ...(this.persistenceError ? { persistenceError: this.persistenceError } : {}),

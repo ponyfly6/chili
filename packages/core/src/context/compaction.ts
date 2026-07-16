@@ -26,6 +26,7 @@ export interface ContextCompactionOptions {
   model: ModelRouter;
   maxSourceChars?: number;
   maxSummaryChars?: number;
+  maxPromptChars?: number;
   verifySummary?: boolean;
   now?: () => TimestampMs;
 }
@@ -65,6 +66,7 @@ interface SummaryGenerationResult {
 
 const DEFAULT_MAX_SOURCE_CHARS = 120_000;
 const DEFAULT_MAX_SUMMARY_CHARS = 16_000;
+const DEFAULT_MAX_PROMPT_CHARS = 160_000;
 
 const COMPACTION_SYSTEM_PROMPT = [
   "You are Chili's context compression engine.",
@@ -93,11 +95,13 @@ const COMPACTION_USER_PROMPT = [
 export class ContextCompactionService {
   private readonly maxSourceChars: number;
   private readonly maxSummaryChars: number;
+  private readonly maxPromptChars: number;
   private readonly verifySummary: boolean;
 
   constructor(private readonly options: ContextCompactionOptions) {
     this.maxSourceChars = options.maxSourceChars ?? DEFAULT_MAX_SOURCE_CHARS;
     this.maxSummaryChars = options.maxSummaryChars ?? DEFAULT_MAX_SUMMARY_CHARS;
+    this.maxPromptChars = finiteHardLimit(options.maxPromptChars, DEFAULT_MAX_PROMPT_CHARS);
     this.verifySummary = options.verifySummary ?? true;
   }
 
@@ -203,11 +207,12 @@ export class ContextCompactionService {
     prompt: string,
     maxOutputTokens: number,
   ): Promise<SummaryGenerationResult> {
+    const boundedPrompt = budgetSourceText(prompt, this.maxPromptChars);
     const modelInput: ModelStreamInput = {
       sessionId: input.sessionId,
       threadId: input.threadId,
       turnId: input.turnId,
-      messages: [syntheticPromptMessage(input.sessionId, input.turnId, prompt, this.now())],
+      messages: [syntheticPromptMessage(input.sessionId, input.turnId, boundedPrompt, this.now())],
       tools: [],
       system: [COMPACTION_SYSTEM_PROMPT],
       maxTokens: maxOutputTokens,
@@ -273,6 +278,7 @@ export class ContextCompactionService {
 
     const builder = new ContextWindowBuilder({
       maxInputChars: Number.MAX_SAFE_INTEGER,
+      maxMessagePartChars: this.maxPromptChars,
       compactionThresholdRatio: 1,
       preserveRecentMessages: 1,
     });
@@ -285,7 +291,7 @@ export class ContextCompactionService {
       },
     );
     const fullResult = buildResult(fullPrompt);
-    if (!fullResult.overflow && fullResult.messages.length === 1) return fullPrompt;
+    if (!fullResult.overflow && fullResult.messages.length === 1) return promptFromBuild(fullResult);
 
     const emptyPrompt = buildPrompt("");
     const emptyResult = buildResult(emptyPrompt);
@@ -306,12 +312,18 @@ export class ContextCompactionService {
       if (!result.overflow && result.messages.length === 1) lower = candidate;
       else upper = candidate - 1;
     }
-    return buildPrompt(budgetSourceText(sourceText, lower));
+    return promptFromBuild(buildResult(buildPrompt(budgetSourceText(sourceText, lower))));
   }
 
   private now(): TimestampMs {
     return this.options.now ? this.options.now() : (Date.now() as TimestampMs);
   }
+}
+
+function finiteHardLimit(value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(0, Math.trunc(value));
 }
 
 function syntheticPromptMessage(sessionId: SessionId, turnId: TurnId, text: string, createdAt: TimestampMs): Message {
@@ -334,6 +346,11 @@ function syntheticPromptMessage(sessionId: SessionId, turnId: TurnId, text: stri
   };
 }
 
+function promptFromBuild(result: ReturnType<ContextWindowBuilder["build"]>): string {
+  const part = result.messages[0]?.parts.find((candidate) => candidate.type === "text");
+  return part?.type === "text" ? part.text : "";
+}
+
 function hasVisibleParts(message: Message): boolean {
   return message.parts.length > 0;
 }
@@ -345,7 +362,25 @@ function budgetSourceText(text: string, maxChars: number): string {
   if (maxChars <= marker.length) return marker.slice(0, maxChars);
   const headChars = Math.min(8_000, Math.floor(maxChars * 0.2));
   const tailChars = Math.max(0, maxChars - headChars - marker.length);
-  return `${text.slice(0, headChars)}${marker}${text.slice(-tailChars)}`;
+  return `${sliceHeadWithoutBrokenSurrogate(text, headChars)}${marker}${sliceTailWithoutBrokenSurrogate(text, tailChars)}`;
+}
+
+function sliceHeadWithoutBrokenSurrogate(text: string, maxChars: number): string {
+  let end = Math.max(0, Math.min(text.length, maxChars));
+  if (end > 0) {
+    const value = text.charCodeAt(end - 1);
+    if (value >= 0xd800 && value <= 0xdbff) end -= 1;
+  }
+  return text.slice(0, end);
+}
+
+function sliceTailWithoutBrokenSurrogate(text: string, maxChars: number): string {
+  let start = Math.max(0, text.length - Math.max(0, maxChars));
+  if (start < text.length) {
+    const value = text.charCodeAt(start);
+    if (value >= 0xdc00 && value <= 0xdfff) start += 1;
+  }
+  return text.slice(start);
 }
 
 function positiveInteger(value: number | undefined): number | undefined {

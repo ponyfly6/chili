@@ -1,9 +1,35 @@
 import { expect, test } from "bun:test";
 import type { ToolCallId } from "@chili/protocol";
-import { link, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { StreamingToolOutputFile } from "./tool-output-storage.js";
+import { StreamingToolOutputFile, validatePersistedToolOutput } from "./tool-output-storage.js";
+
+test("persisted tool output registration validates path existence and size", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-output-registration-"));
+  try {
+    const callId = "toolcall_registration" as ToolCallId;
+    const writer = await StreamingToolOutputFile.open(workspace, callId);
+    await writer.append("registered output");
+    const persisted = await writer.close();
+    expect(await validatePersistedToolOutput(workspace, callId, persisted)).toMatchObject({
+      relativePath: persisted.relativePath,
+      absolutePath: persisted.absolutePath,
+      bytes: persisted.bytes,
+    });
+    await expect(validatePersistedToolOutput(workspace, callId, {
+      ...persisted,
+      relativePath: "../../outside.txt",
+    })).rejects.toThrow("was not created by Chili storage");
+
+    await writeFile(persisted.absolutePath, "changed size", "utf8");
+    await expect(validatePersistedToolOutput(workspace, callId, persisted)).rejects.toThrow("size mismatch");
+    await unlink(persisted.absolutePath);
+    await expect(validatePersistedToolOutput(workspace, callId, persisted)).rejects.toThrow();
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
 
 test("streaming tool output publishes one complete writer for duplicate call ids", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-output-duplicate-call-"));

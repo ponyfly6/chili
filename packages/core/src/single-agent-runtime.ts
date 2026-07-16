@@ -265,7 +265,6 @@ export class SingleAgentRuntime implements AgentRunner {
       };
       const rawMessages = await messagesForContext(this.options.store, input.sessionId);
       let context = this.contextBuilder().build(rawMessages, contextSurface);
-      if (context.overflow) throw new ContextWindowExceededError(context.overflow);
       contextUsage = context.usage;
       if (context.compactionBoundary) {
         await this.append(input, "turn.compaction_requested", {
@@ -286,6 +285,7 @@ export class SingleAgentRuntime implements AgentRunner {
           contextUsage = context.usage;
         }
       }
+      if (context.overflow) throw new ContextWindowExceededError(context.overflow);
 
       assistantMessageId = this.id<MessageId>("msg");
       await this.append(input, "message.created", {
@@ -299,11 +299,11 @@ export class SingleAgentRuntime implements AgentRunner {
         threadId: input.threadId,
         turnId,
         messages: context.messages,
-        tools: visibleTools,
-        system: input.system ?? [],
+        tools: context.surface.tools,
+        system: context.surface.system,
       };
-      if (input.developer && input.developer.length > 0) modelInput.developer = input.developer;
-      if (input.contextualUser && input.contextualUser.length > 0) modelInput.contextualUser = input.contextualUser;
+      if (context.surface.developer.length > 0) modelInput.developer = context.surface.developer;
+      if (context.surface.contextualUser.length > 0) modelInput.contextualUser = context.surface.contextualUser;
       if (input.promptDebug) modelInput.promptDebug = input.promptDebug;
       if (input.modelSelection) modelInput.modelSelection = input.modelSelection;
       if (input.reasoningLevel !== undefined) modelInput.reasoningLevel = input.reasoningLevel;
@@ -340,6 +340,14 @@ export class SingleAgentRuntime implements AgentRunner {
         modelInput = {
           ...modelInput,
           messages: recoveredContext.messages,
+          tools: recoveredContext.surface.tools,
+          system: recoveredContext.surface.system,
+          ...(recoveredContext.surface.developer.length > 0
+            ? { developer: recoveredContext.surface.developer }
+            : {}),
+          ...(recoveredContext.surface.contextualUser.length > 0
+            ? { contextualUser: recoveredContext.surface.contextualUser }
+            : {}),
         };
         streamResult = await this.consumeModelStream(input, turnId, assistantMessageId, modelInput, guard);
       }
@@ -355,7 +363,17 @@ export class SingleAgentRuntime implements AgentRunner {
         );
         finishReason = "tool_use";
       } else {
-        await this.executeToolCalls(input, turnId, assistantMessageId, streamResult.toolCalls);
+        await this.executeToolCalls(
+          input,
+          turnId,
+          assistantMessageId,
+          streamResult.toolCalls,
+          new Set(
+            visibleTools
+              .map((tool) => tool.name)
+              .filter((toolName) => !modelInput.tools.some((tool) => tool.name === toolName)),
+          ),
+        );
       }
 
       await this.append(input, "turn.completed", {
@@ -842,6 +860,7 @@ export class SingleAgentRuntime implements AgentRunner {
     turnId: TurnId,
     assistantMessageId: MessageId,
     toolCalls: readonly PendingToolCall[],
+    envelopeHiddenToolNames: ReadonlySet<string>,
   ): Promise<void> {
     const concurrentLimit = this.options.maxConcurrentToolCalls ?? 10;
     let batch: PendingToolCall[] = [];
@@ -871,6 +890,18 @@ export class SingleAgentRuntime implements AgentRunner {
           assistantMessageId,
           toolCall,
           "Tool use is disabled for this turn.",
+        );
+        await this.appendPart(input, assistantMessageId, part);
+        continue;
+      }
+      if (envelopeHiddenToolNames.has(toolCall.toolName)) {
+        await flush();
+        const part = await this.failToolCallWithoutExecution(
+          input,
+          turnId,
+          assistantMessageId,
+          toolCall,
+          "Tool was not advertised to the model because its definition exceeded the context envelope.",
         );
         await this.appendPart(input, assistantMessageId, part);
         continue;
@@ -1192,7 +1223,7 @@ function filterToolsByPolicies(
 
 function renderContextSummary(result: ContextCompactionResult): string {
   return [
-    `<context_summary boundary_message_id="${result.boundary.boundaryMessageId}" reason="${result.boundary.reason}">`,
+    "<context_summary>",
     stripContextSummary(result.summary),
     "</context_summary>",
   ].join("\n");

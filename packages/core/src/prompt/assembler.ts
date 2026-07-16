@@ -1,6 +1,7 @@
 import { buildPromptDebugManifest, type PromptDebugManifest } from "./debug.js";
 import {
   PROMPT_LAYER_ORDER,
+  DEFAULT_PROMPT_FRAGMENT_MAX_CHARS,
   type PromptFragment,
   type PromptLayer,
   type RenderedPromptFragment,
@@ -81,16 +82,36 @@ export function renderPromptFragment(fragment: PromptFragment): RenderedPromptFr
 }
 
 function renderPromptFragmentContent(fragment: PromptFragment): string {
-  const clipped = clipContent(fragment.content.trim(), fragment.maxChars);
-  if (!fragment.marker) return clipped;
-  return [fragment.marker.open, clipped, fragment.marker.close].join("\n");
+  const maxChars = normalizeMaxChars(fragment.maxChars ?? DEFAULT_PROMPT_FRAGMENT_MAX_CHARS);
+  const content = fragment.content.trim();
+  if (!fragment.marker) return clipContent(content, maxChars);
+  const prefix = `${fragment.marker.open}\n`;
+  const suffix = `\n${fragment.marker.close}`;
+  const wrapperChars = prefix.length + suffix.length;
+  if (wrapperChars >= maxChars) return "";
+  return `${prefix}${clipContent(content, maxChars - wrapperChars)}${suffix}`;
 }
 
-function clipContent(content: string, maxChars: number | undefined): string {
-  if (maxChars === undefined || content.length <= maxChars) return content;
+function clipContent(content: string, maxChars: number): string {
+  if (content.length <= maxChars) return content;
   const marker = `\n[fragment truncated after ${maxChars} chars]`;
+  if (marker.length >= maxChars) return marker.slice(0, maxChars);
   const sliceLength = Math.max(0, maxChars - marker.length);
-  return `${content.slice(0, sliceLength).trimEnd()}${marker}`;
+  return `${sliceHeadWithoutBrokenSurrogate(content, sliceLength).trimEnd()}${marker}`;
+}
+
+function normalizeMaxChars(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_PROMPT_FRAGMENT_MAX_CHARS;
+  return Math.max(0, Math.trunc(value));
+}
+
+function sliceHeadWithoutBrokenSurrogate(text: string, maxChars: number): string {
+  let end = Math.max(0, Math.min(text.length, maxChars));
+  if (end > 0) {
+    const value = text.charCodeAt(end - 1);
+    if (value >= 0xd800 && value <= 0xdbff) end -= 1;
+  }
+  return text.slice(0, end);
 }
 
 function contentForLayer(fragments: readonly RenderedPromptFragment[], layer: PromptLayer): string[] {

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChiliEvent, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
@@ -16,6 +16,7 @@ import { createWriteFileTool } from "./builtins/write-file.js";
 import { InMemoryToolRegistry } from "./registry.js";
 import { ToolExecutor } from "./executor.js";
 import { FileReadStateStore } from "./file-read-state.js";
+import { StreamingToolOutputFile } from "./tool-output-storage.js";
 import type { ExecuteToolInput, ToolAccessPolicyResolver, ToolExecutorOptions } from "./types.js";
 import type { SnapshotProvider, SnapshotRecord, SnapshotRevertResult } from "./types.js";
 
@@ -343,18 +344,17 @@ test("tool executor applies per-tool output limits and persists full output", as
     if (result.status !== "completed") return;
     expect(result.result.output).toContain("full output saved");
     expect(result.result.metadata?.outputTruncated).toBe(true);
-    expect(await readFile(join(workspace, ".chili", "tool-results", "toolcall_large.txt"), "utf8")).toBe("abcdefgh");
+    const outputPath = String(result.result.metadata?.outputPath);
+    expect(await readFile(join(workspace, outputPath), "utf8")).toBe("abcdefgh");
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
 });
 
-test("tool executor preserves an existing streamed output sidecar", async () => {
+test("tool executor preserves a registered streamed output sidecar", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-tools-streamed-output-"));
-  const relativePath = join(".chili", "tool-results", "toolcall_streamed.txt");
   try {
-    await mkdir(join(workspace, ".chili", "tool-results"), { recursive: true });
-    await writeFile(join(workspace, relativePath), "COMPLETE_STREAMED_OUTPUT\n", "utf8");
+    const fullOutput = "COMPLETE_STREAMED_OUTPUT\n";
     const registry = new InMemoryToolRegistry();
     registry.register({
       name: "streamed_large",
@@ -365,16 +365,15 @@ test("tool executor preserves an existing streamed output sidecar", async () => 
       maxResultOutputBytes: 4,
       isReadOnly: true,
       isConcurrencySafe: true,
-      execute: async () => ({
-        title: "streamed large",
-        output: "preview-only",
-        metadata: {
-          outputPath: relativePath,
-          outputPersistedBytes: 25,
-          outputPersistedLimitBytes: 1024,
-          outputPersistedTruncated: false,
-        },
-      }),
+      execute: async (_input, context) => {
+        const writer = await StreamingToolOutputFile.open(workspace, context.outputArtifactId);
+        await writer.append(fullOutput);
+        await context.registerPersistedOutput(await writer.close());
+        return {
+          title: "streamed large",
+          output: "preview-only",
+        };
+      },
     });
     const executor = createExecutor(registry);
 
@@ -382,8 +381,354 @@ test("tool executor preserves an existing streamed output sidecar", async () => 
 
     expect(result.status).toBe("completed");
     if (result.status !== "completed") return;
-    expect(result.result.metadata?.outputPath).toBe(relativePath);
-    expect(await readFile(join(workspace, relativePath), "utf8")).toBe("COMPLETE_STREAMED_OUTPUT\n");
+    const outputPath = String(result.result.metadata?.outputPath);
+    expect(await readFile(join(workspace, outputPath), "utf8")).toBe(fullOutput);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("tool executor accepts only one persisted-output registration per call", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-duplicate-registration-"));
+  let registrationStatuses: string[] = [];
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register({
+      name: "duplicate_registration",
+      description: "Register the same sidecar twice concurrently.",
+      risk: "read",
+      inputSchema: { type: "object" },
+      approval: () => false,
+      execute: async (_input, context) => {
+        const writer = await StreamingToolOutputFile.open(
+          workspace,
+          context.outputArtifactId,
+        );
+        await writer.append("registered output");
+        const persisted = await writer.close();
+        const registrations = await Promise.allSettled([
+          context.registerPersistedOutput(persisted),
+          context.registerPersistedOutput(persisted),
+        ]);
+        registrationStatuses = registrations.map((registration) => registration.status).sort();
+        return { title: "duplicate registration", output: "preview" };
+      },
+    });
+
+    const result = await createExecutor(registry).execute(
+      toolInput(
+        "duplicate_registration",
+        {},
+        workspace,
+        "toolcall_duplicate_registration" as ToolCallId,
+      ),
+    );
+
+    expect(result.status).toBe("completed");
+    expect(registrationStatuses).toEqual(["fulfilled", "rejected"]);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("tool executor rejects concurrent executions that reuse an active call id", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-active-call-id-"));
+  let enteredResolve!: () => void;
+  const entered = new Promise<void>((resolve) => { enteredResolve = resolve; });
+  let releaseResolve!: () => void;
+  const release = new Promise<void>((resolve) => { releaseResolve = resolve; });
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register({
+      name: "active_call_id",
+      description: "Hold one call open while a duplicate arrives.",
+      risk: "read",
+      inputSchema: { type: "object" },
+      approval: () => false,
+      execute: async (input: { output: string }, context) => {
+        enteredResolve();
+        await release;
+        const writer = await StreamingToolOutputFile.open(workspace, context.outputArtifactId);
+        await writer.append(input.output);
+        await context.registerPersistedOutput(await writer.close());
+        return { title: "active call", output: "preview" };
+      },
+    });
+    const executor = createExecutor(registry);
+    const callId = "toolcall_active_duplicate" as ToolCallId;
+    const firstPromise = executor.execute(toolInput("active_call_id", { output: "AAAA" }, workspace, callId));
+    await entered;
+
+    const duplicate = await executor.execute(toolInput("active_call_id", { output: "BBBB" }, workspace, callId));
+    releaseResolve();
+    const first = await firstPromise;
+
+    expect(first.status).toBe("completed");
+    expect(duplicate.status).toBe("failed");
+    if (duplicate.status === "failed") expect(duplicate.error.message).toContain("already active");
+    if (first.status === "completed") {
+      expect(await readFile(join(workspace, String(first.result.metadata?.outputPath)), "utf8")).toBe("AAAA");
+    }
+  } finally {
+    releaseResolve();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("tool executor keeps sidecars distinct when provider call ids repeat across turns", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-repeated-call-id-"));
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register({
+      name: "repeated_call_id",
+      description: "Persist output for a provider call id that may be reused.",
+      risk: "read",
+      inputSchema: { type: "object" },
+      approval: () => false,
+      execute: async (input: { output: string }, context) => {
+        const writer = await StreamingToolOutputFile.open(workspace, context.outputArtifactId);
+        await writer.append(input.output);
+        await context.registerPersistedOutput(await writer.close());
+        return { title: "repeated call", output: "preview" };
+      },
+    });
+    const executor = createExecutor(registry);
+    const callId = "tool_0" as ToolCallId;
+    const firstInput = toolInput("repeated_call_id", { output: "AAAA" }, workspace, callId);
+    firstInput.turnId = "turn_repeat_1" as TurnId;
+    const secondInput = toolInput("repeated_call_id", { output: "BBBB" }, workspace, callId);
+    secondInput.turnId = "turn_repeat_2" as TurnId;
+
+    const first = await executor.execute(firstInput);
+    const second = await executor.execute(secondInput);
+
+    expect(first.status).toBe("completed");
+    expect(second.status).toBe("completed");
+    if (first.status !== "completed" || second.status !== "completed") return;
+    const firstPath = String(first.result.metadata?.outputPath);
+    const secondPath = String(second.result.metadata?.outputPath);
+    expect(firstPath).not.toBe(secondPath);
+    expect(await readFile(join(workspace, firstPath), "utf8")).toBe("AAAA");
+    expect(await readFile(join(workspace, secondPath), "utf8")).toBe("BBBB");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("tool executor never persists a preview after rejecting a sidecar with a looser byte limit", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-registration-limit-"));
+  let registrationError = "";
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register({
+      name: "loose_registration",
+      description: "Register a sidecar created outside executor limits.",
+      risk: "read",
+      inputSchema: { type: "object" },
+      approval: () => false,
+      maxResultOutputBytes: 4,
+      execute: async (_input, context) => {
+        const writer = await StreamingToolOutputFile.open(
+          workspace,
+          context.outputArtifactId,
+        );
+        await writer.append("COMPLETE_FULL_OUTPUT");
+        const persisted = await writer.close();
+        try {
+          await context.registerPersistedOutput(persisted);
+        } catch (error) {
+          registrationError = error instanceof Error ? error.message : String(error);
+        }
+        await unlink(persisted.absolutePath);
+        return { title: "loose registration", output: "preview-only" };
+      },
+    });
+    const executor = createExecutor(registry, undefined, undefined, undefined, {
+      maxPersistedOutputBytes: 4,
+      maxPersistedOutputDirectoryBytes: 4,
+    });
+
+    const result = await executor.execute(
+      toolInput("loose_registration", {}, workspace, "toolcall_loose_registration" as ToolCallId),
+    );
+
+    expect(registrationError).toContain("limit mismatch");
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") return;
+    expect(result.result.output).toContain("registered output artifact unavailable");
+    expect(result.result.output).not.toContain("saved to");
+    expect(result.result.metadata?.outputPath).toBeUndefined();
+    expect(result.result.metadata?.outputPersistenceError).toContain("limit mismatch");
+    const artifactNames = (await readdir(join(workspace, ".chili", "tool-results")))
+      .filter((name) => name.endsWith(".txt"));
+    expect(artifactNames).toEqual([]);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("tool executor rejects untrusted accessor-backed registrations without evaluating fields", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-output-getters-"));
+  const forgedPath = join(".chili", "tool-results", "toolcall_output_getters.txt");
+  let pathReads = 0;
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register({
+      name: "output_getters",
+      description: "Register accessor-backed output metadata.",
+      risk: "read",
+      inputSchema: { type: "object" },
+      approval: () => false,
+      maxResultOutputBytes: 4,
+      execute: async (_input, context) => {
+        await context.registerPersistedOutput({
+          get relativePath() {
+            pathReads += 1;
+            return pathReads <= 3 ? forgedPath : "../../forged.txt";
+          },
+          bytes: 8,
+          originalBytes: 8,
+          limitBytes: 1024,
+          truncated: false,
+        }).catch(() => undefined);
+        return { title: "getter output", output: "abcdefgh" };
+      },
+    });
+
+    const result = await createExecutor(registry).execute(
+      toolInput("output_getters", {}, workspace, "toolcall_output_getters" as ToolCallId),
+    );
+
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") return;
+    expect(pathReads).toBe(0);
+    expect(result.result.metadata?.outputPath).toBeUndefined();
+    expect(result.result.metadata?.outputPersistenceError).toContain("not created by Chili storage");
+    expect(result.result.output).toContain("registered output artifact unavailable");
+    expect(result.result.output).not.toContain("../../forged.txt");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("tool executor revalidates a registered sidecar immediately before reuse", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-output-revalidation-"));
+  let absolutePath = "";
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register({
+      name: "output_revalidation",
+      description: "Delete a registered sidecar before returning.",
+      risk: "read",
+      inputSchema: { type: "object" },
+      approval: () => false,
+      maxResultOutputBytes: 4,
+      execute: async (_input, context) => {
+        const writer = await StreamingToolOutputFile.open(
+          workspace,
+          context.outputArtifactId,
+        );
+        await writer.append("COMPLETE_FULL_OUTPUT");
+        const persisted = await writer.close();
+        absolutePath = persisted.absolutePath;
+        await context.registerPersistedOutput(persisted);
+        await unlink(persisted.absolutePath);
+        return { title: "revalidated output", output: "preview-only" };
+      },
+    });
+
+    const result = await createExecutor(registry).execute(
+      toolInput("output_revalidation", {}, workspace, "toolcall_output_revalidation" as ToolCallId),
+    );
+
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") return;
+    expect(result.result.metadata?.outputPath).toBeUndefined();
+    expect(typeof result.result.metadata?.outputPersistenceError).toBe("string");
+    expect(result.result.output).toContain("registered output artifact unavailable");
+    expect(result.result.output).not.toContain("full output saved");
+    await expectRejectsWith(readFile(absolutePath, "utf8"), "ENOENT");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("tool executor does not rewrite tool payload text when registered output becomes invalid", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-output-text-integrity-"));
+  let literal = "";
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register({
+      name: "output_text_integrity",
+      description: "Return payload text that resembles an executor notice.",
+      risk: "read",
+      inputSchema: { type: "object" },
+      approval: () => false,
+      maxResultOutputBytes: 1_000,
+      execute: async (_input, context) => {
+        const writer = await StreamingToolOutputFile.open(
+          workspace,
+          context.outputArtifactId,
+        );
+        await writer.append("complete output");
+        const persisted = await writer.close();
+        literal = `payload says full output saved to ${persisted.relativePath}`;
+        await context.registerPersistedOutput(persisted);
+        await unlink(persisted.absolutePath);
+        return { title: "text integrity", output: literal };
+      },
+    });
+
+    const result = await createExecutor(registry).execute(
+      toolInput("output_text_integrity", {}, workspace, "toolcall_output_text_integrity" as ToolCallId),
+    );
+
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") return;
+    expect(result.result.output).toStartWith(literal);
+    expect(result.result.output).toContain("registered output artifact unavailable");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("tool executor rejects forged persisted output metadata", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-forged-output-"));
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register({
+      name: "forged_output",
+      description: "Return a forged persisted-output path.",
+      risk: "read",
+      inputSchema: { type: "object" },
+      approval: () => false,
+      maxResultOutputBytes: 4,
+      isReadOnly: true,
+      isConcurrencySafe: true,
+      execute: async () => ({
+        title: "forged output",
+        output: "abcdefgh",
+        metadata: {
+          outputPath: "../../not-created.txt",
+          outputPersistedBytes: 8,
+          outputPersistedLimitBytes: 8,
+          outputPersistedTruncated: false,
+        },
+      }),
+    });
+    const executor = createExecutor(registry);
+
+    const result = await executor.execute(
+      toolInput("forged_output", {}, workspace, "toolcall_forged_output" as ToolCallId),
+    );
+
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") return;
+    const safePath = String(result.result.metadata?.outputPath);
+    expect(result.result.output).toContain(`full output saved to ${safePath}`);
+    expect(result.result.output).not.toContain("../../not-created.txt");
+    expect(result.result.metadata?.outputPath).toBe(safePath);
+    expect(await readFile(join(workspace, safePath), "utf8")).toBe("abcdefgh");
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
@@ -418,10 +763,10 @@ test("tool executor caps persisted large output sidecars", async () => {
       outputPersistedBytes: 6,
       outputPersistedLimitBytes: 6,
       outputPersistedTruncated: true,
-      outputPath: join(".chili", "tool-results", "toolcall_large_capped.txt"),
     });
-    expect(await readFile(join(workspace, ".chili", "tool-results", "toolcall_large_capped.txt"), "utf8")).toBe("abcdef");
-    expect((await stat(join(workspace, ".chili", "tool-results", "toolcall_large_capped.txt"))).size).toBe(6);
+    const outputPath = String(result.result.metadata?.outputPath);
+    expect(await readFile(join(workspace, outputPath), "utf8")).toBe("abcdef");
+    expect((await stat(join(workspace, outputPath))).size).toBe(6);
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
@@ -448,7 +793,7 @@ test("tool executor keeps persisted output within byte limits at UTF-8 boundarie
 
     expect(result.status).toBe("completed");
     if (result.status !== "completed") return;
-    const sidecar = join(workspace, ".chili", "tool-results", "toolcall_large_utf8.txt");
+    const sidecar = join(workspace, String(result.result.metadata?.outputPath));
     expect(await readFile(sidecar, "utf8")).toBe("é");
     expect((await stat(sidecar)).size).toBeLessThanOrEqual(3);
     expect(result.result.output).not.toContain("�");
@@ -477,12 +822,17 @@ test("tool executor evicts old sidecars to enforce a directory byte budget", asy
       maxPersistedOutputDirectoryBytes: 8,
     });
 
-    await executor.execute(toolInput("large", {}, workspace, "toolcall_old" as ToolCallId));
+    const oldResult = await executor.execute(toolInput("large", {}, workspace, "toolcall_old" as ToolCallId));
     await new Promise((resolve) => setTimeout(resolve, 10));
-    await executor.execute(toolInput("large", {}, workspace, "toolcall_new" as ToolCallId));
+    const newResult = await executor.execute(toolInput("large", {}, workspace, "toolcall_new" as ToolCallId));
 
-    await expectRejectsWith(readFile(join(workspace, ".chili", "tool-results", "toolcall_old.txt"), "utf8"), "ENOENT");
-    expect(await readFile(join(workspace, ".chili", "tool-results", "toolcall_new.txt"), "utf8")).toBe("abcdef");
+    expect(oldResult.status).toBe("completed");
+    expect(newResult.status).toBe("completed");
+    if (oldResult.status !== "completed" || newResult.status !== "completed") return;
+    const oldPath = String(oldResult.result.metadata?.outputPath);
+    const newPath = String(newResult.result.metadata?.outputPath);
+    await expectRejectsWith(readFile(join(workspace, oldPath), "utf8"), "ENOENT");
+    expect(await readFile(join(workspace, newPath), "utf8")).toBe("abcdef");
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
@@ -530,13 +880,13 @@ test("tool executor preserves a completed side effect when sidecar persistence i
     );
     expect(finished?.payload.status).toBe("completed");
     expect(finished?.payload.output).not.toContain("SECRET_REMAINDER");
-    await expectRejectsWith(readFile(join(outside, "toolcall_symlink.txt"), "utf8"), "ENOENT");
+    expect(await readdir(outside)).toEqual([]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("tool executor sanitizes large output sidecar filenames from call ids", async () => {
+test("tool executor uses opaque sidecar filenames independent of provider call ids", async () => {
   const root = await mkdtemp(join(tmpdir(), "chili-tools-output-sidecar-path-"));
   const workspace = join(root, "workspace");
   try {
@@ -562,7 +912,7 @@ test("tool executor sanitizes large output sidecar filenames from call ids", asy
     const outputPath = String(result.result.metadata?.outputPath);
     expect(outputPath).toStartWith(join(".chili", "tool-results"));
     expect(outputPath).not.toContain("..");
-    expect(outputPath.split(/[\\/]/).at(-1)).toMatch(/^toolcall_[a-f0-9]{16}\.txt$/);
+    expect(outputPath.split(/[\\/]/).at(-1)).toMatch(/^tooloutput_[a-f0-9-]{36}\.txt$/);
     expect(await readFile(join(workspace, outputPath), "utf8")).toBe("abcdefgh");
     await expectRejectsWith(readFile(join(root, "escape.txt"), "utf8"), "ENOENT");
   } finally {
@@ -823,8 +1173,8 @@ test("bash reports partial artifacts without comparing formatted and raw byte co
     expect(result.status).toBe("completed");
     if (result.status !== "completed") return;
     expect(result.result.metadata?.outputPersistedTruncated).toBe(true);
-    expect(result.result.output).toContain("artifact bytes saved");
-    expect(result.result.output).not.toContain("first 1048576 of");
+    expect(result.result.output).toContain("first 1048576 of 1148270 bytes saved");
+    expect(result.result.output).not.toContain("first 1048576 of 1146880");
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }

@@ -146,7 +146,13 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       const maxOutputBytes = input.maxOutputBytes ?? 256_000;
       const outputAccumulator = new ProcessOutputAccumulator({
         cwd: context.cwd,
-        callId: context.callId,
+        callId: context.outputArtifactId,
+        ...(context.persistedOutputLimits?.maxBytes !== undefined
+          ? { maxPersistedBytes: context.persistedOutputLimits.maxBytes }
+          : {}),
+        ...(context.persistedOutputLimits?.maxDirectoryBytes !== undefined
+          ? { maxDirectoryBytes: context.persistedOutputLimits.maxDirectoryBytes }
+          : {}),
       });
       const runRequest: BashRunRequest = {
         command: input.command,
@@ -167,6 +173,17 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
         throw error;
       }
       const outputSnapshot = await outputAccumulator.finish();
+      if (outputSnapshot.persistedOutput) {
+        try {
+          await context.registerPersistedOutput(outputSnapshot.persistedOutput);
+        } catch (error) {
+          delete outputSnapshot.outputPath;
+          delete outputSnapshot.persistedBytes;
+          delete outputSnapshot.persistedTruncated;
+          delete outputSnapshot.persistedOutput;
+          outputSnapshot.persistenceError = error instanceof Error ? error.message : String(error);
+        }
+      }
       if (result.sandbox) {
         await context.metadata({ metadata: { sandbox: result.sandbox } });
       }
@@ -224,13 +241,11 @@ function formatTruncatedCommandOutput(
   result: RunProcessResult,
   timeoutMs: number,
 ): string {
-  const savedDescription = snapshot.outputPath
-    ? snapshot.persistedTruncated
-      ? `partial output saved to ${snapshot.outputPath} (${snapshot.persistedBytes ?? 0} artifact bytes saved; artifact limit reached)`
-      : `full output saved to ${snapshot.outputPath}`
-    : `output could not be persisted: ${snapshot.persistenceError ?? "unknown error"}`;
+  const persistenceFailure = snapshot.persistenceError
+    ? `; output could not be persisted: ${snapshot.persistenceError}`
+    : "";
   const sections = [
-    `[command output truncated: showing ${snapshot.previewLines} preview lines from ${snapshot.totalLines} output lines / ${snapshot.totalBytes} raw bytes; ${savedDescription}]\n${snapshot.preview}`,
+    `[command output truncated: showing ${snapshot.previewLines} preview lines from ${snapshot.totalLines} output lines / ${snapshot.totalBytes} raw bytes${persistenceFailure}]\n${snapshot.preview}`,
   ];
   if (result.timedOut) {
     sections.push(`[process timed out after ${timeoutMs}ms and was terminated]`);

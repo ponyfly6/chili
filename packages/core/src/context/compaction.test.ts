@@ -102,6 +102,39 @@ test("context builder microcompacts old tool results by total tool-output budget
   expect(outputs[2]).not.toContain("tool result compacted from context");
 });
 
+test("microcompaction cannot exceed the per-result hard limit", () => {
+  const sessionId = "session_tool_microcompact_limit" as SessionId;
+  const oldTool = toolResultMessage(
+    "msg_tool_microcompact_limit_old",
+    sessionId,
+    "old_limit",
+    `old-${"🙂".repeat(100)}`,
+  );
+  const recentTool = toolResultMessage(
+    "msg_tool_microcompact_limit_recent",
+    sessionId,
+    "recent_limit",
+    "recent",
+  );
+
+  const built = new ContextWindowBuilder({
+    maxInputChars: 10_000,
+    maxToolResultChars: 10,
+    maxTotalToolResultChars: 1,
+    compactedToolResultChars: 1,
+    preserveRecentToolResults: 1,
+  }).build([oldTool, recentTool]);
+
+  const compactedResult = built.messages.flatMap((message) => message.parts).find(
+    (part) => part.type === "tool_result" && part.callId === "old_limit",
+  );
+  expect(compactedResult?.type).toBe("tool_result");
+  if (compactedResult?.type === "tool_result") {
+    expect(compactedResult.output.length).toBeLessThanOrEqual(1);
+    expect(Buffer.from(compactedResult.output, "utf8").toString("utf8")).toBe(compactedResult.output);
+  }
+});
+
 test("context builder preserves tool result head and tail", () => {
   const sessionId = "session_tool_head_tail" as SessionId;
   const output = `HEAD_MARKER\n${"x".repeat(300)}DROP_MIDDLE_MARKER${"y".repeat(300)}\nartifact path: .chili/tool-results/call.txt`;
@@ -113,7 +146,9 @@ test("context builder preserves tool result head and tail", () => {
     maxTotalToolResultChars: 10_000,
   }).build([message]);
 
-  const part = built.messages[0]?.parts[0];
+  const part = built.messages.flatMap((candidate) => candidate.parts).find(
+    (candidate) => candidate.type === "tool_result",
+  );
   if (part?.type !== "tool_result") throw new Error("expected tool result");
   expect(part.output).toContain("HEAD_MARKER");
   expect(part.output).toContain("artifact path: .chili/tool-results/call.txt");
@@ -133,34 +168,324 @@ test("context builder does not split surrogate pairs while truncating tool resul
     maxTotalToolResultChars: 10_000,
   }).build([message]);
 
-  const part = built.messages[0]?.parts[0];
+  const part = built.messages.flatMap((candidate) => candidate.parts).find(
+    (candidate) => candidate.type === "tool_result",
+  );
   if (part?.type !== "tool_result") throw new Error("expected tool result");
   expect(Buffer.from(part.output, "utf8").toString("utf8")).toBe(part.output);
   expect(part.output.length).toBeLessThanOrEqual(80);
 });
 
-test("context builder estimates image tool content without counting base64 bytes as text", () => {
-  const sessionId = "session_tool_image_budget" as SessionId;
-  const callId = "image_call";
-  const imageTool = toolResultMessage("msg_tool_image", sessionId, callId, "Image read: screenshot.png");
-  const part = imageTool.parts[0];
-  if (part?.type !== "tool_result") throw new Error("expected tool result");
-  part.content = [{ type: "image", data: "a".repeat(3_500_000), mimeType: "image/png" }];
+test("context builder hard-limits every model-visible message item", () => {
+  const sessionId = "session_complete_envelope" as SessionId;
+  const userMessageId = "msg_complete_user" as MessageId;
+  const assistantMessageId = "msg_complete_assistant" as MessageId;
+  const toolMessageId = "msg_complete_tool" as MessageId;
+  const hugeImage = "a".repeat(3_500_000);
+  const messages: Message[] = [
+    {
+      id: userMessageId,
+      sessionId,
+      role: "user",
+      createdAt: 1 as TimestampMs,
+      parts: [
+        {
+          id: "part_complete_text" as never,
+          messageId: userMessageId,
+          sessionId,
+          type: "text",
+          text: `TEXT_HEAD_${"x".repeat(400)}_TEXT_TAIL`,
+        },
+        {
+          id: "part_complete_reasoning" as never,
+          messageId: userMessageId,
+          sessionId,
+          type: "reasoning",
+          text: `REASONING_HEAD_${"r".repeat(400)}_REASONING_TAIL`,
+        },
+        {
+          id: "part_complete_image" as never,
+          messageId: userMessageId,
+          sessionId,
+          type: "image",
+          data: hugeImage,
+          mimeType: "image/png",
+          filename: "huge.png",
+        },
+      ],
+    },
+    {
+      id: assistantMessageId,
+      sessionId,
+      role: "assistant",
+      createdAt: 2 as TimestampMs,
+      parts: [
+        {
+          id: "part_complete_call" as never,
+          messageId: assistantMessageId,
+          sessionId,
+          type: "tool_call",
+          callId: "toolcall_complete" as never,
+          toolName: "lookup",
+          input: { query: "q".repeat(400) },
+          status: "completed",
+        },
+      ],
+    },
+    {
+      id: toolMessageId,
+      sessionId,
+      role: "tool",
+      createdAt: 3 as TimestampMs,
+      parts: [
+        {
+          id: "part_complete_result" as never,
+          messageId: toolMessageId,
+          sessionId,
+          type: "tool_result",
+          callId: "toolcall_complete" as never,
+          output: `OUTPUT_HEAD_${"o".repeat(400)}_OUTPUT_TAIL`,
+          error: `ERROR_HEAD_${"e".repeat(400)}_ERROR_TAIL`,
+          content: [
+            { type: "text", text: `CONTENT_HEAD_${"c".repeat(400)}_CONTENT_TAIL` },
+            { type: "image", data: hugeImage, mimeType: "image/png" },
+          ],
+        },
+      ],
+    },
+  ];
 
   const built = new ContextWindowBuilder({
-    maxInputChars: 20_000,
-    compactionThresholdRatio: 0.85,
-  }).build([imageTool]);
+    maxInputChars: 50_000,
+    maxToolResultChars: 96,
+    maxTotalToolResultChars: 50_000,
+    maxMessagePartChars: 80,
+    maxImageDataChars: 100,
+  }).build(messages);
 
-  expect(built.usage.contextChars).toBeLessThan(10_000);
-  expect(built.compactionBoundary).toBeUndefined();
-  expect(
-    built.messages.some((message) =>
-      message.parts.some((candidate) =>
-        candidate.type === "tool_result" && candidate.content?.some((item) => item.type === "image"),
-      ),
-    ),
-  ).toBe(true);
+  const parts = built.messages.flatMap((message) => message.parts);
+  const text = parts.find((part) => part.id === "part_complete_text");
+  const reasoning = parts.find((part) => part.id === "part_complete_reasoning");
+  const image = parts.find((part) => part.id === "part_complete_image");
+  const call = parts.find((part) => part.id === "part_complete_call");
+  const result = parts.find((part) => part.id === "part_complete_result");
+
+  expect(text?.type).toBe("text");
+  if (text?.type === "text") expect(text.text.length).toBeLessThanOrEqual(80);
+  expect(reasoning?.type).toBe("reasoning");
+  if (reasoning?.type === "reasoning") expect(reasoning.text.length).toBeLessThanOrEqual(80);
+  expect(image?.type).toBe("text");
+  if (image?.type === "text") expect(image.text.length).toBeLessThanOrEqual(80);
+  expect(call?.type).toBe("tool_call");
+  if (call?.type === "tool_call") {
+    expect(typeof call.input).toBe("object");
+    expect(JSON.stringify(call.input).length).toBeLessThanOrEqual(80);
+  }
+  expect(result?.type).toBe("tool_result");
+  if (result?.type === "tool_result") {
+    expect(result.output.length).toBeLessThanOrEqual(96);
+    expect(result.error?.length).toBeLessThanOrEqual(80);
+    expect(result.content?.some((item) => item.type === "image")).toBe(false);
+    expect(result.content?.every((item) => item.type !== "text" || item.text.length <= 80)).toBe(true);
+  }
+  expect(messages[0]?.parts[0]?.type === "text" && messages[0].parts[0].text.length).toBeGreaterThan(400);
+  expect(messages[0]?.parts[2]?.type === "image" && messages[0].parts[2].data.length).toBe(3_500_000);
+  const joinedUserText = built.messages[0]?.parts
+    .filter((part) => part.type === "text" || part.type === "reasoning")
+    .map((part) => part.text)
+    .join("\n") ?? "";
+  expect(joinedUserText.length).toBeLessThanOrEqual(80);
+});
+
+test("context builder drops an oversized tool call and its matching result when no object can fit", () => {
+  const sessionId = "session_tool_pair_limit" as SessionId;
+  const assistant = textMessage("msg_tool_pair_call", sessionId, "assistant", "");
+  assistant.parts = [{
+    id: "part_tool_pair_call" as never,
+    messageId: assistant.id,
+    sessionId,
+    type: "tool_call",
+    callId: "toolcall_pair_limit" as never,
+    toolName: "lookup",
+    input: { query: "x".repeat(100) },
+    status: "completed",
+  }];
+  const result = toolResultMessage(
+    "msg_tool_pair_result",
+    sessionId,
+    "toolcall_pair_limit",
+    "result",
+    false,
+  );
+
+  const built = new ContextWindowBuilder({
+    maxInputChars: 10_000,
+    maxMessagePartChars: 1,
+  }).build([assistant, result]);
+
+  expect(built.messages.flatMap((message) => message.parts).some(
+    (part) => part.type === "tool_call" || part.type === "tool_result",
+  )).toBe(false);
+  expect(built.messages.every((message) => message.parts.length > 0)).toBe(true);
+});
+
+test("context builder replaces unserializable tool input and keeps its result paired", () => {
+  const sessionId = "session_tool_input_cycle" as SessionId;
+  const assistant = textMessage("msg_tool_input_cycle_call", sessionId, "assistant", "");
+  const cyclic: Record<string, unknown> = {};
+  cyclic.self = cyclic;
+  assistant.parts = [{
+    id: "part_tool_input_cycle_call" as never,
+    messageId: assistant.id,
+    sessionId,
+    type: "tool_call",
+    callId: "toolcall_input_cycle" as never,
+    toolName: "lookup",
+    input: cyclic,
+    status: "completed",
+  }];
+  const result = toolResultMessage(
+    "msg_tool_input_cycle_result",
+    sessionId,
+    "toolcall_input_cycle",
+    "result",
+    false,
+  );
+
+  const built = new ContextWindowBuilder({ maxInputChars: 10_000 }).build([assistant, result]);
+  const call = built.messages.flatMap((message) => message.parts).find((part) => part.type === "tool_call");
+
+  expect(call?.type).toBe("tool_call");
+  if (call?.type === "tool_call") {
+    expect(call.input).toEqual({});
+    expect(() => JSON.stringify(call.input)).not.toThrow();
+  }
+  expect(built.messages.flatMap((message) => message.parts).some(
+    (part) => part.type === "tool_result" && part.callId === "toolcall_input_cycle",
+  )).toBe(true);
+});
+
+test("context builder detaches tool input and image content from dynamic serializers", () => {
+  const sessionId = "session_dynamic_context_values" as SessionId;
+  let inputSerializations = 0;
+  const dynamicInput = {
+    toJSON() {
+      inputSerializations++;
+      return inputSerializations === 1 ? { query: "safe" } : { query: "x".repeat(200_000) };
+    },
+  };
+  const assistant = textMessage("msg_dynamic_context_call", sessionId, "assistant", "");
+  assistant.parts = [{
+    id: "part_dynamic_context_call" as never,
+    messageId: assistant.id,
+    sessionId,
+    type: "tool_call",
+    callId: "toolcall_dynamic_context" as never,
+    toolName: "lookup",
+    input: dynamicInput,
+    status: "completed",
+  }];
+  let imageReads = 0;
+  const dynamicImage = {
+    type: "image" as const,
+    mimeType: "image/png",
+    get data() {
+      imageReads++;
+      return imageReads === 1 ? "a" : "x".repeat(200_000);
+    },
+  };
+  const result = toolResultMessage(
+    "msg_dynamic_context_result",
+    sessionId,
+    "toolcall_dynamic_context",
+    "result",
+    false,
+  );
+  const toolResult = result.parts[0];
+  if (toolResult?.type !== "tool_result") throw new Error("expected tool result");
+  toolResult.content = [dynamicImage];
+
+  const built = new ContextWindowBuilder({
+    maxInputChars: 10_000,
+    maxMessagePartChars: 80,
+    maxImageDataChars: 100,
+  }).build([assistant, result]);
+  const builtCall = built.messages.flatMap((message) => message.parts).find((part) => part.type === "tool_call");
+  const builtResult = built.messages.flatMap((message) => message.parts).find((part) => part.type === "tool_result");
+
+  expect(inputSerializations).toBe(1);
+  expect(builtCall?.type === "tool_call" ? JSON.stringify(builtCall.input).length : Infinity).toBeLessThanOrEqual(80);
+  expect(imageReads).toBe(1);
+  expect(builtResult?.type === "tool_result" && builtResult.content?.[0]?.type === "image"
+    ? builtResult.content[0].data
+    : "").toBe("a");
+});
+
+test("context builder never emits an orphan tool result after history eviction", () => {
+  const sessionId = "session_tool_pair_eviction" as SessionId;
+  const assistant = textMessage("msg_tool_pair_eviction_call", sessionId, "assistant", "");
+  assistant.parts = [{
+    id: "part_tool_pair_eviction_call" as never,
+    messageId: assistant.id,
+    sessionId,
+    type: "tool_call",
+    callId: "toolcall_pair_eviction" as never,
+    toolName: "lookup",
+    input: { query: "q".repeat(80) },
+    status: "completed",
+  }];
+  const result = toolResultMessage(
+    "msg_tool_pair_eviction_result",
+    sessionId,
+    "toolcall_pair_eviction",
+    "r".repeat(80),
+    false,
+  );
+
+  const built = new ContextWindowBuilder({
+    maxInputChars: 120,
+    preserveRecentMessages: 1,
+  }).build([assistant, result]);
+
+  expect(built.usage.contextChars).toBeLessThanOrEqual(120);
+  expect(built.messages.flatMap((message) => message.parts).some(
+    (part) => part.type === "tool_call" || part.type === "tool_result",
+  )).toBe(false);
+});
+
+test("context builder removes a tool result without any preceding call", () => {
+  const sessionId = "session_orphan_tool_result" as SessionId;
+  const orphan = toolResultMessage(
+    "msg_orphan_tool_result",
+    sessionId,
+    "toolcall_missing",
+    "orphan result",
+    false,
+  );
+
+  const built = new ContextWindowBuilder({ maxInputChars: 10_000 }).build([orphan]);
+
+  expect(built.messages).toEqual([]);
+});
+
+test("context builder terminally bounds the latest text without model token limits", () => {
+  const sessionId = "session_latest_text_char_limit" as SessionId;
+  const latest = textMessage(
+    "msg_latest_text_char_limit",
+    sessionId,
+    "user",
+    "current request ".repeat(100),
+  );
+
+  const built = new ContextWindowBuilder({
+    maxInputChars: 120,
+    maxMessagePartChars: 10_000,
+    compactionThresholdRatio: 1,
+  }).build([latest]);
+
+  expect(built.messages).toHaveLength(1);
+  expect(built.usage.contextChars).toBeLessThanOrEqual(120);
+  expect(built.messages[0]?.parts[0]?.type).toBe("text");
 });
 
 test("context builder reserves model output and fixed prompt surface", () => {
@@ -215,6 +540,185 @@ test("context builder rejects an oversized fixed prompt without message history"
     budgetTokens: 16,
   });
   expect(built.overflow?.estimatedTokens).toBeGreaterThan(16);
+});
+
+test("context builder hard-limits fixed request surface items", () => {
+  let dynamicSchemaSerializations = 0;
+  let dynamicDescriptionReads = 0;
+  const safeTool: ToolDefinition = {
+    name: "safe_lookup",
+    description: "d".repeat(400),
+    risk: "read",
+    inputSchema: { type: "object", properties: { query: { type: "string" } } },
+    async execute() {
+      return { title: "safe", output: "done" };
+    },
+  };
+  const oversizedSchemaTool: ToolDefinition = {
+    name: "oversized_schema",
+    description: "large schema",
+    risk: "read",
+    inputSchema: {
+      type: "object",
+      properties: {
+        payload: { type: "string", description: "s".repeat(2_000) },
+      },
+    },
+    async execute() {
+      return { title: "oversized", output: "done" };
+    },
+  };
+  const dynamicSchemaTool: ToolDefinition = {
+    name: "dynamic_schema",
+    get description() {
+      dynamicDescriptionReads++;
+      return dynamicDescriptionReads === 1 ? "dynamic schema" : "x".repeat(200_000);
+    },
+    risk: "read",
+    inputSchema: {
+      toJSON() {
+        dynamicSchemaSerializations++;
+        return dynamicSchemaSerializations === 1
+          ? { type: "object" }
+          : { type: "object", description: "x".repeat(200_000) };
+      },
+    },
+    async execute() {
+      return { title: "dynamic", output: "done" };
+    },
+  };
+
+  const built = new ContextWindowBuilder({
+    maxInputChars: 10_000,
+    maxPromptItemChars: 64,
+    maxToolDefinitionChars: 160,
+  }).build([], {
+    system: ["s".repeat(40), "s".repeat(40)],
+    developer: ["d".repeat(40), "d".repeat(40)],
+    contextualUser: ["u".repeat(40), "u".repeat(40)],
+    tools: [safeTool, oversizedSchemaTool, dynamicSchemaTool],
+  });
+
+  expect(built.surface.system.every((item) => item.length <= 64)).toBe(true);
+  expect(built.surface.developer.every((item) => item.length <= 64)).toBe(true);
+  expect(built.surface.contextualUser.every((item) => item.length <= 64)).toBe(true);
+  expect([...built.surface.system, ...built.surface.developer].join("\n\n").length).toBeLessThanOrEqual(64);
+  expect(built.surface.contextualUser.join("\n\n").length).toBeLessThanOrEqual(64);
+  expect(built.surface.tools.map((tool) => tool.name)).toEqual(["safe_lookup", "dynamic_schema"]);
+  expect(JSON.stringify({
+    name: built.surface.tools[0]?.name,
+    description: built.surface.tools[0]?.description,
+    inputSchema: built.surface.tools[0]?.inputSchema,
+  }).length).toBeLessThanOrEqual(160);
+  expect(dynamicSchemaSerializations).toBe(1);
+  expect(dynamicDescriptionReads).toBe(1);
+  expect(JSON.stringify({
+    name: built.surface.tools[1]?.name,
+    description: built.surface.tools[1]?.description,
+    inputSchema: built.surface.tools[1]?.inputSchema,
+  }).length).toBeLessThanOrEqual(160);
+  expect(safeTool.description.length).toBe(400);
+});
+
+test("context builder shares the instruction limit with stored system messages", () => {
+  const sessionId = "session_system_instruction_limit" as SessionId;
+  const storedSystem = textMessage(
+    "msg_stored_system_limit",
+    sessionId,
+    "system",
+    "h".repeat(70),
+  );
+
+  const built = new ContextWindowBuilder({
+    maxInputChars: 10_000,
+    maxPromptItemChars: 80,
+  }).build([storedSystem], {
+    system: ["s".repeat(70)],
+  });
+  const serializedInstructions = [
+    ...built.surface.system,
+    ...built.surface.developer,
+    ...built.messages
+      .filter((message) => message.role === "system")
+      .flatMap((message) => message.parts)
+      .filter((part) => part.type === "text" || part.type === "reasoning")
+      .map((part) => part.text),
+  ].join("\n\n");
+
+  expect(serializedInstructions.length).toBeLessThanOrEqual(80);
+});
+
+test("runtime sends the bounded request surface to the model", async () => {
+  const store = new ProjectingEventStore();
+  const registry = new InMemoryToolRegistry();
+  let hiddenExecutions = 0;
+  registry.register({
+    name: "bounded_lookup",
+    description: "d".repeat(400),
+    risk: "read",
+    inputSchema: { type: "object", properties: { query: { type: "string" } } },
+    approval: () => false,
+    execute: async () => ({ title: "lookup", output: "done" }),
+  });
+  registry.register({
+    name: "hidden_oversized_schema",
+    description: "oversized",
+    risk: "read",
+    inputSchema: { type: "object", description: "s".repeat(2_000) },
+    approval: () => false,
+    execute: async () => {
+      hiddenExecutions++;
+      return { title: "oversized", output: "done" };
+    },
+  });
+  const modelInputs: ModelStreamInput[] = [];
+  const model: ModelRouter = {
+    async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+      modelInputs.push(input);
+      yield { type: "tool_call", name: "hidden_oversized_schema", input: {} };
+      yield { type: "finish", reason: "tool_use" };
+    },
+  };
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+    }),
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+    contextBudget: {
+      maxInputChars: 10_000,
+      maxPromptItemChars: 64,
+      maxToolDefinitionChars: 160,
+    },
+  });
+
+  const sessionId = await runtime.createSession({ threadId: "thread_bounded_surface" as ThreadId, cwd: "/repo" });
+  await runtime.appendUserMessage({
+    sessionId,
+    threadId: "thread_bounded_surface" as ThreadId,
+    text: "hello",
+  });
+  const result = await runtime.runTurn({
+    sessionId,
+    threadId: "thread_bounded_surface" as ThreadId,
+    cwd: "/repo",
+    system: ["s".repeat(400)],
+    developer: ["d".repeat(400)],
+    contextualUser: ["u".repeat(400)],
+  });
+
+  expect(result.status).toBe("completed");
+  expect(modelInputs).toHaveLength(1);
+  expect(modelInputs[0]?.system.every((item) => item.length <= 64)).toBe(true);
+  expect((modelInputs[0]?.developer ?? []).every((item) => item.length <= 64)).toBe(true);
+  expect(modelInputs[0]?.contextualUser?.every((item) => item.length <= 64)).toBe(true);
+  expect(modelInputs[0]?.tools.map((tool) => tool.name)).toEqual(["bounded_lookup"]);
+  expect(hiddenExecutions).toBe(0);
 });
 
 test("runtime fails before model streaming when fixed input exhausts the model window", async () => {
@@ -342,6 +846,95 @@ test("compaction fits draft and verification requests to the selected model limi
     cacheReadInputTokens: 10,
     totalTokens: 250,
   });
+});
+
+test("compaction hard-limits every synthesized model prompt", async () => {
+  const sessionId = "session_compaction_prompt_limit" as SessionId;
+  const source = textMessage(
+    "msg_compaction_prompt_limit",
+    sessionId,
+    "user",
+    "context to summarize",
+  );
+  const modelInputs: ModelStreamInput[] = [];
+  const compactor = new ContextCompactionService({
+    model: {
+      async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+        modelInputs.push(input);
+        if (modelInputs.length === 1) {
+          yield { type: "text_delta", text: `<context_summary>${"d".repeat(2_000)}</context_summary>` };
+        } else {
+          yield { type: "text_delta", text: "<context_summary>bounded summary</context_summary>" };
+        }
+        yield { type: "finish", reason: "stop" };
+      },
+    },
+    maxPromptChars: 400,
+    maxSummaryChars: 100,
+  });
+
+  await compactor.compact({
+    sessionId,
+    threadId: "thread_compaction_prompt_limit" as ThreadId,
+    turnId: "turn_compaction_prompt_limit" as TurnId,
+    messages: [source],
+    boundary: {
+      boundaryMessageId: source.id,
+      reason: "manual",
+      estimatedChars: 100,
+      budgetChars: 1_000,
+    },
+    instructions: "focus".repeat(1_000),
+  });
+
+  expect(modelInputs).toHaveLength(2);
+  for (const input of modelInputs) {
+    const part = input.messages[0]?.parts[0];
+    expect(part?.type).toBe("text");
+    if (part?.type === "text") expect(part.text.length).toBeLessThanOrEqual(400);
+  }
+});
+
+test("compaction budgets the exact prompt that it sends", async () => {
+  const sessionId = "session_compaction_exact_prompt" as SessionId;
+  const source = textMessage(
+    "msg_compaction_exact_prompt",
+    sessionId,
+    "user",
+    "x".repeat(119_000),
+  );
+  const modelInputs: ModelStreamInput[] = [];
+  const compactor = new ContextCompactionService({
+    model: {
+      resolveRequestLimits() {
+        return { contextWindowTokens: 25_000, requestMaxOutputTokens: 1_000 };
+      },
+      async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+        modelInputs.push(input);
+        yield { type: "text_delta", text: "<context_summary>bounded</context_summary>" };
+        yield { type: "finish", reason: "stop" };
+      },
+    },
+    verifySummary: false,
+    maxPromptChars: 160_000,
+  });
+
+  await compactor.compact({
+    sessionId,
+    threadId: "thread_compaction_exact_prompt" as ThreadId,
+    turnId: "turn_compaction_exact_prompt" as TurnId,
+    messages: [source],
+    boundary: {
+      boundaryMessageId: source.id,
+      reason: "manual",
+      estimatedChars: 119_000,
+      budgetChars: 160_000,
+    },
+  });
+
+  const sent = modelInputs[0]?.messages[0]?.parts[0];
+  expect(sent?.type).toBe("text");
+  if (sent?.type === "text") expect(sent.text.length).toBeLessThan(100_000);
 });
 
 test("compaction preserves usage when an empty model summary fails validation", async () => {
@@ -732,13 +1325,29 @@ function compactionMessage(id: string, sessionId: SessionId, boundaryMessageId: 
   };
 }
 
-function toolResultMessage(id: string, sessionId: SessionId, callId: string, output: string): Message {
+function toolResultMessage(
+  id: string,
+  sessionId: SessionId,
+  callId: string,
+  output: string,
+  includeCall = true,
+): Message {
   return {
     id: id as MessageId,
     sessionId,
     role: "assistant",
     createdAt: 1 as TimestampMs,
     parts: [
+      ...(includeCall ? [{
+        id: `part_${id}_tool_call` as never,
+        messageId: id as MessageId,
+        sessionId,
+        type: "tool_call" as const,
+        callId: callId as never,
+        toolName: "test_tool",
+        input: {},
+        status: "completed" as const,
+      }] : []),
       {
         id: `part_${id}_tool_result` as never,
         messageId: id as MessageId,

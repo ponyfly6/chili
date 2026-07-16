@@ -37,6 +37,8 @@ export interface PromptFragment {
   metadata?: Record<string, unknown>;
 }
 
+export const DEFAULT_PROMPT_FRAGMENT_MAX_CHARS = 80_000;
+
 export interface RenderedPromptFragment {
   id: string;
   layer: PromptLayer;

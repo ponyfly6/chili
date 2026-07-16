@@ -10,6 +10,7 @@ import {
   assertWritablePathInsideWorkspace,
   resolveWorkspacePath,
 } from "./workspace-path.js";
+import type { PersistedToolOutputRegistration } from "./types.js";
 
 export const DEFAULT_MAX_PERSISTED_OUTPUT_BYTES = 1024 * 1024;
 export const DEFAULT_MAX_PERSISTED_OUTPUT_DIRECTORY_BYTES = 64 * 1024 * 1024;
@@ -21,6 +22,7 @@ const FILESYSTEM_LOCK_FILENAME = ".sidecar.lock";
 const LOCK_EXCLUSIVE = 2;
 const LOCK_NONBLOCKING = 4;
 const LOCK_UNLOCK = 8;
+const trustedPersistedOutputs = new WeakSet<object>();
 
 export interface PersistedOutput {
   relativePath: string;
@@ -62,14 +64,14 @@ export async function persistToolOutput(
       await temporary.handle.close();
       await validateOutputTarget(cwd, target);
       await rename(temporary.path, target.absolutePath);
-      return {
+      return trustedPersistedOutput({
         relativePath: target.relativePath,
         absolutePath: target.absolutePath,
         bytes,
         originalBytes: persisted.bytes,
         limitBytes,
         truncated: persisted.truncated,
-      };
+      });
     } catch (error) {
       await temporary.handle.close().catch(() => undefined);
       await unlink(temporary.path).catch((unlinkError) => {
@@ -77,6 +79,49 @@ export async function persistToolOutput(
       });
       throw error;
     }
+  });
+}
+
+export async function validatePersistedToolOutput(
+  cwd: string,
+  callId: ToolCallId,
+  registration: PersistedToolOutputRegistration,
+  options: ToolOutputStorageOptions = {},
+): Promise<PersistedOutput> {
+  if (!isTrustedPersistedOutput(registration)) {
+    throw new Error("Persisted tool output registration was not created by Chili storage");
+  }
+  const snapshot = snapshotPersistedOutputRegistration(registration);
+  validatePersistedOutputRegistration(snapshot);
+  const expectedLimit = effectiveOutputLimit(
+    options.maxBytes ?? DEFAULT_MAX_PERSISTED_OUTPUT_BYTES,
+    options.maxDirectoryBytes ?? DEFAULT_MAX_PERSISTED_OUTPUT_DIRECTORY_BYTES,
+  );
+  if (snapshot.limitBytes !== expectedLimit) {
+    throw new Error(
+      `Persisted tool output limit mismatch: expected ${expectedLimit}, found ${snapshot.limitBytes}`,
+    );
+  }
+  const target = outputTarget(cwd, callId);
+  if (snapshot.relativePath !== target.relativePath) {
+    throw new Error(`Persisted tool output path does not match call ${callId}`);
+  }
+  const file = resolveWorkspacePath(cwd, snapshot.relativePath);
+  await assertExistingPathInsideWorkspace(cwd, file, snapshot.relativePath);
+  const info = await lstat(file.absolutePath);
+  validatePrivateRegularFile(info, "Persisted tool output");
+  if (info.size !== snapshot.bytes) {
+    throw new Error(
+      `Persisted tool output size mismatch: expected ${snapshot.bytes} bytes, found ${info.size}`,
+    );
+  }
+  return trustedPersistedOutput({
+    relativePath: target.relativePath,
+    absolutePath: file.absolutePath,
+    bytes: snapshot.bytes,
+    originalBytes: snapshot.originalBytes,
+    limitBytes: snapshot.limitBytes,
+    truncated: snapshot.truncated,
   });
 }
 
@@ -155,14 +200,14 @@ export class StreamingToolOutputFile {
       });
       throw error;
     }
-    return {
+    return trustedPersistedOutput({
       relativePath: this.target.relativePath,
       absolutePath: this.target.absolutePath,
       bytes: this.persistedBytes,
       originalBytes: this.originalBytes,
       limitBytes: this.limitBytes,
       truncated: this.persistedBytes < this.originalBytes,
-    };
+    });
   }
 }
 
@@ -193,17 +238,72 @@ interface TemporaryOutput {
 }
 
 async function prepareOutputTarget(cwd: string, callId: ToolCallId): Promise<OutputTarget> {
+  const target = outputTarget(cwd, callId);
+  await assertWritablePathInsideWorkspace(cwd, {
+    absolutePath: target.absolutePath,
+    relativePath: target.relativePath,
+  }, target.relativePath);
+  await mkdir(target.directoryPath, { recursive: true });
+  return target;
+}
+
+function outputTarget(cwd: string, callId: ToolCallId): OutputTarget {
   const relativeDirectory = join(".chili", "tool-results");
   const relativePath = join(relativeDirectory, toolResultFilename(callId));
   const directory = resolveWorkspacePath(cwd, relativeDirectory);
   const file = resolveWorkspacePath(cwd, relativePath);
-  await assertWritablePathInsideWorkspace(cwd, file, relativePath);
-  await mkdir(directory.absolutePath, { recursive: true });
   return {
     relativePath,
     absolutePath: file.absolutePath,
     directoryPath: directory.absolutePath,
   };
+}
+
+function validatePersistedOutputRegistration(registration: PersistedToolOutputRegistration): void {
+  for (const [label, value] of [
+    ["bytes", registration.bytes],
+    ["originalBytes", registration.originalBytes],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`Persisted tool output ${label} must be a non-negative safe integer`);
+    }
+  }
+  if (!(registration.limitBytes === Infinity
+    || (Number.isSafeInteger(registration.limitBytes) && registration.limitBytes >= 0))) {
+    throw new Error("Persisted tool output limitBytes must be a non-negative safe integer or Infinity");
+  }
+  if (registration.bytes > registration.originalBytes || registration.bytes > registration.limitBytes) {
+    throw new Error("Persisted tool output byte counts are inconsistent");
+  }
+  if (registration.truncated !== (registration.bytes < registration.originalBytes)) {
+    throw new Error("Persisted tool output truncated flag does not match its byte counts");
+  }
+}
+
+function snapshotPersistedOutputRegistration(
+  registration: PersistedToolOutputRegistration,
+): PersistedToolOutputRegistration {
+  return {
+    relativePath: registration.relativePath,
+    bytes: registration.bytes,
+    originalBytes: registration.originalBytes,
+    limitBytes: registration.limitBytes,
+    truncated: registration.truncated,
+  };
+}
+
+function trustedPersistedOutput(output: PersistedOutput): PersistedOutput {
+  const frozen = Object.freeze(output);
+  trustedPersistedOutputs.add(frozen);
+  return frozen;
+}
+
+function isTrustedPersistedOutput(
+  registration: PersistedToolOutputRegistration,
+): boolean {
+  return typeof registration === "object"
+    && registration !== null
+    && trustedPersistedOutputs.has(registration);
 }
 
 async function validateOutputTarget(cwd: string, target: OutputTarget): Promise<void> {

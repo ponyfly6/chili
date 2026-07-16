@@ -230,7 +230,7 @@ async function smokeSnapshotRevert(workspace: string): Promise<void> {
 
 async function smokeContextAndOutputTruncation(workspace: string): Promise<void> {
   const builder = new ContextWindowBuilder({
-    maxInputChars: 120,
+    maxInputChars: 260,
     maxToolResultChars: 20,
     preserveRecentMessages: 1,
   });
@@ -247,13 +247,33 @@ async function smokeContextAndOutputTruncation(workspace: string): Promise<void>
       sessionId: "session_1" as never,
       role: "assistant",
       createdAt: 2 as never,
-      parts: [{ id: "part_2" as never, messageId: "msg_2" as never, sessionId: "session_1" as never, type: "tool_result", callId: "toolcall_1" as never, output: "y".repeat(100) }],
+      parts: [
+        {
+          id: "part_2_call" as never,
+          messageId: "msg_2" as never,
+          sessionId: "session_1" as never,
+          type: "tool_call",
+          callId: "toolcall_1" as never,
+          toolName: "large_output",
+          input: {},
+          status: "completed",
+        },
+        {
+          id: "part_2" as never,
+          messageId: "msg_2" as never,
+          sessionId: "session_1" as never,
+          type: "tool_result",
+          callId: "toolcall_1" as never,
+          output: "y".repeat(100),
+        },
+      ],
     },
   ]);
   assert.ok(built.compactionBoundary);
   assert.equal(built.usage.truncatedToolResults, 1);
-  assert.ok(built.messages.at(-1)?.parts[0]?.type === "tool_result");
-  assert.ok(built.messages.at(-1)?.parts[0]?.type === "tool_result" && built.messages.at(-1)?.parts[0]?.output.includes("tool result omitted"));
+  const contextToolResult = built.messages.flatMap((message) => message.parts).find((part) => part.type === "tool_result");
+  assert.ok(contextToolResult?.type === "tool_result");
+  assert.ok(contextToolResult?.type === "tool_result" && contextToolResult.output.includes("tool result omitted"));
 
   const createId = idFactory();
   const store = new SqliteEventStore(join(workspace, `${globalThis.crypto.randomUUID()}.sqlite`));
@@ -285,7 +305,7 @@ async function smokeContextAndOutputTruncation(workspace: string): Promise<void>
     toolExecutor: executor,
     createId,
     now: () => 1 as never,
-    contextBudget: { maxInputChars: 80, preserveRecentMessages: 1 },
+    contextBudget: { maxInputChars: 120, preserveRecentMessages: 1 },
   });
 
   const sessionId = await runtime.createSession({ threadId: "thread_6" as never, cwd: workspace });

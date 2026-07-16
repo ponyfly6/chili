@@ -44,9 +44,23 @@ export interface ToolApprovalSpec {
 
 export type ToolBooleanPredicate<Input = any> = boolean | ((input: Input) => boolean | Promise<boolean>);
 
+export interface PersistedToolOutputRegistration {
+  relativePath: string;
+  bytes: number;
+  originalBytes: number;
+  limitBytes: number;
+  truncated: boolean;
+}
+
 export interface ChiliToolExecutionContext extends ToolExecutionContext {
+  outputArtifactId: ToolCallId;
   fileReads?: FileReadStateStore;
   visibleTools?: () => Promise<ChiliToolDefinition[]> | ChiliToolDefinition[];
+  persistedOutputLimits?: {
+    maxBytes?: number;
+    maxDirectoryBytes?: number;
+  };
+  registerPersistedOutput(output: PersistedToolOutputRegistration): Promise<void>;
 }
 
 export interface ToolRegistryEntry {
