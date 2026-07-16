@@ -318,7 +318,8 @@ test("ctrl+o toggles tool details and footer status", async () => {
     expect(app.captureCharFrame()).not.toContain("output hidden");
     expect(app.captureCharFrame()).toContain("output (truncated):");
     expect(app.captureCharFrame()).toContain("line_01");
-    expect(app.captureCharFrame()).toContain("line_05");
+    expect(app.captureCharFrame()).toContain("… +8 lines");
+    expect(app.captureCharFrame()).toContain("line_12");
     expect(app.captureCharFrame()).not.toContain("line_06");
   } finally {
     app.renderer.destroy();
