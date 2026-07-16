@@ -188,6 +188,43 @@ test("hidden thinking masks reasoning text", async () => {
   expect(frame).toContain("final answer");
 });
 
+test("Thinking subjects stay compact and render Markdown details without raw markers", async () => {
+  const items: ChatTranscriptItem[] = [{
+    id: "msg_reasoning_sections" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [
+      {
+        type: "reasoning",
+        id: "part_reasoning_inspecting" as PartId,
+        text: "**Inspecting core**\n\nReading runtime state.",
+      },
+      {
+        type: "reasoning",
+        id: "part_reasoning_checking" as PartId,
+        text: "**Checking schema**\n\nComparing migrations.",
+      },
+    ],
+  }];
+
+  const compact = await renderMessageList(items, { height: 12 });
+  const details = await renderMessageList(items, { showToolDetails: true, height: 16 });
+
+  expect(occurrences(compact, "Thinking:")).toBe(2);
+  expect(compact).toContain("Thinking: Inspecting core");
+  expect(compact).toContain("Thinking: Checking schema");
+  expect(compact).not.toContain("Reading runtime state.");
+  expect(compact).not.toContain("Comparing migrations.");
+  expect(compact).not.toContain("**");
+  expect(compact).not.toContain("****");
+  expect(details).toContain("Thinking: Inspecting core");
+  expect(details).toContain("Reading runtime state.");
+  expect(details).toContain("Thinking: Checking schema");
+  expect(details).toContain("Comparing migrations.");
+  expect(details).not.toContain("**");
+});
+
 test("hidden thinking masks intermediate assistant text before tool calls", async () => {
   const callId = "toolcall_hidden_thinking_text" as ToolCallId;
   const frame = await renderMessageList([
