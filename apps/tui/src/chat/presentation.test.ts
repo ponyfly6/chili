@@ -83,6 +83,120 @@ test("live tool rows render partial input labels without exposing assistant tool
   expect(display.some((item) => item.kind === "summary" && item.text.includes("tool_call"))).toBe(false);
 });
 
+test("preserves explicit assistant phases when commentary is visible", () => {
+  const display = buildChatDisplayItems([{
+    id: "msg_visible_phases" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    completedAt: 2,
+    parts: [
+      { type: "text", id: "part_visible_commentary" as PartId, text: "Checking.", phase: "commentary" },
+      { type: "text", id: "part_visible_final" as PartId, text: "Done.", phase: "final_answer" },
+    ],
+  }]);
+
+  expect(display).toEqual([
+    {
+      kind: "assistant_text",
+      id: "msg_visible_phases:part_visible_commentary:0",
+      text: "Checking.",
+      phase: "commentary",
+      time: 1,
+    },
+    {
+      kind: "assistant_text",
+      id: "msg_visible_phases:part_visible_final:1",
+      text: "Done.",
+      phase: "final_answer",
+      time: 1,
+    },
+  ]);
+});
+
+test("hideThinking hides commentary but keeps the final answer beside tool calls", () => {
+  const callId = "tool_phase_visibility" as ToolCallId;
+  const display = buildChatDisplayItems([{
+    id: "msg_phase_visibility" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [
+      { type: "text", id: "part_phase_commentary" as PartId, text: "Checking.", phase: "commentary" },
+      {
+        type: "tool_call",
+        id: "part_phase_tool" as PartId,
+        callId,
+        toolName: "read",
+        status: "pending",
+      },
+      { type: "text", id: "part_phase_final" as PartId, text: "Done.", phase: "final_answer" },
+    ],
+  }], {
+    hideThinking: true,
+    sessionStatus: "running",
+    activeToolCount: 0,
+  });
+
+  expect(display).toEqual([
+    {
+      kind: "reasoning",
+      id: "msg_phase_visibility:hidden-thinking",
+      text: "",
+      collapsed: true,
+      active: true,
+      time: 1,
+    },
+    {
+      kind: "assistant_text",
+      id: "msg_phase_visibility:part_phase_final:2",
+      text: "Done.",
+      phase: "final_answer",
+      streaming: true,
+      time: 1,
+    },
+  ]);
+});
+
+test("hideThinking never classifies phase-less assistant text as thinking", () => {
+  const display = buildChatDisplayItems([{
+    id: "msg_unclassified_visibility" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    completedAt: 2,
+    parts: [
+      { type: "reasoning", id: "part_hidden_reasoning" as PartId, text: "Internal reasoning." },
+      { type: "text", id: "part_hidden_commentary" as PartId, text: "Checking.", phase: "commentary" },
+      { type: "text", id: "part_visible_unclassified" as PartId, text: "Provider text." },
+      { type: "text", id: "part_visible_answer" as PartId, text: "Done.", phase: "final_answer" },
+    ],
+  }], { hideThinking: true });
+
+  expect(display).toEqual([
+    {
+      kind: "reasoning",
+      id: "msg_unclassified_visibility:hidden-thinking",
+      text: "",
+      collapsed: true,
+      time: 1,
+    },
+    {
+      kind: "assistant_text",
+      id: "msg_unclassified_visibility:part_visible_unclassified:2",
+      text: "Provider text.",
+      time: 1,
+    },
+    {
+      kind: "assistant_text",
+      id: "msg_unclassified_visibility:part_visible_answer:3",
+      text: "Done.",
+      phase: "final_answer",
+      time: 1,
+    },
+  ]);
+});
+
 test("exploration groups expose one semantic failure with an exact failed count", () => {
   const display = buildChatDisplayItems([
     chatTool("read_running" as ToolCallId, "read", "running", "running", { title: "read", path: "package.json", detail: "package.json" }),

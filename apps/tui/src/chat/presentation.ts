@@ -21,7 +21,14 @@ import {
 
 export type ChatDisplayItem =
   | { kind: "user_message"; id: string; text: string; imageLabels: string[]; time?: number }
-  | { kind: "assistant_text"; id: string; text: string; streaming?: boolean; time?: number }
+  | {
+      kind: "assistant_text";
+      id: string;
+      text: string;
+      phase?: Extract<ChatMessagePart, { type: "text" }>["phase"];
+      streaming?: boolean;
+      time?: number;
+    }
   | { kind: "reasoning"; id: string; text: string; collapsed: true; active?: boolean; time?: number }
   | { kind: "tool_activity"; id: string; activity: ToolActivityDisplay; time?: number }
   | { kind: "tool_group"; id: string; label: string; tone: ToolActivityTone; metadata: ToolGroupMetadata; activities: ToolActivityDisplay[]; time?: number }
@@ -150,8 +157,7 @@ function messageDisplayItems(
 
   const output: ChatDisplayItem[] = [];
   const streamingTextPartIndex = streaming ? lastTextPartIndex(message.parts) : -1;
-  const hideStreamingAssistantText = hideThinking && message.role === "assistant" && streaming;
-  const hideAssistantTrace = hideThinking && message.role === "assistant" && (hideStreamingAssistantText || message.parts.some((part) => part.type === "tool_call"));
+  const hideAssistantThinking = hideThinking && message.role === "assistant";
   let hiddenTraceShown = false;
   const showHiddenTrace = (active: boolean) => {
     if (hiddenTraceShown) return;
@@ -162,11 +168,20 @@ function messageDisplayItems(
   for (const [index, part] of message.parts.entries()) {
     const id = `${message.id}:${part.id}:${index}`;
     if (part.type === "text") {
-      if (hideAssistantTrace && part.text.trim()) {
-        showHiddenTrace(hideStreamingAssistantText);
+      if (hideAssistantThinking && part.phase === "commentary") {
+        if (part.text.trim()) showHiddenTrace(streaming);
         continue;
       }
-      if (message.role === "assistant") output.push({ kind: "assistant_text", id, text: part.text, time: message.createdAt, ...(index === streamingTextPartIndex ? { streaming: true } : {}) });
+      if (message.role === "assistant") {
+        output.push({
+          kind: "assistant_text",
+          id,
+          text: part.text,
+          time: message.createdAt,
+          ...(part.phase === undefined ? {} : { phase: part.phase }),
+          ...(index === streamingTextPartIndex ? { streaming: true } : {}),
+        });
+      }
       else output.push({ kind: "summary", id, text: `${message.role}: ${part.text}`, time: message.createdAt });
       continue;
     }
@@ -176,8 +191,8 @@ function messageDisplayItems(
       continue;
     }
     if (part.type === "reasoning") {
-      if (hideAssistantTrace) {
-        if (part.text.trim()) showHiddenTrace(hideStreamingAssistantText);
+      if (hideAssistantThinking) {
+        if (part.text.trim()) showHiddenTrace(streaming);
         continue;
       }
       output.push({ kind: "reasoning", id, text: part.text, collapsed: true, time: message.createdAt, ...(streaming ? { active: true } : {}) });
