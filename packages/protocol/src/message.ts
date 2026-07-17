@@ -11,6 +11,8 @@ import type { ToolResultContent } from "./tool.js";
 
 export type MessageRole = "system" | "user" | "assistant" | "tool";
 
+export type AssistantMessagePhase = "commentary" | "final_answer";
+
 export interface Message {
   id: MessageId;
   sessionId: SessionId;
@@ -41,6 +43,7 @@ export interface BasePart {
 export interface TextPart extends BasePart {
   type: "text";
   text: string;
+  phase?: AssistantMessagePhase;
   displayText?: string;
   synthetic?: boolean;
 }

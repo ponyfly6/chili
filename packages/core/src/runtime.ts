@@ -1,5 +1,6 @@
 import type {
   AgentRunId,
+  AssistantMessagePhase,
   ChiliEvent,
   EventEnvelope,
   Message,
@@ -106,6 +107,7 @@ export interface ModelTextDeltaEvent {
   type: "text_delta";
   text: string;
   index?: number;
+  phase?: AssistantMessagePhase;
 }
 
 export interface ModelReasoningDeltaEvent {

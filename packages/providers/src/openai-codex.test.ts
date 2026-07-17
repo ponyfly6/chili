@@ -406,7 +406,7 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
     body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     return new Response(streamText([
       data({ type: "response.created", response: { id: "resp_1", model: "gpt-5.5" } }),
-      data({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: "msg_1" } }),
+      data({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: "msg_1", phase: "final_answer" } }),
       data({ type: "response.output_text.delta", output_index: 0, delta: "hello" }),
       data({
         type: "response.output_item.added",
@@ -479,7 +479,7 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
     "metadata",
     "finish",
   ]);
-  expect(events[2]).toEqual({ type: "text_delta", text: "hello", index: 0 });
+  expect(events[2]).toEqual({ type: "text_delta", text: "hello", index: 0, phase: "final_answer" });
   expect(events[6]).toEqual({
     type: "tool_call_end",
     toolCallId: "call_1",
@@ -500,6 +500,86 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
     },
   });
 });
+
+test("preserves assistant phase for every Codex message output item", async () => {
+  const model = codexStreamModel([
+    data({ type: "response.created", response: { id: "resp_phases", model: "gpt-5.5" } }),
+    data({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { type: "message", id: "msg_commentary", phase: "commentary" },
+    }),
+    data({ type: "response.output_text.delta", output_index: 0, delta: "Checking " }),
+    data({ type: "response.output_text.delta", output_index: 0, delta: "files." }),
+    data({
+      type: "response.output_item.added",
+      output_index: 2,
+      item: { type: "message", id: "msg_final", phase: "final_answer" },
+    }),
+    data({ type: "response.output_text.delta", output_index: 2, delta: "Done." }),
+    data({
+      type: "response.completed",
+      response: { id: "resp_phases", model: "gpt-5.5", status: "completed" },
+    }),
+  ]);
+
+  const events = await collect(model.stream({ messages: [], tools: [], system: [] }));
+
+  expect(events.filter((event) => event.type === "text_delta")).toEqual([
+    { type: "text_delta", text: "Checking ", index: 0, phase: "commentary" },
+    { type: "text_delta", text: "files.", index: 0, phase: "commentary" },
+    { type: "text_delta", text: "Done.", index: 2, phase: "final_answer" },
+  ]);
+});
+
+for (const scenario of [
+  {
+    name: "rejects a Codex message output item with no phase",
+    events: [
+      data({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: "msg_missing" } }),
+    ],
+    error: "missing assistant phase",
+  },
+  {
+    name: "rejects an unknown Codex message output phase",
+    events: [
+      data({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "message", id: "msg_unknown", phase: "analysis" },
+      }),
+    ],
+    error: 'invalid assistant phase "analysis"',
+  },
+  {
+    name: "rejects a Codex text delta without a declared message item",
+    events: [
+      data({ type: "response.output_text.delta", output_index: 3, delta: "orphan" }),
+    ],
+    error: "text delta for undeclared message output index 3",
+  },
+  {
+    name: "rejects conflicting phases for one Codex output index",
+    events: [
+      data({
+        type: "response.output_item.added",
+        output_index: 1,
+        item: { type: "message", id: "msg_first", phase: "commentary" },
+      }),
+      data({
+        type: "response.output_item.added",
+        output_index: 1,
+        item: { type: "message", id: "msg_second", phase: "final_answer" },
+      }),
+    ],
+    error: "conflicting assistant phase for output index 1",
+  },
+] as const) {
+  test(scenario.name, async () => {
+    const model = codexStreamModel(scenario.events);
+    await expect(collect(model.stream({ messages: [], tools: [], system: [] }))).rejects.toThrow(scenario.error);
+  });
+}
 
 test("preserves reasoning summary sections from Codex Responses streams", async () => {
   const model = new OpenAICodexResponsesModel({
@@ -604,6 +684,11 @@ test("sends OpenAI-compatible Codex requests without ChatGPT account headers", a
     body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     return new Response(streamText([
       data({ type: "response.created", response: { id: "resp_gateway", model: "gpt-5.5" } }),
+      data({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "message", id: "msg_gateway", phase: "final_answer" },
+      }),
       data({ type: "response.output_text.delta", output_index: 0, delta: "ok" }),
       data({ type: "response.completed", response: { id: "resp_gateway", model: "gpt-5.5", status: "completed" } }),
     ].join("")), {
@@ -631,7 +716,7 @@ test("sends OpenAI-compatible Codex requests without ChatGPT account headers", a
     reasoning: { effort: "xhigh", summary: "auto" },
     service_tier: "priority",
   });
-  expect(events).toContainEqual({ type: "text_delta", text: "ok", index: 0 });
+  expect(events).toContainEqual({ type: "text_delta", text: "ok", index: 0, phase: "final_answer" });
 });
 
 test("surfaces nested OpenAI Codex SSE error details", async () => {
@@ -741,6 +826,15 @@ function sseFetch(events: string[]): typeof fetch {
       status: 200,
       headers: { "content-type": "text/event-stream" },
     })) as unknown as typeof fetch;
+}
+
+function codexStreamModel(events: readonly string[]): OpenAICodexResponsesModel {
+  return new OpenAICodexResponsesModel({
+    model: "gpt-5.5",
+    apiKey: jwtWithAccount("acct_test"),
+    fetch: sseFetch([...events]),
+    env: {},
+  });
 }
 
 function streamText(text: string): ReadableStream<Uint8Array> {

@@ -1,5 +1,5 @@
 import { platform, release, arch } from "node:os";
-import type { Message, MessagePart, ServiceTier } from "@chili/protocol";
+import type { AssistantMessagePhase, Message, MessagePart, ServiceTier } from "@chili/protocol";
 import { FileAuthStorage, type OAuthCredentials } from "./auth.js";
 import { type EnvironmentSource, readOpenAICodexEnvironment } from "./env.js";
 import {
@@ -129,6 +129,7 @@ interface CodexOutputItem {
   arguments?: string;
   content?: Array<{ type?: string; text?: string; refusal?: string }>;
   summary?: Array<{ text?: string }>;
+  phase?: string;
 }
 
 interface CodexUsage {
@@ -322,6 +323,7 @@ export class OpenAICodexResponsesModel implements ChiliModel {
     let finishReason = "stop";
     let sawToolCall = false;
     const toolCalls = new Map<string, ToolStreamState>();
+    const messagePhases = new Map<number, AssistantMessagePhase>();
     const reasoningSectionIndexes = new Map<string, number>();
     let activeToolKey: string | undefined;
 
@@ -345,6 +347,15 @@ export class OpenAICodexResponsesModel implements ChiliModel {
       }
 
       if (payload.type === "response.output_item.added" && payload.item) {
+        if (payload.item.type === "message") {
+          const index = requireCodexMessageOutputIndex(payload.output_index);
+          const phase = requireCodexAssistantPhase(payload.item.phase, index);
+          const existing = messagePhases.get(index);
+          if (existing !== undefined && existing !== phase) {
+            throw new Error(`OpenAI Codex stream has conflicting assistant phase for output index ${index}`);
+          }
+          messagePhases.set(index, phase);
+        }
         if (payload.item.type === "function_call") {
           sawToolCall = true;
           const state = createToolState(payload.item, payload.output_index);
@@ -366,7 +377,12 @@ export class OpenAICodexResponsesModel implements ChiliModel {
       }
 
       if ((payload.type === "response.output_text.delta" || payload.type === "response.refusal.delta") && payload.delta) {
-        yield { type: "text_delta", text: payload.delta, index: payload.output_index ?? 0 };
+        const index = payload.output_index;
+        const phase = index === undefined ? undefined : messagePhases.get(index);
+        if (index === undefined || phase === undefined) {
+          throw new Error(`OpenAI Codex stream has text delta for undeclared message output index ${String(index)}`);
+        }
+        yield { type: "text_delta", text: payload.delta, index, phase };
         continue;
       }
 
@@ -618,6 +634,23 @@ function reasoningSectionEventIndex(payload: CodexStreamPayload, indexes: Map<st
   const index = indexes.size;
   indexes.set(key, index);
   return index;
+}
+
+function requireCodexMessageOutputIndex(index: number | undefined): number {
+  if (index === undefined || !Number.isInteger(index) || index < 0) {
+    throw new Error(`OpenAI Codex stream message output item has invalid output index ${String(index)}`);
+  }
+  return index;
+}
+
+function requireCodexAssistantPhase(phase: string | undefined, index: number): AssistantMessagePhase {
+  if (phase === undefined) {
+    throw new Error(`OpenAI Codex message output index ${index} is missing assistant phase`);
+  }
+  if (phase !== "commentary" && phase !== "final_answer") {
+    throw new Error(`OpenAI Codex message output index ${index} has invalid assistant phase ${JSON.stringify(phase)}`);
+  }
+  return phase;
 }
 
 function createToolState(item: CodexOutputItem, index: number | undefined): ToolStreamState {

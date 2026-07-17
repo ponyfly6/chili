@@ -1,4 +1,4 @@
-import type { Message, ServiceTier } from "@chili/protocol";
+import type { AssistantMessagePhase, Message, ServiceTier } from "@chili/protocol";
 import type { ModelCompatibilityOverrides } from "./compat.js";
 
 export type ModelApiFamily = "anthropic-messages" | "openai-completions" | "openai-responses" | (string & {});
@@ -119,6 +119,7 @@ export interface ModelTextDeltaEvent {
   type: "text_delta";
   text: string;
   index?: number;
+  phase?: AssistantMessagePhase;
 }
 
 export interface ModelReasoningDeltaEvent {
