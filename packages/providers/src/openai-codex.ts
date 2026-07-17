@@ -75,7 +75,12 @@ type CodexResponseMessageContent =
 
 type CodexResponseInputItem =
   | {
-      role: "user" | "assistant";
+      role: "user";
+      content: CodexResponseMessageContent[];
+    }
+  | {
+      role: "assistant";
+      phase: AssistantMessagePhase;
       content: CodexResponseMessageContent[];
     }
   | {
@@ -551,16 +556,24 @@ function toResponsesInput(messages: readonly Message[], includeImageContent = tr
   for (const message of messages) {
     if (message.role === "system") continue;
     if (message.role === "assistant") {
-      const text = messageText(message.parts, "text");
-      if (text) output.push({ role: "assistant", content: [{ type: "output_text", text }] });
       for (const part of message.parts) {
-        if (part.type !== "tool_call") continue;
-        output.push({
-          type: "function_call",
-          call_id: normalizeResponsesId(String(part.callId)),
-          name: part.toolName,
-          arguments: stringifyToolInput(part.input),
-        });
+        if (part.type === "text") {
+          if (!part.text) continue;
+          output.push({
+            role: "assistant",
+            phase: requireCodexHistoryPhase(part.phase),
+            content: [{ type: "output_text", text: part.text }],
+          });
+          continue;
+        }
+        if (part.type === "tool_call") {
+          output.push({
+            type: "function_call",
+            call_id: normalizeResponsesId(String(part.callId)),
+            name: part.toolName,
+            arguments: stringifyToolInput(part.input),
+          });
+        }
       }
       continue;
     }
@@ -649,6 +662,16 @@ function requireCodexAssistantPhase(phase: string | undefined, index: number): A
   }
   if (phase !== "commentary" && phase !== "final_answer") {
     throw new Error(`OpenAI Codex message output index ${index} has invalid assistant phase ${JSON.stringify(phase)}`);
+  }
+  return phase;
+}
+
+function requireCodexHistoryPhase(phase: AssistantMessagePhase | undefined): AssistantMessagePhase {
+  if (phase === undefined) {
+    throw new Error("OpenAI Codex assistant text part is missing phase");
+  }
+  if (phase !== "commentary" && phase !== "final_answer") {
+    throw new Error(`OpenAI Codex assistant text part has invalid phase ${JSON.stringify(phase)}`);
   }
   return phase;
 }

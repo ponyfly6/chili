@@ -61,8 +61,9 @@ test("converts Chili messages and tools into a Codex Responses body", () => {
         message("system", [{ type: "text", text: "stored system" }]),
         message("user", [{ type: "text", text: "hello" }]),
         message("assistant", [
-          { type: "text", text: "I will check." },
+          { type: "text", text: "I will check.", phase: "commentary" },
           { type: "tool_call", callId, toolName: "weather", input: { city: "Shanghai" }, status: "pending" },
+          { type: "text", text: "It is sunny.", phase: "final_answer" },
         ]),
         message("user", [{ type: "tool_result", callId, output: "sunny" }]),
       ],
@@ -89,8 +90,9 @@ test("converts Chili messages and tools into a Codex Responses body", () => {
     reasoning: { effort: "low", summary: "auto" },
     input: [
       { role: "user", content: [{ type: "input_text", text: "hello" }] },
-      { role: "assistant", content: [{ type: "output_text", text: "I will check." }] },
+      { role: "assistant", phase: "commentary", content: [{ type: "output_text", text: "I will check." }] },
       { type: "function_call", call_id: callId, name: "weather", arguments: "{\"city\":\"Shanghai\"}" },
+      { role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: "It is sunny." }] },
       { type: "function_call_output", call_id: callId, output: "sunny" },
     ],
     tools: [
@@ -107,6 +109,28 @@ test("converts Chili messages and tools into a Codex Responses body", () => {
       },
     ],
   });
+});
+
+test("rejects phase-less assistant text when building Codex history", () => {
+  expect(() => buildOpenAICodexResponsesRequestBody(
+    {
+      messages: [message("assistant", [{ type: "text", text: "ambiguous" }])],
+      tools: [],
+      system: [],
+    },
+    { model: "gpt-5.5" },
+  )).toThrow("assistant text part is missing phase");
+
+  expect(() => buildOpenAICodexResponsesRequestBody(
+    {
+      messages: [message("assistant", [
+        { type: "tool_call", callId: "call_only", toolName: "lookup", input: {}, status: "completed" },
+      ])],
+      tools: [],
+      system: [],
+    },
+    { model: "gpt-5.5" },
+  )).not.toThrow();
 });
 
 test("adds developer fragments to instructions and contextual fragments to input", () => {
