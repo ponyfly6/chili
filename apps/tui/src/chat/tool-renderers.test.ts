@@ -73,14 +73,45 @@ test("details mode preserves the head and tail of truncated preview lines", () =
   expect(rendered).toMatchObject({
     mode: "block",
     bodyKind: "text",
-    bodyLines: ["line_01", "line_02", "… +3 lines", "line_06", "line_07"],
+    bodyLines: ["line_01", "line_02", "… +3 lines (Ctrl+T for transcript)", "line_06", "line_07"],
     bodyTruncated: true,
   });
   expect(rendered.outputHint).toBeUndefined();
   expect(rendered.details.find((detail) => detail.label === "output")).toMatchObject({
     truncated: true,
-    lines: ["line_01", "line_02", "… +3 lines", "line_06", "line_07"],
+    lines: ["line_01", "line_02", "… +3 lines (Ctrl+T for transcript)", "line_06", "line_07"],
   });
+});
+
+test("compact errors preserve head and tail with a Ctrl+T transcript hint", () => {
+  const error = Array.from({ length: 7 }, (_, index) => `error_${index + 1}`).join("\n");
+  const rendered = renderToolActivity(toolInput({
+    toolName: "bash",
+    status: "failed",
+    displayStatus: "failed",
+    inputSummary: { title: "bash", command: "bun test", detail: "bun test" },
+    error,
+  }));
+
+  expect(rendered.compactErrorLines).toEqual([
+    "error_1",
+    "error_2",
+    "… +4 lines (Ctrl+T for transcript)",
+    "error_7",
+  ]);
+});
+
+test("single-line truncation also points to the full transcript", () => {
+  const rendered = renderToolActivity(toolInput({
+    toolName: "bash",
+    status: "failed",
+    displayStatus: "failed",
+    inputSummary: { title: "bash", command: "bun test", detail: "bun test" },
+    error: "x".repeat(220),
+  }));
+
+  expect(rendered.compactErrorLines?.[0]?.endsWith("~")).toBe(true);
+  expect(rendered.compactErrorLines?.at(-1)).toBe("… output truncated (Ctrl+T for transcript)");
 });
 
 test("running command tools expose live output tail without mixing it into final compact output", () => {
@@ -107,7 +138,7 @@ test("running command tools expose live output tail without mixing it into final
   expect(running).toMatchObject({
     mode: "block",
     bodyKind: "text",
-    bodyLines: ["line_02", "line_03", "line_04", "warn_05", "line_06"],
+    bodyLines: ["… +2 lines (Ctrl+T for transcript)", "line_03", "line_04", "warn_05", "line_06"],
     bodyTruncated: true,
   });
   expect(running.details[0]).toMatchObject({
@@ -116,6 +147,27 @@ test("running command tools expose live output tail without mixing it into final
   });
   expect(completed).toMatchObject({ mode: "inline", bodyKind: "none", bodyLines: [] });
   expect(completed.details).toEqual([]);
+});
+
+test("source-truncated live output points to the full transcript", () => {
+  const rendered = renderToolActivity(toolInput({
+    toolName: "bash",
+    status: "running",
+    displayStatus: "running",
+    inputSummary: { title: "bash", command: "npm install", detail: "npm install" },
+    liveOutput: [
+      { stream: "stdout", delta: "old 1\nold 2\nlatest 3\nlatest 4\nlatest 5\nlatest 6\n", time: 1, truncated: true },
+    ],
+  }));
+
+  expect(rendered.bodyLines).toEqual([
+    "… output truncated (Ctrl+T for transcript)",
+    "latest 3",
+    "latest 4",
+    "latest 5",
+    "latest 6",
+  ]);
+  expect(rendered.bodyTruncated).toBe(true);
 });
 
 test("exploration tools keep running live output out of compact semantic summaries", () => {

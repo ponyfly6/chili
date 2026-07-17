@@ -2,6 +2,8 @@ import { homedir } from "node:os";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { ChatToolDisplayStatus, ChatToolInputSummary, RuntimeToolOutputDelta } from "@chili/sdk";
 
+const TRANSCRIPT_HINT = "Ctrl+T for transcript";
+
 export interface ToolActivityDetail {
   label: string;
   lines: string[];
@@ -386,7 +388,7 @@ function defaultOutputHint(input: ToolRenderInput): string | undefined {
 function defaultCompactErrorLines(input: ToolRenderInput): string[] | undefined {
   const value = input.error ?? (input.displayStatus === "failed" ? input.output : undefined);
   if (!value) return undefined;
-  return previewTextLines(value, { maxLines: 4, maxLineLength: 180 }).lines;
+  return previewTextLines(value, { maxLines: 4, maxLineLength: 180, preserveTail: true }).lines;
 }
 
 function explorationCompactErrorLines(input: ToolRenderInput, action: "Read" | "Search" | "List"): string[] | undefined {
@@ -418,20 +420,29 @@ function previewTextLines(
   const selected = options.preserveTail === true
     ? headTailLines(sourceLines, options.maxLines)
     : sourceLines.slice(0, options.maxLines);
-  const lines = selected.map((line) => shortenLine(line, options.maxLineLength));
-  const truncated = sourceLines.length > options.maxLines || lines.some((line, index) => line !== selected[index]);
+  let lines = selected.map((line) => shortenLine(line, options.maxLineLength));
+  const sourceTruncated = sourceLines.length > options.maxLines;
+  const shortened = lines.some((line, index) => line !== selected[index]);
+  if (!sourceTruncated && shortened) {
+    const hint = `… output truncated (${TRANSCRIPT_HINT})`;
+    const budget = Math.max(1, Math.floor(options.maxLines));
+    lines = budget === 1
+      ? [hint]
+      : [...lines.slice(0, budget - 1), hint];
+  }
+  const truncated = sourceTruncated || shortened;
   return { lines, truncated };
 }
 
 function headTailLines(sourceLines: readonly string[], maxLines: number): string[] {
   if (sourceLines.length <= maxLines) return [...sourceLines];
-  if (maxLines <= 1) return [`… +${sourceLines.length} lines`];
+  if (maxLines <= 1) return [`… +${sourceLines.length} lines (${TRANSCRIPT_HINT})`];
   const headCount = Math.ceil((maxLines - 1) / 2);
   const tailCount = Math.max(0, maxLines - headCount - 1);
   const hiddenCount = sourceLines.length - headCount - tailCount;
   return [
     ...sourceLines.slice(0, headCount),
-    `… +${hiddenCount} lines`,
+    `… +${hiddenCount} lines (${TRANSCRIPT_HINT})`,
     ...(tailCount > 0 ? sourceLines.slice(-tailCount) : []),
   ];
 }
@@ -449,10 +460,25 @@ function liveOutputPreview(
   options: { maxLines: number; maxLineLength: number; stderrTone: LiveOutputTone },
 ): { lines: string[]; lineTones: ("muted" | "error")[]; truncated: boolean } {
   const entries = liveOutputLineEntries(deltas, options.maxLineLength, options.stderrTone);
-  let truncated = deltas.some((delta) => delta.truncated === true);
-  if (entries.length > options.maxLines) truncated = true;
-  if (entries.some((entry) => entry.shortened)) truncated = true;
-  const visible = entries.slice(-options.maxLines);
+  const sourceTruncated = deltas.some((delta) => delta.truncated === true);
+  const shortened = entries.some((entry) => entry.shortened);
+  const budget = Number.isFinite(options.maxLines)
+    ? Math.max(1, Math.floor(options.maxLines))
+    : Math.max(1, entries.length);
+  const overflow = entries.length > budget;
+  const truncated = sourceTruncated || shortened || overflow;
+  let visible = entries.slice(-budget);
+  if (truncated) {
+    const contentBudget = Math.max(0, budget - 1);
+    const retained = contentBudget === 0 ? [] : entries.slice(-contentBudget);
+    const omission = overflow && !sourceTruncated && !shortened
+      ? `… +${entries.length - retained.length} lines (${TRANSCRIPT_HINT})`
+      : `… output truncated (${TRANSCRIPT_HINT})`;
+    visible = [
+      { line: omission, tone: "muted", shortened: false },
+      ...retained,
+    ];
+  }
   return {
     lines: visible.map((entry) => entry.line),
     lineTones: visible.map((entry) => entry.tone),

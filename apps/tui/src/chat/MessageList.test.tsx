@@ -792,8 +792,10 @@ test("running command rows show live output tail without exposing completed live
   expect(runningFrame).toContain("Running npm install");
   expect(runningFrame).toContain("live output (truncated):");
   expect(runningFrame).not.toContain("error (truncated):");
+  expect(runningFrame).toContain("… +2 lines (Ctrl+T for transcript)");
   expect(runningFrame).not.toContain("live_01");
-  expect(runningFrame).toContain("live_02");
+  expect(runningFrame).not.toContain("live_02");
+  expect(runningFrame).toContain("live_03");
   expect(runningFrame).toContain("warn_05");
   expect(runningFrame).toContain("live_06");
   expect(completedFrame).toContain("Ran npm install");
@@ -864,11 +866,12 @@ test("failed tools show a compact error summary", async () => {
   const frame = await renderMessageList([item]);
   const details = await renderMessageList([item], { showToolDetails: true, height: 24 });
 
-  expect(frame).toContain("Failed bun test");
-  expect(frame).toContain("error:");
-  expect(frame).toContain("first failure");
-  expect(frame).toContain("fourth failure");
-  expect(frame).not.toContain("fifth failure");
+  expect(frame).toContain("• Failed bun test");
+  expect(frame).toContain("  └ first failure");
+  expect(frame).not.toContain("error:");
+  expect(frame).toContain("second failure");
+  expect(frame).toContain("… +2 lines (Ctrl+T for transcript)");
+  expect(frame).toContain("fifth failure");
   expect(details.match(/error:/g)).toHaveLength(1);
   expect(details).toContain("fifth failure");
 });

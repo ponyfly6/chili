@@ -1,9 +1,12 @@
-import { StyledText, type MouseEvent, type TextChunk } from "@opentui/core";
+import { RGBA, StyledText, type MouseEvent, type TextChunk } from "@opentui/core";
 import { useRenderer } from "@opentui/react";
 import { useRef } from "react";
 import { fileLinksForText, fileUrlWithPosition, type FileLinkRange, type FileLinkTarget } from "./file-links.js";
-import { wrapTerminalText } from "./markdown.js";
+import { charDisplayWidth, wrapTerminalText } from "./markdown.js";
 import { selectTextOnMultiClick, type TextClickState } from "./text-selection.js";
+
+const TRANSCRIPT_HINT = "Ctrl+T for transcript";
+const TRANSCRIPT_OMISSION_PATTERN = /^… (?:\+\d+(?: lines)?|output truncated|more)(?: \(|$)/;
 
 export interface TranscriptLineModel {
   key: string;
@@ -11,6 +14,22 @@ export interface TranscriptLineModel {
   fg: string;
   bg?: string | undefined;
   fileLinks?: FileLinkRange[];
+  leadingAccent?: LeadingAccent | undefined;
+}
+
+export interface LeadingAccent {
+  length: number;
+  fg: string;
+}
+
+export interface WrapLineOptions {
+  key: string;
+  fg: string;
+  bg?: string | undefined;
+  width: number;
+  hangingIndent?: string | undefined;
+  cwd?: string | undefined;
+  leadingAccent?: LeadingAccent | undefined;
 }
 
 export type OpenFileLinkHandler = (target: FileLinkTarget) => void;
@@ -72,17 +91,20 @@ export function TranscriptLines(props: {
   );
 }
 
-export function wrapLine(text: string, options: { key: string; fg: string; bg?: string; width: number; hangingIndent?: string; cwd?: string }): TranscriptLineModel[] {
+export function wrapLine(text: string, options: WrapLineOptions): TranscriptLineModel[] {
   return wrapTerminalText(text, {
     key: options.key,
     width: options.width,
     ...(options.hangingIndent === undefined ? {} : { hangingIndent: options.hangingIndent }),
-  }).map((line) => ({
+  }).map((line, index) => ({
     key: line.key,
     text: line.text,
     fg: options.fg,
     ...(options.bg === undefined ? {} : { bg: options.bg }),
     ...(options.cwd === undefined ? {} : { fileLinks: fileLinksForText(line.text, options.cwd) }),
+    ...(index !== 0 || options.leadingAccent === undefined
+      ? {}
+      : { leadingAccent: normalizedLeadingAccent(options.leadingAccent, line.text.length) }),
   }));
 }
 
@@ -95,13 +117,21 @@ export function detailPreviewLines(
   fg: string,
   maxContentRows = 5,
 ): TranscriptLineModel[] {
-  const contentRows = lines.flatMap((line, index) => wrapLine(`    ${line || " "}`, {
-    key: `${key}:line:${index}`,
-    fg,
-    width,
-    hangingIndent: "    ",
-  }));
-  const clipped = clipTranscriptRows(contentRows, maxContentRows, `${key}:rows`, fg);
+  const contentRows = lines.flatMap((line, index) => {
+    const text = `    ${line || " "}`;
+    // The omission row describes hidden logical lines. Keep it to one visual row
+    // so its count is not replaced by a second, width-based omission count.
+    if (isTranscriptOmissionLine(line)) {
+      return [{ key: `${key}:line:${index}`, text: formatTranscriptOmissionLine(line, width), fg }];
+    }
+    return wrapLine(text, {
+      key: `${key}:line:${index}`,
+      fg,
+      width,
+      hangingIndent: "    ",
+    });
+  });
+  const clipped = clipTranscriptRows(contentRows, maxContentRows, `${key}:rows`, fg, width, truncated);
   const suffix = truncated || clipped.truncated ? " (truncated)" : "";
   return [
     ...wrapLine(`  ${label}${suffix}:`, {
@@ -119,12 +149,19 @@ export function clipTranscriptRows(
   maxRows: number,
   key: string,
   fg: string,
+  width?: number,
+  sourceTruncated = false,
 ): { lines: TranscriptLineModel[]; truncated: boolean } {
   if (!Number.isFinite(maxRows) || rows.length <= maxRows) return { lines: [...rows], truncated: false };
   const budget = Math.max(1, Math.floor(maxRows));
+  const existingOmissionIndex = rows.findIndex((row) => isTranscriptOmissionLine(row.text));
+  const canCountExactly = !sourceTruncated && existingOmissionIndex < 0;
+  if (!canCountExactly) {
+    return clipPreviouslyTruncatedRows(rows, budget, existingOmissionIndex, key, fg, width);
+  }
   if (budget === 1) {
     return {
-      lines: [{ key: `${key}:omitted`, text: `    … +${rows.length} lines`, fg }],
+      lines: [{ key: `${key}:omitted`, text: clippedOmissionText(rows.length, true, width), fg }],
       truncated: true,
     };
   }
@@ -135,11 +172,22 @@ export function clipTranscriptRows(
   return {
     lines: [
       ...rows.slice(0, headCount),
-      { key: `${key}:omitted`, text: `    … +${hiddenCount} lines`, fg },
+      { key: `${key}:omitted`, text: clippedOmissionText(hiddenCount, true, width), fg },
       ...(tailCount > 0 ? rows.slice(-tailCount) : []),
     ],
     truncated: true,
   };
+}
+
+export function isTranscriptOmissionLine(line: string): boolean {
+  return TRANSCRIPT_OMISSION_PATTERN.test(line.trimStart());
+}
+
+export function formatTranscriptOmissionLine(line: string, width?: number, prefix = "    "): string {
+  const full = `${prefix}${line}`;
+  if (!isTranscriptOmissionLine(line) || width === undefined || displayWidth(full) <= width) return full;
+  const count = line.match(/^… \+(\d+) lines/)?.[1];
+  return `${prefix}${count === undefined ? "… more (Ctrl+T)" : `… +${count} (Ctrl+T)`}`;
 }
 
 function fileLinkAtMouseColumn(links: readonly FileLinkRange[] | undefined, event: MouseEvent): FileLinkRange | undefined {
@@ -150,23 +198,86 @@ function fileLinkAtMouseColumn(links: readonly FileLinkRange[] | undefined, even
 }
 
 function linkedLineContent(line: TranscriptLineModel): string | StyledText {
-  const links = line.fileLinks;
-  if (!links?.length) return line.text;
+  const links = line.fileLinks ?? [];
+  const leadingAccent = line.leadingAccent === undefined
+    ? undefined
+    : normalizedLeadingAccent(line.leadingAccent, line.text.length);
+  if (links.length === 0 && leadingAccent === undefined) return line.text;
 
-  const chunks: TextChunk[] = [];
-  let index = 0;
+  const boundaries = new Set([0, line.text.length]);
+  if (leadingAccent !== undefined) boundaries.add(leadingAccent.length);
   for (const link of links) {
-    if (link.startIndex < index) continue;
-    if (link.startIndex > index) {
-      chunks.push({ __isChunk: true, text: line.text.slice(index, link.startIndex) });
-    }
+    boundaries.add(Math.max(0, Math.min(line.text.length, link.startIndex)));
+    boundaries.add(Math.max(0, Math.min(line.text.length, link.endIndex)));
+  }
+  const offsets = [...boundaries].sort((left, right) => left - right);
+  const chunks: TextChunk[] = [];
+  for (let index = 0; index < offsets.length - 1; index += 1) {
+    const start = offsets[index]!;
+    const end = offsets[index + 1]!;
+    if (end <= start) continue;
+    const link = links.find((candidate) => start >= candidate.startIndex && start < candidate.endIndex);
     chunks.push({
       __isChunk: true,
-      text: line.text.slice(link.startIndex, link.endIndex),
-      link: { url: fileUrlWithPosition(link.target) },
+      text: line.text.slice(start, end),
+      ...(leadingAccent !== undefined && start < leadingAccent.length
+        ? { fg: RGBA.fromHex(leadingAccent.fg) }
+        : {}),
+      ...(link === undefined ? {} : { link: { url: fileUrlWithPosition(link.target) } }),
     });
-    index = link.endIndex;
   }
-  if (index < line.text.length) chunks.push({ __isChunk: true, text: line.text.slice(index) });
   return new StyledText(chunks);
+}
+
+function normalizedLeadingAccent(accent: LeadingAccent, textLength: number): LeadingAccent | undefined {
+  if (!Number.isFinite(accent.length)) return undefined;
+  const length = Math.max(0, Math.min(textLength, Math.floor(accent.length)));
+  return length === 0 ? undefined : { length, fg: accent.fg };
+}
+
+function displayWidth(value: string): number {
+  return [...value].reduce((total, char) => total + charDisplayWidth(char), 0);
+}
+
+function clippedOmissionText(hiddenCount: number, canCountExactly: boolean, width?: number): string {
+  const line = canCountExactly
+    ? `… +${hiddenCount} lines (${TRANSCRIPT_HINT})`
+    : `… output truncated (${TRANSCRIPT_HINT})`;
+  return formatTranscriptOmissionLine(line, width);
+}
+
+function clipPreviouslyTruncatedRows(
+  rows: readonly TranscriptLineModel[],
+  budget: number,
+  existingOmissionIndex: number,
+  key: string,
+  fg: string,
+  width?: number,
+): { lines: TranscriptLineModel[]; truncated: true } {
+  const omission = {
+    key: `${key}:omitted`,
+    text: clippedOmissionText(0, false, width),
+    fg,
+  };
+  if (budget === 1) return { lines: [omission], truncated: true };
+
+  const contentRows = rows.filter((row) => !isTranscriptOmissionLine(row.text));
+  const contentBudget = budget - 1;
+  if (existingOmissionIndex === 0) {
+    return { lines: [omission, ...contentRows.slice(-contentBudget)], truncated: true };
+  }
+  if (existingOmissionIndex === rows.length - 1) {
+    return { lines: [...contentRows.slice(0, contentBudget), omission], truncated: true };
+  }
+
+  const headCount = Math.ceil(contentBudget / 2);
+  const tailCount = contentBudget - headCount;
+  return {
+    lines: [
+      ...contentRows.slice(0, headCount),
+      omission,
+      ...(tailCount > 0 ? contentRows.slice(-tailCount) : []),
+    ],
+    truncated: true,
+  };
 }
