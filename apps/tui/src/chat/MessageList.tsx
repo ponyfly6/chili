@@ -149,6 +149,7 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, 
     const lines = assistantTextCellLines({
       key,
       text: item.text,
+      phase: item.phase,
       streaming: item.streaming === true,
       width,
       theme,
@@ -160,6 +161,7 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, 
         <AssistantMarkdownCell
           cellKey={key}
           text={item.text}
+          phase={item.phase}
           streaming={item.streaming === true}
           width={width}
           theme={theme}

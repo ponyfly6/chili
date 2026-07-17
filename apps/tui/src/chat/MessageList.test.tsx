@@ -165,7 +165,7 @@ test("streaming assistant text does not prematurely close unfinished code fences
 
   expect(frame).toContain("Intro");
   expect(frame).toContain("const ok");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
   expect(occurrences(frame, "```")).toBe(0);
 });
 
@@ -235,7 +235,7 @@ test("hidden thinking masks intermediate assistant text before tool calls", asyn
       createdAt: 1,
       parts: [
         { type: "reasoning", id: "part_hidden_reasoning" as PartId, text: "deciding which file to inspect" },
-        { type: "text", id: "part_hidden_text" as PartId, text: "Let me inspect the prompt handling." },
+        { type: "text", id: "part_hidden_text" as PartId, text: "Let me inspect the prompt handling.", phase: "commentary" },
         {
           type: "tool_call",
           id: "part_hidden_call" as PartId,
@@ -254,7 +254,7 @@ test("hidden thinking masks intermediate assistant text before tool calls", asyn
   expect(occurrences(frame, "🫧")).toBe(1);
   expect(frame).toContain("Read ChatShellApp.tsx");
   expect(frame).not.toContain("deciding which file");
-  expect(frame).not.toContain("🌶️: Let me inspect");
+  expect(frame).not.toContain("↳ Let me inspect");
 });
 
 test("hidden thinking masks live assistant text before a tool call arrives", async () => {
@@ -265,13 +265,13 @@ test("hidden thinking masks live assistant text before a tool call arrives", asy
       role: "assistant",
       createdAt: 1,
       parts: [
-        { type: "text", id: "part_live_trace_hidden" as PartId, text: "Let me inspect the prompt handling." },
+        { type: "text", id: "part_live_trace_hidden" as PartId, text: "Let me inspect the prompt handling.", phase: "commentary" },
       ],
     },
   ], { hideThinking: true, status: "running" });
 
   expect(frame).toContain("🫧 thinking...");
-  expect(frame).not.toContain("🌶️: Let me inspect");
+  expect(frame).not.toContain("↳ Let me inspect");
 });
 
 test("hidden thinking shows completed assistant text without tool calls", async () => {
@@ -282,13 +282,35 @@ test("hidden thinking shows completed assistant text without tool calls", async 
       role: "assistant",
       createdAt: 1,
       parts: [
-        { type: "text", id: "part_final_answer_visible" as PartId, text: "Final answer is visible." },
+        { type: "text", id: "part_final_answer_visible" as PartId, text: "Final answer is visible.", phase: "final_answer" },
       ],
     },
   ], { hideThinking: true, status: "idle" });
 
   expect(frame).toContain("Final answer is visible.");
   expect(frame).not.toContain("🫧 thinking...");
+});
+
+test("assistant phases render distinct prefixes in transcript order", async () => {
+  const frame = await renderMessageList([{
+    id: "msg_phase_prefixes" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    completedAt: 2,
+    parts: [
+      { type: "text", id: "part_prefix_commentary" as PartId, text: "Checking files.", phase: "commentary" },
+      { type: "text", id: "part_prefix_unclassified" as PartId, text: "Provider text." },
+      { type: "text", id: "part_prefix_final" as PartId, text: "Done.", phase: "final_answer" },
+    ],
+  }]);
+
+  expect(frame).toContain("↳ Checking files.");
+  expect(frame).toContain("Assistant: Provider text.");
+  expect(frame).toContain("🌶️: Done.");
+  expect(occurrences(frame, "🌶️:")).toBe(1);
+  expect(frame.indexOf("↳ Checking files.")).toBeLessThan(frame.indexOf("Assistant: Provider text."));
+  expect(frame.indexOf("Assistant: Provider text.")).toBeLessThan(frame.indexOf("🌶️: Done."));
 });
 
 test("streaming markdown keeps the last growing block active", () => {
@@ -346,7 +368,7 @@ test("completed assistant markdown keeps block rendering", async () => {
   expect(frame).toContain("# Done");
   expect(frame).toContain("- ship it");
   expect(frame).toContain("const ok = true;");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
   expect(frame).not.toContain("```ts");
 });
 
@@ -375,7 +397,7 @@ test("assistant markdown table uses native table rendering in the message list",
   expect(frame).toContain("│Name");
   expect(frame).toContain("│alpha");
   expect(frame).not.toContain("│ Name");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
   expect(frame).not.toContain("| ---");
 });
 
@@ -401,7 +423,7 @@ test("streaming assistant markdown table uses native table rendering", async () 
   expect(frame).toContain("Clear");
   expect(frame).toContain("┌");
   expect(frame).toContain("┬");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
   expect(frame).not.toContain("| ---");
 });
 
@@ -434,7 +456,7 @@ test("assistant markdown tables with dotted names and package scopes stay native
   expect(frame).toContain("@pondwader/socks5-server");
   expect(frame).toContain("┌");
   expect(frame).toContain("┬");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
   expect(frame).not.toContain("| ---");
 });
 
@@ -604,7 +626,7 @@ test("assistant tool parts stay out of default chat text while tool rows render 
 
   expect(frame).toContain("Done with");
   expect(frame).toContain("tests");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
   expect(frame).toContain("Ran bun test");
   expect(occurrences(frame, "Ran bun test")).toBe(1);
   expect(frame).not.toContain("tool_call");

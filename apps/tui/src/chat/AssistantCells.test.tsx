@@ -12,6 +12,72 @@ import type { TranscriptLineModel } from "./lines.js";
 
 const theme = resolveTuiTheme("chili-dark", {});
 
+test("assistant phase selects one exact prefix and foreground treatment", () => {
+  const base = {
+    text: "Status update",
+    streaming: false,
+    width: 80,
+    theme,
+  };
+  const commentary = assistantTextCellLines({ ...base, key: "assistant:commentary", phase: "commentary" });
+  const finalAnswer = assistantTextCellLines({ ...base, key: "assistant:final", phase: "final_answer" });
+  const unclassified = assistantTextCellLines({ ...base, key: "assistant:unclassified" });
+
+  expect(commentary[0]?.text).toBe("↳ Status update");
+  expect(finalAnswer[0]?.text).toBe("🌶️: Status update");
+  expect(unclassified[0]?.text).toBe("Assistant: Status update");
+  expect(commentary.every((line) => line.fg === theme.colors.text.muted)).toBe(true);
+  expect(finalAnswer[0]?.fg).toBe(theme.colors.text.secondary);
+  expect(unclassified[0]?.fg).toBe(theme.colors.text.secondary);
+  expect(commentary.some((line) => line.text.includes("🌶️"))).toBe(false);
+  expect(unclassified.some((line) => line.text.includes("🌶️"))).toBe(false);
+});
+
+test("assistant markdown component uses the same phase prefix and foreground mapping", () => {
+  const commentary = AssistantMarkdownCell({
+    cellKey: "assistant:commentary-component",
+    text: "Checking files.",
+    phase: "commentary",
+    streaming: false,
+    width: 80,
+    theme,
+    fallbackLines: [],
+  });
+  const finalAnswer = AssistantMarkdownCell({
+    cellKey: "assistant:final-component",
+    text: "Done.",
+    phase: "final_answer",
+    streaming: false,
+    width: 80,
+    theme,
+    fallbackLines: [],
+  });
+  const unclassified = AssistantMarkdownCell({
+    cellKey: "assistant:unclassified-component",
+    text: "Provider text.",
+    streaming: false,
+    width: 80,
+    theme,
+    fallbackLines: [],
+  });
+
+  expect(findIntrinsicElement(commentary, "text")?.props).toMatchObject({
+    children: "↳ ",
+    fg: theme.colors.text.muted,
+  });
+  expect(findIntrinsicElement(commentary, "markdown")?.props.fg).toBe(theme.colors.text.muted);
+  expect(findIntrinsicElement(finalAnswer, "text")?.props).toMatchObject({
+    children: "🌶️: ",
+    fg: theme.colors.text.secondary,
+  });
+  expect(findIntrinsicElement(finalAnswer, "markdown")?.props.fg).toBe(theme.colors.text.secondary);
+  expect(findIntrinsicElement(unclassified, "text")?.props).toMatchObject({
+    children: "Assistant: ",
+    fg: theme.colors.text.secondary,
+  });
+  expect(findIntrinsicElement(unclassified, "markdown")?.props.fg).toBe(theme.colors.text.secondary);
+});
+
 test("assistant text cell lines keep completed markdown output", async () => {
   const lines = assistantTextCellLines({
     key: "assistant:completed",
@@ -72,7 +138,7 @@ test("assistant markdown cell renders native heading list code diff and quote bl
   expect(frame).toContain("-old");
   expect(frame).toContain("+new");
   expect(frame).toContain("> compact by default");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
   expect(frame).not.toContain("```ts");
   expect(frame).not.toContain("```diff");
 });
@@ -102,7 +168,7 @@ test("assistant markdown cell keeps OpenTUI markdown as the native render path",
     fg: theme.colors.text.secondary,
     wrapMode: "none",
   });
-  expect(prefix?.props.children).toBe("🌶️: ");
+  expect(prefix?.props.children).toBe("Assistant: ");
   expect(markdown?.props).toMatchObject({
     content: text,
     width: "100%",
@@ -181,7 +247,7 @@ test("assistant markdown cell renders compact native table while partial fallbac
   });
   const fallbackText = fallbackLines.map((line) => line.text).join("\n");
 
-  expect(fallbackText).toContain("🌶️: | Name");
+  expect(fallbackText).toContain("Assistant: | Name");
   expect(fallbackText).toContain("| alpha");
   expect(fallbackText).not.toContain("┌");
   expect(frame).toContain("Name");
@@ -192,7 +258,7 @@ test("assistant markdown cell renders compact native table while partial fallbac
   expect(frame).toContain("│Name");
   expect(frame).toContain("│alpha");
   expect(frame).not.toContain("│ Name");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
   expect(frame).not.toContain(":---");
 });
 
@@ -225,7 +291,7 @@ test("assistant markdown native table stays readable with narrow CJK and long ce
   expect(frame).toContain("┌");
   expect(frame).toContain("│名称");
   expect(frame).toContain("│火锅");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
 });
 
 test("assistant markdown compact table conceals inline markdown markers", async () => {
@@ -259,7 +325,7 @@ test("assistant markdown compact table conceals inline markdown markers", async 
   expect(frame).not.toContain("**CLI 命令**");
   expect(frame).not.toContain("`srt`");
   expect(frame).not.toContain("`src/cli.ts`");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
 });
 
 test("assistant text cell lines keep streaming stable and tail rendering", () => {
@@ -294,7 +360,7 @@ test("assistant text cell lines keep unfinished streaming code fences open", asy
   });
   const text = lineText(lines).join("\n");
 
-  expect(text).toContain("🌶️: Intro");
+  expect(text).toContain("Assistant: Intro");
   expect(text).toContain("```ts");
   expect(text).toContain("const ok");
   expect(occurrences(text, "```")).toBe(1);
@@ -309,7 +375,7 @@ test("assistant text cell lines keep unfinished streaming code fences open", asy
 
   expect(frame).toContain("Intro");
   expect(frame).toContain("const ok");
-  expect(frame).toContain("🌶️:");
+  expect(frame).toContain("Assistant:");
   expect(occurrences(frame, "```")).toBe(0);
 });
 
@@ -408,7 +474,7 @@ test("assistant markdown component full render stays rich while partial slices u
   expect(fullFrame).toContain("# Rich visible");
   expect(fullFrame).toContain("- rendered component");
   expect(fullFrame).not.toContain("FALLBACK");
-  expect(fullFrame).toContain("🌶️:");
+  expect(fullFrame).toContain("Assistant:");
   expect(partialFrame).toContain("FALLBACK three");
   expect(partialFrame).not.toContain("# Rich visible");
 });
