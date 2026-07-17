@@ -37,6 +37,39 @@ test("context builder uses the latest compaction message as replacement history"
   expect(built.usage.omittedMessages).toBe(2);
 });
 
+test("context builder snapshots assistant text phases", () => {
+  const sessionId = "session_phase_snapshot" as SessionId;
+  const messageId = "msg_phase_snapshot" as MessageId;
+  const message: Message = {
+    id: messageId,
+    sessionId,
+    role: "assistant",
+    createdAt: 1 as TimestampMs,
+    parts: [
+      {
+        id: "part_phase_snapshot_commentary" as MessagePart["id"],
+        messageId,
+        sessionId,
+        type: "text",
+        text: "Checking.",
+        phase: "commentary",
+      },
+      {
+        id: "part_phase_snapshot_final" as MessagePart["id"],
+        messageId,
+        sessionId,
+        type: "text",
+        text: "Done.",
+        phase: "final_answer",
+      },
+    ],
+  };
+
+  const built = new ContextWindowBuilder({ maxInputChars: 10_000 }).build([message]);
+
+  expect(built.messages[0]?.parts).toEqual(message.parts);
+});
+
 test("compacted message view reorders appended summary before retained messages", () => {
   const sessionId = "session_compacted_order" as SessionId;
   const oldUser = textMessage("msg_order_old_user", sessionId, "user", "old request");

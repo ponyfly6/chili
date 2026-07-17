@@ -31,18 +31,23 @@ function messageLines(item: Extract<ChatTranscriptItem, { kind: "message" }>, is
   appendOptionalField(lines, `message:${item.id}`, "completedAt", item.completedAt === undefined ? undefined : String(item.completedAt));
 
   for (const [partIndex, part] of item.parts.entries()) {
-    lines.push(...messagePartLines(item.id, part, partIndex));
+    lines.push(...messagePartLines(item.id, item.role, part, partIndex));
   }
   if (!isLast) lines.push(sourceLine(`message:${item.id}:spacer`, "", "muted"));
   return lines;
 }
 
-function messagePartLines(messageId: string, part: ChatMessagePart, index: number): TranscriptSourceLine[] {
+function messagePartLines(
+  messageId: string,
+  role: Extract<ChatTranscriptItem, { kind: "message" }>["role"],
+  part: ChatMessagePart,
+  index: number,
+): TranscriptSourceLine[] {
   const key = `message:${messageId}:part:${part.id}:${index}`;
   if (part.type === "text") {
     return blockLines({
       key,
-      label: `  part text ${part.id} phase=${part.phase ?? "unclassified"}`,
+      label: `  part text ${part.id}${role === "assistant" ? ` phase=${part.phase ?? "unclassified"}` : ""}`,
       value: part.text,
       tone: "text",
       valueTone: "text",

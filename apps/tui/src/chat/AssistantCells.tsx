@@ -77,7 +77,9 @@ export function AssistantMarkdownCell(props: {
             borders: true,
             outerBorder: true,
             borderStyle: "single",
-            borderColor: props.theme.colors.border.default,
+            borderColor: presentation.tone === "muted"
+              ? props.theme.colors.text.muted
+              : props.theme.colors.border.default,
             selectable: true,
           }}
         />

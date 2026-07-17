@@ -740,6 +740,7 @@ function snapshotMessagePart(part: MessagePart): MessagePart {
       const snapshot: Extract<MessagePart, { type: "text" }> = { ...base, type: "text", text: part.text };
       if (part.displayText !== undefined) snapshot.displayText = part.displayText;
       if (part.synthetic !== undefined) snapshot.synthetic = part.synthetic;
+      if (part.phase !== undefined) snapshot.phase = part.phase;
       return snapshot;
     }
     case "reasoning": {

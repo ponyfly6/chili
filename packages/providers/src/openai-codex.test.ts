@@ -598,6 +598,33 @@ for (const scenario of [
     ],
     error: "conflicting assistant phase for output index 1",
   },
+  {
+    name: "rejects a completed Codex message output item with no phase",
+    events: [
+      data({
+        type: "response.output_item.done",
+        output_index: 0,
+        item: { type: "message", id: "msg_done_missing" },
+      }),
+    ],
+    error: "missing assistant phase",
+  },
+  {
+    name: "rejects a completed Codex message output item whose phase conflicts with its declaration",
+    events: [
+      data({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "message", id: "msg_done_conflict", phase: "commentary" },
+      }),
+      data({
+        type: "response.output_item.done",
+        output_index: 0,
+        item: { type: "message", id: "msg_done_conflict", phase: "final_answer" },
+      }),
+    ],
+    error: "conflicting assistant phase for output index 0",
+  },
 ] as const) {
   test(scenario.name, async () => {
     const model = codexStreamModel(scenario.events);

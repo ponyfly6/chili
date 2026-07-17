@@ -425,6 +425,7 @@ export class SingleAgentRuntime implements AgentRunner {
       sessionId: input.sessionId,
       type: "text",
       text: `Model request failed: ${error.message}`,
+      synthetic: true,
     });
   }
 

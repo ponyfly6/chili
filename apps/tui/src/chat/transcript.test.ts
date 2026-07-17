@@ -22,3 +22,20 @@ test("diagnostic transcript labels every assistant text phase explicitly", () =>
   expect(transcript).toContain("part text part_transcript_final phase=final_answer:");
   expect(transcript).toContain("part text part_transcript_unclassified phase=unclassified:");
 });
+
+test("diagnostic transcript does not label user text with an assistant phase", () => {
+  const items: ChatTranscriptItem[] = [{
+    id: "message_transcript_user" as MessageId,
+    kind: "message",
+    role: "user",
+    createdAt: 1,
+    parts: [
+      { type: "text", id: "part_transcript_user" as PartId, text: "Hello." },
+    ],
+  }];
+
+  const transcript = buildTranscriptText(items);
+
+  expect(transcript).toContain("part text part_transcript_user:");
+  expect(transcript).not.toContain("part_transcript_user phase=");
+});

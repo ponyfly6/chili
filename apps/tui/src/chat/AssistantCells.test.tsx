@@ -195,6 +195,21 @@ test("assistant markdown cell keeps OpenTUI markdown as the native render path",
   expect(markdown?.props.renderNode).toBeFunction();
 });
 
+test("commentary markdown mutes native table borders", () => {
+  const element = AssistantMarkdownCell({
+    cellKey: "assistant:commentary-table",
+    text: "| Name | Count |\n| --- | ---: |\n| alpha | 7 |",
+    phase: "commentary",
+    streaming: false,
+    width: 72,
+    theme,
+    fallbackLines: [],
+  });
+  const markdown = findIntrinsicElement(element, "markdown");
+
+  expect(markdown?.props.tableOptions).toMatchObject({ borderColor: theme.colors.text.muted });
+});
+
 test("assistant fallback lines expose ctrl-click file link ranges", () => {
   const text = [
     "Changed [main file](src/main.ts:42) and [absolute](/repo/app.ts#L7C3).",

@@ -938,6 +938,77 @@ test("RuntimeService excludes cancelled prompt with no assistant output from sub
   }
 });
 
+test("RuntimeService excludes a failed prompt with only a synthetic error from subsequent model context", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-core-failed-prompt-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const registry = new InMemoryToolRegistry();
+  const createId = createSequentialId();
+  let now = 0;
+  const modelInputs: ModelStreamInput[] = [];
+  const model: ModelRouter = {
+    async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+      modelInputs.push(input);
+      if (modelInputs.length === 1) throw new Error("startup exploded");
+      yield { type: "text_delta", text: "ok" };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+    }),
+    retryPolicy: { maxAttempts: 1 },
+    createId,
+    now: () => ++now as TimestampMs,
+  });
+  const service = new RuntimeService({
+    runtime,
+    store,
+    cwd: "/repo",
+    createId,
+    now: () => ++now as TimestampMs,
+  });
+  const sessionId = "session_failed_prompt_context" as SessionId;
+  const threadId = "thread_failed_prompt_context" as ThreadId;
+
+  try {
+    const failedResult = await service.submitPrompt({
+      sessionId,
+      threadId,
+      text: "prompt that fails",
+    });
+    expect(failedResult.status).toBe("failed");
+
+    const completedResult = await service.submitPrompt({
+      sessionId,
+      threadId,
+      text: "prompt that succeeds",
+    });
+
+    expect(completedResult.status).toBe("completed");
+    expect(modelInputs).toHaveLength(2);
+    const secondContext = messageTextContent(modelInputs[1]?.messages ?? []);
+    expect(secondContext).not.toContain("prompt that fails");
+    expect(secondContext).not.toContain("Model request failed: startup exploded");
+    expect(secondContext).toContain("prompt that succeeds");
+
+    const transcript = await store.messages(sessionId);
+    expect(messageTextContent(transcript)).toContain("Model request failed: startup exploded");
+    const failurePart = transcript
+      .flatMap((message) => message.parts)
+      .find((part) => part.type === "text" && part.text.includes("startup exploded"));
+    expect(failurePart).toMatchObject({ type: "text", synthetic: true });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 class FakeAgentRunner implements AgentRunner {
   readonly createInputs: CreateSessionInput[] = [];
   readonly userMessages: AppendUserMessageInput[] = [];

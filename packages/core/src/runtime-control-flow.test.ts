@@ -485,6 +485,7 @@ test("surfaces model startup failures in the assistant message", async () => {
   expect(textParts(store).map((part) => part.text)).toContain(
     "Model request failed: Kimi provider requires MOONSHOT_API_KEY or KIMI_API_KEY",
   );
+  expect(textParts(store).find((part) => part.text.startsWith("Model request failed:"))?.synthetic).toBe(true);
 });
 
 test("suppresses MCP image understanding tools when direct image input is available", async () => {

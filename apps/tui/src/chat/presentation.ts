@@ -156,7 +156,6 @@ function messageDisplayItems(
   }
 
   const output: ChatDisplayItem[] = [];
-  const streamingTextPartIndex = streaming ? lastTextPartIndex(message.parts) : -1;
   const hideAssistantThinking = hideThinking && message.role === "assistant";
   let hiddenTraceShown = false;
   const showHiddenTrace = (active: boolean) => {
@@ -179,7 +178,7 @@ function messageDisplayItems(
           text: part.text,
           time: message.createdAt,
           ...(part.phase === undefined ? {} : { phase: part.phase }),
-          ...(index === streamingTextPartIndex ? { streaming: true } : {}),
+          ...(streaming ? { streaming: true } : {}),
         });
       }
       else output.push({ kind: "summary", id, text: `${message.role}: ${part.text}`, time: message.createdAt });
@@ -428,14 +427,7 @@ function streamingAssistantMessageId(items: readonly ChatTranscriptItem[], optio
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = items[index];
     if (item?.kind !== "message" || item.role !== "assistant" || item.completedAt !== undefined) continue;
-    if (lastTextPartIndex(item.parts) >= 0) return item.id;
+    if (item.parts.some((part) => part.type === "text")) return item.id;
   }
   return undefined;
-}
-
-function lastTextPartIndex(parts: readonly ChatMessagePart[]): number {
-  for (let index = parts.length - 1; index >= 0; index -= 1) {
-    if (parts[index]?.type === "text") return index;
-  }
-  return -1;
 }

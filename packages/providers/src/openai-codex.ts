@@ -353,13 +353,7 @@ export class OpenAICodexResponsesModel implements ChiliModel {
 
       if (payload.type === "response.output_item.added" && payload.item) {
         if (payload.item.type === "message") {
-          const index = requireCodexMessageOutputIndex(payload.output_index);
-          const phase = requireCodexAssistantPhase(payload.item.phase, index);
-          const existing = messagePhases.get(index);
-          if (existing !== undefined && existing !== phase) {
-            throw new Error(`OpenAI Codex stream has conflicting assistant phase for output index ${index}`);
-          }
-          messagePhases.set(index, phase);
+          recordCodexAssistantPhase(messagePhases, payload.output_index, payload.item.phase);
         }
         if (payload.item.type === "function_call") {
           sawToolCall = true;
@@ -412,6 +406,9 @@ export class OpenAICodexResponsesModel implements ChiliModel {
       }
 
       if (payload.type === "response.output_item.done" && payload.item) {
+        if (payload.item.type === "message") {
+          recordCodexAssistantPhase(messagePhases, payload.output_index, payload.item.phase);
+        }
         if (payload.item.type === "function_call") {
           const state = findToolState(toolCalls, payload, activeToolKey) ?? createToolState(payload.item, payload.output_index);
           if (payload.item.name) state.name = payload.item.name;
@@ -664,6 +661,20 @@ function requireCodexAssistantPhase(phase: string | undefined, index: number): A
     throw new Error(`OpenAI Codex message output index ${index} has invalid assistant phase ${JSON.stringify(phase)}`);
   }
   return phase;
+}
+
+function recordCodexAssistantPhase(
+  phases: Map<number, AssistantMessagePhase>,
+  outputIndex: number | undefined,
+  rawPhase: string | undefined,
+): void {
+  const index = requireCodexMessageOutputIndex(outputIndex);
+  const phase = requireCodexAssistantPhase(rawPhase, index);
+  const existing = phases.get(index);
+  if (existing !== undefined && existing !== phase) {
+    throw new Error(`OpenAI Codex stream has conflicting assistant phase for output index ${index}`);
+  }
+  phases.set(index, phase);
 }
 
 function requireCodexHistoryPhase(phase: AssistantMessagePhase | undefined): AssistantMessagePhase {

@@ -114,6 +114,33 @@ test("preserves explicit assistant phases when commentary is visible", () => {
   ]);
 });
 
+test("marks every text part in the active assistant message as streaming", () => {
+  const display = buildChatDisplayItems([{
+    id: "msg_streaming_phases" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [
+      { type: "text", id: "part_streaming_commentary" as PartId, text: "Checking.", phase: "commentary" },
+      { type: "text", id: "part_streaming_final" as PartId, text: "Draft answer.", phase: "final_answer" },
+    ],
+  }], {
+    sessionStatus: "running",
+    activeToolCount: 0,
+  });
+
+  expect(display.filter((item) => item.kind === "assistant_text")).toEqual([
+    expect.objectContaining({
+      id: "msg_streaming_phases:part_streaming_commentary:0",
+      streaming: true,
+    }),
+    expect.objectContaining({
+      id: "msg_streaming_phases:part_streaming_final:1",
+      streaming: true,
+    }),
+  ]);
+});
+
 test("hideThinking hides commentary but keeps the final answer beside tool calls", () => {
   const callId = "tool_phase_visibility" as ToolCallId;
   const display = buildChatDisplayItems([{
