@@ -42,7 +42,7 @@ function messagePartLines(messageId: string, part: ChatMessagePart, index: numbe
   if (part.type === "text") {
     return blockLines({
       key,
-      label: `  part text ${part.id}`,
+      label: `  part text ${part.id} phase=${part.phase ?? "unclassified"}`,
       value: part.text,
       tone: "text",
       valueTone: "text",
