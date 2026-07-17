@@ -1181,7 +1181,12 @@ test("/thinking hide and show toggle reasoning visibility", async () => {
             createdAt: 1,
             parts: [
               { type: "reasoning", id: "part_reasoning_toggle" as PartId, text: "checking private chain" },
-              { type: "text", id: "part_intermediate_toggle" as PartId, text: "Let me inspect private chain." },
+              {
+                type: "text",
+                id: "part_intermediate_toggle" as PartId,
+                text: "Let me inspect private chain.",
+                phase: "commentary",
+              },
               {
                 type: "tool_call",
                 id: "part_call_toggle" as PartId,
@@ -1199,7 +1204,7 @@ test("/thinking hide and show toggle reasoning visibility", async () => {
             role: "assistant",
             createdAt: 2,
             parts: [
-              { type: "text", id: "part_answer_toggle" as PartId, text: "done" },
+              { type: "text", id: "part_answer_toggle" as PartId, text: "done", phase: "final_answer" },
             ],
           },
         ],
@@ -1950,7 +1955,12 @@ test("left double click selects a wrapped assistant markdown word", async () => 
             role: "assistant",
             createdAt: 1,
             parts: [
-              { type: "text", id: "part_assistant_wrapped_double_click" as PartId, text: `Token ${word} done` },
+              {
+                type: "text",
+                id: "part_assistant_wrapped_double_click" as PartId,
+                text: `Token ${word} done`,
+                phase: "final_answer",
+              },
             ],
           },
         ],
@@ -2000,7 +2010,12 @@ test("left double click selects only a final assistant markdown word", async () 
             role: "assistant",
             createdAt: 1,
             parts: [
-              { type: "text", id: "part_assistant_final_word_double_click" as PartId, text: `英文：\n${sentence}` },
+              {
+                type: "text",
+                id: "part_assistant_final_word_double_click" as PartId,
+                text: `英文：\n${sentence}`,
+                phase: "final_answer",
+              },
             ],
           },
         ],
