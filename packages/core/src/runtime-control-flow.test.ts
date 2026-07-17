@@ -254,6 +254,58 @@ test("keeps indexed reasoning sections in separate message parts", async () => {
   ]);
 });
 
+test("keeps indexed assistant phases in separate text parts", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "text_delta", index: 0, phase: "commentary", text: "Checking " };
+      yield { type: "text_delta", index: 2, phase: "final_answer", text: "Done." };
+      yield { type: "text_delta", index: 0, phase: "commentary", text: "files." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_text_phases" as SessionId,
+    threadId: "thread_text_phases" as ThreadId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(textParts(store).map((part) => ({ text: part.text, phase: part.phase }))).toEqual([
+    { text: "Checking files.", phase: "commentary" },
+    { text: "Done.", phase: "final_answer" },
+  ]);
+});
+
+test("fails when one assistant text index changes phase", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "text_delta", index: 0, phase: "commentary", text: "Working" };
+      yield { type: "text_delta", index: 0, phase: "final_answer", text: "Done" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({
+    sessionId: "session_phase_conflict" as SessionId,
+    threadId: "thread_phase_conflict" as ThreadId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("failed");
+  if (result.status === "failed") {
+    expect(result.error.message).toContain("assistant text index 0 changed phase from commentary to final_answer");
+  }
+  expect(textParts(store).map((part) => ({ text: part.text, phase: part.phase }))).toEqual([
+    { text: "Working", phase: "commentary" },
+  ]);
+});
+
 test("does not execute tool calls from output-limited model responses", async () => {
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();

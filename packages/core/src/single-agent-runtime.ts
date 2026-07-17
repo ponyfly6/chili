@@ -1,4 +1,5 @@
 import type {
+  AssistantMessagePhase,
   ChiliEvent,
   EventEnvelope,
   Message,
@@ -76,7 +77,7 @@ interface StreamingToolCall {
 }
 
 interface AssistantStreamState {
-  textPartId?: PartId;
+  textParts: Map<number, { partId: PartId; phase?: AssistantMessagePhase }>;
   reasoningPartIds: Map<number, PartId>;
   toolCalls: PendingToolCall[];
   streamingToolCalls: Map<string, StreamingToolCall>;
@@ -459,6 +460,7 @@ export class SingleAgentRuntime implements AgentRunner {
       let assistantMutated = false;
       let latestUsage: ModelUsage | undefined;
       const state: AssistantStreamState = {
+        textParts: new Map(),
         reasoningPartIds: new Map(),
         toolCalls: [],
         streamingToolCalls: new Map(),
@@ -468,7 +470,7 @@ export class SingleAgentRuntime implements AgentRunner {
           if (input.signal?.aborted) throw abortError("Turn aborted");
           if (event.type === "text_delta") {
             assistantMutated = true;
-            await this.appendTextDelta(input, assistantMessageId, state, event.text);
+            await this.appendTextDelta(input, assistantMessageId, state, event.text, event.index, event.phase);
             continue;
           }
 
@@ -727,20 +729,31 @@ export class SingleAgentRuntime implements AgentRunner {
     assistantMessageId: MessageId,
     state: AssistantStreamState,
     text: string,
+    index?: number,
+    phase?: AssistantMessagePhase,
   ): Promise<void> {
-    if (!state.textPartId) {
-      state.textPartId = this.id<PartId>("part");
+    const textIndex = index ?? 0;
+    const existing = state.textParts.get(textIndex);
+    if (!existing) {
+      const partId = this.id<PartId>("part");
+      state.textParts.set(textIndex, { partId, ...(phase === undefined ? {} : { phase }) });
       await this.appendPart(input, assistantMessageId, {
-        id: state.textPartId,
+        id: partId,
         messageId: assistantMessageId,
         sessionId: input.sessionId,
         type: "text",
         text,
+        ...(phase === undefined ? {} : { phase }),
       });
       return;
     }
 
-    await this.appendPartDelta(input, assistantMessageId, state.textPartId, "text", text);
+    if (existing.phase !== phase) {
+      throw new Error(
+        `Model assistant text index ${textIndex} changed phase from ${String(existing.phase)} to ${String(phase)}`,
+      );
+    }
+    await this.appendPartDelta(input, assistantMessageId, existing.partId, "text", text);
   }
 
   private async appendReasoningDelta(
