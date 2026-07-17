@@ -20,6 +20,41 @@ import type {
 import { ObservableEventStore } from "./observable-event-store.js";
 import { SqliteEventStore } from "./sqlite-event-store.js";
 
+test("round-trips assistant text phase without transforming the event payload", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-assistant-phase-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const sessionId = "session_assistant_phase" as SessionId;
+  const threadId = "thread_assistant_phase" as ThreadId;
+  const messageId = "message_assistant_phase" as MessageId;
+  const partId = "part_assistant_phase" as PartId;
+  const event: ChiliEvent = {
+    id: "event_assistant_phase",
+    type: "message.part_added",
+    time: 1 as TimestampMs,
+    sessionId,
+    threadId,
+    payload: {
+      messageId,
+      part: {
+        id: partId,
+        messageId,
+        sessionId,
+        type: "text",
+        text: "Checking the repository.",
+        phase: "commentary",
+      },
+    },
+  };
+
+  try {
+    await store.append(event);
+    expect(await store.events({ sessionId, limit: 10 })).toEqual([event]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("configures SQLite for bounded WAL maintenance", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-wal-pragmas-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));

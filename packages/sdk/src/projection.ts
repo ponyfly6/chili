@@ -4,6 +4,7 @@ import type {
   AgentTaskMode,
   ApprovalId,
   ApprovalDecisionAction,
+  AssistantMessagePhase,
   ChiliEvent,
   EventEnvelope,
   MessageId,
@@ -653,7 +654,7 @@ export interface ChatMessageRow {
 }
 
 export type ChatMessagePart =
-  | { type: "text"; id: PartId; text: string; rawText?: string; synthetic?: boolean }
+  | { type: "text"; id: PartId; text: string; phase?: AssistantMessagePhase; rawText?: string; synthetic?: boolean }
   | { type: "image"; id: PartId; mimeType: string; filename?: string; sourcePath?: string; displayText?: string }
   | { type: "reasoning"; id: PartId; text: string; redacted?: boolean }
   | { type: "tool_call"; id: PartId; callId: ToolCallId; toolName: string; status: ToolPartStatus; input?: unknown; displayStatus?: ChatToolDisplayStatus }
@@ -1272,6 +1273,7 @@ function chatMessagePart(part: MessagePart): ChatMessagePart {
   if (part.type === "text") {
     const output: ChatMessagePart = { type: "text", id: part.id, text: part.displayText ?? part.text };
     if (part.displayText && part.displayText !== part.text) output.rawText = part.text;
+    assignOptional(output, "phase", part.phase);
     assignOptional(output, "synthetic", part.synthetic);
     return output;
   }

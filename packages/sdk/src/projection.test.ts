@@ -29,6 +29,96 @@ import {
 } from "./client.js";
 import { chatSessionView, createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, sessionMessages, teamLiveCockpit, teamLiveView, type ChatTranscriptItem } from "./projection.js";
 
+test("projects exact assistant text phases without classifying missing metadata", () => {
+  const sessionId = "session_project_phases" as SessionId;
+  const threadId = "thread_project_phases" as ThreadId;
+  const messageId = "message_project_phases" as MessageId;
+  const commentaryPartId = "part_project_commentary" as PartId;
+  const finalPartId = "part_project_final" as PartId;
+  const unclassifiedPartId = "part_project_unclassified" as PartId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_project_phase_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_project_phase_message",
+      type: "message.created",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId, role: "assistant" },
+    },
+    {
+      id: "event_project_phase_commentary",
+      type: "message.part_added",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        messageId,
+        part: {
+          id: commentaryPartId,
+          messageId,
+          sessionId,
+          type: "text",
+          text: "Checking.",
+          phase: "commentary",
+        },
+      },
+    },
+    {
+      id: "event_project_phase_final",
+      type: "message.part_added",
+      time: 4 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        messageId,
+        part: {
+          id: finalPartId,
+          messageId,
+          sessionId,
+          type: "text",
+          text: "Done.",
+          phase: "final_answer",
+        },
+      },
+    },
+    {
+      id: "event_project_phase_unclassified",
+      type: "message.part_added",
+      time: 5 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        messageId,
+        part: {
+          id: unclassifiedPartId,
+          messageId,
+          sessionId,
+          type: "text",
+          text: "Legacy provider text.",
+        },
+      },
+    },
+  ], createRuntimeView());
+
+  const assistant = chatSessionView(view, { sessionId, threadId }).items.find(
+    (item) => item.kind === "message" && item.role === "assistant",
+  );
+
+  expect(assistant?.kind === "message" ? assistant.parts : []).toEqual([
+    { type: "text", id: commentaryPartId, text: "Checking.", phase: "commentary" },
+    { type: "text", id: finalPartId, text: "Done.", phase: "final_answer" },
+    { type: "text", id: unclassifiedPartId, text: "Legacy provider text." },
+  ]);
+});
+
 test("replays session, message, tool, and approval events into a runtime view", () => {
   const sessionId = "session_test" as SessionId;
   const threadId = "thread_test" as ThreadId;
