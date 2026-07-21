@@ -334,6 +334,7 @@ function cloneModelDescriptor(model: ModelDescriptor): ModelDescriptor {
     };
   }
   if (model.inputCapabilities) clone.inputCapabilities = [...model.inputCapabilities];
+  if (model.reasoningLevels) clone.reasoningLevels = [...model.reasoningLevels];
   if (model.cost) clone.cost = { ...model.cost };
   return clone;
 }

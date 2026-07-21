@@ -336,7 +336,9 @@ function applyReasoningOptions(
   ) return;
   body.thinking = { type: reasoning ? "enabled" : "disabled" };
   if (reasoning && compatibility.supportsReasoningEffort) {
-    const requestedEffort = reasoningEffort ?? (compatibility.reasoningParameterStyle === "deepseek" ? "high" : undefined);
+    const requestedEffort = reasoningEffort === "ultra"
+      ? "max"
+      : reasoningEffort ?? (compatibility.reasoningParameterStyle === "deepseek" ? "high" : undefined);
     if (requestedEffort) {
       body.reasoning_effort = compatibility.reasoningEffortMap[requestedEffort] ?? requestedEffort;
     }

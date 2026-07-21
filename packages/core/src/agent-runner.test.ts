@@ -442,6 +442,93 @@ test("RuntimeService inspectPrompt includes conversation context as a prompt fra
   expect(runner.turnInputs).toEqual([]);
 });
 
+test("RuntimeService injects proactive delegation guidance for ultra reasoning", async () => {
+  const runner = new FakeAgentRunner();
+  const service = new RuntimeService({
+    runtime: runner,
+    store: new MemoryEventStore(),
+    cwd: "/repo",
+    defaultReasoningLevel: "ultra",
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const inspected = await service.inspectPrompt({
+    sessionId: "session_ultra_prompt" as SessionId,
+    threadId: "thread_ultra_prompt" as ThreadId,
+    cwd: "/repo",
+    includeContent: true,
+  });
+
+  expect(inspected.fragments.find((fragment) => fragment.id === "chili.reasoning.ultra")).toMatchObject({
+    layer: "developer",
+    lifecycle: "turn",
+  });
+  expect(inspected.fragments.find((fragment) => fragment.id === "chili.reasoning.ultra")?.content).toContain(
+    "proactively delegate",
+  );
+});
+
+test("RuntimeService reports model-specific advanced reasoning levels", async () => {
+  const store = new MemoryEventStore();
+  const service = new RuntimeService({
+    runtime: new FakeAgentRunner(),
+    store,
+    cwd: "/repo",
+    defaultModelSelection: { provider: "openai-codex", model: "gpt-5.6-sol" },
+    defaultReasoningLevel: "ultra",
+    models: [
+      {
+        provider: "openai-codex",
+        model: "gpt-5.6-sol",
+        default: true,
+        reasoningLevels: ["off", "low", "medium", "high", "xhigh", "max", "ultra"],
+      },
+      {
+        provider: "openai-codex",
+        model: "gpt-5.6-luna",
+        reasoningLevels: ["off", "low", "medium", "high", "xhigh", "max"],
+      },
+    ],
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+  const sessionId = "session_reasoning_levels" as SessionId;
+  const threadId = "thread_reasoning_levels" as ThreadId;
+
+  const solConfig = await service.getModelConfig(sessionId);
+  expect(solConfig.availableReasoningLevels).toEqual([
+    "off",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+  ]);
+  expect(solConfig.reasoningLevel).toBe("ultra");
+  const lunaConfig = await service.setModel({
+    sessionId,
+    threadId,
+    modelSelection: { provider: "openai-codex", model: "gpt-5.6-luna" },
+  });
+  expect(lunaConfig.availableReasoningLevels).toEqual(["off", "low", "medium", "high", "xhigh", "max"]);
+  expect(lunaConfig.reasoningLevel).toBe("max");
+  expect((await store.events({ sessionId, type: "session.reasoning_changed" })).at(-1)?.payload).toMatchObject({
+    reasoningLevel: "max",
+  });
+
+  const requestedUltra = await service.setReasoning({
+    sessionId,
+    threadId,
+    reasoningLevel: "ultra",
+  });
+  expect(requestedUltra.reasoningLevel).toBe("max");
+
+  const inspected = await service.inspectPrompt({ sessionId, threadId, cwd: "/repo", includeContent: true });
+  expect(inspected.fragments.some((fragment) => fragment.id === "chili.reasoning.ultra")).toBe(false);
+});
+
 test("RuntimeService inspectPrompt only assembles prompt debug output", async () => {
   const store = new MemoryEventStore();
   const runner = new FakeAgentRunner();

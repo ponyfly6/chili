@@ -79,6 +79,17 @@ test("parses thinking and reasoning levels", () => {
     reasoningLevel: "xhigh",
     prompt: "hello",
   });
+  expect(parseArgs(["--model", "gpt-5.6-sol:max", "hello"])).toMatchObject({
+    command: "run",
+    model: "gpt-5.6-sol",
+    reasoningLevel: "max",
+    prompt: "hello",
+  });
+  expect(parseArgs(["--thinking", "ultra", "hello"])).toMatchObject({
+    command: "run",
+    reasoningLevel: "ultra",
+    prompt: "hello",
+  });
   expect(parseArgs(["--reasoning", "off", "hello"])).toMatchObject({
     command: "run",
     reasoningLevel: "off",

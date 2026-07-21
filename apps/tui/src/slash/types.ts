@@ -60,6 +60,7 @@ export interface SlashCommandContext {
   cwd?: string;
   modelSelection?: ModelSelection | undefined;
   reasoningLevel?: ReasoningLevel | undefined;
+  availableReasoningLevels?: readonly ReasoningLevel[] | undefined;
   serviceTier?: ServiceTier | undefined;
   modelCandidates?: readonly ModelCandidate[] | undefined;
   skills?: readonly SkillSummary[] | undefined;

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  getModelSelectionAvailableReasoningLevels,
   getProviderCatalogStatus,
   listKnownModels,
   listModelCatalog,
@@ -7,6 +8,8 @@ import {
   OPENAI_CODEX_PROVIDER_ID,
   parseModelSelectionPattern,
   resolveModelSelectionPattern,
+  supportsMaxReasoning,
+  supportsUltraReasoning,
   supportsXHighReasoning,
   ZAI_PROVIDER_ID,
 } from "./index.js";
@@ -30,12 +33,57 @@ test("parses provider/model patterns with optional reasoning suffixes", () => {
     reasoning: "low",
     thinking: "low",
   });
+
+  expect(parseModelSelectionPattern("openai-codex/gpt-5.6-sol:ultra")).toEqual({
+    provider: "openai-codex",
+    model: "gpt-5.6-sol",
+    reasoning: "ultra",
+    thinking: "ultra",
+  });
 });
 
 test("limits GPT xhigh reasoning detection to supported model generations", () => {
   expect(supportsXHighReasoning("gpt-5.5")).toBe(true);
   expect(supportsXHighReasoning("gpt-5.6-sol")).toBe(true);
   expect(supportsXHighReasoning("gpt-5.4")).toBe(false);
+});
+
+test("exposes GPT-5.6 advanced reasoning levels by model tier", () => {
+  expect(supportsMaxReasoning("gpt-5.6-sol")).toBe(true);
+  expect(supportsUltraReasoning("gpt-5.6-terra")).toBe(true);
+  expect(supportsUltraReasoning("gpt-5.6-luna")).toBe(false);
+  expect(getModelSelectionAvailableReasoningLevels({ provider: "openai-codex", model: "gpt-5.6-sol" })).toEqual([
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+  ]);
+  expect(getModelSelectionAvailableReasoningLevels({ provider: "openai-codex", model: "gpt-5.6-luna" })).toEqual([
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+  ]);
+  expect(getModelSelectionAvailableReasoningLevels({ provider: "openai-codex", model: "gpt-5.5" })).toEqual([
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+  ]);
+  expect(getModelSelectionAvailableReasoningLevels({
+    provider: "custom",
+    model: "custom-reasoner",
+    reasoningLevels: ["off", "low", "max"],
+  })).toEqual(["off", "low", "max"]);
 });
 
 test("catalog exposes configured Z.ai GLM-5.2", () => {

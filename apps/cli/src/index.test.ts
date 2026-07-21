@@ -25,6 +25,11 @@ test("CLI environment defaults accept OpenAI Codex aliases", () => {
   });
 });
 
+test("CLI environment defaults accept max and ultra reasoning", () => {
+  expect(cliEnvironmentDefaults({ CHILI_REASONING_LEVEL: "max" })).toEqual({ reasoningLevel: "max" });
+  expect(cliEnvironmentDefaults({ OPENAI_CODEX_REASONING_EFFORT: "ultra" })).toEqual({ reasoningLevel: "ultra" });
+});
+
 test("explicit CLI model ignores environment provider default", () => {
   expect(applyCliEnvironmentDefaults(
     { model: "fake" },

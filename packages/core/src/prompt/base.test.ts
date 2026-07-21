@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { DEFAULT_CHILI_BASE_PROMPT, chiliBasePromptFragment } from "./base.js";
+import { DEFAULT_CHILI_BASE_PROMPT, chiliBasePromptFragment, ultraReasoningPromptFragment } from "./base.js";
 
 test("default Chili base prompt covers core prompt behavior without growing too long", () => {
   expect(DEFAULT_CHILI_BASE_PROMPT).toContain("terminal-first coding agent");
@@ -34,4 +34,14 @@ test("chiliBasePromptFragment wraps the core base prompt", () => {
     lifecycle: "stable",
     content: DEFAULT_CHILI_BASE_PROMPT,
   });
+});
+
+test("ultraReasoningPromptFragment enables proactive subagent delegation", () => {
+  expect(ultraReasoningPromptFragment()).toMatchObject({
+    id: "chili.reasoning.ultra",
+    layer: "developer",
+    lifecycle: "turn",
+    trust: "system",
+  });
+  expect(ultraReasoningPromptFragment().content).toContain("proactively delegate");
 });

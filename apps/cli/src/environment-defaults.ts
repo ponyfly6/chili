@@ -62,10 +62,12 @@ function parseEnvironmentReasoningLevel(value: string): CliReasoningLevel {
     || value === "medium"
     || value === "high"
     || value === "xhigh"
+    || value === "max"
+    || value === "ultra"
   ) {
     return value;
   }
-  throw new Error("CHILI_REASONING_LEVEL must be off, minimal, low, medium, high, or xhigh");
+  throw new Error("CHILI_REASONING_LEVEL must be off, minimal, low, medium, high, xhigh, max, or ultra");
 }
 
 function parseEnvironmentServiceTier(value: string): ServiceTier {

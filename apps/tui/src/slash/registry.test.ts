@@ -231,6 +231,14 @@ test("resolves thinking slash command and completions", async () => {
     type: "set_reasoning",
     level: "xhigh",
   });
+  expect(await resolveSlashCommand(commands, "/thinking max")?.command.run(ctx, "max")).toEqual({
+    type: "set_reasoning",
+    level: "max",
+  });
+  expect(await resolveSlashCommand(commands, "/thinking ultra")?.command.run(ctx, "ultra")).toEqual({
+    type: "set_reasoning",
+    level: "ultra",
+  });
   expect(await resolveSlashCommand(commands, "/thinking hide")?.command.run(ctx, "hide")).toEqual({
     type: "set_hide_thinking",
     hidden: true,
@@ -252,8 +260,27 @@ test("resolves thinking slash command and completions", async () => {
   });
   expect(slashCompletions(commands, ctx, "/thinking h", 8).map((completion) => completion.value)).toContain("/thinking high");
   expect(slashCompletions(commands, ctx, "/thinking h", 8).map((completion) => completion.value)).toContain("/thinking hide");
+  expect(slashCompletions(commands, ctx, "/thinking m", 8).map((completion) => completion.value)).toContain("/thinking max");
+  expect(slashCompletions(commands, ctx, "/thinking u", 8).map((completion) => completion.value)).toContain("/thinking ultra");
   expect(slashCompletions(commands, ctx, "/hide", 8).map((completion) => completion.value)).toContain("/hide-thinking");
   expect(slashCompletions(commands, ctx, "/show", 8).map((completion) => completion.value)).toContain("/show-thinking");
+});
+
+test("limits thinking choices to levels advertised by the selected model", async () => {
+  const commands = createDefaultSlashCommands();
+  const ctx = {
+    model: {},
+    availableReasoningLevels: ["off", "low", "medium", "high", "xhigh", "max"],
+  } as unknown as SlashCommandContext;
+
+  expect(slashCompletions(commands, ctx, "/thinking u", 8).map((completion) => completion.value)).not.toContain(
+    "/thinking ultra",
+  );
+  expect(await resolveSlashCommand(commands, "/thinking ultra")?.command.run(ctx, "ultra")).toEqual({
+    type: "local_message",
+    level: "error",
+    text: "ultra reasoning is not available for the selected model",
+  });
 });
 
 test("resolves fast mode slash command and completions", async () => {

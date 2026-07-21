@@ -36,6 +36,7 @@ import {
   type PromptDebugManifest,
   type PromptFragment,
   type RenderedPromptFragment,
+  ultraReasoningPromptFragment,
 } from "./prompt/index.js";
 import { DEFAULT_GOAL_TOKEN_BUDGET, GoalService, type AccountGoalUsageResult } from "./goal.js";
 import type { AgentRunner, RunTurnInput, RunTurnResult } from "./runner.js";
@@ -245,13 +246,23 @@ export class RuntimeService {
   async setModel(input: SetRuntimeModelInput): Promise<RuntimeModelConfig> {
     const modelSelection = normalizeModelSelection(input.modelSelection);
     const state = await this.resolveSessionModelState(input.sessionId);
+    const previousReasoningLevel = state.reasoningLevel;
     state.modelSelection = modelSelection;
+    if (state.reasoningLevel !== undefined) {
+      state.reasoningLevel = await this.clampReasoningLevelForState(state, state.reasoningLevel);
+    }
     this.sessionModelState.set(input.sessionId, cloneSessionModelState(state));
     this.globalModelState = cloneSessionModelState(state);
     await this.append(input, "session.model_changed", {
       sessionId: input.sessionId,
       modelSelection,
     });
+    if (state.reasoningLevel !== undefined && state.reasoningLevel !== previousReasoningLevel) {
+      await this.append(input, "session.reasoning_changed", {
+        sessionId: input.sessionId,
+        reasoningLevel: state.reasoningLevel,
+      });
+    }
     await this.options.onModelChanged?.({
       sessionId: input.sessionId,
       ...(input.threadId ? { threadId: input.threadId } : {}),
@@ -265,12 +276,12 @@ export class RuntimeService {
       throw new Error(`Invalid reasoning level: ${input.reasoningLevel}`);
     }
     const state = await this.resolveSessionModelState(input.sessionId);
-    state.reasoningLevel = input.reasoningLevel;
+    state.reasoningLevel = await this.clampReasoningLevelForState(state, input.reasoningLevel);
     this.sessionModelState.set(input.sessionId, cloneSessionModelState(state));
     this.globalModelState = cloneSessionModelState(state);
     await this.append(input, "session.reasoning_changed", {
       sessionId: input.sessionId,
-      reasoningLevel: input.reasoningLevel,
+      reasoningLevel: state.reasoningLevel,
     });
     return this.buildModelConfig(input.sessionId, state);
   }
@@ -405,10 +416,12 @@ export class RuntimeService {
   async inspectPrompt(input: InspectPromptInput & { includeContent?: false | undefined }): Promise<PromptDebugManifest>;
   async inspectPrompt(input: InspectPromptInput): Promise<PromptDebugManifest | InspectPromptWithContentResult>;
   async inspectPrompt(input: InspectPromptInput): Promise<PromptDebugManifest | InspectPromptWithContentResult> {
+    const modelState = await this.resolveSessionModelState(input.sessionId);
     const prompt = await this.resolvePromptAssembly({
       sessionId: input.sessionId,
       threadId: input.threadId,
       cwd: input.cwd,
+      ...(modelState.reasoningLevel ? { reasoningLevel: modelState.reasoningLevel } : {}),
       ...(input.text !== undefined ? { turn: turnContext(input), previewTurnInConversation: true } : {}),
     });
     if (!input.includeContent) return prompt.debug;
@@ -471,6 +484,7 @@ export class RuntimeService {
           sessionId: promptInput.sessionId,
           threadId: promptInput.threadId,
           cwd,
+          ...(promptModelState.reasoningLevel ? { reasoningLevel: promptModelState.reasoningLevel } : {}),
           turn: turnContext(promptInput),
           extraFragments: [
             ...directImagePromptFragments(promptInput),
@@ -516,6 +530,7 @@ export class RuntimeService {
         sessionId: promptInput.sessionId,
         threadId: promptInput.threadId,
         cwd,
+        ...(promptModelState.reasoningLevel ? { reasoningLevel: promptModelState.reasoningLevel } : {}),
         turn: turnContext(promptInput),
         extraFragments: [
           ...directImagePromptFragments(promptInput),
@@ -637,6 +652,7 @@ export class RuntimeService {
         sessionId: args.input.sessionId,
         threadId: args.input.threadId,
         cwd: args.cwd,
+        ...(args.modelState.reasoningLevel ? { reasoningLevel: args.modelState.reasoningLevel } : {}),
         extraFragments: [
           ...directImagePromptFragments(args.input),
           ...pathImagePromptFragments(args.input),
@@ -887,6 +903,7 @@ export class RuntimeService {
     sessionId: SessionId;
     threadId: ThreadId;
     cwd: string;
+    reasoningLevel?: ReasoningLevel;
     turn?: RuntimePromptTurnContext;
     previewTurnInConversation?: boolean;
     extraFragments?: PromptFragment[];
@@ -901,6 +918,7 @@ export class RuntimeService {
     const conversation = await this.resolveConversationPromptFragment(input);
     return new PromptAssembler()
       .addMany(fragments)
+      .add(input.reasoningLevel === "ultra" ? ultraReasoningPromptFragment() : undefined)
       .add(goal ? goalStatusPromptFragment(goal) : undefined)
       .addMany(input.extraFragments)
       .add(conversation)
@@ -975,6 +993,9 @@ export class RuntimeService {
     if (input.serviceTier !== undefined) {
       if (!isServiceTier(input.serviceTier)) throw new Error(`Invalid service tier: ${input.serviceTier}`);
       state.serviceTier = input.serviceTier;
+    }
+    if (state.reasoningLevel !== undefined) {
+      state.reasoningLevel = await this.clampReasoningLevelForState(state, state.reasoningLevel);
     }
     return state;
   }
@@ -1052,6 +1073,9 @@ export class RuntimeService {
       }
     }
 
+    if (state.reasoningLevel !== undefined) {
+      state.reasoningLevel = await this.clampReasoningLevelForState(state, state.reasoningLevel);
+    }
     this.sessionModelState.set(sessionId, cloneSessionModelState(state));
     return state;
   }
@@ -1090,6 +1114,9 @@ export class RuntimeService {
       }
     }
 
+    if (state.reasoningLevel !== undefined) {
+      state.reasoningLevel = await this.clampReasoningLevelForState(state, state.reasoningLevel);
+    }
     this.globalModelState = cloneSessionModelState(state);
     return cloneSessionModelState(state);
   }
@@ -1098,10 +1125,16 @@ export class RuntimeService {
     sessionId: SessionId,
     state: RuntimeSessionModelState,
   ): Promise<RuntimeModelConfig> {
+    const models = await this.listModels();
+    const selectedModel = state.modelSelection
+      ? models.find(
+          (model) => model.provider === state.modelSelection?.provider && model.model === state.modelSelection.model,
+        )
+      : models.find((model) => model.default);
     const config: RuntimeModelConfig = {
       sessionId,
-      availableReasoningLevels: [...REASONING_LEVELS],
-      models: await this.listModels(),
+      availableReasoningLevels: [...runtimeModelReasoningLevels(selectedModel)],
+      models,
     };
     if (state.modelSelection) config.modelSelection = cloneModelSelection(state.modelSelection);
     if (state.reasoningLevel !== undefined) config.reasoningLevel = state.reasoningLevel;
@@ -1115,6 +1148,19 @@ export class RuntimeService {
     if (source) return source;
     const runtime = this.options.runtime as AgentRunner & { listModels?: RuntimeModelCatalogProvider };
     return runtime.listModels?.() ?? [];
+  }
+
+  private async clampReasoningLevelForState(
+    state: RuntimeSessionModelState,
+    reasoningLevel: ReasoningLevel,
+  ): Promise<ReasoningLevel> {
+    const models = await this.resolveModelCatalog();
+    const selectedModel = state.modelSelection
+      ? models.find(
+          (model) => model.provider === state.modelSelection?.provider && model.model === state.modelSelection.model,
+        )
+      : models.find((model) => model.default);
+    return clampReasoningLevel(reasoningLevel, runtimeModelReasoningLevels(selectedModel));
   }
 
   async interrupt(sessionId: SessionId, reason = "user_interrupt"): Promise<boolean> {
@@ -1452,8 +1498,33 @@ function cloneModelDescriptor(model: RuntimeModelDescriptor): RuntimeModelDescri
   if (model.inputCapabilities) clone.inputCapabilities = [...model.inputCapabilities];
   if (model.contextWindowTokens !== undefined) clone.contextWindowTokens = model.contextWindowTokens;
   if (model.maxOutputTokens !== undefined) clone.maxOutputTokens = model.maxOutputTokens;
+  if (model.reasoningLevels) clone.reasoningLevels = [...model.reasoningLevels];
   if (model.default !== undefined) clone.default = model.default;
   return clone;
+}
+
+function runtimeModelReasoningLevels(model: RuntimeModelDescriptor | undefined): readonly ReasoningLevel[] {
+  if (model?.capabilities?.reasoning === false) return ["off"];
+  if (model?.reasoningLevels?.length) return model.reasoningLevels;
+  return REASONING_LEVELS;
+}
+
+function clampReasoningLevel(
+  reasoningLevel: ReasoningLevel,
+  availableLevels: readonly ReasoningLevel[],
+): ReasoningLevel {
+  if (availableLevels.includes(reasoningLevel)) return reasoningLevel;
+  const available = new Set(availableLevels);
+  const requestedIndex = REASONING_LEVELS.indexOf(reasoningLevel);
+  for (let index = requestedIndex - 1; index >= 0; index -= 1) {
+    const candidate = REASONING_LEVELS[index];
+    if (candidate && available.has(candidate)) return candidate;
+  }
+  for (let index = requestedIndex + 1; index < REASONING_LEVELS.length; index += 1) {
+    const candidate = REASONING_LEVELS[index];
+    if (candidate && available.has(candidate)) return candidate;
+  }
+  return availableLevels[0] ?? "off";
 }
 
 function isReasoningLevel(value: unknown): value is ReasoningLevel {

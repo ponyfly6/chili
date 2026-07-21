@@ -558,7 +558,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         await requireSession(options.store, route.sessionId);
         const body = await readJson<ReasoningBody>(request);
         if (!isReasoningLevel(body.reasoningLevel)) {
-          throw badRequest("reasoningLevel must be off, minimal, low, medium, high, or xhigh");
+          throw badRequest("reasoningLevel must be off, minimal, low, medium, high, xhigh, max, or ultra");
         }
         return json(await requireModelControl(options).setReasoning({
           sessionId: route.sessionId,
@@ -1708,7 +1708,9 @@ function isReasoningLevel(value: unknown): value is ReasoningLevel {
     || value === "low"
     || value === "medium"
     || value === "high"
-    || value === "xhigh";
+    || value === "xhigh"
+    || value === "max"
+    || value === "ultra";
 }
 
 function isServiceTier(value: unknown): value is ServiceTier {

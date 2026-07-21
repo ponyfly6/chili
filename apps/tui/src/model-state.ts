@@ -4,7 +4,7 @@ import {
   listKnownModels,
 } from "@chili/providers";
 
-export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 
 export const DEFAULT_REASONING_LEVEL: ReasoningLevel = "medium";
@@ -26,6 +26,7 @@ export interface ModelCandidate {
   inputCapabilities?: readonly string[];
   contextWindowTokens?: number;
   maxOutputTokens?: number;
+  reasoningLevels?: readonly ReasoningLevel[];
   default?: boolean;
 }
 

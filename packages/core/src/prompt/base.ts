@@ -36,3 +36,16 @@ export function chiliBasePromptFragment(): PromptFragment {
     content: DEFAULT_CHILI_BASE_PROMPT,
   };
 }
+
+export function ultraReasoningPromptFragment(): PromptFragment {
+  return {
+    id: "chili.reasoning.ultra",
+    layer: "developer",
+    source: "runtime",
+    priority: 20,
+    lifecycle: "turn",
+    trust: "system",
+    content:
+      "Ultra reasoning is active. When task tools are available, proactively delegate independent, well-scoped work to subagents and run independent tasks in parallel. Keep trivial or tightly coupled work local, and verify and integrate delegated results before answering.",
+  };
+}

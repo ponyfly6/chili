@@ -11,7 +11,7 @@ import {
   OPENAI_CODEX_DEFAULT_MODEL,
   OPENAI_CODEX_PROVIDER_ID,
 } from "./models.js";
-import { normalizeReasoningLevel, parseModelSelectionPattern } from "./model-selection.js";
+import { clampModelReasoningLevel, normalizeReasoningLevel, parseModelSelectionPattern } from "./model-selection.js";
 import {
   extractOpenAICodexAccountId,
   refreshOpenAICodexToken,
@@ -885,14 +885,17 @@ export function clampOpenAICodexReasoningEffort(
   model: string,
   effort: OpenAICodexReasoningEffort,
 ): OpenAICodexReasoningEffort {
+  const clamped = clampModelReasoningLevel(model, effort);
+  if (clamped === "off") return effort;
+  if (clamped === "ultra") return "max";
   const id = model.includes("/") ? model.split("/").at(-1) ?? model : model;
   if (
     (id.startsWith("gpt-5.5") || id.startsWith("gpt-5.6")) &&
-    effort === "minimal"
+    clamped === "minimal"
   ) {
     return "low";
   }
-  return effort;
+  return clamped;
 }
 
 function readOpenAICodexInputSelection(input: ModelStreamInput): {

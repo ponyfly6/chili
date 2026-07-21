@@ -322,6 +322,26 @@ test("CLI Codex supports bare concrete model ids with thinking", async () => {
   });
 });
 
+test("CLI Codex maps ultra reasoning to max on the wire", async () => {
+  process.env.OPENAI_CODEX_ACCESS_TOKEN = jwtWithAccount("acct_cli");
+  process.env.OPENAI_CODEX_BASE_URL = "https://chatgpt.test/backend-api";
+  delete process.env.OPENAI_CODEX_MODEL;
+
+  let body: Record<string, unknown> = {};
+  const fetchImpl = (async (_input, init) => {
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return codexResponse(String(body.model));
+  }) as typeof fetch;
+
+  const model = await createCliModel("gpt-5.6-sol:ultra", { fetch: fetchImpl });
+  await collect(model.stream(emptyInput()));
+
+  expect(body).toMatchObject({
+    model: "gpt-5.6-sol",
+    reasoning: { effort: "max", summary: "auto" },
+  });
+});
+
 test("CLI Codex thinking off omits reasoning options", async () => {
   process.env.OPENAI_CODEX_ACCESS_TOKEN = jwtWithAccount("acct_cli");
   process.env.OPENAI_CODEX_BASE_URL = "https://chatgpt.test/backend-api";

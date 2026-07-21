@@ -125,6 +125,24 @@ test("uses compatibility settings when shaping OpenAI-compatible requests", () =
   expect(body).not.toHaveProperty("max_completion_tokens");
 });
 
+test("maps product-level ultra reasoning to max for compatible APIs", () => {
+  const body = buildOpenAICompletionsRequestBody(
+    { messages: [], tools: [], system: [] },
+    {
+      provider: "zai",
+      model: "glm-5.2",
+      baseUrl: "https://api.z.ai/api/paas/v4",
+      reasoning: true,
+      reasoningEffort: "ultra",
+    },
+  );
+
+  expect(body).toMatchObject({
+    thinking: { type: "enabled" },
+    reasoning_effort: "max",
+  });
+});
+
 test("routes developer and contextual user prompt fragments with system fallback", () => {
   const supported = buildOpenAICompletionsRequestBody(
     {

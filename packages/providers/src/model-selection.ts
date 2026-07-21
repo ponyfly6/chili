@@ -23,7 +23,9 @@ export interface ResolveModelSelectionPatternOptions {
 
 const REASONING_LEVEL_SET = new Set<string>(REASONING_LEVELS);
 const REASONING_LEVEL_ORDER: readonly ReasoningLevel[] = REASONING_LEVELS;
-const REASONING_LEVELS_WITHOUT_XHIGH: readonly ReasoningLevel[] = ["off", "minimal", "low", "medium", "high"];
+const REASONING_LEVELS_THROUGH_HIGH: readonly ReasoningLevel[] = ["off", "minimal", "low", "medium", "high"];
+const REASONING_LEVELS_THROUGH_XHIGH: readonly ReasoningLevel[] = [...REASONING_LEVELS_THROUGH_HIGH, "xhigh"];
+const REASONING_LEVELS_THROUGH_MAX: readonly ReasoningLevel[] = [...REASONING_LEVELS_THROUGH_XHIGH, "max"];
 
 export function isReasoningLevel(value: string): value is ReasoningLevel {
   return REASONING_LEVEL_SET.has(value);
@@ -120,7 +122,7 @@ export function resolveModelSelectionPattern(
   if (providerModels.length === 0 || !options.allowCustomModel) return {};
 
   const canonicalProvider = providerModels[0]?.provider ?? provider;
-  const clamped = clampReasoningLevel(parsed.reasoning ?? "off", ["off", "minimal", "low", "medium", "high", "xhigh"]);
+  const clamped = clampModelReasoningLevel(parsed.model, parsed.reasoning ?? "off");
   const selection: ModelSelection = {
     provider: canonicalProvider,
     model: parsed.model,
@@ -137,7 +139,10 @@ export function resolveModelSelectionPattern(
 
 export function getModelSelectionAvailableReasoningLevels(model: ModelDescriptor | undefined): readonly ReasoningLevel[] {
   if (model && model.capabilities?.reasoning === false) return ["off"];
-  return supportsXHighReasoning(model) ? REASONING_LEVELS : REASONING_LEVELS_WITHOUT_XHIGH;
+  if (model?.reasoningLevels?.length) return model.reasoningLevels;
+  if (supportsUltraReasoning(model)) return REASONING_LEVELS;
+  if (supportsMaxReasoning(model)) return REASONING_LEVELS_THROUGH_MAX;
+  return supportsXHighReasoning(model) ? REASONING_LEVELS_THROUGH_XHIGH : REASONING_LEVELS_THROUGH_HIGH;
 }
 
 export function clampModelReasoningLevel(model: ModelDescriptor | string | undefined, level: ReasoningLevel): ReasoningLevel {
@@ -174,6 +179,18 @@ export function supportsXHighReasoning(model: ModelDescriptor | string | undefin
     id.includes("opus-4-7") ||
     id.includes("opus-4.7")
   );
+}
+
+export function supportsMaxReasoning(model: ModelDescriptor | string | undefined): boolean {
+  const modelId = typeof model === "string" ? model : model?.model;
+  return modelId?.toLowerCase().includes("gpt-5.6") ?? false;
+}
+
+export function supportsUltraReasoning(model: ModelDescriptor | string | undefined): boolean {
+  const modelId = typeof model === "string" ? model : model?.model;
+  if (!modelId) return false;
+  const id = modelId.toLowerCase();
+  return id.includes("gpt-5.6") && !id.includes("gpt-5.6-luna");
 }
 
 export function formatModelSelection(selection: Pick<ModelSelection, "provider" | "model" | "reasoning">): string {
@@ -255,6 +272,7 @@ function cloneDescriptor(model: ModelDescriptor): ModelDescriptor {
   if (model.capabilities) clone.capabilities = { ...model.capabilities };
   if (model.compatibility) clone.compatibility = { ...model.compatibility };
   if (model.inputCapabilities) clone.inputCapabilities = [...model.inputCapabilities];
+  if (model.reasoningLevels) clone.reasoningLevels = [...model.reasoningLevels];
   if (model.cost) clone.cost = { ...model.cost };
   return clone;
 }

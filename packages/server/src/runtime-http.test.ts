@@ -1153,11 +1153,11 @@ test("serves model control routes and prompt model overrides", async () => {
 
   const setReasoningResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/reasoning`, {
     method: "POST",
-    body: JSON.stringify({ threadId: session.threadId, reasoningLevel: "high" }),
+    body: JSON.stringify({ threadId: session.threadId, reasoningLevel: "ultra" }),
     headers: { "content-type": "application/json" },
   }));
   expect(setReasoningResponse.status).toBe(200);
-  expect(service.reasoningLevel).toBe("high");
+  expect(service.reasoningLevel).toBe("ultra");
 
   const setServiceTierResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/service-tier`, {
     method: "POST",
@@ -1321,7 +1321,7 @@ class FakeRuntimeService implements RuntimeHttpService {
   async getModelConfig(sessionId: SessionId): Promise<RuntimeModelConfig> {
     return {
       sessionId,
-      availableReasoningLevels: ["off", "minimal", "low", "medium", "high", "xhigh"],
+      availableReasoningLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
       models: await this.listModels(),
       ...(this.modelSelection ? { modelSelection: this.modelSelection } : {}),
       ...(this.reasoningLevel ? { reasoningLevel: this.reasoningLevel } : {}),

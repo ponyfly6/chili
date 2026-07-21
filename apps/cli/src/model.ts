@@ -13,7 +13,9 @@ import {
   DEEPSEEK_PROVIDER_ID,
   FileAuthStorage,
   DEEPSEEK_V4_PRO_MODEL,
+  clampModelReasoningLevel,
   findKnownModel,
+  getModelSelectionAvailableReasoningLevels,
   KIMI_K26_MODEL,
   KIMI_OPENAI_BASE_URL,
   KIMI_PROVIDER_ID,
@@ -39,7 +41,7 @@ import { FakeModelRouter } from "./fake-model.js";
 
 export type CliModelName = string;
 export type CliProviderName = "minimax" | "deepseek" | "kimi" | "zai" | "openai-codex";
-export type CliReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type CliReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 export interface CliModelSelection {
   provider?: string;
@@ -443,7 +445,9 @@ function isReasoningLevel(value: string): value is CliReasoningLevel {
     || value === "low"
     || value === "medium"
     || value === "high"
-    || value === "xhigh";
+    || value === "xhigh"
+    || value === "max"
+    || value === "ultra";
 }
 
 interface CliProviderRouterOptions {
@@ -470,6 +474,7 @@ class CliProviderRouter implements ModelRouter {
       ...(model.inputCapabilities ? { inputCapabilities: [...model.inputCapabilities] } : {}),
       ...(model.contextWindowTokens !== undefined ? { contextWindowTokens: model.contextWindowTokens } : {}),
       ...(model.maxOutputTokens !== undefined ? { maxOutputTokens: model.maxOutputTokens } : {}),
+      reasoningLevels: [...getModelSelectionAvailableReasoningLevels(model)],
       ...(model.default !== undefined ? { default: model.default } : {}),
     }));
   }
@@ -540,7 +545,10 @@ class CliProviderRouter implements ModelRouter {
     };
     if (selection.provider === "openai-codex" && serviceTier !== undefined) input.serviceTier = serviceTier;
     const withEnv = readOptionsForProvider(selection.provider, input);
-    applyReasoningOptions(withEnv, selection.provider, reasoningLevel);
+    const effectiveReasoningLevel = reasoningLevel
+      ? clampModelReasoningLevel(withEnv.model ?? selection.model, reasoningLevel)
+      : undefined;
+    applyReasoningOptions(withEnv, selection.provider, effectiveReasoningLevel);
     return withEnv;
   }
 

@@ -5,7 +5,7 @@ export type ModelApiFamily = "anthropic-messages" | "openai-completions" | "open
 
 export type ModelInputCapability = "text" | "image";
 
-export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 export const THINKING_LEVELS = REASONING_LEVELS;
 export type ThinkingLevel = ReasoningLevel;
@@ -37,6 +37,7 @@ export interface ModelDescriptor {
   inputCapabilities?: readonly ModelInputCapability[];
   contextWindowTokens?: number;
   maxOutputTokens?: number;
+  reasoningLevels?: readonly ReasoningLevel[];
   cost?: ModelCost;
   default?: boolean;
 }

@@ -60,15 +60,24 @@ export function createDefaultSlashCommands(): SlashCommand[] {
       aliases: ["reasoning"],
       description: "Set model reasoning level or visibility",
       category: "model",
-      argumentHint: "<off|minimal|low|medium|high|xhigh|hide|show>",
+      argumentHint: "<off|minimal|low|medium|high|xhigh|max|ultra|hide|show>",
       isSafeConcurrent: true,
       complete: reasoningCompletions,
-      run: (_ctx, args) => {
+      run: (ctx, args) => {
         const level = args.trim().toLowerCase();
         if (!level) return { type: "open_reasoning_picker" };
         if (level === "hide") return { type: "set_hide_thinking", hidden: true };
         if (level === "show") return { type: "set_hide_thinking", hidden: false };
-        if (isReasoningLevel(level)) return { type: "set_reasoning", level };
+        if (isReasoningLevel(level)) {
+          if (ctx.availableReasoningLevels && !ctx.availableReasoningLevels.includes(level)) {
+            return {
+              type: "local_message",
+              level: "error",
+              text: `${level} reasoning is not available for the selected model`,
+            };
+          }
+          return { type: "set_reasoning", level };
+        }
         return {
           type: "local_message",
           level: "error",
@@ -487,7 +496,7 @@ function modelCompletions(ctx: SlashCommandContext, input: string): SlashComplet
   });
 }
 
-function reasoningCompletions(_ctx: SlashCommandContext, input: string): SlashCompletion[] {
+function reasoningCompletions(ctx: SlashCommandContext, input: string): SlashCompletion[] {
   const thinkingQuery = commandArgument(input, "thinking");
   const reasoningQuery = commandArgument(input, "reasoning");
   const query = thinkingQuery ?? reasoningQuery;
@@ -495,7 +504,8 @@ function reasoningCompletions(_ctx: SlashCommandContext, input: string): SlashCo
   const command = thinkingQuery !== undefined ? "thinking" : "reasoning";
   const normalized = query.trim().toLowerCase();
   const candidates: { value: ReasoningLevel | "hide" | "show"; description: string }[] = [
-    ...REASONING_LEVELS.map((value) => ({ value, description: reasoningDescription(value) })),
+    ...(ctx.availableReasoningLevels ?? REASONING_LEVELS)
+      .map((value) => ({ value, description: reasoningDescription(value) })),
     { value: "hide", description: "Hide thinking traces" },
     { value: "show", description: "Show thinking traces" },
   ];
@@ -901,6 +911,10 @@ function reasoningDescription(level: ReasoningLevel): string {
     case "high":
       return "Deep reasoning";
     case "xhigh":
+      return "Extra-high reasoning";
+    case "max":
       return "Maximum reasoning";
+    case "ultra":
+      return "Maximum reasoning with proactive agents";
   }
 }

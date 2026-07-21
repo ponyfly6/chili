@@ -335,6 +335,10 @@ test("clamps and omits Codex reasoning levels for the request body", () => {
   expect(clampOpenAICodexReasoningEffort("gpt-5.4", "minimal")).toBe("minimal");
   expect(clampOpenAICodexReasoningEffort("gpt-5.5", "minimal")).toBe("low");
   expect(clampOpenAICodexReasoningEffort("gpt-5.6-sol", "minimal")).toBe("low");
+  expect(clampOpenAICodexReasoningEffort("gpt-5.6-sol", "max")).toBe("max");
+  expect(clampOpenAICodexReasoningEffort("gpt-5.6-sol", "ultra")).toBe("max");
+  expect(clampOpenAICodexReasoningEffort("gpt-5.6-luna", "ultra")).toBe("max");
+  expect(clampOpenAICodexReasoningEffort("gpt-5.5", "max")).toBe("xhigh");
 
   const body = buildOpenAICodexResponsesRequestBody(
     { messages: [] },
@@ -345,6 +349,12 @@ test("clamps and omits Codex reasoning levels for the request body", () => {
   );
 
   expect(body).not.toHaveProperty("reasoning");
+
+  const ultraBody = buildOpenAICodexResponsesRequestBody(
+    { messages: [] },
+    { model: "gpt-5.6-sol", reasoningEffort: "ultra" },
+  );
+  expect(ultraBody).toMatchObject({ reasoning: { effort: "max", summary: "auto" } });
 });
 
 test("accepts OpenAI Codex token exchange fields from id_token", async () => {

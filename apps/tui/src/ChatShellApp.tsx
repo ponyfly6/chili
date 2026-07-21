@@ -279,6 +279,9 @@ export function ChatShellSurface(props: {
     () => props.runtime.modelCandidates ?? [],
     [props.runtime.modelCandidates],
   );
+  const availableReasoningLevels = props.runtime.modelConfig?.availableReasoningLevels.length
+    ? props.runtime.modelConfig.availableReasoningLevels
+    : REASONING_LEVELS;
   const [modelSelection, setModelSelectionState] = useState<ModelSelection | undefined>(undefined);
   const [reasoningLevel, setReasoningLevelState] = useState<ReasoningLevel | undefined>(undefined);
   const [serviceTier, setServiceTierState] = useState<ServiceTier | undefined>(undefined);
@@ -381,12 +384,13 @@ export function ChatShellSurface(props: {
     cwd,
     ...(modelSelection ? { modelSelection } : {}),
     ...(reasoningLevel ? { reasoningLevel } : {}),
+    availableReasoningLevels,
     ...(serviceTier ? { serviceTier } : {}),
     modelCandidates,
     skills: props.skills ?? [],
     allSkills: props.allSkills ?? props.skills ?? [],
     mcpServers: props.runtime.mcpStatus?.servers ?? [],
-  }), [cwd, modelCandidates, modelSelection, props.allSkills, props.model, props.runtime.mcpStatus?.servers, props.skills, reasoningLevel, serviceTier]);
+  }), [availableReasoningLevels, cwd, modelCandidates, modelSelection, props.allSkills, props.model, props.runtime.mcpStatus?.servers, props.skills, reasoningLevel, serviceTier]);
   const completionSuppressed = acceptedCompletionPrompt !== undefined && prompt === acceptedCompletionPrompt;
   const skillTrigger = activeSkillMentionTrigger(prompt);
   const skillCompletionItems = skillTrigger && !prompt.startsWith("/") && !shellInputActive
@@ -632,14 +636,14 @@ export function ChatShellSurface(props: {
     setModelPicker(undefined);
   }, []);
   const openReasoningPicker = useCallback(() => {
-    const selectedIndex = Math.max(0, REASONING_LEVELS.indexOf(reasoningLevel ?? DEFAULT_REASONING_LEVEL));
+    const selectedIndex = Math.max(0, availableReasoningLevels.indexOf(reasoningLevel ?? DEFAULT_REASONING_LEVEL));
     setResumePicker(undefined);
     setRenamePrompt(undefined);
     setModelPicker(undefined);
     setPermissionsPicker(undefined);
     setThemePicker(undefined);
     setReasoningPicker({ selectedIndex });
-  }, [reasoningLevel]);
+  }, [availableReasoningLevels, reasoningLevel]);
   const closeReasoningPicker = useCallback(() => {
     setReasoningPicker(undefined);
   }, []);
@@ -1415,7 +1419,7 @@ export function ChatShellSurface(props: {
       return;
     }
     if (reasoningPicker) {
-      handleReasoningPickerKey(key, reasoningPicker, {
+      handleReasoningPickerKey(key, reasoningPicker, availableReasoningLevels, {
         setReasoningPicker,
         selectLevel: setReasoningLevel,
         cancel: closeReasoningPicker,
@@ -1569,7 +1573,7 @@ export function ChatShellSurface(props: {
     ? modelPickerView(modelPicker, modelCandidates, modelSelection)
     : undefined;
   const reasoningPickerModel = reasoningPicker
-    ? reasoningPickerView(reasoningPicker, reasoningLevel ?? DEFAULT_REASONING_LEVEL)
+    ? reasoningPickerView(reasoningPicker, reasoningLevel ?? DEFAULT_REASONING_LEVEL, availableReasoningLevels)
     : undefined;
   const permissionsPickerModel = permissionsPicker
     ? permissionsPickerView(permissionsPicker, props.runtime.permissionConfig?.profiles ?? [])
@@ -2337,8 +2341,12 @@ function modelPickerCandidates(
   return filterModelCandidates(scoped, query, current);
 }
 
-function reasoningPickerView(picker: ReasoningPickerNavigation, current: ReasoningLevel): ReasoningPickerModel {
-  const items = REASONING_LEVELS.map((level) => ({
+function reasoningPickerView(
+  picker: ReasoningPickerNavigation,
+  current: ReasoningLevel,
+  availableLevels: readonly ReasoningLevel[],
+): ReasoningPickerModel {
+  const items = availableLevels.map((level) => ({
     level,
     description: reasoningDescription(level),
     current: level === current,
@@ -2497,7 +2505,11 @@ function reasoningDescription(level: ReasoningLevel): string {
     case "high":
       return "Deep reasoning (~16k tokens)";
     case "xhigh":
-      return "Maximum reasoning (~32k tokens)";
+      return "Extra-high reasoning (~32k tokens)";
+    case "max":
+      return "Maximum reasoning for the hardest problems";
+    case "ultra":
+      return "Maximum reasoning with proactive agents";
   }
 }
 
@@ -3427,6 +3439,7 @@ function handleModelPickerKey(
 function handleReasoningPickerKey(
   key: KeyEvent,
   picker: ReasoningPickerNavigation,
+  availableLevels: readonly ReasoningLevel[],
   actions: {
     setReasoningPicker: Dispatch<SetStateAction<ReasoningPickerNavigation | undefined>>;
     selectLevel: (level: ReasoningLevel) => Promise<void>;
@@ -3439,11 +3452,11 @@ function handleReasoningPickerKey(
   }
   if (isArrowUp(key) || isArrowDown(key)) {
     const delta = isArrowUp(key) ? -1 : 1;
-    actions.setReasoningPicker((state) => state ? { selectedIndex: clampIndex(state.selectedIndex + delta, REASONING_LEVELS.length) } : state);
+    actions.setReasoningPicker((state) => state ? { selectedIndex: clampIndex(state.selectedIndex + delta, availableLevels.length) } : state);
     return;
   }
   if (isEnter(key)) {
-    const level = REASONING_LEVELS[clampIndex(picker.selectedIndex, REASONING_LEVELS.length)];
+    const level = availableLevels[clampIndex(picker.selectedIndex, availableLevels.length)];
     if (level) void actions.selectLevel(level);
   }
 }

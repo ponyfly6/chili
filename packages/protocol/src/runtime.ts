@@ -9,7 +9,7 @@ export type RuntimeSessionStatus =
   | "cancelled"
   | "failed";
 
-export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 
 export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 
@@ -48,6 +48,7 @@ export interface RuntimeModelDescriptor extends ModelSelection {
   inputCapabilities?: string[];
   contextWindowTokens?: number;
   maxOutputTokens?: number;
+  reasoningLevels?: ReasoningLevel[];
   default?: boolean;
 }
 

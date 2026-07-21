@@ -461,7 +461,7 @@ export function usage(): string {
     "  --thread <id>       Select a thread for prompt-debug",
     "  --provider <name>   Provider name: minimax | deepseek | kimi | zai | codex | openai-codex",
     "  --model <pattern>   Provider alias, provider/model, or bare model id; default last selected model, then minimax",
-    "  --thinking <level>  Thinking level: off | minimal | low | medium | high | xhigh",
+    "  --thinking <level>  Thinking level: off | minimal | low | medium | high | xhigh | max | ultra",
     "  --reasoning <level> Alias for --thinking",
     "  --yes, -y           Auto-approve tool permissions",
     "  --mcp               Connect configured MCP servers for this CLI run",
@@ -661,7 +661,7 @@ function parseModelValue(value: string): { model: CliModelName; reasoningLevel?:
 
 function parseReasoningLevel(value: string, flag: string): CliReasoningLevel {
   if (isReasoningLevel(value)) return value;
-  throw new Error(`${flag} must be off, minimal, low, medium, high, or xhigh`);
+  throw new Error(`${flag} must be off, minimal, low, medium, high, xhigh, max, or ultra`);
 }
 
 function isReasoningLevel(value: string): value is CliReasoningLevel {
@@ -670,7 +670,9 @@ function isReasoningLevel(value: string): value is CliReasoningLevel {
     || value === "low"
     || value === "medium"
     || value === "high"
-    || value === "xhigh";
+    || value === "xhigh"
+    || value === "max"
+    || value === "ultra";
 }
 
 function parseMemoryCommand(result: CliArgs, args: string[], prompt: string[]): void {
