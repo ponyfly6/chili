@@ -48,14 +48,14 @@ test("permission profiles expose Codex-style default and full-access semantics",
   expect(config.profiles.find((profile) => profile.id === "full-access")?.description).toContain("without the OS sandbox");
 });
 
-test("default profile allows ordinary shell only when the shell runner is sandboxed", async () => {
+test("default profile allows sandboxed shell and local task lifecycle operations", async () => {
   const sandboxed = createCliApprovalRulesets("default", undefined, { sandboxedShell: true });
   const unsandboxed = createCliApprovalRulesets("default", undefined, { sandboxedShell: false });
 
   expect(evaluatePolicy("bash", "rg -n approval packages", sandboxed).action).toBe("allow");
   expect(evaluatePolicy("bash", "rg -n approval packages", unsandboxed).action).toBe("ask");
   expect(evaluatePolicy("task", "spawn", sandboxed).action).toBe("allow");
-  expect(evaluatePolicy("task", "task_existing", sandboxed).action).toBe("ask");
+  expect(evaluatePolicy("task", "task_existing", sandboxed).action).toBe("allow");
 
   let asked = 0;
   const broker = createCliApprovalBroker({

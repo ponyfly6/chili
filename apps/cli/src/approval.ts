@@ -68,7 +68,7 @@ export function createCliPermissionRules(
     { permission: "edit", pattern: "*", action: "allow", source },
     { permission: "write", pattern: "*", action: "allow", source },
     { permission: "bash", pattern: "*", action: options.sandboxedShell ? "allow" : "ask", source },
-    { permission: "task", pattern: "spawn", action: "allow", source },
+    { permission: "task", pattern: "*", action: "allow", source },
     { permission: "git_status", pattern: "*", action: "allow", source },
     { permission: "git_diff", pattern: "*", action: "allow", source },
   ];
