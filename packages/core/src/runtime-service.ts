@@ -1197,7 +1197,12 @@ export class RuntimeService {
   async interrupt(sessionId: SessionId, reason = "user_interrupt"): Promise<boolean> {
     const run = this.running.get(sessionId);
     if (!run) return false;
-    await this.publishStatus({ sessionId, status: "cancelling", reason });
+    await this.publishStatus({
+      sessionId,
+      ...(run.threadId ? { threadId: run.threadId } : {}),
+      status: "cancelling",
+      reason,
+    });
     if (run.threadId) {
       await this.pauseActiveGoalForInterrupt(sessionId, run.threadId);
     }

@@ -973,6 +973,10 @@ test("RuntimeService stops before another tool-use turn when interrupted", async
   expect(result.status).toBe("cancelled");
   expect(runner.turnInputs).toHaveLength(1);
   expect(statuses(store)).toEqual(["running", "cancelling", "running", "cancelled"]);
+  const cancelling = store.items.find(
+    (event) => event.type === "session.status_changed" && event.payload.status === "cancelling",
+  );
+  expect(cancelling?.threadId).toBe(threadId);
 });
 
 test("SingleAgentRuntime satisfies AgentRunner without changing aborted turn behavior", async () => {
