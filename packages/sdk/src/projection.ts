@@ -36,6 +36,8 @@ import { isTransientEvent } from "@chili/protocol";
 
 type ToolPartStatus = Extract<MessagePart, { type: "tool_call" }>["status"];
 
+export type ChatToolExecutionContext = NonNullable<Extract<MessagePart, { type: "tool_result" }>["executionContext"]>;
+
 export interface ChiliRuntimeView {
   sessionIds: SessionId[];
   sessions: Record<string, RuntimeSessionView>;
@@ -661,7 +663,7 @@ export type ChatMessagePart =
   | { type: "image"; id: PartId; mimeType: string; filename?: string; sourcePath?: string; displayText?: string }
   | { type: "reasoning"; id: PartId; text: string; redacted?: boolean }
   | { type: "tool_call"; id: PartId; callId: ToolCallId; toolName: string; status: ToolPartStatus; input?: unknown; displayStatus?: ChatToolDisplayStatus }
-  | { type: "tool_result"; id: PartId; callId: ToolCallId; output: string; content?: Extract<MessagePart, { type: "tool_result" }>["content"]; error?: string; synthetic?: boolean }
+  | { type: "tool_result"; id: PartId; callId: ToolCallId; output: string; content?: Extract<MessagePart, { type: "tool_result" }>["content"]; error?: string; executionContext?: ChatToolExecutionContext; synthetic?: boolean }
   | { type: "summary"; id: PartId; text: string };
 
 export type ChatToolDisplayStatus =
@@ -706,6 +708,7 @@ export interface ChatToolCallRow {
   input?: unknown;
   output?: string;
   error?: string;
+  executionContext?: ChatToolExecutionContext;
   liveOutput?: RuntimeToolOutputDelta[];
   sessionId?: SessionId;
   threadId?: ThreadId;
@@ -1051,11 +1054,14 @@ export function chatSessionView(view: ChiliRuntimeView, input: ChatSessionInput 
       return [chatMessageRow(message)];
     })
     : [];
+  const executionContexts = session
+    ? toolResultExecutionContexts(view, session, input.threadId)
+    : new Map<ToolCallId, ChatToolExecutionContext>();
   const tools = session
     ? session.toolCallIds.flatMap((callId) => {
       const toolCall = view.toolCalls[callId];
       if (!toolCall || !matchesThread(toolCall.threadId, input.threadId) || (toolCall.turnId && hiddenTurnIds.has(toolCall.turnId))) return [];
-      return [chatToolCallRow(view, toolCall)];
+      return [chatToolCallRow(view, toolCall, executionContexts.get(callId))];
     })
     : [];
   const approvals = session
@@ -1319,6 +1325,7 @@ function chatMessagePart(part: MessagePart): ChatMessagePart {
     const output: ChatMessagePart = { type: "tool_result", id: part.id, callId: part.callId, output: part.output };
     assignOptional(output, "content", part.content);
     assignOptional(output, "error", part.error);
+    assignOptional(output, "executionContext", chatToolExecutionContext(part.executionContext));
     assignOptional(output, "synthetic", part.synthetic);
     return output;
   }
@@ -1328,7 +1335,11 @@ function chatMessagePart(part: MessagePart): ChatMessagePart {
   return { type: "summary", id: part.id, text: `agent handoff: ${part.agentPath}` };
 }
 
-function chatToolCallRow(view: ChiliRuntimeView, toolCall: RuntimeToolCallView): ChatToolCallRow {
+function chatToolCallRow(
+  view: ChiliRuntimeView,
+  toolCall: RuntimeToolCallView,
+  executionContext: ChatToolExecutionContext | undefined,
+): ChatToolCallRow {
   const linkedApprovals = approvalsForToolCall(view, toolCall.id);
   const pendingApproval = linkedApprovals.find((approval) => approval.status === "pending");
   const latestApproval = latestApprovalForToolCall(linkedApprovals);
@@ -1346,6 +1357,7 @@ function chatToolCallRow(view: ChiliRuntimeView, toolCall: RuntimeToolCallView):
   assignOptional(row, "input", toolCall.input);
   assignOptional(row, "output", toolCall.output);
   assignOptional(row, "error", toolCall.error);
+  assignOptional(row, "executionContext", executionContext);
   assignOptional(row, "liveOutput", toolCall.liveOutput ? toolCall.liveOutput.map((delta) => ({ ...delta })) : undefined);
   assignOptional(row, "sessionId", toolCall.sessionId);
   assignOptional(row, "threadId", toolCall.threadId);
@@ -1353,6 +1365,39 @@ function chatToolCallRow(view: ChiliRuntimeView, toolCall: RuntimeToolCallView):
   assignOptional(row, "approvalStatus", pendingApproval?.status ?? latestApproval?.status);
   assignOptional(row, "approvalDecision", latestApproval?.decision);
   return row;
+}
+
+function toolResultExecutionContexts(
+  view: ChiliRuntimeView,
+  session: RuntimeSessionView,
+  threadId: ThreadId | undefined,
+): Map<ToolCallId, ChatToolExecutionContext> {
+  const contexts = new Map<ToolCallId, ChatToolExecutionContext>();
+  for (const messageId of session.messageIds) {
+    const message = view.messages[messageId];
+    if (!message || !matchesThread(message.threadId, threadId)) continue;
+    for (const part of message.parts) {
+      if (part.type !== "tool_result") continue;
+      const context = chatToolExecutionContext(part.executionContext);
+      if (context) contexts.set(part.callId, context);
+    }
+  }
+  return contexts;
+}
+
+function chatToolExecutionContext(value: unknown): ChatToolExecutionContext | undefined {
+  const record = recordObjectValue(value);
+  if (!record) return undefined;
+  const context: ChatToolExecutionContext = {};
+  if (record.sandbox === "macos-seatbelt" || record.sandbox === "none") context.sandbox = record.sandbox;
+  if (record.executionMode === "sandboxed" || record.executionMode === "unsandboxed") context.executionMode = record.executionMode;
+  if (record.exitCode === null || (typeof record.exitCode === "number" && Number.isFinite(record.exitCode))) {
+    context.exitCode = record.exitCode;
+  }
+  if (typeof record.timedOut === "boolean") context.timedOut = record.timedOut;
+  if (typeof record.aborted === "boolean") context.aborted = record.aborted;
+  if (record.signal === null || typeof record.signal === "string") context.signal = record.signal;
+  return Object.keys(context).length > 0 ? context : undefined;
 }
 
 function chatApprovalRow(view: ChiliRuntimeView, approval: RuntimeApprovalView): ChatApprovalRow {

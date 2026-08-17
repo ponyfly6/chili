@@ -15,6 +15,7 @@ import type {
   ThreadId,
   TimestampMs,
   ToolCallId,
+  ToolResultExecutionContext,
   TurnId,
 } from "@chili/protocol";
 import { timestampNow } from "@chili/protocol";
@@ -1030,6 +1031,7 @@ export class SingleAgentRuntime implements AgentRunner {
     const result = await this.options.toolExecutor.execute(executeInput);
 
     if (result.status === "completed") {
+      const executionContext = toolResultExecutionContext(result.result.metadata);
       const part: MessagePart = {
         id: this.id<PartId>("part"),
         messageId: assistantMessageId,
@@ -1037,6 +1039,7 @@ export class SingleAgentRuntime implements AgentRunner {
         type: "tool_result",
         callId: toolCall.callId,
         output: result.result.output,
+        ...(executionContext ? { executionContext } : {}),
       };
       if (result.result.content) {
         part.content = result.result.content;
@@ -1144,6 +1147,36 @@ export class SingleAgentRuntime implements AgentRunner {
 
 function defaultCreateId(prefix: string): string {
   return `${prefix}_${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+function toolResultExecutionContext(
+  metadata: Record<string, unknown> | undefined,
+): ToolResultExecutionContext | undefined {
+  if (!metadata) return undefined;
+  const context: ToolResultExecutionContext = {};
+
+  if (metadata.sandbox === "macos-seatbelt" || metadata.sandbox === "none") {
+    context.sandbox = metadata.sandbox;
+  }
+  if (metadata.executionMode === "sandboxed" || metadata.executionMode === "unsandboxed") {
+    context.executionMode = metadata.executionMode;
+  }
+  if (metadata.exitCode === null || isNonNegativeInteger(metadata.exitCode)) {
+    context.exitCode = metadata.exitCode;
+  }
+  if (typeof metadata.timedOut === "boolean") context.timedOut = metadata.timedOut;
+  if (typeof metadata.aborted === "boolean") context.aborted = metadata.aborted;
+  if (metadata.signal === null || isProcessSignal(metadata.signal)) context.signal = metadata.signal;
+
+  return Object.keys(context).length > 0 ? context : undefined;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function isProcessSignal(value: unknown): value is string {
+  return typeof value === "string" && /^SIG[A-Z0-9]{1,28}$/.test(value);
 }
 
 function toError(error: unknown): Error {

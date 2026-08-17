@@ -1,4 +1,4 @@
-import type { Message, MessagePart } from "@chili/protocol";
+import { formatToolResultForModel, type Message, type MessagePart } from "@chili/protocol";
 import { resolveChatCompletionsCompatibility, type ChatCompletionsCompatibility } from "./compat.js";
 import { assertImageInputSupported } from "./image-input.js";
 import { readSseEvents } from "./sse.js";
@@ -431,7 +431,7 @@ function toOpenAIUserOrToolMessages(message: Message): OpenAIMessage[] {
     result.push({
       role: "tool",
       tool_call_id: part.callId,
-      content: formatToolResult(part),
+      content: formatToolResultForModel(part),
     });
   }
   return result;
@@ -551,11 +551,6 @@ function stringifyToolInput(input: unknown): string {
   } catch {
     return "{}";
   }
-}
-
-function formatToolResult(part: Extract<MessagePart, { type: "tool_result" }>): string {
-  if (part.error) return part.output ? `${part.output}\n\nError: ${part.error}` : `Error: ${part.error}`;
-  return part.output;
 }
 
 function isEventStream(response: Response): boolean {

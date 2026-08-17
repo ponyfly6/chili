@@ -1,4 +1,11 @@
-import type { Message, MessageId, MessagePart, ToolDefinition, ToolResultPart } from "@chili/protocol";
+import {
+  formatToolResultForModel,
+  type Message,
+  type MessageId,
+  type MessagePart,
+  type ToolDefinition,
+  type ToolResultPart,
+} from "@chili/protocol";
 
 export interface ContextBudgetOptions {
   maxInputChars?: number;
@@ -433,6 +440,23 @@ export class ContextWindowBuilder {
   }
 
   private truncateToolResult(part: ToolResultPart): ToolResultPart {
+    const executionContext = part.executionContext
+      ? formatToolResultForModel({ output: "", executionContext: part.executionContext })
+      : "";
+    if (executionContext) {
+      const totalLimit = Math.min(this.maxToolResultChars, this.maxMessagePartChars);
+      const budget = toolResultBodyBudget(part, totalLimit, executionContext.length);
+      const result: ToolResultPart = {
+        ...part,
+        callId: truncateIdentifier(part.callId, this.maxMessagePartChars) as typeof part.callId,
+        output: truncateContextText(part.output, budget.outputChars, "tool result"),
+      };
+      if (budget.error !== undefined) result.error = budget.error;
+      this.truncateToolResultContent(part, result);
+      if (part.synthetic !== undefined) result.synthetic = part.synthetic;
+      return result;
+    }
+
     const errorLimit = Math.max(0, this.maxMessagePartChars - "Error: ".length);
     const error = part.error !== undefined
       ? truncateContextText(part.error, errorLimit, "tool error")
@@ -448,28 +472,31 @@ export class ContextWindowBuilder {
       output: truncateContextText(part.output, outputLimit, "tool result"),
     };
     if (error !== undefined) result.error = error;
-    if (part.content !== undefined) {
-      result.content = part.content.map((item) => {
-        if (item.type === "text") {
-          return {
-            type: "text" as const,
-            text: truncateContextText(item.text, this.maxMessagePartChars, "tool result content"),
-          };
-        }
-        if (item.data.length > this.maxImageDataChars || item.mimeType.length > this.maxMessagePartChars) {
-          return {
-            type: "text" as const,
-            text: boundedContextNotice(
-              "tool result image omitted: encoded payload exceeded context limit",
-              this.maxMessagePartChars,
-            ),
-          };
-        }
-        return { ...item };
-      });
-    }
+    this.truncateToolResultContent(part, result);
     if (part.synthetic !== undefined) result.synthetic = part.synthetic;
     return result;
+  }
+
+  private truncateToolResultContent(part: ToolResultPart, result: ToolResultPart): void {
+    if (part.content === undefined) return;
+    result.content = part.content.map((item) => {
+      if (item.type === "text") {
+        return {
+          type: "text" as const,
+          text: truncateContextText(item.text, this.maxMessagePartChars, "tool result content"),
+        };
+      }
+      if (item.data.length > this.maxImageDataChars || item.mimeType.length > this.maxMessagePartChars) {
+        return {
+          type: "text" as const,
+          text: boundedContextNotice(
+            "tool result image omitted: encoded payload exceeded context limit",
+            this.maxMessagePartChars,
+          ),
+        };
+      }
+      return { ...item };
+    });
   }
 
   private compactToolResultsByBudget(messages: readonly Message[]): {
@@ -528,12 +555,19 @@ export class ContextWindowBuilder {
 
   private compactToolResult(part: ToolResultPart): ToolResultPart {
     const { content: _content, ...rest } = part;
+    const executionContext = part.executionContext
+      ? formatToolResultForModel({ output: "", executionContext: part.executionContext })
+      : "";
+    const budget = executionContext
+      ? toolResultBodyBudget(part, this.compactedToolResultChars, executionContext.length)
+      : undefined;
     const result: ToolResultPart = {
       ...rest,
-      output: compactToolResultOutput(part.output, this.compactedToolResultChars),
+      output: compactToolResultOutput(part.output, budget?.outputChars ?? this.compactedToolResultChars),
       synthetic: part.synthetic ?? true,
     };
-    if (part.error !== undefined) result.error = part.error;
+    if (budget?.error !== undefined) result.error = budget.error;
+    else if (part.error !== undefined) result.error = part.error;
     if (part.artifactIds !== undefined) result.artifactIds = part.artifactIds;
     return result;
   }
@@ -559,6 +593,28 @@ export class ContextWindowBuilder {
 }
 
 const OMIT_CONTEXT_PART = Symbol("omit_context_part");
+
+function toolResultBodyBudget(
+  part: Pick<ToolResultPart, "output" | "error">,
+  maxChars: number,
+  executionContextChars: number,
+): { error: string | undefined; outputChars: number } {
+  const hasBody = Boolean(part.output || part.error);
+  const bodyChars = Math.max(
+    0,
+    Math.trunc(maxChars) - executionContextChars - (hasBody ? 2 : 0),
+  );
+  const errorPrefixChars = "Error: ".length;
+  const error = part.error !== undefined
+    ? truncateContextText(part.error, Math.max(0, bodyChars - errorPrefixChars), "tool error")
+    : undefined;
+  const formattedErrorChars = error ? errorPrefixChars + error.length : 0;
+  const errorSeparatorChars = formattedErrorChars > 0 && part.output ? 2 : 0;
+  return {
+    error,
+    outputChars: Math.max(0, bodyChars - formattedErrorChars - errorSeparatorChars),
+  };
+}
 
 function truncateContextText(text: string, maxChars: number, label: string): string {
   if (text.length <= maxChars) return text;
@@ -783,6 +839,7 @@ function snapshotMessagePart(part: MessagePart): MessagePart {
           : { type: "image", data: item.data, mimeType: item.mimeType });
       }
       if (part.error !== undefined) snapshot.error = part.error;
+      if (part.executionContext !== undefined) snapshot.executionContext = { ...part.executionContext };
       if (part.synthetic !== undefined) snapshot.synthetic = part.synthetic;
       if (part.artifactIds !== undefined) snapshot.artifactIds = [...part.artifactIds];
       return snapshot;
@@ -980,8 +1037,7 @@ function estimatePartTokens(part: MessagePart): number {
         + estimateTextTokens(`${part.mimeType}${part.filename ?? ""}${part.sourcePath ?? ""}`)
         + 16;
     case "tool_result":
-      return estimateTextTokens(part.output)
-        + estimateTextTokens(part.error ?? "")
+      return estimateTextTokens(formatToolResultForModel(part))
         + estimateToolResultContentTokens(part.content)
         + 16;
     case "tool_call":
@@ -1045,7 +1101,7 @@ function estimatePart(part: MessagePart): number {
     case "image":
       return IMAGE_CONTEXT_ESTIMATE_CHARS + part.mimeType.length + (part.filename?.length ?? 0) + (part.sourcePath?.length ?? 0) + 64;
     case "tool_result":
-      return part.output.length + (part.error?.length ?? 0) + estimateToolResultContent(part.content) + 64;
+      return formatToolResultForModel(part).length + estimateToolResultContent(part.content) + 64;
     case "tool_call":
       return safeJsonStringify(part.input).length + part.toolName.length + 64;
     case "patch":
@@ -1060,7 +1116,7 @@ function estimatePart(part: MessagePart): number {
 }
 
 function estimateToolResultPayload(part: ToolResultPart): number {
-  return part.output.length + (part.error?.length ?? 0) + estimateToolResultContent(part.content);
+  return formatToolResultForModel(part).length + estimateToolResultContent(part.content);
 }
 
 function estimateToolResultContent(content: ToolResultPart["content"]): number {

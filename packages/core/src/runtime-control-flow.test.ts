@@ -216,6 +216,65 @@ test("consumes rich model streams and executes tool calls after the stream finis
   expect(toolStartedIndex).toBeGreaterThan(toolCallPartIndex);
 });
 
+test("copies only allowlisted tool metadata into model-visible execution context", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  registry.register({
+    name: "sandboxed_command",
+    description: "Run a sandboxed command.",
+    risk: "execute",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => ({
+      title: "exit 1",
+      output: "command failed",
+      metadata: {
+        sandbox: "macos-seatbelt",
+        executionMode: "sandboxed",
+        exitCode: 1,
+        timedOut: false,
+        aborted: false,
+        signal: null,
+        command: "secret command that must not enter model context",
+        cwd: "/private/workspace",
+        durationMs: 42,
+        arbitrary: { nested: "untrusted metadata" },
+      },
+    }),
+  });
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield {
+        type: "tool_call_end",
+        toolCallId: "tool_sandboxed",
+        name: "sandboxed_command",
+        input: {},
+      };
+      yield { type: "finish", reason: "tool_use" };
+    },
+  };
+
+  const result = await testRuntime(store, registry, model).runTurn({
+    sessionId: "session_tool_context" as SessionId,
+    threadId: "thread_tool_context" as ThreadId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("completed");
+  const [part] = toolResultParts(store);
+  expect(part?.executionContext).toEqual({
+    sandbox: "macos-seatbelt",
+    executionMode: "sandboxed",
+    exitCode: 1,
+    timedOut: false,
+    aborted: false,
+    signal: null,
+  });
+  expect(part).not.toHaveProperty("metadata");
+  expect(JSON.stringify(part)).not.toContain("secret command");
+  expect(JSON.stringify(part)).not.toContain("untrusted metadata");
+});
+
 test("keeps indexed reasoning sections in separate message parts", async () => {
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();

@@ -83,6 +83,40 @@ test("details mode preserves the head and tail of truncated preview lines", () =
   });
 });
 
+test("details mode shows only controlled execution context fields", () => {
+  const executionContext = {
+    executionMode: "unsandboxed",
+    sandbox: "none",
+    exitCode: 0,
+    timedOut: false,
+    aborted: false,
+    signal: null,
+    internalMetadata: "must not leak",
+  } satisfies NonNullable<ToolRenderInput["executionContext"]> & { internalMetadata: string };
+  const rendered = renderToolActivity(toolInput({
+    toolName: "bash",
+    inputSummary: { title: "bash", command: "echo ok", detail: "echo ok" },
+    executionContext,
+    showToolDetails: true,
+  }));
+
+  expect(rendered.details).toContainEqual({
+    label: "execution",
+    tone: "muted",
+    lines: [
+      "mode: unsandboxed",
+      "sandbox: none",
+      "exit code: 0",
+      "timed out: false",
+      "aborted: false",
+      "signal: null",
+    ],
+    truncated: false,
+  });
+  expect(JSON.stringify(rendered)).not.toContain("internalMetadata");
+  expect(JSON.stringify(rendered)).not.toContain("must not leak");
+});
+
 test("compact errors preserve head and tail with a Ctrl+T transcript hint", () => {
   const error = Array.from({ length: 7 }, (_, index) => `error_${index + 1}`).join("\n");
   const rendered = renderToolActivity(toolInput({
@@ -455,6 +489,7 @@ function toolInput(overrides: Partial<ToolRenderInput> & { toolName: string }): 
     ...(overrides.input === undefined ? {} : { input: overrides.input }),
     ...(overrides.output === undefined ? {} : { output: overrides.output }),
     ...(overrides.error === undefined ? {} : { error: overrides.error }),
+    ...(overrides.executionContext === undefined ? {} : { executionContext: overrides.executionContext }),
     ...(overrides.liveOutput === undefined ? {} : { liveOutput: overrides.liveOutput }),
   };
 }

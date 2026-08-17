@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { formatToolResultForModel } from "@chili/protocol";
 import type {
   ChiliEvent,
   EventEnvelope,
@@ -9,12 +10,14 @@ import type {
   ThreadId,
   TimestampMs,
   ToolDefinition,
+  ToolResultExecutionContext,
   TurnId,
 } from "@chili/protocol";
 import type { ApprovalRow, EventQuery, EventStore, SessionRow } from "@chili/store";
 import { InMemoryToolRegistry, ToolExecutor } from "@chili/tools";
 import { ContextWindowBuilder, compactedMessageView } from "./window.js";
 import { ContextCompactionService } from "./compaction.js";
+import { formatCompactionSourceMessages, formatConversationMessages } from "./format.js";
 import { takeModelUsage } from "../model-usage.js";
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "../runtime.js";
 import { SingleAgentRuntime } from "../single-agent-runtime.js";
@@ -207,6 +210,68 @@ test("context builder does not split surrogate pairs while truncating tool resul
   if (part?.type !== "tool_result") throw new Error("expected tool result");
   expect(Buffer.from(part.output, "utf8").toString("utf8")).toBe(part.output);
   expect(part.output.length).toBeLessThanOrEqual(80);
+});
+
+test("context builder reserves the tool execution footer inside the result limit", () => {
+  const sessionId = "session_tool_execution_footer_limit" as SessionId;
+  const message = toolResultMessage(
+    "msg_tool_execution_footer_limit",
+    sessionId,
+    "execution_footer_limit",
+    `HEAD_${"x".repeat(500)}_TAIL`,
+  );
+  const source = message.parts.find((part) => part.type === "tool_result");
+  if (source?.type !== "tool_result") throw new Error("expected tool result");
+  source.error = "command failed";
+  source.executionContext = toolExecutionContext();
+  const maxResultChars = 220;
+
+  const built = new ContextWindowBuilder({
+    maxInputChars: 10_000,
+    maxToolResultChars: maxResultChars,
+    maxTotalToolResultChars: 10_000,
+    maxMessagePartChars: 400,
+  }).build([message]);
+
+  const result = built.messages.flatMap((candidate) => candidate.parts).find(
+    (part) => part.type === "tool_result",
+  );
+  if (result?.type !== "tool_result") throw new Error("expected tool result");
+  const formatted = formatToolResultForModel(result);
+  expect(formatted.length).toBeLessThanOrEqual(maxResultChars);
+  expect(formatted).toEndWith(toolExecutionContextFooter());
+  expect(result.output).not.toContain("[tool execution context]");
+  expect(result.output).not.toBe(source.output);
+});
+
+test("tool result microcompaction preserves and budgets the execution footer", () => {
+  const sessionId = "session_tool_execution_footer_compact" as SessionId;
+  const message = toolResultMessage(
+    "msg_tool_execution_footer_compact",
+    sessionId,
+    "execution_footer_compact",
+    `HEAD_${"x".repeat(500)}_TAIL`,
+  );
+  const source = message.parts.find((part) => part.type === "tool_result");
+  if (source?.type !== "tool_result") throw new Error("expected tool result");
+  source.executionContext = toolExecutionContext();
+  const compactedResultChars = 180;
+
+  const built = new ContextWindowBuilder({
+    maxInputChars: 10_000,
+    maxToolResultChars: 1_000,
+    maxTotalToolResultChars: 0,
+    compactedToolResultChars: compactedResultChars,
+  }).build([message]);
+
+  const result = built.messages.flatMap((candidate) => candidate.parts).find(
+    (part) => part.type === "tool_result",
+  );
+  if (result?.type !== "tool_result") throw new Error("expected tool result");
+  const formatted = formatToolResultForModel(result);
+  expect(built.usage.compactedToolResults).toBe(1);
+  expect(formatted.length).toBeLessThanOrEqual(compactedResultChars);
+  expect(formatted).toEndWith(toolExecutionContextFooter());
 });
 
 test("context builder hard-limits every model-visible message item", () => {
@@ -437,6 +502,11 @@ test("context builder detaches tool input and image content from dynamic seriali
   const toolResult = result.parts[0];
   if (toolResult?.type !== "tool_result") throw new Error("expected tool result");
   toolResult.content = [dynamicImage];
+  toolResult.executionContext = {
+    sandbox: "macos-seatbelt",
+    executionMode: "sandboxed",
+    exitCode: 1,
+  };
 
   const built = new ContextWindowBuilder({
     maxInputChars: 10_000,
@@ -452,6 +522,11 @@ test("context builder detaches tool input and image content from dynamic seriali
   expect(builtResult?.type === "tool_result" && builtResult.content?.[0]?.type === "image"
     ? builtResult.content[0].data
     : "").toBe("a");
+  expect(builtResult?.type === "tool_result" ? builtResult.executionContext : undefined).toEqual({
+    sandbox: "macos-seatbelt",
+    executionMode: "sandboxed",
+    exitCode: 1,
+  });
 });
 
 test("context builder never emits an orphan tool result after history eviction", () => {
@@ -801,6 +876,68 @@ test("runtime fails before model streaming when fixed input exhausts the model w
   if (result.status === "completed") throw new Error("expected context overflow failure");
   expect(result.error?.name).toBe("ContextWindowExceededError");
   expect(modelCalls).toBe(0);
+});
+
+test("conversation and compaction formatting preserve controlled tool execution context", async () => {
+  const sessionId = "session_compaction_execution_context" as SessionId;
+  const threadId = "thread_compaction_execution_context" as ThreadId;
+  const turnId = "turn_compaction_execution_context" as TurnId;
+  const source = toolResultMessage(
+    "msg_compaction_execution_context",
+    sessionId,
+    "compaction_execution_context",
+    "command output",
+  );
+  const result = source.parts.find((part) => part.type === "tool_result");
+  if (result?.type !== "tool_result") throw new Error("expected tool result");
+  result.executionContext = toolExecutionContext();
+  const footer = toolExecutionContextFooter();
+  const ordinary = toolResultMessage(
+    "msg_compaction_ordinary_result",
+    sessionId,
+    "compaction_ordinary_result",
+    "plain output",
+  );
+
+  expect(formatConversationMessages([source])).toContain(footer);
+  expect(formatCompactionSourceMessages([source])).toContain(footer);
+  expect(formatConversationMessages([ordinary])).toBe([
+    "[assistant msg_compaction_ordinary_result]",
+    "[tool_call test_tool compaction_ordinary_result completed]",
+    "{}",
+    "[tool_result compaction_ordinary_result]",
+    "plain output",
+  ].join("\n"));
+
+  let compactionPrompt = "";
+  const model: ModelRouter = {
+    async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+      const prompt = input.messages[0]?.parts.find((part) => part.type === "text");
+      compactionPrompt = prompt?.type === "text" ? prompt.text : "";
+      yield { type: "text_delta", text: "<context_summary>command context retained</context_summary>" };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const compactor = new ContextCompactionService({
+    model,
+    verifySummary: false,
+    now: () => 1 as TimestampMs,
+  });
+
+  await compactor.compact({
+    sessionId,
+    threadId,
+    turnId,
+    messages: [source],
+    boundary: {
+      boundaryMessageId: source.id,
+      reason: "manual",
+      estimatedChars: 1_000,
+      budgetChars: 10_000,
+    },
+  });
+
+  expect(compactionPrompt).toContain(footer);
 });
 
 test("compaction fits draft and verification requests to the selected model limits", async () => {
@@ -1391,6 +1528,27 @@ function toolResultMessage(
       },
     ],
   };
+}
+
+function toolExecutionContext(): ToolResultExecutionContext {
+  return {
+    sandbox: "macos-seatbelt",
+    executionMode: "sandboxed",
+    exitCode: 17,
+    timedOut: false,
+    signal: null,
+  };
+}
+
+function toolExecutionContextFooter(): string {
+  return [
+    "[tool execution context]",
+    "sandbox: macos-seatbelt",
+    "execution_mode: sandboxed",
+    "exit_code: 17",
+    "timed_out: false",
+    "signal: null",
+  ].join("\n");
 }
 
 function modelVisiblePartText(part: MessagePart): string {

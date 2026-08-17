@@ -89,6 +89,50 @@ test("converts Chili messages and tools into an OpenAI-compatible chat completio
   });
 });
 
+test("adds controlled execution context to OpenAI tool result content", () => {
+  const callId = "call_sandboxed" as ToolCallId;
+  const body = buildOpenAICompletionsRequestBody(
+    {
+      messages: [
+        message("assistant", [
+          { type: "tool_call", callId, toolName: "bash", input: {}, status: "completed" },
+        ]),
+        message("user", [{
+          type: "tool_result",
+          callId,
+          output: "command failed",
+          executionContext: {
+            sandbox: "macos-seatbelt",
+            executionMode: "sandboxed",
+            exitCode: 1,
+            timedOut: false,
+          },
+        }]),
+      ],
+      tools: [],
+      system: [],
+    },
+    {
+      provider: "openai",
+      model: "gpt-test",
+    },
+  );
+
+  expect((body.messages as unknown[]).at(-1)).toEqual({
+    role: "tool",
+    tool_call_id: callId,
+    content: [
+      "command failed",
+      "",
+      "[tool execution context]",
+      "sandbox: macos-seatbelt",
+      "execution_mode: sandboxed",
+      "exit_code: 1",
+      "timed_out: false",
+    ].join("\n"),
+  });
+});
+
 test("uses compatibility settings when shaping OpenAI-compatible requests", () => {
   const body = buildOpenAICompletionsRequestBody(
     {

@@ -1,4 +1,4 @@
-import type { ChatMessagePart, ChatToolInputSummary, ChatTranscriptItem } from "@chili/sdk";
+import type { ChatMessagePart, ChatToolExecutionContext, ChatToolInputSummary, ChatTranscriptItem } from "@chili/sdk";
 
 export type TranscriptLineTone = "heading" | "text" | "muted" | "error";
 
@@ -95,6 +95,9 @@ function messagePartLines(
   const lines = [
     sourceLine(`${key}:header`, `  part tool_result ${part.id} callId=${part.callId}${part.synthetic ? " synthetic" : ""}`, "heading"),
   ];
+  if (part.executionContext !== undefined) {
+    lines.push(...executionContextLines(`${key}:execution`, "    executionContext", part.executionContext));
+  }
   lines.push(...blockLines({ key: `${key}:output`, label: "    output", value: part.output, tone: "muted", valueTone: "text" }));
   if (part.error !== undefined) {
     lines.push(...blockLines({ key: `${key}:error`, label: "    error", value: part.error, tone: "error", valueTone: "error" }));
@@ -114,6 +117,9 @@ function toolLines(item: Extract<ChatTranscriptItem, { kind: "tool" }>, isLast: 
   appendOptionalField(lines, `tool:${item.id}`, "approvalId", item.approvalId);
   appendOptionalField(lines, `tool:${item.id}`, "approvalStatus", item.approvalStatus);
   appendOptionalField(lines, `tool:${item.id}`, "approvalDecision", item.approvalDecision);
+  if (item.executionContext !== undefined) {
+    lines.push(...executionContextLines(`tool:${item.id}:execution`, "  executionContext", item.executionContext));
+  }
   lines.push(...summaryBlockLines(`tool:${item.id}:summary`, item.inputSummary));
   lines.push(...blockLines({ key: `tool:${item.id}:input`, label: "  input", value: item.input, tone: "muted", valueTone: "text", emptyText: "(none)" }));
   if (item.output !== undefined) {
@@ -150,6 +156,22 @@ function approvalLines(item: Extract<ChatTranscriptItem, { kind: "approval" }>, 
 
 function summaryBlockLines(key: string, summary: ChatToolInputSummary): TranscriptSourceLine[] {
   return blockLines({ key, label: "  inputSummary", value: summary, tone: "muted", valueTone: "text" });
+}
+
+function executionContextLines(key: string, label: string, context: ChatToolExecutionContext): TranscriptSourceLine[] {
+  const fields: [string, string][] = [];
+  if (context.executionMode !== undefined) fields.push(["executionMode", context.executionMode]);
+  if (context.sandbox !== undefined) fields.push(["sandbox", context.sandbox]);
+  if (context.exitCode !== undefined) fields.push(["exitCode", String(context.exitCode ?? "null")]);
+  if (context.timedOut !== undefined) fields.push(["timedOut", String(context.timedOut)]);
+  if (context.aborted !== undefined) fields.push(["aborted", String(context.aborted)]);
+  if (context.signal !== undefined) fields.push(["signal", context.signal ?? "null"]);
+  if (fields.length === 0) return [];
+  const prefix = `${leadingWhitespace(label)}  `;
+  return [
+    sourceLine(`${key}:label`, `${label}:`, "muted"),
+    ...fields.map(([name, value]) => sourceLine(`${key}:${name}`, `${prefix}${name}: ${value}`, "text")),
+  ];
 }
 
 function listBlockLines(key: string, label: string, values: readonly string[]): TranscriptSourceLine[] {

@@ -1,5 +1,11 @@
 import { platform, release, arch } from "node:os";
-import type { AssistantMessagePhase, Message, MessagePart, ServiceTier } from "@chili/protocol";
+import {
+  formatToolResultForModel,
+  type AssistantMessagePhase,
+  type Message,
+  type MessagePart,
+  type ServiceTier,
+} from "@chili/protocol";
 import { FileAuthStorage, type OAuthCredentials } from "./auth.js";
 import { type EnvironmentSource, readOpenAICodexEnvironment } from "./env.js";
 import {
@@ -582,7 +588,7 @@ function toResponsesInput(messages: readonly Message[], includeImageContent = tr
       output.push({
         type: "function_call_output",
         call_id: normalizeResponsesId(String(part.callId)),
-        output: formatToolResult(part),
+        output: formatToolResultForModel(part),
       });
       const imageContent = toolResultImageContent(part, includeImageContent);
       if (imageContent.length > 0) output.push({ role: "user", content: imageContent });
@@ -953,11 +959,6 @@ function formatToolInputParseError(error: unknown): string {
   return message
     ? `Tool call arguments were not valid JSON: ${message}`
     : "Tool call arguments were not valid JSON.";
-}
-
-function formatToolResult(part: Extract<MessagePart, { type: "tool_result" }>): string {
-  if (part.error) return part.output ? `${part.output}\n\nError: ${part.error}` : `Error: ${part.error}`;
-  return part.output;
 }
 
 function toolResultImageContent(

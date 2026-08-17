@@ -13,6 +13,7 @@ import type {
   ThreadId,
   TimestampMs,
   ToolCallId,
+  ToolResultExecutionContext,
   TurnId,
 } from "@chili/protocol";
 import {
@@ -117,6 +118,97 @@ test("projects exact assistant text phases without classifying missing metadata"
     { type: "text", id: finalPartId, text: "Done.", phase: "final_answer" },
     { type: "text", id: unclassifiedPartId, text: "Legacy provider text." },
   ]);
+});
+
+test("projects only controlled tool execution context into message and tool rows", () => {
+  const sessionId = "session_execution_context" as SessionId;
+  const threadId = "thread_execution_context" as ThreadId;
+  const turnId = "turn_execution_context" as TurnId;
+  const messageId = "message_execution_context" as MessageId;
+  const partId = "part_execution_context" as PartId;
+  const callId = "toolcall_execution_context" as ToolCallId;
+  const executionContext = {
+    sandbox: "none",
+    executionMode: "unsandboxed",
+    exitCode: 0,
+    timedOut: false,
+    aborted: false,
+    signal: null,
+    internalMetadata: "must not leak",
+  } satisfies ToolResultExecutionContext & { internalMetadata: string };
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_execution_context_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_execution_context_message",
+      type: "message.created",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId, role: "assistant", turnId },
+    },
+    {
+      id: "event_execution_context_tool",
+      type: "tool.call_started",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId, callId, toolName: "bash", input: { command: "echo ok" } },
+    },
+    {
+      id: "event_execution_context_result",
+      type: "message.part_added",
+      time: 4 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        messageId,
+        part: {
+          id: partId,
+          messageId,
+          sessionId,
+          type: "tool_result",
+          callId,
+          output: "ok",
+          executionContext,
+        },
+      },
+    },
+    {
+      id: "event_execution_context_finished",
+      type: "tool.call_finished",
+      time: 5 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId, status: "completed", output: "ok" },
+    },
+  ], createRuntimeView());
+
+  const chat = chatSessionView(view, { sessionId, threadId, generatedAt: "now" });
+  const message = chat.items.find((item) => item.kind === "message");
+  const result = message?.kind === "message"
+    ? message.parts.find((part) => part.type === "tool_result")
+    : undefined;
+  const tool = chat.items.find((item) => item.kind === "tool");
+  const expected = {
+    sandbox: "none",
+    executionMode: "unsandboxed",
+    exitCode: 0,
+    timedOut: false,
+    aborted: false,
+    signal: null,
+  } satisfies ToolResultExecutionContext;
+
+  expect(result?.type === "tool_result" ? result.executionContext : undefined).toEqual(expected);
+  expect(tool?.kind === "tool" ? tool.executionContext : undefined).toEqual(expected);
+  expect(result?.type === "tool_result" ? result.executionContext : undefined).not.toHaveProperty("internalMetadata");
+  expect(tool?.kind === "tool" ? tool.executionContext : undefined).not.toHaveProperty("internalMetadata");
 });
 
 test("replays session, message, tool, and approval events into a runtime view", () => {

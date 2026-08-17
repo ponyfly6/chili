@@ -1,4 +1,4 @@
-import type { Message, MessagePart } from "@chili/protocol";
+import { formatToolResultForModel, type Message, type MessagePart } from "@chili/protocol";
 import type {
   ChiliModel,
   ModelInputCapability,
@@ -443,17 +443,13 @@ function formatImageBlock(part: Pick<Extract<MessagePart, { type: "image" }>, "d
   };
 }
 
-function formatToolResult(part: Extract<MessagePart, { type: "tool_result" }>): string {
-  if (part.error) return part.output ? `${part.output}\n\nError: ${part.error}` : `Error: ${part.error}`;
-  return part.output;
-}
-
 function formatToolResultContent(part: Extract<MessagePart, { type: "tool_result" }>, includeImageContent = true): AnthropicToolResultContent {
   if (part.error || !includeImageContent || !part.content?.some((item) => item.type === "image")) {
-    return formatToolResult(part);
+    return formatToolResultForModel(part);
   }
   const blocks: Exclude<AnthropicToolResultContent, string> = [];
-  if (part.output) blocks.push({ type: "text", text: part.output });
+  const output = formatToolResultForModel(part);
+  if (output) blocks.push({ type: "text", text: output });
   for (const item of part.content) {
     if (item.type === "text") {
       if (item.text) blocks.push({ type: "text", text: item.text });
@@ -461,7 +457,7 @@ function formatToolResultContent(part: Extract<MessagePart, { type: "tool_result
     }
     blocks.push(formatImageBlock(item));
   }
-  return blocks.length > 0 ? blocks : formatToolResult(part);
+  return blocks.length > 0 ? blocks : formatToolResultForModel(part);
 }
 
 function supportsImageInput(inputCapabilities: readonly ModelInputCapability[] | undefined): boolean {

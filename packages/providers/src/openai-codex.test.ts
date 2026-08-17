@@ -111,6 +111,45 @@ test("converts Chili messages and tools into a Codex Responses body", () => {
   });
 });
 
+test("adds controlled execution context to Codex function outputs", () => {
+  const callId = "call_sandboxed" as ToolCallId;
+  const body = buildOpenAICodexResponsesRequestBody(
+    {
+      messages: [
+        message("assistant", [
+          { type: "tool_call", callId, toolName: "bash", input: {}, status: "completed" },
+        ]),
+        message("user", [{
+          type: "tool_result",
+          callId,
+          output: "command failed",
+          executionContext: {
+            sandbox: "macos-seatbelt",
+            executionMode: "sandboxed",
+            exitCode: 1,
+          },
+        }]),
+      ],
+      tools: [],
+      system: [],
+    },
+    { model: "gpt-5.5" },
+  );
+
+  expect((body.input as unknown[]).at(-1)).toEqual({
+    type: "function_call_output",
+    call_id: callId,
+    output: [
+      "command failed",
+      "",
+      "[tool execution context]",
+      "sandbox: macos-seatbelt",
+      "execution_mode: sandboxed",
+      "exit_code: 1",
+    ].join("\n"),
+  });
+});
+
 test("rejects phase-less assistant text when building Codex history", () => {
   expect(() => buildOpenAICodexResponsesRequestBody(
     {

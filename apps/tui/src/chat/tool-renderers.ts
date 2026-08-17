@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { isAbsolute, relative, resolve } from "node:path";
-import type { ChatToolDisplayStatus, ChatToolInputSummary, RuntimeToolOutputDelta } from "@chili/sdk";
+import type { ChatToolDisplayStatus, ChatToolExecutionContext, ChatToolInputSummary, RuntimeToolOutputDelta } from "@chili/sdk";
 
 const TRANSCRIPT_HINT = "Ctrl+T for transcript";
 
@@ -36,6 +36,7 @@ export interface ToolRenderInput {
   input?: unknown;
   output?: string;
   error?: string;
+  executionContext?: ChatToolExecutionContext;
   liveOutput?: readonly RuntimeToolOutputDelta[];
   cwd?: string;
   showToolDetails: boolean;
@@ -297,6 +298,8 @@ function defaultToolDetails(input: ToolRenderInput, options: { maxOutputLines?: 
     const preview = previewTextLines(formatInput(input.input), { maxLines: 5, maxLineLength: 180, preserveTail: true });
     details.push({ label: "input", tone: "muted", lines: preview.lines, truncated: preview.truncated, maxVisibleRows: 5 });
   }
+  const execution = executionContextDetail(input.executionContext);
+  if (execution) details.push(execution);
   const liveOutput = liveOutputDetail(input, options.maxLiveOutputLines ?? 16);
   if (liveOutput) details.push(liveOutput);
   if (input.error) {
@@ -319,6 +322,19 @@ function defaultToolDetails(input: ToolRenderInput, options: { maxOutputLines?: 
     });
   }
   return details;
+}
+
+function executionContextDetail(context: ChatToolExecutionContext | undefined): ToolActivityDetail | undefined {
+  if (!context) return undefined;
+  const lines: string[] = [];
+  if (context.executionMode !== undefined) lines.push(`mode: ${context.executionMode}`);
+  if (context.sandbox !== undefined) lines.push(`sandbox: ${context.sandbox}`);
+  if (context.exitCode !== undefined) lines.push(`exit code: ${context.exitCode ?? "null"}`);
+  if (context.timedOut !== undefined) lines.push(`timed out: ${String(context.timedOut)}`);
+  if (context.aborted !== undefined) lines.push(`aborted: ${String(context.aborted)}`);
+  if (context.signal !== undefined) lines.push(`signal: ${context.signal ?? "null"}`);
+  if (lines.length === 0) return undefined;
+  return { label: "execution", tone: "muted", lines, truncated: false };
 }
 
 function compactLiveOutputDetails(input: ToolRenderInput): ToolActivityDetail[] {

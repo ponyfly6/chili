@@ -5,6 +5,7 @@ import type {
   ChatSessionView,
   ChatToolCallRow,
   ChatToolDisplayStatus,
+  ChatToolExecutionContext,
   ChatToolInputSummary,
   ChatTranscriptItem,
   RuntimeToolOutputDelta,
@@ -57,6 +58,7 @@ export interface ToolActivityDisplay {
   input?: unknown;
   output?: string;
   error?: string;
+  executionContext?: ChatToolExecutionContext;
   liveOutput?: RuntimeToolOutputDelta[];
   outputHint?: string;
   compactErrorLines?: string[];
@@ -233,6 +235,7 @@ function toolActivityFromRow(row: ChatToolCallRow, showToolDetails: boolean, cwd
     ...(row.input === undefined ? {} : { input: row.input }),
     ...(row.output === undefined ? {} : { output: row.output }),
     ...(row.error === undefined ? {} : { error: row.error }),
+    ...(row.executionContext === undefined ? {} : { executionContext: row.executionContext }),
     ...(row.liveOutput === undefined ? {} : { liveOutput: row.liveOutput }),
   });
 }
@@ -257,6 +260,7 @@ function fallbackToolResultActivity(
     showToolDetails,
     ...(call?.input === undefined ? {} : { input: call.input }),
     ...(part.error === undefined ? {} : { error: part.error }),
+    ...(part.executionContext === undefined ? {} : { executionContext: part.executionContext }),
   });
 }
 
@@ -273,6 +277,7 @@ function toolActivity(input: {
   input?: unknown;
   output?: string;
   error?: string;
+  executionContext?: ChatToolExecutionContext;
   liveOutput?: RuntimeToolOutputDelta[];
 }): ToolActivityDisplay {
   const summary = input.inputSummary ?? inputSummaryFromUnknown(input.toolName, input.input);
@@ -289,6 +294,7 @@ function toolActivity(input: {
     ...(input.input === undefined ? {} : { input: input.input }),
     ...(input.output === undefined ? {} : { output: input.output }),
     ...(input.error === undefined ? {} : { error: input.error }),
+    ...(input.executionContext === undefined ? {} : { executionContext: input.executionContext }),
     ...(input.liveOutput === undefined ? {} : { liveOutput: input.liveOutput }),
   });
 
@@ -312,6 +318,7 @@ function toolActivity(input: {
     ...(input.input === undefined ? {} : { input: input.input }),
     ...(input.output === undefined ? {} : { output: input.output }),
     ...(input.error === undefined ? {} : { error: input.error }),
+    ...(input.executionContext === undefined ? {} : { executionContext: input.executionContext }),
     ...(input.liveOutput === undefined ? {} : { liveOutput: input.liveOutput }),
     ...(rendered.outputHint === undefined ? {} : { outputHint: rendered.outputHint }),
     ...(rendered.compactErrorLines === undefined ? {} : { compactErrorLines: rendered.compactErrorLines }),

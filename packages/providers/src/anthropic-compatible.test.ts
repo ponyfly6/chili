@@ -137,6 +137,11 @@ test("converts image tool results into Anthropic image blocks", () => {
             type: "tool_result",
             callId,
             output: "Image read: pixel.png",
+            executionContext: {
+              sandbox: "macos-seatbelt",
+              executionMode: "sandboxed",
+              exitCode: 1,
+            },
             content: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
           },
         ]),
@@ -157,7 +162,17 @@ test("converts image tool results into Anthropic image blocks", () => {
         type: "tool_result",
         tool_use_id: callId,
         content: [
-          { type: "text", text: "Image read: pixel.png" },
+          {
+            type: "text",
+            text: [
+              "Image read: pixel.png",
+              "",
+              "[tool execution context]",
+              "sandbox: macos-seatbelt",
+              "execution_mode: sandboxed",
+              "exit_code: 1",
+            ].join("\n"),
+          },
           { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2U=" } },
         ],
       },

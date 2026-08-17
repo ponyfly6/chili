@@ -45,6 +45,56 @@ test("tool activity presentation carries renderer cell fields", () => {
   });
 });
 
+test("tool activity details preserve execution context from rows and fallback results", () => {
+  const context = {
+    executionMode: "unsandboxed",
+    sandbox: "none",
+    exitCode: 0,
+  } as const;
+  const rowCallId = "tool_execution_row" as ToolCallId;
+  const rowDisplay = buildChatDisplayItems([
+    chatTool(rowCallId, "bash", "completed", "succeeded", { title: "bash", command: "echo row" }, {
+      executionContext: context,
+    }),
+  ], { showToolDetails: true });
+  const fallbackCallId = "tool_execution_fallback" as ToolCallId;
+  const fallbackDisplay = buildChatDisplayItems([{
+    id: "msg_execution_fallback" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [
+      {
+        type: "tool_call",
+        id: "part_execution_fallback_call" as PartId,
+        callId: fallbackCallId,
+        toolName: "bash",
+        status: "completed",
+        input: { command: "echo fallback" },
+      },
+      {
+        type: "tool_result",
+        id: "part_execution_fallback_result" as PartId,
+        callId: fallbackCallId,
+        output: "ok",
+        executionContext: context,
+      },
+    ],
+  }], { showToolDetails: true });
+
+  for (const item of [rowDisplay[0], fallbackDisplay[0]]) {
+    expect(item?.kind).toBe("tool_activity");
+    if (item?.kind !== "tool_activity") throw new Error("expected a tool activity");
+    expect(item.activity.executionContext).toEqual(context);
+    expect(item.activity.details).toContainEqual({
+      label: "execution",
+      tone: "muted",
+      lines: ["mode: unsandboxed", "sandbox: none", "exit code: 0"],
+      truncated: false,
+    });
+  }
+});
+
 test("live tool rows render partial input labels without exposing assistant tool parts", () => {
   const callId = "tool_live_partial" as ToolCallId;
   const display = buildChatDisplayItems([
@@ -267,7 +317,7 @@ function chatTool(
   status: Extract<ChatTranscriptItem, { kind: "tool" }>["status"],
   displayStatus: Extract<ChatTranscriptItem, { kind: "tool" }>["displayStatus"],
   inputSummary: Extract<ChatTranscriptItem, { kind: "tool" }>["inputSummary"],
-  extra: Partial<Pick<Extract<ChatTranscriptItem, { kind: "tool" }>, "output" | "error" | "input">> = {},
+  extra: Partial<Pick<Extract<ChatTranscriptItem, { kind: "tool" }>, "output" | "error" | "input" | "executionContext">> = {},
 ): Extract<ChatTranscriptItem, { kind: "tool" }> {
   return {
     id,
