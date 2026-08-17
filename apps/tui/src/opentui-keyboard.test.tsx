@@ -2362,6 +2362,97 @@ test("pending approval renders the approval dock and shortcuts resolve it", asyn
   }
 });
 
+test("one-time approval shortcuts cannot grant a wider scope", async () => {
+  const approved: Array<{ id: ApprovalId; scope: ChatApproveOptions["scope"] }> = [];
+  const approvalId = "approval_once_only" as ApprovalId;
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      canSubmit: false,
+      chatView: {
+        status: "waiting_for_approval",
+        items: [],
+        pendingApprovals: [
+          {
+            id: approvalId,
+            kind: "approval",
+            permission: "bash.unsandboxed",
+            patterns: ["remindctl status"],
+            maxApprovalScope: "once",
+            status: "pending",
+            createdAt: 1,
+            toolName: "bash",
+            toolDisplayStatus: "waiting_permission",
+            inputSummary: { title: "bash", command: "remindctl status", detail: "remindctl status" },
+          },
+        ] as never,
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      approveApproval: async (id, options) => {
+        approved.push({ id, scope: options?.scope });
+      },
+    },
+  });
+
+  try {
+    expect(app.captureCharFrame()).toContain("a once | x deny");
+
+    await press(app, () => app.mockInput.pressKey("s"));
+    await press(app, () => app.mockInput.pressKey("a", { shift: true }));
+    expect(approved).toEqual([]);
+
+    await press(app, () => app.mockInput.pressKey("a"));
+    expect(approved).toEqual([{ id: approvalId, scope: "once" }]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("unsandboxed approval cannot be accepted until the full command fits", async () => {
+  const approved: ApprovalId[] = [];
+  const approvalId = "approval_resize_review" as ApprovalId;
+  const command = `remindctl status ${"--include-completed ".repeat(60)}`;
+  const app = await mountShell(teamLiveFixture(), {
+    width: 60,
+    height: 18,
+    runtime: {
+      canSubmit: false,
+      chatView: {
+        status: "waiting_for_approval",
+        items: [],
+        pendingApprovals: [
+          {
+            id: approvalId,
+            kind: "approval",
+            permission: "bash.unsandboxed",
+            patterns: [command],
+            maxApprovalScope: "once",
+            status: "pending",
+            createdAt: 1,
+            toolName: "bash",
+            toolDisplayStatus: "waiting_permission",
+            inputSummary: { title: "bash", command, detail: command, scope: "/repo" },
+            metadata: { justification: "inspect Reminders access" },
+          },
+        ] as never,
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      approveApproval: async (id) => {
+        approved.push(id);
+      },
+    },
+  });
+
+  try {
+    expect(app.captureCharFrame()).toContain("Resize the terminal to review the full command");
+    await press(app, () => app.mockInput.pressKey("a"));
+    expect(approved).toEqual([]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("pending approval shortcuts work when the prompt still has a draft", async () => {
   const approved: Array<{ id: ApprovalId; scope: ChatApproveOptions["scope"] }> = [];
   const approvalId = "approval_with_draft" as ApprovalId;

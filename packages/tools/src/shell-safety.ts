@@ -1,3 +1,5 @@
+import { posix } from "node:path";
+
 export interface DangerousShellCommandFinding {
   action: "ask" | "deny";
   reason: string;
@@ -22,24 +24,88 @@ export function isReadOnlyShellCommand(command: string): boolean {
 }
 
 export function classifyDangerousShellCommand(command: string): DangerousShellCommandFinding | undefined {
+  return classifyDangerousShellCommandAtDepth(command, 0);
+}
+
+export function escalatedShellCommandRejection(command: string): string | undefined {
+  if (/[\r\n]/.test(command)) {
+    return "elevated shell commands must be a single visible line";
+  }
+  if (hasCommandSubstitution(command)) {
+    return "elevated shell commands cannot use command substitution or backticks";
+  }
+  const activeText = unquotedShellText(command);
+  if (activeText.includes("$")) {
+    return "elevated shell commands cannot use shell variable expansion";
+  }
+  if (/[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\{/.test(activeText)) {
+    return "elevated shell commands cannot define shell functions";
+  }
+  if (/[*?\[\]{}]/.test(activeText) || /(^|[\s=;|&<>])~(?:[+\-]|[A-Za-z0-9_])?/.test(activeText)) {
+    return "elevated shell commands cannot use shell path expansion";
+  }
+  for (const segment of shellSegments(command)) {
+    const words = shellWords(segment);
+    if (changesWorkingDirectory(words)) {
+      return "elevated shell commands cannot change the reviewed working directory";
+    }
+    if (stripEnvAssignments(words).length !== words.length) {
+      return "elevated shell commands cannot use shell environment assignments";
+    }
+    const normalized = stripWrappers(words).words;
+    const executable = commandName(normalized[0] ?? "");
+    if (executable === "eval" || executable === "source" || executable === ".") {
+      return "elevated shell commands cannot evaluate or source hidden shell code";
+    }
+    if (SHELL_INTERPRETERS.has(executable)) {
+      return "elevated shell commands cannot invoke another shell interpreter";
+    }
+  }
+  return undefined;
+}
+
+function classifyDangerousShellCommandAtDepth(command: string, depth: number): DangerousShellCommandFinding | undefined {
   const compact = command.replace(/\s+/g, "");
   if (compact.includes(":(){:|:&};:")) {
     return { action: "deny", reason: "Refusing to run a shell fork bomb pattern." };
   }
 
+  let workingDirectoryChanged = false;
   for (const segment of shellSegments(command)) {
-    const words = stripEnvAssignments(shellWords(segment));
-    const analysis = analyzeShellWords(words);
+    const rawWords = shellWords(segment);
+    const segmentChangesWorkingDirectory = changesWorkingDirectory(rawWords);
+    const words = stripEnvAssignments(rawWords);
+    if ((workingDirectoryChanged || segmentChangesWorkingDirectory) && isRecursiveMutation(words)) {
+      return {
+        action: "ask",
+        reason: "Recursive mutation after changing the shell working directory requires explicit approval.",
+      };
+    }
+    const analysis = analyzeShellWords(words, depth);
     if (analysis) return analysis;
+    if (segmentChangesWorkingDirectory) workingDirectoryChanged = true;
   }
 
   return undefined;
 }
 
-function analyzeShellWords(words: string[]): DangerousShellCommandFinding | undefined {
+function analyzeShellWords(words: string[], depth: number): DangerousShellCommandFinding | undefined {
   const normalized = stripWrappers(words);
   const command = commandName(normalized.words[0] ?? "");
   if (!command) return normalized.sawSudo ? { action: "ask", reason: "sudo commands require explicit approval." } : undefined;
+
+  if (depth < 16 && command === "eval") {
+    const nested = classifyDangerousShellCommandAtDepth(normalized.words.slice(1).join(" "), depth + 1);
+    if (nested) return nested;
+  }
+
+  if (depth < 16 && SHELL_INTERPRETERS.has(command)) {
+    const script = shellCommandString(normalized.words.slice(1));
+    if (script !== undefined) {
+      const nested = classifyDangerousShellCommandAtDepth(script, depth + 1);
+      if (nested) return nested;
+    }
+  }
 
   if (command === "rm") {
     return analyzeRm(normalized.words.slice(1));
@@ -88,8 +154,16 @@ function analyzeRm(args: string[]): DangerousShellCommandFinding | undefined {
     return { action: "deny", reason: "Refusing recursive delete of a system, home, workspace, parent, or .git root target." };
   }
 
+  if (recursive && targets.some(isRootExpansionTarget)) {
+    return { action: "deny", reason: "Refusing recursive delete with a shell expansion at the filesystem root." };
+  }
+
   if (recursive && force && targets.some(isWorkspaceWildcardTarget)) {
     return { action: "ask", reason: "Recursive forced delete with a workspace wildcard requires explicit approval." };
+  }
+
+  if (recursive && targets.some(hasShellPathExpansion)) {
+    return { action: "ask", reason: "Recursive delete with shell path expansion requires explicit approval." };
   }
 
   return undefined;
@@ -106,6 +180,10 @@ function shellSegments(command: string): string[] {
     if (escaped) {
       current += char;
       escaped = false;
+      continue;
+    }
+    if (char === "\\" && (command[index + 1] === "\n" || command[index + 1] === "\r")) {
+      index += command[index + 1] === "\r" && command[index + 2] === "\n" ? 2 : 1;
       continue;
     }
     if (char === "\\") {
@@ -129,6 +207,12 @@ function shellSegments(command: string): string[] {
       if ((char === "|" || char === "&") && command[index + 1] === char) index++;
       continue;
     }
+    if (char === "\n" || char === "\r") {
+      pushSegment(segments, current);
+      current = "";
+      if (char === "\r" && command[index + 1] === "\n") index++;
+      continue;
+    }
     current += char;
   }
 
@@ -147,10 +231,15 @@ function shellWords(segment: string): string[] {
   let quote: "'" | "\"" | undefined;
   let escaped = false;
 
-  for (const char of segment) {
+  for (let index = 0; index < segment.length; index++) {
+    const char = segment[index] ?? "";
     if (escaped) {
       current += char;
       escaped = false;
+      continue;
+    }
+    if (char === "\\" && (segment[index + 1] === "\n" || segment[index + 1] === "\r")) {
+      index += segment[index + 1] === "\r" && segment[index + 2] === "\n" ? 2 : 1;
       continue;
     }
     if (char === "\\") {
@@ -395,6 +484,26 @@ function stripWrappers(words: string[]): { words: string[]; sawSudo: boolean } {
       index++;
       continue;
     }
+    if (word === "env") {
+      index++;
+      while (index < words.length) {
+        const arg = words[index] ?? "";
+        if (arg === "--") {
+          index++;
+          break;
+        }
+        if (ENV_OPTIONS_WITH_VALUE.has(arg)) {
+          index += 2;
+          continue;
+        }
+        if (arg.startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)) {
+          index++;
+          continue;
+        }
+        break;
+      }
+      continue;
+    }
     break;
   }
   return { words: words.slice(index), sawSudo };
@@ -435,12 +544,19 @@ function isCatastrophicTarget(target: string): boolean {
     normalized === "/*" ||
     normalized === "." ||
     normalized === ".." ||
+    normalized.startsWith("../") ||
     normalized === "~" ||
+    normalized === "~+" ||
+    normalized === "~-" ||
     normalized === "~/*" ||
     normalized === "$HOME" ||
     normalized === "$HOME/*" ||
     normalized === "${HOME}" ||
     normalized === "${HOME}/*" ||
+    normalized === "$PWD" ||
+    normalized === "${PWD}" ||
+    normalized === "$OLDPWD" ||
+    normalized === "${OLDPWD}" ||
     normalized === ".git"
   ) {
     return true;
@@ -455,11 +571,142 @@ function isWorkspaceWildcardTarget(target: string): boolean {
   return normalized === "*" || normalized === "./*";
 }
 
+function isRootExpansionTarget(target: string): boolean {
+  const normalized = target.trim().replaceAll("\\", "/");
+  if (normalized.startsWith("/")) {
+    const firstComponent = normalized.slice(1).split("/")[0] ?? "";
+    if (hasShellPathExpansion(firstComponent)) return true;
+  }
+  const brace = /^\{([^}]*)\}(\/.*)$/.exec(normalized);
+  return Boolean(brace && brace[1]?.split(",").some((alternative) => alternative.length === 0));
+}
+
+function hasShellPathExpansion(target: string): boolean {
+  return /[$*?\[\]{}]/.test(target) || /^~(?:[+\-]|[A-Za-z0-9_])?/.test(target);
+}
+
+function changesWorkingDirectory(words: readonly string[]): boolean {
+  if (hasEnvChdir(words)) return true;
+  const normalized = stripWrappers(stripEnvAssignments([...words]));
+  const executable = commandName(normalized.words[0] ?? "");
+  return executable === "cd" || executable === "pushd" || executable === "popd";
+}
+
+function hasEnvChdir(words: readonly string[]): boolean {
+  const envIndex = words.findIndex((word) => commandName(word) === "env");
+  if (envIndex < 0) return false;
+  return words.slice(envIndex + 1).some((word) => (
+    word === "-C" || word === "--chdir" || word.startsWith("--chdir=")
+  ));
+}
+
+function isRecursiveMutation(words: string[]): boolean {
+  const normalized = stripWrappers(words);
+  const executable = commandName(normalized.words[0] ?? "");
+  if (executable !== "rm" && executable !== "chmod" && executable !== "chown") return false;
+  return hasRecursiveOption(normalized.words.slice(1));
+}
+
 function normalizeTarget(target: string): string {
   let normalized = target.trim().replaceAll("\\", "/");
   while (normalized.length > 1 && normalized.endsWith("/")) normalized = normalized.slice(0, -1);
+  normalized = posix.normalize(normalized);
   if (normalized === "./") return ".";
   if (normalized === "../") return "..";
   if (normalized === "~/") return "~";
   return normalized;
+}
+
+const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "fish", "dash", "ksh"]);
+const ENV_OPTIONS_WITH_VALUE = new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string"]);
+
+function shellCommandString(args: readonly string[]): string | undefined {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index] ?? "";
+    if (arg === "-c" || (/^-[^-]+$/.test(arg) && arg.includes("c"))) {
+      return args[index + 1];
+    }
+  }
+  return undefined;
+}
+
+function hasCommandSubstitution(command: string): boolean {
+  let quote: "'" | "\"" | undefined;
+  let escaped = false;
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index] ?? "";
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (quote === "'") {
+      if (char === "'") quote = undefined;
+      continue;
+    }
+    if (quote === "\"") {
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === "\"") {
+        quote = undefined;
+        continue;
+      }
+      if (char === "`" || (char === "$" && command[index + 1] === "(")) return true;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === "'") {
+      quote = "'";
+      continue;
+    }
+    if (char === "\"") {
+      quote = "\"";
+      continue;
+    }
+    if (
+      char === "`"
+      || (char === "$" && command[index + 1] === "(")
+      || ((char === "<" || char === ">") && command[index + 1] === "(")
+    ) return true;
+  }
+  return false;
+}
+
+function unquotedShellText(command: string): string {
+  let result = "";
+  let quote: "'" | "\"" | undefined;
+  let escaped = false;
+  for (const char of command) {
+    if (escaped) {
+      result += " ";
+      escaped = false;
+      continue;
+    }
+    if (quote === "'") {
+      if (char === "'") quote = undefined;
+      result += " ";
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      result += " ";
+      continue;
+    }
+    if (char === "'") {
+      quote = "'";
+      result += " ";
+      continue;
+    }
+    if (char === "\"") {
+      quote = quote === "\"" ? undefined : "\"";
+      result += " ";
+      continue;
+    }
+    result += char;
+  }
+  return result;
 }

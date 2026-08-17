@@ -32,6 +32,7 @@ test("macOS Seatbelt runner uses a fixed executable and forwards process control
     env: { CHILI_TEST: "1" },
     timeoutMs: 123,
     maxOutputBytes: 456,
+    sandboxPermissions: "use_default",
     signal: controller.signal,
     onOutput,
     onRawOutput,
@@ -307,6 +308,7 @@ function bashRequest(cwd: string, command: string): BashRunRequest {
     cwd,
     timeoutMs: 5_000,
     maxOutputBytes: 32_000,
+    sandboxPermissions: "use_default",
     signal: new AbortController().signal,
     onOutput: undefined,
   };

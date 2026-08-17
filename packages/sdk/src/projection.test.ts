@@ -190,6 +190,7 @@ test("replays session, message, tool, and approval events into a runtime view", 
         callId,
         permission: "tool.read",
         patterns: ["README.md"],
+        maxApprovalScope: "once",
         metadata: { reason: "Policy asks for README reads", source: "project .chili/config.toml" },
       },
     },
@@ -231,7 +232,130 @@ test("replays session, message, tool, and approval events into a runtime view", 
     reason: "Policy asks for README reads",
     source: "project .chili/config.toml",
   });
+  expect(view.approvals.approval_test?.maxApprovalScope).toBe("once");
   expect(pendingApprovals(view, sessionId)).toHaveLength(0);
+});
+
+test("restores a waiting session to running only after all approvals clear and a tool resumes", () => {
+  const sessionId = "session_resume_after_approval" as SessionId;
+  const threadId = "thread_resume_after_approval" as ThreadId;
+  const turnId = "turn_resume_after_approval" as TurnId;
+  const firstCallId = "toolcall_resume_first" as ToolCallId;
+  const secondCallId = "toolcall_resume_second" as ToolCallId;
+  const firstApprovalId = "approval_resume_first" as ApprovalId;
+  const secondApprovalId = "approval_resume_second" as ApprovalId;
+  const waitingView = reduceRuntimeEvents([
+    {
+      id: "event_resume_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_resume_session_running",
+      type: "session.status_changed",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, status: "running" },
+    },
+    {
+      id: "event_resume_first_started",
+      type: "tool.call_started",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId, callId: firstCallId, toolName: "read", input: { path: "first.ts" } },
+    },
+    {
+      id: "event_resume_first_waiting",
+      type: "tool.call_updated",
+      time: 4 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId: firstCallId, status: "waiting_for_approval" },
+    },
+    {
+      id: "event_resume_first_approval",
+      type: "approval.requested",
+      time: 5 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { approvalId: firstApprovalId, callId: firstCallId, permission: "tool.read", patterns: ["first.ts"] },
+    },
+    {
+      id: "event_resume_second_started",
+      type: "tool.call_started",
+      time: 6 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId, callId: secondCallId, toolName: "read", input: { path: "second.ts" } },
+    },
+    {
+      id: "event_resume_second_waiting",
+      type: "tool.call_updated",
+      time: 7 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId: secondCallId, status: "waiting_for_approval" },
+    },
+    {
+      id: "event_resume_second_approval",
+      type: "approval.requested",
+      time: 8 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { approvalId: secondApprovalId, callId: secondCallId, permission: "tool.read", patterns: ["second.ts"] },
+    },
+  ], createRuntimeView());
+
+  reduceRuntimeEvents([
+    {
+      id: "event_resume_first_resolved",
+      type: "approval.resolved",
+      time: 9 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { approvalId: firstApprovalId, decision: "allow_once" },
+    },
+    {
+      id: "event_resume_first_running",
+      type: "tool.call_updated",
+      time: 10 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId: firstCallId, status: "running" },
+    },
+  ], waitingView);
+
+  expect(waitingView.sessions[sessionId]?.status).toBe("waiting_for_approval");
+  expect(chatSessionView(waitingView, { sessionId, threadId }).status).toBe("waiting_for_approval");
+  expect(pendingApprovals(waitingView, sessionId).map((approval) => approval.id)).toEqual([secondApprovalId]);
+
+  reduceRuntimeEvents([
+    {
+      id: "event_resume_second_resolved",
+      type: "approval.resolved",
+      time: 11 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { approvalId: secondApprovalId, decision: "allow_once" },
+    },
+    {
+      id: "event_resume_second_running",
+      type: "tool.call_updated",
+      time: 12 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId: secondCallId, status: "running" },
+    },
+  ], waitingView);
+
+  expect(waitingView.sessions[sessionId]?.status).toBe("running");
+  expect(chatSessionView(waitingView, { sessionId, threadId }).status).toBe("running");
+  expect(pendingApprovals(waitingView, sessionId)).toEqual([]);
 });
 
 test("chat view hides output-free cancelled turns but keeps interrupted visible output", () => {

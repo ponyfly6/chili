@@ -8,13 +8,14 @@ const MAX_APPROVAL_TARGET_LINES = 2;
 export function ApprovalDock(props: {
   approvals: readonly ChatApprovalRow[];
   width?: number;
+  reviewBlocked?: boolean;
   onApprove: (approvalId: ApprovalId, scope: ChatApprovalGrantScope) => void;
   onReject: (approvalId: ApprovalId) => void;
   theme: TuiTheme;
 }) {
   if (props.approvals.length === 0) return null;
   const width = Math.max(24, props.width ?? 80);
-  const lines = approvalDockLines(props.approvals, width, props.theme);
+  const lines = approvalDockLines(props.approvals, width, props.theme, props.reviewBlocked ?? false);
   return (
     <box width="100%" height={lines.length + 2} flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.warning} paddingX={1}>
       {lines.map((line) => (
@@ -26,9 +27,14 @@ export function ApprovalDock(props: {
   );
 }
 
-export function approvalDockHeight(approvals: readonly ChatApprovalRow[], width: number | undefined, theme: TuiTheme): number {
+export function approvalDockHeight(
+  approvals: readonly ChatApprovalRow[],
+  width: number | undefined,
+  theme: TuiTheme,
+  reviewBlocked = false,
+): number {
   if (approvals.length === 0) return 0;
-  return approvalDockLines(approvals, Math.max(24, width ?? 80), theme).length + 2;
+  return approvalDockLines(approvals, Math.max(24, width ?? 80), theme, reviewBlocked).length + 2;
 }
 
 interface ApprovalDockLine {
@@ -61,7 +67,12 @@ interface TuiApprovalMetadata {
   matchedRule?: unknown;
 }
 
-function approvalDockLines(approvals: readonly ChatApprovalRow[], width: number, theme: TuiTheme): ApprovalDockLine[] {
+function approvalDockLines(
+  approvals: readonly ChatApprovalRow[],
+  width: number,
+  theme: TuiTheme,
+  reviewBlocked: boolean,
+): ApprovalDockLine[] {
   const contentWidth = Math.max(12, width - 6);
   const active = approvals[0];
   if (!active) return [];
@@ -71,6 +82,14 @@ function approvalDockLines(approvals: readonly ChatApprovalRow[], width: number,
     text: approvals.length > 1 ? `Approval required: ${tool} (+${approvals.length - 1})` : `Approval required: ${tool}`,
     fg: theme.colors.status.pending,
   }];
+  if (reviewBlocked) {
+    lines.push(...wrapDetail(
+      `${active.id}:resize-warning`,
+      "Resize the terminal to review the full command before approval. Deny remains available.",
+      contentWidth,
+      theme.colors.status.warning,
+    ));
+  }
 
   const targetLines = wrapDetail(
     `${active.id}:target`,
@@ -78,17 +97,49 @@ function approvalDockLines(approvals: readonly ChatApprovalRow[], width: number,
     contentWidth,
     theme.colors.text.primary,
   );
-  lines.push(...targetLines.slice(0, MAX_APPROVAL_TARGET_LINES));
-  if (targetLines.length > MAX_APPROVAL_TARGET_LINES) {
+  const unsandboxed = active.permission === "bash.unsandboxed";
+  lines.push(...(unsandboxed ? targetLines : targetLines.slice(0, MAX_APPROVAL_TARGET_LINES)));
+  if (!unsandboxed && targetLines.length > MAX_APPROVAL_TARGET_LINES) {
     lines.push({ key: `${active.id}:target-folded`, text: "  ...", fg: theme.colors.text.muted });
   }
 
   const reason = approvalReason(active);
+  if (unsandboxed) {
+    const summary = approvalSummary(active);
+    const metadata = isRecord(active.metadata) ? active.metadata : {};
+    const cwd = summary.scope ?? stringValue(metadata.cwd) ?? "workspace root";
+    lines.push(...wrapDetail(
+      `${active.id}:cwd`,
+      `  cwd: ${cwd}`,
+      contentWidth,
+      theme.colors.text.primary,
+    ));
+    const justification = stringValue(metadata.justification);
+    if (justification) {
+      lines.push(...wrapDetail(
+        `${active.id}:justification`,
+        `  purpose: ${justification}`,
+        contentWidth,
+        theme.colors.text.primary,
+      ));
+    }
+    lines.push(...wrapDetail(
+      `${active.id}:unsandboxed-warning`,
+      "  Runs this exact command outside Chili's host sandbox; approval is one-time.",
+      contentWidth,
+      theme.colors.status.warning,
+    ));
+  }
   if (reason) {
     lines.push({ key: `${active.id}:reason`, text: `  ${reason}`, fg: reason.startsWith("risk:") ? theme.colors.status.warning : theme.colors.text.muted });
   }
 
-  lines.push({ key: "hint", text: "a once | s session | A always | x deny", fg: theme.colors.text.muted });
+  const hint = active.maxApprovalScope === "once"
+    ? "a once | x deny"
+    : active.maxApprovalScope === "session"
+      ? "a once | s session | x deny"
+      : "a once | s session | A always | x deny";
+  lines.push({ key: "hint", text: hint, fg: theme.colors.text.muted });
   return lines;
 }
 

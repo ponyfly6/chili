@@ -1,6 +1,7 @@
 import type {
   ApprovalDecision,
   ApprovalId,
+  ApprovalScope,
   ChiliEvent,
   EventEnvelope,
   SessionId,
@@ -15,6 +16,7 @@ import type {
 import { timestampNow } from "@chili/protocol";
 import { randomUUID } from "node:crypto";
 import { ToolDeniedError, ToolValidationError, UnknownToolError, isAbortError, toError } from "./errors.js";
+import { approvalDecisionWithinScope } from "./approval.js";
 import { FileReadStateStore } from "./file-read-state.js";
 import { authorizeToolByPolicy, filterToolsByPolicy, toolPolicyContext } from "./tool-policy.js";
 import {
@@ -31,10 +33,12 @@ import type {
   ApprovalPreflightDecision,
   SnapshotRecord,
   ToolAccessPolicy,
-  ToolApprovalSpec,
+  ToolApprovalSpecWithDefaults,
   ToolExecutorOptions,
   PersistedToolOutputRegistration,
 } from "./types.js";
+
+type ExecutableApprovalSpec = ToolApprovalSpecWithDefaults & { maxApprovalScope: ApprovalScope };
 
 export class ToolExecutor {
   private readonly fileReads: FileReadStateStore;
@@ -75,7 +79,9 @@ export class ToolExecutor {
             tool,
             executeInput: input,
             validatedInput: validated,
-            approvalSpec: spec === false ? { permission: tool.name, patterns: ["*"], metadata: {} } : spec,
+            approvalSpec: spec === false
+              ? { permission: tool.name, patterns: ["*"], maxApprovalScope: "persistent", metadata: {} }
+              : spec,
             policy,
             isReadOnly: (definition, toolInput) => this.resolvePredicate(definition.isReadOnly, toolInput),
           });
@@ -114,7 +120,7 @@ export class ToolExecutor {
         };
         const rawResult = await tool.execute(
           validated,
-          this.context(tool, input, callId, outputArtifactId, registerPersistedOutput),
+          this.context(tool, validated, input, callId, outputArtifactId, registerPersistedOutput),
         );
         if (registeredOutput) {
           try {
@@ -175,7 +181,7 @@ export class ToolExecutor {
     tool: ChiliToolDefinition<Input>,
     input: ExecuteToolInput,
     callId: ToolCallId,
-    spec: false | Required<ToolApprovalSpec>,
+    spec: false | ExecutableApprovalSpec,
   ): Promise<ApprovalDecision> {
     if (spec === false) return { action: "allow_once" };
 
@@ -187,12 +193,13 @@ export class ToolExecutor {
     return this.createApprovalRequest(input, callId, tool, spec, preflight);
   }
 
-  private approvalSpec<Input>(tool: ChiliToolDefinition<Input>, input: Input): false | Required<ToolApprovalSpec> {
+  private approvalSpec<Input>(tool: ChiliToolDefinition<Input>, input: Input): false | ExecutableApprovalSpec {
     const spec = tool.approval ? tool.approval(input) : { patterns: ["*"] };
     if (spec === false) return false;
     return validateApprovalSpec(tool.name, {
       permission: spec.permission ?? tool.name,
       patterns: spec.patterns,
+      maxApprovalScope: spec.maxApprovalScope ?? "persistent",
       metadata: spec.metadata ?? {},
     });
   }
@@ -202,7 +209,7 @@ export class ToolExecutor {
     input: ExecuteToolInput,
     callId: ToolCallId,
     validated: Input,
-    spec: false | Required<ToolApprovalSpec>,
+    spec: false | ExecutableApprovalSpec,
   ): Promise<SnapshotRecord | undefined> {
     if (spec === false) return undefined;
     if (!this.options.snapshotProvider) return undefined;
@@ -235,7 +242,7 @@ export class ToolExecutor {
     tool: ChiliToolDefinition<Input>,
     input: ExecuteToolInput,
     callId: ToolCallId,
-    spec: Required<ToolApprovalSpec>,
+    spec: ExecutableApprovalSpec,
   ): Promise<SnapshotRecord | undefined> {
     try {
       return await this.options.snapshotProvider?.create({
@@ -349,8 +356,9 @@ export class ToolExecutor {
     };
   }
 
-  private context(
-    tool: ChiliToolDefinition,
+  private context<Input>(
+    tool: ChiliToolDefinition<Input>,
+    validatedInput: Input,
     input: ExecuteToolInput,
     callId: ToolCallId,
     outputArtifactId: ToolCallId,
@@ -381,12 +389,25 @@ export class ToolExecutor {
         outputSequence += 1;
         return this.streamOutput(input, callId, outputSequence, update);
       },
-      requestApproval: (request) =>
-        this.approveOrRequest(input, callId, tool, validateApprovalSpec(tool.name, {
+      requestApproval: async (request) => {
+        const spec = validateApprovalSpec(tool.name, {
           permission: request.permission,
           patterns: request.patterns,
+          maxApprovalScope: request.maxApprovalScope ?? "persistent",
           metadata: request.metadata ?? {},
-        })),
+        });
+        for (const policy of await this.policies(input)) {
+          await authorizeToolByPolicy({
+            tool,
+            executeInput: input,
+            validatedInput,
+            approvalSpec: spec,
+            policy,
+            isReadOnly: (definition, toolInput) => this.resolvePredicate(definition.isReadOnly, toolInput),
+          });
+        }
+        return this.approveOrRequest(input, callId, tool, spec);
+      },
     };
   }
 
@@ -394,7 +415,7 @@ export class ToolExecutor {
     input: ExecuteToolInput,
     callId: ToolCallId,
     tool: ChiliToolDefinition,
-    spec: Required<ToolApprovalSpec>,
+    spec: ExecutableApprovalSpec,
   ): Promise<ApprovalDecision> {
     const preflight = await this.preflightApproval(input, callId, tool, spec);
     if (preflight.action === "allow") return { action: "allow_once" };
@@ -406,7 +427,7 @@ export class ToolExecutor {
     input: ExecuteToolInput,
     callId: ToolCallId,
     tool: ChiliToolDefinition,
-    spec: Required<ToolApprovalSpec>,
+    spec: ExecutableApprovalSpec,
     preflight?: ApprovalPreflightDecision,
   ): Promise<ApprovalDecision> {
     const approvalId = this.id<ApprovalId>("approval");
@@ -416,6 +437,7 @@ export class ToolExecutor {
       callId,
       permission: spec.permission,
       patterns: spec.patterns,
+      maxApprovalScope: spec.maxApprovalScope,
       ...metadataPayload(approvalRequestMetadata(spec, preflight)),
     });
 
@@ -430,6 +452,7 @@ export class ToolExecutor {
         risk: tool.risk,
         permission: spec.permission,
         patterns: spec.patterns,
+        maxApprovalScope: spec.maxApprovalScope,
         metadata: spec.metadata,
       }, input.signal), input.signal);
       throwIfAborted(input.signal);
@@ -443,7 +466,7 @@ export class ToolExecutor {
       }
       throw error;
     }
-    const decision = normalizeApprovalDecision(rawDecision);
+    const decision = normalizeApprovalDecision(rawDecision, spec.maxApprovalScope);
 
     await this.publish("approval.resolved", input, {
       approvalId,
@@ -458,7 +481,7 @@ export class ToolExecutor {
     input: ExecuteToolInput,
     callId: ToolCallId,
     tool: ChiliToolDefinition,
-    spec: Required<ToolApprovalSpec>,
+    spec: ExecutableApprovalSpec,
   ): Promise<ApprovalPreflightDecision> {
     if (!this.options.approvals.preflight) {
       return {
@@ -479,6 +502,7 @@ export class ToolExecutor {
       risk: tool.risk,
       permission: spec.permission,
       patterns: spec.patterns,
+      maxApprovalScope: spec.maxApprovalScope,
       metadata: spec.metadata,
     });
   }
@@ -612,7 +636,7 @@ export class ToolExecutor {
 }
 
 function approvalRequestMetadata(
-  spec: Required<ToolApprovalSpec>,
+  spec: ExecutableApprovalSpec,
   preflight: ApprovalPreflightDecision | undefined,
 ): Record<string, unknown> | undefined {
   const metadata: Record<string, unknown> = { ...spec.metadata };
@@ -636,13 +660,16 @@ function metadataPayload(metadata: Record<string, unknown> | undefined): { metad
   return metadata ? { metadata } : {};
 }
 
-function validateApprovalSpec(toolName: string, spec: Required<ToolApprovalSpec>): Required<ToolApprovalSpec> {
+function validateApprovalSpec(toolName: string, spec: ExecutableApprovalSpec): ExecutableApprovalSpec {
   if (!Array.isArray(spec.patterns) || spec.patterns.length === 0) {
     throw new ToolValidationError(toolName, "Approval spec must include at least one pattern.");
   }
   const invalidIndex = spec.patterns.findIndex((pattern) => typeof pattern !== "string" || pattern.trim().length === 0);
   if (invalidIndex >= 0) {
     throw new ToolValidationError(toolName, `Approval spec pattern at index ${invalidIndex} must be a non-empty string.`);
+  }
+  if (!isApprovalScope(spec.maxApprovalScope)) {
+    throw new ToolValidationError(toolName, `Invalid maximum approval scope: ${String(spec.maxApprovalScope)}`);
   }
   return spec;
 }
@@ -651,10 +678,20 @@ function isApprovalDecisionAction(action: unknown): action is ApprovalDecision["
   return action === "allow_once" || action === "allow_session" || action === "allow_always" || action === "deny";
 }
 
-function normalizeApprovalDecision(decision: ApprovalDecision): ApprovalDecision {
+function normalizeApprovalDecision(decision: ApprovalDecision, maxApprovalScope: ApprovalScope): ApprovalDecision {
   const action = (decision as { action?: unknown } | null | undefined)?.action;
-  if (isApprovalDecisionAction(action)) return decision;
+  if (isApprovalDecisionAction(action)) {
+    if (approvalDecisionWithinScope(action, maxApprovalScope)) return decision;
+    return {
+      action: "deny",
+      feedback: `Approval decision ${action} exceeds the maximum approval scope ${maxApprovalScope}.`,
+    };
+  }
   return { action: "deny", feedback: `Invalid approval decision action: ${String(action)}` };
+}
+
+function isApprovalScope(scope: unknown): scope is ApprovalScope {
+  return scope === "once" || scope === "session" || scope === "persistent";
 }
 
 function defaultCreateId(prefix: string): string {

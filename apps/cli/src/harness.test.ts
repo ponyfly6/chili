@@ -6,7 +6,7 @@ import { chiliBasePromptFragment, type PromptFragment } from "@chili/core";
 import type { AgentPath, ApprovalId, ChiliEvent, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId } from "@chili/protocol";
 import { SkillRegistry, type Skill } from "@chili/skills";
 import { SqliteEventStore, type AgentTaskRow } from "@chili/store";
-import { PolicyApprovalBroker, PolicyApprovalState, type ApprovalBrokerRequest } from "@chili/tools";
+import { PolicyApprovalBroker, PolicyApprovalState, type ApprovalBrokerRequest, type BashRunner } from "@chili/tools";
 import { buildCliChildPromptFragments, buildCliPromptFragments, createCliHarness, linkApprovalSessionsFromEvent, type CliHarness } from "./harness.js";
 import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
 import { runPrompt, runSessionPrompt } from "./runner.js";
@@ -69,6 +69,117 @@ test("CLI harness promptFragments provider includes chili.base", async () => {
       cwd: repo,
     });
     expect(fragments?.some((fragment) => fragment.id === "chili.base")).toBe(true);
+  } finally {
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI harness does not expose an opaque injected Bash runner to scoped workers", async () => {
+  const root = await mkdtempName();
+  const repo = join(root, "repo");
+  let harness: CliHarness | undefined;
+  const injectedRunner: BashRunner = {
+    async run() {
+      throw new Error("injected runner must not be called by this test");
+    },
+  };
+  try {
+    await mkdir(repo, { recursive: true });
+    harness = await createCliHarness({
+      cwd: repo,
+      model: "fake",
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+      bashRunner: injectedRunner,
+    });
+
+    type ToolRegistryView = { list(): Array<{ name: string }> };
+    const rootRegistry = (harness.runtime as unknown as {
+      options: { toolRegistry: ToolRegistryView };
+    }).options.toolRegistry;
+    const childRegistry = (harness.agents as unknown as {
+      options: {
+        runtime?: {
+          options: {
+            runtime: { options: { toolRegistry: ToolRegistryView } };
+          };
+        };
+      };
+    }).options.runtime?.options.runtime.options.toolRegistry;
+
+    expect(rootRegistry.list().some((tool) => tool.name === "bash")).toBe(true);
+    expect(childRegistry?.list().some((tool) => tool.name === "bash")).toBe(false);
+  } finally {
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI harness keeps failed MCP status out of root and child prompt fragments", async () => {
+  const root = await mkdtempName();
+  const home = join(root, "home");
+  const repo = join(root, "repo");
+  let harness: CliHarness | undefined;
+  try {
+    await mkdir(repo, { recursive: true });
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, "mcp.json"), JSON.stringify({
+      mcpServers: {
+        broken: {
+          command: "sh",
+          args: ["-c", "exit 99"],
+          enabled: true,
+        },
+      },
+    }), "utf8");
+
+    harness = await createCliHarness({
+      cwd: repo,
+      chiliHome: home,
+      model: "fake",
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "eager",
+    });
+    expect((await harness.mcp.status?.())?.servers[0]).toMatchObject({
+      name: "broken",
+      status: "error",
+    });
+
+    type PromptFragmentsProvider = (input: {
+      sessionId: SessionId;
+      threadId: ThreadId;
+      cwd: string;
+    }) => Promise<PromptFragment[]> | PromptFragment[];
+    const rootProvider = (harness.service as unknown as {
+      options: { promptFragments?: PromptFragmentsProvider };
+    }).options.promptFragments;
+    const childProvider = (harness.agents as unknown as {
+      options: {
+        runtime?: {
+          options: { promptFragments?: PromptFragmentsProvider };
+        };
+      };
+    }).options.runtime?.options.promptFragments;
+    expect(rootProvider).toBeDefined();
+    expect(childProvider).toBeDefined();
+    const input = {
+      sessionId: "session_mcp_prompt" as SessionId,
+      threadId: "thread_mcp_prompt" as ThreadId,
+      cwd: repo,
+    };
+    const [rootFragments, childFragments] = await Promise.all([
+      Promise.resolve(rootProvider?.(input) ?? []),
+      Promise.resolve(childProvider?.(input) ?? []),
+    ]);
+
+    for (const fragments of [rootFragments, childFragments]) {
+      expect(fragments.some((fragment) => fragment.id === "chili.base")).toBe(true);
+      expect(fragments.some((fragment) => fragment.id === "mcp.server.status")).toBe(false);
+      expect(fragments.some((fragment) => fragment.content.includes("exit 99"))).toBe(false);
+    }
   } finally {
     await harness?.close();
     await rm(root, { recursive: true, force: true });

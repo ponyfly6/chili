@@ -228,8 +228,17 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const bashRunner = options.bashRunner ?? createCliBashRunner({
     permissionProfile: () => permissions.get().profile,
   });
+  // A scoped worker may only receive Bash when Chili owns a concrete host
+  // sandbox. An injected runner is opaque, and non-macOS platforms currently
+  // have no equivalent sandbox implementation, so fail closed by omitting it.
+  const childBashRunner = options.bashRunner || process.platform !== "darwin"
+    ? undefined
+    : createCliBashRunner({
+        permissionProfile: () => permissions.get().profile,
+        allowHostSandboxEscape: false,
+      });
   const registry = createToolRegistry(skillRegistry, bashRunner);
-  const childRegistry = createChildToolRegistry(skillRegistry, bashRunner);
+  const childRegistry = createChildToolRegistry(skillRegistry, childBashRunner);
   let mcpRuntime: CliMcpRuntime | undefined;
   const promptFragments = (context: { cwd: string; turn?: RuntimePromptTurnContext }) =>
     buildCliPromptFragments({
@@ -798,7 +807,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function createChildToolRegistry(skillRegistry: SkillRegistry, bashRunner: BashRunner): InMemoryToolRegistry {
+function createChildToolRegistry(skillRegistry: SkillRegistry, bashRunner?: BashRunner): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool({ defaultMaxBytes: CLI_DEFAULT_READ_MAX_BYTES, maxBytesLimit: CLI_READ_MAX_BYTES_LIMIT }));
   registry.register(createReadImageTool());
@@ -809,7 +818,9 @@ function createChildToolRegistry(skillRegistry: SkillRegistry, bashRunner: BashR
   registry.register(createEditTool());
   registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());
-  registry.register(createBashTool({ runner: bashRunner }));
+  if (bashRunner) {
+    registry.register(createBashTool({ runner: bashRunner, allowEscalation: false }));
+  }
   registerGitTools(registry);
   registry.register(createToolSearchTool(registry));
   return registry;
@@ -913,6 +924,9 @@ function createApprovalBroker(
     rulesets: permissions?.rulesets() ?? createCliApprovalRulesets(options.yes ?? false, config, { sandboxedShell }),
     ...(permissions ? { dangerousShellCommands: permissions.dangerousShellCommands() } : {}),
     state: approvalState,
+    allowOneShotPolicyBypass: () => (
+      permissions?.get().profile ?? (options.yes ? "full-access" : "default")
+    ) === "full-access",
     ask: async (request, signal) => {
       const decision: ApprovalDecision = options.approvalQueue
         ? await options.approvalQueue.ask(request, signal)

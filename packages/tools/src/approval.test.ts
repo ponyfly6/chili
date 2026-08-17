@@ -80,6 +80,64 @@ test("approval fails closed when ask returns an unknown decision action", async 
   expect(decision.feedback).toContain("Invalid approval decision action");
 });
 
+test("once-only approvals reject broader decisions without creating a grant", async () => {
+  const broker = new PolicyApprovalBroker({
+    ask: async (): Promise<ApprovalDecision> => ({ action: "allow_session" }),
+  });
+  const request: ApprovalBrokerRequest = {
+    ...approvalRequest("npm test"),
+    maxApprovalScope: "once",
+  };
+
+  const decision = await broker.decide(request);
+
+  expect(decision.action).toBe("deny");
+  expect(decision.feedback).toContain("exceeds the maximum approval scope once");
+  expect(await broker.preflight(preflightRequest(request))).toMatchObject({ action: "ask" });
+});
+
+test("once-only approvals require a fresh decision despite reusable grants", async () => {
+  const state = new PolicyApprovalState();
+  state.addPersistentGrant({ permission: "*", patterns: ["*"] });
+  let asked = 0;
+  const request: ApprovalBrokerRequest = {
+    ...approvalRequest("remindctl status"),
+    permission: "bash.unsandboxed",
+    maxApprovalScope: "once",
+  };
+  const broker = new PolicyApprovalBroker({
+    state,
+    ask: async () => {
+      asked += 1;
+      return { action: "allow_once" };
+    },
+  });
+
+  expect(await broker.preflight(preflightRequest(request))).toMatchObject({
+    action: "ask",
+    source: "approval_request",
+  });
+  expect(await broker.decide(request)).toEqual({ action: "allow_once" });
+  expect(asked).toBe(1);
+
+  const fullAccess = new PolicyApprovalBroker({ state, allowOneShotPolicyBypass: true });
+  expect(await fullAccess.preflight(preflightRequest(request))).toMatchObject({ action: "allow" });
+});
+
+test("deferred approvals keep a once-only request pending after a broader decision", async () => {
+  const queue = new DeferredApprovalQueue();
+  const request: ApprovalBrokerRequest = {
+    ...approvalRequest("npm test"),
+    maxApprovalScope: "once",
+  };
+  const pending = queue.ask(request);
+
+  expect(queue.resolve({ approvalId: request.approvalId, decision: "allow_session" })).toBe(false);
+  expect(queue.list()).toHaveLength(1);
+  expect(queue.resolve({ approvalId: request.approvalId, decision: "allow_once" })).toBe(true);
+  expect(await pending).toEqual({ action: "allow_once" });
+});
+
 test("approval forces explicit review for dangerous wildcard deletes", async () => {
   let asked: ApprovalBrokerRequest | undefined;
   const broker = new PolicyApprovalBroker({
@@ -104,6 +162,36 @@ test("approval forces explicit review for dangerous wildcard deletes", async () 
     action: "ask",
     source: "bash_danger_classifier",
     suggestions: [{ permission: "bash", pattern: "rm -rf *", scope: "session" }],
+  });
+});
+
+test("unsandboxed bash approvals use the dangerous shell classifier", async () => {
+  let asked: ApprovalBrokerRequest | undefined;
+  const broker = new PolicyApprovalBroker({
+    rulesets: [[{ permission: "*", pattern: "*", action: "allow" }]],
+    ask: async (request): Promise<ApprovalDecision> => {
+      asked = request;
+      return { action: "allow_once" };
+    },
+  });
+  const request: ApprovalBrokerRequest = {
+    ...approvalRequest("rm -rf *"),
+    permission: "bash.unsandboxed",
+    maxApprovalScope: "once",
+  };
+
+  expect((await broker.decide(request)).action).toBe("allow_once");
+  expect(asked?.metadata?.approvalRisks).toEqual([
+    expect.objectContaining({
+      pattern: "rm -rf *",
+      action: "ask",
+      source: "bash_danger_classifier",
+    }),
+  ]);
+  expect(asked?.metadata?.preflightDecision).toMatchObject({
+    action: "ask",
+    source: "bash_danger_classifier",
+    suggestions: [],
   });
 });
 

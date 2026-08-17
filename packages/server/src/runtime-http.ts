@@ -189,6 +189,7 @@ export interface ApprovalResolver {
     decision: ApprovalDecisionAction;
     feedback?: string;
   }): boolean | Promise<boolean>;
+  maxApprovalScope?(approvalId: import("@chili/protocol").ApprovalId): import("@chili/protocol").ApprovalScope | undefined | Promise<import("@chili/protocol").ApprovalScope | undefined>;
 }
 
 export interface PermissionProfileControl {
@@ -679,6 +680,15 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "resolveApproval") {
         if (!options.approvals) return jsonError(501, "No approval resolver is configured");
         const resolveInput = parseResolveApprovalBody(route.approvalId, await readJson<unknown>(request));
+        // A resolver that cannot report the pending request's scope must not be
+        // allowed to create reusable grants. Treat the extension boundary as
+        // one-shot by default and fail closed before resolve() can persist state.
+        const maxApprovalScope = options.approvals.maxApprovalScope
+          ? await options.approvals.maxApprovalScope(route.approvalId)
+          : "once";
+        if (!approvalDecisionWithinScope(resolveInput.decision, maxApprovalScope)) {
+          return jsonError(400, `Approval decision ${resolveInput.decision} exceeds the maximum approval scope ${maxApprovalScope}.`);
+        }
         const resolved = await options.approvals.resolve(resolveInput);
         if (!resolved) {
           return jsonError(409, "Approval is not pending in this runtime. It may have been handled already or orphaned by a server restart.");
@@ -1351,6 +1361,15 @@ function parseResolveApprovalBody(approvalId: import("@chili/protocol").Approval
 
 function isApprovalDecisionAction(value: unknown): value is ApprovalDecisionAction {
   return value === "allow_once" || value === "allow_session" || value === "allow_always" || value === "deny";
+}
+
+function approvalDecisionWithinScope(
+  decision: ApprovalDecisionAction,
+  maxApprovalScope: import("@chili/protocol").ApprovalScope | undefined,
+): boolean {
+  if (decision === "deny" || decision === "allow_once") return true;
+  if (decision === "allow_session") return maxApprovalScope !== "once";
+  return maxApprovalScope === undefined || maxApprovalScope === "persistent";
 }
 
 function rejectLegacySystemField(body: unknown): void {

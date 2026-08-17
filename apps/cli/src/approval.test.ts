@@ -53,6 +53,7 @@ test("default profile allows sandboxed shell and local task lifecycle operations
   const unsandboxed = createCliApprovalRulesets("default", undefined, { sandboxedShell: false });
 
   expect(evaluatePolicy("bash", "rg -n approval packages", sandboxed).action).toBe("allow");
+  expect(evaluatePolicy("bash.unsandboxed", "rg -n approval packages", sandboxed).action).toBe("ask");
   expect(evaluatePolicy("bash", "rg -n approval packages", unsandboxed).action).toBe("ask");
   expect(evaluatePolicy("task", "spawn", sandboxed).action).toBe("allow");
   expect(evaluatePolicy("task", "task_existing", sandboxed).action).toBe("allow");
@@ -77,6 +78,16 @@ test("default profile allows sandboxed shell and local task lifecycle operations
   } finally {
     console.log = originalLog;
   }
+});
+
+test("default profile does not let configured grants bypass one-off unsandboxed approval", () => {
+  const rulesets = createCliApprovalRulesets("default", {
+    userPermissions: [{ permission: "bash.unsandboxed", pattern: "*", action: "allow" }],
+    projectPermissions: [{ permission: "*", pattern: "*", action: "allow" }],
+  }, { sandboxedShell: true });
+
+  expect(evaluatePolicy("bash.unsandboxed", "remindctl status", rulesets).action).toBe("ask");
+  expect(evaluatePolicy("read", "README.md", rulesets).action).toBe("allow");
 });
 
 test("allow_always decisions persist user-level grants", async () => {
@@ -117,6 +128,44 @@ test("allow_session decisions do not persist user-level grants", async () => {
     expect(decision).toEqual({ action: "allow_session" });
     await expect(readFile(join(root, "config.toml"), "utf8")).rejects.toThrow();
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("one-off approvals cannot be persisted or widened interactively", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-approval-once-"));
+  const originalLog = console.log;
+  const prompts: string[] = [];
+  const answers = ["session", "yes"];
+  try {
+    const request = {
+      ...approvalRequest("remindctl status"),
+      permission: "bash.unsandboxed",
+      maxApprovalScope: "once" as const,
+    };
+    expect(await persistAllowAlwaysDecision(request, { action: "allow_always" }, { chiliHome: root })).toMatchObject({
+      action: "deny",
+    });
+    await expect(readFile(join(root, "config.toml"), "utf8")).rejects.toThrow();
+
+    console.log = () => undefined;
+    const broker = createCliApprovalBroker({
+      chiliHome: root,
+      sandboxedShell: true,
+      readline: {
+        question: async (prompt: string) => {
+          prompts.push(prompt);
+          return answers.shift() ?? "no";
+        },
+      } as never,
+    });
+    expect(await broker.decide(request)).toMatchObject({ action: "allow_once" });
+    expect(prompts).toEqual([
+      "Allow once? [y]es / [n]o > ",
+      "Allow once? [y]es / [n]o > ",
+    ]);
+  } finally {
+    console.log = originalLog;
     await rm(root, { recursive: true, force: true });
   }
 });

@@ -8,6 +8,7 @@ import type {
   MessageImageContent,
   ApprovalId,
   ApprovalDecisionAction,
+  ApprovalScope,
   RuntimeApprovalResolveResult,
   RuntimeInterruptResult,
   RuntimeModelConfig,
@@ -281,7 +282,7 @@ export interface ResolveApprovalRequest {
   signal?: AbortSignal;
 }
 
-export type ApprovalGrantScope = "once" | "session" | "persistent";
+export type ApprovalGrantScope = ApprovalScope;
 
 export interface ApproveApprovalRequest {
   approvalId: ApprovalId;

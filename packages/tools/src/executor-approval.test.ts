@@ -98,6 +98,27 @@ test("unknown approval decision actions fail closed", async () => {
   expect(resolved?.payload.feedback).toContain("Invalid approval decision action");
 });
 
+test("executor rejects a broker decision above the tool approval scope", async () => {
+  const events: ChiliEvent[] = [];
+  const executor = createExecutor({
+    events,
+    tool: fakeTool({ permission: "bash.unsandboxed", patterns: ["open README.md"], maxApprovalScope: "once" }),
+    broker: {
+      preflight: async () => ({ action: "ask", source: "test", reason: "test ask", metadata: {} }),
+      decide: async () => ({ action: "allow_session" }),
+    },
+  });
+
+  const result = await executor.execute(toolInput("fake"));
+
+  expect(result.status).toBe("failed");
+  if (result.status === "failed") expect(result.error.message).toContain("exceeds the maximum approval scope once");
+  const requested = events.find((event): event is Extract<ChiliEvent, { type: "approval.requested" }> => event.type === "approval.requested");
+  expect(requested?.payload.maxApprovalScope).toBe("once");
+  const resolved = events.find((event): event is Extract<ChiliEvent, { type: "approval.resolved" }> => event.type === "approval.resolved");
+  expect(resolved?.payload).toMatchObject({ decision: "deny" });
+});
+
 test("allow_always preflights later matching requests in the same session", async () => {
   const events: ChiliEvent[] = [];
   let asked = 0;
@@ -276,7 +297,7 @@ test("allow_session rechecks and resolves matching pending approvals", async () 
   expect(resolved.map((event) => event.payload.decision).sort()).toEqual(["allow_once", "allow_session"]);
 });
 
-function fakeTool(spec: { permission: string; patterns: string[] }): ChiliToolDefinition {
+function fakeTool(spec: { permission: string; patterns: string[]; maxApprovalScope?: "once" | "session" | "persistent" }): ChiliToolDefinition {
   return {
     name: "fake",
     description: "Fake approval test tool.",
@@ -285,6 +306,7 @@ function fakeTool(spec: { permission: string; patterns: string[] }): ChiliToolDe
     approval: () => ({
       permission: spec.permission,
       patterns: spec.patterns,
+      ...(spec.maxApprovalScope ? { maxApprovalScope: spec.maxApprovalScope } : {}),
     }),
     execute: async () => ({ title: "fake", output: "ok" }),
   };

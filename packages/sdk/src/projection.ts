@@ -4,6 +4,7 @@ import type {
   AgentTaskMode,
   ApprovalId,
   ApprovalDecisionAction,
+  ApprovalScope,
   AssistantMessagePhase,
   ChiliEvent,
   EventEnvelope,
@@ -132,6 +133,7 @@ export interface RuntimeApprovalView {
   id: ApprovalId;
   permission: string;
   patterns: string[];
+  maxApprovalScope?: ApprovalScope;
   status: "pending" | "resolved";
   createdAt: number;
   sessionId?: SessionId;
@@ -563,6 +565,7 @@ export interface TeamLiveApprovalSummary {
   id: ApprovalId;
   permission: string;
   patterns: string[];
+  maxApprovalScope?: ApprovalScope;
   status: RuntimeApprovalView["status"];
   createdAt: number;
   sessionId?: SessionId;
@@ -716,6 +719,7 @@ export interface ChatApprovalRow {
   kind: "approval";
   permission: string;
   patterns: string[];
+  maxApprovalScope?: ApprovalScope;
   status: RuntimeApprovalView["status"];
   createdAt: number;
   sessionId?: SessionId;
@@ -910,6 +914,16 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
         const session = upsertSession(view, toolCall.sessionId, event.time);
         session.status = "waiting_for_approval";
         session.updatedAt = event.time;
+      } else if (
+        event.payload.status === "running"
+        && toolCall.sessionId
+        && !hasPendingApprovalForSession(view, toolCall.sessionId)
+      ) {
+        const session = upsertSession(view, toolCall.sessionId, event.time);
+        if (session.status === "waiting_for_approval") {
+          session.status = "running";
+          session.updatedAt = event.time;
+        }
       }
       break;
     }
@@ -951,6 +965,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       assignOptional(approval, "sessionId", event.sessionId);
       assignOptional(approval, "threadId", event.threadId);
       assignOptional(approval, "callId", event.payload.callId);
+      assignOptional(approval, "maxApprovalScope", event.payload.maxApprovalScope);
       assignOptional(approval, "metadata", event.payload.metadata);
       view.approvals[approval.id] = approval;
       linkApprovalToSession(view, approval, event.time);
@@ -1356,6 +1371,7 @@ function chatApprovalRow(view: ChiliRuntimeView, approval: RuntimeApprovalView):
   assignOptional(row, "sessionId", approval.sessionId);
   assignOptional(row, "threadId", approval.threadId);
   assignOptional(row, "callId", approval.callId);
+  assignOptional(row, "maxApprovalScope", approval.maxApprovalScope);
   assignOptional(row, "toolName", toolName);
   assignOptional(row, "toolInput", toolCall?.input);
   assignOptional(row, "toolStatus", toolStatus);
@@ -1970,6 +1986,7 @@ function approvalSummariesForScope(view: ChiliRuntimeView, sessionScope: Readonl
       assignOptional(summary, "sessionId", approval.sessionId);
       assignOptional(summary, "threadId", approval.threadId);
       assignOptional(summary, "callId", approval.callId);
+      assignOptional(summary, "maxApprovalScope", approval.maxApprovalScope);
       assignOptional(summary, "toolName", toolCall?.toolName);
       assignOptional(summary, "decision", approval.decision);
       assignOptional(summary, "feedback", approval.feedback);
@@ -2955,6 +2972,12 @@ function linkApprovalToSession(view: ChiliRuntimeView, approval: RuntimeApproval
   if (!session.approvalIds.includes(approval.id)) session.approvalIds.push(approval.id);
   session.status = "waiting_for_approval";
   session.updatedAt = time;
+}
+
+function hasPendingApprovalForSession(view: ChiliRuntimeView, sessionId: SessionId): boolean {
+  return Object.values(view.approvals).some(
+    (approval) => approval.sessionId === sessionId && approval.status === "pending",
+  );
 }
 
 function linkAgentToSession(view: ChiliRuntimeView, agent: RuntimeAgentView, time: number): void {

@@ -2,7 +2,12 @@ import type { ChiliToolDefinition, ValidationResult } from "../types.js";
 import { resolve } from "node:path";
 import { runProcess, type RunProcessOptions, type RunProcessResult } from "../process.js";
 import { ProcessOutputAccumulator, type ProcessOutputSnapshot } from "../process-output-accumulator.js";
-import { classifyDangerousShellCommand, commandPrefix, isReadOnlyShellCommand } from "../shell-safety.js";
+import {
+  classifyDangerousShellCommand,
+  commandPrefix,
+  escalatedShellCommandRejection,
+  isReadOnlyShellCommand,
+} from "../shell-safety.js";
 import { assertExistingPathInsideWorkspace, resolveWorkspacePath, type WorkspacePath } from "../workspace-path.js";
 
 export interface BashInput {
@@ -12,7 +17,11 @@ export interface BashInput {
   maxOutputBytes?: number;
   cwd?: string;
   env?: Record<string, string>;
+  sandboxPermissions?: BashSandboxPermissions;
+  justification?: string;
 }
+
+export type BashSandboxPermissions = "use_default" | "require_escalated";
 
 export interface BashRunRequest {
   command: string;
@@ -21,13 +30,14 @@ export interface BashRunRequest {
   env?: Record<string, string>;
   timeoutMs: number;
   maxOutputBytes: number;
+  sandboxPermissions: BashSandboxPermissions;
   signal: AbortSignal;
   onOutput: RunProcessOptions["onOutput"];
   onRawOutput?: RunProcessOptions["onRawOutput"];
 }
 
 export interface BashRunResult extends RunProcessResult {
-  sandbox?: "macos-seatbelt";
+  sandbox?: "macos-seatbelt" | "none";
 }
 
 export interface BashRunner {
@@ -36,10 +46,11 @@ export interface BashRunner {
 
 export interface BashToolOptions {
   runner?: BashRunner;
+  allowEscalation?: boolean;
 }
 
 const DEFAULT_BASH_RUNNER: BashRunner = {
-  run(request) {
+  async run(request) {
     const processOptions: RunProcessOptions = {
       cwd: request.cwd,
       signal: request.signal,
@@ -49,7 +60,8 @@ const DEFAULT_BASH_RUNNER: BashRunner = {
     if (request.env) processOptions.env = request.env;
     if (request.onOutput) processOptions.onOutput = request.onOutput;
     if (request.onRawOutput) processOptions.onRawOutput = request.onRawOutput;
-    return runProcess("bash", ["-lc", request.command], processOptions);
+    const result = await runProcess("bash", ["-lc", request.command], processOptions);
+    return { ...result, sandbox: "none" };
   },
 };
 
@@ -59,11 +71,14 @@ export function createUnsandboxedBashRunner(): BashRunner {
 
 export function createBashTool(options: BashToolOptions = {}): ChiliToolDefinition<BashInput> {
   const runner = options.runner ?? DEFAULT_BASH_RUNNER;
+  const allowEscalation = options.allowEscalation ?? true;
   return {
     name: "bash",
     aliases: ["run_shell_command"],
     searchHint: "Run shell commands; read-only commands can be scheduled concurrently.",
-    description: "Run a non-interactive shell command in the workspace.",
+    description: allowEscalation
+      ? "Run a non-interactive shell command in the workspace. Commands that require desktop IPC or other access blocked by the default sandbox may request one-time elevated execution with a justification."
+      : "Run a non-interactive shell command in the workspace.",
     risk: "execute",
     isReadOnly: (input) => isReadOnlyShellCommand(input.command),
     isConcurrencySafe: (input) => isReadOnlyShellCommand(input.command),
@@ -82,6 +97,19 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
         cwd: { type: "string" },
         workingDirectory: { type: "string" },
         env: { type: "object", additionalProperties: { type: "string" } },
+        ...(allowEscalation
+          ? {
+              sandboxPermissions: {
+                type: "string",
+                enum: ["use_default", "require_escalated"],
+              },
+              sandbox_permissions: {
+                type: "string",
+                enum: ["use_default", "require_escalated"],
+              },
+              justification: { type: "string" },
+            }
+          : {}),
       },
     },
     validate(input): ValidationResult<BashInput> {
@@ -92,6 +120,8 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       const maxOutputBytes = input.maxOutputBytes;
       const cwd = pickString(input, "cwd", "workingDirectory", "working_directory");
       const env = parseEnv(input.env);
+      const sandboxPermissions = parseSandboxPermissions(input);
+      const justification = input.justification;
 
       if (typeof command !== "string" || command.trim().length === 0) {
         return { ok: false, message: "command must be a non-empty string" };
@@ -109,36 +139,90 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
         return { ok: false, message: "cwd must be a non-empty string" };
       }
       if (!env.ok) return env;
+      if (!sandboxPermissions.ok) return sandboxPermissions;
+      if (!allowEscalation && sandboxPermissions.value === "require_escalated") {
+        return { ok: false, message: "sandbox escalation is unavailable for this tool registry" };
+      }
+      if (justification !== undefined && typeof justification !== "string") {
+        return { ok: false, message: "justification must be a string" };
+      }
+      const normalizedJustification = typeof justification === "string" ? justification.trim() : undefined;
+      if (sandboxPermissions.value === "require_escalated" && !normalizedJustification) {
+        return {
+          ok: false,
+          message: "justification must be a non-empty string when sandboxPermissions is require_escalated",
+        };
+      }
+      if (sandboxPermissions.value === "require_escalated" && containsUnsafeApprovalText(command)) {
+        return {
+          ok: false,
+          message: "elevated command must not contain control or bidirectional formatting characters",
+        };
+      }
+      if (
+        sandboxPermissions.value === "require_escalated"
+        && normalizedJustification
+        && containsUnsafeApprovalText(normalizedJustification)
+      ) {
+        return {
+          ok: false,
+          message: "elevated justification must not contain control or bidirectional formatting characters",
+        };
+      }
+      if (sandboxPermissions.value === "require_escalated" && env.value !== undefined) {
+        return {
+          ok: false,
+          message: "env overrides are not allowed when sandboxPermissions is require_escalated",
+        };
+      }
+      if (sandboxPermissions.value === "require_escalated") {
+        const rejection = escalatedShellCommandRejection(command);
+        if (rejection) return { ok: false, message: rejection };
+      }
+      if (sandboxPermissions.value === "use_default" && justification !== undefined) {
+        return {
+          ok: false,
+          message: "justification is only valid when sandboxPermissions is require_escalated",
+        };
+      }
 
-      const value: BashInput = { command };
+      const value: BashInput = { command, sandboxPermissions: sandboxPermissions.value };
       if (description !== undefined) value.description = description;
       if (timeoutMs !== undefined) value.timeoutMs = timeoutMs;
       if (maxOutputBytes !== undefined) value.maxOutputBytes = maxOutputBytes;
       if (cwd !== undefined) value.cwd = cwd;
       if (env.value !== undefined) value.env = env.value;
+      if (normalizedJustification !== undefined) value.justification = normalizedJustification;
       return { ok: true, value };
     },
     approval(input) {
       const danger = classifyDangerousShellCommand(input.command);
+      const sandboxPermissions = input.sandboxPermissions ?? "use_default";
       return {
-        permission: "bash",
+        permission: sandboxPermissions === "require_escalated" ? "bash.unsandboxed" : "bash",
         patterns: [input.command],
+        ...(sandboxPermissions === "require_escalated" ? { maxApprovalScope: "once" as const } : {}),
         metadata: {
           command: input.command,
           commandPrefix: commandPrefix(input.command),
           readOnly: isReadOnlyShellCommand(input.command),
           cwd: input.cwd,
           envKeys: input.env ? Object.keys(input.env).sort() : [],
+          sandboxPermissions,
+          ...(input.justification ? { justification: input.justification } : {}),
           ...(danger ? { danger: danger.action, dangerReason: danger.reason, dangerSource: "bash_danger_classifier" } : {}),
         },
       };
     },
     async execute(input, context) {
       const cwd = input.cwd ? (await resolveWorkspaceDirectory(context.cwd, input.cwd)).absolutePath : resolve(context.cwd);
+      const sandboxPermissions = input.sandboxPermissions ?? "use_default";
       await context.metadata({
         metadata: {
           command: input.command,
           cwd,
+          sandboxPermissions,
+          ...(input.justification ? { justification: input.justification } : {}),
         },
       });
 
@@ -161,6 +245,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
         signal: context.signal,
         timeoutMs,
         maxOutputBytes,
+        sandboxPermissions,
         onOutput: (chunk) => context.streamOutput(chunk),
         onRawOutput: (chunk) => outputAccumulator.append(chunk),
       };
@@ -184,9 +269,9 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
           outputSnapshot.persistenceError = error instanceof Error ? error.message : String(error);
         }
       }
-      if (result.sandbox) {
-        await context.metadata({ metadata: { sandbox: result.sandbox } });
-      }
+      const sandbox = result.sandbox ?? "none";
+      const executionMode = sandbox === "none" ? "unsandboxed" : "sandboxed";
+      await context.metadata({ metadata: { sandbox, sandboxPermissions, executionMode } });
 
       const output = outputSnapshot.truncated
         ? formatTruncatedCommandOutput(outputSnapshot, result, timeoutMs)
@@ -199,6 +284,10 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
           command: input.command,
           cwd,
           envKeys: input.env ? Object.keys(input.env).sort() : [],
+          sandboxPermissions,
+          executionMode,
+          sandbox,
+          ...(input.justification ? { justification: input.justification } : {}),
           exitCode: result.exitCode,
           signal: result.signal,
           durationMs: result.durationMs,
@@ -229,7 +318,6 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
                   : {}),
               }
             : {}),
-          ...(result.sandbox ? { sandbox: result.sandbox } : {}),
         },
       };
     },
@@ -298,8 +386,33 @@ function parseEnv(value: unknown): ValidationResult<Record<string, string> | und
   return { ok: true, value: env };
 }
 
+function parseSandboxPermissions(
+  input: Record<string, unknown>,
+): ValidationResult<BashSandboxPermissions> {
+  const camelCase = input.sandboxPermissions;
+  const snakeCase = input.sandbox_permissions;
+  if (camelCase !== undefined && snakeCase !== undefined && camelCase !== snakeCase) {
+    return {
+      ok: false,
+      message: "sandboxPermissions and sandbox_permissions must match when both are provided",
+    };
+  }
+  const value = camelCase ?? snakeCase ?? "use_default";
+  if (value !== "use_default" && value !== "require_escalated") {
+    return {
+      ok: false,
+      message: "sandboxPermissions must be use_default or require_escalated",
+    };
+  }
+  return { ok: true, value };
+}
+
 function isValidEnvName(key: string): boolean {
   return key.length > 0 && !key.includes("=") && !key.includes("\0");
+}
+
+function containsUnsafeApprovalText(value: string): boolean {
+  return /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/u.test(value);
 }
 
 async function resolveWorkspaceDirectory(workspaceInput: string, path: string): Promise<WorkspacePath> {

@@ -1,6 +1,7 @@
 import type {
   ApprovalDecision,
   ApprovalId,
+  ApprovalScope,
   ChiliEvent,
   EventEnvelope,
   SessionId,
@@ -39,8 +40,13 @@ export interface ChiliToolDefinition<Input = any, Output extends ToolResult = To
 export interface ToolApprovalSpec {
   permission?: string;
   patterns: string[];
+  maxApprovalScope?: ApprovalScope;
   metadata?: Record<string, unknown>;
 }
+
+export type ToolApprovalSpecWithDefaults =
+  & Required<Omit<ToolApprovalSpec, "maxApprovalScope">>
+  & Pick<ToolApprovalSpec, "maxApprovalScope">;
 
 export type ToolBooleanPredicate<Input = any> = boolean | ((input: Input) => boolean | Promise<boolean>);
 
@@ -110,6 +116,7 @@ export interface ApprovalBrokerRequest {
   risk: ChiliToolDefinition["risk"];
   permission: string;
   patterns: string[];
+  maxApprovalScope?: ApprovalScope;
   metadata?: Record<string, unknown>;
 }
 
@@ -215,7 +222,7 @@ export interface SnapshotProvider {
 
 export type SnapshotPolicy = (input: {
   tool: ChiliToolDefinition;
-  spec: Required<ToolApprovalSpec>;
+  spec: ToolApprovalSpecWithDefaults;
 }) => boolean;
 
 export type ToolContextFactory = (tool: ChiliToolDefinition, input: ExecuteToolInput, callId: ToolCallId) => ToolExecutionContext;

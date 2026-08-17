@@ -536,6 +536,48 @@ test("renders approval permission patterns and risk metadata", async () => {
   expect(frame).toContain("a once | s session | A always | x deny");
 });
 
+test("renders unsandboxed approvals as one-time only", async () => {
+  const command = "echo visible first\necho visible second\nremindctl status --include-completed";
+  const frame = await renderShellFrame(teamLiveFixture(), {
+    width: 110,
+    height: 34,
+    runtime: fakeChatRuntime({
+      canSubmit: false,
+      chatView: {
+        status: "waiting_for_approval",
+        items: chatMessages(1),
+        pendingApprovals: [
+          {
+            id: "approval_unsandboxed" as ApprovalId,
+            kind: "approval",
+            permission: "bash.unsandboxed",
+            patterns: [command],
+            maxApprovalScope: "once",
+            status: "pending",
+            createdAt: 1,
+            toolName: "bash",
+            toolDisplayStatus: "waiting_permission",
+            inputSummary: { title: "bash", command, detail: command, scope: "tools/reminders" },
+            metadata: { justification: "inspect Reminders authorization through desktop IPC" },
+          },
+        ] as never,
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    }),
+  });
+
+  expect(frame).toContain("outside Chili's host sandbox");
+  expect(frame).toContain("approval is one-time");
+  expect(frame).toContain("remindctl status --include-completed");
+  expect(frame).not.toContain("...");
+  expect(frame).toContain("cwd: tools/reminders");
+  expect(frame).toContain("purpose: inspect Reminders authorization through desktop IPC");
+  expect(frame).toContain("a once | x deny");
+  expect(frame).not.toContain("s session");
+  expect(frame).not.toContain("A always");
+});
+
 test("folds long approval details without hiding the prompt", async () => {
   const longCommand = Array.from({ length: 80 }, (_, index) => `echo segment_${index}`).join(" && ");
   const frame = await renderShellFrame(teamLiveFixture(), {

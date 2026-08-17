@@ -1020,6 +1020,80 @@ test("scoped worker policy allows only read-only bash without execute scope", as
   }
 });
 
+test("scoped worker policy rejects unsandboxed bash even with broad execute scope", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-policy-unsandboxed-bash-"));
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register(createBashTool());
+    const executor = createExecutor(registry, {
+      resolve: () => ({
+        allowedTools: ["bash"],
+        executeScope: ["*"],
+      }),
+    });
+
+    const result = await executor.execute(toolInput("bash", {
+      command: "remindctl status",
+      sandboxPermissions: "require_escalated",
+      justification: "Check whether Reminders access is available.",
+    }, workspace));
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") {
+      expect(result.error.message).toContain("cannot request execution outside the host sandbox");
+    }
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("scoped worker policy also rejects dynamic unsandboxed approval requests", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-policy-dynamic-unsandboxed-"));
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register({
+      name: "dynamic_approval",
+      description: "Request another permission while executing.",
+      risk: "execute",
+      inputSchema: { type: "object" },
+      approval: () => false,
+      async execute(_input, context) {
+        await context.requestApproval({
+          permission: "bash.unsandboxed",
+          patterns: ["remindctl status"],
+          maxApprovalScope: "once",
+        });
+        return { title: "dynamic_approval", output: "unexpected" };
+      },
+    });
+    const executor = createExecutor(registry, {
+      resolve: () => ({ allowedTools: ["dynamic_approval"], executeScope: ["*"] }),
+    });
+
+    const result = await executor.execute(toolInput("dynamic_approval", {}, workspace));
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") {
+      expect(result.error.message).toContain("cannot request execution outside the host sandbox");
+    }
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("child-style bash registries do not expose or accept sandbox escalation", async () => {
+  const tool = createBashTool({ allowEscalation: false });
+  expect(tool.description).not.toContain("elevated execution");
+  expect(JSON.stringify(tool.inputSchema)).not.toContain("sandboxPermissions");
+  expect(JSON.stringify(tool.inputSchema)).not.toContain("sandbox_permissions");
+  expect(await tool.validate?.({
+    command: "remindctl status",
+    sandbox_permissions: "require_escalated",
+    justification: "access Reminders",
+  })).toEqual({
+    ok: false,
+    message: "sandbox escalation is unavailable for this tool registry",
+  });
+});
+
 test("bash supports workspace-scoped cwd and env overrides", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-tools-bash-cwd-"));
   try {
@@ -1035,6 +1109,9 @@ test("bash supports workspace-scoped cwd and env overrides", async () => {
     if (result.status === "completed") {
       expect(result.result.output).toBe("ok:subdir");
       expect(result.result.metadata).toMatchObject({
+        sandboxPermissions: "use_default",
+        executionMode: "unsandboxed",
+        sandbox: "none",
         timedOut: false,
         stdoutBytes: 9,
         outputLimitBytes: 256_000,
@@ -1044,6 +1121,128 @@ test("bash supports workspace-scoped cwd and env overrides", async () => {
     const outside = await executor.execute(toolInput("bash", { command: "pwd", cwd: ".." }, workspace));
     expect(outside.status).toBe("failed");
     if (outside.status === "failed") expect(outside.error.message).toContain("cwd must stay inside the workspace");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("bash validates and normalizes explicit sandbox escalation requests", async () => {
+  const tool = createBashTool();
+  const missingJustification = await tool.validate?.({
+    command: "osascript -e 'return 1'",
+    sandbox_permissions: "require_escalated",
+  });
+  expect(missingJustification).toEqual({
+    ok: false,
+    message: "justification must be a non-empty string when sandboxPermissions is require_escalated",
+  });
+
+  const mismatchedAliases = await tool.validate?.({
+    command: "pwd",
+    sandboxPermissions: "use_default",
+    sandbox_permissions: "require_escalated",
+    justification: "needs desktop IPC",
+  });
+  expect(mismatchedAliases).toEqual({
+    ok: false,
+    message: "sandboxPermissions and sandbox_permissions must match when both are provided",
+  });
+
+  const hiddenEnvironment = await tool.validate?.({
+    command: "remindctl status",
+    sandbox_permissions: "require_escalated",
+    justification: "access Reminders through desktop IPC",
+    env: { PATH: "/tmp/unreviewed-bin" },
+  });
+  expect(hiddenEnvironment).toEqual({
+    ok: false,
+    message: "env overrides are not allowed when sandboxPermissions is require_escalated",
+  });
+
+  for (const command of ["remindctl\tstatus", "remindctl status\u001b[2J"]) {
+    expect(await tool.validate?.({
+      command,
+      sandbox_permissions: "require_escalated",
+      justification: "access Reminders through desktop IPC",
+    })).toEqual({
+      ok: false,
+      message: "elevated command must not contain control or bidirectional formatting characters",
+    });
+  }
+  expect(await tool.validate?.({
+    command: "remindctl status",
+    sandbox_permissions: "require_escalated",
+    justification: "access Reminders\u202e through desktop IPC",
+  })).toEqual({
+    ok: false,
+    message: "elevated justification must not contain control or bidirectional formatting characters",
+  });
+
+  const validated = await tool.validate?.({
+    command: "osascript -e 'return 1'",
+    sandbox_permissions: "require_escalated",
+    justification: "  access Reminders through desktop IPC  ",
+    cwd: "subdir",
+  });
+  expect(validated).toEqual({
+    ok: true,
+    value: {
+      command: "osascript -e 'return 1'",
+      sandboxPermissions: "require_escalated",
+      justification: "access Reminders through desktop IPC",
+      cwd: "subdir",
+    },
+  });
+  if (!validated?.ok) return;
+  expect(tool.approval?.(validated.value)).toMatchObject({
+    permission: "bash.unsandboxed",
+    patterns: ["osascript -e 'return 1'"],
+    maxApprovalScope: "once",
+    metadata: {
+      sandboxPermissions: "require_escalated",
+      justification: "access Reminders through desktop IPC",
+      cwd: "subdir",
+      envKeys: [],
+    },
+  });
+});
+
+test("bash reports the actual sandbox execution mode in result metadata", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-bash-sandbox-metadata-"));
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register(createBashTool({
+      runner: {
+        async run(request) {
+          return {
+            exitCode: 0,
+            signal: null,
+            stdout: "ok",
+            stderr: "",
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            stdoutBytes: 2,
+            stderrBytes: 0,
+            outputLimitBytes: request.maxOutputBytes,
+            durationMs: 1,
+            timedOut: false,
+            aborted: false,
+            sandbox: "macos-seatbelt",
+          };
+        },
+      },
+    }));
+    const executor = createExecutor(registry);
+
+    const result = await executor.execute(toolInput("bash", { command: "pwd" }, workspace));
+
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") return;
+    expect(result.result.metadata).toMatchObject({
+      sandboxPermissions: "use_default",
+      executionMode: "sandboxed",
+      sandbox: "macos-seatbelt",
+    });
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
@@ -1216,9 +1415,10 @@ test("bash runner injection receives resolved request and formats process output
       {
         command: "printf fake",
         cwd: "subdir",
-        env: { CHILI_TEST_ENV: "ok" },
         timeoutMs: 123,
         maxOutputBytes: 17,
+        sandbox_permissions: "require_escalated",
+        justification: "  needs desktop IPC  ",
       },
       workspace,
       "toolcall_fake_bash_runner" as ToolCallId,
@@ -1232,9 +1432,9 @@ test("bash runner injection receives resolved request and formats process output
       command: "printf fake",
       workspaceRoot: workspace,
       cwd: join(workspace, "subdir"),
-      env: { CHILI_TEST_ENV: "ok" },
       timeoutMs: 123,
       maxOutputBytes: 17,
+      sandboxPermissions: "require_escalated",
       signal: controller.signal,
     });
     expect(typeof seen?.onOutput).toBe("function");
@@ -1246,7 +1446,11 @@ test("bash runner injection receives resolved request and formats process output
       expect(result.result.metadata).toMatchObject({
         command: "printf fake",
         cwd: join(workspace, "subdir"),
-        envKeys: ["CHILI_TEST_ENV"],
+        envKeys: [],
+        sandboxPermissions: "require_escalated",
+        executionMode: "unsandboxed",
+        justification: "needs desktop IPC",
+        sandbox: "none",
         signal: "SIGTERM",
         timedOut: true,
         stdoutBytes: 15,

@@ -92,6 +92,7 @@ export const SQLITE_SCHEMA = [
     call_id text,
     permission text not null,
     patterns_json text not null,
+    max_approval_scope text,
     metadata_json text,
     status text not null,
     decision text,

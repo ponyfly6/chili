@@ -22,6 +22,7 @@ import type {
   ThreadId,
   ToolCallStatus,
   ApprovalDecisionAction,
+  ApprovalScope,
 } from "@chili/protocol";
 
 export interface EventQuery {
@@ -67,6 +68,7 @@ export interface ApprovalRow {
   callId?: string;
   permission: string;
   patterns: string[];
+  maxApprovalScope?: ApprovalScope;
   metadata?: Record<string, unknown>;
   status: "pending" | "resolved";
   decision?: ApprovalDecisionAction;

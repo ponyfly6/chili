@@ -1560,6 +1560,7 @@ export class SqliteEventStore
 
   private migrateApprovalSchema(): void {
     this.addColumnIfMissing("approvals", "metadata_json", "text");
+    this.addColumnIfMissing("approvals", "max_approval_scope", "text");
   }
 
   private migrateMessageSchema(): void {
@@ -1892,10 +1893,11 @@ export class SqliteEventStore
       this.db
         .query(
           `insert into approvals
-             (id, session_id, thread_id, call_id, permission, patterns_json, metadata_json, status, created_at)
-           values (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+             (id, session_id, thread_id, call_id, permission, patterns_json, max_approval_scope, metadata_json, status, created_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
            on conflict(id) do update set
              status = 'pending',
+             max_approval_scope = excluded.max_approval_scope,
              metadata_json = excluded.metadata_json`,
         )
         .run(
@@ -1905,6 +1907,7 @@ export class SqliteEventStore
           event.payload.callId ?? null,
           event.payload.permission,
           encodeJson(event.payload.patterns),
+          event.payload.maxApprovalScope ?? null,
           event.payload.metadata ? encodeJson(event.payload.metadata) : null,
           event.time,
         );
@@ -2755,11 +2758,16 @@ function approvalFromRow(row: Record<string, unknown>): ApprovalRow {
   if (row.session_id) approval.sessionId = String(row.session_id) as SessionId;
   if (row.thread_id) approval.threadId = String(row.thread_id) as ThreadId;
   if (row.call_id) approval.callId = String(row.call_id);
+  if (isApprovalScope(row.max_approval_scope)) approval.maxApprovalScope = row.max_approval_scope;
   if (row.metadata_json) approval.metadata = decodeJson<Record<string, unknown>>(String(row.metadata_json), {});
   if (row.decision) approval.decision = row.decision as NonNullable<ApprovalRow["decision"]>;
   if (row.feedback) approval.feedback = String(row.feedback);
   if (row.resolved_at) approval.resolvedAt = Number(row.resolved_at);
   return approval;
+}
+
+function isApprovalScope(value: unknown): value is NonNullable<ApprovalRow["maxApprovalScope"]> {
+  return value === "once" || value === "session" || value === "persistent";
 }
 
 function threadGoalFromRow(row: ThreadGoalProjectionRow): ThreadGoalRow {

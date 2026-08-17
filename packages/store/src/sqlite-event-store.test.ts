@@ -481,7 +481,7 @@ test("migrates older team message tables without delivery", async () => {
   }
 });
 
-test("migrates older approval tables and reads approval metadata", async () => {
+test("migrates older approval tables and reads added projection fields", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-approval-migration-"));
   const dbPath = join(dir, "events.sqlite");
   const db = new Database(dbPath, { create: true, strict: true });
@@ -515,6 +515,7 @@ test("migrates older approval tables and reads approval metadata", async () => {
         approvalId: "approval_metadata" as ApprovalId,
         permission: "tool.bash",
         patterns: ["bun test"],
+        maxApprovalScope: "once",
         metadata: { reason: "Policy requires approval", source: "workspace config" },
       },
     });
@@ -522,7 +523,46 @@ test("migrates older approval tables and reads approval metadata", async () => {
     expect(await store.pendingApprovals(sessionId)).toMatchObject([
       {
         id: "approval_metadata",
+        maxApprovalScope: "once",
         metadata: { reason: "Policy requires approval", source: "workspace config" },
+      },
+    ]);
+    expect(sqliteDatabase(store).query<{ name: string }, []>("pragma table_info(approvals)").all())
+      .toContainEqual(expect.objectContaining({ name: "max_approval_scope" }));
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("materializes maximum approval scope in pending approval rows", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-approval-scope-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const sessionId = "session_approval_scope" as SessionId;
+
+  try {
+    await store.append({
+      id: "event_approval_scope",
+      type: "approval.requested",
+      time: 1 as TimestampMs,
+      sessionId,
+      payload: {
+        approvalId: "approval_scope" as ApprovalId,
+        permission: "bash.unsandboxed",
+        patterns: ["open README.md"],
+        maxApprovalScope: "once",
+      },
+    });
+
+    expect(await store.pendingApprovals(sessionId)).toEqual([
+      {
+        id: "approval_scope",
+        sessionId,
+        permission: "bash.unsandboxed",
+        patterns: ["open README.md"],
+        maxApprovalScope: "once",
+        status: "pending",
+        createdAt: 1,
       },
     ]);
   } finally {

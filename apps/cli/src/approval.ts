@@ -1,6 +1,11 @@
 import { createInterface, type Interface } from "node:readline/promises";
 import type { ApprovalDecision, RuntimePermissionConfig, RuntimePermissionProfileId } from "@chili/protocol";
-import { PolicyApprovalBroker, PolicyApprovalState, type ApprovalBrokerRequest } from "@chili/tools";
+import {
+  PolicyApprovalBroker,
+  PolicyApprovalState,
+  approvalDecisionWithinScope,
+  type ApprovalBrokerRequest,
+} from "@chili/tools";
 import type { PermissionRule } from "@chili/policy";
 import {
   addPersistentPermissionGrants,
@@ -32,6 +37,7 @@ export function createCliApprovalBroker(options: CliApprovalOptions = {}): Polic
       sandboxedShell: options.sandboxedShell ?? false,
     }),
     dangerousShellCommands: dangerousShellCommandsForProfile(profile),
+    allowOneShotPolicyBypass: profile === "full-access",
     ...(options.approvalState ? { state: options.approvalState } : {}),
     ask: async (request, signal) => askApproval(request, options, signal),
   });
@@ -48,6 +54,14 @@ export function createCliApprovalRulesets(
   const projectPermissions = configuredRulesForMode(resolvedProfile, config?.projectPermissions ?? []);
   if (userPermissions.length) rulesets.push(userPermissions);
   if (projectPermissions.length) rulesets.push(projectPermissions);
+  if (resolvedProfile !== "full-access") {
+    rulesets.push([{
+      permission: "bash.unsandboxed",
+      pattern: "*",
+      action: "ask",
+      source: `permission_profile:${resolvedProfile}:one_off_unsandboxed`,
+    }]);
+  }
   return rulesets;
 }
 
@@ -68,6 +82,7 @@ export function createCliPermissionRules(
     { permission: "edit", pattern: "*", action: "allow", source },
     { permission: "write", pattern: "*", action: "allow", source },
     { permission: "bash", pattern: "*", action: options.sandboxedShell ? "allow" : "ask", source },
+    { permission: "bash.unsandboxed", pattern: "*", action: "ask", source },
     { permission: "task", pattern: "*", action: "allow", source },
     { permission: "git_status", pattern: "*", action: "allow", source },
     { permission: "git_diff", pattern: "*", action: "allow", source },
@@ -79,7 +94,8 @@ export function dangerousShellCommandsForProfile(profile: RuntimePermissionProfi
 }
 
 function configuredRulesForMode(profile: RuntimePermissionProfileId, rules: readonly PermissionRule[]): PermissionRule[] {
-  return profile === "full-access" ? rules.filter((rule) => rule.action !== "ask") : [...rules];
+  if (profile === "full-access") return rules.filter((rule) => rule.action !== "ask");
+  return [...rules];
 }
 
 export function runtimePermissionConfig(profile: RuntimePermissionProfileId): RuntimePermissionConfig {
@@ -113,6 +129,9 @@ export async function persistApprovalGrantForRequest(
   request: ApprovalBrokerRequest,
   options: AddPersistentPermissionGrantOptions = {},
 ): Promise<void> {
+  if (!approvalDecisionWithinScope("allow_always", request.maxApprovalScope)) {
+    throw new Error("This approval is restricted to a narrower scope and cannot be persisted.");
+  }
   await addPersistentPermissionGrants(
     request.patterns.map((pattern) => ({ permission: request.permission, pattern })),
     options,
@@ -124,6 +143,12 @@ export async function persistAllowAlwaysDecision(
   decision: ApprovalDecision,
   options: PersistAllowAlwaysDecisionOptions = {},
 ): Promise<ApprovalDecision> {
+  if (!approvalDecisionWithinScope(decision.action, request.maxApprovalScope)) {
+    return {
+      action: "deny",
+      feedback: `Approval decision ${decision.action} exceeds the maximum ${request.maxApprovalScope ?? "persistent"} scope.`,
+    };
+  }
   if (decision.action !== "allow_always") return decision;
   try {
     await persistApprovalGrantForRequest(request, options.chiliHome ? { chiliHome: options.chiliHome } : {});
@@ -153,11 +178,13 @@ async function askApproval(request: ApprovalBrokerRequest, options: CliApprovalO
     }
 
     while (true) {
-      const prompt = "Allow? [y]es / [s]ession / [a]lways / [n]o > ";
+      const prompt = approvalPrompt(request);
       const answer = (signal ? await rl.question(prompt, { signal }) : await rl.question(prompt)).trim().toLowerCase();
       if (answer === "y" || answer === "yes" || answer === "") return { action: "allow_once" };
-      if (answer === "s" || answer === "session") return { action: "allow_session" };
-      if (answer === "a" || answer === "always") {
+      if ((answer === "s" || answer === "session") && approvalDecisionWithinScope("allow_session", request.maxApprovalScope)) {
+        return { action: "allow_session" };
+      }
+      if ((answer === "a" || answer === "always") && approvalDecisionWithinScope("allow_always", request.maxApprovalScope)) {
         return persistAllowAlwaysDecision(request, { action: "allow_always" }, {
           ...(options.chiliHome ? { chiliHome: options.chiliHome } : {}),
           ...(options.approvalState
@@ -175,4 +202,10 @@ async function askApproval(request: ApprovalBrokerRequest, options: CliApprovalO
   } finally {
     ownReadline?.close();
   }
+}
+
+function approvalPrompt(request: ApprovalBrokerRequest): string {
+  if (request.maxApprovalScope === "once") return "Allow once? [y]es / [n]o > ";
+  if (request.maxApprovalScope === "session") return "Allow? [y]es once / [s]ession / [n]o > ";
+  return "Allow? [y]es / [s]ession / [a]lways / [n]o > ";
 }

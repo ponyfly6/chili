@@ -23,7 +23,7 @@ import type {
   McpToolsChangedPayload,
 } from "./mcp.js";
 import type { ModelSelection, ReasoningLevel, ServiceTier, ModelMetadataPayload, RuntimeStatusPayload } from "./runtime.js";
-import type { ApprovalDecisionAction, ToolCallStatus, ToolOutputStream } from "./tool.js";
+import type { ApprovalDecisionAction, ApprovalScope, ToolCallStatus, ToolOutputStream } from "./tool.js";
 
 export interface EventEnvelope<TType extends string = string, TPayload = unknown> {
   id: string;
@@ -82,7 +82,7 @@ export type ToolEvent =
   | EventEnvelope<"tool.call_finished", { callId: ToolCallId; status: "completed" | "failed" | "cancelled"; output?: string; error?: string; synthetic?: boolean }>;
 
 export type ApprovalEvent =
-  | EventEnvelope<"approval.requested", { approvalId: ApprovalId; callId?: ToolCallId; permission: string; patterns: string[]; metadata?: Record<string, unknown> }>
+  | EventEnvelope<"approval.requested", { approvalId: ApprovalId; callId?: ToolCallId; permission: string; patterns: string[]; maxApprovalScope?: ApprovalScope; metadata?: Record<string, unknown> }>
   | EventEnvelope<"approval.resolved", { approvalId: ApprovalId; decision: ApprovalDecisionAction; feedback?: string }>;
 
 export type GoalEvent =

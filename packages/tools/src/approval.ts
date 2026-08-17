@@ -1,4 +1,4 @@
-import type { ApprovalDecision, SessionId } from "@chili/protocol";
+import type { ApprovalDecision, ApprovalScope, SessionId } from "@chili/protocol";
 import { evaluatePolicy, type PermissionDecision, type PermissionRule, type PermissionSuggestion } from "@chili/policy";
 import { classifyDangerousShellCommand } from "./shell-safety.js";
 import type { ApprovalBroker, ApprovalBrokerRequest, ApprovalPreflightDecision, ApprovalPreflightRequest } from "./types.js";
@@ -8,6 +8,7 @@ export interface PolicyApprovalBrokerOptions {
   ask?: (request: ApprovalBrokerRequest, signal?: AbortSignal) => Promise<ApprovalDecision>;
   onSessionGrant?: (grant: SessionApprovalGrant) => Promise<void> | void;
   dangerousShellCommands?: "ask" | "allow";
+  allowOneShotPolicyBypass?: boolean | ((request: ApprovalPreflightRequest) => boolean);
   state?: PolicyApprovalState;
 }
 
@@ -123,6 +124,12 @@ export class PolicyApprovalBroker implements ApprovalBroker {
       const decision = normalizeApprovalDecision(await this.options.ask(requestWithPreflight(request, evaluated.risks, evaluated.decision), signal));
       const rechecked = this.evaluate(request).decision;
       if (rechecked.action === "deny") return denyDecision(rechecked);
+      if (!approvalDecisionWithinScope(decision.action, request.maxApprovalScope)) {
+        return {
+          action: "deny",
+          feedback: `Approval decision ${decision.action} exceeds the maximum approval scope ${request.maxApprovalScope ?? "persistent"}.`,
+        };
+      }
       if (decision.action === "allow_session" || decision.action === "allow_always") {
         const grant = this.rememberSessionGrant(request, decision.action, decision.feedback);
         await this.options.onSessionGrant?.(grant);
@@ -231,6 +238,24 @@ export class PolicyApprovalBroker implements ApprovalBroker {
       };
     }
 
+    if (request.maxApprovalScope === "once" && !this.allowsOneShotPolicyBypass(request)) {
+      return {
+        decision: {
+          action: "ask",
+          source: "approval_request",
+          reason: "This operation requires a fresh one-time approval.",
+          suggestions: [],
+          metadata: {
+            permission: request.permission,
+            patterns: request.patterns,
+            patternDecisions,
+            risks,
+          },
+        },
+        risks,
+      };
+    }
+
     const decision: ApprovalPreflightDecision = {
       action: "allow",
       source: allowDecision?.source ?? "policy_rule",
@@ -268,6 +293,11 @@ export class PolicyApprovalBroker implements ApprovalBroker {
     return grant;
   }
 
+  private allowsOneShotPolicyBypass(request: ApprovalPreflightRequest): boolean {
+    const bypass = this.options.allowOneShotPolicyBypass;
+    return typeof bypass === "function" ? bypass(request) : bypass === true;
+  }
+
   private rulesetsFor(request: ApprovalPreflightRequest): readonly (readonly PermissionRule[])[] {
     return [...(this.options.rulesets ?? []), ...this.state.rulesetsFor(request.sessionId)];
   }
@@ -281,7 +311,8 @@ interface ApprovalRisk {
 }
 
 function approvalRisk(permission: string, pattern: string): ApprovalRisk | undefined {
-  if (permission.toLowerCase() !== "bash") return undefined;
+  const normalizedPermission = permission.toLowerCase();
+  if (normalizedPermission !== "bash" && normalizedPermission !== "bash.unsandboxed") return undefined;
   const risk = classifyDangerousShellCommand(pattern);
   if (!risk) return undefined;
   return { pattern, action: risk.action, reason: risk.reason, source: "bash_danger_classifier" };
@@ -377,6 +408,7 @@ function dangerDecision(request: ApprovalPreflightRequest, risk: ApprovalRisk): 
 }
 
 function approvalSuggestions(request: ApprovalPreflightRequest): PermissionSuggestion[] {
+  if (request.maxApprovalScope === "once") return [];
   return request.patterns.map((pattern) => ({
     permission: request.permission,
     pattern,
@@ -416,4 +448,13 @@ function normalizeApprovalDecision(decision: ApprovalDecision): ApprovalDecision
   const action = (decision as { action?: unknown } | null | undefined)?.action;
   if (isApprovalDecisionAction(action)) return decision;
   return { action: "deny", feedback: `Invalid approval decision action: ${String(action)}` };
+}
+
+export function approvalDecisionWithinScope(
+  action: ApprovalDecision["action"],
+  maxApprovalScope: ApprovalScope | undefined,
+): boolean {
+  if (action === "deny" || action === "allow_once") return true;
+  if (action === "allow_session") return maxApprovalScope !== "once";
+  return maxApprovalScope === undefined || maxApprovalScope === "persistent";
 }

@@ -1,4 +1,5 @@
-import type { ApprovalDecision, ApprovalId } from "@chili/protocol";
+import type { ApprovalDecision, ApprovalId, ApprovalScope } from "@chili/protocol";
+import { approvalDecisionWithinScope } from "./approval.js";
 import type { ApprovalBrokerRequest, ApprovalPreflightDecision } from "./types.js";
 
 export interface DeferredApprovalQueueOptions {
@@ -56,6 +57,7 @@ export class DeferredApprovalQueue {
   resolve(input: ResolveDeferredApprovalInput): boolean {
     const pending = this.pending.get(input.approvalId);
     if (!pending) return false;
+    if (!approvalDecisionWithinScope(input.decision, pending.request.maxApprovalScope)) return false;
     this.pending.delete(input.approvalId);
     this.cleanup(pending);
     const decision: ApprovalDecision = { action: input.decision };
@@ -81,6 +83,10 @@ export class DeferredApprovalQueue {
 
   list(): ApprovalBrokerRequest[] {
     return [...this.pending.values()].map((pending) => pending.request);
+  }
+
+  maxApprovalScope(approvalId: ApprovalId): ApprovalScope | undefined {
+    return this.pending.get(approvalId)?.request.maxApprovalScope;
   }
 
   denyAll(feedback = "Approval queue closed."): void {

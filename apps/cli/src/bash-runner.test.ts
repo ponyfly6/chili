@@ -16,8 +16,22 @@ test("CLI bash runner follows live macOS permission profile changes", async () =
 
   expect((await runner.run(request())).sandbox).toBe("macos-seatbelt");
   profile = "full-access";
-  expect((await runner.run(request())).sandbox).toBeUndefined();
+  expect((await runner.run(request())).sandbox).toBe("none");
   expect({ sandboxedCalls, unsandboxedCalls }).toEqual({ sandboxedCalls: 1, unsandboxedCalls: 1 });
+});
+
+test("CLI bash runner honors an explicitly approved one-command macOS escalation", async () => {
+  let sandboxedCalls = 0;
+  let unsandboxedCalls = 0;
+  const runner = createCliBashRunner({
+    platform: "darwin",
+    permissionProfile: () => "default",
+    sandboxedRunner: fakeRunner(() => { sandboxedCalls += 1; }, "macos-seatbelt"),
+    unsandboxedRunner: fakeRunner(() => { unsandboxedCalls += 1; }, "none"),
+  });
+
+  expect((await runner.run(request("require_escalated"))).sandbox).toBe("none");
+  expect({ sandboxedCalls, unsandboxedCalls }).toEqual({ sandboxedCalls: 0, unsandboxedCalls: 1 });
 });
 
 test("CLI bash runner does not retry outside the sandbox after a sandbox failure", async () => {
@@ -37,7 +51,7 @@ test("CLI bash runner does not retry outside the sandbox after a sandbox failure
   expect(unsandboxedCalls).toBe(0);
 });
 
-test("CLI bash runner keeps the unsandboxed backend on unsupported platforms", async () => {
+test("CLI bash runner keeps both execution modes on the unsandboxed backend on unsupported platforms", async () => {
   let sandboxedCalls = 0;
   let unsandboxedCalls = 0;
   const runner = createCliBashRunner({
@@ -47,11 +61,44 @@ test("CLI bash runner keeps the unsandboxed backend on unsupported platforms", a
     unsandboxedRunner: fakeRunner(() => { unsandboxedCalls += 1; }),
   });
 
-  expect((await runner.run(request())).sandbox).toBeUndefined();
-  expect({ sandboxedCalls, unsandboxedCalls }).toEqual({ sandboxedCalls: 0, unsandboxedCalls: 1 });
+  expect((await runner.run(request())).sandbox).toBe("none");
+  expect((await runner.run(request("require_escalated"))).sandbox).toBe("none");
+  expect({ sandboxedCalls, unsandboxedCalls }).toEqual({ sandboxedCalls: 0, unsandboxedCalls: 2 });
 });
 
-function fakeRunner(onRun: () => void, sandbox?: "macos-seatbelt"): BashRunner {
+test("scoped worker runner ignores Full Access and rejects explicit sandbox escape", async () => {
+  let sandboxedCalls = 0;
+  let unsandboxedCalls = 0;
+  const runner = createCliBashRunner({
+    platform: "darwin",
+    permissionProfile: () => "full-access",
+    allowHostSandboxEscape: false,
+    sandboxedRunner: fakeRunner(() => { sandboxedCalls += 1; }, "macos-seatbelt"),
+    unsandboxedRunner: fakeRunner(() => { unsandboxedCalls += 1; }, "none"),
+  });
+
+  expect((await runner.run(request("use_default"))).sandbox).toBe("macos-seatbelt");
+  await expect(runner.run(request("require_escalated"))).rejects.toThrow(
+    "Scoped workers cannot request execution outside the host sandbox",
+  );
+  expect({ sandboxedCalls, unsandboxedCalls }).toEqual({ sandboxedCalls: 1, unsandboxedCalls: 0 });
+});
+
+test("scoped worker runner fails closed when the host has no shell sandbox", async () => {
+  let unsandboxedCalls = 0;
+  const runner = createCliBashRunner({
+    platform: "linux",
+    permissionProfile: () => "default",
+    allowHostSandboxEscape: false,
+    unsandboxedRunner: fakeRunner(() => { unsandboxedCalls += 1; }),
+  });
+
+  await expect(runner.run(request())).rejects.toThrow("host has no configured shell sandbox");
+  await expect(runner.run(request("require_escalated"))).rejects.toThrow("host has no configured shell sandbox");
+  expect(unsandboxedCalls).toBe(0);
+});
+
+function fakeRunner(onRun: () => void, sandbox: "macos-seatbelt" | "none" = "none"): BashRunner {
   return {
     async run(request) {
       onRun();
@@ -68,19 +115,20 @@ function fakeRunner(onRun: () => void, sandbox?: "macos-seatbelt"): BashRunner {
         durationMs: 1,
         timedOut: false,
         aborted: false,
-        ...(sandbox ? { sandbox } : {}),
+        sandbox,
       };
     },
   };
 }
 
-function request() {
+function request(sandboxPermissions: "use_default" | "require_escalated" = "use_default") {
   return {
     command: "printf ok",
     workspaceRoot: "/repo",
     cwd: "/repo",
     timeoutMs: 1_000,
     maxOutputBytes: 1_000,
+    sandboxPermissions,
     signal: new AbortController().signal,
     onOutput: undefined,
   };

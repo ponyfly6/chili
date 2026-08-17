@@ -71,8 +71,11 @@ export interface ApprovalRequest {
   id?: ApprovalId;
   permission: string;
   patterns: string[];
+  maxApprovalScope?: ApprovalScope;
   metadata?: Record<string, unknown>;
 }
+
+export type ApprovalScope = "once" | "session" | "persistent";
 
 export type ApprovalDecisionAction = "allow_once" | "allow_session" | "allow_always" | "deny";
 

@@ -4,7 +4,7 @@ import type {
   ChiliToolDefinition,
   ExecuteToolInput,
   ToolAccessPolicy,
-  ToolApprovalSpec,
+  ToolApprovalSpecWithDefaults,
   ToolPolicyContext,
 } from "./types.js";
 
@@ -38,7 +38,7 @@ export async function authorizeToolByPolicy<Input>(input: {
   tool: ChiliToolDefinition<Input>;
   executeInput: ExecuteToolInput;
   validatedInput: Input;
-  approvalSpec: Required<ToolApprovalSpec>;
+  approvalSpec: ToolApprovalSpecWithDefaults;
   policy: ToolAccessPolicy | undefined;
   isReadOnly: (tool: ChiliToolDefinition<Input>, input: Input) => Promise<boolean | undefined>;
 }): Promise<void> {
@@ -50,6 +50,13 @@ export async function authorizeToolByPolicy<Input>(input: {
   }
 
   authorizeTeamToolByPolicy(input.tool, input.validatedInput, policy);
+
+  if (normalizeToolName(input.approvalSpec.permission) === "bash.unsandboxed") {
+    throw new ToolDeniedError(
+      input.tool.name,
+      "Scoped workers cannot request execution outside the host sandbox.",
+    );
+  }
 
   if (isFilesystemWriteRequest(input.tool, input.approvalSpec)) {
     const writeScope = normalizedList(policy.writeScope);
@@ -104,7 +111,7 @@ function isFilesystemWriteTool(tool: ChiliToolDefinition): boolean {
   return toolNameMatches(tool, FILE_WRITE_TOOL_NAMES);
 }
 
-function isFilesystemWriteRequest(tool: ChiliToolDefinition, approvalSpec: Required<ToolApprovalSpec>): boolean {
+function isFilesystemWriteRequest(tool: ChiliToolDefinition, approvalSpec: ToolApprovalSpecWithDefaults): boolean {
   if (isFilesystemWriteTool(tool)) return true;
   return FILE_WRITE_PERMISSIONS.has(normalizeToolName(approvalSpec.permission)) && !isScopedTeamTool(tool);
 }

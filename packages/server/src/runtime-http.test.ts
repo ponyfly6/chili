@@ -817,6 +817,9 @@ test("resolves approvals through the runtime HTTP handler", async () => {
   const calls: unknown[] = [];
   const approvals = {
     resolved: false,
+    maxApprovalScope() {
+      return "persistent" as const;
+    },
     resolve(input: { decision: ApprovalDecisionAction; feedback?: string }) {
       calls.push(input);
       this.resolved = input.decision === "allow_session";
@@ -837,6 +840,69 @@ test("resolves approvals through the runtime HTTP handler", async () => {
   expect(await response.json()).toEqual({ resolved: true });
   expect(approvals.resolved).toBe(true);
   expect(calls).toEqual([{ approvalId: "approval_http", decision: "allow_session", feedback: "" }]);
+});
+
+test("approval resolvers without scope introspection can only resolve one-shot decisions", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const calls: unknown[] = [];
+  const handler = createRuntimeHttpHandler({
+    service,
+    store,
+    approvals: {
+      resolve(input: unknown) {
+        calls.push(input);
+        return true;
+      },
+    },
+  });
+
+  const response = await handler(
+    new Request("http://chili.test/approvals/approval_http/resolve", {
+      method: "POST",
+      body: JSON.stringify({ decision: "allow_always" }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+
+  expect(response.status).toBe(400);
+  expect(await response.json()).toEqual({
+    error: { message: "Approval decision allow_always exceeds the maximum approval scope once." },
+  });
+  expect(calls).toEqual([]);
+});
+
+test("rejects approval decisions above the pending request scope", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const calls: unknown[] = [];
+  const handler = createRuntimeHttpHandler({
+    service,
+    store,
+    approvals: {
+      maxApprovalScope: () => "once" as const,
+      resolve(input: unknown) {
+        calls.push(input);
+        return true;
+      },
+    },
+  });
+
+  const response = await handler(
+    new Request("http://chili.test/approvals/approval_http/resolve", {
+      method: "POST",
+      body: JSON.stringify({ decision: "allow_session" }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+
+  expect(response.status).toBe(400);
+  expect(await response.json()).toEqual({
+    error: { message: "Approval decision allow_session exceeds the maximum approval scope once." },
+  });
+  expect(calls).toEqual([]);
 });
 
 test("gets and sets permission profiles through the runtime HTTP handler", async () => {

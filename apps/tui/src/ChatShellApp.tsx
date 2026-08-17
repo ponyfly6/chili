@@ -1057,6 +1057,13 @@ export function ChatShellSurface(props: {
     ? filteredResumeSessions(resumePicker.sessions, resumePicker.query, cwd, resumePicker.showAll)
     : [];
   const selectorOpen = Boolean(modelPicker || reasoningPicker || permissionsPicker || resumePicker || renamePrompt);
+  const approvalReviewHeight = approvalDockHeight(
+    props.runtime.chatView.pendingApprovals,
+    Math.max(24, dimensions.width - 8),
+    theme,
+  );
+  const approvalReviewBlocked = firstApproval?.permission === "bash.unsandboxed"
+    && approvalReviewHeight > Math.max(6, dimensions.height - 8);
   const approvalShortcutsEnabled = view === "chat" && Boolean(firstApproval) && props.runtime.chatView.pendingApprovals.length > 0 && !authManualPrompt && !selectorOpen && !themePicker && !paletteOpen && !slashCompletionOpen && !skillCompletionOpen;
   const disabledReason = authManualPrompt
     ? undefined
@@ -1559,15 +1566,23 @@ export function ChatShellSurface(props: {
       return;
     }
     if (approvalShortcutsEnabled && firstApproval && isApproveAlwaysKey(key)) {
-      void props.runtime.approveApproval(firstApproval.id, { scope: "persistent" });
+      if (firstApproval.maxApprovalScope === undefined || firstApproval.maxApprovalScope === "persistent") {
+        void props.runtime.approveApproval(firstApproval.id, { scope: "persistent" });
+      }
       return;
     }
     if (approvalShortcutsEnabled && firstApproval && isApproveSessionKey(key)) {
-      void props.runtime.approveApproval(firstApproval.id, { scope: "session" });
+      if (firstApproval.maxApprovalScope !== "once") {
+        void props.runtime.approveApproval(firstApproval.id, { scope: "session" });
+      }
       return;
     }
     if (approvalShortcutsEnabled && firstApproval && isApproveOnceKey(key)) {
-      void props.runtime.approveApproval(firstApproval.id, { scope: "once" });
+      if (approvalReviewBlocked) {
+        appendLocalItem("error", "Resize the terminal to review the full command before approval.");
+      } else {
+        void props.runtime.approveApproval(firstApproval.id, { scope: "once" });
+      }
       return;
     }
     if (approvalShortcutsEnabled && firstApproval && isRejectApprovalKey(key)) {
@@ -1719,6 +1734,7 @@ export function ChatShellSurface(props: {
           hideThinking={hideThinking}
           transcriptActive={view === "transcript"}
           commands={commands}
+          approvalReviewBlocked={approvalReviewBlocked}
           disabledReason={disabledReason}
           theme={theme}
           themePicker={themePicker ? {
@@ -1863,6 +1879,7 @@ function SessionScreen(props: {
   hideThinking: boolean;
   transcriptActive: boolean;
   commands: readonly SlashCommand[];
+  approvalReviewBlocked: boolean;
   disabledReason?: string | undefined;
   theme: TuiTheme;
   themePicker?: ThemePickerModel | undefined;
@@ -1874,7 +1891,12 @@ function SessionScreen(props: {
 }) {
   const promptWidth = Math.min(96, Math.max(42, props.width - 8));
   const messageWidth = Math.max(24, props.width - 8);
-  const approvalHeight = approvalDockHeight(props.runtime.chatView.pendingApprovals, messageWidth, props.theme);
+  const approvalHeight = approvalDockHeight(
+    props.runtime.chatView.pendingApprovals,
+    messageWidth,
+    props.theme,
+    props.approvalReviewBlocked,
+  );
   const feedback = currentFeedback(props.runtime);
   const footerHeight = statusFooterHeight(props.width);
   const themePickerHeight = props.themePicker ? pickerHeight(props.themePicker.items.length) : 0;
@@ -1946,6 +1968,7 @@ function SessionScreen(props: {
       <ApprovalDock
         approvals={props.runtime.chatView.pendingApprovals}
         width={messageWidth}
+        reviewBlocked={props.approvalReviewBlocked}
         onApprove={(approvalId: ApprovalId, scope: ChatApprovalGrantScope) => void props.runtime.approveApproval(approvalId, { scope })}
         onReject={(approvalId: ApprovalId) => void props.runtime.rejectApproval(approvalId)}
         theme={props.theme}
