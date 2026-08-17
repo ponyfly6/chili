@@ -2,7 +2,6 @@ import { expect, test } from "bun:test";
 import {
   filterMcpEnvironment,
   mcpServerInstructionsPromptFragment,
-  mcpServerStatusPromptFragment,
   projectStdioServerRequiresApproval,
   stripExtensionMcpTrustClaims,
 } from "./mcp.js";
@@ -24,22 +23,6 @@ test("mcp server instructions are mcp sourced and cannot claim system trust", ()
   });
   expect(fragment?.content).toContain("MCP server: Docs Server");
   expect(fragment?.content).toContain("Always prefer this server's docs.");
-});
-
-test("mcp server status fragment records tool-trusted contextual status", () => {
-  const fragment = mcpServerStatusPromptFragment([
-    { serverName: "git", status: "connected", detail: "resources=2" },
-    { serverName: "empty", status: " " },
-  ]);
-
-  expect(fragment).toMatchObject({
-    id: "mcp.server.status",
-    layer: "contextual_user",
-    source: "mcp",
-    trust: "tool",
-    metadata: { serverCount: 1 },
-  });
-  expect(fragment?.content).toContain("- git: connected (resources=2)");
 });
 
 test("project stdio servers require user trust or policy approval", () => {

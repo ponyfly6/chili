@@ -19,7 +19,6 @@ import {
   chiliBasePromptFragment,
   createMemoryTool,
   defaultScopedWorkerPolicy,
-  mcpServerStatusPromptFragment,
   type PromptFragment,
   type RuntimePromptTurnContext,
   type WorkerToolPolicy,
@@ -232,21 +231,14 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const registry = createToolRegistry(skillRegistry, bashRunner);
   const childRegistry = createChildToolRegistry(skillRegistry, bashRunner);
   let mcpRuntime: CliMcpRuntime | undefined;
-  const promptFragments = async (context: { cwd: string; turn?: RuntimePromptTurnContext }) => {
-    const fragments = await buildCliPromptFragments({
+  const promptFragments = (context: { cwd: string; turn?: RuntimePromptTurnContext }) =>
+    buildCliPromptFragments({
       cwd: context.cwd,
       skillRegistry,
       ...(context.turn ? { turn: context.turn } : {}),
     });
-    const mcpFragment = mcpRuntime ? mcpServerStatusPromptFragment((await mcpRuntime.control.status?.())?.servers.map((server) => ({
-      serverName: server.name,
-      status: server.status,
-      ...(server.error ? { detail: server.error } : {}),
-    })) ?? []) : undefined;
-    return mcpFragment ? [...fragments, mcpFragment] : fragments;
-  };
-  const childPromptFragments = async (context: { sessionId: SessionId; threadId: ThreadId; cwd: string; turn?: RuntimePromptTurnContext }) => {
-    const fragments = await buildCliChildPromptFragments({
+  const childPromptFragments = (context: { sessionId: SessionId; threadId: ThreadId; cwd: string; turn?: RuntimePromptTurnContext }) =>
+    buildCliChildPromptFragments({
       cwd: context.cwd,
       sessionId: context.sessionId,
       threadId: context.threadId,
@@ -254,13 +246,6 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
       store: eventStore,
       ...(context.turn ? { turn: context.turn } : {}),
     });
-    const mcpFragment = mcpRuntime ? mcpServerStatusPromptFragment((await mcpRuntime.control.status?.())?.servers.map((server) => ({
-      serverName: server.name,
-      status: server.status,
-      ...(server.error ? { detail: server.error } : {}),
-    })) ?? []) : undefined;
-    return mcpFragment ? [...fragments, mcpFragment] : fragments;
-  };
   const subagentPromptFragments = (context: { cwd: string }) => buildCliPromptFragments({ cwd: context.cwd, skillRegistry });
   const snapshotProvider = new FileSystemSnapshotProvider({
     rootDir: join(stateDir, "snapshots"),
