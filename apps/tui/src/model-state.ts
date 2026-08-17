@@ -3,6 +3,7 @@ import {
   OPENAI_CODEX_PROVIDER_ID,
   listKnownModels,
 } from "@chili/providers";
+import type { ServiceTier } from "@chili/protocol";
 
 export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
@@ -27,6 +28,7 @@ export interface ModelCandidate {
   contextWindowTokens?: number;
   maxOutputTokens?: number;
   reasoningLevels?: readonly ReasoningLevel[];
+  serviceTiers?: readonly ServiceTier[];
   default?: boolean;
 }
 
@@ -82,7 +84,19 @@ export function modelSupportsReasoning(
 ): boolean {
   if (!selection) return true;
   const candidate = candidates.find((model) => model.provider === selection.provider && model.model === selection.model);
+  if (candidate?.reasoningLevels !== undefined) {
+    return candidate.reasoningLevels.some((level) => level !== "off");
+  }
   return candidate?.capabilities?.reasoning ?? true;
+}
+
+export function modelSupportsServiceTier(
+  selection: ModelSelection | undefined,
+  candidates: readonly ModelCandidate[],
+): boolean {
+  if (!selection) return false;
+  const candidate = candidates.find((model) => model.provider === selection.provider && model.model === selection.model);
+  return candidate?.serviceTiers?.includes("fast") ?? false;
 }
 
 export function modelSupportsImages(

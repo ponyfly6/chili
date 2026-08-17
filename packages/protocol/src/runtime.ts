@@ -49,6 +49,7 @@ export interface RuntimeModelDescriptor extends ModelSelection {
   contextWindowTokens?: number;
   maxOutputTokens?: number;
   reasoningLevels?: ReasoningLevel[];
+  serviceTiers?: ServiceTier[];
   default?: boolean;
 }
 

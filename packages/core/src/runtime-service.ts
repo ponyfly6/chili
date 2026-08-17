@@ -248,9 +248,7 @@ export class RuntimeService {
     const state = await this.resolveSessionModelState(input.sessionId);
     const previousReasoningLevel = state.reasoningLevel;
     state.modelSelection = modelSelection;
-    if (state.reasoningLevel !== undefined) {
-      state.reasoningLevel = await this.clampReasoningLevelForState(state, state.reasoningLevel);
-    }
+    await this.normalizeModelStateForCapabilities(state);
     this.sessionModelState.set(input.sessionId, cloneSessionModelState(state));
     this.globalModelState = cloneSessionModelState(state);
     await this.append(input, "session.model_changed", {
@@ -276,7 +274,11 @@ export class RuntimeService {
       throw new Error(`Invalid reasoning level: ${input.reasoningLevel}`);
     }
     const state = await this.resolveSessionModelState(input.sessionId);
-    state.reasoningLevel = await this.clampReasoningLevelForState(state, input.reasoningLevel);
+    const reasoningLevel = await this.clampReasoningLevelForState(state, input.reasoningLevel);
+    if (reasoningLevel === undefined) {
+      throw new Error(`${modelStateLabel(state)} does not support configurable reasoning`);
+    }
+    state.reasoningLevel = reasoningLevel;
     this.sessionModelState.set(input.sessionId, cloneSessionModelState(state));
     this.globalModelState = cloneSessionModelState(state);
     await this.append(input, "session.reasoning_changed", {
@@ -291,6 +293,9 @@ export class RuntimeService {
       throw new Error(`Invalid service tier: ${input.serviceTier}`);
     }
     const state = await this.resolveSessionModelState(input.sessionId);
+    if (await this.serviceTierSupportForState(state, input.serviceTier) === false) {
+      throw new Error(`${modelStateLabel(state)} does not support service tier ${input.serviceTier}`);
+    }
     state.serviceTier = input.serviceTier;
     this.sessionModelState.set(input.sessionId, cloneSessionModelState(state));
     this.globalModelState = cloneSessionModelState(state);
@@ -986,16 +991,30 @@ export class RuntimeService {
   private async resolvePromptModelState(input: SubmitPromptInput): Promise<RuntimeSessionModelState> {
     const state = await this.resolveSessionModelState(input.sessionId);
     if (input.modelSelection) state.modelSelection = normalizeModelSelection(input.modelSelection);
+    const reasoningRequested = input.reasoningLevel !== undefined;
     if (input.reasoningLevel !== undefined) {
       if (!isReasoningLevel(input.reasoningLevel)) throw new Error(`Invalid reasoning level: ${input.reasoningLevel}`);
       state.reasoningLevel = input.reasoningLevel;
     }
+    const serviceTierRequested = input.serviceTier !== undefined;
     if (input.serviceTier !== undefined) {
       if (!isServiceTier(input.serviceTier)) throw new Error(`Invalid service tier: ${input.serviceTier}`);
       state.serviceTier = input.serviceTier;
     }
     if (state.reasoningLevel !== undefined) {
-      state.reasoningLevel = await this.clampReasoningLevelForState(state, state.reasoningLevel);
+      const reasoningLevel = await this.clampReasoningLevelForState(state, state.reasoningLevel);
+      if (reasoningLevel === undefined) {
+        if (reasoningRequested) throw new Error(`${modelStateLabel(state)} does not support configurable reasoning`);
+        delete state.reasoningLevel;
+      } else {
+        state.reasoningLevel = reasoningLevel;
+      }
+    }
+    if (state.serviceTier !== undefined && await this.serviceTierSupportForState(state, state.serviceTier) === false) {
+      if (serviceTierRequested) {
+        throw new Error(`${modelStateLabel(state)} does not support service tier ${state.serviceTier}`);
+      }
+      delete state.serviceTier;
     }
     return state;
   }
@@ -1073,9 +1092,7 @@ export class RuntimeService {
       }
     }
 
-    if (state.reasoningLevel !== undefined) {
-      state.reasoningLevel = await this.clampReasoningLevelForState(state, state.reasoningLevel);
-    }
+    await this.normalizeModelStateForCapabilities(state);
     this.sessionModelState.set(sessionId, cloneSessionModelState(state));
     return state;
   }
@@ -1114,9 +1131,7 @@ export class RuntimeService {
       }
     }
 
-    if (state.reasoningLevel !== undefined) {
-      state.reasoningLevel = await this.clampReasoningLevelForState(state, state.reasoningLevel);
-    }
+    await this.normalizeModelStateForCapabilities(state);
     this.globalModelState = cloneSessionModelState(state);
     return cloneSessionModelState(state);
   }
@@ -1153,14 +1168,30 @@ export class RuntimeService {
   private async clampReasoningLevelForState(
     state: RuntimeSessionModelState,
     reasoningLevel: ReasoningLevel,
-  ): Promise<ReasoningLevel> {
+  ): Promise<ReasoningLevel | undefined> {
     const models = await this.resolveModelCatalog();
-    const selectedModel = state.modelSelection
-      ? models.find(
-          (model) => model.provider === state.modelSelection?.provider && model.model === state.modelSelection.model,
-        )
-      : models.find((model) => model.default);
-    return clampReasoningLevel(reasoningLevel, runtimeModelReasoningLevels(selectedModel));
+    const availableLevels = runtimeModelReasoningLevels(selectedRuntimeModel(models, state));
+    return availableLevels.length > 0 ? clampReasoningLevel(reasoningLevel, availableLevels) : undefined;
+  }
+
+  private async serviceTierSupportForState(
+    state: RuntimeSessionModelState,
+    serviceTier: ServiceTier,
+  ): Promise<boolean | undefined> {
+    const models = await this.resolveModelCatalog();
+    if (models.length === 0) return undefined;
+    return runtimeModelServiceTiers(selectedRuntimeModel(models, state)).includes(serviceTier);
+  }
+
+  private async normalizeModelStateForCapabilities(state: RuntimeSessionModelState): Promise<void> {
+    if (state.reasoningLevel !== undefined) {
+      const reasoningLevel = await this.clampReasoningLevelForState(state, state.reasoningLevel);
+      if (reasoningLevel === undefined) delete state.reasoningLevel;
+      else state.reasoningLevel = reasoningLevel;
+    }
+    if (state.serviceTier !== undefined && await this.serviceTierSupportForState(state, state.serviceTier) === false) {
+      delete state.serviceTier;
+    }
   }
 
   async interrupt(sessionId: SessionId, reason = "user_interrupt"): Promise<boolean> {
@@ -1498,15 +1529,38 @@ function cloneModelDescriptor(model: RuntimeModelDescriptor): RuntimeModelDescri
   if (model.inputCapabilities) clone.inputCapabilities = [...model.inputCapabilities];
   if (model.contextWindowTokens !== undefined) clone.contextWindowTokens = model.contextWindowTokens;
   if (model.maxOutputTokens !== undefined) clone.maxOutputTokens = model.maxOutputTokens;
-  if (model.reasoningLevels) clone.reasoningLevels = [...model.reasoningLevels];
+  if (model.reasoningLevels !== undefined) clone.reasoningLevels = [...model.reasoningLevels];
+  if (model.serviceTiers !== undefined) clone.serviceTiers = [...model.serviceTiers];
   if (model.default !== undefined) clone.default = model.default;
   return clone;
 }
 
 function runtimeModelReasoningLevels(model: RuntimeModelDescriptor | undefined): readonly ReasoningLevel[] {
-  if (model?.capabilities?.reasoning === false) return ["off"];
-  if (model?.reasoningLevels?.length) return model.reasoningLevels;
+  if (model?.capabilities?.reasoning === false) return [];
+  if (model?.reasoningLevels !== undefined) return model.reasoningLevels;
   return REASONING_LEVELS;
+}
+
+function runtimeModelServiceTiers(model: RuntimeModelDescriptor | undefined): readonly ServiceTier[] {
+  if (!model) return [];
+  return model.serviceTiers ?? [];
+}
+
+function selectedRuntimeModel(
+  models: readonly RuntimeModelDescriptor[],
+  state: RuntimeSessionModelState,
+): RuntimeModelDescriptor | undefined {
+  return state.modelSelection
+    ? models.find(
+        (model) => model.provider === state.modelSelection?.provider && model.model === state.modelSelection.model,
+      )
+    : models.find((model) => model.default);
+}
+
+function modelStateLabel(state: RuntimeSessionModelState): string {
+  return state.modelSelection
+    ? `${state.modelSelection.provider}/${state.modelSelection.model}`
+    : "The selected model";
 }
 
 function clampReasoningLevel(

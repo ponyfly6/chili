@@ -138,8 +138,8 @@ export function resolveModelSelectionPattern(
 }
 
 export function getModelSelectionAvailableReasoningLevels(model: ModelDescriptor | undefined): readonly ReasoningLevel[] {
-  if (model && model.capabilities?.reasoning === false) return ["off"];
-  if (model?.reasoningLevels?.length) return model.reasoningLevels;
+  if (model && model.capabilities?.reasoning === false) return [];
+  if (model?.reasoningLevels !== undefined) return model.reasoningLevels;
   if (supportsUltraReasoning(model)) return REASONING_LEVELS;
   if (supportsMaxReasoning(model)) return REASONING_LEVELS_THROUGH_MAX;
   return supportsXHighReasoning(model) ? REASONING_LEVELS_THROUGH_XHIGH : REASONING_LEVELS_THROUGH_HIGH;
@@ -273,6 +273,7 @@ function cloneDescriptor(model: ModelDescriptor): ModelDescriptor {
   if (model.compatibility) clone.compatibility = { ...model.compatibility };
   if (model.inputCapabilities) clone.inputCapabilities = [...model.inputCapabilities];
   if (model.reasoningLevels) clone.reasoningLevels = [...model.reasoningLevels];
+  if (model.serviceTiers) clone.serviceTiers = [...model.serviceTiers];
   if (model.cost) clone.cost = { ...model.cost };
   return clone;
 }

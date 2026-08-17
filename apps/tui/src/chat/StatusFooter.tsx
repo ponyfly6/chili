@@ -9,6 +9,8 @@ export interface StatusFooterOptions {
   modelName: string;
   providerName: string;
   modelSelection?: ModelSelection | undefined;
+  reasoningConfigurable?: boolean | undefined;
+  serviceTierConfigurable?: boolean | undefined;
   reasoningLevel?: ReasoningLevel | undefined;
   serviceTier?: ServiceTier | undefined;
   cwd: string;
@@ -127,8 +129,10 @@ function contextWindowFor(chatView: ChatSessionView): number | undefined {
 
 function modelText(chatView: ChatSessionView, options: StatusFooterOptions): string {
   const model = options.modelSelection?.model ?? chatView.latestModelMetadata?.model ?? options.modelName;
-  const reasoning = options.reasoningLevel ? reasoningText(options.reasoningLevel) : undefined;
-  const serviceTier = serviceTierText(options.serviceTier);
+  const reasoning = options.reasoningConfigurable !== false && options.reasoningLevel
+    ? reasoningText(options.reasoningLevel)
+    : undefined;
+  const serviceTier = options.serviceTierConfigurable !== false ? serviceTierText(options.serviceTier) : undefined;
   return [model, reasoning, serviceTier].filter(Boolean).join(" · ");
 }
 

@@ -9,7 +9,7 @@ import { SqliteEventStore, type AgentTaskRow } from "@chili/store";
 import { PolicyApprovalBroker, PolicyApprovalState, type ApprovalBrokerRequest } from "@chili/tools";
 import { buildCliChildPromptFragments, buildCliPromptFragments, createCliHarness, linkApprovalSessionsFromEvent, type CliHarness } from "./harness.js";
 import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
-import { runPrompt } from "./runner.js";
+import { runPrompt, runSessionPrompt } from "./runner.js";
 import { readUserModelSelection, writeUserModelSelection } from "./user-model-state.js";
 
 test("CLI prompt fragments include base, memory/project context, and skills catalog", async () => {
@@ -346,6 +346,39 @@ test("CLI runPrompt leaves system prompt selection to the harness service", asyn
 
   expect(submitted).toHaveLength(1);
   expect(submitted[0]).not.toHaveProperty("system");
+});
+
+test("CLI session prompts leave harness model defaults to Runtime normalization", async () => {
+  const submitted: Record<string, unknown>[] = [];
+  const harness = {
+    defaultModelSelection: { provider: "minimax", model: "MiniMax-M3[1m]" },
+    defaultReasoningLevel: "high",
+    defaultServiceTier: "fast",
+    service: {
+      submitPrompt: async (input: Record<string, unknown>) => {
+        submitted.push(input);
+        return { status: "completed", turns: [] };
+      },
+    },
+  } as unknown as CliHarness;
+  const originalLog = console.log;
+  try {
+    console.log = () => undefined;
+    await runSessionPrompt({
+      harness,
+      sessionId: "session_normalized_defaults" as SessionId,
+      threadId: "thread_normalized_defaults" as ThreadId,
+      prompt: "hello",
+      maxTurns: 3,
+    });
+  } finally {
+    console.log = originalLog;
+  }
+
+  expect(submitted).toHaveLength(1);
+  expect(submitted[0]).not.toHaveProperty("modelSelection");
+  expect(submitted[0]).not.toHaveProperty("reasoningLevel");
+  expect(submitted[0]).not.toHaveProperty("serviceTier");
 });
 
 test("CLI runPrompt warns for every output-limit finish reason", async () => {

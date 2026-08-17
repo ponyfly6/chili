@@ -529,6 +529,76 @@ test("RuntimeService reports model-specific advanced reasoning levels", async ()
   expect(inspected.fragments.some((fragment) => fragment.id === "chili.reasoning.ultra")).toBe(false);
 });
 
+test("RuntimeService clears and rejects controls unsupported by a known model", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    defaultModelSelection: { provider: "minimax", model: "MiniMax-M3[1m]" },
+    defaultReasoningLevel: "high",
+    defaultServiceTier: "fast",
+    models: [
+      {
+        provider: "minimax",
+        model: "MiniMax-M3[1m]",
+        default: true,
+        reasoningLevels: [],
+      },
+      {
+        provider: "openai-codex",
+        model: "gpt-5.6-sol",
+        reasoningLevels: ["off", "low", "medium", "high"],
+        serviceTiers: ["standard", "fast"],
+      },
+    ],
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+  const sessionId = "session_unsupported_model_controls" as SessionId;
+  const threadId = "thread_unsupported_model_controls" as ThreadId;
+
+  const minimaxConfig = await service.getModelConfig(sessionId);
+  expect(minimaxConfig.availableReasoningLevels).toEqual([]);
+  expect(minimaxConfig.reasoningLevel).toBeUndefined();
+  expect(minimaxConfig.serviceTier).toBeUndefined();
+  const minimaxPrompt = await service.submitPrompt({
+    sessionId,
+    threadId,
+    text: "hello from MiniMax",
+  });
+  expect(minimaxPrompt.status).toBe("completed");
+  expect(runner.turnInputs[0]?.modelSelection).toEqual({ provider: "minimax", model: "MiniMax-M3[1m]" });
+  expect(runner.turnInputs[0]?.reasoningLevel).toBeUndefined();
+  expect(runner.turnInputs[0]?.serviceTier).toBeUndefined();
+  await expect(service.setReasoning({ sessionId, threadId, reasoningLevel: "high" })).rejects.toThrow(
+    "does not support configurable reasoning",
+  );
+  await expect(service.setServiceTier({ sessionId, threadId, serviceTier: "fast" })).rejects.toThrow(
+    "does not support service tier fast",
+  );
+
+  await service.setModel({
+    sessionId,
+    threadId,
+    modelSelection: { provider: "openai-codex", model: "gpt-5.6-sol" },
+  });
+  const reasoningConfig = await service.setReasoning({ sessionId, threadId, reasoningLevel: "high" });
+  const serviceTierConfig = await service.setServiceTier({ sessionId, threadId, serviceTier: "fast" });
+  expect(reasoningConfig.reasoningLevel).toBe("high");
+  expect(serviceTierConfig.serviceTier).toBe("fast");
+
+  await service.setModel({
+    sessionId,
+    threadId,
+    modelSelection: { provider: "custom", model: "future-model" },
+  });
+  await expect(service.setServiceTier({ sessionId, threadId, serviceTier: "fast" })).rejects.toThrow(
+    "does not support service tier fast",
+  );
+});
+
 test("RuntimeService inspectPrompt only assembles prompt debug output", async () => {
   const store = new MemoryEventStore();
   const runner = new FakeAgentRunner();

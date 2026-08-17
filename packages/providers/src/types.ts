@@ -38,6 +38,7 @@ export interface ModelDescriptor {
   contextWindowTokens?: number;
   maxOutputTokens?: number;
   reasoningLevels?: readonly ReasoningLevel[];
+  serviceTiers?: readonly ServiceTier[];
   cost?: ModelCost;
   default?: boolean;
 }

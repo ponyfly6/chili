@@ -84,6 +84,12 @@ test("exposes GPT-5.6 advanced reasoning levels by model tier", () => {
     model: "custom-reasoner",
     reasoningLevels: ["off", "low", "max"],
   })).toEqual(["off", "low", "max"]);
+  expect(getModelSelectionAvailableReasoningLevels({
+    provider: "minimax",
+    model: "MiniMax-M3[1m]",
+    capabilities: { streaming: true, reasoning: true },
+    reasoningLevels: [],
+  })).toEqual([]);
 });
 
 test("catalog exposes configured Z.ai GLM-5.2", () => {

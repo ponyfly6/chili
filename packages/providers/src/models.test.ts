@@ -143,6 +143,7 @@ test("catalog describes the built-in MiniMax Anthropic-family models", () => {
     inputCapabilities: ["text", "image"],
     contextWindowTokens: 1000000,
     maxOutputTokens: 32768,
+    reasoningLevels: [],
     capabilities: {
       streaming: true,
       reasoning: true,
@@ -183,6 +184,7 @@ test("catalog describes the built-in ChatGPT Codex Responses models", () => {
     inputCapabilities: ["text", "image"],
     contextWindowTokens: 1050000,
     maxOutputTokens: 128000,
+    serviceTiers: ["standard", "fast"],
     capabilities: {
       streaming: true,
       reasoning: true,

@@ -304,6 +304,22 @@ test("resolves fast mode slash command and completions", async () => {
   expect(slashCompletions(commands, ctx, "/fast o", 8).map((completion) => completion.value)).toContain("/fast off");
 });
 
+test("reports fast mode as unsupported when the selected model cannot configure service tiers", async () => {
+  const commands = createDefaultSlashCommands();
+  const ctx = { model: {}, serviceTierConfigurable: false } as SlashCommandContext;
+
+  expect(await resolveSlashCommand(commands, "/fast on")?.command.run(ctx, "on")).toEqual({
+    type: "local_message",
+    level: "error",
+    text: "Fast mode is not available for the selected model",
+  });
+  expect(await resolveSlashCommand(commands, "/fast status")?.command.run(ctx, "status")).toEqual({
+    type: "local_message",
+    level: "error",
+    text: "Fast mode is not available for the selected model",
+  });
+});
+
 test("resolves skills enable and disable commands", async () => {
   const commands = createDefaultSlashCommands();
   const ctx = { model: {} } as SlashCommandContext;

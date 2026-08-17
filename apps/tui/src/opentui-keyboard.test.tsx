@@ -2910,6 +2910,102 @@ test("/model keeps the old UI state when persistence fails", async () => {
   }
 });
 
+test("/status separates the live event stream from execution and reports unsupported MiniMax controls", async () => {
+  let serviceTierChanges = 0;
+  const selection = { provider: "minimax", model: "MiniMax-M3[1m]" };
+  const models: ModelCandidate[] = [{
+    ...selection,
+    capabilities: { reasoning: true },
+    reasoningLevels: [],
+  }];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: models,
+      modelConfig: {
+        sessionId: "session_minimax_status" as SessionId,
+        models: [{
+          ...selection,
+          capabilities: { reasoning: true },
+          reasoningLevels: [],
+        }],
+        availableReasoningLevels: [],
+        modelSelection: selection,
+        reasoningLevel: "high",
+        serviceTier: "fast",
+      },
+      setRuntimeServiceTier: async () => {
+        serviceTierChanges += 1;
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/status");
+    await press(app, () => app.mockInput.pressEnter());
+
+    let frame = app.captureCharFrame();
+    expect(frame).toContain("event stream: connected");
+    expect(frame).toContain("execution: idle");
+    expect(frame).toContain("thinking: unsupported");
+    expect(frame).toContain("service tier: unsupported");
+    expect(frame).not.toContain("connection: streaming");
+
+    await press(app, () => app.mockInput.pressEscape());
+    await typeText(app, "/thinking");
+    await press(app, () => app.mockInput.pressEnter());
+    frame = app.captureCharFrame();
+    expect(frame).toContain("does not support configurable thinking");
+    expect(frame).not.toContain("Very brief reasoning");
+
+    await typeText(app, "/fast on");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(app.captureCharFrame()).toContain("Fast mode is not available for the selected model");
+    expect(serviceTierChanges).toBe(0);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/status preserves effective reasoning and fast tier for OpenAI Codex", async () => {
+  const selection = { provider: "openai-codex", model: "gpt-5.6-sol" };
+  const models: ModelCandidate[] = [{
+    ...selection,
+    capabilities: { reasoning: true },
+    reasoningLevels: ["off", "low", "medium", "high"],
+    serviceTiers: ["standard", "fast"],
+  }];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: models,
+      modelConfig: {
+        sessionId: "session_codex_status" as SessionId,
+        models: [{
+          ...selection,
+          capabilities: { reasoning: true },
+          reasoningLevels: ["off", "low", "medium", "high"],
+          serviceTiers: ["standard", "fast"],
+        }],
+        availableReasoningLevels: ["off", "low", "medium", "high"],
+        modelSelection: selection,
+        reasoningLevel: "high",
+        serviceTier: "fast",
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/status");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("thinking: high");
+    expect(frame).toContain("service tier: fast");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("team run slash command executes SDK run-loop action", async () => {
   const executed: TeamLiveAction[] = [];
   const app = await mountShell(withRunLoopReady(teamLiveFixture()), { executed });

@@ -44,6 +44,7 @@ import {
   modelSelectionLabel,
   modelSupportsImages,
   modelSupportsReasoning,
+  modelSupportsServiceTier,
   sameModelSelection,
   type ModelSelection,
   type ReasoningLevel,
@@ -279,12 +280,15 @@ export function ChatShellSurface(props: {
     () => props.runtime.modelCandidates ?? [],
     [props.runtime.modelCandidates],
   );
-  const availableReasoningLevels = props.runtime.modelConfig?.availableReasoningLevels.length
-    ? props.runtime.modelConfig.availableReasoningLevels
-    : REASONING_LEVELS;
   const [modelSelection, setModelSelectionState] = useState<ModelSelection | undefined>(undefined);
   const [reasoningLevel, setReasoningLevelState] = useState<ReasoningLevel | undefined>(undefined);
   const [serviceTier, setServiceTierState] = useState<ServiceTier | undefined>(undefined);
+  const capabilitySelection = modelSelection ?? modelSelectionFromOptions(props.options);
+  const reasoningConfigurable = modelSupportsReasoning(capabilitySelection, modelCandidates);
+  const serviceTierConfigurable = modelSupportsServiceTier(capabilitySelection, modelCandidates);
+  const availableReasoningLevels = reasoningConfigurable
+    ? props.runtime.modelConfig?.availableReasoningLevels ?? REASONING_LEVELS
+    : [];
   const [modelPicker, setModelPicker] = useState<ModelPickerNavigation | undefined>(undefined);
   const [reasoningPicker, setReasoningPicker] = useState<ReasoningPickerNavigation | undefined>(undefined);
   const [permissionsPicker, setPermissionsPicker] = useState<PermissionsPickerNavigation | undefined>(undefined);
@@ -383,14 +387,15 @@ export function ChatShellSurface(props: {
     model: props.model,
     cwd,
     ...(modelSelection ? { modelSelection } : {}),
-    ...(reasoningLevel ? { reasoningLevel } : {}),
+    ...(reasoningConfigurable && reasoningLevel ? { reasoningLevel } : {}),
     availableReasoningLevels,
-    ...(serviceTier ? { serviceTier } : {}),
+    serviceTierConfigurable,
+    ...(serviceTierConfigurable && serviceTier ? { serviceTier } : {}),
     modelCandidates,
     skills: props.skills ?? [],
     allSkills: props.allSkills ?? props.skills ?? [],
     mcpServers: props.runtime.mcpStatus?.servers ?? [],
-  }), [availableReasoningLevels, cwd, modelCandidates, modelSelection, props.allSkills, props.model, props.runtime.mcpStatus?.servers, props.skills, reasoningLevel, serviceTier]);
+  }), [availableReasoningLevels, cwd, modelCandidates, modelSelection, props.allSkills, props.model, props.runtime.mcpStatus?.servers, props.skills, reasoningConfigurable, reasoningLevel, serviceTier, serviceTierConfigurable]);
   const completionSuppressed = acceptedCompletionPrompt !== undefined && prompt === acceptedCompletionPrompt;
   const skillTrigger = activeSkillMentionTrigger(prompt);
   const skillCompletionItems = skillTrigger && !prompt.startsWith("/") && !shellInputActive
@@ -636,6 +641,10 @@ export function ChatShellSurface(props: {
     setModelPicker(undefined);
   }, []);
   const openReasoningPicker = useCallback(() => {
+    if (!reasoningConfigurable) {
+      appendLocalItem("error", `${capabilityModelLabel(capabilitySelection)} does not support configurable thinking`);
+      return;
+    }
     const selectedIndex = Math.max(0, availableReasoningLevels.indexOf(reasoningLevel ?? DEFAULT_REASONING_LEVEL));
     setResumePicker(undefined);
     setRenamePrompt(undefined);
@@ -643,7 +652,7 @@ export function ChatShellSurface(props: {
     setPermissionsPicker(undefined);
     setThemePicker(undefined);
     setReasoningPicker({ selectedIndex });
-  }, [availableReasoningLevels, reasoningLevel]);
+  }, [appendLocalItem, availableReasoningLevels, capabilitySelection, reasoningConfigurable, reasoningLevel]);
   const closeReasoningPicker = useCallback(() => {
     setReasoningPicker(undefined);
   }, []);
@@ -709,7 +718,7 @@ export function ChatShellSurface(props: {
     if (modelSupportsReasoning(selection, modelCandidates)) {
       resolvedReasoning = nextReasoningLevel;
     } else {
-      resolvedReasoning = "off";
+      setReasoningLevelState(undefined);
     }
 
     if (resolvedReasoning !== undefined) {
@@ -722,6 +731,7 @@ export function ChatShellSurface(props: {
     }
 
     setModelSelectionState(selection);
+    if (!modelSupportsServiceTier(selection, modelCandidates)) setServiceTierState(undefined);
     if (resolvedReasoning && reasoningPersisted) setReasoningLevelState(resolvedReasoning);
     setModelPicker(undefined);
     const reasoningText = resolvedReasoning && reasoningPersisted ? ` (thinking ${resolvedReasoning})` : "";
@@ -731,6 +741,10 @@ export function ChatShellSurface(props: {
   }, [appendLocalItem, modelCandidates, props.runtime]);
 
   const setReasoningLevel = useCallback(async (level: ReasoningLevel) => {
+    if (!reasoningConfigurable) {
+      appendLocalItem("error", `${capabilityModelLabel(capabilitySelection)} does not support configurable thinking`);
+      return;
+    }
     const persisted = props.runtime.setRuntimeReasoning ? await props.runtime.setRuntimeReasoning(level) : true;
     if (!persisted) {
       setReasoningPicker(undefined);
@@ -740,9 +754,13 @@ export function ChatShellSurface(props: {
     setReasoningLevelState(level);
     setReasoningPicker(undefined);
     appendLocalItem("info", `Thinking: ${level}`);
-  }, [appendLocalItem, props.runtime]);
+  }, [appendLocalItem, capabilitySelection, props.runtime, reasoningConfigurable]);
 
   const setServiceTier = useCallback(async (nextServiceTier: ServiceTier) => {
+    if (!serviceTierConfigurable) {
+      appendLocalItem("error", `${capabilityModelLabel(capabilitySelection)} does not support selectable service tiers`);
+      return;
+    }
     const persisted = props.runtime.setRuntimeServiceTier ? await props.runtime.setRuntimeServiceTier(nextServiceTier) : true;
     if (!persisted) {
       appendLocalItem("error", `Fast mode unchanged: failed to persist ${nextServiceTier}`);
@@ -750,7 +768,7 @@ export function ChatShellSurface(props: {
     }
     setServiceTierState(nextServiceTier);
     appendLocalItem("info", nextServiceTier === "fast" ? "Fast mode: on" : "Fast mode: off (standard)");
-  }, [appendLocalItem, props.runtime]);
+  }, [appendLocalItem, capabilitySelection, props.runtime, serviceTierConfigurable]);
 
   const setPermissionProfile = useCallback(async (profile: RuntimePermissionProfileId) => {
     const item = props.runtime.permissionConfig?.profiles.find((candidate) => candidate.id === profile);
@@ -1564,8 +1582,10 @@ export function ChatShellSurface(props: {
     modelName: props.options?.modelName ?? "auto",
     providerName: props.options?.providerName ?? "runtime",
     ...(modelSelection ? { modelSelection } : {}),
-    ...(reasoningLevel ? { reasoningLevel } : {}),
-    ...(serviceTier ? { serviceTier } : {}),
+    reasoningConfigurable,
+    serviceTierConfigurable,
+    ...(reasoningConfigurable && reasoningLevel ? { reasoningLevel } : {}),
+    ...(serviceTierConfigurable && serviceTier ? { serviceTier } : {}),
     cwd,
     ...(gitBranch ? { gitBranch } : {}),
   };
@@ -2687,13 +2707,14 @@ function StatusView(props: {
     <box width="100%" height="100%" flexDirection="column">
       <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Status"}</text>
       <box height={1} />
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`connection: ${props.model.connection.status}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`event stream: ${eventStreamStatus(props.model.connection.status)}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`execution: ${props.runtime.chatView.status}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`session: ${props.runtime.activeSessionId ?? "none"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thread: ${props.runtime.activeThreadId ?? "none"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`mode: ${props.options.modeName}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`model: ${modelLabel}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thinking: ${props.options.reasoningLevel ?? "default"}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`service tier: ${props.options.serviceTier ?? "standard"}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thinking: ${props.options.reasoningConfigurable === false ? "unsupported" : props.options.reasoningLevel ?? "default"}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`service tier: ${props.options.serviceTierConfigurable === false ? "unsupported" : props.options.serviceTier ?? "standard"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thinking traces: ${props.hideThinking ? "hidden" : "shown"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`details: ${props.showToolDetails ? "on" : "off"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`transcript: ${props.transcriptActive ? "on" : "off"}`}</text>
@@ -2701,6 +2722,20 @@ function StatusView(props: {
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`team: ${selected?.team.name ?? selected?.team.id ?? "none"}`}</text>
     </box>
   );
+}
+
+function eventStreamStatus(status: TeamLiveView["connection"]["status"]): string {
+  return status === "streaming" ? "connected" : status;
+}
+
+function modelSelectionFromOptions(options: Partial<ChatShellOptions> | undefined): ModelSelection | undefined {
+  const provider = options?.providerName?.trim();
+  const model = options?.modelName?.trim();
+  return provider && model ? { provider, model } : undefined;
+}
+
+function capabilityModelLabel(selection: ModelSelection | undefined): string {
+  return selection ? modelSelectionLabel(selection) : "Selected model";
 }
 
 function AgentsView(props: { model: TeamLiveView; theme: TuiTheme }) {

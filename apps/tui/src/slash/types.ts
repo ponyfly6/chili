@@ -62,6 +62,7 @@ export interface SlashCommandContext {
   reasoningLevel?: ReasoningLevel | undefined;
   availableReasoningLevels?: readonly ReasoningLevel[] | undefined;
   serviceTier?: ServiceTier | undefined;
+  serviceTierConfigurable?: boolean | undefined;
   modelCandidates?: readonly ModelCandidate[] | undefined;
   skills?: readonly SkillSummary[] | undefined;
   allSkills?: readonly SkillSummary[] | undefined;

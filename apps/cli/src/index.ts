@@ -28,7 +28,7 @@ import { parseArgs, usage } from "./args.js";
 import { applyCliEnvironmentDefaults, cliEnvironmentDefaults } from "./environment-defaults.js";
 import { createCliHarness } from "./harness.js";
 import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
-import { runPrompt } from "./runner.js";
+import { runSessionPrompt } from "./runner.js";
 import { resolveSession } from "./session.js";
 import { formatStoreDoctorText } from "./store-doctor.js";
 
@@ -296,15 +296,12 @@ async function main(): Promise<void> {
     console.log(`[session] ${session.sessionId}${session.isNew ? " (new)" : " (resumed)"}`);
     if (args.prompt) {
       const controller = installInterruptHandler();
-      await runPrompt({
+      await runSessionPrompt({
         harness,
         sessionId: session.sessionId,
         threadId: session.threadId,
         prompt: args.prompt,
         maxTurns: args.maxTurns,
-        ...(harness.defaultModelSelection ? { modelSelection: harness.defaultModelSelection } : {}),
-        ...(harness.defaultReasoningLevel !== undefined ? { reasoningLevel: harness.defaultReasoningLevel } : {}),
-        ...(harness.defaultServiceTier !== undefined ? { serviceTier: harness.defaultServiceTier } : {}),
         signal: controller.signal,
       });
       return;
@@ -1184,15 +1181,12 @@ async function repl(input: {
       }
 
       const controller = installInterruptHandler();
-      await runPrompt({
+      await runSessionPrompt({
         harness: input.harness,
         sessionId: input.sessionId,
         threadId: input.threadId,
         prompt: line,
         maxTurns: input.maxTurns,
-        ...(input.harness.defaultModelSelection ? { modelSelection: input.harness.defaultModelSelection } : {}),
-        ...(input.harness.defaultReasoningLevel !== undefined ? { reasoningLevel: input.harness.defaultReasoningLevel } : {}),
-        ...(input.harness.defaultServiceTier !== undefined ? { serviceTier: input.harness.defaultServiceTier } : {}),
         signal: controller.signal,
       });
     }

@@ -276,6 +276,13 @@ function openPermissionsView(): SlashCommandResult {
 
 function fastResult(ctx: SlashCommandContext, args: string): SlashCommandResult {
   const option = args.trim().toLowerCase();
+  if (ctx.serviceTierConfigurable === false) {
+    return {
+      type: "local_message",
+      level: "error",
+      text: "Fast mode is not available for the selected model",
+    };
+  }
   if (!option || option === "status") {
     const serviceTier = ctx.serviceTier ?? "standard";
     return {

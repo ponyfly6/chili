@@ -475,6 +475,7 @@ class CliProviderRouter implements ModelRouter {
       ...(model.contextWindowTokens !== undefined ? { contextWindowTokens: model.contextWindowTokens } : {}),
       ...(model.maxOutputTokens !== undefined ? { maxOutputTokens: model.maxOutputTokens } : {}),
       reasoningLevels: [...getModelSelectionAvailableReasoningLevels(model)],
+      ...(model.serviceTiers ? { serviceTiers: [...model.serviceTiers] } : {}),
       ...(model.default !== undefined ? { default: model.default } : {}),
     }));
   }

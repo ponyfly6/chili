@@ -13,6 +13,20 @@ export interface RunPromptOptions {
   signal?: AbortSignal;
 }
 
+export type RunSessionPromptOptions = Omit<
+  RunPromptOptions,
+  "modelSelection" | "reasoningLevel" | "serviceTier"
+>;
+
+/**
+ * Submit through the Runtime's persisted model state. Harness defaults seed that
+ * state at construction time; repeating them here would turn defaults into
+ * per-turn overrides and bypass capability normalization for the selected model.
+ */
+export function runSessionPrompt(options: RunSessionPromptOptions): Promise<void> {
+  return runPrompt(options);
+}
+
 export async function runPrompt(options: RunPromptOptions): Promise<void> {
   const input = {
     sessionId: options.sessionId,

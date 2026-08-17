@@ -226,6 +226,7 @@ const BUILTIN_MODELS = [
     inputCapabilities: ["text", "image"],
     contextWindowTokens: 1000000,
     maxOutputTokens: 32768,
+    reasoningLevels: [],
     capabilities: {
       streaming: true,
       reasoning: true,
@@ -249,6 +250,7 @@ const BUILTIN_MODELS = [
     inputCapabilities: ["text"],
     contextWindowTokens: 204800,
     maxOutputTokens: 131072,
+    reasoningLevels: [],
     capabilities: {
       streaming: true,
       reasoning: true,
@@ -272,6 +274,7 @@ const BUILTIN_MODELS = [
     inputCapabilities: ["text"],
     contextWindowTokens: 204800,
     maxOutputTokens: 131072,
+    reasoningLevels: [],
     capabilities: {
       streaming: true,
       reasoning: true,
@@ -335,6 +338,7 @@ function cloneModelDescriptor(model: ModelDescriptor): ModelDescriptor {
   }
   if (model.inputCapabilities) clone.inputCapabilities = [...model.inputCapabilities];
   if (model.reasoningLevels) clone.reasoningLevels = [...model.reasoningLevels];
+  if (model.serviceTiers) clone.serviceTiers = [...model.serviceTiers];
   if (model.cost) clone.cost = { ...model.cost };
   return clone;
 }
@@ -361,6 +365,7 @@ function openAICodexModelDescriptor(model: (typeof OPENAI_CODEX_MODELS)[number])
     inputCapabilities: ["text", "image"],
     contextWindowTokens: isGpt56 ? 1050000 : 272000,
     maxOutputTokens: 128000,
+    serviceTiers: ["standard", "fast"],
     cost: OPENAI_CODEX_MODEL_COSTS[model],
     capabilities: {
       streaming: true,
