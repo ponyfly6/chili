@@ -312,8 +312,8 @@ test("CLI ChatGPT Codex ignores API env and uses OAuth endpoint and headers", as
   expect(body).toMatchObject({
     model: "gpt-5.6-sol",
     prompt_cache_key: "session_cli_model",
-    max_output_tokens: 32768,
   });
+  expect(body).not.toHaveProperty("max_output_tokens");
   expect(limits).toEqual({ contextWindowTokens: 1050000, requestMaxOutputTokens: 32768 });
   expect(events).toContainEqual(expect.objectContaining({
     type: "metadata",

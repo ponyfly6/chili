@@ -323,11 +323,14 @@ class CodexResponsesModel implements ChiliModel {
       inputCapabilities: requestOptions.inputCapabilities,
     });
     const credentials = await this.options.resolveCredentials();
+    const requestBody = this.provider === CODEX_API_PROVIDER_ID
+      ? buildCodexApiResponsesRequestBody(input, requestOptions)
+      : buildOpenAICodexResponsesRequestBody(input, requestOptions);
 
     const init: RequestInit = {
       method: "POST",
       headers: this.headers(credentials, requestOptions.sessionId),
-      body: JSON.stringify(buildOpenAICodexResponsesRequestBody(input, requestOptions)),
+      body: JSON.stringify(requestBody),
     };
     if (input.signal) init.signal = input.signal;
 
@@ -734,6 +737,21 @@ export function buildOpenAICodexResponsesRequestBody(
   input: ModelStreamInput,
   options: OpenAICodexRequestBuildOptions,
 ): Record<string, unknown> {
+  return buildCodexResponsesRequestBody(input, options, false);
+}
+
+function buildCodexApiResponsesRequestBody(
+  input: ModelStreamInput,
+  options: CodexApiRequestBuildOptions,
+): Record<string, unknown> {
+  return buildCodexResponsesRequestBody(input, options, true);
+}
+
+function buildCodexResponsesRequestBody(
+  input: ModelStreamInput,
+  options: OpenAICodexRequestBuildOptions,
+  includeMaxOutputTokens: boolean,
+): Record<string, unknown> {
   const messages = prependContextualUserMessage(
     transformModelMessages(input.messages, { normalizeToolCallId: normalizeResponsesId }),
     input.contextualUser,
@@ -751,7 +769,7 @@ export function buildOpenAICodexResponsesRequestBody(
 
   const instructions = instructionText(messages, input.system ?? [], input.developer ?? []);
   if (instructions) body.instructions = instructions;
-  if (options.maxTokens !== undefined) body.max_output_tokens = options.maxTokens;
+  if (includeMaxOutputTokens && options.maxTokens !== undefined) body.max_output_tokens = options.maxTokens;
   if (options.temperature !== undefined) body.temperature = options.temperature;
   if (options.sessionId) body.prompt_cache_key = options.sessionId;
   const serviceTier = openAICodexWireServiceTier(options.serviceTier);

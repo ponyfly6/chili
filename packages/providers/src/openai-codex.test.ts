@@ -112,7 +112,6 @@ test("converts Chili messages and tools into a Codex Responses body", () => {
     stream: true,
     instructions: "runtime system\n\nstored system",
     prompt_cache_key: "session_codex",
-    max_output_tokens: 123,
     text: { verbosity: "medium" },
     reasoning: { effort: "low", summary: "auto" },
     input: [
@@ -136,6 +135,7 @@ test("converts Chili messages and tools into a Codex Responses body", () => {
       },
     ],
   });
+  expect(body).not.toHaveProperty("max_output_tokens");
 });
 
 test("adds controlled execution context to Codex function outputs", () => {
@@ -520,6 +520,58 @@ test("ChatGPT OAuth ignores legacy API environment and always uses the fixed end
   expect(requestedUrl).toBe("https://chatgpt.com/backend-api/codex/responses");
   expect(headers.get("authorization")).toBe(`Bearer ${oauthAccess}`);
   expect(headers.get("chatgpt-account-id")).toBe("acct_oauth_fixed");
+});
+
+test("ChatGPT OAuth keeps its request limit internal and omits max_output_tokens on the wire", async () => {
+  let body: Record<string, unknown> = {};
+  const model = new OpenAICodexResponsesModel({
+    model: "gpt-5.5",
+    maxTokens: 123,
+    authStorage: staticOAuthStorage(jwtWithAccount("acct_oauth_limit"), "acct_oauth_limit"),
+    fetch: (async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(streamText([
+        data({ type: "response.created", response: { id: "resp_oauth_limit", model: "gpt-5.5" } }),
+        data({ type: "response.completed", response: { id: "resp_oauth_limit", model: "gpt-5.5", status: "completed" } }),
+      ].join("")), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }) as typeof fetch,
+  });
+
+  const requestOptions = resolveOpenAICodexStreamRequestOptions({ messages: [] }, {
+    model: "gpt-5.5",
+    maxTokens: 123,
+  });
+  await collect(model.stream({ messages: [] }));
+
+  expect(requestOptions.maxTokens).toBe(123);
+  expect(body).not.toHaveProperty("max_output_tokens");
+});
+
+test("Codex API sends configured max_output_tokens on the wire", async () => {
+  let body: Record<string, unknown> = {};
+  const model = new CodexApiResponsesModel({
+    model: "gpt-5.5",
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
+    maxTokens: 456,
+    fetch: (async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(streamText([
+        data({ type: "response.created", response: { id: "resp_api_limit", model: "gpt-5.5" } }),
+        data({ type: "response.completed", response: { id: "resp_api_limit", model: "gpt-5.5", status: "completed" } }),
+      ].join("")), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }) as typeof fetch,
+  });
+
+  await collect(model.stream({ messages: [] }));
+
+  expect(body.max_output_tokens).toBe(456);
 });
 
 test("accepts OpenAI Codex token exchange fields from id_token", async () => {
