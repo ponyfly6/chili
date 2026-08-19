@@ -3556,6 +3556,238 @@ test("/status distinguishes a third-party API key connection from ChatGPT OAuth"
   }
 });
 
+test("/status shows status reasons for failed and cancelled executions", async () => {
+  for (const status of ["failed", "cancelled"] as const) {
+    const reason = `${status} because the provider closed the response stream`;
+    const app = await mountShell(teamLiveFixture(), {
+      runtime: {
+        chatView: {
+          status,
+          statusReason: reason,
+          items: [],
+          pendingApprovals: [],
+          activeTools: [],
+          generatedAt: "1970-01-01T00:00:00.000Z",
+        },
+      },
+    });
+
+    try {
+      await typeText(app, "/status");
+      await press(app, () => app.mockInput.pressEnter());
+
+      const frame = app.captureCharFrame();
+      expect(frame).toContain(`execution: ${status}`);
+      expect(frame).toContain(`reason: ${reason}`);
+    } finally {
+      app.renderer.destroy();
+    }
+  }
+});
+
+test("/status shortcut copies the complete status page on a narrow screen and shows feedback", async () => {
+  const copied: string[] = [];
+  const sessionId = "session_status_copy_with_a_value_longer_than_the_visible_status_row" as SessionId;
+  const threadId = "thread_status_copy_with_a_value_longer_than_the_visible_status_row" as ThreadId;
+  const reason = "Provider request failed after every response retry was exhausted";
+  const cwd = "/repo/chili/a/very/long/path/that/is/not/fully/visible/in/the/status/view";
+  const app = await mountShell(teamLiveFixture(), {
+    width: 44,
+    height: 40,
+    cwd,
+    kittyKeyboard: true,
+    clipboard: fakeClipboard({
+      writeText: async (text) => {
+        copied.push(text);
+        return true;
+      },
+    }),
+    runtime: {
+      activeSessionId: sessionId,
+      activeThreadId: threadId,
+      chatView: {
+        status: "failed",
+        statusReason: reason,
+        items: [{
+          id: "msg_status_copy_previous" as MessageId,
+          kind: "message",
+          role: "assistant",
+          createdAt: 1,
+          parts: [{ type: "text", id: "part_status_copy_previous" as PartId, text: "PREVIOUS ASSISTANT REPLY" }],
+        }],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/status");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(app.captureCharFrame()).not.toContain(sessionId);
+
+    await press(app, () => app.mockInput.pressKey("c", { ctrl: true, shift: true }));
+
+    expect(copied).toHaveLength(1);
+    expect(copied[0]).toContain(`execution: failed\nreason: ${reason}`);
+    expect(copied[0]).toContain(`session: ${sessionId}`);
+    expect(copied[0]).toContain(`thread: ${threadId}`);
+    expect(copied[0]).toContain(`cwd: ${cwd}`);
+    expect(copied[0]).not.toContain("PREVIOUS ASSISTANT REPLY");
+    expect(app.captureCharFrame()).toContain("Copied status.");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/status does not show clipboard feedback left by the chat view", async () => {
+  const copied: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    localMessageTtlMs: 0,
+    kittyKeyboard: true,
+    clipboard: fakeClipboard({
+      writeText: async (text) => {
+        copied.push(text);
+        return true;
+      },
+    }),
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: [{
+          id: "msg_status_stale_feedback" as MessageId,
+          kind: "message",
+          role: "assistant",
+          createdAt: 1,
+          parts: [{ type: "text", id: "part_status_stale_feedback" as PartId, text: "ASSISTANT COPY SOURCE" }],
+        }],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    },
+  });
+
+  try {
+    await press(app, () => app.mockInput.pressKey("c", { ctrl: true, shift: true }));
+    expect(copied).toEqual(["ASSISTANT COPY SOURCE"]);
+    expect(app.captureCharFrame()).toContain("Copied latest assistant reply.");
+
+    await typeText(app, "/status");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("Status");
+    expect(frame).not.toContain("Copied latest assistant reply.");
+    expect(frame).not.toContain("Copied status.");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/status discards a pending copy result when the active session changes", async () => {
+  let resolveWrite: ((copied: boolean) => void) | undefined;
+  const writeResult = new Promise<boolean>((resolve) => {
+    resolveWrite = resolve;
+  });
+  const oldSessionId = "session_status_copy_old" as SessionId;
+  const oldThreadId = "thread_status_copy_old" as ThreadId;
+  const newSessionId = "session_status_copy_new" as SessionId;
+  const newThreadId = "thread_status_copy_new" as ThreadId;
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    clipboard: fakeClipboard({ writeText: async () => writeResult }),
+    runtime: {
+      activeSessionId: oldSessionId,
+      activeThreadId: oldThreadId,
+    },
+  });
+
+  try {
+    await typeText(app, "/status");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressKey("c", { ctrl: true, shift: true }));
+
+    await act(async () => {
+      app.setRuntime((current) => ({
+        ...current,
+        activeSessionId: newSessionId,
+        activeThreadId: newThreadId,
+      }));
+      await app.renderOnce();
+    });
+    resolveWrite?.(true);
+    await act(async () => {
+      await Bun.sleep(0);
+      await app.renderOnce();
+    });
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain(`session: ${newSessionId}`);
+    expect(frame).toContain(`thread: ${newThreadId}`);
+    expect(frame).not.toContain("Copied status.");
+  } finally {
+    resolveWrite?.(false);
+    app.renderer.destroy();
+  }
+});
+
+test("/status supports themed multi-click selection and keeps selection copy priority", async () => {
+  const copied: string[] = [];
+  const sessionId = "session_status_selectable" as SessionId;
+  const threadId = "thread_status_selectable" as ThreadId;
+  const app = await mountShell(teamLiveFixture(), {
+    width: 100,
+    height: 36,
+    useMouse: true,
+    kittyKeyboard: true,
+    clipboard: fakeClipboard({
+      writeText: async (text) => {
+        copied.push(text);
+        return true;
+      },
+    }),
+    runtime: {
+      activeSessionId: sessionId,
+      activeThreadId: threadId,
+    },
+  });
+
+  try {
+    await typeText(app, "/status");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    const sessionTarget = frameTextPosition(frame, sessionId);
+    await act(async () => {
+      await app.mockMouse.doubleClick(sessionTarget.x + 4, sessionTarget.y);
+      await Bun.sleep(80);
+      await app.renderOnce();
+    });
+
+    expect(app.renderer.getSelection()?.getSelectedText()).toBe(sessionId);
+    expect(copied.at(-1)).toBe(sessionId);
+    expect(selectionBgAt(app, sessionTarget.x, sessionTarget.y)).toBe(true);
+
+    copied.length = 0;
+    await press(app, () => app.mockInput.pressKey("c", { ctrl: true, shift: true }));
+    expect(copied).toEqual([sessionId]);
+
+    const threadTarget = frameTextPosition(app.captureCharFrame(), threadId);
+    await act(async () => {
+      await app.mockMouse.doubleClick(threadTarget.x + 4, threadTarget.y);
+      await app.mockMouse.click(threadTarget.x + 4, threadTarget.y);
+      await Bun.sleep(80);
+      await app.renderOnce();
+    });
+
+    expect(app.renderer.getSelection()?.getSelectedText()).toBe(`thread: ${threadId}`);
+    expect(copied.at(-1)).toBe(`thread: ${threadId}`);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("team run slash command executes SDK run-loop action", async () => {
   const executed: TeamLiveAction[] = [];
   const app = await mountShell(withRunLoopReady(teamLiveFixture()), { executed });

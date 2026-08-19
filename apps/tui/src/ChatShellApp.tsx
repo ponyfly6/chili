@@ -56,6 +56,7 @@ import { BrandMark } from "./chat/BrandMark.js";
 import { charDisplayWidth } from "./chat/markdown.js";
 import { zedPathWithPosition, type FileLinkTarget } from "./chat/file-links.js";
 import { MessageList } from "./chat/MessageList.js";
+import { TranscriptLine } from "./chat/lines.js";
 import {
   McpManager,
   initialMcpManagerState,
@@ -272,6 +273,7 @@ export function ChatShellSurface(props: {
   const nextPastedImageIdRef = useRef(1);
   const [skillMentionBindings, setSkillMentionBindings] = useState<RuntimeSkillMention[]>([]);
   const [localItems, setLocalItems] = useState<LocalTranscriptItem[]>([]);
+  const [statusClipboardFeedback, setStatusClipboardFeedback] = useState<StatusPageFeedback | undefined>(undefined);
   const deferredLocalItems = useDeferredValue(localItems);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteIndex, setPaletteIndex] = useState(0);
@@ -310,6 +312,31 @@ export function ChatShellSurface(props: {
   const clearedPromptTextRef = useRef<string | undefined>(undefined);
   const localMessageTtlMs = props.localMessageTtlMs ?? LOCAL_ITEM_TTL_MS;
   const localItemTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const statusClipboardFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const statusClipboardFeedbackEpochRef = useRef(0);
+  const clearStatusClipboardFeedback = useCallback(() => {
+    statusClipboardFeedbackEpochRef.current += 1;
+    if (statusClipboardFeedbackTimerRef.current) clearTimeout(statusClipboardFeedbackTimerRef.current);
+    statusClipboardFeedbackTimerRef.current = undefined;
+    setStatusClipboardFeedback(undefined);
+  }, []);
+  const beginStatusClipboardFeedback = useCallback(() => {
+    statusClipboardFeedbackEpochRef.current += 1;
+    if (statusClipboardFeedbackTimerRef.current) clearTimeout(statusClipboardFeedbackTimerRef.current);
+    statusClipboardFeedbackTimerRef.current = undefined;
+    setStatusClipboardFeedback(undefined);
+    return statusClipboardFeedbackEpochRef.current;
+  }, []);
+  const showStatusClipboardFeedback = useCallback((feedback: StatusPageFeedback, epoch: number) => {
+    if (statusClipboardFeedbackEpochRef.current !== epoch) return;
+    setStatusClipboardFeedback(feedback);
+    if (localMessageTtlMs <= 0) return;
+    statusClipboardFeedbackTimerRef.current = setTimeout(() => {
+      if (statusClipboardFeedbackEpochRef.current !== epoch) return;
+      statusClipboardFeedbackTimerRef.current = undefined;
+      setStatusClipboardFeedback(undefined);
+    }, localMessageTtlMs);
+  }, [localMessageTtlMs]);
   const dismissLocalItem = useCallback((id: string) => {
     const timer = localItemTimersRef.current.get(id);
     if (timer) clearTimeout(timer);
@@ -337,7 +364,15 @@ export function ChatShellSurface(props: {
     setLocalItems([]);
   }, []);
   useEffect(() => {
-    return () => clearLocalItemTimers(localItemTimersRef.current);
+    if (view !== "status") clearStatusClipboardFeedback();
+  }, [clearStatusClipboardFeedback, view]);
+  useEffect(() => {
+    return () => {
+      clearLocalItemTimers(localItemTimersRef.current);
+      statusClipboardFeedbackEpochRef.current += 1;
+      if (statusClipboardFeedbackTimerRef.current) clearTimeout(statusClipboardFeedbackTimerRef.current);
+      statusClipboardFeedbackTimerRef.current = undefined;
+    };
   }, []);
   const sessionKey = `${props.runtime.activeSessionId ?? ""}\0${props.runtime.activeThreadId ?? ""}`;
   const previousSessionKey = useRef(sessionKey);
@@ -347,7 +382,8 @@ export function ChatShellSurface(props: {
     interruptedPromptCandidateRef.current = undefined;
     setPendingInterrupt(undefined);
     clearLocalItems();
-  }, [clearLocalItems, sessionKey]);
+    clearStatusClipboardFeedback();
+  }, [clearLocalItems, clearStatusClipboardFeedback, sessionKey]);
   useEffect(() => {
     const config = props.runtime.modelConfig;
     if (!config) return;
@@ -378,6 +414,25 @@ export function ChatShellSurface(props: {
   const themeOptions = selectableTuiThemeOptions;
   const systemThemeAvailable = Boolean(systemTheme);
   const cwd = props.options?.cwd ?? process.cwd();
+  const statusOptions: StatusFooterOptions = {
+    modeName: props.options?.modeName ?? "Build",
+    modelName: props.options?.modelName ?? "auto",
+    providerName: props.options?.providerName ?? "runtime",
+    ...(modelSelection ? { modelSelection } : {}),
+    reasoningConfigurable,
+    serviceTierConfigurable,
+    ...(reasoningConfigurable && reasoningLevel ? { reasoningLevel } : {}),
+    ...(serviceTierConfigurable && serviceTier ? { serviceTier } : {}),
+    cwd,
+  };
+  const statusPage = statusPageModel({
+    model: props.model,
+    runtime: props.runtime,
+    options: statusOptions,
+    showToolDetails,
+    hideThinking,
+    transcriptActive: view === "transcript",
+  });
   const defaultSlashCommands = useMemo(() => createDefaultSlashCommands(), []);
   const customSlashCommands = useMemo(
     () => customSlashCommandsFromRuntime(props.runtime.commandList),
@@ -1247,13 +1302,22 @@ export function ChatShellSurface(props: {
     if (isCopyShortcut(key)) {
       key.preventDefault();
       key.stopPropagation();
-      const source = clipboardCopySource(renderer, props.runtime.chatView.items, view);
+      const copyView = view;
+      const statusFeedbackEpoch = copyView === "status" ? beginStatusClipboardFeedback() : undefined;
+      const reportCopyResult = (level: "info" | "error", text: string) => {
+        if (statusFeedbackEpoch !== undefined) {
+          showStatusClipboardFeedback({ level, text }, statusFeedbackEpoch);
+          return;
+        }
+        appendLocalItem(level, text);
+      };
+      const source = clipboardCopySource(renderer, props.runtime.chatView.items, copyView, statusPage.text);
       if (!source) {
-        appendLocalItem("error", "Nothing to copy yet.");
+        reportCopyResult("error", "Nothing to copy yet.");
         return;
       }
       void copyClipboardText(source.text, clipboard, renderer).then((copied) => {
-        appendLocalItem(copied ? "info" : "error", copied ? `Copied ${source.label}.` : "Clipboard copy is unavailable.");
+        reportCopyResult(copied ? "info" : "error", copied ? `Copied ${source.label}.` : "Clipboard copy is unavailable.");
       });
       return;
     }
@@ -1600,15 +1664,7 @@ export function ChatShellSurface(props: {
 
   const gitBranch = useGitBranch(cwd, props.options?.gitBranch);
   const shellOptions: StatusFooterOptions = {
-    modeName: props.options?.modeName ?? "Build",
-    modelName: props.options?.modelName ?? "auto",
-    providerName: props.options?.providerName ?? "runtime",
-    ...(modelSelection ? { modelSelection } : {}),
-    reasoningConfigurable,
-    serviceTierConfigurable,
-    ...(reasoningConfigurable && reasoningLevel ? { reasoningLevel } : {}),
-    ...(serviceTierConfigurable && serviceTier ? { serviceTier } : {}),
-    cwd,
+    ...statusOptions,
     ...(gitBranch ? { gitBranch } : {}),
   };
   const modelPickerModel = modelPicker
@@ -1737,6 +1793,8 @@ export function ChatShellSurface(props: {
           options={shellOptions}
           runtime={props.runtime}
           mcpManager={mcpManager}
+          statusPage={statusPage}
+          statusClipboardFeedback={statusClipboardFeedback}
           showToolDetails={showToolDetails}
           hideThinking={hideThinking}
           transcriptActive={view === "transcript"}
@@ -1894,6 +1952,8 @@ function SessionScreen(props: {
   model: TeamLiveView;
   runtime: ChatRuntimeState;
   mcpManager: McpManagerState;
+  statusPage: StatusPageModel;
+  statusClipboardFeedback?: StatusPageFeedback | undefined;
   options: StatusFooterOptions;
   showToolDetails: boolean;
   hideThinking: boolean;
@@ -1968,7 +2028,7 @@ function SessionScreen(props: {
         {props.view === "help" ? (
           <HelpView commands={props.commands} theme={props.theme} showToolDetails={props.showToolDetails} />
         ) : props.view === "status" ? (
-          <StatusView model={props.model} runtime={props.runtime} options={props.options} theme={props.theme} showToolDetails={props.showToolDetails} hideThinking={props.hideThinking} transcriptActive={props.transcriptActive} />
+          <StatusView page={props.statusPage} feedback={props.statusClipboardFeedback} theme={props.theme} />
         ) : props.view === "mcp" ? (
           <McpManager state={props.mcpManager} runtime={props.runtime} theme={props.theme} />
         ) : props.view === "agents" ? (
@@ -2827,51 +2887,128 @@ function HelpView(props: { commands: readonly SlashCommand[]; theme: TuiTheme; s
   );
 }
 
-function StatusView(props: {
+type StatusPageRowTone = "heading" | "text" | "error" | "spacer";
+
+interface StatusPageRow {
+  key: string;
+  text: string;
+  tone: StatusPageRowTone;
+}
+
+interface StatusPageModel {
+  rows: readonly StatusPageRow[];
+  text: string;
+}
+
+interface StatusPageInput {
   model: TeamLiveView;
   runtime: ChatRuntimeState;
   options: StatusFooterOptions;
-  theme: TuiTheme;
   showToolDetails: boolean;
   hideThinking: boolean;
   transcriptActive: boolean;
+}
+
+interface StatusPageFeedback {
+  level: "info" | "error";
+  text: string;
+}
+
+function StatusView(props: { page: StatusPageModel; feedback?: StatusPageFeedback | undefined; theme: TuiTheme }) {
+  const selectionColors = {
+    selectionBg: props.theme.colors.menu.selectedBackground,
+    selectionFg: props.theme.colors.menu.selectedText,
+  };
+  const [heading, ...bodyRows] = props.page.rows;
+  return (
+    <box width="100%" height="100%" flexDirection="column">
+      {heading ? <StatusPageRowView row={heading} theme={props.theme} selectionColors={selectionColors} /> : null}
+      {props.feedback ? (
+        <TranscriptLine
+          line={{
+            key: `status:feedback:${props.feedback.level}:${props.feedback.text}`,
+            text: props.feedback.text,
+            fg: props.feedback.level === "error" ? props.theme.colors.status.error : props.theme.colors.status.info,
+          }}
+          selectionColors={selectionColors}
+        />
+      ) : null}
+      {bodyRows.map((row) => <StatusPageRowView key={row.key} row={row} theme={props.theme} selectionColors={selectionColors} />)}
+    </box>
+  );
+}
+
+function StatusPageRowView(props: {
+  row: StatusPageRow;
+  theme: TuiTheme;
+  selectionColors: { selectionBg: string; selectionFg: string };
 }) {
-  const selected = props.model.selected;
-  const modelSelection = statusModelSelection(props.runtime, props.options);
+  if (props.row.tone === "spacer") return <box height={1} />;
+  return (
+    <TranscriptLine
+      line={{ key: props.row.key, text: props.row.text, fg: statusPageRowFg(props.row.tone, props.theme) }}
+      selectionColors={props.selectionColors}
+    />
+  );
+}
+
+function statusPageModel(input: StatusPageInput): StatusPageModel {
+  const selected = input.model.selected;
+  const modelSelection = statusModelSelection(input.runtime, input.options);
   const candidate = modelSelection
-    ? props.runtime.modelCandidates?.find((item) => sameModelSelection(modelSelection, modelDescriptorSelection(item)))
+    ? input.runtime.modelCandidates?.find((item) => sameModelSelection(modelSelection, modelDescriptorSelection(item)))
     : undefined;
   const modelLabel = modelSelection
     ? modelSelectionLabel(modelSelection)
-    : `${props.options.providerName}/${props.options.modelName}`;
+    : `${input.options.providerName}/${input.options.modelName}`;
   const connection = safeConnectionLabel(candidate?.connectionLabel)
     ?? safeConnectionLabel(candidate?.providerDisplayName)
     ?? safeConnectionLabel(modelSelection?.provider)
     ?? "unknown";
   const auth = modelAuthLabel(candidate?.authSource);
   const endpoint = safeEndpointHost(candidate?.endpoint) ?? "unknown";
-  return (
-    <box width="100%" height="100%" flexDirection="column">
-      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Status"}</text>
-      <box height={1} />
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`event stream: ${eventStreamStatus(props.model.connection.status)}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`execution: ${props.runtime.chatView.status}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`session: ${props.runtime.activeSessionId ?? "none"}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thread: ${props.runtime.activeThreadId ?? "none"}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`mode: ${props.options.modeName}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`model: ${modelLabel}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`connection: ${connection}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`auth: ${auth}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`endpoint: ${endpoint}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thinking: ${props.options.reasoningConfigurable === false ? "unsupported" : props.options.reasoningLevel ?? "default"}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`service tier: ${props.options.serviceTierConfigurable === false ? "unsupported" : props.options.serviceTier ?? "standard"}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thinking traces: ${props.hideThinking ? "hidden" : "shown"}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`details: ${props.showToolDetails ? "on" : "off"}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`transcript: ${props.transcriptActive ? "on" : "off"}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`cwd: ${props.options.cwd}`}</text>
-      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`team: ${selected?.team.name ?? selected?.team.id ?? "none"}`}</text>
-    </box>
+  const executionStatus = input.runtime.chatView.status;
+  const rows: StatusPageRow[] = [
+    { key: "status:title", text: "Status", tone: "heading" },
+    { key: "status:spacer", text: "", tone: "spacer" },
+    { key: "status:event-stream", text: `event stream: ${eventStreamStatus(input.model.connection.status)}`, tone: "text" },
+    { key: "status:execution", text: `execution: ${executionStatus}`, tone: executionStatus === "failed" || executionStatus === "cancelled" ? "error" : "text" },
+  ];
+  const reason = singleLineStatusValue(input.runtime.chatView.statusReason);
+  if ((executionStatus === "failed" || executionStatus === "cancelled") && reason) {
+    rows.push({ key: "status:reason", text: `reason: ${reason}`, tone: "error" });
+  }
+  rows.push(
+    { key: "status:session", text: `session: ${input.runtime.activeSessionId ?? "none"}`, tone: "text" },
+    { key: "status:thread", text: `thread: ${input.runtime.activeThreadId ?? "none"}`, tone: "text" },
+    { key: "status:mode", text: `mode: ${input.options.modeName}`, tone: "text" },
+    { key: "status:model", text: `model: ${modelLabel}`, tone: "text" },
+    { key: "status:connection", text: `connection: ${connection}`, tone: "text" },
+    { key: "status:auth", text: `auth: ${auth}`, tone: "text" },
+    { key: "status:endpoint", text: `endpoint: ${endpoint}`, tone: "text" },
+    { key: "status:thinking", text: `thinking: ${input.options.reasoningConfigurable === false ? "unsupported" : input.options.reasoningLevel ?? "default"}`, tone: "text" },
+    { key: "status:service-tier", text: `service tier: ${input.options.serviceTierConfigurable === false ? "unsupported" : input.options.serviceTier ?? "standard"}`, tone: "text" },
+    { key: "status:thinking-traces", text: `thinking traces: ${input.hideThinking ? "hidden" : "shown"}`, tone: "text" },
+    { key: "status:details", text: `details: ${input.showToolDetails ? "on" : "off"}`, tone: "text" },
+    { key: "status:transcript", text: `transcript: ${input.transcriptActive ? "on" : "off"}`, tone: "text" },
+    { key: "status:cwd", text: `cwd: ${input.options.cwd}`, tone: "text" },
+    { key: "status:team", text: `team: ${selected?.team.name ?? selected?.team.id ?? "none"}`, tone: "text" },
   );
+  return { rows, text: rows.map((row) => row.text).join("\n") };
+}
+
+function statusPageRowFg(tone: Exclude<StatusPageRowTone, "spacer">, theme: TuiTheme): string {
+  if (tone === "heading") return theme.colors.text.primary;
+  if (tone === "error") return theme.colors.status.error;
+  return theme.colors.text.secondary;
+}
+
+function singleLineStatusValue(value: string | undefined): string | undefined {
+  const normalized = value
+    ?.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return normalized || undefined;
 }
 
 function statusModelSelection(runtime: ChatRuntimeState, options: StatusFooterOptions): ModelSelection | undefined {
@@ -3783,9 +3920,18 @@ interface ClipboardRenderer {
   off?: (event: "selection", handler: (selection: Selection) => void) => void;
 }
 
-function clipboardCopySource(renderer: ClipboardRenderer, items: readonly ChatTranscriptItem[], view: ShellView): { text: string; label: string } | undefined {
+function clipboardCopySource(
+  renderer: ClipboardRenderer,
+  items: readonly ChatTranscriptItem[],
+  view: ShellView,
+  statusText: string,
+): { text: string; label: string } | undefined {
   const selected = cleanClipboardText(renderer.getSelection?.()?.getSelectedText() ?? "");
   if (selected) return { text: selected, label: "selection" };
+
+  if (view === "status" && statusText.trim()) {
+    return { text: statusText.trimEnd(), label: "status" };
+  }
 
   if (view === "transcript") {
     const transcript = buildTranscriptText(items).trimEnd();
