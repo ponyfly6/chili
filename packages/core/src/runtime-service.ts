@@ -1529,6 +1529,9 @@ function cloneModelDescriptor(model: RuntimeModelDescriptor): RuntimeModelDescri
   };
   if (model.displayName !== undefined) clone.displayName = model.displayName;
   if (model.providerDisplayName !== undefined) clone.providerDisplayName = model.providerDisplayName;
+  if (model.connectionLabel !== undefined) clone.connectionLabel = model.connectionLabel;
+  if (model.authSource !== undefined) clone.authSource = model.authSource;
+  if (model.endpoint !== undefined) clone.endpoint = model.endpoint;
   if (model.available !== undefined) clone.available = model.available;
   if (model.capabilities) clone.capabilities = { ...model.capabilities };
   if (model.inputCapabilities) clone.inputCapabilities = [...model.inputCapabilities];

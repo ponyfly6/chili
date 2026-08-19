@@ -1202,6 +1202,9 @@ test("serves model control routes and prompt model overrides", async () => {
       provider: "openai-codex",
       model: "gpt-5.5",
       displayName: "GPT-5.5",
+      connectionLabel: "ChatGPT OAuth",
+      authSource: "oauth",
+      endpoint: "https://chatgpt.com",
       capabilities: { reasoning: true },
     },
   ]);
@@ -1378,6 +1381,9 @@ class FakeRuntimeService implements RuntimeHttpService {
         provider: "openai-codex",
         model: "gpt-5.5",
         displayName: "GPT-5.5",
+        connectionLabel: "ChatGPT OAuth",
+        authSource: "oauth",
+        endpoint: "https://chatgpt.com",
         capabilities: { reasoning: true },
       },
     ];

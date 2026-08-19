@@ -40,9 +40,18 @@ export interface RuntimeModelCapabilities {
   responseId?: boolean;
 }
 
+export const RUNTIME_MODEL_AUTH_SOURCES = ["none", "environment", "api_key", "oauth"] as const;
+export type RuntimeModelAuthSource = (typeof RUNTIME_MODEL_AUTH_SOURCES)[number];
+
 export interface RuntimeModelDescriptor extends ModelSelection {
   displayName?: string;
   providerDisplayName?: string;
+  /** A non-secret label for the effective model connection or profile. */
+  connectionLabel?: string;
+  /** The effective credential source, without credential material. */
+  authSource?: RuntimeModelAuthSource;
+  /** A sanitized endpoint origin. It must not contain userinfo, path, query, or fragment data. */
+  endpoint?: string;
   available?: boolean;
   capabilities?: RuntimeModelCapabilities;
   inputCapabilities?: string[];

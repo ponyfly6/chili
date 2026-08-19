@@ -77,6 +77,33 @@ test("RuntimeService accepts an AgentRunner implementation", async () => {
   expect(statuses(store)).toEqual(["idle", "running", "running", "idle"]);
 });
 
+test("RuntimeService preserves safe model connection metadata", async () => {
+  const service = new RuntimeService({
+    runtime: new FakeAgentRunner(),
+    store: new MemoryEventStore(),
+    cwd: "/repo",
+    models: [
+      {
+        provider: "codex-api",
+        model: "gpt-5.6-sol",
+        connectionLabel: "Codex API",
+        authSource: "environment",
+        endpoint: "https://gateway.example",
+      },
+    ],
+  });
+
+  expect(await service.listModels()).toEqual([
+    {
+      provider: "codex-api",
+      model: "gpt-5.6-sol",
+      connectionLabel: "Codex API",
+      authSource: "environment",
+      endpoint: "https://gateway.example",
+    },
+  ]);
+});
+
 test("RuntimeService rejects prompt images for text-only models before appending user messages", async () => {
   const store = new MemoryEventStore();
   const runner = new FakeAgentRunner();

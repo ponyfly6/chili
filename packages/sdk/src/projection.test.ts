@@ -2416,7 +2416,13 @@ test("client sends model control requests and prompt overrides", async () => {
       body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
     });
     const body = url.endsWith("/models")
-      ? [{ provider: "openai-codex", model: "gpt-5.5" }]
+      ? [{
+          provider: "codex-api",
+          model: "gpt-5.5",
+          connectionLabel: "Third-party API",
+          authSource: "environment",
+          endpoint: "https://gateway.example",
+        }]
       : url.endsWith("/commands") || url.endsWith("/commands/reload")
         ? ({ commands: [], diagnostics: [], directories: [], skippedConflicts: [] })
         : url.endsWith("/command_async")
@@ -2431,7 +2437,7 @@ test("client sends model control requests and prompt overrides", async () => {
   }) as unknown as typeof fetch;
   const client = new HttpRuntimeClient({ baseUrl: "http://runtime.test/api", fetch: fetchImpl });
 
-  await client.listModels();
+  const models = await client.listModels();
   await client.getModelConfig({ sessionId });
   await client.setModel({ sessionId, threadId, modelSelection: { provider: "openai-codex", model: "gpt-5.5" } });
   await client.setReasoning({ sessionId, threadId, reasoningLevel: "high" });
@@ -2452,6 +2458,14 @@ test("client sends model control requests and prompt overrides", async () => {
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
     reasoningLevel: "high",
   });
+
+  expect(models).toEqual([{
+    provider: "codex-api",
+    model: "gpt-5.5",
+    connectionLabel: "Third-party API",
+    authSource: "environment",
+    endpoint: "https://gateway.example",
+  }]);
 
   expect(records).toEqual([
     {
