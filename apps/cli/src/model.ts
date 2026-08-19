@@ -8,7 +8,10 @@ import type {
 import type { ModelSelection, RuntimeModelDescriptor, ServiceTier } from "@chili/protocol";
 import { createMiniMaxM27HighspeedRouter } from "@chili/core";
 import {
+  assertCodexApiModel,
   assertOpenAICodexModel,
+  CODEX_API_DEFAULT_MODEL,
+  CODEX_API_PROVIDER_ID,
   DEEPSEEK_OPENAI_BASE_URL,
   DEEPSEEK_PROVIDER_ID,
   FileAuthStorage,
@@ -25,13 +28,12 @@ import {
   MINIMAX_M27_HIGHSPEED_MODEL,
   MINIMAX_M3_MODEL,
   MINIMAX_PROVIDER_ID,
-  OPENAI_CODEX_BASE_URL,
   OPENAI_CODEX_DEFAULT_MODEL,
   OPENAI_CODEX_PROVIDER_ID,
   readDeepSeekEnvironment,
+  readCodexApiEnvironment,
   readKimiEnvironment,
   readMiniMaxEnvironment,
-  readOpenAICodexEnvironment,
   readZaiEnvironment,
   ZAI_GLM_52_MODEL,
   ZAI_OPENAI_BASE_URL,
@@ -40,7 +42,7 @@ import {
 import { FakeModelRouter } from "./fake-model.js";
 
 export type CliModelName = string;
-export type CliProviderName = "minimax" | "deepseek" | "kimi" | "zai" | "openai-codex";
+export type CliProviderName = "minimax" | "deepseek" | "kimi" | "zai" | "openai-codex" | "codex-api";
 export type CliReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 export interface CliModelSelection {
@@ -58,6 +60,7 @@ interface ProviderRouterOptions {
   temperature?: number;
   fetch?: typeof fetch;
   headers?: Record<string, string>;
+  authStorage?: FileAuthStorage;
   reasoning?: boolean;
   reasoningEffort?: CliReasoningLevel;
   reasoningSummary?: "auto" | "concise" | "detailed" | "off" | "on" | null;
@@ -111,7 +114,8 @@ const PROVIDER_DISPLAY_NAMES: Record<CliProviderName, string> = {
   deepseek: "DeepSeek",
   kimi: "Kimi",
   zai: "Z.ai",
-  "openai-codex": "OpenAI Codex",
+  "openai-codex": "ChatGPT",
+  "codex-api": "Api",
 };
 
 export async function createCliModel(selection?: CliModelName | CliModelSelection, options: CliModelOptions = {}): Promise<ModelRouter> {
@@ -125,6 +129,9 @@ export async function createCliModel(selection?: CliModelName | CliModelSelectio
       ...baseOptions,
       ...(defaultSelection.model ? { model: defaultSelection.model } : {}),
     }));
+  }
+  if (defaultSelection.provider === OPENAI_CODEX_PROVIDER_ID) {
+    assertOpenAICodexCliOptions(baseOptions);
   }
 
   const routerOptions: CliProviderRouterOptions = {
@@ -148,7 +155,7 @@ export function resolveCliRuntimeModelSelection(selection: CliModelSelection): M
   return { provider: resolved.provider, model };
 }
 
-async function loadProvidersModule(providerName: "minimax" | "deepseek" | "kimi" | "zai" | "codex"): Promise<Record<string, unknown>> {
+async function loadProvidersModule(providerName: "minimax" | "deepseek" | "kimi" | "zai" | "codex" | "codex-api"): Promise<Record<string, unknown>> {
   try {
     return (await import(PROVIDERS_PACKAGE_NAME)) as Record<string, unknown>;
   } catch (error) {
@@ -268,6 +275,25 @@ function resolveOpenAICodexFactory(providers: Record<string, unknown>): Provider
   return factory as ProviderRouterFactory;
 }
 
+function resolveCodexApiFactory(providers: Record<string, unknown>): ProviderRouterFactory {
+  const defaultExport = providers.default;
+  const defaultObject = isRecord(defaultExport) ? defaultExport : {};
+  const candidates = [
+    providers.createCodexApiRouter,
+    providers.createCodexApiModel,
+    providers.createCodexApiProvider,
+    defaultObject.createCodexApiRouter,
+    defaultObject.createCodexApiModel,
+    defaultObject.createCodexApiProvider,
+    typeof defaultExport === "function" ? defaultExport : undefined,
+  ];
+  const factory = candidates.find((candidate) => typeof candidate === "function");
+  if (!factory) {
+    throw new Error("@chili/providers must export createCodexApiRouter(options) or another compatible Codex API factory");
+  }
+  return factory as ProviderRouterFactory;
+}
+
 function modelFromFactoryResult(
   modelOrProvider: ProviderModelOrProvider,
   modelName: string | undefined,
@@ -310,6 +336,7 @@ function providerBaseOptions(input: CliModelOptions): ProviderRouterOptions {
   if (input.temperature !== undefined) options.temperature = input.temperature;
   if (input.fetch !== undefined) options.fetch = input.fetch;
   if (input.headers !== undefined) options.headers = input.headers;
+  if (input.authStorage !== undefined) options.authStorage = input.authStorage;
   if (input.serviceTier !== undefined) options.serviceTier = input.serviceTier;
   return options;
 }
@@ -369,6 +396,7 @@ function normalizeProviderName(value: string | undefined): CliProviderName | und
   if (normalized === "kimi" || normalized === "moonshot") return "kimi";
   if (normalized === "zai" || normalized === "z.ai" || normalized === "glm") return "zai";
   if (normalized === "codex" || normalized === "openai-codex") return "openai-codex";
+  if (normalized === "codex-api") return "codex-api";
   throw new Error(`Unknown provider: ${value}`);
 }
 
@@ -386,6 +414,7 @@ function normalizeProviderAlias(value: string): CliProviderName | undefined {
   if (value === "kimi" || value === "moonshot") return "kimi";
   if (value === "zai" || value === "z.ai" || value === "glm") return "zai";
   if (value === "codex" || value === "openai-codex") return "openai-codex";
+  if (value === "codex-api") return "codex-api";
   return undefined;
 }
 
@@ -421,11 +450,13 @@ function isCliProviderName(provider: string): provider is CliProviderName {
     || provider === DEEPSEEK_PROVIDER_ID
     || provider === KIMI_PROVIDER_ID
     || provider === ZAI_PROVIDER_ID
-    || provider === OPENAI_CODEX_PROVIDER_ID;
+    || provider === OPENAI_CODEX_PROVIDER_ID
+    || provider === CODEX_API_PROVIDER_ID;
 }
 
 function assertCliProviderModel(provider: CliProviderName, model: string | undefined): void {
   if (provider === OPENAI_CODEX_PROVIDER_ID && model) assertOpenAICodexModel(model);
+  if (provider === CODEX_API_PROVIDER_ID && model) assertCodexApiModel(model);
 }
 
 function splitReasoningSuffix(value: string): { model: string; reasoningLevel?: CliReasoningLevel } {
@@ -463,21 +494,31 @@ class CliProviderRouter implements ModelRouter {
   constructor(private readonly options: CliProviderRouterOptions) {}
 
   async listModels(): Promise<readonly RuntimeModelDescriptor[]> {
-    const catalog = await listModelCatalogFromStorage(undefined, new FileAuthStorage());
-    return catalog.filter((model) => isCliProviderName(model.provider)).map((model) => ({
-      provider: model.provider,
-      model: model.model,
-      ...(model.displayName ? { displayName: model.displayName } : {}),
-      ...(model.providerDisplayName ? { providerDisplayName: model.providerDisplayName } : {}),
-      available: model.available,
-      ...(model.capabilities ? { capabilities: { ...model.capabilities } } : {}),
-      ...(model.inputCapabilities ? { inputCapabilities: [...model.inputCapabilities] } : {}),
-      ...(model.contextWindowTokens !== undefined ? { contextWindowTokens: model.contextWindowTokens } : {}),
-      ...(model.maxOutputTokens !== undefined ? { maxOutputTokens: model.maxOutputTokens } : {}),
-      reasoningLevels: [...getModelSelectionAvailableReasoningLevels(model)],
-      ...(model.serviceTiers ? { serviceTiers: [...model.serviceTiers] } : {}),
-      ...(model.default !== undefined ? { default: model.default } : {}),
-    }));
+    const catalog = await listModelCatalogFromStorage(
+      undefined,
+      this.options.baseOptions.authStorage ?? new FileAuthStorage(),
+    );
+    return catalog.filter((model) => isCliProviderName(model.provider)).map((model) => {
+      const endpoint = safeEndpointOrigin(model.endpoint);
+      const connectionLabel = connectionLabelForProvider(model.provider);
+      return {
+        provider: model.provider,
+        model: model.model,
+        ...(model.displayName ? { displayName: model.displayName } : {}),
+        ...(model.providerDisplayName ? { providerDisplayName: model.providerDisplayName } : {}),
+        ...(connectionLabel ? { connectionLabel } : {}),
+        authSource: model.authSource,
+        ...(endpoint ? { endpoint } : {}),
+        available: model.available,
+        ...(model.capabilities ? { capabilities: { ...model.capabilities } } : {}),
+        ...(model.inputCapabilities ? { inputCapabilities: [...model.inputCapabilities] } : {}),
+        ...(model.contextWindowTokens !== undefined ? { contextWindowTokens: model.contextWindowTokens } : {}),
+        ...(model.maxOutputTokens !== undefined ? { maxOutputTokens: model.maxOutputTokens } : {}),
+        reasoningLevels: [...getModelSelectionAvailableReasoningLevels(model)],
+        ...(model.serviceTiers ? { serviceTiers: [...model.serviceTiers] } : {}),
+        ...(model.default !== undefined ? { default: model.default } : {}),
+      };
+    });
   }
 
   async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
@@ -489,7 +530,11 @@ class CliProviderRouter implements ModelRouter {
     }
     if (selection.kind === "legacy-minimax") {
       const legacyOptions = readMiniMaxOptionsFromEnv({
-        ...this.options.baseOptions,
+        ...providerScopedBaseOptions(
+          this.options.baseOptions,
+          this.options.defaultSelection.provider,
+          MINIMAX_PROVIDER_ID,
+        ),
         ...(selection.model ? { model: selection.model } : {}),
       });
       yield* createMiniMaxM27HighspeedRouter(legacyOptions).stream(input);
@@ -515,7 +560,11 @@ class CliProviderRouter implements ModelRouter {
     if (selection.kind === "fake") return undefined;
     if (selection.kind === "legacy-minimax") {
       const providerOptions = readMiniMaxOptionsFromEnv({
-        ...this.options.baseOptions,
+        ...providerScopedBaseOptions(
+          this.options.baseOptions,
+          this.options.defaultSelection.provider,
+          MINIMAX_PROVIDER_ID,
+        ),
         ...(selection.model ? { model: selection.model } : {}),
       });
       return requestLimitsForProvider(MINIMAX_PROVIDER_ID, providerOptions);
@@ -541,10 +590,19 @@ class CliProviderRouter implements ModelRouter {
     serviceTier: ServiceTier | undefined,
   ): ProviderRouterOptions {
     const input: ProviderRouterOptions = {
-      ...this.options.baseOptions,
+      ...providerScopedBaseOptions(
+        this.options.baseOptions,
+        this.options.defaultSelection.provider,
+        selection.provider,
+      ),
       ...(selection.model ? { model: selection.model } : {}),
     };
-    if (selection.provider === "openai-codex" && serviceTier !== undefined) input.serviceTier = serviceTier;
+    if (
+      (selection.provider === OPENAI_CODEX_PROVIDER_ID || selection.provider === CODEX_API_PROVIDER_ID)
+      && serviceTier !== undefined
+    ) {
+      input.serviceTier = serviceTier;
+    }
     const withEnv = readOptionsForProvider(selection.provider, input);
     const effectiveReasoningLevel = reasoningLevel
       ? clampModelReasoningLevel(withEnv.model ?? selection.model, reasoningLevel)
@@ -620,6 +678,7 @@ async function loadFactoryForProvider(provider: CliProviderName): Promise<Provid
   if (provider === "kimi") return resolveKimiFactory(await loadProvidersModule("kimi"));
   if (provider === "zai") return resolveZaiFactory(await loadProvidersModule("zai"));
   if (provider === "openai-codex") return resolveOpenAICodexFactory(await loadProvidersModule("codex"));
+  if (provider === "codex-api") return resolveCodexApiFactory(await loadProvidersModule("codex-api"));
   return resolveMiniMaxFactory(await loadProvidersModule("minimax"));
 }
 
@@ -688,11 +747,30 @@ function readZaiOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
 }
 
 function readOpenAICodexOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
+  assertOpenAICodexCliOptions(input);
   const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_CODEX_MAX_TOKENS };
-  const env = readOpenAICodexEnvironment();
+  const resolvedModel = input.model ?? OPENAI_CODEX_DEFAULT_MODEL;
+
+  if (resolvedModel) options.model = resolvedModel;
+  if (input.temperature !== undefined) options.temperature = input.temperature;
+  if (input.fetch) options.fetch = input.fetch;
+  if (input.headers !== undefined) options.headers = input.headers;
+  if (input.authStorage !== undefined) options.authStorage = input.authStorage;
+  if (input.serviceTier !== undefined) options.serviceTier = input.serviceTier;
+  return options;
+}
+
+function assertOpenAICodexCliOptions(input: Pick<ProviderRouterOptions, "apiKey" | "baseUrl">): void {
+  if (input.apiKey === undefined && input.baseUrl === undefined) return;
+  throw new Error("openai-codex is OAuth-only; use codex-api for API keys and custom endpoints");
+}
+
+function readCodexApiOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
+  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_CODEX_MAX_TOKENS };
+  const env = readCodexApiEnvironment();
   const resolvedApiKey = input.apiKey ?? env.apiKey;
-  const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? OPENAI_CODEX_BASE_URL;
-  const resolvedModel = input.model ?? env.model ?? OPENAI_CODEX_DEFAULT_MODEL;
+  const resolvedBaseUrl = input.baseUrl ?? env.baseUrl;
+  const resolvedModel = input.model ?? env.model ?? CODEX_API_DEFAULT_MODEL;
 
   if (resolvedApiKey) options.apiKey = resolvedApiKey;
   if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
@@ -713,7 +791,34 @@ function readOptionsForProvider(provider: CliProviderName, input: ProviderRouter
     assertCliProviderModel(provider, options.model);
     return options;
   }
+  if (provider === "codex-api") {
+    const options = readCodexApiOptionsFromEnv(input);
+    assertCliProviderModel(provider, options.model);
+    return options;
+  }
   return readMiniMaxOptionsFromEnv(input);
+}
+
+function providerScopedBaseOptions(
+  input: ProviderRouterOptions,
+  defaultProvider: CliProviderName,
+  targetProvider: CliProviderName,
+): ProviderRouterOptions {
+  const options: ProviderRouterOptions = {};
+  if (input.maxTokens !== undefined) options.maxTokens = input.maxTokens;
+  if (input.temperature !== undefined) options.temperature = input.temperature;
+  if (input.fetch !== undefined) options.fetch = input.fetch;
+  if (input.serviceTier !== undefined) options.serviceTier = input.serviceTier;
+
+  if (targetProvider === defaultProvider) {
+    if (input.apiKey !== undefined) options.apiKey = input.apiKey;
+    if (input.baseUrl !== undefined) options.baseUrl = input.baseUrl;
+    if (input.headers !== undefined) options.headers = input.headers;
+  }
+  if (targetProvider === OPENAI_CODEX_PROVIDER_ID && input.authStorage !== undefined) {
+    options.authStorage = input.authStorage;
+  }
+  return options;
 }
 
 function requestLimitsForProvider(
@@ -737,7 +842,7 @@ function applyReasoningOptions(
   reasoningLevel: CliReasoningLevel | undefined,
 ): void {
   if (!reasoningLevel) return;
-  if (provider === "openai-codex") {
+  if (provider === OPENAI_CODEX_PROVIDER_ID || provider === CODEX_API_PROVIDER_ID) {
     if (reasoningLevel === "off") return;
     options.reasoningEffort = reasoningLevel;
     options.reasoningSummary = "auto";
@@ -759,6 +864,23 @@ function isProviderModelProvider(value: unknown): value is ProviderModelProvider
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function connectionLabelForProvider(provider: string): string | undefined {
+  if (provider === OPENAI_CODEX_PROVIDER_ID) return "ChatGPT OAuth";
+  if (provider === CODEX_API_PROVIDER_ID) return "Third-party API";
+  return undefined;
+}
+
+function safeEndpointOrigin(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const endpoint = new URL(value);
+    if (endpoint.protocol !== "https:" && endpoint.protocol !== "http:") return undefined;
+    return endpoint.origin;
+  } catch {
+    return undefined;
+  }
 }
 
 class ProviderModelRouterAdapter implements ModelRouter {

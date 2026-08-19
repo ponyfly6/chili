@@ -38,8 +38,22 @@ test("parses ChatGPT Codex as a CLI model", () => {
   });
 });
 
+test("parses the separate Codex API provider", () => {
+  expect(parseArgs(["--model", "codex-api", "hello"])).toMatchObject({
+    command: "run",
+    model: "codex-api",
+    prompt: "hello",
+  });
+  expect(parseArgs(["--provider", "codex-api", "--model", "gpt-5.6-sol", "hello"])).toMatchObject({
+    command: "run",
+    provider: "codex-api",
+    model: "gpt-5.6-sol",
+    prompt: "hello",
+  });
+});
+
 test("keeps legacy model aliases parseable", () => {
-  for (const alias of ["fake", "minimax", "deepseek", "kimi", "moonshot", "zai", "glm", "codex", "openai-codex", "legacy-minimax"]) {
+  for (const alias of ["fake", "minimax", "deepseek", "kimi", "moonshot", "zai", "glm", "codex", "openai-codex", "codex-api", "legacy-minimax"]) {
     expect(parseArgs(["--model", alias, "hello"])).toMatchObject({
       command: "run",
       model: alias,
@@ -58,6 +72,11 @@ test("parses provider and concrete model references", () => {
   expect(parseArgs(["--model", "openai-codex/gpt-5.6-terra", "hello"])).toMatchObject({
     command: "run",
     model: "openai-codex/gpt-5.6-terra",
+    prompt: "hello",
+  });
+  expect(parseArgs(["--model", "codex-api/gpt-5.6-terra", "hello"])).toMatchObject({
+    command: "run",
+    model: "codex-api/gpt-5.6-terra",
     prompt: "hello",
   });
   expect(parseArgs(["--model", "gpt-5.5", "hello"])).toMatchObject({
@@ -190,6 +209,8 @@ test("usage documents team run loop fan-out flag", () => {
   expect(usage()).toContain("--until-drained");
   expect(usage()).toContain("--max-concurrent-dispatches <n>");
   expect(usage()).toContain("--max-concurrent-verifications <n>");
+  expect(usage()).toContain("openai-codex | codex-api");
+  expect(usage()).toContain("codex-api/gpt-5.6-sol");
 });
 
 test("parses team merge command", () => {
