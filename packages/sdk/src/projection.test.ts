@@ -30,6 +30,138 @@ import {
 } from "./client.js";
 import { chatSessionView, createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, sessionMessages, teamLiveCockpit, teamLiveView, type ChatTranscriptItem } from "./projection.js";
 
+test("projects the selected failed session status reason", () => {
+  const sessionId = "session_status_reason" as SessionId;
+  const threadId = "thread_status_reason" as ThreadId;
+  const otherSessionId = "session_status_reason_other" as SessionId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_status_reason_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_status_reason_failed",
+      type: "session.status_changed",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, status: "failed", reason: "provider stream disconnected" },
+    },
+    {
+      id: "event_status_reason_other_session",
+      type: "session.created",
+      time: 3 as TimestampMs,
+      sessionId: otherSessionId,
+      payload: { sessionId: otherSessionId, cwd: "/other" },
+    },
+    {
+      id: "event_status_reason_other_failed",
+      type: "session.status_changed",
+      time: 4 as TimestampMs,
+      sessionId: otherSessionId,
+      payload: { sessionId: otherSessionId, status: "failed", reason: "unrelated failure" },
+    },
+  ], createRuntimeView());
+
+  const chat = chatSessionView(view, { sessionId, threadId });
+
+  expect(chat.status).toBe("failed");
+  expect(chat.statusReason).toBe("provider stream disconnected");
+});
+
+test("clears stale session status reasons across explicit and turn status transitions", () => {
+  const sessionId = "session_status_reason_transitions" as SessionId;
+  const threadId = "thread_status_reason_transitions" as ThreadId;
+  const turnId = "turn_status_reason_transitions" as TurnId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_status_reason_transition_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_status_reason_transition_failed",
+      type: "session.status_changed",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, status: "failed", reason: "old failure" },
+    },
+  ], createRuntimeView());
+
+  expect(chatSessionView(view, { sessionId, threadId }).statusReason).toBe("old failure");
+
+  reduceRuntimeEvents([{
+    id: "event_status_reason_transition_running",
+    type: "session.status_changed",
+    time: 3 as TimestampMs,
+    sessionId,
+    threadId,
+    payload: { sessionId, status: "running" },
+  }], view);
+  expect(chatSessionView(view, { sessionId, threadId })).toMatchObject({ status: "running" });
+  expect(chatSessionView(view, { sessionId, threadId }).statusReason).toBeUndefined();
+
+  reduceRuntimeEvents([
+    {
+      id: "event_status_reason_transition_prompt",
+      type: "session.status_changed",
+      time: 4 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, status: "running", reason: "prompt_submitted" },
+    },
+    {
+      id: "event_status_reason_transition_turn_started",
+      type: "turn.started",
+      time: 5 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId },
+    },
+  ], view);
+  expect(chatSessionView(view, { sessionId, threadId }).statusReason).toBeUndefined();
+
+  reduceRuntimeEvents([
+    {
+      id: "event_status_reason_transition_streaming",
+      type: "session.status_changed",
+      time: 6 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, status: "running", turnId, reason: "streaming" },
+    },
+    {
+      id: "event_status_reason_transition_turn_failed",
+      type: "turn.completed",
+      time: 7 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId, status: "failed" },
+    },
+  ], view);
+  const failedBeforeReason = chatSessionView(view, { sessionId, threadId });
+  expect(failedBeforeReason.status).toBe("failed");
+  expect(failedBeforeReason.statusReason).toBeUndefined();
+
+  reduceRuntimeEvents([{
+    id: "event_status_reason_transition_failed_reason",
+    type: "session.status_changed",
+    time: 8 as TimestampMs,
+    sessionId,
+    threadId,
+    payload: { sessionId, status: "failed", turnId, reason: "fresh failure" },
+  }], view);
+  expect(chatSessionView(view, { sessionId, threadId }).statusReason).toBe("fresh failure");
+});
+
 test("projects exact assistant text phases without classifying missing metadata", () => {
   const sessionId = "session_project_phases" as SessionId;
   const threadId = "thread_project_phases" as ThreadId;

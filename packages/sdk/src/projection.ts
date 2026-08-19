@@ -633,6 +633,7 @@ export interface ChatSessionView {
   sessionId?: SessionId;
   threadId?: ThreadId;
   status: RuntimeSessionStatus | "unknown";
+  statusReason?: string;
   items: ChatTranscriptItem[];
   pendingApprovals: ChatApprovalRow[];
   activeTools: ChatToolCallRow[];
@@ -803,10 +804,9 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
     }
     case "session.status_changed": {
       const session = upsertSession(view, event.payload.sessionId, event.time);
-      session.status = event.payload.status;
+      setSessionStatus(session, event.payload.status, event.payload.reason);
       session.updatedAt = event.time;
       assignOptional(session, "currentTurnId", event.payload.turnId);
-      assignOptional(session, "statusReason", event.payload.reason);
       if (event.payload.turnId && event.payload.status === "cancelled") {
         view.turnStatuses[event.payload.turnId] = "cancelled";
       }
@@ -822,7 +822,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       view.turnStatuses[event.payload.turnId] = "running";
       if (event.sessionId) {
         const session = upsertSession(view, event.sessionId, event.time);
-        session.status = "running";
+        setSessionStatus(session, "running");
         session.currentTurnId = event.payload.turnId;
         session.updatedAt = event.time;
       }
@@ -832,7 +832,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       view.turnStatuses[event.payload.turnId] = event.payload.status;
       if (event.sessionId) {
         const session = upsertSession(view, event.sessionId, event.time);
-        session.status = event.payload.status === "completed" ? "idle" : event.payload.status;
+        setSessionStatus(session, event.payload.status === "completed" ? "idle" : event.payload.status);
         session.currentTurnId = event.payload.turnId;
         session.updatedAt = event.time;
       }
@@ -915,7 +915,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       setToolPartStatus(view, event.payload.callId, event.payload.status);
       if (event.payload.status === "waiting_for_approval" && toolCall.sessionId) {
         const session = upsertSession(view, toolCall.sessionId, event.time);
-        session.status = "waiting_for_approval";
+        setSessionStatus(session, "waiting_for_approval");
         session.updatedAt = event.time;
       } else if (
         event.payload.status === "running"
@@ -924,7 +924,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       ) {
         const session = upsertSession(view, toolCall.sessionId, event.time);
         if (session.status === "waiting_for_approval") {
-          session.status = "running";
+          setSessionStatus(session, "running");
           session.updatedAt = event.time;
         }
       }
@@ -1092,6 +1092,7 @@ export function chatSessionView(view: ChiliRuntimeView, input: ChatSessionInput 
   };
   assignOptional(output, "sessionId", sessionId);
   assignOptional(output, "threadId", threadId);
+  assignOptional(output, "statusReason", session?.statusReason);
   assignOptional(output, "goal", goal ? cloneThreadGoal(goal) : undefined);
   assignOptional(output, "latestModelMetadata", latestModelMetadata ? chatModelMetadata(latestModelMetadata) : undefined);
   assignOptional(output, "usageSummary", usageSummary);
@@ -2871,6 +2872,19 @@ function upsertSession(view: ChiliRuntimeView, sessionId: SessionId, time: numbe
   return session;
 }
 
+function setSessionStatus(
+  session: RuntimeSessionView,
+  status: RuntimeSessionStatus,
+  reason?: string,
+): void {
+  session.status = status;
+  if (reason === undefined) {
+    delete session.statusReason;
+  } else {
+    session.statusReason = reason;
+  }
+}
+
 function upsertAgentRun(view: ChiliRuntimeView, runId: AgentRunId, path: AgentPath, time: number): RuntimeAgentView {
   const existing = view.agents[runId];
   if (existing) return existing;
@@ -3015,7 +3029,7 @@ function linkApprovalToSession(view: ChiliRuntimeView, approval: RuntimeApproval
   if (!approval.sessionId) return;
   const session = upsertSession(view, approval.sessionId, time);
   if (!session.approvalIds.includes(approval.id)) session.approvalIds.push(approval.id);
-  session.status = "waiting_for_approval";
+  setSessionStatus(session, "waiting_for_approval");
   session.updatedAt = time;
 }
 
