@@ -156,7 +156,7 @@ export function PromptComposer(props: {
       {shellMode ? (
         <text fg={colors.status.info} wrapMode="none" truncate>{"Shell"}</text>
       ) : null}
-      <box width="100%" height={promptBoxHeight} border borderStyle="single" borderColor={borderColor} paddingX={1} alignItems="center">
+      <box width="100%" height={promptBoxHeight} border borderStyle="single" borderColor={borderColor} paddingX={1} flexDirection="row" alignItems="center">
         <text fg={props.disabled ? colors.input.disabledText : shellMode ? colors.status.info : colors.input.text} wrapMode="none" truncate>{promptPrefix}</text>
         {props.disabled ? (
           <text fg={colors.input.disabledText} wrapMode="none" truncate>{promptValue || placeholder}</text>

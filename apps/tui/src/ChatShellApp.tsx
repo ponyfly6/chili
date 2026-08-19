@@ -40,11 +40,13 @@ import {
   filterModelCandidates,
   isValidModelSelection,
   type ModelCandidate,
+  modelAuthLabel,
   modelDescriptorSelection,
   modelSelectionLabel,
   modelSupportsImages,
   modelSupportsReasoning,
   modelSupportsServiceTier,
+  safeEndpointHost,
   sameModelSelection,
   type ModelSelection,
   type ReasoningLevel,
@@ -168,6 +170,8 @@ interface AuthManualPrompt {
 
 const execFileAsync = promisify(execFile);
 const PROMPT_MENU_MAX_ITEMS = 8;
+const MODEL_PICKER_MAX_VISIBLE_ITEMS = 8;
+const MODEL_PICKER_CHROME_HEIGHT = 9;
 const LOCAL_ITEM_TTL_MS = 4_000;
 const USER_SHELL_TIMEOUT_MS = 60 * 60 * 1_000;
 const USER_SHELL_OUTPUT_LIMIT_BYTES = 256_000;
@@ -629,13 +633,16 @@ export function ChatShellSurface(props: {
   }, []);
   const openModelPicker = useCallback((query = "") => {
     void props.runtime.refreshModelConfig?.();
+    const items = modelPickerCandidates(modelCandidates, query, modelSelection, undefined);
     const index = modelPickerIndex(modelCandidates, query, modelSelection, undefined);
+    const selectedCandidate = items[index];
+    const selected = selectedCandidate ? modelDescriptorSelection(selectedCandidate) : undefined;
     setResumePicker(undefined);
     setRenamePrompt(undefined);
     setReasoningPicker(undefined);
     setPermissionsPicker(undefined);
     setThemePicker(undefined);
-    setModelPicker({ query, selectedIndex: index, provider: undefined });
+    setModelPicker({ query, cursor: query.length, selectedIndex: index, selected, provider: undefined });
   }, [modelCandidates, modelSelection, props.runtime]);
   const closeModelPicker = useCallback(() => {
     setModelPicker(undefined);
@@ -1791,7 +1798,16 @@ function HomeScreen(props: {
   const feedback = currentFeedback(props.runtime);
   const footerHeight = statusFooterHeight(props.width);
   const themePickerHeight = props.themePicker ? pickerHeight(props.themePicker.items.length) : 0;
-  const selectorHeight = selectorPickerHeight(props.modelPicker, props.reasoningPicker, props.permissionsPicker, props.resumePicker, props.renamePrompt);
+  const modelPicker = fitModelPickerRows(
+    props.modelPicker,
+    props.height
+      - footerHeight
+      - PROMPT_INPUT_HEIGHT
+      - (feedback ? 1 : 0)
+      - MODEL_PICKER_CHROME_HEIGHT,
+  );
+  const showBrand = !modelPicker;
+  const selectorHeight = selectorPickerHeight(modelPicker, props.reasoningPicker, props.permissionsPicker, props.resumePicker, props.renamePrompt);
   const maxCommandItems = promptMenuItemLimit({
     height: props.height,
     footerHeight,
@@ -1805,12 +1821,16 @@ function HomeScreen(props: {
     <box width="100%" height="100%" flexDirection="column">
       <box flexGrow={2} />
       <box width="100%" flexDirection="column" alignItems="center">
-        <BrandMark compact={compactBrand} />
-        <box height={1} />
-        <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Chili"}</text>
-        <box height={1} />
+        {showBrand ? (
+          <>
+            <BrandMark compact={compactBrand} />
+            <box height={1} />
+            <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Chili"}</text>
+            <box height={1} />
+          </>
+        ) : null}
         {props.themePicker ? <ThemePicker model={props.themePicker} theme={props.theme} /> : null}
-        {props.modelPicker ? <ModelPicker model={props.modelPicker} theme={props.theme} /> : null}
+        {modelPicker ? <ModelPicker model={modelPicker} theme={props.theme} /> : null}
         {props.reasoningPicker ? <ReasoningPicker model={props.reasoningPicker} theme={props.theme} /> : null}
         {props.permissionsPicker ? <PermissionsPicker model={props.permissionsPicker} theme={props.theme} /> : null}
         {props.resumePicker ? <ResumePicker model={props.resumePicker} theme={props.theme} /> : null}
@@ -1900,7 +1920,18 @@ function SessionScreen(props: {
   const feedback = currentFeedback(props.runtime);
   const footerHeight = statusFooterHeight(props.width);
   const themePickerHeight = props.themePicker ? pickerHeight(props.themePicker.items.length) : 0;
-  const selectorHeight = selectorPickerHeight(props.modelPicker, props.reasoningPicker, props.permissionsPicker, props.resumePicker, props.renamePrompt);
+  const modelPicker = fitModelPickerRows(
+    props.modelPicker,
+    props.height
+      - approvalHeight
+      - themePickerHeight
+      - footerHeight
+      - PROMPT_INPUT_HEIGHT
+      - (feedback ? 1 : 0)
+      - 2
+      - MODEL_PICKER_CHROME_HEIGHT,
+  );
+  const selectorHeight = selectorPickerHeight(modelPicker, props.reasoningPicker, props.permissionsPicker, props.resumePicker, props.renamePrompt);
   const maxCommandItems = promptMenuItemLimit({
     height: props.height,
     footerHeight,
@@ -1975,7 +2006,7 @@ function SessionScreen(props: {
       />
       <box width="100%" alignItems="center" flexDirection="column">
         {props.themePicker ? <ThemePicker model={props.themePicker} theme={props.theme} /> : null}
-        {props.modelPicker ? <ModelPicker model={props.modelPicker} theme={props.theme} /> : null}
+        {modelPicker ? <ModelPicker model={modelPicker} theme={props.theme} /> : null}
         {props.reasoningPicker ? <ReasoningPicker model={props.reasoningPicker} theme={props.theme} /> : null}
         {props.permissionsPicker ? <PermissionsPicker model={props.permissionsPicker} theme={props.theme} /> : null}
         {props.resumePicker ? <ResumePicker model={props.resumePicker} theme={props.theme} /> : null}
@@ -2047,18 +2078,20 @@ interface ThemePickerModel {
 
 interface ModelPickerNavigation {
   query: string;
+  cursor: number;
   selectedIndex: number;
+  selected: ModelSelection | undefined;
   provider: string | undefined;
 }
 
 interface ModelPickerModel {
   query: string;
+  cursor: number;
   items: readonly ModelPickerItem[];
   selectedIndex: number;
   total: number;
   provider: ModelPickerProvider;
-  providerIndex: number;
-  providerTotal: number;
+  visibleLimit: number;
 }
 
 interface ModelPickerItem {
@@ -2067,6 +2100,9 @@ interface ModelPickerItem {
   provider: string;
   providerLabel: string;
   displayName?: string | undefined;
+  connectionLabel?: string | undefined;
+  authSource?: ModelCandidate["authSource"];
+  endpoint?: string | undefined;
   available?: boolean | undefined;
   current: boolean;
 }
@@ -2074,7 +2110,6 @@ interface ModelPickerItem {
 interface ModelPickerProvider {
   id: string | undefined;
   label: string;
-  modelCount: number;
 }
 
 interface ReasoningPickerNavigation {
@@ -2144,7 +2179,9 @@ function selectorPickerHeight(
   resumePicker: ResumePickerModel | undefined,
   renamePrompt: RenamePromptNavigation | undefined,
 ): number {
-  if (modelPicker) return Math.min(modelPicker.items.length, 8) + 6;
+  if (modelPicker) {
+    return Math.min(modelPicker.items.length, modelPicker.visibleLimit) + MODEL_PICKER_CHROME_HEIGHT;
+  }
   if (reasoningPicker) return reasoningPicker.items.length + 3;
   if (permissionsPicker) return permissionsPicker.items.length + 3;
   if (resumePicker) return Math.min(resumePicker.items.length, 8) + 6;
@@ -2196,18 +2233,43 @@ function ThemePicker(props: { model: ThemePickerModel; theme: TuiTheme }) {
 }
 
 function ModelPicker(props: { model: ModelPickerModel; theme: TuiTheme }) {
-  const visibleItems = visiblePickerItems(props.model.items, props.model.selectedIndex, 8);
+  const visibleItems = visiblePickerItems(props.model.items, props.model.selectedIndex, props.model.visibleLimit);
+  const cursor = Math.min(Math.max(0, props.model.cursor), props.model.query.length);
+  const searchValue = `${props.model.query.slice(0, cursor)}▏${props.model.query.slice(cursor)}`;
+  const hasQuery = props.model.query.trim().length > 0;
+  const resultNoun = hasQuery
+    ? props.model.total === 1 ? "match" : "matches"
+    : props.model.total === 1 ? "model" : "models";
+  const resultLabel = `${props.model.total} ${resultNoun}`;
   return (
     <box width="100%" flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.focus} paddingX={1}>
-      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Model"}</text>
+      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Select model"}</text>
+      <box
+        width="100%"
+        height={3}
+        border
+        borderStyle="single"
+        borderColor={props.theme.colors.border.default}
+        backgroundColor={props.theme.colors.input.background}
+        paddingX={1}
+        flexDirection="row"
+        alignItems="center"
+      >
+        <text
+          fg={hasQuery ? props.theme.colors.input.text : props.theme.colors.input.placeholder}
+          wrapMode="none"
+          truncate
+        >
+          {`Search  > ${searchValue}${hasQuery ? "" : "  type a model or source"}`}
+        </text>
+      </box>
       <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>
-        {`Provider: ${props.model.provider.label} (${props.model.provider.modelCount})  ${props.model.providerIndex + 1}/${props.model.providerTotal}  ←/→ switch`}
+        {`Source  ${props.model.provider.label} · ${resultLabel}  tab switch`}
       </text>
-      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`Search: ${props.model.query || "type to filter models"}`}</text>
       {visibleItems.map(({ item, index }) => {
         const selected = index === props.model.selectedIndex;
         const suffix = [item.available === false ? " not configured" : "", item.current ? " *" : ""].join("");
-        const provider = props.model.provider.id ? "" : ` [${item.providerLabel}]`;
+        const provider = ` [${item.providerLabel}]`;
         return (
           <text
             key={modelSelectionLabel(item.selection)}
@@ -2225,7 +2287,7 @@ function ModelPicker(props: { model: ModelPickerModel; theme: TuiTheme }) {
       ) : (
         <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{modelPickerDetail(props.model)}</text>
       )}
-      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"  ↑/↓ navigate  enter select  esc close"}</text>
+      <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"  ↑/↓ navigate  type to search  tab source  enter select  esc close"}</text>
     </box>
   );
 }
@@ -2330,7 +2392,7 @@ function modelPickerView(
   candidates: readonly ModelCandidate[],
   current: ModelSelection | undefined,
 ): ModelPickerModel {
-  const providers = modelPickerProviders(candidates, current);
+  const providers = modelPickerProviders(candidates, current, picker.query, picker.provider);
   const providerIndex = Math.max(0, providers.findIndex((provider) => provider.id === picker.provider));
   const provider = providers[providerIndex] ?? providers[0]!;
   const items = modelPickerCandidates(candidates, picker.query, current, provider.id).map((candidate) => ({
@@ -2339,31 +2401,54 @@ function modelPickerView(
     provider: candidate.provider,
     providerLabel: candidate.providerDisplayName ?? candidate.provider,
     ...(candidate.displayName ? { displayName: candidate.displayName } : {}),
+    ...(candidate.connectionLabel ? { connectionLabel: candidate.connectionLabel } : {}),
+    ...(candidate.authSource ? { authSource: candidate.authSource } : {}),
+    ...(candidate.endpoint ? { endpoint: candidate.endpoint } : {}),
     ...(candidate.available !== undefined ? { available: candidate.available } : {}),
     current: sameModelSelection(current, modelDescriptorSelection(candidate)),
   }));
   return {
     query: picker.query,
+    cursor: picker.cursor,
     items,
-    selectedIndex: clampIndex(picker.selectedIndex, items.length),
+    selectedIndex: resolvedModelPickerIndex(picker, items, (item) => item.selection),
     total: items.length,
     provider,
-    providerIndex,
-    providerTotal: providers.length,
+    visibleLimit: MODEL_PICKER_MAX_VISIBLE_ITEMS,
+  };
+}
+
+function fitModelPickerRows(
+  model: ModelPickerModel | undefined,
+  availableRows: number,
+): ModelPickerModel | undefined {
+  if (!model) return undefined;
+  return {
+    ...model,
+    visibleLimit: Math.max(0, Math.min(model.visibleLimit, availableRows)),
   };
 }
 
 function modelPickerProviders(
   candidates: readonly ModelCandidate[],
   current: ModelSelection | undefined,
+  query: string,
+  activeProvider: string | undefined,
 ): ModelPickerProvider[] {
+  const matchingCandidates = filterModelCandidates(candidates, query, current);
+  const matchingCounts = new Map<string, number>();
+  for (const candidate of matchingCandidates) {
+    matchingCounts.set(candidate.provider, (matchingCounts.get(candidate.provider) ?? 0) + 1);
+  }
+  const hasQuery = query.trim().length > 0;
   const providers = new Map<string, ModelPickerProvider>();
   for (const candidate of candidates) {
+    const matchCount = matchingCounts.get(candidate.provider) ?? 0;
+    if (hasQuery && matchCount === 0 && candidate.provider !== activeProvider) continue;
     const existing = providers.get(candidate.provider);
     providers.set(candidate.provider, {
       id: candidate.provider,
       label: candidate.providerDisplayName ?? existing?.label ?? candidate.provider,
-      modelCount: (existing?.modelCount ?? 0) + 1,
     });
   }
   const sorted = [...providers.values()].sort((left, right) => {
@@ -2371,7 +2456,7 @@ function modelPickerProviders(
     if (right.id === current?.provider && left.id !== current?.provider) return 1;
     return left.label.localeCompare(right.label);
   });
-  return [{ id: undefined, label: "All providers", modelCount: candidates.length }, ...sorted];
+  return [{ id: undefined, label: "All" }, ...sorted];
 }
 
 function modelPickerCandidates(
@@ -2518,7 +2603,35 @@ function modelPickerDetail(model: ModelPickerModel): string {
   const count = model.total > 1 ? ` (${model.selectedIndex + 1}/${model.total})` : "";
   const displayName = selected.displayName && selected.displayName !== selected.label ? ` ${selected.displayName}` : "";
   const availability = selected.available === false ? " not configured" : "";
-  return `  ${modelSelectionLabel(selected.selection)}${displayName}${availability}${count}`;
+  const connection = safeConnectionLabel(selected.connectionLabel);
+  const endpoint = safeEndpointHost(selected.endpoint);
+  const details = [
+    connection ? `connection ${connection}` : undefined,
+    selected.authSource ? `auth ${modelAuthLabel(selected.authSource)}` : undefined,
+    endpoint ? `endpoint ${endpoint}` : undefined,
+  ].filter(Boolean).join(" · ");
+  const suffix = details ? ` · ${details}` : "";
+  return `  ${modelSelectionLabel(selected.selection)}${displayName}${availability}${count}${suffix}`;
+}
+
+function resolvedModelPickerIndex<T>(
+  picker: ModelPickerNavigation,
+  items: readonly T[],
+  selectionForItem: (item: T) => ModelSelection,
+): number {
+  if (picker.selected) {
+    const selectedIndex = items.findIndex((item) => sameModelSelection(picker.selected, selectionForItem(item)));
+    if (selectedIndex >= 0) return selectedIndex;
+  }
+  return clampIndex(picker.selectedIndex, items.length);
+}
+
+function modelPickerSelectedCandidate(
+  items: readonly ModelCandidate[],
+  index: number,
+): ModelSelection | undefined {
+  const candidate = items[index];
+  return candidate ? modelDescriptorSelection(candidate) : undefined;
 }
 
 function modelPickerIndex(
@@ -2529,6 +2642,7 @@ function modelPickerIndex(
 ): number {
   const items = modelPickerCandidates(candidates, query, current, provider);
   if (items.length === 0) return 0;
+  if (query.trim()) return 0;
   const currentIndex = current
     ? items.findIndex((item) => sameModelSelection(current, modelDescriptorSelection(item)))
     : -1;
@@ -2723,9 +2837,19 @@ function StatusView(props: {
   transcriptActive: boolean;
 }) {
   const selected = props.model.selected;
-  const modelLabel = props.options.modelSelection
-    ? modelSelectionLabel(props.options.modelSelection)
+  const modelSelection = statusModelSelection(props.runtime, props.options);
+  const candidate = modelSelection
+    ? props.runtime.modelCandidates?.find((item) => sameModelSelection(modelSelection, modelDescriptorSelection(item)))
+    : undefined;
+  const modelLabel = modelSelection
+    ? modelSelectionLabel(modelSelection)
     : `${props.options.providerName}/${props.options.modelName}`;
+  const connection = safeConnectionLabel(candidate?.connectionLabel)
+    ?? safeConnectionLabel(candidate?.providerDisplayName)
+    ?? safeConnectionLabel(modelSelection?.provider)
+    ?? "unknown";
+  const auth = modelAuthLabel(candidate?.authSource);
+  const endpoint = safeEndpointHost(candidate?.endpoint) ?? "unknown";
   return (
     <box width="100%" height="100%" flexDirection="column">
       <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Status"}</text>
@@ -2736,6 +2860,9 @@ function StatusView(props: {
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thread: ${props.runtime.activeThreadId ?? "none"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`mode: ${props.options.modeName}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`model: ${modelLabel}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`connection: ${connection}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`auth: ${auth}`}</text>
+      <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`endpoint: ${endpoint}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thinking: ${props.options.reasoningConfigurable === false ? "unsupported" : props.options.reasoningLevel ?? "default"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`service tier: ${props.options.serviceTierConfigurable === false ? "unsupported" : props.options.serviceTier ?? "standard"}`}</text>
       <text fg={props.theme.colors.text.secondary} wrapMode="none" truncate>{`thinking traces: ${props.hideThinking ? "hidden" : "shown"}`}</text>
@@ -2747,11 +2874,32 @@ function StatusView(props: {
   );
 }
 
+function statusModelSelection(runtime: ChatRuntimeState, options: StatusFooterOptions): ModelSelection | undefined {
+  if (options.modelSelection) return options.modelSelection;
+  const metadata = runtime.chatView.latestModelMetadata;
+  if (metadata?.provider && metadata.model) {
+    return { provider: metadata.provider, model: metadata.model };
+  }
+  return modelSelectionFromOptions(options);
+}
+
+function safeConnectionLabel(value: string | undefined): string | undefined {
+  const sanitized = value
+    ?.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!sanitized) return undefined;
+  if (/^[a-z][a-z\d+.-]*:\/\//i.test(sanitized)) return safeEndpointHost(sanitized);
+  return sanitized.slice(0, 80);
+}
+
 function eventStreamStatus(status: TeamLiveView["connection"]["status"]): string {
   return status === "streaming" ? "connected" : status;
 }
 
-function modelSelectionFromOptions(options: Partial<ChatShellOptions> | undefined): ModelSelection | undefined {
+function modelSelectionFromOptions(
+  options: { providerName?: string | undefined; modelName?: string | undefined } | undefined,
+): ModelSelection | undefined {
   const provider = options?.providerName?.trim();
   const model = options?.modelName?.trim();
   return provider && model ? { provider, model } : undefined;
@@ -3453,34 +3601,96 @@ function handleModelPickerKey(
     actions.cancel();
     return;
   }
-  const providers = modelPickerProviders(candidates, current);
-  if (isArrowLeft(key) || isArrowRight(key)) {
-    const currentProviderIndex = Math.max(0, providers.findIndex((provider) => provider.id === picker.provider));
-    const delta = isArrowLeft(key) ? -1 : 1;
+  const providers = modelPickerProviders(candidates, current, picker.query, picker.provider);
+  const effectiveProvider = picker.provider !== undefined
+    && providers.some((provider) => provider.id === picker.provider)
+    ? picker.provider
+    : undefined;
+  if (isTab(key)) {
+    const currentProviderIndex = Math.max(0, providers.findIndex((provider) => provider.id === effectiveProvider));
+    const delta = key.shift ? -1 : 1;
     const provider = providers[wrapIndex(currentProviderIndex + delta, providers.length)]?.id;
-    actions.setModelPicker((state) => state ? {
-      ...state,
-      provider,
-      selectedIndex: modelPickerIndex(candidates, state.query, current, provider),
-    } : state);
+    actions.setModelPicker((state) => {
+      if (!state) return state;
+      const items = modelPickerCandidates(candidates, state.query, current, provider);
+      const selectedIndex = modelPickerIndex(candidates, state.query, current, provider);
+      return {
+        ...state,
+        provider,
+        selectedIndex,
+        selected: modelPickerSelectedCandidate(items, selectedIndex),
+      };
+    });
     return;
   }
-  const items = modelPickerCandidates(candidates, picker.query, current, picker.provider);
+  if (isArrowLeft(key) || isArrowRight(key)) {
+    actions.setModelPicker((state) => {
+      if (!state) return state;
+      const delta = isArrowLeft(key) ? -1 : 1;
+      return {
+        ...state,
+        provider: effectiveProvider,
+        cursor: Math.min(Math.max(0, state.cursor + delta), state.query.length),
+      };
+    });
+    return;
+  }
+  const items = modelPickerCandidates(candidates, picker.query, current, effectiveProvider);
   if (isArrowUp(key) || isArrowDown(key)) {
     const delta = isArrowUp(key) ? -1 : 1;
-    actions.setModelPicker((state) => state ? { ...state, selectedIndex: clampIndex(state.selectedIndex + delta, items.length) } : state);
+    actions.setModelPicker((state) => {
+      if (!state) return state;
+      const currentIndex = resolvedModelPickerIndex(state, items, modelDescriptorSelection);
+      const selectedIndex = clampIndex(currentIndex + delta, items.length);
+      return {
+        ...state,
+        provider: effectiveProvider,
+        selectedIndex,
+        selected: modelPickerSelectedCandidate(items, selectedIndex),
+      };
+    });
     return;
   }
   if (isEnter(key)) {
-    const selected = items[clampIndex(picker.selectedIndex, items.length)];
+    const selected = items[resolvedModelPickerIndex(picker, items, modelDescriptorSelection)];
     if (selected) void actions.selectModel(modelDescriptorSelection(selected));
     return;
   }
   if (isBackspace(key)) {
     actions.setModelPicker((state) => {
       if (!state) return state;
-      const query = state.query.slice(0, -1);
-      return { ...state, query, selectedIndex: modelPickerIndex(candidates, query, current, state.provider) };
+      const cursor = Math.min(Math.max(0, state.cursor), state.query.length);
+      if (cursor === 0) return state;
+      const query = `${state.query.slice(0, cursor - 1)}${state.query.slice(cursor)}`;
+      const nextItems = modelPickerCandidates(candidates, query, current, effectiveProvider);
+      const selectedIndex = modelPickerIndex(candidates, query, current, effectiveProvider);
+      return {
+        ...state,
+        provider: effectiveProvider,
+        query,
+        cursor: cursor - 1,
+        selectedIndex,
+        selected: modelPickerSelectedCandidate(nextItems, selectedIndex),
+      };
+    });
+    return;
+  }
+  if (isDelete(key)) {
+    actions.setModelPicker((state) => {
+      if (!state) return state;
+      const cursor = Math.min(Math.max(0, state.cursor), state.query.length);
+      if (cursor >= state.query.length) return state;
+      const query = `${state.query.slice(0, cursor)}${state.query.slice(cursor + 1)}`;
+      const nextItems = modelPickerCandidates(candidates, query, current, effectiveProvider);
+      const selectedIndex = modelPickerIndex(candidates, query, current, effectiveProvider);
+      return {
+        ...state,
+        provider: effectiveProvider,
+        query,
+        cursor,
+        selectedIndex,
+        selected: modelPickerSelectedCandidate(nextItems, selectedIndex),
+      };
     });
     return;
   }
@@ -3488,8 +3698,18 @@ function handleModelPickerKey(
   if (printable) {
     actions.setModelPicker((state) => {
       if (!state) return state;
-      const query = `${state.query}${printable}`;
-      return { ...state, query, selectedIndex: modelPickerIndex(candidates, query, current, state.provider) };
+      const cursor = Math.min(Math.max(0, state.cursor), state.query.length);
+      const query = `${state.query.slice(0, cursor)}${printable}${state.query.slice(cursor)}`;
+      const nextItems = modelPickerCandidates(candidates, query, current, effectiveProvider);
+      const selectedIndex = modelPickerIndex(candidates, query, current, effectiveProvider);
+      return {
+        ...state,
+        provider: effectiveProvider,
+        query,
+        cursor: cursor + printable.length,
+        selectedIndex,
+        selected: modelPickerSelectedCandidate(nextItems, selectedIndex),
+      };
     });
   }
 }
@@ -3995,6 +4215,10 @@ function isEscape(key: KeyEvent): boolean {
 
 function isBackspace(key: KeyEvent): boolean {
   return key.name === "backspace" || key.sequence === "\b" || key.sequence === "\x7f";
+}
+
+function isDelete(key: KeyEvent): boolean {
+  return key.name === "delete" || key.name === "del" || key.sequence === "\x1b[3~";
 }
 
 function isTab(key: KeyEvent): boolean {

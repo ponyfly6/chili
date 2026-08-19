@@ -5,7 +5,7 @@ import { expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import { act, useState, type Dispatch, type SetStateAction } from "react";
 import { createRuntimeView, type ChatTranscriptItem, type HttpRuntimeClient, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
-import type { ApprovalId, ChiliEvent, MessageId, PartId, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
+import type { ApprovalId, ChiliEvent, MessageId, PartId, RuntimeModelDescriptor, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import type { ClipboardAccess } from "./clipboard.js";
 import { CONVERSATION_INTERRUPTED_NOTICE, CTRL_C_EXIT_CONFIRM_MS, ChatShellApp, ChatShellSurface, isWithinCtrlCExitWindow, type ChatShellExitInfo } from "./ChatShellApp.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
@@ -2939,7 +2939,7 @@ test("/model uses runtime catalog and persists the selected model", async () => 
   }
 });
 
-test("/model filters by provider and exposes direct search", async () => {
+test("/model uses a focused search surface and skips empty sources", async () => {
   const app = await mountShell(teamLiveFixture(), {
     runtime: {
       modelCandidates: [
@@ -2955,22 +2955,423 @@ test("/model filters by provider and exposes direct search", async () => {
     await press(app, () => app.mockInput.pressEnter());
 
     let frame = app.captureCharFrame();
-    expect(frame).toContain("Provider: All providers (3)");
-    expect(frame).toContain("Search: type to filter models");
-    expect(frame).toContain("←/→ switch");
+    expect(frame).toContain("Select model");
+    expect(frame).toContain("Search  > ▏  type a model or source");
+    expect(frame).toContain("Source  All · 3 models  tab switch");
+    expectFramedModelSearch(frame);
 
-    await press(app, () => app.mockInput.pressArrow("right"));
+    await typeText(app, " ");
     frame = app.captureCharFrame();
-    expect(frame).toContain("Provider: Anthropic (1)");
-    expect(frame).toContain("claude-opus-4.1");
+    expect(frame).toContain("type a model or source");
+    expect(frame).toContain("Source  All · 3 models  tab switch");
+    expectFramedModelSearch(frame);
+    await press(app, () => app.mockInput.pressBackspace());
+
+    await press(app, () => app.mockInput.pressTab());
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Source  Anthropic · 1 model  tab switch");
+    expect(frame).toContain("claude-opus-4.1 [Anthropic]");
     expect(frame).not.toContain("test-model [Test Provider]");
 
     await typeText(app, "opus");
     frame = app.captureCharFrame();
-    expect(frame).toContain("Provider: Anthropic (1)");
-    expect(frame).toContain("Search: opus");
-    expect(frame).toContain("claude-opus-4.1");
+    expect(frame).toContain("Source  Anthropic · 1 match  tab switch");
+    expect(frame).toContain("Search  > opus▏");
+    expect(frame).toContain("claude-opus-4.1 [Anthropic]");
     expect(frame).not.toContain("gpt-5.5");
+
+    await press(app, () => app.mockInput.pressArrow("left"));
+    await typeText(app, "x");
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Search  > opux▏s");
+    await press(app, () => app.mockInput.pressBackspace());
+    await press(app, () => app.mockInput.pressArrow("right"));
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Search  > opus▏");
+
+    await press(app, () => app.mockInput.pressArrow("left"));
+    await press(app, () => app.mockInput.pressArrow("left"));
+    await press(app, () => app.mockInput.pressKey("DELETE"));
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Search  > op▏s");
+    expectFramedModelSearch(frame);
+    await typeText(app, "u");
+    await press(app, () => app.mockInput.pressArrow("right"));
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Search  > opus▏");
+
+    await press(app, () => app.mockInput.pressTab());
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Source  All · 1 match  tab switch");
+    await press(app, () => app.mockInput.pressTab());
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Source  Anthropic · 1 match  tab switch");
+    await press(app, () => app.mockInput.pressTab({ shift: true }));
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Source  All · 1 match  tab switch");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model keeps its chrome and prompt separate in a 48x13 home terminal", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    width: 48,
+    height: 13,
+    runtime: {
+      modelCandidates: Array.from({ length: 10 }, (_, index) => ({
+        provider: "compact",
+        providerDisplayName: "Compact",
+        model: `model-${String(index + 1).padStart(2, "0")}`,
+      })),
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    expectFramedModelSearch(frame);
+    expect(frame).toContain("Source  All · 10 models");
+    expect(frame).not.toContain("> model-01 [Compact]");
+    expect(frame).toContain("↑/↓ navigate");
+    expect(frame).toContain("> Choose a model");
+
+    const lines = frame.split("\n");
+    const helpLine = lines.findIndex((line) => line.includes("↑/↓ navigate"));
+    const promptLine = lines.findIndex((line) => line.includes("> Choose a model"));
+    expect(helpLine).toBeGreaterThan(-1);
+    expect(promptLine).toBeGreaterThan(helpLine);
+    expect(lines[helpLine]).not.toContain("Choose a model");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model keeps its chrome and prompt separate in a 48x15 active chat", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    width: 48,
+    height: 15,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: chatMessages(1),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      modelCandidates: Array.from({ length: 10 }, (_, index) => ({
+        provider: "compact",
+        providerDisplayName: "Compact",
+        model: `model-${String(index + 1).padStart(2, "0")}`,
+      })),
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    expectFramedModelSearch(frame);
+    expect(frame).toContain("Source  All · 10 models");
+    expect(frame).not.toContain("> model-01 [Compact]");
+    expect(frame).toContain("↑/↓ navigate");
+    expect(frame).toContain("> Choose a model");
+
+    const lines = frame.split("\n");
+    const helpLine = lines.findIndex((line) => line.includes("↑/↓ navigate"));
+    const promptLine = lines.findIndex((line) => line.includes("> Choose a model"));
+    expect(helpLine).toBeGreaterThan(-1);
+    expect(promptLine).toBeGreaterThan(helpLine);
+    expect(lines[helpLine]).not.toContain("Choose a model");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model removes result rows when a 48x20 approval dock appears", async () => {
+  const approvalId = "approval_model_picker_compact" as ApprovalId;
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    width: 48,
+    height: 20,
+    runtime: {
+      chatView: {
+        status: "idle",
+        items: chatMessages(1),
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+      modelCandidates: Array.from({ length: 10 }, (_, index) => ({
+        provider: "compact",
+        providerDisplayName: "Compact",
+        model: `model-${String(index + 1).padStart(2, "0")}`,
+      })),
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(app.captureCharFrame()).toContain("> model-01 [Compact]");
+
+    await act(async () => {
+      app.setRuntime((runtime) => ({
+        ...runtime,
+        revision: runtime.revision + 1,
+        chatView: {
+          ...runtime.chatView,
+          status: "waiting_for_approval",
+          pendingApprovals: [{
+            id: approvalId,
+            kind: "approval",
+            permission: "tool.bash",
+            patterns: ["bun test"],
+            status: "pending",
+            createdAt: 1,
+            toolName: "bash",
+            toolDisplayStatus: "waiting_permission",
+            inputSummary: { title: "bash", command: "bun test", detail: "bun test" },
+          }] as never,
+        },
+      }));
+    });
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("Approval required: bash");
+    expect(frame).toContain("> bun test");
+    expect(frame).toContain("a once | s session | A always | x deny");
+    expectFramedModelSearch(frame);
+    expect(frame).toContain("Source  All · 10 models");
+    expect(frame).not.toContain("> model-01 [Compact]");
+    expect(frame).toContain("> Choose a model");
+
+    const lines = frame.split("\n");
+    const approvalHintLine = lines.findIndex((line) => line.includes("a once | s session"));
+    const searchLine = lines.findIndex((line) => line.includes("Search  >"));
+    const pickerHelpLine = lines.findIndex((line) => line.includes("↑/↓ navigate"));
+    const promptLine = lines.findIndex((line) => line.includes("> Choose a model"));
+    expect(approvalHintLine).toBeGreaterThan(-1);
+    expect(searchLine).toBeGreaterThan(approvalHintLine);
+    expect(pickerHelpLine).toBeGreaterThan(searchLine);
+    expect(promptLine).toBeGreaterThan(pickerHelpLine);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model labels identical Codex models as ChatGPT or Api and selects the right provider", async () => {
+  const selected: ModelSelection[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: [
+        {
+          provider: "codex-api",
+          providerDisplayName: "Api",
+          model: "gpt-5.6-sol",
+          connectionLabel: "Third-party API",
+        },
+        {
+          provider: "openai-codex",
+          providerDisplayName: "ChatGPT",
+          model: "gpt-5.6-sol",
+          connectionLabel: "ChatGPT OAuth",
+        },
+      ],
+      setRuntimeModel: async (selection) => {
+        selected.push(selection);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+
+    let frame = app.captureCharFrame();
+    const chatGptIndex = frame.indexOf("gpt-5.6-sol [ChatGPT]");
+    const apiIndex = frame.indexOf("gpt-5.6-sol [Api]");
+    expect(chatGptIndex).toBeGreaterThanOrEqual(0);
+    expect(apiIndex).toBeGreaterThan(chatGptIndex);
+    expect(frame).not.toContain("[ChatGPT Codex]");
+    expect(frame).not.toContain("[Codex API]");
+
+    await typeText(app, "chatgpt");
+    frame = app.captureCharFrame();
+    expect(frame).toContain("gpt-5.6-sol [ChatGPT]");
+    expect(frame).not.toContain("gpt-5.6-sol [Api]");
+
+    await backspace(app, "chatgpt".length);
+    await typeText(app, "api");
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Source  All · 1 match  tab switch");
+    expect(frame).toContain("gpt-5.6-sol [Api]");
+    expect(frame).not.toContain("gpt-5.6-sol [ChatGPT]");
+
+    await press(app, () => app.mockInput.pressEnter());
+    expect(selected).toEqual([{ provider: "codex-api", model: "gpt-5.6-sol" }]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model search highlights the best match instead of keeping a weaker current model", async () => {
+  const current = { provider: "openai-codex", model: "gpt-5.6-sol" };
+  const candidates: RuntimeModelDescriptor[] = [
+    { ...current, providerDisplayName: "ChatGPT", default: true },
+    { provider: "codex-api", providerDisplayName: "Api", model: "gpt-5.6-sol", default: true },
+    { provider: "openai-codex", providerDisplayName: "ChatGPT", model: "gpt-5.6-luna" },
+    { provider: "codex-api", providerDisplayName: "Api", model: "gpt-5.6-luna" },
+  ];
+  const selected: ModelSelection[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: candidates,
+      modelConfig: {
+        sessionId: "session_model_search" as SessionId,
+        models: candidates,
+        availableReasoningLevels: [],
+        modelSelection: current,
+      },
+      setRuntimeModel: async (selection) => {
+        selected.push(selection);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+    await typeText(app, "gpt-5.6-l");
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("> gpt-5.6-luna [ChatGPT]");
+    expect(frame.indexOf("gpt-5.6-luna [Api]")).toBeGreaterThan(frame.indexOf("gpt-5.6-luna [ChatGPT]"));
+
+    await press(app, () => app.mockInput.pressEnter());
+    expect(selected).toEqual([{ provider: "openai-codex", model: "gpt-5.6-luna" }]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model keeps the highlighted model stable when a refreshed catalog reorders rows", async () => {
+  const selected: ModelSelection[] = [];
+  const initialModels: RuntimeModelDescriptor[] = [
+    { provider: "stable", providerDisplayName: "Stable", model: "alpha" },
+    { provider: "stable", providerDisplayName: "Stable", model: "gamma" },
+  ];
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: initialModels,
+      setRuntimeModel: async (selection) => {
+        selected.push(selection);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressArrow("down"));
+    expect(app.captureCharFrame()).toContain("> gamma [Stable]");
+
+    await act(async () => {
+      app.setRuntime((runtime) => ({
+        ...runtime,
+        revision: runtime.revision + 1,
+        modelCandidates: [
+          initialModels[0]!,
+          { provider: "stable", providerDisplayName: "Stable", model: "beta" },
+          initialModels[1]!,
+        ],
+      }));
+    });
+    await app.renderOnce();
+
+    expect(app.captureCharFrame()).toContain("> gamma [Stable]");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(selected).toEqual([{ provider: "stable", model: "gamma" }]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model falls back to All when a refreshed catalog removes the active source", async () => {
+  const selected: ModelSelection[] = [];
+  const remaining: RuntimeModelDescriptor = {
+    provider: "stay",
+    providerDisplayName: "Stay",
+    model: "stay-model",
+  };
+  const app = await mountStatefulShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: [
+        { provider: "gone", providerDisplayName: "Gone", model: "gone-model" },
+        remaining,
+      ],
+      setRuntimeModel: async (selection) => {
+        selected.push(selection);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressTab());
+    expect(app.captureCharFrame()).toContain("Source  Gone · 1 model  tab switch");
+
+    await act(async () => {
+      app.setRuntime((runtime) => ({
+        ...runtime,
+        revision: runtime.revision + 1,
+        modelCandidates: [remaining],
+      }));
+    });
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("Source  All · 1 model  tab switch");
+    expect(frame).toContain("> stay-model [Stay]");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(selected).toEqual([{ provider: "stay", model: "stay-model" }]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/model detail shows safe connection metadata", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: [{
+        provider: "codex-api",
+        model: "gpt-5.5",
+        connectionLabel: "Third-party API",
+        authSource: "environment",
+        endpoint: "https://gateway-user:secret@gateway.example:8443/v1?api_key=hidden#fragment",
+      }],
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("connection Third-party API");
+    expect(frame).toContain("auth API key");
+    expect(frame).toContain("endpoint gateway.example:8443");
+    expect(frame).not.toContain("gateway-user");
+    expect(frame).not.toContain("secret");
+    expect(frame).not.toContain("api_key");
   } finally {
     app.renderer.destroy();
   }
@@ -3062,6 +3463,9 @@ test("/status preserves effective reasoning and fast tier for OpenAI Codex", asy
   const selection = { provider: "openai-codex", model: "gpt-5.6-sol" };
   const models: ModelCandidate[] = [{
     ...selection,
+    connectionLabel: "ChatGPT OAuth",
+    authSource: "oauth",
+    endpoint: "https://chatgpt.com/backend-api",
     capabilities: { reasoning: true },
     reasoningLevels: ["off", "low", "medium", "high"],
     serviceTiers: ["standard", "fast"],
@@ -3073,6 +3477,9 @@ test("/status preserves effective reasoning and fast tier for OpenAI Codex", asy
         sessionId: "session_codex_status" as SessionId,
         models: [{
           ...selection,
+          connectionLabel: "ChatGPT OAuth",
+          authSource: "oauth",
+          endpoint: "https://chatgpt.com/backend-api",
           capabilities: { reasoning: true },
           reasoningLevels: ["off", "low", "medium", "high"],
           serviceTiers: ["standard", "fast"],
@@ -3090,8 +3497,60 @@ test("/status preserves effective reasoning and fast tier for OpenAI Codex", asy
     await press(app, () => app.mockInput.pressEnter());
 
     const frame = app.captureCharFrame();
+    expect(frame).toContain("model: openai-codex/gpt-5.6-sol");
+    expect(frame).toContain("connection: ChatGPT OAuth");
+    expect(frame).toContain("auth: ChatGPT OAuth");
+    expect(frame).toContain("endpoint: chatgpt.com");
     expect(frame).toContain("thinking: high");
     expect(frame).toContain("service tier: fast");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/status distinguishes a third-party API key connection from ChatGPT OAuth", async () => {
+  const selection = { provider: "codex-api", model: "gpt-5.5" };
+  const models: RuntimeModelDescriptor[] = [
+    {
+      provider: "openai-codex",
+      model: "gpt-5.5",
+      connectionLabel: "ChatGPT OAuth",
+      authSource: "oauth",
+      endpoint: "https://chatgpt.com/backend-api",
+    },
+    {
+      ...selection,
+      connectionLabel: "Third-party API",
+      authSource: "environment",
+      endpoint: "https://gateway-user:secret@gateway.example:8443/v1?api_key=hidden#fragment",
+    },
+  ];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: models,
+      modelConfig: {
+        sessionId: "session_api_status" as SessionId,
+        models,
+        availableReasoningLevels: [],
+        modelSelection: selection,
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/status");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("model: codex-api/gpt-5.5");
+    expect(frame).toContain("connection: Third-party API");
+    expect(frame).toContain("auth: API key");
+    expect(frame).toContain("endpoint: gateway.example:8443");
+    expect(frame).not.toContain("ChatGPT OAuth");
+    expect(frame).not.toContain("chatgpt.com");
+    expect(frame).not.toContain("gateway-user");
+    expect(frame).not.toContain("secret");
+    expect(frame).not.toContain("api_key");
   } finally {
     app.renderer.destroy();
   }
@@ -3499,6 +3958,15 @@ function skillSummary(name: string, options: Partial<Pick<SkillSummary, "source"
 
 function emitSelection(renderer: { emit: (event: string, ...args: unknown[]) => boolean }, text: string): void {
   renderer.emit("selection", { getSelectedText: () => text });
+}
+
+function expectFramedModelSearch(frame: string): void {
+  const lines = frame.split("\n");
+  const searchLine = lines.findIndex((line) => line.includes("Search  >"));
+  expect(searchLine).toBeGreaterThan(0);
+  expect(lines[searchLine - 1] ?? "").toContain("┌");
+  expect(lines[searchLine] ?? "").toContain("│");
+  expect(lines[searchLine + 1] ?? "").toContain("└");
 }
 
 function frameTextPosition(frame: string, text: string): { x: number; y: number } {

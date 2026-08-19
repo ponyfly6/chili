@@ -1,9 +1,10 @@
 import {
+  CODEX_API_PROVIDER_ID,
   OPENAI_CODEX_DEFAULT_MODEL,
   OPENAI_CODEX_PROVIDER_ID,
   listKnownModels,
 } from "@chili/providers";
-import type { ServiceTier } from "@chili/protocol";
+import type { RuntimeModelAuthSource, ServiceTier } from "@chili/protocol";
 
 export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
@@ -20,6 +21,9 @@ export interface ModelCandidate {
   model: string;
   displayName?: string;
   providerDisplayName?: string;
+  connectionLabel?: string;
+  authSource?: RuntimeModelAuthSource;
+  endpoint?: string;
   available?: boolean;
   capabilities?: {
     reasoning?: boolean;
@@ -167,23 +171,46 @@ export function filterModelCandidates(
   current: ModelSelection | undefined,
 ): ModelCandidate[] {
   const normalized = query.trim().toLowerCase();
-  const filtered = normalized
-    ? candidates.filter((candidate) => fuzzyMatch(modelSearchText(candidate), normalized))
-    : candidates;
-  return sortModelCandidates(filtered, current);
+  if (!normalized) return sortModelCandidates(candidates, current);
+
+  return candidates
+    .map((candidate) => ({ candidate, score: modelSearchScore(candidate, normalized) }))
+    .filter((entry): entry is { candidate: ModelCandidate; score: number } => entry.score !== undefined)
+    .sort((left, right) => {
+      if (left.score !== right.score) return left.score - right.score;
+      return compareModelCandidates(left.candidate, right.candidate, current);
+    })
+    .map((entry) => entry.candidate);
 }
 
 function sortModelCandidates(candidates: readonly ModelCandidate[], current: ModelSelection | undefined): ModelCandidate[] {
-  return [...candidates].sort((left, right) => {
-    const leftCurrent = sameModelSelection(current, modelDescriptorSelection(left));
-    const rightCurrent = sameModelSelection(current, modelDescriptorSelection(right));
-    if (leftCurrent && !rightCurrent) return -1;
-    if (!leftCurrent && rightCurrent) return 1;
-    if (left.provider !== right.provider) return left.provider.localeCompare(right.provider);
-    if (left.default && !right.default) return -1;
-    if (!left.default && right.default) return 1;
-    return left.model.localeCompare(right.model);
-  });
+  return [...candidates].sort((left, right) => compareModelCandidates(left, right, current));
+}
+
+function compareModelCandidates(
+  left: ModelCandidate,
+  right: ModelCandidate,
+  current: ModelSelection | undefined,
+): number {
+  const leftCurrentModel = current?.model === left.model;
+  const rightCurrentModel = current?.model === right.model;
+  if (leftCurrentModel && !rightCurrentModel) return -1;
+  if (!leftCurrentModel && rightCurrentModel) return 1;
+
+  const modelOrder = left.model.localeCompare(right.model, undefined, { numeric: true, sensitivity: "base" });
+  if (modelOrder !== 0) return modelOrder;
+
+  const leftCurrent = sameModelSelection(current, modelDescriptorSelection(left));
+  const rightCurrent = sameModelSelection(current, modelDescriptorSelection(right));
+  if (leftCurrent && !rightCurrent) return -1;
+  if (!leftCurrent && rightCurrent) return 1;
+
+  if (left.default && !right.default) return -1;
+  if (!left.default && right.default) return 1;
+
+  const providerOrder = modelProviderSortRank(left.provider) - modelProviderSortRank(right.provider);
+  if (providerOrder !== 0) return providerOrder;
+  return left.provider.localeCompare(right.provider);
 }
 
 function splitReasoningSuffix(value: string): { reference: string; reasoningLevel?: ReasoningLevel } {
@@ -211,22 +238,79 @@ function findProviderDefaultSelection(
   return selected ? modelDescriptorSelection(selected) : undefined;
 }
 
-function modelSearchText(candidate: ModelCandidate): string {
-  return [
-    candidate.model,
+function modelSearchScore(candidate: ModelCandidate, query: string): number | undefined {
+  const model = candidate.model.toLowerCase();
+  const canonical = `${candidate.provider}/${candidate.model}`.toLowerCase();
+  const primaryFields = [model, candidate.displayName?.toLowerCase()].filter(
+    (value): value is string => Boolean(value),
+  );
+  const sourceFields = [
     candidate.provider,
-    `${candidate.provider}/${candidate.model}`,
-    candidate.displayName,
-  ].filter(Boolean).join(" ").toLowerCase();
+    candidate.providerDisplayName,
+    candidate.connectionLabel,
+  ].filter((value): value is string => Boolean(value)).map((value) => value.toLowerCase());
+  const auxiliaryFields = [
+    candidate.authSource,
+    safeEndpointHost(candidate.endpoint),
+  ].filter((value): value is string => Boolean(value)).map((value) => value.toLowerCase());
+  const fields = [...primaryFields, canonical, ...sourceFields, ...auxiliaryFields];
+
+  if (model === query || canonical === query) return 0;
+  if (primaryFields.some((field) => field.startsWith(query))) return 10;
+  if (primaryFields.some((field) => field.includes(query))) return 20;
+  if (sourceFields.some((field) => field === query)) return 30;
+  if (sourceFields.some((field) => field.startsWith(query))) return 40;
+  if (sourceFields.some((field) => field.includes(query))) return 50;
+  if (auxiliaryFields.some((field) => field.includes(query))) return 60;
+
+  const tokens = query.split(/\s+/).filter(Boolean);
+  if (tokens.length > 1 && tokens.every((token) => fields.some((field) => field.includes(token)))) return 70;
+
+  const fuzzyScores = fields
+    .map((field) => fuzzyFieldScore(field, query))
+    .filter((score): score is number => score !== undefined);
+  return fuzzyScores.length > 0 ? 100 + Math.min(...fuzzyScores) : undefined;
 }
 
-function fuzzyMatch(value: string, query: string): boolean {
-  if (value.includes(query)) return true;
-  let index = 0;
+function fuzzyFieldScore(value: string, query: string): number | undefined {
+  let valueIndex = 0;
+  let firstMatch = -1;
+  let gapCount = 0;
   for (const char of query) {
-    index = value.indexOf(char, index);
-    if (index === -1) return false;
-    index += 1;
+    const matchIndex = value.indexOf(char, valueIndex);
+    if (matchIndex === -1) return undefined;
+    if (firstMatch === -1) firstMatch = matchIndex;
+    gapCount += matchIndex - valueIndex;
+    valueIndex = matchIndex + 1;
   }
-  return true;
+  return Math.max(0, firstMatch) + gapCount;
+}
+
+function modelProviderSortRank(provider: string): number {
+  if (provider === OPENAI_CODEX_PROVIDER_ID) return 0;
+  if (provider === CODEX_API_PROVIDER_ID) return 1;
+  return 2;
+}
+
+export function safeEndpointHost(endpoint: string | undefined): string | undefined {
+  const value = endpoint?.trim();
+  if (!value) return undefined;
+  try {
+    const url = new URL(hasUrlScheme(value) ? value : `https://${value}`);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    return url.host || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function modelAuthLabel(authSource: RuntimeModelAuthSource | undefined): string {
+  if (authSource === "oauth") return "ChatGPT OAuth";
+  if (authSource === "environment" || authSource === "api_key") return "API key";
+  if (authSource === "none") return "not configured";
+  return "unknown";
+}
+
+function hasUrlScheme(value: string): boolean {
+  return /^[a-z][a-z\d+.-]*:\/\//i.test(value);
 }
