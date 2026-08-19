@@ -135,26 +135,69 @@ MOONSHOT_MODEL=kimi-k2.6
 
 也兼容 `KIMI_API_KEY`、`KIMI_BASE_URL`、`KIMI_MODEL` 命名。可用 `--model kimi:off` 关闭 K2.6 thinking。
 
+Codex 有两条独立的连接，通过 provider 明确区分：
+
+- `openai-codex`：使用 ChatGPT 订阅的 OAuth 凭据，只连接 ChatGPT Codex 后端。
+- `codex-api`：使用 API key 和自定义 base URL，连接第三方 OpenAI Responses-compatible API。
+
+两者不会互相回退或混用凭据。ChatGPT OAuth token 不会发往 `codex-api` 的自定义 endpoint，第三方 API key 也不会被 `openai-codex` 使用。
+
+### ChatGPT OAuth (`openai-codex`)
+
 ChatGPT 订阅里的 Codex 可以通过 TUI 斜杠命令登录：
 
 ```bash
-bun run chili -- serve --model codex
+bun run chili -- serve --provider openai-codex --model gpt-5.6-sol
 bun run tui
 ```
 
-在 TUI 里执行 `/login`，浏览器完成 ChatGPT 登录后，Chili 会把 OAuth 凭据保存到 `~/.chili/auth.json`。这个文件包含 access/refresh token，应按密码处理。登录后使用 `--model codex` 会走 ChatGPT Codex Responses 后端，默认模型为 `gpt-5.5`：
+在 TUI 里执行 `/login`，浏览器完成 ChatGPT 登录后，Chili 会把 OAuth 凭据保存到 `~/.chili/auth.json`。这个文件包含 access/refresh token，应按密码处理。`openai-codex` 的默认模型为 `gpt-5.6-sol`：
 
 ```bash
-bun run chili -- --model codex "总结这个仓库"
+bun run chili -- --model openai-codex/gpt-5.6-sol "总结这个仓库"
 ```
 
-也可以用 `/auth` 查看状态，或用 `/logout` 删除本地 Codex 凭据。可选环境变量：
+也可以用 `/auth` 查看 OAuth 状态，或用 `/logout` 删除本地 ChatGPT Codex 凭据。`openai-codex` 是 OAuth-only provider，不从 API key 或自定义 base URL 取凭据。
+
+### 第三方 Responses API (`codex-api`)
+
+第三方 Responses-compatible 网关使用专用的 `CODEX_API_*` 环境变量：
 
 ```bash
-OPENAI_CODEX_MODEL=gpt-5.5
-OPENAI_CODEX_BASE_URL=https://chatgpt.com/backend-api
-OPENAI_CODEX_ACCESS_TOKEN=...
+CODEX_API_KEY=...
+CODEX_API_BASE_URL=https://gateway.example/v1
+CODEX_API_MODEL=gpt-5.6-sol
 ```
+
+选择该 provider 时，Chili 才会使用这组 API 配置：
+
+```bash
+bun run chili -- --model codex-api/gpt-5.6-sol "总结这个仓库"
+```
+
+为了平滑迁移，以下旧变量仍作为 `codex-api` 的兼容别名：
+
+```text
+OPENAI_CODEX_ACCESS_TOKEN -> CODEX_API_KEY
+OPENAI_CODEX_BASE_URL     -> CODEX_API_BASE_URL
+OPENAI_CODEX_MODEL        -> CODEX_API_MODEL
+```
+
+新配置应优先使用 `CODEX_API_*`。这些旧变量只配置 `codex-api`，不会改变 `openai-codex` 的 OAuth 连接。
+
+### 选择与检查连接
+
+模型选择器用 `[ChatGPT]` 标记订阅 OAuth 连接，用 `[Api]` 标记第三方 API 连接；实际 provider ID 仍分别是 `openai-codex` 和 `codex-api`。
+
+在 TUI 中可以显式切换两个 provider：
+
+```text
+/model openai-codex/gpt-5.6-sol
+/model codex-api/gpt-5.6-sol
+/status
+```
+
+`/status` 会同时显示当前 `model`、`connection`、`auth` 和脱敏后的 `endpoint`，可用来确认请求实际会走 ChatGPT OAuth 还是第三方 API。
 
 ---
 
