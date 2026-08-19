@@ -28,6 +28,10 @@ export const OPENAI_CODEX_MODELS = [
   "gpt-5.6-luna",
 ] as const;
 export type OpenAICodexModel = (typeof OPENAI_CODEX_MODELS)[number];
+export const CODEX_API_PROVIDER_ID = "codex-api";
+export const CODEX_API_DEFAULT_MODEL = OPENAI_CODEX_DEFAULT_MODEL;
+export const CODEX_API_MODELS = [...OPENAI_CODEX_MODELS] as const;
+export type CodexApiModel = (typeof CODEX_API_MODELS)[number];
 
 export function isOpenAICodexModel(model: string): model is OpenAICodexModel {
   return (OPENAI_CODEX_MODELS as readonly string[]).includes(model);
@@ -37,6 +41,17 @@ export function assertOpenAICodexModel(model: string): asserts model is OpenAICo
   if (isOpenAICodexModel(model)) return;
   throw new Error(
     `Unsupported OpenAI Codex model "${model}". Supported models: ${OPENAI_CODEX_MODELS.join(", ")}`,
+  );
+}
+
+export function isCodexApiModel(model: string): model is CodexApiModel {
+  return (CODEX_API_MODELS as readonly string[]).includes(model);
+}
+
+export function assertCodexApiModel(model: string): asserts model is CodexApiModel {
+  if (isCodexApiModel(model)) return;
+  throw new Error(
+    `Unsupported Codex API model "${model}". Supported models: ${CODEX_API_MODELS.join(", ")}`,
   );
 }
 
@@ -289,7 +304,8 @@ const BUILTIN_MODELS = [
       },
     },
   },
-  ...OPENAI_CODEX_MODELS.map(openAICodexModelDescriptor),
+  ...OPENAI_CODEX_MODELS.map((model) => codexModelDescriptor(OPENAI_CODEX_PROVIDER_ID, model, OPENAI_CODEX_BASE_URL)),
+  ...CODEX_API_MODELS.map((model) => codexModelDescriptor(CODEX_API_PROVIDER_ID, model)),
 ] satisfies readonly ModelDescriptor[];
 
 const knownModels = new Map<string, Map<string, ModelDescriptor>>();
@@ -353,14 +369,18 @@ function openAICodexDisplayName(model: string): string {
   return suffix ? `GPT-${match[1]} ${suffix}` : `GPT-${match[1]}`;
 }
 
-function openAICodexModelDescriptor(model: (typeof OPENAI_CODEX_MODELS)[number]): ModelDescriptor {
+function codexModelDescriptor(
+  provider: typeof OPENAI_CODEX_PROVIDER_ID | typeof CODEX_API_PROVIDER_ID,
+  model: (typeof OPENAI_CODEX_MODELS)[number],
+  baseUrl?: string,
+): ModelDescriptor {
   const isGpt56 = model.startsWith("gpt-5.6-");
   return {
-    provider: OPENAI_CODEX_PROVIDER_ID,
+    provider,
     model,
     displayName: openAICodexDisplayName(model),
     apiFamily: "openai-responses",
-    baseUrl: OPENAI_CODEX_BASE_URL,
+    ...(baseUrl ? { baseUrl } : {}),
     default: model === OPENAI_CODEX_DEFAULT_MODEL,
     inputCapabilities: ["text", "image"],
     contextWindowTokens: isGpt56 ? 1050000 : 272000,

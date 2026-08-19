@@ -2,16 +2,26 @@ import { expect, test } from "bun:test";
 import type { Message, MessageId, PartId, SessionId, TimestampMs, ToolCallId } from "@chili/protocol";
 import {
   buildOpenAICodexResponsesRequestBody,
+  CODEX_API_MODELS,
+  CodexApiResponsesModel,
   clampOpenAICodexReasoningEffort,
+  createCodexApiModel,
+  createCodexApiProvider,
   createOpenAICodexModel,
   createOpenAICodexProvider,
   exchangeOpenAICodexAuthorizationCode,
+  FileAuthStorage,
   OPENAI_CODEX_MODELS,
+  OPENAI_CODEX_PROVIDER_ID,
   OpenAICodexResponsesModel,
+  OPENAI_CODEX_TOKEN_URL,
   refreshOpenAICodexToken,
+  resolveCodexApiResponsesUrl,
+  resolveCodexApiStreamRequestOptions,
   resolveOpenAICodexStreamRequestOptions,
   resolveOpenAICodexResponsesUrl,
 } from "./index.js";
+import type { OAuthCredential, OAuthCredentials } from "./auth.js";
 import type { ModelStreamEvent, ModelTool } from "./types.js";
 
 const sessionId = "session_codex" as SessionId;
@@ -28,17 +38,34 @@ test("accepts only cataloged OpenAI Codex models", () => {
   );
   expect(() => createOpenAICodexModel({
     env: { OPENAI_CODEX_MODEL: "gpt-5.3-codex" },
-  })).toThrow('Unsupported OpenAI Codex model "gpt-5.3-codex"');
+  })).not.toThrow();
   expect(() => createOpenAICodexProvider({ model: "gpt-5.4" })).toThrow(
     'Unsupported OpenAI Codex model "gpt-5.4"',
   );
   expect(() => createOpenAICodexProvider({
     env: { OPENAI_CODEX_MODEL: "gpt-5.2" },
-  })).toThrow('Unsupported OpenAI Codex model "gpt-5.2"');
+  })).not.toThrow();
   expect(() => resolveOpenAICodexStreamRequestOptions(
     { messages: [], model: "gpt-5.1" },
     { model: "gpt-5.5" },
   )).toThrow('Unsupported OpenAI Codex model "gpt-5.1"');
+});
+
+test("accepts the same cataloged models for Codex API", () => {
+  for (const model of CODEX_API_MODELS) {
+    expect(() => createCodexApiModel({
+      model,
+      apiKey: "api-key",
+      baseUrl: "https://gateway.test/v1",
+    })).not.toThrow();
+    expect(() => createCodexApiProvider({ model })).not.toThrow();
+  }
+
+  expect(() => createCodexApiModel({
+    model: "gpt-5.4",
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
+  })).toThrow('Unsupported Codex API model "gpt-5.4"');
 });
 
 test("converts Chili messages and tools into a Codex Responses body", () => {
@@ -324,17 +351,16 @@ test("omits image tool result blocks for text-only Codex request bodies", () => 
   expect(JSON.stringify(body.input)).not.toContain("input_image");
 });
 
-test("resolves Codex Responses URL variants", () => {
+test("keeps ChatGPT fixed while resolving Codex API URL variants", () => {
   expect(resolveOpenAICodexResponsesUrl()).toBe("https://chatgpt.com/backend-api/codex/responses");
   expect(resolveOpenAICodexResponsesUrl("https://chatgpt.com/backend-api")).toBe("https://chatgpt.com/backend-api/codex/responses");
-  expect(resolveOpenAICodexResponsesUrl("https://chatgpt.com/backend-api/codex")).toBe("https://chatgpt.com/backend-api/codex/responses");
-  expect(resolveOpenAICodexResponsesUrl("https://chatgpt.com/backend-api/codex/responses")).toBe(
-    "https://chatgpt.com/backend-api/codex/responses",
+  expect(() => resolveOpenAICodexResponsesUrl("https://api.codexapi.space/v1")).toThrow(
+    "ChatGPT Codex uses a fixed endpoint",
   );
-  expect(resolveOpenAICodexResponsesUrl("https://api.codexapi.space/v1")).toBe(
+  expect(resolveCodexApiResponsesUrl("https://api.codexapi.space/v1")).toBe(
     "https://api.codexapi.space/v1/responses",
   );
-  expect(resolveOpenAICodexResponsesUrl("https://api.codexapi.space/v1/responses")).toBe(
+  expect(resolveCodexApiResponsesUrl("https://api.codexapi.space/v1/responses")).toBe(
     "https://api.codexapi.space/v1/responses",
   );
 });
@@ -368,6 +394,16 @@ test("resolves per-stream Codex model and reasoning request options", () => {
     model: "gpt-5.6-terra",
     reasoningEffort: "xhigh",
   });
+
+  expect(resolveCodexApiStreamRequestOptions({
+    messages: [],
+    model: "codex-api/gpt-5.6-luna:high",
+  }, {
+    model: "gpt-5.5",
+  })).toMatchObject({
+    model: "gpt-5.6-luna",
+    reasoningEffort: "high",
+  });
 });
 
 test("clamps and omits Codex reasoning levels for the request body", () => {
@@ -394,6 +430,96 @@ test("clamps and omits Codex reasoning levels for the request body", () => {
     { model: "gpt-5.6-sol", reasoningEffort: "ultra" },
   );
   expect(ultraBody).toMatchObject({ reasoning: { effort: "max", summary: "auto" } });
+});
+
+test("ChatGPT Codex rejects direct credentials and custom endpoints", () => {
+  expect(() => createOpenAICodexModel({ apiKey: "direct-key" })).toThrow(
+    "ChatGPT Codex is OAuth-only",
+  );
+  expect(() => createOpenAICodexModel({ baseUrl: "https://third-party.test/v1" })).toThrow(
+    "ChatGPT Codex uses a fixed endpoint",
+  );
+});
+
+test("Codex API requires a complete API key and base URL configuration", () => {
+  expect(() => createCodexApiModel({ env: {} })).toThrow("requires CODEX_API_KEY");
+  expect(() => createCodexApiModel({ apiKey: "api-key", env: {} })).toThrow("requires CODEX_API_BASE_URL");
+  expect(() => createCodexApiModel({
+    apiKey: "   ",
+    baseUrl: "https://third-party.test/v1",
+    env: {},
+  })).toThrow("requires CODEX_API_KEY");
+  expect(() => createCodexApiModel({
+    apiKey: "api-key",
+    baseUrl: "not-a-url",
+    env: {},
+  })).toThrow("absolute HTTP(S) URL");
+  expect(() => createCodexApiModel({
+    apiKey: "api-key",
+    baseUrl: "ftp://third-party.test/v1",
+    env: {},
+  })).toThrow("absolute HTTP(S) URL");
+  expect(() => createCodexApiModel({
+    env: {
+      CODEX_API_BASE_URL: "https://third-party.test/v1",
+      OPENAI_CODEX_ACCESS_TOKEN: "legacy-key-must-not-cross-fill",
+    },
+  })).toThrow("requires CODEX_API_KEY");
+});
+
+test("Codex API refuses a legacy ChatGPT OAuth token before contacting a custom endpoint", async () => {
+  let fetchCalls = 0;
+  const modelOptions = {
+    env: {
+      OPENAI_CODEX_ACCESS_TOKEN: jwtWithAccount("acct_legacy_oauth"),
+      OPENAI_CODEX_BASE_URL: "https://third-party.test/v1",
+    },
+    fetch: (async () => {
+      fetchCalls += 1;
+      return new Response(null, { status: 500 });
+    }) as unknown as typeof fetch,
+  };
+
+  expect(() => createCodexApiModel(modelOptions)).toThrow("looks like a ChatGPT OAuth token");
+  expect(fetchCalls).toBe(0);
+
+  expect(() => createCodexApiModel({
+    apiKey: jwtWithAccount("acct_explicit_api_key"),
+    baseUrl: "https://third-party.test/v1",
+    env: modelOptions.env,
+  })).not.toThrow();
+});
+
+test("ChatGPT OAuth ignores legacy API environment and always uses the fixed endpoint", async () => {
+  let requestedUrl = "";
+  let headers = new Headers();
+  const fetchImpl = (async (input, init) => {
+    requestedUrl = String(input);
+    headers = new Headers(init?.headers);
+    return new Response(streamText([
+      data({ type: "response.created", response: { id: "resp_oauth_fixed", model: "gpt-5.5" } }),
+      data({ type: "response.completed", response: { id: "resp_oauth_fixed", model: "gpt-5.5", status: "completed" } }),
+    ].join("")), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as typeof fetch;
+  const oauthAccess = jwtWithAccount("acct_oauth_fixed");
+  const model = new OpenAICodexResponsesModel({
+    model: "gpt-5.5",
+    authStorage: staticOAuthStorage(oauthAccess, "acct_oauth_fixed"),
+    fetch: fetchImpl,
+    env: {
+      OPENAI_CODEX_ACCESS_TOKEN: "third-party-key",
+      OPENAI_CODEX_BASE_URL: "https://third-party.test/v1",
+    },
+  });
+
+  await collect(model.stream({ messages: [] }));
+
+  expect(requestedUrl).toBe("https://chatgpt.com/backend-api/codex/responses");
+  expect(headers.get("authorization")).toBe(`Bearer ${oauthAccess}`);
+  expect(headers.get("chatgpt-account-id")).toBe("acct_oauth_fixed");
 });
 
 test("accepts OpenAI Codex token exchange fields from id_token", async () => {
@@ -468,6 +594,93 @@ test("refresh preserves existing token fields when Codex omits optional fields",
   });
 });
 
+test("ChatGPT Codex refreshes expiring OAuth credentials, persists them, and uses the refreshed identity", async () => {
+  const oldCredential: OAuthCredential = {
+    type: "oauth",
+    access: jwtWithAccount("acct_old"),
+    refresh: "refresh_old",
+    expires: Date.now() + 30_000,
+    accountId: "acct_old",
+  };
+  const refreshedAccess = jwtWithPayload({ sub: "refreshed_access" });
+  const refreshedId = jwtWithPayload({
+    exp: Math.floor(Date.now() / 1000) + 3600,
+    "https://api.openai.com/auth": { chatgpt_account_id: "acct_refreshed" },
+  });
+  const storage = new StaticOAuthStorage(oldCredential);
+  let modelCalls = 0;
+  let modelHeaders = new Headers();
+  const fetchImpl = (async (input, init) => {
+    if (String(input) === OPENAI_CODEX_TOKEN_URL) {
+      return new Response(JSON.stringify({
+        access_token: refreshedAccess,
+        refresh_token: "refresh_new",
+        id_token: refreshedId,
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    modelCalls += 1;
+    modelHeaders = new Headers(init?.headers);
+    return new Response(streamText([
+      data({ type: "response.created", response: { id: "resp_refreshed", model: "gpt-5.5" } }),
+      data({ type: "response.completed", response: { id: "resp_refreshed", model: "gpt-5.5", status: "completed" } }),
+    ].join("")), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as typeof fetch;
+
+  const model = new OpenAICodexResponsesModel({
+    model: "gpt-5.5",
+    authStorage: storage,
+    fetch: fetchImpl,
+  });
+  await collect(model.stream({ messages: [] }));
+
+  expect(modelCalls).toBe(1);
+  expect(modelHeaders.get("authorization")).toBe(`Bearer ${refreshedAccess}`);
+  expect(modelHeaders.get("chatgpt-account-id")).toBe("acct_refreshed");
+  expect(storage.writes).toHaveLength(1);
+  expect(storage.writes[0]).toMatchObject({
+    access: refreshedAccess,
+    refresh: "refresh_new",
+    accountId: "acct_refreshed",
+  });
+});
+
+test("ChatGPT Codex does not request a model or overwrite credentials when OAuth refresh fails", async () => {
+  const oldCredential: OAuthCredential = {
+    type: "oauth",
+    access: jwtWithAccount("acct_old"),
+    refresh: "refresh_old",
+    expires: Date.now() - 1,
+    accountId: "acct_old",
+  };
+  const storage = new StaticOAuthStorage(oldCredential);
+  let modelCalls = 0;
+  const fetchImpl = (async (input) => {
+    if (String(input) === OPENAI_CODEX_TOKEN_URL) {
+      return new Response("refresh denied", { status: 401 });
+    }
+    modelCalls += 1;
+    return new Response(null, { status: 500 });
+  }) as typeof fetch;
+  const model = new OpenAICodexResponsesModel({
+    model: "gpt-5.5",
+    authStorage: storage,
+    fetch: fetchImpl,
+  });
+
+  await expect(collect(model.stream({ messages: [] }))).rejects.toThrow(
+    "token request failed with HTTP 401",
+  );
+  expect(modelCalls).toBe(0);
+  expect(storage.writes).toHaveLength(0);
+  expect(await storage.getOAuthCredentials(OPENAI_CODEX_PROVIDER_ID)).toEqual(oldCredential);
+});
+
 test("sends ChatGPT Codex headers and parses Responses SSE events", async () => {
   const token = jwtWithAccount("acct_test");
   let url = "";
@@ -516,7 +729,7 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
   const model = new OpenAICodexResponsesModel({
     model: "gpt-5.5",
     reasoningEffort: "medium",
-    apiKey: token,
+    authStorage: staticOAuthStorage(token, "acct_test"),
     fetch: fetchImpl,
     env: {},
   });
@@ -682,9 +895,10 @@ for (const scenario of [
 }
 
 test("preserves reasoning summary sections from Codex Responses streams", async () => {
-  const model = new OpenAICodexResponsesModel({
+  const model = new CodexApiResponsesModel({
     model: "gpt-5.5",
-    apiKey: jwtWithAccount("acct_test"),
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
     fetch: sseFetch([
       data({ type: "response.created", response: { id: "resp_reasoning", model: "gpt-5.5" } }),
       data({ type: "response.reasoning_summary_text.delta", item_id: "reasoning_1", output_index: 0, summary_index: 0, delta: "**Inspecting " }),
@@ -705,9 +919,10 @@ test("preserves reasoning summary sections from Codex Responses streams", async 
 });
 
 test("maps incomplete Codex tool-call responses to length", async () => {
-  const model = new OpenAICodexResponsesModel({
+  const model = new CodexApiResponsesModel({
     model: "gpt-5.5",
-    apiKey: jwtWithAccount("acct_test"),
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
     fetch: sseFetch([
       data({ type: "response.created", response: { id: "resp_incomplete", model: "gpt-5.5" } }),
       data({
@@ -735,9 +950,10 @@ test("maps incomplete Codex tool-call responses to length", async () => {
 });
 
 test("marks invalid Codex tool arguments", async () => {
-  const model = new OpenAICodexResponsesModel({
+  const model = new CodexApiResponsesModel({
     model: "gpt-5.5",
-    apiKey: jwtWithAccount("acct_test"),
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
     fetch: sseFetch([
       data({ type: "response.created", response: { id: "resp_invalid_args", model: "gpt-5.5" } }),
       data({
@@ -797,9 +1013,10 @@ test("sends OpenAI-compatible Codex requests without ChatGPT account headers", a
     });
   }) as typeof fetch;
 
-  const model = new OpenAICodexResponsesModel({
+  const apiKey = jwtWithAccount("must_not_be_inferred");
+  const model = new CodexApiResponsesModel({
     model: "gpt-5.5",
-    apiKey: "codexapi-key",
+    apiKey,
     baseUrl: "https://api.codexapi.space/v1",
     reasoningEffort: "xhigh",
     serviceTier: "fast",
@@ -808,7 +1025,7 @@ test("sends OpenAI-compatible Codex requests without ChatGPT account headers", a
   const events = await collect(model.stream({ messages: [], tools: [], system: [] }));
 
   expect(url).toBe("https://api.codexapi.space/v1/responses");
-  expect(headers.get("authorization")).toBe("Bearer codexapi-key");
+  expect(headers.get("authorization")).toBe(`Bearer ${apiKey}`);
   expect(headers.get("chatgpt-account-id")).toBeNull();
   expect(headers.get("openai-beta")).toBeNull();
   expect(body).toMatchObject({
@@ -816,13 +1033,15 @@ test("sends OpenAI-compatible Codex requests without ChatGPT account headers", a
     reasoning: { effort: "xhigh", summary: "auto" },
     service_tier: "priority",
   });
+  expect(events[0]).toMatchObject({ type: "metadata", provider: "codex-api", model: "gpt-5.5" });
   expect(events).toContainEqual({ type: "text_delta", text: "ok", index: 0, phase: "final_answer" });
 });
 
 test("surfaces nested OpenAI Codex SSE error details", async () => {
-  const model = new OpenAICodexResponsesModel({
+  const model = new CodexApiResponsesModel({
     model: "gpt-5.5",
-    apiKey: jwtWithAccount("acct_test"),
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
     fetch: sseFetch([
       data({ type: "response.created", response: { id: "resp_error", model: "gpt-5.5" } }),
       data({
@@ -845,9 +1064,10 @@ test("surfaces nested OpenAI Codex SSE error details", async () => {
 });
 
 test("surfaces OpenAI Codex response.failed error details", async () => {
-  const model = new OpenAICodexResponsesModel({
+  const model = new CodexApiResponsesModel({
     model: "gpt-5.5",
-    apiKey: jwtWithAccount("acct_test"),
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
     fetch: sseFetch([
       data({
         type: "response.failed",
@@ -872,9 +1092,10 @@ test("surfaces OpenAI Codex response.failed error details", async () => {
 });
 
 test("surfaces OpenAI Codex HTTP error details", async () => {
-  const model = new OpenAICodexResponsesModel({
+  const model = new CodexApiResponsesModel({
     model: "gpt-5.5",
-    apiKey: jwtWithAccount("acct_test"),
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
     fetch: (async () =>
       new Response(JSON.stringify({
         error: {
@@ -891,6 +1112,38 @@ test("surfaces OpenAI Codex HTTP error details", async () => {
 
   await expect(collect(model.stream({ messages: [], tools: [], system: [] }))).rejects.toThrow(
     "Invalid token (code: invalid_api_key, request id: req_http_1)",
+  );
+});
+
+test("formats HTTP 429 by provider authentication mode", async () => {
+  const rateLimitFetch = (): typeof fetch => (async () => new Response(JSON.stringify({
+    error: {
+      message: "Gateway quota exhausted",
+      code: "rate_limit_exceeded",
+      request_id: "req_rate_limit",
+    },
+  }), {
+    status: 429,
+    headers: { "content-type": "application/json" },
+  })) as unknown as typeof fetch;
+
+  const apiModel = new CodexApiResponsesModel({
+    model: "gpt-5.5",
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
+    fetch: rateLimitFetch(),
+  });
+  await expect(collect(apiModel.stream({ messages: [] }))).rejects.toThrow(
+    "Gateway quota exhausted (code: rate_limit_exceeded, request id: req_rate_limit)",
+  );
+
+  const oauthModel = new OpenAICodexResponsesModel({
+    model: "gpt-5.5",
+    authStorage: staticOAuthStorage(jwtWithAccount("acct_limit"), "acct_limit"),
+    fetch: rateLimitFetch(),
+  });
+  await expect(collect(oauthModel.stream({ messages: [] }))).rejects.toThrow(
+    "You have hit your ChatGPT usage limit",
   );
 });
 
@@ -928,10 +1181,11 @@ function sseFetch(events: string[]): typeof fetch {
     })) as unknown as typeof fetch;
 }
 
-function codexStreamModel(events: readonly string[]): OpenAICodexResponsesModel {
-  return new OpenAICodexResponsesModel({
+function codexStreamModel(events: readonly string[]): CodexApiResponsesModel {
+  return new CodexApiResponsesModel({
     model: "gpt-5.5",
-    apiKey: jwtWithAccount("acct_test"),
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
     fetch: sseFetch([...events]),
     env: {},
   });
@@ -951,6 +1205,34 @@ function jwtWithAccount(accountId: string): string {
   return jwtWithPayload({
     "https://api.openai.com/auth": { chatgpt_account_id: accountId },
   });
+}
+
+function staticOAuthStorage(access: string, accountId: string): FileAuthStorage {
+  return new StaticOAuthStorage({
+    type: "oauth",
+    access,
+    refresh: "refresh_test",
+    expires: Date.now() + 60 * 60 * 1000,
+    accountId,
+  });
+}
+
+class StaticOAuthStorage extends FileAuthStorage {
+  readonly writes: OAuthCredentials[] = [];
+
+  constructor(private credential: OAuthCredential) {
+    super("/tmp/chili-static-oauth-test.json");
+  }
+
+  override async getOAuthCredentials(provider: string): Promise<OAuthCredential | undefined> {
+    return provider === OPENAI_CODEX_PROVIDER_ID ? this.credential : undefined;
+  }
+
+  override async setOAuthCredentials(provider: string, credentials: OAuthCredentials): Promise<void> {
+    if (provider !== OPENAI_CODEX_PROVIDER_ID) return;
+    this.writes.push({ ...credentials });
+    this.credential = { type: "oauth", ...credentials };
+  }
 }
 
 function jwtWithPayload(payload: Record<string, unknown>): string {

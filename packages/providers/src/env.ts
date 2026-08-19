@@ -1,4 +1,5 @@
 import {
+  CODEX_API_PROVIDER_ID,
   DEEPSEEK_PROVIDER_ID,
   KIMI_PROVIDER_ID,
   MINIMAX_PROVIDER_ID,
@@ -48,6 +49,18 @@ export const ZAI_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
 };
 
 export const OPENAI_CODEX_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
+  apiKey: [],
+  baseUrl: [],
+  model: [],
+};
+
+export const CODEX_API_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
+  apiKey: ["CODEX_API_KEY"],
+  baseUrl: ["CODEX_API_BASE_URL"],
+  model: ["CODEX_API_MODEL"],
+};
+
+const LEGACY_CODEX_API_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
   apiKey: ["OPENAI_CODEX_ACCESS_TOKEN"],
   baseUrl: ["OPENAI_CODEX_BASE_URL"],
   model: ["OPENAI_CODEX_MODEL"],
@@ -58,6 +71,7 @@ const PROVIDER_ENVIRONMENT: Record<string, ProviderEnvironmentSpec> = {
   [KIMI_PROVIDER_ID]: KIMI_ENVIRONMENT,
   [MINIMAX_PROVIDER_ID]: MINIMAX_ENVIRONMENT,
   [OPENAI_CODEX_PROVIDER_ID]: OPENAI_CODEX_ENVIRONMENT,
+  [CODEX_API_PROVIDER_ID]: CODEX_API_ENVIRONMENT,
   [ZAI_PROVIDER_ID]: ZAI_ENVIRONMENT,
 };
 
@@ -67,6 +81,7 @@ export function readProviderEnvironment(
 ): ProviderEnvironment {
   const spec = PROVIDER_ENVIRONMENT[provider];
   if (!spec) return {};
+  if (provider === CODEX_API_PROVIDER_ID) return readCodexApiEnvironment(env);
   return readEnvironmentSpec(spec, env);
 }
 
@@ -90,12 +105,44 @@ export function readOpenAICodexEnvironment(env: EnvironmentSource = currentEnvir
   return readEnvironmentSpec(OPENAI_CODEX_ENVIRONMENT, env);
 }
 
+export function readCodexApiEnvironment(env: EnvironmentSource = currentEnvironment()): ProviderEnvironment {
+  const spec = hasConfiguredEnvironment(CODEX_API_ENVIRONMENT, env)
+    ? CODEX_API_ENVIRONMENT
+    : LEGACY_CODEX_API_ENVIRONMENT;
+  return readEnvironmentSpec(spec, env);
+}
+
+export function isAbsoluteHttpUrl(value: string | undefined): boolean {
+  const normalized = value?.trim();
+  if (!normalized) return false;
+  try {
+    const url = new URL(normalized);
+    return url.protocol === "https:" || url.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
 export function findConfiguredEnvironmentNames(
   provider: string,
   env: EnvironmentSource = currentEnvironment(),
 ): readonly string[] {
   const spec = PROVIDER_ENVIRONMENT[provider];
   if (!spec) return [];
+  if (provider === CODEX_API_PROVIDER_ID) {
+    const activeSpec = hasConfiguredEnvironment(CODEX_API_ENVIRONMENT, env)
+      ? CODEX_API_ENVIRONMENT
+      : LEGACY_CODEX_API_ENVIRONMENT;
+    return configuredEnvironmentNames(activeSpec, env);
+  }
+  return configuredEnvironmentNames(spec, env);
+}
+
+function hasConfiguredEnvironment(spec: ProviderEnvironmentSpec, env: EnvironmentSource): boolean {
+  return configuredEnvironmentNames(spec, env).length > 0;
+}
+
+function configuredEnvironmentNames(spec: ProviderEnvironmentSpec, env: EnvironmentSource): string[] {
   return [...configuredNames(spec.apiKey, env), ...configuredNames(spec.baseUrl, env), ...configuredNames(spec.model, env)];
 }
 

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  CODEX_API_PROVIDER_ID,
   getModelSelectionAvailableReasoningLevels,
   getProviderCatalogStatus,
   listKnownModels,
@@ -163,24 +164,36 @@ test("resolves model selection patterns against descriptors", () => {
 
 test("catalog exposes display names, auth state, and Codex model metadata", () => {
   const status = getProviderCatalogStatus(OPENAI_CODEX_PROVIDER_ID, {
-    env: { OPENAI_CODEX_ACCESS_TOKEN: "token" },
+    authStatus: {
+      configured: true,
+      authPath: "/tmp/auth.json",
+      type: "oauth",
+      accountId: "acct_test",
+    },
   });
 
   expect(status).toMatchObject({
     provider: OPENAI_CODEX_PROVIDER_ID,
-    displayName: "ChatGPT Codex",
+    displayName: "ChatGPT",
     configured: true,
     available: true,
-    authSource: "environment",
+    authSource: "oauth",
+    endpoint: "https://chatgpt.com",
   });
 
   const catalog = listModelCatalog(OPENAI_CODEX_PROVIDER_ID, {
-    env: { OPENAI_CODEX_ACCESS_TOKEN: "token" },
+    authStatus: {
+      configured: true,
+      authPath: "/tmp/auth.json",
+      type: "oauth",
+    },
   });
   expect(catalog.find((model) => model.model === OPENAI_CODEX_DEFAULT_MODEL)).toMatchObject({
-    providerDisplayName: "ChatGPT Codex",
+    providerDisplayName: "ChatGPT",
     displayName: "GPT-5.6 Sol",
     available: true,
+    authSource: "oauth",
+    endpoint: "https://chatgpt.com",
     cost: {
       input: 5,
       output: 30,
@@ -195,4 +208,81 @@ test("catalog exposes display names, auth state, and Codex model metadata", () =
     "gpt-5.6-terra",
     "gpt-5.6-luna",
   ]);
+});
+
+test("Codex API catalog requires a complete environment configuration and sanitizes its endpoint", () => {
+  const status = getProviderCatalogStatus(CODEX_API_PROVIDER_ID, {
+    env: {
+      CODEX_API_KEY: "token",
+      CODEX_API_BASE_URL: "https://user:secret@gateway.test:8443/v1?token=hidden",
+    },
+  });
+
+  expect(status).toMatchObject({
+    provider: CODEX_API_PROVIDER_ID,
+    displayName: "Api",
+    configured: true,
+    available: true,
+    authSource: "environment",
+    endpoint: "https://gateway.test:8443",
+  });
+  expect(JSON.stringify(status)).not.toContain("secret");
+  expect(JSON.stringify(status)).not.toContain("hidden");
+
+  expect(getProviderCatalogStatus(CODEX_API_PROVIDER_ID, {
+    env: { CODEX_API_KEY: "key-without-base-url" },
+  })).toMatchObject({
+    configured: false,
+    available: false,
+    authSource: "none",
+  });
+
+  for (const env of [
+    { CODEX_API_BASE_URL: "https://gateway.test/v1" },
+    { CODEX_API_KEY: "   ", CODEX_API_BASE_URL: "https://gateway.test/v1" },
+    { CODEX_API_KEY: "key", CODEX_API_BASE_URL: "not-a-url" },
+    { CODEX_API_KEY: "key", CODEX_API_BASE_URL: "ftp://gateway.test/v1" },
+  ]) {
+    expect(getProviderCatalogStatus(CODEX_API_PROVIDER_ID, { env })).toMatchObject({
+      configured: false,
+      available: false,
+      authSource: "none",
+    });
+  }
+});
+
+test("Codex providers reject auth storage types from the other authentication mode", () => {
+  expect(getProviderCatalogStatus(OPENAI_CODEX_PROVIDER_ID, {
+    authStatus: { configured: true, authPath: "/tmp/auth.json", type: "api_key" },
+  })).toMatchObject({ configured: false, available: false, authSource: "none" });
+
+  expect(getProviderCatalogStatus(CODEX_API_PROVIDER_ID, {
+    authStatus: { configured: true, authPath: "/tmp/auth.json", type: "oauth" },
+  })).toMatchObject({ configured: false, available: false, authSource: "none" });
+});
+
+test("same Codex model IDs require a provider or an explicit default provider", () => {
+  const models = [
+    ...listKnownModels(OPENAI_CODEX_PROVIDER_ID),
+    ...listKnownModels(CODEX_API_PROVIDER_ID),
+  ];
+
+  expect(resolveModelSelectionPattern("gpt-5.5", models)).toEqual({});
+  expect(resolveModelSelectionPattern("5.6", models)).toEqual({});
+  expect(resolveModelSelectionPattern("gpt-5.5", models, {
+    defaultProvider: CODEX_API_PROVIDER_ID,
+  })).toMatchObject({
+    selection: { provider: CODEX_API_PROVIDER_ID, model: "gpt-5.5" },
+  });
+  expect(resolveModelSelectionPattern("5.6", models, {
+    defaultProvider: CODEX_API_PROVIDER_ID,
+  })).toMatchObject({
+    selection: { provider: CODEX_API_PROVIDER_ID },
+  });
+  expect(resolveModelSelectionPattern("openai-codex/gpt-5.5", models)).toMatchObject({
+    selection: { provider: OPENAI_CODEX_PROVIDER_ID, model: "gpt-5.5" },
+  });
+  expect(resolveModelSelectionPattern("codex-api/gpt-5.5", models)).toMatchObject({
+    selection: { provider: CODEX_API_PROVIDER_ID, model: "gpt-5.5" },
+  });
 });

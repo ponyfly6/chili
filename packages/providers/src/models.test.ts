@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import {
   assertOpenAICodexModel,
+  CODEX_API_DEFAULT_MODEL,
+  CODEX_API_PROVIDER_ID,
   DEEPSEEK_OPENAI_BASE_URL,
   DEEPSEEK_PROVIDER_ID,
   DEEPSEEK_V4_FLASH_MODEL,
@@ -21,6 +23,7 @@ import {
   OPENAI_CODEX_PROVIDER_ID,
   isOpenAICodexModel,
   readDeepSeekEnvironment,
+  readCodexApiEnvironment,
   readKimiEnvironment,
   readMiniMaxEnvironment,
   readOpenAICodexEnvironment,
@@ -209,6 +212,25 @@ test("catalog describes the built-in ChatGPT Codex Responses models", () => {
   });
 });
 
+test("catalog gives Codex API the same model IDs under a separate provider", () => {
+  const models = listKnownModels(CODEX_API_PROVIDER_ID);
+
+  expect(models.map((model) => model.model)).toEqual([
+    "gpt-5.5",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+  ]);
+  expect(findDefaultKnownModel(CODEX_API_PROVIDER_ID)).toMatchObject({
+    provider: CODEX_API_PROVIDER_ID,
+    model: CODEX_API_DEFAULT_MODEL,
+    apiFamily: "openai-responses",
+    default: true,
+    inputCapabilities: ["text", "image"],
+  });
+  expect(findDefaultKnownModel(CODEX_API_PROVIDER_ID)).not.toHaveProperty("baseUrl");
+});
+
 test("DeepSeek env resolution uses provider-specific variables", () => {
   expect(
     readDeepSeekEnvironment({
@@ -296,19 +318,54 @@ test("MiniMax env resolution uses Anthropic base URL before generic MiniMax base
   });
 });
 
-test("OpenAI Codex env resolution uses provider-specific variables", () => {
+test("OpenAI Codex ignores direct-token environment variables", () => {
   expect(
     readOpenAICodexEnvironment({
       OPENAI_CODEX_ACCESS_TOKEN: "token",
       OPENAI_CODEX_BASE_URL: "https://chatgpt.test/backend-api",
       OPENAI_CODEX_MODEL: "gpt-5.6-terra",
     }),
-  ).toEqual({
-    apiKey: "token",
-    apiKeyEnv: "OPENAI_CODEX_ACCESS_TOKEN",
-    baseUrl: "https://chatgpt.test/backend-api",
-    baseUrlEnv: "OPENAI_CODEX_BASE_URL",
+  ).toEqual({});
+});
+
+test("Codex API prefers its clean environment variable family", () => {
+  expect(readCodexApiEnvironment({
+    CODEX_API_KEY: "new-key",
+    CODEX_API_BASE_URL: "https://new-gateway.test/v1",
+    CODEX_API_MODEL: "gpt-5.6-terra",
+    OPENAI_CODEX_ACCESS_TOKEN: "legacy-key",
+    OPENAI_CODEX_BASE_URL: "https://legacy-gateway.test/v1",
+    OPENAI_CODEX_MODEL: "gpt-5.5",
+  })).toEqual({
+    apiKey: "new-key",
+    apiKeyEnv: "CODEX_API_KEY",
+    baseUrl: "https://new-gateway.test/v1",
+    baseUrlEnv: "CODEX_API_BASE_URL",
     model: "gpt-5.6-terra",
+    modelEnv: "CODEX_API_MODEL",
+  });
+});
+
+test("Codex API falls back to the legacy environment family atomically", () => {
+  expect(readCodexApiEnvironment({
+    OPENAI_CODEX_ACCESS_TOKEN: "legacy-key",
+    OPENAI_CODEX_BASE_URL: "https://legacy-gateway.test/v1",
+    OPENAI_CODEX_MODEL: "gpt-5.5",
+  })).toEqual({
+    apiKey: "legacy-key",
+    apiKeyEnv: "OPENAI_CODEX_ACCESS_TOKEN",
+    baseUrl: "https://legacy-gateway.test/v1",
+    baseUrlEnv: "OPENAI_CODEX_BASE_URL",
+    model: "gpt-5.5",
     modelEnv: "OPENAI_CODEX_MODEL",
+  });
+
+  expect(readCodexApiEnvironment({
+    CODEX_API_BASE_URL: "https://new-gateway.test/v1",
+    OPENAI_CODEX_ACCESS_TOKEN: "legacy-key-must-not-cross-fill",
+    OPENAI_CODEX_MODEL: "gpt-5.5",
+  })).toEqual({
+    baseUrl: "https://new-gateway.test/v1",
+    baseUrlEnv: "CODEX_API_BASE_URL",
   });
 });

@@ -71,7 +71,7 @@ export function resolveModelSelectionPattern(
   const trimmed = pattern.trim();
   if (!trimmed) return {};
 
-  const matched = tryMatchModel(trimmed, models, options.allowFuzzy ?? true);
+  const matched = tryMatchModel(trimmed, models, options.allowFuzzy ?? true, options.defaultProvider);
   if (matched) {
     return {
       descriptor: cloneDescriptor(matched),
@@ -212,7 +212,17 @@ function tryMatchModel(
   modelPattern: string,
   models: readonly ModelDescriptor[],
   allowFuzzy: boolean,
+  defaultProvider?: string,
 ): ModelDescriptor | undefined {
+  if (!modelPattern.includes("/")) {
+    const normalized = modelPattern.trim().toLowerCase();
+    const bareMatches = models.filter((model) => model.model.toLowerCase() === normalized);
+    if (bareMatches.length > 1) {
+      if (!defaultProvider) return undefined;
+      const providerMatches = bareMatches.filter((model) => equalsIgnoreCase(model.provider, defaultProvider));
+      return providerMatches.length === 1 ? providerMatches[0] : undefined;
+    }
+  }
   const exact = findExactModelReferenceMatch(modelPattern, models);
   if (exact || !allowFuzzy) return exact;
 
@@ -226,7 +236,15 @@ function tryMatchModel(
   if (matches.length === 0) return undefined;
 
   const aliases = matches.filter((model) => isAlias(model.model));
-  const candidates = aliases.length > 0 ? aliases : matches;
+  let candidates = aliases.length > 0 ? aliases : matches;
+  if (!modelPattern.includes("/")) {
+    const matchingProviders = new Set(candidates.map((model) => model.provider.toLowerCase()));
+    if (matchingProviders.size > 1) {
+      if (!defaultProvider) return undefined;
+      candidates = candidates.filter((model) => equalsIgnoreCase(model.provider, defaultProvider));
+      if (candidates.length === 0) return undefined;
+    }
+  }
   return candidates.slice().sort((a, b) => b.model.localeCompare(a.model))[0];
 }
 
