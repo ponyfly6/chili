@@ -42,10 +42,10 @@ test("follows up an existing task through the child session and records a new ru
 
     expect(runtime.inputs[0]).toMatchObject({
       sessionId: "session_child",
-      cwd: "/repo",
       text: "check the package name again",
       maxTurns: 3,
     });
+    expect(runtime.inputs[0]).not.toHaveProperty("cwd");
     expect(runtime.inputs[0]).not.toHaveProperty("system");
     expect(result.result.status).toBe("completed");
     expect(result.task).toMatchObject({

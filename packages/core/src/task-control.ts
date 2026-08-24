@@ -548,7 +548,8 @@ export class AgentTaskControlService {
       sessionId: task.childSessionId,
       text: input.text,
     };
-    if (task.cwd) promptInput.cwd = task.cwd;
+    // A task's cwd is scheduling/audit metadata and may be stale after replay.
+    // RuntimeService resolves existing-session cwd from the session projection.
     if (input.maxTurns !== undefined) promptInput.maxTurns = input.maxTurns;
     promptInput.signal = signal;
     return promptInput;

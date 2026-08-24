@@ -720,7 +720,7 @@ export async function buildCliChildPromptFragments(input: {
       ...(input.projectRoot ? { projectRoot: input.projectRoot } : {}),
     })),
     chiliChildRuntimeBasePromptFragment(),
-    ...(await buildTaskFollowupPromptFragments(input.store, input.sessionId)),
+    ...(await buildTaskFollowupPromptFragments(input.store, input.sessionId, input.cwd)),
   ];
 }
 
@@ -740,6 +740,7 @@ function chiliChildRuntimeBasePromptFragment(): PromptFragment {
 async function buildTaskFollowupPromptFragments(
   store: ObservableEventStore,
   sessionId: SessionId,
+  cwd: string,
 ): Promise<PromptFragment[]> {
   const tasks = await store.agentTasks({ childSessionId: sessionId, limit: 10 });
   if (tasks.length === 0) return [];
@@ -748,11 +749,10 @@ async function buildTaskFollowupPromptFragments(
       `Agent task metadata invariant violated: child session ${sessionId} maps to ${tasks.length} tasks`,
     );
   }
-  return [taskFollowupPromptFragment(tasks[0] as AgentTaskRow)];
+  return [taskFollowupPromptFragment(tasks[0] as AgentTaskRow, cwd)];
 }
 
-function taskFollowupPromptFragment(task: AgentTaskRow): PromptFragment {
-  const cwd = task.cwd ? ` Repository cwd: ${task.cwd}.` : "";
+function taskFollowupPromptFragment(task: AgentTaskRow, cwd: string): PromptFragment {
   return {
     id: `chili.task.followup.${task.id}`,
     layer: "developer",
@@ -761,7 +761,7 @@ function taskFollowupPromptFragment(task: AgentTaskRow): PromptFragment {
     lifecycle: "turn",
     trust: "system",
     content: [
-      `Subagent task id: ${task.id}.${cwd}`,
+      `Subagent task id: ${task.id}. Repository cwd: ${cwd}.`,
       `Agent path: ${task.path} (logical agent identifier, not a filesystem path).`,
       "Use repository-relative paths, or absolute paths under the repository cwd; never prefix file paths with the agent path.",
       "This is a follow-up for an existing task; answer in the task context and call complete_task with this task id when finished.",

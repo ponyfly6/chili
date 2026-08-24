@@ -1218,7 +1218,7 @@ test("CLI child prompt fragments only inject follow-up context for the matching 
       taskName: "reader",
       generation: 1,
       childSessionId: "session_child" as SessionId,
-      cwd: repo,
+      cwd: "/stale/task-projection",
       createdAt: 1,
       updatedAt: 1,
     } satisfies AgentTaskRow;
@@ -1241,13 +1241,16 @@ test("CLI child prompt fragments only inject follow-up context for the matching 
     expect(mismatched.some((fragment) => fragment.id.startsWith("chili.task.followup."))).toBe(false);
 
     const matched = await buildCliChildPromptFragments(common);
-    expect(matched.find((fragment) => fragment.id.startsWith("chili.task.followup."))).toEqual(
+    const followupFragment = matched.find((fragment) => fragment.id.startsWith("chili.task.followup."));
+    expect(followupFragment).toEqual(
       expect.objectContaining({
         id: "chili.task.followup.task_reader",
         layer: "developer",
         source: "runtime",
       }),
     );
+    expect(followupFragment?.content).toContain(`Repository cwd: ${repo}.`);
+    expect(followupFragment?.content).not.toContain("/stale/task-projection");
 
     const duplicateStore = {
       agentTasks: async () => [
