@@ -80,7 +80,7 @@ import type {
 import { UnknownEventCursorError } from "@chili/store";
 import type { EventPublisher, EventStore } from "@chili/store";
 import type { PromptCommandControl, PromptCommandRunResult } from "./commands.js";
-import { PromptCommandAmbiguousError, PromptCommandNotFoundError } from "./commands.js";
+import { PromptCommandNotFoundError, PromptCommandUsageError } from "./commands.js";
 import type {
   AgentMailboxQuery,
   AgentMailboxRow,
@@ -653,20 +653,22 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "command" || route.name === "commandAsync") {
         const body = await readJson<CommandPromptBody>(request);
-        if (typeof body.name !== "string" || body.name.trim().length === 0) throw badRequest("name is required");
-        if (body.args !== undefined && typeof body.args !== "string") throw badRequest("args must be a string when provided");
         await options.service.assertSessionTurnAllowed(route.sessionId);
         const session = await requireSession(options.store, route.sessionId);
+        if (typeof body.commandId !== "string" || body.commandId.trim().length === 0) {
+          throw badRequest("commandId is required");
+        }
+        if (body.args !== undefined && typeof body.args !== "string") throw badRequest("args must be a string when provided");
         const cwd = await authoritativeRequestCwd(session.cwd, body.cwd);
 
         const command = await requireCommandControl(options).run({
-          name: body.name.trim(),
+          commandId: body.commandId.trim(),
           ...(body.args ? { args: body.args } : {}),
           cwd,
         });
         const displayText = body.args?.trim()
-          ? `/${command.command.name} ${body.args.trim()}`
-          : `/${command.command.name}`;
+          ? `${command.command.path} ${body.args.trim()}`
+          : command.command.path;
         const input = buildSubmitPromptInput(route.sessionId, {
           text: command.prompt,
           displayText,
@@ -847,8 +849,8 @@ interface PromptBody {
 }
 
 interface CommandPromptBody {
-  name?: string;
-  args?: string;
+  commandId?: unknown;
+  args?: unknown;
   cwd?: unknown;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
@@ -1764,8 +1766,8 @@ function toHttpError(error: unknown): HttpError {
   if (err instanceof PromptCommandNotFoundError) {
     return { status: 404, message: err.message };
   }
-  if (err instanceof PromptCommandAmbiguousError) {
-    return { status: 409, message: err.message };
+  if (err instanceof PromptCommandUsageError) {
+    return { status: 400, message: err.message };
   }
   return { status: 500, message: err.message };
 }

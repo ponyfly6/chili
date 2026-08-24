@@ -42,8 +42,8 @@ import type {
   RuntimeModelDescriptor,
   RuntimePermissionConfig,
   RuntimePermissionProfileId,
-  RuntimePromptCommandInvocation,
-  RuntimePromptCommandList,
+  RuntimeCommandCatalog,
+  RuntimeCommandInvocation,
   RuntimeSessionRef,
   ServiceTier,
   SessionId,
@@ -65,6 +65,7 @@ import type {
   RuntimeTeamMergeService,
 } from "./runtime-http.js";
 import type { PromptCommandControl, PromptCommandRunResult } from "./commands.js";
+import { PromptCommandNotFoundError, PromptCommandUsageError } from "./commands.js";
 import { createRuntimeHttpHandler } from "./runtime-http.js";
 
 test("serves sessions and event backlog over the runtime HTTP handler", async () => {
@@ -1285,7 +1286,7 @@ test("serves prompt commands and submits expanded command prompts", async () => 
   const listResponse = await handler(new Request("http://chili.test/commands"));
   expect(listResponse.status).toBe(200);
   expect(await listResponse.json()).toMatchObject({
-    commands: [{ name: "joke", description: "Tell a joke" }],
+    roots: [{ id: "prompt.project.joke", name: "joke", description: "Tell a joke" }],
   });
 
   const reloadResponse = await handler(
@@ -1298,10 +1299,11 @@ test("serves prompt commands and submits expanded command prompts", async () => 
     new Request(`http://chili.test/sessions/${session.sessionId}/command_async`, {
       method: "POST",
       body: JSON.stringify({
-        name: "joke",
+        commandId: "prompt.project.joke",
         args: "typescript",
         modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
         reasoningLevel: "high",
+        serviceTier: "fast",
       }),
       headers: { "content-type": "application/json" },
     }),
@@ -1309,7 +1311,7 @@ test("serves prompt commands and submits expanded command prompts", async () => 
 
   expect(submitResponse.status).toBe(202);
   expect(await submitResponse.json()).toEqual({ status: "accepted", sessionId: session.sessionId });
-  expect(commands.lastRun).toEqual({ name: "joke", args: "typescript", cwd: "/repo" });
+  expect(commands.lastRun).toEqual({ commandId: "prompt.project.joke", args: "typescript", cwd: "/repo" });
   expect(service.lastPrompt).toMatchObject({
     sessionId: session.sessionId,
     cwd: "/repo",
@@ -1317,11 +1319,51 @@ test("serves prompt commands and submits expanded command prompts", async () => 
     displayText: "/joke typescript",
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
     reasoningLevel: "high",
+    serviceTier: "fast",
     toolPolicy: {
       allowedTools: ["read", "write"],
       writeScope: ["AGENTS.md"],
     },
   });
+
+  commands.lastRun = undefined;
+  service.lastPrompt = undefined;
+  const legacyNameResponse = await handler(
+    new Request(`http://chili.test/sessions/${session.sessionId}/command_async`, {
+      method: "POST",
+      body: JSON.stringify({ name: "joke" }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  expect(legacyNameResponse.status).toBe(400);
+  expect(await legacyNameResponse.json()).toEqual({ error: { message: "commandId is required" } });
+  expect(commands.lastRun).toBeUndefined();
+  expect(service.lastPrompt).toBeUndefined();
+
+  const usageResponse = await handler(
+    new Request(`http://chili.test/sessions/${session.sessionId}/command`, {
+      method: "POST",
+      body: JSON.stringify({ commandId: "prompt.project.required" }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  expect(usageResponse.status).toBe(400);
+  expect(await usageResponse.json()).toEqual({
+    error: { message: "Command prompt.project.required requires: /prompt project required <input>" },
+  });
+
+  const missingResponse = await handler(
+    new Request(`http://chili.test/sessions/${session.sessionId}/command_async`, {
+      method: "POST",
+      body: JSON.stringify({ commandId: "prompt.project.missing" }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  expect(missingResponse.status).toBe(404);
+  expect(await missingResponse.json()).toEqual({
+    error: { message: "Unknown command ID: prompt.project.missing" },
+  });
+  expect(service.lastPrompt).toBeUndefined();
 });
 
 test("rejects direct HTTP prompts, commands, and goal continuations for subagent sessions", async () => {
@@ -1348,12 +1390,12 @@ test("rejects direct HTTP prompts, commands, and goal continuations for subagent
     }),
     new Request(`http://chili.test/sessions/${session.sessionId}/command_async`, {
       method: "POST",
-      body: JSON.stringify({ name: "joke" }),
+      body: JSON.stringify({ commandId: "prompt.project.joke" }),
       headers: { "content-type": "application/json" },
     }),
     new Request(`http://chili.test/sessions/${session.sessionId}/command`, {
       method: "POST",
-      body: JSON.stringify({ name: "joke", cwd: "   " }),
+      body: JSON.stringify({ commandId: "prompt.project.joke", cwd: "   " }),
       headers: { "content-type": "application/json" },
     }),
     new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
@@ -1392,12 +1434,12 @@ test("rejects a known pending child over HTTP before its session row exists", as
     }),
     new Request(`http://chili.test/sessions/${sessionId}/command_async`, {
       method: "POST",
-      body: JSON.stringify({name: "joke" }),
+      body: JSON.stringify({commandId: "prompt.project.joke" }),
       headers: { "content-type": "application/json" },
     }),
     new Request(`http://chili.test/sessions/${sessionId}/command`, {
       method: "POST",
-      body: JSON.stringify({name: "joke", cwd: null }),
+      body: JSON.stringify({commandId: "prompt.project.joke", cwd: null }),
       headers: { "content-type": "application/json" },
     }),
     new Request(`http://chili.test/sessions/${sessionId}/goal`, {
@@ -1847,8 +1889,8 @@ test("uses one canonical persisted workspace for prompt and command routes", asy
     const acceptedRoutes = [
       { action: "prompt", body: { text: "sync prompt" }, status: 200 },
       { action: "prompt_async", body: { text: "async prompt", cwd: workspaceAlias }, status: 202 },
-      { action: "command", body: { name: "joke" }, status: 200 },
-      { action: "command_async", body: { name: "joke", cwd: workspaceAlias }, status: 202 },
+      { action: "command", body: { commandId: "prompt.project.joke" }, status: 200 },
+      { action: "command_async", body: { commandId: "prompt.project.joke", cwd: workspaceAlias }, status: 202 },
     ] as const;
 
     for (const requestCase of acceptedRoutes) {
@@ -1871,7 +1913,7 @@ test("uses one canonical persisted workspace for prompt and command routes", asy
       service.lastPrompt = undefined;
       commands.lastRun = undefined;
       const body = action.startsWith("command")
-        ? { name: "joke", cwd: missingWorkspace }
+        ? { commandId: "prompt.project.joke", cwd: missingWorkspace }
         : { text: "wrong workspace", cwd: missingWorkspace };
       const response = await handler(new Request(
         `http://chili.test/sessions/${session.sessionId}/${action}`,
@@ -1892,7 +1934,7 @@ test("uses one canonical persisted workspace for prompt and command routes", asy
     for (const cwd of [null, 7, "\t "]) {
       for (const action of ["prompt", "prompt_async", "command", "command_async"] as const) {
         const body = action.startsWith("command")
-          ? { name: "joke", cwd }
+          ? { commandId: "prompt.project.joke", cwd }
           : { text: "invalid workspace", cwd };
         const response = await handler(new Request(
           `http://chili.test/sessions/${session.sessionId}/${action}`,
@@ -2099,24 +2141,31 @@ class MissingSessionRuntimeService extends FakeRuntimeService {
 
 class FakePromptCommandControl implements PromptCommandControl {
   reloadCount = 0;
-  lastRun: RuntimePromptCommandInvocation | undefined;
+  lastRun: RuntimeCommandInvocation | undefined;
 
-  async list(): Promise<RuntimePromptCommandList> {
-    return promptCommandList();
+  async list(): Promise<RuntimeCommandCatalog> {
+    return promptCommandCatalog();
   }
 
-  async reload(): Promise<RuntimePromptCommandList> {
+  async reload(): Promise<RuntimeCommandCatalog> {
     this.reloadCount += 1;
-    return promptCommandList();
+    return promptCommandCatalog();
   }
 
-  async run(input: RuntimePromptCommandInvocation): Promise<PromptCommandRunResult> {
+  async run(input: RuntimeCommandInvocation): Promise<PromptCommandRunResult> {
     this.lastRun = { ...input };
+    if (input.commandId === "prompt.project.required") {
+      throw new PromptCommandUsageError(input.commandId, "/prompt project required <input>");
+    }
+    if (input.commandId === "prompt.project.missing") {
+      throw new PromptCommandNotFoundError(input.commandId);
+    }
     return {
       prompt: `Tell a short joke about ${input.args ?? "coding"}.`,
-      command: promptCommandList().commands[0]!,
+      command: promptCommandCatalog().roots[0]!,
       metadata: {
-        commandName: "joke",
+        commandId: "prompt.project.joke",
+        commandPath: "/joke",
         source: "project",
         allowedTools: ["read", "write"],
         writeScope: ["AGENTS.md"],
@@ -2645,22 +2694,28 @@ function permissionConfig(profile: RuntimePermissionProfileId): RuntimePermissio
   };
 }
 
-function promptCommandList(): RuntimePromptCommandList {
+function promptCommandCatalog(): RuntimeCommandCatalog {
   return {
-    commands: [
+    roots: [
       {
+        id: "prompt.project.joke",
         name: "joke",
-        aliases: [],
+        path: "/joke",
+        title: "Joke",
         description: "Tell a joke",
-        category: "project",
+        group: "project",
         source: "project",
+        argumentMode: "optional",
         argumentHint: "[topic]",
+        selectionMode: "execute",
+        concurrency: "allow",
         hidden: false,
+        enabled: true,
+        executionTarget: "prompt",
+        children: [],
       },
     ],
     diagnostics: [],
-    directories: ["/repo/.chili/commands"],
-    skippedConflicts: [],
   };
 }
 

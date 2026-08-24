@@ -28,8 +28,8 @@ import type {
   RuntimeMcpToolsResponse,
   RuntimePermissionConfig,
   RuntimePermissionProfileId,
-  RuntimePromptCommandInvocation,
-  RuntimePromptCommandList,
+  RuntimeCommandCatalog,
+  RuntimeCommandInvocation,
   RuntimePromptAccepted,
   RuntimePromptResult,
   RuntimeSessionRef,
@@ -65,8 +65,8 @@ export interface RuntimeClient {
   setGoal(input: SetGoalRequest): Promise<SessionGoal>;
   updateGoal(input: UpdateGoalRequest): Promise<SessionGoal>;
   clearGoal(input: ClearGoalRequest): Promise<ClearGoalResult>;
-  listCommands(input?: ListCommandsRequest): Promise<RuntimePromptCommandList>;
-  reloadCommands(input?: ReloadCommandsRequest): Promise<RuntimePromptCommandList>;
+  listCommands(input?: ListCommandsRequest): Promise<RuntimeCommandCatalog>;
+  reloadCommands(input?: ReloadCommandsRequest): Promise<RuntimeCommandCatalog>;
   listMcpServers(input?: ListMcpServersRequest): Promise<RuntimeMcpListResponse>;
   mcpStatus(input?: McpStatusRequest): Promise<RuntimeMcpStatusResponse>;
   mcpServer(input: McpServerRequest): Promise<RuntimeMcpServerDescriptor>;
@@ -78,6 +78,7 @@ export interface RuntimeClient {
   logoutMcpServer(input: LogoutMcpServerRequest): Promise<RuntimeMcpLogoutResponse>;
   submitPrompt(input: SubmitPromptRequest): Promise<RuntimePromptResult>;
   submitPromptAsync(input: SubmitPromptRequest): Promise<RuntimePromptAccepted>;
+  submitCommand(input: SubmitCommandRequest): Promise<RuntimePromptResult>;
   submitCommandAsync(input: SubmitCommandRequest): Promise<RuntimePromptAccepted>;
   interruptSession(input: InterruptSessionRequest): Promise<RuntimeInterruptResult>;
   resolveApproval(input: ResolveApprovalRequest): Promise<RuntimeApprovalResolveResult>;
@@ -266,7 +267,7 @@ export interface LogoutMcpServerRequest {
   signal?: AbortSignal;
 }
 
-export interface SubmitCommandRequest extends RuntimePromptCommandInvocation {
+export interface SubmitCommandRequest extends RuntimeCommandInvocation {
   sessionId: SessionId;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
@@ -1017,11 +1018,11 @@ export class HttpRuntimeClient implements RuntimeClient {
     return this.delete(`sessions/${encodeURIComponent(input.sessionId)}/goal`, input.signal);
   }
 
-  listCommands(input: ListCommandsRequest = {}): Promise<RuntimePromptCommandList> {
+  listCommands(input: ListCommandsRequest = {}): Promise<RuntimeCommandCatalog> {
     return this.get("commands", input.signal);
   }
 
-  reloadCommands(input: ReloadCommandsRequest = {}): Promise<RuntimePromptCommandList> {
+  reloadCommands(input: ReloadCommandsRequest = {}): Promise<RuntimeCommandCatalog> {
     return this.post("commands/reload", {}, input.signal);
   }
 
@@ -1071,6 +1072,11 @@ export class HttpRuntimeClient implements RuntimeClient {
   submitPromptAsync(input: SubmitPromptRequest): Promise<RuntimePromptAccepted> {
     const { sessionId, signal, ...body } = input;
     return this.post(`sessions/${encodeURIComponent(sessionId)}/prompt_async`, body, signal);
+  }
+
+  submitCommand(input: SubmitCommandRequest): Promise<RuntimePromptResult> {
+    const { sessionId, signal, ...body } = input;
+    return this.post(`sessions/${encodeURIComponent(sessionId)}/command`, body, signal);
   }
 
   submitCommandAsync(input: SubmitCommandRequest): Promise<RuntimePromptAccepted> {

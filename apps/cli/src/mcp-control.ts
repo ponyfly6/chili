@@ -2,9 +2,10 @@ import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises
 import { dirname, join, resolve } from "node:path";
 import { projectStdioServerRequiresApproval } from "@chili/core";
 import {
+  createCommandRunInput,
   createCommandRegistry,
   createMcpPromptCommands,
-  resolveCommand,
+  serializeCommandCatalog,
   type CommandDefinition,
   type McpPromptDefinition,
   type McpPromptController,
@@ -39,6 +40,8 @@ import type {
   RuntimeMcpServerStatus,
   RuntimeMcpStatusResponse,
   RuntimeMcpToolsResponse,
+  RuntimeCommandCatalog,
+  RuntimeCommandNode,
   TimestampMs,
 } from "@chili/protocol";
 import type { RuntimeMcpControlService } from "@chili/server";
@@ -408,36 +411,49 @@ function createCompositePromptCommandControl(
 ): PromptCommandControl {
   return {
     async list() {
-      const snapshot = await base.list();
-      const mcpCommands = mcp.promptCommands();
-      return {
-        commands: [...snapshot.commands, ...mcpCommands.map(descriptorForCommand)],
-        diagnostics: snapshot.diagnostics,
-        directories: snapshot.directories,
-        skippedConflicts: snapshot.skippedConflicts,
-      };
+      return mergeRuntimeCommandCatalogs(await base.list(), mcpCommandCatalog(mcp));
     },
     async reload() {
       await base.reload();
       return this.list();
     },
     async run(input) {
-      const command = resolveMcpCommand(mcp.promptCommands(), input.name, input.args);
+      const baseCatalog = await base.list();
+      if (findRuntimeCommandNode(baseCatalog.roots, input.commandId)) return base.run(input);
+
+      const dynamicCatalog = mcpCommandCatalog(mcp);
+      const mergedCatalog = mergeRuntimeCommandCatalogs(baseCatalog, dynamicCatalog);
+      if (!findRuntimeCommandNode(mergedCatalog.roots, input.commandId)) return base.run(input);
+
+      const command = runMcpCommand(mcp.promptCommands(), input.commandId, input.args, input.cwd);
       if (command) return command;
       return base.run(input);
     },
   };
 }
 
-function resolveMcpCommand(commands: readonly CommandDefinition[], name: string, args: string | undefined): PromiseCommandRunResult | undefined {
+function runMcpCommand(
+  commands: readonly CommandDefinition[],
+  commandId: string,
+  args: string | undefined,
+  cwd: string | undefined,
+): PromiseCommandRunResult | undefined {
   if (commands.length === 0) return undefined;
-  const invocation = args?.trim() ? `/${name.trim()} ${args.trim()}` : `/${name.trim()}`;
   const registry = createCommandRegistry(commands);
-  const resolved = resolveCommand(registry, invocation, { includeHidden: true });
-  if (resolved.status !== "matched") return undefined;
+  const command = registry.findById(commandId);
+  if (!command?.run || command.executionTarget !== "prompt") return undefined;
+  const commandRun = command.run;
   const run = async (): Promise<PromptCommandRunResult> => {
-    const result = await resolved.command.run({}, resolved.args);
-    return { prompt: result.prompt, command: descriptorForCommand(resolved.command), metadata: result.metadata };
+    const raw = args?.trim() ?? "";
+    const context = cwd === undefined ? {} : { cwd };
+    const result = await commandRun(context, createCommandRunInput(
+      raw ? `${command.path} ${raw}` : command.path,
+      raw,
+      command.path,
+    ));
+    const descriptor = findRuntimeCommandNode(serializeCommandCatalog(registry, context).roots, command.id);
+    if (!descriptor) throw new Error(`MCP command descriptor is missing: ${command.id}`);
+    return { prompt: result.prompt, command: descriptor, metadata: result.metadata };
   };
   return run();
 }
@@ -683,15 +699,120 @@ function mcpPromptContentText(content: unknown): string {
   return JSON.stringify(content);
 }
 
-function descriptorForCommand(command: CommandDefinition) {
+function mcpCommandCatalog(mcp: CliMcpRuntimeImpl): RuntimeCommandCatalog {
+  return serializeCommandCatalog(createCommandRegistry(mcp.promptCommands()), {});
+}
+
+function mergeRuntimeCommandCatalogs(
+  base: RuntimeCommandCatalog,
+  dynamic: RuntimeCommandCatalog,
+): RuntimeCommandCatalog {
+  const roots = base.roots.map(cloneRuntimeCommandNode);
+  const diagnostics = [...base.diagnostics, ...dynamic.diagnostics].map(cloneRuntimeCommandDiagnostic);
+  const ids = new Map<string, RuntimeCommandNode>();
+  const paths = new Map<string, RuntimeCommandNode>();
+  indexRuntimeCommandNodes(roots, ids, paths);
+
+  mergeRuntimeCommandNodes(roots, dynamic.roots, ids, paths, diagnostics);
   return {
-    name: command.name,
-    aliases: [...command.aliases],
-    description: command.description,
-    category: command.category,
-    source: command.source,
-    argumentHint: command.argumentHint,
-    hidden: command.hidden,
+    roots,
+    diagnostics,
+  };
+}
+
+function mergeRuntimeCommandNodes(
+  target: RuntimeCommandNode[],
+  incoming: readonly RuntimeCommandNode[],
+  ids: Map<string, RuntimeCommandNode>,
+  paths: Map<string, RuntimeCommandNode>,
+  diagnostics: RuntimeCommandCatalog["diagnostics"],
+): void {
+  for (const candidate of incoming) {
+    const pathOwner = paths.get(candidate.path);
+    const idOwner = ids.get(candidate.id);
+    const mergeTarget = pathOwner && idOwner === pathOwner && isMergeableCommandEnvelope(pathOwner, candidate)
+      ? pathOwner
+      : undefined;
+
+    if (mergeTarget) {
+      mergeRuntimeCommandNodes(mergeTarget.children, candidate.children, ids, paths, diagnostics);
+      continue;
+    }
+    if (pathOwner) {
+      diagnostics.push(commandConflictDiagnostic("duplicate_command_path", candidate, pathOwner));
+      continue;
+    }
+    if (idOwner) {
+      diagnostics.push(commandConflictDiagnostic("duplicate_command_id", candidate, idOwner));
+      continue;
+    }
+
+    const accepted = { ...candidate, children: [] };
+    target.push(accepted);
+    ids.set(accepted.id, accepted);
+    paths.set(accepted.path, accepted);
+    mergeRuntimeCommandNodes(accepted.children, candidate.children, ids, paths, diagnostics);
+  }
+}
+
+function isMergeableCommandEnvelope(existing: RuntimeCommandNode, incoming: RuntimeCommandNode): boolean {
+  return existing.id === incoming.id
+    && existing.path === incoming.path
+    && existing.name === incoming.name
+    && existing.selectionMode === "drilldown"
+    && incoming.selectionMode === "drilldown";
+}
+
+function commandConflictDiagnostic(
+  code: "duplicate_command_path" | "duplicate_command_id",
+  rejected: RuntimeCommandNode,
+  existing: RuntimeCommandNode,
+): RuntimeCommandCatalog["diagnostics"][number] {
+  const subject = code === "duplicate_command_path" ? rejected.path : rejected.id;
+  return {
+    level: "error",
+    code,
+    message: `Rejected ${rejected.id} because ${subject} is already owned by ${existing.id}.`,
+    path: rejected.path,
+    commandIds: [existing.id, rejected.id],
+  };
+}
+
+function indexRuntimeCommandNodes(
+  commands: readonly RuntimeCommandNode[],
+  ids: Map<string, RuntimeCommandNode>,
+  paths: Map<string, RuntimeCommandNode>,
+): void {
+  for (const command of commands) {
+    ids.set(command.id, command);
+    paths.set(command.path, command);
+    indexRuntimeCommandNodes(command.children, ids, paths);
+  }
+}
+
+function findRuntimeCommandNode(
+  commands: readonly RuntimeCommandNode[],
+  commandId: string,
+): RuntimeCommandNode | undefined {
+  for (const command of commands) {
+    if (command.id === commandId) return command;
+    const child = findRuntimeCommandNode(command.children, commandId);
+    if (child) return child;
+  }
+  return undefined;
+}
+
+function cloneRuntimeCommandNode(command: RuntimeCommandNode): RuntimeCommandNode {
+  return { ...command, children: command.children.map(cloneRuntimeCommandNode) };
+}
+
+function cloneRuntimeCommandDiagnostic(
+  diagnostic: RuntimeCommandCatalog["diagnostics"][number],
+): RuntimeCommandCatalog["diagnostics"][number] {
+  return {
+    ...diagnostic,
+    ...(diagnostic.commandIds ? { commandIds: [...diagnostic.commandIds] } : {}),
+    ...(diagnostic.origins ? { origins: [...diagnostic.origins] } : {}),
   };
 }
 

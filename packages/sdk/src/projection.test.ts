@@ -5204,7 +5204,44 @@ test("client sends model control requests and prompt overrides", async () => {
           endpoint: "https://gateway.example",
         }]
       : url.endsWith("/commands") || url.endsWith("/commands/reload")
-        ? ({ commands: [], diagnostics: [], directories: [], skippedConflicts: [] })
+        ? ({
+            roots: [{
+              id: "session",
+              name: "session",
+              path: "/session",
+              title: "Session",
+              description: "Session controls",
+              group: "session",
+              source: "builtin",
+              argumentMode: "none",
+              argumentHint: "",
+              selectionMode: "drilldown",
+              concurrency: "allow",
+              hidden: false,
+              enabled: true,
+              executionTarget: "client",
+              children: [{
+                id: "session.rename",
+                name: "rename",
+                path: "/session rename",
+                title: "Rename session",
+                description: "Rename the active session",
+                group: "session",
+                source: "builtin",
+                argumentMode: "required",
+                argumentHint: "<title>",
+                selectionMode: "execute",
+                concurrency: "allow",
+                hidden: false,
+                enabled: true,
+                executionTarget: "client",
+                children: [],
+              }],
+            }],
+            diagnostics: [],
+          })
+        : url.endsWith("/command")
+          ? ({ status: "completed", turns: [], finishReason: "stop" })
         : url.endsWith("/command_async")
           ? ({ status: "accepted", sessionId })
       : url.endsWith("/prompt_async")
@@ -5221,17 +5258,22 @@ test("client sends model control requests and prompt overrides", async () => {
   await client.getModelConfig({ sessionId });
   await client.setModel({ sessionId, modelSelection: { provider: "openai-codex", model: "gpt-5.5" } });
   await client.setReasoning({ sessionId, reasoningLevel: "high" });
-  await client.listCommands();
-  await client.reloadCommands();
+  const commands = await client.listCommands();
+  const reloadedCommands = await client.reloadCommands();
   await client.submitPromptAsync({
     sessionId,
     text: "hello",
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
     reasoningLevel: "xhigh",
   });
+  await client.submitCommand({
+    sessionId,
+    commandId: "prompt.project.joke",
+    args: "synchronous",
+  });
   await client.submitCommandAsync({
     sessionId,
-    name: "joke",
+    commandId: "prompt.project.joke",
     args: "typescript",
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
     reasoningLevel: "high",
@@ -5244,6 +5286,8 @@ test("client sends model control requests and prompt overrides", async () => {
     authSource: "environment",
     endpoint: "https://gateway.example",
   }]);
+  expect(commands.roots[0]?.children[0]?.id).toBe("session.rename");
+  expect(reloadedCommands).toEqual(commands);
 
   expect(records).toEqual([
     {
@@ -5286,10 +5330,18 @@ test("client sends model control requests and prompt overrides", async () => {
       },
     },
     {
+      url: "http://runtime.test/api/sessions/session_sdk_model/command",
+      method: "POST",
+      body: {
+        commandId: "prompt.project.joke",
+        args: "synchronous",
+      },
+    },
+    {
       url: "http://runtime.test/api/sessions/session_sdk_model/command_async",
       method: "POST",
       body: {
-        name: "joke",
+        commandId: "prompt.project.joke",
         args: "typescript",
         modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
         reasoningLevel: "high",
