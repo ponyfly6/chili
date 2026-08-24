@@ -69,9 +69,10 @@ test("projects the selected failed session status reason", () => {
   expect(chat.statusReason).toBe("provider stream disconnected");
 });
 
-test("clears stale session status reasons across explicit and turn status transitions", () => {
+test("keeps explicit session status canonical and applies only matching terminal turn fallback", () => {
   const sessionId = "session_status_reason_transitions" as SessionId;
-  const turnId = "turn_status_reason_transitions" as TurnId;
+  const firstTurnId = "turn_status_reason_transitions_first" as TurnId;
+  const secondTurnId = "turn_status_reason_transitions_second" as TurnId;
   const view = reduceRuntimeEvents([
     {
       id: "event_status_reason_transition_session",
@@ -114,27 +115,63 @@ test("clears stale session status reasons across explicit and turn status transi
       type: "turn.started",
       time: 5 as TimestampMs,
       sessionId,
-      payload: { turnId },
+      payload: { turnId: firstTurnId },
     },
   ], view);
-  expect(chatSessionView(view, { sessionId }).statusReason).toBeUndefined();
+  expect(chatSessionView(view, { sessionId })).toMatchObject({
+    status: "running",
+    statusReason: "prompt_submitted",
+  });
+
+  reduceRuntimeEvents([
+    {
+      id: "event_status_reason_transition_first_completed",
+      type: "turn.completed",
+      time: 6 as TimestampMs,
+      sessionId,
+      payload: { turnId: firstTurnId, status: "completed" },
+    },
+    {
+      id: "event_status_reason_transition_second_started",
+      type: "turn.started",
+      time: 7 as TimestampMs,
+      sessionId,
+      payload: { turnId: secondTurnId },
+    },
+  ], view);
+  expect(chatSessionView(view, { sessionId })).toMatchObject({
+    status: "running",
+    statusReason: "prompt_submitted",
+  });
 
   reduceRuntimeEvents([
     {
       id: "event_status_reason_transition_streaming",
       type: "session.status_changed",
-      time: 6 as TimestampMs,
+      time: 8 as TimestampMs,
       sessionId,
-      payload: { sessionId, status: "running", turnId, reason: "streaming" },
+      payload: { sessionId, status: "running", turnId: secondTurnId, reason: "streaming" },
     },
     {
-      id: "event_status_reason_transition_turn_failed",
+      id: "event_status_reason_transition_stale_turn_failed",
       type: "turn.completed",
-      time: 7 as TimestampMs,
+      time: 9 as TimestampMs,
       sessionId,
-      payload: { turnId, status: "failed" },
+      payload: { turnId: firstTurnId, status: "failed" },
     },
   ], view);
+  expect(chatSessionView(view, { sessionId })).toMatchObject({
+    status: "running",
+    statusReason: "streaming",
+  });
+
+  reduceRuntimeEvents([{
+    id: "event_status_reason_transition_current_turn_failed",
+    type: "turn.completed",
+    time: 10 as TimestampMs,
+    sessionId,
+    payload: { turnId: secondTurnId, status: "failed" },
+  }], view);
   const failedBeforeReason = chatSessionView(view, { sessionId });
   expect(failedBeforeReason.status).toBe("failed");
   expect(failedBeforeReason.statusReason).toBeUndefined();
@@ -142,11 +179,188 @@ test("clears stale session status reasons across explicit and turn status transi
   reduceRuntimeEvents([{
     id: "event_status_reason_transition_failed_reason",
     type: "session.status_changed",
-    time: 8 as TimestampMs,
+    time: 11 as TimestampMs,
     sessionId,
-    payload: { sessionId, status: "failed", turnId, reason: "fresh failure" },
+    payload: { sessionId, status: "failed", turnId: secondTurnId, reason: "fresh failure" },
   }], view);
   expect(chatSessionView(view, { sessionId }).statusReason).toBe("fresh failure");
+});
+
+test("falls back to turn lifecycle until an explicit session status is seen", () => {
+  const sessionId = "session_legacy_lifecycle" as SessionId;
+  const turnId = "turn_legacy_lifecycle" as TurnId;
+  const view = reduceRuntimeEvents([{
+    id: "event_legacy_session",
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd: "/repo" },
+  }], createRuntimeView());
+
+  reduceRuntimeEvents([{
+    id: "event_legacy_turn_started",
+    type: "turn.started",
+    time: 2 as TimestampMs,
+    sessionId,
+    payload: { turnId },
+  }], view);
+  expect(chatSessionView(view, { sessionId }).status).toBe("running");
+
+  reduceRuntimeEvents([{
+    id: "event_legacy_turn_completed",
+    type: "turn.completed",
+    time: 3 as TimestampMs,
+    sessionId,
+    payload: { turnId, status: "completed" },
+  }], view);
+  expect(chatSessionView(view, { sessionId }).status).toBe("idle");
+});
+
+test("projects authoritative session cwd and transient retry details", () => {
+  const sessionId = "session_retry_projection" as SessionId;
+  const turnId = "turn_retry_projection" as TurnId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_retry_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      payload: { sessionId, cwd: "/stored/workspace" },
+    },
+    {
+      id: "event_retry_running",
+      type: "session.status_changed",
+      time: 2 as TimestampMs,
+      sessionId,
+      payload: { sessionId, status: "running", turnId },
+    },
+    {
+      id: "event_retry_scheduled",
+      type: "turn.retry_scheduled",
+      time: 3 as TimestampMs,
+      sessionId,
+      payload: { turnId, attempt: 2, delayMs: 500, reason: "socket closed" },
+    },
+  ], createRuntimeView());
+
+  expect(chatSessionView(view, { sessionId })).toMatchObject({
+    cwd: "/stored/workspace",
+    status: "running",
+    retry: { turnId, attempt: 2, delayMs: 500, reason: "socket closed", scheduledAt: 3 },
+  });
+
+  reduceRuntimeEvents([{
+    id: "event_retry_resumed",
+    type: "turn.model_metadata",
+    time: 4 as TimestampMs,
+    sessionId,
+    payload: { turnId, provider: "test", model: "retry-ok" },
+  }], view);
+  expect(chatSessionView(view, { sessionId }).retry).toBeUndefined();
+});
+
+test("does not clear retry state for activity from a different turn", () => {
+  const sessionId = "session_retry_turn_scope" as SessionId;
+  const retryTurnId = "turn_retry_turn_scope" as TurnId;
+  const otherTurnId = "turn_retry_turn_scope_other" as TurnId;
+  const otherMessageId = "message_retry_turn_scope_other" as MessageId;
+  const otherPartId = "part_retry_turn_scope_other" as PartId;
+  const retryMessageId = "message_retry_turn_scope_current" as MessageId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_retry_turn_scope_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_retry_turn_scope_running",
+      type: "session.status_changed",
+      time: 2 as TimestampMs,
+      sessionId,
+      payload: { sessionId, status: "running", turnId: retryTurnId },
+    },
+    {
+      id: "event_retry_turn_scope_scheduled",
+      type: "turn.retry_scheduled",
+      time: 3 as TimestampMs,
+      sessionId,
+      payload: { turnId: retryTurnId, attempt: 3, delayMs: 750, reason: "retry current turn" },
+    },
+    {
+      id: "event_retry_turn_scope_other_message",
+      type: "message.created",
+      time: 4 as TimestampMs,
+      sessionId,
+      payload: { messageId: otherMessageId, role: "assistant", turnId: otherTurnId },
+    },
+    {
+      id: "event_retry_turn_scope_other_part",
+      type: "message.part_added",
+      time: 5 as TimestampMs,
+      sessionId,
+      payload: {
+        messageId: otherMessageId,
+        part: { id: otherPartId, messageId: otherMessageId, sessionId, type: "text", text: "other turn" },
+      },
+    },
+    {
+      id: "event_retry_turn_scope_other_delta",
+      type: "message.part_delta",
+      time: 6 as TimestampMs,
+      sessionId,
+      payload: { messageId: otherMessageId, partId: otherPartId, field: "text", delta: " output" },
+    },
+    {
+      id: "event_retry_turn_scope_other_metadata",
+      type: "turn.model_metadata",
+      time: 7 as TimestampMs,
+      sessionId,
+      payload: { turnId: otherTurnId, provider: "test", model: "other-turn" },
+    },
+    {
+      id: "event_retry_turn_scope_other_tool",
+      type: "tool.call_started",
+      time: 8 as TimestampMs,
+      sessionId,
+      payload: {
+        turnId: otherTurnId,
+        callId: "toolcall_retry_turn_scope_other" as ToolCallId,
+        toolName: "read",
+        input: { path: "README.md" },
+      },
+    },
+  ], createRuntimeView());
+
+  expect(chatSessionView(view, { sessionId }).retry).toMatchObject({ turnId: retryTurnId });
+
+  reduceRuntimeEvents([
+    {
+      id: "event_retry_turn_scope_current_message",
+      type: "message.created",
+      time: 9 as TimestampMs,
+      sessionId,
+      payload: { messageId: retryMessageId, role: "assistant", turnId: retryTurnId },
+    },
+    {
+      id: "event_retry_turn_scope_current_part",
+      type: "message.part_added",
+      time: 10 as TimestampMs,
+      sessionId,
+      payload: {
+        messageId: retryMessageId,
+        part: {
+          id: "part_retry_turn_scope_current" as PartId,
+          messageId: retryMessageId,
+          sessionId,
+          type: "text",
+          text: "retry succeeded",
+        },
+      },
+    },
+  ], view);
+  expect(chatSessionView(view, { sessionId }).retry).toBeUndefined();
 });
 
 test("projects exact assistant text phases without classifying missing metadata", () => {
@@ -314,8 +528,77 @@ test("projects only controlled tool execution context into message and tool rows
 
   expect(result?.type === "tool_result" ? result.executionContext : undefined).toEqual(expected);
   expect(tool?.kind === "tool" ? tool.executionContext : undefined).toEqual(expected);
+  expect(tool).toMatchObject({ kind: "tool", status: "completed", displayStatus: "succeeded" });
   expect(result?.type === "tool_result" ? result.executionContext : undefined).not.toHaveProperty("internalMetadata");
   expect(tool?.kind === "tool" ? tool.executionContext : undefined).not.toHaveProperty("internalMetadata");
+});
+
+test("marks completed tools failed when process execution context reports failure", () => {
+  const failures: Array<[string, ToolResultExecutionContext]> = [
+    ["exit", { exitCode: 2, timedOut: false, aborted: false, signal: null }],
+    ["timeout", { exitCode: null, timedOut: true, aborted: false, signal: null }],
+    ["abort", { exitCode: null, timedOut: false, aborted: true, signal: null }],
+    ["signal", { exitCode: null, timedOut: false, aborted: false, signal: "SIGTERM" }],
+  ];
+
+  for (const [suffix, executionContext] of failures) {
+    const sessionId = `session_execution_failed_${suffix}` as SessionId;
+    const turnId = `turn_execution_failed_${suffix}` as TurnId;
+    const messageId = `message_execution_failed_${suffix}` as MessageId;
+    const callId = `toolcall_execution_failed_${suffix}` as ToolCallId;
+    const events: ChiliEvent[] = [
+      {
+        id: `event_execution_failed_session_${suffix}`,
+        type: "session.created",
+        time: 1 as TimestampMs,
+        sessionId,
+        payload: { sessionId, cwd: "/repo" },
+      },
+      {
+        id: `event_execution_failed_message_${suffix}`,
+        type: "message.created",
+        time: 2 as TimestampMs,
+        sessionId,
+        payload: { messageId, role: "assistant", turnId },
+      },
+      {
+        id: `event_execution_failed_tool_${suffix}`,
+        type: "tool.call_started",
+        time: 3 as TimestampMs,
+        sessionId,
+        payload: { turnId, callId, toolName: "bash", input: { command: "false" } },
+      },
+      {
+        id: `event_execution_failed_result_${suffix}`,
+        type: "message.part_added",
+        time: 4 as TimestampMs,
+        sessionId,
+        payload: {
+          messageId,
+          part: {
+            id: `part_execution_failed_${suffix}` as PartId,
+            messageId,
+            sessionId,
+            type: "tool_result",
+            callId,
+            output: "process failed",
+            executionContext,
+          },
+        },
+      },
+      {
+        id: `event_execution_failed_finished_${suffix}`,
+        type: "tool.call_finished",
+        time: 5 as TimestampMs,
+        sessionId,
+        payload: { callId, status: "completed", output: "process failed" },
+      },
+    ];
+    const tool = chatSessionView(reduceRuntimeEvents(events, createRuntimeView()), { sessionId })
+      .items.find((item) => item.kind === "tool");
+
+    expect(tool).toMatchObject({ kind: "tool", status: "completed", displayStatus: "failed" });
+  }
 });
 
 test("replays session, message, tool, and approval events into a runtime view", () => {
@@ -507,7 +790,7 @@ test("restores a waiting session to running only after all approvals clear and a
     },
   ], waitingView);
 
-  expect(waitingView.sessions[sessionId]?.status).toBe("waiting_for_approval");
+  expect(waitingView.sessions[sessionId]?.status).toBe("running");
   expect(chatSessionView(waitingView, { sessionId }).status).toBe("waiting_for_approval");
   expect(pendingApprovals(waitingView, sessionId).map((approval) => approval.id)).toEqual([secondApprovalId]);
 

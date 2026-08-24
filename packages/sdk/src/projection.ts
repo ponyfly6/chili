@@ -91,6 +91,17 @@ export interface RuntimeSessionView {
   currentTurnId?: TurnId;
   statusReason?: string;
   delegationPolicy?: DelegationPolicy;
+  /** True once session.status_changed establishes the modern lifecycle source. */
+  hasExplicitStatus?: boolean;
+  retry?: RuntimeTurnRetryView;
+}
+
+export interface RuntimeTurnRetryView {
+  turnId: TurnId;
+  attempt: number;
+  delayMs: number;
+  reason: string;
+  scheduledAt: number;
 }
 
 export interface RuntimeMessageView {
@@ -876,6 +887,7 @@ export interface RuntimeInlineAgentIntegrationView {
 
 export interface ChatSessionView {
   sessionId?: SessionId;
+  cwd?: string;
   status: RuntimeSessionStatus | "unknown";
   statusReason?: string;
   items: ChatTranscriptItem[];
@@ -885,6 +897,7 @@ export interface ChatSessionView {
   generatedAt: string;
   latestModelMetadata?: ModelMetadataPayload;
   usageSummary?: ModelUsage;
+  retry?: RuntimeTurnRetryView;
   lastEventId?: string;
 }
 
@@ -1052,7 +1065,9 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       const sessionId = matchingEnvelopeSessionId(event.sessionId, event.payload?.sessionId);
       if (!sessionId) break;
       const session = upsertSession(view, sessionId, event.time);
+      session.hasExplicitStatus = true;
       setSessionStatus(session, event.payload.status, event.payload.reason);
+      clearSessionRetry(view, sessionId, event.payload.turnId);
       session.updatedAt = event.time;
       assignOptional(session, "currentTurnId", event.payload.turnId);
       if (event.payload.turnId && event.payload.status === "cancelled") {
@@ -1081,7 +1096,8 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       view.turnStartedAt[event.payload.turnId] = event.time;
       if (event.sessionId) {
         const session = upsertSession(view, event.sessionId, event.time);
-        setSessionStatus(session, "running");
+        if (!session.hasExplicitStatus) setSessionStatus(session, "running");
+        clearSessionRetry(view, event.sessionId, event.payload.turnId);
         session.currentTurnId = event.payload.turnId;
         session.updatedAt = event.time;
       }
@@ -1091,8 +1107,35 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       view.turnStatuses[event.payload.turnId] = event.payload.status;
       if (event.sessionId) {
         const session = upsertSession(view, event.sessionId, event.time);
-        setSessionStatus(session, event.payload.status === "completed" ? "idle" : event.payload.status);
-        session.currentTurnId = event.payload.turnId;
+        const isCurrentTurn = session.currentTurnId === undefined || session.currentTurnId === event.payload.turnId;
+        if (!session.hasExplicitStatus) {
+          setSessionStatus(session, event.payload.status === "completed" ? "idle" : event.payload.status);
+        } else if (
+          isCurrentTurn
+          && (event.payload.status === "failed" || event.payload.status === "cancelled")
+          && !isTerminalSessionStatus(session.status)
+        ) {
+          // A turn terminal event is persisted before the matching session
+          // terminal event. Preserve the session event as the normal source of
+          // truth, but fail closed if a crash leaves only the turn terminal.
+          setSessionStatus(session, event.payload.status);
+        }
+        clearSessionRetry(view, event.sessionId, event.payload.turnId);
+        if (isCurrentTurn) session.currentTurnId = event.payload.turnId;
+        session.updatedAt = event.time;
+      }
+      break;
+    }
+    case "turn.retry_scheduled": {
+      if (event.sessionId) {
+        const session = upsertSession(view, event.sessionId, event.time);
+        session.retry = {
+          turnId: event.payload.turnId,
+          attempt: event.payload.attempt,
+          delayMs: event.payload.delayMs,
+          reason: event.payload.reason,
+          scheduledAt: event.time,
+        };
         session.updatedAt = event.time;
       }
       break;
@@ -1104,7 +1147,10 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       }
       view.modelMetadataByTurn[event.payload.turnId] = runtimeModelMetadata(event.payload, event.time, event.sessionId, existing);
       const sessionId = event.sessionId ?? existing?.sessionId;
-      if (sessionId) touchSession(view, sessionId, event.time);
+      if (sessionId) {
+        clearSessionRetry(view, sessionId, event.payload.turnId);
+        touchSession(view, sessionId, event.time);
+      }
       break;
     }
     case "message.created": {
@@ -1129,6 +1175,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
     case "message.part_added": {
       const message = view.messages[event.payload.messageId];
       if (!message) break;
+      if (message.turnId) clearSessionRetry(view, message.sessionId, message.turnId);
       const existingIndex = message.parts.findIndex((part) => part.id === event.payload.part.id);
       if (existingIndex >= 0) {
         message.parts[existingIndex] = event.payload.part;
@@ -1146,8 +1193,9 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
     }
     case "message.part_delta": {
       const entry = view.partIndex[event.payload.partId];
-      applyPartDelta(view, event.payload.partId as PartId, event.payload.field, event.payload.delta);
       const message = entry ? view.messages[entry.messageId] : undefined;
+      if (message?.turnId) clearSessionRetry(view, message.sessionId, message.turnId);
+      applyPartDelta(view, event.payload.partId as PartId, event.payload.field, event.payload.delta);
       if (message && entry) {
         message.updatedAt = event.time;
         const part = message.parts[entry.index];
@@ -1157,6 +1205,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       break;
     }
     case "tool.call_started": {
+      if (event.sessionId) clearSessionRetry(view, event.sessionId, event.payload.turnId);
       const toolCall: RuntimeToolCallView = {
         id: event.payload.callId,
         status: "running",
@@ -1184,7 +1233,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       setToolPartStatus(view, event.payload.callId, event.payload.status);
       if (event.payload.status === "waiting_for_approval" && toolCall.sessionId) {
         const session = upsertSession(view, toolCall.sessionId, event.time);
-        setSessionStatus(session, "waiting_for_approval");
+        if (!session.hasExplicitStatus) setSessionStatus(session, "waiting_for_approval");
         session.updatedAt = event.time;
       } else if (
         event.payload.status === "running"
@@ -1192,7 +1241,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
         && !hasPendingApprovalForSession(view, toolCall.sessionId)
       ) {
         const session = upsertSession(view, toolCall.sessionId, event.time);
-        if (session.status === "waiting_for_approval") {
+        if (!session.hasExplicitStatus && session.status === "waiting_for_approval") {
           setSessionStatus(session, "running");
           session.updatedAt = event.time;
         }
@@ -1438,18 +1487,26 @@ export function chatSessionView(view: ChiliRuntimeView, input: ChatSessionInput 
   const items = [...messages, ...tools, ...approvals]
     .sort((left, right) => chatItemTime(left) - chatItemTime(right))
     .slice(-limit);
+  const pendingApprovalRows = approvals.filter((approval) => approval.status === "pending");
+  const effectiveStatus = session?.status === "running"
+    && (pendingApprovalRows.length > 0
+      || tools.some((tool) => tool.status === "waiting_for_approval"))
+    ? "waiting_for_approval"
+    : session?.status ?? "unknown";
   const output: ChatSessionView = {
-    status: session?.status ?? "unknown",
+    status: effectiveStatus,
     items,
-    pendingApprovals: approvals.filter((approval) => approval.status === "pending"),
+    pendingApprovals: pendingApprovalRows,
     activeTools: tools.filter((tool) => tool.status === "running" || tool.status === "waiting_for_approval" || tool.status === "validating"),
     generatedAt: input.generatedAt ?? new Date().toISOString(),
   };
   assignOptional(output, "sessionId", sessionId);
+  assignOptional(output, "cwd", session?.cwd || undefined);
   assignOptional(output, "statusReason", session?.statusReason);
   assignOptional(output, "goal", goal ? cloneSessionGoal(goal) : undefined);
   assignOptional(output, "latestModelMetadata", latestModelMetadata ? chatModelMetadata(latestModelMetadata) : undefined);
   assignOptional(output, "usageSummary", usageSummary);
+  assignOptional(output, "retry", session?.retry ? { ...session.retry } : undefined);
   assignOptional(output, "lastEventId", view.lastEventId);
   return output;
 }
@@ -2830,7 +2887,9 @@ function chatToolCallRow(
     kind: "tool",
     toolName: toolCall.toolName,
     status,
-    displayStatus: chatToolDisplayStatus(status, latestApproval),
+    displayStatus: status === "completed" && chatToolExecutionFailed(executionContext)
+      ? "failed"
+      : chatToolDisplayStatus(status, latestApproval),
     waitingForApproval: Boolean(pendingApproval),
     updatedAt: toolCall.updatedAt,
     inputSummary: chatToolInputSummary(toolCall.toolName, toolCall.input, pendingApproval?.patterns ?? latestApproval?.patterns ?? []),
@@ -2845,6 +2904,14 @@ function chatToolCallRow(
   assignOptional(row, "approvalStatus", pendingApproval?.status ?? latestApproval?.status);
   assignOptional(row, "approvalDecision", latestApproval?.decision);
   return row;
+}
+
+function chatToolExecutionFailed(context: ChatToolExecutionContext | undefined): boolean {
+  if (!context) return false;
+  return (typeof context.exitCode === "number" && context.exitCode !== 0)
+    || context.timedOut === true
+    || context.aborted === true
+    || (typeof context.signal === "string" && context.signal.length > 0);
 }
 
 function toolResultExecutionContexts(
@@ -4372,6 +4439,7 @@ function upsertSession(view: ChiliRuntimeView, sessionId: SessionId, time: numbe
     agentRunIds: [],
     taskIds: [],
     updatedAt: time,
+    hasExplicitStatus: false,
   };
   view.sessions[sessionId] = session;
   view.sessionIds.push(sessionId);
@@ -4389,6 +4457,10 @@ function setSessionStatus(
   } else {
     session.statusReason = reason;
   }
+}
+
+function isTerminalSessionStatus(status: RuntimeSessionStatus): boolean {
+  return status === "idle" || status === "failed" || status === "cancelled";
 }
 
 function upsertAgentRun(view: ChiliRuntimeView, runId: AgentRunId, path: AgentPath, time: number): RuntimeAgentView {
@@ -4535,8 +4607,15 @@ function linkApprovalToSession(view: ChiliRuntimeView, approval: RuntimeApproval
   if (!approval.sessionId) return;
   const session = upsertSession(view, approval.sessionId, time);
   if (!session.approvalIds.includes(approval.id)) session.approvalIds.push(approval.id);
-  setSessionStatus(session, "waiting_for_approval");
+  if (!session.hasExplicitStatus) setSessionStatus(session, "waiting_for_approval");
   session.updatedAt = time;
+}
+
+function clearSessionRetry(view: ChiliRuntimeView, sessionId: SessionId, turnId?: TurnId): void {
+  const session = view.sessions[sessionId];
+  if (!session?.retry) return;
+  if (turnId !== undefined && session.retry.turnId !== turnId) return;
+  delete session.retry;
 }
 
 function hasPendingApprovalForSession(view: ChiliRuntimeView, sessionId: SessionId): boolean {
