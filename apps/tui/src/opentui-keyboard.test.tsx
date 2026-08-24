@@ -348,6 +348,200 @@ test("/new starts a fresh runtime session for following prompts", async () => {
   }
 });
 
+test("fresh home keeps its standalone Chili title while typing slash and ordinary drafts", async () => {
+  for (const draft of ["ordinary draft", "/mod"]) {
+    const app = await mountShell(teamLiveFixture());
+
+    try {
+      expect(hasStandaloneChiliTitle(app.captureCharFrame())).toBe(true);
+
+      await typeText(app, draft);
+
+      const frame = app.captureCharFrame();
+      expect(frame).toContain(draft);
+      expect(hasStandaloneChiliTitle(frame)).toBe(true);
+    } finally {
+      app.renderer.destroy();
+    }
+  }
+});
+
+test("an explicitly resumed empty session starts in the session layout", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      activeSessionId: "session_resumed_empty" as SessionId,
+    },
+  });
+
+  try {
+    expect(hasStandaloneChiliTitle(app.captureCharFrame())).toBe(false);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("expired /model notice keeps an empty session draft and caret in the session composer", async () => {
+  const noticeTtlMs = 500;
+  let finishModelSelection: ((persisted: boolean) => void) | undefined;
+  const modelPersisted = new Promise<boolean>((resolve) => {
+    finishModelSelection = resolve;
+  });
+  const app = await mountShell(teamLiveFixture(), {
+    localMessageTtlMs: noticeTtlMs,
+    runtime: {
+      modelCandidates: [{ provider: "test-provider", model: "test-model" }],
+      setRuntimeModel: () => modelPersisted,
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressEscape());
+
+    let frame = app.captureCharFrame();
+    expect(frame).not.toContain("Model: test-provider/test-model");
+    expect(hasStandaloneChiliTitle(frame)).toBe(false);
+
+    await typeText(app, "caret");
+    await press(app, () => app.mockInput.pressArrow("left"));
+    const promptY = frameTextPosition(app.captureCharFrame(), "caret").y;
+
+    await act(async () => {
+      finishModelSelection?.(true);
+      await Promise.resolve();
+    });
+    await app.renderOnce();
+
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Model: test-provider/test-model");
+    expect(frame).toContain("caret");
+    expect(hasStandaloneChiliTitle(frame)).toBe(false);
+    expect(frameTextPosition(frame, "caret").y).toBe(promptY);
+
+    await act(async () => {
+      await Bun.sleep(noticeTtlMs + 150);
+    });
+    await app.renderOnce();
+
+    frame = app.captureCharFrame();
+    expect(frame).not.toContain("Model: test-provider/test-model");
+    expect(frame).toContain("caret");
+    expect(hasStandaloneChiliTitle(frame)).toBe(false);
+    expect(frameTextPosition(frame, "caret").y).toBe(promptY);
+
+    await typeText(app, "X");
+    expect(app.captureCharFrame()).toContain("careXt");
+
+    await press(app, () => app.mockInput.pressArrow("right"));
+    await backspace(app, "careXt".length);
+    frame = app.captureCharFrame();
+    expect(frame).not.toContain("careXt");
+    expect(frame).toContain("Ask anything");
+    expect(hasStandaloneChiliTitle(frame)).toBe(false);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/thinking enters the session layout and /new stably restores Home while it starts", async () => {
+  const noticeTtlMs = 500;
+  let finishNewSession: (() => void) | undefined;
+  const newSessionStarted = new Promise<void>((resolve) => {
+    finishNewSession = resolve;
+  });
+  const app = await mountShell(teamLiveFixture(), {
+    localMessageTtlMs: noticeTtlMs,
+    runtime: {
+      setRuntimeReasoning: async () => true,
+      startNewSession: () => newSessionStarted,
+    },
+  });
+
+  try {
+    await typeText(app, "/thinking low");
+    await press(app, () => app.mockInput.pressEnter());
+
+    let frame = app.captureCharFrame();
+    expect(frame).toContain("Thinking: low");
+    expect(hasStandaloneChiliTitle(frame)).toBe(false);
+
+    await act(async () => {
+      await Bun.sleep(noticeTtlMs + 150);
+    });
+    await app.renderOnce();
+
+    frame = app.captureCharFrame();
+    expect(frame).not.toContain("Thinking: low");
+    expect(hasStandaloneChiliTitle(frame)).toBe(false);
+
+    await typeText(app, "/new");
+    await press(app, () => app.mockInput.pressEnter());
+
+    frame = app.captureCharFrame();
+    expect(hasStandaloneChiliTitle(frame)).toBe(true);
+
+    await typeText(app, "new session draft");
+    const promptY = frameTextPosition(app.captureCharFrame(), "new session draft").y;
+    await act(async () => {
+      finishNewSession?.();
+      await Promise.resolve();
+    });
+    await app.renderOnce();
+
+    frame = app.captureCharFrame();
+    expect(frame).toContain("new session draft");
+    expect(hasStandaloneChiliTitle(frame)).toBe(true);
+    expect(frameTextPosition(frame, "new session draft").y).toBe(promptY);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("a stale /model completion cannot move a new-session draft out of Home", async () => {
+  let finishModelSelection: ((persisted: boolean) => void) | undefined;
+  const modelPersisted = new Promise<boolean>((resolve) => {
+    finishModelSelection = resolve;
+  });
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      modelCandidates: [{ provider: "test-provider", model: "test-model" }],
+      setRuntimeModel: () => modelPersisted,
+      startNewSession: async () => {},
+    },
+  });
+
+  try {
+    await typeText(app, "/model");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressEscape());
+    expect(app.captureCharFrame()).toContain("Ask anything");
+    expect(hasStandaloneChiliTitle(app.captureCharFrame())).toBe(false);
+
+    await typeText(app, "/new");
+    await press(app, () => app.mockInput.pressEnter());
+    expect(hasStandaloneChiliTitle(app.captureCharFrame())).toBe(true);
+
+    await typeText(app, "new session draft");
+    const promptY = frameTextPosition(app.captureCharFrame(), "new session draft").y;
+    await act(async () => {
+      finishModelSelection?.(true);
+      await Promise.resolve();
+    });
+    await app.renderOnce();
+
+    const frame = app.captureCharFrame();
+    expect(frame).not.toContain("Model: test-provider/test-model");
+    expect(frame).toContain("new session draft");
+    expect(hasStandaloneChiliTitle(frame)).toBe(true);
+    expect(frameTextPosition(frame, "new session draft").y).toBe(promptY);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("running session blocks a second prompt submit", async () => {
   const submitted: string[] = [];
   const app = await mountShell(teamLiveFixture(), {
@@ -4205,6 +4399,10 @@ function frameTextPosition(frame: string, text: string): { x: number; y: number 
     if (index >= 0) return { x: Bun.stringWidth(line.slice(0, index)), y };
   }
   throw new Error(`Frame did not include ${text}`);
+}
+
+function hasStandaloneChiliTitle(frame: string): boolean {
+  return frame.split("\n").some((line) => line.trim() === "Chili");
 }
 
 function selectionBgAt(app: { renderer: { currentRenderBuffer: { width: number; buffers: { bg: Float32Array } } } }, x: number, y: number): boolean {

@@ -118,6 +118,9 @@ interface PendingInterruptRequest {
 
 interface SlashActions {
   cwd: string;
+  enterSessionLayout: () => void;
+  currentSessionUiEpoch: () => number;
+  isSessionUiEpochCurrent: (epoch: number) => boolean;
   setView: (view: ShellView) => void;
   appendLocalItem: AppendLocalItem;
   appendShellItem: AppendShellItem;
@@ -276,6 +279,19 @@ export function ChatShellSurface(props: {
   const nextPastedImageIdRef = useRef(1);
   const [skillMentionBindings, setSkillMentionBindings] = useState<RuntimeSkillMention[]>([]);
   const [localItems, setLocalItems] = useState<LocalTranscriptItem[]>([]);
+  // A session reset invalidates notices and other UI work started by the old session.
+  const sessionUiEpochRef = useRef(0);
+  // The welcome screen is an entry state. Once work reaches the session layout,
+  // expiring transient notices must not remount the composer back on welcome.
+  const [sessionLayoutEntered, setSessionLayoutEntered] = useState(() => (
+    props.runtime.chatView.items.length > 0
+    || props.runtime.chatView.pendingApprovals.length > 0
+    || Boolean(
+      props.options?.sessionId
+      || props.runtime.activeSessionId
+      || props.runtime.chatView.sessionId,
+    )
+  ));
   const [statusClipboardFeedback, setStatusClipboardFeedback] = useState<StatusPageFeedback | undefined>(undefined);
   const deferredLocalItems = useDeferredValue(localItems);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -346,19 +362,29 @@ export function ChatShellSurface(props: {
     localItemTimersRef.current.delete(id);
     setLocalItems((current) => current.filter((item) => item.id !== id));
   }, []);
+  const enterSessionLayout = useCallback(() => {
+    setSessionLayoutEntered(true);
+  }, []);
+  const currentSessionUiEpoch = useCallback(() => sessionUiEpochRef.current, []);
+  const isSessionUiEpochCurrent = useCallback((epoch: number) => sessionUiEpochRef.current === epoch, []);
+  const invalidateSessionUiOperations = useCallback(() => {
+    sessionUiEpochRef.current += 1;
+  }, []);
   const appendLocalItem = useCallback<AppendLocalItem>((level, text, itemOptions) => {
     const item = localItem(level, text, itemOptions?.persistent, itemOptions?.bare);
+    enterSessionLayout();
     setLocalItems((current) => [...current, item]);
     if (itemOptions?.persistent || localMessageTtlMs <= 0) return;
     const timer = setTimeout(() => dismissLocalItem(item.id), localMessageTtlMs);
     localItemTimersRef.current.set(item.id, timer);
-  }, [dismissLocalItem, localMessageTtlMs]);
+  }, [dismissLocalItem, enterSessionLayout, localMessageTtlMs]);
   const appendShellItem = useCallback<AppendShellItem>((item) => {
     const createdAt = Date.now();
     const id = `${createdAt}:shell:${item.command}`;
+    enterSessionLayout();
     setLocalItems((current) => [...current, { id, kind: "shell", createdAt, ...item }]);
     return id;
-  }, []);
+  }, [enterSessionLayout]);
   const updateShellItem = useCallback<UpdateShellItem>((id, update) => {
     setLocalItems((current) => current.map((item) => item.kind === "shell" && item.id === id ? { ...item, ...update } : item));
   }, []);
@@ -369,6 +395,11 @@ export function ChatShellSurface(props: {
   useEffect(() => {
     if (view !== "status") clearStatusClipboardFeedback();
   }, [clearStatusClipboardFeedback, view]);
+  const runtimeSessionActivity = props.runtime.chatView.items.length > 0
+    || props.runtime.chatView.pendingApprovals.length > 0;
+  useEffect(() => {
+    if (runtimeSessionActivity) setSessionLayoutEntered(true);
+  }, [runtimeSessionActivity]);
   useEffect(() => {
     return () => {
       clearLocalItemTimers(localItemTimersRef.current);
@@ -456,6 +487,9 @@ export function ChatShellSurface(props: {
     props.runtime.revision,
     props.runtime.runtimeView,
   ]);
+  useEffect(() => {
+    if (inlineAgentBatches.length > 0) setSessionLayoutEntered(true);
+  }, [inlineAgentBatches.length]);
   const statusPage = statusPageModel({
     model: props.model,
     runtime: props.runtime,
@@ -571,6 +605,7 @@ export function ChatShellSurface(props: {
     });
   }, [appendLocalItem]);
   const startNewChatSession = useCallback(async () => {
+    invalidateSessionUiOperations();
     setView("chat");
     setAuthManualPrompt(undefined);
     setResumePicker(undefined);
@@ -582,8 +617,9 @@ export function ChatShellSurface(props: {
     clearLocalItems();
     scrollMessageToBottom();
     setTranscriptScrollOffset(0);
+    setSessionLayoutEntered(false);
     await props.runtime.startNewSession();
-  }, [clearLocalItems, history, props.runtime, scrollMessageToBottom, setAuthManualPrompt, setPrompt]);
+  }, [clearLocalItems, history, invalidateSessionUiOperations, props.runtime, scrollMessageToBottom, setAuthManualPrompt, setPrompt]);
   const prepareForSessionSwitch = useCallback(() => {
     setView("chat");
     setAuthManualPrompt(undefined);
@@ -594,16 +630,20 @@ export function ChatShellSurface(props: {
     clearLocalItems();
     scrollMessageToBottom();
     setTranscriptScrollOffset(0);
+    setSessionLayoutEntered(true);
   }, [clearLocalItems, history, scrollMessageToBottom, setAuthManualPrompt, setPrompt]);
   const resumeChatSession = useCallback(async (session: RuntimeSessionSummary) => {
     if (session.status === "archived") {
       appendLocalItem("error", "Archived sessions cannot be resumed yet.");
       return;
     }
+    invalidateSessionUiOperations();
+    const uiEpoch = currentSessionUiEpoch();
+    enterSessionLayout();
     setResumePicker(undefined);
     const resumed = await props.runtime.resumeSession(session);
-    if (resumed) prepareForSessionSwitch();
-  }, [appendLocalItem, prepareForSessionSwitch, props.runtime]);
+    if (resumed && isSessionUiEpochCurrent(uiEpoch)) prepareForSessionSwitch();
+  }, [appendLocalItem, currentSessionUiEpoch, enterSessionLayout, invalidateSessionUiOperations, isSessionUiEpochCurrent, prepareForSessionSwitch, props.runtime]);
   const openResumePicker = useCallback(() => {
     if (props.runtime.chatView.status === "running" || props.runtime.chatView.status === "waiting_for_approval") {
       appendLocalItem("error", "Finish or interrupt the current session before resuming another chat.");
@@ -629,19 +669,22 @@ export function ChatShellSurface(props: {
       appendLocalItem("error", "Finish or interrupt the current session before resuming another chat.");
       return;
     }
+    const uiEpoch = currentSessionUiEpoch();
+    enterSessionLayout();
     let sessions: RuntimeSessionSummary[];
     try {
       sessions = await props.runtime.listSessions();
     } catch {
       return;
     }
+    if (!isSessionUiEpochCurrent(uiEpoch)) return;
     const match = resolveResumeTarget(sessions, target);
     if (typeof match === "string") {
       appendLocalItem("error", match);
       return;
     }
     await resumeChatSession(match);
-  }, [appendLocalItem, props.runtime, resumeChatSession]);
+  }, [appendLocalItem, currentSessionUiEpoch, enterSessionLayout, isSessionUiEpochCurrent, props.runtime, resumeChatSession]);
   const openRenamePrompt = useCallback(() => {
     const sessionId = props.runtime.activeSessionId ?? props.runtime.chatView.sessionId;
     if (!sessionId) {
@@ -800,7 +843,10 @@ export function ChatShellSurface(props: {
     setMcpManager(initialMcpManagerState());
   }, []);
   const setModelSelection = useCallback(async (selection: ModelSelection, nextReasoningLevel?: ReasoningLevel) => {
+    const uiEpoch = currentSessionUiEpoch();
+    enterSessionLayout();
     const persisted = props.runtime.setRuntimeModel ? await props.runtime.setRuntimeModel(selection) : true;
+    if (!isSessionUiEpochCurrent(uiEpoch)) return;
     if (!persisted) {
       setModelPicker(undefined);
       appendLocalItem("error", `Model unchanged: failed to persist ${modelSelectionLabel(selection)}`);
@@ -819,6 +865,7 @@ export function ChatShellSurface(props: {
       reasoningPersisted = props.runtime.setRuntimeReasoning
         ? await props.runtime.setRuntimeReasoning(resolvedReasoning)
         : true;
+      if (!isSessionUiEpochCurrent(uiEpoch)) return;
       if (!reasoningPersisted) {
         appendLocalItem("error", `Thinking unchanged: failed to persist ${resolvedReasoning}`);
       }
@@ -832,14 +879,17 @@ export function ChatShellSurface(props: {
     const selectedModel = modelCandidates.find((candidate) => sameModelSelection(selection, modelDescriptorSelection(candidate)));
     const availabilityText = selectedModel?.available === false ? " (not configured)" : "";
     appendLocalItem("info", `Model: ${modelSelectionLabel(selection)}${reasoningText}${availabilityText}`);
-  }, [appendLocalItem, modelCandidates, props.runtime]);
+  }, [appendLocalItem, currentSessionUiEpoch, enterSessionLayout, isSessionUiEpochCurrent, modelCandidates, props.runtime]);
 
   const setReasoningLevel = useCallback(async (level: ReasoningLevel) => {
     if (!reasoningConfigurable) {
       appendLocalItem("error", `${capabilityModelLabel(capabilitySelection)} does not support configurable thinking`);
       return;
     }
+    const uiEpoch = currentSessionUiEpoch();
+    enterSessionLayout();
     const persisted = props.runtime.setRuntimeReasoning ? await props.runtime.setRuntimeReasoning(level) : true;
+    if (!isSessionUiEpochCurrent(uiEpoch)) return;
     if (!persisted) {
       setReasoningPicker(undefined);
       appendLocalItem("error", `Thinking unchanged: failed to persist ${level}`);
@@ -848,21 +898,24 @@ export function ChatShellSurface(props: {
     setReasoningLevelState(level);
     setReasoningPicker(undefined);
     appendLocalItem("info", `Thinking: ${level}`);
-  }, [appendLocalItem, capabilitySelection, props.runtime, reasoningConfigurable]);
+  }, [appendLocalItem, capabilitySelection, currentSessionUiEpoch, enterSessionLayout, isSessionUiEpochCurrent, props.runtime, reasoningConfigurable]);
 
   const setServiceTier = useCallback(async (nextServiceTier: ServiceTier) => {
     if (!serviceTierConfigurable) {
       appendLocalItem("error", `${capabilityModelLabel(capabilitySelection)} does not support selectable service tiers`);
       return;
     }
+    const uiEpoch = currentSessionUiEpoch();
+    enterSessionLayout();
     const persisted = props.runtime.setRuntimeServiceTier ? await props.runtime.setRuntimeServiceTier(nextServiceTier) : true;
+    if (!isSessionUiEpochCurrent(uiEpoch)) return;
     if (!persisted) {
       appendLocalItem("error", `Fast mode unchanged: failed to persist ${nextServiceTier}`);
       return;
     }
     setServiceTierState(nextServiceTier);
     appendLocalItem("info", nextServiceTier === "fast" ? "Fast mode: on" : "Fast mode: off (standard)");
-  }, [appendLocalItem, capabilitySelection, props.runtime, serviceTierConfigurable]);
+  }, [appendLocalItem, capabilitySelection, currentSessionUiEpoch, enterSessionLayout, isSessionUiEpochCurrent, props.runtime, serviceTierConfigurable]);
 
   const setPermissionProfile = useCallback(async (profile: RuntimePermissionProfileId) => {
     const item = props.runtime.permissionConfig?.profiles.find((candidate) => candidate.id === profile);
@@ -870,30 +923,38 @@ export function ChatShellSurface(props: {
       appendLocalItem("error", `${item.label}: ${item.disabledReason}`);
       return;
     }
+    const uiEpoch = currentSessionUiEpoch();
+    enterSessionLayout();
     const persisted = props.runtime.setRuntimePermissionProfile
       ? await props.runtime.setRuntimePermissionProfile(profile)
       : false;
+    if (!isSessionUiEpochCurrent(uiEpoch)) return;
     setPermissionsPicker(undefined);
     if (!persisted) {
       appendLocalItem("error", `Permissions unchanged: failed to select ${item?.label ?? profile}`);
       return;
     }
     appendLocalItem("info", `Permissions updated to ${item?.label ?? profile}`);
-  }, [appendLocalItem, props.runtime]);
+  }, [appendLocalItem, currentSessionUiEpoch, enterSessionLayout, isSessionUiEpochCurrent, props.runtime]);
   const setHideThinking = useCallback((hidden: boolean) => {
     setHideThinkingState(hidden);
     appendLocalItem("info", hidden ? "Thinking traces hidden." : "Thinking traces shown.");
   }, [appendLocalItem]);
 
   const ensureOpenAICodexDefaultModel = useCallback(async () => {
+    const uiEpoch = currentSessionUiEpoch();
     await props.runtime.refreshModelConfig?.();
+    if (!isSessionUiEpochCurrent(uiEpoch)) return;
     if (isValidModelSelection(modelSelection, modelCandidates)) return;
     const selection = defaultOpenAICodexSelection();
     await setModelSelection(selection);
+    if (!isSessionUiEpochCurrent(uiEpoch)) return;
     await props.runtime.refreshModelConfig?.();
-  }, [modelCandidates, modelSelection, props.runtime, setModelSelection]);
+  }, [currentSessionUiEpoch, isSessionUiEpochCurrent, modelCandidates, modelSelection, props.runtime, setModelSelection]);
   const reloadCommands = useCallback(async () => {
+    const uiEpoch = currentSessionUiEpoch();
     const commandList = await props.runtime.reloadCommands?.();
+    if (!isSessionUiEpochCurrent(uiEpoch)) return;
     if (!commandList) {
       appendLocalItem("error", "Could not reload commands.");
       return;
@@ -906,9 +967,12 @@ export function ChatShellSurface(props: {
     for (const name of state.skippedConflicts) {
       appendLocalItem("info", `Skipped user command /${name}; project command wins.`);
     }
-  }, [appendLocalItem, props.runtime]);
+  }, [appendLocalItem, currentSessionUiEpoch, isSessionUiEpochCurrent, props.runtime]);
   const slashActions = useMemo<SlashActions>(() => ({
     cwd,
+    enterSessionLayout,
+    currentSessionUiEpoch,
+    isSessionUiEpochCurrent,
     setView,
     appendLocalItem,
     appendShellItem,
@@ -935,7 +999,7 @@ export function ChatShellSurface(props: {
       await props.onSkillsChanged?.();
     },
     reloadCommands,
-  }), [appendLocalItem, appendShellItem, cwd, ensureOpenAICodexDefaultModel, openMcpManager, openModelPicker, openPermissionsPicker, openReasoningPicker, openRenamePrompt, openResumePicker, openThemePicker, props.onSkillsChanged, reloadCommands, renameChatSession, resumeSessionByTarget, setAuthManualPrompt, setHideThinking, setModelSelection, setPermissionProfile, setPrompt, setReasoningLevel, setServiceTier, startNewChatSession, updateShellItem]);
+  }), [appendLocalItem, appendShellItem, currentSessionUiEpoch, cwd, ensureOpenAICodexDefaultModel, enterSessionLayout, isSessionUiEpochCurrent, openMcpManager, openModelPicker, openPermissionsPicker, openReasoningPicker, openRenamePrompt, openResumePicker, openThemePicker, props.onSkillsChanged, reloadCommands, renameChatSession, resumeSessionByTarget, setAuthManualPrompt, setHideThinking, setModelSelection, setPermissionProfile, setPrompt, setReasoningLevel, setServiceTier, startNewChatSession, updateShellItem]);
   const runSelectedSlashCompletion = useCallback(() => {
     if (!slashCompletionOpen) return false;
     const completion = slashCompletionItems[selectedCompletionIndex] ?? slashCompletionItems[0];
@@ -1728,7 +1792,8 @@ export function ChatShellSurface(props: {
     );
   }
 
-  const home = props.runtime.chatView.items.length === 0
+  const home = !sessionLayoutEntered
+    && props.runtime.chatView.items.length === 0
     && inlineAgentBatches.length === 0
     && localItems.length === 0
     && props.runtime.chatView.pendingApprovals.length === 0
@@ -3231,8 +3296,25 @@ async function runResolvedSlashCommand(
   runtime: ChatRuntimeState,
   actions: SlashActions,
 ): Promise<void> {
+  const uiEpoch = actions.currentSessionUiEpoch();
   const result = await match.command.run(ctx, match.args);
-  await applySlashResult(result, ctx, model, runtime, actions);
+  if (!actions.isSessionUiEpochCurrent(uiEpoch)) return;
+  const scopedActions: SlashActions = {
+    ...actions,
+    enterSessionLayout: () => {
+      if (actions.isSessionUiEpochCurrent(uiEpoch)) actions.enterSessionLayout();
+    },
+    appendLocalItem: (level, text, options) => {
+      if (actions.isSessionUiEpochCurrent(uiEpoch)) actions.appendLocalItem(level, text, options);
+    },
+    setAuthManualPrompt: (value) => {
+      if (actions.isSessionUiEpochCurrent(uiEpoch)) actions.setAuthManualPrompt(value);
+    },
+    ensureOpenAICodexDefaultModel: async () => {
+      if (actions.isSessionUiEpochCurrent(uiEpoch)) await actions.ensureOpenAICodexDefaultModel();
+    },
+  };
+  await applySlashResult(result, ctx, model, runtime, scopedActions);
 }
 
 async function applySlashResult(
@@ -3259,6 +3341,7 @@ async function applySlashResult(
     return;
   }
   if (result.type === "reload_commands") {
+    actions.enterSessionLayout();
     await actions.reloadCommands();
     return;
   }
@@ -3267,6 +3350,7 @@ async function applySlashResult(
       actions.appendLocalItem("error", runtime.submitBlockedReason ?? "Session is not ready for another prompt.");
       return;
     }
+    actions.enterSessionLayout();
     const accepted = await runtime.submitCommand(result.commandName, result.args, {
       ...(ctx.modelSelection ? { modelSelection: ctx.modelSelection } : {}),
       ...(ctx.reasoningLevel ? { reasoningLevel: ctx.reasoningLevel } : {}),
@@ -3300,6 +3384,7 @@ async function applySlashResult(
     return;
   }
   if (result.type === "goal_action") {
+    actions.enterSessionLayout();
     await performGoalAction(result, runtime, actions.appendLocalItem);
     return;
   }
@@ -3336,18 +3421,22 @@ async function applySlashResult(
     return;
   }
   if (result.type === "delegation_action") {
+    actions.enterSessionLayout();
     await performDelegationAction(result, runtime, actions.appendLocalItem);
     return;
   }
   if (result.type === "auth_action") {
+    actions.enterSessionLayout();
     await performAuthAction(result, actions.appendLocalItem, actions.setAuthManualPrompt, actions.ensureOpenAICodexDefaultModel);
     return;
   }
   if (result.type === "skills_action") {
+    actions.enterSessionLayout();
     await performSkillsAction(result, actions);
     return;
   }
   if (result.type === "mcp_action") {
+    actions.enterSessionLayout();
     await performMcpAction(result, runtime, actions.appendLocalItem);
     return;
   }
