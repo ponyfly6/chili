@@ -759,12 +759,13 @@ export class AgentTreeControlService {
     }
 
     if (message.triggerTurn) {
+      // Mailbox turns always resume an existing session. Its persisted
+      // projection owns cwd; task rows are historical metadata and may be stale.
       const input: SubmitPromptInput = {
         sessionId,
         text,
         ...(signal ? { signal } : {}),
       };
-      if (deliveryTask?.cwd) input.cwd = deliveryTask.cwd;
       const team = teamDeliveryContext(message);
       if (team) {
         const finalDiscardedReason = await this.mailboxTurnSkipReason(message, deliveryTask);

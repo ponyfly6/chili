@@ -191,7 +191,7 @@ test("synthesizes missing root and ancestor nodes from agent paths", async () =>
   }
 });
 
-test("delivers mailbox messages to child sessions before consuming them", async () => {
+test("delivers direct mailbox turns without overriding the persisted session cwd", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-agent-tree-delivery-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const runtime = new FakeMailboxRuntime();
@@ -215,7 +215,7 @@ test("delivers mailbox messages to child sessions before consuming them", async 
           parentSessionId,
           childSessionId,
           taskName: "reader",
-          cwd: "/repo",
+          cwd: "/stale/task-row",
           prompt: "read",
           mode: "resumable",
         },
@@ -252,10 +252,9 @@ test("delivers mailbox messages to child sessions before consuming them", async 
 
     const consumed = await service.consumeMailbox({ messageId: "event_mailbox" });
 
-    expect(runtime.prompts).toMatchObject([
+    expect(runtime.prompts).toEqual([
       {
         sessionId: childSessionId,
-        cwd: "/repo",
         text: "continue from mailbox",
       },
     ]);
@@ -568,7 +567,7 @@ test("keeps mailbox queued when delivery fails", async () => {
   }
 });
 
-test("trigger-turn team messages keep member lifecycle in sync", async () => {
+test("trigger-turn team messages preserve session cwd ownership and member lifecycle", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-mailbox-lifecycle-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const runtime = new FakeMailboxRuntime();
@@ -596,7 +595,7 @@ test("trigger-turn team messages keep member lifecycle in sync", async () => {
           parentSessionId: rootSessionId,
           childSessionId: workerSessionId,
           taskName: "team worker",
-          cwd: "/repo",
+          cwd: "/stale/team-task-row",
           prompt: "initial team task",
           mode: "resumable",
         },
@@ -643,6 +642,10 @@ test("trigger-turn team messages keep member lifecycle in sync", async () => {
     });
     await agents.consumeMailbox({ messageId: mailbox?.id ?? "missing" });
 
+    expect(runtime.prompts).toEqual([{
+      sessionId: workerSessionId,
+      text: "Run the next step.",
+    }]);
     expect(
       (await store.events({ type: "team.member_status_changed", limit: 10 }))
         .filter(
