@@ -27,6 +27,7 @@ import { parseArgs, usage } from "./args.js";
 import { applyCliEnvironmentDefaults, cliEnvironmentDefaults } from "./environment-defaults.js";
 import { createCliHarness } from "./harness.js";
 import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
+import { createCliReplCommandRegistry, dispatchCliReplCommand, type CliReplCommandContext } from "./repl-commands.js";
 import { runSessionPrompt } from "./runner.js";
 import { resolveSession } from "./session.js";
 import { formatStoreDoctorText } from "./store-doctor.js";
@@ -602,8 +603,11 @@ async function handleStoreDoctorCommand(args: ReturnType<typeof parseArgs>): Pro
   console.log(args.json ? jsonStringify(report) : formatStoreDoctorText(report));
 }
 
-async function printTasks(harness: Awaited<ReturnType<typeof createCliHarness>>): Promise<void> {
-  const tasks = await harness.tasks.listTasks();
+async function printTasks(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  sessionId?: SessionId,
+): Promise<void> {
+  const tasks = await harness.tasks.listTasks(sessionId ? { parentSessionId: sessionId } : {});
   if (tasks.length === 0) {
     console.log("No tasks yet.");
     return;
@@ -622,13 +626,25 @@ async function printTasks(harness: Awaited<ReturnType<typeof createCliHarness>>)
   }
 }
 
-async function printTask(harness: Awaited<ReturnType<typeof createCliHarness>>, taskId: TaskId): Promise<void> {
+async function printTask(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  taskId: TaskId,
+  sessionId?: SessionId,
+): Promise<void> {
   const task = await harness.tasks.getTask(taskId);
+  if (sessionId && task.parentSessionId !== sessionId) {
+    throw new Error(`Task ${taskId} does not belong to session ${sessionId}`);
+  }
   console.log(JSON.stringify(task, null, 2));
 }
 
-async function printAgentTree(harness: Awaited<ReturnType<typeof createCliHarness>>): Promise<void> {
-  const snapshot = await harness.agents.snapshot({ rootPath: ROOT_AGENT_PATH });
+async function printAgentTree(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  sessionId?: SessionId,
+): Promise<void> {
+  const snapshot = await harness.agents.snapshot(
+    sessionId ? { rootPath: ROOT_AGENT_PATH, sessionId } : { rootPath: ROOT_AGENT_PATH },
+  );
   if (snapshot.nodes.length === 0) {
     console.log("No agents yet.");
     return;
@@ -918,8 +934,13 @@ function mergeFilesChanged(summary: unknown): string {
   return `files=${typeof filesChanged === "number" ? filesChanged : 0}`;
 }
 
-async function printMailbox(harness: Awaited<ReturnType<typeof createCliHarness>>): Promise<void> {
-  const messages = await harness.agents.mailbox({ status: "queued" });
+async function printMailbox(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  sessionId?: SessionId,
+): Promise<void> {
+  const messages = sessionId
+    ? (await harness.agents.snapshot({ rootPath: ROOT_AGENT_PATH, sessionId })).mailbox.filter((message) => message.status === "queued")
+    : await harness.agents.mailbox({ status: "queued" });
   if (messages.length === 0) {
     console.log("No mailbox messages.");
     return;
@@ -1084,85 +1105,84 @@ async function repl(input: {
   maxTurns: number;
 }): Promise<void> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  console.log("Type /help for commands, /exit to quit.");
+  const commandRegistry = createCliReplCommandRegistry(await input.harness.commands.list());
+  const commandContext: CliReplCommandContext = {
+    sessionId: input.sessionId,
+    cwd: input.harness.cwd,
+    listSessions: async () => printSessions(input.harness.store),
+    setModel: async (sessionId, selection) => {
+      const config = await input.harness.service.setModel({ sessionId, modelSelection: selection });
+      console.log(`[model] ${config.modelSelection?.provider ?? selection.provider}/${config.modelSelection?.model ?? selection.model}`);
+    },
+    setReasoning: async (sessionId, reasoningLevel) => {
+      const config = await input.harness.service.setReasoning({ sessionId, reasoningLevel });
+      console.log(`[thinking] ${config.reasoningLevel ?? reasoningLevel}`);
+    },
+    setServiceTier: async (sessionId, serviceTier) => {
+      const config = await input.harness.service.setServiceTier({ sessionId, serviceTier });
+      console.log(`[service] ${config.serviceTier ?? serviceTier}`);
+    },
+    compactSession: async (sessionId, focus) => {
+      const controller = installInterruptHandler();
+      const compactInput: {
+        sessionId: SessionId;
+        instructions?: string;
+        signal: AbortSignal;
+      } = {
+        sessionId,
+        signal: controller.signal,
+      };
+      if (focus) compactInput.instructions = focus;
+      const result = await input.harness.service.compactSession(compactInput);
+      if (result.status === "skipped") console.log(`[context] compact skipped: ${result.reason}`);
+      else if (result.status === "failed" || result.status === "cancelled") console.error(`[context] compact ${result.status}: ${result.error.message}`);
+    },
+    revertSession: async (sessionId, snapshotId) => {
+      await input.harness.recovery.revert({ sessionId, snapshotId: snapshotId as never });
+      console.log(`Reverted snapshot ${snapshotId}`);
+    },
+    showDelegation: async (sessionId, policy) => {
+      const config = policy
+        ? await input.harness.service.setDelegationPolicy({ sessionId, policy })
+        : await input.harness.service.getDelegationConfig(sessionId);
+      console.log(`[delegation] ${config.policy} (${config.source})`);
+    },
+    showAgents: async (sessionId) => printAgentTree(input.harness, sessionId),
+    showMailbox: async (sessionId) => printMailbox(input.harness, sessionId),
+    listTasks: async (sessionId) => printTasks(input.harness, sessionId),
+    showTask: async (sessionId, taskId) => printTask(input.harness, taskId as TaskId, sessionId),
+    showMemory: async (scope) => handleMemoryReplCommand(input.harness, `show ${scope}`.trim()),
+    addMemory: async (value) => handleMemoryReplCommand(input.harness, `add ${value}`.trim()),
+    reloadMemory: async (scope) => handleMemoryReplCommand(input.harness, `reload ${scope}`.trim()),
+    runPromptCommand: async (sessionId, commandId, args) => {
+      const command = await input.harness.commands.run({
+        commandId,
+        ...(args ? { args } : {}),
+        cwd: input.harness.cwd,
+      });
+      const controller = installInterruptHandler();
+      await runSessionPrompt({
+        harness: input.harness,
+        sessionId,
+        prompt: command.prompt,
+        maxTurns: input.maxTurns,
+        signal: controller.signal,
+      });
+    },
+  };
+  console.log("Type /help for commands, /app exit to quit.");
   try {
     while (true) {
       const line = (await rl.question("chili> ")).trim();
       if (!line) continue;
-      if (line === "/exit" || line === "/quit") return;
-      if (line === "/help") {
-        console.log(
-          [
-            "/help                 Show commands",
-            "/sessions             List sessions",
-            "/agents               Show agent tree",
-            "/mailbox              List queued mailbox messages",
-            "/memory show          Show loaded memory and project instructions",
-            "/memory add <text>    Save a project memory entry",
-            "/memory reload        Refresh and show loaded memory sources",
-            "/tasks                List subagent tasks",
-            "/recover-tasks        Mark stale background tasks cancelled",
-            "/task <taskId>        Show a subagent task",
-            "/compact [focus]      Compress conversation context",
-            "/revert <snapshotId>  Revert a snapshot in this session",
-            "/exit                 Quit",
-          ].join("\n"),
-        );
+      const command = await dispatchCliReplCommand(commandRegistry, commandContext, line);
+      if (command.status === "exit") return;
+      if (command.status === "handled") {
+        if (command.output) console.log(command.output);
         continue;
       }
-      if (line === "/sessions") {
-        await printSessions(input.harness.store);
-        continue;
-      }
-      if (line === "/agents") {
-        await printAgentTree(input.harness);
-        continue;
-      }
-      if (line === "/mailbox") {
-        await printMailbox(input.harness);
-        continue;
-      }
-      if (line === "/memory" || line.startsWith("/memory ")) {
-        await handleMemoryReplCommand(input.harness, line.slice("/memory".length).trim());
-        continue;
-      }
-      if (line === "/tasks") {
-        await printTasks(input.harness);
-        continue;
-      }
-      if (line === "/recover-tasks") {
-        const result = await input.harness.tasks.reconcileStaleTasks();
-        console.log(`[tasks] scanned=${result.scanned} closed=${result.closed.length}`);
-        continue;
-      }
-      if (line.startsWith("/task ")) {
-        await printTask(input.harness, line.slice("/task ".length).trim() as TaskId);
-        continue;
-      }
-      if (line === "/compact" || line.startsWith("/compact ")) {
-        const instructions = line.slice("/compact".length).trim();
-        const controller = installInterruptHandler();
-        const compactInput: {
-          sessionId: SessionId;
-          instructions?: string;
-          signal: AbortSignal;
-        } = {
-          sessionId: input.sessionId,
-          signal: controller.signal,
-        };
-        if (instructions) compactInput.instructions = instructions;
-        const result = await input.harness.service.compactSession(compactInput);
-        if (result.status === "skipped") {
-          console.log(`[context] compact skipped: ${result.reason}`);
-        } else if (result.status === "failed" || result.status === "cancelled") {
-          console.error(`[context] compact ${result.status}: ${result.error.message}`);
-        }
-        continue;
-      }
-      if (line.startsWith("/revert ")) {
-        const snapshotId = line.slice("/revert ".length).trim();
-        await input.harness.recovery.revert({ sessionId: input.sessionId, snapshotId: snapshotId as never });
-        console.log(`Reverted snapshot ${snapshotId}`);
+      if (command.status === "error") {
+        console.error(command.output ?? "Command failed.");
         continue;
       }
 
