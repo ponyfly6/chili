@@ -56,14 +56,19 @@ export class DelegationPolicyGate {
     let current = sessionId;
 
     for (let depth = 0; depth < MAX_DELEGATION_PARENT_DEPTH; depth += 1) {
-      if (visited.has(current)) break;
+      if (visited.has(current)) {
+        throw new Error(`Cyclic delegation ancestry for session ${current}`);
+      }
       visited.add(current);
       const parent = await this.parentSessionId(current);
-      if (!parent || parent === current) break;
+      if (!parent) return current;
+      if (parent === current) {
+        throw new Error(`Cyclic delegation ancestry for session ${current}`);
+      }
       current = parent;
     }
 
-    return current;
+    throw new Error(`Delegation ancestry exceeds ${MAX_DELEGATION_PARENT_DEPTH} sessions for ${sessionId}`);
   }
 
   async configForSession(sessionId: SessionId): Promise<RuntimeDelegationConfig> {

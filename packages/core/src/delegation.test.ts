@@ -154,6 +154,49 @@ test("delegation policy gate fails closed for duplicate team session ancestry", 
     .rejects.toThrow(`Ambiguous delegation ancestry for team member session ${childSessionId}`);
 });
 
+test("delegation policy gate fails closed for multi-session ancestry cycles", async () => {
+  const first = "session_cycle_first" as SessionId;
+  const second = "session_cycle_second" as SessionId;
+  const store = {
+    async agentTasks(query: { childSessionId?: SessionId }) {
+      return query.childSessionId === first
+        ? [{ childSessionId: first, parentSessionId: second }]
+        : [{ childSessionId: second, parentSessionId: first }];
+    },
+  } as unknown as DelegationPolicyGateOptions["store"];
+  const gate = new DelegationPolicyGate({
+    store,
+    async getDelegationConfig(requestedSessionId) {
+      return { sessionId: requestedSessionId, policy: "explicit", source: "default" };
+    },
+  });
+
+  await expect(gate.assertEnabled({ sessionId: first, action: "task.spawn" }))
+    .rejects.toThrow(`Cyclic delegation ancestry for session ${first}`);
+});
+
+test("delegation policy gate fails closed when ancestry exceeds its depth bound", async () => {
+  const start = "session_depth_0" as SessionId;
+  const store = {
+    async agentTasks(query: { childSessionId?: SessionId }) {
+      const depth = Number(query.childSessionId?.split("_").at(-1));
+      return [{
+        childSessionId: query.childSessionId,
+        parentSessionId: `session_depth_${depth + 1}` as SessionId,
+      }];
+    },
+  } as unknown as DelegationPolicyGateOptions["store"];
+  const gate = new DelegationPolicyGate({
+    store,
+    async getDelegationConfig(requestedSessionId) {
+      return { sessionId: requestedSessionId, policy: "explicit", source: "default" };
+    },
+  });
+
+  await expect(gate.rootSessionId(start))
+    .rejects.toThrow("Delegation ancestry exceeds 64 sessions");
+});
+
 test("delegation policy ignores lead self-memberships across multiple teams", async () => {
   const rootSessionId = "session_multi_team_root" as SessionId;
   const store = {
