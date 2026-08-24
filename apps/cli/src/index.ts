@@ -15,6 +15,7 @@ import type {
   RuntimeMcpServerDescriptor,
   RuntimeMcpStatusResponse,
   SessionId,
+  SnapshotId,
   TaskId,
   TeamId,
 } from "@chili/protocol";
@@ -30,6 +31,7 @@ import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput
 import { createCliReplCommandRegistry, dispatchCliReplCommand, type CliReplCommandContext } from "./repl-commands.js";
 import { runSessionPrompt } from "./runner.js";
 import { resolveSession } from "./session.js";
+import { revertSessionSnapshot } from "./session-recovery.js";
 import { formatStoreDoctorText } from "./store-doctor.js";
 
 async function main(): Promise<void> {
@@ -280,8 +282,14 @@ async function main(): Promise<void> {
     if (args.command === "revert") {
       if (!args.resume) throw new Error("revert requires --resume <session-id>");
       if (!args.snapshotId) throw new Error("revert requires a snapshot id");
-      const sessionId = args.resume as SessionId;
-      await harness.recovery.revert({ sessionId, snapshotId: args.snapshotId as never });
+      await revertSessionSnapshot({
+        service: harness.service,
+        store: harness.store,
+        recovery: harness.recovery,
+        cwd: harness.cwd,
+        resume: args.resume,
+        snapshotId: args.snapshotId as SnapshotId,
+      });
       console.log(`Reverted snapshot ${args.snapshotId}`);
       return;
     }

@@ -20,8 +20,13 @@ export class SnapshotRecoveryService {
 
   async revert(input: RevertSnapshotInput): Promise<SnapshotRevertResult> {
     const session = (await this.options.store.sessions()).find((item) => item.id === input.sessionId);
+    if (!session) throw new Error(`Session not found: ${input.sessionId}`);
+    if (!(await this.snapshotBelongsToSession(input))) {
+      throw new Error(`Snapshot not found for session ${input.sessionId}: ${input.snapshotId}`);
+    }
+
     try {
-      const result = await this.options.snapshotProvider.revert(input.snapshotId, session ? { cwd: session.cwd } : {});
+      const result = await this.options.snapshotProvider.revert(input.snapshotId, { cwd: session.cwd });
       await this.append(input, "snapshot.reverted", {
         snapshotId: input.snapshotId,
         status: "completed",
@@ -37,6 +42,29 @@ export class SnapshotRecoveryService {
         error: err.message,
       });
       throw err;
+    }
+  }
+
+  private async snapshotBelongsToSession(input: RevertSnapshotInput): Promise<boolean> {
+    const limit = 500;
+    let afterEventId: string | undefined;
+
+    while (true) {
+      const events = await this.options.store.events({
+        sessionId: input.sessionId,
+        type: "snapshot.created",
+        limit,
+        ...(afterEventId ? { afterEventId } : {}),
+      });
+      if (events.some((event) => (
+        event.sessionId === input.sessionId
+        && event.type === "snapshot.created"
+        && isSnapshotCreatedPayload(event.payload)
+        && event.payload.snapshotId === input.snapshotId
+      ))) return true;
+      if (events.length < limit) return false;
+      afterEventId = events.at(-1)?.id;
+      if (!afterEventId) return false;
     }
   }
 
@@ -67,4 +95,11 @@ export class SnapshotRecoveryService {
 
 function defaultCreateId(prefix: string): string {
   return `${prefix}_${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+function isSnapshotCreatedPayload(payload: unknown): payload is { snapshotId: SnapshotId } {
+  return typeof payload === "object"
+    && payload !== null
+    && "snapshotId" in payload
+    && typeof payload.snapshotId === "string";
 }
