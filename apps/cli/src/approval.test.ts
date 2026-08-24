@@ -5,7 +5,13 @@ import { expect, test } from "bun:test";
 import type { ApprovalId, SessionId, ToolCallId } from "@chili/protocol";
 import { evaluatePolicy } from "@chili/policy";
 import { PolicyApprovalBroker, PolicyApprovalState, type ApprovalBrokerRequest } from "@chili/tools";
-import { createCliApprovalBroker, createCliApprovalRulesets, persistAllowAlwaysDecision, runtimePermissionConfig } from "./approval.js";
+import {
+  createCliApprovalBroker,
+  createCliApprovalRulesets,
+  createRequestScopedPolicyApprovalBroker,
+  persistAllowAlwaysDecision,
+  runtimePermissionConfig,
+} from "./approval.js";
 
 test("CLI approval rules layer defaults, user config, then project config", () => {
   const rulesets = createCliApprovalRulesets(false, {
@@ -88,6 +94,120 @@ test("default profile does not let configured grants bypass one-off unsandboxed 
 
   expect(evaluatePolicy("bash.unsandboxed", "remindctl status", rulesets).action).toBe("ask");
   expect(evaluatePolicy("read", "README.md", rulesets).action).toBe("allow");
+});
+
+test("request-scoped approval rules isolate project denies and grants across workspace trees", async () => {
+  const state = new PolicyApprovalState();
+  const parentA = "session_policy_parent_a" as SessionId;
+  const parentB = "session_policy_parent_b" as SessionId;
+  const childA = "session_policy_child_a" as SessionId;
+  const childB = "session_policy_child_b" as SessionId;
+  const workspaceBySession = new Map<SessionId, "a" | "b">([
+    [parentA, "a"],
+    [childA, "a"],
+    [parentB, "b"],
+    [childB, "b"],
+  ]);
+  const projectPermissions = {
+    a: [
+      { permission: "workspace.guard", pattern: "a-only", action: "deny", source: "project-a" },
+      { permission: "workspace.guard", pattern: "denied-a", action: "deny", source: "project-a" },
+    ],
+    b: [
+      { permission: "workspace.guard", pattern: "b-only", action: "deny", source: "project-b" },
+      { permission: "workspace.guard", pattern: "denied-b", action: "deny", source: "project-b" },
+    ],
+  } as const;
+  const broker = createRequestScopedPolicyApprovalBroker({
+    state,
+    rulesetsForRequest: (request) => {
+      const workspace = workspaceBySession.get(request.sessionId);
+      if (!workspace) throw new Error("unknown session");
+      return createCliApprovalRulesets("default", {
+        userPermissions: [],
+        projectPermissions: [...projectPermissions[workspace]],
+      });
+    },
+  });
+  const preflight = (sessionId: SessionId, pattern: string) => broker.preflight({
+    ...approvalRequest(pattern),
+    sessionId,
+    permission: "workspace.guard",
+  });
+
+  expect(await preflight(parentA, "a-only")).toMatchObject({
+    action: "deny",
+    matchedRule: { source: "project-a" },
+  });
+  expect(await preflight(parentB, "a-only")).toMatchObject({ action: "ask" });
+  expect(await preflight(parentB, "b-only")).toMatchObject({
+    action: "deny",
+    matchedRule: { source: "project-b" },
+  });
+  expect(await preflight(parentA, "b-only")).toMatchObject({ action: "ask" });
+
+  state.linkSession(parentA, childA);
+  state.linkSession(parentB, childB);
+  state.addSessionGrant({
+    sessionId: parentA,
+    permission: "workspace.guard",
+    patterns: ["denied-a", "grant-a"],
+    source: "parent-a",
+  });
+  expect(await preflight(childA, "grant-a")).toMatchObject({ action: "allow", source: "session_grant" });
+  expect(await preflight(childB, "grant-a")).toMatchObject({ action: "ask" });
+  expect(await preflight(childA, "denied-a")).toMatchObject({
+    action: "deny",
+    matchedRule: { source: "project-a" },
+  });
+
+  state.addSessionGrant({
+    sessionId: parentB,
+    permission: "workspace.guard",
+    patterns: ["denied-b", "grant-b"],
+    source: "parent-b",
+  });
+  expect(await preflight(childB, "grant-b")).toMatchObject({ action: "allow", source: "session_grant" });
+  expect(await preflight(childA, "grant-b")).toMatchObject({ action: "ask" });
+  expect(await preflight(childB, "denied-b")).toMatchObject({
+    action: "deny",
+    matchedRule: { source: "project-b" },
+  });
+});
+
+test("request-scoped approval rules fail closed when session policy resolution fails", async () => {
+  const broker = createRequestScopedPolicyApprovalBroker({
+    rulesetsForRequest: async () => {
+      throw new Error("missing session workspace");
+    },
+  });
+  const request = approvalRequest("workspace-bound-operation");
+
+  expect(await broker.preflight(request)).toMatchObject({
+    action: "deny",
+    source: "session_workspace_policy",
+    feedback: "Unable to resolve permission policy for session session_test.",
+  });
+  expect(await broker.decide(request)).toEqual({
+    action: "deny",
+    feedback: "Unable to resolve permission policy for session session_test.",
+  });
+});
+
+test("request-scoped approval broker propagates approval handler failures", async () => {
+  const failure = new Error("approval queue failed");
+  const broker = createRequestScopedPolicyApprovalBroker({
+    rulesetsForRequest: () => [],
+    ask: async () => {
+      throw failure;
+    },
+  });
+  const request: ApprovalBrokerRequest = {
+    ...approvalRequest("needs-review"),
+    permission: "workspace.guard",
+  };
+
+  await expect(broker.decide(request)).rejects.toBe(failure);
 });
 
 test("allow_always decisions persist user-level grants", async () => {

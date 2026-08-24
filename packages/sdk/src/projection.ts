@@ -3993,6 +3993,16 @@ function applyTeamProjectionEvent(view: ChiliRuntimeView, event: EventEnvelope):
     return;
   }
 
+  if (event.type === "team.owner_session_bound") {
+    const teamId = stringValue(payload.teamId) as TeamId | undefined;
+    const ownerSessionId = stringValue(payload.ownerSessionId) as SessionId | undefined;
+    if (!teamId || !ownerSessionId || event.sessionId !== ownerSessionId) return;
+    const team = upsertTeam(view, teamId, event.time);
+    team.sessionId = ownerSessionId;
+    team.updatedAt = event.time;
+    return;
+  }
+
   if (event.type === "team.member_added") {
     const teamId = stringValue(payload.teamId) as TeamId | undefined;
     const path = stringValue(payload.path) as AgentPath | undefined;

@@ -5,6 +5,9 @@ import {
   PolicyApprovalState,
   approvalDecisionWithinScope,
   type ApprovalBrokerRequest,
+  type ApprovalPreflightDecision,
+  type ApprovalPreflightRequest,
+  type PolicyApprovalBrokerOptions,
 } from "@chili/tools";
 import type { PermissionRule } from "@chili/policy";
 import {
@@ -20,6 +23,7 @@ export interface CliApprovalOptions {
   chiliHome?: string;
   sandboxedShell?: boolean;
   approvalState?: PolicyApprovalState;
+  rulesetsForRequest?: CliApprovalRulesetResolver;
 }
 
 export interface CliApprovalRulesetOptions {
@@ -30,17 +34,110 @@ export interface PersistAllowAlwaysDecisionOptions extends AddPersistentPermissi
   onPersisted?: (request: ApprovalBrokerRequest) => Promise<void> | void;
 }
 
+export type CliApprovalRulesetResolver = (
+  request: ApprovalPreflightRequest,
+) => Promise<readonly (readonly PermissionRule[])[]> | readonly (readonly PermissionRule[])[];
+
+export interface RequestScopedPolicyApprovalBrokerOptions extends PolicyApprovalBrokerOptions {
+  rulesetsForRequest: CliApprovalRulesetResolver;
+}
+
 export function createCliApprovalBroker(options: CliApprovalOptions = {}): PolicyApprovalBroker {
   const profile = options.yes ? "full-access" : "default";
-  return new PolicyApprovalBroker({
+  const brokerOptions: PolicyApprovalBrokerOptions = {
     rulesets: createCliApprovalRulesets(profile, options.config, {
       sandboxedShell: options.sandboxedShell ?? false,
     }),
     dangerousShellCommands: dangerousShellCommandsForProfile(profile),
     allowOneShotPolicyBypass: profile === "full-access",
-    ...(options.approvalState ? { state: options.approvalState } : {}),
+    state: options.approvalState ?? new PolicyApprovalState(),
     ask: async (request, signal) => askApproval(request, options, signal),
-  });
+  };
+  return options.rulesetsForRequest
+    ? createRequestScopedPolicyApprovalBroker({
+        ...brokerOptions,
+        rulesetsForRequest: options.rulesetsForRequest,
+      })
+    : new PolicyApprovalBroker(brokerOptions);
+}
+
+export function createRequestScopedPolicyApprovalBroker(
+  options: RequestScopedPolicyApprovalBrokerOptions,
+): PolicyApprovalBroker {
+  return new RequestScopedPolicyApprovalBroker(options);
+}
+
+class RequestScopedPolicyApprovalBroker extends PolicyApprovalBroker {
+  private readonly rulesetsForRequest: CliApprovalRulesetResolver;
+  private readonly delegateOptions: PolicyApprovalBrokerOptions;
+
+  constructor(options: RequestScopedPolicyApprovalBrokerOptions) {
+    const { rulesetsForRequest, ...brokerOptions } = options;
+    const delegateOptions: PolicyApprovalBrokerOptions = {
+      ...brokerOptions,
+      state: brokerOptions.state ?? new PolicyApprovalState(),
+    };
+    super(delegateOptions);
+    this.rulesetsForRequest = rulesetsForRequest;
+    this.delegateOptions = delegateOptions;
+  }
+
+  override setRulesets(rulesets: readonly (readonly PermissionRule[])[]): void {
+    this.delegateOptions.rulesets = rulesets;
+    super.setRulesets(rulesets);
+  }
+
+  override setDangerousShellCommands(mode: "ask" | "allow"): void {
+    this.delegateOptions.dangerousShellCommands = mode;
+    super.setDangerousShellCommands(mode);
+  }
+
+  override async preflight(request: ApprovalPreflightRequest): Promise<ApprovalPreflightDecision> {
+    let delegate: PolicyApprovalBroker;
+    try {
+      delegate = await this.delegateFor(request);
+    } catch {
+      return approvalPolicyResolutionFailure(request);
+    }
+    return delegate.preflight(request);
+  }
+
+  override async decide(request: ApprovalBrokerRequest, signal?: AbortSignal): Promise<ApprovalDecision> {
+    let delegate: PolicyApprovalBroker;
+    try {
+      delegate = await this.delegateFor(request);
+    } catch {
+      const failure = approvalPolicyResolutionFailure(request);
+      return {
+        action: "deny",
+        feedback: failure.feedback ?? failure.reason ?? "Unable to resolve session permission policy.",
+      };
+    }
+    return delegate.decide(request, signal);
+  }
+
+  private async delegateFor(request: ApprovalPreflightRequest): Promise<PolicyApprovalBroker> {
+    const rulesets = await this.rulesetsForRequest(request);
+    return new PolicyApprovalBroker({
+      ...this.delegateOptions,
+      rulesets,
+    });
+  }
+}
+
+function approvalPolicyResolutionFailure(request: ApprovalPreflightRequest): ApprovalPreflightDecision {
+  const message = `Unable to resolve permission policy for session ${request.sessionId}.`;
+  return {
+    action: "deny",
+    source: "session_workspace_policy",
+    reason: message,
+    feedback: message,
+    metadata: {
+      sessionId: request.sessionId,
+      permission: request.permission,
+      patterns: request.patterns,
+    },
+  };
 }
 
 export function createCliApprovalRulesets(

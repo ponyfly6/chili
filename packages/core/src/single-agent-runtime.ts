@@ -430,7 +430,14 @@ export class SingleAgentRuntime implements AgentRunner {
       turnId,
       cwd: input.cwd,
     });
-    let tools = filterToolsByPolicies(this.options.toolRegistry.list(), input.toolPolicy, resolvedPolicy);
+    const registeredTools = this.options.toolRegistry.listForContext
+      ? await this.options.toolRegistry.listForContext({
+        sessionId: input.sessionId,
+        turnId,
+        cwd: input.cwd,
+      })
+      : this.options.toolRegistry.list();
+    let tools = filterToolsByPolicies(registeredTools, input.toolPolicy, resolvedPolicy);
     if (input.preferExternalImageTools && tools.some(isExternalImageUnderstandingTool)) {
       tools = tools.filter((tool) => !isDirectImageBlockTool(tool));
       return tools;
@@ -949,7 +956,11 @@ export class SingleAgentRuntime implements AgentRunner {
         await this.appendPart(input, assistantMessageId, part);
         continue;
       }
-      const safe = await this.options.toolExecutor.canRunConcurrently(toolCall.toolName, toolCall.input);
+      const safe = await this.options.toolExecutor.canRunConcurrently(toolCall.toolName, toolCall.input, {
+        sessionId: input.sessionId,
+        turnId,
+        cwd: input.cwd,
+      });
       if (safe) {
         batch.push(toolCall);
         if (batch.length >= concurrentLimit) await flush();
@@ -1205,18 +1216,82 @@ function didAssistantMutate(error: Error): boolean {
 }
 
 function isContextLimitError(error: Error): boolean {
-  const message = error.message.toLowerCase();
-  return (
-    message.includes("context window") ||
-    message.includes("context length") ||
-    message.includes("maximum context") ||
-    message.includes("prompt is too long") ||
-    message.includes("input is too long") ||
-    message.includes("too many tokens") ||
-    message.includes("request too large") ||
-    message.includes("http 413") ||
-    /\b413\b/.test(message)
-  );
+  return isContextLimitErrorValue(error, new Set<object>());
+}
+
+function isContextLimitErrorValue(value: unknown, seen: Set<object>): boolean {
+  if (typeof value === "string") return isContextLimitMessage(value);
+  if (typeof value !== "object" || value === null || seen.has(value)) return false;
+  seen.add(value);
+
+  const status = numericErrorField(value, "status")
+    ?? numericErrorField(value, "statusCode")
+    ?? numericErrorField(value, "httpStatus");
+  if (status === 413) return true;
+
+  for (const key of ["code", "type", "reason", "errorCode"] as const) {
+    const tag = stringErrorField(value, key);
+    if (tag && isContextLimitTag(tag)) return true;
+  }
+
+  const name = stringErrorField(value, "name");
+  if (name && isContextLimitTag(name)) return true;
+  const message = stringErrorField(value, "message");
+  if (message && isContextLimitMessage(message)) return true;
+
+  const cause = unknownErrorField(value, "cause");
+  if (cause !== undefined && isContextLimitErrorValue(cause, seen)) return true;
+  const errors = unknownErrorField(value, "errors");
+  return Array.isArray(errors) && errors.some((item) => isContextLimitErrorValue(item, seen));
+}
+
+function isContextLimitMessage(value: string): boolean {
+  const message = value.toLowerCase();
+  return message.includes("context window")
+    || message.includes("context length")
+    || message.includes("maximum context")
+    || message.includes("prompt is too long")
+    || message.includes("input is too long")
+    || message.includes("too many tokens")
+    || message.includes("request too large")
+    || message.includes("http 413")
+    || /\b413\b/.test(message);
+}
+
+function isContextLimitTag(value: string): boolean {
+  const tag = value.trim().toLowerCase().replace(/[.\s-]+/g, "_");
+  return tag === "context_length_exceeded"
+    || tag === "context_window_exceeded"
+    || tag === "max_context_length_exceeded"
+    || tag === "maximum_context_length"
+    || tag === "context_overflow"
+    || tag === "prompt_too_long"
+    || tag === "input_too_long"
+    || tag === "request_too_large"
+    || tag === "too_many_tokens"
+    || tag === "token_limit_exceeded"
+    || /(?:context|prompt|input|request).*(?:length|window|tokens?|size).*(?:error|exceed|limit|long|large|overflow)/.test(tag);
+}
+
+function stringErrorField(value: object, key: string): string | undefined {
+  const field = unknownErrorField(value, key);
+  return typeof field === "string" && field.trim() ? field : undefined;
+}
+
+function numericErrorField(value: object, key: string): number | undefined {
+  const field = unknownErrorField(value, key);
+  if (typeof field === "number" && Number.isFinite(field)) return field;
+  if (typeof field !== "string" || !field.trim()) return undefined;
+  const parsed = Number(field);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function unknownErrorField(value: object, key: string): unknown {
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
 }
 
 function isExternalImageUnderstandingTool(tool: { name: string; description: string; mcp?: unknown }): boolean {

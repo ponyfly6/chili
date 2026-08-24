@@ -40,10 +40,53 @@ try {
   const runner = new ParallelSmokeRunner();
 
   try {
-    const teams = new TeamControlService({ store, createId: ids, now });
+    await store.append({
+      id: "event_team_parallel_smoke_session",
+      type: "session.created",
+      time: now(),
+      sessionId,
+      payload: { sessionId, cwd: workspace },
+    });
+    const persistedSession = (await store.sessions()).find((candidate) => candidate.id === sessionId);
+    assert.ok(persistedSession, "smoke parent session was not persisted");
+    assert.equal(persistedSession.status, "active");
+    assert.equal(persistedSession.source, "interactive");
+    assert.equal(persistedSession.cwd, workspace);
+    const resolveSession = async (requestedSessionId: SessionId) => {
+      const session = (await store.sessions()).find((candidate) => candidate.id === requestedSessionId);
+      assert.ok(session, `Session not found: ${requestedSessionId}`);
+      assert.equal(session.status, "active", `Session is not active: ${requestedSessionId}`);
+      assert.equal(session.source, "interactive", `Session is not a root session: ${requestedSessionId}`);
+      return { cwd: session.cwd };
+    };
+    const sessionOperations = {
+      async withSessionOperation<T>(
+        _sessionId: SessionId,
+        fn: (operation: { readonly signal: AbortSignal; assertCurrent(): void }) => Promise<T> | T,
+      ): Promise<T> {
+        return fn({ signal: new AbortController().signal, assertCurrent() {} });
+      },
+    };
+
+    const teams = new TeamControlService({ store, createId: ids, now, sessionOperations });
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
-    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: workspace, now });
-    const execution = new TeamExecutionRunner({ teams, dispatcher, cwd: workspace, now });
+    const dispatcher = new TeamTaskDispatchService({
+      teams,
+      subagents,
+      store,
+      cwd: workspace,
+      now,
+      resolveSession,
+      sessionOperations,
+    });
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      cwd: workspace,
+      now,
+      resolveSession,
+      sessionOperations,
+    });
 
     const team = await teams.createTeam({ sessionId, name: "parallel smoke", leadPath });
     await teams.addMember({

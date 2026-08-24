@@ -35,6 +35,7 @@ import type {
   ToolApprovalSpecWithDefaults,
   ToolExecutorOptions,
   PersistedToolOutputRegistration,
+  ToolRegistryContext,
 } from "./types.js";
 
 type ExecutableApprovalSpec = ToolApprovalSpecWithDefaults & { maxApprovalScope: ApprovalScope };
@@ -51,8 +52,6 @@ export class ToolExecutor {
     const callId = input.callId ?? this.id<ToolCallId>("toolcall");
     const outputArtifactId = `tooloutput_${randomUUID()}` as ToolCallId;
     const activeCallKey = [input.cwd, input.sessionId, input.turnId, callId].join("\0");
-    const tool = this.options.registry.get(input.toolName);
-
     await this.publish("tool.call_started", input, {
       turnId: input.turnId,
       callId,
@@ -66,6 +65,12 @@ export class ToolExecutor {
     this.activeCallIds.add(activeCallKey);
 
     try {
+      let tool: ChiliToolDefinition | undefined;
+      try {
+        tool = await this.toolForContext(input.toolName, toolRegistryContext(input));
+      } catch (error) {
+        return await this.fail(input, callId, toError(error));
+      }
       if (!tool) {
         return await this.fail(input, callId, new UnknownToolError(input.toolName));
       }
@@ -161,8 +166,14 @@ export class ToolExecutor {
     }
   }
 
-  async canRunConcurrently(toolName: string, input: unknown): Promise<boolean> {
-    const tool = this.options.registry.get(toolName);
+  async canRunConcurrently(
+    toolName: string,
+    input: unknown,
+    context?: ToolRegistryContext,
+  ): Promise<boolean> {
+    const tool = context
+      ? await this.toolForContext(toolName, context)
+      : this.options.registry.get(toolName);
     if (!tool) return false;
     const explicit = await this.resolvePredicate(tool.isConcurrencySafe, input);
     if (explicit !== undefined) return explicit;
@@ -529,10 +540,22 @@ export class ToolExecutor {
 
   private async visibleTools(input: ExecuteToolInput): Promise<ChiliToolDefinition[]> {
     const policies = await this.policies(input);
+    const tools = this.options.registry.listForContext
+      ? await this.options.registry.listForContext(toolRegistryContext(input))
+      : this.options.registry.list();
     return policies.reduce(
       (tools, policy) => filterToolsByPolicy(tools, policy),
-      this.options.registry.list(),
+      tools,
     );
+  }
+
+  private toolForContext(
+    name: string,
+    context: ToolRegistryContext,
+  ): Promise<ChiliToolDefinition | undefined> | ChiliToolDefinition | undefined {
+    return this.options.registry.getForContext
+      ? this.options.registry.getForContext(name, context)
+      : this.options.registry.get(name);
   }
 
   private async policies(input: ExecuteToolInput): Promise<ToolAccessPolicy[]> {
@@ -625,6 +648,16 @@ export class ToolExecutor {
         : {}),
     };
   }
+}
+
+function toolRegistryContext(
+  input: Pick<ExecuteToolInput, "sessionId" | "turnId" | "cwd">,
+): ToolRegistryContext {
+  return {
+    sessionId: input.sessionId,
+    turnId: input.turnId,
+    cwd: input.cwd,
+  };
 }
 
 function approvalRequestMetadata(

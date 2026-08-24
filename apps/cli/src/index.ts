@@ -33,6 +33,7 @@ import { runSessionPrompt } from "./runner.js";
 import { resolveSession } from "./session.js";
 import { revertSessionSnapshot } from "./session-recovery.js";
 import { formatStoreDoctorText } from "./store-doctor.js";
+import { bindNewTeamOwnerSession } from "./team-owner-session.js";
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
@@ -160,7 +161,6 @@ async function main(): Promise<void> {
       const controller = installInterruptHandler();
       const input: Parameters<typeof harness.teamRunner.run>[0] = {
         teamId: args.teamId as TeamId,
-        cwd: harness.cwd,
         once: args.once,
         signal: controller.signal,
       };
@@ -178,7 +178,6 @@ async function main(): Promise<void> {
       if (!args.teamId) throw new Error("team-merge requires a team id");
       const input: Parameters<typeof harness.teamMerger.mergeTeamTasks>[0] = {
         teamId: args.teamId as TeamId,
-        cwd: harness.cwd,
       };
       if (args.taskId) input.taskId = args.taskId as TaskId;
       const result = await harness.teamMerger.mergeTeamTasks(input);
@@ -335,17 +334,21 @@ async function printPromptDebug(
   };
   if (args.resume) sessionInput.resume = args.resume;
   const session = await resolveSession(sessionInput);
+  const persistedSession = (await harness.store.sessions()).find((candidate) => (
+    candidate.id === session.sessionId
+  ));
+  if (!persistedSession) throw new Error(`Session not found: ${session.sessionId}`);
+  const cwd = persistedSession.cwd;
 
   if (args.content) {
     const inspected = await harness.service.inspectPrompt({
       sessionId: session.sessionId,
-      cwd: harness.cwd,
       ...(args.prompt !== undefined ? { text: args.prompt } : {}),
       includeContent: true,
     });
     const output: CliPromptDebugOutput = {
       sessionId: session.sessionId,
-      cwd: harness.cwd,
+      cwd,
       created: session.isNew,
       debug: inspected.debug,
       fragments: inspected.fragments,
@@ -356,12 +359,11 @@ async function printPromptDebug(
 
   const debug = await harness.service.inspectPrompt({
     sessionId: session.sessionId,
-    cwd: harness.cwd,
     ...(args.prompt !== undefined ? { text: args.prompt } : {}),
   });
   const output: CliPromptDebugOutput = {
     sessionId: session.sessionId,
-    cwd: harness.cwd,
+    cwd,
     created: session.isNew,
     debug,
   };
@@ -408,9 +410,9 @@ async function serve(input: {
 }
 
 interface CliMcpControl {
-  list(): Promise<RuntimeMcpListResponse>;
-  status?(): Promise<RuntimeMcpStatusResponse>;
-  reload?(): Promise<RuntimeMcpReloadResponse>;
+  list(input?: { cwd?: string }): Promise<RuntimeMcpListResponse>;
+  status?(input?: { cwd?: string }): Promise<RuntimeMcpStatusResponse>;
+  reload?(input?: { cwd?: string }): Promise<RuntimeMcpReloadResponse>;
   add?(input: RuntimeMcpAddServerRequest): Promise<RuntimeMcpServerDescriptor>;
   remove?(server: string): Promise<RuntimeMcpRemoveServerResponse>;
   auth?(server: string, input?: RuntimeMcpAuthRequest): Promise<RuntimeMcpAuthResponse>;
@@ -429,12 +431,13 @@ async function handleMcpCommand(
   }
 
   if (action === "list") {
-    const result = await control.list();
+    const result = await control.list({ cwd: harness.cwd });
     printMcpList(result, args.json);
     return;
   }
   if (action === "status") {
-    const result = control.status ? await control.status() : statusFromMcpList(await control.list());
+    const scope = { cwd: harness.cwd };
+    const result = control.status ? await control.status(scope) : statusFromMcpList(await control.list(scope));
     if (args.mcpServer) {
       const server = result.servers.find((item) => item.name === args.mcpServer);
       if (!server) throw new Error(`MCP server not found: ${args.mcpServer}`);
@@ -446,7 +449,7 @@ async function handleMcpCommand(
   }
   if (action === "reload") {
     if (!control.reload) throw new Error("MCP reload is not supported by the configured manager");
-    const result = await control.reload();
+    const result = await control.reload({ cwd: harness.cwd });
     printMcpReload(result, args.json);
     return;
   }
@@ -819,17 +822,21 @@ async function dispatchTeamTask(
   const task = (await harness.teams.tasks(teamId)).find((item) => item.id === taskId);
   if (!task) throw new Error(`Team task not found: ${taskId}`);
 
-  let sessionId = task.sessionId ?? team.sessionId;
+  let sessionId = team.sessionId;
   if (!sessionId) {
     const session = await harness.service.createSession({ cwd: harness.cwd });
-    sessionId = session.sessionId;
+    sessionId = await bindNewTeamOwnerSession({
+      teams: harness.teams,
+      teamId,
+      candidateSessionId: session.sessionId,
+      discardCandidate: () => harness.service.archiveSession(session.sessionId),
+    });
   }
 
   const result = await harness.teamDispatcher.dispatchTask({
     teamId,
     taskId,
     mode,
-    cwd: harness.cwd,
     sessionId,
   });
   console.log(jsonStringify(result));
@@ -961,8 +968,12 @@ async function printMailbox(
 
 type MemoryScopeArg = "user" | "project" | "all" | undefined;
 
-async function printMemory(harness: Awaited<ReturnType<typeof createCliHarness>>, scope: MemoryScopeArg): Promise<void> {
-  const snapshot = await loadChiliMemoryContext({ cwd: harness.cwd });
+async function printMemory(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  scope: MemoryScopeArg,
+  cwd = harness.cwd,
+): Promise<void> {
+  const snapshot = await loadChiliMemoryContext({ cwd });
   const documents = filterMemoryDocuments(snapshot.documents, scope);
   if (documents.length === 0) {
     console.log("No Chili memory or project instructions loaded.");
@@ -981,9 +992,10 @@ async function addMemory(
   harness: Awaited<ReturnType<typeof createCliHarness>>,
   text: string,
   scope: MemoryScopeArg,
+  cwd = harness.cwd,
 ): Promise<void> {
   const result = await addChiliMemoryEntry({
-    cwd: harness.cwd,
+    cwd,
     text,
     scope: memoryWriteScope(scope),
   });
@@ -991,8 +1003,12 @@ async function addMemory(
   console.log(`- ${result.text}`);
 }
 
-async function reloadMemory(harness: Awaited<ReturnType<typeof createCliHarness>>, scope: MemoryScopeArg): Promise<void> {
-  const snapshot = await loadChiliMemoryContext({ cwd: harness.cwd });
+async function reloadMemory(
+  harness: Awaited<ReturnType<typeof createCliHarness>>,
+  scope: MemoryScopeArg,
+  cwd = harness.cwd,
+): Promise<void> {
+  const snapshot = await loadChiliMemoryContext({ cwd });
   const documents = filterMemoryDocuments(snapshot.documents, scope);
   console.log(`[memory] reloaded ${documents.length} source(s)`);
   if (documents.length > 0) {
@@ -1113,10 +1129,13 @@ async function repl(input: {
   maxTurns: number;
 }): Promise<void> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const commandRegistry = createCliReplCommandRegistry(await input.harness.commands.list());
+  const persistedSession = (await input.harness.store.sessions()).find((session) => session.id === input.sessionId);
+  if (!persistedSession) throw new Error(`Session not found: ${input.sessionId}`);
+  const sessionCwd = persistedSession.cwd;
+  const commandRegistry = createCliReplCommandRegistry(await input.harness.commands.list({ cwd: sessionCwd }));
   const commandContext: CliReplCommandContext = {
     sessionId: input.sessionId,
-    cwd: input.harness.cwd,
+    cwd: sessionCwd,
     listSessions: async () => printSessions(input.harness.store),
     setModel: async (sessionId, selection) => {
       const config = await input.harness.service.setModel({ sessionId, modelSelection: selection });
@@ -1159,14 +1178,21 @@ async function repl(input: {
     showMailbox: async (sessionId) => printMailbox(input.harness, sessionId),
     listTasks: async (sessionId) => printTasks(input.harness, sessionId),
     showTask: async (sessionId, taskId) => printTask(input.harness, taskId as TaskId, sessionId),
-    showMemory: async (scope) => handleMemoryReplCommand(input.harness, `show ${scope}`.trim()),
-    addMemory: async (value) => handleMemoryReplCommand(input.harness, `add ${value}`.trim()),
-    reloadMemory: async (scope) => handleMemoryReplCommand(input.harness, `reload ${scope}`.trim()),
+    recoverTasks: async (sessionId) => {
+      const result = await input.harness.tasks.reconcileStaleTasks({ parentSessionId: sessionId });
+      console.log(`[tasks] scanned=${result.scanned} closed=${result.closed.length}`);
+      for (const task of result.closed) {
+        console.log(`[task] ${task.id}\t${task.status}\t${task.summary ?? ""}`);
+      }
+    },
+    showMemory: async (cwd, scope) => handleMemoryReplCommand(input.harness, `show ${scope}`.trim(), cwd),
+    addMemory: async (cwd, value) => handleMemoryReplCommand(input.harness, `add ${value}`.trim(), cwd),
+    reloadMemory: async (cwd, scope) => handleMemoryReplCommand(input.harness, `reload ${scope}`.trim(), cwd),
     runPromptCommand: async (sessionId, commandId, args) => {
       const command = await input.harness.commands.run({
         commandId,
         ...(args ? { args } : {}),
-        cwd: input.harness.cwd,
+        cwd: sessionCwd,
       });
       const controller = installInterruptHandler();
       await runSessionPrompt({
@@ -1211,21 +1237,22 @@ async function repl(input: {
 async function handleMemoryReplCommand(
   harness: Awaited<ReturnType<typeof createCliHarness>>,
   command: string,
+  cwd = harness.cwd,
 ): Promise<void> {
   const action = command.split(/\s+/, 1)[0] || "show";
   const rest = command.slice(action.length).trim();
   if (action === "show" || action === "list") {
-    await printMemory(harness, parseReplMemoryScope(rest));
+    await printMemory(harness, parseReplMemoryScope(rest), cwd);
     return;
   }
   if (action === "reload" || action === "refresh") {
-    await reloadMemory(harness, parseReplMemoryScope(rest));
+    await reloadMemory(harness, parseReplMemoryScope(rest), cwd);
     return;
   }
   if (action === "add") {
     const parsed = parseReplMemoryAdd(rest);
     if (!parsed.text) throw new Error("/memory add requires text");
-    await addMemory(harness, parsed.text, parsed.scope);
+    await addMemory(harness, parsed.text, parsed.scope, cwd);
     return;
   }
   throw new Error(`Unknown /memory command: ${action}`);

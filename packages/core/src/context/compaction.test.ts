@@ -1309,6 +1309,34 @@ test("runtime auto-compacts before the main model request and sends the summary 
 });
 
 test("runtime reactively compacts and retries context limit failures before output starts", async () => {
+  await expectReactiveCompactionRecovery(() => new Error("context window exceeded"));
+});
+
+test("runtime recovers from structured context-limit codes, types, and statuses with generic messages", async () => {
+  await expectReactiveCompactionRecovery(() => {
+    const error = new Error("Model request failed with HTTP 400 Bad Request") as Error & {
+      name: string;
+      code: string;
+      type: string;
+      status: number;
+    };
+    error.name = "ProviderError";
+    error.code = "context_length_exceeded";
+    error.type = "invalid_request_error";
+    error.status = 400;
+    return error;
+  });
+  await expectReactiveCompactionRecovery(() => Object.assign(
+    new Error("Model response rejected"),
+    { name: "ProviderError", type: "context_window_exceeded", status: 400 },
+  ));
+  await expectReactiveCompactionRecovery(() => Object.assign(
+    new Error("Model response rejected"),
+    { name: "ProviderError", status: 413 },
+  ));
+});
+
+async function expectReactiveCompactionRecovery(firstError: () => Error): Promise<void> {
   const store = new ProjectingEventStore();
   const registry = new InMemoryToolRegistry();
   let mainCalls = 0;
@@ -1333,7 +1361,7 @@ test("runtime reactively compacts and retries context limit failures before outp
       mainCalls++;
       if (mainCalls === 1) {
         yield { type: "metadata", provider: "test", model: "large-context", responseId: "resp_before_recovery" };
-        throw new Error("context window exceeded");
+        throw firstError();
       }
       const modelText = input.messages.flatMap((message) => message.parts).map(modelVisiblePartText).join("\n");
       expect(modelText).toContain("recover from a context limit error");
@@ -1377,7 +1405,7 @@ test("runtime reactively compacts and retries context limit failures before outp
       (event) => event.type === "turn.compaction_requested" && event.payload.reason === "recovery",
     ),
   ).toBe(true);
-});
+}
 
 class ProjectingEventStore implements EventStore {
   readonly items: ChiliEvent[] = [];

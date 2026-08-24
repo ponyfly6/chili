@@ -1,11 +1,18 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
 import type { AgentPath, SessionId, TimestampMs } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import { runProcess } from "@chili/tools";
+import {
+  RuntimeBusyError,
+  type RuntimeSessionOperation,
+  type SessionOperationCoordinator,
+} from "./runtime-service.js";
 import { TeamMergeService, type TeamMergeGitRunnerResult } from "./team-merge.js";
+import { TeamSessionAuthorityError } from "./team-session-authority.js";
 import { TeamControlService } from "./team.js";
 import { taskMergeMetadata, TeamWorktreeService } from "./team-worktree.js";
 
@@ -50,6 +57,60 @@ test("applies a verifier-passed pending worktree merge to the main workspace", a
       errors: [],
     });
     expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 2;\n");
+  } finally {
+    await context.close();
+  }
+});
+
+test("continues apply and finalization after the request aborts post-marker", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-post-marker-abort-");
+  const controller = new AbortController();
+  let markerObserved = false;
+
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    const merger = new TeamMergeService({
+      teams: context.teams,
+      cwd: context.dir,
+      resolveSession: persistedRootSessionResolver(context.store),
+      sessionOperations: passthroughSessionOperations,
+      runGit: async (input): Promise<TeamMergeGitRunnerResult> => {
+        if (
+          input.args[0] === "apply"
+          && input.args.includes("--reverse")
+          && input.args.includes("--check")
+          && !controller.signal.aborted
+        ) {
+          const [taskAtMarker] = await context.teams.tasks(context.teamId);
+          const mergeAtMarker = taskAtMarker?.metadata?.merge as Record<string, unknown> | undefined;
+          markerObserved = mergeAtMarker?.status === "pending"
+            && typeof mergeAtMarker.applyStartedAt === "number"
+            && typeof mergeAtMarker.patchFingerprint === "string";
+          controller.abort(new DOMException("request closed", "AbortError"));
+        }
+        const result = await runProcess("git", input.args, {
+          cwd: input.cwd,
+          ...(input.signal ? { signal: input.signal } : {}),
+          timeoutMs: input.timeoutMs ?? 30_000,
+          maxOutputBytes: input.maxOutputBytes ?? 5_000_000,
+        });
+        return result;
+      },
+    });
+
+    const result = await merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+      signal: controller.signal,
+    });
+
+    expect(controller.signal.aborted).toBe(true);
+    expect(markerObserved).toBe(true);
+    expect(result.applied).toMatchObject([{ teamTask: { id: context.taskId } }]);
+    expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 2;\n");
+    const [storedTask] = await context.teams.tasks(context.teamId);
+    expect(taskMergeMetadata(storedTask?.metadata)?.status).toBe("applied");
   } finally {
     await context.close();
   }
@@ -141,6 +202,368 @@ test("applies staged and untracked worktree changes in the merge diff", async ()
   }
 });
 
+test("merges worker commits by diffing the frozen base commit to the current worktree", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-worker-commit-");
+
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 7;\n");
+    await git(context.worktreePath, ["add", "packages/core/src/feature.ts"]);
+    await git(context.worktreePath, ["commit", "-q", "-m", "worker commit"]);
+
+    const result = await context.merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    });
+
+    expect(result.applied).toMatchObject([{ status: "applied", diffSummary: { filesChanged: 1 } }]);
+    expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 7;\n");
+    const [storedTask] = await context.teams.tasks(context.teamId);
+    expect(taskMergeMetadata(storedTask?.metadata)?.diff).toContain("export const value = 7;");
+  } finally {
+    await context.close();
+  }
+});
+
+test("rejects committed main divergence on a touched path before git apply", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-committed-divergence-");
+  let actualApplyCalls = 0;
+
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    await writeFile(
+      join(context.dir, "packages/core/src/feature.ts"),
+      "export const value = 1;\nexport const mainOnly = true;\n",
+    );
+    await git(context.dir, ["add", "packages/core/src/feature.ts"]);
+    await git(context.dir, ["commit", "-q", "-m", "main touched same file"]);
+    const beforeMerge = await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8");
+    const merger = new TeamMergeService({
+      teams: context.teams,
+      cwd: context.dir,
+      resolveSession: persistedRootSessionResolver(context.store),
+      sessionOperations: passthroughSessionOperations,
+      runGit: async (input): Promise<TeamMergeGitRunnerResult> => {
+        if (input.args[0] === "apply" && !input.args.includes("--check")) actualApplyCalls++;
+        return runProcess("git", input.args, {
+          cwd: input.cwd,
+          ...(input.signal ? { signal: input.signal } : {}),
+          timeoutMs: input.timeoutMs ?? 30_000,
+          maxOutputBytes: input.maxOutputBytes ?? 5_000_000,
+        });
+      },
+    });
+
+    const result = await merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    });
+
+    expect(result.conflicted).toMatchObject([{
+      error: "Main workspace has committed changes in files touched by the task patch",
+    }]);
+    expect(actualApplyCalls).toBe(0);
+    expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toBe(beforeMerge);
+  } finally {
+    await context.close();
+  }
+});
+
+test("recovers a durable apply intent after a crash before git apply", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-marker-recovery-");
+  let crashBeforeApply = true;
+  let actualApplyCalls = 0;
+
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    const merger = new TeamMergeService({
+      teams: context.teams,
+      cwd: context.dir,
+      resolveSession: persistedRootSessionResolver(context.store),
+      sessionOperations: passthroughSessionOperations,
+      runGit: async (input): Promise<TeamMergeGitRunnerResult> => {
+        if (
+          crashBeforeApply
+          && input.args[0] === "apply"
+          && input.args.includes("--reverse")
+          && input.args.includes("--check")
+        ) {
+          crashBeforeApply = false;
+          throw new Error("simulated crash after apply marker");
+        }
+        if (input.args[0] === "apply" && !input.args.includes("--check")) actualApplyCalls++;
+        return runProcess("git", input.args, {
+          cwd: input.cwd,
+          ...(input.signal ? { signal: input.signal } : {}),
+          timeoutMs: input.timeoutMs ?? 30_000,
+          maxOutputBytes: input.maxOutputBytes ?? 5_000_000,
+        });
+      },
+    });
+
+    const interrupted = await merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    });
+    expect(interrupted.errors).toMatchObject([{ taskId: context.taskId, error: "simulated crash after apply marker" }]);
+    expect(actualApplyCalls).toBe(0);
+    expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 1;\n");
+    const [markedTask] = await context.teams.tasks(context.teamId);
+    const markedMerge = markedTask?.metadata?.merge as Record<string, unknown> | undefined;
+    expect(markedMerge).toMatchObject({
+      status: "pending",
+      baseCommit: expect.any(String),
+      mainHead: expect.any(String),
+      worktreeHead: expect.any(String),
+      applyStartedAt: expect.any(Number),
+      patchFingerprint: expect.any(String),
+      postStateFingerprint: expect.any(String),
+    });
+
+    const recovered = await merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    });
+    expect(recovered.applied).toMatchObject([{ teamTask: { id: context.taskId } }]);
+    expect(actualApplyCalls).toBe(1);
+    expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 2;\n");
+  } finally {
+    await context.close();
+  }
+});
+
+test("refuses a frozen apply intent after main HEAD advances", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-main-head-fence-");
+  let stopAfterMarker = true;
+  let actualApplyCalls = 0;
+
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    const merger = new TeamMergeService({
+      teams: context.teams,
+      cwd: context.dir,
+      resolveSession: persistedRootSessionResolver(context.store),
+      sessionOperations: passthroughSessionOperations,
+      runGit: async (input): Promise<TeamMergeGitRunnerResult> => {
+        if (
+          stopAfterMarker
+          && input.args[0] === "apply"
+          && input.args.includes("--reverse")
+          && input.args.includes("--check")
+        ) {
+          stopAfterMarker = false;
+          throw new Error("stop after marker");
+        }
+        if (input.args[0] === "apply" && !input.args.includes("--check")) actualApplyCalls++;
+        return runProcess("git", input.args, {
+          cwd: input.cwd,
+          ...(input.signal ? { signal: input.signal } : {}),
+          timeoutMs: input.timeoutMs ?? 30_000,
+          maxOutputBytes: input.maxOutputBytes ?? 5_000_000,
+        });
+      },
+    });
+
+    const interrupted = await merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    });
+    expect(interrupted.errors).toHaveLength(1);
+    await writeFile(join(context.dir, "docs/readme.md"), "# docs\n\nmain advanced\n");
+    await git(context.dir, ["add", "docs/readme.md"]);
+    await git(context.dir, ["commit", "-q", "-m", "advance main"]);
+
+    const recovered = await merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    });
+    expect(recovered.conflicted).toMatchObject([{
+      error: "Main workspace HEAD changed after the merge apply intent was frozen",
+    }]);
+    expect(actualApplyCalls).toBe(0);
+    expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 1;\n");
+  } finally {
+    await context.close();
+  }
+});
+
+test("finalizes exactly once when the owner lease is lost after git apply", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-apply-lease-loss-");
+  const sessionOperations = new TestSessionOperationCoordinator();
+  const fencedTeams = new TeamControlService({
+    store: context.store,
+    now: () => 2000 as TimestampMs,
+    sessionOperations,
+  });
+  let loseLeaseAfterApply = true;
+  let actualApplyCalls = 0;
+
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    const merger = new TeamMergeService({
+      teams: fencedTeams,
+      cwd: context.dir,
+      resolveSession: persistedRootSessionResolver(context.store),
+      sessionOperations,
+      runGit: async (input): Promise<TeamMergeGitRunnerResult> => {
+        const result = await runProcess("git", input.args, {
+          cwd: input.cwd,
+          ...(input.signal ? { signal: input.signal } : {}),
+          timeoutMs: input.timeoutMs ?? 30_000,
+          maxOutputBytes: input.maxOutputBytes ?? 5_000_000,
+        });
+        if (input.args[0] === "apply" && !input.args.includes("--check")) {
+          actualApplyCalls++;
+          if (loseLeaseAfterApply && result.exitCode === 0) {
+            loseLeaseAfterApply = false;
+            sessionOperations.invalidate(context.sessionId);
+          }
+        }
+        return result;
+      },
+    });
+
+    await expect(merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    })).rejects.toBeInstanceOf(RuntimeBusyError);
+    expect(actualApplyCalls).toBe(1);
+    expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 2;\n");
+    const [pendingTask] = await fencedTeams.tasks(context.teamId);
+    expect(taskMergeMetadata(pendingTask?.metadata)?.status).toBe("pending");
+
+    const recovered = await merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    });
+    expect(recovered.applied).toMatchObject([{ teamTask: { id: context.taskId } }]);
+    expect(actualApplyCalls).toBe(1);
+    const [appliedTask] = await fencedTeams.tasks(context.teamId);
+    expect(taskMergeMetadata(appliedTask?.metadata)?.status).toBe("applied");
+  } finally {
+    await context.close();
+  }
+});
+
+test("marks a partially applied frozen patch conflicted without rollback", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-partial-recovery-");
+  let stopAfterMarker = true;
+  let actualApplyCalls = 0;
+
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    await writeFile(join(context.worktreePath, "docs/readme.md"), "# docs\n\nworker docs\n");
+    const merger = new TeamMergeService({
+      teams: context.teams,
+      cwd: context.dir,
+      resolveSession: persistedRootSessionResolver(context.store),
+      sessionOperations: passthroughSessionOperations,
+      runGit: async (input): Promise<TeamMergeGitRunnerResult> => {
+        if (
+          stopAfterMarker
+          && input.args[0] === "apply"
+          && input.args.includes("--reverse")
+          && input.args.includes("--check")
+        ) {
+          stopAfterMarker = false;
+          throw new Error("stop after marker");
+        }
+        if (input.args[0] === "apply" && !input.args.includes("--check")) actualApplyCalls++;
+        return runProcess("git", input.args, {
+          cwd: input.cwd,
+          ...(input.signal ? { signal: input.signal } : {}),
+          timeoutMs: input.timeoutMs ?? 30_000,
+          maxOutputBytes: input.maxOutputBytes ?? 5_000_000,
+        });
+      },
+    });
+
+    const interrupted = await merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    });
+    expect(interrupted.errors).toHaveLength(1);
+    await writeFile(join(context.dir, "packages/core/src/feature.ts"), "export const value = 2;\n");
+
+    const recovered = await merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    });
+    expect(recovered.conflicted).toMatchObject([{
+      error: "Frozen task patch is partially applied or conflicts with the main workspace",
+    }]);
+    expect(actualApplyCalls).toBe(0);
+    expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 2;\n");
+    expect(await readFile(join(context.dir, "docs/readme.md"), "utf8")).toBe("# docs\n");
+  } finally {
+    await context.close();
+  }
+});
+
+test("does not accept an already-applied patch after touched files receive extra edits", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-post-state-fence-");
+  let crashAfterApply = true;
+
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    const merger = new TeamMergeService({
+      teams: context.teams,
+      cwd: context.dir,
+      resolveSession: persistedRootSessionResolver(context.store),
+      sessionOperations: passthroughSessionOperations,
+      runGit: async (input): Promise<TeamMergeGitRunnerResult> => {
+        const result = await runProcess("git", input.args, {
+          cwd: input.cwd,
+          ...(input.signal ? { signal: input.signal } : {}),
+          timeoutMs: input.timeoutMs ?? 30_000,
+          maxOutputBytes: input.maxOutputBytes ?? 5_000_000,
+        });
+        if (
+          crashAfterApply
+          && input.args[0] === "apply"
+          && !input.args.includes("--check")
+          && result.exitCode === 0
+        ) {
+          crashAfterApply = false;
+          throw new Error("simulated crash after git apply");
+        }
+        return result;
+      },
+    });
+
+    const interrupted = await merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    });
+    expect(interrupted.errors).toHaveLength(1);
+    await writeFile(
+      join(context.dir, "packages/core/src/feature.ts"),
+      "export const value = 2;\n// user edit after apply\n",
+    );
+
+    const recovered = await merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    });
+    expect(recovered.conflicted).toHaveLength(1);
+    expect(recovered.applied).toEqual([]);
+    expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toContain("user edit after apply");
+  } finally {
+    await context.close();
+  }
+});
+
 test("prechecks pending merge patches concurrently before serial apply", async () => {
   const context = await createPendingMergeContext("chili-team-merge-precheck-");
   const now = () => 2000 as TimestampMs;
@@ -148,7 +571,13 @@ test("prechecks pending merge patches concurrently before serial apply", async (
   let maxRunningDiffs = 0;
 
   try {
-    const worktrees = new TeamWorktreeService({ teams: context.teams, cwd: context.dir, now });
+    const worktrees = new TeamWorktreeService({
+      teams: context.teams,
+      cwd: context.dir,
+      now,
+      resolveSession: persistedRootSessionResolver(context.store),
+      sessionOperations: passthroughSessionOperations,
+    });
     const second = await context.teams.createTask({
       sessionId: context.sessionId,
       teamId: context.teamId,
@@ -187,8 +616,12 @@ test("prechecks pending merge patches concurrently before serial apply", async (
       teams: context.teams,
       cwd: context.dir,
       now,
+      resolveSession: persistedRootSessionResolver(context.store),
+      sessionOperations: passthroughSessionOperations,
       runGit: async (input): Promise<TeamMergeGitRunnerResult> => {
-        const isWorktreeHeadDiff = input.args[0] === "diff" && input.args.includes("HEAD") && input.cwd.includes(".chili/worktrees");
+        const isWorktreeHeadDiff = input.args[0] === "diff"
+          && input.args.includes("--binary")
+          && input.cwd.includes(".chili/worktrees");
         if (isWorktreeHeadDiff) {
           runningDiffs++;
           maxRunningDiffs = Math.max(maxRunningDiffs, runningDiffs);
@@ -222,6 +655,455 @@ test("prechecks pending merge patches concurrently before serial apply", async (
   }
 });
 
+test("rejects merge session/workspace overrides and resolver failures before any git command", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-authority-");
+  const workspaceB = await mkdtemp(join(tmpdir(), "chili-team-merge-authority-b-"));
+  const sessionB = "session_team_merge_b" as SessionId;
+  let gitCalls = 0;
+  const runGit = async (): Promise<TeamMergeGitRunnerResult> => {
+    gitCalls++;
+    return { exitCode: 0, stdout: "", stderr: "" };
+  };
+
+  try {
+    const merger = new TeamMergeService({
+      teams: context.teams,
+      cwd: workspaceB,
+      resolveSession: persistedRootSessionResolver(context.store),
+      sessionOperations: passthroughSessionOperations,
+      runGit,
+    });
+    await expect(merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: sessionB,
+      cwd: context.dir,
+    })).rejects.toBeInstanceOf(TeamSessionAuthorityError);
+    await expect(merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: workspaceB,
+    })).rejects.toBeInstanceOf(TeamSessionAuthorityError);
+
+    for (const reason of ["missing", "archived", "subagent"] as const) {
+      const rejectingMerger = new TeamMergeService({
+        teams: context.teams,
+        cwd: context.dir,
+        resolveSession: async () => {
+          throw new Error(`session is ${reason}`);
+        },
+        sessionOperations: passthroughSessionOperations,
+        runGit,
+      });
+      await expect(rejectingMerger.mergeTeamTasks({
+        teamId: context.teamId,
+        sessionId: context.sessionId,
+        cwd: context.dir,
+      })).rejects.toThrow(`session is ${reason}`);
+    }
+
+    expect(gitCalls).toBe(0);
+    const [storedTask] = await context.teams.tasks(context.teamId);
+    expect(taskMergeMetadata(storedTask?.metadata)?.status).toBe("pending");
+  } finally {
+    await rm(workspaceB, { recursive: true, force: true });
+    await context.close();
+  }
+});
+
+test("rejects absolute, traversal, and symlink worktree path overrides before git or finalize", async () => {
+  const cases = ["absolute", "traversal", "symlink"] as const;
+
+  for (const variant of cases) {
+    const context = await createPendingMergeContext(`chili-team-merge-path-${variant}-`);
+    const workspaceB = await mkdtemp(join(tmpdir(), `chili-team-merge-path-${variant}-b-`));
+    let gitCalls = 0;
+    try {
+      const [task] = await context.teams.tasks(context.teamId);
+      if (!task) throw new Error("expected pending merge task");
+      if (variant === "symlink") {
+        await rm(context.worktreePath, { recursive: true, force: true });
+        await symlink(await realpath(workspaceB), context.worktreePath, "dir");
+      } else {
+        const merge = taskMergeMetadata(task.metadata);
+        if (!merge) throw new Error("expected pending merge metadata");
+        await context.teams.updateTask({
+          sessionId: context.sessionId,
+          teamId: context.teamId,
+          taskId: context.taskId,
+          metadata: {
+            ...(task.metadata ?? {}),
+            merge: {
+              ...merge,
+              worktreePath: variant === "absolute" ? await realpath(workspaceB) : "../../../workspace-b",
+            },
+          },
+        });
+      }
+
+      const merger = new TeamMergeService({
+        teams: context.teams,
+        cwd: context.dir,
+        resolveSession: persistedRootSessionResolver(context.store),
+        sessionOperations: passthroughSessionOperations,
+        runGit: async () => {
+          gitCalls++;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      });
+      const result = await merger.mergeTeamTasks({
+        teamId: context.teamId,
+        sessionId: context.sessionId,
+        cwd: context.dir,
+      });
+
+      expect(result.errors).toHaveLength(1);
+      expect(result.applied).toEqual([]);
+      expect(result.conflicted).toEqual([]);
+      expect(result.skipped).toEqual([]);
+      expect(gitCalls).toBe(0);
+      const [storedTask] = await context.teams.tasks(context.teamId);
+      expect(taskMergeMetadata(storedTask?.metadata)?.status).toBe("pending");
+    } finally {
+      await rm(workspaceB, { recursive: true, force: true });
+      await context.close();
+    }
+  }
+});
+
+test("reauthorizes every merge-prepare finalization branch before task mutation", async () => {
+  const scenarios = [
+    {
+      name: "missing",
+      setup: async (context: Awaited<ReturnType<typeof createPendingMergeContext>>) => {
+        await rm(context.worktreePath, { recursive: true, force: true });
+      },
+    },
+    {
+      name: "empty",
+      setup: async (_context: Awaited<ReturnType<typeof createPendingMergeContext>>) => {},
+    },
+    {
+      name: "dirty",
+      setup: async (context: Awaited<ReturnType<typeof createPendingMergeContext>>) => {
+        await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+        await writeFile(join(context.dir, "packages/core/src/feature.ts"), "export const value = 99;\n");
+      },
+    },
+    {
+      name: "patch-conflict",
+      setup: async (context: Awaited<ReturnType<typeof createPendingMergeContext>>) => {
+        await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+        await writeFile(join(context.dir, "packages/core/src/feature.ts"), "export const value = 99;\n");
+        await git(context.dir, ["add", "packages/core/src/feature.ts"]);
+        await git(context.dir, ["commit", "-q", "-m", "diverge main"]);
+      },
+    },
+  ] as const;
+
+  for (const scenario of scenarios) {
+    const context = await createPendingMergeContext(`chili-team-merge-reauth-${scenario.name}-`);
+    try {
+      await scenario.setup(context);
+      const persistedResolver = persistedRootSessionResolver(context.store);
+      let resolverCalls = 0;
+      const merger = new TeamMergeService({
+        teams: context.teams,
+        cwd: context.dir,
+        resolveSession: async (sessionId) => {
+          resolverCalls++;
+          if (resolverCalls === 3) throw new Error(`session revoked before ${scenario.name} finalization`);
+          return persistedResolver(sessionId);
+        },
+        sessionOperations: passthroughSessionOperations,
+      });
+
+      const result = await merger.mergeTeamTasks({
+        teamId: context.teamId,
+        sessionId: context.sessionId,
+        cwd: context.dir,
+      });
+
+      expect(resolverCalls).toBe(3);
+      expect(result.errors).toMatchObject([{ taskId: context.taskId }]);
+      expect(result.applied).toEqual([]);
+      expect(result.conflicted).toEqual([]);
+      expect(result.skipped).toEqual([]);
+      const [storedTask] = await context.teams.tasks(context.teamId);
+      expect(taskMergeMetadata(storedTask?.metadata)?.status).toBe("pending");
+    } finally {
+      await context.close();
+    }
+  }
+});
+
+test("reauthorizes immediately before the actual git apply", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-apply-reauth-");
+  let resolverCalls = 0;
+  let actualApplyCalls = 0;
+
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    const persistedResolver = persistedRootSessionResolver(context.store);
+    const merger = new TeamMergeService({
+      teams: context.teams,
+      cwd: context.dir,
+      resolveSession: async (sessionId) => {
+        resolverCalls++;
+        if (resolverCalls === 5) throw new Error("session revoked immediately before git apply");
+        return persistedResolver(sessionId);
+      },
+      sessionOperations: passthroughSessionOperations,
+      runGit: async (input): Promise<TeamMergeGitRunnerResult> => {
+        if (input.args[0] === "apply" && !input.args.includes("--check")) actualApplyCalls++;
+        return runProcess("git", input.args, {
+          cwd: input.cwd,
+          ...(input.signal ? { signal: input.signal } : {}),
+          timeoutMs: input.timeoutMs ?? 30_000,
+          maxOutputBytes: input.maxOutputBytes ?? 5_000_000,
+        });
+      },
+    });
+
+    const result = await merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    });
+
+    expect(resolverCalls).toBe(5);
+    expect(actualApplyCalls).toBe(0);
+    expect(result.errors).toMatchObject([{ taskId: context.taskId }]);
+    expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 1;\n");
+    const [storedTask] = await context.teams.tasks(context.teamId);
+    expect(taskMergeMetadata(storedTask?.metadata)?.status).toBe("pending");
+  } finally {
+    await context.close();
+  }
+});
+
+test("holds one session operation across the merge sweep and rejects a concurrent merge before side effects", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-operation-busy-");
+  const sessionOperations = new TestSessionOperationCoordinator();
+  let releaseGit: (() => void) | undefined;
+  let reachedGit: (() => void) | undefined;
+  const gitReleased = new Promise<void>((resolve) => {
+    releaseGit = resolve;
+  });
+  const gitReached = new Promise<void>((resolve) => {
+    reachedGit = resolve;
+  });
+  let shouldBlock = true;
+  let gitCalls = 0;
+  let actualApplyCalls = 0;
+  let firstMerge: Promise<unknown> | undefined;
+
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    const merger = new TeamMergeService({
+      teams: context.teams,
+      cwd: context.dir,
+      resolveSession: persistedRootSessionResolver(context.store),
+      sessionOperations,
+      runGit: async (input): Promise<TeamMergeGitRunnerResult> => {
+        gitCalls++;
+        const isWorktreeDiff = input.args[0] === "diff"
+          && input.args.includes("--binary")
+          && input.cwd === context.worktreePath;
+        if (shouldBlock && isWorktreeDiff) {
+          shouldBlock = false;
+          reachedGit?.();
+          await gitReleased;
+        }
+        if (input.args[0] === "apply" && !input.args.includes("--check")) actualApplyCalls++;
+        return runProcess("git", input.args, {
+          cwd: input.cwd,
+          ...(input.signal ? { signal: input.signal } : {}),
+          timeoutMs: input.timeoutMs ?? 30_000,
+          maxOutputBytes: input.maxOutputBytes ?? 5_000_000,
+        });
+      },
+    });
+
+    firstMerge = merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    });
+    await gitReached;
+    const callsBeforeConcurrentAttempt = gitCalls;
+
+    await expect(merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    })).rejects.toBeInstanceOf(RuntimeBusyError);
+
+    expect(gitCalls).toBe(callsBeforeConcurrentAttempt);
+    expect(actualApplyCalls).toBe(0);
+    const [pendingTask] = await context.teams.tasks(context.teamId);
+    expect(taskMergeMetadata(pendingTask?.metadata)?.status).toBe("pending");
+
+    releaseGit?.();
+    const completed = await firstMerge;
+    expect(completed).toMatchObject({ applied: [{ teamTask: { id: context.taskId } }] });
+    expect(actualApplyCalls).toBe(1);
+  } finally {
+    releaseGit?.();
+    await firstMerge?.catch(() => undefined);
+    await context.close();
+  }
+});
+
+test("fails closed when the session operation capability is lost immediately before git apply", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-operation-lost-");
+  const sessionOperations = new TestSessionOperationCoordinator();
+  const persistedResolver = persistedRootSessionResolver(context.store);
+  let resolverCalls = 0;
+  let actualApplyCalls = 0;
+
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    const merger = new TeamMergeService({
+      teams: context.teams,
+      cwd: context.dir,
+      resolveSession: async (sessionId) => {
+        resolverCalls++;
+        const resolved = await persistedResolver(sessionId);
+        if (resolverCalls === 5) sessionOperations.invalidate(sessionId);
+        return resolved;
+      },
+      sessionOperations,
+      runGit: async (input): Promise<TeamMergeGitRunnerResult> => {
+        if (input.args[0] === "apply" && !input.args.includes("--check")) actualApplyCalls++;
+        return runProcess("git", input.args, {
+          cwd: input.cwd,
+          ...(input.signal ? { signal: input.signal } : {}),
+          timeoutMs: input.timeoutMs ?? 30_000,
+          maxOutputBytes: input.maxOutputBytes ?? 5_000_000,
+        });
+      },
+    });
+
+    await expect(merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    })).rejects.toBeInstanceOf(RuntimeBusyError);
+
+    expect(resolverCalls).toBe(5);
+    expect(actualApplyCalls).toBe(0);
+    expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 1;\n");
+    const [storedTask] = await context.teams.tasks(context.teamId);
+    expect(taskMergeMetadata(storedTask?.metadata)?.status).toBe("pending");
+  } finally {
+    await context.close();
+  }
+});
+
+test("refuses merge finalization when the session operation capability expires after revalidation", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-operation-finalize-");
+  const sessionOperations = new TestSessionOperationCoordinator();
+  const persistedResolver = persistedRootSessionResolver(context.store);
+  let resolverCalls = 0;
+  let actualApplyCalls = 0;
+
+  try {
+    const merger = new TeamMergeService({
+      teams: context.teams,
+      cwd: context.dir,
+      resolveSession: async (sessionId) => {
+        resolverCalls++;
+        const resolved = await persistedResolver(sessionId);
+        if (resolverCalls === 3) sessionOperations.invalidate(sessionId);
+        return resolved;
+      },
+      sessionOperations,
+      runGit: async (input): Promise<TeamMergeGitRunnerResult> => {
+        if (input.args[0] === "apply" && !input.args.includes("--check")) actualApplyCalls++;
+        return runProcess("git", input.args, {
+          cwd: input.cwd,
+          ...(input.signal ? { signal: input.signal } : {}),
+          timeoutMs: input.timeoutMs ?? 30_000,
+          maxOutputBytes: input.maxOutputBytes ?? 5_000_000,
+        });
+      },
+    });
+
+    await expect(merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    })).rejects.toBeInstanceOf(RuntimeBusyError);
+
+    expect(resolverCalls).toBe(3);
+    expect(actualApplyCalls).toBe(0);
+    const [storedTask] = await context.teams.tasks(context.teamId);
+    expect(taskMergeMetadata(storedTask?.metadata)?.status).toBe("pending");
+  } finally {
+    await context.close();
+  }
+});
+
+test("reuses a nested session operation while preserving the merge capability", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-operation-nested-");
+  const sessionOperations = new TestSessionOperationCoordinator();
+
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    const merger = new TeamMergeService({
+      teams: context.teams,
+      cwd: context.dir,
+      resolveSession: persistedRootSessionResolver(context.store),
+      sessionOperations,
+    });
+
+    const result = await sessionOperations.withSessionOperation(
+      context.sessionId,
+      () => merger.mergeTeamTasks({
+        teamId: context.teamId,
+        sessionId: context.sessionId,
+        cwd: context.dir,
+      }),
+    );
+
+    expect(result.applied).toMatchObject([{ teamTask: { id: context.taskId } }]);
+    expect(sessionOperations.acquisitions).toBe(1);
+    expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 2;\n");
+  } finally {
+    await context.close();
+  }
+});
+
+test("does not downgrade a merge authority revocation into a per-task error", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-operation-authority-");
+  const persistedResolver = persistedRootSessionResolver(context.store);
+  let resolverCalls = 0;
+
+  try {
+    await rm(context.worktreePath, { recursive: true, force: true });
+    const merger = new TeamMergeService({
+      teams: context.teams,
+      cwd: context.dir,
+      resolveSession: async (sessionId) => {
+        resolverCalls++;
+        if (resolverCalls === 3) throw new TeamSessionAuthorityError("team owner session was revoked");
+        return persistedResolver(sessionId);
+      },
+      sessionOperations: passthroughSessionOperations,
+    });
+
+    await expect(merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    })).rejects.toBeInstanceOf(TeamSessionAuthorityError);
+    const [storedTask] = await context.teams.tasks(context.teamId);
+    expect(taskMergeMetadata(storedTask?.metadata)?.status).toBe("pending");
+  } finally {
+    await context.close();
+  }
+});
+
 async function createPendingMergeContext(prefix: string): Promise<{
   dir: string;
   store: SqliteEventStore;
@@ -240,9 +1122,22 @@ async function createPendingMergeContext(prefix: string): Promise<{
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_merge" as SessionId;
+  await persistRootSession(store, sessionId, dir, now());
   const teams = new TeamControlService({ store, createId: ids, now });
-  const worktrees = new TeamWorktreeService({ teams, cwd: dir, now });
-  const merger = new TeamMergeService({ teams, cwd: dir, now });
+  const worktrees = new TeamWorktreeService({
+    teams,
+    cwd: dir,
+    now,
+    resolveSession: persistedRootSessionResolver(store),
+    sessionOperations: passthroughSessionOperations,
+  });
+  const merger = new TeamMergeService({
+    teams,
+    cwd: dir,
+    now,
+    resolveSession: persistedRootSessionResolver(store),
+    sessionOperations: passthroughSessionOperations,
+  });
   const team = await teams.createTeam({ sessionId, name: "merge", leadPath });
   await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer", writeScope: ["packages/core", "docs"] });
   const task = await teams.createTask({
@@ -307,6 +1202,31 @@ async function git(cwd: string, args: readonly string[]): Promise<void> {
   if (result.exitCode !== 0) throw new Error(result.stderr || `git ${args.join(" ")} failed`);
 }
 
+async function persistRootSession(
+  store: SqliteEventStore,
+  sessionId: SessionId,
+  cwd: string,
+  time: number,
+): Promise<void> {
+  await store.append({
+    id: `event_${sessionId}`,
+    type: "session.created",
+    time: time as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd },
+  });
+}
+
+function persistedRootSessionResolver(store: SqliteEventStore) {
+  return async (sessionId: SessionId): Promise<{ cwd: string }> => {
+    const session = (await store.sessions()).find((candidate) => candidate.id === sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (session.status !== "active") throw new Error(`Session is not active: ${sessionId}`);
+    if (session.source === "subagent") throw new Error(`Session is not interactive: ${sessionId}`);
+    return { cwd: session.cwd };
+  };
+}
+
 function createSequentialId(): (prefix: string) => string {
   let next = 0;
   return (prefix: string) => `${prefix}_${++next}`;
@@ -314,4 +1234,81 @@ function createSequentialId(): (prefix: string) => string {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const passthroughSessionOperations: SessionOperationCoordinator = {
+  async withSessionOperation<T>(
+    _sessionId: SessionId,
+    fn: (operation: RuntimeSessionOperation) => Promise<T> | T,
+  ): Promise<T> {
+    const operation: RuntimeSessionOperation = {
+      signal: new AbortController().signal,
+      assertCurrent: () => {},
+    };
+    return fn(operation);
+  },
+};
+
+interface TestSessionOperationState {
+  sessionId: SessionId;
+  controller: AbortController;
+  active: boolean;
+  operation: RuntimeSessionOperation;
+}
+
+class TestSessionOperationCoordinator implements SessionOperationCoordinator {
+  readonly #storage = new AsyncLocalStorage<TestSessionOperationState>();
+  readonly #active = new Map<SessionId, TestSessionOperationState>();
+  acquisitions = 0;
+
+  async withSessionOperation<T>(
+    sessionId: SessionId,
+    fn: (operation: RuntimeSessionOperation) => Promise<T> | T,
+  ): Promise<T> {
+    const inherited = this.#storage.getStore();
+    if (inherited?.sessionId === sessionId) {
+      inherited.operation.assertCurrent();
+      const result = await fn(inherited.operation);
+      inherited.operation.assertCurrent();
+      return result;
+    }
+    if (this.#active.has(sessionId)) throw new RuntimeBusyError(sessionId);
+
+    const controller = new AbortController();
+    let state: TestSessionOperationState;
+    state = {
+      sessionId,
+      controller,
+      active: true,
+      operation: {
+        signal: controller.signal,
+        assertCurrent: () => {
+          if (!state.active || this.#active.get(sessionId) !== state) {
+            throw new RuntimeBusyError(sessionId);
+          }
+        },
+      },
+    };
+    this.#active.set(sessionId, state);
+    this.acquisitions++;
+    return this.#storage.run(state, async () => {
+      try {
+        state.operation.assertCurrent();
+        const result = await fn(state.operation);
+        state.operation.assertCurrent();
+        return result;
+      } finally {
+        state.active = false;
+        if (this.#active.get(sessionId) === state) this.#active.delete(sessionId);
+      }
+    });
+  }
+
+  invalidate(sessionId: SessionId): void {
+    const state = this.#active.get(sessionId);
+    if (!state) return;
+    state.active = false;
+    this.#active.delete(sessionId);
+    state.controller.abort(new RuntimeBusyError(sessionId));
+  }
 }

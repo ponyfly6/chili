@@ -29,6 +29,7 @@ import type {
   SessionGoalStatus,
   TeamTaskClaimedPayload,
   TimestampMs,
+  ToolCallId,
   ToolEvent,
   TurnId,
 } from "@chili/protocol";
@@ -61,11 +62,15 @@ import type {
   AgentTaskQuery,
   AgentTaskRow,
   ApprovalRow,
+  EventAppendOptions,
+  EventCommitAwareStore,
   EventMirror,
   EventQuery,
   EventStore,
   GoalProjectionStore,
   SessionRow,
+  SessionCreationClaimFence,
+  SessionRunClaimFence,
   SubagentProjectionStore,
   TeamMemberQuery,
   TeamMemberRow,
@@ -73,6 +78,9 @@ import type {
   TeamMessageDeliveryRow,
   TeamMessageQuery,
   TeamMessageRow,
+  TeamOwnerSessionBindInput,
+  TeamOwnerSessionBindResult,
+  TeamOwnerSessionBindStore,
   TeamProjectionStore,
   TeamQuery,
   TeamRow,
@@ -135,6 +143,9 @@ interface SessionGoalProjectionRow {
 
 interface AgentTaskProjectionRow {
   id: string;
+  dispatch_id: string | null;
+  reserved_run_id: string | null;
+  worker_policy_json: string | null;
   path: string;
   parent_path: string | null;
   parent_session_id: string | null;
@@ -164,10 +175,14 @@ interface AgentTaskProjectionRow {
 }
 
 interface AgentTaskStateRow {
+  dispatch_id: string | null;
+  reserved_run_id: string | null;
+  worker_policy_json: string | null;
   status: string;
   generation: number;
   current_run_id: string | null;
   lease_owner: string | null;
+  lease_expires_at: number | null;
   path: string;
   parent_path: string | null;
   parent_session_id: string | null;
@@ -175,6 +190,12 @@ interface AgentTaskStateRow {
   task_name: string;
   cwd: string | null;
   mode: string | null;
+  source_call_id: string | null;
+  batch_id: string | null;
+  batch_index: number | null;
+  expected_batch_size: number | null;
+  completion_policy: string | null;
+  max_concurrency: number | null;
 }
 
 interface AgentRunProjectionRow {
@@ -304,6 +325,84 @@ export class UnknownEventCursorError extends Error {
   }
 }
 
+export class SessionCwdConflictError extends Error {
+  override readonly name = "SessionCwdConflictError";
+
+  constructor(
+    readonly sessionId: SessionId,
+    readonly existingCwd: string,
+    readonly requestedCwd: string,
+  ) {
+    super(
+      `Session ${sessionId} already exists with cwd ${existingCwd}; cannot recreate it with cwd ${requestedCwd}`,
+    );
+  }
+}
+
+export class SessionAlreadyExistsError extends Error {
+  override readonly name = "SessionAlreadyExistsError";
+
+  constructor(
+    readonly sessionId: SessionId,
+    readonly existingCwd: string,
+    readonly requestedCwd: string,
+  ) {
+    super(`Session ${sessionId} already exists with cwd ${existingCwd}`);
+  }
+}
+
+export class SessionReservedForSubagentError extends Error {
+  override readonly name = "SessionReservedForSubagentError";
+
+  constructor(readonly sessionId: SessionId) {
+    super(`Session ${sessionId} is reserved for a subagent`);
+  }
+}
+
+export class SessionCreationClaimConflictError extends Error {
+  override readonly name = "SessionCreationClaimConflictError";
+
+  constructor(readonly sessionId: SessionId) {
+    super(`Session ${sessionId} creation claim is not owned by this store connection`);
+  }
+}
+
+export class SessionRunClaimConflictError extends Error {
+  override readonly name = "SessionRunClaimConflictError";
+
+  constructor(readonly sessionId: SessionId) {
+    super(`Session ${sessionId} has an active runtime claim`);
+  }
+}
+
+export class SessionStateConflictError extends Error {
+  override readonly name = "SessionStateConflictError";
+
+  constructor(readonly sessionId: SessionId, readonly status?: string) {
+    super(status
+      ? `Session ${sessionId} is not active (${status})`
+      : `Session ${sessionId} does not exist`);
+  }
+}
+
+export class TeamAlreadyExistsError extends Error {
+  override readonly name = "TeamAlreadyExistsError";
+
+  constructor(readonly teamId: TeamId) {
+    super(`Team already exists: ${teamId}`);
+  }
+}
+
+export class TeamTaskAlreadyExistsError extends Error {
+  override readonly name = "TeamTaskAlreadyExistsError";
+
+  constructor(readonly taskId: TaskId, readonly existingTeamId?: TeamId) {
+    super(existingTeamId
+      ? `Team task already exists: ${taskId} in ${existingTeamId}`
+      : `Team task already exists: ${taskId}`);
+  }
+}
+
 export interface SqliteEventStoreOptions {
   mirror?: EventMirror;
   onMirrorError?: (error: unknown, event: ChiliEvent) => void;
@@ -314,6 +413,7 @@ export interface SqliteEventStoreOptions {
 export class SqliteEventStore
   implements
     EventStore,
+    EventCommitAwareStore,
     GoalProjectionStore,
     SubagentProjectionStore,
     AgentTaskLeaseStore,
@@ -321,12 +421,15 @@ export class SqliteEventStore
     AgentTaskFinalizationStore,
     AgentMailboxDeliveryStore,
     TeamProjectionStore,
+    TeamOwnerSessionBindStore,
     TeamTaskClaimStore,
     TeamTaskAgentSyncStore,
     TeamTaskVerificationClaimStore
 {
   private readonly db: Database;
   private readonly legacySessionIds = new Map<string, SessionId>();
+  private readonly ownedCreationClaims = new Map<SessionId, string>();
+  private readonly ownedRunClaims = new Map<SessionId, string>();
   private closed = false;
 
   constructor(path = ".chili/chili.sqlite", private readonly options: SqliteEventStoreOptions = {}) {
@@ -365,6 +468,7 @@ export class SqliteEventStore
       this.db.exec(AGENT_TASKS_CHILD_SESSION_UNIQUE_INDEX);
       this.migrateSubagentSchema();
       this.migrateTeamSchema();
+      this.migrateSessionClaimSchema();
       this.loadLegacySessionIdentities();
     } catch (error) {
       try {
@@ -386,18 +490,223 @@ export class SqliteEventStore
     }
   }
 
-  async append(event: ChiliEvent): Promise<void> {
-    if (isTransientEvent(event)) return;
-    this.writeTransaction([event]);
-    await this.writeMirror(event);
+  async append(event: ChiliEvent, options?: EventAppendOptions): Promise<void> {
+    await this.appendCommitted(event, options);
   }
 
-  async appendMany(events: readonly ChiliEvent[]): Promise<void> {
+  async appendCommitted(event: ChiliEvent, options?: EventAppendOptions): Promise<boolean> {
+    const durableEvents = isTransientEvent(event) ? [] : [event];
+    const committed = this.writeTransaction(
+      durableEvents,
+      options?.runClaim,
+      options?.creationClaim,
+      [event],
+    );
+    if (durableEvents.length === 0) return true;
+    if (committed.length === 0) return false;
+    await this.writeMirror(committed[0]!);
+    return true;
+  }
+
+  async appendMany(
+    events: readonly ChiliEvent[],
+    options?: EventAppendOptions,
+  ): Promise<void> {
+    await this.appendManyCommitted(events, options);
+  }
+
+  async appendManyCommitted(
+    events: readonly ChiliEvent[],
+    options?: EventAppendOptions,
+  ): Promise<readonly ChiliEvent[]> {
     const durableEvents = events.filter((event) => !isTransientEvent(event));
-    if (durableEvents.length === 0) return;
-    this.writeTransaction(durableEvents);
-    for (const event of durableEvents) {
+    const committed = this.writeTransaction(
+      durableEvents,
+      options?.runClaim,
+      options?.creationClaim,
+      events,
+    );
+    for (const event of committed) {
       await this.writeMirror(event);
+    }
+    const committedIds = new Set(committed.map((event) => event.id));
+    const accepted = events.filter((event) => isTransientEvent(event) || committedIds.has(event.id));
+    return accepted;
+  }
+
+  claimSessionCreation(input: {
+    sessionId: SessionId;
+    claimId: string;
+    cwd: string;
+    owner: "root" | "child";
+    time: number;
+    leaseDurationMs: number;
+  }): { status: "claimed" | "already_exists" | "subagent" } {
+    const claim = this.db.transaction(() => {
+      // A store connection is the implicit fence for ordinary session-scoped
+      // appends. Never replace its claim in place: doing so would let the stale
+      // caller's writes pass under the replacement claim stored in this map.
+      if (this.ownedCreationClaims.has(input.sessionId)) {
+        return { status: "already_exists" as const };
+      }
+      this.db.query(
+        `delete from session_creation_claims where session_id = ? and lease_expires_at <= ?`,
+      ).run(input.sessionId, input.time);
+      const existing = this.db
+        .query<{ found: number }, [string]>(`select 1 as found from sessions where id = ? limit 1`)
+        .get(input.sessionId);
+      const existingClaim = this.db
+        .query<{ found: number }, [string]>(
+          `select 1 as found from session_creation_claims where session_id = ? limit 1`,
+        )
+        .get(input.sessionId);
+      if (existing || existingClaim) return { status: "already_exists" as const };
+      if (input.owner === "root" && this.subagentSessionReservationExists(input.sessionId)) {
+        return { status: "subagent" as const };
+      }
+      this.db.query(
+        `insert into session_creation_claims
+           (session_id, claim_id, cwd, owner, claimed_at, heartbeat_at, lease_expires_at)
+         values (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        input.sessionId,
+        input.claimId,
+        input.cwd,
+        input.owner,
+        input.time,
+        input.time,
+        input.time + input.leaseDurationMs,
+      );
+      return { status: "claimed" as const };
+    });
+    const result = this.runWithWriteRetry(() => claim());
+    if (result.status === "claimed") this.ownedCreationClaims.set(input.sessionId, input.claimId);
+    return result;
+  }
+
+  renewSessionCreation(input: {
+    sessionId: SessionId;
+    claimId: string;
+    time: number;
+    leaseDurationMs: number;
+  }): boolean {
+    if (this.ownedCreationClaims.get(input.sessionId) !== input.claimId) return false;
+    const renewed = this.runWithWriteRetry(() => this.db.query(
+      `update session_creation_claims
+          set heartbeat_at = ?, lease_expires_at = ?
+        where session_id = ? and claim_id = ? and lease_expires_at > ?`,
+    ).run(
+      input.time,
+      input.time + input.leaseDurationMs,
+      input.sessionId,
+      input.claimId,
+      input.time,
+    ));
+    return renewed.changes === 1;
+  }
+
+  releaseSessionCreation(input: { sessionId: SessionId; claimId: string }): void {
+    if (this.ownedCreationClaims.get(input.sessionId) !== input.claimId) return;
+    this.runWithWriteRetry(() => {
+      this.db.query(
+        `delete from session_creation_claims where session_id = ? and claim_id = ?`,
+      ).run(input.sessionId, input.claimId);
+    });
+    if (this.ownedCreationClaims.get(input.sessionId) === input.claimId) {
+      this.ownedCreationClaims.delete(input.sessionId);
+    }
+  }
+
+  claimSessionRun(input: {
+    sessionId: SessionId;
+    claimId: string;
+    allowSubagentSessions: boolean;
+    time: number;
+    leaseDurationMs: number;
+  }): { status: "claimed" | "busy" | "inactive" | "not_found" | "subagent"; sessionStatus?: string } {
+    const claim = this.db.transaction(() => {
+      // See claimSessionCreation: replacing an owned claim on this connection
+      // would erase the identity needed to reject the old operation's appends.
+      if (this.ownedRunClaims.has(input.sessionId)) return { status: "busy" as const };
+      this.db.query(
+        `delete from session_creation_claims where session_id = ? and lease_expires_at <= ?`,
+      ).run(input.sessionId, input.time);
+      const creationClaim = this.db
+        .query<{ found: number }, [string]>(
+          `select 1 as found from session_creation_claims where session_id = ? limit 1`,
+        )
+        .get(input.sessionId);
+      if (creationClaim) return { status: "busy" as const };
+      const session = this.db
+        .query<{ status: string }, [string]>(`select status from sessions where id = ?`)
+        .get(input.sessionId);
+      const subagentOwned = this.subagentSessionReservationExists(input.sessionId);
+      if (!session) {
+        return !input.allowSubagentSessions && subagentOwned
+          ? { status: "subagent" as const }
+          : { status: "not_found" as const };
+      }
+      if (session.status !== "active") {
+        return { status: "inactive" as const, sessionStatus: session.status };
+      }
+      if (!input.allowSubagentSessions && subagentOwned) return { status: "subagent" as const };
+      const inserted = this.db.query(
+        `insert into session_run_claims
+           (session_id, claim_id, claimed_at, heartbeat_at, lease_expires_at)
+         values (?, ?, ?, ?, ?)
+         on conflict(session_id) do update set
+           claim_id = excluded.claim_id,
+           claimed_at = excluded.claimed_at,
+           heartbeat_at = excluded.heartbeat_at,
+           lease_expires_at = excluded.lease_expires_at
+         where session_run_claims.lease_expires_at <= ?`,
+      ).run(
+        input.sessionId,
+        input.claimId,
+        input.time,
+        input.time,
+        input.time + input.leaseDurationMs,
+        input.time,
+      );
+      return inserted.changes === 1
+        ? { status: "claimed" as const }
+        : { status: "busy" as const };
+    });
+    const result = this.runWithWriteRetry(() => claim());
+    if (result.status === "claimed") this.ownedRunClaims.set(input.sessionId, input.claimId);
+    return result;
+  }
+
+  renewSessionRun(input: {
+    sessionId: SessionId;
+    claimId: string;
+    time: number;
+    leaseDurationMs: number;
+  }): boolean {
+    if (this.ownedRunClaims.get(input.sessionId) !== input.claimId) return false;
+    const renewed = this.runWithWriteRetry(() => this.db.query(
+      `update session_run_claims
+          set heartbeat_at = ?, lease_expires_at = ?
+        where session_id = ? and claim_id = ? and lease_expires_at > ?`,
+    ).run(
+      input.time,
+      input.time + input.leaseDurationMs,
+      input.sessionId,
+      input.claimId,
+      input.time,
+    ));
+    return renewed.changes === 1;
+  }
+
+  releaseSessionRun(input: { sessionId: SessionId; claimId: string }): void {
+    if (this.ownedRunClaims.get(input.sessionId) !== input.claimId) return;
+    this.runWithWriteRetry(() => {
+      this.db.query(
+        `delete from session_run_claims where session_id = ? and claim_id = ?`,
+      ).run(input.sessionId, input.claimId);
+    });
+    if (this.ownedRunClaims.get(input.sessionId) === input.claimId) {
+      this.ownedRunClaims.delete(input.sessionId);
     }
   }
 
@@ -641,7 +950,8 @@ export class SqliteEventStore
     const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
     return this.db
       .query<AgentTaskProjectionRow, any>(
-        `select id, path, parent_path, parent_session_id, child_session_id,
+        `select id, dispatch_id, reserved_run_id, worker_policy_json,
+                path, parent_path, parent_session_id, child_session_id,
                 task_name, cwd, prompt, mode, source_call_id, batch_id, batch_index, expected_batch_size,
                 completion_policy, max_concurrency, status, current_run_id, summary, error, completion_json,
                 generation, lease_owner, lease_expires_at, lease_heartbeat_at, created_at, updated_at, completed_at
@@ -971,6 +1281,7 @@ export class SqliteEventStore
           `update team_tasks
            set owner_path = $ownerPath,
                status = 'in_progress',
+               metadata_json = $metadata,
                updated_at = $time,
                completed_at = null
            where id = $taskId
@@ -982,10 +1293,11 @@ export class SqliteEventStore
           teamId: item.teamId,
           taskId: item.taskId,
           ownerPath: item.ownerPath,
+          metadata: item.metadata ? encodeJson(item.metadata) : current.metadata_json,
           time: event.time,
         });
       if (cas.changes === 0) return { applied: false, reason: "already_claimed" as const, events: [] as ChiliEvent[] };
-      this.writeTransactionEvents([event]);
+      this.writeTransactionEvents([event], item.runClaim);
       return { applied: true, events: [event] };
     });
     const result = this.runWithWriteRetry(() => run(input));
@@ -993,6 +1305,118 @@ export class SqliteEventStore
     await this.writeMirrors(result.events);
     const task = (await this.teamTasks({ teamId: input.teamId, taskId: input.taskId, limit: 1 }))[0];
     return { ...result, ...(task ? { task } : {}) };
+  }
+
+  async bindTeamOwnerSession(input: TeamOwnerSessionBindInput): Promise<TeamOwnerSessionBindResult> {
+    const run = this.db.transaction((item: TeamOwnerSessionBindInput) => {
+      const current = this.db
+        .query<{ session_id: string | null; status: TeamRow["status"] }, [string]>(
+          `select session_id, status from teams where id = ?`,
+        )
+        .get(item.teamId);
+      if (!current) {
+        return { applied: false, reason: "not_found" as const, events: [] as ChiliEvent[] };
+      }
+      if (current.status !== "active") {
+        return {
+          applied: false,
+          reason: "team_inactive" as const,
+          ...(current.session_id ? { ownerSessionId: current.session_id as SessionId } : {}),
+          events: [] as ChiliEvent[],
+        };
+      }
+      if (current.session_id) {
+        return current.session_id === item.ownerSessionId
+          ? {
+              applied: false,
+              reason: "already_bound" as const,
+              ownerSessionId: current.session_id as SessionId,
+              events: [] as ChiliEvent[],
+            }
+          : {
+              applied: false,
+              reason: "conflict" as const,
+              ownerSessionId: current.session_id as SessionId,
+              events: [] as ChiliEvent[],
+            };
+      }
+
+      const session = this.teamOwnerSessionState(item.ownerSessionId);
+      if (!session) {
+        return { applied: false, reason: "session_not_found" as const, events: [] as ChiliEvent[] };
+      }
+      if (session.status !== "active") {
+        return { applied: false, reason: "session_inactive" as const, events: [] as ChiliEvent[] };
+      }
+      if (session.source === "subagent" || this.subagentSessionReservationExists(item.ownerSessionId)) {
+        return { applied: false, reason: "subagent_session" as const, events: [] as ChiliEvent[] };
+      }
+
+      const time = (item.time ?? Date.now()) as TimestampMs;
+      const event: Extract<ChiliEvent, { type: "team.owner_session_bound" }> = {
+        id: item.eventId,
+        type: "team.owner_session_bound",
+        time,
+        sessionId: item.ownerSessionId,
+        payload: {
+          teamId: item.teamId,
+          ownerSessionId: item.ownerSessionId,
+        },
+      };
+      const cas = this.db
+        .query(
+          `update teams
+              set session_id = $ownerSessionId,
+                  updated_at = $time
+            where id = $teamId
+              and status = 'active'
+              and session_id is null`,
+        )
+        .run({
+          teamId: item.teamId,
+          ownerSessionId: item.ownerSessionId,
+          time,
+        });
+      if (cas.changes === 0) {
+        const latest = this.db
+          .query<{ session_id: string | null; status: TeamRow["status"] }, [string]>(
+            `select session_id, status from teams where id = ?`,
+          )
+          .get(item.teamId);
+        if (!latest) return { applied: false, reason: "not_found" as const, events: [] as ChiliEvent[] };
+        if (latest.status !== "active") {
+          return {
+            applied: false,
+            reason: "team_inactive" as const,
+            ...(latest.session_id ? { ownerSessionId: latest.session_id as SessionId } : {}),
+            events: [] as ChiliEvent[],
+          };
+        }
+        return latest.session_id === item.ownerSessionId
+          ? {
+              applied: false,
+              reason: "already_bound" as const,
+              ownerSessionId: item.ownerSessionId,
+              events: [] as ChiliEvent[],
+            }
+          : {
+              applied: false,
+              reason: "conflict" as const,
+              ...(latest.session_id ? { ownerSessionId: latest.session_id as SessionId } : {}),
+              events: [] as ChiliEvent[],
+            };
+      }
+      this.writeTransactionEvents([event], item.runClaim);
+      return {
+        applied: true,
+        ownerSessionId: item.ownerSessionId,
+        events: [event],
+      };
+    });
+    const result = this.runWithWriteRetry(() => run(input));
+    await this.writeMirrors(result.events);
+    const team = (await this.teams({ teamId: input.teamId, limit: 1 }))[0];
+    return { ...result, ...(team ? { team } : {}) };
   }
 
   async claimTeamTaskVerification(input: TeamTaskVerificationClaimInput): Promise<TeamTaskVerificationClaimResult> {
@@ -1037,7 +1461,7 @@ export class SqliteEventStore
         return { applied: false, reason: "stale" as const, events: [] as ChiliEvent[] };
       }
 
-      this.writeTransactionEvents([event]);
+      this.writeTransactionEvents([event], item.runClaim);
       return { applied: true, events: [event] };
     });
     const result = this.runWithWriteRetry(() => run(input));
@@ -1054,10 +1478,13 @@ export class SqliteEventStore
       if (current.status !== "in_progress") {
         return { applied: false, reason: "not_in_progress" as const, events: [] as ChiliEvent[] };
       }
-      if (
-        !teamTaskDispatchBindingMatches(current.metadata_json, item) ||
-        !teamTaskDispatchBindingMatches(encodeJson(item.metadata), item)
-      ) {
+      const nextMetadataJson = encodeJson(item.metadata);
+      const dispatchIdentity = teamTaskDispatchSyncIdentity(
+        current.metadata_json,
+        nextMetadataJson,
+        item,
+      );
+      if (!dispatchIdentity) {
         return { applied: false, reason: "binding_mismatch" as const, events: [] as ChiliEvent[] };
       }
 
@@ -1065,7 +1492,16 @@ export class SqliteEventStore
       if (
         !agent ||
         agent.generation !== item.agentGeneration ||
-        agent.current_run_id !== item.agentRunId
+        (
+          dispatchIdentity.modern
+            ? agent.dispatch_id !== dispatchIdentity.dispatchId
+              || agent.reserved_run_id !== item.agentRunId
+              || (
+                agent.current_run_id !== item.agentRunId
+                && !(dispatchIdentity.allowUnspawned && agent.current_run_id === null)
+              )
+            : agent.current_run_id !== item.agentRunId
+        )
       ) {
         return { applied: false, reason: "binding_mismatch" as const, events: [] as ChiliEvent[] };
       }
@@ -1090,7 +1526,18 @@ export class SqliteEventStore
                select 1 from agent_tasks
                where id = $agentTaskId
                  and generation = $agentGeneration
-                 and current_run_id = $agentRunId
+                 and (
+                   ($modernDispatch = 0 and current_run_id = $agentRunId)
+                   or (
+                     $modernDispatch = 1
+                     and dispatch_id = $dispatchId
+                     and reserved_run_id = $agentRunId
+                     and (
+                       current_run_id = $agentRunId
+                       or ($allowUnspawned = 1 and current_run_id is null)
+                     )
+                   )
+                 )
                  and status = $agentStatus
              )`,
         )
@@ -1103,6 +1550,9 @@ export class SqliteEventStore
           agentGeneration: item.agentGeneration,
           agentRunId: item.agentRunId,
           agentStatus: item.agentStatus,
+          modernDispatch: dispatchIdentity.modern ? 1 : 0,
+          dispatchId: dispatchIdentity.dispatchId ?? null,
+          allowUnspawned: dispatchIdentity.allowUnspawned ? 1 : 0,
         });
       if (cas.changes === 0) {
         return { applied: false, reason: "stale" as const, events: [] as ChiliEvent[] };
@@ -1141,7 +1591,7 @@ export class SqliteEventStore
         events.push(memberEvent);
       }
 
-      this.writeTransactionEvents(events);
+      this.writeTransactionEvents(events, item.runClaim);
       return { applied: true, events };
     });
     const result = this.runWithWriteRetry(() => run(input));
@@ -1272,7 +1722,6 @@ export class SqliteEventStore
              lease_owner is null
              or lease_expires_at is null
              or lease_expires_at <= $now
-             or lease_owner = $owner
            )`,
       ).run({
         taskId: item.taskId,
@@ -1350,7 +1799,41 @@ export class SqliteEventStore
   async beginAgentTaskRunCas(input: AgentTaskBeginRunCasInput): Promise<AgentTaskBeginRunResult> {
     const run = this.db.transaction((item: AgentTaskBeginRunCasInput) => {
       const current = this.agentTaskState(item.taskId);
-      if (!current || !isFinalTaskStatus(current.status)) return { applied: false, events: [] as ChiliEvent[] };
+      if (!current) return { applied: false, events: [] as ChiliEvent[] };
+      const reservedInitial = item.reservedInitial === true;
+      if (reservedInitial) {
+        if (
+          current.status !== "pending"
+          || current.generation !== 0
+          || current.current_run_id !== null
+          || current.lease_owner !== null
+          || current.dispatch_id === null
+          || current.reserved_run_id !== item.runId
+        ) {
+          return { applied: false, events: [] as ChiliEvent[] };
+        }
+        if (
+          item.expectedGeneration !== 0
+          || item.expectedRunId !== null
+          || item.expectedLeaseOwner !== null
+        ) {
+          throw new Error("reserved initial agent task run requires pending generation 0 without a run or lease");
+        }
+        if (item.sourceMailboxMessageId || item.messageEventId || item.messageClaimEventId || item.message) {
+          throw new Error("reserved initial agent task run cannot include a follow-up message");
+        }
+      } else {
+        if (
+          current.dispatch_id !== null
+          || current.reserved_run_id !== null
+          || isTeamTaskWorkerPolicyJson(current.worker_policy_json)
+        ) {
+          return { applied: false, events: [] as ChiliEvent[] };
+        }
+        if (!isFinalTaskStatus(current.status)) {
+          return { applied: false, events: [] as ChiliEvent[] };
+        }
+      }
       if (item.generation !== item.expectedGeneration + 1) {
         throw new Error("agent task run generation must advance its expected generation fence by one");
       }
@@ -1388,22 +1871,36 @@ export class SqliteEventStore
         }
       }
 
-      const cas = this.db
-        .query(
-          `update agent_tasks
-           set updated_at = updated_at
-           where id = $taskId
-             and status in ('completed', 'incomplete', 'failed', 'cancelled')
-             and generation = $expectedGeneration
-             and current_run_id is $expectedRunId
-             and lease_owner is $expectedLeaseOwner`,
-        )
-        .run({
-          taskId: item.taskId,
-          expectedGeneration: item.expectedGeneration,
-          expectedRunId: item.expectedRunId,
-          expectedLeaseOwner: item.expectedLeaseOwner,
-        });
+      const cas = reservedInitial
+        ? this.db
+            .query(
+              `update agent_tasks
+               set updated_at = updated_at
+               where id = $taskId
+                 and status = 'pending'
+                 and generation = 0
+                 and current_run_id is null
+                 and lease_owner is null
+                 and dispatch_id is not null
+                 and reserved_run_id = $runId`,
+            )
+            .run({ taskId: item.taskId, runId: item.runId })
+        : this.db
+            .query(
+              `update agent_tasks
+               set updated_at = updated_at
+               where id = $taskId
+                 and status in ('completed', 'incomplete', 'failed', 'cancelled')
+                 and generation = $expectedGeneration
+                 and current_run_id is $expectedRunId
+                 and lease_owner is $expectedLeaseOwner`,
+            )
+            .run({
+              taskId: item.taskId,
+              expectedGeneration: item.expectedGeneration,
+              expectedRunId: item.expectedRunId,
+              expectedLeaseOwner: item.expectedLeaseOwner,
+            });
       if (cas.changes === 0) return { applied: false, events: [] as ChiliEvent[] };
 
       const now = item.time ?? Date.now();
@@ -1455,6 +1952,23 @@ export class SqliteEventStore
           taskName: current.task_name,
           ...(current.cwd ? { cwd: current.cwd } : {}),
           ...(current.mode ? { mode: current.mode as NonNullable<Extract<ChiliEvent, { type: "agent.spawned" }>["payload"]["mode"]> } : {}),
+          ...(current.worker_policy_json
+            ? { workerPolicy: decodeJson<Record<string, unknown>>(current.worker_policy_json, {}) }
+            : {}),
+          ...(current.source_call_id ? { sourceCallId: current.source_call_id as ToolCallId } : {}),
+          ...(current.batch_id ? { batchId: current.batch_id } : {}),
+          ...(current.batch_index !== null ? { batchIndex: current.batch_index } : {}),
+          ...(current.expected_batch_size !== null
+            ? { expectedBatchSize: current.expected_batch_size }
+            : {}),
+          ...(current.completion_policy
+            ? {
+                completionPolicy: current.completion_policy as NonNullable<
+                  Extract<ChiliEvent, { type: "agent.spawned" }>["payload"]["completionPolicy"]
+                >,
+              }
+            : {}),
+          ...(current.max_concurrency !== null ? { maxConcurrency: current.max_concurrency } : {}),
           generation: item.generation,
         },
       };
@@ -1562,7 +2076,7 @@ export class SqliteEventStore
           time: now,
         }, mailbox));
       }
-      this.writeTransactionEvents(events);
+      this.writeTransactionEvents(events, item.runClaim);
       return { applied: true, events };
     });
     const result = this.runWithWriteRetry(() => run(input));
@@ -1683,7 +2197,7 @@ export class SqliteEventStore
           }, mailbox));
         }
       }
-      this.writeTransactionEvents(events);
+      this.writeTransactionEvents(events, item.runClaim);
       return { applied: true, events };
     });
     const result = this.runWithWriteRetry(() => run(input));
@@ -1693,18 +2207,280 @@ export class SqliteEventStore
     return { ...result, ...(task ? { task } : {}) };
   }
 
-  private writeTransaction(events: readonly ChiliEvent[]): void {
+  private writeTransaction(
+    events: readonly ChiliEvent[],
+    runClaim?: SessionRunClaimFence,
+    creationClaim?: SessionCreationClaimFence,
+    fenceEvents: readonly ChiliEvent[] = events,
+  ): ChiliEvent[] {
     const run = this.db.transaction((items: readonly ChiliEvent[]) => {
-      this.writeTransactionEvents(items);
+      return this.writeTransactionEvents(items, runClaim, creationClaim, fenceEvents);
     });
-    this.runWithWriteRetry(() => run(events));
+    return this.runWithWriteRetry(() => run(events));
   }
 
-  private writeTransactionEvents(events: readonly ChiliEvent[]): void {
-    for (const event of events) {
+  private writeTransactionEvents(
+    events: readonly ChiliEvent[],
+    runClaim?: SessionRunClaimFence,
+    creationClaim?: SessionCreationClaimFence,
+    fenceEvents: readonly ChiliEvent[] = events,
+  ): ChiliEvent[] {
+    this.assertRunClaimFence(runClaim, fenceEvents);
+    this.assertCreationClaimFence(creationClaim, fenceEvents);
+    for (const event of fenceEvents) {
       validateScopedEventSessionIdentity(event);
+      this.assertOwnedCreationClaim(event.sessionId);
+      this.assertOwnedRunClaim(event.sessionId);
+    }
+    const committed: ChiliEvent[] = [];
+    for (const event of events) {
+      if (event.type === "agent.task_created") {
+        const existing = this.agentTaskProjectionState(event.payload.taskId);
+        if (existing) {
+          if (sameAgentTaskCreationIdentity(existing, event.payload)) continue;
+          throw new Error(
+            `Agent task already exists with a different creation identity: ${event.payload.taskId}`,
+          );
+        }
+        this.assertAgentTaskReservationAvailable(event.payload);
+      }
       this.insertEvent(event);
       this.applyProjection(event);
+      committed.push(event);
+    }
+    return committed;
+  }
+
+  private assertAgentTaskReservationAvailable(
+    payload: Extract<AgentEvent, { type: "agent.task_created" }>["payload"],
+  ): void {
+    if (payload.dispatchId) {
+      const conflict = this.db
+        .query<{ id: string }, [string]>(
+          `select id from agent_tasks where dispatch_id = ? limit 1`,
+        )
+        .get(payload.dispatchId);
+      if (conflict && conflict.id !== payload.taskId) {
+        throw new Error(`Agent dispatch identity already belongs to task ${conflict.id}: ${payload.dispatchId}`);
+      }
+    }
+    if (payload.reservedRunId) {
+      const conflict = this.db
+        .query<{ id: string }, [string]>(
+          `select id from agent_tasks where reserved_run_id = ? limit 1`,
+        )
+        .get(payload.reservedRunId);
+      if (conflict && conflict.id !== payload.taskId) {
+        throw new Error(`Agent run reservation already belongs to task ${conflict.id}: ${payload.reservedRunId}`);
+      }
+    }
+  }
+
+  private assertCreationClaimFence(
+    creationClaim: SessionCreationClaimFence | undefined,
+    events: readonly ChiliEvent[],
+  ): void {
+    if (!creationClaim) return;
+    if (events.some((event) => event.sessionId !== creationClaim.sessionId)) {
+      throw new SessionCreationClaimConflictError(creationClaim.sessionId);
+    }
+    const durableClaim = this.db
+      .query<{ claim_id: string; lease_expires_at: number }, [string]>(
+        `select claim_id, lease_expires_at from session_creation_claims where session_id = ?`,
+      )
+      .get(creationClaim.sessionId);
+    if (
+      this.ownedCreationClaims.get(creationClaim.sessionId) !== creationClaim.claimId
+      || !durableClaim
+      || durableClaim.claim_id !== creationClaim.claimId
+      || durableClaim.lease_expires_at <= Date.now()
+    ) {
+      throw new SessionCreationClaimConflictError(creationClaim.sessionId);
+    }
+  }
+
+  private assertRunClaimFence(
+    runClaim: SessionRunClaimFence | undefined,
+    events: readonly ChiliEvent[],
+  ): void {
+    if (!runClaim) return;
+    const durableClaim = this.db
+      .query<{ claim_id: string; lease_expires_at: number }, [string]>(
+        `select claim_id, lease_expires_at from session_run_claims where session_id = ?`,
+      )
+      .get(runClaim.sessionId);
+    if (
+      this.ownedRunClaims.get(runClaim.sessionId) !== runClaim.claimId
+      || !durableClaim
+      || durableClaim.claim_id !== runClaim.claimId
+      || durableClaim.lease_expires_at <= Date.now()
+    ) {
+      throw new SessionRunClaimConflictError(runClaim.sessionId);
+    }
+    for (const event of events) {
+      if (!this.isRunClaimEventIdentityAuthorized(runClaim.sessionId, event)) {
+        throw new SessionRunClaimConflictError(runClaim.sessionId);
+      }
+    }
+  }
+
+  private isRunClaimEventIdentityAuthorized(
+    ownerSessionId: SessionId,
+    event: ChiliEvent,
+  ): boolean {
+    const actorSessionId = event.sessionId;
+    if (!actorSessionId) return false;
+    if (actorSessionId === ownerSessionId) return true;
+
+    if (event.type.startsWith("team.")) {
+      const teamEvent = event as TeamEvent;
+      const teamId = teamEvent.payload.teamId;
+      let actorPath: AgentPath | undefined;
+      if (teamEvent.type === "team.member_status_changed") {
+        actorPath = teamEvent.payload.path;
+      } else if (teamEvent.type === "team.task_claimed") {
+        actorPath = teamEvent.payload.claimedBy ?? teamEvent.payload.ownerPath;
+      } else if (teamEvent.type === "team.message_sent") {
+        actorPath = teamEvent.payload.from;
+      } else if (teamEvent.type === "team.task_created") {
+        actorPath = teamEvent.payload.createdBy;
+      } else if (teamEvent.type === "team.task_assigned") {
+        actorPath = teamEvent.payload.assignedBy;
+      } else if (teamEvent.type === "team.task_updated") {
+        const ownerPath = this.db
+          .query<{ owner_path: string | null }, [string, string]>(
+            `select owner_path from team_tasks where team_id = ? and id = ?`,
+          )
+          .get(teamId, teamEvent.payload.taskId)?.owner_path;
+        actorPath = ownerPath ? ownerPath as AgentPath : undefined;
+      }
+      return actorPath !== undefined && this.teamDescendantBindingExists({
+        teamId,
+        ownerSessionId,
+        actorSessionId,
+        actorPath,
+      });
+    }
+
+    // Team mailbox fan-out is the sole agent event written with descendant
+    // provenance under the owning team's run claim. All other agent/session/
+    // goal/runtime events must use the claimed session identity exactly.
+    if (event.type === "agent.message_queued") {
+      const metadata = teamMailboxMetadata(event.payload.message);
+      if (!metadata) return false;
+      if (!this.teamDescendantBindingExists({
+        teamId: metadata.teamId,
+        ownerSessionId,
+        actorSessionId,
+        actorPath: event.payload.from,
+      })) {
+        return false;
+      }
+      const recipientSessionId = event.payload.recipientSessionId;
+      if (!recipientSessionId) return false;
+      return this.db
+        .query<{ found: number }, [string, string, string]>(
+          `select 1 as found
+             from team_members
+            where team_id = ?
+              and path = ?
+              and child_session_id = ?
+              and status <> 'closed'
+            limit 1`,
+        )
+        .get(metadata.teamId, event.payload.path, recipientSessionId) !== null;
+    }
+
+    return false;
+  }
+
+  private teamDescendantBindingExists(input: {
+    teamId: TeamId;
+    ownerSessionId: SessionId;
+    actorSessionId: SessionId;
+    actorPath: AgentPath;
+  }): boolean {
+    const team = this.db
+      .query<{ lead_path: string }, [string, string, string, string]>(
+        `select t.lead_path
+           from teams t
+           join team_members m on m.team_id = t.id
+          where t.id = ?
+            and t.session_id = ?
+            and t.status = 'active'
+            and m.child_session_id = ?
+            and m.path = ?
+            and m.status <> 'closed'
+          limit 1`,
+      )
+      .get(input.teamId, input.ownerSessionId, input.actorSessionId, input.actorPath);
+    if (!team) return false;
+
+    return this.db
+      .query<{ found: number }, {
+        actorSessionId: string;
+        actorPath: string;
+        ownerSessionId: string;
+        leadPath: string;
+      }>(
+        `with recursive ancestry(child_session_id, path, parent_session_id, parent_path) as (
+           select child_session_id, path, parent_session_id, parent_path
+             from agent_tasks
+            where child_session_id = $actorSessionId
+              and path = $actorPath
+           union
+           select parent.child_session_id, parent.path, parent.parent_session_id, parent.parent_path
+             from agent_tasks parent
+             join ancestry child on parent.child_session_id = child.parent_session_id
+            where parent.path = child.parent_path
+         )
+         select 1 as found
+           from ancestry
+          where parent_session_id = $ownerSessionId
+            and parent_path = $leadPath
+          limit 1`,
+      )
+      .get({
+        actorSessionId: input.actorSessionId,
+        actorPath: input.actorPath,
+        ownerSessionId: input.ownerSessionId,
+        leadPath: team.lead_path,
+      }) !== null;
+  }
+
+  private assertOwnedCreationClaim(sessionId: SessionId | undefined): void {
+    if (!sessionId) return;
+    const ownedClaimId = this.ownedCreationClaims.get(sessionId);
+    if (!ownedClaimId) return;
+    const durableClaim = this.db
+      .query<{ claim_id: string; lease_expires_at: number }, [string]>(
+        `select claim_id, lease_expires_at from session_creation_claims where session_id = ?`,
+      )
+      .get(sessionId);
+    if (
+      !durableClaim
+      || durableClaim.claim_id !== ownedClaimId
+      || durableClaim.lease_expires_at <= Date.now()
+    ) {
+      throw new SessionCreationClaimConflictError(sessionId);
+    }
+  }
+
+  private assertOwnedRunClaim(sessionId: SessionId | undefined): void {
+    if (!sessionId) return;
+    const ownedClaimId = this.ownedRunClaims.get(sessionId);
+    if (!ownedClaimId) return;
+    const durableClaim = this.db
+      .query<{ claim_id: string; lease_expires_at: number }, [string]>(
+        `select claim_id, lease_expires_at from session_run_claims where session_id = ?`,
+      )
+      .get(sessionId);
+    if (
+      !durableClaim
+      || durableClaim.claim_id !== ownedClaimId
+      || durableClaim.lease_expires_at <= Date.now()
+    ) {
+      throw new SessionRunClaimConflictError(sessionId);
     }
   }
 
@@ -1718,58 +2494,161 @@ export class SqliteEventStore
     const status = input.status ?? "failed";
     const reason = input.reason ?? "stale_turn_recovered";
     const now = (input.now ?? Date.now()) as TimestampMs;
-    const rows = this.db
-      .query<{
-        session_id: string;
-        turn_id: string;
-        time: number;
-      }, [number]>(
-        `select started.session_id,
-                json_extract(started.payload_json, '$.turnId') as turn_id,
-                started.time
-           from events started
-          where started.type = 'turn.started'
-            and started.session_id is not null
-            and started.time < ?
-            and not exists (
-              select 1
-                from events completed
-               where completed.type = 'turn.completed'
-                 and json_extract(completed.payload_json, '$.turnId') = json_extract(started.payload_json, '$.turnId')
-            )
-          order by started.seq asc`,
-      )
-      .all(input.staleBefore);
+    const reconcile = this.db.transaction(() => {
+      const rows = this.db
+        .query<{
+          session_id: string;
+          turn_seq: number | null;
+          turn_time: number | null;
+          turn_id: string | null;
+          status_seq: number | null;
+          status_time: number | null;
+          runtime_status: string | null;
+          completion_seq: number | null;
+          completion_time: number | null;
+        }, { now: number }>(
+          `with latest_turns as (
+             select event.session_id,
+                    event.seq,
+                    event.time,
+                    json_extract(event.payload_json, '$.turnId') as turn_id,
+                    row_number() over (partition by event.session_id order by event.seq desc) as ordinal
+               from events event
+              where event.type = 'turn.started'
+                and event.session_id is not null
+           ),
+           latest_statuses as (
+             select event.session_id,
+                    event.seq,
+                    event.time,
+                    json_extract(event.payload_json, '$.status') as runtime_status,
+                    row_number() over (partition by event.session_id order by event.seq desc) as ordinal
+               from events event
+              where event.type = 'session.status_changed'
+                and event.session_id is not null
+           )
+           select session.id as session_id,
+                  turn.seq as turn_seq,
+                  turn.time as turn_time,
+                  turn.turn_id as turn_id,
+                  runtime.seq as status_seq,
+                  runtime.time as status_time,
+                  runtime.runtime_status as runtime_status,
+                  (
+                    select max(completed.seq)
+                      from events completed
+                     where completed.session_id = session.id
+                       and completed.type = 'turn.completed'
+                       and json_extract(completed.payload_json, '$.turnId') = turn.turn_id
+                  ) as completion_seq,
+                  (
+                    select max(completed.time)
+                      from events completed
+                     where completed.session_id = session.id
+                       and completed.type = 'turn.completed'
+                       and json_extract(completed.payload_json, '$.turnId') = turn.turn_id
+                  ) as completion_time
+             from sessions session
+             left join latest_turns turn
+               on turn.session_id = session.id
+              and turn.ordinal = 1
+             left join latest_statuses runtime
+               on runtime.session_id = session.id
+              and runtime.ordinal = 1
+            where session.status = 'active'
+              and not exists (
+                select 1
+                  from session_creation_claims creation
+                 where creation.session_id = session.id
+                   and creation.lease_expires_at > $now
+              )
+              and not exists (
+                select 1
+                  from session_run_claims run
+                 where run.session_id = session.id
+                   and run.lease_expires_at > $now
+              )
+            order by coalesce(turn.seq, runtime.seq) asc`,
+        )
+        .all({ now: Number(now) });
 
-    const events: ChiliEvent[] = [];
-    for (const row of rows) {
-      const sessionId = row.session_id as SessionId;
-      const turnId = row.turn_id as TurnId;
-      const base = {
-        time: now,
-        sessionId,
-      };
-      events.push({
-        ...base,
-        id: input.createId("event"),
-        type: "turn.completed",
-        payload: { turnId, status },
-      });
-      events.push({
-        ...base,
-        id: input.createId("event"),
-        type: "session.status_changed",
-        payload: {
-          sessionId,
-          status,
-          turnId,
-          reason,
-        },
-      });
-    }
+      const events: ChiliEvent[] = [];
+      for (const row of rows) {
+        const sessionId = row.session_id as SessionId;
+        if (
+          this.ownedCreationClaims.has(sessionId)
+          || this.ownedRunClaims.has(sessionId)
+        ) continue;
 
+        const transientStatus = row.runtime_status === "running"
+          || row.runtime_status === "waiting_for_approval"
+          || row.runtime_status === "cancelling";
+        const base = { time: now, sessionId };
+
+        if (row.turn_id === null || row.turn_seq === null || row.turn_time === null) {
+          // Runtime publishes the prompt-level running state before the runner
+          // can append turn.started. A crash in that window still needs a
+          // terminal recovery event, but there is no turn identity to attach.
+          if (
+            !transientStatus
+            || row.status_time === null
+            || row.status_time >= input.staleBefore
+          ) continue;
+          events.push({
+            ...base,
+            id: input.createId("event"),
+            type: "session.status_changed",
+            payload: { sessionId, status, reason },
+          });
+          continue;
+        }
+
+        const lastActivityAt = Math.max(
+          row.turn_time,
+          row.status_time ?? Number.NEGATIVE_INFINITY,
+          row.completion_time ?? Number.NEGATIVE_INFINITY,
+        );
+        if (lastActivityAt >= input.staleBefore) continue;
+
+        const statusAfterTurn = row.status_seq !== null && row.status_seq > row.turn_seq;
+        const turnId = row.turn_id as TurnId;
+
+        if (row.completion_seq === null) {
+          // A later terminal/idle session event proves this historic incomplete
+          // turn is no longer the active prompt. Only a transient latest state
+          // (or no status written after the turn) is recoverable.
+          if (statusAfterTurn && !transientStatus) continue;
+          events.push({
+            ...base,
+            id: input.createId("event"),
+            type: "turn.completed",
+            payload: { turnId, status },
+          });
+        } else if (!transientStatus) {
+          // A completed internal turn can still belong to a multi-turn prompt.
+          // Recover only when the latest session state proves the prompt was
+          // left transient; never infer idle directly from turn.completed.
+          continue;
+        }
+
+        events.push({
+          ...base,
+          id: input.createId("event"),
+          type: "session.status_changed",
+          payload: {
+            sessionId,
+            status,
+            turnId,
+            reason,
+          },
+        });
+      }
+
+      if (events.length > 0) this.writeTransactionEvents(events);
+      return events;
+    });
+    const events = this.runWithWriteRetry(() => reconcile());
     if (events.length === 0) return [];
-    this.writeTransaction(events);
     await this.writeMirrors(events);
     return events;
   }
@@ -2018,6 +2897,10 @@ export class SqliteEventStore
     this.addColumnIfMissing("agent_runs", "mode", "text");
     this.addColumnIfMissing("agent_runs", "generation", "integer not null default 0");
     this.addColumnIfMissing("agent_tasks", "generation", "integer not null default 0");
+    this.addColumnIfMissing("agent_tasks", "dispatch_id", "text");
+    this.addColumnIfMissing("agent_tasks", "reserved_run_id", "text");
+    this.addColumnIfMissing("agent_tasks", "worker_policy_json", "text");
+    this.backfillAgentTaskWorkerPolicies();
     this.addColumnIfMissing("agent_tasks", "lease_owner", "text");
     this.addColumnIfMissing("agent_tasks", "lease_expires_at", "integer");
     this.addColumnIfMissing("agent_tasks", "lease_heartbeat_at", "integer");
@@ -2028,6 +2911,10 @@ export class SqliteEventStore
     this.addColumnIfMissing("agent_tasks", "completion_policy", "text");
     this.addColumnIfMissing("agent_tasks", "max_concurrency", "integer");
     this.addColumnIfMissing("agent_mailbox", "consumed_at", "integer");
+    this.db.exec(`create unique index if not exists agent_tasks_dispatch_id_idx
+      on agent_tasks(dispatch_id) where dispatch_id is not null`);
+    this.db.exec(`create unique index if not exists agent_tasks_reserved_run_id_idx
+      on agent_tasks(reserved_run_id) where reserved_run_id is not null`);
     this.db.exec(`create index if not exists agent_runs_task_idx on agent_runs(task_id)`);
     this.db.exec(`create index if not exists agent_runs_child_session_idx on agent_runs(child_session_id)`);
     this.db.exec(AGENT_TASKS_CHILD_SESSION_UNIQUE_INDEX);
@@ -2042,6 +2929,50 @@ export class SqliteEventStore
       `create index if not exists agent_tasks_batch_idx
        on agent_tasks(parent_session_id, source_call_id, batch_id)`,
     );
+  }
+
+  private backfillAgentTaskWorkerPolicies(): void {
+    const migrate = this.db.transaction(() => {
+      this.db.exec(`
+        create table if not exists schema_migrations (
+          name text primary key
+        )
+      `);
+      const marker = "agent_task_worker_policy_backfill_v1";
+      const alreadyMigrated = this.db
+        .query<{ found: number }, [string]>(
+          `select 1 as found from schema_migrations where name = ? limit 1`,
+        )
+        .get(marker);
+      if (alreadyMigrated) return;
+
+      this.db.exec(`
+        update agent_tasks
+           set worker_policy_json = (
+             select json_extract(event.payload_json, '$.workerPolicy')
+               from events event
+              where event.type = 'agent.task_created'
+                and json_valid(event.payload_json)
+                and json_type(event.payload_json, '$.taskId') = 'text'
+                and json_extract(event.payload_json, '$.taskId') = agent_tasks.id
+                and json_type(event.payload_json, '$.workerPolicy') = 'object'
+              order by event.seq asc
+              limit 1
+           )
+         where worker_policy_json is null
+           and exists (
+             select 1
+               from events event
+              where event.type = 'agent.task_created'
+                and json_valid(event.payload_json)
+                and json_type(event.payload_json, '$.taskId') = 'text'
+                and json_extract(event.payload_json, '$.taskId') = agent_tasks.id
+                and json_type(event.payload_json, '$.workerPolicy') = 'object'
+           )
+      `);
+      this.db.query(`insert into schema_migrations (name) values (?)`).run(marker);
+    });
+    migrate();
   }
 
   private migrateApprovalSchema(): void {
@@ -2660,6 +3591,100 @@ export class SqliteEventStore
     this.db.exec(`create index if not exists team_message_deliveries_status_idx on team_message_deliveries(status, updated_at)`);
   }
 
+  private migrateSessionClaimSchema(): void {
+    this.db.exec(`
+      create table if not exists session_creation_claims (
+        session_id text primary key,
+        claim_id text not null unique,
+        cwd text not null,
+        owner text not null check (owner in ('root', 'child')),
+        claimed_at integer not null,
+        heartbeat_at integer not null,
+        lease_expires_at integer not null
+      )
+    `);
+    this.addColumnIfMissing("session_creation_claims", "heartbeat_at", "integer");
+    this.addColumnIfMissing("session_creation_claims", "lease_expires_at", "integer");
+    this.db.exec(`update session_creation_claims set heartbeat_at = coalesce(heartbeat_at, claimed_at)`);
+    this.db.exec(`update session_creation_claims set lease_expires_at = coalesce(lease_expires_at, 0)`);
+    this.db.exec(`
+      create table if not exists session_run_claims (
+        session_id text primary key,
+        claim_id text not null unique,
+        claimed_at integer not null,
+        heartbeat_at integer not null,
+        lease_expires_at integer not null
+      )
+    `);
+    this.addColumnIfMissing("session_run_claims", "heartbeat_at", "integer");
+    this.addColumnIfMissing("session_run_claims", "lease_expires_at", "integer");
+    this.db.exec(`update session_run_claims set heartbeat_at = coalesce(heartbeat_at, claimed_at)`);
+    this.db.exec(`update session_run_claims set lease_expires_at = coalesce(lease_expires_at, 0)`);
+  }
+
+  private subagentSessionReservationExists(sessionId: SessionId): boolean {
+    return this.db.query<{ found: number }, [string, string, string]>(
+      `select 1 as found
+         where exists (select 1 from agent_tasks where child_session_id = ?)
+            or exists (select 1 from agent_runs where child_session_id = ?)
+            or exists (
+              select 1
+                from team_members m
+                join teams t on t.id = m.team_id
+               where m.child_session_id = ?
+                 and m.path <> t.lead_path
+            )
+         limit 1`,
+    ).get(sessionId, sessionId, sessionId) !== null;
+  }
+
+  private teamOwnerSessionState(
+    sessionId: SessionId,
+  ): { status: string; source: "interactive" | "subagent" } | undefined {
+    return this.db
+      .query<{ status: string; source: "interactive" | "subagent" }, [string, string, string, string]>(
+        `select s.status,
+                case
+                  when exists (select 1 from agent_tasks where child_session_id = ?)
+                    or exists (select 1 from agent_runs where child_session_id = ?)
+                    or exists (
+                      select 1
+                        from team_members m
+                        join teams t on t.id = m.team_id
+                       where m.child_session_id = ?
+                         and m.path <> t.lead_path
+                    )
+                  then 'subagent'
+                  else 'interactive'
+                end as source
+           from sessions s
+          where s.id = ?`,
+      )
+      .get(sessionId, sessionId, sessionId, sessionId) ?? undefined;
+  }
+
+  private sessionCreationClaimExists(sessionId: SessionId): boolean {
+    this.db.query(
+      `delete from session_creation_claims where session_id = ? and lease_expires_at <= ?`,
+    ).run(sessionId, Date.now());
+    return this.db
+      .query<{ found: number }, [string]>(
+        `select 1 as found from session_creation_claims where session_id = ? limit 1`,
+      )
+      .get(sessionId) !== null;
+  }
+
+  private sessionRunClaimExists(sessionId: SessionId): boolean {
+    this.db.query(
+      `delete from session_run_claims where session_id = ? and lease_expires_at <= ?`,
+    ).run(sessionId, Date.now());
+    return this.db
+      .query<{ found: number }, [string]>(
+        `select 1 as found from session_run_claims where session_id = ? limit 1`,
+      )
+      .get(sessionId) !== null;
+  }
+
   private addColumnIfMissing(table: string, column: string, definition: string): boolean {
     if (!this.columnExists(table, column)) {
       this.db.exec(`alter table ${table} add column ${column} ${definition}`);
@@ -2743,20 +3768,72 @@ export class SqliteEventStore
 
   private applySessionEvent(event: SessionEvent): void {
     if (event.type === "session.created") {
+      const creationClaim = this.db
+        .query<{
+          claim_id: string;
+          cwd: string;
+          owner: "root" | "child";
+          lease_expires_at: number;
+        }, [string]>(
+          `select claim_id, cwd, owner, lease_expires_at
+             from session_creation_claims
+            where session_id = ?`,
+        )
+        .get(event.sessionId);
+      const ownedCreationClaimId = this.ownedCreationClaims.get(event.sessionId);
+      if (
+        (!creationClaim && ownedCreationClaimId !== undefined)
+        || (
+          creationClaim !== null
+          && (
+            creationClaim.lease_expires_at <= Date.now()
+            || ownedCreationClaimId !== creationClaim.claim_id
+          )
+        )
+      ) {
+        throw new SessionCreationClaimConflictError(event.sessionId);
+      }
+      if (creationClaim?.cwd !== undefined && creationClaim.cwd !== event.payload.cwd) {
+        throw new SessionCwdConflictError(event.sessionId, creationClaim.cwd, event.payload.cwd);
+      }
+      if (creationClaim?.owner === "root" && this.subagentSessionReservationExists(event.sessionId)) {
+        throw new SessionReservedForSubagentError(event.sessionId);
+      }
       const title = event.payload.cwd.split("/").filter(Boolean).at(-1) ?? "Untitled";
-      this.db
+      const inserted = this.db
         .query(
           `insert into sessions (id, cwd, title, status, created_at, updated_at)
            values (?, ?, ?, 'active', ?, ?)
-           on conflict(id) do update set
-             cwd = excluded.cwd,
-             updated_at = excluded.updated_at`,
+           on conflict(id) do nothing`,
         )
         .run(event.sessionId, event.payload.cwd, title, event.time, event.time);
+      if (inserted.changes === 0) {
+        const persisted = this.db
+          .query<{ cwd: string }, [string]>(`select cwd from sessions where id = ?`)
+          .get(event.sessionId);
+        if (persisted && persisted.cwd !== event.payload.cwd) {
+          throw new SessionCwdConflictError(event.sessionId, persisted.cwd, event.payload.cwd);
+        }
+        throw new SessionAlreadyExistsError(
+          event.sessionId,
+          persisted?.cwd ?? event.payload.cwd,
+          event.payload.cwd,
+        );
+      }
       return;
     }
 
     if (event.type === "session.archived") {
+      const session = this.db
+        .query<{ status: string }, [string]>(`select status from sessions where id = ?`)
+        .get(event.sessionId);
+      if (!session) throw new SessionStateConflictError(event.sessionId);
+      if (session.status !== "active") {
+        throw new SessionStateConflictError(event.sessionId, session.status);
+      }
+      if (this.sessionCreationClaimExists(event.sessionId) || this.sessionRunClaimExists(event.sessionId)) {
+        throw new SessionRunClaimConflictError(event.sessionId);
+      }
       this.db
         .query(`update sessions set status = 'archived', updated_at = ? where id = ?`)
         .run(event.time, event.sessionId);
@@ -2995,32 +4072,25 @@ export class SqliteEventStore
 
   private applyAgentEvent(event: AgentEvent): void {
     if (event.type === "agent.task_created") {
+      const existing = this.agentTaskProjectionState(event.payload.taskId);
+      if (existing) {
+        if (sameAgentTaskCreationIdentity(existing, event.payload)) return;
+        throw new Error(`Agent task already exists with a different creation identity: ${event.payload.taskId}`);
+      }
       this.db
         .query(
           `insert into agent_tasks
-             (id, path, parent_path, parent_session_id, child_session_id,
+             (id, dispatch_id, reserved_run_id, worker_policy_json,
+              path, parent_path, parent_session_id, child_session_id,
               task_name, cwd, prompt, mode, source_call_id, batch_id, batch_index, expected_batch_size,
               completion_policy, max_concurrency, status, created_at, updated_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-           on conflict(id) do update set
-             path = excluded.path,
-             parent_path = excluded.parent_path,
-             parent_session_id = excluded.parent_session_id,
-             child_session_id = excluded.child_session_id,
-             task_name = excluded.task_name,
-             cwd = excluded.cwd,
-             prompt = excluded.prompt,
-             mode = excluded.mode,
-             source_call_id = coalesce(excluded.source_call_id, agent_tasks.source_call_id),
-             batch_id = coalesce(excluded.batch_id, agent_tasks.batch_id),
-             batch_index = coalesce(excluded.batch_index, agent_tasks.batch_index),
-             expected_batch_size = coalesce(excluded.expected_batch_size, agent_tasks.expected_batch_size),
-             completion_policy = coalesce(excluded.completion_policy, agent_tasks.completion_policy),
-             max_concurrency = coalesce(excluded.max_concurrency, agent_tasks.max_concurrency),
-             updated_at = excluded.updated_at`,
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
         )
         .run(
           event.payload.taskId,
+          event.payload.dispatchId ?? null,
+          event.payload.reservedRunId ?? null,
+          event.payload.workerPolicy ? encodeJson(event.payload.workerPolicy) : null,
           event.payload.path,
           event.payload.parentPath,
           event.payload.parentSessionId,
@@ -3378,8 +4448,10 @@ export class SqliteEventStore
   private agentTaskState(taskId: TaskId): AgentTaskStateRow | undefined {
     const row = this.db
       .query<AgentTaskStateRow, [string]>(
-        `select status, generation, current_run_id, lease_owner, path, parent_path, parent_session_id,
-                child_session_id, task_name, cwd, mode
+        `select dispatch_id, reserved_run_id, worker_policy_json,
+                status, generation, current_run_id, lease_owner, lease_expires_at,
+                path, parent_path, parent_session_id, child_session_id, task_name, cwd, mode,
+                source_call_id, batch_id, batch_index, expected_batch_size, completion_policy, max_concurrency
          from agent_tasks
          where id = ?`,
       )
@@ -3390,7 +4462,8 @@ export class SqliteEventStore
   private agentTaskProjectionState(taskId: TaskId): AgentTaskProjectionRow | undefined {
     const row = this.db
       .query<AgentTaskProjectionRow, [string]>(
-        `select id, path, parent_path, parent_session_id, child_session_id,
+        `select id, dispatch_id, reserved_run_id, worker_policy_json,
+                path, parent_path, parent_session_id, child_session_id,
                 task_name, cwd, prompt, mode, source_call_id, batch_id, batch_index, expected_batch_size,
                 completion_policy, max_concurrency, status, current_run_id, summary, error, completion_json,
                 generation, lease_owner, lease_expires_at, lease_heartbeat_at, created_at, updated_at, completed_at
@@ -3493,6 +4566,7 @@ export class SqliteEventStore
       ownerPath: input.ownerPath,
     };
     if (input.claimedBy) payload.claimedBy = input.claimedBy;
+    if (input.metadata) payload.metadata = input.metadata;
 
     const event: EventEnvelope<"team.task_claimed", TeamTaskClaimedPayload> = {
       id: input.eventId,
@@ -3537,15 +4611,11 @@ export class SqliteEventStore
 
   private applyTeamEvent(event: TeamEvent): void {
     if (event.type === "team.created") {
-      this.db
+      const inserted = this.db
         .query(
           `insert into teams (id, session_id, name, lead_path, status, description, created_at, updated_at)
            values (?, ?, ?, ?, 'active', ?, ?, ?)
-           on conflict(id) do update set
-             name = excluded.name,
-             lead_path = excluded.lead_path,
-             description = excluded.description,
-             updated_at = excluded.updated_at`,
+           on conflict(id) do nothing`,
         )
         .run(
           event.payload.teamId,
@@ -3555,6 +4625,47 @@ export class SqliteEventStore
           event.payload.description ?? null,
           event.time,
           event.time,
+        );
+      if (inserted.changes === 0) throw new TeamAlreadyExistsError(event.payload.teamId);
+      return;
+    }
+
+    if (event.type === "team.owner_session_bound") {
+      const current = this.db
+        .query<{ session_id: string | null; status: TeamRow["status"] }, [string]>(
+          `select session_id, status from teams where id = ?`,
+        )
+        .get(event.payload.teamId);
+      if (!current) throw new Error(`Cannot bind owner session for missing team ${event.payload.teamId}`);
+      if (current.status !== "active") {
+        throw new Error(`Cannot bind owner session for inactive team ${event.payload.teamId}`);
+      }
+      if (current.session_id && current.session_id !== event.payload.ownerSessionId) {
+        throw new Error(
+          `Team ${event.payload.teamId} owner session conflicts: ${current.session_id} != ${event.payload.ownerSessionId}`,
+        );
+      }
+      const session = this.teamOwnerSessionState(event.payload.ownerSessionId);
+      if (!session) throw new Error(`Cannot bind missing owner session ${event.payload.ownerSessionId}`);
+      if (session.status !== "active") {
+        throw new Error(`Cannot bind inactive owner session ${event.payload.ownerSessionId}`);
+      }
+      if (session.source !== "interactive" || this.subagentSessionReservationExists(event.payload.ownerSessionId)) {
+        throw new Error(`Cannot bind subagent owner session ${event.payload.ownerSessionId}`);
+      }
+      this.db
+        .query(
+          `update teams
+              set session_id = ?,
+                  updated_at = ?
+            where id = ?
+              and (session_id is null or session_id = ?)`,
+        )
+        .run(
+          event.payload.ownerSessionId,
+          event.time,
+          event.payload.teamId,
+          event.payload.ownerSessionId,
         );
       return;
     }
@@ -3618,24 +4729,13 @@ export class SqliteEventStore
     }
 
     if (event.type === "team.task_created") {
-      this.db
+      const inserted = this.db
         .query(
           `insert into team_tasks
              (id, team_id, session_id, owner_path, status, title, description, created_by,
               depends_on_json, metadata_json, created_at, updated_at, completed_at)
            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           on conflict(id) do update set
-             team_id = excluded.team_id,
-             session_id = coalesce(excluded.session_id, team_tasks.session_id),
-             owner_path = excluded.owner_path,
-             status = excluded.status,
-             title = excluded.title,
-             description = excluded.description,
-             created_by = excluded.created_by,
-             depends_on_json = excluded.depends_on_json,
-             metadata_json = excluded.metadata_json,
-             completed_at = excluded.completed_at,
-             updated_at = excluded.updated_at`,
+           on conflict(id) do nothing`,
         )
         .run(
           event.payload.taskId,
@@ -3652,6 +4752,15 @@ export class SqliteEventStore
           event.time,
           isFinalTeamTaskStatus(event.payload.status ?? "pending") ? event.time : null,
         );
+      if (inserted.changes === 0) {
+        const existing = this.db
+          .query<{ team_id: string }, [string]>(`select team_id from team_tasks where id = ?`)
+          .get(event.payload.taskId);
+        throw new TeamTaskAlreadyExistsError(
+          event.payload.taskId,
+          existing?.team_id as TeamId | undefined,
+        );
+      }
       this.touchTeam(event.payload.teamId, event.time);
       return;
     }
@@ -3683,11 +4792,18 @@ export class SqliteEventStore
           `update team_tasks
            set owner_path = ?,
                status = 'in_progress',
+               metadata_json = coalesce(?, metadata_json),
                completed_at = null,
                updated_at = ?
            where id = ? and team_id = ?`,
         )
-        .run(event.payload.ownerPath, event.time, event.payload.taskId, event.payload.teamId);
+        .run(
+          event.payload.ownerPath,
+          event.payload.metadata ? encodeJson(event.payload.metadata) : null,
+          event.time,
+          event.payload.taskId,
+          event.payload.teamId,
+        );
       this.db
         .query(
           `update team_members
@@ -3842,6 +4958,17 @@ function validateScopedEventSessionIdentity(event: ChiliEvent): void {
     if (event.payload.previousGoal && event.payload.previousGoal.sessionId !== event.sessionId) {
       throw new Error(
         `goal.cleared previous goal sessionId ${event.payload.previousGoal.sessionId} does not match event.sessionId ${event.sessionId}`,
+      );
+    }
+    return;
+  }
+  if (event.type === "team.owner_session_bound") {
+    if (!event.sessionId) {
+      throw new Error("team.owner_session_bound requires event.sessionId");
+    }
+    if (event.payload.ownerSessionId !== event.sessionId) {
+      throw new Error(
+        `team.owner_session_bound ownerSessionId ${event.payload.ownerSessionId} does not match event.sessionId ${event.sessionId}`,
       );
     }
   }
@@ -4016,12 +5143,17 @@ function agentTaskFromRow(row: AgentTaskProjectionRow): AgentTaskRow {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+  if (row.dispatch_id) task.dispatchId = row.dispatch_id;
+  if (row.reserved_run_id) task.reservedRunId = row.reserved_run_id as AgentRunId;
   if (row.parent_path) task.parentPath = row.parent_path as AgentPath;
   if (row.parent_session_id) task.parentSessionId = row.parent_session_id as SessionId;
   if (row.child_session_id) task.childSessionId = row.child_session_id as SessionId;
   if (row.cwd) task.cwd = row.cwd;
   if (row.prompt) task.prompt = row.prompt;
   if (row.mode) task.mode = row.mode as NonNullable<AgentTaskRow["mode"]>;
+  if (row.worker_policy_json) {
+    task.workerPolicy = decodeJson<Record<string, unknown>>(row.worker_policy_json, {});
+  }
   if (row.source_call_id) task.sourceCallId = row.source_call_id as NonNullable<AgentTaskRow["sourceCallId"]>;
   if (row.batch_id) task.batchId = row.batch_id;
   if (row.batch_index !== null) task.batchIndex = row.batch_index;
@@ -4231,6 +5363,38 @@ function normalizedGeneration(value: unknown): number | undefined {
   return Math.max(0, Math.trunc(value));
 }
 
+function sameAgentTaskCreationIdentity(
+  current: AgentTaskProjectionRow,
+  payload: Extract<AgentEvent, { type: "agent.task_created" }>["payload"],
+): boolean {
+  if (current.dispatch_id !== (payload.dispatchId ?? null)) return false;
+  return (
+    current.reserved_run_id === (payload.reservedRunId ?? null)
+    && sameCanonicalJson(current.worker_policy_json, payload.workerPolicy)
+    && current.path === payload.path
+    && current.parent_path === payload.parentPath
+    && current.parent_session_id === payload.parentSessionId
+    && current.child_session_id === payload.childSessionId
+    && current.task_name === payload.taskName
+    && current.cwd === payload.cwd
+    && current.prompt === payload.prompt
+    && current.mode === (payload.mode ?? null)
+    && current.source_call_id === (payload.sourceCallId ?? null)
+    && current.batch_id === (payload.batchId ?? null)
+    && current.batch_index === (payload.batchIndex ?? null)
+    && current.expected_batch_size === (payload.expectedBatchSize ?? null)
+    && current.completion_policy === (payload.completionPolicy ?? null)
+    && current.max_concurrency === (payload.maxConcurrency ?? null)
+  );
+}
+
+function sameCanonicalJson(currentJson: string | null, candidate: unknown): boolean {
+  if (currentJson === null) return candidate === undefined;
+  if (candidate === undefined) return false;
+  return JSON.stringify(sortJsonValue(decodeJson<unknown>(currentJson, null)))
+    === JSON.stringify(sortJsonValue(candidate));
+}
+
 function shouldApplySpawnToTask(
   current: AgentTaskStateRow,
   runId: string,
@@ -4277,18 +5441,87 @@ function verificationStatus(metadataJson: string | null): string | undefined {
   return typeof status === "string" ? status : undefined;
 }
 
-function teamTaskDispatchBindingMatches(
-  metadataJson: string | null,
+function teamTaskDispatchSyncIdentity(
+  currentMetadataJson: string | null,
+  nextMetadataJson: string,
   input: Pick<TeamTaskAgentSyncInput, "agentTaskId" | "agentRunId" | "agentGeneration">,
-): boolean {
-  if (!metadataJson) return false;
+): { modern: boolean; dispatchId?: string; allowUnspawned: boolean } | undefined {
+  const current = teamTaskDispatchMetadata(currentMetadataJson);
+  const next = teamTaskDispatchMetadata(nextMetadataJson);
+  if (!current || !next) return undefined;
+  if (
+    current.agentTaskId !== input.agentTaskId
+    || current.runId !== input.agentRunId
+    || next.agentTaskId !== input.agentTaskId
+    || next.runId !== input.agentRunId
+    || next.generation !== input.agentGeneration
+  ) {
+    return undefined;
+  }
+
+  const currentDispatchId = typeof current.dispatchId === "string" ? current.dispatchId : undefined;
+  const nextDispatchId = typeof next.dispatchId === "string" ? next.dispatchId : undefined;
+  if (!currentDispatchId && !nextDispatchId) {
+    return current.generation === input.agentGeneration
+      ? { modern: false, allowUnspawned: false }
+      : undefined;
+  }
+  if (
+    !currentDispatchId
+    || currentDispatchId !== nextDispatchId
+    || (current.state !== "prepared" && current.state !== "bound")
+    || next.state !== "bound"
+    || (current.state === "bound"
+      && (typeof current.generation !== "number" || current.generation > input.agentGeneration))
+    || canonicalDispatchIdentity(current) !== canonicalDispatchIdentity(next)
+  ) {
+    return undefined;
+  }
+  return {
+    modern: true,
+    dispatchId: currentDispatchId,
+    allowUnspawned: current.state === "prepared",
+  };
+}
+
+function teamTaskDispatchMetadata(metadataJson: string | null): Record<string, unknown> | undefined {
+  if (!metadataJson) return undefined;
   const metadata = decodeJson<Record<string, unknown>>(metadataJson, {});
-  const binding = metadata.chiliTeamDispatch;
-  if (!binding || typeof binding !== "object" || Array.isArray(binding)) return false;
-  const value = binding as Record<string, unknown>;
-  return value.agentTaskId === input.agentTaskId &&
-    value.runId === input.agentRunId &&
-    value.generation === input.agentGeneration;
+  const dispatch = metadata.chiliTeamDispatch;
+  return dispatch && typeof dispatch === "object" && !Array.isArray(dispatch)
+    ? dispatch as Record<string, unknown>
+    : undefined;
+}
+
+function canonicalDispatchIdentity(value: Record<string, unknown>): string {
+  const identity = { ...value };
+  delete identity.state;
+  delete identity.generation;
+  delete identity.agentStatus;
+  delete identity.syncedAt;
+  return JSON.stringify(sortJsonValue(identity));
+}
+
+function isTeamTaskWorkerPolicyJson(value: string | null): boolean {
+  if (!value) return false;
+  const policy = decodeJson<unknown>(value, null);
+  if (!policy || typeof policy !== "object" || Array.isArray(policy)) return false;
+  const record = policy as Record<string, unknown>;
+  return typeof record.teamId === "string"
+    && record.teamId.length > 0
+    && typeof record.taskId === "string"
+    && record.taskId.length > 0;
+}
+
+function sortJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortJsonValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, sortJsonValue(item)]),
+  );
 }
 
 function teamTaskStatusMatchesAgentStatus(

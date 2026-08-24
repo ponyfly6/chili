@@ -235,6 +235,11 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
     const path = stringValue(payload.path) as AgentPath | undefined;
     if (!taskId || !path) return;
 
+    // Task creation is an immutable, first-write-wins boundary. Replayed or
+    // late duplicate creation events must not rewind a running/terminal task
+    // or replace the identity established by the first projected event.
+    if (view.tasks[taskId]) return;
+
     const task = upsertTask(view, taskId, event.time);
     task.status = "pending";
     task.generation = 0;

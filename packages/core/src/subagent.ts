@@ -14,7 +14,10 @@ import type {
   AgentTaskFinalizationStore,
   AgentTaskLeaseStore,
   AgentTaskRow,
+  AgentTaskRunClaimStore,
+  EventAppendOptions,
   EventStore,
+  SessionRunClaimFence,
   SubagentProjectionStore,
 } from "@chili/store";
 import type {
@@ -73,6 +76,13 @@ export interface LocalSubagentSchedulingMetadata {
 }
 
 export interface LocalSubagentTaskInput extends LocalSubagentSchedulingMetadata {
+  /** Reserved durable identity. Team dispatch supplies all four fields together. */
+  dispatchId?: string;
+  taskId?: TaskId;
+  runId?: AgentRunId;
+  childSessionId?: SessionId;
+  /** Owner-session lease fencing the durable task creation marker. */
+  runClaim?: SessionRunClaimFence;
   parentSessionId: SessionId;
   parentPath?: AgentPath;
   cwd: string;
@@ -156,6 +166,8 @@ interface LocalSubagentTaskState {
   task: LocalSubagentTaskResult;
   runInput: LocalSubagentRunInput;
   controller: AbortController;
+  reservationFingerprint?: string;
+  reservedInitial?: boolean;
   lease?: LocalSubagentTaskLease;
   batchLimiter?: RetainedBatchLimiter;
   spawned?: boolean;
@@ -194,6 +206,10 @@ export interface AgentRunnerSubagentRunnerOptions {
 
 export class LocalSubagentManager implements SubagentController {
   private readonly tasks = new Map<string, LocalSubagentTaskState>();
+  private readonly reservedSpawns = new Map<string, {
+    fingerprint: string;
+    promise: Promise<LocalSubagentTaskResult>;
+  }>();
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly batchLimiters = new Map<string, BatchLimiterEntry>();
   private readonly runLimiter: LocalSubagentRunLimiter;
@@ -292,25 +308,58 @@ export class LocalSubagentManager implements SubagentController {
     return true;
   }
 
-  private async spawnLocalTask(input: LocalSubagentTaskInput): Promise<LocalSubagentTaskResult> {
+  private spawnLocalTask(input: LocalSubagentTaskInput): Promise<LocalSubagentTaskResult> {
+    validateReservedTaskIdentity(input);
+    if (!input.taskId) return this.spawnLocalTaskOnce(input);
+
+    const fingerprint = reservedTaskFingerprint(input);
+    const active = this.tasks.get(input.taskId);
+    if (active) {
+      if (active.reservationFingerprint !== fingerprint) {
+        return Promise.reject(new Error(
+          `Local subagent task reservation conflicts with an active task: ${input.taskId}`,
+        ));
+      }
+      return Promise.resolve({ ...active.task });
+    }
+    const existing = this.reservedSpawns.get(input.taskId);
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) {
+        return Promise.reject(new Error(
+          `Local subagent task reservation conflicts with an in-flight spawn: ${input.taskId}`,
+        ));
+      }
+      return existing.promise;
+    }
+
+    const promise = this.spawnLocalTaskOnce(input);
+    this.reservedSpawns.set(input.taskId, { fingerprint, promise });
+    void promise.finally(() => {
+      const current = this.reservedSpawns.get(input.taskId as TaskId);
+      if (current?.promise === promise) this.reservedSpawns.delete(input.taskId as TaskId);
+    }).catch(() => undefined);
+    return promise;
+  }
+
+  private async spawnLocalTaskOnce(input: LocalSubagentTaskInput): Promise<LocalSubagentTaskResult> {
     await this.options.assertDelegationEnabled?.({
       sessionId: input.parentSessionId,
       action: "task.spawn",
     });
-    const taskId = this.id<TaskId>("task");
-    const runId = this.id<AgentRunId>("agent");
+    const taskId = input.taskId ?? this.id<TaskId>("task");
+    const runId = input.runId ?? this.id<AgentRunId>("agent");
     const parentPath = input.parentPath ?? ROOT_AGENT_PATH;
     const path = joinAgentPath(parentPath, taskId);
-    const childSessionId = this.id<SessionId>("session");
+    const childSessionId = input.childSessionId ?? this.id<SessionId>("session");
     const mode = input.mode ?? "one_shot";
-    const generation = 1;
+    let generation = 1;
     const controller = linkedAbortController(input.signal);
     const batchLimiter = this.retainBatchLimiter(input);
     const workerPolicy = input.workerPolicy
       ? completeWorkerToolPolicy(input.workerPolicy, childSessionId)
       : undefined;
 
-    const task: LocalSubagentTaskResult = {
+    let task: LocalSubagentTaskResult = {
       taskId,
       runId,
       path,
@@ -321,27 +370,94 @@ export class LocalSubagentManager implements SubagentController {
     if (workerPolicy) task.workerPolicy = workerPolicy;
     assignSchedulingMetadata(task, input);
 
-    try {
-      await this.append(
-        eventContext(input.parentSessionId),
-        "agent.task_created",
-        {
-          taskId,
-          path,
-          parentPath,
-          parentSessionId: input.parentSessionId,
-          childSessionId,
-          taskName: input.taskName,
-          cwd: input.cwd,
-          prompt: input.prompt,
-          ...(mode ? { mode } : {}),
-          ...(workerPolicy ? { workerPolicy } : {}),
-          ...schedulingEventPayload(input),
-        },
-      );
-    } catch (error) {
+    const existingTask = input.taskId ? await this.projectedTask(input.taskId) : undefined;
+    if (existingTask) {
+      task = localTaskResultFromProjection(existingTask, input, {
+        taskId,
+        runId,
+        path,
+        parentPath,
+        childSessionId,
+        ...(workerPolicy ? { workerPolicy } : {}),
+      });
+      if (
+        task.status === "running"
+        && (existingTask.leaseExpiresAt === undefined
+          || existingTask.leaseExpiresAt <= Number(this.now()))
+      ) {
+        const finalizationStore = this.finalizationStore();
+        if (finalizationStore) {
+          const closeInput: Parameters<AgentTaskFinalizationStore["closeAgentTaskCas"]>[0] = {
+            taskId: existingTask.id,
+            status: "incomplete",
+            eventId: this.id("event"),
+            expectedGeneration: existingTask.generation,
+            expectedRunId: (existingTask.currentRunId as AgentRunId | undefined) ?? null,
+            expectedLeaseOwner: existingTask.leaseOwner ?? null,
+            requireExpiredLease: true,
+            summary: "Reserved worker lease expired before recovery",
+            error: "reserved_worker_lease_expired",
+            sessionId: input.parentSessionId,
+            time: this.now(),
+          };
+          if (existingTask.leaseExpiresAt !== undefined) {
+            closeInput.expectedLeaseExpiresAt = existingTask.leaseExpiresAt;
+          }
+          if (existingTask.currentRunId) closeInput.agentEventId = this.id("event");
+          if (input.runClaim) closeInput.runClaim = input.runClaim;
+          const closed = await finalizationStore.closeAgentTaskCas(closeInput);
+          const authoritative = closed.task ?? await this.projectedTask(existingTask.id);
+          if (authoritative) {
+            task = localTaskResultFromProjection(authoritative, input, {
+              taskId,
+              runId,
+              path,
+              parentPath,
+              childSessionId,
+              ...(workerPolicy ? { workerPolicy } : {}),
+            });
+          }
+        }
+      }
+      if (task.status !== "pending") {
+        this.releaseBatchLimiter(batchLimiter);
+        return task;
+      }
+      generation = Math.max(existingTask.generation + 1, 1);
+    }
+
+    if (!existingTask) {
+      try {
+        await this.append(
+          eventContext(input.parentSessionId),
+          "agent.task_created",
+          {
+            taskId,
+            ...(input.dispatchId ? { dispatchId: input.dispatchId } : {}),
+            ...(input.runId ? { reservedRunId: input.runId } : {}),
+            path,
+            parentPath,
+            parentSessionId: input.parentSessionId,
+            childSessionId,
+            taskName: input.taskName,
+            cwd: input.cwd,
+            prompt: input.prompt,
+            ...(mode ? { mode } : {}),
+            ...(workerPolicy ? { workerPolicy } : {}),
+            ...schedulingEventPayload(input),
+          },
+          input.runClaim ? { runClaim: input.runClaim } : undefined,
+        );
+      } catch (error) {
+        this.releaseBatchLimiter(batchLimiter);
+        throw error;
+      }
+    }
+    if (input.dispatchId && !this.runClaimStore()) {
       this.releaseBatchLimiter(batchLimiter);
-      throw error;
+      throw new Error(
+        `Reserved local subagent task requires atomic run-claim capability: ${taskId}`,
+      );
     }
 
     const runInput: LocalSubagentRunInput = {
@@ -361,7 +477,13 @@ export class LocalSubagentManager implements SubagentController {
     assignSchedulingMetadata(runInput, input);
     runInput.signal = controller.signal;
 
-    const state: LocalSubagentTaskState = { task, runInput, controller };
+    const state: LocalSubagentTaskState = {
+      task,
+      runInput,
+      controller,
+      ...(input.taskId ? { reservationFingerprint: reservedTaskFingerprint(input) } : {}),
+      ...(input.dispatchId ? { reservedInitial: true } : {}),
+    };
     if (batchLimiter) state.batchLimiter = batchLimiter;
     this.tasks.set(taskId, state);
 
@@ -424,21 +546,14 @@ export class LocalSubagentManager implements SubagentController {
       countedActive = true;
       this.peakActiveRuns = Math.max(this.peakActiveRuns, this.activeRuns);
       task.status = "running";
-      state.spawned = true;
       try {
-        await this.appendAgentSpawned(state);
+        if (!(await this.beginTaskRun(state))) return task;
       } catch (error) {
         if (!state.externallyClosed) {
           task.status = "pending";
           state.spawned = false;
         }
         throw error;
-      }
-      const lease = await this.claimTaskLease(input);
-      if (lease) {
-        input.generation = lease.generation;
-        state.lease = lease;
-        this.startLeaseHeartbeat(state);
       }
 
       await this.options.assertDelegationEnabled?.({
@@ -509,6 +624,65 @@ export class LocalSubagentManager implements SubagentController {
       if (countedActive) this.activeRuns = Math.max(0, this.activeRuns - 1);
       for (let index = releases.length - 1; index >= 0; index--) releases[index]?.();
     }
+  }
+
+  private async beginTaskRun(state: LocalSubagentTaskState): Promise<boolean> {
+    const input = state.runInput;
+    const atomicStore = state.reservedInitial ? this.runClaimStore() : undefined;
+    if (state.reservedInitial && !atomicStore) {
+      throw new Error(
+        `Reserved local subagent task requires atomic run-claim capability: ${input.taskId}`,
+      );
+    }
+    if (atomicStore) {
+      const ttlMs = this.options.leaseTtlMs ?? 30_000;
+      const owner = leaseOwner(input.runId);
+      const result = await atomicStore.beginAgentTaskRunCas({
+        taskId: input.taskId,
+        expectedGeneration: 0,
+        expectedRunId: null,
+        expectedLeaseOwner: null,
+        runId: input.runId,
+        generation: 1,
+        leaseOwner: owner,
+        leaseTtlMs: ttlMs,
+        spawnEventId: this.id("event"),
+        reservedInitial: true,
+        sessionId: input.parentSessionId,
+        time: this.now(),
+      });
+      if (!result.applied) {
+        const authoritative = result.task ?? await this.projectedTask(input.taskId);
+        if (authoritative) this.hydrateAuthoritativeTask(state, authoritative);
+        if (this.tasks.get(input.taskId) === state) this.tasks.delete(input.taskId);
+        return false;
+      }
+      const task = result.task ?? await this.projectedTask(input.taskId);
+      if (!task || task.leaseExpiresAt === undefined) {
+        throw new Error(`Reserved local subagent task began without a durable lease: ${input.taskId}`);
+      }
+      input.generation = task.generation;
+      state.spawned = true;
+      state.lease = {
+        owner,
+        generation: task.generation,
+        expiresAt: task.leaseExpiresAt,
+        ttlMs,
+        heartbeatIntervalMs: this.leaseHeartbeatIntervalMs(ttlMs),
+      };
+      this.startLeaseHeartbeat(state);
+      return true;
+    }
+
+    await this.appendAgentSpawned(state);
+    state.spawned = true;
+    const lease = await this.claimTaskLease(input);
+    if (lease) {
+      input.generation = lease.generation;
+      state.lease = lease;
+      this.startLeaseHeartbeat(state);
+    }
+    return true;
   }
 
   private async appendAgentSpawned(state: LocalSubagentTaskState): Promise<void> {
@@ -781,6 +955,16 @@ export class LocalSubagentManager implements SubagentController {
     return undefined;
   }
 
+  private runClaimStore(): AgentTaskRunClaimStore | undefined {
+    const store = this.options.store;
+    const capabilityStore = store as EventStore & Partial<AgentTaskCapabilityStore>;
+    if (capabilityStore.supportsAgentTaskCapability?.("run-claim") === false) return undefined;
+    if ((store as Partial<AgentTaskRunClaimStore>).beginAgentTaskRunCas) {
+      return store as EventStore & AgentTaskRunClaimStore;
+    }
+    return undefined;
+  }
+
   private finalizationStore(): AgentTaskFinalizationStore | undefined {
     const store = this.options.store;
     const capabilityStore = store as EventStore & Partial<AgentTaskCapabilityStore>;
@@ -789,6 +973,12 @@ export class LocalSubagentManager implements SubagentController {
       return store as EventStore & AgentTaskFinalizationStore;
     }
     return undefined;
+  }
+
+  private async projectedTask(taskId: TaskId): Promise<AgentTaskRow | undefined> {
+    const projection = this.options.store.agentTask;
+    if (!projection) return undefined;
+    return projection.call(this.options.store, taskId);
   }
 
   private leaseHeartbeatIntervalMs(ttlMs: number): number {
@@ -853,6 +1043,7 @@ export class LocalSubagentManager implements SubagentController {
     input: { sessionId: SessionId },
     type: TType,
     payload: TPayload,
+    options?: EventAppendOptions,
   ): Promise<void> {
     const event: EventEnvelope<TType, TPayload> = {
       id: this.id("event"),
@@ -861,7 +1052,7 @@ export class LocalSubagentManager implements SubagentController {
       sessionId: input.sessionId,
       payload,
     };
-    await this.options.store.append(event as ChiliEvent);
+    await this.options.store.append(event as ChiliEvent, options);
   }
 
   private id<T extends string>(prefix: string): T {
@@ -1006,6 +1197,101 @@ function runTurnInputFromPrompt(input: LocalSubagentRunInput, prompt: PromptAsse
   if (prompt.developer.length > 0) runInput.developer = prompt.developer;
   if (prompt.contextualUser.length > 0) runInput.contextualUser = prompt.contextualUser;
   return runInput;
+}
+
+function validateReservedTaskIdentity(input: LocalSubagentTaskInput): void {
+  const reservation = [input.dispatchId, input.taskId, input.runId, input.childSessionId];
+  const present = reservation.filter((value) => value !== undefined).length;
+  if (present !== 0 && present !== reservation.length) {
+    throw new Error("Crash-safe dispatch reservations require dispatchId, taskId, runId, and childSessionId together");
+  }
+  if (input.dispatchId !== undefined && input.dispatchId.trim().length === 0) {
+    throw new Error("dispatchId must not be empty");
+  }
+}
+
+function reservedTaskFingerprint(input: LocalSubagentTaskInput): string {
+  return canonicalJson({
+    dispatchId: input.dispatchId,
+    taskId: input.taskId,
+    runId: input.runId,
+    childSessionId: input.childSessionId,
+    parentSessionId: input.parentSessionId,
+    parentPath: input.parentPath ?? ROOT_AGENT_PATH,
+    cwd: input.cwd,
+    taskName: input.taskName,
+    prompt: input.prompt,
+    mode: input.mode ?? "one_shot",
+    workerPolicy: input.workerPolicy,
+    ...schedulingEventPayload(input),
+  });
+}
+
+function localTaskResultFromProjection(
+  projected: AgentTaskRow,
+  input: LocalSubagentTaskInput,
+  expected: {
+    taskId: TaskId;
+    runId: AgentRunId;
+    path: AgentPath;
+    parentPath: AgentPath;
+    childSessionId: SessionId;
+    workerPolicy?: WorkerToolPolicy;
+  },
+): LocalSubagentTaskResult {
+  const mode = input.mode ?? "one_shot";
+  const identityMatches = Boolean(input.dispatchId)
+    && projected.dispatchId === input.dispatchId
+    && projected.reservedRunId === expected.runId
+    && projected.id === expected.taskId
+    && projected.path === expected.path
+    && projected.parentPath === expected.parentPath
+    && projected.parentSessionId === input.parentSessionId
+    && projected.childSessionId === expected.childSessionId
+    && projected.taskName === input.taskName
+    && projected.cwd === input.cwd
+    && projected.prompt === input.prompt
+    && projected.mode === mode
+    && canonicalJson(projected.workerPolicy) === canonicalJson(expected.workerPolicy)
+    && projected.sourceCallId === input.sourceCallId
+    && projected.batchId === input.batchId
+    && projected.batchIndex === input.batchIndex
+    && projected.expectedBatchSize === input.expectedBatchSize
+    && projected.maxConcurrency === input.maxConcurrency
+    && projected.completionPolicy === input.completionPolicy
+    && (!projected.currentRunId || projected.currentRunId === expected.runId);
+  if (!identityMatches) {
+    throw new Error(`Local subagent task already exists with a different creation identity: ${expected.taskId}`);
+  }
+
+  const result: LocalSubagentTaskResult = {
+    taskId: projected.id,
+    runId: expected.runId,
+    path: projected.path,
+    parentPath: expected.parentPath,
+    childSessionId: expected.childSessionId,
+    status: projected.status,
+  };
+  if (expected.workerPolicy) result.workerPolicy = expected.workerPolicy;
+  if (projected.summary) result.summary = projected.summary;
+  if (projected.error) result.error = new Error(projected.error);
+  assignSchedulingMetadata(result, projected);
+  return result;
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(canonicalJsonValue(value));
+}
+
+function canonicalJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => canonicalJsonValue(item));
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, canonicalJsonValue(item)]),
+  );
 }
 
 function defaultCreateId(prefix: string): string {

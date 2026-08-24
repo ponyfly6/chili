@@ -68,6 +68,39 @@ test("rejects cross-session and unknown snapshots without provider or event side
   expect(fixture.appended).toEqual([]);
 });
 
+test("rejects archived and subagent sessions before reading snapshots", async () => {
+  for (const session of [
+    { ...sessionRow(sessionId, "/workspace"), status: "archived" as const },
+    { ...sessionRow(sessionId, "/workspace"), source: "subagent" as const },
+  ]) {
+    const fixture = recoveryFixture({
+      sessions: [session],
+      events: [snapshotCreatedEvent(sessionId, snapshotId, "event_snapshot_created")],
+    });
+
+    await expect(fixture.service.revert({ sessionId, snapshotId })).rejects.toThrow();
+    expect(fixture.eventQueries).toEqual([]);
+    expect(fixture.revertCalls).toEqual([]);
+    expect(fixture.appended).toEqual([]);
+  }
+});
+
+test("rechecks session authority immediately before reverting", async () => {
+  const active = sessionRow(sessionId, "/workspace");
+  const archived = { ...active, status: "archived" as const };
+  const fixture = recoveryFixture({
+    sessions: [active],
+    sessionReads: [[active], [archived]],
+    events: [snapshotCreatedEvent(sessionId, snapshotId, "event_snapshot_created")],
+  });
+
+  await expect(fixture.service.revert({ sessionId, snapshotId }))
+    .rejects.toThrow(`Session is not active: ${sessionId} (archived)`);
+  expect(fixture.eventQueries).toHaveLength(1);
+  expect(fixture.revertCalls).toEqual([]);
+  expect(fixture.appended).toEqual([]);
+});
+
 test("finds snapshot ownership beyond the first bounded event page", async () => {
   const earlierSnapshots = Array.from({ length: 500 }, (_, index) => snapshotCreatedEvent(
     sessionId,
@@ -90,6 +123,7 @@ test("finds snapshot ownership beyond the first bounded event page", async () =>
 
 function recoveryFixture(input: {
   sessions: SessionRow[];
+  sessionReads?: SessionRow[][];
   events: ChiliEvent[];
 }): {
   service: SnapshotRecoveryService;
@@ -100,6 +134,7 @@ function recoveryFixture(input: {
   const events = [...input.events];
   const appended: ChiliEvent[] = [];
   const eventQueries: EventQuery[] = [];
+  let sessionReadIndex = 0;
   const store = {
     async append(event: ChiliEvent) {
       events.push(event);
@@ -123,7 +158,9 @@ function recoveryFixture(input: {
       return matches;
     },
     async sessions() {
-      return input.sessions;
+      const sessions = input.sessionReads?.[sessionReadIndex] ?? input.sessions;
+      sessionReadIndex += 1;
+      return sessions;
     },
     async messages() {
       return [];

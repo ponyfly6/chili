@@ -33,9 +33,10 @@ export interface CliReplCommandContext {
   showMailbox(sessionId: SessionId): Promise<void>;
   listTasks(sessionId: SessionId): Promise<void>;
   showTask(sessionId: SessionId, taskId: string): Promise<void>;
-  showMemory(scope: string): Promise<void>;
-  addMemory(input: string): Promise<void>;
-  reloadMemory(scope: string): Promise<void>;
+  recoverTasks(sessionId: SessionId): Promise<void>;
+  showMemory(cwd: string, scope: string): Promise<void>;
+  addMemory(cwd: string, input: string): Promise<void>;
+  reloadMemory(cwd: string, scope: string): Promise<void>;
   runPromptCommand(sessionId: SessionId, commandId: string, args: string): Promise<void>;
 }
 
@@ -58,6 +59,7 @@ type CliReplCommandAction =
   | { type: "team_mailbox" }
   | { type: "team_tasks" }
   | { type: "team_task"; taskId: string }
+  | { type: "team_recover" }
   | { type: "memory_show"; scope: string }
   | { type: "memory_add"; input: string }
   | { type: "memory_reload"; scope: string }
@@ -90,6 +92,7 @@ export function createCliReplCommandRegistry(runtimeCatalog?: RuntimeCommandCata
     "team.mailbox": { run: () => ({ type: "team_mailbox" }) },
     "team.tasks": { run: () => ({ type: "team_tasks" }) },
     "team.task": { run: (_context, input) => ({ type: "team_task", taskId: input.raw }) },
+    "team.recover": { run: () => ({ type: "team_recover" }) },
     memory: { run: () => ({ type: "memory_show", scope: "" }) },
     "memory.show": { run: (_context, input) => ({ type: "memory_show", scope: input.raw }) },
     "memory.add": { run: (_context, input) => ({ type: "memory_add", input: input.raw }) },
@@ -179,14 +182,17 @@ async function executeAction(
     case "team_task":
       await context.showTask(context.sessionId, action.taskId);
       break;
+    case "team_recover":
+      await context.recoverTasks(context.sessionId);
+      break;
     case "memory_show":
-      await context.showMemory(action.scope);
+      await context.showMemory(context.cwd, action.scope);
       break;
     case "memory_add":
-      await context.addMemory(action.input);
+      await context.addMemory(context.cwd, action.input);
       break;
     case "memory_reload":
-      await context.reloadMemory(action.scope);
+      await context.reloadMemory(context.cwd, action.scope);
       break;
     case "prompt":
       await context.runPromptCommand(context.sessionId, action.commandId, action.args);

@@ -30,6 +30,8 @@ import type {
   AgentTaskRow,
   ApprovalRow,
   EventQuery,
+  EventAppendOptions,
+  EventCommitAwareStore,
   EventStore,
   GoalProjectionStore,
   SessionRow,
@@ -40,6 +42,9 @@ import type {
   TeamMessageDeliveryRow,
   TeamMessageQuery,
   TeamMessageRow,
+  TeamOwnerSessionBindInput,
+  TeamOwnerSessionBindResult,
+  TeamOwnerSessionBindStore,
   TeamProjectionStore,
   TeamQuery,
   TeamRow,
@@ -69,6 +74,7 @@ export interface ObservableEventStoreOptions {
 export class ObservableEventStore
   implements
     EventStore,
+    EventCommitAwareStore,
     EventPublisher,
     GoalProjectionStore,
     SubagentProjectionStore,
@@ -79,6 +85,7 @@ export class ObservableEventStore
     AgentMailboxCapabilityStore,
     AgentMailboxDeliveryStore,
     TeamProjectionStore,
+    TeamOwnerSessionBindStore,
     TeamTaskClaimStore,
     TeamTaskAgentSyncStore,
     TeamTaskVerificationClaimStore
@@ -90,14 +97,36 @@ export class ObservableEventStore
     private readonly options: ObservableEventStoreOptions = {},
   ) {}
 
-  async append(event: ChiliEvent): Promise<void> {
-    await this.inner.append(event);
-    this.emit(event);
+  async append(event: ChiliEvent, options?: EventAppendOptions): Promise<void> {
+    await this.appendCommitted(event, options);
   }
 
-  async appendMany(events: readonly ChiliEvent[]): Promise<void> {
-    await this.inner.appendMany(events);
-    for (const event of events) this.emit(event);
+  async appendCommitted(event: ChiliEvent, options?: EventAppendOptions): Promise<boolean> {
+    const aware = this.inner as EventStore & Partial<EventCommitAwareStore>;
+    const committed = aware.appendCommitted
+      ? await aware.appendCommitted(event, options)
+      : (await this.inner.append(event, options), true);
+    if (committed) this.emit(event);
+    return committed;
+  }
+
+  async appendMany(
+    events: readonly ChiliEvent[],
+    options?: EventAppendOptions,
+  ): Promise<void> {
+    await this.appendManyCommitted(events, options);
+  }
+
+  async appendManyCommitted(
+    events: readonly ChiliEvent[],
+    options?: EventAppendOptions,
+  ): Promise<readonly ChiliEvent[]> {
+    const aware = this.inner as EventStore & Partial<EventCommitAwareStore>;
+    const committed = aware.appendManyCommitted
+      ? await aware.appendManyCommitted(events, options)
+      : (await this.inner.appendMany(events, options), events);
+    for (const event of committed) this.emit(event);
+    return committed;
   }
 
   events(query?: EventQuery): Promise<EventEnvelope[]> {
@@ -246,6 +275,13 @@ export class ObservableEventStore
     return result;
   }
 
+  async bindTeamOwnerSession(input: TeamOwnerSessionBindInput): Promise<TeamOwnerSessionBindResult> {
+    const result = await (this.teamOwnerSessionBindStore()?.bindTeamOwnerSession(input) ??
+      Promise.resolve({ applied: false, reason: "not_found" as const, events: [] }));
+    for (const event of result.events) this.emit(event);
+    return result;
+  }
+
   async claimTeamTaskVerification(input: TeamTaskVerificationClaimInput): Promise<TeamTaskVerificationClaimResult> {
     const result = await (this.teamTaskVerificationClaimStore()?.claimTeamTaskVerification(input) ??
       Promise.resolve({ applied: false, reason: "not_found" as const, events: [] }));
@@ -347,6 +383,12 @@ export class ObservableEventStore
     if (inner.claimTeamTask) {
       return inner as EventStore & TeamTaskClaimStore;
     }
+    return undefined;
+  }
+
+  private teamOwnerSessionBindStore(): TeamOwnerSessionBindStore | undefined {
+    const inner = this.inner as EventStore & Partial<TeamOwnerSessionBindStore>;
+    if (inner.bindTeamOwnerSession) return inner as EventStore & TeamOwnerSessionBindStore;
     return undefined;
   }
 

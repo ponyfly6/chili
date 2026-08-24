@@ -93,6 +93,7 @@ test("child ToolExecutor inherits root off without losing the worker policy", as
   const rootSessionId = "session_delegation_root" as SessionId;
   const childSessionId = "session_delegation_child" as SessionId;
   try {
+    await fixture.harness.service.createSession({ sessionId: rootSessionId, cwd: fixture.repo });
     await fixture.harness.events.append(taskCreatedEvent({
       rootSessionId,
       childSessionId,
@@ -139,7 +140,7 @@ test("queued descendant and sibling triggers pause under off and deliver after r
       rootSessionId,
       childSessionId,
     }));
-    await fixture.harness.service.createSession({ sessionId: childSessionId, cwd: fixture.repo });
+    await fixture.harness.runtime.createSession({ sessionId: childSessionId, cwd: fixture.repo });
     const queued = await fixture.harness.agents.sendMessage({
       from: "/root" as AgentPath,
       to: "/root/task_delegation_child",

@@ -1,4 +1,5 @@
 import { relative, resolve } from "node:path";
+import { TEAM_TASK_RUNTIME_METADATA_KEYS } from "@chili/protocol";
 import { ToolDeniedError } from "./errors.js";
 import type {
   ChiliToolDefinition,
@@ -18,6 +19,7 @@ const SCOPED_TEAM_TOOL_NAMES = new Set([
   "team_message_list",
 ]);
 const SCOPED_AGENT_MESSAGE_TOOL_NAMES = new Set(["agent_message_send", "agent_message_list"]);
+const TEAM_TASK_RUNTIME_METADATA_KEY_SET = new Set<string>(TEAM_TASK_RUNTIME_METADATA_KEYS);
 
 export function filterToolsByPolicy(
   tools: readonly ChiliToolDefinition[],
@@ -188,9 +190,43 @@ function authorizeTeamTaskTool(
     throw new ToolDeniedError(tool.name, "Team task tool is outside this worker's team task scope.");
   }
 
+  authorizeTeamTaskProgressUpdate(tool, input);
+
   const ownerPath = stringField(input, "ownerPath");
   if (ownerPath && policy.memberPath && ownerPath !== policy.memberPath) {
     throw new ToolDeniedError(tool.name, "Team task ownerPath must match this worker's member path.");
+  }
+}
+
+function authorizeTeamTaskProgressUpdate(
+  tool: ChiliToolDefinition,
+  input: Record<string, unknown>,
+): void {
+  const status = stringField(input, "status");
+  if (status && status !== "in_progress") {
+    throw new ToolDeniedError(
+      tool.name,
+      "Scoped workers may only report in-progress task updates; complete the local task with complete_task.",
+    );
+  }
+
+  const structuralFields = ["ownerPath", "title", "description", "dependsOn", "error"] as const;
+  const structuralField = structuralFields.find((field) => input[field] !== undefined);
+  if (structuralField) {
+    throw new ToolDeniedError(
+      tool.name,
+      `Scoped workers cannot change team task field: ${structuralField}.`,
+    );
+  }
+
+  const metadata = recordField(input, "metadata");
+  if (!metadata) return;
+  const protectedKey = Object.keys(metadata).find((key) => TEAM_TASK_RUNTIME_METADATA_KEY_SET.has(key));
+  if (protectedKey) {
+    throw new ToolDeniedError(
+      tool.name,
+      `Scoped workers cannot change runtime-owned team task metadata: ${protectedKey}.`,
+    );
   }
 }
 
@@ -254,6 +290,13 @@ function recordInput(input: unknown): Record<string, unknown> {
 function stringField(input: Record<string, unknown>, key: string): string | undefined {
   const value = input[key];
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function recordField(input: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  const value = input[key];
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 function pathPatternWithinScopes(cwd: string, pattern: string, scopes: readonly string[]): boolean {

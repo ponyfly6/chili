@@ -2,8 +2,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { AgentPath, SessionId, TaskId, TimestampMs } from "@chili/protocol";
-import { SqliteEventStore } from "@chili/store";
+import type { AgentPath, SessionId, TaskId, TeamId, TimestampMs } from "@chili/protocol";
+import { SessionRunClaimConflictError, SqliteEventStore } from "@chili/store";
 import {
   TeamControlService,
   TeamMemberSessionOwnershipError,
@@ -11,6 +11,8 @@ import {
   TeamMessageConflictError,
   TeamMessageDeliveryError,
   TeamMessageSenderUnauthorizedError,
+  TeamTaskAlreadyExistsError,
+  TeamTaskWorkerMutationError,
 } from "./team.js";
 
 test("creates a persistent team with leader, members, task assignment, claim, and completion", async () => {
@@ -213,6 +215,284 @@ test("creates a persistent team with leader, members, task assignment, claim, an
       "team.task_updated",
       "team.member_status_changed",
     ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("explicit team ids are first-write-wins across SQLite connections", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-create-race-"));
+  const dbPath = join(dir, "events.sqlite");
+  const firstStore = new SqliteEventStore(dbPath);
+  const secondStore = new SqliteEventStore(dbPath);
+  const teamId = "team_explicit_race" as TeamId;
+  const first = new TeamControlService({ store: firstStore });
+  const second = new TeamControlService({ store: secondStore });
+
+  try {
+    const results = await Promise.allSettled([
+      first.createTeam({ teamId, name: "first", leadPath: "/root/first" as AgentPath }),
+      second.createTeam({ teamId, name: "second", leadPath: "/root/second" as AgentPath }),
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    const rejection = results.find((result) => result.status === "rejected");
+    expect(rejection?.status === "rejected" ? rejection.reason?.name : undefined).toBe("TeamAlreadyExistsError");
+    const [team] = await firstStore.teams({ teamId });
+    expect(team).toBeDefined();
+    expect(["first", "second"]).toContain(team!.name);
+    expect(await firstStore.teamMembers({ teamId })).toHaveLength(1);
+    expect(await firstStore.events({ type: "team.created", limit: 10 })).toHaveLength(1);
+  } finally {
+    secondStore.close();
+    firstStore.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("explicit team task ids are globally first-write-wins across teams", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-task-explicit-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const service = new TeamControlService({ store, now: () => 20 as TimestampMs });
+  const firstTeamId = "team_task_explicit_first" as TeamId;
+  const secondTeamId = "team_task_explicit_second" as TeamId;
+  const taskId = "task_explicit_global" as TaskId;
+
+  try {
+    await service.createTeam({ teamId: firstTeamId, name: "first", leadPath: "/root/first" as AgentPath });
+    await service.createTeam({ teamId: secondTeamId, name: "second", leadPath: "/root/second" as AgentPath });
+    const membersBefore = await store.teamMembers({});
+    const original = await service.createTask({
+      teamId: firstTeamId,
+      taskId,
+      title: "keep the first task",
+      description: "first description",
+      createdBy: "/root/first" as AgentPath,
+      status: "completed",
+      metadata: { source: "first", attempt: 1 },
+    });
+
+    await expect(service.createTask({
+      teamId: firstTeamId,
+      taskId,
+      title: "same-team replacement",
+      status: "pending",
+      metadata: { source: "same-team duplicate" },
+    })).rejects.toBeInstanceOf(TeamTaskAlreadyExistsError);
+    await expect(service.createTask({
+      teamId: secondTeamId,
+      taskId,
+      title: "cross-team replacement",
+      status: "failed",
+      metadata: { source: "cross-team duplicate" },
+    })).rejects.toBeInstanceOf(TeamTaskAlreadyExistsError);
+
+    expect(await store.teamTasks({ taskId })).toEqual([original]);
+    expect(original).toMatchObject({
+      id: taskId,
+      teamId: firstTeamId,
+      title: "keep the first task",
+      description: "first description",
+      status: "completed",
+      metadata: { source: "first", attempt: 1 },
+      completedAt: 20,
+    });
+    expect(await store.teamMembers({})).toEqual(membersBefore);
+    const createdEvents = await store.events({ type: "team.task_created", limit: 10 });
+    expect(createdEvents.filter(
+      (event) => event.type === "team.task_created"
+        && (event.payload as { taskId?: TaskId }).taskId === taskId,
+    )).toHaveLength(1);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent team task creation across SQLite connections has one global winner", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-task-race-"));
+  const dbPath = join(dir, "events.sqlite");
+  const firstStore = new SqliteEventStore(dbPath);
+  const secondStore = new SqliteEventStore(dbPath);
+  const first = new TeamControlService({ store: firstStore, now: () => 30 as TimestampMs });
+  const second = new TeamControlService({ store: secondStore, now: () => 40 as TimestampMs });
+  const firstTeamId = "team_task_race_first" as TeamId;
+  const secondTeamId = "team_task_race_second" as TeamId;
+  const taskId = "task_global_race" as TaskId;
+
+  try {
+    await first.createTeam({ teamId: firstTeamId, name: "first", leadPath: "/root/first" as AgentPath });
+    await second.createTeam({ teamId: secondTeamId, name: "second", leadPath: "/root/second" as AgentPath });
+    const membersBefore = await firstStore.teamMembers({});
+    const results = await Promise.allSettled([
+      first.createTask({
+        teamId: firstTeamId,
+        taskId,
+        title: "first contender",
+        status: "completed",
+        metadata: { contender: "first" },
+      }),
+      second.createTask({
+        teamId: secondTeamId,
+        taskId,
+        title: "second contender",
+        status: "failed",
+        metadata: { contender: "second" },
+      }),
+    ]);
+
+    const winners = results.filter((result) => result.status === "fulfilled");
+    expect(winners).toHaveLength(1);
+    const rejection = results.find((result) => result.status === "rejected");
+    expect(rejection?.status === "rejected" ? rejection.reason?.name : undefined)
+      .toBe("TeamTaskAlreadyExistsError");
+    const winner = winners[0]?.status === "fulfilled" ? winners[0].value : undefined;
+    expect(winner).toBeDefined();
+    expect(await firstStore.teamTasks({ taskId })).toEqual([winner!]);
+    expect(winner).toMatchObject(
+      winner?.teamId === firstTeamId
+        ? {
+            teamId: firstTeamId,
+            title: "first contender",
+            status: "completed",
+            metadata: { contender: "first" },
+            completedAt: 30,
+          }
+        : {
+            teamId: secondTeamId,
+            title: "second contender",
+            status: "failed",
+            metadata: { contender: "second" },
+            completedAt: 40,
+          },
+    );
+    expect(await firstStore.teamMembers({})).toEqual(membersBefore);
+    const createdEvents = await firstStore.events({ type: "team.task_created", limit: 10 });
+    expect(createdEvents.filter(
+      (event) => event.type === "team.task_created"
+        && (event.payload as { taskId?: TaskId }).taskId === taskId,
+    )).toHaveLength(1);
+  } finally {
+    secondStore.close();
+    firstStore.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("scoped workers can report progress without forging runtime task state", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-worker-update-policy-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ownerSessionId = "session_team_worker_policy_owner" as SessionId;
+  const workerSessionId = "session_team_worker_policy_child" as SessionId;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const dispatchedAgentPath = "/root/worker/protected-task" as AgentPath;
+  const dispatchedAgentTaskId = "task_worker_policy_agent" as TaskId;
+  const protectedMetadata = {
+    verification: { status: "failed", feedback: "retry" },
+    merge: { status: "pending", createdAt: 10 },
+    worktree: { path: "/repo/.chili/worktrees/team/task", baseRef: "abc", createdAt: 9, status: "active" },
+    chiliTeamDispatch: {
+      agentTaskId: dispatchedAgentTaskId,
+      agentPath: dispatchedAgentPath,
+      childSessionId: workerSessionId,
+      runId: "run_1",
+      generation: 1,
+    },
+    writeScope: ["packages/core"],
+  };
+
+  try {
+    const service = new TeamControlService({
+      store,
+      createId: createSequentialId(),
+      now: () => 20 as TimestampMs,
+    });
+    const team = await service.createTeam({
+      sessionId: ownerSessionId,
+      name: "worker-policy",
+      leadPath,
+    });
+    await seedMemberTask(store, {
+      taskId: dispatchedAgentTaskId,
+      path: dispatchedAgentPath,
+      parentPath: workerPath,
+      parentSessionId: ownerSessionId,
+      childSessionId: workerSessionId,
+      time: 10,
+    });
+    await service.addMember({
+      sessionId: ownerSessionId,
+      teamId: team.id,
+      path: workerPath,
+      name: "worker",
+      role: "implementer",
+    });
+    const task = await service.createTask({
+      sessionId: ownerSessionId,
+      teamId: team.id,
+      title: "protected task",
+      ownerPath: workerPath,
+      metadata: protectedMetadata,
+    });
+    expect(await service.claimTask({
+      sessionId: ownerSessionId,
+      teamId: team.id,
+      taskId: task.id,
+      ownerPath: workerPath,
+    })).toMatchObject({ applied: true });
+
+    const eventCountBefore = (await store.events({ type: "team.task_updated", limit: 100 })).length;
+    await expect(service.updateTask({
+      sessionId: "session_team_worker_policy_stranger" as SessionId,
+      teamId: team.id,
+      taskId: task.id,
+      summary: "unauthorized progress",
+    })).rejects.toBeInstanceOf(TeamTaskWorkerMutationError);
+    expect(await store.events({ type: "team.task_updated", limit: 100 })).toHaveLength(eventCountBefore);
+
+    const maliciousUpdates = [
+      { status: "completed" as const },
+      { status: "pending" as const },
+      { metadata: { verification: { status: "passed" } } },
+      { metadata: { merge: { status: "pending" } } },
+      { metadata: { worktree: null } },
+      { metadata: { chiliTeamDispatch: null } },
+      { metadata: { writeScope: ["."] } },
+      { ownerPath: leadPath },
+      { title: "forged title" },
+      { error: "forged error" },
+    ];
+    for (const update of maliciousUpdates) {
+      await expect(service.updateTask({
+        sessionId: workerSessionId,
+        actorScope: "scoped_worker",
+        teamId: team.id,
+        taskId: task.id,
+        ...update,
+      })).rejects.toBeInstanceOf(TeamTaskWorkerMutationError);
+    }
+    expect(await store.events({ type: "team.task_updated", limit: 100 })).toHaveLength(eventCountBefore);
+
+    const progressed = await service.updateTask({
+      sessionId: workerSessionId,
+      actorScope: "scoped_worker",
+      teamId: team.id,
+      taskId: task.id,
+      status: "in_progress",
+      summary: "Implemented half of the change",
+      metadata: { workerProgress: { percent: 50 } },
+    });
+    expect(progressed).toMatchObject({
+      status: "in_progress",
+      summary: "Implemented half of the change",
+      metadata: {
+        ...protectedMetadata,
+        workerProgress: { percent: 50 },
+      },
+    });
+    expect(await store.events({ type: "team.task_updated", limit: 100 })).toHaveLength(eventCountBefore + 1);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -786,6 +1066,162 @@ test("team member sessions must have unique descendant task ownership", async ()
     })).rejects.toBeInstanceOf(TeamMemberSessionOwnershipError);
     expect(await store.agentMailbox({ recipientSessionId: victimSessionId })).toEqual([]);
   } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("bound team mutations use the owner operation fence and fail before append when it is lost", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-operation-fence-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ownerSessionId = "session_team_owner_fence" as SessionId;
+  const actorSessionId = ownerSessionId;
+  const acquired: SessionId[] = [];
+  let failAtMutation = false;
+  const sessionOperations = {
+    async withSessionOperation<T>(
+      sessionId: SessionId,
+      fn: (operation: { readonly signal: AbortSignal; assertCurrent(): void }) => Promise<T> | T,
+    ): Promise<T> {
+      acquired.push(sessionId);
+      let assertions = 0;
+      const operation = {
+        signal: new AbortController().signal,
+        assertCurrent() {
+          assertions++;
+          if (failAtMutation && assertions >= 2) throw new Error("lease lost");
+        },
+      };
+      return fn(operation);
+    },
+  };
+
+  try {
+    const service = new TeamControlService({
+      store,
+      createId: createSequentialId(),
+      now: () => 100 as TimestampMs,
+      sessionOperations,
+    });
+    const team = await service.createTeam({
+      sessionId: ownerSessionId,
+      name: "fenced-team",
+      leadPath: "/root" as AgentPath,
+    });
+    const task = await service.createTask({
+      teamId: team.id,
+      sessionId: ownerSessionId,
+      title: "fenced task",
+    });
+
+    failAtMutation = true;
+    await expect(service.updateTask({
+      teamId: team.id,
+      taskId: task.id,
+      sessionId: actorSessionId,
+      status: "completed",
+    })).rejects.toThrow("lease lost");
+    expect((await service.tasks(team.id))[0]?.status).toBe("pending");
+
+    failAtMutation = false;
+    await service.updateTask({
+      teamId: team.id,
+      taskId: task.id,
+      sessionId: actorSessionId,
+      status: "completed",
+    });
+    expect(acquired.at(-1)).toBe(ownerSessionId);
+    expect((await service.tasks(team.id))[0]?.status).toBe("completed");
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("bound writes commit under the durable owner claim", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-durable-owner-fence-"));
+  const dbPath = join(dir, "events.sqlite");
+  const store = new SqliteEventStore(dbPath);
+  const contender = new SqliteEventStore(dbPath);
+  const ownerSessionId = "session_team_durable_owner" as SessionId;
+  const actorSessionId = ownerSessionId;
+  const claimId = "run_claim_team_durable_owner";
+  const claimedAt = Date.now();
+  let assertions = 0;
+  let replaceClaim = false;
+  const sessionOperations = {
+    async withSessionOperation<T>(
+      sessionId: SessionId,
+      fn: (operation: {
+        readonly signal: AbortSignal;
+        readonly runClaim: { sessionId: SessionId; claimId: string };
+        assertCurrent(): void;
+      }) => Promise<T> | T,
+    ): Promise<T> {
+      expect(sessionId).toBe(ownerSessionId);
+      return fn({
+        signal: new AbortController().signal,
+        runClaim: { sessionId: ownerSessionId, claimId },
+        assertCurrent() {
+          assertions++;
+          if (replaceClaim && assertions === 2) {
+            expect(contender.claimSessionRun({
+              sessionId: ownerSessionId,
+              claimId: "run_claim_team_contender",
+              allowSubagentSessions: false,
+              time: claimedAt + 60_000,
+              leaseDurationMs: 60_000,
+            })).toEqual({ status: "claimed" });
+          }
+        },
+      });
+    },
+  };
+
+  try {
+    await store.append({
+      id: "event_team_durable_owner_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId: ownerSessionId,
+      payload: { sessionId: ownerSessionId, cwd: "/repo" },
+    });
+    expect(store.claimSessionRun({
+      sessionId: ownerSessionId,
+      claimId,
+      allowSubagentSessions: false,
+      time: claimedAt,
+      leaseDurationMs: 60_000,
+    })).toEqual({ status: "claimed" });
+
+    const service = new TeamControlService({ store, sessionOperations });
+    const team = await service.createTeam({
+      sessionId: ownerSessionId,
+      name: "durably fenced",
+      leadPath: "/root" as AgentPath,
+    });
+    const task = await service.createTask({
+      teamId: team.id,
+      title: "must keep owner claim",
+    });
+    expect((await store.events({
+      sessionId: ownerSessionId,
+      type: "team.task_created",
+      limit: 10,
+    })).at(-1)?.payload).toMatchObject({ taskId: task.id });
+
+    assertions = 0;
+    replaceClaim = true;
+    await expect(service.updateTask({
+      teamId: team.id,
+      taskId: task.id,
+      sessionId: actorSessionId,
+      status: "completed",
+    })).rejects.toBeInstanceOf(SessionRunClaimConflictError);
+    expect((await service.tasks(team.id))[0]?.status).toBe("pending");
+    expect(await store.events({ sessionId: actorSessionId, type: "team.task_updated", limit: 10 })).toEqual([]);
+  } finally {
+    contender.close();
     store.close();
     await rm(dir, { recursive: true, force: true });
   }

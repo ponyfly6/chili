@@ -110,6 +110,10 @@ export type AgentMailboxStatus = "queued" | "delivering" | "consumed" | "discard
 
 export interface AgentTaskCreatedPayload {
   taskId: TaskId;
+  /** Stable identity used to make crash-retried task creation idempotent. */
+  dispatchId?: string;
+  /** Run id reserved by the dispatcher before the task is durably created. */
+  reservedRunId?: AgentRunId;
   path: AgentPath;
   parentPath: AgentPath;
   parentSessionId: SessionId;
@@ -234,6 +238,11 @@ export interface TeamCreatedPayload {
   description?: string;
 }
 
+export interface TeamOwnerSessionBoundPayload {
+  teamId: TeamId;
+  ownerSessionId: SessionId;
+}
+
 export interface TeamMemberAddedPayload {
   teamId: TeamId;
   path: AgentPath;
@@ -280,6 +289,8 @@ export interface TeamTaskClaimedPayload {
   taskId: TaskId;
   ownerPath: AgentPath;
   claimedBy?: AgentPath;
+  /** Scheduler-owned metadata committed atomically with the claim. */
+  metadata?: Record<string, unknown>;
 }
 
 export interface TeamTaskUpdatedPayload {
@@ -294,6 +305,33 @@ export interface TeamTaskUpdatedPayload {
   error?: string;
   metadata?: Record<string, unknown>;
 }
+
+/**
+ * Team task metadata owned by the scheduler/runtime rather than a scoped
+ * worker. Scoped progress updates must neither replace nor remove these
+ * fields. Aliases are included because dispatch policy readers accept them.
+ */
+export const TEAM_TASK_RUNTIME_METADATA_KEYS = [
+  "verification",
+  "merge",
+  "worktree",
+  "chiliTeamDispatch",
+  "writeScope",
+  "write_scope",
+  "writeScopes",
+  "write_scopes",
+  "executeScope",
+  "execute_scope",
+  "executionScope",
+  "execution_scope",
+  "requiredTools",
+  "required_tools",
+  "toolScope",
+  "tool_scope",
+  "suggestedTestCommands",
+  "suggested_test_commands",
+  "priority",
+] as const;
 
 export interface TeamMessageSentPayload {
   teamId: TeamId;
@@ -360,6 +398,7 @@ export interface TeamRunCompletedPayload {
 
 export type TeamEvent =
   | EventEnvelope<"team.created", TeamCreatedPayload>
+  | EventEnvelope<"team.owner_session_bound", TeamOwnerSessionBoundPayload>
   | EventEnvelope<"team.member_added", TeamMemberAddedPayload>
   | EventEnvelope<"team.member_status_changed", TeamMemberStatusChangedPayload>
   | EventEnvelope<"team.task_created", TeamTaskCreatedPayload>

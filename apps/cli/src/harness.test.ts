@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
@@ -15,7 +15,6 @@ import { SqliteEventStore, type AgentMailboxRow, type AgentTaskRow } from "@chil
 import {
   PolicyApprovalBroker,
   PolicyApprovalState,
-  type ApprovalBrokerRequest,
   type BashRunner,
   type ChiliToolDefinition,
   type ChiliToolExecutionContext,
@@ -27,7 +26,6 @@ import {
   createCompleteTaskController,
   createSubagentControlController,
   createTeamToolController,
-  linkApprovalSessionsFromEvent,
   type CliHarness,
 } from "./harness.js";
 import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
@@ -90,6 +88,99 @@ test("CLI harness promptFragments provider includes chili.base", async () => {
       cwd: repo,
     });
     expect(fragments?.some((fragment) => fragment.id === "chili.base")).toBe(true);
+  } finally {
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI harness scopes skill catalogs, mentions, and activation to the session cwd", async () => {
+  const root = await mkdtempName();
+  const repoA = join(root, "repo-a");
+  const repoB = join(root, "repo-b");
+  const skillName = "workspace-skill";
+  let harness: CliHarness | undefined;
+  try {
+    for (const [repo, marker] of [[repoA, "WORKSPACE_A"], [repoB, "WORKSPACE_B"]] as const) {
+      const skillDir = join(repo, ".chili", "skills", skillName);
+      await mkdir(skillDir, { recursive: true });
+      await writeFile(
+        join(skillDir, "SKILL.md"),
+        [
+          "---",
+          `name: ${skillName}`,
+          `description: ${marker} description`,
+          "---",
+          `${marker} instructions`,
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+    }
+    harness = await createCliHarness({
+      cwd: repoB,
+      model: "fake",
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+    });
+    const service = harness.service as unknown as {
+      options: {
+        promptFragments?: (input: {
+          sessionId: SessionId;
+          cwd: string;
+          turn?: { text: string };
+        }) => Promise<PromptFragment[]>;
+      };
+    };
+
+    const fragmentsA = await service.options.promptFragments?.({
+      sessionId: "session_skill_a" as SessionId,
+      cwd: repoA,
+      turn: { text: `use $${skillName}` },
+    });
+    const textA = (fragmentsA ?? []).map((fragment) => fragment.content).join("\n");
+    expect(textA).toContain("WORKSPACE_A description");
+    expect(textA).toContain("WORKSPACE_A instructions");
+    expect(textA).not.toContain("WORKSPACE_B");
+
+    const fragmentsB = await service.options.promptFragments?.({
+      sessionId: "session_skill_b" as SessionId,
+      cwd: repoB,
+      turn: { text: `use $${skillName}` },
+    });
+    const textB = (fragmentsB ?? []).map((fragment) => fragment.content).join("\n");
+    expect(textB).toContain("WORKSPACE_B description");
+    expect(textB).toContain("WORKSPACE_B instructions");
+    expect(textB).not.toContain("WORKSPACE_A");
+
+    const session = await harness.service.createSession({
+      sessionId: "session_skill_activation" as SessionId,
+      cwd: repoA,
+    });
+    const executor = (harness.runtime as unknown as {
+      options: {
+        toolExecutor: {
+          execute(input: {
+            sessionId: SessionId;
+            turnId: TurnId;
+            toolName: string;
+            input: unknown;
+            cwd: string;
+          }): Promise<{ status: string; result?: { output: string } }>;
+        };
+      };
+    }).options.toolExecutor;
+    const activated = await executor.execute({
+      sessionId: session.sessionId,
+      turnId: "turn_skill_activation" as TurnId,
+      toolName: "activate_skill",
+      input: { name: skillName },
+      cwd: repoA,
+    });
+    expect(activated.status).toBe("completed");
+    expect(activated.result?.output).toContain("WORKSPACE_A instructions");
+    expect(activated.result?.output).not.toContain("WORKSPACE_B");
   } finally {
     await harness?.close();
     await rm(root, { recursive: true, force: true });
@@ -525,6 +616,77 @@ test("CLI team tools isolate teams and descendant session bindings between roots
   expect(addMemberCalls).toBe(0);
 });
 
+test("CLI child team task updates are marked as scoped worker mutations", async () => {
+  const ownerSessionId = "session_team_update_owner" as SessionId;
+  const workerSessionId = "session_team_update_worker" as SessionId;
+  const teamId = "team_update_scope" as TeamId;
+  const taskId = "task_update_scope" as TaskId;
+  const workerPath = "/root/worker" as AgentPath;
+  const updates: Array<Record<string, unknown>> = [];
+  const teams = {
+    async listTeams() {
+      return [{
+        id: teamId,
+        sessionId: ownerSessionId,
+        name: "update scope",
+        leadPath: "/root" as AgentPath,
+        status: "active" as const,
+        createdAt: 1,
+        updatedAt: 1,
+      }];
+    },
+    async members() {
+      return [{
+        teamId,
+        path: workerPath,
+        name: "worker",
+        role: "implementer",
+        status: "running" as const,
+        childSessionId: workerSessionId,
+        createdAt: 1,
+        updatedAt: 1,
+      }];
+    },
+    async updateTask(input: Record<string, unknown>) {
+      updates.push(input);
+      return {
+        id: taskId,
+        teamId,
+        status: "in_progress" as const,
+        title: "scoped update",
+        ownerPath: workerPath,
+        dependsOn: [],
+        summary: input.summary as string | undefined,
+        createdAt: 1,
+        updatedAt: 2,
+      };
+    },
+  } as unknown as TeamControlService;
+  const tasks = {} as AgentTaskControlService;
+
+  await createTeamToolController(teams, tasks, "child").updateTask({
+    teamId,
+    taskId,
+    status: "in_progress",
+    summary: "halfway",
+  }, agentMessageToolContext("/repo", workerSessionId));
+  expect(updates[0]).toMatchObject({
+    sessionId: workerSessionId,
+    actorScope: "scoped_worker",
+    teamId,
+    taskId,
+    status: "in_progress",
+    summary: "halfway",
+  });
+
+  await createTeamToolController(teams, tasks, "root").updateTask({
+    teamId,
+    taskId,
+    status: "completed",
+  }, agentMessageToolContext("/repo", ownerSessionId));
+  expect(updates[1]).not.toHaveProperty("actorScope");
+});
+
 test("CLI agent message controllers bind senders, list descendants, and isolate root sessions", async () => {
   const root = await mkdtempName();
   const repo = join(root, "repo");
@@ -720,42 +882,278 @@ test("CLI harness keeps failed MCP status out of root and child prompt fragments
   }
 });
 
-test("CLI harness approval session linker joins spawned children to the parent grant scope", async () => {
-  const state = new PolicyApprovalState();
-  const parentSessionId = "session_approval_parent" as SessionId;
-  const childSessionId = "session_approval_child" as SessionId;
-  const parentBroker = new PolicyApprovalBroker({
-    state,
-    ask: async () => ({ action: "allow_session" }),
-  });
-  const childBroker = new PolicyApprovalBroker({ state });
-  const request: ApprovalBrokerRequest = {
-    approvalId: "approval_harness" as ApprovalId,
-    sessionId: parentSessionId,
-    callId: "toolcall_harness" as ToolCallId,
-    toolName: "bash",
-    risk: "execute",
-    permission: "bash",
-    patterns: ["bun test"],
-  };
+test("CLI harness resolves root and child approval policy from each persisted session cwd", async () => {
+  const root = await mkdtempName();
+  const home = join(root, "home");
+  const repoA = join(root, "repo-a");
+  const repoB = join(root, "repo-b");
+  const repoBLink = join(root, "repo-b-link");
+  const parentA = "session_policy_harness_parent_a" as SessionId;
+  const parentB = "session_policy_harness_parent_b" as SessionId;
+  const childA = "session_policy_harness_child_a" as SessionId;
+  const childB = "session_policy_harness_child_b" as SessionId;
+  let harness: CliHarness | undefined;
+  try {
+    await mkdir(join(repoA, ".chili"), { recursive: true });
+    await mkdir(join(repoB, ".chili"), { recursive: true });
+    await mkdir(home, { recursive: true });
+    await writeFile(
+      join(repoA, ".chili", "config.toml"),
+      '[permissions]\ndeny = ["workspace.guard(a-only)"]\n',
+      "utf8",
+    );
+    await writeFile(
+      join(repoB, ".chili", "config.toml"),
+      '[permissions]\ndeny = ["workspace.guard(b-only)"]\n',
+      "utf8",
+    );
+    await symlink(repoB, repoBLink, "dir");
 
-  linkApprovalSessionsFromEvent(state, {
-    id: "event_approval_spawn",
-    type: "agent.spawned",
-    time: 1 as TimestampMs,
-    sessionId: childSessionId,
-    payload: {
-      runId: "run_approval_child" as never,
-      path: "/root/child" as AgentPath,
-      taskName: "child",
-      parentSessionId,
-      childSessionId,
-    },
-  });
-  await parentBroker.decide(request);
+    harness = await createCliHarness({
+      cwd: repoA,
+      chiliHome: home,
+      model: "fake",
+      quiet: true,
+      mcpConnectMode: "manual",
+    });
+    await harness.service.createSession({ sessionId: parentA, cwd: repoA });
+    await harness.service.createSession({ sessionId: parentB, cwd: repoBLink });
+    await harness.service.createSession({ sessionId: childA, cwd: repoA });
+    await harness.service.createSession({ sessionId: childB, cwd: repoBLink });
 
-  const { approvalId: _approvalId, ...childRequest } = { ...request, sessionId: childSessionId };
-  expect(await childBroker.preflight(childRequest)).toMatchObject({ action: "allow", source: "session_grant" });
+    await harness.events.append({
+      id: "event_policy_harness_spawn_b",
+      type: "agent.spawned",
+      time: 1 as TimestampMs,
+      sessionId: parentB,
+      payload: {
+        runId: "run_policy_harness_child_b" as never,
+        path: "/root/child-b" as AgentPath,
+        taskName: "child-b",
+        parentSessionId: parentB,
+        childSessionId: childB,
+      },
+    });
+    await harness.events.append({
+      id: "event_policy_harness_spawn_a",
+      type: "agent.spawned",
+      time: 2 as TimestampMs,
+      sessionId: parentA,
+      payload: {
+        runId: "run_policy_harness_child_a" as never,
+        path: "/root/child-a" as AgentPath,
+        taskName: "child-a",
+        parentSessionId: parentA,
+        childSessionId: childA,
+      },
+    });
+
+    type RuntimeWithApprovals = {
+      options: { toolExecutor: { options: { approvals: PolicyApprovalBroker } } };
+    };
+    type ServiceWithRuntime = { options: { runtime: RuntimeWithApprovals } };
+    const rootBroker = (harness.runtime as unknown as RuntimeWithApprovals).options.toolExecutor.options.approvals;
+    const childService = (harness.agents as unknown as { options: { runtime: ServiceWithRuntime } }).options.runtime;
+    const childBroker = childService.options.runtime.options.toolExecutor.options.approvals;
+    const preflight = (broker: PolicyApprovalBroker, sessionId: SessionId, pattern: string) => broker.preflight({
+      sessionId,
+      callId: `toolcall_policy_${sessionId}_${pattern}` as ToolCallId,
+      toolName: "workspace_guard",
+      risk: "write",
+      permission: "workspace.guard",
+      patterns: [pattern],
+    });
+
+    const [rootAA, rootBA, rootBB, rootAB, childAA, childBA, childBB, childAB] = await Promise.all([
+      preflight(rootBroker, parentA, "a-only"),
+      preflight(rootBroker, parentB, "a-only"),
+      preflight(rootBroker, parentB, "b-only"),
+      preflight(rootBroker, parentA, "b-only"),
+      preflight(childBroker, childA, "a-only"),
+      preflight(childBroker, childB, "a-only"),
+      preflight(childBroker, childB, "b-only"),
+      preflight(childBroker, childA, "b-only"),
+    ]);
+    expect(rootAA).toMatchObject({ action: "deny" });
+    expect(rootBA).toMatchObject({ action: "ask" });
+    expect(rootBB).toMatchObject({ action: "deny" });
+    expect(rootAB).toMatchObject({ action: "ask" });
+    expect(childAA).toMatchObject({ action: "deny" });
+    expect(childBA).toMatchObject({ action: "ask" });
+    expect(childBB).toMatchObject({ action: "deny" });
+    expect(childAB).toMatchObject({ action: "ask" });
+
+    const state = (rootBroker as unknown as { state: PolicyApprovalState }).state;
+    expect((childBroker as unknown as { state: PolicyApprovalState }).state).toBe(state);
+    state.addSessionGrant({
+      sessionId: parentA,
+      permission: "workspace.guard",
+      patterns: ["a-only", "grant-from-a"],
+      source: "test-parent-a",
+    });
+    state.addSessionGrant({
+      sessionId: parentB,
+      permission: "workspace.guard",
+      patterns: ["b-only", "grant-from-b"],
+      source: "test-parent-b",
+    });
+    expect(await preflight(childBroker, childA, "grant-from-a")).toMatchObject({
+      action: "allow",
+      source: "session_grant",
+    });
+    expect(await preflight(childBroker, childB, "grant-from-a")).toMatchObject({ action: "ask" });
+    expect(await preflight(childBroker, childA, "a-only")).toMatchObject({ action: "deny" });
+    expect(await preflight(childBroker, childB, "grant-from-b")).toMatchObject({
+      action: "allow",
+      source: "session_grant",
+    });
+    expect(await preflight(childBroker, childA, "grant-from-b")).toMatchObject({ action: "ask" });
+    expect(await preflight(childBroker, childB, "b-only")).toMatchObject({ action: "deny" });
+  } finally {
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI harness approval resolver denies preflight and decide after session archival", async () => {
+  const root = await mkdtempName();
+  const repo = join(root, "repo");
+  const sessionId = "session_policy_archived" as SessionId;
+  let harness: CliHarness | undefined;
+  try {
+    await mkdir(repo, { recursive: true });
+    harness = await createCliHarness({
+      cwd: repo,
+      model: "fake",
+      quiet: true,
+      mcpConnectMode: "manual",
+    });
+    await harness.service.createSession({ sessionId, cwd: repo });
+    const broker = (harness.runtime as unknown as {
+      options: { toolExecutor: { options: { approvals: PolicyApprovalBroker } } };
+    }).options.toolExecutor.options.approvals;
+    const request = {
+      sessionId,
+      callId: "toolcall_policy_archived" as ToolCallId,
+      toolName: "read",
+      risk: "read" as const,
+      permission: "read",
+      patterns: ["README.md"],
+    };
+
+    expect(await broker.preflight(request)).toMatchObject({ action: "allow" });
+    await harness.service.archiveSession(sessionId);
+    expect(await broker.preflight(request)).toMatchObject({
+      action: "deny",
+      source: "session_workspace_policy",
+      feedback: `Unable to resolve permission policy for session ${sessionId}.`,
+    });
+    expect(await broker.decide({
+      ...request,
+      approvalId: "approval_policy_archived" as ApprovalId,
+    })).toEqual({
+      action: "deny",
+      feedback: `Unable to resolve permission policy for session ${sessionId}.`,
+    });
+  } finally {
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI harness approval resolver denies archived and orphan subagent ancestry roots", async () => {
+  const root = await mkdtempName();
+  const repo = join(root, "repo");
+  const rootSessionId = "session_policy_root_archived" as SessionId;
+  const childSessionId = "session_policy_child_active" as SessionId;
+  const orphanSessionId = "session_policy_orphan_subagent" as SessionId;
+  let harness: CliHarness | undefined;
+  try {
+    await mkdir(repo, { recursive: true });
+    harness = await createCliHarness({
+      cwd: repo,
+      model: "fake",
+      quiet: true,
+      mcpConnectMode: "manual",
+    });
+    await harness.service.createSession({ sessionId: rootSessionId, cwd: repo });
+    await harness.service.createSession({ sessionId: childSessionId, cwd: repo });
+    await harness.service.createSession({ sessionId: orphanSessionId, cwd: repo });
+    await harness.events.append({
+      id: "event_policy_archived_root_child",
+      type: "agent.spawned",
+      time: 1 as TimestampMs,
+      sessionId: rootSessionId,
+      payload: {
+        runId: "run_policy_archived_root_child" as never,
+        path: "/root/active-child" as AgentPath,
+        taskName: "active-child",
+        parentSessionId: rootSessionId,
+        childSessionId,
+      },
+    });
+    await harness.events.append({
+      id: "event_policy_orphan_subagent",
+      type: "agent.spawned",
+      time: 2 as TimestampMs,
+      payload: {
+        runId: "run_policy_orphan_subagent" as never,
+        path: "/root/orphan" as AgentPath,
+        taskName: "orphan",
+        childSessionId: orphanSessionId,
+      },
+    });
+
+    const beforeArchive = await harness.events.sessions();
+    expect(beforeArchive.find((session) => session.id === childSessionId)).toMatchObject({
+      source: "subagent",
+      status: "active",
+    });
+    expect(beforeArchive.find((session) => session.id === orphanSessionId)).toMatchObject({
+      source: "subagent",
+      status: "active",
+    });
+    await harness.service.archiveSession(rootSessionId);
+    const afterArchive = await harness.events.sessions();
+    expect(afterArchive.find((session) => session.id === rootSessionId)?.status).toBe("archived");
+    expect(afterArchive.find((session) => session.id === childSessionId)?.status).toBe("active");
+
+    type RuntimeWithApprovals = {
+      options: { toolExecutor: { options: { approvals: PolicyApprovalBroker } } };
+    };
+    type ServiceWithRuntime = { options: { runtime: RuntimeWithApprovals } };
+    const childService = (harness.agents as unknown as { options: { runtime: ServiceWithRuntime } }).options.runtime;
+    const broker = childService.options.runtime.options.toolExecutor.options.approvals;
+    const request = (sessionId: SessionId, suffix: string) => ({
+      sessionId,
+      callId: `toolcall_policy_${suffix}` as ToolCallId,
+      toolName: "read",
+      risk: "read" as const,
+      permission: "read",
+      patterns: ["README.md"],
+    });
+
+    for (const [sessionId, suffix] of [
+      [childSessionId, "archived_root"],
+      [orphanSessionId, "orphan_root"],
+    ] as const) {
+      const approvalRequest = request(sessionId, suffix);
+      expect(await broker.preflight(approvalRequest)).toMatchObject({
+        action: "deny",
+        source: "session_workspace_policy",
+      });
+      expect(await broker.decide({
+        ...approvalRequest,
+        approvalId: `approval_policy_${suffix}` as ApprovalId,
+      })).toEqual({
+        action: "deny",
+        feedback: `Unable to resolve permission policy for session ${sessionId}.`,
+      });
+    }
+  } finally {
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("CLI harness uses the user last model for new workspaces without forcing a prompt override", async () => {
@@ -1003,6 +1401,13 @@ test("CLI exact-session resume rejects a subagent session and points to task_fol
       mcpConnectMode: "manual",
     });
     await harness.events.appendMany([
+      {
+        id: "event_session_cli_parent_created",
+        type: "session.created",
+        time: 1 as TimestampMs,
+        sessionId: parentSessionId,
+        payload: { sessionId: parentSessionId, cwd: repo },
+      },
       {
         id: "event_session_cli_child_created",
         type: "session.created",

@@ -26,7 +26,11 @@ test("follows up an existing task through the child session and records a new ru
   const taskId = "task_reader" as TaskId;
 
   try {
-    await seedTask(store, { taskId, status: "completed" });
+    await seedTask(store, {
+      taskId,
+      status: "completed",
+      workerPolicy: { allowedTools: ["read"], writeScope: [], executeScope: [] },
+    });
     const service = new AgentTaskControlService({
       store,
       runtime,
@@ -79,6 +83,98 @@ test("follows up an existing task through the child session and records a new ru
       },
     ]);
     expect(await store.agentMailbox({ status: "queued" })).toEqual([]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("rejects direct follow-up of a terminal crash-safe dispatch reservation", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-task-control-reserved-followup-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const runtime = new FakeTaskRuntime(store);
+  const taskId = "task_reserved_followup" as TaskId;
+  const reservedRunId = "agent_reserved_followup" as AgentRunId;
+
+  try {
+    await seedTask(store, {
+      taskId,
+      status: "completed",
+      dispatchId: "dispatch_reserved_followup",
+      reservedRunId,
+    });
+    const service = new AgentTaskControlService({ store, runtime, createId: createSequentialId() });
+
+    await expect(service.followupTask({ taskId, text: "must create a new team dispatch instead" }))
+      .rejects.toMatchObject({
+        name: "AgentTaskNotRunnableError",
+        message: expect.stringContaining("cannot be reopened directly"),
+      });
+    expect(runtime.inputs).toEqual([]);
+    expect(await store.events({ type: "agent.spawned", limit: 10 })).toHaveLength(1);
+    expect(await store.agentRuns({ taskId })).toHaveLength(1);
+
+    const task = (await store.agentTask(taskId))!;
+    const defended = await store.beginAgentTaskRunCas({
+      taskId,
+      expectedGeneration: task.generation,
+      expectedRunId: reservedRunId,
+      expectedLeaseOwner: null,
+      runId: "agent_reserved_followup_forbidden" as AgentRunId,
+      generation: task.generation + 1,
+      leaseOwner: "task-followup:forbidden",
+      leaseTtlMs: 100,
+      spawnEventId: "event_reserved_followup_forbidden",
+      time: 20,
+    });
+    expect(defended).toMatchObject({ applied: false, events: [] });
+    expect(await store.events({ type: "agent.spawned", limit: 10 })).toHaveLength(1);
+    expect(await store.agentRuns({ taskId })).toHaveLength(1);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("rejects direct follow-up of a legacy team task identified by its worker policy", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-task-control-legacy-team-followup-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const runtime = new FakeTaskRuntime(store);
+  const taskId = "task_legacy_team_followup" as TaskId;
+
+  try {
+    await seedTask(store, {
+      taskId,
+      status: "completed",
+      workerPolicy: {
+        teamId: "team_legacy_followup",
+        taskId: "team_task_legacy_followup",
+        memberPath: "/root/worker",
+        parentSessionId: "session_parent",
+      },
+    });
+    const projected = await store.agentTask(taskId);
+    expect(projected).toMatchObject({
+      id: taskId,
+      status: "completed",
+      workerPolicy: {
+        teamId: "team_legacy_followup",
+        taskId: "team_task_legacy_followup",
+      },
+    });
+    expect(projected?.dispatchId).toBeUndefined();
+    expect(projected?.reservedRunId).toBeUndefined();
+
+    const service = new AgentTaskControlService({ store, runtime, createId: createSequentialId() });
+    await expect(service.followupTask({ taskId, text: "must not reopen the legacy team worker" }))
+      .rejects.toMatchObject({
+        name: "AgentTaskNotRunnableError",
+        message: expect.stringContaining("cannot be reopened directly"),
+      });
+
+    expect(runtime.inputs).toEqual([]);
+    expect(await store.events({ type: "agent.spawned", limit: 10 })).toHaveLength(1);
+    expect(await store.agentRuns({ taskId })).toHaveLength(1);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -1073,6 +1169,94 @@ test("reconciles stale running background tasks without touching live task ids",
   }
 });
 
+test("stale reconciliation is authoritatively scoped to one parent session", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-task-control-reconcile-session-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const runtime = new FakeTaskRuntime(store);
+  const activeSessionId = "session_recover_active" as SessionId;
+  const otherSessionId = "session_recover_other" as SessionId;
+  const activeTaskId = "task_recover_active" as TaskId;
+  const otherTaskId = "task_recover_other" as TaskId;
+
+  try {
+    await seedTask(store, {
+      taskId: activeTaskId,
+      status: "running",
+      mode: "background",
+      time: 10 as TimestampMs,
+      parentSessionId: activeSessionId,
+    });
+    await seedTask(store, {
+      taskId: otherTaskId,
+      status: "running",
+      mode: "background",
+      time: 10 as TimestampMs,
+      parentSessionId: otherSessionId,
+      childSessionId: "session_recover_other_child" as SessionId,
+    });
+    const service = new AgentTaskControlService({
+      store,
+      runtime,
+      createId: createSequentialId(),
+      now: () => 100 as TimestampMs,
+    });
+
+    const result = await service.reconcileStaleTasks({
+      parentSessionId: activeSessionId,
+      staleAfterMs: 30,
+    });
+
+    expect(result.scanned).toBe(1);
+    expect(result.closed.map((task) => task.id)).toEqual([activeTaskId]);
+    expect(await store.agentTask(activeTaskId)).toMatchObject({ status: "cancelled" });
+    expect(await store.agentTask(otherTaskId)).toMatchObject({ status: "running" });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("stale reconciliation scans past an ineligible limited prefix", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-task-control-reconcile-prefix-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const runtime = new FakeTaskRuntime(store);
+  const blockerTaskId = "task_recover_prefix_blocker" as TaskId;
+  const staleTaskId = "task_recover_prefix_stale" as TaskId;
+
+  try {
+    await seedTask(store, {
+      taskId: blockerTaskId,
+      status: "running",
+      mode: "resumable",
+      time: 10 as TimestampMs,
+      childSessionId: "session_recover_prefix_blocker" as SessionId,
+    });
+    await seedTask(store, {
+      taskId: staleTaskId,
+      status: "running",
+      mode: "background",
+      time: 20 as TimestampMs,
+      childSessionId: "session_recover_prefix_stale" as SessionId,
+    });
+    const service = new AgentTaskControlService({
+      store,
+      runtime,
+      createId: createSequentialId(),
+      now: () => 100 as TimestampMs,
+    });
+
+    const result = await service.reconcileStaleTasks({ staleAfterMs: 30, limit: 1 });
+
+    expect(result.scanned).toBe(2);
+    expect(result.closed.map((task) => task.id)).toEqual([staleTaskId]);
+    expect(await store.agentTask(blockerTaskId)).toMatchObject({ status: "running" });
+    expect(await store.agentTask(staleTaskId)).toMatchObject({ status: "cancelled" });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("stale reconciliation cannot close a takeover generation created after its scan", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-task-control-reconcile-takeover-race-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -1347,12 +1531,16 @@ async function seedTask(
     status: "running" | "completed";
     mode?: "one_shot" | "resumable" | "background";
     time?: TimestampMs;
+    parentSessionId?: SessionId;
     childSessionId?: SessionId;
+    dispatchId?: string;
+    reservedRunId?: AgentRunId;
+    workerPolicy?: Record<string, unknown>;
   },
 ): Promise<void> {
-  const parentSessionId = "session_parent" as SessionId;
+  const parentSessionId = input.parentSessionId ?? ("session_parent" as SessionId);
   const childSessionId = input.childSessionId ?? ("session_child" as SessionId);
-  const runId = `agent_initial_${input.taskId}` as AgentRunId;
+  const runId = input.reservedRunId ?? (`agent_initial_${input.taskId}` as AgentRunId);
   const path = `/root/${input.taskId}` as AgentPath;
   const parentPath = "/root" as AgentPath;
   const time = input.time ?? (1 as TimestampMs);
@@ -1366,6 +1554,8 @@ async function seedTask(
       sessionId: parentSessionId,
       payload: {
         taskId: input.taskId,
+        ...(input.dispatchId ? { dispatchId: input.dispatchId } : {}),
+        ...(input.reservedRunId ? { reservedRunId: input.reservedRunId } : {}),
         path,
         parentPath,
         parentSessionId,
@@ -1374,6 +1564,7 @@ async function seedTask(
         cwd: "/repo",
         prompt: "read package",
         mode,
+        ...(input.workerPolicy ? { workerPolicy: input.workerPolicy } : {}),
       },
     },
     {

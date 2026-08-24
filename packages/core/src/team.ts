@@ -14,13 +14,20 @@ import type {
   TeamTaskStatus as ProtocolTeamTaskStatus,
   TimestampMs,
 } from "@chili/protocol";
-import { normalizeAgentPath, timestampNow } from "@chili/protocol";
+import {
+  normalizeAgentPath,
+  TEAM_TASK_RUNTIME_METADATA_KEYS,
+  timestampNow,
+} from "@chili/protocol";
 import type {
+  EventAppendOptions,
   EventStore,
   SubagentProjectionStore,
   TeamMemberRow,
   TeamMessageDeliveryRow,
   TeamMessageRow,
+  TeamOwnerSessionBindResult,
+  TeamOwnerSessionBindStore,
   TeamProjectionStore,
   TeamRow,
   TeamTaskClaimStore,
@@ -31,12 +38,16 @@ import type {
   TeamTaskVerificationClaimResult,
   TeamTaskVerificationClaimStore,
 } from "@chili/store";
+import type { RuntimeSessionOperation, SessionOperationCoordinator } from "./runtime-service.js";
 
 export type TeamMemberStatus = ProtocolTeamMemberStatus;
 export type TeamTaskStatus = ProtocolTeamTaskStatus;
 
+const TEAM_TASK_RUNTIME_METADATA_KEY_SET = new Set<string>(TEAM_TASK_RUNTIME_METADATA_KEYS);
+
 export interface TeamRuntime {
   createTeam(input: CreateTeamInput): Promise<TeamRow>;
+  bindOwnerSession(input: BindTeamOwnerSessionInput): Promise<TeamOwnerSessionBindResult>;
   addMember(input: AddTeamMemberInput): Promise<TeamMemberRow>;
   createTask(input: CreateTeamTaskInput): Promise<TeamTaskRow>;
   assignTask(input: AssignTeamTaskInput): Promise<TeamTaskRow>;
@@ -52,11 +63,18 @@ export interface TeamControlServiceOptions {
   store: EventStore
     & TeamProjectionStore
     & SubagentProjectionStore
+    & Partial<TeamOwnerSessionBindStore>
     & Partial<TeamTaskClaimStore>
     & Partial<TeamTaskVerificationClaimStore>
     & Partial<TeamTaskAgentSyncStore>;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
+  /**
+   * Production callers provide the root runtime coordinator so every bound
+   * team mutation is serialized with prompts, runs, dispatches, and merges.
+   * The option stays optional for isolated projection/unit-test stores.
+   */
+  sessionOperations?: SessionOperationCoordinator;
 }
 
 export interface TeamEventContext {
@@ -72,6 +90,11 @@ export interface CreateTeamInput extends TeamEventContext {
   leadRole?: string;
   leadStatus?: TeamMemberStatus;
   leadWriteScope?: string[];
+}
+
+export interface BindTeamOwnerSessionInput {
+  teamId: TeamId;
+  ownerSessionId: SessionId;
 }
 
 export interface AddTeamMemberInput extends TeamEventContext {
@@ -113,6 +136,7 @@ export interface ClaimTeamTaskInput extends TeamEventContext {
   taskId: TaskId;
   ownerPath: AgentPath;
   claimedBy?: AgentPath;
+  metadata?: Record<string, unknown>;
 }
 
 export interface ClaimTeamTaskVerificationInput extends TeamEventContext {
@@ -138,6 +162,8 @@ export interface SyncTeamTaskFromAgentInput extends TeamEventContext {
 export interface UpdateTeamTaskInput extends TeamEventContext {
   teamId: TeamId;
   taskId: TaskId;
+  /** Marks an untrusted child-tool mutation so core enforces worker authority. */
+  actorScope?: "scoped_worker";
   status?: TeamTaskStatus;
   ownerPath?: AgentPath;
   title?: string;
@@ -223,6 +249,33 @@ export class TeamTaskNotFoundError extends Error {
   constructor(readonly teamId: TeamId, readonly taskId: TaskId) {
     super(`Team task not found: ${taskId} in ${teamId}`);
     this.name = "TeamTaskNotFoundError";
+  }
+}
+
+export class TeamTaskWorkerMutationError extends Error {
+  constructor(
+    readonly teamId: TeamId,
+    readonly taskId: TaskId,
+    readonly reason: string,
+  ) {
+    super(`Scoped worker cannot update team task ${taskId} in ${teamId}: ${reason}`);
+    this.name = "TeamTaskWorkerMutationError";
+  }
+}
+
+export class TeamAlreadyExistsError extends Error {
+  constructor(readonly teamId: TeamId) {
+    super(`Team already exists: ${teamId}`);
+    this.name = "TeamAlreadyExistsError";
+  }
+}
+
+export class TeamTaskAlreadyExistsError extends Error {
+  constructor(readonly taskId: TaskId, readonly existingTeamId?: TeamId) {
+    super(existingTeamId
+      ? `Team task already exists: ${taskId} in ${existingTeamId}`
+      : `Team task already exists: ${taskId}`);
+    this.name = "TeamTaskAlreadyExistsError";
   }
 }
 
@@ -337,7 +390,24 @@ export class TeamControlService implements TeamRuntime {
   constructor(private readonly options: TeamControlServiceOptions) {}
 
   async createTeam(input: CreateTeamInput): Promise<TeamRow> {
+    if (input.sessionId && this.options.sessionOperations) {
+      return this.options.sessionOperations.withSessionOperation(
+        input.sessionId,
+        (operation) => this.createTeamUnlocked(input, operation),
+      );
+    }
+    return this.createTeamUnlocked(input);
+  }
+
+  private async createTeamUnlocked(
+    input: CreateTeamInput,
+    operation?: RuntimeSessionOperation,
+  ): Promise<TeamRow> {
     const teamId = input.teamId ?? this.id<TeamId>("team");
+    if ((await this.options.store.teams({ teamId, limit: 1 })).length > 0) {
+      throw new TeamAlreadyExistsError(teamId);
+    }
+    operation?.assertCurrent();
     await this.options.store.appendMany([
       this.teamEvent(
         input,
@@ -362,18 +432,58 @@ export class TeamControlService implements TeamRuntime {
           writeScope: input.leadWriteScope,
         }),
       ),
-    ]);
+    ], appendOptions(operation));
+    operation?.assertCurrent();
     return this.requireTeam(teamId);
   }
 
+  async bindOwnerSession(input: BindTeamOwnerSessionInput): Promise<TeamOwnerSessionBindResult> {
+    return this.withTeamSessionOperation(
+      input.teamId,
+      input.ownerSessionId,
+      (operation) => this.bindOwnerSessionUnlocked(input, operation),
+    );
+  }
+
+  private async bindOwnerSessionUnlocked(
+    input: BindTeamOwnerSessionInput,
+    operation?: RuntimeSessionOperation,
+  ): Promise<TeamOwnerSessionBindResult> {
+    const bindStore = this.options.store.bindTeamOwnerSession;
+    if (!bindStore) {
+      throw new Error("Team owner-session CAS store is not available");
+    }
+    operation?.assertCurrent();
+    return bindStore.call(this.options.store, {
+      teamId: input.teamId,
+      ownerSessionId: input.ownerSessionId,
+      eventId: this.id("event"),
+      ...(operation?.runClaim ? { runClaim: operation.runClaim } : {}),
+      time: this.now(),
+    });
+  }
+
   async addMember(input: AddTeamMemberInput): Promise<TeamMemberRow> {
+    return this.withTeamSessionOperation(
+      input.teamId,
+      input.sessionId,
+      (operation) => this.addMemberUnlocked(input, operation),
+    );
+  }
+
+  private async addMemberUnlocked(
+    input: AddTeamMemberInput,
+    operation?: RuntimeSessionOperation,
+  ): Promise<TeamMemberRow> {
     const team = await this.requireTeam(input.teamId);
+    const eventContext = this.operationEventContext(input, operation);
     if (input.childSessionId) {
       await this.assertMemberSessionOwnership(team, input.path, input.childSessionId);
     }
+    operation?.assertCurrent();
     await this.options.store.append(
       this.teamEvent(
-        input,
+        eventContext,
         "team.member_added",
         pruneUndefined({
           teamId: input.teamId,
@@ -387,16 +497,32 @@ export class TeamControlService implements TeamRuntime {
           writeScope: input.writeScope,
         }),
       ),
+      appendOptions(operation),
     );
     return this.requireMember(input.teamId, input.path);
   }
 
   async createTask(input: CreateTeamTaskInput): Promise<TeamTaskRow> {
+    return this.withTeamSessionOperation(
+      input.teamId,
+      input.sessionId,
+      (operation) => this.createTaskUnlocked(input, operation),
+    );
+  }
+
+  private async createTaskUnlocked(
+    input: CreateTeamTaskInput,
+    operation?: RuntimeSessionOperation,
+  ): Promise<TeamTaskRow> {
     await this.requireTeam(input.teamId);
+    const eventContext = this.operationEventContext(input, operation);
     const taskId = input.taskId ?? this.id<TaskId>("task");
+    const existing = (await this.options.store.teamTasks({ taskId, limit: 1 }))[0];
+    if (existing) throw new TeamTaskAlreadyExistsError(taskId, existing.teamId);
+    operation?.assertCurrent();
     await this.options.store.append(
       this.teamEvent(
-        input,
+        eventContext,
         "team.task_created",
         pruneUndefined({
           teamId: input.teamId,
@@ -410,12 +536,25 @@ export class TeamControlService implements TeamRuntime {
           metadata: input.metadata,
         }),
       ),
+      appendOptions(operation),
     );
     return this.requireTask(input.teamId, taskId);
   }
 
   async assignTask(input: AssignTeamTaskInput): Promise<TeamTaskRow> {
+    return this.withTeamSessionOperation(
+      input.teamId,
+      input.sessionId,
+      (operation) => this.assignTaskUnlocked(input, operation),
+    );
+  }
+
+  private async assignTaskUnlocked(
+    input: AssignTeamTaskInput,
+    operation?: RuntimeSessionOperation,
+  ): Promise<TeamTaskRow> {
     const task = await this.requireTask(input.teamId, input.taskId);
+    const eventContext = this.operationEventContext(input, operation);
     await this.requireMember(input.teamId, input.ownerPath);
 
     const messageId = input.message ? this.id("teammsg") : undefined;
@@ -423,7 +562,7 @@ export class TeamControlService implements TeamRuntime {
     const messageDelivery = input.messageDelivery ?? "queueOnly";
     const events: ChiliEvent[] = [
       this.teamEvent(
-        input,
+        eventContext,
         "team.task_assigned",
         pruneUndefined({
           teamId: input.teamId,
@@ -438,7 +577,7 @@ export class TeamControlService implements TeamRuntime {
     if (input.message && messageId) {
       events.push(
         this.teamEvent(
-          input,
+          eventContext,
           "team.message_sent",
           pruneUndefined({
             teamId: input.teamId,
@@ -454,7 +593,7 @@ export class TeamControlService implements TeamRuntime {
         ),
       );
       events.push(
-        ...(await this.teamMessageDeliveryEvents(input, {
+        ...(await this.teamMessageDeliveryEvents(eventContext, {
           teamId: input.teamId,
           messageId,
           from: messageFrom,
@@ -469,11 +608,23 @@ export class TeamControlService implements TeamRuntime {
       );
     }
 
-    await this.options.store.appendMany(events);
+    operation?.assertCurrent();
+    await this.options.store.appendMany(events, appendOptions(operation));
     return this.requireTask(input.teamId, input.taskId);
   }
 
   async claimTask(input: ClaimTeamTaskInput): Promise<TeamTaskMutationResult> {
+    return this.withTeamSessionOperation(
+      input.teamId,
+      input.sessionId,
+      (operation) => this.claimTaskUnlocked(input, operation),
+    );
+  }
+
+  private async claimTaskUnlocked(
+    input: ClaimTeamTaskInput,
+    operation?: RuntimeSessionOperation,
+  ): Promise<TeamTaskMutationResult> {
     await this.requireTeam(input.teamId);
     await this.requireMember(input.teamId, input.ownerPath);
     const claimStore = this.options.store.claimTeamTask;
@@ -481,13 +632,17 @@ export class TeamControlService implements TeamRuntime {
       throw new Error("Team task CAS store is not available");
     }
 
+    operation?.assertCurrent();
+    const eventSessionId = input.sessionId ?? operation?.runClaim?.sessionId;
     const result = await claimStore.call(this.options.store, {
       teamId: input.teamId,
       taskId: input.taskId,
       ownerPath: input.ownerPath,
       eventId: this.id("event"),
       ...(input.claimedBy ? { claimedBy: input.claimedBy } : {}),
-      ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      ...(input.metadata ? { metadata: input.metadata } : {}),
+      ...(eventSessionId ? { sessionId: eventSessionId } : {}),
+      ...(operation?.runClaim ? { runClaim: operation.runClaim } : {}),
       time: this.now(),
     });
     if (!result.applied && result.reason === "not_found") {
@@ -497,18 +652,32 @@ export class TeamControlService implements TeamRuntime {
   }
 
   async claimTaskVerification(input: ClaimTeamTaskVerificationInput): Promise<TeamTaskVerificationClaimResult> {
+    return this.withTeamSessionOperation(
+      input.teamId,
+      input.sessionId,
+      (operation) => this.claimTaskVerificationUnlocked(input, operation),
+    );
+  }
+
+  private async claimTaskVerificationUnlocked(
+    input: ClaimTeamTaskVerificationInput,
+    operation?: RuntimeSessionOperation,
+  ): Promise<TeamTaskVerificationClaimResult> {
     await this.requireTeam(input.teamId);
     const claimStore = this.options.store.claimTeamTaskVerification;
     if (!claimStore) {
       throw new Error("Team task verification CAS store is not available");
     }
 
+    operation?.assertCurrent();
+    const eventSessionId = input.sessionId ?? operation?.runClaim?.sessionId;
     const result = await claimStore.call(this.options.store, {
       teamId: input.teamId,
       taskId: input.taskId,
       metadata: input.metadata,
       eventId: this.id("event"),
-      ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      ...(eventSessionId ? { sessionId: eventSessionId } : {}),
+      ...(operation?.runClaim ? { runClaim: operation.runClaim } : {}),
       ...(input.stalePendingBefore !== undefined ? { stalePendingBefore: input.stalePendingBefore } : {}),
       time: this.now(),
     });
@@ -519,12 +688,25 @@ export class TeamControlService implements TeamRuntime {
   }
 
   async syncTaskFromAgent(input: SyncTeamTaskFromAgentInput): Promise<TeamTaskAgentSyncResult> {
+    return this.withTeamSessionOperation(
+      input.teamId,
+      input.sessionId,
+      (operation) => this.syncTaskFromAgentUnlocked(input, operation),
+    );
+  }
+
+  private async syncTaskFromAgentUnlocked(
+    input: SyncTeamTaskFromAgentInput,
+    operation?: RuntimeSessionOperation,
+  ): Promise<TeamTaskAgentSyncResult> {
     await this.requireTeam(input.teamId);
     const syncStore = this.options.store.syncTeamTaskFromAgentCas;
     if (!syncStore) {
       throw new Error("Team task agent sync CAS store is not available");
     }
 
+    operation?.assertCurrent();
+    const eventSessionId = input.sessionId ?? operation?.runClaim?.sessionId;
     const result = await syncStore.call(this.options.store, {
       teamId: input.teamId,
       taskId: input.taskId,
@@ -538,7 +720,8 @@ export class TeamControlService implements TeamRuntime {
       memberEventId: this.id("event"),
       ...(input.summary !== undefined ? { summary: input.summary } : {}),
       ...(input.error !== undefined ? { error: input.error } : {}),
-      ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      ...(eventSessionId ? { sessionId: eventSessionId } : {}),
+      ...(operation?.runClaim ? { runClaim: operation.runClaim } : {}),
       time: this.now(),
     });
     if (!result.applied && result.reason === "not_found") {
@@ -548,46 +731,173 @@ export class TeamControlService implements TeamRuntime {
   }
 
   async updateTask(input: UpdateTeamTaskInput): Promise<TeamTaskRow> {
+    return this.withTeamSessionOperation(
+      input.teamId,
+      input.sessionId,
+      (operation) => this.updateTaskUnlocked(input, operation),
+    );
+  }
+
+  private async updateTaskUnlocked(
+    input: UpdateTeamTaskInput,
+    operation?: RuntimeSessionOperation,
+  ): Promise<TeamTaskRow> {
     const task = await this.requireTask(input.teamId, input.taskId);
-    const ownerPath = input.ownerPath ?? task.ownerPath;
+    const team = await this.requireTeam(input.teamId);
+    const eventContext = this.operationEventContext(input, operation);
+    const update = await this.authorizeTaskUpdate(team, task, input);
+    const ownerPath = update.ownerPath ?? task.ownerPath;
     const events: ChiliEvent[] = [
       this.teamEvent(
-        input,
+        eventContext,
         "team.task_updated",
         pruneUndefined({
           teamId: input.teamId,
           taskId: input.taskId,
-          status: input.status,
-          ownerPath: input.ownerPath,
-          title: input.title,
-          description: input.description,
-          dependsOn: input.dependsOn,
-          summary: input.summary,
-          error: input.error,
-          metadata: input.metadata,
+          status: update.status,
+          ownerPath: update.ownerPath,
+          title: update.title,
+          description: update.description,
+          dependsOn: update.dependsOn,
+          summary: update.summary,
+          error: update.error,
+          metadata: update.metadata,
         }),
       ),
     ];
-    if (ownerPath && input.status && input.status !== "in_progress") {
+    if (ownerPath && update.status && update.status !== "in_progress") {
       events.push(
         this.teamEvent(
-          input,
+          eventContext,
           "team.member_status_changed",
           pruneUndefined({
             teamId: input.teamId,
             path: ownerPath,
             status: "idle" as const,
-            reason: `task_${input.status}`,
+            reason: `task_${update.status}`,
           }),
         ),
       );
     }
-    await this.options.store.appendMany(events);
+    operation?.assertCurrent();
+    await this.options.store.appendMany(events, appendOptions(operation));
     return this.requireTask(input.teamId, input.taskId);
   }
 
+  private async authorizeTaskUpdate(
+    team: TeamRow,
+    task: TeamTaskRow,
+    input: UpdateTeamTaskInput,
+  ): Promise<UpdateTeamTaskInput> {
+    const actorSessionId = input.sessionId;
+    if (!actorSessionId || actorSessionId === team.sessionId) return input;
+
+    const member = await this.resolveScopedTaskActor(team, task, actorSessionId);
+    if (!member) {
+      if (team.sessionId || input.actorScope === "scoped_worker") {
+        throw this.workerMutationError(input, "actor session is not a unique team member");
+      }
+      return input;
+    }
+
+    if (task.ownerPath !== member.path) {
+      throw this.workerMutationError(input, `task is owned by ${task.ownerPath ?? "no member"}`);
+    }
+    if (member.status === "closed" || member.currentTaskId !== task.id) {
+      throw this.workerMutationError(input, "task is not the member's active assignment");
+    }
+    if (task.status !== "in_progress") {
+      throw this.workerMutationError(input, `task is not in progress (${task.status})`);
+    }
+    if (input.status !== undefined && input.status !== "in_progress") {
+      throw this.workerMutationError(
+        input,
+        "only in-progress status reports are allowed; completion must flow through complete_task",
+      );
+    }
+
+    const structuralFields = ["ownerPath", "title", "description", "dependsOn", "error"] as const;
+    const structuralField = structuralFields.find((field) => input[field] !== undefined);
+    if (structuralField) {
+      throw this.workerMutationError(input, `field is runtime-owned: ${structuralField}`);
+    }
+
+    if (input.metadata) {
+      const protectedKey = Object.keys(input.metadata)
+        .find((key) => TEAM_TASK_RUNTIME_METADATA_KEY_SET.has(key));
+      if (protectedKey) {
+        throw this.workerMutationError(input, `metadata is runtime-owned: ${protectedKey}`);
+      }
+    }
+
+    return {
+      ...input,
+      ...(input.metadata
+        ? { metadata: { ...(task.metadata ?? {}), ...input.metadata } }
+        : {}),
+    };
+  }
+
+  private async resolveScopedTaskActor(
+    team: TeamRow,
+    task: TeamTaskRow,
+    actorSessionId: SessionId,
+  ): Promise<TeamMemberRow | undefined> {
+    const directMembers = await this.options.store.teamMembers({
+      teamId: team.id,
+      childSessionId: actorSessionId,
+      limit: 2,
+    });
+    if (directMembers.length > 1) return undefined;
+
+    const candidates = [...directMembers];
+    const dispatch = recordValue(task.metadata?.chiliTeamDispatch);
+    if (dispatch?.childSessionId === actorSessionId) {
+      const agentTasks = (await this.options.store.agentTasks({
+        childSessionId: actorSessionId,
+        limit: 2,
+      })).filter((candidate) => candidate.childSessionId === actorSessionId);
+      const agentTask = agentTasks.length === 1 ? agentTasks[0] : undefined;
+      const ownerMembers = task.ownerPath
+        ? await this.options.store.teamMembers({ teamId: team.id, path: task.ownerPath, limit: 2 })
+        : [];
+      const ownerMember = ownerMembers.length === 1 ? ownerMembers[0] : undefined;
+      if (
+        agentTask
+        && ownerMember
+        && typeof dispatch.agentTaskId === "string"
+        && dispatch.agentTaskId === agentTask.id
+        && typeof dispatch.agentPath === "string"
+        && dispatch.agentPath === agentTask.path
+        && agentTask.parentSessionId === team.sessionId
+        && agentTask.parentPath === ownerMember.path
+      ) {
+        candidates.push(ownerMember);
+      }
+    }
+
+    const byPath = new Map(candidates.map((candidate) => [candidate.path, candidate]));
+    return byPath.size === 1 ? byPath.values().next().value : undefined;
+  }
+
+  private workerMutationError(input: UpdateTeamTaskInput, reason: string): TeamTaskWorkerMutationError {
+    return new TeamTaskWorkerMutationError(input.teamId, input.taskId, reason);
+  }
+
   async sendMessage(input: SendTeamMessageInput): Promise<TeamMessageRow> {
+    return this.withTeamSessionOperation(
+      input.teamId,
+      input.sessionId,
+      (operation) => this.sendMessageUnlocked(input, operation),
+    );
+  }
+
+  private async sendMessageUnlocked(
+    input: SendTeamMessageInput,
+    operation?: RuntimeSessionOperation,
+  ): Promise<TeamMessageRow> {
     const team = await this.requireTeam(input.teamId);
+    const eventContext = this.operationEventContext(input, operation);
     const from = (await this.resolveMemberTarget(input.teamId, input.from)).path;
     if (input.sessionId) await this.authorizeMessageSender(team, input.sessionId, from);
     const to = input.to === "*" ? "*" : (await this.resolveMemberTarget(input.teamId, input.to)).path;
@@ -611,7 +921,7 @@ export class TeamControlService implements TeamRuntime {
 
     const events: ChiliEvent[] = [
       this.teamEvent(
-        input,
+        eventContext,
         "team.message_sent",
         pruneUndefined({
           teamId: input.teamId,
@@ -629,7 +939,7 @@ export class TeamControlService implements TeamRuntime {
       ),
     ];
     events.push(
-      ...(await this.teamMessageDeliveryEvents(input, {
+      ...(await this.teamMessageDeliveryEvents(eventContext, {
         teamId: input.teamId,
         messageId,
         from,
@@ -644,8 +954,9 @@ export class TeamControlService implements TeamRuntime {
       })),
     );
 
+    operation?.assertCurrent();
     try {
-      await this.options.store.appendMany(events);
+      await this.options.store.appendMany(events, appendOptions(operation));
     } catch (error) {
       const raced = await this.findTeamMessage(messageId);
       if (raced) return requireMatchingTeamMessage(raced, expected);
@@ -689,6 +1000,30 @@ export class TeamControlService implements TeamRuntime {
       messages,
       messageDeliveries,
       generatedAt: Number(this.now()),
+    });
+  }
+
+  private async withTeamSessionOperation<T>(
+    teamId: TeamId,
+    actorSessionId: SessionId | undefined,
+    fn: (operation?: RuntimeSessionOperation) => Promise<T>,
+  ): Promise<T> {
+    const coordinator = this.options.sessionOperations;
+    if (!coordinator) return fn();
+
+    const before = await this.requireTeam(teamId);
+    const ownerSessionId = before.sessionId ?? actorSessionId;
+    if (!ownerSessionId) return fn();
+
+    return coordinator.withSessionOperation(ownerSessionId, async (operation) => {
+      const current = await this.requireTeam(teamId);
+      if (current.sessionId && current.sessionId !== ownerSessionId) {
+        throw new Error(
+          `Team ${teamId} owner session changed before mutation: ${ownerSessionId} -> ${current.sessionId}`,
+        );
+      }
+      operation.assertCurrent();
+      return fn(operation);
     });
   }
 
@@ -830,6 +1165,14 @@ export class TeamControlService implements TeamRuntime {
     };
     if (context.sessionId) event.sessionId = context.sessionId;
     return event as ChiliEvent;
+  }
+
+  private operationEventContext(
+    context: TeamEventContext,
+    operation: RuntimeSessionOperation | undefined,
+  ): TeamEventContext {
+    const sessionId = context.sessionId ?? operation?.runClaim?.sessionId;
+    return sessionId ? { sessionId } : {};
   }
 
   private agentMessageQueuedEvent(
@@ -1056,6 +1399,12 @@ function dispatchMetadata(metadata: Record<string, unknown> | undefined): unknow
   return metadata ? metadata.chiliTeamDispatch : undefined;
 }
 
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
 function teamSnapshotStats(input: {
   members: TeamSnapshotMember[];
   tasks: TeamSnapshotTask[];
@@ -1120,6 +1469,10 @@ function pruneUndefined<T>(value: T): T {
     if (item !== undefined) output[key] = item;
   }
   return output as T;
+}
+
+function appendOptions(operation: RuntimeSessionOperation | undefined): EventAppendOptions | undefined {
+  return operation?.runClaim ? { runClaim: operation.runClaim } : undefined;
 }
 
 function stableJson(value: unknown): string {

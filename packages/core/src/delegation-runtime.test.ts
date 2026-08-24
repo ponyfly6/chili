@@ -19,6 +19,7 @@ test("delegation policy reads the durable latest value across runtime instances 
   const second = runtimeService(secondStore);
 
   try {
+    await firstStore.append(sessionCreatedEvent("event_shared_delegation_session", sessionId));
     expect((await first.getDelegationConfig(sessionId)).policy).toBe("explicit");
 
     await second.setDelegationPolicy({ sessionId, policy: "off" });
@@ -144,6 +145,7 @@ test("a durable off written by another runtime after spawn prevents the local ru
   });
 
   try {
+    await managerStore.append(sessionCreatedEvent("event_post_spawn_policy_session", parentSessionId));
     const task = await manager.spawnTask({
       parentSessionId,
       cwd: "/repo",
@@ -178,6 +180,16 @@ function runtimeService(store: SqliteEventStore): RuntimeService {
     store,
     cwd: "/repo",
   });
+}
+
+function sessionCreatedEvent(id: string, sessionId: SessionId): Extract<ChiliEvent, { type: "session.created" }> {
+  return {
+    id,
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd: "/repo" },
+  };
 }
 
 async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {

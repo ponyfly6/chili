@@ -23,9 +23,24 @@ import type {
   TurnId,
 } from "@chili/protocol";
 import { DELEGATION_POLICIES, REASONING_LEVELS, SERVICE_TIERS, timestampNow } from "@chili/protocol";
-import type { EventStore, SubagentProjectionStore, TeamProjectionStore } from "@chili/store";
+import {
+  SessionAlreadyExistsError,
+  SessionCreationClaimConflictError,
+  SessionCwdConflictError,
+  SessionReservedForSubagentError,
+  SessionRunClaimConflictError,
+  SessionStateConflictError,
+  type EventAppendOptions,
+  type EventStore,
+  type SessionCreationClaimFence,
+  type SessionRunClaimFence,
+  type SubagentProjectionStore,
+  type TeamProjectionStore,
+} from "@chili/store";
 import type { ToolAccessPolicy } from "@chili/tools";
-import { resolve } from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { realpath } from "node:fs/promises";
+import { basename, dirname, resolve } from "node:path";
 import {
   ContextWindowBuilder,
   conversationPromptFragment,
@@ -63,6 +78,8 @@ const DIRECT_IMAGE_INPUT_SYSTEM =
   "The current user turn includes direct image attachment(s). Inspect the attached image block(s) directly when answering. Do not call external image-analysis, OCR, or MCP tools solely to read those same attachments unless the user explicitly asked to use a tool or direct image input is unavailable.";
 const PATH_IMAGE_INPUT_SYSTEM =
   "The current user turn includes pasted image file path(s) because direct image blocks are unavailable for the selected model. Use an available MCP image-understanding or OCR tool that returns text, passing the absolute image path when the tool schema supports it (for example image_source). Do not use read_image unless no text-returning image MCP tool is available.";
+const SESSION_CLAIM_LEASE_MS = 120_000;
+const SESSION_CLAIM_HEARTBEAT_MS = 30_000;
 
 export type RuntimeModelCatalogProvider = () =>
   | Promise<readonly RuntimeModelDescriptor[]>
@@ -134,7 +151,7 @@ export interface SubmitPromptInput {
 
 export interface InspectPromptInput {
   sessionId: SessionId;
-  cwd: string;
+  cwd?: string;
   text?: string;
   skillMentions?: readonly RuntimeSkillMention[];
   includeContent?: boolean;
@@ -179,7 +196,54 @@ interface RuntimeSessionModelState {
 
 interface RuntimeRunState {
   controller: AbortController;
-  purpose: "prompt" | "goal" | "compaction";
+  purpose: "prompt" | "goal" | "compaction" | "operation";
+  durableClaimId?: string;
+  durableClaimHeartbeat?: ReturnType<typeof setInterval>;
+  operationContext: RuntimeSessionOperationContext;
+}
+
+interface RuntimeSessionOperationContext {
+  sessionId: SessionId;
+  controller: AbortController;
+  capability: RuntimeSessionOperation;
+  active: boolean;
+  lost: boolean;
+  nestedOperations: Set<Promise<void>>;
+  nestedFailure?: { error: unknown };
+  durableClaimId?: string;
+  atomicStore: Partial<RuntimeAtomicSessionStore>;
+}
+
+interface RuntimeAtomicSessionStore {
+  claimSessionCreation(input: {
+    sessionId: SessionId;
+    claimId: string;
+    cwd: string;
+    owner: "root" | "child";
+    time: number;
+    leaseDurationMs: number;
+  }): { status: "claimed" | "already_exists" | "subagent" };
+  renewSessionCreation(input: {
+    sessionId: SessionId;
+    claimId: string;
+    time: number;
+    leaseDurationMs: number;
+  }): boolean;
+  releaseSessionCreation(input: { sessionId: SessionId; claimId: string }): void;
+  claimSessionRun(input: {
+    sessionId: SessionId;
+    claimId: string;
+    allowSubagentSessions: boolean;
+    time: number;
+    leaseDurationMs: number;
+  }): { status: "claimed" | "busy" | "inactive" | "not_found" | "subagent"; sessionStatus?: string };
+  renewSessionRun(input: {
+    sessionId: SessionId;
+    claimId: string;
+    time: number;
+    leaseDurationMs: number;
+  }): boolean;
+  releaseSessionRun(input: { sessionId: SessionId; claimId: string }): void;
 }
 
 export type SubmitPromptResult =
@@ -196,6 +260,20 @@ export type SubmitPromptResult =
     };
 
 export type RuntimeBackgroundErrorHandler = (error: unknown) => void;
+
+export interface RuntimeSessionOperation {
+  readonly signal: AbortSignal;
+  /** Present when the operation is backed by a durable store claim. */
+  readonly runClaim?: SessionRunClaimFence;
+  assertCurrent(): void;
+}
+
+export interface SessionOperationCoordinator {
+  withSessionOperation<T>(
+    sessionId: SessionId,
+    fn: (operation: RuntimeSessionOperation) => Promise<T> | T,
+  ): Promise<T>;
+}
 
 export class RuntimeBusyError extends Error {
   constructor(readonly sessionId: SessionId) {
@@ -221,8 +299,43 @@ export class RuntimeSessionNotFoundError extends Error {
   }
 }
 
+export class RuntimeSessionAlreadyExistsError extends Error {
+  constructor(readonly sessionId: SessionId) {
+    super(`Session already exists: ${sessionId}`);
+    this.name = "RuntimeSessionAlreadyExistsError";
+  }
+}
+
+export class RuntimeSessionCreationConflictError extends Error {
+  constructor(readonly sessionId: SessionId) {
+    super(`Session creation ownership was lost before completion: ${sessionId}`);
+    this.name = "RuntimeSessionCreationConflictError";
+  }
+}
+
+export class RuntimeSessionClaimCapabilityError extends Error {
+  constructor(
+    readonly capability: "creation" | "run",
+    readonly missingMethods: readonly string[],
+  ) {
+    super(
+      `Incomplete atomic session ${capability} capability; missing ${missingMethods.join(", ")}`,
+    );
+    this.name = "RuntimeSessionClaimCapabilityError";
+  }
+}
+
+export class RuntimeSessionInactiveError extends Error {
+  constructor(readonly sessionId: SessionId, readonly status: string) {
+    super(`Session is not active: ${sessionId} (${status})`);
+    this.name = "RuntimeSessionInactiveError";
+  }
+}
+
 export class RuntimeService {
   private readonly running = new Map<SessionId, RuntimeRunState>();
+  private readonly sessionOperationStorage = new AsyncLocalStorage<RuntimeSessionOperationContext>();
+  private readonly creatingSessions = new Set<SessionId>();
   private readonly goals: GoalService;
   private readonly sessionModelState = new Map<SessionId, RuntimeSessionModelState>();
   private globalModelState?: RuntimeSessionModelState;
@@ -241,16 +354,143 @@ export class RuntimeService {
   }
 
   async createSession(input: CreateRuntimeSessionInput = {}): Promise<RuntimeSessionHandle> {
-    const createInput: {
-      sessionId?: SessionId;
-      cwd: string;
-    } = {
-      cwd: resolve(input.cwd ?? this.options.cwd),
-    };
-    if (input.sessionId) createInput.sessionId = input.sessionId;
-    const sessionId = await this.options.runtime.createSession(createInput);
-    await this.publishStatus({ sessionId, status: "idle", reason: "session_created" });
-    return { sessionId };
+    const sessionId = input.sessionId ?? this.id<SessionId>("session");
+    const cwd = await canonicalWorkspacePath(input.cwd ?? this.options.cwd);
+    if (this.creatingSessions.has(sessionId)) {
+      throw new RuntimeSessionAlreadyExistsError(sessionId);
+    }
+    this.creatingSessions.add(sessionId);
+
+    try {
+      if (
+        (await this.options.store.sessions()).some((session) => session.id === sessionId)
+      ) {
+        throw new RuntimeSessionAlreadyExistsError(sessionId);
+      }
+      if (
+        !this.options.allowSubagentSessions
+        && await this.isSubagentSessionOwned(sessionId)
+      ) {
+        throw new RuntimeSubagentSessionAccessError(sessionId);
+      }
+
+      const atomicStore = this.atomicSessionStore("creation");
+      let creationClaimId: string | undefined;
+      let creationClaimHeartbeat: ReturnType<typeof setInterval> | undefined;
+      let creationClaimLost = false;
+      if (atomicStore.claimSessionCreation && atomicStore.releaseSessionCreation) {
+        const claimId = this.id("session_create_claim");
+        const claimed = atomicStore.claimSessionCreation({
+          sessionId,
+          claimId,
+          cwd,
+          owner: this.options.allowSubagentSessions ? "child" : "root",
+          time: Date.now(),
+          leaseDurationMs: SESSION_CLAIM_LEASE_MS,
+        });
+        if (claimed.status === "already_exists") {
+          throw new RuntimeSessionAlreadyExistsError(sessionId);
+        }
+        if (claimed.status === "subagent") {
+          throw new RuntimeSubagentSessionAccessError(sessionId);
+        }
+        creationClaimId = claimId;
+        if (atomicStore.renewSessionCreation) {
+          creationClaimHeartbeat = this.startClaimHeartbeat(
+            () => atomicStore.renewSessionCreation?.({
+              sessionId,
+              claimId,
+              time: Date.now(),
+              leaseDurationMs: SESSION_CLAIM_LEASE_MS,
+            }) === true,
+            () => {
+              creationClaimLost = true;
+            },
+          );
+        }
+      }
+
+      const createInput: { sessionId: SessionId; cwd: string } = {
+        sessionId,
+        cwd,
+      };
+      try {
+        const createdSessionId = await this.options.runtime.createSession(createInput);
+        if (createdSessionId !== sessionId) {
+          throw new Error(`Runtime created unexpected session ${createdSessionId}; expected ${sessionId}`);
+        }
+        const assertCreationClaimCurrent = (): void => {
+          const claimId = creationClaimId;
+          if (!claimId) return;
+          if (creationClaimLost) throw new SessionCreationClaimConflictError(sessionId);
+          if (atomicStore.renewSessionCreation) {
+            let renewed = false;
+            try {
+              renewed = atomicStore.renewSessionCreation({
+                sessionId,
+                claimId,
+                time: Date.now(),
+                leaseDurationMs: SESSION_CLAIM_LEASE_MS,
+              });
+            } catch {
+              creationClaimLost = true;
+            }
+            if (!renewed) creationClaimLost = true;
+          }
+          if (creationClaimLost) throw new SessionCreationClaimConflictError(sessionId);
+        };
+        const creationClaim: SessionCreationClaimFence | undefined = creationClaimId
+          ? { sessionId, claimId: creationClaimId }
+          : undefined;
+        assertCreationClaimCurrent();
+        await this.publishStatus(
+          { sessionId, status: "idle", reason: "session_created" },
+          creationClaim ? { creationClaim } : undefined,
+        );
+        assertCreationClaimCurrent();
+        return { sessionId };
+      } catch (error) {
+        if (error instanceof SessionReservedForSubagentError || (
+          error instanceof Error && error.name === "SessionReservedForSubagentError"
+        )) {
+          throw new RuntimeSubagentSessionAccessError(
+            (error as SessionReservedForSubagentError).sessionId ?? sessionId,
+          );
+        }
+        if (
+          error instanceof SessionAlreadyExistsError
+          || isErrorNamed(error, "SessionAlreadyExistsError")
+        ) {
+          throw new RuntimeSessionAlreadyExistsError(errorSessionId(error) ?? sessionId);
+        }
+        if (
+          error instanceof SessionCreationClaimConflictError
+          || isErrorNamed(error, "SessionCreationClaimConflictError")
+          || error instanceof SessionCwdConflictError
+          || isErrorNamed(error, "SessionCwdConflictError")
+        ) {
+          const conflictSessionId = errorSessionId(error) ?? sessionId;
+          const sessionExists = (await this.options.store.sessions()).some(
+            (session) => session.id === conflictSessionId,
+          );
+          if (sessionExists) {
+            throw new RuntimeSessionAlreadyExistsError(conflictSessionId);
+          }
+          throw new RuntimeSessionCreationConflictError(conflictSessionId);
+        }
+        throw error;
+      } finally {
+        if (creationClaimHeartbeat) clearInterval(creationClaimHeartbeat);
+        if (creationClaimId) {
+          atomicStore.releaseSessionCreation?.({
+            sessionId,
+            claimId: creationClaimId,
+          });
+        }
+      }
+    } finally {
+      this.creatingSessions.delete(sessionId);
+    }
   }
 
   async appendUserMessage(input: { sessionId: SessionId; turnId?: TurnId; text: string; displayText?: string; images?: readonly MessageImageContent[] }): Promise<MessageId> {
@@ -261,10 +501,64 @@ export class RuntimeService {
   async assertSessionTurnAllowed(sessionId: SessionId): Promise<void> {
     const sessions = await this.options.store.sessions();
     const session = sessions.find((candidate) => candidate.id === sessionId);
+    if (session && session.status !== "active") {
+      throw new RuntimeSessionInactiveError(sessionId, session.status);
+    }
     if (this.options.allowSubagentSessions) {
       if (!session) throw new RuntimeSessionNotFoundError(sessionId);
       return;
     }
+    if (session?.source === "subagent" || await this.isSubagentSessionOwned(sessionId)) {
+      throw new RuntimeSubagentSessionAccessError(sessionId);
+    }
+    if (!session) throw new RuntimeSessionNotFoundError(sessionId);
+  }
+
+  withSessionOperation<T>(
+    sessionId: SessionId,
+    fn: (operation: RuntimeSessionOperation) => Promise<T> | T,
+  ): Promise<T> {
+    const inherited = this.sessionOperationStorage.getStore();
+    if (
+      inherited?.sessionId === sessionId
+      && inherited.active
+      && !inherited.lost
+    ) {
+      const nestedOperation = (async () => {
+        inherited.capability.assertCurrent();
+        try {
+          const result = await fn(inherited.capability);
+          inherited.capability.assertCurrent();
+          return result;
+        } catch (error) {
+          // A lost durable lease is authoritative even when the downstream
+          // operation observed the abort signal first.
+          inherited.capability.assertCurrent();
+          throw error;
+        }
+      })();
+      return this.trackNestedSessionOperation(inherited, nestedOperation);
+    }
+    return (async () => {
+      if (this.running.has(sessionId)) throw new RuntimeBusyError(sessionId);
+
+      this.createRunController({ sessionId, text: "" }, "operation");
+      return this.runWithSessionOperation(sessionId, async (operation) => {
+        try {
+          await this.assertSessionTurnAllowed(sessionId);
+          operation.assertCurrent();
+          const result = await fn(operation);
+          operation.assertCurrent();
+          return result;
+        } catch (error) {
+          operation.assertCurrent();
+          throw error;
+        }
+      });
+    })();
+  }
+
+  private async isSubagentSessionOwned(sessionId: SessionId): Promise<boolean> {
     const teamMemberQuery: NonNullable<Parameters<TeamProjectionStore["teamMembers"]>[0]>
       & { childSessionId: SessionId } = { childSessionId: sessionId, limit: 500 };
     const [tasks, runs, members] = await Promise.all([
@@ -283,10 +577,7 @@ export class RuntimeService {
       const leadPath = teamLeadPaths.get(member.teamId);
       return member.childSessionId === sessionId && leadPath !== undefined && leadPath !== member.path;
     });
-    if (session?.source === "subagent" || taskOwnsSession || runOwnsSession || teamWorkerOwnsSession) {
-      throw new RuntimeSubagentSessionAccessError(sessionId);
-    }
-    if (!session) throw new RuntimeSessionNotFoundError(sessionId);
+    return taskOwnsSession || runOwnsSession || teamWorkerOwnsSession;
   }
 
   async listModels(input: { provider?: string } = {}): Promise<RuntimeModelDescriptor[]> {
@@ -301,6 +592,7 @@ export class RuntimeService {
   }
 
   async setModel(input: SetRuntimeModelInput): Promise<RuntimeModelConfig> {
+    await this.assertSessionTurnAllowed(input.sessionId);
     const modelSelection = normalizeModelSelection(input.modelSelection);
     const state = await this.resolveSessionModelState(input.sessionId);
     const previousReasoningLevel = state.reasoningLevel;
@@ -326,6 +618,7 @@ export class RuntimeService {
   }
 
   async setReasoning(input: SetRuntimeReasoningInput): Promise<RuntimeModelConfig> {
+    await this.assertSessionTurnAllowed(input.sessionId);
     if (!isReasoningLevel(input.reasoningLevel)) {
       throw new Error(`Invalid reasoning level: ${input.reasoningLevel}`);
     }
@@ -345,6 +638,7 @@ export class RuntimeService {
   }
 
   async setServiceTier(input: SetRuntimeServiceTierInput): Promise<RuntimeModelConfig> {
+    await this.assertSessionTurnAllowed(input.sessionId);
     if (!isServiceTier(input.serviceTier)) {
       throw new Error(`Invalid service tier: ${input.serviceTier}`);
     }
@@ -368,6 +662,7 @@ export class RuntimeService {
   }
 
   async setDelegationPolicy(input: SetRuntimeDelegationPolicyInput): Promise<RuntimeDelegationConfig> {
+    await this.assertSessionTurnAllowed(input.sessionId);
     if (!isDelegationPolicy(input.policy)) {
       throw new Error(`Invalid delegation policy: ${input.policy}`);
     }
@@ -403,9 +698,7 @@ export class RuntimeService {
     objective?: string;
     tokenBudget?: number;
   }): Promise<SessionGoal> {
-    if (input.status === undefined || input.status === "active") {
-      await this.assertSessionTurnAllowed(input.sessionId);
-    }
+    await this.assertSessionTurnAllowed(input.sessionId);
     const goal = await this.goals.updateGoal(input);
     if (goal.status === "active") {
       this.submitGoalContinuationAsync(input);
@@ -417,6 +710,7 @@ export class RuntimeService {
   }
 
   async clearGoal(input: { sessionId: SessionId }): Promise<{ cleared: boolean; previousGoal?: SessionGoal }> {
+    await this.assertSessionTurnAllowed(input.sessionId);
     const result = await this.goals.clearGoal(input);
     if (result.cleared) this.abortRunForSession(input.sessionId);
     return result;
@@ -441,9 +735,10 @@ export class RuntimeService {
     if (!runtime.compactContext) {
       throw new Error("Runtime does not support context compaction");
     }
+    const compactContext = runtime.compactContext.bind(runtime);
 
     const controller = this.createRunController({ ...input, text: "" }, "compaction");
-    try {
+    return this.runWithSessionOperation(input.sessionId, async () => {
       const modelState = await this.resolveSessionModelState(input.sessionId);
       await this.publishStatus({
         sessionId: input.sessionId,
@@ -468,7 +763,7 @@ export class RuntimeService {
       if (modelState.reasoningLevel !== undefined) compactInput.reasoningLevel = modelState.reasoningLevel;
       if (modelState.serviceTier !== undefined) compactInput.serviceTier = modelState.serviceTier;
       const startedAt = this.now();
-      const result = await runtime.compactContext(compactInput);
+      const result = await compactContext(compactInput);
       await this.accountGoalUsage(input, result.turnId, result.usage, startedAt);
       await this.publishStatus({
         sessionId: input.sessionId,
@@ -476,9 +771,7 @@ export class RuntimeService {
         ...(result.status === "failed" || result.status === "cancelled" ? { reason: result.error.message } : {}),
       });
       return result;
-    } finally {
-      this.running.delete(input.sessionId);
-    }
+    });
   }
 
   async submitPrompt(input: SubmitPromptInput): Promise<SubmitPromptResult> {
@@ -487,17 +780,22 @@ export class RuntimeService {
     }
 
     const controller = this.createRunController(input, "prompt");
-    return this.runReservedPrompt(input, controller);
+    return this.runWithSessionOperation(
+      input.sessionId,
+      () => this.runReservedPrompt(input, controller),
+    );
   }
 
   async inspectPrompt(input: InspectPromptInput & { includeContent: true }): Promise<InspectPromptWithContentResult>;
   async inspectPrompt(input: InspectPromptInput & { includeContent?: false | undefined }): Promise<PromptDebugManifest>;
   async inspectPrompt(input: InspectPromptInput): Promise<PromptDebugManifest | InspectPromptWithContentResult>;
   async inspectPrompt(input: InspectPromptInput): Promise<PromptDebugManifest | InspectPromptWithContentResult> {
+    await this.assertSessionTurnAllowed(input.sessionId);
+    const cwd = await this.resolveExistingSessionCwd(input.sessionId, input.cwd);
     const modelState = await this.resolveSessionModelState(input.sessionId);
     const prompt = await this.resolvePromptAssembly({
       sessionId: input.sessionId,
-      cwd: input.cwd,
+      cwd,
       ...(modelState.reasoningLevel ? { reasoningLevel: modelState.reasoningLevel } : {}),
       ...(input.text !== undefined ? { turn: turnContext(input), previewTurnInConversation: true } : {}),
     });
@@ -513,9 +811,16 @@ export class RuntimeService {
       throw new RuntimeBusyError(input.sessionId);
     }
 
+    // Reserving the durable run claim is part of accepting an async prompt.
+    // Boundary failures here must remain synchronous so transports cannot
+    // acknowledge work that was never accepted. Only failures after the
+    // reservation succeeds belong to the background error channel below.
     const controller = this.createRunController(input, "prompt");
     queueMicrotask(() => {
-      void this.runReservedPrompt(input, controller).catch((error: unknown) => {
+      void this.runWithSessionOperation(
+        input.sessionId,
+        () => this.runReservedPrompt(input, controller),
+      ).catch((error: unknown) => {
         onError?.(error);
       });
     });
@@ -779,7 +1084,7 @@ export class RuntimeService {
       };
     } catch (error) {
       const err = toError(error);
-      if (err instanceof RuntimeSubagentSessionAccessError || err instanceof RuntimeSessionNotFoundError) throw err;
+      if (isRuntimeSessionBoundaryError(err) || isSessionRunClaimConflictError(err)) throw err;
       const status: Extract<RuntimeSessionStatus, "cancelled" | "failed"> = isAbortError(err) ? "cancelled" : "failed";
       await this.publishStatus({
         sessionId: input.sessionId,
@@ -791,8 +1096,6 @@ export class RuntimeService {
         turns,
         error: err,
       };
-    } finally {
-      this.running.delete(input.sessionId);
     }
   }
 
@@ -945,10 +1248,21 @@ export class RuntimeService {
       text: "",
       ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
     };
-    const controller = this.createRunController(continuationInput, "goal");
+    let controller: AbortController;
+    try {
+      controller = this.createRunController(continuationInput, "goal");
+    } catch (error) {
+      const err = toError(error);
+      if (isRuntimeSessionBoundaryError(err) || err instanceof RuntimeBusyError) return;
+      throw error;
+    }
     queueMicrotask(() => {
-      void this.runStandaloneGoalContinuation(continuationInput, controller).catch(async (error: unknown) => {
+      void this.runWithSessionOperation(
+        continuationInput.sessionId,
+        () => this.runStandaloneGoalContinuation(continuationInput, controller),
+      ).catch(async (error: unknown) => {
         const err = toError(error);
+        if (isRuntimeSessionBoundaryError(err) || isSessionRunClaimConflictError(err)) return;
         await this.publishStatus({
           sessionId: continuationInput.sessionId,
           status: isAbortError(err) ? "cancelled" : "failed",
@@ -959,28 +1273,24 @@ export class RuntimeService {
   }
 
   private async runStandaloneGoalContinuation(input: SubmitPromptInput, controller: AbortController): Promise<void> {
-    try {
-      await this.assertSessionTurnAllowed(input.sessionId);
-      const cwd = await this.resolveExistingSessionCwd(input.sessionId, input.cwd);
-      const normalizedInput: SubmitPromptInput = { ...input, cwd };
-      const modelState = await this.resolvePromptModelState(normalizedInput);
-      const turns: RunTurnResult[] = [];
-      const result = await this.runGoalContinuation({
-        input: normalizedInput,
-        turns,
-        controller,
-        cwd,
-        modelState,
+    await this.assertSessionTurnAllowed(input.sessionId);
+    const cwd = await this.resolveExistingSessionCwd(input.sessionId, input.cwd);
+    const normalizedInput: SubmitPromptInput = { ...input, cwd };
+    const modelState = await this.resolvePromptModelState(normalizedInput);
+    const turns: RunTurnResult[] = [];
+    const result = await this.runGoalContinuation({
+      input: normalizedInput,
+      turns,
+      controller,
+      cwd,
+      modelState,
+    });
+    if (!result) {
+      await this.publishStatus({
+        sessionId: input.sessionId,
+        status: "idle",
+        reason: "goal_not_active",
       });
-      if (!result) {
-        await this.publishStatus({
-          sessionId: input.sessionId,
-          status: "idle",
-          reason: "goal_not_active",
-        });
-      }
-    } finally {
-      this.running.delete(input.sessionId);
     }
   }
 
@@ -1060,9 +1370,9 @@ export class RuntimeService {
     const session = (await this.options.store.sessions()).find((candidate) => candidate.id === sessionId);
     if (!session) throw new RuntimeSessionNotFoundError(sessionId);
 
-    const sessionCwd = resolve(session.cwd);
+    const sessionCwd = await canonicalWorkspacePath(session.cwd);
     if (requestedCwd !== undefined) {
-      const normalizedRequestedCwd = resolve(requestedCwd);
+      const normalizedRequestedCwd = await canonicalWorkspacePath(requestedCwd);
       if (normalizedRequestedCwd !== sessionCwd) {
         throw new Error(
           `Session cwd mismatch for ${sessionId}: expected ${sessionCwd}, received ${normalizedRequestedCwd}`,
@@ -1568,16 +1878,32 @@ export class RuntimeService {
   }
 
   async archiveSession(sessionId: SessionId): Promise<void> {
-    await this.append({ sessionId }, "session.archived", { sessionId });
+    await this.assertSessionTurnAllowed(sessionId);
+    if (this.running.has(sessionId)) throw new RuntimeBusyError(sessionId);
+    try {
+      await this.append({ sessionId }, "session.archived", { sessionId });
+    } catch (error) {
+      if (error instanceof SessionRunClaimConflictError || (
+        error instanceof Error && error.name === "SessionRunClaimConflictError"
+      )) {
+        throw new RuntimeBusyError(sessionId);
+      }
+      if (error instanceof SessionStateConflictError || (
+        error instanceof Error && error.name === "SessionStateConflictError"
+      )) {
+        const status = (error as SessionStateConflictError).status;
+        if (!status) throw new RuntimeSessionNotFoundError(sessionId);
+        throw new RuntimeSessionInactiveError(sessionId, status);
+      }
+      throw error;
+    }
   }
 
   async renameSession(sessionId: SessionId, title: string): Promise<void> {
+    await this.assertSessionTurnAllowed(sessionId);
     const normalized = title.trim().replace(/\s+/g, " ");
     if (!normalized) throw new Error("Session title cannot be empty.");
     if (normalized.length > 120) throw new Error("Session title must be 120 characters or fewer.");
-    if (!(await this.options.store.sessions()).some((item) => item.id === sessionId)) {
-      throw new Error(`Session not found: ${sessionId}`);
-    }
     await this.append({ sessionId }, "session.renamed", { sessionId, title: normalized });
   }
 
@@ -1603,7 +1929,50 @@ export class RuntimeService {
   }
 
   private createRunController(input: SubmitPromptInput, purpose: RuntimeRunState["purpose"]): AbortController {
+    const atomicStore = this.atomicSessionStore("run");
+    let durableClaimId: string | undefined;
+    if (atomicStore.claimSessionRun && atomicStore.releaseSessionRun) {
+      const claimId = this.id("session_run_claim");
+      const claimed = atomicStore.claimSessionRun({
+        sessionId: input.sessionId,
+        claimId,
+        allowSubagentSessions: this.options.allowSubagentSessions === true,
+        time: Date.now(),
+        leaseDurationMs: SESSION_CLAIM_LEASE_MS,
+      });
+      if (claimed.status === "busy") throw new RuntimeBusyError(input.sessionId);
+      if (claimed.status === "not_found") throw new RuntimeSessionNotFoundError(input.sessionId);
+      if (claimed.status === "subagent") throw new RuntimeSubagentSessionAccessError(input.sessionId);
+      if (claimed.status === "inactive") {
+        throw new RuntimeSessionInactiveError(input.sessionId, claimed.sessionStatus ?? "inactive");
+      }
+      durableClaimId = claimId;
+    }
     const controller = new AbortController();
+    let operationContext: RuntimeSessionOperationContext;
+    operationContext = {
+      sessionId: input.sessionId,
+      controller,
+      active: true,
+      lost: false,
+      nestedOperations: new Set(),
+      atomicStore,
+      ...(durableClaimId ? { durableClaimId } : {}),
+      capability: {
+        signal: controller.signal,
+        ...(durableClaimId
+          ? { runClaim: { sessionId: input.sessionId, claimId: durableClaimId } }
+          : {}),
+        assertCurrent: () => this.assertSessionOperationCurrent(operationContext),
+      },
+    };
+    let durableClaimHeartbeat: ReturnType<typeof setInterval> | undefined;
+    if (durableClaimId && atomicStore.renewSessionRun) {
+      durableClaimHeartbeat = this.startClaimHeartbeat(
+        () => this.renewSessionOperation(operationContext),
+        () => this.loseSessionOperation(operationContext),
+      );
+    }
     if (input.signal) {
       if (input.signal.aborted) {
         controller.abort();
@@ -1611,8 +1980,179 @@ export class RuntimeService {
         input.signal.addEventListener("abort", () => controller.abort(), { once: true });
       }
     }
-    this.running.set(input.sessionId, { controller, purpose });
+    this.running.set(input.sessionId, {
+      controller,
+      purpose,
+      operationContext,
+      ...(durableClaimId ? { durableClaimId } : {}),
+      ...(durableClaimHeartbeat ? { durableClaimHeartbeat } : {}),
+    });
     return controller;
+  }
+
+  private releaseRunController(
+    sessionId: SessionId,
+    expectedContext?: RuntimeSessionOperationContext,
+  ): void {
+    const run = this.running.get(sessionId);
+    if (expectedContext && run?.operationContext !== expectedContext) return;
+    try {
+      if (run) run.operationContext.active = false;
+      if (run?.durableClaimHeartbeat) clearInterval(run.durableClaimHeartbeat);
+      if (run?.durableClaimId) {
+        run.operationContext.atomicStore.releaseSessionRun?.({
+          sessionId,
+          claimId: run.durableClaimId,
+        });
+      }
+    } finally {
+      if (this.running.get(sessionId) === run) this.running.delete(sessionId);
+    }
+  }
+
+  private runWithSessionOperation<T>(
+    sessionId: SessionId,
+    fn: (operation: RuntimeSessionOperation) => Promise<T> | T,
+  ): Promise<T> {
+    const context = this.running.get(sessionId)?.operationContext;
+    if (!context) throw new RuntimeBusyError(sessionId);
+    return (async () => {
+      try {
+        context.capability.assertCurrent();
+        return await this.sessionOperationStorage.run(
+          context,
+          async () => {
+            let outcome:
+              | { status: "completed"; value: T }
+              | { status: "failed"; error: unknown };
+            try {
+              outcome = { status: "completed", value: await fn(context.capability) };
+            } catch (error) {
+              outcome = { status: "failed", error };
+            }
+            await this.awaitNestedSessionOperations(context);
+            // A lost durable lease is authoritative even when the operation or
+            // one of its nested scopes observes the abort signal first.
+            context.capability.assertCurrent();
+            if (outcome.status === "failed") throw outcome.error;
+            if (context.nestedFailure) throw context.nestedFailure.error;
+            return outcome.value;
+          },
+        );
+      } finally {
+        this.releaseRunController(sessionId, context);
+      }
+    })();
+  }
+
+  private trackNestedSessionOperation<T>(
+    context: RuntimeSessionOperationContext,
+    operation: Promise<T>,
+  ): Promise<T> {
+    const observed = operation.then(
+      () => undefined,
+      (error: unknown) => {
+        context.nestedFailure ??= { error };
+      },
+    );
+    let completion: Promise<void>;
+    completion = observed.then(() => {
+      context.nestedOperations.delete(completion);
+    });
+    context.nestedOperations.add(completion);
+    return operation;
+  }
+
+  private async awaitNestedSessionOperations(context: RuntimeSessionOperationContext): Promise<void> {
+    while (context.nestedOperations.size > 0) {
+      await Promise.all([...context.nestedOperations]);
+    }
+  }
+
+  private assertSessionOperationCurrent(context: RuntimeSessionOperationContext): void {
+    if (
+      !context.active
+      || context.lost
+      || this.running.get(context.sessionId)?.operationContext !== context
+    ) {
+      throw new RuntimeBusyError(context.sessionId);
+    }
+    if (!context.durableClaimId) return;
+    if (!context.atomicStore.renewSessionRun) {
+      this.loseSessionOperation(context);
+      throw new RuntimeSessionClaimCapabilityError("run", ["renewSessionRun"]);
+    }
+    if (this.renewSessionOperation(context)) return;
+    this.loseSessionOperation(context);
+    throw new RuntimeBusyError(context.sessionId);
+  }
+
+  private renewSessionOperation(context: RuntimeSessionOperationContext): boolean {
+    if (!context.active || context.lost || !context.durableClaimId) return false;
+    if (!context.atomicStore.renewSessionRun) return false;
+    try {
+      return context.atomicStore.renewSessionRun({
+        sessionId: context.sessionId,
+        claimId: context.durableClaimId,
+        time: Date.now(),
+        leaseDurationMs: SESSION_CLAIM_LEASE_MS,
+      }) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  private loseSessionOperation(context: RuntimeSessionOperationContext): void {
+    if (context.lost) return;
+    context.lost = true;
+    if (!context.controller.signal.aborted) {
+      context.controller.abort(new RuntimeBusyError(context.sessionId));
+    }
+  }
+
+  private atomicSessionStore(
+    capability: "creation" | "run",
+  ): Partial<RuntimeAtomicSessionStore> {
+    const methods = capability === "creation"
+      ? ["claimSessionCreation", "renewSessionCreation", "releaseSessionCreation"] as const
+      : ["claimSessionRun", "renewSessionRun", "releaseSessionRun"] as const;
+    let candidate: unknown = this.options.store;
+    const seen = new Set<object>();
+    while (isRecord(candidate) && !seen.has(candidate)) {
+      seen.add(candidate);
+      const atomic = candidate as Partial<RuntimeAtomicSessionStore>;
+      const available = methods.filter((method) => typeof atomic[method] === "function");
+      if (available.length > 0 && available.length < methods.length) {
+        const missing = methods.filter((method) => typeof atomic[method] !== "function");
+        throw new RuntimeSessionClaimCapabilityError(capability, missing);
+      }
+      if (available.length === methods.length) {
+        return atomic;
+      }
+      candidate = candidate.inner;
+    }
+    return {};
+  }
+
+  private startClaimHeartbeat(
+    renew: () => boolean,
+    onLost?: () => void,
+  ): ReturnType<typeof setInterval> {
+    let heartbeat: ReturnType<typeof setInterval>;
+    heartbeat = setInterval(() => {
+      let renewed = false;
+      try {
+        renewed = renew();
+      } catch {
+        // Treat an exhausted store retry as a lost lease. Continuing without the
+        // durable fence would let another runtime archive or run this session.
+      }
+      if (renewed) return;
+      clearInterval(heartbeat);
+      onLost?.();
+    }, SESSION_CLAIM_HEARTBEAT_MS);
+    (heartbeat as ReturnType<typeof setInterval> & { unref?: () => void }).unref?.();
+    return heartbeat;
   }
 
   private abortRunForSession(sessionId: SessionId): void {
@@ -1634,7 +2174,7 @@ export class RuntimeService {
     status: RuntimeSessionStatus;
     turnId?: TurnId;
     reason?: string;
-  }): Promise<void> {
+  }, options?: EventAppendOptions): Promise<void> {
     const payload: {
       sessionId: SessionId;
       status: RuntimeSessionStatus;
@@ -1646,13 +2186,14 @@ export class RuntimeService {
     };
     if (input.turnId) payload.turnId = input.turnId;
     if (input.reason) payload.reason = input.reason;
-    await this.append(input, "session.status_changed", payload);
+    await this.append(input, "session.status_changed", payload, options);
   }
 
   private async append<TType extends ChiliEvent["type"], TPayload>(
     input: { sessionId: SessionId },
     type: TType,
     payload: TPayload,
+    options?: EventAppendOptions,
   ): Promise<void> {
     const event: EventEnvelope<TType, TPayload> = {
       id: this.id("event"),
@@ -1661,7 +2202,7 @@ export class RuntimeService {
       sessionId: input.sessionId,
       payload,
     };
-    await this.options.store.append(event as ChiliEvent);
+    await this.options.store.append(event as ChiliEvent, options);
   }
 
   private id<T extends string>(prefix: string): T {
@@ -2339,12 +2880,56 @@ function isDelegationPayload(payload: unknown): payload is { policy: DelegationP
   return isRecord(payload) && isDelegationPolicy(payload.policy);
 }
 
+async function canonicalWorkspacePath(value: string): Promise<string> {
+  const absolute = resolve(value);
+  const missingSegments: string[] = [];
+  let candidate = absolute;
+
+  while (true) {
+    try {
+      const canonicalBase = await realpath(candidate);
+      return resolve(canonicalBase, ...missingSegments);
+    } catch (error) {
+      if (!isMissingPathError(error)) throw error;
+      const parent = dirname(candidate);
+      if (parent === candidate) return absolute;
+      missingSegments.unshift(basename(candidate));
+      candidate = parent;
+    }
+  }
+}
+
+function isMissingPathError(error: unknown): boolean {
+  if (!(error instanceof Error) || !("code" in error)) return false;
+  const code = (error as Error & { code?: unknown }).code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function isErrorNamed(error: unknown, name: string): error is Error {
+  return error instanceof Error && error.name === name;
+}
+
+function errorSessionId(error: unknown): SessionId | undefined {
+  if (!isRecord(error) || typeof error.sessionId !== "string") return undefined;
+  return error.sessionId as SessionId;
+}
+
+function isRuntimeSessionBoundaryError(error: Error): boolean {
+  return error instanceof RuntimeSessionInactiveError
+    || error instanceof RuntimeSubagentSessionAccessError
+    || error instanceof RuntimeSessionNotFoundError;
+}
+
+function isSessionRunClaimConflictError(error: Error): boolean {
+  return error instanceof SessionRunClaimConflictError || error.name === "SessionRunClaimConflictError";
 }
 
 function abortError(message: string): Error {

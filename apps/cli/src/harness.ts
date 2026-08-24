@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   AgentRunnerSubagentRunner,
@@ -127,7 +127,15 @@ import {
 } from "@chili/skills";
 import { defaultChiliHome } from "@chili/providers";
 import { createFilesystemPromptCommandControl, type PromptCommandControl } from "@chili/server";
-import { createCliApprovalBroker, createCliApprovalRulesets, dangerousShellCommandsForProfile, persistAllowAlwaysDecision, runtimePermissionConfig } from "./approval.js";
+import {
+  createCliApprovalBroker,
+  createCliApprovalRulesets,
+  createRequestScopedPolicyApprovalBroker,
+  dangerousShellCommandsForProfile,
+  persistAllowAlwaysDecision,
+  runtimePermissionConfig,
+  type CliApprovalRulesetResolver,
+} from "./approval.js";
 import { createCliBashRunner } from "./bash-runner.js";
 import { loadCliConfig, type CliConfig } from "./config.js";
 import { createIdFactory } from "./id.js";
@@ -144,6 +152,22 @@ const DEV_MAX_CONCURRENT_TOOL_CALLS = 32;
 const STALE_TURN_RECOVERY_MS = 30 * 60 * 1000;
 const CLI_DEFAULT_READ_MAX_BYTES = 32 * 1024;
 const CLI_READ_MAX_BYTES_LIMIT = 256 * 1024;
+
+async function canonicalSkillWorkspace(cwd: string): Promise<string> {
+  const absolute = resolve(cwd);
+  try {
+    return await realpath(absolute);
+  } catch (error) {
+    if (
+      error instanceof Error
+      && "code" in error
+      && ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR")
+    ) {
+      return absolute;
+    }
+    throw error;
+  }
+}
 
 export interface CliHarnessOptions {
   cwd: string;
@@ -235,19 +259,50 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const persistUserModelSelection = async (input: { modelSelection: ModelSelection }): Promise<void> => {
     await writeUserModelSelection(input.modelSelection, { chiliHome }).catch(() => undefined);
   };
-  const skillRegistry = await discoverSkills({ cwd });
+  const skillRegistryForCwd = async (requestedCwd: string): Promise<SkillRegistry> => {
+    const canonicalCwd = await canonicalSkillWorkspace(requestedCwd);
+    return discoverSkills({ cwd: canonicalCwd });
+  };
+  await skillRegistryForCwd(cwd);
   const config = await loadCliConfig(cwd, { chiliHome });
   const approvalState = new PolicyApprovalState();
-  for (const event of await eventStore.events({ type: "agent.spawned", limit: 10_000 })) {
-    linkApprovalSessionsFromEvent(approvalState, event);
-  }
-  eventStore.subscribe((event) => linkApprovalSessionsFromEvent(approvalState, event));
+  const approvalRootBySession = new Map<SessionId, SessionId>();
   const sandboxedShell = options.bashRunner === undefined && process.platform === "darwin";
   const permissions = createPermissionProfileControl(
     config,
     options.yes ? "full-access" : "default",
     sandboxedShell,
   );
+  const approvalRulesetsForRequest: CliApprovalRulesetResolver = async (request) => {
+    if (!delegationPolicyGate) throw new Error("Delegation policy gate is not initialized");
+    const rootSessionId = await delegationPolicyGate.rootSessionId(request.sessionId);
+    const sessions = await eventStore.sessions();
+    const session = sessions.find((candidate) => candidate.id === request.sessionId);
+    if (!session) throw new Error(`Session not found: ${request.sessionId}`);
+    if (session.status !== "active") {
+      throw new Error(`Session is not active: ${request.sessionId} (${session.status})`);
+    }
+    const rootSession = sessions.find((candidate) => candidate.id === rootSessionId);
+    if (!rootSession) throw new Error(`Approval root session not found: ${rootSessionId}`);
+    if (rootSession.status !== "active") {
+      throw new Error(`Approval root session is not active: ${rootSessionId} (${rootSession.status})`);
+    }
+    if (rootSession.source === "subagent") {
+      throw new Error(`Approval root session cannot be a subagent: ${rootSessionId}`);
+    }
+    const sessionCwd = await canonicalSkillWorkspace(session.cwd);
+    const sessionConfig = await loadCliConfig(sessionCwd, { chiliHome });
+    const rulesets = createCliApprovalRulesets(permissions.get().profile, sessionConfig, { sandboxedShell });
+    const previousRootSessionId = approvalRootBySession.get(request.sessionId);
+    if (previousRootSessionId && previousRootSessionId !== rootSessionId) {
+      throw new Error(
+        `Approval ancestry changed for session ${request.sessionId}: ${previousRootSessionId} -> ${rootSessionId}`,
+      );
+    }
+    approvalRootBySession.set(request.sessionId, rootSessionId);
+    approvalState.linkSession(rootSessionId, request.sessionId);
+    return rulesets;
+  };
   const bashRunner = options.bashRunner ?? createCliBashRunner({
     permissionProfile: () => permissions.get().profile,
   });
@@ -260,24 +315,27 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
         permissionProfile: () => permissions.get().profile,
         allowHostSandboxEscape: false,
       });
-  const registry = createToolRegistry(skillRegistry, bashRunner);
-  const childRegistry = createChildToolRegistry(skillRegistry, childBashRunner);
+  const registry = createToolRegistry(skillRegistryForCwd, bashRunner);
+  const childRegistry = createChildToolRegistry(skillRegistryForCwd, childBashRunner);
   let mcpRuntime: CliMcpRuntime | undefined;
-  const promptFragments = (context: { cwd: string; turn?: RuntimePromptTurnContext }) =>
+  const promptFragments = async (context: { cwd: string; turn?: RuntimePromptTurnContext }) =>
     buildCliPromptFragments({
       cwd: context.cwd,
-      skillRegistry,
+      skillRegistry: await skillRegistryForCwd(context.cwd),
       ...(context.turn ? { turn: context.turn } : {}),
     });
-  const childPromptFragments = (context: { sessionId: SessionId; cwd: string; turn?: RuntimePromptTurnContext }) =>
+  const childPromptFragments = async (context: { sessionId: SessionId; cwd: string; turn?: RuntimePromptTurnContext }) =>
     buildCliChildPromptFragments({
       cwd: context.cwd,
       sessionId: context.sessionId,
-      skillRegistry,
+      skillRegistry: await skillRegistryForCwd(context.cwd),
       store: eventStore,
       ...(context.turn ? { turn: context.turn } : {}),
     });
-  const subagentPromptFragments = (context: { cwd: string }) => buildCliPromptFragments({ cwd: context.cwd, skillRegistry });
+  const subagentPromptFragments = async (context: { cwd: string }) => buildCliPromptFragments({
+    cwd: context.cwd,
+    skillRegistry: await skillRegistryForCwd(context.cwd),
+  });
   const snapshotProvider = new FileSystemSnapshotProvider({
     rootDir: join(stateDir, "snapshots"),
     createId,
@@ -285,7 +343,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const childToolExecutor = new ToolExecutor({
     registry: childRegistry,
     events: { publish: (event: ChiliEvent) => eventStore.append(event) },
-    approvals: createApprovalBroker(options, config, approvalState, permissions),
+    approvals: createApprovalBroker(options, config, approvalState, permissions, approvalRulesetsForRequest),
     policyResolver: combinedChildToolPolicyResolver,
     snapshotProvider,
     createId,
@@ -349,38 +407,13 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     runLimiter: childRunLimiter,
     assertDelegationEnabled,
   });
-  const teams = new TeamControlService({
-    store: eventStore,
-    createId,
-  });
-  const teamWorktrees = new TeamWorktreeService({
-    teams,
-    cwd,
-  });
-  const teamDispatcher = new TeamTaskDispatchService({
-    teams,
-    subagents,
-    store: eventStore,
-    worktrees: teamWorktrees,
-    cwd,
-    assertDelegationEnabled,
-  });
-  const teamVerifier = new TeamTaskVerificationService({
-    teams,
-    subagents,
-    cwd,
-  });
-  const teamMerger = new TeamMergeService({
-    teams,
-    cwd,
-  });
   const completeTaskController = createCompleteTaskController(tasks, subagents);
   registry.register(createTaskTool(subagents));
   childRegistry.register(createCompleteTaskTool(completeTaskController));
   const toolExecutor = new ToolExecutor({
     registry,
     events: { publish: (event) => eventStore.append(event) },
-    approvals: createApprovalBroker(options, config, approvalState, permissions),
+    approvals: createApprovalBroker(options, config, approvalState, permissions, approvalRulesetsForRequest),
     policyResolver: delegationToolPolicyResolver,
     snapshotProvider,
     createId,
@@ -427,9 +460,49 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
     onModelChanged: persistUserModelSelection,
   });
+  const teams = new TeamControlService({
+    store: eventStore,
+    createId,
+    sessionOperations: service,
+  });
+  const resolveTeamSession = async (sessionId: SessionId) => {
+    await service.assertSessionTurnAllowed(sessionId);
+    const session = (await eventStore.sessions()).find((candidate) => candidate.id === sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    return session;
+  };
+  const teamWorktrees = new TeamWorktreeService({
+    teams,
+    cwd,
+    resolveSession: resolveTeamSession,
+    sessionOperations: service,
+  });
+  const teamVerifier = new TeamTaskVerificationService({
+    teams,
+    subagents,
+    cwd,
+    resolveSession: resolveTeamSession,
+    sessionOperations: service,
+  });
   delegationPolicyGate = new DelegationPolicyGate({
     store: eventStore,
     getDelegationConfig: (sessionId) => service.getDelegationConfig(sessionId),
+  });
+  const teamMerger = new TeamMergeService({
+    teams,
+    cwd,
+    resolveSession: resolveTeamSession,
+    sessionOperations: service,
+  });
+  const teamDispatcher = new TeamTaskDispatchService({
+    teams,
+    subagents,
+    store: eventStore,
+    worktrees: teamWorktrees,
+    cwd,
+    assertDelegationEnabled,
+    resolveSession: resolveTeamSession,
+    sessionOperations: service,
   });
   for (const tool of createGoalTools(createGoalToolController(service))) {
     registry.register(tool);
@@ -451,8 +524,16 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     merger: teamMerger,
     events: eventStore,
     cwd,
-    createSession: async (input) => service.createSession({ cwd: input.cwd }),
+    resolveSession: resolveTeamSession,
+    createSession: async (input) => {
+      const session = await service.createSession({ cwd: input.cwd });
+      return {
+        sessionId: session.sessionId,
+        discard: () => service.archiveSession(session.sessionId),
+      };
+    },
     assertDelegationEnabled,
+    sessionOperations: service,
   });
   const agents = new AgentTreeControlService({
     store: eventStore,
@@ -848,14 +929,17 @@ function shortHash(value: string): string {
   return (hash >>> 0).toString(16).padStart(8, "0").slice(0, 8);
 }
 
-function createToolRegistry(skillRegistry: SkillRegistry, bashRunner: BashRunner): InMemoryToolRegistry {
+function createToolRegistry(
+  skillRegistryForCwd: (cwd: string) => Promise<SkillRegistry>,
+  bashRunner: BashRunner,
+): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool({ defaultMaxBytes: CLI_DEFAULT_READ_MAX_BYTES, maxBytesLimit: CLI_READ_MAX_BYTES_LIMIT }));
   registry.register(createReadImageTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
   registry.register(createMemoryTool());
-  registry.register(createActivateSkillTool(skillRegistry));
+  registry.register(createActivateSkillTool((context) => skillRegistryForCwd(context.cwd)));
   registry.register(createEditTool());
   registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());
@@ -875,14 +959,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function createChildToolRegistry(skillRegistry: SkillRegistry, bashRunner?: BashRunner): InMemoryToolRegistry {
+function createChildToolRegistry(
+  skillRegistryForCwd: (cwd: string) => Promise<SkillRegistry>,
+  bashRunner?: BashRunner,
+): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool({ defaultMaxBytes: CLI_DEFAULT_READ_MAX_BYTES, maxBytesLimit: CLI_READ_MAX_BYTES_LIMIT }));
   registry.register(createReadImageTool());
   registry.register(createGlobTool());
   registry.register(createGrepTool());
   registry.register(createMemoryTool());
-  registry.register(createActivateSkillTool(skillRegistry));
+  registry.register(createActivateSkillTool((context) => skillRegistryForCwd(context.cwd)));
   registry.register(createEditTool());
   registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());
@@ -978,6 +1065,7 @@ function createApprovalBroker(
   config: CliConfig,
   approvalState: PolicyApprovalState,
   permissions?: MutableCliPermissionProfileControl,
+  rulesetsForRequest?: CliApprovalRulesetResolver,
 ): PolicyApprovalBroker {
   const sandboxedShell = options.bashRunner === undefined && process.platform === "darwin";
   if (!options.approvalQueue) {
@@ -987,13 +1075,14 @@ function createApprovalBroker(
       ...(options.chiliHome ? { chiliHome: options.chiliHome } : {}),
       sandboxedShell,
       approvalState,
+      ...(rulesetsForRequest ? { rulesetsForRequest } : {}),
     });
     permissions?.register(broker);
     return broker;
   }
 
   let broker: PolicyApprovalBroker;
-  broker = new PolicyApprovalBroker({
+  const brokerOptions: import("@chili/tools").PolicyApprovalBrokerOptions = {
     rulesets: permissions?.rulesets() ?? createCliApprovalRulesets(options.yes ?? false, config, { sandboxedShell }),
     ...(permissions ? { dangerousShellCommands: permissions.dangerousShellCommands() } : {}),
     state: approvalState,
@@ -1015,19 +1104,12 @@ function createApprovalBroker(
     onSessionGrant: async () => {
       await options.approvalQueue?.recheckPending((request) => broker.preflight(request));
     },
-  });
+  };
+  broker = rulesetsForRequest
+    ? createRequestScopedPolicyApprovalBroker({ ...brokerOptions, rulesetsForRequest })
+    : new PolicyApprovalBroker(brokerOptions);
   permissions?.register(broker);
   return broker;
-}
-
-export function linkApprovalSessionsFromEvent(state: PolicyApprovalState, event: EventEnvelope): void {
-  if (event.type !== "agent.task_created" && event.type !== "agent.spawned") return;
-  const { parentSessionId, childSessionId } = event.payload as {
-    parentSessionId?: SessionId;
-    childSessionId?: SessionId;
-  };
-  if (!parentSessionId || !childSessionId) return;
-  state.linkSession(parentSessionId, childSessionId);
 }
 
 export function createSubagentControlController(
@@ -1508,6 +1590,7 @@ export function createTeamToolController(
         taskId: input.taskId as TaskId,
         sessionId: context.sessionId,
       };
+      if (role === "child") updateInput.actorScope = "scoped_worker";
       if (input.status) updateInput.status = input.status;
       if (input.ownerPath) updateInput.ownerPath = input.ownerPath as AgentPath;
       if (input.title) updateInput.title = input.title;

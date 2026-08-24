@@ -48,6 +48,34 @@ test("synthetic provider errors are sanitized before chat presentation", () => {
   expect(JSON.stringify(display)).not.toContain(jwt);
 });
 
+test("synthetic failure checkpoints retain their multiline body in chat presentation", () => {
+  const checkpoint = [
+    "Incomplete partial result saved before the model request failed. This is not a complete answer.",
+    "",
+    "Previously saved assistant progress:",
+    `- ${"retained progress ".repeat(50)}`,
+    "",
+    "Tool activity completed before the failure:",
+    "- read: completed (/repo/src/runtime.ts)",
+    "",
+    "The task remains incomplete. Continue after the model service recovers.",
+  ].join("\n");
+  const display = buildChatDisplayItems([{
+    id: "msg_failure_checkpoint" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [{
+      type: "text",
+      id: "part_failure_checkpoint" as PartId,
+      synthetic: true,
+      text: checkpoint,
+    }],
+  }]);
+
+  expect(display[0]).toMatchObject({ kind: "assistant_text", text: checkpoint });
+});
+
 test("tool activity presentation carries renderer cell fields", () => {
   const display = buildChatDisplayItems([
     chatTool("git_diff_1" as ToolCallId, "git_diff", "completed", "succeeded", { title: "git_diff", detail: "src/example.ts" }, {

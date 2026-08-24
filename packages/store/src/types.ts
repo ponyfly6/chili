@@ -101,6 +101,8 @@ export interface AgentRunRow {
 
 export interface AgentTaskRow {
   id: TaskId;
+  dispatchId?: string;
+  reservedRunId?: AgentRunId;
   path: AgentPath;
   status: AgentTaskStatus;
   taskName: string;
@@ -111,6 +113,7 @@ export interface AgentTaskRow {
   cwd?: string;
   prompt?: string;
   mode?: AgentTaskMode;
+  workerPolicy?: Record<string, unknown>;
   sourceCallId?: ToolCallId;
   batchId?: string;
   batchIndex?: number;
@@ -228,6 +231,8 @@ export interface AgentTaskCompleteCasInput {
   mailboxConsumeEventId?: string;
   sessionId?: SessionId;
   time?: number;
+  /** Optional root-session ownership fence for owner-driven completion. */
+  runClaim?: SessionRunClaimFence;
 }
 
 export interface AgentTaskCloseCasInput {
@@ -259,6 +264,8 @@ export interface AgentTaskCloseCasInput {
   mailboxError?: string;
   sessionId?: SessionId;
   time?: number;
+  /** Optional root-session ownership fence for owner-driven closure. */
+  runClaim?: SessionRunClaimFence;
 }
 
 export interface AgentTaskFinalizationResult {
@@ -277,6 +284,12 @@ export interface AgentTaskBeginRunCasInput {
   leaseOwner: string;
   leaseTtlMs: number;
   spawnEventId: string;
+  /**
+   * Start the immutable run reserved by agent.task_created. This path accepts
+   * only pending generation 0 with no current run or lease, and verifies that
+   * runId matches the stored reservation.
+   */
+  reservedInitial?: boolean;
   sourceMailboxMessageId?: string;
   messageEventId?: string;
   messageClaimEventId?: string;
@@ -448,13 +461,36 @@ export interface TeamMessageDeliveryQuery {
   limit?: number;
 }
 
+/**
+ * A durable runtime claim that must still be owned when a write transaction
+ * commits. This is separate from event.sessionId so descendant actors can keep
+ * their provenance while the root session remains the operation authority.
+ */
+export interface SessionRunClaimFence {
+  sessionId: SessionId;
+  claimId: string;
+}
+
+/** A durable session-creation claim that must still be owned at commit time. */
+export interface SessionCreationClaimFence {
+  sessionId: SessionId;
+  claimId: string;
+}
+
+export interface EventAppendOptions {
+  runClaim?: SessionRunClaimFence;
+  creationClaim?: SessionCreationClaimFence;
+}
+
 export interface TeamTaskClaimInput {
   teamId: TeamId;
   taskId: TaskId;
   ownerPath: AgentPath;
   eventId: string;
   claimedBy?: AgentPath;
+  metadata?: Record<string, unknown>;
   sessionId?: SessionId;
+  runClaim?: SessionRunClaimFence;
   time?: number;
 }
 
@@ -471,6 +507,7 @@ export interface TeamTaskVerificationClaimInput {
   eventId: string;
   metadata: Record<string, unknown>;
   sessionId?: SessionId;
+  runClaim?: SessionRunClaimFence;
   stalePendingBefore?: number;
   time?: number;
 }
@@ -494,6 +531,7 @@ export interface TeamTaskAgentSyncInput {
   taskEventId: string;
   memberEventId: string;
   sessionId?: SessionId;
+  runClaim?: SessionRunClaimFence;
   summary?: string;
   error?: string;
   time?: number;
@@ -506,13 +544,38 @@ export interface TeamTaskAgentSyncResult {
   reason?: "not_found" | "not_in_progress" | "binding_mismatch" | "agent_not_terminal" | "stale";
 }
 
+export interface TeamOwnerSessionBindInput {
+  teamId: TeamId;
+  ownerSessionId: SessionId;
+  eventId: string;
+  runClaim?: SessionRunClaimFence;
+  time?: number;
+}
+
+export interface TeamOwnerSessionBindResult {
+  applied: boolean;
+  ownerSessionId?: SessionId;
+  team?: TeamRow;
+  events: ChiliEvent[];
+  reason?: "not_found" | "team_inactive" | "session_not_found" | "session_inactive" | "subagent_session" | "already_bound" | "conflict";
+}
+
 export interface EventStore {
-  append(event: ChiliEvent): Promise<void>;
-  appendMany(events: readonly ChiliEvent[]): Promise<void>;
+  append(event: ChiliEvent, options?: EventAppendOptions): Promise<void>;
+  appendMany(events: readonly ChiliEvent[], options?: EventAppendOptions): Promise<void>;
   events(query?: EventQuery): Promise<EventEnvelope[]>;
   sessions(): Promise<SessionRow[]>;
   messages(sessionId: SessionId): Promise<Message[]>;
   pendingApprovals(sessionId?: SessionId): Promise<ApprovalRow[]>;
+}
+
+/** Optional append receipts used by wrappers to suppress idempotent no-ops. */
+export interface EventCommitAwareStore {
+  appendCommitted(event: ChiliEvent, options?: EventAppendOptions): Promise<boolean>;
+  appendManyCommitted(
+    events: readonly ChiliEvent[],
+    options?: EventAppendOptions,
+  ): Promise<readonly ChiliEvent[]>;
 }
 
 export interface GoalProjectionStore {
@@ -579,6 +642,10 @@ export interface TeamProjectionStore {
 
 export interface TeamTaskClaimStore {
   claimTeamTask(input: TeamTaskClaimInput): Promise<TeamTaskMutationResult>;
+}
+
+export interface TeamOwnerSessionBindStore {
+  bindTeamOwnerSession(input: TeamOwnerSessionBindInput): Promise<TeamOwnerSessionBindResult>;
 }
 
 export interface TeamTaskVerificationClaimStore {

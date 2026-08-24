@@ -12,7 +12,7 @@ import type {
   TimestampMs,
   TurnId,
 } from "@chili/protocol";
-import type { ApprovalRow, EventQuery, EventStore, SessionRow } from "@chili/store";
+import type { ApprovalRow, EventAppendOptions, EventQuery, EventStore, SessionRow } from "@chili/store";
 import { ObservableEventStore, SqliteEventStore } from "@chili/store";
 import type { AgentRunner, AppendUserMessageInput, CreateSessionInput, RunTurnInput, RunTurnResult } from "./runner.js";
 import {
@@ -1241,6 +1241,501 @@ test("an interrupt during the delegation gate cannot append a ghost spawn", asyn
   expect(store.items.filter((event) => event.type === "agent.completed")).toEqual([]);
 });
 
+test("reserved task creation recovers the exact durable task and rejects identity reuse", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-subagent-reserved-identity-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  let firstRuns = 0;
+  let retryRuns = 0;
+  const reserved = {
+    dispatchId: "dispatch_reserved_identity",
+    taskId: "task_reserved_identity" as never,
+    runId: "agent_reserved_identity" as never,
+    childSessionId: "session_reserved_identity_child" as SessionId,
+    parentSessionId: "session_reserved_identity_parent" as SessionId,
+    parentPath: "/root/worker" as const,
+    cwd: "/repo",
+    taskName: "reserved",
+    prompt: "Perform the frozen work",
+    mode: "one_shot" as const,
+  };
+
+  try {
+    const first = new LocalSubagentManager({
+      store,
+      createId: createSequentialId(),
+      runner: {
+        async run() {
+          firstRuns++;
+          return { status: "completed", summary: "done" };
+        },
+      },
+    });
+    const created = await first.spawnTask(reserved);
+    expect(created).toMatchObject({
+      taskId: reserved.taskId,
+      runId: reserved.runId,
+      childSessionId: reserved.childSessionId,
+      status: "completed",
+    });
+
+    const retry = new LocalSubagentManager({
+      store,
+      createId: createSequentialId(),
+      runner: {
+        async run() {
+          retryRuns++;
+          return { status: "completed", summary: "must not run" };
+        },
+      },
+    });
+    await expect(retry.spawnTask(reserved)).resolves.toMatchObject({
+      taskId: reserved.taskId,
+      runId: reserved.runId,
+      status: "completed",
+      summary: "done",
+    });
+    await expect(retry.spawnTask({ ...reserved, prompt: "Different work" })).rejects.toThrow(
+      "different creation identity",
+    );
+
+    const firstCreation = (await store.events({ type: "agent.task_created" }))[0];
+    if (!firstCreation || firstCreation.type !== "agent.task_created") throw new Error("missing creation event");
+    const creationEvent = firstCreation as Extract<ChiliEvent, { type: "agent.task_created" }>;
+    await expect(store.append({
+      ...creationEvent,
+      id: "event_conflicting_reserved_identity",
+      payload: {
+        ...creationEvent.payload,
+        dispatchId: "dispatch_conflicting_identity",
+        prompt: "Overwrite attempt",
+      },
+    })).rejects.toThrow("different creation identity");
+
+    expect(firstRuns).toBe(1);
+    expect(retryRuns).toBe(0);
+    expect(await store.events({ type: "agent.task_created" })).toHaveLength(1);
+    expect(await store.agentTask(reserved.taskId)).toMatchObject({
+      dispatchId: reserved.dispatchId,
+      reservedRunId: reserved.runId,
+      prompt: reserved.prompt,
+      summary: "done",
+    });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reserved agent.task_created is owner-fenced and fails closed without atomic run claim", async () => {
+  const store = new RecordingMemoryEventStore();
+  const manager = new LocalSubagentManager({
+    store,
+    createId: createSequentialId(),
+    runner: { async run() { return { status: "completed" }; } },
+  });
+  const runClaim = {
+    sessionId: "session_reserved_fence" as SessionId,
+    claimId: "claim_reserved_fence",
+  };
+
+  await expect(manager.spawnTask({
+    dispatchId: "dispatch_reserved_fence",
+    taskId: "task_reserved_fence" as never,
+    runId: "agent_reserved_fence" as never,
+    childSessionId: "session_reserved_fence_child" as SessionId,
+    parentSessionId: runClaim.sessionId,
+    cwd: "/repo",
+    taskName: "fenced",
+    prompt: "fenced creation",
+    runClaim,
+  })).rejects.toThrow("requires atomic run-claim capability");
+
+  expect(store.appends.find((item) => item.event.type === "agent.task_created")?.options).toEqual({ runClaim });
+  expect(store.appends.find((item) => item.event.type === "agent.spawned")).toBeUndefined();
+});
+
+test("repeating a reserved background spawn in one manager returns the active task without scheduling twice", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-subagent-reserved-active-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const completion = deferred<void>();
+  let runs = 0;
+  const manager = new LocalSubagentManager({
+    store,
+    createId: createSequentialId(),
+    runner: {
+      async run() {
+        runs++;
+        await completion.promise;
+        return { status: "completed", summary: "once" };
+      },
+    },
+  });
+  const reserved = {
+    dispatchId: "dispatch_reserved_active",
+    taskId: "task_reserved_active" as never,
+    runId: "agent_reserved_active" as never,
+    childSessionId: "session_reserved_active_child" as SessionId,
+    parentSessionId: "session_reserved_active_parent" as SessionId,
+    cwd: "/repo",
+    taskName: "active",
+    prompt: "run once",
+    mode: "background" as const,
+  };
+
+  try {
+    const first = await manager.spawnTask(reserved);
+    const second = await manager.spawnTask(reserved);
+    expect(first).toMatchObject({ taskId: reserved.taskId, status: "pending" });
+    expect(second).toMatchObject({ taskId: reserved.taskId });
+    await waitUntil(() => runs === 1);
+    expect(runs).toBe(1);
+    expect(await store.events({ type: "agent.task_created" })).toHaveLength(1);
+
+    completion.resolve();
+    await manager.waitForBackgroundTasks();
+    expect(runs).toBe(1);
+    expect(await store.agentTask(reserved.taskId)).toMatchObject({ status: "completed", summary: "once" });
+  } finally {
+    completion.resolve();
+    await manager.waitForBackgroundTasks();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("two managers race to recover a pending reserved task but the durable lease starts only one runner", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-subagent-pending-takeover-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const completion = deferred<void>();
+  const ids = createSequentialId();
+  let runs = 0;
+  const reserved = {
+    dispatchId: "dispatch_pending_takeover",
+    taskId: "task_pending_takeover" as never,
+    runId: "agent_pending_takeover" as never,
+    childSessionId: "session_pending_takeover_child" as SessionId,
+    parentSessionId: "session_pending_takeover_parent" as SessionId,
+    parentPath: "/root" as const,
+    cwd: "/repo",
+    taskName: "pending takeover",
+    prompt: "resume the durable pending task",
+    mode: "one_shot" as const,
+  };
+  const runner = {
+    async run() {
+      runs++;
+      await completion.promise;
+      return { status: "completed" as const, summary: "taken over once" };
+    },
+  };
+
+  try {
+    await store.append({
+      id: "event_seed_pending_takeover",
+      type: "agent.task_created",
+      time: 1 as TimestampMs,
+      sessionId: reserved.parentSessionId,
+      payload: {
+        taskId: reserved.taskId,
+        dispatchId: reserved.dispatchId,
+        reservedRunId: reserved.runId,
+        path: "/root/task_pending_takeover" as never,
+        parentPath: reserved.parentPath,
+        parentSessionId: reserved.parentSessionId,
+        childSessionId: reserved.childSessionId,
+        taskName: reserved.taskName,
+        cwd: reserved.cwd,
+        prompt: reserved.prompt,
+        mode: reserved.mode,
+      },
+    });
+    expect(await store.agentTask(reserved.taskId)).toMatchObject({ status: "pending", generation: 0 });
+
+    const first = new LocalSubagentManager({ store, runner, createId: ids });
+    const second = new LocalSubagentManager({ store, runner, createId: ids });
+    const firstResult = first.spawnTask(reserved);
+    const secondResult = second.spawnTask(reserved);
+    await waitUntil(() => runs === 1);
+    expect(runs).toBe(1);
+
+    completion.resolve();
+    await Promise.all([firstResult, secondResult]);
+    expect(runs).toBe(1);
+    expect(await store.events({ type: "agent.task_created" })).toHaveLength(1);
+    expect(await store.agentTask(reserved.taskId)).toMatchObject({
+      status: "completed",
+      summary: "taken over once",
+    });
+  } finally {
+    completion.resolve();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("two SQLite managers race a fresh reserved identity but create, spawn, and run it only once", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-subagent-fresh-reserved-race-"));
+  const dbPath = join(dir, "events.sqlite");
+  const firstStore = new SqliteEventStore(dbPath);
+  const secondStore = new SqliteEventStore(dbPath);
+  const completion = deferred<void>();
+  const attempts: Array<Promise<unknown>> = [];
+  let runs = 0;
+  let firstIds = 0;
+  let secondIds = 0;
+  const runner = {
+    async run() {
+      runs++;
+      await completion.promise;
+      return { status: "completed" as const, summary: "fresh reservation ran once" };
+    },
+  };
+  const reservation = {
+    dispatchId: "dispatch_fresh_reserved_race",
+    taskId: "task_fresh_reserved_race" as never,
+    runId: "agent_fresh_reserved_race" as never,
+    childSessionId: "session_fresh_reserved_race_child" as SessionId,
+    parentSessionId: "session_fresh_reserved_race_parent" as SessionId,
+    parentPath: "/root" as const,
+    cwd: "/repo",
+    taskName: "fresh reserved race",
+    prompt: "run the fresh reservation exactly once",
+    mode: "one_shot" as const,
+  };
+  const first = new LocalSubagentManager({
+    store: firstStore,
+    runner,
+    createId: (prefix) => `${prefix}_fresh_first_${++firstIds}`,
+  });
+  const second = new LocalSubagentManager({
+    store: secondStore,
+    runner,
+    createId: (prefix) => `${prefix}_fresh_second_${++secondIds}`,
+  });
+
+  try {
+    const firstAttempt = first.spawnTask({
+      ...reservation,
+      workerPolicy: {
+        allowedTools: ["read", "grep"],
+        writeScope: ["/repo/packages"],
+        executeScope: [],
+        metadata: { alpha: 1, nested: { left: true, right: false } },
+      },
+    });
+    const secondAttempt = second.spawnTask({
+      ...reservation,
+      workerPolicy: {
+        metadata: { nested: { right: false, left: true }, alpha: 1 },
+        executeScope: [],
+        writeScope: ["/repo/packages"],
+        allowedTools: ["read", "grep"],
+      },
+    });
+    attempts.push(firstAttempt, secondAttempt);
+
+    await waitUntil(() => runs === 1, 1_000);
+    expect(runs).toBe(1);
+    expect(await firstStore.events({ type: "agent.task_created" })).toHaveLength(1);
+    expect(await firstStore.events({ type: "agent.spawned" })).toHaveLength(1);
+
+    completion.resolve();
+    const results = await Promise.allSettled([firstAttempt, secondAttempt]);
+    expect(results.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+    expect(runs).toBe(1);
+    expect(await firstStore.events({ type: "agent.task_created" })).toHaveLength(1);
+    expect(await firstStore.events({ type: "agent.spawned" })).toHaveLength(1);
+    expect(await firstStore.agentTask(reservation.taskId)).toMatchObject({
+      status: "completed",
+      generation: 1,
+      summary: "fresh reservation ran once",
+    });
+  } finally {
+    completion.resolve();
+    await Promise.allSettled(attempts);
+    firstStore.close();
+    secondStore.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a reserved retry observes a live durable lease without creating, spawning, or running again", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-subagent-live-reserved-retry-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  let runs = 0;
+  const reserved = {
+    dispatchId: "dispatch_live_reserved_retry",
+    taskId: "task_live_reserved_retry" as never,
+    runId: "agent_live_reserved_retry" as never,
+    childSessionId: "session_live_reserved_retry_child" as SessionId,
+    parentSessionId: "session_live_reserved_retry_parent" as SessionId,
+    parentPath: "/root" as const,
+    cwd: "/repo",
+    taskName: "live reserved retry",
+    prompt: "observe the active owner",
+    mode: "one_shot" as const,
+  };
+
+  try {
+    await store.append({
+      id: "event_live_reserved_retry_created",
+      type: "agent.task_created",
+      time: 100 as TimestampMs,
+      sessionId: reserved.parentSessionId,
+      payload: {
+        taskId: reserved.taskId,
+        dispatchId: reserved.dispatchId,
+        reservedRunId: reserved.runId,
+        path: "/root/task_live_reserved_retry" as never,
+        parentPath: reserved.parentPath,
+        parentSessionId: reserved.parentSessionId,
+        childSessionId: reserved.childSessionId,
+        taskName: reserved.taskName,
+        cwd: reserved.cwd,
+        prompt: reserved.prompt,
+        mode: reserved.mode,
+      },
+    });
+    expect((await store.beginAgentTaskRunCas({
+      taskId: reserved.taskId,
+      expectedGeneration: 0,
+      expectedRunId: null,
+      expectedLeaseOwner: null,
+      runId: reserved.runId,
+      generation: 1,
+      leaseOwner: `local:${reserved.runId}`,
+      leaseTtlMs: 1_000,
+      spawnEventId: "event_live_reserved_retry_spawned",
+      reservedInitial: true,
+      sessionId: reserved.parentSessionId,
+      time: 100,
+    })).applied).toBe(true);
+
+    const retry = new LocalSubagentManager({
+      store,
+      now: () => 200 as TimestampMs,
+      createId: createSequentialId(),
+      runner: {
+        async run() {
+          runs++;
+          return { status: "completed", summary: "must not run" };
+        },
+      },
+    });
+    await expect(retry.spawnTask(reserved)).resolves.toMatchObject({
+      taskId: reserved.taskId,
+      runId: reserved.runId,
+      status: "running",
+    });
+
+    expect(runs).toBe(0);
+    expect(await store.events({ type: "agent.task_created" })).toHaveLength(1);
+    expect(await store.events({ type: "agent.spawned" })).toHaveLength(1);
+    expect(await store.agentTask(reserved.taskId)).toMatchObject({
+      status: "running",
+      generation: 1,
+      leaseOwner: `local:${reserved.runId}`,
+      leaseExpiresAt: 1_100,
+    });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reserved retries close expired and missing durable leases without rerunning", async () => {
+  for (const leaseState of ["expired", "missing"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), `chili-subagent-${leaseState}-reserved-retry-`));
+    const store = new SqliteEventStore(join(dir, "events.sqlite"));
+    let runs = 0;
+    const reserved = {
+      dispatchId: `dispatch_${leaseState}_reserved_retry`,
+      taskId: `task_${leaseState}_reserved_retry` as never,
+      runId: `agent_${leaseState}_reserved_retry` as never,
+      childSessionId: `session_${leaseState}_reserved_retry_child` as SessionId,
+      parentSessionId: `session_${leaseState}_reserved_retry_parent` as SessionId,
+      parentPath: "/root" as const,
+      cwd: "/repo",
+      taskName: `${leaseState} reserved retry`,
+      prompt: "close abandoned durable work",
+      mode: "one_shot" as const,
+    };
+
+    try {
+      await store.append({
+        id: `event_${leaseState}_reserved_retry_created`,
+        type: "agent.task_created",
+        time: 100 as TimestampMs,
+        sessionId: reserved.parentSessionId,
+        payload: {
+          taskId: reserved.taskId,
+          dispatchId: reserved.dispatchId,
+          reservedRunId: reserved.runId,
+          path: `/root/${reserved.taskId}` as never,
+          parentPath: reserved.parentPath,
+          parentSessionId: reserved.parentSessionId,
+          childSessionId: reserved.childSessionId,
+          taskName: reserved.taskName,
+          cwd: reserved.cwd,
+          prompt: reserved.prompt,
+          mode: reserved.mode,
+        },
+      });
+      expect((await store.beginAgentTaskRunCas({
+        taskId: reserved.taskId,
+        expectedGeneration: 0,
+        expectedRunId: null,
+        expectedLeaseOwner: null,
+        runId: reserved.runId,
+        generation: 1,
+        leaseOwner: `local:${reserved.runId}`,
+        leaseTtlMs: 10,
+        spawnEventId: `event_${leaseState}_reserved_retry_spawned`,
+        reservedInitial: true,
+        sessionId: reserved.parentSessionId,
+        time: 100,
+      })).applied).toBe(true);
+      if (leaseState === "missing") {
+        expect(await store.releaseAgentTaskLease({
+          taskId: reserved.taskId,
+          owner: `local:${reserved.runId}`,
+          generation: 1,
+          now: 105,
+        })).toBe(true);
+      }
+
+      const retry = new LocalSubagentManager({
+        store,
+        now: () => 200 as TimestampMs,
+        createId: createSequentialId(),
+        runner: {
+          async run() {
+            runs++;
+            return { status: "completed", summary: "must not run" };
+          },
+        },
+      });
+      await expect(retry.spawnTask(reserved)).resolves.toMatchObject({
+        taskId: reserved.taskId,
+        runId: reserved.runId,
+        status: "incomplete",
+      });
+
+      expect(runs).toBe(0);
+      expect(await store.events({ type: "agent.task_created" })).toHaveLength(1);
+      expect(await store.events({ type: "agent.spawned" })).toHaveLength(1);
+      expect(await store.agentTask(reserved.taskId)).toMatchObject({
+        status: "incomplete",
+        generation: 2,
+        error: "reserved_worker_lease_expired",
+      });
+    } finally {
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
 class MemoryEventStore implements EventStore {
   readonly items: ChiliEvent[] = [];
 
@@ -1293,6 +1788,15 @@ class MemoryEventStore implements EventStore {
 
   async pendingApprovals(): Promise<ApprovalRow[]> {
     return [];
+  }
+}
+
+class RecordingMemoryEventStore extends MemoryEventStore {
+  readonly appends: Array<{ event: ChiliEvent; options?: EventAppendOptions }> = [];
+
+  override async append(event: ChiliEvent, options?: EventAppendOptions): Promise<void> {
+    this.appends.push({ event, ...(options ? { options } : {}) });
+    await super.append(event);
   }
 }
 

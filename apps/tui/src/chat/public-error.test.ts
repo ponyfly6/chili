@@ -63,6 +63,53 @@ test("replaces synthetic provider markup before rendering", () => {
   expect(text).not.toContain("DOCTYPE");
 });
 
+test("preserves complete multiline failure checkpoints beyond the status-reason bound", () => {
+  const checkpoint = [
+    "Incomplete partial result saved before the model request failed. This is not a complete answer.",
+    "",
+    "Previously saved assistant progress:",
+    `- ${"safe progress ".repeat(80)}`,
+    "",
+    "Tool activity completed before the failure:",
+    "- read: completed (/repo/src/runtime.ts)",
+    "",
+    "The task remains incomplete. Continue after the model service recovers.",
+  ].join("\n");
+
+  const text = publicSyntheticAssistantText(checkpoint, true);
+
+  expect(text).toBe(checkpoint);
+  expect(text.length).toBeGreaterThan(600);
+  expect(text).toContain("\n\nTool activity completed before the failure:\n");
+  expect(text).toEndWith("The task remains incomplete. Continue after the model service recovers.");
+});
+
+test("redacts credentials and whole unsafe markup items inside failure checkpoints", () => {
+  const checkpoint = [
+    "Incomplete partial result saved before the model request failed. This is not a complete answer.",
+    "",
+    "Previously saved assistant progress:",
+    "- preserved safe progress",
+    "- token=my-private-token from 2001:db8::1",
+    "- <error>private provider payload</error>",
+    "  continuation must also stay hidden",
+    "",
+    "The task remains incomplete. Continue after the model service recovers.",
+  ].join("\n");
+
+  const text = publicSyntheticAssistantText(checkpoint, true);
+
+  expect(text).toContain("\n- preserved safe progress\n");
+  expect(text).toContain("token=[redacted-credential]");
+  expect(text).toContain("[redacted-ip]");
+  expect(text).toContain("- [unsafe markup hidden]");
+  expect(text).toEndWith("The task remains incomplete. Continue after the model service recovers.");
+  expect(text).not.toContain("my-private-token");
+  expect(text).not.toContain("2001:db8::1");
+  expect(text).not.toContain("private provider payload");
+  expect(text).not.toContain("continuation must also stay hidden");
+});
+
 test("does not alter genuine model-authored assistant text", () => {
   const text = "Explain <html> and token=example literally";
   expect(publicSyntheticAssistantText(text, false)).toBe(text);

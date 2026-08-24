@@ -127,6 +127,37 @@ test("command execution loads and caches project commands by authoritative cwd",
   expect(defaultResult.metadata.filePath).toBe(path.join(defaultCwd, ".chili/commands/review.md"));
 });
 
+test("catalog discovery and reload use the requested authoritative workspace", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "chili-command-catalog-scope-home-"));
+  const defaultCwd = await mkdtemp(path.join(tmpdir(), "chili-command-catalog-scope-default-"));
+  const sessionCwd = await mkdtemp(path.join(tmpdir(), "chili-command-catalog-scope-session-"));
+  await mkdir(path.join(defaultCwd, ".chili/commands"), { recursive: true });
+  await mkdir(path.join(sessionCwd, ".chili/commands"), { recursive: true });
+  await writeFile(path.join(defaultCwd, ".chili/commands/default-only.md"), "Default command");
+  await writeFile(path.join(sessionCwd, ".chili/commands/session-only.md"), "Session command v1");
+  const commands = createFilesystemPromptCommandControl({ cwd: defaultCwd, chiliHome: home });
+
+  const defaultCatalog = await commands.list();
+  const sessionCatalog = await commands.list({ cwd: sessionCwd });
+  expect(flatten(defaultCatalog.roots).map((command) => command.id)).toContain("prompt.project.default-only");
+  expect(flatten(defaultCatalog.roots).map((command) => command.id)).not.toContain("prompt.project.session-only");
+  expect(flatten(sessionCatalog.roots).map((command) => command.id)).toContain("prompt.project.session-only");
+  expect(flatten(sessionCatalog.roots).map((command) => command.id)).not.toContain("prompt.project.default-only");
+
+  await writeFile(path.join(sessionCwd, ".chili/commands/after-reload.md"), "Reloaded session command");
+  expect(flatten((await commands.list({ cwd: sessionCwd })).roots).map((command) => command.id))
+    .not.toContain("prompt.project.after-reload");
+  expect(flatten((await commands.reload({ cwd: sessionCwd })).roots).map((command) => command.id))
+    .toContain("prompt.project.after-reload");
+  expect(flatten((await commands.list()).roots).map((command) => command.id))
+    .not.toContain("prompt.project.after-reload");
+
+  await expect(commands.run({ commandId: "prompt.project.session-only" }))
+    .rejects.toBeInstanceOf(PromptCommandNotFoundError);
+  await expect(commands.run({ commandId: "prompt.project.session-only", cwd: sessionCwd }))
+    .resolves.toMatchObject({ prompt: "Session command v1" });
+});
+
 test("filesystem command control preserves builtin prompt metadata", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "chili-command-empty-home-"));
   const cwd = await mkdtemp(path.join(tmpdir(), "chili-command-empty-project-"));

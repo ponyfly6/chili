@@ -21,9 +21,13 @@ import type {
 } from "@chili/protocol";
 
 export interface PromptCommandControl {
-  list(): Promise<RuntimeCommandCatalog>;
-  reload(): Promise<RuntimeCommandCatalog>;
+  list(input?: PromptCommandCatalogInput): Promise<RuntimeCommandCatalog>;
+  reload(input?: PromptCommandCatalogInput): Promise<RuntimeCommandCatalog>;
   run(input: RuntimeCommandInvocation): Promise<PromptCommandRunResult>;
+}
+
+export interface PromptCommandCatalogInput {
+  cwd?: string;
 }
 
 export interface PromptCommandRunResult {
@@ -98,12 +102,14 @@ export function createFilesystemPromptCommandControl(
   };
 
   return {
-    async list() {
-      return cloneCatalog((await ensure(defaultCwd)).snapshot);
+    async list(input = {}) {
+      const cwd = path.resolve(input.cwd ?? defaultCwd);
+      return cloneCatalog((await ensure(cwd)).snapshot);
     },
-    async reload() {
-      cache.clear();
-      return cloneCatalog((await ensure(defaultCwd)).snapshot);
+    async reload(input = {}) {
+      const cwd = path.resolve(input.cwd ?? defaultCwd);
+      cache.delete(cwd);
+      return cloneCatalog((await ensure(cwd)).snapshot);
     },
     async run(input) {
       const cwd = path.resolve(input.cwd ?? defaultCwd);

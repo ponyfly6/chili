@@ -1,6 +1,6 @@
 import type { ChiliEvent, EventEnvelope, SessionId, SnapshotId, TimestampMs } from "@chili/protocol";
 import { timestampNow } from "@chili/protocol";
-import type { EventStore } from "@chili/store";
+import type { EventStore, SessionRow } from "@chili/store";
 import type { SnapshotProvider, SnapshotRevertResult } from "@chili/tools";
 
 export interface SnapshotRecoveryServiceOptions {
@@ -19,11 +19,14 @@ export class SnapshotRecoveryService {
   constructor(private readonly options: SnapshotRecoveryServiceOptions) {}
 
   async revert(input: RevertSnapshotInput): Promise<SnapshotRevertResult> {
-    const session = (await this.options.store.sessions()).find((item) => item.id === input.sessionId);
-    if (!session) throw new Error(`Session not found: ${input.sessionId}`);
+    await this.requireRecoverableSession(input.sessionId);
     if (!(await this.snapshotBelongsToSession(input))) {
       throw new Error(`Snapshot not found for session ${input.sessionId}: ${input.snapshotId}`);
     }
+    // Snapshot lookup may page through a long event history. Re-read the
+    // authoritative session immediately before the filesystem mutation so an
+    // archive or ownership change during that lookup fails closed.
+    const session = await this.requireRecoverableSession(input.sessionId);
 
     try {
       const result = await this.options.snapshotProvider.revert(input.snapshotId, { cwd: session.cwd });
@@ -43,6 +46,18 @@ export class SnapshotRecoveryService {
       });
       throw err;
     }
+  }
+
+  private async requireRecoverableSession(sessionId: SessionId): Promise<SessionRow> {
+    const session = (await this.options.store.sessions()).find((item) => item.id === sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (session.status !== "active") {
+      throw new Error(`Session is not active: ${sessionId} (${session.status})`);
+    }
+    if (session.source === "subagent") {
+      throw new Error(`Snapshot recovery is not allowed for subagent session: ${sessionId}`);
+    }
+    return session;
   }
 
   private async snapshotBelongsToSession(input: RevertSnapshotInput): Promise<boolean> {

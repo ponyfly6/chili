@@ -4,7 +4,7 @@ import path from "node:path";
 import { expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import { act, useState, type Dispatch, type SetStateAction } from "react";
-import { createRuntimeView, type ChatTranscriptItem, type HttpRuntimeClient, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
+import { createRuntimeView, type ChatTranscriptItem, type HttpRuntimeClient, type RuntimeSessionSummary, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
 import type { ApprovalId, ChiliEvent, MessageId, PartId, RuntimeCommandCatalog, RuntimeModelDescriptor, SessionId, TaskId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import type { ClipboardAccess } from "./clipboard.js";
 import { CONVERSATION_INTERRUPTED_NOTICE, CTRL_C_EXIT_CONFIRM_MS, ChatShellApp, ChatShellSurface, isWithinCtrlCExitWindow, type ChatShellExitInfo } from "./ChatShellApp.js";
@@ -193,9 +193,10 @@ test("bang prompt switches the composer into shell mode while typing", async () 
 
 test("resume session submits without creating a new session", async () => {
   const records = chatClientRecords();
-  const client = fakeChatClient(records);
+  const sessionId = "session_resume" as SessionId;
+  const client = fakeChatClient(records, [], { sessions: [runtimeSessionSummary(sessionId)] });
   const app = await mountChatApp(client, {
-    sessionId: "session_resume" as SessionId,
+    sessionId,
   });
 
   try {
@@ -207,9 +208,87 @@ test("resume session submits without creating a new session", async () => {
     expect(records.create).toHaveLength(0);
     expect(records.submit).toHaveLength(1);
     expect(records.submit[0]).toMatchObject({
-      sessionId: "session_resume",
+      sessionId,
       text: "continue",
     });
+    expect(records.sessionLifecycle.slice(0, 2)).toEqual(["list", `events:${sessionId}`]);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+for (const scenario of [
+  {
+    name: "missing",
+    sessionId: "session_missing" as SessionId,
+    sessions: [] as RuntimeSessionSummary[],
+    error: "Saved chat not found: session_missing",
+  },
+  {
+    name: "archived",
+    sessionId: "session_archived" as SessionId,
+    sessions: [runtimeSessionSummary("session_archived" as SessionId, { status: "archived" as const })],
+    error: "Session session_archived is archived and cannot be resumed.",
+  },
+  {
+    name: "subagent",
+    sessionId: "session_subagent" as SessionId,
+    sessions: [runtimeSessionSummary("session_subagent" as SessionId, { source: "subagent" as const })],
+    error: "Session session_subagent belongs to a subagent and cannot be resumed directly.",
+  },
+] as const) {
+  test(`exact resume rejects a ${scenario.name} session before hydration`, async () => {
+    const records = chatClientRecords();
+    const client = fakeChatClient(records, [], { sessions: scenario.sessions });
+    const app = await mountChatApp(client, { sessionId: scenario.sessionId });
+
+    try {
+      await Bun.sleep(80);
+      await app.renderOnce();
+
+      expect(records.listSessions).toHaveLength(1);
+      expect(records.sessionEvents).toHaveLength(0);
+      expect(records.create).toHaveLength(0);
+      expect(records.submit).toHaveLength(0);
+      expect(app.captureCharFrame()).toContain(scenario.error);
+
+      await typeText(app, "start a safe replacement chat");
+      await press(app, () => app.mockInput.pressEnter());
+      await Bun.sleep(80);
+      await app.renderOnce();
+
+      expect(records.create).toHaveLength(1);
+      expect(records.submit[0]).toMatchObject({
+        sessionId: "session_created",
+        text: "start a safe replacement chat",
+      });
+    } finally {
+      app.renderer.destroy();
+    }
+  });
+}
+
+test("manual resume revalidates the selected session before hydration", async () => {
+  const records = chatClientRecords();
+  const sessionId = "session_became_archived" as SessionId;
+  const active = runtimeSessionSummary(sessionId, { title: "About to archive" });
+  const archived = { ...active, status: "archived" as const };
+  const client = fakeChatClient(records, [], {
+    sessionLists: [[active], [archived]],
+  });
+  const app = await mountChatApp(client);
+
+  try {
+    await typeText(app, `/session resume ${sessionId}`);
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(records.listSessions).toHaveLength(2);
+    expect(records.sessionEvents).toHaveLength(0);
+    expect(records.create).toHaveLength(0);
+    expect(records.submit).toHaveLength(0);
+    expect(app.captureCharFrame()).toContain(`Session ${sessionId} is archived and cannot be resumed.`);
   } finally {
     app.renderer.destroy();
   }
@@ -315,11 +394,45 @@ test("resumed runtime commands submit canonical commandId without a thread field
   }
 });
 
+test("active sessions scope command catalog discovery and reload without a client cwd", async () => {
+  const records = chatClientRecords();
+  const sessionId = "session_command_catalog" as SessionId;
+  const client = fakeChatClient(records, [{
+    id: "event_command_catalog_session",
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd: "/server/catalog-workspace" },
+  }]);
+  const app = await mountChatApp(client, { sessionId });
+
+  try {
+    await Bun.sleep(80);
+    await app.renderOnce();
+    expect(records.listCommands.length).toBeGreaterThan(0);
+    expect(records.listCommands.some((input) => input.sessionId === sessionId)).toBe(true);
+    expect(records.listCommands.at(-1)).toMatchObject({ sessionId });
+    expect(records.listCommands.every((input) => !("cwd" in input))).toBe(true);
+
+    await typeText(app, "/commands reload");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(records.reloadCommands).toHaveLength(1);
+    expect(records.reloadCommands[0]).toMatchObject({ sessionId });
+    expect(records.reloadCommands[0]).not.toHaveProperty("cwd");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("resumed chat keeps the stream global so /session resume can switch sessions", async () => {
   const records = chatClientRecords();
-  const client = fakeChatClient(records);
+  const sessionId = "session_resume" as SessionId;
+  const client = fakeChatClient(records, [], { sessions: [runtimeSessionSummary(sessionId)] });
   const app = await mountChatApp(client, {
-    sessionId: "session_resume" as SessionId,
+    sessionId,
   });
 
   try {
@@ -334,9 +447,10 @@ test("resumed chat keeps the stream global so /session resume can switch session
 
 test("resume session with empty history still submits without creating a new session", async () => {
   const records = chatClientRecords();
-  const client = fakeChatClient(records);
+  const sessionId = "session_resume_empty_history" as SessionId;
+  const client = fakeChatClient(records, [], { sessions: [runtimeSessionSummary(sessionId)] });
   const app = await mountChatApp(client, {
-    sessionId: "session_resume_empty_history" as SessionId,
+    sessionId,
   });
 
   try {
@@ -348,7 +462,7 @@ test("resume session with empty history still submits without creating a new ses
     expect(records.create).toHaveLength(0);
     expect(records.submit).toHaveLength(1);
     expect(records.submit[0]).toMatchObject({
-      sessionId: "session_resume_empty_history",
+      sessionId,
       text: "continue",
     });
   } finally {
@@ -966,6 +1080,24 @@ test("Enter executes the selected slash completion without Tab", async () => {
   }
 });
 
+test("Enter completes a required-argument leaf and waits for its argument", async () => {
+  const app = await mountShell(teamLiveFixture());
+
+  try {
+    await typeText(app, "/model ");
+    expect(app.captureCharFrame()).toContain("> /model select <provider/model>");
+
+    await press(app, () => app.mockInput.pressEnter());
+    const frame = app.captureCharFrame();
+
+    expect(frame).toContain("/model select ");
+    expect(frame).not.toContain("Incomplete command");
+    expect(frame).not.toContain("Choose a model");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("slash completion keeps the input visible in a short frame", async () => {
   const app = await mountShell(teamLiveFixture(), {
     width: 72,
@@ -1535,6 +1667,27 @@ test("/skills inserts $ and opens the skill picker", async () => {
   }
 });
 
+test("/skills browse inserts $ and opens the skill picker", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    skills: [skillSummary("reviewer")],
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "/skills browse");
+    await press(app, () => app.mockInput.pressEnter());
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("> $");
+    expect(frame).toContain("Skills");
+    expect(frame).toContain("$reviewer");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("/thinking traces hide and show toggle reasoning visibility", async () => {
   const callId = "call_reasoning_toggle" as ToolCallId;
   const app = await mountShell(teamLiveFixture(), {
@@ -1669,6 +1822,28 @@ test("leading slash absolute paths submit as normal prompts", async () => {
   }
 });
 
+test("probable command typos show suggestions and never submit as prompts", async () => {
+  const submitted: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async (text) => {
+        submitted.push(text);
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/sesion list");
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(submitted).toEqual([]);
+    expect(app.captureCharFrame()).toContain("Did you mean /session?");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("command palette selection uses Up and Down without switching prompt history", async () => {
   const app = await mountShell(teamLiveFixture(), {
     runtime: {
@@ -1715,6 +1890,45 @@ test("command palette keeps the draft visible without entering prompt history", 
   }
 });
 
+test("/help opens the same searchable command browser", async () => {
+  const app = await mountShell(teamLiveFixture());
+
+  try {
+    await typeText(app, "/help");
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(app.captureCharFrame()).toContain("Command Palette · type to search");
+    expect(app.captureCharFrame()).toContain("/model select <provider/model>");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("command palette edits its query and preserves the composer draft", async () => {
+  const app = await mountShell(teamLiveFixture());
+
+  try {
+    await typeText(app, "draft stays here");
+    await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
+    await typeText(app, "diagnostics");
+
+    let frame = app.captureCharFrame();
+    expect(frame).toContain("Command Palette · diagnostics");
+    expect(frame).toContain("> /commands diagnostics — Show command loading errors and conflicts");
+    expect(frame).toContain("draft stays here");
+
+    await press(app, () => app.mockInput.pressBackspace());
+    expect(app.captureCharFrame()).toContain("Command Palette · diagnostic");
+    await press(app, () => app.mockInput.pressKey("u", { ctrl: true }));
+    expect(app.captureCharFrame()).toContain("Command Palette · type to search");
+
+    await press(app, () => app.mockInput.pressEscape());
+    expect(app.captureCharFrame()).toContain("draft stays here");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("command palette Tab drills down while Enter executes the selected command", async () => {
   const app = await mountShell(teamLiveFixture());
 
@@ -1736,6 +1950,25 @@ test("command palette Tab drills down while Enter executes the selected command"
     frame = app.captureCharFrame();
     expect(frame).toContain("Chili Team Live");
     expect(frame).not.toContain("Command Palette");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("command palette Enter completes required arguments without executing", async () => {
+  const app = await mountShell(teamLiveFixture());
+
+  try {
+    await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
+    await typeText(app, "model select");
+    expect(app.captureCharFrame()).toContain("> /model select <provider/model>");
+
+    await press(app, () => app.mockInput.pressEnter());
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("/model select ");
+    expect(frame).not.toContain("Command Palette");
+    expect(frame).not.toContain("Incomplete command");
+    expect(frame).not.toContain("Choose a model");
   } finally {
     app.renderer.destroy();
   }
@@ -4714,6 +4947,9 @@ async function backspace(app: TestRenderHarness, count: number): Promise<void> {
 
 function chatClientRecords(): {
   create: Array<Record<string, unknown>>;
+  sessionEvents: Array<Record<string, unknown>>;
+  listSessions: Array<Record<string, unknown>>;
+  sessionLifecycle: string[];
   submit: Array<Record<string, unknown>>;
   interrupt: Array<Record<string, unknown>>;
   approve: Array<Record<string, unknown>>;
@@ -4722,10 +4958,15 @@ function chatClientRecords(): {
   getModel: Array<Record<string, unknown>>;
   setModel: Array<Record<string, unknown>>;
   setReasoning: Array<Record<string, unknown>>;
+  listCommands: Array<Record<string, unknown>>;
+  reloadCommands: Array<Record<string, unknown>>;
   stream: Array<Record<string, unknown>>;
 } {
   return {
     create: [],
+    sessionEvents: [],
+    listSessions: [],
+    sessionLifecycle: [],
     submit: [],
     interrupt: [],
     approve: [],
@@ -4734,6 +4975,8 @@ function chatClientRecords(): {
     getModel: [],
     setModel: [],
     setReasoning: [],
+    listCommands: [],
+    reloadCommands: [],
     stream: [],
   };
 }
@@ -4751,10 +4994,13 @@ function fakeChatClient(
     setModelError?: Error;
     setReasoningError?: Error;
     commandCatalog?: RuntimeCommandCatalog;
+    sessions?: readonly RuntimeSessionSummary[];
+    sessionLists?: readonly (readonly RuntimeSessionSummary[])[];
   } = {},
 ): HttpRuntimeClient {
   let currentModelSelection = options.modelSelection;
   let currentReasoningLevel = options.reasoningLevel;
+  const discoveredSessions = sessionSummariesFromEvents(events);
   const client = {
     listModels: async (input: Record<string, unknown> = {}) => {
       records.listModels.push(input);
@@ -4802,8 +5048,20 @@ function fakeChatClient(
       const suffix = index === 1 ? "" : `_${index}`;
       return { sessionId: `session_created${suffix}` as SessionId };
     },
-    sessionEvents: async (input: Record<string, unknown>) => events.filter((event) => event.sessionId === input.sessionId),
-    listSessions: async () => [],
+    sessionEvents: async (input: Record<string, unknown>) => {
+      records.sessionEvents.push(input);
+      records.sessionLifecycle.push(`events:${String(input.sessionId)}`);
+      return events.filter((event) => event.sessionId === input.sessionId);
+    },
+    listSessions: async () => {
+      const callIndex = records.listSessions.length;
+      records.listSessions.push({});
+      records.sessionLifecycle.push("list");
+      const configured = options.sessionLists?.[callIndex]
+        ?? options.sessions
+        ?? discoveredSessions;
+      return [...configured];
+    },
     renameSession: async (input: Record<string, unknown>) => ({
       id: input.sessionId as SessionId,
       cwd: "/repo/chili",
@@ -4821,8 +5079,19 @@ function fakeChatClient(
       return { status: "accepted", sessionId: input.sessionId as SessionId };
     },
     submitPrompt: async () => ({ status: "completed", turns: [] }),
-    listCommands: async () => options.commandCatalog ?? ({ roots: [], diagnostics: [] }),
-    reloadCommands: async () => options.commandCatalog ?? ({ roots: [], diagnostics: [] }),
+    listCommands: async (input: Record<string, unknown> = {}) => {
+      records.listCommands.push(input);
+      return options.commandCatalog ?? ({ roots: [], diagnostics: [] });
+    },
+    reloadCommands: async (input: Record<string, unknown> = {}) => {
+      records.reloadCommands.push(input);
+      return options.commandCatalog ?? ({ roots: [], diagnostics: [] });
+    },
+    getPermissionConfig: async () => ({ profile: "default" as const, profiles: [] }),
+    mcpStatus: async () => ({
+      servers: [],
+      summary: { total: 0, running: 0, disabled: 0, authRequired: 0, errored: 0 },
+    }),
     interruptSession: async (input: Record<string, unknown>) => {
       records.interrupt.push(input);
       return { interrupted: true };
@@ -4874,6 +5143,37 @@ function fakeChatClient(
     }),
   };
   return client as unknown as HttpRuntimeClient;
+}
+
+function sessionSummariesFromEvents(events: readonly ChiliEvent[]): RuntimeSessionSummary[] {
+  const sessions = new Map<SessionId, RuntimeSessionSummary>();
+  for (const event of events) {
+    if (event.type !== "session.created") continue;
+    sessions.set(event.payload.sessionId, {
+      id: event.payload.sessionId,
+      cwd: event.payload.cwd,
+      source: "interactive",
+      status: "active",
+      createdAt: Number(event.time),
+      updatedAt: Number(event.time),
+    });
+  }
+  return [...sessions.values()];
+}
+
+function runtimeSessionSummary(
+  id: SessionId,
+  overrides: Partial<Omit<RuntimeSessionSummary, "id">> = {},
+): RuntimeSessionSummary {
+  return {
+    id,
+    cwd: "/repo/chili",
+    source: "interactive",
+    status: "active",
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
+  };
 }
 
 function approvalEvents(sessionId: SessionId, approvalId: ApprovalId): ChiliEvent[] {

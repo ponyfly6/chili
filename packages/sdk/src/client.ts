@@ -219,27 +219,33 @@ export interface ClearGoalResult {
 }
 
 export interface ListCommandsRequest {
+  sessionId?: SessionId;
   signal?: AbortSignal;
 }
 
 export interface ReloadCommandsRequest {
+  sessionId?: SessionId;
   signal?: AbortSignal;
 }
 
 export interface ListMcpServersRequest {
+  sessionId?: SessionId;
   signal?: AbortSignal;
 }
 
 export interface McpStatusRequest {
+  sessionId?: SessionId;
   signal?: AbortSignal;
 }
 
 export interface McpServerRequest {
   server: string;
+  sessionId?: SessionId;
   signal?: AbortSignal;
 }
 
 export interface ReloadMcpRequest {
+  sessionId?: SessionId;
   signal?: AbortSignal;
 }
 
@@ -254,6 +260,7 @@ export interface RemoveMcpServerRequest {
 
 export interface ListMcpToolsRequest {
   server: string;
+  sessionId?: SessionId;
   signal?: AbortSignal;
 }
 
@@ -899,6 +906,7 @@ export interface CloseTaskRequest {
 }
 
 export interface ReconcileStaleTasksRequest {
+  parentSessionId?: SessionId;
   staleAfterMs?: number;
   modes?: AgentTaskMode[];
   limit?: number;
@@ -1019,27 +1027,33 @@ export class HttpRuntimeClient implements RuntimeClient {
   }
 
   listCommands(input: ListCommandsRequest = {}): Promise<RuntimeCommandCatalog> {
-    return this.get("commands", input.signal);
+    const path = input.sessionId === undefined
+      ? "commands"
+      : `sessions/${encodeURIComponent(commandCatalogSessionId(input.sessionId))}/commands`;
+    return this.get(path, input.signal);
   }
 
   reloadCommands(input: ReloadCommandsRequest = {}): Promise<RuntimeCommandCatalog> {
-    return this.post("commands/reload", {}, input.signal);
+    const path = input.sessionId === undefined
+      ? "commands/reload"
+      : `sessions/${encodeURIComponent(commandCatalogSessionId(input.sessionId))}/commands/reload`;
+    return this.post(path, {}, input.signal);
   }
 
   listMcpServers(input: ListMcpServersRequest = {}): Promise<RuntimeMcpListResponse> {
-    return this.get("mcp", input.signal);
+    return this.get(sessionScopedRequestPath("mcp", input.sessionId), input.signal);
   }
 
   mcpStatus(input: McpStatusRequest = {}): Promise<RuntimeMcpStatusResponse> {
-    return this.get("mcp/status", input.signal);
+    return this.get(sessionScopedRequestPath("mcp/status", input.sessionId), input.signal);
   }
 
   mcpServer(input: McpServerRequest): Promise<RuntimeMcpServerDescriptor> {
-    return this.get(`mcp/${encodeURIComponent(input.server)}`, input.signal);
+    return this.get(sessionScopedRequestPath(`mcp/${encodeURIComponent(input.server)}`, input.sessionId), input.signal);
   }
 
   reloadMcp(input: ReloadMcpRequest = {}): Promise<RuntimeMcpReloadResponse> {
-    return this.post("mcp/reload", {}, input.signal);
+    return this.post(sessionScopedRequestPath("mcp/reload", input.sessionId), {}, input.signal);
   }
 
   addMcpServer(input: AddMcpServerRequest): Promise<RuntimeMcpServerDescriptor> {
@@ -1052,7 +1066,7 @@ export class HttpRuntimeClient implements RuntimeClient {
   }
 
   listMcpTools(input: ListMcpToolsRequest): Promise<RuntimeMcpToolsResponse> {
-    return this.get(`mcp/${encodeURIComponent(input.server)}/tools`, input.signal);
+    return this.get(sessionScopedRequestPath(`mcp/${encodeURIComponent(input.server)}/tools`, input.sessionId), input.signal);
   }
 
   authMcpServer(input: AuthMcpServerRequest): Promise<RuntimeMcpAuthResponse> {
@@ -1379,6 +1393,21 @@ export class HttpRuntimeClient implements RuntimeClient {
   private url(path: string): URL {
     return new URL(path.replace(/^\/+/, ""), this.baseUrl);
   }
+}
+
+function commandCatalogSessionId(value: unknown): SessionId {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new TypeError("sessionId must be a non-empty string when provided");
+  }
+  const sessionId = value.trim();
+  if (sessionId.length > 512) throw new TypeError("sessionId must not exceed 512 characters");
+  if (/[\u0000-\u001f\u007f]/u.test(sessionId)) throw new TypeError("sessionId must be valid text");
+  return sessionId as SessionId;
+}
+
+function sessionScopedRequestPath(path: string, sessionId: SessionId | undefined): string {
+  if (sessionId === undefined) return path;
+  return `${path}?sessionId=${encodeURIComponent(commandCatalogSessionId(sessionId))}`;
 }
 
 function approvalDecisionForApproveRequest(input: ApproveApprovalRequest): ApprovalDecisionAction {

@@ -1,11 +1,12 @@
-import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { access, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import { projectStdioServerRequiresApproval } from "@chili/core";
 import {
   createCommandRunInput,
   createCommandRegistry,
   createMcpPromptCommands,
   serializeCommandCatalog,
+  type CommandContext,
   type CommandDefinition,
   type McpPromptDefinition,
   type McpPromptController,
@@ -45,7 +46,13 @@ import type {
   TimestampMs,
 } from "@chili/protocol";
 import type { RuntimeMcpControlService } from "@chili/server";
-import type { McpResourceReadResult, McpResourceSummary, McpResourcesController, MutableToolRegistry } from "@chili/tools";
+import type {
+  McpResourceReadResult,
+  McpResourceSummary,
+  McpResourcesController,
+  McpToolControllerContext,
+  MutableToolRegistry,
+} from "@chili/tools";
 import type { PromptCommandControl, PromptCommandRunResult } from "@chili/server";
 
 export interface CliMcpRuntimeOptions {
@@ -72,20 +79,34 @@ interface LoadedMcpConfig {
   errors: RuntimeMcpReloadError[];
 }
 
+interface McpScopeInput {
+  cwd?: string;
+}
+
+interface McpManagerScope {
+  kind: "user" | "project";
+  cwd?: string;
+  manager: McpClientManager;
+  diagnostics: McpDiagnostic[];
+  loadErrors: RuntimeMcpReloadError[];
+  active: boolean;
+}
+
+interface McpScopeView {
+  user: McpManagerScope;
+  project?: McpManagerScope;
+}
+
 class CliMcpRuntimeImpl implements CliMcpRuntime, RuntimeMcpControlService, McpResourcesController, McpPromptController {
-  private manager: McpClientManager;
-  private diagnostics: McpDiagnostic[] = [];
-  private loadErrors: RuntimeMcpReloadError[] = [];
-  private registeredToolSources = new Set<string>();
-  private generation = 0;
+  private userScope: McpManagerScope | undefined;
+  private readonly projectScopes = new Map<string, Promise<McpManagerScope>>();
   private closed = false;
+  private connectMode: "eager" | "background" | "manual" = "eager";
 
   constructor(
     private readonly options: CliMcpRuntimeOptions,
     private readonly baseCommands: PromptCommandControl,
-  ) {
-    this.manager = this.createManager({ servers: {} }, []);
-  }
+  ) {}
 
   get control(): RuntimeMcpControlService {
     return this;
@@ -105,38 +126,52 @@ class CliMcpRuntimeImpl implements CliMcpRuntime, RuntimeMcpControlService, McpR
 
   async start(): Promise<void> {
     this.closed = false;
-    const loaded = await loadMcpConfig(this.options.cwd, this.options.chiliHome);
-    const connectMode = this.options.connectMode ?? (this.options.deferConnect === true ? "background" : "eager");
-    await this.applyLoadedConfig(loaded, { connectMode });
+    this.connectMode = this.options.connectMode ?? (this.options.deferConnect === true ? "background" : "eager");
+    await this.reloadUserScope();
+    this.registerMcpToolProviders();
   }
 
   async close(): Promise<void> {
     this.closed = true;
-    this.generation += 1;
-    await this.manager.disconnect();
+    const userScope = this.userScope;
+    this.userScope = undefined;
+    const projectScopes = [...this.projectScopes.values()];
+    this.projectScopes.clear();
+    if (userScope) userScope.active = false;
+    this.unregisterMcpToolProviders();
+    await Promise.allSettled([
+      ...(userScope ? [userScope.manager.disconnect()] : []),
+      ...projectScopes.map(async (pending) => {
+        const scope = await pending;
+        scope.active = false;
+        await scope.manager.disconnect();
+      }),
+    ]);
   }
 
-  async list(): Promise<RuntimeMcpListResponse> {
-    return { servers: this.manager.listStates().map(toRuntimeServerDescriptor) };
+  async list(input: McpScopeInput = {}): Promise<RuntimeMcpListResponse> {
+    const view = await this.scopeView(input.cwd);
+    return { servers: scopedStates(view).map(toRuntimeServerDescriptor) };
   }
 
-  async status(): Promise<RuntimeMcpStatusResponse> {
-    const servers = (await this.list()).servers;
+  async status(input: McpScopeInput = {}): Promise<RuntimeMcpStatusResponse> {
+    const servers = (await this.list(input)).servers;
     return { servers, summary: mcpSummary(servers) };
   }
 
-  async get(server: string): Promise<RuntimeMcpServerDescriptor | undefined> {
-    const state = this.manager.getState(server);
+  async get(server: string, input: McpScopeInput = {}): Promise<RuntimeMcpServerDescriptor | undefined> {
+    const state = scopedState(await this.scopeView(input.cwd), server);
     return state ? toRuntimeServerDescriptor(state) : undefined;
   }
 
-  async reload(): Promise<RuntimeMcpReloadResponse> {
-    const loaded = await loadMcpConfig(this.options.cwd, this.options.chiliHome);
-    await this.applyLoadedConfig(loaded);
+  async reload(input: McpScopeInput = {}): Promise<RuntimeMcpReloadResponse> {
+    await this.reloadUserScope();
+    await this.invalidateProjectScopes();
+    const view = await this.scopeView(input.cwd);
     return {
       reloaded: true,
-      servers: (await this.list()).servers,
-      errors: [...this.loadErrors],
+      servers: scopedStates(view).map(toRuntimeServerDescriptor),
+      errors: scopedLoadErrors(view),
     };
   }
 
@@ -154,8 +189,8 @@ class CliMcpRuntimeImpl implements CliMcpRuntime, RuntimeMcpControlService, McpR
     return { server, removed };
   }
 
-  async tools(server: string): Promise<RuntimeMcpToolsResponse> {
-    const state = this.manager.getState(server);
+  async tools(server: string, input: McpScopeInput = {}): Promise<RuntimeMcpToolsResponse> {
+    const state = scopedState(await this.scopeView(input.cwd), server);
     if (!state) throw new Error(`MCP server not found: ${server}`);
     return {
       server,
@@ -180,14 +215,22 @@ class CliMcpRuntimeImpl implements CliMcpRuntime, RuntimeMcpControlService, McpR
     return Promise.resolve({ server, loggedOut: false });
   }
 
-  listResources(input: { serverName?: string }): readonly McpResourceSummary[] {
-    return this.manager.listResources()
+  async listResources(
+    input: { serverName?: string },
+    context: McpToolControllerContext,
+  ): Promise<readonly McpResourceSummary[]> {
+    return scopedResources(await this.scopeView(context.cwd))
       .filter((resource) => input.serverName ? resource.server.name === input.serverName : true)
       .map(toResourceSummary);
   }
 
-  async readResource(input: { serverName: string; uri: string }): Promise<McpResourceReadResult> {
-    const result = await this.manager.readResource(input.serverName, input.uri);
+  async readResource(
+    input: { serverName: string; uri: string },
+    context: McpToolControllerContext,
+  ): Promise<McpResourceReadResult> {
+    const manager = scopedManagerForServer(await this.scopeView(context.cwd), input.serverName);
+    if (!manager) throw new Error(`MCP server not found: ${input.serverName}`);
+    const result = await manager.readResource(input.serverName, input.uri, context.signal);
     const content = firstResourceContent(result, input.uri);
     return {
       serverName: input.serverName,
@@ -198,8 +241,10 @@ class CliMcpRuntimeImpl implements CliMcpRuntime, RuntimeMcpControlService, McpR
     };
   }
 
-  async renderPrompt(request: McpPromptRenderRequest): Promise<McpPromptRenderResult> {
-    const result = await this.manager.getPrompt(request.serverName, request.promptName, request.arguments);
+  async renderPrompt(request: McpPromptRenderRequest, context: CommandContext): Promise<McpPromptRenderResult> {
+    const manager = scopedManagerForServer(await this.scopeView(context.cwd), request.serverName);
+    if (!manager) throw new Error(`MCP server not found: ${request.serverName}`);
+    const result = await manager.getPrompt(request.serverName, request.promptName, request.arguments);
     return {
       messages: result.messages.map((message) => ({
         role: message.role,
@@ -212,107 +257,160 @@ class CliMcpRuntimeImpl implements CliMcpRuntime, RuntimeMcpControlService, McpR
     };
   }
 
-  promptCommands(): CommandDefinition[] {
-    return createMcpPromptCommands(this.manager.listPrompts().map(toPromptDefinition), this);
+  async promptCommands(cwd?: string): Promise<CommandDefinition[]> {
+    const prompts = scopedPrompts(await this.scopeView(cwd));
+    return createMcpPromptCommands(prompts.map(toPromptDefinition), this);
   }
 
-  private async applyLoadedConfig(
-    loaded: LoadedMcpConfig,
-    options: { connectMode?: "eager" | "background" | "manual" } = {},
-  ): Promise<void> {
-    await this.manager.disconnect();
-    this.diagnostics = loaded.diagnostics;
-    this.loadErrors = loaded.errors;
-    const generation = this.generation + 1;
-    this.generation = generation;
-    this.manager = this.createManager(loaded.config, loaded.diagnostics, generation);
-    const connectMode = options.connectMode ?? "eager";
-    if (connectMode === "manual") {
-      this.registerAllMcpTools();
-      return;
+  private async reloadUserScope(): Promise<void> {
+    const previous = this.userScope;
+    if (previous) {
+      previous.active = false;
+      await previous.manager.disconnect();
     }
-    if (connectMode === "background") {
-      this.registerAllMcpTools();
-      this.connectManagerInBackground(this.manager, generation);
-      return;
+    this.userScope = await this.createScope("user", await loadUserMcpConfig(this.options.chiliHome));
+  }
+
+  private async invalidateProjectScopes(): Promise<void> {
+    const scopes = [...this.projectScopes.values()];
+    this.projectScopes.clear();
+    await Promise.allSettled(scopes.map(async (pending) => {
+      const scope = await pending;
+      scope.active = false;
+      await scope.manager.disconnect();
+    }));
+  }
+
+  private async scopeView(cwd?: string): Promise<McpScopeView> {
+    const user = this.requireUserScope();
+    if (cwd === undefined) return { user };
+    return { user, project: await this.projectScope(cwd) };
+  }
+
+  private async projectScope(cwd: string): Promise<McpManagerScope> {
+    const canonicalCwd = await canonicalMcpWorkspace(cwd);
+    const existing = this.projectScopes.get(canonicalCwd);
+    if (existing) return existing;
+    const pending = loadProjectMcpConfig(canonicalCwd, this.options.chiliHome)
+      .then((loaded) => this.createScope("project", loaded, canonicalCwd));
+    this.projectScopes.set(canonicalCwd, pending);
+    void pending.catch(() => {
+      if (this.projectScopes.get(canonicalCwd) === pending) this.projectScopes.delete(canonicalCwd);
+    });
+    return pending;
+  }
+
+  private requireUserScope(): McpManagerScope {
+    if (!this.userScope) throw new Error("MCP runtime is not started");
+    return this.userScope;
+  }
+
+  private async createScope(
+    kind: McpManagerScope["kind"],
+    loaded: LoadedMcpConfig,
+    cwd?: string,
+  ): Promise<McpManagerScope> {
+    const scope = {
+      kind,
+      ...(cwd ? { cwd } : {}),
+      manager: undefined as unknown as McpClientManager,
+      diagnostics: [...loaded.diagnostics],
+      loadErrors: [...loaded.errors, ...loaded.diagnostics.map(diagnosticError)],
+      active: true,
+    } satisfies McpManagerScope;
+    scope.manager = this.createManager(scope, loaded.config);
+    if (kind === "user") {
+      for (const diagnostic of loaded.diagnostics) this.publishDiagnostic(diagnostic);
+    }
+
+    if (this.connectMode === "manual") {
+      if (kind === "user") this.publishUserScopeSnapshot(scope);
+      return scope;
+    }
+    if (this.connectMode === "background") {
+      if (kind === "user") this.publishUserScopeSnapshot(scope);
+      this.connectManagerInBackground(scope);
+      return scope;
     }
     try {
-      await this.manager.connect();
+      await scope.manager.connect();
     } finally {
-      this.registerAllMcpTools();
+      if (kind === "user") this.publishUserScopeSnapshot(scope);
     }
+    return scope;
   }
 
-  private connectManagerInBackground(manager: McpClientManager, generation: number): void {
-    void manager.connect()
+  private connectManagerInBackground(scope: McpManagerScope): void {
+    void scope.manager.connect()
       .catch((error: unknown) => {
-        if (generation !== this.generation || this.closed) return;
-        this.loadErrors = [...this.loadErrors, { message: errorMessage(error) }];
+        if (!scope.active || this.closed) return;
+        scope.loadErrors = [...scope.loadErrors, { message: errorMessage(error) }];
       })
       .finally(() => {
-        if (generation !== this.generation || this.closed || this.manager !== manager) {
-          void manager.disconnect().catch(() => undefined);
+        if (!scope.active || this.closed) {
+          void scope.manager.disconnect().catch(() => undefined);
           return;
         }
-        this.registerAllMcpTools();
+        if (scope.kind === "user") this.publishUserScopeSnapshot(scope);
       });
   }
 
-  private createManager(config: McpConfig, diagnostics: readonly McpDiagnostic[], generation = this.generation): McpClientManager {
+  private createManager(scope: McpManagerScope, config: McpConfig): McpClientManager {
     return new McpClientManager({
       config,
-      diagnostics,
       createClient: (server) => createSdkMcpClient(server),
       onDiagnostic: (diagnostic) => {
-        this.diagnostics = [...this.diagnostics, diagnostic];
-        this.loadErrors = [...this.loadErrors, diagnosticError(diagnostic)];
-        this.publish("mcp.diagnostic", {
-          serverName: diagnostic.path.startsWith("servers.") ? diagnostic.path.slice("servers.".length) : "unknown",
-          level: diagnostic.severity,
-          message: diagnostic.message,
-          code: diagnostic.code,
-          source: diagnostic.source,
-        });
+        if (!scope.active) return;
+        scope.diagnostics = [...scope.diagnostics, diagnostic];
+        scope.loadErrors = [...scope.loadErrors, diagnosticError(diagnostic)];
+        if (scope.kind === "user") this.publishDiagnostic(diagnostic);
       },
       onToolsChanged: (event) => {
-        if (generation !== this.generation) return;
-        this.registerServerTools(event.server, event.tools.map((tool) => tool.tool));
+        if (!scope.active || scope.kind !== "user") return;
+        this.publishServerTools(scope, event.server, event.tools.map((tool) => tool.tool));
       },
       onPromptsChanged: (event) => {
-        if (generation !== this.generation) return;
+        if (!scope.active || scope.kind !== "user") return;
         this.publishPromptsChanged(event.server, event.prompts.map((prompt) => prompt.prompt));
       },
       onResourcesChanged: (event) => {
-        if (generation !== this.generation) return;
+        if (!scope.active || scope.kind !== "user") return;
         this.publishResourcesChanged(event.server, event.resources.map((resource) => resource.resource));
       },
     });
   }
 
-  private registerAllMcpTools(): void {
-    const nextSources = new Set(this.manager.listStates().map((state) => mcpToolSource(state.server.name)));
-    for (const staleSource of this.registeredToolSources) {
-      if (nextSources.has(staleSource)) continue;
-      for (const registry of this.options.registries) registry.unregisterSource(staleSource);
-    }
-    for (const state of this.manager.listStates()) this.registerServerTools(state.server, state.tools);
-    this.registeredToolSources = nextSources;
-    this.publishStatusSnapshot();
-    for (const state of this.manager.listStates()) {
+  private publishUserScopeSnapshot(scope: McpManagerScope): void {
+    if (!scope.active || scope.kind !== "user") return;
+    for (const state of scope.manager.listStates()) this.publishToolsChanged(state.server, state.tools);
+    this.publishStatusSnapshot(scope);
+    for (const state of scope.manager.listStates()) {
       this.publishPromptsChanged(state.server, state.prompts);
       this.publishResourcesChanged(state.server, state.resources);
     }
   }
 
-  private registerServerTools(server: McpServerConfig, tools: readonly McpTool[]): void {
-    const source = mcpToolSource(server.name);
-    const definitions = createMcpChiliTools(server, tools, this.manager);
-    for (const registry of this.options.registries) registry.replaceSource(source, definitions);
+  private unregisterMcpToolProviders(): void {
+    for (const registry of this.options.registries) registry.unregisterContextualSource(MCP_TOOL_SOURCE);
+  }
+
+  private publishServerTools(scope: McpManagerScope, server: McpServerConfig, tools: readonly McpTool[]): void {
+    if (!scope.active || scope.kind !== "user") return;
     this.publishToolsChanged(server, tools);
   }
 
-  private publishStatusSnapshot(): void {
-    for (const state of this.manager.listStates()) {
+  private registerMcpToolProviders(): void {
+    for (const registry of this.options.registries) {
+      registry.replaceContextualSource(MCP_TOOL_SOURCE, async (context) => {
+        const view = await this.scopeView(context.cwd);
+        return scopedToolDefinitions(view);
+      });
+    }
+  }
+
+  private publishStatusSnapshot(scope: McpManagerScope): void {
+    if (!scope.active || scope.kind !== "user") return;
+    for (const state of scope.manager.listStates()) {
       this.publish("mcp.server_status_changed", {
         serverName: state.server.name,
         status: protocolStatus(state.status),
@@ -326,7 +424,7 @@ class CliMcpRuntimeImpl implements CliMcpRuntime, RuntimeMcpControlService, McpR
   }
 
   private publishToolsChanged(server: McpServerConfig, tools: readonly McpTool[]): void {
-    const state = this.manager.getState(server.name);
+    const state = this.userScope?.manager.getState(server.name);
     this.publish("mcp.tools_changed", {
       serverName: server.name,
       tools: tools.map((tool) => ({
@@ -343,7 +441,7 @@ class CliMcpRuntimeImpl implements CliMcpRuntime, RuntimeMcpControlService, McpR
   }
 
   private publishPromptsChanged(server: McpServerConfig, prompts: readonly McpPrompt[]): void {
-    const state = this.manager.getState(server.name);
+    const state = this.userScope?.manager.getState(server.name);
     this.publish("mcp.prompts_changed", {
       serverName: server.name,
       prompts: prompts.map((prompt) => ({
@@ -365,7 +463,7 @@ class CliMcpRuntimeImpl implements CliMcpRuntime, RuntimeMcpControlService, McpR
   }
 
   private publishResourcesChanged(server: McpServerConfig, resources: readonly McpResource[]): void {
-    const state = this.manager.getState(server.name);
+    const state = this.userScope?.manager.getState(server.name);
     this.publish("mcp.resources_changed", {
       serverName: server.name,
       resources: resources.map((resource) => ({
@@ -378,6 +476,16 @@ class CliMcpRuntimeImpl implements CliMcpRuntime, RuntimeMcpControlService, McpR
       })),
       resourceCount: resources.length,
       ...(state ? { status: protocolStatus(state.status) } : {}),
+    });
+  }
+
+  private publishDiagnostic(diagnostic: McpDiagnostic): void {
+    this.publish("mcp.diagnostic", {
+      serverName: diagnostic.path.startsWith("servers.") ? diagnostic.path.slice("servers.".length) : "unknown",
+      level: diagnostic.severity,
+      message: diagnostic.message,
+      code: diagnostic.code,
+      source: diagnostic.source,
     });
   }
 
@@ -410,22 +518,30 @@ function createCompositePromptCommandControl(
   mcp: CliMcpRuntimeImpl,
 ): PromptCommandControl {
   return {
-    async list() {
-      return mergeRuntimeCommandCatalogs(await base.list(), mcpCommandCatalog(mcp));
+    async list(input) {
+      const [baseCatalog, dynamicCommands] = await Promise.all([
+        base.list(input),
+        mcp.promptCommands(input?.cwd),
+      ]);
+      return mergeRuntimeCommandCatalogs(baseCatalog, mcpCommandCatalog(dynamicCommands));
     },
-    async reload() {
-      await base.reload();
-      return this.list();
+    async reload(input) {
+      const [baseCatalog, dynamicCommands] = await Promise.all([
+        base.reload(input),
+        mcp.promptCommands(input?.cwd),
+      ]);
+      return mergeRuntimeCommandCatalogs(baseCatalog, mcpCommandCatalog(dynamicCommands));
     },
     async run(input) {
-      const baseCatalog = await base.list();
+      const baseCatalog = await base.list(input.cwd ? { cwd: input.cwd } : undefined);
       if (findRuntimeCommandNode(baseCatalog.roots, input.commandId)) return base.run(input);
 
-      const dynamicCatalog = mcpCommandCatalog(mcp);
+      const dynamicCommands = await mcp.promptCommands(input.cwd);
+      const dynamicCatalog = mcpCommandCatalog(dynamicCommands);
       const mergedCatalog = mergeRuntimeCommandCatalogs(baseCatalog, dynamicCatalog);
       if (!findRuntimeCommandNode(mergedCatalog.roots, input.commandId)) return base.run(input);
 
-      const command = runMcpCommand(mcp.promptCommands(), input.commandId, input.args, input.cwd);
+      const command = runMcpCommand(dynamicCommands, input.commandId, input.args, input.cwd);
       if (command) return command;
       return base.run(input);
     },
@@ -460,24 +576,50 @@ function runMcpCommand(
 
 type PromiseCommandRunResult = Promise<PromptCommandRunResult>;
 
-async function loadMcpConfig(cwd: string, chiliHome: string): Promise<LoadedMcpConfig> {
+async function loadUserMcpConfig(chiliHome: string): Promise<LoadedMcpConfig> {
   const errors: RuntimeMcpReloadError[] = [];
-  const [userRaw, projectRaw] = await Promise.all([
-    readJsonIfExists(userMcpConfigPath(chiliHome), errors),
-    readJsonIfExists(await findProjectMcpConfigPath(cwd, chiliHome), errors),
-  ]);
-  const parsed = parseMcpConfig(userRaw, projectRaw);
+  const userRaw = await readJsonIfExists(userMcpConfigPath(chiliHome), errors);
+  const parsed = parseMcpConfig(userRaw);
   return {
-    config: enforceProjectMcpTrustPolicy(parsed.config, parsed.diagnostics),
+    config: parsed.config,
     diagnostics: parsed.diagnostics,
     errors,
   };
 }
 
-function enforceProjectMcpTrustPolicy(config: McpConfig, diagnostics: McpDiagnostic[]): McpConfig {
+async function loadProjectMcpConfig(cwd: string, chiliHome: string): Promise<LoadedMcpConfig> {
+  const errors: RuntimeMcpReloadError[] = [];
+  const [userRaw, projectRaw] = await Promise.all([
+    readJsonIfExists(userMcpConfigPath(chiliHome), []),
+    readJsonIfExists(await findProjectMcpConfigPath(cwd, chiliHome), errors),
+  ]);
+  const userConfig = parseMcpConfig(userRaw).config;
+  const parsed = parseMcpConfig(userRaw, projectRaw);
+  const diagnostics = parsed.diagnostics.filter((diagnostic) => diagnostic.source === "project");
+  const config: McpConfig = {
+    servers: Object.fromEntries(
+      Object.entries(parsed.config.servers).filter(([, server]) => server.source === "project"),
+    ),
+  };
+  return {
+    config: enforceProjectMcpTrustPolicy(config, diagnostics, explicitlyTrustedUserServers(userConfig)),
+    diagnostics,
+    errors,
+  };
+}
+
+function enforceProjectMcpTrustPolicy(
+  config: McpConfig,
+  diagnostics: McpDiagnostic[],
+  trustedUserServers: ReadonlySet<string>,
+): McpConfig {
   const servers: Record<string, McpServerConfig> = {};
   for (const [name, server] of Object.entries(config.servers)) {
-    if (server.enabled && projectStdioServerRequiresApproval({ scope: server.source, transport: server.type })) {
+    if (server.enabled && projectStdioServerRequiresApproval({
+      scope: server.source,
+      transport: server.type,
+      trustedByUser: trustedUserServers.has(name),
+    })) {
       diagnostics.push({
         severity: "warning",
         code: "project_stdio_requires_user_approval",
@@ -491,6 +633,12 @@ function enforceProjectMcpTrustPolicy(config: McpConfig, diagnostics: McpDiagnos
     servers[name] = server;
   }
   return { servers };
+}
+
+function explicitlyTrustedUserServers(config: McpConfig): ReadonlySet<string> {
+  return new Set(Object.values(config.servers)
+    .filter((server) => server.source === "user" && server.trust === true)
+    .map((server) => server.name));
 }
 
 async function readJsonIfExists(path: string | undefined, errors: RuntimeMcpReloadError[]): Promise<unknown> {
@@ -666,6 +814,93 @@ function mcpSummary(servers: readonly RuntimeMcpServerDescriptor[]): RuntimeMcpS
   };
 }
 
+function scopedStates(view: McpScopeView): McpServerState[] {
+  const projectNames = new Set(view.project?.manager.listStates().map((state) => state.server.name) ?? []);
+  return [
+    ...view.user.manager.listStates().filter((state) => !projectNames.has(state.server.name)),
+    ...(view.project?.manager.listStates() ?? []),
+  ];
+}
+
+function scopedToolDefinitions(view: McpScopeView): ReturnType<typeof createMcpChiliTools> {
+  const project = view.project;
+  const projectNames = new Set(project?.manager.listStates().map((state) => state.server.name) ?? []);
+  return [
+    ...view.user.manager.listStates()
+      .filter((state) => !projectNames.has(state.server.name))
+      .flatMap((state) => createMcpChiliTools(state.server, state.tools, view.user.manager)),
+    ...(project?.manager.listStates()
+      .flatMap((state) => createMcpChiliTools(state.server, state.tools, project.manager)) ?? []),
+  ];
+}
+
+function scopedState(view: McpScopeView, serverName: string): McpServerState | undefined {
+  return view.project?.manager.getState(serverName) ?? view.user.manager.getState(serverName);
+}
+
+function scopedManagerForServer(view: McpScopeView, serverName: string): McpClientManager | undefined {
+  if (view.project?.manager.getState(serverName)) return view.project.manager;
+  if (view.user.manager.getState(serverName)) return view.user.manager;
+  return undefined;
+}
+
+function scopedPrompts(view: McpScopeView): ReturnType<McpClientManager["listPrompts"]> {
+  const projectNames = new Set(view.project?.manager.listStates().map((state) => state.server.name) ?? []);
+  return [
+    ...view.user.manager.listPrompts().filter((prompt) => !projectNames.has(prompt.server.name)),
+    ...(view.project?.manager.listPrompts() ?? []),
+  ];
+}
+
+function scopedResources(view: McpScopeView): ReturnType<McpClientManager["listResources"]> {
+  const projectNames = new Set(view.project?.manager.listStates().map((state) => state.server.name) ?? []);
+  return [
+    ...view.user.manager.listResources().filter((resource) => !projectNames.has(resource.server.name)),
+    ...(view.project?.manager.listResources() ?? []),
+  ];
+}
+
+function scopedLoadErrors(view: McpScopeView): RuntimeMcpReloadError[] {
+  return [
+    ...view.user.loadErrors.map((error) => ({ ...error })),
+    ...(view.project?.loadErrors.map((error) => ({ ...error })) ?? []),
+  ];
+}
+
+async function canonicalMcpWorkspace(cwd: string): Promise<string> {
+  if (typeof cwd !== "string" || cwd.trim().length === 0 || cwd.includes("\0")) {
+    throw new Error("MCP workspace cwd must be a non-empty valid filesystem path");
+  }
+  const absolute = resolve(cwd);
+  const missingSegments: string[] = [];
+  let candidate = absolute;
+
+  while (true) {
+    let canonicalBase: string;
+    try {
+      canonicalBase = await realpath(candidate);
+    } catch (error) {
+      if (!isMissingPath(error)) throw new Error("MCP workspace cwd could not be resolved");
+      const parent = dirname(candidate);
+      if (parent === candidate) {
+        throw new Error("MCP workspace cwd could not be resolved");
+      }
+      missingSegments.unshift(basename(candidate));
+      candidate = parent;
+      continue;
+    }
+
+    let isDirectory: boolean;
+    try {
+      isDirectory = (await stat(canonicalBase)).isDirectory();
+    } catch {
+      throw new Error("MCP workspace cwd could not be resolved");
+    }
+    if (!isDirectory) throw new Error("MCP workspace cwd is not a directory");
+    return resolve(canonicalBase, ...missingSegments);
+  }
+}
+
 function toResourceSummary(resource: ReturnType<McpClientManager["listResources"]>[number]): McpResourceSummary {
   return {
     serverName: resource.server.name,
@@ -699,8 +934,8 @@ function mcpPromptContentText(content: unknown): string {
   return JSON.stringify(content);
 }
 
-function mcpCommandCatalog(mcp: CliMcpRuntimeImpl): RuntimeCommandCatalog {
-  return serializeCommandCatalog(createCommandRegistry(mcp.promptCommands()), {});
+function mcpCommandCatalog(commands: readonly CommandDefinition[]): RuntimeCommandCatalog {
+  return serializeCommandCatalog(createCommandRegistry(commands), {});
 }
 
 function mergeRuntimeCommandCatalogs(
@@ -816,9 +1051,7 @@ function cloneRuntimeCommandDiagnostic(
   };
 }
 
-function mcpToolSource(serverName: string): string {
-  return `mcp:${serverName}`;
-}
+const MCP_TOOL_SOURCE = "mcp:scoped";
 
 function diagnosticError(diagnostic: McpDiagnostic): RuntimeMcpReloadError {
   const error: RuntimeMcpReloadError = { message: diagnostic.message };
@@ -837,6 +1070,10 @@ function serverAuthDescriptor(server: McpServerConfig): NonNullable<RuntimeMcpSe
 
 function isNotFound(error: unknown): boolean {
   return isRecord(error) && error.code === "ENOENT";
+}
+
+function isMissingPath(error: unknown): boolean {
+  return isRecord(error) && (error.code === "ENOENT" || error.code === "ENOTDIR");
 }
 
 function errorMessage(error: unknown): string {

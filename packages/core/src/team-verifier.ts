@@ -3,10 +3,20 @@ import type { AgentPath, AgentRunId, SessionId, TaskId, TeamId, TimestampMs } fr
 import { timestampNow } from "@chili/protocol";
 import type { TeamMemberRow, TeamRow, TeamTaskRow } from "@chili/store";
 import { runProcess } from "@chili/tools";
+import {
+  RuntimeBusyError,
+  type RuntimeSessionOperation,
+  type SessionOperationCoordinator,
+} from "./runtime-service.js";
 import type { LocalSubagentTaskResult } from "./subagent.js";
 import type { TeamTaskSubagentRunner } from "./team-dispatcher.js";
 import { TeamTaskNotFoundError, type TeamControlService } from "./team.js";
-import { mergeMergeMetadata, worktreeMetadata } from "./team-worktree.js";
+import {
+  resolveTeamSessionAuthority,
+  TeamSessionAuthorityError,
+  type TeamSessionResolver,
+} from "./team-session-authority.js";
+import { mergeMergeMetadata, preflightTeamTaskWorktree } from "./team-worktree.js";
 import type { WorkerToolPolicyTemplate } from "./worker-policy.js";
 
 const VERIFICATION_METADATA_KEY = "verification";
@@ -41,6 +51,8 @@ export interface TeamTaskVerifierOptions {
   teams: TeamControlService;
   subagents: TeamTaskSubagentRunner;
   cwd: string;
+  resolveSession: TeamSessionResolver;
+  sessionOperations: SessionOperationCoordinator;
   now?: () => TimestampMs;
   gitDiff?: (input: TeamTaskVerifierGitDiffInput) => Promise<string>;
 }
@@ -50,6 +62,8 @@ export interface TeamTaskVerifierGitDiffInput {
   task: TeamTaskRow;
   member?: TeamMemberRow;
   cwd: string;
+  baseRef?: string;
+  baseCwd?: string;
   signal?: AbortSignal;
 }
 
@@ -97,15 +111,42 @@ export interface TeamTaskVerifierError {
   error: string;
 }
 
+type AuthorizedTeamTaskVerifierInput = TeamTaskVerifierSweepInput & {
+  sessionId: SessionId;
+  cwd: string;
+};
+
+interface AuthorizedTeamTaskVerifierState {
+  input: AuthorizedTeamTaskVerifierInput;
+  team: TeamRow;
+  tasks: TeamTaskRow[];
+  members: TeamMemberRow[];
+}
+
 export class TeamTaskVerificationService {
   constructor(private readonly options: TeamTaskVerifierOptions) {}
 
   async verifyCompletedTasks(input: TeamTaskVerifierSweepInput): Promise<TeamTaskVerifierSweepResult> {
-    const [team, tasks, members] = await Promise.all([
-      this.requireTeam(input.teamId),
-      this.options.teams.tasks(input.teamId),
-      this.options.teams.members(input.teamId),
-    ]);
+    const initial = await this.authorizedState(input);
+    return this.options.sessionOperations.withSessionOperation(initial.input.sessionId, async (operation) => {
+      operation.assertCurrent();
+      const current = await this.authorizedState({
+        ...input,
+        sessionId: initial.input.sessionId,
+        cwd: initial.input.cwd,
+        signal: combinedAbortSignal(input.signal, operation.signal),
+      });
+      operation.assertCurrent();
+      throwIfAborted(current.input.signal);
+      return this.verifyCompletedTasksWithOperation(current, operation);
+    });
+  }
+
+  private async verifyCompletedTasksWithOperation(
+    state: AuthorizedTeamTaskVerifierState,
+    operation: RuntimeSessionOperation,
+  ): Promise<TeamTaskVerifierSweepResult> {
+    const { input, team, tasks, members } = state;
     const maxConcurrentVerifications = normalizeMaxConcurrentVerifications(input.maxConcurrentVerifications);
     const result: TeamTaskVerifierSweepResult = {
       scanned: 0,
@@ -120,9 +161,20 @@ export class TeamTaskVerificationService {
     for (const batch of chunk(candidates, maxConcurrentVerifications)) {
       const verifiedBatch = await Promise.all(batch.map(async (task) => {
         try {
-          return { task, result: await this.verifyTaskWithState({ ...input, taskId: task.id }, team, task, members) };
+          operation.assertCurrent();
+          throwIfAborted(input.signal);
+          return {
+            task,
+            result: await this.verifyTaskWithState(
+              input,
+              team,
+              task,
+              members,
+              operation,
+            ),
+          };
         } catch (error) {
-          if (isSignalAbort(error, input.signal)) throw error;
+          this.assertRecoverableVerificationError(error, input.signal, operation);
           return { task, error };
         }
       }));
@@ -144,22 +196,32 @@ export class TeamTaskVerificationService {
   }
 
   async verifyTask(input: TeamTaskVerifierTaskInput): Promise<TeamTaskVerifierResult> {
-    const [team, tasks, members] = await Promise.all([
-      this.requireTeam(input.teamId),
-      this.options.teams.tasks(input.teamId),
-      this.options.teams.members(input.teamId),
-    ]);
-    const task = tasks.find((item) => item.id === input.taskId);
-    if (!task) throw new TeamTaskNotFoundError(input.teamId, input.taskId);
-    return this.verifyTaskWithState(input, team, task, members);
+    const initial = await this.authorizedState(input);
+    return this.options.sessionOperations.withSessionOperation(initial.input.sessionId, async (operation) => {
+      operation.assertCurrent();
+      const current = await this.authorizedState({
+        ...input,
+        sessionId: initial.input.sessionId,
+        cwd: initial.input.cwd,
+        signal: combinedAbortSignal(input.signal, operation.signal),
+      });
+      operation.assertCurrent();
+      throwIfAborted(current.input.signal);
+      const task = current.tasks.find((item) => item.id === input.taskId);
+      if (!task) throw new TeamTaskNotFoundError(input.teamId, input.taskId);
+      return this.verifyTaskWithState(current.input, current.team, task, current.members, operation);
+    });
   }
 
   private async verifyTaskWithState(
-    input: TeamTaskVerifierTaskInput,
+    input: AuthorizedTeamTaskVerifierInput,
     team: TeamRow,
     task: TeamTaskRow,
     members: readonly TeamMemberRow[],
+    operation: RuntimeSessionOperation,
   ): Promise<TeamTaskVerifierResult> {
+    operation.assertCurrent();
+    throwIfAborted(input.signal);
     if (task.status !== "completed") {
       return { status: "skipped", reason: "not_completed", teamTask: task };
     }
@@ -173,15 +235,19 @@ export class TeamTaskVerificationService {
       return { status: "skipped", reason: "missing_owner", teamTask: task };
     }
 
-    const parentSessionId = input.sessionId ?? task.sessionId ?? team.sessionId;
-    if (!parentSessionId) {
-      return { status: "skipped", reason: "missing_session", teamTask: task };
-    }
-
-    const worktree = worktreeMetadata(task.metadata);
-    const cwd = worktree?.path ?? input.cwd ?? this.options.cwd;
-    const member = members.find((item) => item.path === task.ownerPath);
+    const parentSessionId = input.sessionId;
+    const workspaceCwd = input.cwd;
+    let worktree = await preflightTeamTaskWorktree({
+      cwd: workspaceCwd,
+      teamId: task.teamId,
+      taskId: task.id,
+      metadata: task.metadata,
+      requireExisting: true,
+    });
+    operation.assertCurrent();
     throwIfAborted(input.signal);
+    let cwd = worktree?.path ?? workspaceCwd;
+    const member = members.find((item) => item.path === task.ownerPath);
     const startedAt = Number(this.now());
     const claimId = randomUUID();
     const pendingMetadata = mergeVerificationMetadata(task.metadata, verificationFields({
@@ -190,6 +256,9 @@ export class TeamTaskVerificationService {
       startedAt,
       workerSummary: task.summary,
     }));
+    await this.revalidateAuthority(input, operation);
+    operation.assertCurrent();
+    throwIfAborted(input.signal);
     const pendingClaim = await this.options.teams.claimTaskVerification({
       teamId: task.teamId,
       taskId: task.id,
@@ -197,6 +266,8 @@ export class TeamTaskVerificationService {
       sessionId: parentSessionId,
       stalePendingBefore: startedAt - VERIFICATION_PENDING_TTL_MS,
     });
+    operation.assertCurrent();
+    throwIfAborted(input.signal);
     if (!pendingClaim.applied) {
       return {
         status: "skipped",
@@ -205,22 +276,45 @@ export class TeamTaskVerificationService {
       };
     }
     const pendingTask = pendingClaim.task ?? task;
+    await this.revalidateAuthority(input, operation);
+    worktree = await preflightTeamTaskWorktree({
+      cwd: workspaceCwd,
+      teamId: pendingTask.teamId,
+      taskId: pendingTask.id,
+      metadata: pendingTask.metadata,
+      requireExisting: true,
+    });
+    operation.assertCurrent();
     throwIfAborted(input.signal);
-    const gitDiffInput: TeamTaskVerifierGitDiffInput = { team, task, cwd };
+    cwd = worktree?.path ?? workspaceCwd;
+    const gitDiffInput: TeamTaskVerifierGitDiffInput = { team, task: pendingTask, cwd };
     if (member) gitDiffInput.member = member;
+    if (worktree) {
+      gitDiffInput.baseRef = worktree.baseRef;
+      gitDiffInput.baseCwd = workspaceCwd;
+    }
     if (input.signal) gitDiffInput.signal = input.signal;
     let gitDiff: string;
     try {
+      await this.revalidateAuthority(input, operation);
+      operation.assertCurrent();
+      throwIfAborted(input.signal);
       gitDiff = await this.gitDiff(gitDiffInput);
+      operation.assertCurrent();
       throwIfAborted(input.signal);
     } catch (error) {
+      if (error instanceof RuntimeBusyError || error instanceof TeamSessionAuthorityError) throw error;
+      operation.assertCurrent();
       if (isSignalAbort(error, input.signal)) {
-        await this.clearPendingVerificationClaim(task, claimId, parentSessionId);
+        await this.clearPendingVerificationClaim(task, claimId, input, operation);
       }
       throw error;
     }
     const testCommands = verifierTestCommands(task.metadata);
-    await this.options.teams.updateTask({
+    await this.revalidateAuthority(input, operation);
+    operation.assertCurrent();
+    throwIfAborted(input.signal);
+    const verificationPendingTask = await this.options.teams.updateTask({
       teamId: task.teamId,
       taskId: task.id,
       metadata: mergeVerificationMetadata(pendingTask.metadata, verificationFields({
@@ -232,7 +326,18 @@ export class TeamTaskVerificationService {
       })),
       sessionId: parentSessionId,
     });
+    operation.assertCurrent();
     throwIfAborted(input.signal);
+    worktree = await preflightTeamTaskWorktree({
+      cwd: workspaceCwd,
+      teamId: verificationPendingTask.teamId,
+      taskId: verificationPendingTask.id,
+      metadata: verificationPendingTask.metadata,
+      requireExisting: true,
+    });
+    operation.assertCurrent();
+    throwIfAborted(input.signal);
+    cwd = worktree?.path ?? workspaceCwd;
 
     const verifierInput = {
       parentSessionId,
@@ -250,7 +355,12 @@ export class TeamTaskVerificationService {
       }),
       ...(input.signal ? { signal: input.signal } : {}),
     };
+    await this.revalidateAuthority(input, operation);
+    operation.assertCurrent();
+    throwIfAborted(input.signal);
     const verifierTask = await this.options.subagents.spawnTask(verifierInput);
+    operation.assertCurrent();
+    throwIfAborted(input.signal);
     const verdict = verifierVerdict(verifierTask);
     const checkedAt = Number(this.now());
     const feedback = verdict.feedback;
@@ -275,15 +385,23 @@ export class TeamTaskVerificationService {
             diff: gitDiff,
           })
         : verificationMetadata;
+      await this.revalidateAuthority(input, operation);
+      operation.assertCurrent();
+      throwIfAborted(input.signal);
       const acceptedTask = await this.options.teams.updateTask({
         teamId: task.teamId,
         taskId: task.id,
         metadata,
         sessionId: parentSessionId,
       });
+      operation.assertCurrent();
+      throwIfAborted(input.signal);
       return { status: "passed", teamTask: acceptedTask, verifierTask, feedback };
     }
 
+    await this.revalidateAuthority(input, operation);
+    operation.assertCurrent();
+    throwIfAborted(input.signal);
     const reopenedTask = await this.options.teams.updateTask({
       teamId: task.teamId,
       taskId: task.id,
@@ -301,23 +419,84 @@ export class TeamTaskVerificationService {
       })),
       sessionId: parentSessionId,
     });
+    operation.assertCurrent();
+    throwIfAborted(input.signal);
     return { status: "failed", teamTask: reopenedTask, verifierTask, feedback };
   }
 
   private async clearPendingVerificationClaim(
     task: TeamTaskRow,
     claimId: string,
-    sessionId: SessionId,
+    input: AuthorizedTeamTaskVerifierInput,
+    operation: RuntimeSessionOperation,
   ): Promise<void> {
+    const cleanupInput: AuthorizedTeamTaskVerifierInput = {
+      ...input,
+      signal: operation.signal,
+    };
+    await this.revalidateAuthority(cleanupInput, operation);
     const current = (await this.options.teams.tasks(task.teamId)).find((item) => item.id === task.id);
     if (!current || verificationMetadata(current.metadata)?.status !== "pending") return;
     if (verificationMetadata(current.metadata)?.claimId !== claimId) return;
+    operation.assertCurrent();
     await this.options.teams.updateTask({
       teamId: task.teamId,
       taskId: task.id,
       metadata: restoreVerificationMetadata(current.metadata, task.metadata),
-      sessionId,
+      sessionId: input.sessionId,
     });
+    operation.assertCurrent();
+  }
+
+  private async authorizedState(input: TeamTaskVerifierSweepInput): Promise<AuthorizedTeamTaskVerifierState> {
+    const [team, tasks, members] = await Promise.all([
+      this.requireTeam(input.teamId),
+      this.options.teams.tasks(input.teamId),
+      this.options.teams.members(input.teamId),
+    ]);
+    const authority = await resolveTeamSessionAuthority({
+      team,
+      tasks,
+      ...(input.sessionId ? { requestedSessionId: input.sessionId } : {}),
+      ...(input.cwd !== undefined ? { requestedCwd: input.cwd } : {}),
+      resolveSession: this.options.resolveSession,
+    });
+    return {
+      input: {
+        ...input,
+        sessionId: authority.sessionId,
+        cwd: authority.cwd,
+      },
+      team,
+      tasks,
+      members,
+    };
+  }
+
+  private async revalidateAuthority(
+    input: AuthorizedTeamTaskVerifierInput,
+    operation: RuntimeSessionOperation,
+  ): Promise<AuthorizedTeamTaskVerifierState> {
+    operation.assertCurrent();
+    throwIfAborted(input.signal);
+    const state = await this.authorizedState({
+      ...input,
+      sessionId: input.sessionId,
+      cwd: input.cwd,
+    });
+    operation.assertCurrent();
+    throwIfAborted(input.signal);
+    return state;
+  }
+
+  private assertRecoverableVerificationError(
+    error: unknown,
+    signal: AbortSignal | undefined,
+    operation: RuntimeSessionOperation,
+  ): void {
+    if (error instanceof RuntimeBusyError || error instanceof TeamSessionAuthorityError) throw error;
+    operation.assertCurrent();
+    if (isSignalAbort(error, signal)) throw error;
   }
 
   private async requireTeam(teamId: TeamId): Promise<TeamRow> {
@@ -330,36 +509,59 @@ export class TeamTaskVerificationService {
     try {
       if (this.options.gitDiff) return await this.options.gitDiff(input);
       const processInput = {
-        cwd: input.cwd,
         timeoutMs: 15_000,
         maxOutputBytes: DEFAULT_GIT_DIFF_MAX_BYTES,
       };
-      const runGit = (args: readonly string[]) =>
-        runProcess("git", args, input.signal ? { ...processInput, signal: input.signal } : processInput);
-      const tracked = await runGit(["diff", "--no-ext-diff", "--no-color", "HEAD", "--"]);
+      const runGit = (cwd: string, args: readonly string[]) =>
+        runProcess("git", args, input.signal
+          ? { ...processInput, cwd, signal: input.signal }
+          : { ...processInput, cwd });
+      let diffBase = "HEAD";
+      if (input.baseRef) {
+        const resolved = await runGit(input.baseCwd ?? input.cwd, [
+          "rev-parse",
+          "--verify",
+          "--end-of-options",
+          `${input.baseRef}^{commit}`,
+        ]);
+        if (resolved.timedOut) return `(git diff failed: resolving baseRef ${input.baseRef} timed out after 15000ms)`;
+        if (resolved.exitCode !== 0 || !isFullObjectId(resolved.stdout.trim())) {
+          return `(git diff failed: could not resolve baseRef ${input.baseRef}: ${resolved.stderr || `exit ${resolved.exitCode}`})`;
+        }
+        diffBase = resolved.stdout.trim();
+      }
+      const tracked = await runGit(input.cwd, [
+        "diff",
+        "--no-ext-diff",
+        "--no-color",
+        "--no-renames",
+        "--binary",
+        diffBase,
+        "--",
+      ]);
       if (tracked.timedOut) return "(git diff failed: timed out after 15000ms)";
       if (tracked.exitCode !== 0) return `(git diff failed: ${tracked.stderr || `exit ${tracked.exitCode}`})`;
 
-      const parts = tracked.stdout.trim().length > 0 ? [tracked.stdout.trimEnd()] : [];
-      const untracked = await runGit(["ls-files", "--others", "--exclude-standard", "-z"]);
+      const parts = tracked.stdout.length > 0 ? [tracked.stdout] : [];
+      const untracked = await runGit(input.cwd, ["ls-files", "--others", "--exclude-standard", "-z"]);
       if (untracked.timedOut) {
         parts.push("(git untracked file scan failed: timed out after 15000ms)");
       } else if (untracked.exitCode !== 0) {
         parts.push(`(git untracked file scan failed: ${untracked.stderr || `exit ${untracked.exitCode}`})`);
       } else {
         for (const path of splitNul(untracked.stdout)) {
-          const fileDiff = await runGit(["diff", "--no-ext-diff", "--no-color", "--no-index", "--", "/dev/null", path]);
+          const fileDiff = await runGit(input.cwd, ["diff", "--no-ext-diff", "--no-color", "--binary", "--no-index", "--", "/dev/null", path]);
           if (fileDiff.timedOut) {
             parts.push(`(git diff for untracked file failed: ${path}: timed out after 15000ms)`);
           } else if (fileDiff.exitCode !== 0 && fileDiff.exitCode !== 1) {
             parts.push(`(git diff for untracked file failed: ${path}: ${fileDiff.stderr || `exit ${fileDiff.exitCode}`})`);
-          } else if (fileDiff.stdout.trim().length > 0) {
-            parts.push(fileDiff.stdout.trimEnd());
+          } else if (fileDiff.stdout.length > 0) {
+            parts.push(fileDiff.stdout);
           }
         }
       }
 
-      return parts.length > 0 ? truncateDiff(parts.join("\n")) : "(no diff)";
+      return parts.length > 0 ? truncateDiff(concatenatePatchParts(parts)) : "(no diff)";
     } catch (error) {
       if (isSignalAbort(error, input.signal)) throw error;
       return `(git diff unavailable: ${toError(error).message})`;
@@ -638,6 +840,20 @@ function splitNul(value: string): string[] {
   return value.split("\0").filter((item) => item.length > 0);
 }
 
+function concatenatePatchParts(parts: readonly string[]): string {
+  let output = "";
+  for (const part of parts) {
+    if (part.length === 0) continue;
+    if (output.length > 0 && !output.endsWith("\n") && !part.startsWith("\n")) output += "\n";
+    output += part;
+  }
+  return output;
+}
+
+function isFullObjectId(value: string): boolean {
+  return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
+}
+
 function truncateDiff(value: string): string {
   if (value.length <= DEFAULT_GIT_DIFF_MAX_BYTES) return value;
   return `${value.slice(0, DEFAULT_GIT_DIFF_MAX_BYTES)}\n(diff truncated at ${DEFAULT_GIT_DIFF_MAX_BYTES} characters)`;
@@ -660,4 +876,12 @@ function isSignalAbort(error: unknown, signal: AbortSignal | undefined): boolean
   if (signal?.aborted) return true;
   const err = toError(error);
   return err.name === "AbortError" && err.message.toLowerCase().includes("aborted");
+}
+
+function combinedAbortSignal(
+  requestSignal: AbortSignal | undefined,
+  operationSignal: AbortSignal,
+): AbortSignal {
+  if (!requestSignal || requestSignal === operationSignal) return operationSignal;
+  return AbortSignal.any([requestSignal, operationSignal]);
 }

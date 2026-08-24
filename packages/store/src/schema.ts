@@ -120,6 +120,9 @@ export const SQLITE_SCHEMA = [
 
   `create table if not exists agent_tasks (
     id text primary key,
+    dispatch_id text,
+    reserved_run_id text,
+    worker_policy_json text,
     path text not null,
     parent_path text,
     parent_session_id text,

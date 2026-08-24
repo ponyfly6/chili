@@ -106,6 +106,7 @@ export interface AgentTaskCloseInput {
 }
 
 export interface AgentTaskReconcileStaleInput {
+  parentSessionId?: SessionId;
   staleAfterMs?: number;
   modes?: AgentTaskMode[];
   liveTaskIds?: Iterable<TaskId | string>;
@@ -453,18 +454,47 @@ export class AgentTaskControlService {
 
   async reconcileStaleTasks(input: AgentTaskReconcileStaleInput = {}): Promise<AgentTaskReconcileStaleResult> {
     const limit = input.limit ?? 500;
+    if (!Number.isInteger(limit) || limit <= 0) {
+      throw new RangeError("Task reconciliation limit must be a positive integer");
+    }
     const staleAfterMs = input.staleAfterMs ?? 30_000;
-    const cutoff = Number(this.now()) - staleAfterMs;
+    const now = Number(this.now());
+    const cutoff = now - staleAfterMs;
     const liveTaskIds = new Set([...(input.liveTaskIds ?? [])].map(String));
     const modes = input.modes ?? ["background"];
-    const candidates = await this.options.store.agentTasks({ status: "running", limit });
+    let queryLimit = Math.min(limit, 500);
+    let scanned = 0;
+    let candidates: AgentTaskRow[] = [];
+
+    // `agentTasks` is ordered and limited before the policy filters below. Grow
+    // the prefix until we find the requested number of actually stale tasks or
+    // exhaust the running projection; otherwise a fixed prefix of live or
+    // non-background tasks can starve every stale task behind it forever.
+    while (true) {
+      const page = await this.options.store.agentTasks({
+        status: "running",
+        limit: queryLimit,
+        ...(input.parentSessionId ? { parentSessionId: input.parentSessionId } : {}),
+      });
+      candidates = [];
+      scanned = 0;
+      for (const task of page) {
+        scanned += 1;
+        if (liveTaskIds.has(task.id)) continue;
+        if (modes.length > 0 && (!task.mode || !modes.includes(task.mode))) continue;
+        if (task.leaseOwner && task.leaseExpiresAt && task.leaseExpiresAt > now) continue;
+        if (task.updatedAt > cutoff) continue;
+        candidates.push(task);
+        if (candidates.length >= limit) break;
+      }
+      if (candidates.length >= limit || page.length < queryLimit) break;
+      const nextLimit = Math.min(2_147_483_647, queryLimit * 2);
+      if (nextLimit === queryLimit) break;
+      queryLimit = nextLimit;
+    }
     const closed: AgentTaskRow[] = [];
 
     for (const task of candidates) {
-      if (liveTaskIds.has(task.id)) continue;
-      if (modes.length > 0 && (!task.mode || !modes.includes(task.mode))) continue;
-      if (task.leaseOwner && task.leaseExpiresAt && task.leaseExpiresAt > Number(this.now())) continue;
-      if (task.updatedAt > cutoff) continue;
       const outcome = await this.closeTaskFinal(
         task,
         "cancelled",
@@ -479,7 +509,7 @@ export class AgentTaskControlService {
     }
 
     return {
-      scanned: candidates.length,
+      scanned,
       closed,
     };
   }
@@ -492,6 +522,12 @@ export class AgentTaskControlService {
 
   private async requireRunnableTask(taskId: TaskId): Promise<AgentTaskRow> {
     const task = await this.requireTask(taskId);
+    if (task.dispatchId || task.reservedRunId || isTeamTaskWorkerPolicy(task.workerPolicy)) {
+      throw new AgentTaskNotRunnableError(
+        taskId,
+        `Crash-safe dispatched agent task cannot be reopened directly: ${taskId}`,
+      );
+    }
     if (!task.childSessionId) {
       throw new AgentTaskNotRunnableError(taskId, `Agent task is missing child session metadata: ${taskId}`);
     }
@@ -1145,6 +1181,14 @@ function completionAssessmentError(
 
 function isFinalTaskStatus(status: AgentTaskStatus): status is AgentTaskFinalStatus {
   return status === "completed" || status === "incomplete" || status === "failed" || status === "cancelled";
+}
+
+function isTeamTaskWorkerPolicy(policy: Record<string, unknown> | undefined): boolean {
+  if (!policy || typeof policy !== "object" || Array.isArray(policy)) return false;
+  return typeof policy.teamId === "string"
+    && policy.teamId.length > 0
+    && typeof policy.taskId === "string"
+    && policy.taskId.length > 0;
 }
 
 function followupLeaseOwner(runId: AgentRunId): string {

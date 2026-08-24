@@ -18,7 +18,14 @@ import type {
   TurnId,
 } from "@chili/protocol";
 import { ObservableEventStore } from "./observable-event-store.js";
-import { SqliteEventStore } from "./sqlite-event-store.js";
+import {
+  SessionAlreadyExistsError,
+  SessionCreationClaimConflictError,
+  SessionCwdConflictError,
+  SessionRunClaimConflictError,
+  SqliteEventStore,
+  TeamTaskAlreadyExistsError,
+} from "./sqlite-event-store.js";
 
 test("round-trips assistant text phase without transforming the event payload", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-assistant-phase-"));
@@ -145,6 +152,114 @@ test("broadcasts transient tool output deltas without persisting or mirroring th
     unsubscribe();
     baseStore.close();
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("transient output validates run claims before Observable emits it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-transient-run-fence-"));
+  const dbPath = join(dir, "events.sqlite");
+  const staleBase = new SqliteEventStore(dbPath);
+  const currentBase = new SqliteEventStore(dbPath);
+  const stale = new ObservableEventStore(staleBase);
+  const sessionId = "session_transient_run_fence" as SessionId;
+  const claimedAt = Date.now();
+  const emitted: ChiliEvent[] = [];
+  const unsubscribe = stale.subscribe((event) => emitted.push(event));
+  const delta: ChiliEvent = {
+    id: "event_transient_stale_delta",
+    type: "tool.output_delta",
+    time: 2 as TimestampMs,
+    sessionId,
+    payload: {
+      callId: "toolcall_transient_stale_delta" as ToolCallId,
+      stream: "stdout",
+      delta: "must not escape a stale lease",
+    },
+  };
+
+  try {
+    await staleBase.append(sessionEvent("event_transient_run_session", sessionId, 1 as TimestampMs));
+    expect(staleBase.claimSessionRun({
+      sessionId,
+      claimId: "run_claim_transient_stale",
+      allowSubagentSessions: false,
+      time: claimedAt,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "claimed" });
+    expect(currentBase.claimSessionRun({
+      sessionId,
+      claimId: "run_claim_transient_current",
+      allowSubagentSessions: false,
+      time: claimedAt + 100,
+      leaseDurationMs: 60_000,
+    })).toEqual({ status: "claimed" });
+
+    await expect(stale.append(delta)).rejects.toBeInstanceOf(SessionRunClaimConflictError);
+    await expect(stale.append(delta, {
+      runClaim: { sessionId, claimId: "run_claim_transient_stale" },
+    })).rejects.toBeInstanceOf(SessionRunClaimConflictError);
+    expect(emitted).toEqual([]);
+    expect(await staleBase.events({ type: "tool.output_delta", limit: 10 })).toEqual([]);
+  } finally {
+    unsubscribe();
+    currentBase.releaseSessionRun({ sessionId, claimId: "run_claim_transient_current" });
+    staleBase.releaseSessionRun({ sessionId, claimId: "run_claim_transient_stale" });
+    currentBase.close();
+    staleBase.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("mixed transient batches validate every event against the creation fence", async () => {
+  const store = new SqliteEventStore(":memory:");
+  const observable = new ObservableEventStore(store);
+  const sessionId = "session_mixed_creation_fence" as SessionId;
+  const otherSessionId = "session_mixed_creation_fence_other" as SessionId;
+  const claimId = "creation_claim_mixed_events";
+  const emitted: ChiliEvent[] = [];
+  const unsubscribe = observable.subscribe((event) => emitted.push(event));
+  const now = Date.now();
+
+  try {
+    expect(store.claimSessionCreation({
+      sessionId,
+      claimId,
+      cwd: "/repo",
+      owner: "root",
+      time: now,
+      leaseDurationMs: 60_000,
+    })).toEqual({ status: "claimed" });
+    await store.append(sessionEvent("event_mixed_creation_session", sessionId, 1 as TimestampMs));
+
+    await expect(observable.appendMany([
+      {
+        id: "event_mixed_creation_status",
+        type: "session.status_changed",
+        time: 2 as TimestampMs,
+        sessionId,
+        payload: { sessionId, status: "idle" },
+      },
+      {
+        id: "event_mixed_creation_delta",
+        type: "tool.output_delta",
+        time: 3 as TimestampMs,
+        sessionId: otherSessionId,
+        payload: {
+          callId: "toolcall_mixed_creation_delta" as ToolCallId,
+          stream: "stderr",
+          delta: "wrong session",
+        },
+      },
+    ], { creationClaim: { sessionId, claimId } })).rejects.toBeInstanceOf(
+      SessionCreationClaimConflictError,
+    );
+
+    expect(emitted).toEqual([]);
+    expect(await store.events({ sessionId, type: "session.status_changed", limit: 10 })).toEqual([]);
+  } finally {
+    unsubscribe();
+    store.releaseSessionCreation({ sessionId, claimId });
+    store.close();
   }
 });
 
@@ -356,15 +471,832 @@ test("tail event replay returns the latest bounded window in insertion order", a
 
   try {
     await store.append(sessionEvent("event_1", sessionId, 1 as TimestampMs));
-    await store.append(sessionEvent("event_2", sessionId, 2 as TimestampMs));
-    await store.append(sessionEvent("event_3", sessionId, 3 as TimestampMs));
-    await store.append(sessionEvent("event_4", sessionId, 4 as TimestampMs));
+    for (const [id, time] of [["event_2", 2], ["event_3", 3], ["event_4", 4]] as const) {
+      await store.append({
+        id,
+        type: "session.status_changed",
+        time: time as TimestampMs,
+        sessionId,
+        payload: { sessionId, status: "idle" },
+      });
+    }
 
     expect((await store.events({ sessionId, limit: 2 })).map((event) => event.id)).toEqual(["event_1", "event_2"]);
     expect((await store.events({ sessionId, limit: 2, tail: true })).map((event) => event.id)).toEqual(["event_3", "event_4"]);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("atomically rejects live duplicate session creation while preserving historic duplicate events", async () => {
+  const store = new SqliteEventStore(":memory:");
+  const sessionId = "session_first_cwd_wins" as SessionId;
+
+  try {
+    await store.append({
+      id: "event_first_session_create",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      payload: { sessionId, cwd: "/authoritative/repo" },
+    });
+    sqliteDatabase(store).query(
+      `insert into events (id, type, time, session_id, payload_json)
+       values (?, 'session.created', ?, ?, ?)`,
+    ).run(
+      "event_historic_duplicate_session_create",
+      2,
+      sessionId,
+      JSON.stringify({ sessionId, cwd: "/authoritative/repo" }),
+    );
+
+    await expect(store.append({
+      id: "event_live_duplicate_session_create",
+      type: "session.created",
+      time: 3 as TimestampMs,
+      sessionId,
+      payload: { sessionId, cwd: "/authoritative/repo" },
+    })).rejects.toBeInstanceOf(SessionAlreadyExistsError);
+
+    await expect(store.append({
+      id: "event_conflicting_session_recreate",
+      type: "session.created",
+      time: 4 as TimestampMs,
+      sessionId,
+      payload: { sessionId, cwd: "/attacker/repo" },
+    })).rejects.toBeInstanceOf(SessionCwdConflictError);
+
+    expect(await store.sessions()).toEqual([
+      expect.objectContaining({
+        id: sessionId,
+        cwd: "/authoritative/repo",
+        status: "active",
+        createdAt: 1,
+        updatedAt: 1,
+      }),
+    ]);
+    expect((await store.events({ sessionId, type: "session.created", limit: 10 })).map((event) => event.id)).toEqual([
+      "event_first_session_create",
+      "event_historic_duplicate_session_create",
+    ]);
+  } finally {
+    store.close();
+  }
+});
+
+test("session claim leases survive reopen, renew active work, and recover after expiry", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-session-claim-lease-"));
+  const dbPath = join(dir, "events.sqlite");
+  const activeSessionId = "session_claim_lease_active" as SessionId;
+  const creatingSessionId = "session_claim_lease_creating" as SessionId;
+  const first = new SqliteEventStore(dbPath);
+
+  try {
+    await first.append(sessionEvent("event_claim_lease_session", activeSessionId, 1 as TimestampMs));
+    expect(first.claimSessionRun({
+      sessionId: activeSessionId,
+      claimId: "run_claim_crashed_owner",
+      allowSubagentSessions: false,
+      time: 1_000,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "claimed" });
+    expect(first.renewSessionRun({
+      sessionId: activeSessionId,
+      claimId: "run_claim_crashed_owner",
+      time: 1_050,
+      leaseDurationMs: 100,
+    })).toBe(true);
+    expect(first.claimSessionCreation({
+      sessionId: creatingSessionId,
+      claimId: "creation_claim_crashed_owner",
+      cwd: "/repo",
+      owner: "root",
+      time: 2_000,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "claimed" });
+    first.close();
+
+    const beforeExpiry = new SqliteEventStore(dbPath);
+    expect(beforeExpiry.claimSessionRun({
+      sessionId: activeSessionId,
+      claimId: "run_claim_early_contender",
+      allowSubagentSessions: false,
+      time: 1_149,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "busy" });
+    expect(beforeExpiry.claimSessionCreation({
+      sessionId: creatingSessionId,
+      claimId: "creation_claim_early_contender",
+      cwd: "/repo",
+      owner: "root",
+      time: 2_099,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "already_exists" });
+    beforeExpiry.close();
+
+    const afterExpiry = new SqliteEventStore(dbPath);
+    expect(afterExpiry.claimSessionRun({
+      sessionId: activeSessionId,
+      claimId: "run_claim_recovered_owner",
+      allowSubagentSessions: false,
+      time: 1_150,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "claimed" });
+    expect(afterExpiry.claimSessionCreation({
+      sessionId: creatingSessionId,
+      claimId: "creation_claim_recovered_owner",
+      cwd: "/repo",
+      owner: "root",
+      time: 2_100,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "claimed" });
+    afterExpiry.releaseSessionRun({
+      sessionId: activeSessionId,
+      claimId: "run_claim_recovered_owner",
+    });
+    afterExpiry.releaseSessionCreation({
+      sessionId: creatingSessionId,
+      claimId: "creation_claim_recovered_owner",
+    });
+    afterExpiry.close();
+  } finally {
+    first.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a connection cannot replace its own stale claim before the old owner releases it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-same-connection-claim-"));
+  const dbPath = join(dir, "events.sqlite");
+  const stale = new SqliteEventStore(dbPath);
+  const peer = new SqliteEventStore(dbPath);
+  const sessionId = "session_same_connection_claim" as SessionId;
+  const creatingSessionId = "session_same_connection_creation" as SessionId;
+  const now = Date.now();
+
+  try {
+    await stale.append(sessionEvent("event_same_connection_claim_session", sessionId, 1 as TimestampMs));
+    expect(stale.claimSessionRun({
+      sessionId,
+      claimId: "run_claim_same_connection_old",
+      allowSubagentSessions: false,
+      time: now - 1_000,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "claimed" });
+    expect(stale.claimSessionRun({
+      sessionId,
+      claimId: "run_claim_same_connection_replacement",
+      allowSubagentSessions: false,
+      time: now,
+      leaseDurationMs: 60_000,
+    })).toEqual({ status: "busy" });
+    expect(peer.claimSessionRun({
+      sessionId,
+      claimId: "run_claim_peer_replacement",
+      allowSubagentSessions: false,
+      time: now,
+      leaseDurationMs: 60_000,
+    })).toEqual({ status: "claimed" });
+    await expect(stale.append({
+      id: "event_same_connection_stale_write",
+      type: "session.status_changed",
+      time: 2 as TimestampMs,
+      sessionId,
+      payload: { sessionId, status: "failed" },
+    })).rejects.toBeInstanceOf(SessionRunClaimConflictError);
+
+    expect(stale.claimSessionCreation({
+      sessionId: creatingSessionId,
+      claimId: "creation_claim_same_connection_old",
+      cwd: "/repo",
+      owner: "root",
+      time: now - 1_000,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "claimed" });
+    expect(stale.claimSessionCreation({
+      sessionId: creatingSessionId,
+      claimId: "creation_claim_same_connection_replacement",
+      cwd: "/repo",
+      owner: "root",
+      time: now,
+      leaseDurationMs: 60_000,
+    })).toEqual({ status: "already_exists" });
+    expect(peer.claimSessionCreation({
+      sessionId: creatingSessionId,
+      claimId: "creation_claim_peer_replacement",
+      cwd: "/repo",
+      owner: "root",
+      time: now,
+      leaseDurationMs: 60_000,
+    })).toEqual({ status: "claimed" });
+    await expect(stale.append(sessionEvent(
+      "event_same_connection_stale_create",
+      creatingSessionId,
+      3 as TimestampMs,
+    ))).rejects.toBeInstanceOf(SessionCreationClaimConflictError);
+  } finally {
+    peer.releaseSessionRun({ sessionId, claimId: "run_claim_peer_replacement" });
+    stale.releaseSessionRun({ sessionId, claimId: "run_claim_same_connection_old" });
+    peer.releaseSessionCreation({
+      sessionId: creatingSessionId,
+      claimId: "creation_claim_peer_replacement",
+    });
+    stale.releaseSessionCreation({
+      sessionId: creatingSessionId,
+      claimId: "creation_claim_same_connection_old",
+    });
+    peer.close();
+    stale.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("claim renewal and release are owned by the claiming store connection", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-claim-connection-owner-"));
+  const dbPath = join(dir, "events.sqlite");
+  const owner = new SqliteEventStore(dbPath);
+  const stranger = new SqliteEventStore(dbPath);
+  const sessionId = "session_claim_connection_owner" as SessionId;
+  const creatingSessionId = "session_creation_connection_owner" as SessionId;
+  const now = Date.now();
+
+  try {
+    await owner.append(sessionEvent("event_claim_connection_owner", sessionId, 1 as TimestampMs));
+    expect(owner.claimSessionRun({
+      sessionId,
+      claimId: "run_claim_connection_owner",
+      allowSubagentSessions: false,
+      time: now,
+      leaseDurationMs: 60_000,
+    })).toEqual({ status: "claimed" });
+    expect(stranger.renewSessionRun({
+      sessionId,
+      claimId: "run_claim_connection_owner",
+      time: now + 1,
+      leaseDurationMs: 60_000,
+    })).toBe(false);
+    stranger.releaseSessionRun({ sessionId, claimId: "run_claim_connection_owner" });
+    expect(owner.renewSessionRun({
+      sessionId,
+      claimId: "run_claim_connection_owner",
+      time: now + 2,
+      leaseDurationMs: 60_000,
+    })).toBe(true);
+
+    expect(owner.claimSessionCreation({
+      sessionId: creatingSessionId,
+      claimId: "creation_claim_connection_owner",
+      cwd: "/repo",
+      owner: "root",
+      time: now,
+      leaseDurationMs: 60_000,
+    })).toEqual({ status: "claimed" });
+    expect(stranger.renewSessionCreation({
+      sessionId: creatingSessionId,
+      claimId: "creation_claim_connection_owner",
+      time: now + 1,
+      leaseDurationMs: 60_000,
+    })).toBe(false);
+    stranger.releaseSessionCreation({
+      sessionId: creatingSessionId,
+      claimId: "creation_claim_connection_owner",
+    });
+    expect(owner.renewSessionCreation({
+      sessionId: creatingSessionId,
+      claimId: "creation_claim_connection_owner",
+      time: now + 2,
+      leaseDurationMs: 60_000,
+    })).toBe(true);
+  } finally {
+    owner.releaseSessionRun({ sessionId, claimId: "run_claim_connection_owner" });
+    owner.releaseSessionCreation({
+      sessionId: creatingSessionId,
+      claimId: "creation_claim_connection_owner",
+    });
+    stranger.close();
+    owner.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an active creation claim fences run and archive after session.created until release", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-session-creation-fence-"));
+  const dbPath = join(dir, "events.sqlite");
+  const creator = new SqliteEventStore(dbPath);
+  const peer = new SqliteEventStore(dbPath);
+  const sessionId = "session_creation_fence" as SessionId;
+  const creationClaimId = "creation_claim_initializing";
+  const runClaimId = "run_claim_after_creation";
+  const now = Date.now();
+
+  try {
+    expect(creator.claimSessionCreation({
+      sessionId,
+      claimId: creationClaimId,
+      cwd: "/repo",
+      owner: "root",
+      time: now,
+      leaseDurationMs: 120_000,
+    })).toEqual({ status: "claimed" });
+    await creator.append({
+      id: "event_session_creation_fence_created",
+      type: "session.created",
+      time: now as TimestampMs,
+      sessionId,
+      payload: { sessionId, cwd: "/repo" },
+    });
+
+    await expect(peer.append({
+      id: "event_creation_fence_wrong_connection",
+      type: "session.status_changed",
+      time: now as TimestampMs,
+      sessionId,
+      payload: { sessionId, status: "idle" },
+    }, { creationClaim: { sessionId, claimId: creationClaimId } })).rejects.toBeInstanceOf(
+      SessionCreationClaimConflictError,
+    );
+    await expect(creator.append({
+      id: "event_creation_fence_wrong_claim",
+      type: "session.status_changed",
+      time: now as TimestampMs,
+      sessionId,
+      payload: { sessionId, status: "idle" },
+    }, { creationClaim: { sessionId, claimId: "creation_claim_wrong" } })).rejects.toBeInstanceOf(
+      SessionCreationClaimConflictError,
+    );
+    const otherSessionId = "session_creation_fence_other" as SessionId;
+    await expect(creator.append({
+      id: "event_creation_fence_wrong_session",
+      type: "session.status_changed",
+      time: now as TimestampMs,
+      sessionId: otherSessionId,
+      payload: { sessionId: otherSessionId, status: "idle" },
+    }, { creationClaim: { sessionId, claimId: creationClaimId } })).rejects.toBeInstanceOf(
+      SessionCreationClaimConflictError,
+    );
+    await expect(creator.append({
+      id: "event_creation_fence_authorized",
+      type: "session.status_changed",
+      time: now as TimestampMs,
+      sessionId,
+      payload: { sessionId, status: "idle" },
+    }, { creationClaim: { sessionId, claimId: creationClaimId } })).resolves.toBeUndefined();
+    expect((await creator.events({ sessionId, type: "session.status_changed", limit: 10 })).map((event) =>
+      event.id
+    )).toEqual(["event_creation_fence_authorized"]);
+
+    expect(peer.claimSessionRun({
+      sessionId,
+      claimId: "run_claim_during_creation",
+      allowSubagentSessions: false,
+      time: now + 1,
+      leaseDurationMs: 120_000,
+    })).toEqual({ status: "busy" });
+    await expect(peer.append({
+      id: "event_archive_during_creation",
+      type: "session.archived",
+      time: (now + 1) as TimestampMs,
+      sessionId,
+      payload: { sessionId },
+    })).rejects.toBeInstanceOf(SessionRunClaimConflictError);
+    expect(await peer.events({ sessionId, type: "session.archived", limit: 10 })).toEqual([]);
+
+    creator.releaseSessionCreation({ sessionId, claimId: creationClaimId });
+    expect(peer.claimSessionRun({
+      sessionId,
+      claimId: runClaimId,
+      allowSubagentSessions: false,
+      time: now + 2,
+      leaseDurationMs: 120_000,
+    })).toEqual({ status: "claimed" });
+    peer.releaseSessionRun({ sessionId, claimId: runClaimId });
+  } finally {
+    peer.close();
+    creator.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an expired root creation owner fails closed when a contender discovers a child reservation", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-expired-root-claim-"));
+  const dbPath = join(dir, "events.sqlite");
+  const staleRootStore = new SqliteEventStore(dbPath);
+  const contenderStore = new SqliteEventStore(dbPath);
+  const parentSessionId = "session_expired_claim_parent" as SessionId;
+  const childSessionId = "session_expired_claim_child" as SessionId;
+
+  try {
+    expect(staleRootStore.claimSessionCreation({
+      sessionId: childSessionId,
+      claimId: "creation_claim_expired_root",
+      cwd: "/repo",
+      owner: "root",
+      time: 1_000,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "claimed" });
+    await contenderStore.append({
+      id: "event_expired_claim_child_reserved",
+      type: "agent.task_created",
+      time: 1 as TimestampMs,
+      sessionId: parentSessionId,
+      payload: {
+        taskId: "task_expired_claim_child" as TaskId,
+        path: "/root/expired-claim-child" as AgentPath,
+        parentPath: "/root" as AgentPath,
+        parentSessionId,
+        childSessionId,
+        taskName: "expired claim child",
+        cwd: "/repo",
+        prompt: "own the reserved child session",
+        mode: "background",
+      },
+    });
+
+    expect(contenderStore.claimSessionCreation({
+      sessionId: childSessionId,
+      claimId: "creation_claim_reservation_contender",
+      cwd: "/repo",
+      owner: "root",
+      time: 1_100,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "subagent" });
+    await expect(staleRootStore.append({
+      id: "event_expired_root_late_create",
+      type: "session.created",
+      time: 2 as TimestampMs,
+      sessionId: childSessionId,
+      payload: { sessionId: childSessionId, cwd: "/repo" },
+    })).rejects.toBeInstanceOf(SessionCreationClaimConflictError);
+
+    expect(await staleRootStore.sessions()).toEqual([]);
+    expect(await staleRootStore.events({
+      sessionId: childSessionId,
+      type: "session.created",
+      limit: 10,
+    })).toEqual([]);
+  } finally {
+    contenderStore.close();
+    staleRootStore.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stale run owner cannot append after another connection takes over its lease", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-stale-run-owner-"));
+  const dbPath = join(dir, "events.sqlite");
+  const staleOwner = new SqliteEventStore(dbPath);
+  const currentOwner = new SqliteEventStore(dbPath);
+  const sessionId = "session_stale_run_owner" as SessionId;
+  const staleTurnId = "turn_stale_run_owner" as TurnId;
+  const staleMessageId = "message_stale_run_owner" as MessageId;
+  const currentTurnId = "turn_current_run_owner" as TurnId;
+  const currentMessageId = "message_current_run_owner" as MessageId;
+  const claimedAt = Date.now();
+
+  try {
+    await staleOwner.append(sessionEvent("event_stale_run_session", sessionId, 1 as TimestampMs));
+    expect(staleOwner.claimSessionRun({
+      sessionId,
+      claimId: "run_claim_stale_owner",
+      allowSubagentSessions: false,
+      time: claimedAt,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "claimed" });
+    expect(currentOwner.claimSessionRun({
+      sessionId,
+      claimId: "run_claim_current_owner",
+      allowSubagentSessions: false,
+      time: claimedAt + 100,
+      leaseDurationMs: 60_000,
+    })).toEqual({ status: "claimed" });
+
+    const staleEvents: ChiliEvent[] = [
+      {
+        id: "event_stale_owner_turn",
+        type: "turn.started",
+        time: 2 as TimestampMs,
+        sessionId,
+        payload: { turnId: staleTurnId },
+      },
+      {
+        id: "event_stale_owner_message",
+        type: "message.created",
+        time: 3 as TimestampMs,
+        sessionId,
+        payload: { messageId: staleMessageId, role: "user", turnId: staleTurnId },
+      },
+      {
+        id: "event_stale_owner_status",
+        type: "session.status_changed",
+        time: 4 as TimestampMs,
+        sessionId,
+        payload: { sessionId, status: "running", turnId: staleTurnId },
+      },
+    ];
+    await expect(staleOwner.appendMany(staleEvents)).rejects.toBeInstanceOf(SessionRunClaimConflictError);
+    expect((await staleOwner.events({ sessionId, limit: 10 })).map((event) => event.id)).toEqual([
+      "event_stale_run_session",
+    ]);
+    expect(await staleOwner.messages(sessionId)).toEqual([]);
+
+    staleOwner.releaseSessionRun({ sessionId, claimId: "run_claim_stale_owner" });
+    expect(sqliteDatabase(currentOwner)
+      .query<{ claim_id: string }, [string]>(
+        `select claim_id from session_run_claims where session_id = ?`,
+      )
+      .get(sessionId))
+      .toEqual({ claim_id: "run_claim_current_owner" });
+
+    await currentOwner.appendMany([
+      {
+        id: "event_current_owner_turn",
+        type: "turn.started",
+        time: 5 as TimestampMs,
+        sessionId,
+        payload: { turnId: currentTurnId },
+      },
+      {
+        id: "event_current_owner_message",
+        type: "message.created",
+        time: 6 as TimestampMs,
+        sessionId,
+        payload: { messageId: currentMessageId, role: "user", turnId: currentTurnId },
+      },
+      {
+        id: "event_current_owner_status",
+        type: "session.status_changed",
+        time: 7 as TimestampMs,
+        sessionId,
+        payload: { sessionId, status: "running", turnId: currentTurnId },
+      },
+    ]);
+    expect((await currentOwner.events({ sessionId, limit: 10 })).map((event) => event.id)).toEqual([
+      "event_stale_run_session",
+      "event_current_owner_turn",
+      "event_current_owner_message",
+      "event_current_owner_status",
+    ]);
+    expect(await currentOwner.messages(sessionId)).toEqual([
+      expect.objectContaining({ id: currentMessageId, sessionId, turnId: currentTurnId }),
+    ]);
+  } finally {
+    currentOwner.close();
+    staleOwner.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a run owner cannot append after its own lease expires without a takeover", async () => {
+  const store = new SqliteEventStore(":memory:");
+  const sessionId = "session_expired_run_owner" as SessionId;
+
+  try {
+    await store.append(sessionEvent("event_expired_run_session", sessionId, 1 as TimestampMs));
+    expect(store.claimSessionRun({
+      sessionId,
+      claimId: "run_claim_expired_owner",
+      allowSubagentSessions: false,
+      time: Date.now() - 1_000,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "claimed" });
+
+    await expect(store.append({
+      id: "event_expired_owner_status",
+      type: "session.status_changed",
+      time: 2 as TimestampMs,
+      sessionId,
+      payload: { sessionId, status: "running" },
+    })).rejects.toBeInstanceOf(SessionRunClaimConflictError);
+    expect((await store.events({ sessionId, limit: 10 })).map((event) => event.id)).toEqual([
+      "event_expired_run_session",
+    ]);
+  } finally {
+    store.close();
+  }
+});
+
+test("run-claim fences allow only durably bound descendant actor provenance", async () => {
+  const store = new SqliteEventStore(":memory:");
+  const ownerSessionId = "session_fenced_team_owner" as SessionId;
+  const actorSessionId = "session_fenced_team_actor" as SessionId;
+  const siblingSessionId = "session_fenced_team_sibling" as SessionId;
+  const unrelatedSessionId = "session_fenced_team_unrelated" as SessionId;
+  const teamId = "team_fenced_actor" as TeamId;
+  const otherTeamId = "team_fenced_other" as TeamId;
+  const actorPath = "/root/actor" as AgentPath;
+  const siblingPath = "/root/sibling" as AgentPath;
+  const claimId = "run_claim_fenced_team_owner";
+  const actorClaimId = "run_claim_fenced_team_actor";
+
+  try {
+    await store.append(sessionEvent("event_fenced_owner_session", ownerSessionId, 1 as TimestampMs));
+    await store.appendMany([
+      {
+        id: "event_fenced_actor_task",
+        type: "agent.task_created",
+        time: 2 as TimestampMs,
+        sessionId: ownerSessionId,
+        payload: {
+          taskId: "task_fenced_actor" as TaskId,
+          path: actorPath,
+          parentPath: "/root" as AgentPath,
+          parentSessionId: ownerSessionId,
+          childSessionId: actorSessionId,
+          taskName: "actor",
+          cwd: "/repo",
+          prompt: "act",
+        },
+      },
+      {
+        id: "event_fenced_sibling_task",
+        type: "agent.task_created",
+        time: 3 as TimestampMs,
+        sessionId: ownerSessionId,
+        payload: {
+          taskId: "task_fenced_sibling" as TaskId,
+          path: siblingPath,
+          parentPath: "/root" as AgentPath,
+          parentSessionId: ownerSessionId,
+          childSessionId: siblingSessionId,
+          taskName: "sibling",
+          cwd: "/repo",
+          prompt: "act",
+        },
+      },
+      sessionEvent("event_fenced_actor_session", actorSessionId, 4 as TimestampMs),
+      sessionEvent("event_fenced_sibling_session", siblingSessionId, 5 as TimestampMs),
+      sessionEvent("event_fenced_unrelated_session", unrelatedSessionId, 6 as TimestampMs),
+      {
+        id: "event_fenced_team",
+        type: "team.created",
+        time: 7 as TimestampMs,
+        sessionId: ownerSessionId,
+        payload: { teamId, name: "fenced", leadPath: "/root" as AgentPath },
+      },
+      {
+        id: "event_fenced_team_lead",
+        type: "team.member_added",
+        time: 8 as TimestampMs,
+        sessionId: ownerSessionId,
+        payload: {
+          teamId,
+          path: "/root" as AgentPath,
+          name: "lead",
+          role: "lead",
+          childSessionId: ownerSessionId,
+        },
+      },
+      {
+        id: "event_fenced_team_actor",
+        type: "team.member_added",
+        time: 9 as TimestampMs,
+        sessionId: ownerSessionId,
+        payload: {
+          teamId,
+          path: actorPath,
+          name: "actor",
+          role: "worker",
+          childSessionId: actorSessionId,
+        },
+      },
+      {
+        id: "event_fenced_team_sibling",
+        type: "team.member_added",
+        time: 10 as TimestampMs,
+        sessionId: ownerSessionId,
+        payload: {
+          teamId,
+          path: siblingPath,
+          name: "sibling",
+          role: "worker",
+          childSessionId: siblingSessionId,
+        },
+      },
+      {
+        id: "event_fenced_other_team",
+        type: "team.created",
+        time: 11 as TimestampMs,
+        sessionId: ownerSessionId,
+        payload: { teamId: otherTeamId, name: "other", leadPath: "/root" as AgentPath },
+      },
+    ]);
+    expect(store.claimSessionRun({
+      sessionId: ownerSessionId,
+      claimId,
+      allowSubagentSessions: false,
+      time: Date.now(),
+      leaseDurationMs: 60_000,
+    })).toEqual({ status: "claimed" });
+
+    await expect(store.append({
+      id: "event_fenced_actor_write",
+      type: "team.member_status_changed",
+      time: 12 as TimestampMs,
+      sessionId: actorSessionId,
+      payload: { teamId, path: actorPath, status: "running" },
+    }, { runClaim: { sessionId: ownerSessionId, claimId } })).resolves.toBeUndefined();
+
+    await expect(store.append({
+      id: "event_fenced_ordinary_cross_session",
+      type: "session.status_changed",
+      time: 13 as TimestampMs,
+      sessionId: actorSessionId,
+      payload: { sessionId: actorSessionId, status: "idle" },
+    }, { runClaim: { sessionId: ownerSessionId, claimId } })).rejects.toBeInstanceOf(
+      SessionRunClaimConflictError,
+    );
+    await expect(store.append({
+      id: "event_fenced_missing_session",
+      type: "tool.output_delta",
+      time: 14 as TimestampMs,
+      payload: {
+        callId: "toolcall_fenced_missing_session" as ToolCallId,
+        stream: "stdout",
+        delta: "forged",
+      },
+    }, { runClaim: { sessionId: ownerSessionId, claimId } })).rejects.toBeInstanceOf(
+      SessionRunClaimConflictError,
+    );
+    await expect(store.append({
+      id: "event_fenced_fake_path",
+      type: "team.member_status_changed",
+      time: 15 as TimestampMs,
+      sessionId: actorSessionId,
+      payload: { teamId, path: "/root/forged" as AgentPath, status: "idle" },
+    }, { runClaim: { sessionId: ownerSessionId, claimId } })).rejects.toBeInstanceOf(
+      SessionRunClaimConflictError,
+    );
+    await expect(store.append({
+      id: "event_fenced_cross_team",
+      type: "team.member_status_changed",
+      time: 16 as TimestampMs,
+      sessionId: actorSessionId,
+      payload: { teamId: otherTeamId, path: actorPath, status: "idle" },
+    }, { runClaim: { sessionId: ownerSessionId, claimId } })).rejects.toBeInstanceOf(
+      SessionRunClaimConflictError,
+    );
+    await expect(store.append({
+      id: "event_fenced_unrelated_actor",
+      type: "team.member_status_changed",
+      time: 17 as TimestampMs,
+      sessionId: unrelatedSessionId,
+      payload: { teamId, path: actorPath, status: "idle" },
+    }, { runClaim: { sessionId: ownerSessionId, claimId } })).rejects.toBeInstanceOf(
+      SessionRunClaimConflictError,
+    );
+
+    expect(store.claimSessionRun({
+      sessionId: actorSessionId,
+      claimId: actorClaimId,
+      allowSubagentSessions: true,
+      time: Date.now(),
+      leaseDurationMs: 60_000,
+    })).toEqual({ status: "claimed" });
+    await expect(store.append({
+      id: "event_fenced_reverse_actor",
+      type: "team.member_status_changed",
+      time: 18 as TimestampMs,
+      sessionId: ownerSessionId,
+      payload: { teamId, path: "/root" as AgentPath, status: "idle" },
+    }, { runClaim: { sessionId: actorSessionId, claimId: actorClaimId } })).rejects.toBeInstanceOf(
+      SessionRunClaimConflictError,
+    );
+    await expect(store.append({
+      id: "event_fenced_sibling_actor",
+      type: "team.member_status_changed",
+      time: 19 as TimestampMs,
+      sessionId: siblingSessionId,
+      payload: { teamId, path: siblingPath, status: "idle" },
+    }, { runClaim: { sessionId: actorSessionId, claimId: actorClaimId } })).rejects.toBeInstanceOf(
+      SessionRunClaimConflictError,
+    );
+
+    await store.append({
+      id: "event_fenced_actor_closed",
+      type: "team.member_status_changed",
+      time: 20 as TimestampMs,
+      sessionId: ownerSessionId,
+      payload: { teamId, path: actorPath, status: "closed" },
+    }, { runClaim: { sessionId: ownerSessionId, claimId } });
+    await expect(store.append({
+      id: "event_fenced_closed_actor_write",
+      type: "team.member_status_changed",
+      time: 21 as TimestampMs,
+      sessionId: actorSessionId,
+      payload: { teamId, path: actorPath, status: "idle" },
+    }, { runClaim: { sessionId: ownerSessionId, claimId } })).rejects.toBeInstanceOf(
+      SessionRunClaimConflictError,
+    );
+
+    expect((await store.events({ sessionId: actorSessionId, limit: 20 })).map((event) => event.id)).toEqual([
+      "event_fenced_actor_session",
+      "event_fenced_actor_write",
+    ]);
+  } finally {
+    store.releaseSessionRun({ sessionId: actorSessionId, claimId: actorClaimId });
+    store.releaseSessionRun({ sessionId: ownerSessionId, claimId });
+    store.close();
   }
 });
 
@@ -408,6 +1340,249 @@ test("reconciles stale turns without completion events", async () => {
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("stale-turn recovery does not finalize a turn protected by a live run claim", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-live-turn-recovery-"));
+  const dbPath = join(dir, "events.sqlite");
+  const runner = new SqliteEventStore(dbPath);
+  const recovery = new SqliteEventStore(dbPath);
+  const sessionId = "session_live_turn_recovery" as SessionId;
+  const turnId = "turn_live_turn_recovery" as TurnId;
+  const now = Date.now();
+  let recoveredIds = 0;
+
+  try {
+    await runner.appendMany([
+      sessionEvent("event_live_turn_session", sessionId, 1 as TimestampMs),
+      {
+        id: "event_live_turn_running",
+        type: "session.status_changed",
+        time: 2 as TimestampMs,
+        sessionId,
+        payload: { sessionId, status: "running" },
+      },
+      {
+        id: "event_live_turn_started",
+        type: "turn.started",
+        time: 3 as TimestampMs,
+        sessionId,
+        payload: { turnId },
+      },
+    ]);
+    expect(runner.claimSessionRun({
+      sessionId,
+      claimId: "run_claim_live_turn_recovery",
+      allowSubagentSessions: false,
+      time: now,
+      leaseDurationMs: 60_000,
+    })).toEqual({ status: "claimed" });
+
+    expect(await recovery.reconcileStaleTurns({
+      staleBefore: 1_000,
+      now,
+      createId: (prefix) => `${prefix}_live_${recoveredIds++}`,
+    })).toEqual([]);
+    expect((await recovery.events({ sessionId, limit: 10 })).map((event) => event.id)).toEqual([
+      "event_live_turn_session",
+      "event_live_turn_running",
+      "event_live_turn_started",
+    ]);
+
+    runner.releaseSessionRun({ sessionId, claimId: "run_claim_live_turn_recovery" });
+    expect((await recovery.reconcileStaleTurns({
+      staleBefore: 1_000,
+      now: now + 1,
+      createId: (prefix) => `${prefix}_released_${recoveredIds++}`,
+    })).map((event) => event.type)).toEqual(["turn.completed", "session.status_changed"]);
+  } finally {
+    runner.releaseSessionRun({ sessionId, claimId: "run_claim_live_turn_recovery" });
+    recovery.close();
+    runner.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("recovers a completed internal turn whose latest stale session state is still transient", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-completed-turn-crash-gap-"));
+  const dbPath = join(dir, "events.sqlite");
+  const first = new SqliteEventStore(dbPath);
+  const second = new SqliteEventStore(dbPath);
+  const sessionId = "session_completed_turn_crash_gap" as SessionId;
+  const turnId = "turn_completed_turn_crash_gap" as TurnId;
+  let recoveredIds = 0;
+
+  try {
+    await first.appendMany([
+      sessionEvent("event_completed_gap_session", sessionId, 1 as TimestampMs),
+      {
+        id: "event_completed_gap_running",
+        type: "session.status_changed",
+        time: 2 as TimestampMs,
+        sessionId,
+        payload: { sessionId, status: "running" },
+      },
+      {
+        id: "event_completed_gap_turn_started",
+        type: "turn.started",
+        time: 3 as TimestampMs,
+        sessionId,
+        payload: { turnId },
+      },
+      {
+        id: "event_completed_gap_turn_completed",
+        type: "turn.completed",
+        time: 4 as TimestampMs,
+        sessionId,
+        payload: { turnId, status: "completed" },
+      },
+    ]);
+
+    const recovered = await first.reconcileStaleTurns({
+      staleBefore: 100,
+      now: 101,
+      createId: (prefix) => `${prefix}_completed_gap_${recoveredIds++}`,
+    });
+    expect(recovered.map((event) => event.type)).toEqual(["session.status_changed"]);
+    expect(recovered[0]?.payload).toEqual({
+      sessionId,
+      status: "failed",
+      turnId,
+      reason: "stale_turn_recovered",
+    });
+    expect((await first.events({ sessionId, type: "turn.completed", limit: 10 }))).toHaveLength(1);
+
+    // A second connection rechecks the committed terminal status instead of
+    // duplicating the recovery event selected by the first transaction.
+    expect(await second.reconcileStaleTurns({
+      staleBefore: 200,
+      now: 201,
+      createId: (prefix) => `${prefix}_duplicate_${recoveredIds++}`,
+    })).toEqual([]);
+  } finally {
+    second.close();
+    first.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("recovers a stale transient session that crashed before turn.started", async () => {
+  const store = new SqliteEventStore(":memory:");
+  const sessionId = "session_crash_before_turn_started" as SessionId;
+
+  try {
+    await store.appendMany([
+      sessionEvent("event_crash_before_turn_session", sessionId, 1 as TimestampMs),
+      {
+        id: "event_crash_before_turn_running",
+        type: "session.status_changed",
+        time: 2 as TimestampMs,
+        sessionId,
+        payload: { sessionId, status: "running", reason: "prompt_submitted" },
+      },
+    ]);
+
+    const recovered = await store.reconcileStaleTurns({
+      staleBefore: 100,
+      now: 101,
+      createId: (prefix) => `${prefix}_before_turn`,
+    });
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]).toMatchObject({
+      type: "session.status_changed",
+      sessionId,
+      payload: {
+        sessionId,
+        status: "failed",
+        reason: "stale_turn_recovered",
+      },
+    });
+    expect(recovered[0]?.payload).not.toHaveProperty("turnId");
+    expect(await store.reconcileStaleTurns({
+      staleBefore: 200,
+      now: 201,
+      createId: (prefix) => `${prefix}_again`,
+    })).toEqual([]);
+  } finally {
+    store.close();
+  }
+});
+
+test("stale recovery preserves later idle and archived session outcomes", async () => {
+  const store = new SqliteEventStore(":memory:");
+  const idleSessionId = "session_recovery_later_idle" as SessionId;
+  const archivedSessionId = "session_recovery_later_archived" as SessionId;
+  const idleTurnId = "turn_recovery_later_idle" as TurnId;
+  const archivedTurnId = "turn_recovery_later_archived" as TurnId;
+
+  try {
+    await store.appendMany([
+      sessionEvent("event_recovery_idle_session", idleSessionId, 1 as TimestampMs),
+      {
+        id: "event_recovery_idle_running",
+        type: "session.status_changed",
+        time: 2 as TimestampMs,
+        sessionId: idleSessionId,
+        payload: { sessionId: idleSessionId, status: "running" },
+      },
+      {
+        id: "event_recovery_idle_turn",
+        type: "turn.started",
+        time: 3 as TimestampMs,
+        sessionId: idleSessionId,
+        payload: { turnId: idleTurnId },
+      },
+      {
+        id: "event_recovery_idle_completion",
+        type: "turn.completed",
+        time: 4 as TimestampMs,
+        sessionId: idleSessionId,
+        payload: { turnId: idleTurnId, status: "completed" },
+      },
+      {
+        id: "event_recovery_idle_terminal",
+        type: "session.status_changed",
+        time: 5 as TimestampMs,
+        sessionId: idleSessionId,
+        payload: { sessionId: idleSessionId, status: "idle", turnId: idleTurnId },
+      },
+      sessionEvent("event_recovery_archived_session", archivedSessionId, 6 as TimestampMs),
+      {
+        id: "event_recovery_archived_running",
+        type: "session.status_changed",
+        time: 7 as TimestampMs,
+        sessionId: archivedSessionId,
+        payload: { sessionId: archivedSessionId, status: "running" },
+      },
+      {
+        id: "event_recovery_archived_turn",
+        type: "turn.started",
+        time: 8 as TimestampMs,
+        sessionId: archivedSessionId,
+        payload: { turnId: archivedTurnId },
+      },
+      {
+        id: "event_recovery_archived_terminal",
+        type: "session.archived",
+        time: 9 as TimestampMs,
+        sessionId: archivedSessionId,
+        payload: { sessionId: archivedSessionId },
+      },
+    ]);
+
+    expect(await store.reconcileStaleTurns({
+      staleBefore: 100,
+      now: 101,
+      createId: (prefix) => `${prefix}_must_not_write`,
+    })).toEqual([]);
+    expect((await store.events({ type: "session.status_changed", limit: 20 })).map((event) => event.id)).toEqual([
+      "event_recovery_idle_running",
+      "event_recovery_idle_terminal",
+      "event_recovery_archived_running",
+    ]);
+  } finally {
+    store.close();
   }
 });
 
@@ -1391,6 +2566,137 @@ test("migrates older agent task tables with generation and lease columns", async
   }
 });
 
+test("migration preserves legacy team worker identity and follow-up CAS rejects reopening it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-legacy-team-worker-migration-"));
+  const dbPath = join(dir, "events.sqlite");
+  const taskId = "task_legacy_team_worker" as TaskId;
+  const currentRunId = "agent_legacy_team_worker" as AgentRunId;
+  const legacyWorkerPolicy = {
+    teamId: "team_legacy_worker",
+    taskId: "team_task_legacy_worker",
+    memberPath: "/root/worker",
+    parentSessionId: "session_legacy_worker_parent",
+  };
+  const legacyDb = new Database(dbPath, { create: true, strict: true });
+  legacyDb.exec(`
+    create table events (
+      id text primary key,
+      type text not null,
+      time integer not null,
+      session_id text,
+      payload_json text not null
+    );
+    create table agent_tasks (
+      id text primary key,
+      path text not null,
+      parent_path text,
+      parent_session_id text,
+      child_session_id text,
+      task_name text not null,
+      cwd text,
+      prompt text,
+      mode text,
+      status text not null,
+      generation integer not null default 0,
+      current_run_id text,
+      summary text,
+      error text,
+      completion_json text,
+      created_at integer not null,
+      updated_at integer not null,
+      completed_at integer
+    )
+  `);
+  legacyDb.query(
+    `insert into agent_tasks
+       (id, path, parent_path, parent_session_id, child_session_id,
+        task_name, cwd, prompt, mode, status, generation, current_run_id,
+        created_at, updated_at, completed_at)
+     values (?, ?, ?, ?, ?, ?, '/repo', 'legacy team prompt', 'background',
+             'completed', 1, ?, 1, 2, 2)`,
+  ).run(
+    taskId,
+    "/root/worker/task_legacy_team_worker",
+    "/root/worker",
+    "session_legacy_worker_parent",
+    "session_legacy_worker_child",
+    "legacy team worker",
+    currentRunId,
+  );
+  legacyDb.query(
+    `insert into events (id, type, time, session_id, payload_json)
+     values ('event_legacy_team_worker_created', 'agent.task_created', 1, ?, ?)`,
+  ).run(
+    "session_legacy_worker_parent",
+    JSON.stringify({
+      taskId,
+      path: "/root/worker/task_legacy_team_worker",
+      parentPath: "/root/worker",
+      parentSessionId: "session_legacy_worker_parent",
+      childSessionId: "session_legacy_worker_child",
+      taskName: "legacy team worker",
+      cwd: "/repo",
+      prompt: "legacy team prompt",
+      mode: "background",
+      workerPolicy: legacyWorkerPolicy,
+    }),
+  );
+  legacyDb.close();
+
+  const store = new SqliteEventStore(dbPath);
+  try {
+    const migrated = sqliteDatabase(store).query<{
+      dispatch_id: string | null;
+      reserved_run_id: string | null;
+      worker_policy_json: string | null;
+    }, [string]>(
+      `select dispatch_id, reserved_run_id, worker_policy_json
+       from agent_tasks where id = ?`,
+    ).get(taskId);
+    expect(migrated).toMatchObject({
+      dispatch_id: null,
+      reserved_run_id: null,
+      worker_policy_json: expect.any(String),
+    });
+    expect(sqliteDatabase(store).query<{ name: string }, []>(
+      `select name from schema_migrations where name = 'agent_task_worker_policy_backfill_v1'`,
+    ).get()).toEqual({ name: "agent_task_worker_policy_backfill_v1" });
+    expect(await store.agentTask(taskId)).toMatchObject({
+      id: taskId,
+      status: "completed",
+      generation: 1,
+      currentRunId,
+      workerPolicy: {
+        teamId: "team_legacy_worker",
+        taskId: "team_task_legacy_worker",
+      },
+    });
+
+    const result = await store.beginAgentTaskRunCas({
+      taskId,
+      expectedGeneration: 1,
+      expectedRunId: currentRunId,
+      expectedLeaseOwner: null,
+      runId: "agent_legacy_team_worker_forbidden" as AgentRunId,
+      generation: 2,
+      leaseOwner: "task-followup:legacy-team-worker",
+      leaseTtlMs: 100,
+      spawnEventId: "event_legacy_team_worker_forbidden",
+      time: 3,
+    });
+    expect(result).toMatchObject({ applied: false, events: [] });
+    expect(await store.agentTask(taskId)).toMatchObject({
+      status: "completed",
+      generation: 1,
+      currentRunId,
+    });
+    expect(await store.events({ type: "agent.spawned", limit: 10 })).toEqual([]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("migrates older team message tables without delivery", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-team-message-migration-"));
   const dbPath = join(dir, "events.sqlite");
@@ -2145,6 +3451,171 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
   }
 });
 
+test("treats an exact late reserved task creation as a no-op across ledger, mirror, and observers", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-reserved-create-idempotency-"));
+  const mirrored: ChiliEvent[] = [];
+  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"), {
+    mirror: {
+      async write(event) {
+        mirrored.push(event);
+      },
+    },
+  });
+  const store = new ObservableEventStore(baseStore);
+  const observed: ChiliEvent[] = [];
+  const unsubscribe = store.subscribe((event) => observed.push(event));
+  const parentSessionId = "session_reserved_create_parent" as SessionId;
+  const taskId = "task_reserved_create" as TaskId;
+  const runId = "agent_reserved_create" as AgentRunId;
+  const path = "/root/task_reserved_create" as AgentPath;
+  const workerPolicy = {
+    tools: ["read", "search"],
+    constraints: { network: false, filesystem: "workspace" },
+    enabled: true,
+  };
+  const creation: Extract<ChiliEvent, { type: "agent.task_created" }> = {
+    id: "event_reserved_create_first",
+    type: "agent.task_created",
+    time: 1 as TimestampMs,
+    sessionId: parentSessionId,
+    payload: {
+      taskId,
+      dispatchId: "dispatch_reserved_create",
+      reservedRunId: runId,
+      path,
+      parentPath: "/root" as AgentPath,
+      parentSessionId,
+      childSessionId: "session_reserved_create_child" as SessionId,
+      taskName: "reserved create",
+      cwd: "/repo",
+      prompt: "perform the frozen work",
+      mode: "one_shot",
+      workerPolicy,
+    },
+  };
+
+  try {
+    await store.append(creation);
+    expect((await store.closeAgentTaskCas({
+      taskId,
+      status: "cancelled",
+      eventId: "event_reserved_create_cancelled",
+      expectedGeneration: 0,
+      expectedRunId: null,
+      expectedLeaseOwner: null,
+      time: 2,
+    })).applied).toBe(true);
+
+    await store.append({
+      ...creation,
+      id: "event_reserved_create_late_exact",
+      time: 3 as TimestampMs,
+      payload: {
+        ...creation.payload,
+        workerPolicy: {
+          enabled: true,
+          constraints: { filesystem: "workspace", network: false },
+          tools: ["read", "search"],
+        },
+      },
+    });
+
+    expect(await baseStore.agentTask(taskId)).toMatchObject({
+      status: "cancelled",
+      generation: 1,
+      dispatchId: creation.payload.dispatchId,
+      reservedRunId: runId,
+      workerPolicy,
+    });
+    expect(await baseStore.events({ type: "agent.task_created", limit: 10 })).toEqual([creation]);
+    expect(mirrored.filter((event) => event.type === "agent.task_created")).toEqual([creation]);
+    expect(observed.filter((event) => event.type === "agent.task_created")).toEqual([creation]);
+  } finally {
+    unsubscribe();
+    baseStore.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("rejects cross-task dispatch and reserved-run reuse and rolls back the whole batch", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-reservation-conflict-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const parentSessionId = "session_reservation_conflict_parent" as SessionId;
+  const first: Extract<ChiliEvent, { type: "agent.task_created" }> = {
+    id: "event_reservation_conflict_first",
+    type: "agent.task_created",
+    time: 1 as TimestampMs,
+    sessionId: parentSessionId,
+    payload: {
+      taskId: "task_reservation_conflict_first" as TaskId,
+      dispatchId: "dispatch_reservation_conflict",
+      reservedRunId: "agent_reservation_conflict" as AgentRunId,
+      path: "/root/task_reservation_conflict_first" as AgentPath,
+      parentPath: "/root" as AgentPath,
+      parentSessionId,
+      childSessionId: "session_reservation_conflict_first" as SessionId,
+      taskName: "first reservation",
+      cwd: "/repo",
+      prompt: "first",
+      mode: "one_shot",
+    },
+  };
+
+  try {
+    await store.append(first);
+    const dispatchConflict: Extract<ChiliEvent, { type: "agent.task_created" }> = {
+      ...first,
+      id: "event_reservation_dispatch_conflict",
+      payload: {
+        ...first.payload,
+        taskId: "task_reservation_dispatch_conflict" as TaskId,
+        reservedRunId: "agent_reservation_dispatch_conflict" as AgentRunId,
+        path: "/root/task_reservation_dispatch_conflict" as AgentPath,
+        childSessionId: "session_reservation_dispatch_conflict" as SessionId,
+      },
+    };
+    await expect(store.append(dispatchConflict)).rejects.toThrow("dispatch identity already belongs");
+
+    const runConflict: Extract<ChiliEvent, { type: "agent.task_created" }> = {
+      ...dispatchConflict,
+      id: "event_reservation_run_conflict",
+      payload: {
+        ...dispatchConflict.payload,
+        taskId: "task_reservation_run_conflict" as TaskId,
+        dispatchId: "dispatch_reservation_run_conflict",
+        reservedRunId: first.payload.reservedRunId as AgentRunId,
+        path: "/root/task_reservation_run_conflict" as AgentPath,
+        childSessionId: "session_reservation_run_conflict" as SessionId,
+      },
+    };
+    await expect(store.append(runConflict)).rejects.toThrow("run reservation already belongs");
+
+    const batchCandidate: Extract<ChiliEvent, { type: "agent.task_created" }> = {
+      ...first,
+      id: "event_reservation_batch_candidate",
+      payload: {
+        ...first.payload,
+        taskId: "task_reservation_batch_candidate" as TaskId,
+        dispatchId: "dispatch_reservation_batch_candidate",
+        reservedRunId: "agent_reservation_batch_candidate" as AgentRunId,
+        path: "/root/task_reservation_batch_candidate" as AgentPath,
+        childSessionId: "session_reservation_batch_candidate" as SessionId,
+      },
+    };
+    await expect(store.appendMany([batchCandidate, dispatchConflict])).rejects.toThrow(
+      "dispatch identity already belongs",
+    );
+
+    expect(await store.agentTask(batchCandidate.payload.taskId)).toBeUndefined();
+    expect((await store.events({ type: "agent.task_created", limit: 10 })).map((event) => event.id)).toEqual([
+      first.id,
+    ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("round-trips and queries local subagent scheduling provenance", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-subagent-provenance-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -2266,6 +3737,23 @@ test("claims, renews, expires, and releases task leases with generation CAS", as
         leaseOwner: "worker_a",
         leaseExpiresAt: 150,
         leaseHeartbeatAt: 100,
+      },
+    });
+
+    const sameOwnerBlocked = await store.claimAgentTaskLease({
+      taskId,
+      runId,
+      generation: 2,
+      owner: "worker_a",
+      ttlMs: 50,
+      now: 105,
+    });
+    expect(sameOwnerBlocked).toMatchObject({
+      acquired: false,
+      task: {
+        generation: 2,
+        leaseOwner: "worker_a",
+        leaseExpiresAt: 150,
       },
     });
 
@@ -2463,6 +3951,244 @@ test("rejects stale lease-holder finalization after a takeover generation", asyn
     ]);
   } finally {
     store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("rejects task completion and closure fenced by a released run claim after takeover", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-task-finalization-run-claim-"));
+  const dbPath = join(dir, "events.sqlite");
+  const staleOwner = new SqliteEventStore(dbPath);
+  const takeoverOwner = new SqliteEventStore(dbPath);
+  const sessionId = "session_parent" as SessionId;
+  const taskId = "task_finalization_run_claim" as TaskId;
+  const runId = "agent_finalization_run_claim" as AgentRunId;
+  const path = "/root/task_finalization_run_claim" as AgentPath;
+  const staleClaim = { sessionId, claimId: "run_claim_finalization_stale" };
+  const takeoverClaim = { sessionId, claimId: "run_claim_finalization_takeover" };
+
+  try {
+    await staleOwner.append(sessionEvent("event_finalization_run_claim_session", sessionId, 1 as TimestampMs));
+    await appendRunningTask(staleOwner, { taskId, runId, path, generation: 1, time: 2 as TimestampMs });
+    expect(staleOwner.claimSessionRun({
+      ...staleClaim,
+      allowSubagentSessions: true,
+      time: 10,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "claimed" });
+    staleOwner.releaseSessionRun(staleClaim);
+    expect(takeoverOwner.claimSessionRun({
+      ...takeoverClaim,
+      allowSubagentSessions: true,
+      time: 11,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "claimed" });
+
+    await expect(staleOwner.completeAgentTaskCas({
+      taskId,
+      path,
+      runId,
+      generation: 1,
+      expectedGeneration: 1,
+      expectedRunId: runId,
+      expectedLeaseOwner: null,
+      status: "completed",
+      eventId: "event_finalization_stale_task_complete",
+      agentEventId: "event_finalization_stale_run_complete",
+      sessionId,
+      time: 12,
+      runClaim: staleClaim,
+    })).rejects.toBeInstanceOf(SessionRunClaimConflictError);
+    await expect(staleOwner.closeAgentTaskCas({
+      taskId,
+      status: "cancelled",
+      eventId: "event_finalization_stale_task_close",
+      agentEventId: "event_finalization_stale_run_close",
+      expectedGeneration: 1,
+      expectedRunId: runId,
+      expectedLeaseOwner: null,
+      sessionId,
+      time: 13,
+      runClaim: staleClaim,
+    })).rejects.toBeInstanceOf(SessionRunClaimConflictError);
+
+    expect(await takeoverOwner.agentTask(taskId)).toMatchObject({
+      status: "running",
+      generation: 1,
+      currentRunId: runId,
+    });
+    expect(await takeoverOwner.agentRuns({ taskId })).toEqual([
+      expect.objectContaining({ id: runId, status: "running" }),
+    ]);
+    expect(await takeoverOwner.events({ type: "agent.task_completed", limit: 10 })).toEqual([]);
+    expect(await takeoverOwner.events({ type: "agent.completed", limit: 10 })).toEqual([]);
+  } finally {
+    takeoverOwner.releaseSessionRun(takeoverClaim);
+    staleOwner.close();
+    takeoverOwner.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("rejects team-agent synchronization fenced by a released run claim after takeover", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-team-agent-sync-run-claim-"));
+  const dbPath = join(dir, "events.sqlite");
+  const staleOwner = new SqliteEventStore(dbPath);
+  const takeoverOwner = new SqliteEventStore(dbPath);
+  const sessionId = "session_team_agent_sync_run_claim" as SessionId;
+  const teamId = "team_agent_sync_run_claim" as TeamId;
+  const teamTaskId = "task_team_agent_sync_run_claim" as TaskId;
+  const agentTaskId = "task_agent_sync_run_claim" as TaskId;
+  const agentRunId = "agent_sync_run_claim" as AgentRunId;
+  const workerPath = "/root/worker" as AgentPath;
+  const agentPath = "/root/worker/task_agent_sync_run_claim" as AgentPath;
+  const childSessionId = "session_team_agent_sync_child" as SessionId;
+  const staleClaim = { sessionId, claimId: "run_claim_team_agent_sync_stale" };
+  const takeoverClaim = { sessionId, claimId: "run_claim_team_agent_sync_takeover" };
+  const preparedDispatch = {
+    state: "prepared",
+    dispatchId: "dispatch_team_agent_sync_run_claim",
+    agentTaskId,
+    agentPath,
+    runId: agentRunId,
+    childSessionId,
+    ownerPath: workerPath,
+    mode: "background",
+    dispatchedAt: 5,
+    taskCwd: "/repo",
+    taskName: "fenced synchronization",
+    prompt: "complete the fenced task",
+    workerPolicy: {
+      teamId,
+      taskId: teamTaskId,
+      memberPath: workerPath,
+      parentSessionId: sessionId,
+    },
+  };
+
+  try {
+    await staleOwner.appendMany([
+      sessionEvent("event_team_agent_sync_session", sessionId, 1 as TimestampMs),
+      {
+        id: "event_team_agent_sync_team",
+        type: "team.created",
+        time: 2 as TimestampMs,
+        sessionId,
+        payload: { teamId, name: "sync fence", leadPath: "/root" as AgentPath },
+      },
+      {
+        id: "event_team_agent_sync_member",
+        type: "team.member_added",
+        time: 3 as TimestampMs,
+        sessionId,
+        payload: { teamId, path: workerPath, name: "worker", role: "implementer" },
+      },
+      {
+        id: "event_team_agent_sync_task",
+        type: "team.task_created",
+        time: 4 as TimestampMs,
+        sessionId,
+        payload: {
+          teamId,
+          taskId: teamTaskId,
+          title: "fenced synchronization",
+          ownerPath: workerPath,
+        },
+      },
+      {
+        id: "event_team_agent_sync_claimed",
+        type: "team.task_claimed",
+        time: 5 as TimestampMs,
+        sessionId,
+        payload: {
+          teamId,
+          taskId: teamTaskId,
+          ownerPath: workerPath,
+          claimedBy: workerPath,
+          metadata: { chiliTeamDispatch: preparedDispatch },
+        },
+      },
+      {
+        id: "event_team_agent_sync_agent_created",
+        type: "agent.task_created",
+        time: 6 as TimestampMs,
+        sessionId,
+        payload: {
+          taskId: agentTaskId,
+          dispatchId: preparedDispatch.dispatchId,
+          reservedRunId: agentRunId,
+          path: agentPath,
+          parentPath: workerPath,
+          parentSessionId: sessionId,
+          childSessionId,
+          taskName: preparedDispatch.taskName,
+          cwd: preparedDispatch.taskCwd,
+          prompt: preparedDispatch.prompt,
+          mode: "background",
+          workerPolicy: preparedDispatch.workerPolicy,
+        },
+      },
+    ]);
+    expect((await staleOwner.closeAgentTaskCas({
+      taskId: agentTaskId,
+      status: "cancelled",
+      eventId: "event_team_agent_sync_agent_closed",
+      expectedGeneration: 0,
+      expectedRunId: null,
+      expectedLeaseOwner: null,
+      sessionId,
+      time: 7,
+    })).applied).toBe(true);
+
+    expect(staleOwner.claimSessionRun({
+      ...staleClaim,
+      allowSubagentSessions: false,
+      time: 10,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "claimed" });
+    staleOwner.releaseSessionRun(staleClaim);
+    expect(takeoverOwner.claimSessionRun({
+      ...takeoverClaim,
+      allowSubagentSessions: false,
+      time: 11,
+      leaseDurationMs: 100,
+    })).toEqual({ status: "claimed" });
+
+    await expect(staleOwner.syncTeamTaskFromAgentCas({
+      teamId,
+      taskId: teamTaskId,
+      agentTaskId,
+      agentRunId,
+      agentGeneration: 1,
+      agentStatus: "cancelled",
+      status: "cancelled",
+      metadata: {
+        chiliTeamDispatch: {
+          ...preparedDispatch,
+          state: "bound",
+          generation: 1,
+          agentStatus: "cancelled",
+          syncedAt: 12,
+        },
+      },
+      taskEventId: "event_team_agent_sync_stale_task",
+      memberEventId: "event_team_agent_sync_stale_member",
+      sessionId,
+      runClaim: staleClaim,
+      time: 12,
+    })).rejects.toBeInstanceOf(SessionRunClaimConflictError);
+
+    expect(await takeoverOwner.teamTasks({ teamId, taskId: teamTaskId, limit: 1 })).toMatchObject([
+      { id: teamTaskId, status: "in_progress", ownerPath: workerPath },
+    ]);
+    expect((await takeoverOwner.events({ type: "team.task_updated", limit: 10 })).map((event) => event.id))
+      .not.toContain("event_team_agent_sync_stale_task");
+    expect((await takeoverOwner.events({ type: "team.member_status_changed", limit: 10 })).map((event) => event.id))
+      .not.toContain("event_team_agent_sync_stale_member");
+  } finally {
+    takeoverOwner.releaseSessionRun(takeoverClaim);
+    staleOwner.close();
+    takeoverOwner.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -3306,6 +5032,127 @@ test("final task projection wins over late completion and stale spawn", async ()
   }
 });
 
+test("atomically binds one active interactive owner session and preserves it across reopen", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-team-owner-bind-"));
+  const dbPath = join(dir, "events.sqlite");
+  const first = new SqliteEventStore(dbPath);
+  const second = new SqliteEventStore(dbPath);
+  const teamId = "team_owner_bind" as TeamId;
+  const sessionA = "session_owner_a" as SessionId;
+  const sessionB = "session_owner_b" as SessionId;
+
+  try {
+    await first.appendMany([
+      sessionEvent("event_owner_a", sessionA, 1 as TimestampMs),
+      sessionEvent("event_owner_b", sessionB, 2 as TimestampMs),
+      {
+        id: "event_team_owner_unbound",
+        type: "team.created",
+        time: 3 as TimestampMs,
+        payload: {
+          teamId,
+          name: "owner bind",
+          leadPath: "/root" as AgentPath,
+        },
+      },
+    ]);
+
+    const results = await Promise.all([
+      first.bindTeamOwnerSession({
+        teamId,
+        ownerSessionId: sessionA,
+        eventId: "event_bind_owner_a",
+        time: 4,
+      }),
+      second.bindTeamOwnerSession({
+        teamId,
+        ownerSessionId: sessionB,
+        eventId: "event_bind_owner_b",
+        time: 5,
+      }),
+    ]);
+    expect(results.filter((result) => result.applied)).toHaveLength(1);
+    expect(results.filter((result) => result.reason === "conflict")).toHaveLength(1);
+    const winner = results.find((result) => result.applied)?.ownerSessionId;
+    expect(winner === sessionA || winner === sessionB).toBe(true);
+
+    first.close();
+    second.close();
+    const reopened = new SqliteEventStore(dbPath);
+    try {
+      expect(await reopened.teams({ teamId })).toMatchObject([{ id: teamId, sessionId: winner }]);
+      expect(await reopened.events({ type: "team.owner_session_bound", limit: 10 })).toHaveLength(1);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    first.close();
+    second.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("owner binding rejects subagent sessions and mismatched binding event identity", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-team-owner-subagent-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const teamId = "team_owner_subagent" as TeamId;
+  const rootSessionId = "session_owner_root" as SessionId;
+  const childSessionId = "session_owner_child" as SessionId;
+
+  try {
+    await store.appendMany([
+      sessionEvent("event_owner_root", rootSessionId, 1 as TimestampMs),
+      sessionEvent("event_owner_child", childSessionId, 2 as TimestampMs),
+      {
+        id: "event_owner_child_task",
+        type: "agent.task_created",
+        time: 3 as TimestampMs,
+        sessionId: rootSessionId,
+        payload: {
+          taskId: "task_owner_child" as TaskId,
+          path: "/root/child" as AgentPath,
+          parentPath: "/root" as AgentPath,
+          parentSessionId: rootSessionId,
+          childSessionId,
+          taskName: "child",
+          cwd: "/repo",
+          prompt: "child",
+        },
+      },
+      {
+        id: "event_team_owner_subagent",
+        type: "team.created",
+        time: 4 as TimestampMs,
+        payload: {
+          teamId,
+          name: "subagent owner",
+          leadPath: "/root" as AgentPath,
+        },
+      },
+    ]);
+
+    expect(await store.bindTeamOwnerSession({
+      teamId,
+      ownerSessionId: childSessionId,
+      eventId: "event_bind_subagent",
+      time: 5,
+    })).toMatchObject({ applied: false, reason: "subagent_session" });
+    expect((await store.teams({ teamId }))[0]?.sessionId).toBeUndefined();
+
+    await expect(store.append({
+      id: "event_bind_mismatch",
+      type: "team.owner_session_bound",
+      time: 6 as TimestampMs,
+      sessionId: rootSessionId,
+      payload: { teamId, ownerSessionId: childSessionId },
+    })).rejects.toThrow("does not match event.sessionId");
+    expect((await store.teams({ teamId }))[0]?.sessionId).toBeUndefined();
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("projects team members, task board, and messages", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-team-projection-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -3508,6 +5355,128 @@ test("projects team members, task board, and messages", async () => {
         content: "Please review team runtime.",
       },
     ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("duplicate team task projection preserves the first write and rolls back its batch", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-team-task-first-write-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const firstTeamId = "team_task_store_first" as TeamId;
+  const secondTeamId = "team_task_store_second" as TeamId;
+  const firstLead = "/root/first" as AgentPath;
+  const secondLead = "/root/second" as AgentPath;
+  const taskId = "task_store_global" as TaskId;
+
+  try {
+    await store.appendMany([
+      {
+        id: "event_task_store_first_team",
+        type: "team.created",
+        time: 1 as TimestampMs,
+        payload: { teamId: firstTeamId, name: "first", leadPath: firstLead },
+      },
+      {
+        id: "event_task_store_first_lead",
+        type: "team.member_added",
+        time: 2 as TimestampMs,
+        payload: {
+          teamId: firstTeamId,
+          path: firstLead,
+          name: "first lead",
+          role: "leader",
+          status: "running",
+        },
+      },
+      {
+        id: "event_task_store_second_team",
+        type: "team.created",
+        time: 3 as TimestampMs,
+        payload: { teamId: secondTeamId, name: "second", leadPath: secondLead },
+      },
+      {
+        id: "event_task_store_second_lead",
+        type: "team.member_added",
+        time: 4 as TimestampMs,
+        payload: {
+          teamId: secondTeamId,
+          path: secondLead,
+          name: "second lead",
+          role: "leader",
+          status: "running",
+        },
+      },
+      {
+        id: "event_task_store_original",
+        type: "team.task_created",
+        time: 5 as TimestampMs,
+        payload: {
+          teamId: firstTeamId,
+          taskId,
+          title: "preserve original",
+          description: "original description",
+          createdBy: firstLead,
+          ownerPath: firstLead,
+          status: "completed",
+          metadata: { source: "original", ordinal: 1 },
+        },
+      },
+    ]);
+    const [original] = await store.teamTasks({ taskId });
+    const teamsBefore = await store.teams({});
+    const membersBefore = await store.teamMembers({});
+    const eventsBefore = await store.events({ limit: 100 });
+
+    await expect(store.appendMany([
+      {
+        id: "event_task_store_rolled_back_member",
+        type: "team.member_status_changed",
+        time: 6 as TimestampMs,
+        payload: {
+          teamId: secondTeamId,
+          path: secondLead,
+          status: "idle",
+        },
+      },
+      {
+        id: "event_task_store_duplicate",
+        type: "team.task_created",
+        time: 7 as TimestampMs,
+        payload: {
+          teamId: secondTeamId,
+          taskId,
+          title: "must not replace original",
+          description: "replacement description",
+          createdBy: secondLead,
+          ownerPath: secondLead,
+          status: "failed",
+          metadata: { source: "duplicate", ordinal: 2 },
+        },
+      },
+    ])).rejects.toBeInstanceOf(TeamTaskAlreadyExistsError);
+
+    expect(await store.teamTasks({ taskId })).toEqual([original!]);
+    expect(original).toMatchObject({
+      id: taskId,
+      teamId: firstTeamId,
+      ownerPath: firstLead,
+      status: "completed",
+      title: "preserve original",
+      description: "original description",
+      createdBy: firstLead,
+      metadata: { source: "original", ordinal: 1 },
+      completedAt: 5,
+    });
+    expect(await store.teams({})).toEqual(teamsBefore);
+    expect(await store.teamMembers({})).toEqual(membersBefore);
+    expect(await store.events({ limit: 100 })).toEqual(eventsBefore);
+    const createdEvents = await store.events({ type: "team.task_created", limit: 10 });
+    expect(createdEvents.filter(
+      (event) => event.type === "team.task_created"
+        && (event.payload as { taskId?: TaskId }).taskId === taskId,
+    )).toHaveLength(1);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });

@@ -154,6 +154,164 @@ test("delegation policy gate fails closed for duplicate team session ancestry", 
     .rejects.toThrow(`Ambiguous delegation ancestry for team member session ${childSessionId}`);
 });
 
+test("delegation policy gate fails closed when task and run projections disagree", async () => {
+  const childSessionId = "session_cross_projection" as SessionId;
+  const store = {
+    async agentTasks() {
+      return [{ childSessionId, parentSessionId: "session_task_parent" as SessionId }];
+    },
+    async agentRuns() {
+      return [{ childSessionId, parentSessionId: "session_run_parent" as SessionId }];
+    },
+  } as unknown as DelegationPolicyGateOptions["store"];
+  const gate = new DelegationPolicyGate({
+    store,
+    async getDelegationConfig(requestedSessionId) {
+      return { sessionId: requestedSessionId, policy: "explicit", source: "default" };
+    },
+  });
+
+  await expect(gate.rootSessionId(childSessionId))
+    .rejects.toThrow(`Conflicting delegation ancestry for session ${childSessionId}`);
+});
+
+test("delegation policy gate fails closed when task and team projections disagree", async () => {
+  const childSessionId = "session_task_team_conflict" as SessionId;
+  const store = {
+    async agentTasks() {
+      return [{ childSessionId, parentSessionId: "session_task_parent" as SessionId }];
+    },
+    async agentRuns() {
+      return [];
+    },
+    async teamMembers() {
+      return [{ teamId: "team_conflict", path: "/root/worker", childSessionId }];
+    },
+    async teams() {
+      return [{
+        id: "team_conflict",
+        sessionId: "session_team_parent" as SessionId,
+        leadPath: "/root",
+      }];
+    },
+  } as unknown as DelegationPolicyGateOptions["store"];
+  const gate = new DelegationPolicyGate({
+    store,
+    async getDelegationConfig(requestedSessionId) {
+      return { sessionId: requestedSessionId, policy: "explicit", source: "default" };
+    },
+  });
+
+  await expect(gate.rootSessionId(childSessionId))
+    .rejects.toThrow(`Conflicting delegation ancestry for session ${childSessionId}`);
+});
+
+test("delegation policy gate rejects a projected parent missing from sessions", async () => {
+  const childSessionId = "session_orphan_child" as SessionId;
+  const missingParentSessionId = "session_orphan_parent" as SessionId;
+  const store = {
+    async sessions() {
+      return [{
+        id: childSessionId,
+        cwd: "/repo",
+        status: "active" as const,
+        createdAt: 1,
+        updatedAt: 1,
+      }];
+    },
+    async agentTasks() {
+      return [{ childSessionId, parentSessionId: missingParentSessionId }];
+    },
+    async agentRuns() {
+      return [];
+    },
+  } as unknown as DelegationPolicyGateOptions["store"];
+  const gate = new DelegationPolicyGate({
+    store,
+    async getDelegationConfig(requestedSessionId) {
+      return { sessionId: requestedSessionId, policy: "explicit", source: "default" };
+    },
+  });
+
+  await expect(gate.rootSessionId(childSessionId))
+    .rejects.toThrow(`Delegation parent session not found: ${missingParentSessionId} (child ${childSessionId})`);
+});
+
+test("delegation policy gate rejects an archived root behind an active child", async () => {
+  const rootSessionId = "session_archived_root" as SessionId;
+  const childSessionId = "session_active_child" as SessionId;
+  const store = {
+    async sessions() {
+      return [
+        {
+          id: rootSessionId,
+          cwd: "/repo",
+          status: "archived" as const,
+          source: "interactive" as const,
+          createdAt: 1,
+          updatedAt: 2,
+        },
+        {
+          id: childSessionId,
+          cwd: "/repo",
+          status: "active" as const,
+          source: "subagent" as const,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ];
+    },
+    async agentTasks(query: { childSessionId?: SessionId }) {
+      return query.childSessionId === childSessionId
+        ? [{ childSessionId, parentSessionId: rootSessionId }]
+        : [];
+    },
+    async agentRuns() {
+      return [];
+    },
+  } as unknown as DelegationPolicyGateOptions["store"];
+  const gate = new DelegationPolicyGate({
+    store,
+    async getDelegationConfig(requestedSessionId) {
+      return { sessionId: requestedSessionId, policy: "proactive", source: "session" };
+    },
+  });
+
+  await expect(gate.rootSessionId(childSessionId))
+    .rejects.toThrow(`Delegation parent session is not active: ${rootSessionId} (archived)`);
+});
+
+test("delegation policy gate rejects an orphan subagent as a root", async () => {
+  const orphanSessionId = "session_orphan_subagent" as SessionId;
+  const store = {
+    async sessions() {
+      return [{
+        id: orphanSessionId,
+        cwd: "/repo",
+        status: "active" as const,
+        source: "subagent" as const,
+        createdAt: 1,
+        updatedAt: 1,
+      }];
+    },
+    async agentTasks() {
+      return [];
+    },
+    async agentRuns() {
+      return [];
+    },
+  } as unknown as DelegationPolicyGateOptions["store"];
+  const gate = new DelegationPolicyGate({
+    store,
+    async getDelegationConfig(requestedSessionId) {
+      return { sessionId: requestedSessionId, policy: "proactive", source: "session" };
+    },
+  });
+
+  await expect(gate.rootSessionId(orphanSessionId))
+    .rejects.toThrow(`Delegation root session cannot be a subagent: ${orphanSessionId}`);
+});
+
 test("delegation policy gate fails closed for multi-session ancestry cycles", async () => {
   const first = "session_cycle_first" as SessionId;
   const second = "session_cycle_second" as SessionId;

@@ -96,6 +96,35 @@ test("delegation client reads and updates the deterministic session policy endpo
   expect(await requests[1]!.json()).toEqual({ policy: "proactive" });
 });
 
+test("MCP catalog requests carry the selected session scope", async () => {
+  const requests: Request[] = [];
+  const sessionId = "session_mcp/scope" as SessionId;
+  const client = new HttpRuntimeClient({
+    baseUrl: "http://chili.test/api",
+    fetch: (async (input, init) => {
+      requests.push(new Request(input, init));
+      return Response.json({ servers: [], summary: {}, tools: [], reloaded: true, errors: [] });
+    }) as typeof fetch,
+  });
+
+  await client.listMcpServers({ sessionId });
+  await client.mcpStatus({ sessionId });
+  await client.mcpServer({ server: "github/issues", sessionId });
+  await client.listMcpTools({ server: "github/issues", sessionId });
+  await client.reloadMcp({ sessionId });
+
+  expect(requests.map((request) => {
+    const url = new URL(request.url);
+    return [request.method, url.pathname, url.searchParams.get("sessionId")];
+  })).toEqual([
+    ["GET", "/api/mcp", sessionId],
+    ["GET", "/api/mcp/status", sessionId],
+    ["GET", "/api/mcp/github%2Fissues", sessionId],
+    ["GET", "/api/mcp/github%2Fissues/tools", sessionId],
+    ["POST", "/api/mcp/reload", sessionId],
+  ]);
+});
+
 test("mailbox filters by the canonical recipient session query", async () => {
   const requests: Request[] = [];
   const recipientSessionId = "session_mailbox_recipient" as SessionId;

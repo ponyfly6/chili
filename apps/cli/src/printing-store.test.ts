@@ -2,10 +2,19 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import { TeamControlService, TeamTaskDispatchService, type TeamTaskSubagentRunner } from "@chili/core";
+import { LocalSubagentManager, TeamControlService, TeamTaskDispatchService } from "@chili/core";
 import type { AgentPath, AgentRunId, ChiliEvent, SessionId, TaskId, TeamId, TimestampMs } from "@chili/protocol";
 import { ObservableEventStore, SqliteEventStore } from "@chili/store";
 import { CliPrinter, PrintingEventStore } from "./printing-store.js";
+
+const PASSTHROUGH_SESSION_OPERATIONS = {
+  async withSessionOperation<T>(
+    _sessionId: SessionId,
+    fn: (operation: { readonly signal: AbortSignal; assertCurrent(): void }) => Promise<T> | T,
+  ): Promise<T> {
+    return fn({ signal: new AbortController().signal, assertCurrent() {} });
+  },
+};
 
 test("printing and observable wrappers report mailbox CAS capability recursively", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-printing-mailbox-capability-"));
@@ -205,27 +214,45 @@ test("team dispatcher can claim through printing store before spawning a worker"
   const store = new ObservableEventStore(new PrintingEventStore(sqlite, printer));
   const teams = new TeamControlService({ store });
   const spawned: string[] = [];
-  const subagents: TeamTaskSubagentRunner = {
-    async spawnTask(input) {
+  const subagents = new LocalSubagentManager({
+    store,
+    runner: {
+      async run(input) {
       spawned.push(input.prompt);
       return {
-        taskId: "agent_task_printing_dispatch" as TaskId,
-        runId: "run_printing_dispatch" as AgentRunId,
-        path: "/agents/worker/task" as AgentPath,
-        parentPath: input.parentPath ?? ("/root" as AgentPath),
-        childSessionId: "session_child_printing_dispatch" as SessionId,
         status: "completed",
         summary: "worker completed",
       };
+      },
     },
-  };
-  const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir });
+  });
   const sessionId = "session_printing_dispatch" as SessionId;
   const teamId = "team_printing_dispatch" as TeamId;
   const taskId = "task_printing_dispatch" as TaskId;
   const workerPath = "/agents/worker" as AgentPath;
+  const dispatcher = new TeamTaskDispatchService({
+    teams,
+    subagents,
+    store,
+    cwd: dir,
+    resolveSession: async (requestedSessionId) => {
+      const session = (await store.sessions()).find((candidate) => candidate.id === requestedSessionId);
+      if (!session) throw new Error(`Session not found: ${requestedSessionId}`);
+      if (session.status !== "active") throw new Error(`Session is not active: ${requestedSessionId}`);
+      if (session.source !== "interactive") throw new Error(`Session is not a root session: ${requestedSessionId}`);
+      return { cwd: session.cwd };
+    },
+    sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
+  });
 
   try {
+    await store.append({
+      id: "event_printing_dispatch_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      payload: { sessionId, cwd: dir },
+    });
     await teams.createTeam({ sessionId, teamId, name: "printing dispatch", leadPath: "/root" as AgentPath });
     await teams.addMember({ sessionId, teamId, path: workerPath, name: "worker", role: "implementer" });
     await teams.createTask({ sessionId, teamId, taskId, title: "Dispatch me", ownerPath: workerPath });

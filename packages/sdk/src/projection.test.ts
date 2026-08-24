@@ -2305,6 +2305,32 @@ test("keeps historical team workers out of ad-hoc agents after redispatch", () =
   expect(status.team).toMatchObject({ count: 1, activeCount: 1, selectedTeamId: teamId });
 });
 
+test("projects a late persisted team owner-session binding", () => {
+  const teamId = "team_late_owner" as TeamId;
+  const ownerSessionId = "session_late_owner" as SessionId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_late_owner_team",
+      type: "team.created",
+      time: 1 as TimestampMs,
+      payload: { teamId, name: "late owner", leadPath: "/root" as AgentPath },
+    },
+    {
+      id: "event_late_owner_bind",
+      type: "team.owner_session_bound",
+      time: 2 as TimestampMs,
+      sessionId: ownerSessionId,
+      payload: { teamId, ownerSessionId },
+    },
+  ], createRuntimeView());
+
+  expect(view.teams[teamId]).toMatchObject({
+    id: teamId,
+    sessionId: ownerSessionId,
+    updatedAt: 2,
+  });
+});
+
 test("scopes delegation records by session", () => {
   const firstSessionId = "session_scope_first" as SessionId;
   const secondSessionId = "session_scope_second" as SessionId;
@@ -5254,12 +5280,25 @@ test("client sends model control requests and prompt overrides", async () => {
   }) as unknown as typeof fetch;
   const client = new HttpRuntimeClient({ baseUrl: "http://runtime.test/api", fetch: fetchImpl });
 
+  expect(() => client.listCommands({ sessionId: "" as SessionId })).toThrow(
+    "sessionId must be a non-empty string when provided",
+  );
+  expect(() => client.reloadCommands({ sessionId: "   " as SessionId })).toThrow(
+    "sessionId must be a non-empty string when provided",
+  );
+  expect(() => client.listCommands({ sessionId: "session\ninvalid" as SessionId })).toThrow(
+    "sessionId must be valid text",
+  );
+  expect(() => client.reloadCommands({ sessionId: "x".repeat(513) as SessionId })).toThrow(
+    "sessionId must not exceed 512 characters",
+  );
+
   const models = await client.listModels();
   await client.getModelConfig({ sessionId });
   await client.setModel({ sessionId, modelSelection: { provider: "openai-codex", model: "gpt-5.5" } });
   await client.setReasoning({ sessionId, reasoningLevel: "high" });
-  const commands = await client.listCommands();
-  const reloadedCommands = await client.reloadCommands();
+  const commands = await client.listCommands({ sessionId });
+  const reloadedCommands = await client.reloadCommands({ sessionId });
   await client.submitPromptAsync({
     sessionId,
     text: "hello",
@@ -5311,12 +5350,12 @@ test("client sends model control requests and prompt overrides", async () => {
       body: { reasoningLevel: "high" },
     },
     {
-      url: "http://runtime.test/api/commands",
+      url: "http://runtime.test/api/sessions/session_sdk_model/commands",
       method: "GET",
       body: undefined,
     },
     {
-      url: "http://runtime.test/api/commands/reload",
+      url: "http://runtime.test/api/sessions/session_sdk_model/commands/reload",
       method: "POST",
       body: {},
     },

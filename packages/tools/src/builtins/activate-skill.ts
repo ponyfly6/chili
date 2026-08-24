@@ -6,15 +6,20 @@ import {
   type SkillResourceFile,
   type SkillRegistry,
 } from "@chili/skills";
-import type { ChiliToolDefinition, ValidationResult } from "../types.js";
+import type { ChiliToolDefinition, ChiliToolExecutionContext, ValidationResult } from "../types.js";
 
 export interface ActivateSkillInput {
   name: string;
 }
 
 export type SkillRegistryLike = Pick<SkillRegistry, "get" | "list">;
+export type SkillRegistryResolver = (
+  context: ChiliToolExecutionContext,
+) => Promise<SkillRegistryLike> | SkillRegistryLike;
 
-export function createActivateSkillTool(registry: SkillRegistryLike): ChiliToolDefinition<ActivateSkillInput> {
+export function createActivateSkillTool(
+  registry: SkillRegistryLike | SkillRegistryResolver,
+): ChiliToolDefinition<ActivateSkillInput> {
   return {
     name: "activate_skill",
     aliases: ["skill"],
@@ -41,10 +46,11 @@ export function createActivateSkillTool(registry: SkillRegistryLike): ChiliToolD
       return { ok: true, value: { name: input.name.trim() } };
     },
     approval: () => false,
-    async execute(input) {
-      const skill = registry.get(input.name);
+    async execute(input, context) {
+      const scopedRegistry = typeof registry === "function" ? await registry(context) : registry;
+      const skill = scopedRegistry.get(input.name);
       if (!skill) {
-        const availableSkills = registry.list().map((item) => item.name);
+        const availableSkills = scopedRegistry.list().map((item) => item.name);
         return {
           title: `activate skill ${input.name}`,
           output: `Skill "${input.name}" not found. Available skills: ${availableSkills.length > 0 ? availableSkills.join(", ") : "none"}.`,

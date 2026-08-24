@@ -19,9 +19,10 @@ function context(calls: string[], sessionId = currentSessionId): CliReplCommandC
     showMailbox: async (id) => { calls.push(`mailbox:${id}`); },
     listTasks: async (id) => { calls.push(`tasks:${id}`); },
     showTask: async (id, taskId) => { calls.push(`task:${id}:${taskId}`); },
-    showMemory: async (scope) => { calls.push(`memory-show:${scope}`); },
-    addMemory: async (input) => { calls.push(`memory-add:${input}`); },
-    reloadMemory: async (scope) => { calls.push(`memory-reload:${scope}`); },
+    recoverTasks: async (id) => { calls.push(`recover:${id}`); },
+    showMemory: async (cwd, scope) => { calls.push(`memory-show:${cwd}:${scope}`); },
+    addMemory: async (cwd, input) => { calls.push(`memory-add:${cwd}:${input}`); },
+    reloadMemory: async (cwd, scope) => { calls.push(`memory-reload:${cwd}:${scope}`); },
     runPromptCommand: async (id, commandId, args) => { calls.push(`prompt:${id}:${commandId}:${args}`); },
   };
 }
@@ -39,6 +40,7 @@ test("CLI dispatcher scopes session and team commands to the active session", as
   await dispatchCliReplCommand(registry, ctx, "/team mailbox");
   await dispatchCliReplCommand(registry, ctx, "/team tasks");
   await dispatchCliReplCommand(registry, ctx, "/team task task_1");
+  await dispatchCliReplCommand(registry, ctx, "/team recover");
   await dispatchCliReplCommand(registry, ctx, "/memory show --all");
   await dispatchCliReplCommand(registry, ctx, "/memory add --project remember this");
   await dispatchCliReplCommand(registry, ctx, "/memory reload --user");
@@ -52,9 +54,10 @@ test("CLI dispatcher scopes session and team commands to the active session", as
     "mailbox:session_current",
     "tasks:session_current",
     "task:session_current:task_1",
-    "memory-show:--all",
-    "memory-add:--project remember this",
-    "memory-reload:--user",
+    "recover:session_current",
+    "memory-show:/repo:--all",
+    "memory-add:/repo:--project remember this",
+    "memory-reload:/repo:--user",
   ]);
 });
 
@@ -76,7 +79,7 @@ test("model, reasoning, service, and delegation changes use persisted session co
   ]);
 });
 
-test("CLI help is generated from canonical paths without unsafe global recovery", async () => {
+test("CLI help includes canonical session-scoped recovery", async () => {
   const registry = createCliReplCommandRegistry();
   const ctx = context([]);
   const help = await dispatchCliReplCommand(registry, ctx, "/help");
@@ -85,8 +88,8 @@ test("CLI help is generated from canonical paths without unsafe global recovery"
   expect(help.output).toContain("/session compact [focus]");
   expect(help.output).toContain("/session delegation [off|explicit|proactive|status]");
   expect(help.output).toContain("/team agents");
+  expect(help.output).toContain("/team recover");
   expect(help.output).toContain("/app exit");
-  expect(help.output).not.toContain("/team recover");
 
   for (const legacy of ["/exit", "/quit", "/sessions", "/agents", "/tasks", "/recover-tasks", "/compact", "/revert"]) {
     const result = await dispatchCliReplCommand(registry, ctx, legacy);

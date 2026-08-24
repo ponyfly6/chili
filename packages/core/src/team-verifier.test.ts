@@ -1,4 +1,5 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
@@ -13,12 +14,25 @@ import {
   createReadFileTool,
   createWriteFileTool,
   filterToolsByPolicy,
+  runProcess,
 } from "@chili/tools";
 import { LocalSubagentManager, type LocalSubagentRunInput, type LocalSubagentRunResult, type LocalSubagentRunner } from "./subagent.js";
+import {
+  RuntimeBusyError,
+  type RuntimeSessionOperation,
+  type SessionOperationCoordinator,
+} from "./runtime-service.js";
 import { TeamTaskDispatchService } from "./team-dispatcher.js";
 import { TeamExecutionRunner } from "./team-execution-runner.js";
+import { TeamSessionAuthorityError } from "./team-session-authority.js";
 import { TeamControlService } from "./team.js";
-import { TeamTaskVerificationService, verificationMetadata, verifierWorkerPolicy } from "./team-verifier.js";
+import {
+  TeamTaskVerificationService,
+  type TeamTaskVerifierGitDiffInput,
+  verificationMetadata,
+  verifierWorkerPolicy,
+} from "./team-verifier.js";
+import { taskMergeMetadata, TeamTaskWorktreePathError, TeamWorktreeService } from "./team-worktree.js";
 
 test("team runner auto-verifies worker completion before accepting the task", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-verifier-runner-"));
@@ -31,17 +45,36 @@ test("team runner auto-verifies worker completion before accepting the task", as
   const runner = new RoutingLocalSubagentRunner();
 
   try {
+    await persistRootSession(store, sessionId, dir);
     const teams = new TeamControlService({ store, createId: ids, now });
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
-    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
+    const dispatcher = new TeamTaskDispatchService({
+      teams,
+      subagents,
+      store,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+      sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
+    });
     const verifier = new TeamTaskVerificationService({
       teams,
       subagents,
       cwd: dir,
       now,
+      resolveSession: testSessionResolver(dir),
+      sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
       gitDiff: async () => "diff --git a/packages/core/src/team.ts b/packages/core/src/team.ts",
     });
-    const execution = new TeamExecutionRunner({ teams, dispatcher, verifier, cwd: dir, now });
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      verifier,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+      sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
+    });
 
     const team = await teams.createTeam({ sessionId, name: "verifier-runner", leadPath });
     await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
@@ -84,6 +117,78 @@ test("team runner auto-verifies worker completion before accepting the task", as
   }
 });
 
+test("verifier includes worker commits by diffing from the persisted worktree base", async () => {
+  const dir = await mkVerifierGitRepo("chili-team-verifier-worker-commit-");
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 1050 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const sessionId = "session_team_verifier_worker_commit" as SessionId;
+  const runner = new FixedVerifierRunner("VERDICT: passed\nCommitted change is visible.");
+
+  try {
+    await persistRootSession(store, sessionId, dir);
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+    const worktrees = new TeamWorktreeService({
+      teams,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+      sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
+    });
+    const verifier = new TeamTaskVerificationService({
+      teams,
+      subagents,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+      sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
+    });
+    const team = await teams.createTeam({ sessionId, name: "verifier-worker-commit", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const task = await teams.createTask({
+      sessionId,
+      teamId: team.id,
+      title: "Verify committed work",
+      ownerPath: workerPath,
+    });
+    const worktree = await worktrees.ensureTaskWorktree({
+      teamId: team.id,
+      taskId: task.id,
+      sessionId,
+      cwd: dir,
+    });
+    await writeFile(join(worktree.path, "packages/core/src/feature.ts"), "export const committed = 7;\n");
+    await verifierGit(worktree.path, ["add", "packages/core/src/feature.ts"]);
+    await verifierGit(worktree.path, ["commit", "-q", "-m", "worker commit"]);
+    await teams.updateTask({
+      sessionId,
+      teamId: team.id,
+      taskId: task.id,
+      status: "completed",
+      summary: "Committed the implementation",
+      metadata: worktree.task.metadata ?? {},
+    });
+
+    const result = await verifier.verifyTask({ teamId: team.id, taskId: task.id, sessionId, cwd: dir });
+
+    expect(result.status).toBe("passed");
+    expect(runner.runs).toHaveLength(1);
+    expect(runner.runs[0]?.prompt).toContain("export const committed = 7;");
+    const [storedTask] = await teams.tasks(team.id);
+    expect(verificationMetadata(storedTask?.metadata)?.gitDiff).toContain("export const committed = 7;");
+    expect(taskMergeMetadata(storedTask?.metadata)).toMatchObject({
+      status: "pending",
+      baseRef: worktree.baseRef,
+    });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("failed verifier reopens the task with feedback", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-verifier-failed-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -97,7 +202,15 @@ test("failed verifier reopens the task with feedback", async () => {
   try {
     const teams = new TeamControlService({ store, createId: ids, now });
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
-    const verifier = new TeamTaskVerificationService({ teams, subagents, cwd: dir, now, gitDiff: async () => "(no diff)" });
+    const verifier = new TeamTaskVerificationService({
+      teams,
+      subagents,
+      cwd: dir,
+      now,
+      resolveSession: testSessionResolver(dir),
+      sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
+      gitDiff: async () => "(no diff)",
+    });
     const team = await teams.createTeam({ sessionId, name: "verifier-failed", leadPath });
     await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
     const task = await teams.createTask({ sessionId, teamId: team.id, title: "Needs verification", ownerPath: workerPath });
@@ -127,6 +240,75 @@ test("failed verifier reopens the task with feedback", async () => {
   }
 });
 
+test("verifier rejects forged worktree metadata before verification claim, git, or spawn", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-verifier-path-authority-"));
+  const workspaceB = await mkdtemp(join(tmpdir(), "chili-team-verifier-path-b-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 1125 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const sessionId = "session_team_verifier_path_authority" as SessionId;
+  const runner = new FixedVerifierRunner("VERDICT: passed\nShould not run.");
+  let gitDiffCalls = 0;
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+    const verifier = new TeamTaskVerificationService({
+      teams,
+      subagents,
+      cwd: dir,
+      now,
+      resolveSession: testSessionResolver(dir),
+      sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
+      gitDiff: async () => {
+        gitDiffCalls++;
+        return "(should not run)";
+      },
+    });
+    const team = await teams.createTeam({ sessionId, name: "verifier-path-authority", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const task = await teams.createTask({
+      sessionId,
+      teamId: team.id,
+      title: "Forged worktree",
+      ownerPath: workerPath,
+      metadata: {
+        worktree: {
+          path: workspaceB,
+          baseRef: "HEAD",
+          createdAt: 1125,
+          status: "active",
+        },
+      },
+    });
+    await teams.updateTask({
+      sessionId,
+      teamId: team.id,
+      taskId: task.id,
+      status: "completed",
+      summary: "Worker says done",
+    });
+
+    await expect(verifier.verifyTask({
+      teamId: team.id,
+      taskId: task.id,
+      sessionId,
+      cwd: dir,
+    })).rejects.toBeInstanceOf(TeamTaskWorktreePathError);
+
+    expect(gitDiffCalls).toBe(0);
+    expect(runner.runs).toEqual([]);
+    const [storedTask] = await teams.tasks(team.id);
+    expect(verificationMetadata(storedTask?.metadata)).toBeUndefined();
+  } finally {
+    store.close();
+    await rm(workspaceB, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("abort during verifier setup does not mark verification pending or reopen the task", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-verifier-abort-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -139,14 +321,25 @@ test("abort during verifier setup does not mark verification pending or reopen t
   const runner = new FixedVerifierRunner("VERDICT: failed\nShould not run.");
 
   try {
+    await persistRootSession(store, sessionId, dir);
     const teams = new TeamControlService({ store, createId: ids, now });
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
-    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
+    const dispatcher = new TeamTaskDispatchService({
+      teams,
+      subagents,
+      store,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+      sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
+    });
     const verifier = new TeamTaskVerificationService({
       teams,
       subagents,
       cwd: dir,
       now,
+      resolveSession: testSessionResolver(dir),
+      sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
       gitDiff: async () => {
         controller.abort();
         const error = new Error("git diff aborted");
@@ -154,7 +347,15 @@ test("abort during verifier setup does not mark verification pending or reopen t
         throw error;
       },
     });
-    const execution = new TeamExecutionRunner({ teams, dispatcher, verifier, cwd: dir, now });
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      verifier,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+      sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
+    });
     const team = await teams.createTeam({ sessionId, name: "verifier-abort", leadPath });
     await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
     const task = await teams.createTask({ sessionId, teamId: team.id, title: "Abort verifier setup", ownerPath: workerPath });
@@ -199,7 +400,15 @@ test("verifier sweep runs completed tasks with bounded parallelism", async () =>
   try {
     const teams = new TeamControlService({ store, createId: ids, now });
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
-    const verifier = new TeamTaskVerificationService({ teams, subagents, cwd: dir, now, gitDiff: async () => "(no diff)" });
+    const verifier = new TeamTaskVerificationService({
+      teams,
+      subagents,
+      cwd: dir,
+      now,
+      resolveSession: testSessionResolver(dir),
+      sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
+      gitDiff: async () => "(no diff)",
+    });
     const team = await teams.createTeam({ sessionId, name: "verifier-parallel", leadPath });
     await teams.addMember({ sessionId, teamId: team.id, path: workerA, name: "a", role: "implementer" });
     await teams.addMember({ sessionId, teamId: team.id, path: workerB, name: "b", role: "implementer" });
@@ -241,7 +450,15 @@ test("verifier sweep skips a task already claimed by another verifier", async ()
   try {
     const teams = new TeamControlService({ store, createId: ids, now });
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
-    const verifier = new TeamTaskVerificationService({ teams, subagents, cwd: dir, now, gitDiff: async () => "(no diff)" });
+    const verifier = new TeamTaskVerificationService({
+      teams,
+      subagents,
+      cwd: dir,
+      now,
+      resolveSession: testSessionResolver(dir),
+      sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
+      gitDiff: async () => "(no diff)",
+    });
     const team = await teams.createTeam({ sessionId, name: "verifier-claim", leadPath });
     await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
     const task = await teams.createTask({ sessionId, teamId: team.id, title: "Claim once", ownerPath: workerPath });
@@ -260,6 +477,113 @@ test("verifier sweep skips a task already claimed by another verifier", async ()
     runner.release();
     store.close();
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("direct verifier rejects a wrong or archived owner session before side effects", async () => {
+  const context = await createDirectVerifierContext("chili-team-verifier-direct-authority-");
+
+  try {
+    context.operations.resetAcquisitions();
+    const verifier = context.createVerifier();
+
+    await expect(verifier.verifyTask({
+      teamId: context.teamId,
+      taskId: context.taskId,
+      sessionId: context.actorSessionId,
+    })).rejects.toBeInstanceOf(TeamSessionAuthorityError);
+
+    context.setOwnerStatus("archived");
+    await expect(verifier.verifyTask({
+      teamId: context.teamId,
+      taskId: context.taskId,
+    })).rejects.toBeInstanceOf(TeamSessionAuthorityError);
+
+    expect(context.operations.acquisitions).toEqual([]);
+    expect(context.gitDiffCwds).toEqual([]);
+    expect(context.runner.runs).toEqual([]);
+    const [storedTask] = await context.teams.tasks(context.teamId);
+    expect(verificationMetadata(storedTask?.metadata)).toBeUndefined();
+  } finally {
+    await context.close();
+  }
+});
+
+test("direct verifier rejects a busy owner session without claiming or spawning", async () => {
+  const context = await createDirectVerifierContext("chili-team-verifier-direct-busy-");
+
+  try {
+    context.operations.resetAcquisitions();
+    context.operations.block(context.ownerSessionId);
+    const verifier = context.createVerifier();
+
+    await expect(verifier.verifyCompletedTasks({
+      teamId: context.teamId,
+    })).rejects.toBeInstanceOf(RuntimeBusyError);
+
+    expect(context.operations.acquisitions).toEqual([]);
+    expect(context.gitDiffCwds).toEqual([]);
+    expect(context.runner.runs).toEqual([]);
+    const [storedTask] = await context.teams.tasks(context.teamId);
+    expect(verificationMetadata(storedTask?.metadata)).toBeUndefined();
+  } finally {
+    context.operations.unblock(context.ownerSessionId);
+    await context.close();
+  }
+});
+
+test("direct verifier stops after losing its owner lease", async () => {
+  const context = await createDirectVerifierContext("chili-team-verifier-direct-lost-");
+
+  try {
+    context.operations.resetAcquisitions();
+    const verifier = context.createVerifier(async (input) => {
+      context.gitDiffCwds.push(input.cwd);
+      context.operations.lose(context.ownerSessionId);
+      return "(diff before lease loss)";
+    });
+
+    await expect(verifier.verifyCompletedTasks({
+      teamId: context.teamId,
+    })).rejects.toBeInstanceOf(RuntimeBusyError);
+
+    expect(context.operations.acquisitions).toEqual([context.ownerSessionId]);
+    expect(context.runner.runs).toEqual([]);
+    const [storedTask] = await context.teams.tasks(context.teamId);
+    expect(verificationMetadata(storedTask?.metadata)?.status).toBe("pending");
+  } finally {
+    await context.close();
+  }
+});
+
+test("direct verifier reenters the persisted owner operation", async () => {
+  const context = await createDirectVerifierContext("chili-team-verifier-direct-nested-");
+
+  try {
+    context.operations.resetAcquisitions();
+    const verifier = context.createVerifier();
+    const [beforeVerification] = await context.teams.tasks(context.teamId);
+    expect(beforeVerification?.sessionId).toBe(context.ownerSessionId);
+    const result = await context.operations.withSessionOperation(
+      context.ownerSessionId,
+      () => verifier.verifyTask({ teamId: context.teamId, taskId: context.taskId }),
+    );
+
+    expect(result.status).toBe("passed");
+    expect(context.operations.acquisitions).toEqual([context.ownerSessionId]);
+    const canonicalOwnerCwd = await realpath(context.ownerCwd);
+    expect(context.gitDiffCwds).toEqual([canonicalOwnerCwd]);
+    expect(context.runner.runs).toHaveLength(1);
+    expect(context.runner.runs[0]).toMatchObject({
+      parentSessionId: context.ownerSessionId,
+      cwd: canonicalOwnerCwd,
+    });
+    expect(context.runner.runs[0]?.cwd).not.toBe(context.defaultCwd);
+    const [storedTask] = await context.teams.tasks(context.teamId);
+    expect(storedTask?.sessionId).toBe(context.ownerSessionId);
+    expect(verificationMetadata(storedTask?.metadata)?.status).toBe("passed");
+  } finally {
+    await context.close();
   }
 });
 
@@ -368,11 +692,36 @@ test("runner does not report drained while a completed task is unverified", asyn
   const runner = new RoutingLocalSubagentRunner();
 
   try {
+    await persistRootSession(store, sessionId, dir);
     const teams = new TeamControlService({ store, createId: ids, now });
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
-    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
-    const verifier = new TeamTaskVerificationService({ teams, subagents, cwd: dir, now, gitDiff: async () => "(no diff)" });
-    const execution = new TeamExecutionRunner({ teams, dispatcher, verifier, cwd: dir, now });
+    const dispatcher = new TeamTaskDispatchService({
+      teams,
+      subagents,
+      store,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+      sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
+    });
+    const verifier = new TeamTaskVerificationService({
+      teams,
+      subagents,
+      cwd: dir,
+      now,
+      resolveSession: testSessionResolver(dir),
+      sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
+      gitDiff: async () => "(no diff)",
+    });
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      verifier,
+      cwd: dir,
+      now,
+      resolveSession: persistedRootSessionResolver(store),
+      sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
+    });
     const team = await teams.createTeam({ sessionId, name: "verifier-undrained", leadPath });
     await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
     await teams.createTask({ sessionId, teamId: team.id, title: "Complete then verify later", ownerPath: workerPath });
@@ -391,6 +740,188 @@ test("runner does not report drained while a completed task is unverified", asyn
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+interface DirectVerifierContext {
+  ownerCwd: string;
+  defaultCwd: string;
+  ownerSessionId: SessionId;
+  actorSessionId: SessionId;
+  teamId: TeamId;
+  taskId: TaskId;
+  teams: TeamControlService;
+  runner: FixedVerifierRunner;
+  operations: TestSessionOperationCoordinator;
+  gitDiffCwds: string[];
+  setOwnerStatus(status: "active" | "archived"): void;
+  createVerifier(
+    gitDiff?: (input: TeamTaskVerifierGitDiffInput) => Promise<string>,
+  ): TeamTaskVerificationService;
+  close(): Promise<void>;
+}
+
+async function createDirectVerifierContext(prefix: string): Promise<DirectVerifierContext> {
+  const ownerCwd = await mkdtemp(join(tmpdir(), `${prefix}owner-`));
+  const defaultCwd = await mkdtemp(join(tmpdir(), `${prefix}default-`));
+  const store = new SqliteEventStore(join(ownerCwd, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 1250 as TimestampMs;
+  const ownerSessionId = "session_team_verifier_direct_owner" as SessionId;
+  const actorSessionId = "session_team_verifier_direct_actor" as SessionId;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const operations = new TestSessionOperationCoordinator();
+  const teams = new TeamControlService({ store, createId: ids, now, sessionOperations: operations });
+  const runner = new FixedVerifierRunner("VERDICT: passed\nDirect verification passed.");
+  const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+  const team = await teams.createTeam({ sessionId: ownerSessionId, name: "direct-verifier", leadPath });
+  await teams.addMember({
+    sessionId: ownerSessionId,
+    teamId: team.id,
+    path: workerPath,
+    name: "worker",
+    role: "implementer",
+  });
+  const task = await teams.createTask({
+    sessionId: ownerSessionId,
+    teamId: team.id,
+    title: "Verify direct API",
+    ownerPath: workerPath,
+  });
+  await teams.updateTask({
+    sessionId: ownerSessionId,
+    teamId: team.id,
+    taskId: task.id,
+    status: "completed",
+    summary: "Actor completed the task",
+  });
+
+  let ownerStatus: "active" | "archived" = "active";
+  const gitDiffCwds: string[] = [];
+  return {
+    ownerCwd,
+    defaultCwd,
+    ownerSessionId,
+    actorSessionId,
+    teamId: team.id,
+    taskId: task.id,
+    teams,
+    runner,
+    operations,
+    gitDiffCwds,
+    setOwnerStatus(status) {
+      ownerStatus = status;
+    },
+    createVerifier(gitDiff) {
+      return new TeamTaskVerificationService({
+        teams,
+        subagents,
+        cwd: defaultCwd,
+        now,
+        resolveSession: async (sessionId) => {
+          if (sessionId !== ownerSessionId) throw new Error(`Unexpected verifier session: ${sessionId}`);
+          return { cwd: ownerCwd, status: ownerStatus, source: "interactive" };
+        },
+        sessionOperations: operations,
+        gitDiff: gitDiff ?? (async (input) => {
+          gitDiffCwds.push(input.cwd);
+          return "(direct verifier diff)";
+        }),
+      });
+    },
+    async close() {
+      store.close();
+      await rm(defaultCwd, { recursive: true, force: true });
+      await rm(ownerCwd, { recursive: true, force: true });
+    },
+  };
+}
+
+interface TestSessionOperationState {
+  sessionId: SessionId;
+  controller: AbortController;
+  active: boolean;
+  lost: boolean;
+}
+
+class TestSessionOperationCoordinator implements SessionOperationCoordinator {
+  readonly acquisitions: SessionId[] = [];
+  private readonly storage = new AsyncLocalStorage<TestSessionOperationState>();
+  private readonly active = new Map<SessionId, TestSessionOperationState>();
+  private readonly blocked = new Set<SessionId>();
+
+  async withSessionOperation<T>(
+    sessionId: SessionId,
+    fn: (operation: RuntimeSessionOperation) => Promise<T> | T,
+  ): Promise<T> {
+    const inherited = this.storage.getStore();
+    if (inherited?.sessionId === sessionId && inherited.active && !inherited.lost) {
+      const operation = this.operation(inherited);
+      operation.assertCurrent();
+      try {
+        const result = await fn(operation);
+        operation.assertCurrent();
+        return result;
+      } catch (error) {
+        operation.assertCurrent();
+        throw error;
+      }
+    }
+    if (this.blocked.has(sessionId) || this.active.has(sessionId)) {
+      throw new RuntimeBusyError(sessionId);
+    }
+
+    const state: TestSessionOperationState = {
+      sessionId,
+      controller: new AbortController(),
+      active: true,
+      lost: false,
+    };
+    const operation = this.operation(state);
+    this.active.set(sessionId, state);
+    this.acquisitions.push(sessionId);
+    return this.storage.run(state, async () => {
+      try {
+        const result = await fn(operation);
+        operation.assertCurrent();
+        return result;
+      } catch (error) {
+        operation.assertCurrent();
+        throw error;
+      } finally {
+        state.active = false;
+        if (this.active.get(sessionId) === state) this.active.delete(sessionId);
+      }
+    });
+  }
+
+  block(sessionId: SessionId): void {
+    this.blocked.add(sessionId);
+  }
+
+  unblock(sessionId: SessionId): void {
+    this.blocked.delete(sessionId);
+  }
+
+  lose(sessionId: SessionId): void {
+    const state = this.active.get(sessionId);
+    if (!state) throw new Error(`No active operation for ${sessionId}`);
+    state.lost = true;
+    state.controller.abort(new RuntimeBusyError(sessionId));
+  }
+
+  resetAcquisitions(): void {
+    this.acquisitions.length = 0;
+  }
+
+  private operation(state: TestSessionOperationState): RuntimeSessionOperation {
+    return {
+      signal: state.controller.signal,
+      assertCurrent() {
+        if (!state.active || state.lost) throw new RuntimeBusyError(state.sessionId);
+      },
+    };
+  }
+}
 
 class RoutingLocalSubagentRunner implements LocalSubagentRunner {
   readonly runs: LocalSubagentRunInput[] = [];
@@ -451,6 +982,59 @@ class BlockingVerifierRunner implements LocalSubagentRunner {
   release(): void {
     this.releaseRun();
   }
+}
+
+const PASSTHROUGH_SESSION_OPERATIONS = {
+  async withSessionOperation<T>(
+    _sessionId: SessionId,
+    fn: (operation: { readonly signal: AbortSignal; assertCurrent(): void }) => Promise<T> | T,
+  ): Promise<T> {
+    return fn({
+      signal: new AbortController().signal,
+      assertCurrent() {},
+    });
+  },
+};
+
+async function mkVerifierGitRepo(prefix: string): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), prefix));
+  await mkdir(join(dir, "packages/core/src"), { recursive: true });
+  await writeFile(join(dir, "packages/core/src/feature.ts"), "export const committed = 1;\n");
+  await verifierGit(dir, ["init", "-q"]);
+  await verifierGit(dir, ["config", "user.email", "test@example.com"]);
+  await verifierGit(dir, ["config", "user.name", "Test"]);
+  await verifierGit(dir, ["add", "."]);
+  await verifierGit(dir, ["commit", "-q", "-m", "init"]);
+  return dir;
+}
+
+async function verifierGit(cwd: string, args: readonly string[]): Promise<void> {
+  const result = await runProcess("git", args, { cwd, timeoutMs: 30_000, maxOutputBytes: 128_000 });
+  if (result.exitCode !== 0) throw new Error(result.stderr || `git ${args.join(" ")} failed`);
+}
+
+async function persistRootSession(store: SqliteEventStore, sessionId: SessionId, cwd: string): Promise<void> {
+  await store.append({
+    id: `event_root_${sessionId}`,
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd },
+  });
+}
+
+function persistedRootSessionResolver(store: SqliteEventStore) {
+  return async (sessionId: SessionId): Promise<{ cwd: string }> => {
+    const session = (await store.sessions()).find((candidate) => candidate.id === sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (session.status !== "active") throw new Error(`Session is not active: ${sessionId}`);
+    if (session.source !== "interactive") throw new Error(`Session is not a root session: ${sessionId}`);
+    return { cwd: session.cwd };
+  };
+}
+
+function testSessionResolver(cwd: string) {
+  return async () => ({ cwd, status: "active" as const, source: "interactive" as const });
 }
 
 function createSequentialId(): (prefix: string) => string {

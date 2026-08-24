@@ -1,7 +1,11 @@
 import { DELEGATION_POLICIES, isTransientEvent, RUNTIME_PERMISSION_PROFILE_IDS } from "@chili/protocol";
 import { realpath } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
-import { RuntimeSessionNotFoundError } from "@chili/core";
+import {
+  resolveTeamSessionAuthority,
+  RuntimeSessionNotFoundError,
+  TeamSessionAuthorityError,
+} from "@chili/core";
 import type {
   ChiliEvent,
   EventEnvelope,
@@ -96,7 +100,16 @@ import type {
 } from "@chili/store";
 import { projectRuntimeAgents } from "./agent-projection.js";
 
+export interface RuntimeHttpSessionOperation {
+  readonly signal: AbortSignal;
+  assertCurrent(): void;
+}
+
 export interface RuntimeHttpService {
+  withSessionOperation<T>(
+    sessionId: SessionId,
+    fn: (operation: RuntimeHttpSessionOperation) => Promise<T> | T,
+  ): Promise<T>;
   createSession(input?: { sessionId?: SessionId; cwd?: string }): Promise<RuntimeSessionRef>;
   listModels?(input?: { provider?: string }): Promise<RuntimeModelDescriptor[]>;
   getModelConfig?(sessionId: SessionId): Promise<RuntimeModelConfig>;
@@ -162,14 +175,18 @@ export interface RuntimeTeamMergeService {
   mergeTeamTasks(input: TeamMergeInput): Promise<TeamMergeSweepResult>;
 }
 
+export interface RuntimeMcpScopeInput {
+  cwd?: string;
+}
+
 export interface RuntimeMcpControlService {
-  list(): Promise<RuntimeMcpListResponse>;
-  status?(): Promise<RuntimeMcpStatusResponse>;
-  get?(server: string): Promise<RuntimeMcpServerDescriptor | undefined>;
-  reload?(): Promise<RuntimeMcpReloadResponse>;
+  list(input?: RuntimeMcpScopeInput): Promise<RuntimeMcpListResponse>;
+  status?(input?: RuntimeMcpScopeInput): Promise<RuntimeMcpStatusResponse>;
+  get?(server: string, input?: RuntimeMcpScopeInput): Promise<RuntimeMcpServerDescriptor | undefined>;
+  reload?(input?: RuntimeMcpScopeInput): Promise<RuntimeMcpReloadResponse>;
   add?(input: RuntimeMcpAddServerRequest): Promise<RuntimeMcpServerDescriptor>;
   remove?(server: string): Promise<RuntimeMcpRemoveServerResponse>;
-  tools?(server: string): Promise<RuntimeMcpToolsResponse>;
+  tools?(server: string, input?: RuntimeMcpScopeInput): Promise<RuntimeMcpToolsResponse>;
   auth?(server: string, input?: RuntimeMcpAuthRequest): Promise<RuntimeMcpAuthResponse>;
   logout?(server: string): Promise<RuntimeMcpLogoutResponse>;
 }
@@ -250,26 +267,35 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       }
 
       if (route.name === "commands") {
-        return json(await requireCommandControl(options).list());
+        if (!route.sessionId) return json(await requireCommandControl(options).list());
+        await options.service.assertSessionTurnAllowed(route.sessionId);
+        const session = await requireSession(options.store, route.sessionId);
+        const cwd = await authoritativeRequestCwd(session.cwd, undefined);
+        return json(await requireCommandControl(options).list({ cwd }));
       }
 
       if (route.name === "commandsReload") {
-        return json(await requireCommandControl(options).reload());
+        if (!route.sessionId) return json(await requireCommandControl(options).reload());
+        await options.service.assertSessionTurnAllowed(route.sessionId);
+        const session = await requireSession(options.store, route.sessionId);
+        const cwd = await authoritativeRequestCwd(session.cwd, undefined);
+        return json(await requireCommandControl(options).reload({ cwd }));
       }
 
       if (route.name === "mcpList") {
-        return json(await requireMcpControl(options).list());
+        return json(await requireMcpControl(options).list(await mcpScopeFromRequest(options, url)));
       }
 
       if (route.name === "mcpStatus") {
         const mcp = requireMcpControl(options);
-        return json(mcp.status ? await mcp.status() : statusFromMcpList(await mcp.list()));
+        const scope = await mcpScopeFromRequest(options, url);
+        return json(mcp.status ? await mcp.status(scope) : statusFromMcpList(await mcp.list(scope)));
       }
 
       if (route.name === "mcpReload") {
         const mcp = requireMcpControl(options);
         if (!mcp.reload) return jsonError(501, "No MCP reload controller is configured");
-        return json(await mcp.reload());
+        return json(await mcp.reload(await mcpScopeFromRequest(options, url)));
       }
 
       if (route.name === "mcpAdd") {
@@ -284,7 +310,11 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       }
 
       if (route.name === "mcpServer") {
-        return json(await mcpServerDescriptor(requireMcpControl(options), route.server));
+        return json(await mcpServerDescriptor(
+          requireMcpControl(options),
+          route.server,
+          await mcpScopeFromRequest(options, url),
+        ));
       }
 
       if (route.name === "mcpRemove") {
@@ -296,7 +326,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "mcpTools") {
         const mcp = requireMcpControl(options);
         if (!mcp.tools) return jsonError(501, "No MCP tools controller is configured");
-        return json(await mcp.tools(route.server));
+        return json(await mcp.tools(route.server, await mcpScopeFromRequest(options, url)));
       }
 
       if (route.name === "mcpAuth") {
@@ -397,19 +427,42 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         const body = await readJson<TeamCreateBody>(request);
         if (!body.name) throw badRequest("name is required");
         if (!body.leadPath) throw badRequest("leadPath is required");
-        return json(await teams.createTeam(teamCreateInput(body)), 201);
+        const input = teamCreateInput(body);
+        if (!input.sessionId) return json(await teams.createTeam(input), 201);
+        const sessionId = input.sessionId;
+        await resolveHttpInteractiveSession(options, sessionId);
+        return json(await options.service.withSessionOperation(sessionId, async (operation) => {
+          await resolveHttpInteractiveSession(options, sessionId);
+          operation.assertCurrent();
+          return teams.createTeam(input);
+        }), 201);
       }
 
       if (route.name === "teamReconcileDispatches") {
         const dispatcher = requireTeamDispatcher(options);
         const body = await readJson<TeamTaskReconcileBody>(request);
-        return json(await dispatcher.reconcileTasks(teamTaskReconcileInput(route.teamId, body)));
+        const input = teamTaskReconcileInput(route.teamId, body);
+        await assertHttpTeamReconcileAuthority(options, input);
+        return json(await dispatcher.reconcileTasks(input));
       }
 
       if (route.name === "teamRunLoop") {
         const runner = requireTeamRunner(options);
         const body = await readJson<TeamRunLoopBody>(request);
         const input = teamRunLoopInput(route.teamId, body);
+        const team = await requireHttpTeam(options, route.teamId);
+        if (team.status !== "active") {
+          throw new TeamSessionAuthorityError(`Cannot operate on archived team ${team.id}`);
+        }
+        if (team.sessionId) {
+          const authority = await resolveHttpTeamAuthority(options, route.teamId, input.sessionId, input.cwd);
+          input.sessionId = authority.sessionId;
+          input.cwd = authority.cwd;
+        } else {
+          // An unbound team must let the runner create and atomically persist a
+          // fresh owner session. Never promote a caller-provided id to owner.
+          delete input.sessionId;
+        }
         input.signal = request.signal;
         return json(await runner.run(input));
       }
@@ -418,6 +471,9 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         const merger = requireTeamMerger(options);
         const body = await readJson<TeamMergeBody>(request);
         const input = teamMergeInput(route.teamId, body);
+        const authority = await resolveHttpTeamAuthority(options, route.teamId, input.sessionId, input.cwd);
+        input.sessionId = authority.sessionId;
+        input.cwd = authority.cwd;
         input.signal = request.signal;
         return json(await merger.mergeTeamTasks(input));
       }
@@ -438,7 +494,11 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         if (!body.path) throw badRequest("path is required");
         if (!body.name) throw badRequest("name is required");
         if (!body.role) throw badRequest("role is required");
-        return json(await teams.addMember(teamMemberInput(route.teamId, body)), 201);
+        const input = teamMemberInput(route.teamId, body);
+        return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
+          input.sessionId = authority.sessionId;
+          return teams.addMember(input);
+        }), 201);
       }
 
       if (route.name === "teamTasks") {
@@ -450,41 +510,65 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         const teams = requireTeams(options);
         const body = await readJson<TeamTaskCreateBody>(request);
         if (!body.title) throw badRequest("title is required");
-        return json(await teams.createTask(teamTaskCreateInput(route.teamId, body)), 201);
+        const input = teamTaskCreateInput(route.teamId, body);
+        return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
+          input.sessionId = authority.sessionId;
+          return teams.createTask(input);
+        }), 201);
       }
 
       if (route.name === "teamAssignTask") {
         const teams = requireTeams(options);
         const body = await readJson<TeamTaskAssignBody>(request);
         if (!body.ownerPath) throw badRequest("ownerPath is required");
-        return json(await teams.assignTask(teamTaskAssignInput(route.teamId, route.taskId, body)));
+        const input = teamTaskAssignInput(route.teamId, route.taskId, body);
+        return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
+          input.sessionId = authority.sessionId;
+          return teams.assignTask(input);
+        }));
       }
 
       if (route.name === "teamClaimTask") {
         const teams = requireTeams(options);
         const body = await readJson<TeamTaskClaimBody>(request);
         if (!body.ownerPath) throw badRequest("ownerPath is required");
-        return json(await teams.claimTask(teamTaskClaimInput(route.teamId, route.taskId, body)));
+        const input = teamTaskClaimInput(route.teamId, route.taskId, body);
+        return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
+          input.sessionId = authority.sessionId;
+          return teams.claimTask(input);
+        }));
       }
 
       if (route.name === "teamDispatchTask") {
         const dispatcher = requireTeamDispatcher(options);
         const body = await readJson<TeamTaskDispatchBody>(request);
+        const input = teamTaskDispatchInput(route.teamId, route.taskId, body);
+        const authority = await resolveHttpTeamAuthority(options, route.teamId, input.sessionId, input.cwd);
+        input.sessionId = authority.sessionId;
+        input.cwd = authority.cwd;
+        input.signal = request.signal;
         return json(
-          serializeTeamTaskDispatchResult(await dispatcher.dispatchTask(teamTaskDispatchInput(route.teamId, route.taskId, body))),
+          serializeTeamTaskDispatchResult(await dispatcher.dispatchTask(input)),
         );
       }
 
       if (route.name === "teamSyncTask") {
         const dispatcher = requireTeamDispatcher(options);
         const body = await readJson<TeamContextBody>(request);
-        return json(await dispatcher.syncTask(teamTaskSyncInput(route.teamId, route.taskId, body)));
+        const input = teamTaskSyncInput(route.teamId, route.taskId, body);
+        const authority = await resolveHttpTeamAuthority(options, route.teamId, input.sessionId, undefined);
+        input.sessionId = authority.sessionId;
+        return json(await dispatcher.syncTask(input));
       }
 
       if (route.name === "teamUpdateTask") {
         const teams = requireTeams(options);
         const body = await readJson<TeamTaskUpdateBody>(request);
-        return json(await teams.updateTask(teamTaskUpdateInput(route.teamId, route.taskId, body)));
+        const input = teamTaskUpdateInput(route.teamId, route.taskId, body);
+        return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
+          input.sessionId = authority.sessionId;
+          return teams.updateTask(input);
+        }));
       }
 
       if (route.name === "teamMessages") {
@@ -498,13 +582,34 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         if (!body.from) throw badRequest("from is required");
         if (!body.to) throw badRequest("to is required");
         if (!body.content) throw badRequest("content is required");
-        return json(await teams.sendMessage(teamMessageInput(route.teamId, body)), 201);
+        const input = teamMessageInput(route.teamId, body);
+        const authority = await resolveHttpTeamAuthority(options, route.teamId, undefined, undefined);
+        const actorSessionId = input.sessionId;
+        if (actorSessionId && actorSessionId !== authority.sessionId) {
+          await resolveHttpActiveActorSession(options, actorSessionId);
+        }
+        return json(await options.service.withSessionOperation(authority.sessionId, async (operation) => {
+          const current = await resolveHttpTeamAuthority(
+            options,
+            route.teamId,
+            authority.sessionId,
+            undefined,
+          );
+          if (actorSessionId && actorSessionId !== current.sessionId) {
+            await resolveHttpActiveActorSession(options, actorSessionId);
+            input.sessionId = actorSessionId;
+          } else {
+            input.sessionId = current.sessionId;
+          }
+          operation.assertCurrent();
+          return teams.sendMessage(input);
+        }), 201);
       }
 
       if (route.name === "createSession") {
         const body = await readJson<CreateSessionBody>(request);
         const input: { sessionId?: SessionId; cwd?: string } = {};
-        if (body.sessionId) input.sessionId = body.sessionId;
+        if (body.sessionId !== undefined) input.sessionId = requestSessionId(body.sessionId);
         if (body.cwd !== undefined) input.cwd = await requestWorkspaceCwd(body.cwd);
         return json(await options.service.createSession(input), 201);
       }
@@ -529,6 +634,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "renameSession") {
         await requireSession(options.store, route.sessionId);
+        await options.service.assertSessionTurnAllowed(route.sessionId);
         if (!options.service.renameSession) return jsonError(501, "Session rename is not available from this runtime");
         const body = await readJson<RenameSessionBody>(request);
         const title = body.title?.trim().replace(/\s+/g, " ") ?? "";
@@ -547,6 +653,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "setModel") {
         await requireSession(options.store, route.sessionId);
+        await options.service.assertSessionTurnAllowed(route.sessionId);
         const body = await readJson<ModelBody>(request);
         if (!isModelSelection(body.modelSelection)) throw badRequest("modelSelection with provider and model is required");
         return json(await requireModelControl(options).setModel({
@@ -557,6 +664,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "setReasoning") {
         await requireSession(options.store, route.sessionId);
+        await options.service.assertSessionTurnAllowed(route.sessionId);
         const body = await readJson<ReasoningBody>(request);
         if (!isReasoningLevel(body.reasoningLevel)) {
           throw badRequest("reasoningLevel must be off, minimal, low, medium, high, xhigh, max, or ultra");
@@ -569,6 +677,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "setServiceTier") {
         await requireSession(options.store, route.sessionId);
+        await options.service.assertSessionTurnAllowed(route.sessionId);
         const body = await readJson<ServiceTierBody>(request);
         if (!isServiceTier(body.serviceTier)) {
           throw badRequest("serviceTier must be standard or fast");
@@ -586,6 +695,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "setDelegationPolicy") {
         await requireSession(options.store, route.sessionId);
+        await options.service.assertSessionTurnAllowed(route.sessionId);
         const body = await readJson<DelegationBody>(request);
         if (!isDelegationPolicy(body.policy)) {
           throw badRequest("policy must be off, explicit, or proactive");
@@ -614,14 +724,13 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         if (request.method === "PATCH") {
           const body = await readJson<GoalBody>(request);
           const input = goalUpdateInput(route.sessionId, body);
-          if (input.status === undefined || input.status === "active") {
-            await options.service.assertSessionTurnAllowed(route.sessionId);
-          }
+          await options.service.assertSessionTurnAllowed(route.sessionId);
           await requireSession(options.store, route.sessionId);
           return json(await goals.updateGoal(input));
         }
         if (request.method === "DELETE") {
           rejectUnknownQueryParameters(url, []);
+          await options.service.assertSessionTurnAllowed(route.sessionId);
           await requireSession(options.store, route.sessionId);
           return json(await goals.clearGoal({ sessionId: route.sessionId }));
         }
@@ -701,6 +810,8 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       }
 
       if (route.name === "archive") {
+        await requireSession(options.store, route.sessionId);
+        await options.service.assertSessionTurnAllowed(route.sessionId);
         await options.service.archiveSession(route.sessionId);
         return new Response(null, { status: 204 });
       }
@@ -771,8 +882,8 @@ type Route =
   | { name: "models" }
   | { name: "permissionsConfig" }
   | { name: "setPermissions" }
-  | { name: "commands" }
-  | { name: "commandsReload" }
+  | { name: "commands"; sessionId?: SessionId }
+  | { name: "commandsReload"; sessionId?: SessionId }
   | { name: "mcpList" }
   | { name: "mcpStatus" }
   | { name: "mcpReload" }
@@ -919,6 +1030,7 @@ interface TaskCloseBody {
 }
 
 interface TaskReconcileStaleBody {
+  parentSessionId?: unknown;
   staleAfterMs?: number;
   modes?: unknown;
   limit?: number;
@@ -988,7 +1100,7 @@ interface TeamTaskReconcileBody extends TeamContextBody {
 }
 
 interface TeamRunLoopBody extends TeamContextBody {
-  cwd?: string;
+  cwd?: unknown;
   mode?: string;
   once?: boolean;
   maxCycles?: number;
@@ -998,7 +1110,7 @@ interface TeamRunLoopBody extends TeamContextBody {
 
 interface TeamMergeBody extends TeamContextBody {
   taskId?: TaskId;
-  cwd?: string;
+  cwd?: unknown;
 }
 
 interface TeamTaskUpdateBody extends TeamContextBody {
@@ -1143,10 +1255,19 @@ function routeRequest(method: string, pathname: string): Route {
     return { name: "notFound" };
   }
 
+  const sessionCommandsRoute = /^\/sessions\/([^/]+)\/commands(?:\/(reload))?$/.exec(path);
+  if (sessionCommandsRoute) {
+    const sessionId = requestSessionId(decodeURIComponent(sessionCommandsRoute[1] ?? ""));
+    const action = sessionCommandsRoute[2];
+    if (method === "GET" && !action) return { name: "commands", sessionId };
+    if (method === "POST" && action === "reload") return { name: "commandsReload", sessionId };
+    return { name: "notFound" };
+  }
+
   const sessionRoute = /^\/sessions\/([^/]+)\/([^/]+)$/.exec(path);
   if (!sessionRoute) return { name: "notFound" };
 
-  const sessionId = decodeURIComponent(sessionRoute[1] ?? "") as SessionId;
+  const sessionId = requestSessionId(decodeURIComponent(sessionRoute[1] ?? ""));
   const action = sessionRoute[2];
   if (method === "GET" && action === "agents") return { name: "agents", sessionId };
   if (method === "GET" && action === "messages") return { name: "messages", sessionId };
@@ -1627,6 +1748,19 @@ async function requireSession(store: EventStore, sessionId: SessionId): Promise<
   return session;
 }
 
+async function mcpScopeFromRequest(
+  options: RuntimeHttpHandlerOptions,
+  url: URL,
+): Promise<RuntimeMcpScopeInput> {
+  rejectUnknownQueryParameters(url, ["sessionId"]);
+  const sessionId = asSessionId(url.searchParams.get("sessionId"));
+  if (!sessionId) return {};
+
+  await options.service.assertSessionTurnAllowed(sessionId);
+  const session = await requireSession(options.store, sessionId);
+  return { cwd: await authoritativeRequestCwd(session.cwd, undefined) };
+}
+
 async function authoritativeRequestCwd(sessionCwd: string, requestedCwd: unknown): Promise<string> {
   const workspace = await canonicalWorkspacePath(sessionCwd);
   if (requestedCwd === undefined) return workspace;
@@ -1648,6 +1782,15 @@ async function requestWorkspaceCwd(value: unknown): Promise<string> {
   if (value.trim().length === 0) throw badRequest("cwd must not be empty");
   if (value.includes("\0")) throw badRequest("cwd must be a valid filesystem path");
   return canonicalWorkspacePath(value);
+}
+
+function requestSessionId(value: unknown, field = "sessionId"): SessionId {
+  if (typeof value !== "string") throw badRequest(`${field} must be a string when provided`);
+  const sessionId = value.trim();
+  if (!sessionId) throw badRequest(`${field} must not be empty`);
+  if (sessionId.length > 512) throw badRequest(`${field} must not exceed 512 characters`);
+  if (/[\u0000-\u001f\u007f]/u.test(sessionId)) throw badRequest(`${field} must be valid text`);
+  return sessionId as SessionId;
 }
 
 async function canonicalWorkspacePath(value: string): Promise<string> {
@@ -1736,8 +1879,23 @@ function toHttpError(error: unknown): HttpError {
   if (err.name === "TeamNotFoundError" || err.name === "TeamMemberNotFoundError" || err.name === "TeamTaskNotFoundError") {
     return { status: 404, message: err.message };
   }
+  if (err.name === "TeamAlreadyExistsError" || err.name === "TeamTaskAlreadyExistsError") {
+    return { status: 409, message: err.message };
+  }
   if (err.name === "TeamTaskClaimError") {
     return { status: 409, message: err.message };
+  }
+  if (err.name === "TeamTaskDispatchAuthorityError") {
+    return { status: 409, message: err.message };
+  }
+  if (err.name === "TeamSessionAuthorityError") {
+    return { status: 409, message: err.message };
+  }
+  if (err.name === "TeamMemberSessionOwnershipError") {
+    return { status: 409, message: err.message };
+  }
+  if (err.name === "TeamTaskWorkerMutationError") {
+    return { status: 403, message: err.message };
   }
   if (err.name === "TeamMessageDeliveryError") {
     return { status: 409, message: err.message };
@@ -1752,6 +1910,13 @@ function toHttpError(error: unknown): HttpError {
     return { status: 409, message: err.message };
   }
   if (err.name === "RuntimeSubagentSessionAccessError") {
+    return { status: 409, message: err.message };
+  }
+  if (
+    err.name === "RuntimeSessionAlreadyExistsError" ||
+    err.name === "RuntimeSessionCreationConflictError" ||
+    err.name === "RuntimeSessionInactiveError"
+  ) {
     return { status: 409, message: err.message };
   }
   if (err instanceof RuntimeSessionNotFoundError || err.name === "RuntimeSessionNotFoundError") {
@@ -1785,9 +1950,7 @@ function isHttpError(error: unknown): error is HttpError {
 
 function asSessionId(value: string | null, parameterName = "sessionId"): SessionId | undefined {
   if (value === null) return undefined;
-  const normalized = value.trim();
-  if (!normalized) throw badRequest(`${parameterName} must not be empty`);
-  return normalized as SessionId;
+  return requestSessionId(value, parameterName);
 }
 
 function requireModelControl(options: RuntimeHttpHandlerOptions): Required<Pick<RuntimeHttpService, "listModels" | "getModelConfig" | "setModel" | "setReasoning">> {
@@ -1887,10 +2050,14 @@ function requireMcpControl(options: RuntimeHttpHandlerOptions): RuntimeMcpContro
   return options.mcp;
 }
 
-async function mcpServerDescriptor(control: RuntimeMcpControlService, server: string): Promise<RuntimeMcpServerDescriptor> {
+async function mcpServerDescriptor(
+  control: RuntimeMcpControlService,
+  server: string,
+  scope: RuntimeMcpScopeInput = {},
+): Promise<RuntimeMcpServerDescriptor> {
   const descriptor = control.get
-    ? await control.get(server)
-    : (await control.list()).servers.find((candidate) => candidate.name === server);
+    ? await control.get(server, scope)
+    : (await control.list(scope)).servers.find((candidate) => candidate.name === server);
   if (!descriptor) throw notFound(`MCP server not found: ${server}`);
   return descriptor;
 }
@@ -1933,9 +2100,79 @@ function requireTeamMerger(options: RuntimeHttpHandlerOptions): RuntimeTeamMerge
   return options.teamMerger;
 }
 
+async function resolveHttpTeamAuthority(
+  options: RuntimeHttpHandlerOptions,
+  teamId: TeamId,
+  requestedSessionId: SessionId | undefined,
+  requestedCwd: string | undefined,
+): Promise<{ sessionId: SessionId; cwd: string }> {
+  const team = await requireHttpTeam(options, teamId);
+  return resolveTeamSessionAuthority({
+    team,
+    tasks: [],
+    ...(requestedSessionId ? { requestedSessionId } : {}),
+    ...(requestedCwd !== undefined ? { requestedCwd } : {}),
+    resolveSession: (sessionId) => resolveHttpInteractiveSession(options, sessionId),
+  });
+}
+
+async function requireHttpTeam(options: RuntimeHttpHandlerOptions, teamId: TeamId) {
+  const team = (await requireTeams(options).listTeams()).find((candidate) => candidate.id === teamId);
+  if (!team) throw { status: 404, message: `Team not found: ${teamId}` } satisfies HttpError;
+  return team;
+}
+
+async function resolveHttpInteractiveSession(options: RuntimeHttpHandlerOptions, sessionId: SessionId) {
+  await options.service.assertSessionTurnAllowed(sessionId);
+  const session = await requireSession(options.store, sessionId);
+  if (session.status !== "active") throw new Error(`Session ${sessionId} is not active (${session.status})`);
+  if (session.source === "subagent") throw new Error(`Session ${sessionId} is reserved for a subagent`);
+  return session;
+}
+
+async function resolveHttpActiveActorSession(options: RuntimeHttpHandlerOptions, sessionId: SessionId) {
+  const session = await requireSession(options.store, sessionId);
+  if (session.status !== "active") {
+    throw { status: 409, message: `Session ${sessionId} is not active (${session.status})` } satisfies HttpError;
+  }
+  return session;
+}
+
+async function withHttpTeamOwnerMutation<T>(
+  options: RuntimeHttpHandlerOptions,
+  teamId: TeamId,
+  requestedSessionId: SessionId | undefined,
+  mutate: (authority: { sessionId: SessionId; cwd: string }) => Promise<T>,
+): Promise<T> {
+  const authority = await resolveHttpTeamAuthority(options, teamId, requestedSessionId, undefined);
+  return options.service.withSessionOperation(authority.sessionId, async (operation) => {
+    const current = await resolveHttpTeamAuthority(
+      options,
+      teamId,
+      authority.sessionId,
+      undefined,
+    );
+    operation.assertCurrent();
+    return mutate(current);
+  });
+}
+
+async function assertHttpTeamReconcileAuthority(
+  options: RuntimeHttpHandlerOptions,
+  input: TeamTaskReconcileInput,
+): Promise<void> {
+  const teams = input.teamId
+    ? [await requireHttpTeam(options, input.teamId)]
+    : (await requireTeams(options).listTeams()).filter((team) => team.status === "active");
+  for (const team of teams) {
+    const authority = await resolveHttpTeamAuthority(options, team.id, input.sessionId, undefined);
+    if (input.teamId) input.sessionId = authority.sessionId;
+  }
+}
+
 function teamContext(body: TeamContextBody): TeamEventContextInput {
   const input: TeamEventContextInput = {};
-  if (body.sessionId) input.sessionId = body.sessionId;
+  if (body.sessionId !== undefined) input.sessionId = requestSessionId(body.sessionId);
   return input;
 }
 
@@ -2062,7 +2299,11 @@ function teamTaskDispatchInput(teamId: TeamId, taskId: TaskId, body: TeamTaskDis
     taskId,
   };
   if (body.ownerPath) input.ownerPath = body.ownerPath;
-  if (body.cwd) input.cwd = body.cwd;
+  if (body.cwd !== undefined) {
+    const cwd = stringField(body.cwd, "cwd");
+    if (cwd.includes("\0")) throw badRequest("cwd must be a valid filesystem path");
+    input.cwd = cwd;
+  }
   if (body.prompt) input.prompt = body.prompt;
   const mode = localSubagentMode(body.mode);
   if (mode) input.mode = mode;
@@ -2094,7 +2335,7 @@ function teamRunLoopInput(teamId: TeamId, body: TeamRunLoopBody): TeamExecutionR
     ...teamContext(body),
     teamId,
   };
-  if (body.cwd) input.cwd = body.cwd;
+  if (body.cwd !== undefined) input.cwd = teamRequestCwd(body.cwd);
   const mode = localSubagentMode(body.mode);
   if (mode) input.mode = mode;
   if (body.once !== undefined) input.once = body.once;
@@ -2119,8 +2360,14 @@ function teamMergeInput(teamId: TeamId, body: TeamMergeBody): TeamMergeInput {
     teamId,
   };
   if (body.taskId) input.taskId = body.taskId;
-  if (body.cwd) input.cwd = body.cwd;
+  if (body.cwd !== undefined) input.cwd = teamRequestCwd(body.cwd);
   return input;
+}
+
+function teamRequestCwd(value: unknown): string {
+  const cwd = stringField(value, "cwd");
+  if (cwd.includes("\0")) throw badRequest("cwd must be a valid filesystem path");
+  return cwd;
 }
 
 function teamTaskUpdateInput(teamId: TeamId, taskId: TaskId, body: TeamTaskUpdateBody): UpdateTeamTaskInput {
@@ -2311,6 +2558,9 @@ function closeStatus(value: unknown): AgentTaskFinalStatus {
 
 function reconcileStaleInput(body: TaskReconcileStaleBody): AgentTaskReconcileStaleInput {
   const input: AgentTaskReconcileStaleInput = {};
+  if (body.parentSessionId !== undefined) {
+    input.parentSessionId = requestSessionId(body.parentSessionId);
+  }
   if (body.staleAfterMs !== undefined) {
     if (!Number.isInteger(body.staleAfterMs) || body.staleAfterMs < 0) {
       throw badRequest("staleAfterMs must be a non-negative integer");

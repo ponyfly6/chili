@@ -1605,7 +1605,13 @@ test("scoped worker policy allows scoped team task updates without file write sc
     if (search.status === "completed") expect(search.result.output).toContain("team_task_update:");
 
     const update = await executor.execute(
-      toolInput("team_task_update", { teamId: "team_1", taskId: "task_1", summary: "done" }, workspace),
+      toolInput("team_task_update", {
+        teamId: "team_1",
+        taskId: "task_1",
+        status: "in_progress",
+        summary: "halfway",
+        metadata: { workerProgress: { percent: 50 } },
+      }, workspace),
     );
     expect(update.status).toBe("completed");
 
@@ -1614,6 +1620,44 @@ test("scoped worker policy allows scoped team task updates without file write sc
     );
     expect(otherTask.status).toBe("failed");
     if (otherTask.status === "failed") expect(otherTask.error.message).toContain("team task scope");
+
+    for (const status of ["pending", "blocked", "completed", "failed", "cancelled"]) {
+      const result = await executor.execute(
+        toolInput("team_task_update", { teamId: "team_1", taskId: "task_1", status }, workspace),
+      );
+      expect(result.status).toBe("failed");
+      if (result.status === "failed") expect(result.error.message).toContain("complete_task");
+    }
+
+    for (const metadata of [
+      { verification: { status: "passed" } },
+      { merge: { status: "pending" } },
+      { worktree: null },
+      { chiliTeamDispatch: null },
+      { writeScope: ["."] },
+    ]) {
+      const result = await executor.execute(
+        toolInput("team_task_update", { teamId: "team_1", taskId: "task_1", metadata }, workspace),
+      );
+      expect(result.status).toBe("failed");
+      if (result.status === "failed") expect(result.error.message).toContain("runtime-owned");
+    }
+
+    for (const updateInput of [
+      { ownerPath: "/root/worker" },
+      { title: "rewrite" },
+      { description: "rewrite" },
+      { dependsOn: [] },
+      { error: "pretend failure" },
+    ]) {
+      const result = await executor.execute(toolInput("team_task_update", {
+        teamId: "team_1",
+        taskId: "task_1",
+        ...updateInput,
+      }, workspace));
+      expect(result.status).toBe("failed");
+      if (result.status === "failed") expect(result.error.message).toContain("cannot change team task field");
+    }
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }

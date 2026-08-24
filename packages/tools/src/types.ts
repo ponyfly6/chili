@@ -87,11 +87,26 @@ export interface ToolRegistryListOptions {
   includeDeferred?: boolean;
 }
 
+export interface ToolRegistryContext {
+  sessionId: SessionId;
+  turnId: TurnId;
+  cwd: string;
+}
+
+export type ContextualToolProvider = (
+  context: ToolRegistryContext,
+) => Promise<readonly ChiliToolDefinition[]> | readonly ChiliToolDefinition[];
+
 export interface ToolRegistry {
   register(tool: ChiliToolDefinition, options?: ToolRegistryRegisterOptions): void;
   get(name: string): ChiliToolDefinition | undefined;
   list(options?: ToolRegistryListOptions): ChiliToolDefinition[];
   entries?(options?: ToolRegistryListOptions): ToolRegistryEntry[];
+  getForContext?(name: string, context: ToolRegistryContext): Promise<ChiliToolDefinition | undefined>;
+  listForContext?(
+    context: ToolRegistryContext,
+    options?: ToolRegistryListOptions,
+  ): Promise<ChiliToolDefinition[]>;
 }
 
 export interface MutableToolRegistry extends ToolRegistry {
@@ -100,6 +115,8 @@ export interface MutableToolRegistry extends ToolRegistry {
   unregisterSource(source: string): ChiliToolDefinition[];
   replaceMatching(selector: ToolRegistrySelector, tools: readonly ChiliToolDefinition[], options?: ToolRegistryRegisterOptions): ChiliToolDefinition[];
   replaceSource(source: string, tools: readonly ChiliToolDefinition[]): ChiliToolDefinition[];
+  replaceContextualSource(source: string, provider: ContextualToolProvider): void;
+  unregisterContextualSource(source: string): boolean;
 }
 
 export interface ToolEventSink {
