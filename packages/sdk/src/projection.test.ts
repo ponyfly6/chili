@@ -67,6 +67,7 @@ test("projects the selected failed session status reason", () => {
 
   expect(chat.status).toBe("failed");
   expect(chat.statusReason).toBe("provider stream disconnected");
+  expect(chat.statusEventId).toBe("event_status_reason_failed");
 });
 
 test("keeps explicit session status canonical and applies only matching terminal turn fallback", () => {
@@ -99,7 +100,10 @@ test("keeps explicit session status canonical and applies only matching terminal
     sessionId,
     payload: { sessionId, status: "running" },
   }], view);
-  expect(chatSessionView(view, { sessionId })).toMatchObject({ status: "running" });
+  expect(chatSessionView(view, { sessionId })).toMatchObject({
+    status: "running",
+    statusEventId: "event_status_reason_transition_running",
+  });
   expect(chatSessionView(view, { sessionId }).statusReason).toBeUndefined();
 
   reduceRuntimeEvents([
@@ -175,6 +179,7 @@ test("keeps explicit session status canonical and applies only matching terminal
   const failedBeforeReason = chatSessionView(view, { sessionId });
   expect(failedBeforeReason.status).toBe("failed");
   expect(failedBeforeReason.statusReason).toBeUndefined();
+  expect(failedBeforeReason.statusEventId).toBe("event_status_reason_transition_current_turn_failed");
 
   reduceRuntimeEvents([{
     id: "event_status_reason_transition_failed_reason",
