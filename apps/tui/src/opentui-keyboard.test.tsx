@@ -215,6 +215,36 @@ test("resume session submits without creating a new session", async () => {
   }
 });
 
+test("resumed prompts submit the persisted session workspace instead of the local cwd", async () => {
+  const records = chatClientRecords();
+  const sessionId = "session_authoritative_workspace" as SessionId;
+  const client = fakeChatClient(records, [{
+    id: "event_authoritative_workspace",
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd: "/server/persisted-workspace" },
+  }]);
+  const app = await mountChatApp(client, { sessionId });
+
+  try {
+    await Bun.sleep(80);
+    await app.renderOnce();
+    await typeText(app, "continue in the same workspace");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(records.create).toHaveLength(0);
+    expect(records.submit[0]).toMatchObject({
+      sessionId,
+      cwd: "/server/persisted-workspace",
+    });
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("resumed chat keeps the stream global so /resume can switch sessions", async () => {
   const records = chatClientRecords();
   const client = fakeChatClient(records);
@@ -3842,7 +3872,7 @@ test("/status shortcut copies the complete status page on a narrow screen and sh
     expect(copied).toHaveLength(1);
     expect(copied[0]).toContain(`execution: failed\nreason: ${reason}`);
     expect(copied[0]).toContain(`session: ${sessionId}`);
-    expect(copied[0]).toContain(`cwd: ${cwd}`);
+    expect(copied[0]).toContain(`workspace: ${cwd}`);
     expect(copied[0]).not.toContain("PREVIOUS ASSISTANT REPLY");
     expect(app.captureCharFrame()).toContain("Copied status.");
   } finally {

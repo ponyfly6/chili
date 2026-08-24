@@ -1,6 +1,6 @@
 import type { ChatSessionView, TeamLiveView } from "@chili/sdk";
 import type { ServiceTier } from "@chili/protocol";
-import { basename } from "node:path";
+import { basename, resolve } from "node:path";
 import type { ModelSelection, ReasoningLevel } from "../model-state.js";
 import type { TuiTheme } from "../theme/index.js";
 import type { AgentsViewModel } from "./AgentsView.js";
@@ -42,7 +42,7 @@ export function StatusFooter(props: {
   const left = [
     modelText(props.chatView, props.options),
     contextText(props.chatView.latestModelMetadata?.usage, contextWindowFor(props.chatView)),
-    workspaceText(props.options),
+    statusFooterWorkspaceText(props.chatView, props.options),
   ].filter(Boolean).join(" · ");
   const status = statusFooterStatusText(props.chatView, props.canSubmit, props.model, props.agentExperience);
   const right = [
@@ -79,11 +79,17 @@ export function statusFooterStatusText(
   model: TeamLiveView,
   agentExperience: AgentsViewModel | undefined,
 ): string | undefined {
-  const session = chatView.status === "waiting_for_approval"
-    ? "approval"
-    : chatView.status === "running"
-      ? "running"
-      : canSubmit ? undefined : "waiting";
+  const session = chatView.status === "failed"
+    ? "failed"
+    : chatView.status === "cancelled"
+      ? "cancelled"
+      : chatView.status === "cancelling"
+        ? "cancelling"
+        : chatView.status === "waiting_for_approval"
+          ? "approval"
+          : chatView.status === "running"
+            ? "running"
+            : canSubmit ? undefined : "waiting";
   const goal = goalStatusText(chatView);
   const agents = agentExperience && agentExperience.activeAdHocAgents > 0
     ? `${agentExperience.activeAdHocAgents} ad-hoc agent${agentExperience.activeAdHocAgents === 1 ? "" : "s"}`
@@ -156,12 +162,17 @@ function serviceTierText(serviceTier: ServiceTier | undefined): string | undefin
   return undefined;
 }
 
-function workspaceText(options: StatusFooterOptions): string {
-  const workspace = basename(options.cwd) || options.cwd;
-  return options.gitBranch ? `${workspace} (${options.gitBranch})` : workspace;
+export function statusFooterWorkspaceText(chatView: ChatSessionView, options: StatusFooterOptions): string {
+  const cwd = chatView.cwd ?? options.cwd;
+  const workspace = basename(cwd) || cwd;
+  const branchBelongsToWorkspace = chatView.cwd === undefined || resolve(chatView.cwd) === resolve(options.cwd);
+  return options.gitBranch && branchBelongsToWorkspace
+    ? `${workspace} (${options.gitBranch})`
+    : workspace;
 }
 
 function statusColor(status: string, theme: TuiTheme): string {
+  if (status.includes("failed") || status.includes("cancelled")) return theme.colors.status.error;
   if (status.includes("approval")) return theme.colors.status.pending;
   if (status.includes("running")) return theme.colors.status.info;
   if (status === "waiting") return theme.colors.text.muted;

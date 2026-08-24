@@ -154,7 +154,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  setTerminalTitle(formatTerminalTitle(options.cwd ?? process.cwd()));
+  options.cwd = resolve(options.cwd ?? process.cwd());
+
+  setTerminalTitle(formatTerminalTitle(options.cwd));
 
   const client = new HttpRuntimeClient({ baseUrl: options.baseUrl });
   const renderer = await createCliRenderer(rendererConfig());

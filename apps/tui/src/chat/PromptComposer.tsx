@@ -275,5 +275,6 @@ function feedbackColor(status: string, theme: TuiTheme): string {
   if (status === "success") return theme.colors.status.success;
   if (status === "error") return theme.colors.status.error;
   if (status === "pending") return theme.colors.status.pending;
+  if (status === "accepted") return theme.colors.status.info;
   return theme.colors.text.muted;
 }

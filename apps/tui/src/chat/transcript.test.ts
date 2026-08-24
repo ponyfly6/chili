@@ -40,6 +40,39 @@ test("diagnostic transcript does not label user text with an assistant phase", (
   expect(transcript).not.toContain("part_transcript_user phase=");
 });
 
+test("diagnostic transcript sanitizes plain and markup synthetic provider errors", () => {
+  const jwt = "eyJhbGciOiJIUzI1NiJ9.c2VjcmV0LXBheWxvYWQ.c2lnbmF0dXJl";
+  const items: ChatTranscriptItem[] = [{
+    id: "message_transcript_legacy_error" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [
+      {
+        type: "text",
+        id: "part_transcript_plain_error" as PartId,
+        text: `Model request failed: token=private ${jwt} 103.151.173.205`,
+        synthetic: true,
+      },
+      {
+        type: "text",
+        id: "part_transcript_markup_error" as PartId,
+        text: "Model request failed: HTTP 502 <!DOCTYPE html><html>private edge response</html>",
+        synthetic: true,
+      },
+    ],
+  }];
+
+  const transcript = buildTranscriptText(items);
+
+  expect(transcript).toContain("unsafe markup response hidden");
+  expect(transcript).toContain("token=[redacted-credential]");
+  expect(transcript).not.toContain("private edge response");
+  expect(transcript).not.toContain("103.151.173.205");
+  expect(transcript).not.toContain(jwt);
+  expect(transcript).not.toContain("<!DOCTYPE");
+});
+
 test("diagnostic transcript exposes only controlled tool execution context", () => {
   const callId = "tool_transcript_execution" as ToolCallId;
   const executionContext = {

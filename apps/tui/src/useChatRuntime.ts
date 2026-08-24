@@ -32,11 +32,22 @@ import type {
 import { useTeamLiveRuntime, type TeamLiveRuntimeState, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
 
-export type ChatRequestStatus = "idle" | "pending" | "success" | "error";
+export type ChatRequestStatus = "idle" | "pending" | "accepted" | "success" | "error";
 
 export interface ChatRuntimeFeedback {
   status: ChatRequestStatus;
   message: string;
+  acceptedSessionId?: SessionId;
+  acceptedAgainstStatusEventId?: string | null;
+}
+
+export function acceptedFeedbackMatchesStatus(
+  feedback: ChatRuntimeFeedback | undefined,
+  chatView: Pick<ChatSessionView, "sessionId" | "statusEventId">,
+): boolean {
+  if (feedback?.status !== "accepted" || feedback.acceptedAgainstStatusEventId === undefined) return false;
+  if (feedback.acceptedSessionId && chatView.sessionId && feedback.acceptedSessionId !== chatView.sessionId) return false;
+  return (chatView.statusEventId ?? null) === feedback.acceptedAgainstStatusEventId;
 }
 
 export interface ChatRuntimeState extends TeamLiveRuntimeState {
@@ -149,6 +160,16 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     if (activeSessionId) request.sessionId = activeSessionId;
     return chatSessionView(teamRuntime.runtimeView, request);
   }, [activeSessionId, teamRuntime.revision, teamRuntime.runtimeView]);
+
+  useEffect(() => {
+    setChatFeedback((current) => {
+      if (current?.status !== "accepted" || current.acceptedAgainstStatusEventId === undefined) return current;
+      if (current.acceptedSessionId && !chatView.sessionId) return current;
+      return acceptedFeedbackMatchesStatus(current, chatView)
+        ? current
+        : undefined;
+    });
+  }, [chatView.sessionId, chatView.statusEventId]);
 
   useEffect(() => {
     if (activeSessionId && chatView.sessionId && activeSessionId !== chatView.sessionId) setActiveSessionId(chatView.sessionId);
@@ -432,11 +453,14 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   const submitPrompt = useCallback(async (text: string, submitOptions: ChatSubmitOptions = {}): Promise<boolean> => {
     const trimmed = text.trim();
     if (!trimmed || submitPending || running || chatView.pendingApprovals.length > 0) return false;
+    const acceptedAgainstStatusEventId = chatView.statusEventId ?? null;
     setSubmitPending(true);
     setChatFeedback({ status: "pending", message: "sending prompt" });
     try {
-      await withAbort(async (signal) => {
+      const acceptedSessionId = await withAbort(async (signal) => {
         let sessionId = activeSessionId ?? chatView.sessionId;
+        const executionCwd = chatView.cwd
+          ?? (sessionId === undefined ? options.cwd : undefined);
         if (!sessionId) {
           const created = await client.createSession({
             ...(options.cwd ? { cwd: options.cwd } : {}),
@@ -452,7 +476,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
           sessionId,
           text: trimmed,
           ...(submitOptions.displayText ? { displayText: submitOptions.displayText } : {}),
-          ...(options.cwd ? { cwd: options.cwd } : {}),
+          ...(executionCwd ? { cwd: executionCwd } : {}),
           ...(submitOptions.modelSelection ? { modelSelection: submitOptions.modelSelection } : {}),
           ...(submitOptions.reasoningLevel ? { reasoningLevel: submitOptions.reasoningLevel } : {}),
           ...(submitOptions.serviceTier ? { serviceTier: submitOptions.serviceTier } : {}),
@@ -461,8 +485,14 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
           signal,
         };
         await client.submitPromptAsync(request);
+        return sessionId;
       });
-      setChatFeedback({ status: "success", message: "prompt accepted" });
+      setChatFeedback({
+        status: "accepted",
+        message: "prompt queued",
+        acceptedSessionId,
+        acceptedAgainstStatusEventId,
+      });
       return true;
     } catch (error) {
       if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
@@ -470,7 +500,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     } finally {
       setSubmitPending(false);
     }
-  }, [activeSessionId, chatView.pendingApprovals.length, chatView.sessionId, client, options.baseUrl, options.cwd, running, submitPending, withAbort]);
+  }, [activeSessionId, chatView.cwd, chatView.pendingApprovals.length, chatView.sessionId, chatView.statusEventId, client, options.baseUrl, options.cwd, running, submitPending, withAbort]);
 
   const submitCommand = useCallback(async (
     name: string,
@@ -479,11 +509,14 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   ): Promise<boolean> => {
     const commandName = name.trim();
     if (!commandName || submitPending || running || chatView.pendingApprovals.length > 0) return false;
+    const acceptedAgainstStatusEventId = chatView.statusEventId ?? null;
     setSubmitPending(true);
     setChatFeedback({ status: "pending", message: "sending command" });
     try {
-      await withAbort(async (signal) => {
+      const acceptedSessionId = await withAbort(async (signal) => {
         let sessionId = activeSessionId ?? chatView.sessionId;
+        const executionCwd = chatView.cwd
+          ?? (sessionId === undefined ? options.cwd : undefined);
         if (!sessionId) {
           const created = await client.createSession({
             ...(options.cwd ? { cwd: options.cwd } : {}),
@@ -499,14 +532,20 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
           sessionId,
           name: commandName,
           ...(args.trim().length > 0 ? { args: args.trim() } : {}),
-          ...(options.cwd ? { cwd: options.cwd } : {}),
+          ...(executionCwd ? { cwd: executionCwd } : {}),
           ...(submitOptions.modelSelection ? { modelSelection: submitOptions.modelSelection } : {}),
           ...(submitOptions.reasoningLevel ? { reasoningLevel: submitOptions.reasoningLevel } : {}),
           ...(submitOptions.serviceTier ? { serviceTier: submitOptions.serviceTier } : {}),
           signal,
         });
+        return sessionId;
       });
-      setChatFeedback({ status: "success", message: "command accepted" });
+      setChatFeedback({
+        status: "accepted",
+        message: "command queued",
+        acceptedSessionId,
+        acceptedAgainstStatusEventId,
+      });
       return true;
     } catch (error) {
       if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
@@ -514,7 +553,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     } finally {
       setSubmitPending(false);
     }
-  }, [activeSessionId, chatView.pendingApprovals.length, chatView.sessionId, client, options.baseUrl, options.cwd, running, submitPending, withAbort]);
+  }, [activeSessionId, chatView.cwd, chatView.pendingApprovals.length, chatView.sessionId, chatView.statusEventId, client, options.baseUrl, options.cwd, running, submitPending, withAbort]);
 
   const setRuntimeModel = useCallback(async (selection: ModelSelection): Promise<boolean> => {
     let updatedSessionId: SessionId | undefined;

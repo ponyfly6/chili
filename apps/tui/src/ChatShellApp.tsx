@@ -31,7 +31,7 @@ import { promisify } from "node:util";
 import { cleanClipboardText, systemClipboard, type ClipboardAccess, type ClipboardImage } from "./clipboard.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import { teamLiveModel, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
-import { useChatRuntime, type ChatApprovalGrantScope, type ChatRuntimeState } from "./useChatRuntime.js";
+import { acceptedFeedbackMatchesStatus, useChatRuntime, type ChatApprovalGrantScope, type ChatRuntimeState } from "./useChatRuntime.js";
 import { findAction, shorten } from "./components/helpers.js";
 import {
   DEFAULT_REASONING_LEVEL,
@@ -71,6 +71,7 @@ import {
   type McpServerMenuAction,
 } from "./chat/McpManager.js";
 import { PROMPT_INPUT_HEIGHT, PROMPT_PLACEHOLDER, PromptComposer, promptComposerHeight } from "./chat/PromptComposer.js";
+import { publicStatusReason, publicSyntheticAssistantText } from "./chat/public-error.js";
 import { StatusFooter, statusFooterHeight, type StatusFooterOptions } from "./chat/StatusFooter.js";
 import { buildTranscriptLines, buildTranscriptText } from "./chat/transcript.js";
 import { TranscriptView } from "./chat/TranscriptView.js";
@@ -2152,7 +2153,7 @@ function SessionScreen(props: {
             localItems={props.localItems}
             width={messageWidth}
             scrollRef={props.messageScrollRef}
-            cwd={props.options.cwd}
+            cwd={props.runtime.chatView.cwd ?? props.options.cwd}
             onOpenFile={props.onOpenFile}
             theme={props.theme}
             showToolDetails={props.showToolDetails}
@@ -3098,7 +3099,10 @@ function statusPageModel(input: StatusPageInput): StatusPageModel {
     { key: "status:thinking-traces", text: `thinking traces: ${input.hideThinking ? "hidden" : "shown"}`, tone: "text" },
     { key: "status:details", text: `details: ${input.showToolDetails ? "on" : "off"}`, tone: "text" },
     { key: "status:transcript", text: `transcript: ${input.transcriptActive ? "on" : "off"}`, tone: "text" },
-    { key: "status:cwd", text: `cwd: ${input.options.cwd}`, tone: "text" },
+    { key: "status:workspace", text: `workspace: ${input.runtime.chatView.cwd ?? input.options.cwd}`, tone: "text" },
+    ...(input.runtime.chatView.cwd && input.runtime.chatView.cwd !== input.options.cwd
+      ? [{ key: "status:local-cwd", text: `local cwd: ${input.options.cwd}`, tone: "text" as const }]
+      : []),
   );
   return { rows, text: rows.map((row) => row.text).join("\n") };
 }
@@ -3110,11 +3114,7 @@ function statusPageRowFg(tone: Exclude<StatusPageRowTone, "spacer">, theme: TuiT
 }
 
 function singleLineStatusValue(value: string | undefined): string | undefined {
-  const normalized = value
-    ?.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return normalized || undefined;
+  return publicStatusReason(value);
 }
 
 function statusModelSelection(runtime: ChatRuntimeState, options: StatusFooterOptions): ModelSelection | undefined {
@@ -4066,7 +4066,38 @@ function handlePermissionsPickerKey(
 }
 
 function currentFeedback(runtime: ChatRuntimeState): { status: string; message: string } | undefined {
-  if (runtime.chatFeedback) return runtime.chatFeedback;
+  if (runtime.chatFeedback?.status === "pending") return runtime.chatFeedback;
+  if (runtime.chatFeedback?.status === "accepted") {
+    if (acceptedFeedbackMatchesStatus(runtime.chatFeedback, runtime.chatView)) return runtime.chatFeedback;
+    if (runtime.chatFeedback.acceptedAgainstStatusEventId === undefined
+      && (runtime.chatView.status === "idle" || runtime.chatView.status === "unknown")) {
+      return runtime.chatFeedback;
+    }
+  }
+  const reason = publicStatusReason(runtime.chatView.statusReason);
+  if (runtime.chatView.status === "failed") return { status: "error", message: reason ?? "Session failed" };
+  if (runtime.chatView.status === "cancelled") return { status: "error", message: reason ?? "Session cancelled" };
+  if (runtime.chatFeedback && runtime.chatFeedback.status !== "accepted") {
+    if (runtime.chatFeedback.status === "error") {
+      return {
+        status: "error",
+        message: publicStatusReason(runtime.chatFeedback.message) ?? "Runtime request failed",
+      };
+    }
+    return runtime.chatFeedback;
+  }
+  if (runtime.chatView.status === "cancelling") return { status: "pending", message: "cancelling session" };
+  // The approval dock and footer already own this state. Avoid consuming an
+  // extra row (and never let a stale neutral acknowledgement replace the dock).
+  if (runtime.chatView.status === "waiting_for_approval") return undefined;
+  if (runtime.chatView.status === "running") {
+    const retry = runtime.chatView.retry;
+    if (retry) {
+      const delaySeconds = Math.max(1, Math.ceil(retry.delayMs / 1_000));
+      return { status: "pending", message: `retrying request · attempt ${retry.attempt} · ${delaySeconds}s` };
+    }
+    return { status: "pending", message: "session running" };
+  }
   if (runtime.actionFeedback) return runtime.actionFeedback;
   return undefined;
 }
@@ -4113,7 +4144,7 @@ function latestAssistantText(items: readonly ChatTranscriptItem[]): string | und
     if (item?.kind !== "message" || item.role !== "assistant") continue;
     const text = item.parts
       .filter((part) => part.type === "text")
-      .map((part) => part.text)
+      .map((part) => publicSyntheticAssistantText(part.text, part.synthetic))
       .filter(Boolean)
       .join("\n\n");
     if (text.trim()) return text;

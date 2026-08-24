@@ -663,7 +663,7 @@ test("consecutive exploration tools merge into a compact group", () => {
   });
 });
 
-test("exploration group labels pending and failed runs naturally", () => {
+test("non-succeeded exploration tools remain standalone", () => {
   const running = buildChatDisplayItems([
     chatTool("read_running" as ToolCallId, "read", "running", "running", { title: "read", path: "package.json", detail: "package.json" }),
     chatTool("grep_done" as ToolCallId, "grep", "completed", "succeeded", { title: "grep", pattern: "TODO", scope: "apps/tui", detail: "TODO in apps/tui" }),
@@ -673,16 +673,33 @@ test("exploration group labels pending and failed runs naturally", () => {
     chatTool("grep_after_failed" as ToolCallId, "grep", "completed", "succeeded", { title: "grep", pattern: "TODO", scope: "apps/tui", detail: "TODO in apps/tui" }),
   ]);
 
-  expect(running[0]).toMatchObject({
-    kind: "tool_group",
-    label: "Exploring 1 file, searched 1 pattern",
-    tone: "pending",
-  });
-  expect(failed[0]).toMatchObject({
-    kind: "tool_group",
-    label: "Explored 1 file, searched 1 pattern · 1 failed",
-    tone: "error",
-  });
+  expect(running).toHaveLength(2);
+  expect(running[0]).toMatchObject({ kind: "tool_activity", activity: { id: "read_running", displayStatus: "running" } });
+  expect(running[1]).toMatchObject({ kind: "tool_activity", activity: { id: "grep_done", displayStatus: "succeeded" } });
+  expect(failed).toHaveLength(2);
+  expect(failed[0]).toMatchObject({ kind: "tool_activity", activity: { id: "read_failed", displayStatus: "failed" } });
+  expect(failed[1]).toMatchObject({ kind: "tool_activity", activity: { id: "grep_after_failed", displayStatus: "succeeded" } });
+});
+
+test("exact no-match exploration results remain visible when compact", async () => {
+  const single = await renderMessageList([
+    chatTool("glob_no_matches" as ToolCallId, "glob", "completed", "succeeded", { title: "glob", pattern: "*.missing", path: "apps/tui/src" }, {
+      output: "(no matches)",
+    }),
+  ], { height: 8 });
+  const grouped = await renderMessageList([
+    chatTool("grep_no_matches" as ToolCallId, "grep", "completed", "succeeded", { title: "grep", pattern: "missing", scope: "apps/tui/src" }, {
+      output: "(no matches)",
+    }),
+    chatTool("glob_one_match" as ToolCallId, "glob", "completed", "succeeded", { title: "glob", pattern: "*.tsx", path: "apps/tui/src" }, {
+      output: "apps/tui/src/index.tsx",
+    }),
+  ], { height: 8 });
+
+  expect(single).toContain("Listed *.missing under apps/tui/src");
+  expect(single).toContain("No matches");
+  expect(single).not.toContain("(no matches)");
+  expect(grouped).toContain("Explored searched 1 pattern, listed 1 path · No matches");
 });
 
 test("exploration tool groups hide raw output when compact and expand in details mode", async () => {
@@ -719,7 +736,7 @@ test("exploration tool groups hide raw output when compact and expand in details
   expect(occurrences(details, "output:")).toBe(3);
 });
 
-test("exploration group failures stay compact while details retain every raw diagnostic", async () => {
+test("exploration failures remain individually visible while details retain every raw diagnostic", async () => {
   const failed = [
     chatTool("read_group_failed" as ToolCallId, "read", "failed", "failed", { title: "read", path: "/repo/app/first.php" }, {
       error: "ENOENT: no such file or directory, lstat '/repo/app/first.php'",
@@ -735,16 +752,19 @@ test("exploration group failures stay compact while details retain every raw dia
     }),
   ];
 
-  const compact = await renderMessageList(failed, { cwd: "/repo", height: 16 });
-  const details = await renderMessageList(failed, { cwd: "/repo", showToolDetails: true, height: 40 });
+  const compact = await renderMessageList(failed, { cwd: "/repo", height: 24 });
+  const details = await renderMessageList(failed, { cwd: "/repo", showToolDetails: true, height: 56 });
 
-  expect(compact).toContain("Explored 1 file, searched 1 pattern, listed 1 path · 3 failed");
+  expect(compact).not.toContain("Explored");
+  expect(compact).toContain("Failed first.php");
+  expect(compact).toContain("Failed /repo/app/second.php");
+  expect(compact).toContain("Failed /repo/app/third.php");
   expect(compact).toContain("File not found: app/first.php");
-  expect(compact).toContain("+2 more failures (Ctrl+O for details)");
+  expect(compact).toContain("File not found: app/second.php");
+  expect(compact).toContain("File not found: app/third.php");
+  expect(compact).not.toContain("more failures");
   expect(compact).not.toContain("ENOENT");
   expect(compact).not.toContain("RAW_LIVE_ENOENT");
-  expect(compact).not.toContain("/repo/app/second.php");
-  expect(compact).not.toContain("/repo/app/third.php");
   expect(occurrences(compact, "error:")).toBe(0);
   expect(details).toContain("ENOENT: no such file or directory, lstat '/repo/app/first.php'");
   expect(details).toContain("RAW_LIVE_ENOENT: lstat '/repo/app/first.php'");

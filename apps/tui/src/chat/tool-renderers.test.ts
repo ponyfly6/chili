@@ -60,6 +60,38 @@ test("tool renderers expose inline and block cell modes without compact raw outp
   expect(unknown.outputHint).toBe("output hidden (2 lines, details available)");
 });
 
+test("bash compact labels expose explicit cwd and bound long commands", () => {
+  const command = `printf start-${"x".repeat(260)}-tail-marker`;
+  const rendered = renderToolActivity({
+    ...toolInput({
+      toolName: "bash",
+      inputSummary: { title: "bash", command, detail: command, scope: "/repo/packages/core" },
+      input: { command, cwd: "/repo/packages/core" },
+    }),
+    cwd: "/repo",
+  });
+
+  expect(rendered.label).toStartWith("Ran printf start-");
+  expect(rendered.label).toContain("…");
+  expect(rendered.label).toContain("-tail-marker");
+  expect(rendered.label).toEndWith("· in packages/core");
+  expect(rendered.label.length).toBeLessThanOrEqual(190);
+});
+
+test("exact no-match results remain visible in compact exploration rows", () => {
+  for (const toolName of ["grep", "glob"]) {
+    const rendered = renderToolActivity(toolInput({
+      toolName,
+      inputSummary: { title: toolName, pattern: "missing", scope: "apps/tui" },
+      output: "(no matches)",
+    }));
+
+    expect(rendered.outputHint).toBe("No matches");
+    expect(rendered.bodyLines).toEqual([]);
+    expect(rendered.details).toEqual([]);
+  }
+});
+
 test("details mode preserves the head and tail of truncated preview lines", () => {
   const output = Array.from({ length: 7 }, (_, index) => `line_${String(index + 1).padStart(2, "0")}`).join("\n");
   const rendered = renderToolActivity(toolInput({
@@ -296,6 +328,20 @@ test("failed command tools keep compact error summary when live output exists", 
   expect(failed.details.find((detail) => detail.label === "live output")?.lines).toEqual(["installing"]);
   expect(failed.details.find((detail) => detail.label === "live output")?.lineTones).toEqual(["error"]);
   expect(failed.compactErrorLines).toEqual(["command failed"]);
+});
+
+test("failed command execution context uses a semantic compact error", () => {
+  const failed = renderToolActivity(toolInput({
+    toolName: "bash",
+    status: "completed",
+    displayStatus: "failed",
+    inputSummary: { title: "bash", command: "bun test", detail: "bun test" },
+    output: "very long raw command output\nthat stays out of the semantic summary",
+    executionContext: { exitCode: 2, timedOut: false },
+  }));
+
+  expect(failed.compactErrorLines).toEqual(["Command exited with code 2"]);
+  expect(failed.compactErrorLines).not.toContain("very long raw command output");
 });
 
 test("exploration failures use semantic compact copy while details keep raw diagnostics", () => {

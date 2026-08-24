@@ -14,12 +14,14 @@ import {
   explorationToolKind,
   inputSummaryFromUnknown,
   isExplorationTool,
+  isNoMatchOutput,
   renderToolActivity,
   type ToolActivityDetail,
   type ToolRenderBodyKind,
   type ToolRenderMode,
 } from "./tool-renderers.js";
 import type { InlineAgentBatchDisplay } from "./AgentBatchCells.js";
+import { publicSyntheticAssistantText } from "./public-error.js";
 
 export type ChatDisplayItem =
   | { kind: "user_message"; id: string; text: string; imageLabels: string[]; time?: number }
@@ -212,7 +214,7 @@ function messageDisplayItems(
         output.push({
           kind: "assistant_text",
           id,
-          text: part.text,
+          text: publicSyntheticAssistantText(part.text, part.synthetic),
           time: message.createdAt,
           ...(part.phase === undefined ? {} : { phase: part.phase }),
           ...(streaming ? { streaming: true } : {}),
@@ -283,12 +285,13 @@ function fallbackToolResultActivity(
   cwd: string,
 ): ToolActivityDisplay {
   const toolName = call?.toolName ?? "tool";
+  const failed = Boolean(part.error) || failedExecutionContext(part.executionContext);
   return toolActivity({
     id: part.callId,
     callId: part.callId,
     toolName,
-    status: part.error ? "failed" : "completed",
-    displayStatus: part.error ? "failed" : "succeeded",
+    status: failed ? "failed" : "completed",
+    displayStatus: failed ? "failed" : "succeeded",
     source: "fallback",
     inputSummary: inputSummaryFromUnknown(toolName, call?.input),
     cwd,
@@ -298,6 +301,13 @@ function fallbackToolResultActivity(
     ...(part.error === undefined ? {} : { error: part.error }),
     ...(part.executionContext === undefined ? {} : { executionContext: part.executionContext }),
   });
+}
+
+function failedExecutionContext(context: ChatToolExecutionContext | undefined): boolean {
+  return context?.timedOut === true
+    || context?.aborted === true
+    || (typeof context?.exitCode === "number" && context.exitCode !== 0)
+    || (typeof context?.signal === "string" && context.signal.length > 0);
 }
 
 function toolActivity(input: {
@@ -388,7 +398,11 @@ export function groupExplorationTools(items: readonly ChatDisplayItem[]): ChatDi
   };
 
   for (const item of items) {
-    if (item.kind === "tool_activity" && isExplorationTool(item.activity.toolName)) {
+    if (
+      item.kind === "tool_activity"
+      && isExplorationTool(item.activity.toolName)
+      && item.activity.displayStatus === "succeeded"
+    ) {
       pending.push(item);
       continue;
     }
@@ -409,12 +423,19 @@ function explorationGroupLabel(activities: readonly ToolActivityDisplay[]): stri
   if (lists > 0) parts.push(`listed ${lists} ${plural(lists, "path", "paths")}`);
   const verb = activities.some((activity) => activity.tone === "pending") ? "Exploring" : "Explored";
   const statusParts = [
+    noMatchStatus(activities),
     countStatus(activities, "failed", "failed"),
     countStatus(activities, "rejected", "rejected"),
     countStatus(activities, "cancelled", "cancelled"),
   ].filter((part): part is string => part !== undefined);
   const suffix = statusParts.length > 0 ? ` · ${statusParts.join(", ")}` : "";
   return parts.length > 0 ? `${verb} ${parts.join(", ")}${suffix}` : `${verb} ${activities.length} tools${suffix}`;
+}
+
+function noMatchStatus(activities: readonly ToolActivityDisplay[]): string | undefined {
+  const count = activities.filter((activity) => isNoMatchOutput(activity.output)).length;
+  if (count === 0) return undefined;
+  return count === 1 ? "No matches" : `${count} no-match results`;
 }
 
 function explorationGroupMetadata(activities: readonly ToolActivityDisplay[]): ToolGroupMetadata {

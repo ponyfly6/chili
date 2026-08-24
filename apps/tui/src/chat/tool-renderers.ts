@@ -3,6 +3,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 import type { ChatToolDisplayStatus, ChatToolExecutionContext, ChatToolInputSummary, RuntimeToolOutputDelta } from "@chili/sdk";
 
 const TRANSCRIPT_HINT = "Ctrl+T for transcript";
+const MAX_COMPACT_LABEL_TARGET_LENGTH = 160;
 
 export interface ToolActivityDetail {
   label: string;
@@ -113,8 +114,19 @@ export function renderToolActivity(input: ToolRenderInput, registry = defaultToo
 const bashRenderer: ToolRenderer = {
   name: "bash",
   match: (toolName) => matchesTool(toolName, ["bash", "run_shell_command"]),
-  label: (input) => labelWithTarget(statusVerb(input.displayStatus, "Ran", "Running"), input.inputSummary.command ?? input.inputSummary.detail ?? input.inputSummary.title),
+  label: (input) => {
+    const label = labelWithTarget(
+      statusVerb(input.displayStatus, "Ran", "Running"),
+      input.inputSummary.command ?? input.inputSummary.detail ?? input.inputSummary.title,
+    );
+    const explicitCwd = stringFromInput(input.input, "cwd", "workingDirectory", "working_directory")
+      ?? input.inputSummary.scope;
+    return explicitCwd
+      ? `${label} · in ${displayToolPath(explicitCwd, input.cwd)}`
+      : label;
+  },
   details: (input) => defaultToolDetails(input, { maxOutputLines: 5, maxLiveOutputLines: 16 }),
+  compactErrorLines: (input) => bashCompactErrorLines(input),
 };
 
 const readRenderer: ToolRenderer = {
@@ -409,15 +421,32 @@ function defaultSummary(input: ToolRenderInput): string | undefined {
 }
 
 function defaultOutputHint(input: ToolRenderInput): string | undefined {
+  if (input.displayStatus === "succeeded" && isNoMatchOutput(input.output)) return "No matches";
   if (input.error || !input.output || !isLargeOutput(input.output)) return undefined;
   const lines = Math.max(1, input.output.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").length);
   return `output hidden (${lines} ${plural(lines, "line", "lines")}, details available)`;
+}
+
+export function isNoMatchOutput(value: string | undefined): boolean {
+  return value?.trim() === "(no matches)";
 }
 
 function defaultCompactErrorLines(input: ToolRenderInput): string[] | undefined {
   const value = input.error ?? (input.displayStatus === "failed" ? input.output : undefined);
   if (!value) return undefined;
   return previewTextLines(value, { maxLines: 4, maxLineLength: 180, preserveTail: true }).lines;
+}
+
+function bashCompactErrorLines(input: ToolRenderInput): string[] | undefined {
+  if (input.error) return defaultCompactErrorLines(input);
+  const context = input.executionContext;
+  if (context?.timedOut) return ["Command timed out"];
+  if (context?.aborted) return ["Command was interrupted"];
+  if (typeof context?.signal === "string" && context.signal) return [`Command stopped by ${context.signal}`];
+  if (typeof context?.exitCode === "number" && context.exitCode !== 0) {
+    return [`Command exited with code ${context.exitCode}`];
+  }
+  return defaultCompactErrorLines(input);
 }
 
 function explorationCompactErrorLines(input: ToolRenderInput, action: "Read" | "Search" | "List"): string[] | undefined {
@@ -593,7 +622,7 @@ function statusVerb(status: ChatToolDisplayStatus, succeeded: string, active: st
 
 function labelWithTarget(verb: string, target: string | undefined): string {
   const trimmed = target?.replace(/\s+/g, " ").trim();
-  return trimmed ? `${verb} ${trimmed}` : verb;
+  return trimmed ? `${verb} ${middleElideText(trimmed, MAX_COMPACT_LABEL_TARGET_LENGTH)}` : verb;
 }
 
 function gitDiffTarget(input: ToolRenderInput): string | undefined {
@@ -895,6 +924,13 @@ function middleElidePath(value: string, maxLength: number): string {
     if (headLength >= 8) return `${value.slice(0, headLength).replace(/\/+$/, "")}…${suffix}`;
   }
   const headLength = Math.max(1, Math.floor((maxLength - 1) / 2));
+  const tailLength = Math.max(1, maxLength - headLength - 1);
+  return `${value.slice(0, headLength)}…${value.slice(-tailLength)}`;
+}
+
+function middleElideText(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  const headLength = Math.max(1, Math.ceil((maxLength - 1) / 2));
   const tailLength = Math.max(1, maxLength - headLength - 1);
   return `${value.slice(0, headLength)}…${value.slice(-tailLength)}`;
 }

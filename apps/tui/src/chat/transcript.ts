@@ -1,4 +1,5 @@
 import type { ChatMessagePart, ChatToolExecutionContext, ChatToolInputSummary, ChatTranscriptItem } from "@chili/sdk";
+import { publicSyntheticAssistantText } from "./public-error.js";
 
 export type TranscriptLineTone = "heading" | "text" | "muted" | "error";
 
@@ -47,7 +48,7 @@ function messagePartLines(
     return blockLines({
       key,
       label: `  part text ${part.id}${role === "assistant" ? ` phase=${part.phase ?? "unclassified"}` : ""}`,
-      value: part.text,
+      value: publicSyntheticAssistantText(part.text, part.synthetic),
       tone: "text",
       valueTone: "text",
     });

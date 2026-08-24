@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import type { MessageId, PartId, ToolCallId } from "@chili/protocol";
 import type { ChatTranscriptItem } from "@chili/sdk";
+import type { InlineAgentBatchDisplay } from "./AgentBatchCells.js";
 import { buildChatDisplayItems } from "./presentation.js";
 
 test("user message presentation keeps text and images in one card", () => {
@@ -22,6 +23,29 @@ test("user message presentation keeps text and images in one card", () => {
     imageLabels: ["[Image #1]"],
     time: 1,
   }]);
+});
+
+test("synthetic provider errors are sanitized before chat presentation", () => {
+  const jwt = "eyJhbGciOiJIUzI1NiJ9.c2VjcmV0LXBheWxvYWQ.c2lnbmF0dXJl";
+  const display = buildChatDisplayItems([{
+    id: "msg_legacy_provider_error" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [{
+      type: "text",
+      id: "part_legacy_provider_error" as PartId,
+      synthetic: true,
+      text: `Model request failed: token=private ${jwt} 103.151.173.205`,
+    }],
+  }]);
+
+  expect(display[0]).toMatchObject({
+    kind: "assistant_text",
+    text: "Model request failed: token=[redacted-credential] [redacted-jwt] [redacted-ip]",
+  });
+  expect(JSON.stringify(display)).not.toContain("103.151.173.205");
+  expect(JSON.stringify(display)).not.toContain(jwt);
 });
 
 test("tool activity presentation carries renderer cell fields", () => {
@@ -93,6 +117,41 @@ test("tool activity details preserve execution context from rows and fallback re
       truncated: false,
     });
   }
+});
+
+test("fallback command results treat nonzero exit codes as failures", () => {
+  const callId = "tool_nonzero_fallback" as ToolCallId;
+  const display = buildChatDisplayItems([{
+    id: "msg_nonzero_fallback" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [
+      {
+        type: "tool_call",
+        id: "part_nonzero_call" as PartId,
+        callId,
+        toolName: "bash",
+        status: "completed",
+        input: { command: "exit 7" },
+      },
+      {
+        type: "tool_result",
+        id: "part_nonzero_result" as PartId,
+        callId,
+        output: "",
+        executionContext: { exitCode: 7 },
+      },
+    ],
+  }]);
+
+  expect(display[0]).toMatchObject({
+    kind: "tool_activity",
+    activity: {
+      displayStatus: "failed",
+      compactErrorLines: ["Command exited with code 7"],
+    },
+  });
 });
 
 test("live tool rows render partial input labels without exposing assistant tool parts", () => {
@@ -274,41 +333,111 @@ test("hideThinking never classifies phase-less assistant text as thinking", () =
   ]);
 });
 
-test("exploration groups expose one semantic failure with an exact failed count", () => {
+test("empty opaque reasoning stays hidden while the final answer remains visible", () => {
+  const display = buildChatDisplayItems([{
+    id: "msg_opaque_reasoning" as MessageId,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [
+      { type: "reasoning", id: "part_opaque_reasoning" as PartId, text: "", redacted: true },
+      { type: "text", id: "part_opaque_answer" as PartId, text: "Done.", phase: "final_answer" },
+    ],
+  }]);
+
+  expect(display).toHaveLength(1);
+  expect(display[0]).toMatchObject({ kind: "assistant_text", text: "Done." });
+});
+
+test("agent batches keep chronological order with surrounding messages", () => {
+  const batch: InlineAgentBatchDisplay = {
+    id: "batch_chronological",
+    kind: "team",
+    title: "Reviewers",
+    status: "running",
+    expected: 1,
+    counts: { total: 1, pending: 0, running: 1, active: 1, completed: 0, incomplete: 0, failed: 0, cancelled: 0 },
+    agents: [],
+    spawnFailures: [],
+    messages: [],
+    integration: { status: "pending" },
+    createdAt: 20,
+    updatedAt: 20,
+  };
   const display = buildChatDisplayItems([
-    chatTool("read_running" as ToolCallId, "read", "running", "running", { title: "read", path: "package.json", detail: "package.json" }),
+    {
+      id: "msg_before_batch" as MessageId,
+      kind: "message",
+      role: "user",
+      createdAt: 10,
+      parts: [{ type: "text", id: "part_before_batch" as PartId, text: "Start" }],
+    },
+    {
+      id: "msg_after_batch" as MessageId,
+      kind: "message",
+      role: "assistant",
+      createdAt: 30,
+      parts: [{ type: "text", id: "part_after_batch" as PartId, text: "Finished", phase: "final_answer" }],
+    },
+  ], { agentBatches: [batch] });
+
+  expect(display.map((item) => item.kind)).toEqual(["user_message", "agent_batch", "assistant_text"]);
+});
+
+test("exploration groups contain only consecutive successes and retain failures", () => {
+  const display = buildChatDisplayItems([
+    chatTool("read_done_1" as ToolCallId, "read", "completed", "succeeded", { title: "read", path: "package.json", detail: "package.json" }),
+    chatTool("grep_done_1" as ToolCallId, "grep", "completed", "succeeded", { title: "grep", pattern: "TODO", scope: "apps/tui", detail: "TODO in apps/tui" }),
     chatTool("grep_failed" as ToolCallId, "grep", "failed", "failed", { title: "grep", pattern: "TODO", scope: "apps/tui", detail: "TODO in apps/tui" }, {
       error: "grep failed",
       output: "SECRET_GREP_OUTPUT",
     }),
-    chatTool("glob_done" as ToolCallId, "glob", "completed", "succeeded", { title: "glob", pattern: "*.tsx", path: "apps/tui/src", detail: "*.tsx under apps/tui/src" }, {
-      output: "SECRET_GLOB_OUTPUT",
+    chatTool("glob_done_2" as ToolCallId, "glob", "completed", "succeeded", { title: "glob", pattern: "*.tsx", path: "apps/tui/src", detail: "*.tsx under apps/tui/src" }),
+    chatTool("read_done_2" as ToolCallId, "read", "completed", "succeeded", { title: "read", path: "README.md", detail: "README.md" }),
+  ]);
+
+  expect(display).toHaveLength(3);
+  expect(display[0]).toMatchObject({
+    kind: "tool_group",
+    label: "Explored 1 file, searched 1 pattern",
+    activities: [
+      { id: "read_done_1", displayStatus: "succeeded" },
+      { id: "grep_done_1", displayStatus: "succeeded" },
+    ],
+  });
+  expect(display[1]).toMatchObject({
+    kind: "tool_activity",
+    activity: {
+      id: "grep_failed",
+      displayStatus: "failed",
+      compactErrorLines: ["Search failed: apps/tui"],
+    },
+  });
+  expect(display[2]).toMatchObject({
+    kind: "tool_group",
+    label: "Explored 1 file, listed 1 path",
+    activities: [
+      { id: "glob_done_2", displayStatus: "succeeded" },
+      { id: "read_done_2", displayStatus: "succeeded" },
+    ],
+  });
+});
+
+test("exploration group labels surface exact no-match results", () => {
+  const display = buildChatDisplayItems([
+    chatTool("grep_empty" as ToolCallId, "grep", "completed", "succeeded", { title: "grep", pattern: "missing", scope: "apps/tui" }, {
+      output: "(no matches)",
+    }),
+    chatTool("glob_done" as ToolCallId, "glob", "completed", "succeeded", { title: "glob", pattern: "*.tsx", path: "apps/tui/src" }, {
+      output: "apps/tui/src/index.tsx",
     }),
   ]);
 
-  const item = display[0];
-  expect(item?.kind).toBe("tool_group");
-  if (item?.kind !== "tool_group") throw new Error("expected a tool group");
-
-  expect(item).toMatchObject({
-    label: "Exploring 1 file, searched 1 pattern, listed 1 path · 1 failed",
-    tone: "error",
-    metadata: {
-      activeHint: "Reading package.json",
-      hasErrors: true,
-      collapsedCount: 3,
-      readCount: 1,
-      searchCount: 1,
-      listCount: 1,
-      activeCount: 1,
-      errorCount: 1,
-      failedCount: 1,
-      compactFailureLines: ["Search failed: apps/tui (Ctrl+O for details)"],
-    },
+  expect(display).toHaveLength(1);
+  expect(display[0]).toMatchObject({
+    kind: "tool_group",
+    label: "Explored searched 1 pattern, listed 1 path · No matches",
   });
-  expect(item.activities.every((activity) => activity.mode === "inline")).toBe(true);
-  expect(item.activities.every((activity) => activity.bodyLines.length === 0)).toBe(true);
-  expect(item.activities.find((activity) => activity.toolName === "grep")?.compactErrorLines).toEqual(["Search failed: apps/tui"]);
 });
 
 function chatTool(

@@ -52,6 +52,27 @@ test("renders a restrained one-line chat footer", async () => {
   expect(frame).not.toContain("Ctrl+T Transcript");
 });
 
+test("chat footer follows the persisted session workspace", async () => {
+  const frame = await renderShellFrame(emptyTeamLiveFixture("streaming"), {
+    width: 120,
+    height: 24,
+    runtime: fakeChatRuntime({
+      chatView: {
+        cwd: "/server/persisted-workspace",
+        status: "idle",
+        items: [],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "now",
+      },
+    }),
+  });
+
+  const footerLine = frame.split("\n").find((line) => line.includes("test-model")) ?? "";
+  expect(footerLine).toContain("persisted-workspace");
+  expect(footerLine).not.toContain("chili");
+});
+
 test("renders remaining context without cumulative token usage", async () => {
   const frame = await renderShellFrame(emptyTeamLiveFixture("streaming"), {
     width: 120,
@@ -156,6 +177,102 @@ test("renders chat shell action feedback", async () => {
   expect(pending).toContain("pending: starting team loop");
   expect(success).toContain("success: merge completed");
   expect(error).toContain("merge failed");
+});
+
+test("accepted feedback is bound to the next per-session status event", async () => {
+  const staleFailure = await renderShellFrame(teamLiveFixture(), {
+    width: 120,
+    height: 40,
+    runtime: fakeChatRuntime({
+      chatFeedback: {
+        status: "accepted",
+        message: "prompt queued",
+        acceptedAgainstStatusEventId: "event_old_failed",
+      },
+      chatView: {
+        status: "failed",
+        statusEventId: "event_old_failed",
+        statusReason: "old failure must not replace the new acknowledgement",
+        items: [],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "now",
+      },
+    }),
+  });
+  const running = await renderShellFrame(teamLiveFixture(), {
+    width: 120,
+    height: 40,
+    runtime: fakeChatRuntime({
+      chatFeedback: {
+        status: "accepted",
+        message: "prompt queued",
+        acceptedAgainstStatusEventId: "event_old_failed",
+      },
+      chatView: {
+        status: "running",
+        statusEventId: "event_new_running",
+        items: [],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "now",
+      },
+    }),
+  });
+  const newFailure = await renderShellFrame(teamLiveFixture(), {
+    width: 120,
+    height: 40,
+    runtime: fakeChatRuntime({
+      chatFeedback: {
+        status: "accepted",
+        message: "prompt queued",
+        acceptedAgainstStatusEventId: "event_old_failed",
+      },
+      chatView: {
+        status: "failed",
+        statusEventId: "event_new_failed",
+        statusReason: "Model request failed with HTTP 502 Bad Gateway",
+        items: [],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "now",
+      },
+    }),
+  });
+
+  expect(staleFailure).toContain("accepted: prompt queued");
+  expect(staleFailure).not.toContain("old failure must not replace");
+  expect(running).toContain("pending: session running");
+  expect(running).not.toContain("prompt queued");
+  expect(newFailure).toContain("Model request failed with HTTP 502 Bad Gateway");
+  expect(newFailure).not.toContain("prompt queued");
+});
+
+test("retry feedback exposes timing without rendering the unsafe provider reason", async () => {
+  const frame = await renderShellFrame(teamLiveFixture(), {
+    width: 120,
+    height: 40,
+    runtime: fakeChatRuntime({
+      chatView: {
+        status: "running",
+        statusEventId: "event_retry_running",
+        items: [],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "now",
+        retry: {
+          turnId: "turn_retry" as TurnId,
+          attempt: 2,
+          delayMs: 1_500,
+          reason: "<!DOCTYPE html><html>private provider page</html>",
+          scheduledAt: 1,
+        },
+      },
+    }),
+  });
+
+  expect(frame).toContain("retrying request · attempt 2 · 2s");
+  expect(frame).not.toContain("private provider page");
 });
 
 test("renders chat transcript as a scrollable window", async () => {
@@ -276,7 +393,8 @@ test("renders tool rows as compact activity without raw output blocks", async ()
   });
 
   expect(frame).toContain("Waiting approval for bun test");
-  expect(frame).toContain("Exploring 1 file, searched 1 pattern");
+  expect(frame).toContain("Searching TODO in apps/tui");
+  expect(frame).toContain("Read README.md");
   expect(frame).not.toContain("result tool_done: ok");
   expect(frame).toContain("Rejected a.ts");
 });
