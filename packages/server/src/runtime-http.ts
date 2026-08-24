@@ -1,4 +1,7 @@
 import { DELEGATION_POLICIES, isTransientEvent, RUNTIME_PERMISSION_PROFILE_IDS } from "@chili/protocol";
+import { realpath } from "node:fs/promises";
+import { basename, dirname, resolve } from "node:path";
+import { RuntimeSessionNotFoundError } from "@chili/core";
 import type {
   ChiliEvent,
   EventEnvelope,
@@ -502,7 +505,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         const body = await readJson<CreateSessionBody>(request);
         const input: { sessionId?: SessionId; cwd?: string } = {};
         if (body.sessionId) input.sessionId = body.sessionId;
-        if (body.cwd) input.cwd = body.cwd;
+        if (body.cwd !== undefined) input.cwd = await requestWorkspaceCwd(body.cwd);
         return json(await options.service.createSession(input), 201);
       }
 
@@ -630,9 +633,11 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         const promptImages = parsePromptImages(body.images);
         if (!body.text && promptImages.length === 0) throw badRequest("text is required");
         await options.service.assertSessionTurnAllowed(route.sessionId);
-        await requireSession(options.store, route.sessionId);
+        const session = await requireSession(options.store, route.sessionId);
+        const cwd = await authoritativeRequestCwd(session.cwd, body.cwd);
 
         const input = buildSubmitPromptInput(route.sessionId, body, promptImages);
+        input.cwd = cwd;
 
         if (route.name === "prompt") {
           return json(serializeSubmitPromptResult(await options.service.submitPrompt(input)));
@@ -646,18 +651,18 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         return json(accepted, 202);
       }
 
-      if (route.name === "commandAsync") {
+      if (route.name === "command" || route.name === "commandAsync") {
         const body = await readJson<CommandPromptBody>(request);
         if (typeof body.name !== "string" || body.name.trim().length === 0) throw badRequest("name is required");
         if (body.args !== undefined && typeof body.args !== "string") throw badRequest("args must be a string when provided");
-        if (body.cwd !== undefined && typeof body.cwd !== "string") throw badRequest("cwd must be a string when provided");
         await options.service.assertSessionTurnAllowed(route.sessionId);
-        await requireSession(options.store, route.sessionId);
+        const session = await requireSession(options.store, route.sessionId);
+        const cwd = await authoritativeRequestCwd(session.cwd, body.cwd);
 
         const command = await requireCommandControl(options).run({
           name: body.name.trim(),
           ...(body.args ? { args: body.args } : {}),
-          ...(body.cwd ? { cwd: body.cwd } : {}),
+          cwd,
         });
         const displayText = body.args?.trim()
           ? `/${command.command.name} ${body.args.trim()}`
@@ -665,13 +670,18 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         const input = buildSubmitPromptInput(route.sessionId, {
           text: command.prompt,
           displayText,
-          ...(body.cwd ? { cwd: body.cwd } : {}),
+          cwd,
           ...(body.modelSelection ? { modelSelection: body.modelSelection } : {}),
           ...(body.reasoningLevel ? { reasoningLevel: body.reasoningLevel } : {}),
           ...(body.serviceTier ? { serviceTier: body.serviceTier } : {}),
         });
         const toolPolicy = commandToolPolicy(command.metadata);
         if (toolPolicy) input.toolPolicy = toolPolicy;
+
+        if (route.name === "command") {
+          return json(serializeSubmitPromptResult(await options.service.submitPrompt(input)));
+        }
+
         options.service.submitPromptAsync(input, options.onBackgroundError);
         const accepted: RuntimePromptAccepted = {
           status: "accepted",
@@ -808,6 +818,7 @@ type Route =
   | { name: "goal"; sessionId: SessionId }
   | { name: "prompt"; sessionId: SessionId }
   | { name: "promptAsync"; sessionId: SessionId }
+  | { name: "command"; sessionId: SessionId }
   | { name: "commandAsync"; sessionId: SessionId }
   | { name: "interrupt"; sessionId: SessionId }
   | { name: "archive"; sessionId: SessionId }
@@ -816,7 +827,7 @@ type Route =
 
 interface CreateSessionBody {
   sessionId?: SessionId;
-  cwd?: string;
+  cwd?: unknown;
 }
 
 interface RenameSessionBody {
@@ -828,7 +839,7 @@ interface PromptBody {
   displayText?: string;
   images?: unknown;
   skillMentions?: unknown;
-  cwd?: string;
+  cwd?: unknown;
   maxTurns?: number;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
@@ -838,7 +849,7 @@ interface PromptBody {
 interface CommandPromptBody {
   name?: string;
   args?: string;
-  cwd?: string;
+  cwd?: unknown;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
   serviceTier?: ServiceTier;
@@ -1148,6 +1159,7 @@ function routeRequest(method: string, pathname: string): Route {
   if ((method === "GET" || method === "POST" || method === "PATCH" || method === "DELETE") && action === "goal") return { name: "goal", sessionId };
   if (method === "POST" && action === "prompt") return { name: "prompt", sessionId };
   if (method === "POST" && action === "prompt_async") return { name: "promptAsync", sessionId };
+  if (method === "POST" && action === "command") return { name: "command", sessionId };
   if (method === "POST" && action === "command_async") return { name: "commandAsync", sessionId };
   if (method === "POST" && action === "interrupt") return { name: "interrupt", sessionId };
   if (method === "POST" && action === "archive") return { name: "archive", sessionId };
@@ -1162,7 +1174,7 @@ function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody, parsedIm
   if (body.displayText) input.displayText = body.displayText;
   const images = parsedImages ?? parsePromptImages(body.images);
   if (images.length > 0) input.images = images;
-  if (body.cwd) input.cwd = body.cwd;
+  if (typeof body.cwd === "string" && body.cwd.trim().length > 0) input.cwd = body.cwd;
   const skillMentions = parseSkillMentions(body.skillMentions);
   if (skillMentions.length > 0) input.skillMentions = skillMentions;
   if (body.maxTurns !== undefined) input.maxTurns = body.maxTurns;
@@ -1604,11 +1616,61 @@ function serializeError(error: Error): { name: string; message: string } {
   };
 }
 
-async function requireSession(store: EventStore, sessionId: SessionId): Promise<void> {
+async function requireSession(store: EventStore, sessionId: SessionId): Promise<Awaited<ReturnType<EventStore["sessions"]>>[number]> {
   const sessions = await store.sessions();
-  if (!sessions.some((session) => session.id === sessionId)) {
+  const session = sessions.find((candidate) => candidate.id === sessionId);
+  if (!session) {
     throw notFound(`Session not found: ${sessionId}`);
   }
+  return session;
+}
+
+async function authoritativeRequestCwd(sessionCwd: string, requestedCwd: unknown): Promise<string> {
+  const workspace = await canonicalWorkspacePath(sessionCwd);
+  if (requestedCwd === undefined) return workspace;
+
+  const requestedWorkspace = await requestWorkspaceCwd(requestedCwd);
+  if (requestedWorkspace !== workspace) {
+    throw {
+      status: 409,
+      message:
+        `Request workspace does not match the session workspace. Expected ${workspace}; received ${requestedWorkspace}. ` +
+        "Start a new session to use another workspace.",
+    } satisfies HttpError;
+  }
+  return workspace;
+}
+
+async function requestWorkspaceCwd(value: unknown): Promise<string> {
+  if (typeof value !== "string") throw badRequest("cwd must be a string when provided");
+  if (value.trim().length === 0) throw badRequest("cwd must not be empty");
+  if (value.includes("\0")) throw badRequest("cwd must be a valid filesystem path");
+  return canonicalWorkspacePath(value);
+}
+
+async function canonicalWorkspacePath(value: string): Promise<string> {
+  const absolute = resolve(value);
+  const missingSegments: string[] = [];
+  let candidate = absolute;
+
+  while (true) {
+    try {
+      const canonicalBase = await realpath(candidate);
+      return resolve(canonicalBase, ...missingSegments);
+    } catch (error) {
+      if (!isMissingPathError(error)) throw error;
+      const parent = dirname(candidate);
+      if (parent === candidate) return absolute;
+      missingSegments.unshift(basename(candidate));
+      candidate = parent;
+    }
+  }
+}
+
+function isMissingPathError(error: unknown): boolean {
+  if (!(error instanceof Error) || !("code" in error)) return false;
+  const code = (error as Error & { code?: unknown }).code;
+  return code === "ENOENT" || code === "ENOTDIR";
 }
 
 async function readJson<T>(request: Request): Promise<T> {
@@ -1689,6 +1751,9 @@ function toHttpError(error: unknown): HttpError {
   }
   if (err.name === "RuntimeSubagentSessionAccessError") {
     return { status: 409, message: err.message };
+  }
+  if (err instanceof RuntimeSessionNotFoundError || err.name === "RuntimeSessionNotFoundError") {
+    return { status: 404, message: err.message };
   }
   if (err.name === "GoalAlreadyExistsError") {
     return { status: 409, message: err.message };

@@ -1,10 +1,11 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
 import {
   AgentTaskControlService,
   LocalSubagentConcurrencyLimiter,
+  RuntimeSessionNotFoundError,
   RuntimeSubagentSessionAccessError,
   TeamControlService,
   type AgentTreeSnapshot,
@@ -1308,9 +1309,10 @@ test("serves prompt commands and submits expanded command prompts", async () => 
 
   expect(submitResponse.status).toBe(202);
   expect(await submitResponse.json()).toEqual({ status: "accepted", sessionId: session.sessionId });
-  expect(commands.lastRun).toEqual({ name: "joke", args: "typescript" });
+  expect(commands.lastRun).toEqual({ name: "joke", args: "typescript", cwd: "/repo" });
   expect(service.lastPrompt).toMatchObject({
     sessionId: session.sessionId,
+    cwd: "/repo",
     text: "Tell a short joke about typescript.",
     displayText: "/joke typescript",
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
@@ -1341,12 +1343,17 @@ test("rejects direct HTTP prompts, commands, and goal continuations for subagent
     }),
     new Request(`http://chili.test/sessions/${session.sessionId}/prompt_async`, {
       method: "POST",
-      body: JSON.stringify({ text: "bypass" }),
+      body: JSON.stringify({ text: "bypass", cwd: 42 }),
       headers: { "content-type": "application/json" },
     }),
     new Request(`http://chili.test/sessions/${session.sessionId}/command_async`, {
       method: "POST",
       body: JSON.stringify({ name: "joke" }),
+      headers: { "content-type": "application/json" },
+    }),
+    new Request(`http://chili.test/sessions/${session.sessionId}/command`, {
+      method: "POST",
+      body: JSON.stringify({ name: "joke", cwd: "   " }),
       headers: { "content-type": "application/json" },
     }),
     new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
@@ -1380,12 +1387,17 @@ test("rejects a known pending child over HTTP before its session row exists", as
   const requests = [
     new Request(`http://chili.test/sessions/${sessionId}/prompt_async`, {
       method: "POST",
-      body: JSON.stringify({text: "race the pending child" }),
+      body: JSON.stringify({text: "race the pending child", cwd: 42 }),
       headers: { "content-type": "application/json" },
     }),
     new Request(`http://chili.test/sessions/${sessionId}/command_async`, {
       method: "POST",
       body: JSON.stringify({name: "joke" }),
+      headers: { "content-type": "application/json" },
+    }),
+    new Request(`http://chili.test/sessions/${sessionId}/command`, {
+      method: "POST",
+      body: JSON.stringify({name: "joke", cwd: null }),
       headers: { "content-type": "application/json" },
     }),
     new Request(`http://chili.test/sessions/${sessionId}/goal`, {
@@ -1690,6 +1702,7 @@ test("serves model control routes and prompt model overrides", async () => {
   expect(await promptResponse.json()).toEqual({ status: "accepted", sessionId: session.sessionId });
   expect(service.lastPrompt).toMatchObject({
     sessionId: session.sessionId,
+    cwd: "/repo",
     skillMentions: [{ name: "reviewer", path: "/repo/.chili/skills/reviewer/SKILL.md" }],
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
     reasoningLevel: "xhigh",
@@ -1774,6 +1787,129 @@ test("does not accept async prompts for missing or busy sessions", async () => {
   );
   expect(busyResponse.status).toBe(409);
   expect(service.accepted).toBe(false);
+});
+
+test("maps a runtime missing-session preflight to 404", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new MissingSessionRuntimeService(store);
+  const handler = createRuntimeHttpHandler({ service, store });
+
+  const response = await handler(
+    new Request("http://chili.test/sessions/session_missing_preflight/prompt_async", {
+      method: "POST",
+      body: JSON.stringify({ text: "hello" }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+
+  expect(response.status).toBe(404);
+  expect(await response.json()).toEqual({
+    error: { message: "Session not found: session_missing_preflight" },
+  });
+});
+
+test("uses one canonical persisted workspace for prompt and command routes", async () => {
+  const fixture = await mkdtemp(join(tmpdir(), "chili-http-cwd-"));
+  const workspace = join(fixture, "workspace");
+  const workspaceAlias = join(fixture, "workspace-alias");
+  const missingWorkspace = join(fixture, "missing-workspace");
+
+  try {
+    await mkdir(workspace);
+    await symlink(workspace, workspaceAlias);
+    const canonicalWorkspace = await realpath(workspace);
+
+    const baseStore = new MemoryEventStore();
+    const store = new ObservableEventStore(baseStore);
+    const service = new FakeRuntimeService(store);
+    const commands = new FakePromptCommandControl();
+    const handler = createRuntimeHttpHandler({ service, store, commands });
+
+    for (const cwd of [null, 42, "   "]) {
+      const response = await handler(new Request("http://chili.test/sessions", {
+        method: "POST",
+        body: JSON.stringify({ cwd }),
+        headers: { "content-type": "application/json" },
+      }));
+      expect(response.status).toBe(400);
+    }
+
+    const createResponse = await handler(new Request("http://chili.test/sessions", {
+      method: "POST",
+      body: JSON.stringify({ cwd: workspaceAlias }),
+      headers: { "content-type": "application/json" },
+    }));
+    expect(createResponse.status).toBe(201);
+    const session = (await createResponse.json()) as RuntimeSessionRef;
+    expect((await store.sessions())[0]?.cwd).toBe(canonicalWorkspace);
+
+    const acceptedRoutes = [
+      { action: "prompt", body: { text: "sync prompt" }, status: 200 },
+      { action: "prompt_async", body: { text: "async prompt", cwd: workspaceAlias }, status: 202 },
+      { action: "command", body: { name: "joke" }, status: 200 },
+      { action: "command_async", body: { name: "joke", cwd: workspaceAlias }, status: 202 },
+    ] as const;
+
+    for (const requestCase of acceptedRoutes) {
+      const response = await handler(new Request(
+        `http://chili.test/sessions/${session.sessionId}/${requestCase.action}`,
+        {
+          method: "POST",
+          body: JSON.stringify(requestCase.body),
+          headers: { "content-type": "application/json" },
+        },
+      ));
+      expect(response.status).toBe(requestCase.status);
+      expect(service.lastPrompt?.cwd).toBe(canonicalWorkspace);
+      if (requestCase.action.startsWith("command")) {
+        expect(commands.lastRun?.cwd).toBe(canonicalWorkspace);
+      }
+    }
+
+    for (const action of ["prompt", "prompt_async", "command", "command_async"] as const) {
+      service.lastPrompt = undefined;
+      commands.lastRun = undefined;
+      const body = action.startsWith("command")
+        ? { name: "joke", cwd: missingWorkspace }
+        : { text: "wrong workspace", cwd: missingWorkspace };
+      const response = await handler(new Request(
+        `http://chili.test/sessions/${session.sessionId}/${action}`,
+        {
+          method: "POST",
+          body: JSON.stringify(body),
+          headers: { "content-type": "application/json" },
+        },
+      ));
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        error: { message: expect.stringContaining("does not match the session workspace") },
+      });
+      expect(service.lastPrompt).toBeUndefined();
+      expect(commands.lastRun).toBeUndefined();
+    }
+
+    for (const cwd of [null, 7, "\t "]) {
+      for (const action of ["prompt", "prompt_async", "command", "command_async"] as const) {
+        const body = action.startsWith("command")
+          ? { name: "joke", cwd }
+          : { text: "invalid workspace", cwd };
+        const response = await handler(new Request(
+          `http://chili.test/sessions/${session.sessionId}/${action}`,
+          {
+            method: "POST",
+            body: JSON.stringify(body),
+            headers: { "content-type": "application/json" },
+          },
+        ));
+        expect(response.status).toBe(400);
+      }
+    }
+
+    await expect(access(missingWorkspace)).rejects.toThrow();
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
 });
 
 test("cleans up SSE subscriptions when the stream reader is cancelled", async () => {
@@ -1952,6 +2088,12 @@ class BusyRuntimeService extends FakeRuntimeService {
     const error = new Error("Session is already running: session_http");
     error.name = "RuntimeBusyError";
     throw error;
+  }
+}
+
+class MissingSessionRuntimeService extends FakeRuntimeService {
+  override async assertSessionTurnAllowed(sessionId: SessionId): Promise<void> {
+    throw new RuntimeSessionNotFoundError(sessionId);
   }
 }
 
