@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { ProviderError, isProviderError } from "./provider-error.js";
+import { ProviderError, clampProviderRetryAfterMs, isProviderError } from "./provider-error.js";
 
 export interface ProviderRequestScope {
   provider: string;
@@ -11,6 +11,7 @@ export interface ProviderRequestScope {
 export interface ProviderBackpressureCoordinatorOptions {
   circuitOpenMs?: number;
   rateLimitBackoffMs?: number;
+  maxStates?: number;
   now?: () => number;
   wait?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
@@ -25,17 +26,20 @@ type ProviderBackpressureState = ProviderBackpressureSnapshot;
 
 const DEFAULT_CIRCUIT_OPEN_MS = 30_000;
 const DEFAULT_RATE_LIMIT_BACKOFF_MS = 500;
+const DEFAULT_MAX_STATES = 512;
 
 export class ProviderBackpressureCoordinator {
   private readonly states = new Map<string, ProviderBackpressureState>();
   private readonly circuitOpenMs: number;
   private readonly rateLimitBackoffMs: number;
+  private readonly maxStates: number;
   private readonly now: () => number;
   private readonly waitImpl: (ms: number, signal?: AbortSignal) => Promise<void>;
 
   constructor(options: ProviderBackpressureCoordinatorOptions = {}) {
     this.circuitOpenMs = finiteDelay(options.circuitOpenMs, DEFAULT_CIRCUIT_OPEN_MS);
     this.rateLimitBackoffMs = finiteDelay(options.rateLimitBackoffMs, DEFAULT_RATE_LIMIT_BACKOFF_MS);
+    this.maxStates = positiveInteger(options.maxStates, DEFAULT_MAX_STATES);
     this.now = options.now ?? Date.now;
     this.waitImpl = options.wait ?? abortableWait;
   }
@@ -55,12 +59,13 @@ export class ProviderBackpressureCoordinator {
 
   recordError(scope: ProviderRequestScope, error: unknown): void {
     if (!isProviderError(error)) return;
+    this.sweepExpired();
     const key = scopeKey(scope);
     const now = this.now();
     if (error.opensCircuit) {
-      this.states.set(key, {
+      this.storeState(key, {
         mode: "circuit_open",
-        blockedUntil: now + this.circuitOpenMs,
+        blockedUntil: now + (error.retryAfterMs ?? this.circuitOpenMs),
         error,
       });
       return;
@@ -75,7 +80,7 @@ export class ProviderBackpressureCoordinator {
     };
     const current = this.activeState(key);
     if (current?.mode === "circuit_open") return;
-    if (!current || next.blockedUntil > current.blockedUntil) this.states.set(key, next);
+    if (!current || next.blockedUntil > current.blockedUntil) this.storeState(key, next);
   }
 
   snapshot(scope: ProviderRequestScope): ProviderBackpressureSnapshot | undefined {
@@ -94,6 +99,23 @@ export class ProviderBackpressureCoordinator {
     if (state.blockedUntil > this.now()) return state;
     this.states.delete(key);
     return undefined;
+  }
+
+  private sweepExpired(): void {
+    const now = this.now();
+    for (const [key, state] of this.states) {
+      if (state.blockedUntil <= now) this.states.delete(key);
+    }
+  }
+
+  private storeState(key: string, state: ProviderBackpressureState): void {
+    this.states.delete(key);
+    while (this.states.size >= this.maxStates) {
+      const oldest = this.states.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.states.delete(oldest);
+    }
+    this.states.set(key, state);
   }
 }
 
@@ -116,7 +138,7 @@ function normalizedEndpoint(value: string | undefined): string {
   if (!value) return "";
   try {
     const url = new URL(value);
-    return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+    return `${url.origin}${url.pathname.replace(/\/+$/, "")}${url.search}`;
   } catch {
     return value.replace(/\/+$/, "");
   }
@@ -131,14 +153,18 @@ function cloneCircuitError(error: ProviderError): ProviderError {
     ...(error.status !== undefined ? { status: error.status } : {}),
     ...(error.code !== undefined ? { code: error.code } : {}),
     ...(error.type !== undefined ? { type: error.type } : {}),
+    ...(error.param !== undefined ? { param: error.param } : {}),
+    ...(error.requestId !== undefined ? { requestId: error.requestId } : {}),
     ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}),
-    ...(error.details !== undefined ? { details: error.details } : {}),
-    cause: error,
   });
 }
 
 function finiteDelay(value: number | undefined, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value) : fallback;
+  return clampProviderRetryAfterMs(value) ?? fallback;
+}
+
+function positiveInteger(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
 async function abortableWait(ms: number, signal?: AbortSignal): Promise<void> {

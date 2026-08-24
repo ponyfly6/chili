@@ -317,3 +317,117 @@ test("Anthropic-compatible router sends controlled tool execution context", asyn
     },
   ]);
 });
+
+test("legacy Anthropic-compatible router parses successful responses larger than 64 KiB", async () => {
+  const text = `large-success-${"x".repeat(72 * 1024)}`;
+  const router = legacyRouter(() => new Response(JSON.stringify({
+    content: [{ type: "text", text }],
+    stop_reason: "end_turn",
+  }), { status: 200 }));
+
+  expect(await collectLegacy(router, "large_success")).toEqual([
+    { type: "text_delta", text },
+    { type: "finish", reason: "end_turn" },
+  ]);
+});
+
+test("legacy Anthropic-compatible router bounds opaque HTTP error bodies", async () => {
+  let cancelled = false;
+  const chunk = new TextEncoder().encode(`private-upstream 10.20.30.40 ${"x".repeat(16 * 1024)}`);
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      controller.enqueue(chunk);
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const router = legacyRouter(() => new Response(body, { status: 502, headers: { "content-type": "text/html" } }));
+
+  const error = await captureLegacyError(router, "bounded_error");
+
+  expect(error).toMatchObject({ status: 502, message: "Model request failed with HTTP 502 Bad Gateway" });
+  expect(error.message).not.toContain("private-upstream");
+  expect(error.message).not.toContain("10.20.30.40");
+  expect(cancelled).toBe(true);
+});
+
+test("legacy Anthropic-compatible router sanitizes structured errors in 2xx envelopes", async () => {
+  const router = legacyRouter(() => new Response(JSON.stringify({
+    error: {
+      message: "Authentication failed for Bearer bearer-secret-123, api_key=secret-key-456, and API key is SUPERSECRET12345 at 10.20.30.40 / 2001:db8::1234",
+      code: "invalid_api_key",
+      type: "authentication_error",
+      param: "token",
+      request_id: "req_2xx_error",
+      internal_debug: "must-never-appear",
+    },
+  }), { status: 200 }));
+
+  const error = await captureLegacyError(router, "payload_error");
+
+  expect(error).toMatchObject({
+    status: 200,
+    code: "invalid_api_key",
+    type: "authentication_error",
+    param: "token",
+    requestId: "req_2xx_error",
+  });
+  expect(error.message).toContain("Authentication failed");
+  expect(error.message).not.toContain("bearer-secret-123");
+  expect(error.message).not.toContain("secret-key-456");
+  expect(error.message).not.toContain("SUPERSECRET12345");
+  expect(error.message).not.toContain("10.20.30.40");
+  expect(error.message).not.toContain("2001:db8::1234");
+  expect(error.message).not.toContain("must-never-appear");
+  expect(new TextEncoder().encode(error.message).byteLength).toBeLessThanOrEqual(1024);
+});
+
+test("legacy Anthropic-compatible router does not echo invalid successful responses", async () => {
+  const router = legacyRouter(() => new Response("private-invalid-success <html>failure</html>", { status: 200 }));
+
+  const error = await captureLegacyError(router, "invalid_success");
+
+  expect(error.message).toBe("Model response was not valid JSON");
+  expect(error.message).not.toContain("private-invalid-success");
+});
+
+type LegacyProviderError = Error & {
+  status?: number;
+  code?: string;
+  type?: string;
+  param?: string;
+  requestId?: string;
+};
+
+function legacyRouter(response: () => Response): AnthropicCompatibleModelRouter {
+  return new AnthropicCompatibleModelRouter({
+    model: "test-model",
+    apiKey: "test-key",
+    baseUrl: "https://model.test",
+    fetch: (async () => response()) as unknown as typeof fetch,
+  });
+}
+
+async function collectLegacy(router: AnthropicCompatibleModelRouter, id: string) {
+  const events = [];
+  for await (const event of router.stream({
+    sessionId: `session_${id}` as SessionId,
+    turnId: `turn_${id}` as TurnId,
+    messages: [],
+    tools: [],
+    system: [],
+  })) {
+    events.push(event);
+  }
+  return events;
+}
+
+async function captureLegacyError(router: AnthropicCompatibleModelRouter, id: string): Promise<LegacyProviderError> {
+  try {
+    await collectLegacy(router, id);
+  } catch (error) {
+    return error as LegacyProviderError;
+  }
+  throw new Error("Expected router stream to fail");
+}

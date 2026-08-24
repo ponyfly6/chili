@@ -696,7 +696,7 @@ test("types MiniMax 2062 as non-retryable and short-circuits sibling requests", 
     retryable: false,
     opensCircuit: true,
   });
-  expect(firstError.message).toBe("Traffic is currently high—please retry shortly. (2062)");
+  expect(firstError.message).toBe("Traffic is currently high—please retry shortly. (2062) (type: rate_limit_error)");
 
   const siblingError = await caught(collect(sibling.stream({ messages: [], tools: [], system: [] })));
   expect(siblingError).toMatchObject({ category: "plan_capacity", retryable: false, code: "2062" });
@@ -782,6 +782,185 @@ test("types Anthropic SSE error events before exposing them to core", async () =
   });
 });
 
+test("normalizes Anthropic-compatible HTTP and raw SSE failures without exposing response bodies", async () => {
+  const html = "<!DOCTYPE html><html><body>gateway 10.9.8.7 bearer-secret-123</body></html>";
+  const httpModel = new AnthropicCompatibleModel({
+    provider: "minimax",
+    model: "test-model",
+    apiKey: "http-error-key",
+    baseUrl: "https://safe-error.test/v1",
+    backpressureCoordinator: new ProviderBackpressureCoordinator(),
+    fetch: (async () => new Response(html, { status: 502 })) as unknown as typeof fetch,
+  });
+
+  const httpError = await caught(collect(httpModel.stream({ messages: [] })));
+  expect(httpError).toMatchObject({
+    name: "ProviderError",
+    status: 502,
+    category: "server_error",
+    retryable: true,
+    message: "Model request failed with HTTP 502 Bad Gateway",
+  });
+  expect(httpError.message).not.toContain("10.9.8.7");
+  expect(httpError.message).not.toContain("bearer-secret-123");
+
+  const sseModel = new AnthropicCompatibleModel({
+    provider: "minimax",
+    model: "test-model",
+    apiKey: "sse-raw-key",
+    baseUrl: "https://safe-sse.test/v1",
+    backpressureCoordinator: new ProviderBackpressureCoordinator(),
+    fetch: sseFetch([`event: error\ndata: ${html}\n\n`]),
+  });
+  const events = await collect(sseModel.stream({ messages: [] }));
+  expect(events).toHaveLength(1);
+  expect(events[0]).toMatchObject({
+    type: "error",
+    error: { name: "ProviderError", message: "Model stream failed", category: "unknown" },
+  });
+  expect(String(events[0]?.type === "error" ? events[0].error : "")).not.toContain("10.9.8.7");
+});
+
+test("preserves structured safe fields on Anthropic SSE errors", async () => {
+  const model = new AnthropicCompatibleModel({
+    provider: "minimax",
+    model: "test-model",
+    apiKey: "sse-structured-key",
+    baseUrl: "https://structured-sse.test/v1",
+    backpressureCoordinator: new ProviderBackpressureCoordinator(),
+    fetch: sseFetch([event("error", {
+      type: "error",
+      error: {
+        message: "Quota exhausted",
+        code: 2056,
+        type: "rate_limit_error",
+      },
+    })], { "x-request-id": "req_anthropic_sse_1", "retry-after": "7" }),
+  });
+
+  const events = await collect(model.stream({ messages: [] }));
+  expect(events[0]).toMatchObject({
+    type: "error",
+    error: {
+      code: "2056",
+      requestId: "req_anthropic_sse_1",
+      retryAfterMs: 7_000,
+      status: 200,
+      category: "quota_exhausted",
+      retryable: false,
+      message: "Quota exhausted (code: 2056, type: rate_limit_error)",
+    },
+  });
+});
+
+test("preserves header hints on Anthropic 2xx JSON error envelopes", async () => {
+  const model = new AnthropicCompatibleModel({
+    provider: "minimax",
+    model: "test-model",
+    apiKey: "json-error-key",
+    baseUrl: "https://json-error.test/v1",
+    backpressureCoordinator: new ProviderBackpressureCoordinator(),
+    fetch: jsonFetch({ error: { message: "Rate limited", code: 1002 } }, {
+      "x-request-id": "req_anthropic_json_1",
+      "retry-after": "9",
+    }),
+  });
+
+  const events = await collect(model.stream({ messages: [] }));
+  expect(events[0]).toMatchObject({
+    type: "error",
+    error: {
+      status: 200,
+      code: "1002",
+      requestId: "req_anthropic_json_1",
+      retryAfterMs: 9_000,
+      category: "rate_limit",
+      retryable: true,
+    },
+  });
+});
+
+test("uses the resolved messages URL as the shared backpressure scope", async () => {
+  let fetchCalls = 0;
+  const coordinator = new ProviderBackpressureCoordinator();
+  const fetchImpl = (async () => {
+    fetchCalls++;
+    return new Response(JSON.stringify({
+      type: "error",
+      error: { message: "Traffic is currently high. (2062)" },
+    }), { status: 429 });
+  }) as unknown as typeof fetch;
+  const common = {
+    provider: "minimax",
+    model: "test-model",
+    apiKey: "same-key",
+    fetch: fetchImpl,
+    backpressureCoordinator: coordinator,
+  };
+  const baseV1 = new AnthropicCompatibleModel({ ...common, baseUrl: "https://equivalent.test/v1" });
+  const messagesUrl = new AnthropicCompatibleModel({ ...common, baseUrl: "https://equivalent.test/v1/messages" });
+
+  await caught(collect(baseV1.stream({ messages: [] })));
+  const siblingError = await caught(collect(messagesUrl.stream({ messages: [] })));
+
+  expect(siblingError).toMatchObject({ category: "plan_capacity", code: "2062" });
+  expect(fetchCalls).toBe(1);
+});
+
+test("preserves URL queries and partitions backpressure by the actual request URL", async () => {
+  const requestedUrls: string[] = [];
+  const coordinator = new ProviderBackpressureCoordinator();
+  const fetchImpl = (async (input: RequestInfo | URL) => {
+    requestedUrls.push(String(input));
+    return new Response(JSON.stringify({
+      type: "error",
+      error: { message: "Traffic is currently high. (2062)" },
+    }), { status: 429 });
+  }) as unknown as typeof fetch;
+  const common = {
+    provider: "minimax",
+    model: "test-model",
+    apiKey: "same-key",
+    fetch: fetchImpl,
+    backpressureCoordinator: coordinator,
+  };
+
+  await caught(collect(new AnthropicCompatibleModel({
+    ...common,
+    baseUrl: "https://tenant.test/v1?deployment=a#ignored",
+  }).stream({ messages: [] })));
+  await caught(collect(new AnthropicCompatibleModel({
+    ...common,
+    baseUrl: "https://tenant.test/v1?deployment=b",
+  }).stream({ messages: [] })));
+
+  expect(requestedUrls).toEqual([
+    "https://tenant.test/v1/messages?deployment=a",
+    "https://tenant.test/v1/messages?deployment=b",
+  ]);
+});
+
+test("handles malformed Anthropic error field types without bypassing classification", async () => {
+  const model = new AnthropicCompatibleModel({
+    provider: "minimax",
+    model: "test-model",
+    apiKey: "malformed-key",
+    baseUrl: "https://malformed.test/v1",
+    backpressureCoordinator: new ProviderBackpressureCoordinator(),
+    fetch: (async () => new Response(JSON.stringify({
+      error: { message: { private: true }, type: 42, code: 1002 },
+    }), { status: 429 })) as unknown as typeof fetch,
+  });
+
+  const error = await caught(collect(model.stream({ messages: [] })));
+  expect(error).toMatchObject({
+    name: "ProviderError",
+    code: "1002",
+    category: "rate_limit",
+    retryable: true,
+  });
+});
+
 async function collect(stream: AsyncIterable<ModelStreamEvent>): Promise<ModelStreamEvent[]> {
   const events: ModelStreamEvent[] = [];
   for await (const streamEvent of stream) events.push(streamEvent);
@@ -818,19 +997,19 @@ function event(name: string, data: unknown): string {
   return `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
-function sseFetch(events: string[]): typeof fetch {
+function sseFetch(events: string[], extraHeaders: Record<string, string> = {}): typeof fetch {
   return (async () =>
     new Response(streamText(events.join("")), {
       status: 200,
-      headers: { "content-type": "text/event-stream" },
+      headers: { "content-type": "text/event-stream", ...extraHeaders },
     })) as unknown as typeof fetch;
 }
 
-function jsonFetch(data: unknown): typeof fetch {
+function jsonFetch(data: unknown, extraHeaders: Record<string, string> = {}): typeof fetch {
   return (async () =>
     new Response(JSON.stringify(data), {
       status: 200,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...extraHeaders },
     })) as unknown as typeof fetch;
 }
 

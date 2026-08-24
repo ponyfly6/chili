@@ -13,7 +13,11 @@ import {
   type ProviderBackpressureCoordinator,
   type ProviderRequestScope,
 } from "./provider-backpressure.js";
-import { ProviderError } from "./provider-error.js";
+import {
+  providerHttpError,
+  providerPayloadError,
+  type ProviderErrorDetails,
+} from "./provider-error.js";
 import { readSseEvents } from "./sse.js";
 import { normalizeAnthropicToolCallId, prependContextualUserMessage, transformModelMessages } from "./transform-messages.js";
 
@@ -157,7 +161,7 @@ export class AnthropicCompatibleModel implements ChiliModel {
     this.backpressureCoordinator = options.backpressureCoordinator ?? sharedProviderBackpressureCoordinator;
     this.requestScope = {
       provider: this.provider,
-      endpoint: options.baseUrl,
+      endpoint: resolveMessagesUrl(options.baseUrl),
       credential: options.apiKey,
     };
   }
@@ -195,29 +199,30 @@ export class AnthropicCompatibleModel implements ChiliModel {
     if (input.signal) init.signal = input.signal;
 
     await this.backpressureCoordinator.beforeRequest(this.requestScope, input.signal);
-    const response = await this.fetchImpl(resolveMessagesUrl(this.options.baseUrl), init);
+    const response = await this.fetchImpl(this.requestScope.endpoint ?? resolveMessagesUrl(this.options.baseUrl), init);
     if (!response.ok) {
-      const text = await response.text();
-      const payload = parseJson<unknown>(text, undefined);
-      const error = this.providerError(
-        payload,
-        `Model request failed with HTTP ${response.status}: ${text}`,
-        response.status,
-        response.headers.get("retry-after"),
-      );
+      const error = await providerHttpError(response, {
+        provider: this.provider,
+        label: "Model request",
+        selectJson: ({ json }) => anthropicErrorDetails(json),
+      });
       this.backpressureCoordinator.recordError(this.requestScope, error);
       throw error;
     }
 
     if (isEventStream(response) && response.body) {
-      yield* this.streamSseResponse(response.body, input.signal);
+      yield* this.streamSseResponse(response.body, response, input.signal);
       return;
     }
 
-    yield* this.streamJsonResponse(await response.text());
+    yield* this.streamJsonResponse(await response.text(), response);
   }
 
-  private async *streamSseResponse(body: ReadableStream<Uint8Array>, signal?: AbortSignal): AsyncIterable<ModelStreamEvent> {
+  private async *streamSseResponse(
+    body: ReadableStream<Uint8Array>,
+    response: Response,
+    signal?: AbortSignal,
+  ): AsyncIterable<ModelStreamEvent> {
     let responseId: string | undefined;
     let usage: ModelUsage | undefined;
     let finishReason = "stop";
@@ -228,11 +233,18 @@ export class AnthropicCompatibleModel implements ChiliModel {
       if (event.data === "[DONE]") break;
       const fallback: AnthropicSsePayload = {};
       if (event.event !== undefined) fallback.type = event.event;
-      const payload = parseJson<AnthropicSsePayload>(event.data, fallback);
+      const parsed = parseJson<AnthropicSsePayload>(event.data, undefined);
+      const payload = parsed ?? fallback;
       if (!payload) continue;
 
       if (payload.type === "error" || event.event === "error") {
-        const error = this.providerError(payload.error ?? payload, "Anthropic-compatible model stream failed");
+        const details = anthropicErrorDetails(parsed);
+        const error = providerPayloadError(parsed, {
+          provider: this.provider,
+          label: "Model stream failed",
+          response,
+          ...(details ? { details } : {}),
+        });
         this.backpressureCoordinator.recordError(this.requestScope, error);
         yield errorEvent(error, responseId, usage);
         return;
@@ -328,11 +340,23 @@ export class AnthropicCompatibleModel implements ChiliModel {
     }
   }
 
-  private async *streamJsonResponse(text: string): AsyncIterable<ModelStreamEvent> {
+  private async *streamJsonResponse(text: string, response: Response): AsyncIterable<ModelStreamEvent> {
     const payload = parseJson<AnthropicResponse>(text, undefined);
-    if (!payload) throw new Error(`Model response was not JSON: ${text}`);
+    if (!payload) {
+      throw providerPayloadError(undefined, {
+        provider: this.provider,
+        label: "Model response was not valid JSON",
+        response,
+      });
+    }
     if (payload.error) {
-      const error = this.providerError(payload.error, "Anthropic-compatible model request failed");
+      const details = anthropicErrorDetails(payload);
+      const error = providerPayloadError(payload, {
+        provider: this.provider,
+        label: "Model response failed",
+        response,
+        ...(details ? { details } : {}),
+      });
       this.backpressureCoordinator.recordError(this.requestScope, error);
       yield errorEvent(error, payload.id, undefined);
       return;
@@ -373,26 +397,6 @@ export class AnthropicCompatibleModel implements ChiliModel {
     return headers;
   }
 
-  private providerError(
-    value: unknown,
-    fallbackMessage: string,
-    status?: number,
-    retryAfterHeader?: string | null,
-  ): ProviderError {
-    const payload = extractAnthropicErrorPayload(value);
-    const message = payload?.message?.trim() || fallbackMessage;
-    const code = errorCode(payload) ?? errorCodeFromMessage(message);
-    const type = payload?.type;
-    const retryAfterMs = parseRetryAfterMs(retryAfterHeader, payload);
-    return new ProviderError(message, {
-      provider: this.provider,
-      ...(status !== undefined ? { status } : {}),
-      ...(code !== undefined ? { code } : {}),
-      ...(type !== undefined ? { type } : {}),
-      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
-      details: value,
-    });
-  }
 }
 
 export function buildAnthropicRequestBody(
@@ -426,10 +430,17 @@ export function buildAnthropicRequestBody(
 }
 
 export function resolveMessagesUrl(baseUrl: string): string {
-  const clean = baseUrl.replace(/\/+$/, "");
-  if (clean.endsWith("/v1/messages")) return clean;
-  if (clean.endsWith("/v1")) return `${clean}/messages`;
-  return `${clean}/v1/messages`;
+  const url = new URL(baseUrl);
+  url.hash = "";
+  const cleanPath = url.pathname.replace(/\/+$/, "");
+  if (cleanPath.endsWith("/v1/messages")) {
+    url.pathname = cleanPath;
+  } else if (cleanPath.endsWith("/v1")) {
+    url.pathname = `${cleanPath}/messages`;
+  } else {
+    url.pathname = `${cleanPath}/v1/messages`;
+  }
+  return url.toString();
 }
 
 function reasoningEnabledForInput(input: ModelStreamInput): boolean | undefined {
@@ -553,14 +564,28 @@ function parseJson<T>(text: string, fallback: T | undefined): T | undefined {
   }
 }
 
-function extractAnthropicErrorPayload(value: unknown): AnthropicErrorPayload | undefined {
-  if (!isRecord(value)) return undefined;
-  if (isRecord(value.error)) return value.error as AnthropicErrorPayload;
-  return value as AnthropicErrorPayload;
+function anthropicErrorDetails(value: unknown): ProviderErrorDetails | undefined {
+  const payload = extractAnthropicErrorPayload(value);
+  if (!payload) return undefined;
+  const message = stringField(payload, "message");
+  const code = codeField(payload, "code")
+    ?? codeField(payload, "error_code")
+    ?? codeField(payload, "status_code")
+    ?? (message ? errorCodeFromMessage(message) : undefined);
+  const type = stringField(payload, "type");
+  const retryAfterMs = retryAfterFromPayload(payload);
+  if (!message && code === undefined && !type && retryAfterMs === undefined) return undefined;
+  return {
+    ...(message ? { message } : {}),
+    ...(code !== undefined ? { code } : {}),
+    ...(type ? { type } : {}),
+    ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+  };
 }
 
-function errorCode(payload: AnthropicErrorPayload | undefined): string | number | undefined {
-  return payload?.code ?? payload?.error_code ?? payload?.status_code;
+function extractAnthropicErrorPayload(value: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(value)) return undefined;
+  return isRecord(value.error) ? value.error : value;
 }
 
 function errorCodeFromMessage(message: string): string | undefined {
@@ -568,37 +593,33 @@ function errorCodeFromMessage(message: string): string | undefined {
     ?? /\b(?:error|status)[ _-]?code\s*[:=]?\s*(\d{3,6})\b/i.exec(message)?.[1];
 }
 
-function parseRetryAfterMs(
-  retryAfterHeader: string | null | undefined,
-  payload: AnthropicErrorPayload | undefined,
-): number | undefined {
-  const headerDelay = retryAfterHeader === null || retryAfterHeader === undefined
-    ? undefined
-    : retryAfterHeaderMs(retryAfterHeader);
-  if (headerDelay !== undefined) return headerDelay;
-
-  const milliseconds = finiteNumber(payload?.retry_after_ms);
+function retryAfterFromPayload(payload: Record<string, unknown>): number | undefined {
+  const milliseconds = finiteNumber(payload.retry_after_ms);
   if (milliseconds !== undefined && milliseconds >= 0) return Math.round(milliseconds);
-  const seconds = finiteNumber(payload?.retry_after);
+  const seconds = finiteNumber(payload.retry_after);
   return seconds !== undefined && seconds >= 0 ? Math.round(seconds * 1_000) : undefined;
 }
 
-function retryAfterHeaderMs(value: string): number | undefined {
-  const seconds = finiteNumber(value);
-  if (seconds !== undefined && seconds >= 0) return Math.round(seconds * 1_000);
-  const at = Date.parse(value);
-  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : undefined;
-}
-
-function finiteNumber(value: string | number | undefined): number | undefined {
+function finiteNumber(value: unknown): number | undefined {
   if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
   if (typeof value !== "string" || !value.trim()) return undefined;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+function stringField(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function codeField(record: Record<string, unknown>, key: string): string | number | undefined {
+  const value = record[key];
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function toolCallDeltaEvent(

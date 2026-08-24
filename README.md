@@ -179,7 +179,7 @@ bun run chili -- serve --provider openai-codex --model gpt-5.6-sol
 bun run tui
 ```
 
-在 TUI 里执行 `/login`，浏览器完成 ChatGPT 登录后，Chili 会把 OAuth 凭据保存到 `~/.chili/auth.json`。这个文件包含 access/refresh token，应按密码处理。`openai-codex` 的默认模型为 `gpt-5.6-sol`：
+在 TUI 里执行 `/auth login`，浏览器完成 ChatGPT 登录后，Chili 会把 OAuth 凭据保存到 `~/.chili/auth.json`。这个文件包含 access/refresh token，应按密码处理。`openai-codex` 的默认模型为 `gpt-5.6-sol`：
 
 ```bash
 bun run chili -- --model openai-codex/gpt-5.6-sol "总结这个仓库"

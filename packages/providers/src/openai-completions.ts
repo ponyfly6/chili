@@ -1,6 +1,7 @@
 import { formatToolResultForModel, type Message, type MessagePart } from "@chili/protocol";
 import { resolveChatCompletionsCompatibility, type ChatCompletionsCompatibility } from "./compat.js";
 import { assertImageInputSupported } from "./image-input.js";
+import { providerHttpError, providerPayloadError } from "./provider-error.js";
 import { readSseEvents } from "./sse.js";
 import { prependContextualUserMessage, transformModelMessages } from "./transform-messages.js";
 import type {
@@ -186,21 +187,23 @@ export class OpenAICompletionsModel implements ChiliModel {
 
     const response = await this.fetchImpl(resolveChatCompletionsUrl(this.options.baseUrl), init);
     if (!response.ok) {
-      const text = await response.text();
-      const payload = parseJson<OpenAIChatCompletionResponse>(text, undefined);
-      throw new Error(payload?.error?.message ?? `Model request failed with HTTP ${response.status}: ${text}`);
+      throw await providerHttpError(response, {
+        provider: this.provider,
+        label: "Model request",
+      });
     }
 
     if (isEventStream(response) && response.body) {
-      yield* this.streamSseResponse(response.body, input.signal);
+      yield* this.streamSseResponse(response.body, response, input.signal);
       return;
     }
 
-    yield* this.streamJsonResponse(await response.text());
+    yield* this.streamJsonResponse(await response.text(), response);
   }
 
   private async *streamSseResponse(
     body: ReadableStream<Uint8Array>,
+    response: Response,
     signal?: AbortSignal,
   ): AsyncIterable<ModelStreamEvent> {
     let responseId: string | undefined;
@@ -213,10 +216,24 @@ export class OpenAICompletionsModel implements ChiliModel {
     for await (const event of readSseEvents(body, signal)) {
       if (event.data === "[DONE]") break;
       const payload = parseJson<OpenAIChatCompletionResponse>(event.data, undefined);
-      if (!payload) continue;
+      if (!payload) {
+        if (event.event === "error") {
+          yield errorEvent(providerPayloadError(undefined, {
+            provider: this.provider,
+            label: "Model stream failed",
+            response,
+          }), responseId, usage);
+          return;
+        }
+        continue;
+      }
 
-      if (payload.error) {
-        yield errorEvent(payload.error, responseId, usage);
+      if (event.event === "error" || payload.error) {
+        yield errorEvent(providerPayloadError(payload, {
+          provider: this.provider,
+          label: "Model stream failed",
+          response,
+        }), responseId, usage);
         return;
       }
 
@@ -253,11 +270,21 @@ export class OpenAICompletionsModel implements ChiliModel {
     }
   }
 
-  private async *streamJsonResponse(text: string): AsyncIterable<ModelStreamEvent> {
+  private async *streamJsonResponse(text: string, response: Response): AsyncIterable<ModelStreamEvent> {
     const payload = parseJson<OpenAIChatCompletionResponse>(text, undefined);
-    if (!payload) throw new Error(`Model response was not JSON: ${text}`);
+    if (!payload) {
+      throw providerPayloadError(undefined, {
+        provider: this.provider,
+        label: "Model response was not valid JSON",
+        response,
+      });
+    }
     if (payload.error) {
-      yield errorEvent(payload.error, payload.id, undefined);
+      yield errorEvent(providerPayloadError(payload, {
+        provider: this.provider,
+        label: "Model response failed",
+        response,
+      }), payload.id, undefined);
       return;
     }
 

@@ -3,6 +3,7 @@ import type { Message, MessageId, PartId, SessionId, TimestampMs, ToolCallId } f
 import {
   buildOpenAICompletionsRequestBody,
   OpenAICompletionsModel,
+  ProviderError,
   resolveChatCompletionsUrl,
 } from "./index.js";
 import type { ModelStreamEvent, ModelStreamInput, ModelTool, ReasoningLevel } from "./types.js";
@@ -660,6 +661,160 @@ test("resolves chat completions URL variants", () => {
   );
 });
 
+test("normalizes OpenAI-compatible HTML and plain-text HTTP failures", async () => {
+  const scenarios: Array<{
+    status: number;
+    body: string;
+    headers: Record<string, string>;
+    message: string;
+    secrets: string[];
+  }> = [
+    {
+      status: 502,
+      body: "<!DOCTYPE html><html><body>gateway 10.9.8.7 bearer-secret-123</body></html>",
+      headers: { "content-type": "text/html", "x-request-id": "req_openai_http_1" },
+      message: "Model request failed with HTTP 502 Bad Gateway (request id: req_openai_http_1)",
+      secrets: ["10.9.8.7", "bearer-secret-123"],
+    },
+    {
+      status: 503,
+      body: "upstream private-token-456 at 10.8.7.6",
+      headers: { "content-type": "text/plain" },
+      message: "Model request failed with HTTP 503 Service Unavailable",
+      secrets: ["private-token-456", "10.8.7.6"],
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const model = new OpenAICompletionsModel({
+      provider: "openai",
+      model: "gpt-test",
+      apiKey: "test-key",
+      baseUrl: "https://api.test",
+      fetch: (async () => new Response(scenario.body, {
+        status: scenario.status,
+        headers: scenario.headers,
+      })) as unknown as typeof fetch,
+    });
+
+    const error = await rejectedProviderError(() => collect(model.stream({ messages: [] })));
+    expect(error).toMatchObject({
+      name: "ProviderError",
+      provider: "openai",
+      status: scenario.status,
+      category: "server_error",
+      retryable: true,
+      opensCircuit: false,
+      message: scenario.message,
+    });
+    for (const secret of scenario.secrets) expect(error.message).not.toContain(secret);
+  }
+});
+
+test("normalizes raw and structured OpenAI-compatible SSE errors", async () => {
+  const rawHtml = "<!DOCTYPE html><html><body>gateway 10.9.8.7 bearer-secret-123</body></html>";
+  const rawModel = new OpenAICompletionsModel({
+    provider: "openai",
+    model: "gpt-test",
+    apiKey: "test-key",
+    baseUrl: "https://api.test",
+    fetch: sseFetch([`event: error\ndata: ${rawHtml}\n\n`]),
+  });
+
+  const rawEvents = await collect(rawModel.stream({ messages: [] }));
+  expect(rawEvents).toHaveLength(1);
+  expect(rawEvents[0]).toMatchObject({
+    type: "error",
+    error: {
+      name: "ProviderError",
+      provider: "openai",
+      category: "unknown",
+      retryable: false,
+      opensCircuit: false,
+      message: "Model stream failed",
+    },
+  });
+  const rawError = eventProviderError(rawEvents[0]);
+  expect(rawError.message).not.toContain("10.9.8.7");
+  expect(rawError.message).not.toContain("bearer-secret-123");
+
+  const structuredModel = new OpenAICompletionsModel({
+    provider: "openai",
+    model: "gpt-test",
+    apiKey: "test-key",
+    baseUrl: "https://api.test",
+    fetch: sseFetch([data({
+      error: {
+        message: "Quota exhausted at 10.1.2.3 for api_key=private-stream-token",
+        code: "rate_limit_exceeded",
+        type: "rate_limit_error",
+      },
+    })], { "x-request-id": "req_openai_sse_1", "retry-after": "7" }),
+  });
+
+  const structuredEvents = await collect(structuredModel.stream({ messages: [] }));
+  expect(structuredEvents).toHaveLength(1);
+  expect(structuredEvents[0]).toMatchObject({
+    type: "error",
+    error: {
+      name: "ProviderError",
+      provider: "openai",
+      code: "rate_limit_exceeded",
+      type: "rate_limit_error",
+      requestId: "req_openai_sse_1",
+      retryAfterMs: 7_000,
+      status: 200,
+      category: "quota_exhausted",
+      retryable: false,
+      opensCircuit: true,
+    },
+  });
+  const structuredError = eventProviderError(structuredEvents[0]);
+  expect(structuredError.message).toContain("[REDACTED_IP]");
+  expect(structuredError.message).toContain("api_key=[REDACTED]");
+  expect(structuredError.message).not.toContain("10.1.2.3");
+  expect(structuredError.message).not.toContain("private-stream-token");
+});
+
+test("normalizes OpenAI-compatible 2xx JSON error envelopes", async () => {
+  const model = new OpenAICompletionsModel({
+    provider: "openai",
+    model: "gpt-test",
+    apiKey: "test-key",
+    baseUrl: "https://api.test",
+    fetch: jsonFetch({
+      id: "chatcmpl_error",
+      error: {
+        message: "Quota exhausted for Bearer bearer-secret-789",
+        code: "insufficient_quota",
+        type: "insufficient_quota",
+      },
+    }, { "x-request-id": "req_openai_json_1", "retry-after": "8" }),
+  });
+
+  const events = await collect(model.stream({ messages: [] }));
+  expect(events).toHaveLength(1);
+  expect(events[0]).toMatchObject({
+    type: "error",
+    responseId: "chatcmpl_error",
+    error: {
+      name: "ProviderError",
+      provider: "openai",
+      code: "insufficient_quota",
+      type: "insufficient_quota",
+      requestId: "req_openai_json_1",
+      retryAfterMs: 8_000,
+      status: 200,
+      category: "quota_exhausted",
+      retryable: false,
+      opensCircuit: true,
+    },
+  });
+  const error = eventProviderError(events[0]);
+  expect(error.message).toContain("Bearer [REDACTED]");
+  expect(error.message).not.toContain("bearer-secret-789");
+});
+
 test("parses OpenAI-compatible SSE text, reasoning, tool deltas, and usage", async () => {
   const model = new OpenAICompletionsModel({
     provider: "openai",
@@ -936,6 +1091,22 @@ async function collect(stream: AsyncIterable<ModelStreamEvent>): Promise<ModelSt
   return events;
 }
 
+async function rejectedProviderError(run: () => Promise<unknown>): Promise<ProviderError> {
+  try {
+    await run();
+  } catch (error) {
+    expect(error).toBeInstanceOf(ProviderError);
+    return error as ProviderError;
+  }
+  throw new Error("Expected operation to reject with ProviderError");
+}
+
+function eventProviderError(event: ModelStreamEvent | undefined): ProviderError {
+  const error = event?.type === "error" ? event.error : undefined;
+  expect(error).toBeInstanceOf(ProviderError);
+  return error as ProviderError;
+}
+
 function message(role: Message["role"], parts: Array<Record<string, unknown>>): Message {
   const messageId = `msg_${role}_${Math.random().toString(16).slice(2)}` as MessageId;
   return {
@@ -956,19 +1127,19 @@ function data(payload: unknown): string {
   return `data: ${JSON.stringify(payload)}\n\n`;
 }
 
-function sseFetch(events: string[]): typeof fetch {
+function sseFetch(events: string[], extraHeaders: Record<string, string> = {}): typeof fetch {
   return (async () =>
     new Response(streamText(events.join("")), {
       status: 200,
-      headers: { "content-type": "text/event-stream" },
+      headers: { "content-type": "text/event-stream", ...extraHeaders },
     })) as unknown as typeof fetch;
 }
 
-function jsonFetch(data: unknown): typeof fetch {
+function jsonFetch(data: unknown, extraHeaders: Record<string, string> = {}): typeof fetch {
   return (async () =>
     new Response(JSON.stringify(data), {
       status: 200,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...extraHeaders },
     })) as unknown as typeof fetch;
 }
 

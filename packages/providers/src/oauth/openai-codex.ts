@@ -1,6 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { OAuthCredentials } from "../auth.js";
+import { OPENAI_CODEX_PROVIDER_ID } from "../models.js";
+import { providerHttpError, providerPayloadError, type ProviderRequestError } from "../provider-error.js";
 import { generatePKCE } from "./pkce.js";
 
 export const OPENAI_CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -34,6 +36,7 @@ interface TokenSuccess {
 interface TokenFailure {
   type: "failed";
   message: string;
+  error?: ProviderRequestError;
 }
 
 type TokenResult = TokenSuccess | TokenFailure;
@@ -79,7 +82,7 @@ export async function loginOpenAICodex(options: OpenAICodexLoginOptions): Promis
     const code = await waitForAuthorizationCode(server, state, options);
     if (!code) throw new Error("Missing authorization code");
     const result = await exchangeOpenAICodexAuthorizationCode(code, verifier, options.fetch);
-    if (result.type === "failed") throw new Error(result.message);
+    if (result.type === "failed") throw result.error ?? new Error(result.message);
     return result.credentials;
   } finally {
     server.close();
@@ -103,7 +106,7 @@ export async function refreshOpenAICodexToken(
   const previous: Partial<OAuthCredentials> = { ...(options.previous ?? {}) };
   if (!previous.refresh) previous.refresh = refreshToken;
   const result = await readTokenResponse(response, previous);
-  if (result.type === "failed") throw new Error(result.message);
+  if (result.type === "failed") throw result.error ?? new Error(result.message);
   return result.credentials;
 }
 
@@ -205,29 +208,56 @@ function parseManualAuthorizationCode(input: string, expectedState: string): str
 
 async function readTokenResponse(response: Response, previous: Partial<OAuthCredentials> = {}): Promise<TokenResult> {
   if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    return { type: "failed", message: `OpenAI Codex token request failed with HTTP ${response.status}: ${text}` };
+    const error = await providerHttpError(response, {
+      provider: OPENAI_CODEX_PROVIDER_ID,
+      label: "OpenAI Codex token request",
+    });
+    return { type: "failed", message: error.message, error };
   }
 
   const json = await response.json().catch(() => undefined) as unknown;
   if (!isRecord(json)) {
-    return { type: "failed", message: "OpenAI Codex token response was not a JSON object" };
+    return tokenResponseFailure(
+      response,
+      json,
+      "OpenAI Codex token response was not a JSON object",
+    );
+  }
+  if (json.error !== undefined && json.error !== null && json.error !== false) {
+    const error = providerPayloadError(json, {
+      provider: OPENAI_CODEX_PROVIDER_ID,
+      label: "OpenAI Codex token response failed",
+      response,
+    });
+    return { type: "failed", message: error.message, error };
   }
 
   const accessToken = stringField(json, "access_token");
   if (!accessToken) {
-    return { type: "failed", message: "OpenAI Codex token response was missing access_token" };
+    return tokenResponseFailure(
+      response,
+      json,
+      "OpenAI Codex token response was missing access_token",
+    );
   }
 
   const idToken = stringField(json, "id_token");
   const refreshToken = stringField(json, "refresh_token") ?? previous.refresh;
   if (!refreshToken) {
-    return { type: "failed", message: "OpenAI Codex token response was missing refresh_token" };
+    return tokenResponseFailure(
+      response,
+      json,
+      "OpenAI Codex token response was missing refresh_token",
+    );
   }
 
   const accountId = resolveAccountId(idToken, previous.accountId, accessToken);
   if (!accountId) {
-    return { type: "failed", message: "OpenAI Codex token response was missing ChatGPT account id" };
+    return tokenResponseFailure(
+      response,
+      json,
+      "OpenAI Codex token response was missing ChatGPT account id",
+    );
   }
 
   return {
@@ -239,6 +269,20 @@ async function readTokenResponse(response: Response, previous: Partial<OAuthCred
       accountId,
     },
   };
+}
+
+function tokenResponseFailure(
+  response: Response,
+  payload: unknown,
+  publicMessage: string,
+): TokenFailure {
+  const error = providerPayloadError(payload, {
+    provider: OPENAI_CODEX_PROVIDER_ID,
+    label: publicMessage,
+    response,
+    details: { publicMessage },
+  });
+  return { type: "failed", message: error.message, error };
 }
 
 function stringField(record: TokenResponseJson, key: string): string | undefined {

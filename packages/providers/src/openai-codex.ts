@@ -25,6 +25,11 @@ import {
 import { clampModelReasoningLevel, normalizeReasoningLevel, parseModelSelectionPattern } from "./model-selection.js";
 import { extractOpenAICodexAccountId, refreshOpenAICodexToken } from "./oauth/openai-codex.js";
 import { assertImageInputSupported } from "./image-input.js";
+import {
+  providerHttpError,
+  providerPayloadError,
+  type ProviderRequestError,
+} from "./provider-error.js";
 import { readSseEvents } from "./sse.js";
 import { prependContextualUserMessage, transformModelMessages } from "./transform-messages.js";
 import type {
@@ -153,13 +158,13 @@ interface CodexStreamPayload {
   output_index?: number;
   summary_index?: number;
   item_id?: string;
-  code?: string;
+  code?: string | number;
   message?: string;
 }
 
 interface CodexErrorPayload {
   message?: string;
-  code?: string;
+  code?: string | number;
   type?: string;
   param?: string;
   request_id?: string;
@@ -226,6 +231,19 @@ interface ToolStreamState {
 interface FinalToolInput {
   input: unknown;
   inputParseError?: string;
+}
+
+interface CodexProviderErrorDetails {
+  message?: string;
+  publicMessage?: string;
+  code?: string | number;
+  type?: string;
+  param?: string;
+  requestId?: string;
+  retryAfterMs?: number;
+  category?: "quota_exhausted";
+  retryable?: boolean;
+  opensCircuit?: boolean;
 }
 
 const TOKEN_REFRESH_SKEW_MS = 60_000;
@@ -354,10 +372,24 @@ class CodexResponsesModel implements ChiliModel {
     yield { type: "metadata", provider: this.provider, model: requestOptions.model };
     const response = await this.fetchImpl(resolveCodexResponsesUrl(this.options.baseUrl), init);
     if (!response.ok) {
-      throw new Error(await parseCodexErrorResponse(response, this.options.chatGptHeaders));
+      throw await parseCodexErrorResponse(
+        response,
+        this.provider,
+        this.options.chatGptHeaders,
+        `${getProviderDisplayLabel(this.provider)} request`,
+      );
     }
-    if (!response.body) throw new Error("OpenAI Codex response did not include a body");
-    yield* this.streamSseResponse(response.body, input.signal, requestOptions.model);
+    if (!response.body) {
+      throw codexProtocolError(this.provider, "OpenAI Codex response did not include a body", response);
+    }
+    if (!isEventStreamResponse(response)) {
+      const payload = parseJson<CodexStreamPayload>(await response.text(), undefined);
+      if (payload?.error || payload?.type === "error" || payload?.type === "response.failed") {
+        throw formatCodexStreamError(payload, this.provider, "OpenAI Codex response failed", response);
+      }
+      throw codexProtocolError(this.provider, "OpenAI Codex response was not an event stream", response);
+    }
+    yield* this.streamSseResponse(response.body, response, input.signal, requestOptions.model);
   }
 
   private headers(credentials: ResolvedCodexCredentials, sessionId: string | undefined): HeadersInit {
@@ -383,6 +415,7 @@ class CodexResponsesModel implements ChiliModel {
 
   private async *streamSseResponse(
     body: ReadableStream<Uint8Array>,
+    response: Response,
     signal?: AbortSignal,
     requestModel: string = this.model,
   ): AsyncIterable<ModelStreamEvent> {
@@ -400,12 +433,12 @@ class CodexResponsesModel implements ChiliModel {
       const payload = parseJson<CodexStreamPayload>(event.data, undefined);
 
       if (event.event === "error" || payload?.type === "error") {
-        throw new Error(formatCodexStreamError(payload, event.data, "OpenAI Codex stream error"));
+        throw formatCodexStreamError(payload, this.provider, "OpenAI Codex stream error", response);
       }
       if (!payload?.type) continue;
 
       if (payload.type === "response.failed") {
-        throw new Error(formatCodexStreamError(payload, event.data, "OpenAI Codex response failed"));
+        throw formatCodexStreamError(payload, this.provider, "OpenAI Codex response failed", response);
       }
 
       if (payload.type === "response.created") {
@@ -416,7 +449,7 @@ class CodexResponsesModel implements ChiliModel {
 
       if (payload.type === "response.output_item.added" && payload.item) {
         if (payload.item.type === "message") {
-          recordCodexAssistantPhase(messagePhases, payload.output_index, payload.item.phase);
+          recordCodexAssistantPhase(messagePhases, payload.output_index, payload.item.phase, this.provider, response);
         }
         if (payload.item.type === "function_call") {
           sawToolCall = true;
@@ -442,7 +475,11 @@ class CodexResponsesModel implements ChiliModel {
         const index = payload.output_index;
         const phase = index === undefined ? undefined : messagePhases.get(index);
         if (index === undefined || phase === undefined) {
-          throw new Error(`OpenAI Codex stream has text delta for undeclared message output index ${String(index)}`);
+          throw codexProtocolError(
+            this.provider,
+            "OpenAI Codex stream has text delta for an undeclared message output",
+            response,
+          );
         }
         yield { type: "text_delta", text: payload.delta, index, phase };
         continue;
@@ -483,7 +520,7 @@ class CodexResponsesModel implements ChiliModel {
           };
         }
         if (payload.item.type === "message") {
-          recordCodexAssistantPhase(messagePhases, payload.output_index, payload.item.phase);
+          recordCodexAssistantPhase(messagePhases, payload.output_index, payload.item.phase, this.provider, response);
         }
         if (payload.item.type === "function_call") {
           const state = findToolState(toolCalls, payload, activeToolKey) ?? createToolState(payload.item, payload.output_index);
@@ -561,7 +598,7 @@ export class CodexApiResponsesModel extends CodexResponsesModel {
     ) {
       throw new Error(
         "OPENAI_CODEX_ACCESS_TOKEN looks like a ChatGPT OAuth token and cannot be used by codex-api; "
-        + "use /login for ChatGPT OAuth or set CODEX_API_KEY explicitly for the third-party API",
+        + "use /auth login for ChatGPT OAuth or set CODEX_API_KEY explicitly for the third-party API",
       );
     }
     const model = canonicalizeCodexApiModel(options.model ?? env.model ?? CODEX_API_DEFAULT_MODEL);
@@ -732,7 +769,7 @@ async function resolveOpenAICodexOAuthCredentials(
   const stored = await authStorage.getOAuthCredentials(OPENAI_CODEX_PROVIDER_ID);
   if (!stored) {
     throw new Error(
-      "No ChatGPT Codex OAuth credentials found. Run /login in the Chili TUI before using openai-codex.",
+      "No ChatGPT Codex OAuth credentials found. Run /auth login in the Chili TUI before using openai-codex.",
     );
   }
   if (stored.expires > Date.now() + TOKEN_REFRESH_SKEW_MS) {
@@ -948,7 +985,7 @@ function reasoningSectionEventIndex(payload: CodexStreamPayload, indexes: Map<st
 
 function requireCodexMessageOutputIndex(index: number | undefined): number {
   if (index === undefined || !Number.isInteger(index) || index < 0) {
-    throw new Error(`OpenAI Codex stream message output item has invalid output index ${String(index)}`);
+    throw new Error("OpenAI Codex stream message output item has an invalid output index");
   }
   return index;
 }
@@ -958,7 +995,7 @@ function requireCodexAssistantPhase(phase: string | undefined, index: number): A
     throw new Error(`OpenAI Codex message output index ${index} is missing assistant phase`);
   }
   if (phase !== "commentary" && phase !== "final_answer") {
-    throw new Error(`OpenAI Codex message output index ${index} has invalid assistant phase ${JSON.stringify(phase)}`);
+    throw new Error(`OpenAI Codex message output index ${index} has an invalid assistant phase`);
   }
   return phase;
 }
@@ -967,12 +1004,28 @@ function recordCodexAssistantPhase(
   phases: Map<number, AssistantMessagePhase>,
   outputIndex: number | undefined,
   rawPhase: string | undefined,
+  provider: typeof OPENAI_CODEX_PROVIDER_ID | typeof CODEX_API_PROVIDER_ID,
+  response: Response,
 ): void {
-  const index = requireCodexMessageOutputIndex(outputIndex);
-  const phase = requireCodexAssistantPhase(rawPhase, index);
+  let index: number;
+  let phase: AssistantMessagePhase;
+  try {
+    index = requireCodexMessageOutputIndex(outputIndex);
+    phase = requireCodexAssistantPhase(rawPhase, index);
+  } catch (error) {
+    throw codexProtocolError(
+      provider,
+      error instanceof Error ? error.message : "OpenAI Codex stream contained an invalid message item",
+      response,
+    );
+  }
   const existing = phases.get(index);
   if (existing !== undefined && existing !== phase) {
-    throw new Error(`OpenAI Codex stream has conflicting assistant phase for output index ${index}`);
+    throw codexProtocolError(
+      provider,
+      `OpenAI Codex stream has conflicting assistant phase for output index ${index}`,
+      response,
+    );
   }
   phases.set(index, phase);
 }
@@ -1095,43 +1148,147 @@ function mapCodexFinishReason(status: string | undefined, sawToolCall: boolean):
   return "stop";
 }
 
-async function parseCodexErrorResponse(response: Response, chatGptUsageMessage: boolean): Promise<string> {
-  const raw = await response.text().catch(() => "");
-  try {
-    const parsed = JSON.parse(raw) as { error?: CodexErrorPayload };
-    const error = parsed.error;
-    if (error) {
-      const code = error.code || error.type || "";
-      if (chatGptUsageMessage && (/usage_limit_reached|usage_not_included|rate_limit_exceeded/i.test(code) || response.status === 429)) {
-        const plan = error.plan_type ? ` (${error.plan_type.toLowerCase()} plan)` : "";
-        const minutes = error.resets_at ? Math.max(0, Math.round((error.resets_at * 1000 - Date.now()) / 60000)) : undefined;
+async function parseCodexErrorResponse(
+  response: Response,
+  provider: typeof OPENAI_CODEX_PROVIDER_ID | typeof CODEX_API_PROVIDER_ID,
+  chatGptUsageMessage: boolean,
+  label: string,
+): Promise<ProviderRequestError> {
+  return providerHttpError(response, {
+    provider,
+    label,
+    selectJson: ({ json }) => {
+      const error = codexJsonError(json);
+      if (!error) return undefined;
+      const details = codexProviderErrorDetails(error);
+      const code = typeof error === "string"
+        ? error
+        : nonEmptyCode(error.code) ?? nonEmptyString(error.type) ?? "";
+      if (
+        chatGptUsageMessage
+        && /(?:^|[_-])usage(?:[_-]limit[_-]reached|[_-]not[_-]included)(?:$|[_-])/i.test(code)
+      ) {
+        const planType = typeof error === "string" ? undefined : nonEmptyString(error.plan_type);
+        const resetsAt = typeof error === "string" || typeof error.resets_at !== "number" || !Number.isFinite(error.resets_at)
+          ? undefined
+          : error.resets_at;
+        const plan = planType ? ` (${planType.toLowerCase()} plan)` : "";
+        const minutes = resetsAt === undefined
+          ? undefined
+          : Math.max(0, Math.round((resetsAt * 1000 - Date.now()) / 60000));
+        const retryAfterMs = resetsAt === undefined
+          ? undefined
+          : Math.max(0, resetsAt * 1000 - Date.now());
         const retry = minutes !== undefined ? ` Try again in ~${minutes} min.` : "";
-        return `You have hit your ChatGPT usage limit${plan}.${retry}`.trim();
+        return {
+          ...(details ?? {}),
+          publicMessage: `You have hit your ChatGPT usage limit${plan}.${retry}`.trim(),
+          ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+          category: "quota_exhausted",
+          retryable: false,
+          opensCircuit: true,
+        };
       }
-      return formatCodexError(error) || raw || `OpenAI Codex request failed with HTTP ${response.status}`;
-    }
-  } catch {
-    // Fall back to raw text below.
-  }
-  return raw || `OpenAI Codex request failed with HTTP ${response.status}`;
+      return details;
+    },
+  });
 }
 
 function formatCodexStreamError(
   payload: CodexStreamPayload | undefined,
-  raw: string,
-  fallback: string,
-): string {
-  return codexPayloadErrorMessage(payload) ?? rawCodexErrorMessage(raw) ?? fallback;
+  provider: typeof OPENAI_CODEX_PROVIDER_ID | typeof CODEX_API_PROVIDER_ID,
+  label: string,
+  response?: Response,
+): ProviderRequestError {
+  const details = codexStreamErrorDetails(payload);
+  return providerPayloadError(payload, {
+    provider,
+    label,
+    ...(response ? { response } : {}),
+    ...(details ? { details } : {}),
+  });
 }
 
-function codexPayloadErrorMessage(payload: CodexStreamPayload | undefined): string | undefined {
+function codexProtocolError(
+  provider: typeof OPENAI_CODEX_PROVIDER_ID | typeof CODEX_API_PROVIDER_ID,
+  label: string,
+  response?: Response,
+): ProviderRequestError {
+  return providerPayloadError(undefined, {
+    provider,
+    label,
+    ...(response ? { response } : {}),
+  });
+}
+
+function isEventStreamResponse(response: Response): boolean {
+  const contentType = response.headers.get("content-type")?.toLowerCase();
+  return contentType === undefined || contentType.includes("text/event-stream");
+}
+
+function codexStreamErrorDetails(payload: CodexStreamPayload | undefined): CodexProviderErrorDetails | undefined {
   if (!payload) return undefined;
-  return firstNonEmptyString(
-    formatCodexError(payload.error),
-    formatCodexError(payload.response?.error),
-    payload.message,
-    payload.code,
-  );
+  const direct: CodexErrorPayload = {};
+  const message = nonEmptyString(payload.message);
+  const code = nonEmptyCode(payload.code);
+  if (message) direct.message = message;
+  if (code) direct.code = code;
+  return codexProviderErrorDetails(payload.error)
+    ?? codexProviderErrorDetails(payload.response?.error)
+    ?? codexProviderErrorDetails(direct);
+}
+
+function codexJsonError(value: unknown): CodexErrorPayload | string | undefined {
+  if (!isRecord(value)) return undefined;
+  const error = value.error;
+  if (typeof error === "string") return nonEmptyString(error);
+  if (!isRecord(error)) return undefined;
+
+  const result: CodexErrorPayload = {};
+  const message = nonEmptyString(error.message);
+  const code = nonEmptyCode(error.code);
+  const type = nonEmptyString(error.type);
+  const param = nonEmptyString(error.param);
+  const requestId = nonEmptyString(error.request_id);
+  const camelRequestId = nonEmptyString(error.requestId);
+  const planType = nonEmptyString(error.plan_type);
+  if (message) result.message = message;
+  if (code) result.code = code;
+  if (type) result.type = type;
+  if (param) result.param = param;
+  if (requestId) result.request_id = requestId;
+  if (camelRequestId) result.requestId = camelRequestId;
+  if (planType) result.plan_type = planType;
+  if (typeof error.resets_at === "number" && Number.isFinite(error.resets_at)) {
+    result.resets_at = error.resets_at;
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function codexProviderErrorDetails(
+  error: CodexErrorPayload | string | undefined,
+): CodexProviderErrorDetails | undefined {
+  const publicMessage = formatCodexError(error);
+  if (!error || !publicMessage) return undefined;
+  if (typeof error === "string") return { message: error, publicMessage };
+
+  const message = nonEmptyString(error.message);
+  const code = nonEmptyCode(error.code);
+  const type = nonEmptyString(error.type);
+  const param = nonEmptyString(error.param);
+  const requestId = nonEmptyString(error.request_id ?? error.requestId);
+  return {
+    publicMessage,
+    ...(message ? { message } : {}),
+    ...(code ? { code } : {}),
+    ...(type ? { type } : {}),
+    ...(param ? { param } : {}),
+    ...(requestId ? { requestId } : {}),
+  };
 }
 
 function formatCodexError(error: CodexErrorPayload | string | undefined): string | undefined {
@@ -1139,7 +1296,7 @@ function formatCodexError(error: CodexErrorPayload | string | undefined): string
   if (typeof error === "string") return nonEmptyString(error);
 
   const message = nonEmptyString(error.message);
-  const code = nonEmptyString(error.code);
+  const code = nonEmptyCode(error.code);
   const type = nonEmptyString(error.type);
   const param = nonEmptyString(error.param);
   const requestId = nonEmptyString(error.request_id ?? error.requestId);
@@ -1154,22 +1311,13 @@ function formatCodexError(error: CodexErrorPayload | string | undefined): string
   return details.length > 0 ? `${primary} (${details.join(", ")})` : primary;
 }
 
-function rawCodexErrorMessage(raw: string): string | undefined {
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed === "[DONE]") return undefined;
-  return trimmed;
+function nonEmptyCode(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return nonEmptyString(value);
 }
 
-function firstNonEmptyString(...values: Array<string | undefined>): string | undefined {
-  for (const value of values) {
-    const normalized = nonEmptyString(value);
-    if (normalized) return normalized;
-  }
-  return undefined;
-}
-
-function nonEmptyString(value: string | undefined): string | undefined {
-  const trimmed = value?.trim();
+function nonEmptyString(value: unknown): string | undefined {
+  const trimmed = typeof value === "string" ? value.trim() : "";
   return trimmed ? trimmed : undefined;
 }
 

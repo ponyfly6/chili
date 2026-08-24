@@ -15,6 +15,8 @@ import {
   OPENAI_CODEX_PROVIDER_ID,
   OpenAICodexResponsesModel,
   OPENAI_CODEX_TOKEN_URL,
+  PROVIDER_RETRY_AFTER_MAX_MS,
+  ProviderError,
   refreshOpenAICodexToken,
   resolveCodexApiResponsesUrl,
   resolveCodexApiStreamRequestOptions,
@@ -658,6 +660,33 @@ test("accepts OpenAI Codex token exchange fields from id_token", async () => {
   });
 });
 
+test("types and sanitizes OAuth 2xx error envelopes", async () => {
+  const error = await rejectedProviderError(() => refreshOpenAICodexToken("refresh_old", {
+    fetch: (async () => new Response(JSON.stringify({
+      error: "invalid_grant",
+      error_description: "API key is SUPERSECRET12345 rejected at ::ffff:192.0.2.1",
+    }), {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "x-request-id": "req_oauth_2xx",
+        "retry-after": String(10 * 24 * 60 * 60),
+      },
+    })) as unknown as typeof fetch,
+  }));
+
+  expect(error).toMatchObject({
+    provider: OPENAI_CODEX_PROVIDER_ID,
+    status: 200,
+    code: "invalid_grant",
+    requestId: "req_oauth_2xx",
+    retryAfterMs: PROVIDER_RETRY_AFTER_MAX_MS,
+    retryable: false,
+  });
+  expect(error.message).not.toContain("SUPERSECRET12345");
+  expect(error.message).not.toContain("192.0.2.1");
+});
+
 test("refresh preserves existing token fields when Codex omits optional fields", async () => {
   const expiresAtSeconds = Math.floor(Date.now() / 1000) + 3600;
   const accessToken = jwtWithPayload({ exp: expiresAtSeconds, sub: "new_access" });
@@ -763,7 +792,10 @@ test("ChatGPT Codex does not request a model or overwrite credentials when OAuth
   let modelCalls = 0;
   const fetchImpl = (async (input) => {
     if (String(input) === OPENAI_CODEX_TOKEN_URL) {
-      return new Response("refresh denied", { status: 401 });
+      return new Response(
+        "<!DOCTYPE html><html><body>refresh denied at 10.9.8.7 with private-refresh-token</body></html>",
+        { status: 401 },
+      );
     }
     modelCalls += 1;
     return new Response(null, { status: 500 });
@@ -774,9 +806,16 @@ test("ChatGPT Codex does not request a model or overwrite credentials when OAuth
     fetch: fetchImpl,
   });
 
-  await expect(collect(model.stream({ messages: [] }))).rejects.toThrow(
-    "token request failed with HTTP 401",
-  );
+  const error = await rejectedProviderError(() => collect(model.stream({ messages: [] })));
+  expect(error).toMatchObject({
+    provider: OPENAI_CODEX_PROVIDER_ID,
+    status: 401,
+    category: "authentication",
+    retryable: false,
+    message: "OpenAI Codex token request failed with HTTP 401 Unauthorized",
+  });
+  expect(error.message).not.toContain("10.9.8.7");
+  expect(error.message).not.toContain("private-refresh-token");
   expect(modelCalls).toBe(0);
   expect(storage.writes).toHaveLength(0);
   expect(await storage.getOAuthCredentials(OPENAI_CODEX_PROVIDER_ID)).toEqual(oldCredential);
@@ -943,14 +982,14 @@ for (const scenario of [
         item: { type: "message", id: "msg_unknown", phase: "analysis" },
       }),
     ],
-    error: 'invalid assistant phase "analysis"',
+    error: "invalid assistant phase",
   },
   {
     name: "rejects a Codex text delta without a declared message item",
     events: [
       data({ type: "response.output_text.delta", output_index: 3, delta: "orphan" }),
     ],
-    error: "text delta for undeclared message output index 3",
+    error: "text delta for an undeclared message output",
   },
   {
     name: "rejects conflicting phases for one Codex output index",
@@ -998,9 +1037,37 @@ for (const scenario of [
 ] as const) {
   test(scenario.name, async () => {
     const model = codexStreamModel(scenario.events);
-    await expect(collect(model.stream({ messages: [], tools: [], system: [] }))).rejects.toThrow(scenario.error);
+    const error = await rejectedProviderError(() => collect(model.stream({ messages: [], tools: [], system: [] })));
+    expect(error).toMatchObject({ provider: "codex-api", category: "unknown", retryable: false });
+    expect(error.message).toContain(scenario.error);
   });
 }
+
+test("sanitizes malformed Codex stream indexes and phases", async () => {
+  const secrets = [
+    `Bearer ${"secret".repeat(40)}`,
+    `<script>${"private".repeat(100)}</script>`,
+  ];
+  const scenarios = [
+    data({
+      type: "response.output_item.added",
+      output_index: secrets[0],
+      item: { type: "message", id: "msg_bad_index", phase: "commentary" },
+    }),
+    data({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { type: "message", id: "msg_bad_phase", phase: secrets[1] },
+    }),
+  ];
+
+  for (const event of scenarios) {
+    const error = await rejectedProviderError(() => collect(codexStreamModel([event]).stream({ messages: [] })));
+    expect(error).toMatchObject({ provider: "codex-api", category: "unknown", retryable: false });
+    expect(new TextEncoder().encode(error.message).byteLength).toBeLessThanOrEqual(1024);
+    for (const secret of secrets) expect(error.message).not.toContain(secret);
+  }
+});
 
 test("preserves reasoning summary sections from Codex Responses streams", async () => {
   const model = new CodexApiResponsesModel({
@@ -1235,9 +1302,15 @@ test("surfaces nested OpenAI Codex SSE error details", async () => {
     env: {},
   });
 
-  await expect(collect(model.stream({ messages: [], tools: [], system: [] }))).rejects.toThrow(
-    "Request too large for model (code: context_length_exceeded, type: invalid_request_error, param: input, request id: req_sse_1)",
-  );
+  const error = await rejectedProviderError(() => collect(model.stream({ messages: [], tools: [], system: [] })));
+  expect(error).toMatchObject({
+    provider: "codex-api",
+    code: "context_length_exceeded",
+    type: "invalid_request_error",
+    param: "input",
+    requestId: "req_sse_1",
+    message: "Request too large for model (code: context_length_exceeded, type: invalid_request_error, param: input, request id: req_sse_1)",
+  });
 });
 
 test("surfaces OpenAI Codex response.failed error details", async () => {
@@ -1256,6 +1329,7 @@ test("surfaces OpenAI Codex response.failed error details", async () => {
             message: "Rate limit reached",
             code: "rate_limit_exceeded",
             request_id: "req_failed_1",
+            retry_after_ms: 10 * 24 * 60 * 60 * 1_000,
           },
         },
       }),
@@ -1263,9 +1337,104 @@ test("surfaces OpenAI Codex response.failed error details", async () => {
     env: {},
   });
 
-  await expect(collect(model.stream({ messages: [], tools: [], system: [] }))).rejects.toThrow(
-    "Rate limit reached (code: rate_limit_exceeded, request id: req_failed_1)",
-  );
+  const error = await rejectedProviderError(() => collect(model.stream({ messages: [], tools: [], system: [] })));
+  expect(error).toMatchObject({
+    provider: "codex-api",
+    category: "rate_limit",
+    retryable: true,
+    opensCircuit: false,
+    code: "rate_limit_exceeded",
+    requestId: "req_failed_1",
+    retryAfterMs: PROVIDER_RETRY_AFTER_MAX_MS,
+    message: "Rate limit reached (code: rate_limit_exceeded, request id: req_failed_1)",
+  });
+});
+
+test("types Codex string-form HTTP and SSE machine errors", async () => {
+  const expectations = [
+    { code: "rate_limit_exceeded", category: "rate_limit", retryable: true, opensCircuit: false },
+    { code: "usage_limit_reached", category: "quota_exhausted", retryable: false, opensCircuit: true },
+    { code: "usage_not_included", category: "quota_exhausted", retryable: false, opensCircuit: true },
+  ] as const;
+
+  for (const expected of expectations) {
+    const sseError = await rejectedProviderError(() => collect(codexStreamModel([
+      data({ type: "error", error: expected.code }),
+    ]).stream({ messages: [] })));
+    expect(sseError).toMatchObject({ provider: "codex-api", ...expected });
+  }
+
+  const httpModel = new CodexApiResponsesModel({
+    model: "gpt-5.6-sol",
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
+    fetch: (async () => new Response(JSON.stringify({ error: "rate_limit_exceeded" }), {
+      status: 429,
+      headers: { "content-type": "application/json" },
+    })) as unknown as typeof fetch,
+    env: {},
+  });
+  const httpError = await rejectedProviderError(() => collect(httpModel.stream({ messages: [] })));
+  expect(httpError).toMatchObject({
+    provider: "codex-api",
+    status: 429,
+    code: "rate_limit_exceeded",
+    category: "rate_limit",
+    retryable: true,
+  });
+});
+
+test("types missing-body and 2xx JSON Codex response failures", async () => {
+  const missingBody = new CodexApiResponsesModel({
+    model: "gpt-5.6-sol",
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
+    fetch: (async () => new Response(null, {
+      status: 200,
+      headers: { "x-request-id": "req_missing_body" },
+    })) as unknown as typeof fetch,
+    env: {},
+  });
+  const missingError = await rejectedProviderError(() => collect(missingBody.stream({ messages: [] })));
+  expect(missingError).toMatchObject({
+    provider: "codex-api",
+    status: 200,
+    requestId: "req_missing_body",
+    message: "OpenAI Codex response did not include a body (request id: req_missing_body)",
+  });
+
+  const envelope = new CodexApiResponsesModel({
+    model: "gpt-5.6-sol",
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
+    fetch: (async () => new Response(JSON.stringify({
+      error: {
+        message: "Quota exhausted for API key is SUPERSECRET12345 at 2001:db8::1234",
+        code: "usage_limit_reached",
+      },
+    }), {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "x-request-id": "req_codex_2xx",
+        "retry-after": String(10 * 24 * 60 * 60),
+      },
+    })) as unknown as typeof fetch,
+    env: {},
+  });
+  const envelopeError = await rejectedProviderError(() => collect(envelope.stream({ messages: [] })));
+  expect(envelopeError).toMatchObject({
+    provider: "codex-api",
+    status: 200,
+    code: "usage_limit_reached",
+    requestId: "req_codex_2xx",
+    retryAfterMs: PROVIDER_RETRY_AFTER_MAX_MS,
+    category: "quota_exhausted",
+    retryable: false,
+    opensCircuit: true,
+  });
+  expect(envelopeError.message).not.toContain("SUPERSECRET12345");
+  expect(envelopeError.message).not.toContain("2001:db8::1234");
 });
 
 test("surfaces OpenAI Codex HTTP error details", async () => {
@@ -1287,15 +1456,92 @@ test("surfaces OpenAI Codex HTTP error details", async () => {
     env: {},
   });
 
-  await expect(collect(model.stream({ messages: [], tools: [], system: [] }))).rejects.toThrow(
-    "Invalid token (code: invalid_api_key, request id: req_http_1)",
-  );
+  const error = await rejectedProviderError(() => collect(model.stream({ messages: [], tools: [], system: [] })));
+  expect(error).toMatchObject({
+    provider: "codex-api",
+    status: 401,
+    category: "authentication",
+    retryable: false,
+    code: "invalid_api_key",
+    requestId: "req_http_1",
+    message: "Invalid token (code: invalid_api_key, request id: req_http_1)",
+  });
 });
 
-test("formats HTTP 429 by provider authentication mode", async () => {
+test("validates structured Codex error fields before selecting a public message", async () => {
+  const model = new CodexApiResponsesModel({
+    model: "gpt-5.6-sol",
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
+    fetch: (async () => new Response(JSON.stringify({
+      error: {
+        message: { nested: "private-message-10.9.8.7" },
+        code: 1234,
+        type: ["private-type"],
+        request_id: { secret: "private-request-id" },
+      },
+    }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    })) as unknown as typeof fetch,
+    env: {},
+  });
+
+  const error = await rejectedProviderError(() => collect(model.stream({ messages: [] })));
+  expect(error).toMatchObject({
+    provider: "codex-api",
+    status: 400,
+    category: "invalid_request",
+    code: "1234",
+    message: "1234",
+  });
+  expect(error.message).not.toContain("private-message");
+  expect(error.message).not.toContain("private-type");
+  expect(error.message).not.toContain("private-request-id");
+  expect(error.message).not.toContain("10.9.8.7");
+});
+
+test("normalizes Codex API HTTP and raw SSE failures without exposing provider bodies", async () => {
+  const html = "<!DOCTYPE html><html><body>gateway 10.9.8.7 bearer-secret-123</body></html>";
+  const httpModel = new CodexApiResponsesModel({
+    model: "gpt-5.6-sol",
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
+    fetch: (async () => new Response(html, { status: 502 })) as unknown as typeof fetch,
+    env: {},
+  });
+
+  const httpError = await rejectedProviderError(() => collect(httpModel.stream({ messages: [] })));
+  expect(httpError).toMatchObject({
+    provider: "codex-api",
+    status: 502,
+    category: "server_error",
+    retryable: true,
+    message: "Codex API request failed with HTTP 502 Bad Gateway",
+  });
+  expect(httpError.message).not.toContain("10.9.8.7");
+  expect(httpError.message).not.toContain("bearer-secret-123");
+
+  const sseModel = new CodexApiResponsesModel({
+    model: "gpt-5.6-sol",
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
+    fetch: sseFetch([`event: error\ndata: ${html}\n\n`]),
+    env: {},
+  });
+  const sseError = await rejectedProviderError(() => collect(sseModel.stream({ messages: [] })));
+  expect(sseError).toMatchObject({
+    provider: "codex-api",
+    message: "OpenAI Codex stream error",
+  });
+  expect(sseError.message).not.toContain("10.9.8.7");
+  expect(sseError.message).not.toContain("bearer-secret-123");
+});
+
+test("keeps transient ChatGPT 429 failures retryable", async () => {
   const rateLimitFetch = (): typeof fetch => (async () => new Response(JSON.stringify({
     error: {
-      message: "Gateway quota exhausted",
+      message: "Gateway rate limit reached",
       code: "rate_limit_exceeded",
       request_id: "req_rate_limit",
     },
@@ -1311,7 +1557,7 @@ test("formats HTTP 429 by provider authentication mode", async () => {
     fetch: rateLimitFetch(),
   });
   await expect(collect(apiModel.stream({ messages: [] }))).rejects.toThrow(
-    "Gateway quota exhausted (code: rate_limit_exceeded, request id: req_rate_limit)",
+    "Gateway rate limit reached (code: rate_limit_exceeded, request id: req_rate_limit)",
   );
 
   const oauthModel = new OpenAICodexResponsesModel({
@@ -1319,10 +1565,62 @@ test("formats HTTP 429 by provider authentication mode", async () => {
     authStorage: staticOAuthStorage(jwtWithAccount("acct_limit"), "acct_limit"),
     fetch: rateLimitFetch(),
   });
-  await expect(collect(oauthModel.stream({ messages: [] }))).rejects.toThrow(
-    "You have hit your ChatGPT usage limit",
-  );
+  const error = await rejectedProviderError(() => collect(oauthModel.stream({ messages: [] })));
+  expect(error).toMatchObject({
+    provider: OPENAI_CODEX_PROVIDER_ID,
+    status: 429,
+    category: "rate_limit",
+    retryable: true,
+    opensCircuit: false,
+    code: "rate_limit_exceeded",
+  });
+  expect(error.message).toBe("Gateway rate limit reached (code: rate_limit_exceeded, request id: req_rate_limit)");
 });
+
+test.each(["usage_limit_reached", "usage_not_included"])(
+  "opens the ChatGPT usage circuit for %s",
+  async (code) => {
+    const model = new OpenAICodexResponsesModel({
+      model: "gpt-5.6-sol",
+      authStorage: staticOAuthStorage(jwtWithAccount("acct_limit"), "acct_limit"),
+      fetch: (async () => new Response(JSON.stringify({
+        error: {
+          message: "Provider-specific private quota detail",
+          code,
+          plan_type: "Plus",
+          resets_at: Math.round((Date.now() + 120_000) / 1_000),
+          request_id: "req_usage_limit",
+        },
+      }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch,
+    });
+
+    const error = await rejectedProviderError(() => collect(model.stream({ messages: [] })));
+    expect(error).toMatchObject({
+      provider: OPENAI_CODEX_PROVIDER_ID,
+      status: 429,
+      category: "quota_exhausted",
+      retryable: false,
+      opensCircuit: true,
+      code,
+      requestId: "req_usage_limit",
+    });
+    expect(error.message).toContain("You have hit your ChatGPT usage limit (plus plan).");
+    expect(error.message).not.toContain("Provider-specific private quota detail");
+  },
+);
+
+async function rejectedProviderError(run: () => Promise<unknown>): Promise<ProviderError> {
+  try {
+    await run();
+  } catch (error) {
+    expect(error).toBeInstanceOf(ProviderError);
+    return error as ProviderError;
+  }
+  throw new Error("Expected operation to reject with ProviderError");
+}
 
 async function collect(stream: AsyncIterable<ModelStreamEvent>): Promise<ModelStreamEvent[]> {
   const events: ModelStreamEvent[] = [];
