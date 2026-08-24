@@ -28,7 +28,7 @@ import {
   type RuntimeTeamTaskSyncResult,
   type RuntimeTeamSnapshot,
 } from "./client.js";
-import { chatSessionView, createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, sessionMessages, teamLiveCockpit, teamLiveView, type ChatTranscriptItem } from "./projection.js";
+import { chatAgentBatches, chatSessionView, createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, runtimeDelegationStatus, sessionMessages, teamLiveCockpit, teamLiveView, type ChatTranscriptItem } from "./projection.js";
 
 test("projects the selected failed session status reason", () => {
   const sessionId = "session_status_reason" as SessionId;
@@ -1433,6 +1433,2642 @@ test("projects tool-specific approval summaries for chat TUI", () => {
   });
 });
 
+test("keeps parent execution idle while an ad-hoc child agent is running", () => {
+  const sessionId = "session_parent_idle_child_running" as SessionId;
+  const threadId = "thread_parent_idle_child_running" as ThreadId;
+  const childSessionId = "session_child_running" as SessionId;
+  const childThreadId = "thread_child_running" as ThreadId;
+  const taskId = "task_child_running" as TaskId;
+  const runId = "agent_child_running" as AgentRunId;
+  const path = "/root/child-running" as AgentPath;
+  const callId = "tool_child_running" as ToolCallId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_parent_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_delegation_policy",
+      type: "session.delegation_changed",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, policy: "proactive" },
+    },
+    {
+      id: "event_agent_task",
+      type: "agent.task_created",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        taskId,
+        path,
+        parentPath: "/root" as AgentPath,
+        parentSessionId: sessionId,
+        parentThreadId: threadId,
+        childSessionId,
+        childThreadId,
+        taskName: "inspect child state",
+        cwd: "/repo",
+        prompt: "Inspect the child state.",
+        mode: "background",
+      },
+    },
+    {
+      id: "event_agent_spawn",
+      type: "agent.spawned",
+      time: 4 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        runId,
+        taskId,
+        path,
+        parentPath: "/root" as AgentPath,
+        parentSessionId: sessionId,
+        parentThreadId: threadId,
+        childSessionId,
+        childThreadId,
+        taskName: "inspect child state",
+        mode: "background",
+        generation: 1,
+      },
+    },
+    {
+      id: "event_child_session",
+      type: "session.created",
+      time: 5 as TimestampMs,
+      sessionId: childSessionId,
+      threadId: childThreadId,
+      payload: { sessionId: childSessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_child_running",
+      type: "session.status_changed",
+      time: 6 as TimestampMs,
+      sessionId: childSessionId,
+      threadId: childThreadId,
+      payload: { sessionId: childSessionId, status: "running" },
+    },
+    {
+      id: "event_child_tool",
+      type: "tool.call_started",
+      time: 7 as TimestampMs,
+      sessionId: childSessionId,
+      threadId: childThreadId,
+      payload: { turnId: "turn_child_running" as TurnId, callId, toolName: "read_file", input: { path: "README.md" } },
+    },
+    {
+      id: "event_parent_idle",
+      type: "session.status_changed",
+      time: 8 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, status: "idle" },
+    },
+  ], createRuntimeView());
+
+  const status = runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" });
+
+  expect(status.parent).toMatchObject({ sessionId, threadId, status: "idle", active: false });
+  expect(status.delegation).toEqual({ supported: true, observed: true, policy: "proactive", source: "session" });
+  expect(status.agents.counts).toEqual({
+    total: 1,
+    pending: 0,
+    running: 1,
+    active: 1,
+    completed: 0,
+    incomplete: 0,
+    failed: 0,
+    cancelled: 0,
+  });
+  expect(status.agents.active[0]).toMatchObject({
+    taskId,
+    runId,
+    status: "running",
+    activity: { kind: "tool", label: "read_file", status: "running", updatedAt: 7 },
+  });
+  expect(status.team).toEqual({ count: 0, activeCount: 0 });
+});
+
+test("projects the last agent batch with one incomplete and four failed tasks", () => {
+  const sessionId = "session_partial_agent_batch" as SessionId;
+  const threadId = "thread_partial_agent_batch" as ThreadId;
+  const callId = "tool_partial_agent_batch" as ToolCallId;
+  const batchId = "batch_partial_agent_batch";
+  const taskStatuses = ["incomplete", "failed", "failed", "failed", "failed"] as const;
+  const taskIds = taskStatuses.map((_, index) => `task_partial_${index}` as TaskId);
+  const taskEvents = taskStatuses.flatMap((status, index): ChiliEvent[] => {
+    const taskId = taskIds[index] as TaskId;
+    const path = `/root/partial-${index}` as AgentPath;
+    return [
+      {
+        id: `event_partial_task_${index}`,
+        type: "agent.task_created",
+        time: (10 + index * 3) as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          taskId,
+          path,
+          parentPath: "/root" as AgentPath,
+          parentSessionId: sessionId,
+          parentThreadId: threadId,
+          childSessionId: `session_partial_${index}` as SessionId,
+          childThreadId: `thread_partial_${index}` as ThreadId,
+          taskName: `partial slice ${index}`,
+          cwd: "/repo",
+          prompt: `Inspect slice ${index}`,
+          mode: "background",
+          sourceCallId: callId,
+          batchId,
+          batchIndex: index,
+          expectedBatchSize: taskStatuses.length,
+          completionPolicy: "notify",
+          maxConcurrency: 5,
+        },
+      },
+      {
+        id: `event_partial_spawn_${index}`,
+        type: "agent.spawned",
+        time: (11 + index * 3) as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          runId: `agent_partial_${index}` as AgentRunId,
+          taskId,
+          path,
+          parentPath: "/root" as AgentPath,
+          parentSessionId: sessionId,
+          parentThreadId: threadId,
+          childSessionId: `session_partial_${index}` as SessionId,
+          childThreadId: `thread_partial_${index}` as ThreadId,
+          taskName: `partial slice ${index}`,
+          mode: "background",
+          generation: 1,
+          sourceCallId: callId,
+          batchId,
+          batchIndex: index,
+          expectedBatchSize: taskStatuses.length,
+          completionPolicy: "notify",
+          maxConcurrency: 5,
+        },
+      },
+      {
+        id: `event_partial_terminal_${index}`,
+        type: "agent.task_completed",
+        time: (12 + index * 3) as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          taskId,
+          path,
+          runId: `agent_partial_${index}` as AgentRunId,
+          status,
+          generation: 1,
+          ...(status === "incomplete" ? { summary: "evidence missing" } : { error: `worker ${index} failed` }),
+        },
+      },
+    ];
+  });
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_partial_parent",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_partial_batch_tool",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        turnId: "turn_partial_batch" as TurnId,
+        callId,
+        toolName: "task_batch",
+        input: { tasks: taskStatuses.map((_, index) => ({ description: `slice ${index}`, prompt: "inspect" })) },
+      },
+    },
+    ...taskEvents,
+    {
+      id: "event_partial_batch_finished",
+      type: "tool.call_finished",
+      time: 40 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId, status: "completed", output: JSON.stringify({ tasks: taskIds.map((taskId) => ({ task_id: taskId })) }) },
+    },
+    {
+      id: "event_partial_parent_idle",
+      type: "session.status_changed",
+      time: 41 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, status: "idle" },
+    },
+  ], createRuntimeView());
+
+  const status = runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" });
+
+  expect(status.parent).toMatchObject({ status: "idle", active: false });
+  expect(status.agents.counts).toEqual({
+    total: 5,
+    pending: 0,
+    running: 0,
+    active: 0,
+    completed: 0,
+    incomplete: 1,
+    failed: 4,
+    cancelled: 0,
+  });
+  expect(status.lastBatch).toMatchObject({
+    callId,
+    batchId,
+    taskIds,
+    expected: 5,
+    untracked: 0,
+    total: 5,
+    active: 0,
+    incomplete: 1,
+    failed: 4,
+    mixed: true,
+    partial: false,
+    status: "mixed",
+    completionPolicy: "notify",
+    maxConcurrency: 5,
+  });
+});
+
+test("keeps the newest batch selected while an older batch finishes late", () => {
+  const sessionId = "session_latest_batch" as SessionId;
+  const threadId = "thread_latest_batch" as ThreadId;
+  const oldCallId = "tool_old_batch" as ToolCallId;
+  const newCallId = "tool_new_batch" as ToolCallId;
+  const oldTaskId = "task_old_batch" as TaskId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_latest_batch_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_old_batch_started",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_old_batch" as TurnId, callId: oldCallId, toolName: "task_batch", input: { tasks: [{}] } },
+    },
+    agentTaskCreatedEvent({
+      id: "event_old_batch_task",
+      time: 3,
+      sessionId,
+      threadId,
+      taskId: oldTaskId,
+      sourceCallId: oldCallId,
+      batchId: "batch_old",
+      batchIndex: 0,
+      expectedBatchSize: 1,
+    }),
+    {
+      id: "event_new_batch_started",
+      type: "tool.call_started",
+      time: 4 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        turnId: "turn_new_batch" as TurnId,
+        callId: newCallId,
+        toolName: "task_batch",
+        input: { tasks: [{}, {}, {}] },
+      },
+    },
+    {
+      id: "event_old_batch_late_failure",
+      type: "agent.task_completed",
+      time: 10 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        taskId: oldTaskId,
+        path: "/root/task_old_batch" as AgentPath,
+        status: "failed",
+        error: "late old failure",
+      },
+    },
+  ], createRuntimeView());
+
+  const launching = runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" });
+  expect(launching.delegation.observed).toBe(true);
+  expect(launching.lastBatch).toMatchObject({
+    callId: newCallId,
+    expected: 3,
+    total: 0,
+    untracked: 3,
+    mixed: false,
+    partial: false,
+    status: "running",
+  });
+
+  reduceRuntimeEvents([{
+    id: "event_new_batch_failed",
+    type: "tool.call_finished",
+    time: 11 as TimestampMs,
+    sessionId,
+    threadId,
+    payload: { callId: newCallId, status: "failed", error: "launch rejected" },
+  }], view);
+  const failed = runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" });
+  expect(failed.lastBatch).toMatchObject({
+    callId: newCallId,
+    total: 0,
+    untracked: 3,
+    mixed: false,
+    partial: false,
+    status: "failed",
+    error: "launch rejected",
+  });
+});
+
+test("uses partial only when a terminal batch tracks fewer tasks than planned", () => {
+  const sessionId = "session_structural_partial" as SessionId;
+  const threadId = "thread_structural_partial" as ThreadId;
+  const callId = "tool_structural_partial" as ToolCallId;
+  const taskId = "task_structural_partial" as TaskId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_structural_partial_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_structural_partial_started",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        turnId: "turn_structural_partial" as TurnId,
+        callId,
+        toolName: "task_batch",
+        input: { tasks: [{}, {}, {}] },
+      },
+    },
+    agentTaskCreatedEvent({
+      id: "event_structural_partial_task",
+      time: 3,
+      sessionId,
+      threadId,
+      taskId,
+      sourceCallId: callId,
+      batchId: "batch_structural_partial",
+      batchIndex: 0,
+      expectedBatchSize: 1,
+    }),
+    {
+      id: "event_structural_partial_task_done",
+      type: "agent.task_completed",
+      time: 4 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { taskId, path: "/root/task_structural_partial" as AgentPath, status: "completed", summary: "done" },
+    },
+    {
+      id: "event_structural_partial_tool_done",
+      type: "tool.call_finished",
+      time: 5 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId, status: "completed" },
+    },
+  ], createRuntimeView());
+
+  expect(runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" }).lastBatch).toMatchObject({
+    callId,
+    expected: 3,
+    total: 1,
+    untracked: 2,
+    completed: 1,
+    mixed: false,
+    partial: true,
+    status: "partial",
+  });
+});
+
+test("projects a completed tool envelope with zero successful spawns as a failed batch", () => {
+  const sessionId = "session_all_spawns_failed" as SessionId;
+  const threadId = "thread_all_spawns_failed" as ThreadId;
+  const callId = "tool_all_spawns_failed" as ToolCallId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_all_spawns_failed_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_all_spawns_failed_started",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        turnId: "turn_all_spawns_failed" as TurnId,
+        callId,
+        toolName: "task_batch",
+        input: { tasks: [{}, {}, {}] },
+      },
+    },
+    {
+      id: "event_all_spawns_failed_finished",
+      type: "tool.call_finished",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        callId,
+        status: "completed",
+        output: JSON.stringify({
+          expected_batch_size: 3,
+          spawned_count: 0,
+          spawn_failure_count: 3,
+          spawn_failures: [
+            { batch_index: 0, description: "first", error: "spawn failed: first" },
+            { batch_index: 1, description: "second", error: "spawn failed: second" },
+            { batch_index: 2, description: "third", error: "spawn failed: third" },
+          ],
+          tasks: [],
+        }),
+      },
+    },
+  ], createRuntimeView());
+
+  const status = runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" });
+  expect(status.delegation.observed).toBe(true);
+  expect(status.lastBatch).toMatchObject({
+    callId,
+    expected: 3,
+    total: 0,
+    untracked: 3,
+    spawnedCount: 0,
+    spawnFailureCount: 3,
+    mixed: false,
+    partial: false,
+    status: "failed",
+    error: "3 of 3 agent tasks failed to spawn: first: spawn failed: first; second: spawn failed: second; third: spawn failed: third",
+    spawnFailures: [
+      { batchIndex: 0, description: "first", error: "spawn failed: first" },
+      { batchIndex: 1, description: "second", error: "spawn failed: second" },
+      { batchIndex: 2, description: "third", error: "spawn failed: third" },
+    ],
+  });
+});
+
+test("keeps a partially spawned completed tool envelope structurally partial", () => {
+  const sessionId = "session_partial_spawn" as SessionId;
+  const threadId = "thread_partial_spawn" as ThreadId;
+  const callId = "tool_partial_spawn" as ToolCallId;
+  const firstTaskId = "task_partial_spawn_first" as TaskId;
+  const thirdTaskId = "task_partial_spawn_third" as TaskId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_partial_spawn_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_partial_spawn_started",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        turnId: "turn_partial_spawn" as TurnId,
+        callId,
+        toolName: "task_batch",
+        input: { tasks: [{}, {}, {}] },
+      },
+    },
+    agentTaskCreatedEvent({
+      id: "event_partial_spawn_first_task",
+      time: 3,
+      sessionId,
+      threadId,
+      taskId: firstTaskId,
+      sourceCallId: callId,
+      batchId: "batch_partial_spawn",
+      batchIndex: 0,
+      expectedBatchSize: 3,
+    }),
+    agentTaskCreatedEvent({
+      id: "event_partial_spawn_third_task",
+      time: 4,
+      sessionId,
+      threadId,
+      taskId: thirdTaskId,
+      sourceCallId: callId,
+      batchId: "batch_partial_spawn",
+      batchIndex: 2,
+      expectedBatchSize: 3,
+    }),
+    {
+      id: "event_partial_spawn_metadata",
+      type: "tool.call_updated",
+      time: 5 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        callId,
+        status: "running",
+        metadata: {
+          spawnedCount: 2,
+          spawnFailureCount: 1,
+          spawnFailures: [{ batchIndex: 1, description: "second", error: "spawn failed: second" }],
+        },
+      },
+    },
+    {
+      id: "event_partial_spawn_finished",
+      type: "tool.call_finished",
+      time: 6 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        callId,
+        status: "completed",
+        output: JSON.stringify({
+          expectedBatchSize: 3,
+          tasks: [{ taskId: firstTaskId }, { taskId: thirdTaskId }],
+        }),
+      },
+    },
+  ], createRuntimeView());
+
+  expect(runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" }).lastBatch).toMatchObject({
+    callId,
+    expected: 3,
+    taskIds: [firstTaskId, thirdTaskId],
+    total: 2,
+    pending: 2,
+    active: 2,
+    untracked: 1,
+    spawnedCount: 2,
+    spawnFailureCount: 1,
+    mixed: false,
+    partial: true,
+    status: "partial",
+    error: "1 of 3 agent task failed to spawn: second: spawn failed: second",
+  });
+});
+
+test("keeps historical team workers out of ad-hoc agents after redispatch", () => {
+  const sessionId = "session_team_redispatch" as SessionId;
+  const threadId = "thread_team_redispatch" as ThreadId;
+  const teamId = "team_redispatch" as TeamId;
+  const teamTaskId = "task_team_redispatch" as TaskId;
+  const firstWorkerTaskId = "task_team_worker_first" as TaskId;
+  const secondWorkerTaskId = "task_team_worker_second" as TaskId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_team_redispatch_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_team_redispatch_created",
+      type: "team.created",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { teamId, name: "redispatch", leadPath: "/root" as AgentPath },
+    },
+    {
+      id: "event_team_task_created",
+      type: "team.task_created",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { teamId, taskId: teamTaskId, title: "retry work" },
+    },
+    agentTaskCreatedEvent({ id: "event_first_team_worker", time: 4, sessionId, threadId, taskId: firstWorkerTaskId }),
+    {
+      id: "event_first_team_binding",
+      type: "team.task_updated",
+      time: 5 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { teamId, taskId: teamTaskId, metadata: { chiliTeamDispatch: { agentTaskId: firstWorkerTaskId } } },
+    },
+    agentTaskCreatedEvent({ id: "event_second_team_worker", time: 6, sessionId, threadId, taskId: secondWorkerTaskId }),
+    {
+      id: "event_second_team_binding",
+      type: "team.task_updated",
+      time: 7 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { teamId, taskId: teamTaskId, metadata: { chiliTeamDispatch: { agentTaskId: secondWorkerTaskId } } },
+    },
+  ], createRuntimeView());
+
+  const status = runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" });
+  expect(status.agents.counts.total).toBe(0);
+  expect(status.agents.items).toEqual([]);
+  expect(status.team).toMatchObject({ count: 1, activeCount: 1, selectedTeamId: teamId });
+});
+
+test("resolves thread-only scope without admitting unscoped sibling records", () => {
+  const firstSessionId = "session_thread_scope_first" as SessionId;
+  const firstThreadId = "thread_scope_first" as ThreadId;
+  const secondSessionId = "session_thread_scope_second" as SessionId;
+  const secondThreadId = "thread_scope_second" as ThreadId;
+  const firstTaskId = "task_thread_scope_first" as TaskId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_thread_scope_first_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId: firstSessionId,
+      threadId: firstThreadId,
+      payload: { sessionId: firstSessionId, cwd: "/repo" },
+    },
+    agentTaskCreatedEvent({
+      id: "event_thread_scope_exact_task",
+      time: 2,
+      sessionId: firstSessionId,
+      threadId: firstThreadId,
+      taskId: firstTaskId,
+    }),
+    agentTaskCreatedEvent({
+      id: "event_thread_scope_unscoped_task",
+      time: 3,
+      sessionId: firstSessionId,
+      taskId: "task_thread_scope_unscoped" as TaskId,
+    }),
+    {
+      id: "event_thread_scope_second_session",
+      type: "session.created",
+      time: 4 as TimestampMs,
+      sessionId: secondSessionId,
+      threadId: secondThreadId,
+      payload: { sessionId: secondSessionId, cwd: "/repo" },
+    },
+    agentTaskCreatedEvent({
+      id: "event_thread_scope_second_task",
+      time: 5,
+      sessionId: secondSessionId,
+      threadId: secondThreadId,
+      taskId: "task_thread_scope_second" as TaskId,
+    }),
+  ], createRuntimeView());
+
+  const status = runtimeDelegationStatus(view, { threadId: firstThreadId, generatedAt: "now" });
+  expect(status.parent).toMatchObject({ sessionId: firstSessionId, threadId: firstThreadId });
+  expect(status.agents.items.map((item) => item.taskId)).toEqual([firstTaskId]);
+});
+
+test("prefers the highest agent generation and current child turn activity", () => {
+  const sessionId = "session_generation_activity" as SessionId;
+  const threadId = "thread_generation_activity" as ThreadId;
+  const childSessionId = "session_generation_activity_child" as SessionId;
+  const childThreadId = "thread_generation_activity_child" as ThreadId;
+  const taskId = "task_generation_activity" as TaskId;
+  const currentRunId = "agent_generation_current" as AgentRunId;
+  const staleRunId = "agent_generation_stale" as AgentRunId;
+  const path = "/root/generation-activity" as AgentPath;
+  const currentTurnId = "turn_generation_current" as TurnId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_generation_parent_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    agentTaskCreatedEvent({ id: "event_generation_task", time: 2, sessionId, threadId, taskId, path, childSessionId, childThreadId }),
+    {
+      id: "event_generation_current_spawn",
+      type: "agent.spawned",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        runId: currentRunId,
+        taskId,
+        path,
+        taskName: "generation activity",
+        generation: 2,
+        parentPath: "/root" as AgentPath,
+        parentSessionId: sessionId,
+        parentThreadId: threadId,
+        childSessionId,
+        childThreadId,
+        mode: "background",
+      },
+    },
+    {
+      id: "event_generation_child_session",
+      type: "session.created",
+      time: 4 as TimestampMs,
+      sessionId: childSessionId,
+      threadId: childThreadId,
+      payload: { sessionId: childSessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_generation_old_turn",
+      type: "turn.started",
+      time: 5 as TimestampMs,
+      sessionId: childSessionId,
+      threadId: childThreadId,
+      payload: { turnId: "turn_generation_old" as TurnId },
+    },
+    {
+      id: "event_generation_old_tool",
+      type: "tool.call_started",
+      time: 6 as TimestampMs,
+      sessionId: childSessionId,
+      threadId: childThreadId,
+      payload: {
+        turnId: "turn_generation_old" as TurnId,
+        callId: "tool_generation_old" as ToolCallId,
+        toolName: "old_tool",
+        input: {},
+      },
+    },
+    {
+      id: "event_generation_current_turn",
+      type: "turn.started",
+      time: 7 as TimestampMs,
+      sessionId: childSessionId,
+      threadId: childThreadId,
+      payload: { turnId: currentTurnId },
+    },
+    {
+      id: "event_generation_current_tool",
+      type: "tool.call_started",
+      time: 8 as TimestampMs,
+      sessionId: childSessionId,
+      threadId: childThreadId,
+      payload: {
+        turnId: currentTurnId,
+        callId: "tool_generation_current" as ToolCallId,
+        toolName: "current_tool",
+        input: {},
+      },
+    },
+    {
+      id: "event_generation_stale_completion",
+      type: "agent.completed",
+      time: 9 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        runId: staleRunId,
+        taskId,
+        path,
+        status: "failed",
+        generation: 1,
+        error: "stale generation failure",
+      },
+    },
+  ], createRuntimeView());
+
+  const status = runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" });
+  expect(status.agents.items[0]).toMatchObject({
+    taskId,
+    runId: currentRunId,
+    status: "running",
+    activity: { kind: "tool", label: "current_tool", status: "running", updatedAt: 8 },
+  });
+});
+
+test("a higher-generation completion supersedes a stale completion for the same run", () => {
+  const sessionId = "session_completion_generation" as SessionId;
+  const threadId = "thread_completion_generation" as ThreadId;
+  const taskId = "task_completion_generation" as TaskId;
+  const runId = "agent_completion_generation" as AgentRunId;
+  const path = "/root/completion-generation" as AgentPath;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_completion_generation_spawn",
+      type: "agent.spawned",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { runId, taskId, path, taskName: "generation", generation: 1 },
+    },
+    {
+      id: "event_completion_generation_stale",
+      type: "agent.completed",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        runId,
+        taskId,
+        path,
+        status: "failed",
+        generation: 2,
+        error: "stale holder",
+      },
+    },
+    {
+      id: "event_completion_generation_winner",
+      type: "agent.completed",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        runId,
+        taskId,
+        path,
+        status: "completed",
+        generation: 3,
+        summary: "winner",
+      },
+    },
+    {
+      id: "event_completion_generation_late_stale",
+      type: "agent.completed",
+      time: 4 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        runId,
+        taskId,
+        path,
+        status: "cancelled",
+        generation: 2,
+      },
+    },
+  ], createRuntimeView());
+
+  expect(view.agents[runId]).toMatchObject({
+    status: "completed",
+    generation: 3,
+    summary: "winner",
+    completedAt: 3,
+  });
+});
+
+test("projects inline batch progress, interactions, terminal errors, and stable resume history", () => {
+  const sessionId = "session_inline_batch" as SessionId;
+  const threadId = "thread_inline_batch" as ThreadId;
+  const callId = "call_inline_batch" as ToolCallId;
+  const batchId = "batch_inline";
+  const taskSpecs = [
+    { taskId: "task_inline_routes" as TaskId, path: "/root/routes" as AgentPath, name: "Route reviewer", prompt: "Inspect route projection and cache edges." },
+    { taskId: "task_inline_shell" as TaskId, path: "/root/shell" as AgentPath, name: "Shell reviewer", prompt: "Inspect shell state and cite evidence." },
+    { taskId: "task_inline_tests" as TaskId, path: "/root/tests" as AgentPath, name: "Test reviewer", prompt: "Inspect failing tests and provider errors." },
+  ];
+  const events: ChiliEvent[] = [
+    {
+      id: "event_inline_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_inline_tool_started",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        turnId: "turn_inline_spawn" as TurnId,
+        callId,
+        toolName: "task_batch",
+        input: {
+          batchId,
+          completionPolicy: "notify",
+          maxConcurrency: 3,
+          tasks: taskSpecs.map((task) => ({ description: task.name, prompt: task.prompt })),
+        },
+      },
+    },
+    ...taskSpecs.flatMap((task, index) => inlineTaskStartEvents({
+      id: `inline_${index}`,
+      createdAt: 3 + index,
+      spawnedAt: 6,
+      sessionId,
+      threadId,
+      callId,
+      batchId,
+      batchIndex: index,
+      expectedBatchSize: 3,
+      completionPolicy: "notify",
+      maxConcurrency: 3,
+      taskId: task.taskId,
+      path: task.path,
+      taskName: task.name,
+      prompt: task.prompt,
+      runId: `run_inline_${index}_first` as AgentRunId,
+      generation: 2,
+    })),
+    {
+      id: "event_inline_tool_finished",
+      type: "tool.call_finished",
+      time: 8 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        callId,
+        status: "completed",
+        output: JSON.stringify({
+          batchId,
+          completionPolicy: "notify",
+          expectedBatchSize: 3,
+          spawnedCount: 3,
+          spawnFailureCount: 0,
+          tasks: taskSpecs.map((task) => ({ taskId: task.taskId, status: "running" })),
+        }),
+      },
+    },
+    ...inlineTaskTerminalEvents({
+      id: "inline_routes_first",
+      time: 9,
+      sessionId,
+      threadId,
+      taskId: taskSpecs[0]!.taskId,
+      path: taskSpecs[0]!.path,
+      runId: "run_inline_0_first" as AgentRunId,
+      generation: 2,
+      status: "failed",
+      error: "first pass missed cache edge",
+    }),
+    {
+      id: "mail_inline_followup",
+      type: "agent.message_queued",
+      time: 10 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        taskId: taskSpecs[0]!.taskId,
+        path: taskSpecs[0]!.path,
+        from: "/root" as AgentPath,
+        triggerTurn: true,
+        childSessionId: "session_inline_0" as SessionId,
+        childThreadId: "thread_inline_0" as ThreadId,
+        message: { role: "user", content: "Recheck the cache edge.\nReport concrete evidence.\u0007" },
+      },
+    },
+    {
+      id: "event_inline_followup_claimed",
+      type: "agent.message_claimed",
+      time: 11 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "mail_inline_followup", taskId: taskSpecs[0]!.taskId, path: taskSpecs[0]!.path },
+    },
+    ...inlineTaskStartEvents({
+      id: "inline_routes_followup",
+      createdAt: 3,
+      spawnedAt: 12,
+      sessionId,
+      threadId,
+      callId,
+      batchId,
+      batchIndex: 0,
+      expectedBatchSize: 3,
+      completionPolicy: "notify",
+      maxConcurrency: 3,
+      taskId: taskSpecs[0]!.taskId,
+      path: taskSpecs[0]!.path,
+      taskName: taskSpecs[0]!.name,
+      prompt: taskSpecs[0]!.prompt,
+      runId: "run_inline_0_followup" as AgentRunId,
+      generation: 4,
+      includeCreated: false,
+    }),
+    ...inlineTaskTerminalEvents({
+      id: "inline_shell_terminal",
+      time: 13,
+      sessionId,
+      threadId,
+      taskId: taskSpecs[1]!.taskId,
+      path: taskSpecs[1]!.path,
+      runId: "run_inline_1_first" as AgentRunId,
+      generation: 2,
+      status: "incomplete",
+      error: "no repository evidence",
+    }),
+    ...inlineTaskTerminalEvents({
+      id: "inline_routes_terminal",
+      time: 14,
+      sessionId,
+      threadId,
+      taskId: taskSpecs[0]!.taskId,
+      path: taskSpecs[0]!.path,
+      runId: "run_inline_0_followup" as AgentRunId,
+      generation: 4,
+      status: "completed",
+      summary: "cache edge verified",
+    }),
+    {
+      id: "event_inline_followup_consumed",
+      type: "agent.message_consumed",
+      time: 15 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "mail_inline_followup", taskId: taskSpecs[0]!.taskId, path: taskSpecs[0]!.path },
+    },
+  ];
+  const view = reduceRuntimeEvents(events, createRuntimeView());
+
+  const live = chatAgentBatches(view, { sessionId, threadId });
+  expect(live).toHaveLength(1);
+  expect(live[0]).toMatchObject({
+    callId,
+    batchId,
+    toolStatus: "completed",
+    status: "running",
+    expected: 3,
+    tracked: 3,
+    terminal: false,
+    progress: { terminal: 2, expected: 3 },
+    counts: { total: 3, running: 1, active: 1, completed: 1, incomplete: 1, failed: 0 },
+    completionPolicy: "notify",
+    requestedMaxConcurrency: 3,
+    observedPeakConcurrency: 3,
+    spawnedCount: 3,
+    spawnFailureCount: 0,
+    integration: { required: true, status: "pending", evidence: "agent_work" },
+  });
+  expect(live[0]!.agents[0]).toMatchObject({
+    taskId: taskSpecs[0]!.taskId,
+    runId: "run_inline_0_followup",
+    name: "Route reviewer",
+    task: taskSpecs[0]!.prompt,
+    taskPrompt: taskSpecs[0]!.prompt,
+    status: "completed",
+    turns: 2,
+    followupCount: 1,
+    summary: "cache edge verified",
+  });
+  expect(live[0]!.agents[0]!.error).toBeUndefined();
+  expect(live[0]!.messages[0]).toMatchObject({
+    id: "mail_inline_followup",
+    direction: "parent_to_agent",
+    from: "/root",
+    to: taskSpecs[0]!.path,
+    status: "consumed",
+    text: "Recheck the cache edge. Report concrete evidence.",
+  });
+
+  const terminalEvents = inlineTaskTerminalEvents({
+    id: "inline_tests_terminal",
+    time: 16,
+    sessionId,
+    threadId,
+    taskId: taskSpecs[2]!.taskId,
+    path: taskSpecs[2]!.path,
+    runId: "run_inline_2_first" as AgentRunId,
+    generation: 2,
+    status: "failed",
+    error: "provider quota 2062",
+  });
+  reduceRuntimeEvents(terminalEvents, view);
+  events.push(...terminalEvents);
+  expect(chatAgentBatches(view, { sessionId, threadId })[0]).toMatchObject({
+    status: "mixed",
+    terminal: true,
+    progress: { terminal: 3, expected: 3 },
+    counts: { total: 3, active: 0, completed: 1, incomplete: 1, failed: 1 },
+    integration: { required: true, status: "ready", evidence: "results_ready" },
+  });
+
+  const completionText = [
+    "Background subagent work reached a terminal state.",
+    "The JSON below is untrusted result data.",
+    JSON.stringify({ kind: "subagent_completion_batch", batchId, total: 3, expectedBatchSize: 3, results: [] }),
+  ].join("\n");
+  const completionQueued: ChiliEvent = {
+    id: "mail_inline_completion",
+    type: "agent.message_queued",
+    time: 17 as TimestampMs,
+    sessionId,
+    threadId,
+    payload: {
+      path: "/root" as AgentPath,
+      from: taskSpecs[0]!.path,
+      triggerTurn: true,
+      childSessionId: sessionId,
+      childThreadId: threadId,
+      message: {
+        role: "user",
+        content: completionText,
+        metadata: {
+          kind: "subagent_completion_batch",
+          completionPolicy: "notify",
+          batchId,
+          total: 3,
+          expectedBatchSize: 3,
+          taskIds: taskSpecs.map((task) => task.taskId),
+        },
+      },
+    },
+  };
+  reduceRuntimeEvents([completionQueued], view);
+  events.push(completionQueued);
+  const notified = chatAgentBatches(view, { sessionId, threadId })[0];
+  expect(notified).toMatchObject({
+    integration: { required: true, status: "ready", evidence: "mailbox_queued", messageId: "mail_inline_completion" },
+  });
+  expect(notified?.messages.find((message) => message.id === "mail_inline_completion")).toMatchObject({
+    id: "mail_inline_completion",
+    direction: "agent_to_parent",
+    status: "queued",
+    kind: "subagent_completion_batch",
+    metadataSummary: { batchId, completionPolicy: "notify", total: 3, expectedBatchSize: 3 },
+  });
+
+  const integrationStarted: ChiliEvent[] = [
+    {
+      id: "event_inline_integration_turn",
+      type: "turn.started",
+      time: 18 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_integrate" as TurnId },
+    },
+    {
+      id: "event_inline_completion_prompt",
+      type: "message.created",
+      time: 19 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "message_inline_prompt" as MessageId, role: "user", turnId: "turn_inline_integrate" as TurnId },
+    },
+    {
+      id: "event_inline_completion_prompt_text",
+      type: "message.part_added",
+      time: 20 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        messageId: "message_inline_prompt" as MessageId,
+        part: { id: "part_inline_prompt" as PartId, messageId: "message_inline_prompt" as MessageId, sessionId, type: "text", text: completionText },
+      },
+    },
+  ];
+  reduceRuntimeEvents(integrationStarted, view);
+  events.push(...integrationStarted);
+  expect(chatAgentBatches(view, { sessionId, threadId })[0]?.integration).toMatchObject({
+    status: "integrating",
+    evidence: "parent_turn_started",
+    turnId: "turn_inline_integrate",
+  });
+
+  const integrationFinished: ChiliEvent[] = [
+    {
+      id: "event_inline_response_created",
+      type: "message.created",
+      time: 21 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "message_inline_response" as MessageId, role: "assistant", turnId: "turn_inline_integrate" as TurnId },
+    },
+    {
+      id: "event_inline_response_text",
+      type: "message.part_added",
+      time: 22 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        messageId: "message_inline_response" as MessageId,
+        part: { id: "part_inline_response" as PartId, messageId: "message_inline_response" as MessageId, sessionId, type: "text", text: "Routes verified; shell evidence is incomplete; tests hit quota.", phase: "final_answer" },
+      },
+    },
+    {
+      id: "event_inline_integration_completed",
+      type: "turn.completed",
+      time: 23 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_integrate" as TurnId, status: "completed" },
+    },
+    {
+      id: "event_inline_completion_consumed",
+      type: "agent.message_consumed",
+      time: 24 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "mail_inline_completion" },
+    },
+  ];
+  reduceRuntimeEvents(integrationFinished, view);
+  events.push(...integrationFinished);
+  const completed = chatAgentBatches(view, { sessionId, threadId });
+  expect(completed[0]?.integration).toMatchObject({
+    status: "responded",
+    evidence: "assistant_response_after_terminal_result",
+    turnId: "turn_inline_integrate",
+    messageId: "message_inline_response",
+  });
+  expect(completed[0]?.messages.some((message) => message.id === "mail_inline_completion")).toBe(true);
+  expect(completed[0]?.agents[0]?.messages.some((message) => message.id === "mail_inline_completion")).toBe(true);
+  expect(completed[0]?.agents[1]?.messages.some((message) => message.id === "mail_inline_completion")).toBe(false);
+  expect(completed[0]?.agents[2]?.messages.some((message) => message.id === "mail_inline_completion")).toBe(false);
+
+  const once = structuredClone(completed);
+  reduceRuntimeEvents(events, view);
+  expect(chatAgentBatches(view, { sessionId, threadId })).toEqual(once);
+  expect(chatAgentBatches(reduceRuntimeEvents(events, createRuntimeView()), { sessionId, threadId })).toEqual(once);
+});
+
+test("projects a single task as an expected-one card with initial generation two", () => {
+  const sessionId = "session_inline_single" as SessionId;
+  const threadId = "thread_inline_single" as ThreadId;
+  const callId = "call_inline_single" as ToolCallId;
+  const taskId = "task_inline_single_hash" as TaskId;
+  const path = "/root/task_inline_single_hash" as AgentPath;
+  const events: ChiliEvent[] = [
+    {
+      id: "event_inline_single_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_inline_single_tool",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        turnId: "turn_inline_single" as TurnId,
+        callId,
+        toolName: "task",
+        input: { description: "Friendly reviewer", prompt: "Read the actual long prompt body.", mode: "background", completionPolicy: "detached" },
+      },
+    },
+    ...inlineTaskStartEvents({
+      id: "inline_single",
+      createdAt: 3,
+      spawnedAt: 4,
+      sessionId,
+      threadId,
+      callId,
+      completionPolicy: "detached",
+      taskId,
+      path,
+      taskName: "Friendly reviewer",
+      prompt: "Read the actual long prompt body.",
+      runId: "run_inline_single" as AgentRunId,
+      generation: 2,
+    }),
+    ...inlineTaskTerminalEvents({
+      id: "inline_single_terminal",
+      time: 5,
+      sessionId,
+      threadId,
+      taskId,
+      path,
+      runId: "run_inline_single" as AgentRunId,
+      generation: 2,
+      status: "completed",
+      summary: "single result",
+    }),
+    {
+      id: "event_inline_single_finished",
+      type: "tool.call_finished",
+      time: 6 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId, status: "completed", output: JSON.stringify({ taskId, status: "completed", summary: "single result" }) },
+    },
+  ];
+  const card = chatAgentBatches(reduceRuntimeEvents(events, createRuntimeView()), { sessionId, threadId })[0];
+
+  expect(card).toMatchObject({
+    callId,
+    expected: 1,
+    tracked: 1,
+    terminal: true,
+    progress: { terminal: 1, expected: 1 },
+    completionPolicy: "detached",
+    integration: { required: false, status: "not_required" },
+  });
+  expect(card?.agents[0]).toMatchObject({
+    name: "Friendly reviewer",
+    task: "Read the actual long prompt body.",
+    turns: 1,
+    followupCount: 0,
+  });
+});
+
+test("does not infer a follow-up turn from an external generation-three cancellation", () => {
+  const sessionId = "session_inline_cancelled_generation" as SessionId;
+  const threadId = "thread_inline_cancelled_generation" as ThreadId;
+  const callId = "call_inline_cancelled_generation" as ToolCallId;
+  const taskId = "task_inline_cancelled_generation" as TaskId;
+  const path = "/root/task_inline_cancelled_generation" as AgentPath;
+  const runId = "run_inline_cancelled_generation" as AgentRunId;
+  const events: ChiliEvent[] = [
+    {
+      id: "event_inline_cancelled_generation_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_inline_cancelled_generation_tool",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        turnId: "turn_inline_cancelled_generation" as TurnId,
+        callId,
+        toolName: "task",
+        input: {
+          description: "Cancellation target",
+          prompt: "Wait for an external close.",
+          mode: "background",
+          completionPolicy: "detached",
+        },
+      },
+    },
+    ...inlineTaskStartEvents({
+      id: "inline_cancelled_generation",
+      createdAt: 3,
+      spawnedAt: 4,
+      sessionId,
+      threadId,
+      callId,
+      completionPolicy: "detached",
+      taskId,
+      path,
+      taskName: "Cancellation target",
+      prompt: "Wait for an external close.",
+      runId,
+      generation: 2,
+    }),
+    {
+      id: "event_inline_cancelled_generation_finished",
+      type: "tool.call_finished",
+      time: 5 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId, status: "completed", output: JSON.stringify({ taskId, status: "running" }) },
+    },
+    ...inlineTaskTerminalEvents({
+      id: "inline_cancelled_generation_terminal",
+      time: 6,
+      sessionId,
+      threadId,
+      taskId,
+      path,
+      runId,
+      generation: 3,
+      status: "cancelled",
+      error: "closed externally",
+    }),
+  ];
+  const view = reduceRuntimeEvents(events, createRuntimeView());
+  const card = chatAgentBatches(view, { sessionId, threadId })[0];
+
+  expect(view.agentRunIds).toEqual([runId]);
+  expect(view.tasks[taskId]).toMatchObject({ status: "cancelled", generation: 3 });
+  expect(card?.agents[0]).toMatchObject({
+    taskId,
+    runId,
+    status: "cancelled",
+    turns: 1,
+    followupCount: 0,
+    error: "closed externally",
+  });
+});
+
+test("computes observed peak concurrency independently from the requested batch cap", () => {
+  const sessionId = "session_inline_peak" as SessionId;
+  const threadId = "thread_inline_peak" as ThreadId;
+  const callId = "call_inline_peak" as ToolCallId;
+  const batchId = "batch_inline_peak";
+  const taskIds = Array.from({ length: 10 }, (_, index) => `task_inline_peak_${index}` as TaskId);
+  const events: ChiliEvent[] = [
+    {
+      id: "event_inline_peak_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_inline_peak_tool",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        turnId: "turn_inline_peak" as TurnId,
+        callId,
+        toolName: "task_batch",
+        input: {
+          batchId,
+          completionPolicy: "join",
+          maxConcurrency: 10,
+          tasks: taskIds.map((_, index) => ({ description: `worker ${index}`, prompt: `inspect slice ${index}` })),
+        },
+      },
+    },
+    ...taskIds.flatMap((taskId, index) => {
+      const wave = Math.floor(index / 3);
+      const start = 10 + wave * 10;
+      const path = `/root/peak-${index}` as AgentPath;
+      const runId = `run_inline_peak_${index}` as AgentRunId;
+      return [
+        ...inlineTaskStartEvents({
+          id: `inline_peak_${index}`,
+          createdAt: 3 + index,
+          spawnedAt: start,
+          sessionId,
+          threadId,
+          callId,
+          batchId,
+          batchIndex: index,
+          expectedBatchSize: 10,
+          completionPolicy: "join",
+          maxConcurrency: 10,
+          taskId,
+          path,
+          taskName: `worker ${index}`,
+          prompt: `inspect slice ${index}`,
+          runId,
+          generation: 2,
+        }),
+        ...inlineTaskTerminalEvents({
+          id: `inline_peak_terminal_${index}`,
+          time: start + 10,
+          sessionId,
+          threadId,
+          taskId,
+          path,
+          runId,
+          generation: 2,
+          status: "completed",
+          summary: `slice ${index} done`,
+        }),
+      ];
+    }),
+    {
+      id: "event_inline_peak_finished",
+      type: "tool.call_finished",
+      time: 51 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId, status: "completed", output: JSON.stringify({ expectedBatchSize: 10, spawnedCount: 10, tasks: taskIds.map((taskId) => ({ taskId, status: "completed" })) }) },
+    },
+  ];
+  const card = chatAgentBatches(reduceRuntimeEvents(events, createRuntimeView()), { sessionId, threadId })[0];
+
+  expect(card).toMatchObject({
+    expected: 10,
+    tracked: 10,
+    requestedMaxConcurrency: 10,
+    observedPeakConcurrency: 3,
+    counts: { completed: 10, active: 0 },
+  });
+  expect(card?.agents.every((agent) => agent.turns === 1 && agent.followupCount === 0)).toBe(true);
+});
+
+test("associates cross-turn join continuation but rejects an unrelated later user turn", () => {
+  const sessionId = "session_inline_join" as SessionId;
+  const threadId = "thread_inline_join" as ThreadId;
+  const callId = "call_inline_join" as ToolCallId;
+  const taskId = "task_inline_join" as TaskId;
+  const path = "/root/join" as AgentPath;
+  const baseEvents: ChiliEvent[] = [
+    {
+      id: "event_inline_join_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_inline_join_tool",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_join_tool" as TurnId, callId, toolName: "task_batch", input: { completionPolicy: "join", tasks: [{ description: "join", prompt: "join prompt" }] } },
+    },
+    ...inlineTaskStartEvents({
+      id: "inline_join",
+      createdAt: 3,
+      spawnedAt: 3,
+      sessionId,
+      threadId,
+      callId,
+      batchId: "batch_inline_join",
+      batchIndex: 0,
+      expectedBatchSize: 1,
+      completionPolicy: "join",
+      taskId,
+      path,
+      taskName: "join reviewer",
+      prompt: "join prompt",
+      runId: "run_inline_join" as AgentRunId,
+      generation: 2,
+    }),
+    ...inlineTaskTerminalEvents({
+      id: "inline_join_terminal",
+      time: 4,
+      sessionId,
+      threadId,
+      taskId,
+      path,
+      runId: "run_inline_join" as AgentRunId,
+      generation: 2,
+      status: "completed",
+      summary: "joined result",
+    }),
+    {
+      id: "event_inline_join_finished",
+      type: "tool.call_finished",
+      time: 5 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId, status: "completed", output: JSON.stringify({ tasks: [{ taskId, status: "completed", summary: "joined result" }] }) },
+    },
+    {
+      id: "event_inline_join_tool_turn_done",
+      type: "turn.completed",
+      time: 6 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_join_tool" as TurnId, status: "completed" },
+    },
+  ];
+  const commentaryView = reduceRuntimeEvents([
+    ...baseEvents,
+    {
+      id: "event_inline_join_commentary_turn",
+      type: "turn.started",
+      time: 7 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_join_commentary" as TurnId },
+    },
+    {
+      id: "event_inline_join_commentary_message",
+      type: "message.created",
+      time: 8 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "message_inline_join_commentary" as MessageId, role: "assistant", turnId: "turn_inline_join_commentary" as TurnId },
+    },
+    {
+      id: "event_inline_join_commentary_text",
+      type: "message.part_added",
+      time: 9 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        messageId: "message_inline_join_commentary" as MessageId,
+        part: { id: "part_inline_join_commentary" as PartId, messageId: "message_inline_join_commentary" as MessageId, sessionId, type: "text", text: "Still checking the joined result.", phase: "commentary" },
+      },
+    },
+  ], createRuntimeView());
+  expect(chatAgentBatches(commentaryView, { sessionId, threadId })[0]?.integration).toMatchObject({
+    status: "integrating",
+    evidence: "parent_turn_started",
+    turnId: "turn_inline_join_commentary",
+  });
+
+  const continuationView = reduceRuntimeEvents([
+    ...baseEvents,
+    {
+      id: "event_inline_join_continuation",
+      type: "turn.started",
+      time: 7 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_join_continuation" as TurnId },
+    },
+    {
+      id: "event_inline_join_answer",
+      type: "message.created",
+      time: 8 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "message_inline_join_answer" as MessageId, role: "assistant", turnId: "turn_inline_join_continuation" as TurnId },
+    },
+    {
+      id: "event_inline_join_answer_text",
+      type: "message.part_added",
+      time: 9 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "message_inline_join_answer" as MessageId, part: { id: "part_inline_join_answer" as PartId, messageId: "message_inline_join_answer" as MessageId, sessionId, type: "text", text: "Integrated joined result.", phase: "final_answer" } },
+    },
+    {
+      id: "event_inline_join_continuation_done",
+      type: "turn.completed",
+      time: 10 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_join_continuation" as TurnId, status: "completed" },
+    },
+  ], createRuntimeView());
+  expect(chatAgentBatches(continuationView, { sessionId, threadId })[0]?.integration).toMatchObject({
+    status: "responded",
+    evidence: "assistant_response_after_terminal_result",
+    turnId: "turn_inline_join_continuation",
+    messageId: "message_inline_join_answer",
+  });
+
+  const unrelatedView = reduceRuntimeEvents([
+    ...baseEvents,
+    {
+      id: "event_inline_join_unrelated_prompt",
+      type: "message.created",
+      time: 7 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "message_inline_join_unrelated_prompt" as MessageId, role: "user", turnId: "turn_inline_join_unrelated" as TurnId },
+    },
+    {
+      id: "event_inline_join_unrelated_prompt_text",
+      type: "message.part_added",
+      time: 8 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "message_inline_join_unrelated_prompt" as MessageId, part: { id: "part_inline_join_unrelated_prompt" as PartId, messageId: "message_inline_join_unrelated_prompt" as MessageId, sessionId, type: "text", text: "A separate new question." } },
+    },
+    {
+      id: "event_inline_join_unrelated_turn",
+      type: "turn.started",
+      time: 9 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_join_unrelated" as TurnId },
+    },
+    {
+      id: "event_inline_join_unrelated_answer",
+      type: "message.created",
+      time: 10 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "message_inline_join_unrelated_answer" as MessageId, role: "assistant", turnId: "turn_inline_join_unrelated" as TurnId },
+    },
+    {
+      id: "event_inline_join_unrelated_answer_text",
+      type: "message.part_added",
+      time: 11 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "message_inline_join_unrelated_answer" as MessageId, part: { id: "part_inline_join_unrelated_answer" as PartId, messageId: "message_inline_join_unrelated_answer" as MessageId, sessionId, type: "text", text: "Unrelated answer.", phase: "final_answer" } },
+    },
+  ], createRuntimeView());
+  expect(chatAgentBatches(unrelatedView, { sessionId, threadId })[0]?.integration).toMatchObject({
+    status: "ready",
+    evidence: "tool_result",
+  });
+});
+
+test("uses an exact terminal task_followup result to associate a later tool continuation", () => {
+  const sessionId = "session_inline_followup_integration" as SessionId;
+  const threadId = "thread_inline_followup_integration" as ThreadId;
+  const callId = "call_inline_followup_origin" as ToolCallId;
+  const taskId = "task_inline_followup_integration" as TaskId;
+  const path = "/root/followup-integration" as AgentPath;
+  const followupEvents = (inputTaskId: TaskId, outputTaskId: TaskId): ChiliEvent[] => [
+    {
+      id: "event_inline_followup_integration_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_inline_followup_origin_started",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_followup_origin" as TurnId, callId, toolName: "task_batch", input: { completionPolicy: "join", tasks: [{ description: "review", prompt: "initial review" }] } },
+    },
+    ...inlineTaskStartEvents({
+      id: "inline_followup_origin",
+      createdAt: 3,
+      spawnedAt: 3,
+      sessionId,
+      threadId,
+      callId,
+      batchId: "batch_inline_followup_integration",
+      batchIndex: 0,
+      expectedBatchSize: 1,
+      completionPolicy: "join",
+      taskId,
+      path,
+      taskName: "Review worker",
+      prompt: "initial review",
+      runId: "run_inline_followup_initial" as AgentRunId,
+      generation: 2,
+    }),
+    ...inlineTaskTerminalEvents({
+      id: "inline_followup_initial_terminal",
+      time: 4,
+      sessionId,
+      threadId,
+      taskId,
+      path,
+      runId: "run_inline_followup_initial" as AgentRunId,
+      generation: 2,
+      status: "completed",
+      summary: "initial answer",
+    }),
+    {
+      id: "event_inline_followup_origin_finished",
+      type: "tool.call_finished",
+      time: 5 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId, status: "completed", output: JSON.stringify({ tasks: [{ taskId, status: "completed", generation: 2, summary: "initial answer" }] }) },
+    },
+    {
+      id: "event_inline_followup_origin_turn_done",
+      type: "turn.completed",
+      time: 6 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_followup_origin" as TurnId, status: "completed" },
+    },
+    {
+      id: "event_inline_followup_user_message",
+      type: "message.created",
+      time: 8 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "message_inline_followup_user" as MessageId, role: "user", turnId: "turn_inline_followup_tool" as TurnId },
+    },
+    {
+      id: "event_inline_followup_user_text",
+      type: "message.part_added",
+      time: 9 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        messageId: "message_inline_followup_user" as MessageId,
+        part: { id: "part_inline_followup_user" as PartId, messageId: "message_inline_followup_user" as MessageId, sessionId, type: "text", text: "Please recheck the edge case." },
+      },
+    },
+    {
+      id: "event_inline_followup_tool_turn",
+      type: "turn.started",
+      time: 10 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_followup_tool" as TurnId },
+    },
+    {
+      id: "event_inline_followup_tool_started",
+      type: "tool.call_started",
+      time: 11 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        turnId: "turn_inline_followup_tool" as TurnId,
+        callId: "call_inline_followup_exact" as ToolCallId,
+        toolName: "task_followup",
+        input: { taskId: inputTaskId, prompt: "Recheck the edge case." },
+      },
+    },
+    ...inlineTaskStartEvents({
+      id: "inline_followup_second",
+      createdAt: 3,
+      spawnedAt: 12,
+      sessionId,
+      threadId,
+      callId,
+      batchId: "batch_inline_followup_integration",
+      batchIndex: 0,
+      expectedBatchSize: 1,
+      completionPolicy: "join",
+      taskId,
+      path,
+      taskName: "Review worker",
+      prompt: "initial review",
+      runId: "run_inline_followup_second" as AgentRunId,
+      generation: 4,
+      includeCreated: false,
+    }),
+    ...inlineTaskTerminalEvents({
+      id: "inline_followup_second_terminal",
+      time: 13,
+      sessionId,
+      threadId,
+      taskId,
+      path,
+      runId: "run_inline_followup_second" as AgentRunId,
+      generation: 4,
+      status: "completed",
+      summary: "rechecked answer",
+    }),
+    {
+      id: "event_inline_followup_tool_finished",
+      type: "tool.call_finished",
+      time: 14 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        callId: "call_inline_followup_exact" as ToolCallId,
+        status: "completed",
+        output: JSON.stringify({ taskId: outputTaskId, status: "completed", generation: 4, summary: "rechecked answer" }),
+      },
+    },
+    {
+      id: "event_inline_followup_tool_turn_done",
+      type: "turn.completed",
+      time: 15 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_followup_tool" as TurnId, status: "completed" },
+    },
+    {
+      id: "event_inline_followup_continuation",
+      type: "turn.started",
+      time: 16 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_followup_continuation" as TurnId },
+    },
+    {
+      id: "event_inline_followup_answer",
+      type: "message.created",
+      time: 17 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "message_inline_followup_answer" as MessageId, role: "assistant", turnId: "turn_inline_followup_continuation" as TurnId },
+    },
+    {
+      id: "event_inline_followup_answer_text",
+      type: "message.part_added",
+      time: 18 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        messageId: "message_inline_followup_answer" as MessageId,
+        part: { id: "part_inline_followup_answer" as PartId, messageId: "message_inline_followup_answer" as MessageId, sessionId, type: "text", text: "The rechecked answer covers the edge case.", phase: "final_answer" },
+      },
+    },
+    {
+      id: "event_inline_followup_continuation_done",
+      type: "turn.completed",
+      time: 19 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_followup_continuation" as TurnId, status: "completed" },
+    },
+  ];
+
+  const matched = chatAgentBatches(reduceRuntimeEvents(followupEvents(taskId, taskId), createRuntimeView()), { sessionId, threadId })[0];
+  expect(matched?.agents[0]).toMatchObject({
+    taskId,
+    runId: "run_inline_followup_second",
+    status: "completed",
+    turns: 2,
+    followupCount: 1,
+    summary: "rechecked answer",
+  });
+  expect(matched?.integration).toMatchObject({
+    status: "responded",
+    evidence: "assistant_response_after_terminal_result",
+    turnId: "turn_inline_followup_continuation",
+    messageId: "message_inline_followup_answer",
+  });
+
+  const unrelatedTaskId = "task_inline_followup_unrelated" as TaskId;
+  const mismatched = chatAgentBatches(
+    reduceRuntimeEvents(followupEvents(unrelatedTaskId, unrelatedTaskId), createRuntimeView()),
+    { sessionId, threadId },
+  )[0];
+  expect(mismatched?.integration).toMatchObject({ status: "ready", evidence: "results_ready" });
+});
+
+test("uses a plain zero-spawn tool failure as continuation evidence", () => {
+  const sessionId = "session_inline_plain_failure" as SessionId;
+  const threadId = "thread_inline_plain_failure" as ThreadId;
+  const callId = "call_inline_plain_failure" as ToolCallId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_inline_plain_failure_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_inline_plain_failure_started",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_plain_failure_tool" as TurnId, callId, toolName: "task_batch", input: { tasks: [{}, {}, {}] } },
+    },
+    {
+      id: "event_inline_plain_failure_finished",
+      type: "tool.call_finished",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId, status: "failed", error: "provider rejected every spawn" },
+    },
+    {
+      id: "event_inline_plain_failure_tool_turn_done",
+      type: "turn.completed",
+      time: 4 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_plain_failure_tool" as TurnId, status: "completed" },
+    },
+    {
+      id: "event_inline_plain_failure_continuation",
+      type: "turn.started",
+      time: 5 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_plain_failure_continuation" as TurnId },
+    },
+    {
+      id: "event_inline_plain_failure_answer",
+      type: "message.created",
+      time: 6 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "message_inline_plain_failure_answer" as MessageId, role: "assistant", turnId: "turn_inline_plain_failure_continuation" as TurnId },
+    },
+    {
+      id: "event_inline_plain_failure_answer_text",
+      type: "message.part_added",
+      time: 7 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        messageId: "message_inline_plain_failure_answer" as MessageId,
+        part: { id: "part_inline_plain_failure_answer" as PartId, messageId: "message_inline_plain_failure_answer" as MessageId, sessionId, type: "text", text: "All three agents failed to start, so no delegated result is available.", phase: "final_answer" },
+      },
+    },
+    {
+      id: "event_inline_plain_failure_continuation_done",
+      type: "turn.completed",
+      time: 8 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_plain_failure_continuation" as TurnId, status: "completed" },
+    },
+  ], createRuntimeView());
+  const batch = chatAgentBatches(view, { sessionId, threadId })[0];
+
+  expect(batch).toMatchObject({
+    status: "failed",
+    terminal: true,
+    progress: { terminal: 3, expected: 3 },
+    error: "provider rejected every spawn",
+    integration: {
+      status: "responded",
+      evidence: "assistant_response_after_terminal_result",
+      turnId: "turn_inline_plain_failure_continuation",
+      messageId: "message_inline_plain_failure_answer",
+    },
+  });
+});
+
+test("associates one continuation response with overlapping batches from the same parent prompt", () => {
+  const sessionId = "session_inline_overlap" as SessionId;
+  const threadId = "thread_inline_overlap" as ThreadId;
+  const turnId = "turn_inline_overlap_tools" as TurnId;
+  const specs = [
+    { callId: "call_inline_overlap_a" as ToolCallId, taskId: "task_inline_overlap_a" as TaskId, path: "/root/overlap-a" as AgentPath, start: 2, terminal: 10, finished: 12 },
+    { callId: "call_inline_overlap_b" as ToolCallId, taskId: "task_inline_overlap_b" as TaskId, path: "/root/overlap-b" as AgentPath, start: 3, terminal: 11, finished: 13 },
+  ];
+  const events: ChiliEvent[] = [
+    {
+      id: "event_inline_overlap_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    ...specs.flatMap((spec, index): ChiliEvent[] => [
+      {
+        id: `event_inline_overlap_${index}_tool`,
+        type: "tool.call_started",
+        time: spec.start as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { turnId, callId: spec.callId, toolName: "task_batch", input: { completionPolicy: "join", tasks: [{ description: `overlap ${index}`, prompt: `inspect overlap ${index}` }] } },
+      },
+      ...inlineTaskStartEvents({
+        id: `inline_overlap_${index}`,
+        createdAt: 4 + index,
+        spawnedAt: 6,
+        sessionId,
+        threadId,
+        callId: spec.callId,
+        batchId: `batch_inline_overlap_${index}`,
+        batchIndex: 0,
+        expectedBatchSize: 1,
+        completionPolicy: "join",
+        taskId: spec.taskId,
+        path: spec.path,
+        taskName: `overlap ${index}`,
+        prompt: `inspect overlap ${index}`,
+        runId: `run_inline_overlap_${index}` as AgentRunId,
+        generation: 2,
+      }),
+      ...inlineTaskTerminalEvents({
+        id: `inline_overlap_terminal_${index}`,
+        time: spec.terminal,
+        sessionId,
+        threadId,
+        taskId: spec.taskId,
+        path: spec.path,
+        runId: `run_inline_overlap_${index}` as AgentRunId,
+        generation: 2,
+        status: "completed",
+        summary: `overlap ${index} done`,
+      }),
+      {
+        id: `event_inline_overlap_${index}_finished`,
+        type: "tool.call_finished",
+        time: spec.finished as TimestampMs,
+        sessionId,
+        threadId,
+        payload: { callId: spec.callId, status: "completed", output: JSON.stringify({ tasks: [{ taskId: spec.taskId, status: "completed" }] }) },
+      },
+    ]),
+    {
+      id: "event_inline_overlap_tools_done",
+      type: "turn.completed",
+      time: 14 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId, status: "completed" },
+    },
+    {
+      id: "event_inline_overlap_continuation",
+      type: "turn.started",
+      time: 15 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_overlap_continuation" as TurnId },
+    },
+    {
+      id: "event_inline_overlap_answer",
+      type: "message.created",
+      time: 16 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { messageId: "message_inline_overlap_answer" as MessageId, role: "assistant", turnId: "turn_inline_overlap_continuation" as TurnId },
+    },
+    {
+      id: "event_inline_overlap_answer_text",
+      type: "message.part_added",
+      time: 17 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        messageId: "message_inline_overlap_answer" as MessageId,
+        part: {
+          id: "part_inline_overlap_answer" as PartId,
+          messageId: "message_inline_overlap_answer" as MessageId,
+          sessionId,
+          type: "text",
+          text: "Integrated both overlapping agent batches.",
+          phase: "final_answer",
+        },
+      },
+    },
+    {
+      id: "event_inline_overlap_continuation_done",
+      type: "turn.completed",
+      time: 18 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_overlap_continuation" as TurnId, status: "completed" },
+    },
+  ];
+  const batches = chatAgentBatches(reduceRuntimeEvents(events, createRuntimeView()), { sessionId, threadId });
+
+  expect(batches).toHaveLength(2);
+  expect(batches.map((batch) => batch.callId)).toEqual(specs.map((spec) => spec.callId));
+  expect(batches.map((batch) => batch.integration)).toEqual([
+    expect.objectContaining({ status: "responded", turnId: "turn_inline_overlap_continuation", messageId: "message_inline_overlap_answer" }),
+    expect.objectContaining({ status: "responded", turnId: "turn_inline_overlap_continuation", messageId: "message_inline_overlap_answer" }),
+  ]);
+});
+
+test("requires a supervised wait-all to cover every task before integration can proceed", () => {
+  const sessionId = "session_inline_supervised" as SessionId;
+  const threadId = "thread_inline_supervised" as ThreadId;
+  const callId = "call_inline_supervised" as ToolCallId;
+  const taskIds = ["task_inline_supervised_a", "task_inline_supervised_b"] as TaskId[];
+  const batchId = "batch_inline_supervised";
+  const baseEvents: ChiliEvent[] = [
+    {
+      id: "event_inline_supervised_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_inline_supervised_tool",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_supervised" as TurnId, callId, toolName: "task_batch", input: { batchId, completionPolicy: "supervised", tasks: [{}, {}] } },
+    },
+    ...taskIds.flatMap((taskId, index) => [
+      ...inlineTaskStartEvents({
+        id: `inline_supervised_${index}`,
+        createdAt: 3 + index,
+        spawnedAt: 5,
+        sessionId,
+        threadId,
+        callId,
+        batchId,
+        batchIndex: index,
+        expectedBatchSize: 2,
+        completionPolicy: "supervised",
+        taskId,
+        path: `/root/supervised-${index}` as AgentPath,
+        taskName: `supervised ${index}`,
+        prompt: `supervise ${index}`,
+        runId: `run_inline_supervised_${index}` as AgentRunId,
+        generation: 2,
+      }),
+      ...inlineTaskTerminalEvents({
+        id: `inline_supervised_terminal_${index}`,
+        time: 6 + index,
+        sessionId,
+        threadId,
+        taskId,
+        path: `/root/supervised-${index}` as AgentPath,
+        runId: `run_inline_supervised_${index}` as AgentRunId,
+        generation: 2,
+        status: "completed",
+        summary: `supervised ${index} done`,
+      }),
+    ]),
+    {
+      id: "event_inline_supervised_finished",
+      type: "tool.call_finished",
+      time: 8 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId, status: "completed", output: JSON.stringify({ completionPolicy: "supervised", tasks: taskIds.map((taskId) => ({ taskId, status: "running" })) }) },
+    },
+  ];
+  const view = reduceRuntimeEvents(baseEvents, createRuntimeView());
+  expect(chatAgentBatches(view, { sessionId, threadId })[0]?.integration).toMatchObject({
+    completionPolicy: "supervised",
+    status: "pending",
+    evidence: "results_ready",
+  });
+
+  reduceRuntimeEvents([
+    {
+      id: "event_inline_supervised_partial_wait",
+      type: "tool.call_started",
+      time: 9 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_supervised_partial_wait" as TurnId, callId: "call_inline_supervised_partial_wait" as ToolCallId, toolName: "task_wait_batch", input: { batchId, taskIds: [taskIds[0]], waitFor: "all" } },
+    },
+    {
+      id: "event_inline_supervised_partial_wait_done",
+      type: "tool.call_finished",
+      time: 10 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId: "call_inline_supervised_partial_wait" as ToolCallId, status: "completed", output: JSON.stringify({ tasks: [{ taskId: taskIds[0], status: "completed" }] }) },
+    },
+  ], view);
+  expect(chatAgentBatches(view, { sessionId, threadId })[0]?.integration.status).toBe("pending");
+
+  reduceRuntimeEvents([
+    {
+      id: "event_inline_supervised_full_wait",
+      type: "tool.call_started",
+      time: 11 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { turnId: "turn_inline_supervised_full_wait" as TurnId, callId: "call_inline_supervised_full_wait" as ToolCallId, toolName: "task_wait_batch", input: { batchId, taskIds, waitFor: "all" } },
+    },
+    {
+      id: "event_inline_supervised_full_wait_done",
+      type: "tool.call_finished",
+      time: 12 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { callId: "call_inline_supervised_full_wait" as ToolCallId, status: "completed", output: JSON.stringify({ tasks: taskIds.map((taskId) => ({ taskId, status: "completed" })) }) },
+    },
+  ], view);
+  expect(chatAgentBatches(view, { sessionId, threadId })[0]?.integration).toMatchObject({
+    completionPolicy: "supervised",
+    status: "ready",
+    evidence: "tool_result",
+    turnId: "turn_inline_supervised_full_wait",
+  });
+
+  reduceRuntimeEvents([
+    {
+      id: "event_inline_supervised_followup",
+      type: "tool.call_started",
+      time: 13 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        turnId: "turn_inline_supervised_followup" as TurnId,
+        callId: "call_inline_supervised_followup" as ToolCallId,
+        toolName: "task_followup",
+        input: { taskId: taskIds[0], prompt: "Recheck the first result." },
+      },
+    },
+    ...inlineTaskStartEvents({
+      id: "inline_supervised_followup",
+      createdAt: 3,
+      spawnedAt: 14,
+      sessionId,
+      threadId,
+      callId,
+      batchId,
+      batchIndex: 0,
+      expectedBatchSize: 2,
+      completionPolicy: "supervised",
+      taskId: taskIds[0]!,
+      path: "/root/supervised-0" as AgentPath,
+      taskName: "supervised 0",
+      prompt: "supervise 0",
+      runId: "run_inline_supervised_followup" as AgentRunId,
+      generation: 4,
+      includeCreated: false,
+    }),
+    ...inlineTaskTerminalEvents({
+      id: "inline_supervised_followup_terminal",
+      time: 15,
+      sessionId,
+      threadId,
+      taskId: taskIds[0]!,
+      path: "/root/supervised-0" as AgentPath,
+      runId: "run_inline_supervised_followup" as AgentRunId,
+      generation: 4,
+      status: "completed",
+      summary: "supervised 0 rechecked",
+    }),
+    {
+      id: "event_inline_supervised_followup_done",
+      type: "tool.call_finished",
+      time: 16 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        callId: "call_inline_supervised_followup" as ToolCallId,
+        status: "completed",
+        output: JSON.stringify({ taskId: taskIds[0], status: "completed", generation: 4 }),
+      },
+    },
+  ], view);
+  const invalidated = chatAgentBatches(view, { sessionId, threadId })[0];
+  expect(invalidated?.agents[0]).toMatchObject({ taskId: taskIds[0], turns: 2, followupCount: 1 });
+  expect(invalidated?.integration).toMatchObject({
+    completionPolicy: "supervised",
+    status: "pending",
+    evidence: "results_ready",
+  });
+
+  reduceRuntimeEvents([
+    {
+      id: "event_inline_supervised_reconfirmed_wait",
+      type: "tool.call_started",
+      time: 17 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        turnId: "turn_inline_supervised_reconfirmed_wait" as TurnId,
+        callId: "call_inline_supervised_reconfirmed_wait" as ToolCallId,
+        toolName: "task_wait_batch",
+        input: { batchId, taskIds, waitFor: "all" },
+      },
+    },
+    {
+      id: "event_inline_supervised_reconfirmed_wait_done",
+      type: "tool.call_finished",
+      time: 18 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        callId: "call_inline_supervised_reconfirmed_wait" as ToolCallId,
+        status: "completed",
+        output: JSON.stringify({ tasks: taskIds.map((taskId) => ({ taskId, status: "completed" })) }),
+      },
+    },
+  ], view);
+  expect(chatAgentBatches(view, { sessionId, threadId })[0]?.integration).toMatchObject({
+    completionPolicy: "supervised",
+    status: "ready",
+    evidence: "tool_result",
+    turnId: "turn_inline_supervised_reconfirmed_wait",
+  });
+
+  const singleSessionId = "session_inline_supervised_single" as SessionId;
+  const singleThreadId = "thread_inline_supervised_single" as ThreadId;
+  const singleCallId = "call_inline_supervised_single" as ToolCallId;
+  const singleTaskId = "task_inline_supervised_single" as TaskId;
+  const singlePath = "/root/supervised-single" as AgentPath;
+  const singleView = reduceRuntimeEvents([
+    {
+      id: "event_inline_supervised_single_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId: singleSessionId,
+      threadId: singleThreadId,
+      payload: { sessionId: singleSessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_inline_supervised_single_batch",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId: singleSessionId,
+      threadId: singleThreadId,
+      payload: {
+        turnId: "turn_inline_supervised_single" as TurnId,
+        callId: singleCallId,
+        toolName: "task_batch",
+        input: { completionPolicy: "supervised", tasks: [{ description: "single", prompt: "supervise single" }] },
+      },
+    },
+    ...inlineTaskStartEvents({
+      id: "inline_supervised_single",
+      createdAt: 3,
+      spawnedAt: 4,
+      sessionId: singleSessionId,
+      threadId: singleThreadId,
+      callId: singleCallId,
+      batchId: "batch_inline_supervised_single",
+      batchIndex: 0,
+      expectedBatchSize: 1,
+      completionPolicy: "supervised",
+      taskId: singleTaskId,
+      path: singlePath,
+      taskName: "single supervised",
+      prompt: "supervise single",
+      runId: "run_inline_supervised_single" as AgentRunId,
+      generation: 2,
+    }),
+    ...inlineTaskTerminalEvents({
+      id: "inline_supervised_single_terminal",
+      time: 5,
+      sessionId: singleSessionId,
+      threadId: singleThreadId,
+      taskId: singleTaskId,
+      path: singlePath,
+      runId: "run_inline_supervised_single" as AgentRunId,
+      generation: 2,
+      status: "completed",
+      summary: "single done",
+    }),
+    {
+      id: "event_inline_supervised_single_finished",
+      type: "tool.call_finished",
+      time: 6 as TimestampMs,
+      sessionId: singleSessionId,
+      threadId: singleThreadId,
+      payload: { callId: singleCallId, status: "completed", output: JSON.stringify({ tasks: [{ taskId: singleTaskId, status: "running" }] }) },
+    },
+    {
+      id: "event_inline_supervised_single_wait",
+      type: "tool.call_started",
+      time: 7 as TimestampMs,
+      sessionId: singleSessionId,
+      threadId: singleThreadId,
+      payload: { turnId: "turn_inline_supervised_single_wait" as TurnId, callId: "call_inline_supervised_single_wait" as ToolCallId, toolName: "task_wait", input: { taskId: singleTaskId } },
+    },
+    {
+      id: "event_inline_supervised_single_wait_done",
+      type: "tool.call_finished",
+      time: 8 as TimestampMs,
+      sessionId: singleSessionId,
+      threadId: singleThreadId,
+      payload: { callId: "call_inline_supervised_single_wait" as ToolCallId, status: "completed", output: JSON.stringify({ taskId: singleTaskId, status: "completed" }) },
+    },
+  ], createRuntimeView());
+  expect(chatAgentBatches(singleView, { sessionId: singleSessionId, threadId: singleThreadId })[0]?.integration).toMatchObject({
+    completionPolicy: "supervised",
+    status: "pending",
+    evidence: "results_ready",
+  });
+});
+
+function inlineTaskStartEvents(input: {
+  id: string;
+  createdAt: number;
+  spawnedAt: number;
+  sessionId: SessionId;
+  threadId: ThreadId;
+  callId: ToolCallId;
+  batchId?: string;
+  batchIndex?: number;
+  expectedBatchSize?: number;
+  completionPolicy: "join" | "notify" | "detached" | "supervised";
+  maxConcurrency?: number;
+  taskId: TaskId;
+  path: AgentPath;
+  taskName: string;
+  prompt: string;
+  runId: AgentRunId;
+  generation: number;
+  includeCreated?: boolean;
+}): ChiliEvent[] {
+  const scheduling = {
+    sourceCallId: input.callId,
+    ...(input.batchId ? { batchId: input.batchId } : {}),
+    ...(input.batchIndex === undefined ? {} : { batchIndex: input.batchIndex }),
+    ...(input.expectedBatchSize === undefined ? {} : { expectedBatchSize: input.expectedBatchSize }),
+    completionPolicy: input.completionPolicy,
+    ...(input.maxConcurrency === undefined ? {} : { maxConcurrency: input.maxConcurrency }),
+  };
+  const childSessionId = `session_${input.id}` as SessionId;
+  const childThreadId = `thread_${input.id}` as ThreadId;
+  const created: ChiliEvent = {
+    id: `event_${input.id}_created`,
+    type: "agent.task_created",
+    time: input.createdAt as TimestampMs,
+    sessionId: input.sessionId,
+    threadId: input.threadId,
+    payload: {
+      taskId: input.taskId,
+      path: input.path,
+      parentPath: "/root" as AgentPath,
+      parentSessionId: input.sessionId,
+      parentThreadId: input.threadId,
+      childSessionId,
+      childThreadId,
+      taskName: input.taskName,
+      cwd: "/repo",
+      prompt: input.prompt,
+      mode: "background",
+      ...scheduling,
+    },
+  };
+  const spawned: ChiliEvent = {
+    id: `event_${input.id}_spawned`,
+    type: "agent.spawned",
+    time: input.spawnedAt as TimestampMs,
+    sessionId: input.sessionId,
+    threadId: input.threadId,
+    payload: {
+      runId: input.runId,
+      taskId: input.taskId,
+      path: input.path,
+      parentPath: "/root" as AgentPath,
+      parentSessionId: input.sessionId,
+      parentThreadId: input.threadId,
+      childSessionId,
+      childThreadId,
+      taskName: input.taskName,
+      mode: "background",
+      generation: input.generation,
+      ...scheduling,
+    },
+  };
+  return input.includeCreated === false ? [spawned] : [created, spawned];
+}
+
+function inlineTaskTerminalEvents(input: {
+  id: string;
+  time: number;
+  sessionId: SessionId;
+  threadId: ThreadId;
+  taskId: TaskId;
+  path: AgentPath;
+  runId: AgentRunId;
+  generation: number;
+  status: "completed" | "incomplete" | "failed" | "cancelled";
+  summary?: string;
+  error?: string;
+}): ChiliEvent[] {
+  const detail = {
+    ...(input.summary ? { summary: input.summary } : {}),
+    ...(input.error ? { error: input.error } : {}),
+  };
+  return [
+    {
+      id: `event_${input.id}_agent_completed`,
+      type: "agent.completed",
+      time: input.time as TimestampMs,
+      sessionId: input.sessionId,
+      threadId: input.threadId,
+      payload: {
+        runId: input.runId,
+        taskId: input.taskId,
+        path: input.path,
+        generation: input.generation,
+        status: input.status,
+        ...detail,
+      },
+    },
+    {
+      id: `event_${input.id}_task_completed`,
+      type: "agent.task_completed",
+      time: input.time as TimestampMs,
+      sessionId: input.sessionId,
+      threadId: input.threadId,
+      payload: {
+        runId: input.runId,
+        taskId: input.taskId,
+        path: input.path,
+        generation: input.generation,
+        status: input.status,
+        ...detail,
+      },
+    },
+  ];
+}
+
+function agentTaskCreatedEvent(input: {
+  id: string;
+  time: number;
+  sessionId: SessionId;
+  threadId?: ThreadId;
+  taskId: TaskId;
+  path?: AgentPath;
+  childSessionId?: SessionId;
+  childThreadId?: ThreadId;
+  sourceCallId?: ToolCallId;
+  batchId?: string;
+  batchIndex?: number;
+  expectedBatchSize?: number;
+}): ChiliEvent {
+  const path = input.path ?? (`/root/${input.taskId}` as AgentPath);
+  const childSessionId = input.childSessionId ?? (`session_${input.taskId}` as SessionId);
+  const childThreadId = input.childThreadId ?? (`thread_${input.taskId}` as ThreadId);
+  return {
+    id: input.id,
+    type: "agent.task_created",
+    time: input.time as TimestampMs,
+    sessionId: input.sessionId,
+    ...(input.threadId ? { threadId: input.threadId } : {}),
+    payload: {
+      taskId: input.taskId,
+      path,
+      parentPath: "/root" as AgentPath,
+      parentSessionId: input.sessionId,
+      ...(input.threadId ? { parentThreadId: input.threadId } : {}),
+      childSessionId,
+      childThreadId,
+      taskName: String(input.taskId),
+      cwd: "/repo",
+      prompt: "inspect",
+      mode: "background",
+      ...(input.sourceCallId ? { sourceCallId: input.sourceCallId } : {}),
+      ...(input.batchId ? { batchId: input.batchId } : {}),
+      ...(input.batchIndex === undefined ? {} : { batchIndex: input.batchIndex }),
+      ...(input.expectedBatchSize === undefined ? {} : { expectedBatchSize: input.expectedBatchSize }),
+    },
+  };
+}
+
 test("projects subagent runs, mailbox messages, and team tasks", () => {
   const sessionId = "session_agents" as SessionId;
   const threadId = "thread_agents" as ThreadId;
@@ -2030,6 +4666,18 @@ test("derives Team Live cockpit view from team projection state", () => {
   expect(live.selected?.mergeQueue.map((merge) => merge.status).sort()).toEqual(["applied", "conflicted", "failed", "pending"]);
   expect(live.selected?.recentActivity.map((item) => item.kind)).toContain("verifier");
   expect(live.selected?.recentActivity.map((item) => item.kind)).toContain("merge");
+  expect(live.selected?.recentActivity.find((item) => item.id === "teammsg_live")).toMatchObject({
+    kind: "message",
+    teamMessageId: "teammsg_live",
+    from: leadPath,
+    to: memberPath,
+  });
+  expect(live.selected?.recentActivity.find((item) => item.id === "event_mailbox")).toMatchObject({
+    kind: "mailbox",
+    teamMessageId: "teammsg_live",
+    from: leadPath,
+    to: memberPath,
+  });
   expect(live.selected?.recentActivity).toContainEqual(
     expect.objectContaining({ id: resolvedApprovalId, kind: "approval", status: "resolved" }),
   );

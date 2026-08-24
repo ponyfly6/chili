@@ -54,6 +54,7 @@ export interface TeamExecutionRunnerOptions {
   createId?: (prefix: string) => string;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   createSession?: (input: TeamExecutionSessionRequest) => Promise<TeamExecutionSession>;
+  assertDelegationEnabled?: (input: { sessionId: SessionId; action: "team.run" }) => Promise<void> | void;
 }
 
 export interface TeamRunEventStore {
@@ -241,7 +242,7 @@ interface TeamDispatchCandidate {
 const DEFAULT_MAX_CYCLES = 50;
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_POLL_INTERVAL_MS = 250;
-const DEFAULT_MAX_CONCURRENT_DISPATCHES = 4;
+const DEFAULT_MAX_CONCURRENT_DISPATCHES = 3;
 const MAX_CONCURRENT_DISPATCHES = 64;
 const DEFAULT_MAX_CONCURRENT_VERIFICATIONS = 2;
 const MAX_CONCURRENT_VERIFICATIONS = 4;
@@ -250,6 +251,14 @@ export class TeamExecutionRunner {
   constructor(private readonly options: TeamExecutionRunnerOptions) {}
 
   async run(input: TeamExecutionRunInput): Promise<TeamExecutionRunSummary> {
+    const initialState = await this.loadState(input.teamId);
+    const delegationSessionId = input.sessionId ?? initialState.team.sessionId;
+    if (delegationSessionId) {
+      await this.options.assertDelegationEnabled?.({
+        sessionId: delegationSessionId,
+        action: "team.run",
+      });
+    }
     const startedAt = Number(this.now());
     const runId = this.id("teamrun");
     const maxCycles = input.once ? 1 : input.maxCycles ?? DEFAULT_MAX_CYCLES;
@@ -284,7 +293,6 @@ export class TeamExecutionRunner {
       errors: [],
     };
 
-    const initialState = await this.loadState(input.teamId);
     await this.publishRunStarted(input, sessionState, initialState.team, runId, {
       maxCycles,
       timeoutMs,
@@ -358,8 +366,10 @@ export class TeamExecutionRunner {
 
       const dispatches: TeamDispatchWork[] = [];
       const reservations = dispatchReservationsForRunningTasks(state.tasks);
+      const availableDispatchSlots = Math.max(0, maxConcurrentDispatches - runningTasks(state.tasks).length);
       for (const task of sortedDispatchCandidates(state.tasks)) {
         if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
+        if (dispatches.length >= availableDispatchSlots) break;
         if (task.status !== "pending") continue;
 
         const blockedBy = incompleteDependencies(task, state.tasks, Boolean(this.options.verifier));
@@ -430,9 +440,8 @@ export class TeamExecutionRunner {
         dispatches.push({ task: dispatchTask, input: dispatchInput });
       }
 
-      for (const batch of chunk(dispatches, maxConcurrentDispatches)) {
-        if (controlStopReason(input, startedMonotonic, timeoutMs)) break;
-        const results = await Promise.all(batch.map(async (work) => {
+      if (!controlStopReason(input, startedMonotonic, timeoutMs)) {
+        const results = await Promise.all(dispatches.map(async (work) => {
           try {
             return { work, result: await this.options.dispatcher.dispatchTask(work.input) };
           } catch (error) {
@@ -498,7 +507,13 @@ export class TeamExecutionRunner {
         break;
       }
 
-      if ((stillRunning.length > 0 || pendingVerification.length > 0) && !input.signal?.aborted) {
+      const dispatchCapacityExhausted = stillRunning.length >= maxConcurrentDispatches;
+      if (
+        (pendingVerification.length > 0 ||
+          (stillRunning.length > 0 &&
+            (runnable.length === 0 || dispatchCapacityExhausted || dispatches.length === 0))) &&
+        !input.signal?.aborted
+      ) {
         await this.publishRunProgress(input, sessionState, postCycle.team, runId, summary, "wait");
         await this.sleep(Math.min(pollIntervalMs, remainingDelay(timeoutMs, startedMonotonic)), input.signal);
       }
@@ -901,14 +916,6 @@ function normalizeMaxConcurrentVerifications(value: number | undefined): number 
   if (value === undefined) return DEFAULT_MAX_CONCURRENT_VERIFICATIONS;
   if (!Number.isInteger(value) || value <= 0) return DEFAULT_MAX_CONCURRENT_VERIFICATIONS;
   return Math.min(value, MAX_CONCURRENT_VERIFICATIONS);
-}
-
-function chunk<T>(items: readonly T[], size: number): T[][] {
-  const chunks: T[][] = [];
-  for (let index = 0; index < items.length; index += size) {
-    chunks.push(items.slice(index, index + size));
-  }
-  return chunks;
 }
 
 function dispatchReservationsForRunningTasks(tasks: readonly TeamTaskRow[]): DispatchReservations {

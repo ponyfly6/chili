@@ -2,10 +2,19 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import { TeamControlService, type AgentTreeSnapshot, type SubmitPromptInput } from "@chili/core";
+import {
+  AgentTaskControlService,
+  LocalSubagentConcurrencyLimiter,
+  RuntimeSubagentSessionAccessError,
+  TeamControlService,
+  type AgentTreeSnapshot,
+  type AgentTaskPromptRuntime,
+  type SubmitPromptInput,
+} from "@chili/core";
 import type {
   ApprovalRow,
   AgentMailboxQuery,
+  AgentRunQuery,
   AgentTaskRow,
   AgentMailboxRow,
   AgentRunRow,
@@ -21,11 +30,14 @@ import type {
   AgentRunId,
   ApprovalDecisionAction,
   ChiliEvent,
+  DelegationPolicy,
+  DelegationPolicySource,
   EventEnvelope,
   Message,
   ModelSelection,
   ReasoningLevel,
   RuntimeModelConfig,
+  RuntimeDelegationConfig,
   RuntimeModelDescriptor,
   RuntimePermissionConfig,
   RuntimePermissionProfileId,
@@ -42,7 +54,7 @@ import type {
   TimestampMs,
   TurnId,
 } from "@chili/protocol";
-import type { RuntimeAgentsSnapshot } from "./agent-projection.js";
+import { projectRuntimeAgents, type RuntimeAgentsSnapshot } from "./agent-projection.js";
 import type {
   RuntimeAgentTreeService,
   RuntimeHttpService,
@@ -426,6 +438,10 @@ test("serves task control routes", async () => {
   expect(await listResponse.json()).toMatchObject([{ id: "task_http", status: "running" }]);
   expect(tasks.lastListStatus).toBe("running");
 
+  const incompleteListResponse = await handler(new Request("http://chili.test/tasks?status=incomplete"));
+  expect(incompleteListResponse.status).toBe(200);
+  expect(tasks.lastListStatus).toBe("incomplete");
+
   const taskResponse = await handler(new Request("http://chili.test/tasks/task_http"));
   expect(taskResponse.status).toBe(200);
   expect(await taskResponse.json()).toMatchObject({ id: "task_http", status: "running" });
@@ -443,6 +459,7 @@ test("serves task control routes", async () => {
     result: { status: "completed", finishReason: "stop" },
   });
   expect(tasks.lastFollowupText).toBe("continue");
+  expect(tasks.lastFollowupSignal).toBeInstanceOf(AbortSignal);
 
   const legacyFollowupResponse = await handler(
     new Request("http://chili.test/tasks/task_http/followup", {
@@ -465,6 +482,7 @@ test("serves task control routes", async () => {
   );
   expect(waitResponse.status).toBe(200);
   expect(await waitResponse.json()).toMatchObject({ id: "task_http" });
+  expect(tasks.lastWaitSignal).toBeInstanceOf(AbortSignal);
 
   const closeResponse = await handler(
     new Request("http://chili.test/tasks/task_http/close", {
@@ -475,6 +493,20 @@ test("serves task control routes", async () => {
   );
   expect(closeResponse.status).toBe(200);
   expect(await closeResponse.json()).toMatchObject({ id: "task_http", status: "cancelled", summary: "stopped" });
+
+  const incompleteCloseResponse = await handler(
+    new Request("http://chili.test/tasks/task_http/close", {
+      method: "POST",
+      body: JSON.stringify({ status: "incomplete", summary: "planning_only" }),
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  expect(incompleteCloseResponse.status).toBe(200);
+  expect(await incompleteCloseResponse.json()).toMatchObject({
+    id: "task_http",
+    status: "incomplete",
+    summary: "planning_only",
+  });
 
   const reconcileResponse = await handler(
     new Request("http://chili.test/tasks/reconcile_stale", {
@@ -491,6 +523,130 @@ test("serves task control routes", async () => {
   expect(tasks.lastReconcile).toMatchObject({ staleAfterMs: 0, modes: ["background"], limit: 25 });
 });
 
+test("task follow-up HTTP requests propagate client abort to the task controller", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const tasks = new AbortableFollowupTaskControlService();
+  const handler = createRuntimeHttpHandler({ service, store, tasks });
+  const controller = new AbortController();
+
+  const responsePromise = handler(new Request("http://chili.test/tasks/task_http/followup", {
+    method: "POST",
+    body: JSON.stringify({ text: "wait for capacity" }),
+    headers: { "content-type": "application/json" },
+    signal: controller.signal,
+  }));
+  await tasks.started.promise;
+
+  controller.abort();
+
+  const response = await responsePromise;
+  expect(response.status).toBe(499);
+  expect(tasks.lastFollowupSignal?.aborted).toBe(true);
+  expect(await response.json()).toMatchObject({ error: { message: "Task follow-up aborted" } });
+});
+
+test("task close HTTP requests cancel a capacity-queued follow-up without changing the terminal task", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-http-close-queued-followup-"));
+  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const taskId = "task_http_queued" as TaskId;
+  const limiter = new LocalSubagentConcurrencyLimiter(1);
+  const releaseBlocker = await limiter.acquire();
+  const taskRuntime: AgentTaskPromptRuntime = {
+    async submitPrompt(): Promise<never> {
+      throw new Error("queued follow-up must not reach the runtime");
+    },
+  };
+
+  try {
+    await seedCompletedHttpTask(baseStore, taskId);
+    const tasks = new AgentTaskControlService({ store, runtime: taskRuntime, runLimiter: limiter });
+    const handler = createRuntimeHttpHandler({ service, store, tasks });
+    const followupResponsePromise = handler(new Request(`http://chili.test/tasks/${taskId}/followup`, {
+      method: "POST",
+      body: JSON.stringify({ text: "wait for capacity" }),
+      headers: { "content-type": "application/json" },
+    }));
+    await waitUntil(() => limiter.snapshot().queuedRuns === 1);
+
+    const closeResponse = await handler(new Request(`http://chili.test/tasks/${taskId}/close`, {
+      method: "POST",
+      body: JSON.stringify({ status: "cancelled" }),
+      headers: { "content-type": "application/json" },
+    }));
+    const followupResponse = await followupResponsePromise;
+
+    expect(closeResponse.status).toBe(200);
+    expect(await closeResponse.json()).toMatchObject({ id: taskId, status: "completed", summary: "initial answer" });
+    expect(followupResponse.status).toBe(499);
+    expect(await baseStore.events({ type: "agent.spawned", limit: 100 })).toHaveLength(1);
+    expect(await baseStore.agentTask(taskId)).toMatchObject({ status: "completed", generation: 1 });
+  } finally {
+    releaseBlocker();
+    baseStore.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("projects incomplete agent tasks and runs as terminal", () => {
+  const sessionId = "session_incomplete_projection" as SessionId;
+  const threadId = "thread_incomplete_projection" as ThreadId;
+  const taskId = "task_incomplete_projection" as TaskId;
+  const runId = "agent_incomplete_projection" as AgentRunId;
+  const path = "/root/task_incomplete_projection" as AgentPath;
+  const events: ChiliEvent[] = [
+    {
+      id: "event_incomplete_created",
+      type: "agent.task_created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        taskId,
+        path,
+        parentPath: "/root" as AgentPath,
+        parentSessionId: sessionId,
+        childSessionId: "session_incomplete_child" as SessionId,
+        childThreadId: "thread_incomplete_child" as ThreadId,
+        taskName: "Inspect repository",
+        cwd: "/repo",
+        prompt: "Inspect repository",
+      },
+    },
+    {
+      id: "event_incomplete_spawned",
+      type: "agent.spawned",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { runId, taskId, path, taskName: "Inspect repository", generation: 1 },
+    },
+    {
+      id: "event_incomplete_task_done",
+      type: "agent.task_completed",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { taskId, runId, path, status: "incomplete", generation: 1, error: "planning_only" },
+    },
+    {
+      id: "event_incomplete_agent_done",
+      type: "agent.completed",
+      time: 4 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: { runId, taskId, path, status: "incomplete", generation: 1, error: "planning_only" },
+    },
+  ];
+
+  const snapshot = projectRuntimeAgents(events, sessionId);
+  expect(snapshot.tasks).toMatchObject([{ id: taskId, status: "incomplete", completedAt: 3 }]);
+  expect(snapshot.agents).toMatchObject([{ id: runId, status: "incomplete", completedAt: 4 }]);
+});
+
 test("serves agent tree and mailbox control routes", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
@@ -505,9 +661,10 @@ test("serves agent tree and mailbox control routes", async () => {
     nodes: [{ path: "/root", children: [{ path: "/root/task_http" }] }],
   });
 
-  const runsResponse = await handler(new Request("http://chili.test/agent_runs?path=/root/task_http"));
+  const runsResponse = await handler(new Request("http://chili.test/agent_runs?path=/root/task_http&status=incomplete"));
   expect(runsResponse.status).toBe(200);
   expect(await runsResponse.json()).toMatchObject([{ id: "agent_http_child", path: "/root/task_http" }]);
+  expect(agents.runQueries.at(-1)).toMatchObject({ path: "/root/task_http", status: "incomplete" });
 
   const mailboxResponse = await handler(new Request("http://chili.test/mailbox?status=queued"));
   expect(mailboxResponse.status).toBe(200);
@@ -994,6 +1151,94 @@ test("serves prompt commands and submits expanded command prompts", async () => 
   });
 });
 
+test("rejects direct HTTP prompts, commands, and goal continuations for subagent sessions", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const commands = new FakePromptCommandControl();
+  const handler = createRuntimeHttpHandler({ service, store, commands });
+  const session = await service.createSession({
+    sessionId: "session_http_child" as SessionId,
+    threadId: "thread_http_child" as ThreadId,
+  });
+  service.blockedSubagentSessions.add(session.sessionId);
+
+  const requests = [
+    new Request(`http://chili.test/sessions/${session.sessionId}/prompt`, {
+      method: "POST",
+      body: JSON.stringify({ threadId: session.threadId, text: "bypass synchronously" }),
+      headers: { "content-type": "application/json" },
+    }),
+    new Request(`http://chili.test/sessions/${session.sessionId}/prompt_async`, {
+      method: "POST",
+      body: JSON.stringify({ threadId: session.threadId, text: "bypass" }),
+      headers: { "content-type": "application/json" },
+    }),
+    new Request(`http://chili.test/sessions/${session.sessionId}/command_async`, {
+      method: "POST",
+      body: JSON.stringify({ threadId: session.threadId, name: "joke" }),
+      headers: { "content-type": "application/json" },
+    }),
+    new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
+      method: "POST",
+      body: JSON.stringify({ threadId: session.threadId, objective: "bypass through goal" }),
+      headers: { "content-type": "application/json" },
+    }),
+  ];
+
+  for (const request of requests) {
+    const response = await handler(request);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: { message: expect.stringContaining("Use task_followup for the owning task") },
+    });
+  }
+  expect(service.lastPrompt).toBeUndefined();
+  expect(service.goal).toBeUndefined();
+  expect(commands.lastRun).toBeUndefined();
+});
+
+test("rejects a known pending child over HTTP before its session row exists", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const commands = new FakePromptCommandControl();
+  const handler = createRuntimeHttpHandler({ service, store, commands });
+  const sessionId = "session_http_pending_child" as SessionId;
+  const threadId = "thread_http_pending_child" as ThreadId;
+  service.blockedSubagentSessions.add(sessionId);
+
+  const requests = [
+    new Request(`http://chili.test/sessions/${sessionId}/prompt_async`, {
+      method: "POST",
+      body: JSON.stringify({ threadId, text: "race the pending child" }),
+      headers: { "content-type": "application/json" },
+    }),
+    new Request(`http://chili.test/sessions/${sessionId}/command_async`, {
+      method: "POST",
+      body: JSON.stringify({ threadId, name: "joke" }),
+      headers: { "content-type": "application/json" },
+    }),
+    new Request(`http://chili.test/sessions/${sessionId}/goal`, {
+      method: "POST",
+      body: JSON.stringify({ threadId, objective: "race through a goal continuation" }),
+      headers: { "content-type": "application/json" },
+    }),
+  ];
+
+  expect(await store.sessions()).toEqual([]);
+  for (const request of requests) {
+    const response = await handler(request);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: { message: expect.stringContaining("Use task_followup for the owning task") },
+    });
+  }
+  expect(service.lastPrompt).toBeUndefined();
+  expect(service.goal).toBeUndefined();
+  expect(commands.lastRun).toBeUndefined();
+});
+
 test("serves MCP management routes through optional runtime control", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
@@ -1236,6 +1481,32 @@ test("serves model control routes and prompt model overrides", async () => {
   expect(setServiceTierResponse.status).toBe(200);
   expect(service.serviceTier).toBe("fast");
 
+  const delegationResponse = await handler(
+    new Request(`http://chili.test/sessions/${session.sessionId}/delegation`),
+  );
+  expect(delegationResponse.status).toBe(200);
+  expect(await delegationResponse.json()).toEqual({
+    sessionId: session.sessionId,
+    policy: "explicit",
+    source: "default",
+  });
+
+  const setDelegationResponse = await handler(new Request(
+    `http://chili.test/sessions/${session.sessionId}/delegation`,
+    {
+      method: "POST",
+      body: JSON.stringify({ threadId: session.threadId, policy: "proactive" }),
+      headers: { "content-type": "application/json" },
+    },
+  ));
+  expect(setDelegationResponse.status).toBe(200);
+  expect(service.delegationPolicy).toBe("proactive");
+  expect(await setDelegationResponse.json()).toEqual({
+    sessionId: session.sessionId,
+    policy: "proactive",
+    source: "session",
+  });
+
   const promptResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/prompt_async`, {
     method: "POST",
     body: JSON.stringify({
@@ -1356,10 +1627,19 @@ class FakeRuntimeService implements RuntimeHttpService {
   modelSelection: ModelSelection | undefined;
   reasoningLevel: ReasoningLevel | undefined;
   serviceTier: ServiceTier | undefined;
+  delegationPolicy: DelegationPolicy = "explicit";
+  delegationSource: DelegationPolicySource = "default";
   lastPrompt: SubmitPromptInput | undefined;
   goal: ThreadGoal | undefined;
+  readonly blockedSubagentSessions = new Set<SessionId>();
 
   constructor(private readonly store: EventStore & EventPublisher) {}
+
+  async assertSessionTurnAllowed(sessionId: SessionId): Promise<void> {
+    if (this.blockedSubagentSessions.has(sessionId)) {
+      throw new RuntimeSubagentSessionAccessError(sessionId);
+    }
+  }
 
   async createSession(input: { sessionId?: SessionId; threadId?: ThreadId; cwd?: string } = {}): Promise<RuntimeSessionRef> {
     const sessionId = input.sessionId ?? ("session_http" as SessionId);
@@ -1414,6 +1694,20 @@ class FakeRuntimeService implements RuntimeHttpService {
   async setServiceTier(input: { sessionId: SessionId; serviceTier: ServiceTier }): Promise<RuntimeModelConfig> {
     this.serviceTier = input.serviceTier;
     return this.getModelConfig(input.sessionId);
+  }
+
+  async getDelegationConfig(sessionId: SessionId): Promise<RuntimeDelegationConfig> {
+    return {
+      sessionId,
+      policy: this.delegationPolicy,
+      source: this.delegationSource,
+    };
+  }
+
+  async setDelegationPolicy(input: { sessionId: SessionId; policy: DelegationPolicy }): Promise<RuntimeDelegationConfig> {
+    this.delegationPolicy = input.policy;
+    this.delegationSource = "session";
+    return this.getDelegationConfig(input.sessionId);
   }
 
   async getGoal(input: { threadId: ThreadId }): Promise<ThreadGoal | undefined> {
@@ -1588,6 +1882,8 @@ class FakeMcpControlService implements RuntimeMcpControlService {
 class FakeTaskControlService implements RuntimeTaskControlService {
   lastListStatus: string | undefined;
   lastFollowupText: string | undefined;
+  lastFollowupSignal: AbortSignal | undefined;
+  lastWaitSignal: AbortSignal | undefined;
   lastReconcile: unknown;
 
   async listTasks(query: { status?: string } = {}): Promise<AgentTaskRow[]> {
@@ -1599,8 +1895,11 @@ class FakeTaskControlService implements RuntimeTaskControlService {
     return taskRow({ status: "running" });
   }
 
-  async followupTask(input: { text: string }): Promise<Awaited<ReturnType<RuntimeTaskControlService["followupTask"]>>> {
+  async followupTask(
+    input: Parameters<RuntimeTaskControlService["followupTask"]>[0],
+  ): Promise<Awaited<ReturnType<RuntimeTaskControlService["followupTask"]>>> {
     this.lastFollowupText = input.text;
+    this.lastFollowupSignal = input.signal;
     return {
       task: taskRow({ status: "completed", summary: "done" }),
       result: {
@@ -1611,11 +1910,12 @@ class FakeTaskControlService implements RuntimeTaskControlService {
     };
   }
 
-  async waitForTask(): Promise<AgentTaskRow> {
+  async waitForTask(input: Parameters<RuntimeTaskControlService["waitForTask"]>[0]): Promise<AgentTaskRow> {
+    this.lastWaitSignal = input.signal;
     return taskRow({ status: "completed", summary: "done" });
   }
 
-  async closeTask(input: { status?: "completed" | "failed" | "cancelled"; summary?: string }): Promise<AgentTaskRow> {
+  async closeTask(input: { status?: "completed" | "incomplete" | "failed" | "cancelled"; summary?: string }): Promise<AgentTaskRow> {
     const rowInput: { status: AgentTaskRow["status"]; summary?: string } = { status: input.status ?? "cancelled" };
     if (input.summary) rowInput.summary = input.summary;
     return taskRow(rowInput);
@@ -1627,8 +1927,29 @@ class FakeTaskControlService implements RuntimeTaskControlService {
   }
 }
 
+class AbortableFollowupTaskControlService extends FakeTaskControlService {
+  readonly started = deferred<void>();
+
+  override async followupTask(
+    input: Parameters<RuntimeTaskControlService["followupTask"]>[0],
+  ): Promise<Awaited<ReturnType<RuntimeTaskControlService["followupTask"]>>> {
+    this.lastFollowupText = input.text;
+    this.lastFollowupSignal = input.signal;
+    this.started.resolve();
+    if (input.signal?.aborted) throw abortError("Task follow-up aborted");
+    return new Promise((_, reject) => {
+      input.signal?.addEventListener(
+        "abort",
+        () => reject(abortError("Task follow-up aborted")),
+        { once: true },
+      );
+    });
+  }
+}
+
 class FakeAgentTreeService implements RuntimeAgentTreeService {
   consumedIds: string[] = [];
+  runQueries: AgentRunQuery[] = [];
   mailboxQueries: AgentMailboxQuery[] = [];
 
   async snapshot(): Promise<AgentTreeSnapshot> {
@@ -1671,7 +1992,8 @@ class FakeAgentTreeService implements RuntimeAgentTreeService {
     };
   }
 
-  async agentRuns(): Promise<AgentRunRow[]> {
+  async agentRuns(query: AgentRunQuery = {}): Promise<AgentRunRow[]> {
+    this.runQueries.push(query);
     return [agentRunRow({ id: "agent_http_child", path: "/root/task_http", parentPath: "/root", taskName: "review" })];
   }
 
@@ -1880,14 +2202,14 @@ function teamDispatchMetadata(agentStatus: "running" | "completed", syncedAt?: n
   };
 }
 
-function localSubagentTaskRow(input: { status: "running" | "completed" | "failed" | "cancelled" }): {
+function localSubagentTaskRow(input: { status: "running" | "completed" | "incomplete" | "failed" | "cancelled" }): {
   taskId: TaskId;
   runId: AgentRunId;
   path: AgentPath;
   parentPath: AgentPath;
   childSessionId: SessionId;
   childThreadId: ThreadId;
-  status: "running" | "completed" | "failed" | "cancelled";
+  status: "running" | "completed" | "incomplete" | "failed" | "cancelled";
 } {
   return {
     taskId: "task_agent_http" as TaskId,
@@ -2037,6 +2359,102 @@ function promptCommandList(): RuntimePromptCommandList {
     directories: ["/repo/.chili/commands"],
     skippedConflicts: [],
   };
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value?: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return {
+    promise,
+    resolve: (value?: T) => resolve(value as T),
+  };
+}
+
+async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("Timed out waiting for condition");
+}
+
+async function seedCompletedHttpTask(store: SqliteEventStore, taskId: TaskId): Promise<void> {
+  const sessionId = "session_http_parent" as SessionId;
+  const threadId = "thread_http_parent" as ThreadId;
+  const childSessionId = "session_http_child" as SessionId;
+  const childThreadId = "thread_http_child" as ThreadId;
+  const path = `/root/${taskId}` as AgentPath;
+  const runId = `agent_initial_${taskId}` as AgentRunId;
+  await store.appendMany([
+    {
+      id: `event_created_${taskId}`,
+      type: "agent.task_created",
+      time: 1 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        taskId,
+        path,
+        parentPath: "/root" as AgentPath,
+        parentSessionId: sessionId,
+        parentThreadId: threadId,
+        childSessionId,
+        childThreadId,
+        taskName: "queued worker",
+        cwd: "/repo",
+        prompt: "initial work",
+        mode: "resumable",
+      },
+    },
+    {
+      id: `event_spawned_${taskId}`,
+      type: "agent.spawned",
+      time: 2 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        runId,
+        taskId,
+        path,
+        parentPath: "/root" as AgentPath,
+        parentSessionId: sessionId,
+        parentThreadId: threadId,
+        childSessionId,
+        childThreadId,
+        taskName: "queued worker",
+        cwd: "/repo",
+        mode: "resumable",
+        generation: 1,
+      },
+    },
+    {
+      id: `event_completed_${taskId}`,
+      type: "agent.completed",
+      time: 3 as TimestampMs,
+      sessionId,
+      threadId,
+      payload: {
+        runId,
+        taskId,
+        path,
+        status: "completed",
+        generation: 1,
+        summary: "initial answer",
+      },
+    },
+  ]);
+}
+
+function abortError(message: string): Error {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
 }
 
 class MemoryEventStore implements EventStore {

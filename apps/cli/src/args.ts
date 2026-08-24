@@ -62,7 +62,7 @@ export interface CliArgs {
   mcpScopes?: string[];
   skillName?: string;
   skillScope?: "user" | "project";
-  taskStatus?: Extract<AgentTaskStatus, "completed" | "failed" | "cancelled">;
+  taskStatus?: Extract<AgentTaskStatus, "completed" | "incomplete" | "failed" | "cancelled">;
   timeoutMs?: number;
   staleAfterMs?: number;
   maxCycles?: number;
@@ -368,8 +368,8 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     }
     if (arg === "--status") {
       const status = requireValue(arg, args);
-      if (status !== "completed" && status !== "failed" && status !== "cancelled") {
-        throw new Error("--status must be completed, failed, or cancelled");
+      if (status !== "completed" && status !== "incomplete" && status !== "failed" && status !== "cancelled") {
+        throw new Error("--status must be completed, incomplete, failed, or cancelled");
       }
       result.taskStatus = status;
       continue;
@@ -476,9 +476,9 @@ export function usage(): string {
     "  --until-drained     Run team execution until drained, max cycles, or timeout",
     "  --max-turns <n>     Max automatic tool-use continuation turns before final answer, default 128",
     "  --max-cycles <n>    Max team execution runner cycles",
-    "  --max-concurrent-dispatches <n>  Max parallel team dispatch fan-out",
+    "  --max-concurrent-dispatches <n>  Team dispatch cap, default 3; live children also obey the runtime-wide cap",
     "  --max-concurrent-verifications <n>  Max parallel team verifier fan-out, 1-4",
-    "  --status <status>   Task close status: completed | failed | cancelled",
+    "  --status <status>   Task close status: completed | incomplete | failed | cancelled",
     "  --task <task-id>     Limit team merge to one task",
     "  --timeout-ms <n>    Task wait timeout in milliseconds",
     "  --stale-after-ms <n> Recover running background tasks older than this many milliseconds",

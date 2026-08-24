@@ -459,6 +459,8 @@ test("team run loop tool schedules scoped team work through the runner", async (
       stop_reason: "cycle_limit",
       bottleneck: "workers-running",
       max_concurrent_dispatches: 6,
+      requested_max_concurrent_dispatches: 6,
+      concurrency_limit_scope: "team_scheduler_capped_by_runtime_global",
       max_concurrent_verifications: 3,
       dispatched: [{ task_id: "task_team", owner_path: "/worker", agent_task_id: "agent_task" }],
       still_running: [{ task_id: "task_team", title: "Implement team tools" }],
@@ -494,8 +496,18 @@ test("team run loop tool schedules scoped team work through the runner", async (
   if (drained.status === "completed") {
     expect(JSON.parse(drained.result.output)).toMatchObject({
       stop_reason: "drained",
+      max_concurrent_dispatches: 3,
     });
   }
+  expect(approvals.at(-1)).toMatchObject({
+    permission: "team_run_loop",
+    patterns: ["team_core", "once:false", "drain:true", "concurrency:3", "verify:default", "background"],
+    metadata: {
+      maxConcurrentDispatches: 3,
+      requestedMaxConcurrentDispatches: 3,
+      concurrencyLimitScope: "team_scheduler_capped_by_runtime_global",
+    },
+  });
 
   const rejected = await executor.execute(toolInput("team_run_loop", {
     team_id: "team_core",
@@ -528,6 +540,7 @@ test("team dispatch batch launches background tasks with bounded parallelism", a
     task_ids: ["task_one"],
   })).resolves.toBe(true);
 
+  const batchCallId = "call_team_dispatch_batch" as ToolCallId;
   const result = await executor.execute(toolInput("team_dispatch_batch", {
     team_id: "team_core",
     max_concurrency: 2,
@@ -536,18 +549,53 @@ test("team dispatch batch launches background tasks with bounded parallelism", a
       { task_id: "task_two", owner_path: "/worker-b" },
       "task_three",
     ],
-  }));
+  }, batchCallId));
 
   expect(result.status).toBe("completed");
   expect(controller.maxRunningDispatches).toBe(2);
   expect(controller.taskDispatchInputs).toEqual([
-    { teamId: "team_core", taskId: "task_one", ownerPath: "/worker-a", mode: "background", prompt: "Implement one." },
-    { teamId: "team_core", taskId: "task_two", ownerPath: "/worker-b", mode: "background" },
-    { teamId: "team_core", taskId: "task_three", mode: "background" },
+    {
+      teamId: "team_core",
+      taskId: "task_one",
+      ownerPath: "/worker-a",
+      mode: "background",
+      prompt: "Implement one.",
+      sourceCallId: batchCallId,
+      batchId: batchCallId,
+      batchIndex: 0,
+      expectedBatchSize: 3,
+      maxConcurrency: 2,
+    },
+    {
+      teamId: "team_core",
+      taskId: "task_two",
+      ownerPath: "/worker-b",
+      mode: "background",
+      sourceCallId: batchCallId,
+      batchId: batchCallId,
+      batchIndex: 1,
+      expectedBatchSize: 3,
+      maxConcurrency: 2,
+    },
+    {
+      teamId: "team_core",
+      taskId: "task_three",
+      mode: "background",
+      sourceCallId: batchCallId,
+      batchId: batchCallId,
+      batchIndex: 2,
+      expectedBatchSize: 3,
+      maxConcurrency: 2,
+    },
   ]);
   if (result.status === "completed") {
     expect(JSON.parse(result.result.output)).toMatchObject({
       count: 3,
+      batch_id: batchCallId,
+      source_call_id: batchCallId,
+      max_concurrency: 2,
+      requested_max_concurrency: 2,
+      concurrency_limit_scope: "batch_lifecycle_capped_by_runtime_global",
       dispatched: [
         { status: "running", team_task: { task_id: "task_one", owner_path: "/worker-a" } },
         { status: "running", team_task: { task_id: "task_two", owner_path: "/worker-b" } },
@@ -568,6 +616,83 @@ test("team dispatch batch launches background tasks with bounded parallelism", a
     task_ids: ["task_one"],
   }));
   expect(rejected.status).toBe("failed");
+});
+
+test("team dispatch batch defaults request fan-out to three", async () => {
+  const controller = new FakeTeamToolController();
+  controller.dispatchDelayMs = 20;
+  const approvals: ApprovalBrokerRequest[] = [];
+  const executor = createExecutor(registryWithTeamTools(controller), approvals);
+
+  const batchCallId = "call_team_dispatch_default" as ToolCallId;
+  const result = await executor.execute(toolInput("team_task_dispatch_batch", {
+    team_id: "team_core",
+    task_ids: ["task_one", "task_two", "task_three", "task_four"],
+  }, batchCallId));
+
+  expect(result.status).toBe("completed");
+  expect(controller.maxRunningDispatches).toBe(3);
+  if (result.status === "completed") {
+    expect(JSON.parse(result.result.output)).toMatchObject({
+      max_concurrency: 3,
+      requested_max_concurrency: 3,
+      concurrency_limit_scope: "batch_lifecycle_capped_by_runtime_global",
+      batch_id: batchCallId,
+      source_call_id: batchCallId,
+    });
+    expect(result.result.metadata).toMatchObject({
+      maxConcurrency: 3,
+      requestedMaxConcurrency: 3,
+      concurrencyLimitScope: "batch_lifecycle_capped_by_runtime_global",
+    });
+  }
+  expect(approvals).toHaveLength(1);
+  expect(approvals[0]).toMatchObject({
+    permission: "team_task_dispatch",
+    patterns: ["team_core", "count:4", "concurrency:3", "background"],
+    metadata: {
+      maxConcurrency: 3,
+      max_concurrency: 3,
+    },
+  });
+});
+
+test("team dispatch batch preserves lifecycle identity after a partial dispatch failure", async () => {
+  const controller = new FakeTeamToolController();
+  controller.dispatchFailures.add("task_two");
+  const executor = createExecutor(registryWithTeamTools(controller), []);
+  const batchCallId = "call_team_dispatch_partial" as ToolCallId;
+
+  const result = await executor.execute(toolInput("team_task_dispatch_batch", {
+    team_id: "team_core",
+    max_concurrency: 1,
+    task_ids: ["task_one", "task_two", "task_three"],
+  }, batchCallId));
+
+  expect(result.status).toBe("completed");
+  expect(controller.taskDispatchInputs.map((input) => ({
+    taskId: input.taskId,
+    sourceCallId: input.sourceCallId,
+    batchId: input.batchId,
+    batchIndex: input.batchIndex,
+    expectedBatchSize: input.expectedBatchSize,
+    maxConcurrency: input.maxConcurrency,
+  }))).toEqual([
+    { taskId: "task_one", sourceCallId: batchCallId, batchId: batchCallId, batchIndex: 0, expectedBatchSize: 3, maxConcurrency: 1 },
+    { taskId: "task_two", sourceCallId: batchCallId, batchId: batchCallId, batchIndex: 1, expectedBatchSize: 3, maxConcurrency: 1 },
+    { taskId: "task_three", sourceCallId: batchCallId, batchId: batchCallId, batchIndex: 2, expectedBatchSize: 3, maxConcurrency: 1 },
+  ]);
+  if (result.status === "completed") {
+    expect(JSON.parse(result.result.output)).toMatchObject({
+      batch_id: batchCallId,
+      max_concurrency: 1,
+      dispatched: [
+        { team_task: { task_id: "task_one" } },
+        { team_task: { task_id: "task_three" } },
+      ],
+      errors: [{ task_id: "task_two", error: "dispatch failed: task_two" }],
+    });
+  }
 });
 
 test("team tools reject non-absolute agent paths", async () => {
@@ -658,6 +783,7 @@ class FakeTeamToolController implements TeamToolController, TeamTaskDispatchTool
   messageSendInputs: TeamMessageSendToolInput[] = [];
   messageListInputs: TeamMessageListToolInput[] = [];
   dispatchDelayMs = 0;
+  dispatchFailures = new Set<string>();
   runningDispatches = 0;
   maxRunningDispatches = 0;
 
@@ -717,6 +843,7 @@ class FakeTeamToolController implements TeamToolController, TeamTaskDispatchTool
     this.taskDispatchInputs.push(input);
     try {
       if (this.dispatchDelayMs > 0) await sleepMs(this.dispatchDelayMs);
+      if (this.dispatchFailures.has(input.taskId)) throw new Error(`dispatch failed: ${input.taskId}`);
       const status = input.mode === "one_shot" ? "completed" : "running";
       const teamTaskInput: Partial<TeamTaskCreateToolInput & TeamTaskAssignToolInput & TeamTaskClaimToolInput & TeamTaskUpdateToolInput> = {
         teamId: input.teamId,
@@ -789,7 +916,7 @@ class FakeTeamToolController implements TeamToolController, TeamTaskDispatchTool
       stopReason: input.once === false ? "drained" : "cycle_limit",
       startedAt: 1,
       endedAt: 2,
-      maxConcurrentDispatches: input.maxConcurrentDispatches ?? 4,
+      maxConcurrentDispatches: input.maxConcurrentDispatches ?? 3,
       maxConcurrentVerifications: input.maxConcurrentVerifications ?? 2,
       dispatched: [
         { teamId: input.teamId, taskId: "task_team", ownerPath: "/worker", agentTaskId: "agent_task", status: "running" },

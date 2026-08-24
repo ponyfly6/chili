@@ -1,4 +1,4 @@
-import type { AgentPath, TaskId, TeamId, ThreadId, SessionId, ToolExecutionContext } from "@chili/protocol";
+import type { AgentPath, TaskId, TeamId, ThreadId, SessionId, ToolCallId, ToolExecutionContext } from "@chili/protocol";
 
 export type TeamMemberStatus = "idle" | "running" | "waiting" | "blocked" | "closed";
 export type TeamTaskStatus = "pending" | "in_progress" | "blocked" | "completed" | "failed" | "cancelled";
@@ -247,7 +247,7 @@ export interface TeamTaskUpdateToolInput {
 }
 
 export type TeamTaskDispatchMode = "one_shot" | "resumable" | "background";
-export type TeamTaskDispatchStatus = "running" | "completed" | "failed" | "cancelled" | "skipped";
+export type TeamTaskDispatchStatus = "running" | "completed" | "incomplete" | "failed" | "cancelled" | "skipped";
 
 export interface TeamTaskDispatchToolInput {
   teamId: string;
@@ -255,6 +255,11 @@ export interface TeamTaskDispatchToolInput {
   ownerPath?: string;
   mode?: TeamTaskDispatchMode;
   prompt?: string;
+  sourceCallId?: ToolCallId;
+  batchId?: string;
+  batchIndex?: number;
+  expectedBatchSize?: number;
+  maxConcurrency?: number;
 }
 
 export interface TeamTaskDispatchBatchItemInput {
@@ -311,6 +316,10 @@ export interface TeamTaskDispatchBatchErrorRecord {
 
 export interface TeamTaskDispatchBatchRecord {
   count: number;
+  batchId: string;
+  sourceCallId: ToolCallId;
+  maxConcurrency: number;
+  concurrencyLimitScope: "batch_lifecycle_capped_by_runtime_global";
   dispatched: TeamTaskDispatchRecord[];
   errors: TeamTaskDispatchBatchErrorRecord[];
 }

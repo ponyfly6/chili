@@ -1,7 +1,7 @@
 import type { AgentPath, AgentRunId, EventEnvelope, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
 
-export type RuntimeAgentStatus = "running" | "completed" | "failed" | "cancelled";
-export type RuntimeTaskStatus = "pending" | "running" | "in_progress" | "blocked" | "completed" | "failed" | "cancelled";
+export type RuntimeAgentStatus = "running" | "completed" | "incomplete" | "failed" | "cancelled";
+export type RuntimeTaskStatus = "pending" | "running" | "in_progress" | "blocked" | "completed" | "incomplete" | "failed" | "cancelled";
 
 export interface RuntimeAgentView {
   id: AgentRunId;
@@ -25,7 +25,7 @@ export interface RuntimeAgentMailboxMessageView {
   path: AgentPath;
   from: AgentPath;
   triggerTurn: boolean;
-  status: "queued" | "delivering" | "consumed";
+  status: "queued" | "delivering" | "consumed" | "discarded";
   queuedAt: number;
   sessionId?: SessionId;
   threadId?: ThreadId;
@@ -305,7 +305,7 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
     task.status = status;
     if (generation !== undefined) task.generation = Math.max(task.generation, generation);
     task.updatedAt = event.time;
-    if (status === "completed" || status === "failed" || status === "cancelled") task.completedAt = event.time;
+    if (status === "completed" || status === "incomplete" || status === "failed" || status === "cancelled") task.completedAt = event.time;
     assignOptional(task, "sessionId", event.sessionId);
     assignOptional(task, "ownerPath", stringValue(payload.ownerPath) as AgentPath | undefined);
     assignOptional(task, "path", stringValue(payload.path) as AgentPath | undefined);
@@ -401,11 +401,13 @@ function generationValue(value: unknown): number | undefined {
 }
 
 function agentStatusValue(value: unknown): RuntimeAgentStatus | undefined {
-  return value === "running" || value === "completed" || value === "failed" || value === "cancelled" ? value : undefined;
+  return value === "running" || value === "completed" || value === "incomplete" || value === "failed" || value === "cancelled"
+    ? value
+    : undefined;
 }
 
 function taskStatusValue(value: unknown): RuntimeTaskStatus | undefined {
-  return value === "pending" || value === "running" || value === "in_progress" || value === "blocked" || value === "completed" || value === "failed" || value === "cancelled"
+  return value === "pending" || value === "running" || value === "in_progress" || value === "blocked" || value === "completed" || value === "incomplete" || value === "failed" || value === "cancelled"
     ? value
     : undefined;
 }
@@ -416,5 +418,5 @@ function isStaleTaskSpawn(task: RuntimeTaskView, generation: number | undefined)
 }
 
 function isFinalTaskStatus(status: RuntimeTaskStatus): boolean {
-  return status === "completed" || status === "failed" || status === "cancelled";
+  return status === "completed" || status === "incomplete" || status === "failed" || status === "cancelled";
 }

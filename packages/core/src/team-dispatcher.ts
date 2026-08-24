@@ -7,6 +7,7 @@ import type {
   TeamTaskStatus,
   ThreadId,
   TimestampMs,
+  ToolCallId,
 } from "@chili/protocol";
 import { timestampNow } from "@chili/protocol";
 import type {
@@ -27,6 +28,8 @@ import {
 } from "./worker-policy.js";
 
 const DISPATCH_METADATA_KEY = "chiliTeamDispatch";
+const INCOMPLETE_AGENT_RESULT_ERROR =
+  "subagent_incomplete: child result did not satisfy the completion contract; inspect the summary and retry or follow up";
 
 export interface TeamTaskDispatchServiceOptions {
   teams: TeamControlService;
@@ -35,6 +38,7 @@ export interface TeamTaskDispatchServiceOptions {
   worktrees?: TeamTaskWorktreeManager;
   cwd: string;
   now?: () => TimestampMs;
+  assertDelegationEnabled?: (input: { sessionId: SessionId; action: "team.dispatch" }) => Promise<void> | void;
 }
 
 export interface TeamTaskSubagentRunner {
@@ -54,6 +58,11 @@ export interface TeamTaskDispatchInput {
   cwd?: string;
   mode?: LocalSubagentMode;
   prompt?: string;
+  sourceCallId?: ToolCallId;
+  batchId?: string;
+  batchIndex?: number;
+  expectedBatchSize?: number;
+  maxConcurrency?: number;
   signal?: AbortSignal;
 }
 
@@ -75,6 +84,7 @@ export interface TeamTaskAgentBinding {
   agentTaskId: TaskId;
   agentPath: AgentPath;
   runId: AgentRunId;
+  generation: number;
   childSessionId: SessionId;
   childThreadId: ThreadId;
   mode: LocalSubagentMode;
@@ -103,7 +113,7 @@ export interface TeamTaskDispatchPolicyMetadata {
   checkedAt: number;
 }
 
-export type TeamTaskDispatchStatus = "running" | "completed" | "failed" | "cancelled" | "skipped";
+export type TeamTaskDispatchStatus = "running" | "completed" | "incomplete" | "failed" | "cancelled" | "skipped";
 export type TeamTaskDispatchPolicyReason = "missing_member" | "member_unavailable" | "scope_mismatch" | "write_conflict";
 
 export interface TeamTaskDispatchResult {
@@ -117,7 +127,7 @@ export interface TeamTaskSyncResult {
   applied: boolean;
   teamTask: TeamTaskRow;
   agentTask?: AgentTaskRow;
-  reason?: "not_dispatched" | "agent_task_not_found" | "agent_running" | "team_already_final";
+  reason?: "not_dispatched" | "agent_task_not_found" | "agent_running" | "team_already_final" | "team_not_in_progress" | "stale_dispatch";
 }
 
 export interface TeamTaskReconcileError {
@@ -147,6 +157,10 @@ export class TeamTaskDispatchService {
 
     const parentSessionId = input.sessionId ?? task.sessionId ?? team.sessionId;
     if (!parentSessionId) return { status: "skipped", reason: "missing_session", teamTask: task };
+    await this.options.assertDelegationEnabled?.({
+      sessionId: parentSessionId,
+      action: "team.dispatch",
+    });
 
     const dispatchPolicy = await this.dispatchPolicy({
       teamId: input.teamId,
@@ -238,6 +252,7 @@ export class TeamTaskDispatchService {
         taskName: taskForPrompt.title,
         prompt: input.prompt ?? teamTaskPrompt(taskForPrompt, ownerPath, dispatchPolicy, worktree?.path),
         mode,
+        completionPolicy: "detached",
         workerPolicy: workerPolicyForDispatch({
           teamId: input.teamId,
           taskId: input.taskId,
@@ -246,13 +261,23 @@ export class TeamTaskDispatchService {
           dispatchPolicy,
         }),
       };
+      if (input.sourceCallId !== undefined) spawnInput.sourceCallId = input.sourceCallId;
+      if (input.batchId !== undefined) spawnInput.batchId = input.batchId;
+      if (input.batchIndex !== undefined) spawnInput.batchIndex = input.batchIndex;
+      if (input.expectedBatchSize !== undefined) spawnInput.expectedBatchSize = input.expectedBatchSize;
+      if (input.maxConcurrency !== undefined) spawnInput.maxConcurrency = input.maxConcurrency;
       if (input.signal) spawnInput.signal = input.signal;
       const agentTask = await this.options.subagents.spawnTask(spawnInput);
+      const projectedAgentTask = await this.options.store.agentTask(agentTask.taskId);
+      // Team dispatch always creates a fresh local task. Its spawn is generation 1;
+      // the lease/terminal CAS owns generation 2, even when the child is still queued.
+      const agentGeneration = Math.max(projectedAgentTask?.generation ?? 0, 2);
       const policyMetadata = dispatchPolicyForMetadata(dispatchPolicy);
 
       const updateInput = {
         task: taskForPrompt,
         agentTask,
+        agentGeneration,
         mode,
         sessionId: parentSessionId,
         ...(policyMetadata ? { policy: policyMetadata } : {}),
@@ -260,7 +285,11 @@ export class TeamTaskDispatchService {
       const teamTask = await this.updateTeamTaskFromAgentResult(
         input.threadId ? { ...updateInput, threadId: input.threadId } : updateInput,
       );
-      return { status: agentTask.status, teamTask, agentTask };
+      return {
+        status: agentTask.status === "pending" ? "running" : agentTask.status,
+        teamTask,
+        agentTask,
+      };
     } catch (error) {
       const err = toError(error);
       const teamTask = await this.options.teams.updateTask({
@@ -296,16 +325,36 @@ export class TeamTaskDispatchService {
     if (!isFinalAgentTaskStatus(agentTask.status)) {
       return { applied: false, reason: "agent_running", teamTask, agentTask };
     }
-    if (isFinalTeamTaskStatus(teamTask.status)) {
-      return { applied: false, reason: "team_already_final", teamTask, agentTask };
+    if (agentTask.currentRunId !== binding.runId || agentTask.generation !== binding.generation) {
+      return { applied: false, reason: "stale_dispatch", teamTask, agentTask };
+    }
+    if (teamTask.status !== "in_progress") {
+      return {
+        applied: false,
+        reason: isFinalTeamTaskStatus(teamTask.status) ? "team_already_final" : "team_not_in_progress",
+        teamTask,
+        agentTask,
+      };
     }
 
-    const updated = await this.options.teams.updateTask({
+    const status = teamStatusFromAgentStatus(agentTask.status) as Exclude<TeamTaskStatus, "pending" | "in_progress">;
+    const error = agentTask.error
+      ? agentTask.error
+      : agentTask.status === "incomplete"
+        ? INCOMPLETE_AGENT_RESULT_ERROR
+        : status === "completed" && teamTask.error
+          ? ""
+          : undefined;
+    const synced = await this.options.teams.syncTaskFromAgent({
       teamId: input.teamId,
       taskId: input.taskId,
-      status: teamStatusFromAgentStatus(agentTask.status),
+      agentTaskId: binding.agentTaskId,
+      agentRunId: binding.runId,
+      agentGeneration: binding.generation,
+      agentStatus: agentTask.status,
+      status,
       ...(agentTask.summary ? { summary: agentTask.summary } : {}),
-      ...(agentTask.error ? { error: agentTask.error } : {}),
+      ...(error !== undefined ? { error } : {}),
       metadata: mergeDispatchMetadata(teamTask.metadata, {
         ...binding,
         agentStatus: agentTask.status,
@@ -314,7 +363,14 @@ export class TeamTaskDispatchService {
       ...(input.sessionId ?? teamTask.sessionId ? { sessionId: input.sessionId ?? teamTask.sessionId } : {}),
       ...(input.threadId ? { threadId: input.threadId } : {}),
     });
-    return { applied: true, teamTask: updated, agentTask };
+    const updated = synced.task ?? (await this.requireTeamTask(input.teamId, input.taskId));
+    if (synced.applied) return { applied: true, teamTask: updated, agentTask };
+    const reason = synced.reason === "agent_not_terminal"
+      ? "agent_running"
+      : synced.reason === "not_in_progress"
+        ? isFinalTeamTaskStatus(updated.status) ? "team_already_final" : "team_not_in_progress"
+        : "stale_dispatch";
+    return { applied: false, reason, teamTask: updated, agentTask };
   }
 
   async reconcileTasks(input: TeamTaskReconcileInput = {}): Promise<TeamTaskReconcileResult> {
@@ -361,6 +417,7 @@ export class TeamTaskDispatchService {
   private async updateTeamTaskFromAgentResult(input: {
     task: TeamTaskRow;
     agentTask: LocalSubagentTaskResult;
+    agentGeneration: number;
     mode: LocalSubagentMode;
     sessionId: SessionId;
     threadId?: ThreadId;
@@ -375,6 +432,7 @@ export class TeamTaskDispatchService {
         agentTaskId: input.agentTask.taskId,
         agentPath: input.agentTask.path,
         runId: input.agentTask.runId,
+        generation: input.agentGeneration,
         childSessionId: input.agentTask.childSessionId,
         childThreadId: input.agentTask.childThreadId,
         mode: input.mode,
@@ -389,6 +447,7 @@ export class TeamTaskDispatchService {
     if (input.agentTask.summary) update.summary = input.agentTask.summary;
     if (status === "completed" && input.task.error) update.error = "";
     if (input.agentTask.error) update.error = input.agentTask.error.message;
+    else if (input.agentTask.status === "incomplete") update.error = INCOMPLETE_AGENT_RESULT_ERROR;
     return this.options.teams.updateTask(update);
   }
 
@@ -526,6 +585,9 @@ function dispatchBinding(metadata: Record<string, unknown> | undefined): TeamTas
     typeof value.agentTaskId !== "string" ||
     typeof value.agentPath !== "string" ||
     typeof value.runId !== "string" ||
+    typeof value.generation !== "number" ||
+    !Number.isInteger(value.generation) ||
+    value.generation < 0 ||
     typeof value.childSessionId !== "string" ||
     typeof value.childThreadId !== "string"
   ) {
@@ -628,6 +690,8 @@ function normalizeToolName(tool: string): string {
 function isEssentialWorkerTool(tool: string): boolean {
   return (
     tool === "complete_task" ||
+    tool === "agent_message_send" ||
+    tool === "agent_message_list" ||
     tool === "tool_search" ||
     tool === "team_snapshot" ||
     tool === "team_task_list" ||
@@ -684,6 +748,7 @@ function normalizePathScope(value: string): string {
 
 function teamStatusFromAgentStatus(status: LocalSubagentTaskResult["status"] | AgentTaskRow["status"]): TeamTaskStatus {
   if (status === "completed") return "completed";
+  if (status === "incomplete") return "blocked";
   if (status === "failed") return "failed";
   if (status === "cancelled") return "cancelled";
   return "in_progress";
@@ -693,12 +758,14 @@ function isFinalTeamTaskStatus(status: TeamTaskStatus): boolean {
   return status === "completed" || status === "failed" || status === "cancelled";
 }
 
-function isFinalAgentTaskStatus(status: AgentTaskRow["status"]): boolean {
-  return status === "completed" || status === "failed" || status === "cancelled";
+function isFinalAgentTaskStatus(
+  status: AgentTaskRow["status"],
+): status is Exclude<AgentTaskRow["status"], "pending" | "running"> {
+  return status === "completed" || status === "incomplete" || status === "failed" || status === "cancelled";
 }
 
 function isFinalLocalSubagentStatus(status: LocalSubagentTaskResult["status"]): boolean {
-  return status === "completed" || status === "failed" || status === "cancelled";
+  return status === "completed" || status === "incomplete" || status === "failed" || status === "cancelled";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

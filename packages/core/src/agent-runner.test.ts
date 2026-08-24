@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
 import type {
+  AgentPath,
   ChiliEvent,
   EventEnvelope,
   Message,
@@ -10,6 +11,8 @@ import type {
   PartId,
   RuntimeModelDescriptor,
   SessionId,
+  TaskId,
+  TeamId,
   ThreadId,
   TimestampMs,
   ToolCallId,
@@ -19,7 +22,11 @@ import { SqliteEventStore, type ApprovalRow, type EventQuery, type EventStore, t
 import { InMemoryToolRegistry, ToolExecutor } from "@chili/tools";
 import type { AgentRunner, AppendUserMessageInput, CreateSessionInput, RunTurnInput, RunTurnResult } from "./runner.js";
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.js";
-import { RuntimeBusyError, RuntimeService } from "./runtime-service.js";
+import {
+  RuntimeBusyError,
+  RuntimeService,
+  RuntimeSubagentSessionAccessError,
+} from "./runtime-service.js";
 import { SingleAgentRuntime } from "./single-agent-runtime.js";
 
 test("RuntimeService accepts an AgentRunner implementation", async () => {
@@ -75,6 +82,171 @@ test("RuntimeService accepts an AgentRunner implementation", async () => {
   expect(runner.turnInputs[0]?.system).toEqual(["be brief"]);
   expect(runner.turnInputs[0]?.signal?.aborted).toBe(false);
   expect(statuses(store)).toEqual(["idle", "running", "running", "idle"]);
+});
+
+test("root RuntimeService rejects direct subagent turns while an explicit child service remains usable", async () => {
+  const sessionId = "session_guarded_child" as SessionId;
+  const threadId = "thread_guarded_child" as ThreadId;
+  const store = new SessionSourceEventStore({
+    id: sessionId,
+    cwd: "/repo",
+    threadId,
+    source: "subagent",
+    status: "active",
+    createdAt: 1,
+    updatedAt: 1,
+  });
+  const rootRunner = new FakeAgentRunner();
+  const root = new RuntimeService({ runtime: rootRunner, store, cwd: "/repo" });
+  const input = { sessionId, threadId, text: "bypass child policy" };
+
+  await expect(root.submitPrompt(input)).rejects.toBeInstanceOf(RuntimeSubagentSessionAccessError);
+  const asyncError = new Promise<unknown>((resolve) => {
+    root.submitPromptAsync({ ...input, text: "async bypass" }, resolve);
+  });
+  await expect(asyncError).resolves.toBeInstanceOf(RuntimeSubagentSessionAccessError);
+  expect(root.isRunning(sessionId)).toBe(false);
+  await expect(root.appendUserMessage(input)).rejects.toThrow("Use task_followup for the owning task");
+  await expect(root.compactSession({ sessionId, threadId })).rejects.toBeInstanceOf(
+    RuntimeSubagentSessionAccessError,
+  );
+  await expect(root.setGoal({ sessionId, threadId, objective: "bypass through goal continuation" })).rejects.toBeInstanceOf(
+    RuntimeSubagentSessionAccessError,
+  );
+  expect(rootRunner.userMessages).toEqual([]);
+  expect(rootRunner.turnInputs).toEqual([]);
+
+  const childRunner = new FakeAgentRunner();
+  const child = new RuntimeService({
+    runtime: childRunner,
+    store,
+    cwd: "/repo",
+    allowSubagentSessions: true,
+  });
+  await expect(child.submitPrompt({ ...input, text: "authorized child continuation" })).resolves.toMatchObject({
+    status: "completed",
+  });
+  expect(childRunner.userMessages).toHaveLength(1);
+  expect(childRunner.turnInputs).toHaveLength(1);
+});
+
+test("root RuntimeService rejects a pending child before its session row exists", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-runtime-pending-child-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const parentSessionId = "session_guard_pending_parent" as SessionId;
+  const parentThreadId = "thread_guard_pending_parent" as ThreadId;
+  const childSessionId = "session_guard_pending_child" as SessionId;
+  const childThreadId = "thread_guard_pending_child" as ThreadId;
+  const runner = new FakeAgentRunner();
+
+  try {
+    await store.append({
+      id: "event_guard_pending_task",
+      type: "agent.task_created",
+      time: 1 as TimestampMs,
+      sessionId: parentSessionId,
+      threadId: parentThreadId,
+      payload: {
+        taskId: "task_guard_pending_child" as TaskId,
+        path: "/root/pending-child" as AgentPath,
+        parentPath: "/root" as AgentPath,
+        parentSessionId,
+        parentThreadId,
+        childSessionId,
+        childThreadId,
+        taskName: "pending child",
+        cwd: "/repo",
+        prompt: "wait for a lifecycle permit",
+        mode: "background",
+      },
+    });
+    expect(await store.sessions()).toEqual([]);
+
+    const root = new RuntimeService({ runtime: runner, store, cwd: "/repo" });
+    const input = { sessionId: childSessionId, threadId: childThreadId, text: "race the pending child" };
+    await expect(root.submitPrompt(input)).rejects.toBeInstanceOf(RuntimeSubagentSessionAccessError);
+    const asyncError = new Promise<unknown>((resolve) => {
+      root.submitPromptAsync({ ...input, text: "race asynchronously" }, resolve);
+    });
+    await expect(asyncError).resolves.toBeInstanceOf(RuntimeSubagentSessionAccessError);
+
+    expect(root.isRunning(childSessionId)).toBe(false);
+    expect(runner.userMessages).toEqual([]);
+    expect(runner.turnInputs).toEqual([]);
+    expect((await store.agentTasks({ childSessionId }))[0]).toMatchObject({ status: "pending" });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("root RuntimeService rejects a direct team worker before session creation but preserves the lead", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-runtime-pending-team-worker-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const rootSessionId = "session_guard_team_root" as SessionId;
+  const rootThreadId = "thread_guard_team_root" as ThreadId;
+  const workerSessionId = "session_guard_team_worker" as SessionId;
+  const workerThreadId = "thread_guard_team_worker" as ThreadId;
+  const teamId = "team_guard_pending_worker" as TeamId;
+  const runner = new FakeAgentRunner();
+
+  try {
+    await store.appendMany([
+      {
+        id: "event_guard_pending_team",
+        type: "team.created",
+        time: 1 as TimestampMs,
+        sessionId: rootSessionId,
+        threadId: rootThreadId,
+        payload: { teamId, name: "pending worker guard", leadPath: "/root" as AgentPath },
+      },
+      {
+        id: "event_guard_pending_team_lead",
+        type: "team.member_added",
+        time: 2 as TimestampMs,
+        sessionId: rootSessionId,
+        threadId: rootThreadId,
+        payload: {
+          teamId,
+          path: "/root" as AgentPath,
+          name: "lead",
+          role: "leader",
+          childSessionId: rootSessionId,
+          childThreadId: rootThreadId,
+        },
+      },
+      {
+        id: "event_guard_pending_team_worker",
+        type: "team.member_added",
+        time: 3 as TimestampMs,
+        sessionId: rootSessionId,
+        threadId: rootThreadId,
+        payload: {
+          teamId,
+          path: "/root/worker" as AgentPath,
+          name: "worker",
+          role: "implementer",
+          childSessionId: workerSessionId,
+          childThreadId: workerThreadId,
+        },
+      },
+    ]);
+    expect(await store.sessions()).toEqual([]);
+
+    const root = new RuntimeService({ runtime: runner, store, cwd: "/repo" });
+    await expect(root.assertSessionTurnAllowed(rootSessionId, rootThreadId)).resolves.toBeUndefined();
+    await expect(root.submitPrompt({
+      sessionId: workerSessionId,
+      threadId: workerThreadId,
+      text: "race the team worker",
+    })).rejects.toBeInstanceOf(RuntimeSubagentSessionAccessError);
+
+    expect(runner.userMessages).toEqual([]);
+    expect(runner.turnInputs).toEqual([]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("RuntimeService preserves safe model connection metadata", async () => {
@@ -313,11 +485,13 @@ test("RuntimeService passes promptFragments by prompt layer", async () => {
 
   expect(result.status).toBe("completed");
   expect(runner.turnInputs[0]?.system).toEqual(["base system"]);
-  expect(runner.turnInputs[0]?.developer).toEqual(["skills catalog"]);
+  expect(runner.turnInputs[0]?.developer?.[0]).toBe("skills catalog");
+  expect(runner.turnInputs[0]?.developer?.[1]).toContain("Delegation policy is explicit");
   expect(runner.turnInputs[0]?.contextualUser).toEqual(["memory context"]);
   expect(runner.turnInputs[0]?.promptDebug?.fragments.map((fragment) => [fragment.id, fragment.source, fragment.layer])).toEqual([
     ["base", "core", "base"],
     ["skills", "skills", "developer"],
+    ["chili.delegation.explicit", "runtime", "developer"],
     ["memory", "memory", "contextual_user"],
   ]);
 });
@@ -453,7 +627,7 @@ test("RuntimeService inspectPrompt includes conversation context as a prompt fra
   });
 
   const conversation = inspected.fragments.find((fragment) => fragment.layer === "conversation");
-  expect(inspected.debug.fragments.map((fragment) => fragment.layer)).toEqual(["base", "conversation"]);
+  expect(inspected.debug.fragments.map((fragment) => fragment.layer)).toEqual(["base", "developer", "conversation"]);
   expect(conversation).toMatchObject({
     id: "runtime.conversation",
     source: "runtime",
@@ -487,12 +661,69 @@ test("RuntimeService injects proactive delegation guidance for ultra reasoning",
     includeContent: true,
   });
 
-  expect(inspected.fragments.find((fragment) => fragment.id === "chili.reasoning.ultra")).toMatchObject({
+  expect(inspected.fragments.find((fragment) => fragment.id === "chili.delegation.proactive")).toMatchObject({
     layer: "developer",
     lifecycle: "turn",
+    metadata: { policy: "proactive" },
   });
-  expect(inspected.fragments.find((fragment) => fragment.id === "chili.reasoning.ultra")?.content).toContain(
-    "proactively delegate",
+  expect(inspected.fragments.find((fragment) => fragment.id === "chili.delegation.proactive")?.content).toContain(
+    "Proactively delegate",
+  );
+});
+
+test("RuntimeService applies session delegation policy independently of model reasoning support", async () => {
+  const store = new MemoryEventStore();
+  const sessionId = "session_delegation_policy" as SessionId;
+  const threadId = "thread_delegation_policy" as ThreadId;
+  const service = new RuntimeService({
+    runtime: new FakeAgentRunner(),
+    store,
+    cwd: "/repo",
+    defaultModelSelection: { provider: "minimax", model: "MiniMax-M3[1m]" },
+    models: [{
+      provider: "minimax",
+      model: "MiniMax-M3[1m]",
+      default: true,
+      capabilities: { reasoning: false, toolCalls: true },
+      reasoningLevels: [],
+    }],
+    defaultDelegationPolicy: "proactive",
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  expect(await service.getDelegationConfig(sessionId)).toEqual({
+    sessionId,
+    policy: "proactive",
+    source: "default",
+  });
+  const proactive = await service.inspectPrompt({ sessionId, threadId, cwd: "/repo", includeContent: true });
+  expect(proactive.fragments.some((fragment) => fragment.id === "chili.delegation.proactive")).toBe(true);
+
+  expect(await service.setDelegationPolicy({ sessionId, threadId, policy: "off" })).toEqual({
+    sessionId,
+    policy: "off",
+    source: "session",
+  });
+  expect((await store.events({ sessionId, type: "session.delegation_changed" })).at(-1)?.payload).toEqual({
+    sessionId,
+    policy: "off",
+  });
+
+  const resumed = new RuntimeService({
+    runtime: new FakeAgentRunner(),
+    store,
+    cwd: "/repo",
+    defaultDelegationPolicy: "proactive",
+  });
+  expect(await resumed.getDelegationConfig(sessionId)).toEqual({
+    sessionId,
+    policy: "off",
+    source: "session",
+  });
+  const disabled = await resumed.inspectPrompt({ sessionId, threadId, cwd: "/repo", includeContent: true });
+  expect(disabled.fragments.find((fragment) => fragment.id === "chili.delegation.off")?.content).toContain(
+    "Do not spawn",
   );
 });
 
@@ -553,7 +784,8 @@ test("RuntimeService reports model-specific advanced reasoning levels", async ()
   expect(requestedUltra.reasoningLevel).toBe("max");
 
   const inspected = await service.inspectPrompt({ sessionId, threadId, cwd: "/repo", includeContent: true });
-  expect(inspected.fragments.some((fragment) => fragment.id === "chili.reasoning.ultra")).toBe(false);
+  expect(inspected.fragments.some((fragment) => fragment.id === "chili.delegation.proactive")).toBe(false);
+  expect(inspected.fragments.some((fragment) => fragment.id === "chili.delegation.explicit")).toBe(true);
 });
 
 test("RuntimeService clears and rejects controls unsupported by a known model", async () => {
@@ -680,6 +912,7 @@ test("RuntimeService inspectPrompt only assembles prompt debug output", async ()
 
   expect(debug.fragments.map((fragment) => [fragment.id, fragment.layer, fragment.source])).toEqual([
     ["debug.base", "base", "core"],
+    ["chili.delegation.explicit", "developer", "runtime"],
     ["debug.skills", "developer", "skills"],
     ["debug.project", "contextual_user", "project"],
   ]);
@@ -690,7 +923,12 @@ test("RuntimeService inspectPrompt only assembles prompt debug output", async ()
     scope: "project",
     truncated: false,
   });
-  expect(debug.totalChars).toBe("base instructions".length + "skills catalog".length + "project instructions".length);
+  expect(debug.totalChars).toBe(
+    "base instructions".length
+      + "skills catalog".length
+      + "project instructions".length
+      + debug.fragments.find((fragment) => fragment.id === "chili.delegation.explicit")!.chars,
+  );
   expect(runner.createInputs).toEqual([]);
   expect(runner.userMessages).toEqual([]);
   expect(runner.turnInputs).toEqual([]);
@@ -1268,6 +1506,16 @@ class MemoryEventStore implements EventStore {
 
   async pendingApprovals(): Promise<ApprovalRow[]> {
     return [];
+  }
+}
+
+class SessionSourceEventStore extends MemoryEventStore {
+  constructor(private readonly row: SessionRow) {
+    super();
+  }
+
+  override async sessions(): Promise<SessionRow[]> {
+    return [{ ...this.row }];
   }
 }
 

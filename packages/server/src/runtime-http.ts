@@ -1,11 +1,13 @@
-import { isTransientEvent, RUNTIME_PERMISSION_PROFILE_IDS } from "@chili/protocol";
+import { DELEGATION_POLICIES, isTransientEvent, RUNTIME_PERMISSION_PROFILE_IDS } from "@chili/protocol";
 import type {
   ChiliEvent,
   AgentPath,
   AgentTaskMode,
   AgentTaskStatus,
   ApprovalDecisionAction,
+  DelegationPolicy,
   RuntimeInterruptResult,
+  RuntimeDelegationConfig,
   RuntimeModelConfig,
   RuntimeModelDescriptor,
   RuntimeMcpAddServerRequest,
@@ -98,10 +100,13 @@ export interface RuntimeHttpService {
   setModel?(input: { sessionId: SessionId; threadId?: ThreadId; modelSelection: ModelSelection }): Promise<RuntimeModelConfig>;
   setReasoning?(input: { sessionId: SessionId; threadId?: ThreadId; reasoningLevel: ReasoningLevel }): Promise<RuntimeModelConfig>;
   setServiceTier?(input: { sessionId: SessionId; threadId?: ThreadId; serviceTier: ServiceTier }): Promise<RuntimeModelConfig>;
+  getDelegationConfig?(sessionId: SessionId): Promise<RuntimeDelegationConfig>;
+  setDelegationPolicy?(input: { sessionId: SessionId; threadId?: ThreadId; policy: DelegationPolicy }): Promise<RuntimeDelegationConfig>;
   getGoal?(input: { sessionId: SessionId; threadId: ThreadId }): Promise<ThreadGoal | undefined>;
   setGoal?(input: { sessionId: SessionId; threadId: ThreadId; objective: string; tokenBudget?: number; replace?: boolean }): Promise<ThreadGoal>;
   updateGoal?(input: { sessionId: SessionId; threadId: ThreadId; status?: ThreadGoalStatus; objective?: string; tokenBudget?: number }): Promise<ThreadGoal>;
   clearGoal?(input: { sessionId: SessionId; threadId: ThreadId }): Promise<{ cleared: boolean; previousGoal?: ThreadGoal }>;
+  assertSessionTurnAllowed(sessionId: SessionId, threadId?: ThreadId): Promise<void>;
   submitPrompt(input: SubmitPromptInput): Promise<SubmitPromptResult>;
   submitPromptAsync(input: SubmitPromptInput, onError?: RuntimeBackgroundErrorHandler): void;
   interrupt(sessionId: SessionId, reason?: string): Promise<boolean>;
@@ -327,6 +332,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         const input: AgentTaskFollowupInput = {
           taskId: route.taskId,
           text: body.text,
+          signal: request.signal,
         };
         if (body.maxTurns !== undefined) input.maxTurns = body.maxTurns;
         return json(serializeTaskFollowupResult(await tasks.followupTask(input)));
@@ -335,7 +341,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "taskWait") {
         const tasks = requireTaskControl(options);
         const body = await readJson<TaskWaitBody>(request);
-        const input: AgentTaskWaitInput = { taskId: route.taskId };
+        const input: AgentTaskWaitInput = { taskId: route.taskId, signal: request.signal };
         if (body.timeoutMs !== undefined) input.timeoutMs = body.timeoutMs;
         return json(await tasks.waitForTask(input));
       }
@@ -581,10 +587,28 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         }));
       }
 
-      if (route.name === "goal") {
+      if (route.name === "delegationConfig") {
         await requireSession(options.store, route.sessionId);
+        return json(await requireDelegationControl(options).getDelegationConfig(route.sessionId));
+      }
+
+      if (route.name === "setDelegationPolicy") {
+        await requireSession(options.store, route.sessionId);
+        const body = await readJson<DelegationBody>(request);
+        if (!isDelegationPolicy(body.policy)) {
+          throw badRequest("policy must be off, explicit, or proactive");
+        }
+        return json(await requireDelegationControl(options).setDelegationPolicy({
+          sessionId: route.sessionId,
+          ...(body.threadId ? { threadId: body.threadId } : {}),
+          policy: body.policy,
+        }));
+      }
+
+      if (route.name === "goal") {
         const goals = requireGoalControl(options);
         if (request.method === "GET") {
+          await requireSession(options.store, route.sessionId);
           const threadId = requiredThreadId(url.searchParams.get("threadId"));
           const goal = await goals.getGoal({ sessionId: route.sessionId, threadId });
           return goal ? json(goal) : new Response(null, { status: 204 });
@@ -592,14 +616,21 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         if (request.method === "POST") {
           const body = await readJson<GoalBody>(request);
           const input = goalSetInput(route.sessionId, body);
+          await options.service.assertSessionTurnAllowed(route.sessionId, input.threadId);
+          await requireSession(options.store, route.sessionId);
           return json(await goals.setGoal(input), 201);
         }
         if (request.method === "PATCH") {
           const body = await readJson<GoalBody>(request);
           const input = goalUpdateInput(route.sessionId, body);
+          if (input.status === undefined || input.status === "active") {
+            await options.service.assertSessionTurnAllowed(route.sessionId, input.threadId);
+          }
+          await requireSession(options.store, route.sessionId);
           return json(await goals.updateGoal(input));
         }
         if (request.method === "DELETE") {
+          await requireSession(options.store, route.sessionId);
           const threadId = requiredThreadId(url.searchParams.get("threadId"));
           return json(await goals.clearGoal({ sessionId: route.sessionId, threadId }));
         }
@@ -611,6 +642,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         if (!body.threadId) throw badRequest("threadId is required");
         const promptImages = parsePromptImages(body.images);
         if (!body.text && promptImages.length === 0) throw badRequest("text is required");
+        await options.service.assertSessionTurnAllowed(route.sessionId, body.threadId);
         await requireSession(options.store, route.sessionId);
 
         const input = buildSubmitPromptInput(route.sessionId, body, promptImages);
@@ -634,6 +666,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         if (typeof body.name !== "string" || body.name.trim().length === 0) throw badRequest("name is required");
         if (body.args !== undefined && typeof body.args !== "string") throw badRequest("args must be a string when provided");
         if (body.cwd !== undefined && typeof body.cwd !== "string") throw badRequest("cwd must be a string when provided");
+        await options.service.assertSessionTurnAllowed(route.sessionId, body.threadId);
         await requireSession(options.store, route.sessionId);
 
         const command = await requireCommandControl(options).run({
@@ -788,6 +821,8 @@ type Route =
   | { name: "setModel"; sessionId: SessionId }
   | { name: "setReasoning"; sessionId: SessionId }
   | { name: "setServiceTier"; sessionId: SessionId }
+  | { name: "delegationConfig"; sessionId: SessionId }
+  | { name: "setDelegationPolicy"; sessionId: SessionId }
   | { name: "goal"; sessionId: SessionId }
   | { name: "prompt"; sessionId: SessionId }
   | { name: "promptAsync"; sessionId: SessionId }
@@ -843,6 +878,11 @@ interface ReasoningBody {
 interface ServiceTierBody {
   threadId?: ThreadId;
   serviceTier?: unknown;
+}
+
+interface DelegationBody {
+  threadId?: ThreadId;
+  policy?: unknown;
 }
 
 interface GoalBody {
@@ -989,8 +1029,8 @@ interface TeamTaskUpdateBody extends TeamContextBody {
 
 interface TeamMessageBody extends TeamContextBody {
   messageId?: string;
-  from?: AgentPath;
-  to?: AgentPath | "*";
+  from?: string;
+  to?: string | "*";
   content?: string;
   kind?: unknown;
   delivery?: unknown;
@@ -1132,6 +1172,8 @@ function routeRequest(method: string, pathname: string): Route {
   if (method === "POST" && action === "model") return { name: "setModel", sessionId };
   if (method === "POST" && action === "reasoning") return { name: "setReasoning", sessionId };
   if (method === "POST" && (action === "service-tier" || action === "service_tier" || action === "fast")) return { name: "setServiceTier", sessionId };
+  if (method === "GET" && action === "delegation") return { name: "delegationConfig", sessionId };
+  if (method === "POST" && action === "delegation") return { name: "setDelegationPolicy", sessionId };
   if ((method === "GET" || method === "POST" || method === "PATCH" || method === "DELETE") && action === "goal") return { name: "goal", sessionId };
   if (method === "POST" && action === "prompt") return { name: "prompt", sessionId };
   if (method === "POST" && action === "prompt_async") return { name: "promptAsync", sessionId };
@@ -1625,11 +1667,23 @@ function toHttpError(error: unknown): HttpError {
   if (err.name === "AgentTaskWaitTimeoutError") {
     return { status: 408, message: err.message };
   }
+  if (err.name === "AbortError") {
+    return { status: 499, message: err.message };
+  }
   if (err.name === "AgentMailboxNotFoundError") {
     return { status: 404, message: err.message };
   }
   if (err.name === "AgentMailboxNotDeliverableError") {
     return { status: 409, message: err.message };
+  }
+  if (err.name === "AgentMessageRecipientNotFoundError") {
+    return { status: 404, message: err.message };
+  }
+  if (err.name === "AgentMessageRecipientAmbiguousError" || err.name === "AgentMessageConflictError") {
+    return { status: 409, message: err.message };
+  }
+  if (err.name === "AgentMessageRecipientTerminalError" || err.name === "AgentMessageRecipientMetadataError") {
+    return { status: 422, message: err.message };
   }
   if (err.name === "TeamNotFoundError" || err.name === "TeamMemberNotFoundError" || err.name === "TeamTaskNotFoundError") {
     return { status: 404, message: err.message };
@@ -1640,7 +1694,16 @@ function toHttpError(error: unknown): HttpError {
   if (err.name === "TeamMessageDeliveryError") {
     return { status: 409, message: err.message };
   }
+  if (err.name === "TeamMemberTargetAmbiguousError" || err.name === "TeamMessageConflictError") {
+    return { status: 409, message: err.message };
+  }
+  if (err.name === "TeamMessageSenderUnauthorizedError") {
+    return { status: 403, message: err.message };
+  }
   if (err.name === "RuntimeBusyError") {
+    return { status: 409, message: err.message };
+  }
+  if (err.name === "RuntimeSubagentSessionAccessError") {
     return { status: 409, message: err.message };
   }
   if (err.name === "GoalAlreadyExistsError") {
@@ -1700,6 +1763,17 @@ function requireServiceTierControl(options: RuntimeHttpHandlerOptions): Required
   };
 }
 
+function requireDelegationControl(options: RuntimeHttpHandlerOptions): Required<Pick<RuntimeHttpService, "getDelegationConfig" | "setDelegationPolicy">> {
+  const service = options.service;
+  if (!service.getDelegationConfig || !service.setDelegationPolicy) {
+    throw { status: 501, message: "No delegation control service is configured" } satisfies HttpError;
+  }
+  return {
+    getDelegationConfig: service.getDelegationConfig.bind(service),
+    setDelegationPolicy: service.setDelegationPolicy.bind(service),
+  };
+}
+
 function requireGoalControl(options: RuntimeHttpHandlerOptions): Required<Pick<RuntimeHttpService, "getGoal" | "setGoal" | "updateGoal" | "clearGoal">> {
   const service = options.service;
   if (!service.getGoal || !service.setGoal || !service.updateGoal || !service.clearGoal) {
@@ -1730,6 +1804,10 @@ function isReasoningLevel(value: unknown): value is ReasoningLevel {
     || value === "xhigh"
     || value === "max"
     || value === "ultra";
+}
+
+function isDelegationPolicy(value: unknown): value is DelegationPolicy {
+  return typeof value === "string" && (DELEGATION_POLICIES as readonly string[]).includes(value);
 }
 
 function isServiceTier(value: unknown): value is ServiceTier {
@@ -2014,12 +2092,18 @@ function teamTaskUpdateInput(teamId: TeamId, taskId: TaskId, body: TeamTaskUpdat
 }
 
 function teamMessageInput(teamId: TeamId, body: TeamMessageBody): SendTeamMessageInput {
+  const from = body.from?.trim();
+  const to = body.to?.trim();
+  const content = body.content?.trim();
+  if (!from) throw badRequest("from must be a non-empty member path or member name");
+  if (!to) throw badRequest("to must be a non-empty member path, member name, or *");
+  if (!content) throw badRequest("content must be a non-empty string");
   const input: SendTeamMessageInput = {
     ...teamContext(body),
     teamId,
-    from: body.from as AgentPath,
-    to: body.to as AgentPath | "*",
-    content: body.content ?? "",
+    from: from as SendTeamMessageInput["from"],
+    to: to as SendTeamMessageInput["to"],
+    content,
   };
   if (body.messageId) input.messageId = body.messageId;
   const kind = teamMessageKind(body.kind);
@@ -2055,7 +2139,7 @@ function agentRunQueryFromUrl(url: URL): AgentRunQuery {
   if (sessionId) query.sessionId = sessionId;
   if (childSessionId) query.childSessionId = childSessionId;
   if (path) query.path = path as AgentPath;
-  if (status === "running" || status === "completed" || status === "failed" || status === "cancelled") {
+  if (status === "running" || status === "completed" || status === "incomplete" || status === "failed" || status === "cancelled") {
     query.status = status;
   }
   if (limit !== undefined) query.limit = limit;
@@ -2072,7 +2156,9 @@ function mailboxQueryFromUrl(url: URL): AgentMailboxQuery {
   const limit = numberParam(url.searchParams.get("limit"));
   if (messageId) query.messageId = messageId;
   if (taskId) query.taskId = taskId as TaskId;
-  if (status === "queued" || status === "delivering" || status === "consumed") query.status = status;
+  if (status === "queued" || status === "delivering" || status === "consumed" || status === "discarded") {
+    query.status = status;
+  }
   if (path) query.path = path as AgentPath;
   if (childSessionId) query.childSessionId = childSessionId;
   if (limit !== undefined) query.limit = limit;
@@ -2097,6 +2183,7 @@ function taskStatus(value: string | null): AgentTaskStatus | undefined {
     value === "pending" ||
     value === "running" ||
     value === "completed" ||
+    value === "incomplete" ||
     value === "failed" ||
     value === "cancelled"
   ) {
@@ -2167,8 +2254,8 @@ function serializeLocalSubagentTask(task: NonNullable<TeamTaskDispatchResult["ag
 
 function closeStatus(value: unknown): AgentTaskFinalStatus {
   if (value === undefined) return "cancelled";
-  if (value === "completed" || value === "failed" || value === "cancelled") return value;
-  throw badRequest("status must be completed, failed, or cancelled");
+  if (value === "completed" || value === "incomplete" || value === "failed" || value === "cancelled") return value;
+  throw badRequest("status must be completed, incomplete, failed, or cancelled");
 }
 
 function reconcileStaleInput(body: TaskReconcileStaleBody): AgentTaskReconcileStaleInput {

@@ -4,6 +4,7 @@ import {
   type AnthropicAuthScheme,
   type AnthropicCompatibleModelOptions,
 } from "./anthropic-compatible.js";
+import type { ProviderBackpressureCoordinator } from "./provider-backpressure.js";
 import { type EnvironmentSource, readMiniMaxEnvironment } from "./env.js";
 import {
   findDefaultKnownModel,
@@ -26,6 +27,7 @@ export interface MiniMaxModelOptions {
   fetch?: typeof fetch;
   headers?: Record<string, string>;
   authScheme?: AnthropicAuthScheme;
+  backpressureCoordinator?: ProviderBackpressureCoordinator;
   env?: EnvironmentSource;
 }
 
@@ -123,5 +125,8 @@ export function createMiniMaxM27HighspeedModel(options: MiniMaxModelOptions = {}
   if (options.temperature !== undefined) modelOptions.temperature = options.temperature;
   if (options.fetch !== undefined) modelOptions.fetch = options.fetch;
   if (options.headers !== undefined) modelOptions.headers = options.headers;
+  if (options.backpressureCoordinator !== undefined) {
+    modelOptions.backpressureCoordinator = options.backpressureCoordinator;
+  }
   return new AnthropicCompatibleModel(modelOptions);
 }

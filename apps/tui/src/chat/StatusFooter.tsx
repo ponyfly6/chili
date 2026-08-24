@@ -3,6 +3,7 @@ import type { ServiceTier } from "@chili/protocol";
 import { basename } from "node:path";
 import type { ModelSelection, ReasoningLevel } from "../model-state.js";
 import type { TuiTheme } from "../theme/index.js";
+import type { AgentsViewModel } from "./AgentsView.js";
 
 export interface StatusFooterOptions {
   modeName: string;
@@ -30,6 +31,7 @@ export function TeamStatusRow(props: { model: TeamLiveView; theme: TuiTheme }) {
 export function StatusFooter(props: {
   options: StatusFooterOptions;
   model: TeamLiveView;
+  agentExperience?: AgentsViewModel | undefined;
   chatView: ChatSessionView;
   canSubmit: boolean;
   width: number;
@@ -42,7 +44,7 @@ export function StatusFooter(props: {
     contextText(props.chatView.latestModelMetadata?.usage, contextWindowFor(props.chatView)),
     workspaceText(props.options),
   ].filter(Boolean).join(" · ");
-  const status = sessionStatusText(props.chatView, props.canSubmit, props.model);
+  const status = statusFooterStatusText(props.chatView, props.canSubmit, props.model, props.agentExperience);
   const right = [
     props.options.modeName,
     props.showToolDetails ? "Details on" : undefined,
@@ -71,15 +73,23 @@ export function statusFooterHeight(_width: number): number {
   return 1;
 }
 
-function sessionStatusText(chatView: ChatSessionView, canSubmit: boolean, model: TeamLiveView): string | undefined {
+export function statusFooterStatusText(
+  chatView: ChatSessionView,
+  canSubmit: boolean,
+  model: TeamLiveView,
+  agentExperience: AgentsViewModel | undefined,
+): string | undefined {
   const session = chatView.status === "waiting_for_approval"
     ? "approval"
     : chatView.status === "running"
       ? "running"
       : canSubmit ? undefined : "waiting";
   const goal = goalStatusText(chatView);
+  const agents = agentExperience && agentExperience.activeAdHocAgents > 0
+    ? `${agentExperience.activeAdHocAgents} ad-hoc agent${agentExperience.activeAdHocAgents === 1 ? "" : "s"}`
+    : undefined;
   const team = teamStatusText(model);
-  const status = [session, goal, team].filter(Boolean).join(" · ");
+  const status = [session, goal, agents, team].filter(Boolean).join(" · ");
   return status || undefined;
 }
 

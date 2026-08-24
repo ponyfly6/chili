@@ -4,6 +4,7 @@ import {
   HttpRuntimeClient,
   isEventCursorResyncRequiredError,
 } from "./client.js";
+import type { SessionId, ThreadId } from "@chili/protocol";
 
 test("streamEvents exposes a cursor resync signal for rejected resume cursors", async () => {
   const client = new HttpRuntimeClient({
@@ -57,4 +58,42 @@ test("streamEvents keeps non-resume HTTP conflicts as ordinary errors", async ()
   expect(caught).toBeInstanceOf(Error);
   expect(isEventCursorResyncRequiredError(caught)).toBe(false);
   expect((caught as Error).message).toBe("conflict");
+});
+
+test("delegation client reads and updates the deterministic session policy endpoint", async () => {
+  const requests: Request[] = [];
+  const sessionId = "session_1" as SessionId;
+  const threadId = "thread_1" as ThreadId;
+  const client = new HttpRuntimeClient({
+    baseUrl: "http://chili.test/api",
+    fetch: (async (input, init) => {
+      const request = new Request(input, init);
+      requests.push(request);
+      const policy = request.method === "POST"
+        ? (JSON.parse(await request.clone().text()) as { policy: string }).policy
+        : "explicit";
+      return Response.json({ sessionId: "session_1", policy, source: request.method === "POST" ? "session" : "default" });
+    }) as typeof fetch,
+  });
+
+  expect(await client.getDelegationConfig({ sessionId })).toEqual({
+    sessionId,
+    policy: "explicit",
+    source: "default",
+  });
+  expect(await client.setDelegationPolicy({
+    sessionId,
+    threadId,
+    policy: "proactive",
+  })).toEqual({
+    sessionId,
+    policy: "proactive",
+    source: "session",
+  });
+
+  expect(requests.map((request) => [request.method, request.url])).toEqual([
+    ["GET", "http://chili.test/api/sessions/session_1/delegation"],
+    ["POST", "http://chili.test/api/sessions/session_1/delegation"],
+  ]);
+  expect(await requests[1]!.json()).toEqual({ threadId: "thread_1", policy: "proactive" });
 });

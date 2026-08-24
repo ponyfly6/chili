@@ -462,17 +462,185 @@ test("team renderers label batched tasks and summarize run loop output", () => {
   }));
 
   expect(created).toMatchObject({
-    label: "Created team tasks team_core",
+    label: "Created persistent team tasks team_core",
     mode: "inline",
   });
   expect(dispatched).toMatchObject({
-    label: "Dispatched team tasks team_core",
+    label: "Dispatched persistent team tasks team_core",
     mode: "inline",
   });
   expect(runLoop).toMatchObject({
-    label: "Ran team loop team_core",
+    label: "Ran persistent team loop team_core",
     mode: "inline",
     summary: "stop=once, bottleneck=blocked, fanout=4, verify=2, dispatched=2, completed=1, running=1, blocked=1",
+  });
+});
+
+test("agent and team renderers distinguish ad-hoc work from persistent teams", () => {
+  const batch = renderToolActivity(toolInput({
+    toolName: "task_batch",
+    inputSummary: { title: "task_batch" },
+    input: {
+      max_concurrency: 2,
+      tasks: [
+        { description: "inspect API" },
+        { description: "inspect TUI" },
+        { description: "run tests" },
+      ],
+    },
+    output: JSON.stringify({
+      count: 3,
+      max_concurrency: 2,
+      tasks: [
+        { task_id: "task_a", status: "running" },
+        { task_id: "task_b", status: "completed" },
+        { task_id: "task_c", status: "failed" },
+      ],
+    }),
+  }));
+  const createdTeam = renderToolActivity(toolInput({
+    toolName: "team_create",
+    inputSummary: { title: "team_create" },
+    input: { name: "research" },
+  }));
+  const addedMember = renderToolActivity(toolInput({
+    toolName: "team_member_add",
+    inputSummary: { title: "team_member_add" },
+    input: { team_id: "team_research", name: "reader", path: "/root/reader" },
+  }));
+
+  expect(batch).toMatchObject({
+    label: "Started 3 ad-hoc agents",
+    mode: "inline",
+    summary: "agents=3, fanout=2, running=1, completed=1, failed=1",
+  });
+  expect(createdTeam.label).toBe("Created persistent team research");
+  expect(addedMember.label).toBe("Added persistent team member reader");
+});
+
+test("batch wait and agent message renderers expose lifecycle semantics", () => {
+  const joined = renderToolActivity(toolInput({
+    toolName: "task_batch",
+    inputSummary: { title: "task_batch" },
+    input: { tasks: [{ description: "a" }, { description: "b" }] },
+    output: JSON.stringify({
+      count: 2,
+      completion_policy: "join",
+      max_concurrency: 4,
+      joined: true,
+      tasks: [
+        { task_id: "task_a", status: "completed", summary: "done" },
+        { task_id: "task_b", status: "incomplete", summary: "turn limit" },
+      ],
+    }),
+  }));
+  const waited = renderToolActivity(toolInput({
+    toolName: "task_wait_batch",
+    inputSummary: { title: "task_wait_batch" },
+    input: { task_ids: ["task_a", "task_b", "task_c"], wait_for: "any" },
+    output: JSON.stringify({
+      wait_for: "any",
+      count: 3,
+      timed_out: true,
+      tasks: [
+        { task_id: "task_a", status: "completed" },
+        { task_id: "task_b", status: "running" },
+        { task_id: "task_c", status: "failed" },
+      ],
+    }),
+  }));
+  const sent = renderToolActivity(toolInput({
+    toolName: "agent_message_send",
+    inputSummary: { title: "agent_message_send" },
+    input: { to: "/root/reader", content: "focus on projection" },
+  }));
+  const listed = renderToolActivity(toolInput({
+    toolName: "agent_message_list",
+    inputSummary: { title: "agent_message_list" },
+    input: { status: "queued" },
+  }));
+
+  expect(joined).toMatchObject({
+    label: "Started 2 ad-hoc agents",
+    summary: "agents=2, policy=join, fanout=4, joined=true, completed=1, incomplete=1",
+  });
+  expect(waited).toMatchObject({
+    label: "Waited for 3 ad-hoc agents (any)",
+    mode: "inline",
+    summary: "wait=any, agents=3, timed_out=true, running=1, completed=1, failed=1",
+  });
+  expect(sent.label).toBe("Sent agent message to /root/reader");
+  expect(listed.label).toBe("Listed agent messages queued");
+});
+
+test("task batch renderer reports an all-failed camel-case spawn result", () => {
+  const batch = renderToolActivity(toolInput({
+    toolName: "task_batch",
+    inputSummary: { title: "task_batch" },
+    input: {
+      tasks: [
+        { description: "inspect API" },
+        { description: "inspect TUI" },
+        { description: "run tests" },
+      ],
+    },
+    output: JSON.stringify({
+      expectedBatchSize: 3,
+      spawnedCount: 0,
+      spawnFailureCount: 3,
+      spawnFailures: [
+        { batchIndex: 0, description: "inspect API", error: "spawn failed: inspect API" },
+        { batchIndex: 1, description: "inspect TUI", error: "spawn failed: inspect TUI" },
+        { batchIndex: 2, description: "run tests", error: "spawn failed: run tests" },
+      ],
+      completionPolicy: "join",
+      maxConcurrency: 3,
+      joined: true,
+      timedOut: false,
+      tasks: [],
+    }),
+  }));
+
+  expect(batch).toMatchObject({
+    label: "Failed to spawn 3 ad-hoc agents",
+    mode: "inline",
+    summary: "agents=0, planned=3, spawn_failed=3, policy=join, fanout=3, joined=true, timed_out=false",
+  });
+});
+
+test("task batch renderer reports a partial snake-case spawn result", () => {
+  const batch = renderToolActivity(toolInput({
+    toolName: "task_batch",
+    inputSummary: { title: "task_batch" },
+    input: {
+      tasks: [
+        { description: "inspect API" },
+        { description: "inspect TUI" },
+        { description: "run tests" },
+      ],
+    },
+    output: JSON.stringify({
+      expected_batch_size: 3,
+      spawned_count: 2,
+      spawn_failure_count: 1,
+      spawn_failures: [
+        { batch_index: 1, description: "inspect TUI", error: "spawn failed: inspect TUI" },
+      ],
+      completion_policy: "join",
+      max_concurrency: 3,
+      joined: true,
+      timed_out: false,
+      tasks: [
+        { task_id: "task_api", status: "completed" },
+        { task_id: "task_tests", status: "running" },
+      ],
+    }),
+  }));
+
+  expect(batch).toMatchObject({
+    label: "Started 2 of 3 ad-hoc agents (1 failed to spawn)",
+    mode: "inline",
+    summary: "agents=2, planned=3, spawn_failed=1, policy=join, fanout=3, joined=true, timed_out=false, running=1, completed=1",
   });
 });
 

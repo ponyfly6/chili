@@ -9,8 +9,10 @@ import type {
   ApprovalId,
   ApprovalDecisionAction,
   ApprovalScope,
+  DelegationPolicy,
   RuntimeApprovalResolveResult,
   RuntimeInterruptResult,
+  RuntimeDelegationConfig,
   RuntimeModelConfig,
   RuntimeModelDescriptor,
   RuntimeMcpAddServerRequest,
@@ -55,6 +57,8 @@ export interface RuntimeClient {
   setModel(input: SetModelRequest): Promise<RuntimeModelConfig>;
   setReasoning(input: SetReasoningRequest): Promise<RuntimeModelConfig>;
   setServiceTier(input: SetServiceTierRequest): Promise<RuntimeModelConfig>;
+  getDelegationConfig(input: GetDelegationConfigRequest): Promise<RuntimeDelegationConfig>;
+  setDelegationPolicy(input: SetDelegationPolicyRequest): Promise<RuntimeDelegationConfig>;
   getPermissionConfig(input?: GetPermissionConfigRequest): Promise<RuntimePermissionConfig>;
   setPermissionProfile(input: SetPermissionProfileRequest): Promise<RuntimePermissionConfig>;
   getGoal(input: GetGoalRequest): Promise<ThreadGoal | undefined>;
@@ -164,6 +168,18 @@ export interface SetServiceTierRequest {
   sessionId: SessionId;
   threadId?: ThreadId;
   serviceTier: ServiceTier;
+  signal?: AbortSignal;
+}
+
+export interface GetDelegationConfigRequest {
+  sessionId: SessionId;
+  signal?: AbortSignal;
+}
+
+export interface SetDelegationPolicyRequest {
+  sessionId: SessionId;
+  threadId?: ThreadId;
+  policy: DelegationPolicy;
   signal?: AbortSignal;
 }
 
@@ -376,7 +392,7 @@ export interface RuntimeAgentRunRecord {
   taskName: string;
   cwd?: string;
   mode?: AgentTaskMode;
-  status: "running" | "completed" | "failed" | "cancelled";
+  status: "running" | "completed" | "incomplete" | "failed" | "cancelled";
   createdAt: number;
   completedAt?: number;
 }
@@ -603,7 +619,7 @@ export interface RuntimeLocalSubagentTaskRecord {
 }
 
 export interface RuntimeTeamTaskDispatchResult {
-  status: "running" | "completed" | "failed" | "cancelled" | "skipped";
+  status: "running" | "completed" | "incomplete" | "failed" | "cancelled" | "skipped";
   teamTask: RuntimeTeamTaskRecord;
   team_task: RuntimeTeamTaskRecord;
   agentTask?: RuntimeLocalSubagentTaskRecord;
@@ -898,7 +914,7 @@ export interface WaitTaskRequest {
 
 export interface CloseTaskRequest {
   taskId: TaskId;
-  status?: Extract<AgentTaskStatus, "completed" | "failed" | "cancelled">;
+  status?: Extract<AgentTaskStatus, "completed" | "incomplete" | "failed" | "cancelled">;
   summary?: string;
   error?: string;
   interrupt?: boolean;
@@ -989,6 +1005,17 @@ export class HttpRuntimeClient implements RuntimeClient {
     return this.post(`sessions/${encodeURIComponent(input.sessionId)}/service-tier`, {
       threadId: input.threadId,
       serviceTier: input.serviceTier,
+    }, input.signal);
+  }
+
+  getDelegationConfig(input: GetDelegationConfigRequest): Promise<RuntimeDelegationConfig> {
+    return this.get(`sessions/${encodeURIComponent(input.sessionId)}/delegation`, input.signal);
+  }
+
+  setDelegationPolicy(input: SetDelegationPolicyRequest): Promise<RuntimeDelegationConfig> {
+    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/delegation`, {
+      threadId: input.threadId,
+      policy: input.policy,
     }, input.signal);
   }
 

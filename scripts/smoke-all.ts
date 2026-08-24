@@ -10,6 +10,7 @@ const suites = [
   "smoke:p2-control",
   "smoke:p3",
   "smoke:p3-background",
+  "smoke:p3-multi-agent-lifecycle",
   "smoke:p3-team-model",
   "smoke:p3-team-parallel",
 ] as const;

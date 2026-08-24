@@ -10,6 +10,7 @@ import { charDisplayWidth, markdownToTerminalLines } from "./markdown.js";
 import { localTranscriptItemTime } from "./local-transcript.js";
 import { buildChatDisplayItems, groupExplorationTools, type ChatDisplayItem } from "./presentation.js";
 import { ToolCell, ToolGroupCell, toolCellLines, toolGroupCellLines } from "./ToolCells.js";
+import { AgentBatchCell, agentBatchCellLines, type InlineAgentBatchDisplay } from "./AgentBatchCells.js";
 import type { LocalTranscriptItem } from "./types.js";
 
 export function MessageList(props: {
@@ -22,6 +23,7 @@ export function MessageList(props: {
   cwd?: string | undefined;
   onOpenFile?: OpenFileLinkHandler | undefined;
   theme: TuiTheme;
+  agentBatches?: readonly InlineAgentBatchDisplay[];
 }) {
   const allCells = transcriptCells(props.chatView.items, props.localItems, {
     width: Math.max(24, props.width ?? 80),
@@ -31,6 +33,7 @@ export function MessageList(props: {
     activeToolCount: props.chatView.activeTools.length,
     theme: props.theme,
     cwd: props.cwd ?? process.cwd(),
+    ...(props.agentBatches === undefined ? {} : { agentBatches: props.agentBatches }),
   });
   const selectionColors = {
     selectionBg: props.theme.colors.menu.selectedBackground,
@@ -66,10 +69,33 @@ export function MessageList(props: {
   );
 }
 
+export function messageListLineCount(input: {
+  chatView: ChatSessionView;
+  localItems: readonly LocalTranscriptItem[];
+  width?: number;
+  showToolDetails?: boolean;
+  hideThinking?: boolean;
+  cwd?: string;
+  theme: TuiTheme;
+  agentBatches?: readonly InlineAgentBatchDisplay[];
+}): number {
+  const count = transcriptCells(input.chatView.items, input.localItems, {
+    width: Math.max(24, input.width ?? 80),
+    showToolDetails: input.showToolDetails === true,
+    hideThinking: input.hideThinking === true,
+    sessionStatus: input.chatView.status,
+    activeToolCount: input.chatView.activeTools.length,
+    theme: input.theme,
+    cwd: input.cwd ?? process.cwd(),
+    ...(input.agentBatches === undefined ? {} : { agentBatches: input.agentBatches }),
+  }).reduce((lineCount, cell) => lineCount + cell.lineCount, 0);
+  return Math.max(1, count);
+}
+
 function transcriptCells(
   items: readonly ChatTranscriptItem[],
   localItems: readonly LocalTranscriptItem[],
-  options: { width: number; showToolDetails: boolean; hideThinking: boolean; sessionStatus: ChatSessionView["status"]; activeToolCount: number; theme: TuiTheme; cwd: string },
+  options: { width: number; showToolDetails: boolean; hideThinking: boolean; sessionStatus: ChatSessionView["status"]; activeToolCount: number; theme: TuiTheme; cwd: string; agentBatches?: readonly InlineAgentBatchDisplay[] },
 ): TranscriptCellModel[] {
   const displayItems = buildChatDisplayItems(items, {
     showToolDetails: options.showToolDetails,
@@ -78,6 +104,7 @@ function transcriptCells(
     activeToolCount: options.activeToolCount,
     groupExplorationTools: localItems.length === 0,
     cwd: options.cwd,
+    ...(options.agentBatches === undefined ? {} : { agentBatches: options.agentBatches }),
   });
   if (localItems.length === 0) {
     return displayItems.map((item) => displayItemCell(item, options.width, options.theme, options.showToolDetails, options.hideThinking, options.cwd));
@@ -184,6 +211,14 @@ function displayItemCell(item: ChatDisplayItem, width: number, theme: TuiTheme, 
       key: `display:${item.kind}:${item.id}`,
       render: () => <ToolGroupCell group={item} width={width} theme={theme} />,
       fallbackLines: toolGroupCellLines(item, width, theme),
+    });
+  }
+  if (item.kind === "agent_batch") {
+    const lines = agentBatchCellLines(item.batch, width, showToolDetails, theme);
+    return componentBackedCell({
+      key: `display:${item.kind}:${item.id}`,
+      render: () => <AgentBatchCell batch={item.batch} width={width} expanded={showToolDetails} theme={theme} />,
+      fallbackLines: lines,
     });
   }
   if (item.kind === "summary") {

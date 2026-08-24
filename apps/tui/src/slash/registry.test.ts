@@ -304,6 +304,21 @@ test("resolves fast mode slash command and completions", async () => {
   expect(slashCompletions(commands, ctx, "/fast o", 8).map((completion) => completion.value)).toContain("/fast off");
 });
 
+test("resolves agent delegation policy commands and completions", async () => {
+  const commands = createDefaultSlashCommands();
+  const ctx = { model: {} } as SlashCommandContext;
+  const agents = resolveSlashCommand(commands, "/agents")?.command;
+
+  expect(await agents?.run(ctx, "")).toEqual({ type: "open_view", view: "agents" });
+  expect(await agents?.run(ctx, "status")).toEqual({ type: "delegation_action", action: "status" });
+  expect(await agents?.run(ctx, "off")).toEqual({ type: "delegation_action", action: "set", policy: "off" });
+  expect(await agents?.run(ctx, "explicit")).toEqual({ type: "delegation_action", action: "set", policy: "explicit" });
+  expect(await agents?.run(ctx, "proactive")).toEqual({ type: "delegation_action", action: "set", policy: "proactive" });
+  expect(await agents?.run(ctx, "maybe")).toMatchObject({ type: "local_message", level: "error" });
+  expect(slashCompletions(commands, ctx, "/agents p", 8).map((completion) => completion.value)).toContain("/agents proactive");
+  expect(slashCompletions(commands, ctx, "/agents s", 8).map((completion) => completion.value)).toContain("/agents status");
+});
+
 test("reports fast mode as unsupported when the selected model cannot configure service tiers", async () => {
   const commands = createDefaultSlashCommands();
   const ctx = { model: {}, serviceTierConfigurable: false } as SlashCommandContext;

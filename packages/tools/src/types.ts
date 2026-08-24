@@ -169,6 +169,7 @@ export interface ToolPolicyContext {
 
 export interface ToolAccessPolicy {
   allowedTools?: readonly string[];
+  deniedTools?: readonly string[];
   writeScope?: readonly string[];
   executeScope?: readonly string[];
   teamId?: string;

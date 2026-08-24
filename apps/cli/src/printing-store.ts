@@ -2,13 +2,19 @@ import type { ChiliEvent, EventEnvelope, Message, MessagePart, MessageRole, Sess
 import type {
   AgentMailboxQuery,
   AgentMailboxRow,
+  AgentMailboxCapabilityStore,
   AgentMailboxClaimInput,
   AgentMailboxConsumeInput,
+  AgentMailboxDiscardInput,
   AgentMailboxDeliveryStore,
   AgentMailboxMutationResult,
   AgentMailboxRequeueInput,
+  AgentMailboxStoreCapability,
   AgentRunQuery,
   AgentRunRow,
+  AgentTaskBeginRunCasInput,
+  AgentTaskBeginRunResult,
+  AgentTaskCapabilityStore,
   AgentTaskCloseCasInput,
   AgentTaskCompleteCasInput,
   AgentTaskFinalizationResult,
@@ -20,6 +26,8 @@ import type {
   AgentTaskLeaseStore,
   AgentTaskQuery,
   AgentTaskRow,
+  AgentTaskRunClaimStore,
+  AgentTaskStoreCapability,
   ApprovalRow,
   EventQuery,
   EventStore,
@@ -36,6 +44,9 @@ import type {
   TeamRow,
   TeamTaskClaimInput,
   TeamTaskClaimStore,
+  TeamTaskAgentSyncInput,
+  TeamTaskAgentSyncResult,
+  TeamTaskAgentSyncStore,
   TeamTaskMutationResult,
   TeamTaskQuery,
   TeamTaskRow,
@@ -46,10 +57,14 @@ export class PrintingEventStore
     EventStore,
     SubagentProjectionStore,
     AgentTaskLeaseStore,
+    AgentTaskCapabilityStore,
+    AgentTaskRunClaimStore,
     AgentTaskFinalizationStore,
+    AgentMailboxCapabilityStore,
     AgentMailboxDeliveryStore,
     TeamProjectionStore,
-    TeamTaskClaimStore
+    TeamTaskClaimStore,
+    TeamTaskAgentSyncStore
 {
   constructor(private readonly inner: EventStore, private readonly printer: CliPrinter) {}
 
@@ -127,6 +142,31 @@ export class PrintingEventStore
     return this.leaseStore()?.releaseAgentTaskLease(input) ?? Promise.resolve(false);
   }
 
+  supportsAgentTaskCapability(capability: AgentTaskStoreCapability): boolean {
+    const inner = this.inner as EventStore & Partial<AgentTaskCapabilityStore>;
+    if (inner.supportsAgentTaskCapability) {
+      return inner.supportsAgentTaskCapability(capability);
+    }
+    if (capability === "lease") return this.leaseStore() !== undefined;
+    if (capability === "run-claim") return this.runClaimStore() !== undefined;
+    return this.finalizationStore() !== undefined;
+  }
+
+  supportsAgentMailboxCapability(capability: AgentMailboxStoreCapability): boolean {
+    const inner = this.inner as EventStore & Partial<AgentMailboxCapabilityStore>;
+    if (inner.supportsAgentMailboxCapability) {
+      return inner.supportsAgentMailboxCapability(capability);
+    }
+    return capability === "delivery" && this.mailboxDeliveryStore() !== undefined;
+  }
+
+  async beginAgentTaskRunCas(input: AgentTaskBeginRunCasInput): Promise<AgentTaskBeginRunResult> {
+    const result = await (this.runClaimStore()?.beginAgentTaskRunCas(input) ??
+      Promise.resolve({ applied: false, events: [] }));
+    for (const event of result.events) this.printer.event(event);
+    return result;
+  }
+
   async completeAgentTaskCas(input: AgentTaskCompleteCasInput): Promise<AgentTaskFinalizationResult> {
     const result = await (this.finalizationStore()?.completeAgentTaskCas(input) ??
       Promise.resolve({ applied: false, events: [] }));
@@ -162,8 +202,22 @@ export class PrintingEventStore
     return result;
   }
 
+  async discardAgentMailboxMessage(input: AgentMailboxDiscardInput): Promise<AgentMailboxMutationResult> {
+    const result = await (this.mailboxDeliveryStore()?.discardAgentMailboxMessage(input) ??
+      Promise.resolve({ applied: false, events: [] }));
+    for (const event of result.events) this.printer.event(event);
+    return result;
+  }
+
   async claimTeamTask(input: TeamTaskClaimInput): Promise<TeamTaskMutationResult> {
     const result = await (this.teamTaskClaimStore()?.claimTeamTask(input) ??
+      Promise.resolve({ applied: false, reason: "not_found" as const, events: [] }));
+    for (const event of result.events) this.printer.event(event);
+    return result;
+  }
+
+  async syncTeamTaskFromAgentCas(input: TeamTaskAgentSyncInput): Promise<TeamTaskAgentSyncResult> {
+    const result = await (this.teamTaskAgentSyncStore()?.syncTeamTaskFromAgentCas(input) ??
       Promise.resolve({ applied: false, reason: "not_found" as const, events: [] }));
     for (const event of result.events) this.printer.event(event);
     return result;
@@ -193,9 +247,23 @@ export class PrintingEventStore
     return undefined;
   }
 
+  private runClaimStore(): AgentTaskRunClaimStore | undefined {
+    const inner = this.inner as EventStore & Partial<AgentTaskRunClaimStore>;
+    if (inner.beginAgentTaskRunCas) return inner as EventStore & AgentTaskRunClaimStore;
+    return undefined;
+  }
+
   private mailboxDeliveryStore(): AgentMailboxDeliveryStore | undefined {
-    const inner = this.inner as EventStore & Partial<AgentMailboxDeliveryStore>;
-    if (inner.claimAgentMailboxMessage && inner.consumeAgentMailboxMessage && inner.requeueAgentMailboxMessage) {
+    const inner = this.inner as EventStore
+      & Partial<AgentMailboxDeliveryStore>
+      & Partial<AgentMailboxCapabilityStore>;
+    if (inner.supportsAgentMailboxCapability?.("delivery") === false) return undefined;
+    if (
+      inner.claimAgentMailboxMessage &&
+      inner.consumeAgentMailboxMessage &&
+      inner.requeueAgentMailboxMessage &&
+      inner.discardAgentMailboxMessage
+    ) {
       return inner as EventStore & AgentMailboxDeliveryStore;
     }
     return undefined;
@@ -213,6 +281,14 @@ export class PrintingEventStore
     const inner = this.inner as EventStore & Partial<TeamTaskClaimStore>;
     if (inner.claimTeamTask) {
       return inner as EventStore & TeamTaskClaimStore;
+    }
+    return undefined;
+  }
+
+  private teamTaskAgentSyncStore(): TeamTaskAgentSyncStore | undefined {
+    const inner = this.inner as EventStore & Partial<TeamTaskAgentSyncStore>;
+    if (inner.syncTeamTaskFromAgentCas) {
+      return inner as EventStore & TeamTaskAgentSyncStore;
     }
     return undefined;
   }

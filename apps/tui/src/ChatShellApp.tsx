@@ -1,9 +1,10 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type Dispatch, type RefObject, type SetStateAction } from "react";
 import { useAppContext, useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, MouseEvent, ScrollBoxRenderable, Selection } from "@opentui/core";
-import type { ChatSessionView, ChatTranscriptItem, HttpRuntimeClient, RuntimeSessionSummary, TeamLiveAction, TeamLiveView } from "@chili/sdk";
+import { runtimeDelegationStatus, type ChatSessionView, type ChatTranscriptItem, type HttpRuntimeClient, type RuntimeSessionSummary, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
 import type {
   ApprovalId,
+  DelegationPolicy,
   MessageImageContent,
   RuntimeMcpAuthResponse,
   RuntimeMcpLogoutResponse,
@@ -52,10 +53,13 @@ import {
   type ReasoningLevel,
 } from "./model-state.js";
 import { ApprovalDock, approvalDockHeight } from "./chat/ApprovalDock.js";
+import { AgentsView, agentsViewModel, type AgentsViewModel } from "./chat/AgentsView.js";
 import { BrandMark } from "./chat/BrandMark.js";
 import { charDisplayWidth } from "./chat/markdown.js";
 import { zedPathWithPosition, type FileLinkTarget } from "./chat/file-links.js";
 import { MessageList } from "./chat/MessageList.js";
+import { inlineAgentBatchesForSession } from "./chat/inline-agent-batches.js";
+import type { InlineAgentBatchDisplay } from "./chat/AgentBatchCells.js";
 import { TranscriptLine } from "./chat/lines.js";
 import {
   McpManager,
@@ -205,17 +209,18 @@ export function ChatShellApp(props: {
     [shellOptions],
   );
   const runtime = useChatRuntime({ client: props.client, options: chatOptions });
+  const currentSessionId = runtime.activeSessionId ?? runtime.chatView.sessionId;
   const allTeams = teamLiveModel(runtime.runtimeView, {
     connection: runtime.connection,
-    sessionId: shellOptions.sessionId,
+    sessionId: currentSessionId,
     limit: 48,
   });
   const [selectedTeamId, setSelectedTeamId] = useState<TeamId | undefined>(shellOptions.teamId ?? allTeams.selectedTeamId);
-  const resolvedSelectedTeamId = shellOptions.teamId ?? validSelectedTeamId(allTeams, selectedTeamId);
+  const resolvedSelectedTeamId = validSelectedTeamId(allTeams, shellOptions.teamId ?? selectedTeamId);
   const model = teamLiveModel(runtime.runtimeView, {
     connection: runtime.connection,
     selectedTeamId: resolvedSelectedTeamId,
-    sessionId: shellOptions.sessionId,
+    sessionId: currentSessionId,
     limit: 64,
   });
   const skillSummaries = useSkillSummaries(shellOptions.cwd ?? process.cwd());
@@ -425,10 +430,42 @@ export function ChatShellSurface(props: {
     ...(serviceTierConfigurable && serviceTier ? { serviceTier } : {}),
     cwd,
   };
+  const delegationStatus = runtimeDelegationStatus(props.runtime.runtimeView, {
+    ...(props.runtime.activeSessionId ? { sessionId: props.runtime.activeSessionId } : {}),
+    ...(props.runtime.activeThreadId ? { threadId: props.runtime.activeThreadId } : {}),
+    ...(props.selectedTeamId ? { teamId: props.selectedTeamId } : {}),
+    ...(props.runtime.delegationConfig ? { delegationConfig: props.runtime.delegationConfig } : {}),
+  });
+  const capabilityCandidate = capabilitySelection
+    ? modelCandidates.find((item) => sameModelSelection(capabilitySelection, modelDescriptorSelection(item)))
+    : undefined;
+  const capabilitySupported = modelToolCallSupport(capabilityCandidate);
+  const agentExperience = agentsViewModel({
+    runtimeView: props.runtime.runtimeView,
+    status: delegationStatus,
+    parentExecution: props.runtime.chatView.status,
+    ...(props.runtime.activeSessionId ? { sessionId: props.runtime.activeSessionId } : {}),
+    ...(capabilitySupported === undefined ? {} : { capabilitySupported }),
+  });
+  const currentSessionId = props.runtime.activeSessionId ?? props.runtime.chatView.sessionId;
+  const inlineAgentBatches = useMemo(() => inlineAgentBatchesForSession({
+    runtimeView: props.runtime.runtimeView,
+    teamView: props.model,
+    ...(currentSessionId ? { sessionId: currentSessionId } : {}),
+    ...(props.runtime.activeThreadId ? { threadId: props.runtime.activeThreadId } : {}),
+    limit: 20,
+  }), [
+    currentSessionId,
+    props.model,
+    props.runtime.activeThreadId,
+    props.runtime.revision,
+    props.runtime.runtimeView,
+  ]);
   const statusPage = statusPageModel({
     model: props.model,
     runtime: props.runtime,
     options: statusOptions,
+    agentExperience,
     showToolDetails,
     hideThinking,
     transcriptActive: view === "transcript",
@@ -1697,6 +1734,7 @@ export function ChatShellSurface(props: {
   }
 
   const home = props.runtime.chatView.items.length === 0
+    && inlineAgentBatches.length === 0
     && localItems.length === 0
     && props.runtime.chatView.pendingApprovals.length === 0
     && view === "chat";
@@ -1728,6 +1766,7 @@ export function ChatShellSurface(props: {
           paletteItems={paletteItems}
           paletteIndex={paletteIndex}
           model={props.model}
+          agentExperience={agentExperience}
           options={shellOptions}
           runtime={props.runtime}
           showToolDetails={showToolDetails}
@@ -1790,6 +1829,8 @@ export function ChatShellSurface(props: {
           paletteItems={paletteItems}
           paletteIndex={paletteIndex}
           model={props.model}
+          agentExperience={agentExperience}
+          agentBatches={inlineAgentBatches}
           options={shellOptions}
           runtime={props.runtime}
           mcpManager={mcpManager}
@@ -1838,6 +1879,7 @@ function HomeScreen(props: {
   paletteItems: readonly SlashCompletion[];
   paletteIndex: number;
   model: TeamLiveView;
+  agentExperience: AgentsViewModel;
   runtime: ChatRuntimeState;
   options: StatusFooterOptions;
   showToolDetails: boolean;
@@ -1919,7 +1961,7 @@ function HomeScreen(props: {
         />
       </box>
       <box flexGrow={3} />
-      <StatusFooter options={props.options} model={props.model} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
+      <StatusFooter options={props.options} model={props.model} agentExperience={props.agentExperience} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
     </box>
   );
 }
@@ -1950,6 +1992,8 @@ function SessionScreen(props: {
   paletteItems: readonly SlashCompletion[];
   paletteIndex: number;
   model: TeamLiveView;
+  agentExperience: AgentsViewModel;
+  agentBatches: readonly InlineAgentBatchDisplay[];
   runtime: ChatRuntimeState;
   mcpManager: McpManagerState;
   statusPage: StatusPageModel;
@@ -2032,7 +2076,7 @@ function SessionScreen(props: {
         ) : props.view === "mcp" ? (
           <McpManager state={props.mcpManager} runtime={props.runtime} theme={props.theme} />
         ) : props.view === "agents" ? (
-          <AgentsView model={props.model} theme={props.theme} />
+          <AgentsView model={props.agentExperience} theme={props.theme} />
         ) : props.view === "transcript" ? (
           <TranscriptView
             chatView={props.runtime.chatView}
@@ -2053,6 +2097,7 @@ function SessionScreen(props: {
             theme={props.theme}
             showToolDetails={props.showToolDetails}
             hideThinking={props.hideThinking}
+            agentBatches={props.agentBatches}
           />
         )}
       </box>
@@ -2096,7 +2141,7 @@ function SessionScreen(props: {
           maxCommandItems={maxCommandItems}
         />
       </box>
-      <StatusFooter options={props.options} model={props.model} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
+      <StatusFooter options={props.options} model={props.model} agentExperience={props.agentExperience} chatView={props.runtime.chatView} canSubmit={props.runtime.canSubmit} width={props.width} theme={props.theme} showToolDetails={props.showToolDetails} transcriptActive={props.transcriptActive} />
     </box>
   );
 }
@@ -2595,14 +2640,13 @@ function resolveResumeTarget(
   target: string,
 ): RuntimeSessionSummary | string {
   const normalized = target.trim().toLowerCase();
-  const active = sessions.filter((session) => session.status === "active");
+  const active = sessions.filter((session) => session.status === "active" && isInteractiveSession(session));
   const exactId = active.find((session) => String(session.id).toLowerCase() === normalized);
   if (exactId) return exactId;
-  const interactive = active.filter(isInteractiveSession);
-  const exactTitles = interactive.filter((session) => session.title?.toLowerCase() === normalized);
+  const exactTitles = active.filter((session) => session.title?.toLowerCase() === normalized);
   if (exactTitles.length === 1) return exactTitles[0]!;
   if (exactTitles.length > 1) return `More than one saved chat is named "${target}". Use /resume and select one, or pass its session ID.`;
-  const idPrefixes = interactive.filter((session) => String(session.id).toLowerCase().startsWith(normalized));
+  const idPrefixes = active.filter((session) => String(session.id).toLowerCase().startsWith(normalized));
   if (idPrefixes.length === 1) return idPrefixes[0]!;
   if (idPrefixes.length > 1) return `Session ID prefix "${target}" is ambiguous.`;
   return `Saved chat not found: ${target}`;
@@ -2904,6 +2948,7 @@ interface StatusPageInput {
   model: TeamLiveView;
   runtime: ChatRuntimeState;
   options: StatusFooterOptions;
+  agentExperience: AgentsViewModel;
   showToolDetails: boolean;
   hideThinking: boolean;
   transcriptActive: boolean;
@@ -2953,7 +2998,6 @@ function StatusPageRowView(props: {
 }
 
 function statusPageModel(input: StatusPageInput): StatusPageModel {
-  const selected = input.model.selected;
   const modelSelection = statusModelSelection(input.runtime, input.options);
   const candidate = modelSelection
     ? input.runtime.modelCandidates?.find((item) => sameModelSelection(modelSelection, modelDescriptorSelection(item)))
@@ -2972,13 +3016,17 @@ function statusPageModel(input: StatusPageInput): StatusPageModel {
     { key: "status:title", text: "Status", tone: "heading" },
     { key: "status:spacer", text: "", tone: "spacer" },
     { key: "status:event-stream", text: `event stream: ${eventStreamStatus(input.model.connection.status)}`, tone: "text" },
-    { key: "status:execution", text: `execution: ${executionStatus}`, tone: executionStatus === "failed" || executionStatus === "cancelled" ? "error" : "text" },
+    { key: "status:execution", text: `parent execution: ${input.agentExperience.parentExecution}`, tone: executionStatus === "failed" || executionStatus === "cancelled" ? "error" : "text" },
   ];
   const reason = singleLineStatusValue(input.runtime.chatView.statusReason);
   if ((executionStatus === "failed" || executionStatus === "cancelled") && reason) {
     rows.push({ key: "status:reason", text: `reason: ${reason}`, tone: "error" });
   }
   rows.push(
+    { key: "status:agent-capability", text: `agent capability: ${input.agentExperience.capability}`, tone: input.agentExperience.capability.startsWith("unavailable") ? "error" : "text" },
+    { key: "status:delegation", text: `delegation: ${input.agentExperience.delegation}`, tone: "text" },
+    { key: "status:ad-hoc-agents", text: `ad-hoc agents: ${input.agentExperience.adHocSummary}`, tone: "text" },
+    { key: "status:persistent-team", text: `persistent teams: ${input.agentExperience.persistentTeamSummary}`, tone: "text" },
     { key: "status:session", text: `session: ${input.runtime.activeSessionId ?? "none"}`, tone: "text" },
     { key: "status:thread", text: `thread: ${input.runtime.activeThreadId ?? "none"}`, tone: "text" },
     { key: "status:mode", text: `mode: ${input.options.modeName}`, tone: "text" },
@@ -2992,7 +3040,6 @@ function statusPageModel(input: StatusPageInput): StatusPageModel {
     { key: "status:details", text: `details: ${input.showToolDetails ? "on" : "off"}`, tone: "text" },
     { key: "status:transcript", text: `transcript: ${input.transcriptActive ? "on" : "off"}`, tone: "text" },
     { key: "status:cwd", text: `cwd: ${input.options.cwd}`, tone: "text" },
-    { key: "status:team", text: `team: ${selected?.team.name ?? selected?.team.id ?? "none"}`, tone: "text" },
   );
   return { rows, text: rows.map((row) => row.text).join("\n") };
 }
@@ -3046,23 +3093,8 @@ function capabilityModelLabel(selection: ModelSelection | undefined): string {
   return selection ? modelSelectionLabel(selection) : "Selected model";
 }
 
-function AgentsView(props: { model: TeamLiveView; theme: TuiTheme }) {
-  const members = props.model.selected?.members ?? [];
-  return (
-    <box width="100%" height="100%" flexDirection="column">
-      <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Agents"}</text>
-      <box height={1} />
-      {members.length === 0 ? (
-        <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{"No active agents yet."}</text>
-      ) : (
-        members.slice(0, 10).map((member) => (
-          <text key={member.id} fg={props.theme.colors.text.secondary} wrapMode="none" truncate>
-            {`${member.isLead ? "lead" : "agent"} ${member.name ?? member.path} ${member.status}`}
-          </text>
-        ))
-      )}
-    </box>
-  );
+function modelToolCallSupport(candidate: ModelCandidate | undefined): boolean | undefined {
+  return candidate?.capabilities?.toolCalls;
 }
 
 async function submitPrompt(
@@ -3309,6 +3341,10 @@ async function applySlashResult(
     actions.setHideThinking(result.hidden);
     return;
   }
+  if (result.type === "delegation_action") {
+    await performDelegationAction(result, runtime, actions.appendLocalItem);
+    return;
+  }
   if (result.type === "auth_action") {
     await performAuthAction(result, actions.appendLocalItem, actions.setAuthManualPrompt, actions.ensureOpenAICodexDefaultModel);
     return;
@@ -3325,6 +3361,45 @@ async function applySlashResult(
     const action = actionForSlashResult(result, model);
     if (action) runtime.executeAction(action);
   }
+}
+
+async function performDelegationAction(
+  result: Extract<SlashCommandResult, { type: "delegation_action" }>,
+  runtime: ChatRuntimeState,
+  appendLocalItem: AppendLocalItem,
+): Promise<void> {
+  if (result.action === "status") {
+    if (!runtime.activeSessionId && !runtime.chatView.sessionId) {
+      appendLocalItem("error", "Start a session before checking its agent delegation policy.");
+      return;
+    }
+    const config = await runtime.refreshDelegationConfig?.() ?? runtime.delegationConfig;
+    if (!config) {
+      appendLocalItem("error", "Could not read the session agent delegation policy.");
+      return;
+    }
+    appendLocalItem("info", delegationConfigMessage(config.policy, config.source));
+    return;
+  }
+  if (!result.policy || !runtime.setRuntimeDelegationPolicy) {
+    appendLocalItem("error", "This runtime cannot update agent delegation policy.");
+    return;
+  }
+  const config = await runtime.setRuntimeDelegationPolicy(result.policy);
+  if (!config) {
+    appendLocalItem("error", `Could not set agent delegation to ${result.policy}.`);
+    return;
+  }
+  appendLocalItem("info", delegationConfigMessage(config.policy, config.source));
+}
+
+function delegationConfigMessage(policy: DelegationPolicy, source: string): string {
+  const detail = policy === "off"
+    ? "Chili will not delegate work in this session."
+    : policy === "explicit"
+      ? "Chili delegates only when the user explicitly requests it."
+      : "Chili may delegate useful independent work proactively.";
+  return `Agent delegation: ${policy} (source: ${source}). ${detail}`;
 }
 
 async function performGoalAction(

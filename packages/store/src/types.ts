@@ -5,6 +5,7 @@ import type {
   AgentMailboxStatus,
   AgentTaskMode,
   AgentTaskStatus,
+  TaskCompletionPolicy,
   ChiliEvent,
   EventEnvelope,
   Message,
@@ -20,6 +21,7 @@ import type {
   TeamMessageKind,
   TeamTaskStatus,
   ThreadId,
+  ToolCallId,
   ToolCallStatus,
   ApprovalDecisionAction,
   ApprovalScope,
@@ -100,7 +102,7 @@ export interface AgentRunRow {
   taskName: string;
   cwd?: string;
   mode?: AgentTaskMode;
-  status: "running" | "completed" | "failed" | "cancelled";
+  status: "running" | "completed" | "incomplete" | "failed" | "cancelled";
   createdAt: number;
   completedAt?: number;
 }
@@ -119,6 +121,12 @@ export interface AgentTaskRow {
   cwd?: string;
   prompt?: string;
   mode?: AgentTaskMode;
+  sourceCallId?: ToolCallId;
+  batchId?: string;
+  batchIndex?: number;
+  expectedBatchSize?: number;
+  completionPolicy?: TaskCompletionPolicy;
+  maxConcurrency?: number;
   currentRunId?: string;
   summary?: string;
   error?: string;
@@ -150,6 +158,8 @@ export interface AgentTaskQuery {
   path?: AgentPath;
   parentSessionId?: SessionId;
   childSessionId?: SessionId;
+  sourceCallId?: ToolCallId;
+  batchId?: string;
   status?: AgentTaskStatus;
   limit?: number;
 }
@@ -168,6 +178,7 @@ export interface AgentMailboxQuery {
   taskId?: TaskId;
   path?: AgentPath;
   childSessionId?: SessionId;
+  triggerTurn?: boolean;
   status?: AgentMailboxStatus;
   limit?: number;
 }
@@ -208,12 +219,24 @@ export interface AgentTaskCompleteCasInput {
   path: AgentPath;
   status: AgentTaskFinalStatus;
   eventId: string;
+  /** Exact task generation owned by the caller. */
+  expectedGeneration: number;
+  /** Exact run owned by the caller, or null when closing an unspawned task. */
+  expectedRunId: AgentRunId | null;
+  /** Exact lease owner observed/owned by the caller, including null for no lease. */
+  expectedLeaseOwner: string | null;
+  /** Require the matching lease to still be unexpired (worker-owned finalization). */
+  requireActiveLease?: boolean;
   runId?: AgentRunId;
   generation?: number;
   owner?: string;
   summary?: string;
   error?: string;
   agentEventId?: string;
+  /** Delivering mailbox message completed by this task generation. */
+  mailboxMessageId?: string;
+  /** Event that consumes mailboxMessageId in the same transaction as task/run completion. */
+  mailboxConsumeEventId?: string;
   sessionId?: SessionId;
   threadId?: ThreadId;
   time?: number;
@@ -223,15 +246,61 @@ export interface AgentTaskCloseCasInput {
   taskId: TaskId;
   status: AgentTaskFinalStatus;
   eventId: string;
+  /** Exact task generation observed by the caller. */
+  expectedGeneration: number;
+  /** Exact current run observed by the caller, or null when no run exists. */
+  expectedRunId: AgentRunId | null;
+  /** Exact lease owner observed by the caller, including null for no lease. */
+  expectedLeaseOwner: string | null;
+  /** Require the matching lease to still be unexpired (worker-owned finalization). */
+  requireActiveLease?: boolean;
+  /** Exact lease expiry observed by a stale scanner or lease holder. */
+  expectedLeaseExpiresAt?: number | null;
+  /** Require the observed lease to still be absent or expired at commit time. */
+  requireExpiredLease?: boolean;
+  /** Require the task to remain no newer than the stale-scan cutoff. */
+  updatedBeforeOrAt?: number;
   summary?: string;
   error?: string;
   agentEventId?: string;
+  /** Delivering mailbox message owned by the task generation being closed. */
+  mailboxMessageId?: string;
+  /** Event that consumes or requeues mailboxMessageId in the same transaction. */
+  mailboxEventId?: string;
+  mailboxDisposition?: "consume" | "requeue";
+  mailboxError?: string;
   sessionId?: SessionId;
   threadId?: ThreadId;
   time?: number;
 }
 
 export interface AgentTaskFinalizationResult {
+  applied: boolean;
+  task?: AgentTaskRow;
+  events: ChiliEvent[];
+}
+
+export interface AgentTaskBeginRunCasInput {
+  taskId: TaskId;
+  expectedGeneration: number;
+  expectedRunId: AgentRunId | null;
+  expectedLeaseOwner: string | null;
+  runId: AgentRunId;
+  generation: number;
+  leaseOwner: string;
+  leaseTtlMs: number;
+  spawnEventId: string;
+  sourceMailboxMessageId?: string;
+  messageEventId?: string;
+  messageClaimEventId?: string;
+  from?: AgentPath;
+  message?: AgentMailboxPayload;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  time?: number;
+}
+
+export interface AgentTaskBeginRunResult {
   applied: boolean;
   task?: AgentTaskRow;
   events: ChiliEvent[];
@@ -259,6 +328,16 @@ export interface AgentMailboxRequeueInput {
   messageId: string;
   eventId: string;
   error?: string;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  time?: number;
+}
+
+export interface AgentMailboxDiscardInput {
+  messageId: string;
+  eventId: string;
+  discardedBy?: AgentPath;
+  reason: string;
   sessionId?: SessionId;
   threadId?: ThreadId;
   time?: number;
@@ -344,6 +423,7 @@ export interface TeamQuery {
 export interface TeamMemberQuery {
   teamId?: TeamId;
   path?: AgentPath;
+  childSessionId?: SessionId;
   status?: TeamMemberStatus;
   limit?: number;
 }
@@ -357,6 +437,7 @@ export interface TeamTaskQuery {
 }
 
 export interface TeamMessageQuery {
+  messageId?: string;
   teamId?: TeamId;
   path?: AgentPath;
   taskId?: TaskId;
@@ -423,6 +504,31 @@ export interface TeamTaskVerificationClaimResult {
   reason?: "not_found" | "not_completed" | "already_verified" | "verification_pending" | "stale";
 }
 
+export interface TeamTaskAgentSyncInput {
+  teamId: TeamId;
+  taskId: TaskId;
+  agentTaskId: TaskId;
+  agentRunId: AgentRunId;
+  agentGeneration: number;
+  agentStatus: AgentTaskFinalStatus;
+  status: Exclude<TeamTaskStatus, "pending" | "in_progress">;
+  metadata: Record<string, unknown>;
+  taskEventId: string;
+  memberEventId: string;
+  sessionId?: SessionId;
+  threadId?: ThreadId;
+  summary?: string;
+  error?: string;
+  time?: number;
+}
+
+export interface TeamTaskAgentSyncResult {
+  applied: boolean;
+  task?: TeamTaskRow;
+  events: ChiliEvent[];
+  reason?: "not_found" | "not_in_progress" | "binding_mismatch" | "agent_not_terminal" | "stale";
+}
+
 export interface EventStore {
   append(event: ChiliEvent): Promise<void>;
   appendMany(events: readonly ChiliEvent[]): Promise<void>;
@@ -455,10 +561,35 @@ export interface AgentTaskFinalizationStore {
   closeAgentTaskCas(input: AgentTaskCloseCasInput): Promise<AgentTaskFinalizationResult>;
 }
 
+export interface AgentTaskRunClaimStore {
+  beginAgentTaskRunCas(input: AgentTaskBeginRunCasInput): Promise<AgentTaskBeginRunResult>;
+}
+
+export type AgentTaskStoreCapability = "lease" | "run-claim" | "finalization";
+
+/**
+ * Wrappers that always expose forwarding methods use this hook to report
+ * whether their inner store actually implements the optional capability.
+ */
+export interface AgentTaskCapabilityStore {
+  supportsAgentTaskCapability(capability: AgentTaskStoreCapability): boolean;
+}
+
 export interface AgentMailboxDeliveryStore {
   claimAgentMailboxMessage(input: AgentMailboxClaimInput): Promise<AgentMailboxMutationResult>;
   consumeAgentMailboxMessage(input: AgentMailboxConsumeInput): Promise<AgentMailboxMutationResult>;
   requeueAgentMailboxMessage(input: AgentMailboxRequeueInput): Promise<AgentMailboxMutationResult>;
+  discardAgentMailboxMessage(input: AgentMailboxDiscardInput): Promise<AgentMailboxMutationResult>;
+}
+
+export type AgentMailboxStoreCapability = "delivery";
+
+/**
+ * Wrappers that always expose mailbox CAS forwarding methods use this hook to
+ * report whether their inner store actually implements the capability.
+ */
+export interface AgentMailboxCapabilityStore {
+  supportsAgentMailboxCapability(capability: AgentMailboxStoreCapability): boolean;
 }
 
 export interface TeamProjectionStore {
@@ -475,6 +606,10 @@ export interface TeamTaskClaimStore {
 
 export interface TeamTaskVerificationClaimStore {
   claimTeamTaskVerification(input: TeamTaskVerificationClaimInput): Promise<TeamTaskVerificationClaimResult>;
+}
+
+export interface TeamTaskAgentSyncStore {
+  syncTeamTaskFromAgentCas(input: TeamTaskAgentSyncInput): Promise<TeamTaskAgentSyncResult>;
 }
 
 export interface EventMirror {

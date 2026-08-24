@@ -15,8 +15,14 @@ import type {
 } from "@chili/protocol";
 import { ObservableEventStore, SqliteEventStore } from "@chili/store";
 import type { SubmitPromptInput, SubmitPromptResult } from "./runtime-service.js";
-import { AgentTreeControlService } from "./agent-tree.js";
+import {
+  AgentMessageConflictError,
+  AgentMessageRecipientAmbiguousError,
+  AgentMessageRecipientTerminalError,
+  AgentTreeControlService,
+} from "./agent-tree.js";
 import { AgentMailboxDeliveryPump } from "./agent-mailbox-delivery-pump.js";
+import { TeamControlService } from "./team.js";
 
 test("builds an agent path tree and consumes mailbox messages", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-agent-tree-"));
@@ -230,6 +236,14 @@ test("delivers mailbox messages to child sessions before consuming them", async 
           prompt: "read",
           mode: "resumable",
         },
+      },
+      {
+        id: "event_task_completed",
+        type: "agent.task_completed",
+        time: 2 as TimestampMs,
+        sessionId: parentSessionId,
+        threadId: parentThreadId,
+        payload: { taskId, path: childPath, status: "completed" },
       },
       {
         id: "event_mailbox",
@@ -484,6 +498,14 @@ test("claims mailbox before delivery so concurrent consumers only deliver once",
         },
       },
       {
+        id: "event_task_completed",
+        type: "agent.task_completed",
+        time: 2 as TimestampMs,
+        sessionId: parentSessionId,
+        threadId: parentThreadId,
+        payload: { taskId, path: childPath, status: "completed" },
+      },
+      {
         id: "event_mailbox",
         type: "agent.message_queued",
         time: 2 as TimestampMs,
@@ -585,6 +607,265 @@ test("keeps mailbox queued when delivery fails", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("trigger-turn team messages keep member lifecycle in sync", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-mailbox-lifecycle-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const runtime = new FakeMailboxRuntime();
+  const workerPath = "/root/worker" as AgentPath;
+
+  try {
+    const teams = new TeamControlService({ store, createId: createSequentialId(), now: () => 6 as TimestampMs });
+    const team = await teams.createTeam({ name: "lifecycle-team", leadPath: "/root" as AgentPath });
+    await teams.addMember({
+      teamId: team.id,
+      path: workerPath,
+      name: "worker",
+      role: "implementer",
+      status: "idle",
+      childSessionId: "session_worker" as SessionId,
+      childThreadId: "thread_worker" as ThreadId,
+    });
+    await teams.sendMessage({
+      teamId: team.id,
+      messageId: "wake_worker",
+      from: "/root",
+      to: "worker",
+      content: "Run the next step.",
+      delivery: "triggerTurn",
+    });
+    const mailbox = (await store.agentMailbox({ path: workerPath }))[0];
+    expect(mailbox).toBeDefined();
+
+    let nextDeliveryId = 0;
+    const agents = new AgentTreeControlService({
+      store,
+      runtime,
+      createId: (prefix) => `delivery_${prefix}_${++nextDeliveryId}`,
+      now: () => 7 as TimestampMs,
+    });
+    await agents.consumeMailbox({ messageId: mailbox?.id ?? "missing" });
+
+    expect(
+      (await store.events({ type: "team.member_status_changed", limit: 10 }))
+        .filter(
+          (event): event is Extract<ChiliEvent, { type: "team.member_status_changed" }> =>
+            event.type === "team.member_status_changed",
+        )
+        .map((event) => event.payload.status),
+    ).toEqual(["running", "idle"]);
+    expect(await store.teamMembers({ teamId: team.id, path: workerPath })).toMatchObject([{ status: "idle" }]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("sends idempotent agent messages and keeps consumed messages terminal", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-agent-message-idempotency-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const parentSessionId = "session_parent" as SessionId;
+  const parentThreadId = "thread_parent" as ThreadId;
+  const taskId = "task_reader" as TaskId;
+  const childPath = "/root/reader" as AgentPath;
+
+  try {
+    await seedMessageTask(store, {
+      taskId,
+      path: childPath,
+      taskName: "reader",
+      parentSessionId,
+      parentThreadId,
+      status: "completed",
+    });
+    const service = new AgentTreeControlService({ store, now: () => 10 as TimestampMs });
+    const input = {
+      messageId: "agent_message_once",
+      from: "/root" as AgentPath,
+      to: "reader",
+      content: "Use this if you are resumed later.",
+      delivery: "queueOnly" as const,
+      sessionId: parentSessionId,
+      threadId: parentThreadId,
+      metadata: { reason: "followup-context" },
+    };
+
+    const first = await service.sendMessage(input);
+    const retry = await service.sendMessage(input);
+    expect(retry.id).toBe(first.id);
+    expect(await store.events({ type: "agent.message_queued", limit: 10 })).toHaveLength(1);
+
+    const consumed = await service.consumeMailbox({ messageId: first.id });
+    expect(consumed.status).toBe("consumed");
+    expect((await service.sendMessage(input)).status).toBe("consumed");
+    expect((await store.agentMailbox({ messageId: first.id }))[0]?.status).toBe("consumed");
+
+    await expect(service.sendMessage({ ...input, content: "different" })).rejects.toBeInstanceOf(
+      AgentMessageConflictError,
+    );
+    await expect(service.sendMessage({
+      ...input,
+      messageId: "agent_message_wake_terminal",
+      delivery: "triggerTurn",
+    })).rejects.toBeInstanceOf(AgentMessageRecipientTerminalError);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("scopes named agent recipients to the sending session", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-agent-message-scope-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const sessionA = "session_a" as SessionId;
+  const sessionB = "session_b" as SessionId;
+  const threadA = "thread_a" as ThreadId;
+  const threadB = "thread_b" as ThreadId;
+
+  try {
+    await seedMessageTask(store, {
+      taskId: "task_reader_a" as TaskId,
+      path: "/root/reader_a" as AgentPath,
+      taskName: "reader",
+      parentSessionId: sessionA,
+      parentThreadId: threadA,
+      status: "running",
+    });
+    await seedMessageTask(store, {
+      taskId: "task_reader_b" as TaskId,
+      path: "/root/reader_b" as AgentPath,
+      taskName: "reader",
+      parentSessionId: sessionB,
+      parentThreadId: threadB,
+      status: "running",
+    });
+    const service = new AgentTreeControlService({ store, now: () => 10 as TimestampMs });
+
+    const scoped = await service.sendMessage({
+      messageId: "agent_message_scoped",
+      from: "/root" as AgentPath,
+      to: "reader",
+      content: "session A only",
+      sessionId: sessionA,
+      threadId: threadA,
+    });
+    expect(scoped).toMatchObject({ taskId: "task_reader_a", path: "/root/reader_a" });
+
+    await expect(service.sendMessage({
+      messageId: "agent_message_ambiguous",
+      from: "/root" as AgentPath,
+      to: "reader",
+      content: "no session scope",
+    })).rejects.toBeInstanceOf(AgentMessageRecipientAmbiguousError);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("explicit recipient metadata wins over terminal task lookup and mailbox reads are FIFO", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-agent-message-explicit-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const parentSessionId = "session_parent" as SessionId;
+  const parentThreadId = "thread_parent" as ThreadId;
+  const taskId = "task_done" as TaskId;
+
+  try {
+    await seedMessageTask(store, {
+      taskId,
+      path: "/root/done" as AgentPath,
+      taskName: "done",
+      parentSessionId,
+      parentThreadId,
+      status: "completed",
+    });
+    const service = new AgentTreeControlService({ store, now: () => 20 as TimestampMs });
+    await service.sendMessage({
+      messageId: "z_first",
+      from: "/root/done" as AgentPath,
+      to: "/root",
+      taskId,
+      content: "first",
+      delivery: "triggerTurn",
+      recipientSessionId: parentSessionId,
+      recipientThreadId: parentThreadId,
+    });
+    await service.sendMessage({
+      messageId: "a_second",
+      from: "/root/done" as AgentPath,
+      to: "/root",
+      taskId,
+      content: "second",
+      recipientSessionId: parentSessionId,
+      recipientThreadId: parentThreadId,
+    });
+
+    expect((await store.agentMailbox({ path: "/root" as AgentPath })).map((message) => message.id)).toEqual([
+      "z_first",
+      "a_second",
+    ]);
+    const explicit = await store.agentMailbox({ messageId: "z_first" });
+    expect(explicit).toMatchObject([{
+      path: "/root",
+      childSessionId: parentSessionId,
+      childThreadId: parentThreadId,
+      triggerTurn: true,
+    }]);
+    expect(explicit[0]?.taskId).toBeUndefined();
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+async function seedMessageTask(
+  store: SqliteEventStore,
+  input: {
+    taskId: TaskId;
+    path: AgentPath;
+    taskName: string;
+    parentSessionId: SessionId;
+    parentThreadId: ThreadId;
+    status: "running" | "completed";
+  },
+): Promise<void> {
+  const childSessionId = `child_${input.taskId}` as SessionId;
+  const childThreadId = `thread_${input.taskId}` as ThreadId;
+  await store.append({
+    id: `created_${input.taskId}`,
+    type: "agent.task_created",
+    time: 1 as TimestampMs,
+    sessionId: input.parentSessionId,
+    threadId: input.parentThreadId,
+    payload: {
+      taskId: input.taskId,
+      path: input.path,
+      parentPath: "/root" as AgentPath,
+      parentSessionId: input.parentSessionId,
+      parentThreadId: input.parentThreadId,
+      childSessionId,
+      childThreadId,
+      taskName: input.taskName,
+      cwd: "/repo",
+      prompt: "work",
+      mode: "resumable",
+    },
+  });
+  if (input.status === "completed") {
+    await store.append({
+      id: `completed_${input.taskId}`,
+      type: "agent.task_completed",
+      time: 2 as TimestampMs,
+      sessionId: input.parentSessionId,
+      threadId: input.parentThreadId,
+      payload: {
+        taskId: input.taskId,
+        path: input.path,
+        status: "completed",
+      },
+    });
+  }
+}
 
 function agentSpawned(
   id: string,

@@ -112,6 +112,7 @@ test("different writing tasks can run with different task worktrees", async () =
 
     const first = await dispatcher.dispatchTask({ teamId: team.id, taskId: coreTask.id, mode: "background", sessionId, cwd: dir });
     const second = await dispatcher.dispatchTask({ teamId: team.id, taskId: docsTask.id, mode: "background", sessionId, cwd: dir });
+    await runner.waitForRuns(2);
 
     expect(first.status).toBe("running");
     expect(second.status).toBe("running");
@@ -442,11 +443,23 @@ class CapturingRunner implements LocalSubagentRunner {
 class HoldingRunner implements LocalSubagentRunner {
   readonly runs: LocalSubagentRunInput[] = [];
   private readonly completions: Array<() => void> = [];
+  private readonly runWaiters: Array<{ count: number; resolve: () => void }> = [];
 
   async run(input: LocalSubagentRunInput): Promise<LocalSubagentRunResult> {
     this.runs.push(input);
+    for (let index = this.runWaiters.length - 1; index >= 0; index--) {
+      const waiter = this.runWaiters[index];
+      if (!waiter || this.runs.length < waiter.count) continue;
+      this.runWaiters.splice(index, 1);
+      waiter.resolve();
+    }
     await new Promise<void>((resolve) => this.completions.push(resolve));
     return { status: "completed", summary: `Done ${input.taskName}` };
+  }
+
+  waitForRuns(count: number): Promise<void> {
+    if (this.runs.length >= count) return Promise.resolve();
+    return new Promise<void>((resolve) => this.runWaiters.push({ count, resolve }));
   }
 
   completeAll(): void {

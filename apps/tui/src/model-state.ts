@@ -4,7 +4,7 @@ import {
   OPENAI_CODEX_PROVIDER_ID,
   listKnownModels,
 } from "@chili/providers";
-import type { RuntimeModelAuthSource, ServiceTier } from "@chili/protocol";
+import type { RuntimeModelAuthSource, RuntimeModelCapabilities, ServiceTier } from "@chili/protocol";
 
 export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
@@ -25,9 +25,7 @@ export interface ModelCandidate {
   authSource?: RuntimeModelAuthSource;
   endpoint?: string;
   available?: boolean;
-  capabilities?: {
-    reasoning?: boolean;
-  };
+  capabilities?: RuntimeModelCapabilities;
   inputCapabilities?: readonly string[];
   contextWindowTokens?: number;
   maxOutputTokens?: number;

@@ -267,7 +267,7 @@ async function main(): Promise<void> {
 
     if (args.command === "task-close") {
       if (!args.taskId) throw new Error("close requires a task id");
-      const input: { taskId: TaskId; status?: "completed" | "failed" | "cancelled"; summary?: string } = {
+      const input: { taskId: TaskId; status?: "completed" | "incomplete" | "failed" | "cancelled"; summary?: string } = {
         taskId: args.taskId as TaskId,
       };
       if (args.taskStatus) input.status = args.taskStatus;

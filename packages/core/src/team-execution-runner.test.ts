@@ -138,77 +138,84 @@ test("runs one cycle and reports still-running background tasks", async () => {
   }
 });
 
-test("dispatches independent team tasks concurrently with a bounded fan-out", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-concurrent-dispatch-"));
-  const store = new SqliteEventStore(join(dir, "events.sqlite"));
-  const ids = createSequentialId();
-  const now = () => 620 as TimestampMs;
-  const leadPath = "/root" as AgentPath;
-  const sessionId = "session_team_runner_concurrent" as SessionId;
-  let running = 0;
-  let maxRunning = 0;
+for (const maxConcurrentDispatches of [1, 2]) {
+  test(`limits five live child tasks to ${maxConcurrentDispatches} and replenishes terminal slots`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), `chili-team-runner-live-cap-${maxConcurrentDispatches}-`));
+    const store = new SqliteEventStore(join(dir, "events.sqlite"));
+    const ids = createSequentialId();
+    const now = () => 620 as TimestampMs;
+    const leadPath = "/root" as AgentPath;
+    const sessionId = `session_team_runner_live_cap_${maxConcurrentDispatches}` as SessionId;
+    const runner = new DeferredLocalSubagentRunner();
+    const activeRunsAtWait: number[] = [];
+    let subagents: LocalSubagentManager | undefined;
 
-  try {
-    const teams = new TeamControlService({ store, createId: ids, now });
-    const team = await teams.createTeam({ sessionId, name: "runner-concurrent", leadPath });
-    const workerA = "/root/a" as AgentPath;
-    const workerB = "/root/b" as AgentPath;
-    const workerC = "/root/c" as AgentPath;
-    await teams.addMember({ sessionId, teamId: team.id, path: workerA, name: "a", role: "implementer" });
-    await teams.addMember({ sessionId, teamId: team.id, path: workerB, name: "b", role: "implementer" });
-    await teams.addMember({ sessionId, teamId: team.id, path: workerC, name: "c", role: "implementer" });
-    const first = await teams.createTask({ sessionId, teamId: team.id, title: "First", ownerPath: workerA });
-    const second = await teams.createTask({ sessionId, teamId: team.id, title: "Second", ownerPath: workerB });
-    const third = await teams.createTask({ sessionId, teamId: team.id, title: "Third", ownerPath: workerC });
-    const tasksById = new Map([first, second, third].map((task) => [task.id, task]));
+    try {
+      const teams = new TeamControlService({ store, createId: ids, now });
+      subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+      const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
+      const execution = new TeamExecutionRunner({
+        teams,
+        dispatcher,
+        cwd: dir,
+        now,
+        sleep: async () => {
+          activeRunsAtWait.push(runner.activeRunCount);
+          const completedTaskId = runner.completeNext();
+          if (!completedTaskId) throw new Error("expected an active subagent run");
+          await waitForAgentTaskTerminal(store, completedTaskId);
+        },
+      });
 
-    const dispatcher = {
-      async reconcileTasks() {
-        return emptyReconcileResult();
-      },
-      async dispatchTask(input: Parameters<TeamTaskDispatchService["dispatchTask"]>[0]): Promise<TeamTaskDispatchResult> {
-        const task = tasksById.get(input.taskId);
-        if (!task) throw new Error(`missing task ${input.taskId}`);
-        running += 1;
-        maxRunning = Math.max(maxRunning, running);
-        await delay(task.id === first.id ? 20 : 1);
-        running -= 1;
-        return {
-          status: "running",
-          teamTask: { ...task, status: "in_progress" },
-        };
-      },
-    };
-    const execution = new TeamExecutionRunner({
-      teams,
-      dispatcher: dispatcher as unknown as TeamTaskDispatchService,
-      cwd: dir,
-      now,
-    });
+      const team = await teams.createTeam({ sessionId, name: `runner-live-cap-${maxConcurrentDispatches}`, leadPath });
+      const tasks = [];
+      for (let index = 0; index < 5; index++) {
+        const workerPath = `/root/worker-${index + 1}` as AgentPath;
+        await teams.addMember({
+          sessionId,
+          teamId: team.id,
+          path: workerPath,
+          name: `worker-${index + 1}`,
+          role: "implementer",
+        });
+        tasks.push(await teams.createTask({
+          sessionId,
+          teamId: team.id,
+          title: `Task ${index + 1}`,
+          ownerPath: workerPath,
+        }));
+      }
 
-    const summary = await execution.run({
-      teamId: team.id,
-      sessionId,
-      once: true,
-      maxConcurrentDispatches: 2,
-    });
+      const summary = await execution.run({
+        teamId: team.id,
+        sessionId,
+        maxCycles: 10,
+        timeoutMs: 10_000,
+        pollIntervalMs: 1,
+        maxConcurrentDispatches,
+      });
 
-    expect(maxRunning).toBe(2);
-    expect(summary).toMatchObject({
-      stopReason: "once",
-      maxConcurrentDispatches: 2,
-      errors: [],
-    });
-    expect(summary.dispatched).toEqual(expect.arrayContaining([
-      expect.objectContaining({ taskId: first.id, status: "running", ownerPath: workerA }),
-      expect.objectContaining({ taskId: second.id, status: "running", ownerPath: workerB }),
-      expect.objectContaining({ taskId: third.id, status: "running", ownerPath: workerC }),
-    ]));
-  } finally {
-    store.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
+      expect(runner.maxActiveRuns).toBe(maxConcurrentDispatches);
+      expect(runner.runs).toHaveLength(5);
+      expect(activeRunsAtWait).toEqual(maxConcurrentDispatches === 1 ? [1, 1, 1, 1, 1] : [2, 2, 2, 2, 1]);
+      expect(summary).toMatchObject({
+        stopReason: "drained",
+        maxConcurrentDispatches,
+        stillRunning: [],
+        errors: [],
+      });
+      expect(summary.dispatched).toHaveLength(5);
+      expect(summary.dispatched.map((task) => task.taskId)).toEqual(expect.arrayContaining(tasks.map((task) => task.id)));
+      expect(summary.completed).toHaveLength(5);
+      expect(summary.completed.map((task) => task.taskId)).toEqual(expect.arrayContaining(tasks.map((task) => task.id)));
+    } finally {
+      runner.completeAll();
+      await subagents?.waitForBackgroundTasks();
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
 
 test("orders runnable dispatches by task priority before creation order", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-priority-dispatch-"));
@@ -264,7 +271,7 @@ test("orders runnable dispatches by task priority before creation order", async 
 
     await execution.run({ teamId: team.id, sessionId, once: true, maxConcurrentDispatches: 1 });
 
-    expect(dispatchOrder).toEqual([high.id, low.id]);
+    expect(dispatchOrder).toEqual([high.id]);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -397,7 +404,7 @@ test("emits team run lifecycle events", async () => {
         mode: "one_shot",
         once: false,
         maxCycles: 3,
-        maxConcurrentDispatches: 4,
+        maxConcurrentDispatches: 3,
         maxConcurrentVerifications: 2,
       },
     });
@@ -1106,18 +1113,29 @@ test("does not report drained while a pending merge has not been processed", asy
 
 class DeferredLocalSubagentRunner implements LocalSubagentRunner {
   readonly runs: LocalSubagentRunInput[] = [];
-  private readonly completions: Array<() => void> = [];
+  maxActiveRuns = 0;
+  private readonly completions: Array<{ taskId: TaskId; resolve: () => void }> = [];
+  private activeRuns = 0;
+
+  get activeRunCount(): number {
+    return this.activeRuns;
+  }
 
   async run(input: LocalSubagentRunInput): Promise<LocalSubagentRunResult> {
     this.runs.push(input);
+    this.activeRuns++;
+    this.maxActiveRuns = Math.max(this.maxActiveRuns, this.activeRuns);
     await new Promise<void>((resolve) => {
-      this.completions.push(resolve);
+      this.completions.push({ taskId: input.taskId, resolve });
     });
+    this.activeRuns--;
     return { status: "completed", summary: `Done ${input.taskName}` };
   }
 
-  completeNext(): void {
-    this.completions.shift()?.();
+  completeNext(): TaskId | undefined {
+    const completion = this.completions.shift();
+    completion?.resolve();
+    return completion?.taskId;
   }
 
   completeAll(): void {
@@ -1262,6 +1280,15 @@ function emptyReconcileResult() {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForAgentTaskTerminal(store: SqliteEventStore, taskId: TaskId): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const task = await store.agentTask(taskId);
+    if (task && task.status !== "running") return;
+    await delay(1);
+  }
+  throw new Error(`agent task did not reach terminal state: ${taskId}`);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

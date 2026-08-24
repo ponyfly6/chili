@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { AgentPath, AgentRunId, SessionId, TaskId, ThreadId, TimestampMs } from "@chili/protocol";
+import type { AgentPath, AgentRunId, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import { LocalSubagentManager, type LocalSubagentRunInput, type LocalSubagentRunResult, type LocalSubagentRunner } from "./subagent.js";
 import { TeamTaskDispatchService } from "./team-dispatcher.js";
@@ -139,7 +139,7 @@ test("includes failed verifier feedback in retry prompts and clears stale task e
   }
 });
 
-test("syncs a background team task after the subagent finishes", async () => {
+test("applies one concurrent background sync and fences stale sync after verifier reopen", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-dispatch-background-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const ids = createSequentialId();
@@ -188,7 +188,7 @@ test("syncs a background team task after the subagent finishes", async () => {
         childThreadId: dispatchedAgentTask.childThreadId,
         mode: "background",
         dispatchedAt: 200,
-        agentStatus: "running",
+        agentStatus: "pending",
         policy: {
           allowed: true,
           allowedTools: expect.arrayContaining(["read", "complete_task", "team_task_update"]),
@@ -205,11 +205,22 @@ test("syncs a background team task after the subagent finishes", async () => {
       writeScope: [],
       executeScope: [],
     });
+    expect(await store.agentTask(dispatchedAgentTask.taskId)).toMatchObject({
+      mode: "background",
+      completionPolicy: "detached",
+    });
 
     await runner.started;
     runner.complete();
     await subagents.waitForBackgroundTasks();
-    const synced = await dispatcher.syncTask({ teamId: team.id, taskId: task.id, sessionId, threadId });
+    const syncs = await Promise.all([
+      dispatcher.syncTask({ teamId: team.id, taskId: task.id, sessionId, threadId }),
+      dispatcher.syncTask({ teamId: team.id, taskId: task.id, sessionId, threadId }),
+    ]);
+    expect(syncs.filter((result) => result.applied)).toHaveLength(1);
+    expect(syncs.filter((result) => !result.applied)).toMatchObject([{ reason: "team_already_final" }]);
+    const synced = syncs.find((result) => result.applied);
+    if (!synced) throw new Error("expected one applied team sync");
 
     expect(synced).toMatchObject({
       applied: true,
@@ -241,6 +252,242 @@ test("syncs a background team task after the subagent finishes", async () => {
         },
       },
     });
+    const terminalUpdates = (await store.events({ type: "team.task_updated" })).filter(
+      (event) => {
+        const payload = event.payload as { taskId?: TaskId; status?: string };
+        return event.type === "team.task_updated" && payload.taskId === task.id && payload.status === "completed";
+      },
+    );
+    expect(terminalUpdates).toHaveLength(1);
+    expect(await store.teamMembers({ teamId: team.id, path: workerPath })).toMatchObject([{ status: "idle" }]);
+
+    const reopenedMetadata = {
+      ...synced.teamTask.metadata,
+      verification: { status: "failed", feedback: "retry required" },
+    };
+    await teams.updateTask({
+      teamId: team.id,
+      taskId: task.id,
+      status: "pending",
+      error: "verification_failed",
+      metadata: reopenedMetadata,
+      sessionId,
+      threadId,
+    });
+    const terminalAgentTask = synced.agentTask;
+    if (!terminalAgentTask?.currentRunId || terminalAgentTask.status !== "completed") {
+      throw new Error("expected a completed agent task with a run fence");
+    }
+    const stale = await teams.syncTaskFromAgent({
+      teamId: team.id,
+      taskId: task.id,
+      agentTaskId: terminalAgentTask.id,
+      agentRunId: terminalAgentTask.currentRunId as AgentRunId,
+      agentGeneration: terminalAgentTask.generation,
+      agentStatus: terminalAgentTask.status,
+      status: "completed",
+      ...(terminalAgentTask.summary ? { summary: terminalAgentTask.summary } : {}),
+      metadata: synced.teamTask.metadata ?? {},
+      sessionId,
+      threadId,
+    });
+    expect(stale).toMatchObject({
+      applied: false,
+      reason: "not_in_progress",
+      task: {
+        status: "pending",
+        error: "verification_failed",
+        metadata: { verification: { status: "failed", feedback: "retry required" } },
+      },
+    });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+for (const maxConcurrency of [1, 2]) {
+  test(`direct team batch limits five real child lifetimes to ${maxConcurrency} and replenishes slots`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), `chili-team-dispatch-batch-cap-${maxConcurrency}-`));
+    const store = new SqliteEventStore(join(dir, "events.sqlite"));
+    const ids = createSequentialId();
+    const now = () => 205 as TimestampMs;
+    const leadPath = "/root" as AgentPath;
+    const sessionId = `session_team_batch_cap_${maxConcurrency}` as SessionId;
+    const threadId = `thread_team_batch_cap_${maxConcurrency}` as ThreadId;
+    const sourceCallId = `call_team_batch_cap_${maxConcurrency}` as ToolCallId;
+    const batchId = sourceCallId;
+    const runner = new RollingDeferredLocalSubagentRunner();
+    let subagents: LocalSubagentManager | undefined;
+
+    try {
+      const teams = new TeamControlService({ store, createId: ids, now });
+      subagents = new LocalSubagentManager({ store, runner, createId: ids, now, maxActiveRuns: 5 });
+      const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
+      const team = await teams.createTeam({ sessionId, threadId, name: `batch-cap-${maxConcurrency}`, leadPath });
+      const tasks = [];
+      for (let index = 0; index < 5; index++) {
+        const ownerPath = `/root/batch-worker-${index}` as AgentPath;
+        await teams.addMember({
+          sessionId,
+          threadId,
+          teamId: team.id,
+          path: ownerPath,
+          name: `batch-worker-${index}`,
+          role: "implementer",
+        });
+        tasks.push(await teams.createTask({
+          sessionId,
+          threadId,
+          teamId: team.id,
+          title: `Batch task ${index}`,
+          ownerPath,
+        }));
+      }
+
+      const dispatched = await Promise.all(tasks.map((task, batchIndex) => dispatcher.dispatchTask({
+        teamId: team.id,
+        taskId: task.id,
+        mode: "background",
+        sessionId,
+        threadId,
+        cwd: dir,
+        sourceCallId,
+        batchId,
+        batchIndex,
+        expectedBatchSize: tasks.length,
+        maxConcurrency,
+      })));
+
+      expect(dispatched).toHaveLength(5);
+      expect(dispatched.every((result) => result.status === "running")).toBe(true);
+      expect(dispatched.map((result) => result.agentTask?.status)).toEqual(Array(5).fill("pending"));
+      await waitUntil(() => runner.runs.length === maxConcurrency);
+      expect(runner.activeRunCount).toBe(maxConcurrency);
+
+      while (runner.runs.length < tasks.length) {
+        const expectedStarted = runner.runs.length + 1;
+        runner.completeNext();
+        await waitUntil(() => runner.runs.length === expectedStarted);
+        expect(runner.activeRunCount).toBeLessThanOrEqual(maxConcurrency);
+      }
+
+      runner.completeAll();
+      await subagents.waitForBackgroundTasks();
+      expect(runner.maxActiveRuns).toBe(maxConcurrency);
+      expect(runner.activeRunCount).toBe(0);
+      expect(runner.runs.map((run) => ({
+        sourceCallId: run.sourceCallId,
+        batchId: run.batchId,
+        batchIndex: run.batchIndex,
+        expectedBatchSize: run.expectedBatchSize,
+        maxConcurrency: run.maxConcurrency,
+        completionPolicy: run.completionPolicy,
+      })).sort((left, right) => Number(left.batchIndex) - Number(right.batchIndex))).toEqual(
+        Array.from({ length: 5 }, (_, batchIndex) => ({
+          sourceCallId,
+          batchId,
+          batchIndex,
+          expectedBatchSize: 5,
+          maxConcurrency,
+          completionPolicy: "detached",
+        })),
+      );
+    } finally {
+      runner.completeAll();
+      await subagents?.waitForBackgroundTasks();
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("syncs an incomplete child as a blocked team task with an actionable error", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-dispatch-incomplete-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 210 as TimestampMs;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/reviewer" as AgentPath;
+  const sessionId = "session_team_incomplete" as SessionId;
+  const threadId = "thread_team_incomplete" as ThreadId;
+  const runner = new DeferredLocalSubagentRunner({
+    status: "incomplete",
+    summary: "I'll inspect the repository next.",
+  });
+
+  try {
+    const teams = new TeamControlService({ store, createId: ids, now });
+    const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+    const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
+
+    const team = await teams.createTeam({ sessionId, threadId, name: "incomplete", leadPath });
+    await teams.addMember({
+      sessionId,
+      threadId,
+      teamId: team.id,
+      path: workerPath,
+      name: "reviewer",
+      role: "reviewer",
+    });
+    const task = await teams.createTask({
+      sessionId,
+      threadId,
+      teamId: team.id,
+      title: "Inspect architecture",
+      ownerPath: workerPath,
+    });
+
+    const dispatched = await dispatcher.dispatchTask({
+      teamId: team.id,
+      taskId: task.id,
+      mode: "background",
+      sessionId,
+      threadId,
+      cwd: dir,
+    });
+    expect(dispatched).toMatchObject({
+      status: "running",
+      teamTask: { status: "in_progress" },
+    });
+
+    await runner.started;
+    runner.complete();
+    await subagents.waitForBackgroundTasks();
+    const synced = await dispatcher.syncTask({ teamId: team.id, taskId: task.id, sessionId, threadId });
+
+    expect(synced).toMatchObject({
+      applied: true,
+      teamTask: {
+        status: "blocked",
+        summary: "I'll inspect the repository next.",
+        error: expect.stringContaining("subagent_incomplete"),
+        metadata: {
+          chiliTeamDispatch: {
+            agentStatus: "incomplete",
+            syncedAt: 210,
+          },
+        },
+      },
+      agentTask: {
+        status: "incomplete",
+        summary: "I'll inspect the repository next.",
+      },
+    });
+    expect(await store.teamMembers({ teamId: team.id, path: workerPath })).toMatchObject([{ status: "idle" }]);
+    const duplicate = await dispatcher.syncTask({ teamId: team.id, taskId: task.id, sessionId, threadId });
+    expect(duplicate).toMatchObject({
+      applied: false,
+      reason: "team_not_in_progress",
+      teamTask: { status: "blocked" },
+    });
+    const blockedUpdates = (await store.events({ type: "team.task_updated" })).filter(
+      (event) => {
+        const payload = event.payload as { taskId?: TaskId; status?: string };
+        return event.type === "team.task_updated" && payload.taskId === task.id && payload.status === "blocked";
+      },
+    );
+    expect(blockedUpdates).toHaveLength(1);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -299,6 +546,7 @@ test("reports skipped reasons for dispatch, sync, and reconcile", async () => {
           agentTaskId: "task_missing_agent" as TaskId,
           agentPath: workerPath,
           runId: "agentrun_missing_agent" as AgentRunId,
+          generation: 2,
           childSessionId: "session_missing_agent" as SessionId,
           childThreadId: "thread_missing_agent" as ThreadId,
           mode: "background",
@@ -1129,6 +1377,45 @@ class DeferredLocalSubagentRunner implements LocalSubagentRunner {
   complete(): void {
     this.resolveCompletion?.();
   }
+}
+
+class RollingDeferredLocalSubagentRunner implements LocalSubagentRunner {
+  readonly runs: LocalSubagentRunInput[] = [];
+  maxActiveRuns = 0;
+  private activeRuns = 0;
+  private readonly completions: Array<() => void> = [];
+
+  get activeRunCount(): number {
+    return this.activeRuns;
+  }
+
+  async run(input: LocalSubagentRunInput): Promise<LocalSubagentRunResult> {
+    this.runs.push(input);
+    this.activeRuns++;
+    this.maxActiveRuns = Math.max(this.maxActiveRuns, this.activeRuns);
+    await new Promise<void>((resolve) => {
+      this.completions.push(resolve);
+    });
+    this.activeRuns--;
+    return { status: "completed", summary: `Done ${input.taskName}` };
+  }
+
+  completeNext(): void {
+    this.completions.shift()?.();
+  }
+
+  completeAll(): void {
+    while (this.completions.length > 0) this.completeNext();
+  }
+}
+
+async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("Timed out waiting for condition");
 }
 
 function createSequentialId(): (prefix: string) => string {

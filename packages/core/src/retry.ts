@@ -62,16 +62,34 @@ export function normalizeRetryPolicy(policy: RetryPolicy | undefined): Required<
   };
 }
 
-export function retryDelay(policy: Required<RetryPolicy>, attempt: number): number {
+export function retryDelay(policy: Required<RetryPolicy>, attempt: number, error?: unknown): number {
   const delay = policy.initialDelayMs * policy.factor ** Math.max(0, attempt - 1);
-  return Math.min(policy.maxDelayMs, Math.round(delay));
+  const backoffMs = Math.min(policy.maxDelayMs, Math.round(delay));
+  const retryAfterMs = retryAfterHint(error, new Set<object>());
+  return retryAfterMs === undefined ? backoffMs : Math.max(backoffMs, retryAfterMs);
 }
 
-export async function sleep(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms));
+export async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw abortError();
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export function isRetryableTransientError(error: unknown): boolean {
+  // Provider classifications are authoritative anywhere in the wrapped error
+  // graph. A non-retryable verdict vetoes retryable verdicts; heuristics run
+  // only when no explicit verdict exists.
+  const explicit = explicitRetryability(error, new Set<object>());
+  if (explicit !== undefined) return explicit;
   return isRetryableTransientErrorValue(error, new Set<object>());
 }
 
@@ -101,6 +119,32 @@ function isRetryableTransientErrorValue(value: unknown, seen: Set<object>): bool
   return false;
 }
 
+function explicitRetryability(value: unknown, seen: Set<object>): boolean | undefined {
+  if (!isRecord(value) || seen.has(value)) return undefined;
+  seen.add(value);
+
+  const direct = booleanProperty(value, "retryable");
+  if (direct === false) return false;
+  let foundRetryable = direct === true;
+
+  if ("cause" in value) {
+    const nested = explicitRetryability(value.cause, seen);
+    if (nested === false) return false;
+    if (nested === true) foundRetryable = true;
+  }
+
+  const errors = value.errors;
+  if (Array.isArray(errors)) {
+    for (const item of errors) {
+      const nested = explicitRetryability(item, seen);
+      if (nested === false) return false;
+      if (nested === true) foundRetryable = true;
+    }
+  }
+
+  return foundRetryable ? true : undefined;
+}
+
 function isRetryableMessage(message: string): boolean {
   return RETRYABLE_MESSAGE_PATTERNS.some((pattern) => pattern.test(message)) || isRetryableHttpStatusMessage(message);
 }
@@ -127,6 +171,26 @@ function numberProperty(record: Record<string, unknown>, key: string): number | 
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+function booleanProperty(record: Record<string, unknown>, key: string): boolean | undefined {
+  const value = record[key];
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function retryAfterHint(value: unknown, seen: Set<object>): number | undefined {
+  if (!isRecord(value) || seen.has(value)) return undefined;
+  seen.add(value);
+
+  const direct = numberProperty(value, "retryAfterMs");
+  if (direct !== undefined && direct >= 0) return Math.round(direct);
+  return "cause" in value ? retryAfterHint(value.cause, seen) : undefined;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function abortError(): Error {
+  const error = new Error("Retry wait aborted");
+  error.name = "AbortError";
+  return error;
 }

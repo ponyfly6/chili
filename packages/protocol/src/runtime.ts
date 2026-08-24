@@ -17,6 +17,20 @@ export const THINKING_LEVELS = REASONING_LEVELS;
 
 export type ThinkingLevel = ReasoningLevel;
 
+export const DELEGATION_POLICIES = ["off", "explicit", "proactive"] as const;
+
+export type DelegationPolicy = (typeof DELEGATION_POLICIES)[number];
+
+export const DELEGATION_POLICY_SOURCES = ["default", "reasoning_legacy", "session"] as const;
+
+export type DelegationPolicySource = (typeof DELEGATION_POLICY_SOURCES)[number];
+
+export interface RuntimeDelegationConfig {
+  sessionId: SessionId;
+  policy: DelegationPolicy;
+  source: DelegationPolicySource;
+}
+
 export const SERVICE_TIERS = ["standard", "fast"] as const;
 
 export type ServiceTier = (typeof SERVICE_TIERS)[number];

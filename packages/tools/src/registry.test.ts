@@ -109,6 +109,66 @@ test("policy allowedTools matches MCP canonical names and aliases", () => {
   ]);
 });
 
+test("policy deniedTools hides canonical names and aliases and wins over allowedTools", () => {
+  const jira = tool("mcp__jira__search", ["jira_search"]);
+  const slack = tool("mcp__slack__search", ["slack_search"]);
+
+  expect(filterToolsByPolicy([jira, slack], { deniedTools: ["mcp__jira__search"] }).map((entry) => entry.name)).toEqual([
+    "mcp__slack__search",
+  ]);
+  expect(filterToolsByPolicy([jira, slack], { deniedTools: ["slack_search"] }).map((entry) => entry.name)).toEqual([
+    "mcp__jira__search",
+  ]);
+  expect(filterToolsByPolicy([jira, slack], {
+    allowedTools: ["*"],
+    deniedTools: ["jira_search"],
+  }).map((entry) => entry.name)).toEqual(["mcp__slack__search"]);
+  expect(filterToolsByPolicy([jira, slack], { deniedTools: ["*"] })).toEqual([]);
+});
+
+test("a deny-only policy overlays root capabilities without becoming a worker scope", async () => {
+  const delegated = tool("task");
+  const write = tool("write");
+  const teamStatus = tool("team_snapshot");
+  const registry = new InMemoryToolRegistry();
+  registry.register(delegated);
+  registry.register(write);
+  registry.register(teamStatus);
+
+  const policy = { deniedTools: ["task"] };
+  expect(filterToolsByPolicy([delegated, write, teamStatus], policy).map((entry) => entry.name)).toEqual([
+    "write",
+    "team_snapshot",
+  ]);
+
+  const executor = createExecutor(registry, { resolve: () => policy });
+  expect((await executor.execute(toolInput("write", {}, "/tmp"))).status).toBe("completed");
+  expect((await executor.execute(toolInput("team_snapshot", {}, "/tmp"))).status).toBe("completed");
+  expect((await executor.execute(toolInput("task", {}, "/tmp"))).status).toBe("failed");
+});
+
+test("policy deniedTools rejects execution through canonical names and aliases", async () => {
+  for (const deniedTool of ["mcp__jira__search", "jira_search"]) {
+    const registry = new InMemoryToolRegistry();
+    registry.register(tool("mcp__jira__search", ["jira_search"]));
+    const executor = createExecutor(registry, {
+      resolve: () => ({
+        allowedTools: ["mcp__jira__search"],
+        deniedTools: [deniedTool],
+      }),
+    });
+
+    for (const invokedName of ["mcp__jira__search", "jira_search"]) {
+      const result = await executor.execute(toolInput(invokedName, {}, "/tmp"));
+      expect(result.status).toBe("failed");
+      if (result.status === "failed") {
+        expect(result.error.name).toBe("ToolDeniedError");
+        expect(result.error.message).toContain("not allowed by the current worker policy");
+      }
+    }
+  }
+});
+
 function tool(name: string, aliases: string[] = [], description = `${name} tool`): ChiliToolDefinition {
   return {
     name,

@@ -214,10 +214,12 @@ export function createDefaultSlashCommands(): SlashCommand[] {
     },
     {
       name: "agents",
-      description: "Show agent activity",
+      description: "Show agent activity or set delegation policy",
       category: "team",
+      argumentHint: "[off|explicit|proactive|status]",
       isSafeConcurrent: true,
-      run: () => ({ type: "open_view", view: "agents" }),
+      complete: agentCompletions,
+      run: (_ctx, args) => agentResult(args),
     },
     {
       name: "login",
@@ -543,6 +545,40 @@ function fastCompletions(_ctx: SlashCommandContext, input: string): SlashComplet
       description: candidate.description,
       category: "model" as const,
     }));
+}
+
+function agentCompletions(_ctx: SlashCommandContext, input: string): SlashCompletion[] {
+  const query = commandArgument(input, "agents");
+  if (query === undefined) return [];
+  const normalized = query.trim().toLowerCase();
+  const candidates = [
+    { value: "off", description: "Disable model delegation for this session" },
+    { value: "explicit", description: "Delegate only when the user explicitly requests it" },
+    { value: "proactive", description: "Allow the model to delegate useful parallel work proactively" },
+    { value: "status", description: "Show the effective session delegation policy" },
+  ];
+  return candidates
+    .filter((candidate) => !normalized || candidate.value.startsWith(normalized) || fuzzyMatch(candidate.value, normalized))
+    .map((candidate) => ({
+      value: `/agents ${candidate.value}`,
+      label: candidate.value,
+      description: candidate.description,
+      category: "team" as const,
+    }));
+}
+
+function agentResult(args: string): SlashCommandResult {
+  const option = args.trim().toLowerCase();
+  if (!option) return { type: "open_view", view: "agents" };
+  if (option === "status") return { type: "delegation_action", action: "status" };
+  if (option === "off" || option === "explicit" || option === "proactive") {
+    return { type: "delegation_action", action: "set", policy: option };
+  }
+  return {
+    type: "local_message",
+    level: "error",
+    text: `Unknown agents option: ${args.trim() || "none"}. Use off, explicit, proactive, or status.`,
+  };
 }
 
 const MCP_SUBCOMMANDS: Array<{ value: string; description: string }> = [

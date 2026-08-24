@@ -1,7 +1,9 @@
 export * from "./approval.js";
 export * from "./builtins/activate-skill.js";
+export * from "./builtins/agent-message.js";
 export * from "./builtins/apply-patch.js";
 export * from "./builtins/bash.js";
+export * from "./builtins/delegation.js";
 export * from "./builtins/edit.js";
 export * from "./builtins/glob.js";
 export * from "./builtins/grep.js";
@@ -23,6 +25,7 @@ export * from "./process.js";
 export * from "./registry.js";
 export * from "./snapshot.js";
 export * from "./subagent.js";
+export * from "./agent-message.js";
 export * from "./team.js";
 export * from "./tool-policy.js";
 export * from "./types.js";

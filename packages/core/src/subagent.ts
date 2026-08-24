@@ -7,15 +7,24 @@ import type {
   TaskId,
   ThreadId,
   TimestampMs,
+  ToolCallId,
 } from "@chili/protocol";
 import { joinAgentPath, ROOT_AGENT_PATH, timestampNow } from "@chili/protocol";
-import type { AgentTaskFinalizationStore, AgentTaskLeaseStore, EventStore } from "@chili/store";
+import type {
+  AgentTaskCapabilityStore,
+  AgentTaskFinalizationStore,
+  AgentTaskLeaseStore,
+  AgentTaskRow,
+  EventStore,
+  SubagentProjectionStore,
+} from "@chili/store";
 import type {
   CompleteTaskToolInput,
   SubagentController,
   SubagentTaskCompletion,
   SubagentTaskHandle,
   SubagentToolContext,
+  TaskCompletionPolicy,
   TaskToolInput,
 } from "@chili/tools";
 import {
@@ -26,6 +35,16 @@ import {
 import type { AgentRunner, RunTurnInput } from "./runner.js";
 import type { RuntimePromptFragmentsProvider } from "./runtime-service.js";
 import {
+  assessSubagentCompletion,
+  subagentCompletionRepairPrompt,
+  type SubagentCompletionAssessment,
+} from "./subagent-completion.js";
+import {
+  DEFAULT_LOCAL_SUBAGENT_MAX_ACTIVE_RUNS,
+  LocalSubagentConcurrencyLimiter,
+  type LocalSubagentRunLimiter,
+} from "./subagent-run-limiter.js";
+import {
   completeWorkerToolPolicy,
   workerPolicySystemSummary,
   type WorkerToolPolicy,
@@ -35,10 +54,26 @@ import {
 const FINAL_RESPONSE_AFTER_MAX_TURNS_SYSTEM =
   "The automatic tool-use continuation limit has been reached. Do not call tools. Use the information already available in the conversation to give the best final answer now, and briefly state anything that remains uncertain.";
 
-export type LocalSubagentMode = "one_shot" | "resumable" | "background";
-export type LocalSubagentStatus = "running" | "completed" | "failed" | "cancelled";
+export {
+  DEFAULT_LOCAL_SUBAGENT_MAX_ACTIVE_RUNS,
+  LocalSubagentConcurrencyLimiter,
+  type LocalSubagentRunLimiter,
+  type LocalSubagentRunLimiterSnapshot,
+} from "./subagent-run-limiter.js";
 
-export interface LocalSubagentTaskInput {
+export type LocalSubagentMode = "one_shot" | "resumable" | "background";
+export type LocalSubagentStatus = "pending" | "running" | "completed" | "incomplete" | "failed" | "cancelled";
+
+export interface LocalSubagentSchedulingMetadata {
+  sourceCallId?: ToolCallId;
+  batchId?: string;
+  batchIndex?: number;
+  expectedBatchSize?: number;
+  maxConcurrency?: number;
+  completionPolicy?: TaskCompletionPolicy;
+}
+
+export interface LocalSubagentTaskInput extends LocalSubagentSchedulingMetadata {
   parentSessionId: SessionId;
   parentThreadId?: ThreadId;
   parentPath?: AgentPath;
@@ -50,7 +85,7 @@ export interface LocalSubagentTaskInput {
   signal?: AbortSignal;
 }
 
-export interface LocalSubagentRunInput {
+export interface LocalSubagentRunInput extends LocalSubagentSchedulingMetadata {
   taskId: TaskId;
   runId: AgentRunId;
   path: AgentPath;
@@ -62,18 +97,19 @@ export interface LocalSubagentRunInput {
   cwd: string;
   taskName: string;
   prompt: string;
+  mode?: LocalSubagentMode;
   generation: number;
   workerPolicy?: WorkerToolPolicy;
   signal?: AbortSignal;
 }
 
 export interface LocalSubagentRunResult {
-  status: Exclude<LocalSubagentStatus, "running">;
+  status: Exclude<LocalSubagentStatus, "pending" | "running">;
   summary?: string;
   error?: Error;
 }
 
-export interface LocalSubagentTaskResult {
+export interface LocalSubagentTaskResult extends LocalSubagentSchedulingMetadata {
   taskId: TaskId;
   runId: AgentRunId;
   path: AgentPath;
@@ -92,14 +128,33 @@ export interface LocalSubagentRunner {
 
 export type LocalSubagentBackgroundErrorHandler = (error: unknown, task: LocalSubagentTaskResult) => void;
 
+export interface LocalSubagentManagerRunStats {
+  maxActiveRuns?: number;
+  activeRuns: number;
+  queuedRuns: number;
+  peakActiveRuns: number;
+  backgroundTasks: number;
+}
+
+export interface LocalSubagentInterruptFence {
+  runId: AgentRunId | null;
+  generation: number;
+}
+
 export interface LocalSubagentManagerOptions {
-  store: EventStore & Partial<AgentTaskLeaseStore> & Partial<AgentTaskFinalizationStore>;
+  store: EventStore
+    & Partial<AgentTaskLeaseStore>
+    & Partial<AgentTaskFinalizationStore>
+    & Partial<SubagentProjectionStore>;
   runner: LocalSubagentRunner;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
   onBackgroundError?: LocalSubagentBackgroundErrorHandler;
   leaseTtlMs?: number;
   leaseHeartbeatIntervalMs?: number;
+  maxActiveRuns?: number;
+  runLimiter?: LocalSubagentRunLimiter;
+  assertDelegationEnabled?: (input: { sessionId: SessionId; action: "task.spawn" }) => Promise<void> | void;
 }
 
 interface LocalSubagentTaskState {
@@ -107,16 +162,31 @@ interface LocalSubagentTaskState {
   runInput: LocalSubagentRunInput;
   controller: AbortController;
   lease?: LocalSubagentTaskLease;
+  batchLimiter?: RetainedBatchLimiter;
+  spawned?: boolean;
+  externalFinalization?: Promise<void>;
   externallyClosed?: boolean;
+  finalizationCommitted?: boolean;
+  leaseLost?: boolean;
+}
+
+interface RetainedBatchLimiter {
+  id: string;
+  limiter: LocalSubagentConcurrencyLimiter;
+}
+
+interface BatchLimiterEntry extends RetainedBatchLimiter {
+  references: number;
 }
 
 interface LocalSubagentTaskLease {
   owner: string;
   generation: number;
+  expiresAt: number;
   ttlMs: number;
   heartbeatIntervalMs: number;
   timer?: ReturnType<typeof setInterval>;
-  renewing?: boolean;
+  renewal?: Promise<Awaited<ReturnType<AgentTaskLeaseStore["renewAgentTaskLease"]>>>;
   stopped?: boolean;
 }
 
@@ -130,8 +200,16 @@ export interface AgentRunnerSubagentRunnerOptions {
 export class LocalSubagentManager implements SubagentController {
   private readonly tasks = new Map<string, LocalSubagentTaskState>();
   private readonly backgroundTasks = new Set<Promise<void>>();
+  private readonly batchLimiters = new Map<string, BatchLimiterEntry>();
+  private readonly runLimiter: LocalSubagentRunLimiter;
+  private activeRuns = 0;
+  private queuedRuns = 0;
+  private peakActiveRuns = 0;
 
-  constructor(private readonly options: LocalSubagentManagerOptions) {}
+  constructor(private readonly options: LocalSubagentManagerOptions) {
+    this.runLimiter = options.runLimiter
+      ?? new LocalSubagentConcurrencyLimiter(options.maxActiveRuns ?? DEFAULT_LOCAL_SUBAGENT_MAX_ACTIVE_RUNS);
+  }
 
   async spawnTask(input: LocalSubagentTaskInput): Promise<LocalSubagentTaskResult>;
   async spawnTask(input: TaskToolInput, context: SubagentToolContext): Promise<SubagentTaskHandle>;
@@ -161,17 +239,27 @@ export class LocalSubagentManager implements SubagentController {
     if (!(await this.ensureTaskLease(state))) {
       throw new Error(`Local subagent task lease lost: ${input.taskId}`);
     }
-    state.task.status = input.status ?? "completed";
+    let completionStatus = input.status ?? "completed";
+    if (completionStatus === "completed") {
+      const assessment = assessSubagentCompletion(input.summary);
+      if (assessment.status === "incomplete") {
+        completionStatus = "incomplete";
+        state.task.error = completionIssueError(assessment);
+      }
+    }
+    state.task.status = completionStatus;
     state.task.summary = input.summary;
     this.stopLeaseHeartbeat(state);
-    if (!(await this.completeTaskFinal(state, false))) {
+    if (!(await this.completeTaskFinal(state))) {
+      state.externallyClosed = true;
+      state.controller.abort();
       throw new Error(`Local subagent task finalization lost CAS: ${input.taskId}`);
     }
     state.controller.abort();
     return {
       taskId: input.taskId,
       summary: input.summary,
-      status: input.status ?? "completed",
+      status: completionStatus,
     };
   }
 
@@ -179,18 +267,41 @@ export class LocalSubagentManager implements SubagentController {
     await Promise.allSettled([...this.backgroundTasks]);
   }
 
-  async interruptTask(taskId: TaskId | string): Promise<boolean> {
+  runStats(): LocalSubagentManagerRunStats {
+    const limiter = this.runLimiter.snapshot?.();
+    return {
+      ...(limiter ? { maxActiveRuns: limiter.maxActiveRuns } : {}),
+      activeRuns: this.activeRuns,
+      queuedRuns: this.queuedRuns,
+      peakActiveRuns: this.peakActiveRuns,
+      backgroundTasks: this.backgroundTasks.size,
+    };
+  }
+
+  async interruptTask(taskId: TaskId | string, fence?: LocalSubagentInterruptFence): Promise<boolean> {
     const state = this.tasks.get(taskId);
     if (!state) return false;
+    if (fence) {
+      const currentRunId = state.spawned ? state.runInput.runId : null;
+      const currentGeneration = state.spawned ? state.runInput.generation : 0;
+      if (fence.runId !== currentRunId || fence.generation !== currentGeneration) return false;
+    }
+    if (isFinalLocalSubagentStatus(state.task.status)) return false;
     state.externallyClosed = true;
     state.task.status = "cancelled";
     this.stopLeaseHeartbeat(state);
-    await this.releaseTaskLease(state);
     state.controller.abort();
+    const finalization = this.beginExternalFinalization(state, "cancelled");
+    await finalization;
+    await this.releaseTaskLease(state);
     return true;
   }
 
   private async spawnLocalTask(input: LocalSubagentTaskInput): Promise<LocalSubagentTaskResult> {
+    await this.options.assertDelegationEnabled?.({
+      sessionId: input.parentSessionId,
+      action: "task.spawn",
+    });
     const taskId = this.id<TaskId>("task");
     const runId = this.id<AgentRunId>("agent");
     const parentPath = input.parentPath ?? ROOT_AGENT_PATH;
@@ -200,6 +311,7 @@ export class LocalSubagentManager implements SubagentController {
     const mode = input.mode ?? "one_shot";
     const generation = 1;
     const controller = linkedAbortController(input.signal);
+    const batchLimiter = this.retainBatchLimiter(input);
     const workerPolicy = input.workerPolicy
       ? completeWorkerToolPolicy(input.workerPolicy, childSessionId, childThreadId)
       : undefined;
@@ -211,48 +323,35 @@ export class LocalSubagentManager implements SubagentController {
       parentPath,
       childSessionId,
       childThreadId,
-      status: "running",
+      status: "pending",
     };
     if (workerPolicy) task.workerPolicy = workerPolicy;
+    assignSchedulingMetadata(task, input);
 
-    await this.append(
-      eventContext(input.parentSessionId, input.parentThreadId),
-      "agent.task_created",
-      {
-        taskId,
-        path,
-        parentPath,
-        parentSessionId: input.parentSessionId,
-        childSessionId,
-        childThreadId,
-        taskName: input.taskName,
-        cwd: input.cwd,
-        prompt: input.prompt,
-        ...(input.parentThreadId ? { parentThreadId: input.parentThreadId } : {}),
-        ...(mode ? { mode } : {}),
-        ...(workerPolicy ? { workerPolicy } : {}),
-      },
-    );
-
-    await this.append(
-      eventContext(input.parentSessionId, input.parentThreadId),
-      "agent.spawned",
-      {
-        runId,
-        path,
-        parentPath,
-        taskId,
-        parentSessionId: input.parentSessionId,
-        childSessionId,
-        childThreadId,
-        taskName: input.taskName,
-        cwd: input.cwd,
-        generation,
-        ...(input.parentThreadId ? { parentThreadId: input.parentThreadId } : {}),
-        ...(mode ? { mode } : {}),
-        ...(workerPolicy ? { workerPolicy } : {}),
-      },
-    );
+    try {
+      await this.append(
+        eventContext(input.parentSessionId, input.parentThreadId),
+        "agent.task_created",
+        {
+          taskId,
+          path,
+          parentPath,
+          parentSessionId: input.parentSessionId,
+          childSessionId,
+          childThreadId,
+          taskName: input.taskName,
+          cwd: input.cwd,
+          prompt: input.prompt,
+          ...(input.parentThreadId ? { parentThreadId: input.parentThreadId } : {}),
+          ...(mode ? { mode } : {}),
+          ...(workerPolicy ? { workerPolicy } : {}),
+          ...schedulingEventPayload(input),
+        },
+      );
+    } catch (error) {
+      this.releaseBatchLimiter(batchLimiter);
+      throw error;
+    }
 
     const runInput: LocalSubagentRunInput = {
       taskId,
@@ -265,21 +364,16 @@ export class LocalSubagentManager implements SubagentController {
       cwd: input.cwd,
       taskName: input.taskName,
       prompt: input.prompt,
+      mode,
       generation,
     };
     if (input.parentThreadId) runInput.parentThreadId = input.parentThreadId;
     if (workerPolicy) runInput.workerPolicy = workerPolicy;
+    assignSchedulingMetadata(runInput, input);
     runInput.signal = controller.signal;
 
-    const lease = await this.claimTaskLease(runInput);
-    if (lease) {
-      runInput.generation = lease.generation;
-    }
     const state: LocalSubagentTaskState = { task, runInput, controller };
-    if (lease) {
-      state.lease = lease;
-      this.startLeaseHeartbeat(state);
-    }
+    if (batchLimiter) state.batchLimiter = batchLimiter;
     this.tasks.set(taskId, state);
 
     if (mode === "background") {
@@ -290,56 +384,245 @@ export class LocalSubagentManager implements SubagentController {
         } catch (error: unknown) {
           this.options.onBackgroundError?.(error, task);
         } finally {
+          this.releaseBatchLimiter(state.batchLimiter);
           this.backgroundTasks.delete(promise);
         }
       });
       this.backgroundTasks.add(promise);
-      return task;
+      return { ...task };
     }
 
-    return this.completeFromRunner(state);
+    try {
+      return await this.completeFromRunner(state);
+    } finally {
+      this.releaseBatchLimiter(state.batchLimiter);
+    }
   }
 
   private async completeFromRunner(state: LocalSubagentTaskState): Promise<LocalSubagentTaskResult> {
     const { task, runInput: input } = state;
+    const releases: Array<() => void> = [];
+    let countedActive = false;
     try {
-      const result = await this.options.runner.run(input);
-      if (state.externallyClosed) return task;
-      if (task.status !== "running") {
-        this.stopLeaseHeartbeat(state);
-        await this.appendAgentCompletion(input, task);
+      this.queuedRuns++;
+      try {
+        if (state.batchLimiter) releases.push(await state.batchLimiter.limiter.acquire(input.signal));
+        releases.push(await this.runLimiter.acquire(input.signal));
+      } finally {
+        this.queuedRuns = Math.max(0, this.queuedRuns - 1);
+      }
+
+      if (state.externallyClosed) {
+        await state.externalFinalization;
         return task;
       }
-      if (!(await this.ensureTaskLease(state))) return task;
+      if (input.signal?.aborted) throw abortError();
+      if (task.status !== "pending") {
+        return task;
+      }
+      await this.options.assertDelegationEnabled?.({
+        sessionId: input.parentSessionId,
+        action: "task.spawn",
+      });
+      if (state.externallyClosed) {
+        await state.externalFinalization;
+        return task;
+      }
+      if (input.signal?.aborted) throw abortError();
+      if (task.status !== "pending") return task;
+
+      this.activeRuns++;
+      countedActive = true;
+      this.peakActiveRuns = Math.max(this.peakActiveRuns, this.activeRuns);
+      task.status = "running";
+      state.spawned = true;
+      try {
+        await this.appendAgentSpawned(state);
+      } catch (error) {
+        if (!state.externallyClosed) {
+          task.status = "pending";
+          state.spawned = false;
+        }
+        throw error;
+      }
+      const lease = await this.claimTaskLease(input);
+      if (lease) {
+        input.generation = lease.generation;
+        state.lease = lease;
+        this.startLeaseHeartbeat(state);
+      }
+
+      await this.options.assertDelegationEnabled?.({
+        sessionId: input.parentSessionId,
+        action: "task.spawn",
+      });
+      if (state.externallyClosed) {
+        await state.externalFinalization;
+        return task;
+      }
+      if (input.signal?.aborted) throw abortError();
+      if (task.status !== "running") return task;
+      if (!(await this.ensureTaskLease(state))) {
+        await state.externalFinalization;
+        return task;
+      }
+
+      const result = await this.options.runner.run(input);
+      if (state.externallyClosed) {
+        await state.externalFinalization;
+        return task;
+      }
+      if (input.signal?.aborted) throw abortError();
+      if (task.status !== "running") {
+        this.stopLeaseHeartbeat(state);
+        return task;
+      }
+      if (!(await this.ensureTaskLease(state))) {
+        await state.externalFinalization;
+        return task;
+      }
       task.status = result.status;
       if (result.summary) task.summary = result.summary;
       if (result.error) task.error = result.error;
       this.stopLeaseHeartbeat(state);
-      if (!(await this.completeTaskFinal(state, true))) {
-        state.externallyClosed = true;
-        task.status = "cancelled";
-      }
+      if (!(await this.completeTaskFinal(state))) state.externallyClosed = true;
       return task;
     } catch (error) {
-      if (state.externallyClosed) return task;
-      if (task.status !== "running") {
-        this.stopLeaseHeartbeat(state);
-        await this.appendAgentCompletion(input, task);
+      if (state.externallyClosed) {
+        await state.externalFinalization;
         return task;
       }
-      if (!(await this.ensureTaskLease(state))) return task;
+      if (task.status !== "running") {
+        if (isFinalLocalSubagentStatus(task.status)) {
+          this.stopLeaseHeartbeat(state);
+          return task;
+        }
+        const err = toError(error);
+        await this.beginExternalFinalization(
+          state,
+          isAbortError(err) ? "cancelled" : "failed",
+          err,
+        );
+        return task;
+      }
+      if (!(await this.ensureTaskLease(state))) {
+        await state.externalFinalization;
+        return task;
+      }
       const err = toError(error);
       task.status = isAbortError(err) ? "cancelled" : "failed";
       task.error = err;
       this.stopLeaseHeartbeat(state);
-      if (!(await this.completeTaskFinal(state, true))) {
-        state.externallyClosed = true;
-        task.status = "cancelled";
-      }
+      if (!(await this.completeTaskFinal(state))) state.externallyClosed = true;
       return task;
     } finally {
       this.stopLeaseHeartbeat(state);
+      if (countedActive) this.activeRuns = Math.max(0, this.activeRuns - 1);
+      for (let index = releases.length - 1; index >= 0; index--) releases[index]?.();
     }
+  }
+
+  private async appendAgentSpawned(state: LocalSubagentTaskState): Promise<void> {
+    const input = state.runInput;
+    await this.append(
+      eventContext(input.parentSessionId, input.parentThreadId),
+      "agent.spawned",
+      {
+        runId: input.runId,
+        path: input.path,
+        parentPath: input.parentPath,
+        taskId: input.taskId,
+        parentSessionId: input.parentSessionId,
+        childSessionId: input.childSessionId,
+        childThreadId: input.childThreadId,
+        taskName: input.taskName,
+        cwd: input.cwd,
+        generation: input.generation,
+        ...(input.parentThreadId ? { parentThreadId: input.parentThreadId } : {}),
+        ...(input.mode ? { mode: input.mode } : {}),
+        ...(input.workerPolicy ? { workerPolicy: input.workerPolicy } : {}),
+        ...schedulingEventPayload(input),
+      },
+    );
+  }
+
+  private retainBatchLimiter(input: LocalSubagentTaskInput): RetainedBatchLimiter | undefined {
+    validateSchedulingMetadata(input);
+    if (input.maxConcurrency === undefined || !input.batchId) return undefined;
+
+    const existing = this.batchLimiters.get(input.batchId);
+    if (existing) {
+      if (existing.limiter.maxActiveRuns !== input.maxConcurrency) {
+        throw new Error(
+          `Batch ${input.batchId} already uses maxConcurrency=${existing.limiter.maxActiveRuns}; received ${input.maxConcurrency}`,
+        );
+      }
+      existing.references++;
+      return existing;
+    }
+
+    const entry: BatchLimiterEntry = {
+      id: input.batchId,
+      limiter: new LocalSubagentConcurrencyLimiter(input.maxConcurrency),
+      references: 1,
+    };
+    this.batchLimiters.set(input.batchId, entry);
+    return entry;
+  }
+
+  private releaseBatchLimiter(retained: RetainedBatchLimiter | undefined): void {
+    if (!retained) return;
+    const entry = this.batchLimiters.get(retained.id);
+    if (!entry || entry.limiter !== retained.limiter) return;
+    entry.references = Math.max(0, entry.references - 1);
+    if (entry.references === 0) this.batchLimiters.delete(entry.id);
+  }
+
+  private beginExternalFinalization(
+    state: LocalSubagentTaskState,
+    status: Exclude<LocalSubagentStatus, "pending" | "running">,
+    error?: Error,
+  ): Promise<void> {
+    if (state.externalFinalization) return state.externalFinalization;
+    state.externallyClosed = true;
+    state.task.status = status;
+    if (error) state.task.error = error;
+    this.stopLeaseHeartbeat(state);
+    state.externalFinalization = this.finalizeExternalClosure(state);
+    return state.externalFinalization;
+  }
+
+  private async finalizeExternalClosure(state: LocalSubagentTaskState): Promise<void> {
+    const { task, runInput: input } = state;
+    if (!isFinalLocalSubagentStatus(task.status)) return;
+    const store = this.finalizationStore();
+    if (store) {
+      const closeInput: Parameters<AgentTaskFinalizationStore["closeAgentTaskCas"]>[0] = {
+        taskId: input.taskId,
+        status: task.status,
+        eventId: this.id("event"),
+        expectedGeneration: state.spawned ? input.generation : 0,
+        expectedRunId: state.spawned ? input.runId : null,
+        expectedLeaseOwner: state.lease?.owner ?? null,
+        sessionId: input.parentSessionId,
+        time: this.now(),
+      };
+      if (state.lease) {
+        if (state.leaseLost) closeInput.expectedLeaseExpiresAt = state.lease.expiresAt;
+        else closeInput.requireActiveLease = true;
+      }
+      if (input.parentThreadId) closeInput.threadId = input.parentThreadId;
+      if (task.summary) closeInput.summary = task.summary;
+      if (task.error) closeInput.error = task.error.message;
+      if (state.spawned) closeInput.agentEventId = this.id("event");
+      const result = await store.closeAgentTaskCas(closeInput);
+      if (result.applied) state.finalizationCommitted = true;
+      if (result.task) this.hydrateAuthoritativeTask(state, result.task);
+      return;
+    }
+
+    await this.appendCompletionEvents(input, task, state.spawned === true);
+    state.finalizationCommitted = true;
   }
 
   private async claimTaskLease(input: LocalSubagentRunInput): Promise<LocalSubagentTaskLease | undefined> {
@@ -362,6 +645,7 @@ export class LocalSubagentManager implements SubagentController {
     return {
       owner: leaseOwner(input.runId),
       generation: result.task.generation,
+      expiresAt: result.task.leaseExpiresAt ?? (Number(this.now()) + ttlMs),
       ttlMs,
       heartbeatIntervalMs: this.leaseHeartbeatIntervalMs(ttlMs),
     };
@@ -389,22 +673,14 @@ export class LocalSubagentManager implements SubagentController {
   private async renewTaskLease(state: LocalSubagentTaskState): Promise<void> {
     const lease = state.lease;
     const store = this.leaseStore();
-    if (!lease || lease.stopped || lease.renewing || !store) return;
+    if (!lease || lease.stopped || !store) return;
 
-    lease.renewing = true;
-    try {
-      const result = await store.renewAgentTaskLease({
-        taskId: state.runInput.taskId,
-        owner: lease.owner,
-        generation: lease.generation,
-        ttlMs: lease.ttlMs,
-        now: Number(this.now()),
-      });
-      if (result.acquired) return;
-      this.cancelForLeaseLoss(state);
-    } finally {
-      lease.renewing = false;
+    const result = await this.renewTaskLeaseOnce(state, store, lease);
+    if (result.acquired) {
+      if (result.task?.leaseExpiresAt !== undefined) lease.expiresAt = result.task.leaseExpiresAt;
+      return;
     }
+    this.cancelForLeaseLoss(state);
   }
 
   private async ensureTaskLease(state: LocalSubagentTaskState): Promise<boolean> {
@@ -415,27 +691,51 @@ export class LocalSubagentManager implements SubagentController {
 
     let result: Awaited<ReturnType<AgentTaskLeaseStore["renewAgentTaskLease"]>>;
     try {
-      result = await store.renewAgentTaskLease({
-        taskId: state.runInput.taskId,
-        owner: lease.owner,
-        generation: lease.generation,
-        ttlMs: lease.ttlMs,
-        now: Number(this.now()),
-      });
+      result = await this.renewTaskLeaseOnce(state, store, lease);
     } catch (error) {
       this.cancelForLeaseLoss(state, error);
       return false;
     }
-    if (result.acquired) return true;
+    if (result.acquired) {
+      if (result.task?.leaseExpiresAt !== undefined) lease.expiresAt = result.task.leaseExpiresAt;
+      return true;
+    }
     this.cancelForLeaseLoss(state);
     return false;
   }
 
+  private async renewTaskLeaseOnce(
+    state: LocalSubagentTaskState,
+    store: AgentTaskLeaseStore,
+    lease: LocalSubagentTaskLease,
+  ): Promise<Awaited<ReturnType<AgentTaskLeaseStore["renewAgentTaskLease"]>>> {
+    if (lease.renewal) return lease.renewal;
+    const renewal = store.renewAgentTaskLease({
+      taskId: state.runInput.taskId,
+      owner: lease.owner,
+      generation: lease.generation,
+      ttlMs: lease.ttlMs,
+      now: Number(this.now()),
+    });
+    lease.renewal = renewal;
+    try {
+      return await renewal;
+    } finally {
+      if (lease.renewal === renewal) delete lease.renewal;
+    }
+  }
+
   private cancelForLeaseLoss(state: LocalSubagentTaskState, error?: unknown): void {
-    state.externallyClosed = true;
-    state.task.status = "cancelled";
-    this.stopLeaseHeartbeat(state);
+    if (state.externallyClosed || isFinalLocalSubagentStatus(state.task.status)) return;
+    const leaseError = error === undefined
+      ? new Error(`Local subagent task lease lost: ${state.task.taskId}`)
+      : toError(error);
+    state.leaseLost = true;
     state.controller.abort();
+    const finalization = this.beginExternalFinalization(state, "cancelled", leaseError);
+    void finalization.catch((finalizationError) => {
+      this.options.onBackgroundError?.(finalizationError, state.task);
+    });
     if (error) this.options.onBackgroundError?.(error, state.task);
   }
 
@@ -451,9 +751,9 @@ export class LocalSubagentManager implements SubagentController {
     });
   }
 
-  private async completeTaskFinal(state: LocalSubagentTaskState, includeAgentEvent: boolean): Promise<boolean> {
+  private async completeTaskFinal(state: LocalSubagentTaskState): Promise<boolean> {
     const { task, runInput: input } = state;
-    if (task.status === "running") return false;
+    if (!isFinalLocalSubagentStatus(task.status)) return false;
 
     const store = this.finalizationStore();
     if (store) {
@@ -462,27 +762,34 @@ export class LocalSubagentManager implements SubagentController {
         path: input.path,
         runId: input.runId,
         status: task.status,
+        expectedGeneration: input.generation,
+        expectedRunId: input.runId,
+        expectedLeaseOwner: state.lease?.owner ?? null,
         generation: input.generation,
         eventId: this.id("event"),
         sessionId: input.parentSessionId,
         time: this.now(),
       };
-      if (state.lease?.owner) casInput.owner = state.lease.owner;
+      if (state.lease) casInput.requireActiveLease = true;
       if (input.parentThreadId) casInput.threadId = input.parentThreadId;
       if (task.summary) casInput.summary = task.summary;
       if (task.error) casInput.error = task.error.message;
-      if (includeAgentEvent) casInput.agentEventId = this.id("event");
+      if (state.spawned) casInput.agentEventId = this.id("event");
       const result = await store.completeAgentTaskCas(casInput);
+      if (result.applied) state.finalizationCommitted = true;
+      if (result.task) this.hydrateAuthoritativeTask(state, result.task);
       return result.applied;
     }
 
-    await this.appendTaskCompletion(input, task);
-    if (includeAgentEvent) await this.appendAgentCompletion(input, task);
+    await this.appendCompletionEvents(input, task, state.spawned === true);
+    state.finalizationCommitted = true;
     return true;
   }
 
   private leaseStore(): AgentTaskLeaseStore | undefined {
     const store = this.options.store;
+    const capabilityStore = store as EventStore & Partial<AgentTaskCapabilityStore>;
+    if (capabilityStore.supportsAgentTaskCapability?.("lease") === false) return undefined;
     if (store.claimAgentTaskLease && store.renewAgentTaskLease && store.releaseAgentTaskLease) {
       return store as EventStore & AgentTaskLeaseStore;
     }
@@ -491,6 +798,8 @@ export class LocalSubagentManager implements SubagentController {
 
   private finalizationStore(): AgentTaskFinalizationStore | undefined {
     const store = this.options.store;
+    const capabilityStore = store as EventStore & Partial<AgentTaskCapabilityStore>;
+    if (capabilityStore.supportsAgentTaskCapability?.("finalization") === false) return undefined;
     if (store.completeAgentTaskCas && store.closeAgentTaskCas) {
       return store as EventStore & AgentTaskFinalizationStore;
     }
@@ -503,38 +812,58 @@ export class LocalSubagentManager implements SubagentController {
     return Math.max(1, Math.floor(ttlMs / 3));
   }
 
-  private async appendTaskCompletion(input: LocalSubagentRunInput, task: LocalSubagentTaskResult): Promise<void> {
-    if (task.status === "running") return;
-    await this.append(
-      eventContext(input.parentSessionId, input.parentThreadId),
-      "agent.task_completed",
-      {
-        taskId: input.taskId,
-        path: input.path,
-        runId: input.runId,
-        status: task.status,
-        generation: input.generation,
-        ...(task.summary ? { summary: task.summary } : {}),
-        ...(task.error ? { error: task.error.message } : {}),
-      },
-    );
+  private hydrateAuthoritativeTask(state: LocalSubagentTaskState, authoritative: AgentTaskRow): void {
+    state.task.status = authoritative.status;
+    if (authoritative.summary !== undefined) state.task.summary = authoritative.summary;
+    else delete state.task.summary;
+    if (authoritative.error !== undefined) state.task.error = new Error(authoritative.error);
+    else delete state.task.error;
   }
 
-  private async appendAgentCompletion(input: LocalSubagentRunInput, task: LocalSubagentTaskResult): Promise<void> {
-    if (task.status === "running") return;
-    await this.append(
-      eventContext(input.parentSessionId, input.parentThreadId),
-      "agent.completed",
-      {
-        runId: input.runId,
-        path: input.path,
+  private async appendCompletionEvents(
+    input: LocalSubagentRunInput,
+    task: LocalSubagentTaskResult,
+    includeAgentEvent: boolean,
+  ): Promise<void> {
+    if (!isFinalLocalSubagentStatus(task.status)) return;
+    const time = this.now();
+    const taskEvent: EventEnvelope<"agent.task_completed", Extract<ChiliEvent, { type: "agent.task_completed" }>["payload"]> = {
+      id: this.id("event"),
+      type: "agent.task_completed",
+      time,
+      sessionId: input.parentSessionId,
+      payload: {
         taskId: input.taskId,
+        path: input.path,
+        runId: input.runId,
         status: task.status,
         generation: input.generation,
         ...(task.summary ? { summary: task.summary } : {}),
         ...(task.error ? { error: task.error.message } : {}),
       },
-    );
+    };
+    if (input.parentThreadId) taskEvent.threadId = input.parentThreadId;
+    const events: ChiliEvent[] = [taskEvent];
+    if (includeAgentEvent) {
+      const agentEvent: EventEnvelope<"agent.completed", Extract<ChiliEvent, { type: "agent.completed" }>["payload"]> = {
+        id: this.id("event"),
+        type: "agent.completed",
+        time,
+        sessionId: input.parentSessionId,
+        payload: {
+          runId: input.runId,
+          path: input.path,
+          taskId: input.taskId,
+          status: task.status,
+          generation: input.generation,
+          ...(task.summary ? { summary: task.summary } : {}),
+          ...(task.error ? { error: task.error.message } : {}),
+        },
+      };
+      if (input.parentThreadId) agentEvent.threadId = input.parentThreadId;
+      events.push(agentEvent);
+    }
+    await this.options.store.appendMany(events);
   }
 
   private async append<TType extends ChiliEvent["type"], TPayload>(
@@ -580,7 +909,10 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
 
     const maxTurns = this.options.maxTurns ?? 128;
     const prompt = await this.resolvePromptAssembly(input);
-    for (let index = 0; index < maxTurns; index++) {
+    let repairAttempted = false;
+    let extraRepairTurn = false;
+    for (let index = 0; index < maxTurns || extraRepairTurn; index++) {
+      extraRepairTurn = false;
       const runInput = runTurnInputFromPrompt(input, prompt);
       if (input.signal) runInput.signal = input.signal;
       const result = await this.options.runner.runTurn(runInput);
@@ -593,12 +925,19 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
       }
 
       if (!isToolUseFinishReason(result.finishReason)) {
-        const completed: LocalSubagentRunResult = {
-          status: "completed",
-        };
-        const summary = await this.latestAssistantText(input.childSessionId);
-        if (summary) completed.summary = summary;
-        return completed;
+        const assessment = await this.assessLatestCompletion(input.childSessionId);
+        if (assessment.status === "completed") {
+          return { status: "completed", summary: assessment.summary };
+        }
+        if (repairAttempted) return incompleteRunResult(assessment);
+
+        repairAttempted = true;
+        await this.options.runner.appendUserMessage({
+          sessionId: input.childSessionId,
+          threadId: input.childThreadId,
+          text: subagentCompletionRepairPrompt(assessment),
+        });
+        if (index + 1 >= maxTurns) extraRepairTurn = true;
       }
     }
 
@@ -622,17 +961,15 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
       };
     }
     if (!isToolUseFinishReason(finalResult.finishReason)) {
-      const completed: LocalSubagentRunResult = {
-        status: "completed",
-      };
-      const summary = await this.latestAssistantText(input.childSessionId);
-      if (summary) completed.summary = summary;
-      return completed;
+      const assessment = await this.assessLatestCompletion(input.childSessionId);
+      return assessment.status === "completed"
+        ? { status: "completed", summary: assessment.summary }
+        : incompleteRunResult(assessment);
     }
 
     return {
-      status: "failed",
-      error: new Error(`Subagent exceeded max turns: ${maxTurns}`),
+      status: "incomplete",
+      error: new Error(`Subagent max-turn final response attempted tool use: ${maxTurns}`),
     };
   }
 
@@ -675,6 +1012,10 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
       if (text.trim().length > 0) return text;
     }
     return undefined;
+  }
+
+  private async assessLatestCompletion(sessionId: SessionId): Promise<SubagentCompletionAssessment> {
+    return assessSubagentCompletion(await this.latestAssistantText(sessionId));
   }
 }
 
@@ -745,6 +1086,47 @@ function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
+function abortError(): Error {
+  const error = new Error("Local subagent run aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function assertPositiveInteger(value: number, name: string): void {
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+}
+
+function assertNonNegativeInteger(value: number, name: string): void {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+}
+
+function isFinalLocalSubagentStatus(
+  status: LocalSubagentStatus,
+): status is Exclude<LocalSubagentStatus, "pending" | "running"> {
+  return status !== "pending" && status !== "running";
+}
+
+function incompleteRunResult(
+  assessment: Extract<SubagentCompletionAssessment, { status: "incomplete" }>,
+): LocalSubagentRunResult {
+  const result: LocalSubagentRunResult = {
+    status: "incomplete",
+    error: completionIssueError(assessment),
+  };
+  if (assessment.summary) result.summary = assessment.summary;
+  return result;
+}
+
+function completionIssueError(
+  assessment: Extract<SubagentCompletionAssessment, { status: "incomplete" }>,
+): Error {
+  return new Error(`Subagent completion incomplete: ${assessment.issue}`);
+}
+
 function isAbortError(error: Error): boolean {
   return error.name === "AbortError" || error.message.toLowerCase().includes("aborted");
 }
@@ -779,6 +1161,40 @@ function linkedAbortController(signal: AbortSignal | undefined): AbortController
   return controller;
 }
 
+function validateSchedulingMetadata(input: LocalSubagentSchedulingMetadata): void {
+  if (input.maxConcurrency !== undefined) assertPositiveInteger(input.maxConcurrency, "maxConcurrency");
+  if (input.batchIndex !== undefined) assertNonNegativeInteger(input.batchIndex, "batchIndex");
+  if (input.expectedBatchSize !== undefined) {
+    assertPositiveInteger(input.expectedBatchSize, "expectedBatchSize");
+    if (input.batchIndex !== undefined && input.batchIndex >= input.expectedBatchSize) {
+      throw new Error("batchIndex must be less than expectedBatchSize");
+    }
+  }
+}
+
+function assignSchedulingMetadata(
+  target: LocalSubagentSchedulingMetadata,
+  source: LocalSubagentSchedulingMetadata,
+): void {
+  if (source.sourceCallId !== undefined) target.sourceCallId = source.sourceCallId;
+  if (source.batchId !== undefined) target.batchId = source.batchId;
+  if (source.batchIndex !== undefined) target.batchIndex = source.batchIndex;
+  if (source.expectedBatchSize !== undefined) target.expectedBatchSize = source.expectedBatchSize;
+  if (source.maxConcurrency !== undefined) target.maxConcurrency = source.maxConcurrency;
+  if (source.completionPolicy !== undefined) target.completionPolicy = source.completionPolicy;
+}
+
+function schedulingEventPayload(input: LocalSubagentSchedulingMetadata): Record<string, unknown> {
+  return {
+    ...(input.sourceCallId !== undefined ? { sourceCallId: input.sourceCallId } : {}),
+    ...(input.batchId !== undefined ? { batchId: input.batchId } : {}),
+    ...(input.batchIndex !== undefined ? { batchIndex: input.batchIndex } : {}),
+    ...(input.expectedBatchSize !== undefined ? { expectedBatchSize: input.expectedBatchSize } : {}),
+    ...(input.maxConcurrency !== undefined ? { maxConcurrency: input.maxConcurrency } : {}),
+    ...(input.completionPolicy !== undefined ? { completionPolicy: input.completionPolicy } : {}),
+  };
+}
+
 function fromToolTaskInput(input: TaskToolInput, context: SubagentToolContext): LocalSubagentTaskInput {
   const task: LocalSubagentTaskInput = {
     parentSessionId: context.sessionId,
@@ -786,11 +1202,17 @@ function fromToolTaskInput(input: TaskToolInput, context: SubagentToolContext): 
     taskName: input.description,
     prompt: input.prompt,
     signal: context.signal,
+    sourceCallId: context.callId,
   };
   const threadId = toolContextThreadId(context);
   if (threadId) task.parentThreadId = threadId;
   const mode = normalizeToolMode(input.mode);
   if (mode) task.mode = mode;
+  if (input.batchId !== undefined) task.batchId = input.batchId;
+  if (input.batchIndex !== undefined) task.batchIndex = input.batchIndex;
+  if (input.expectedBatchSize !== undefined) task.expectedBatchSize = input.expectedBatchSize;
+  if (input.maxConcurrency !== undefined) task.maxConcurrency = input.maxConcurrency;
+  if (input.completionPolicy !== undefined) task.completionPolicy = input.completionPolicy;
   return task;
 }
 

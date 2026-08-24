@@ -2,12 +2,31 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import { chiliBasePromptFragment, type PromptFragment } from "@chili/core";
-import type { AgentPath, ApprovalId, ChiliEvent, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId } from "@chili/protocol";
+import {
+  chiliBasePromptFragment,
+  type AgentTaskControlService,
+  type AgentTreeControlService,
+  type PromptFragment,
+} from "@chili/core";
+import type { AgentPath, ApprovalId, ChiliEvent, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import { SkillRegistry, type Skill } from "@chili/skills";
 import { SqliteEventStore, type AgentTaskRow } from "@chili/store";
-import { PolicyApprovalBroker, PolicyApprovalState, type ApprovalBrokerRequest, type BashRunner } from "@chili/tools";
-import { buildCliChildPromptFragments, buildCliPromptFragments, createCliHarness, linkApprovalSessionsFromEvent, type CliHarness } from "./harness.js";
+import {
+  PolicyApprovalBroker,
+  PolicyApprovalState,
+  type ApprovalBrokerRequest,
+  type BashRunner,
+  type ChiliToolDefinition,
+  type ChiliToolExecutionContext,
+} from "@chili/tools";
+import {
+  buildCliChildPromptFragments,
+  buildCliPromptFragments,
+  createCliHarness,
+  createSubagentControlController,
+  linkApprovalSessionsFromEvent,
+  type CliHarness,
+} from "./harness.js";
 import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
 import { runPrompt, runSessionPrompt } from "./runner.js";
 import { readUserModelSelection, writeUserModelSelection } from "./user-model-state.js";
@@ -111,6 +130,141 @@ test("CLI harness does not expose an opaque injected Bash runner to scoped worke
 
     expect(rootRegistry.list().some((tool) => tool.name === "bash")).toBe(true);
     expect(childRegistry?.list().some((tool) => tool.name === "bash")).toBe(false);
+    expect(rootRegistry.list().some((tool) => tool.name === "delegation_status")).toBe(true);
+    expect(rootRegistry.list().some((tool) => tool.name === "delegation_set")).toBe(true);
+    expect(childRegistry?.list().some((tool) => tool.name === "delegation_status")).toBe(false);
+    expect(childRegistry?.list().some((tool) => tool.name === "delegation_set")).toBe(false);
+  } finally {
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI task tool adapter forwards the tool AbortSignal to task follow-up", async () => {
+  let receivedSignal: AbortSignal | undefined;
+  const task: AgentTaskRow = {
+    id: "task_signal" as TaskId,
+    path: "/root/task_signal" as AgentPath,
+    taskName: "signal worker",
+    status: "completed",
+    generation: 1,
+    createdAt: 1,
+    updatedAt: 2,
+  };
+  const tasks = {
+    async followupTask(input: { signal?: AbortSignal }) {
+      receivedSignal = input.signal;
+      return {
+        task,
+        result: { status: "completed", turns: [], finishReason: "stop" },
+      };
+    },
+  } as unknown as AgentTaskControlService;
+  const controller = createSubagentControlController(
+    tasks,
+    {} as AgentTreeControlService,
+  );
+  const context = agentMessageToolContext(
+    "/repo",
+    "session_signal" as SessionId,
+    "thread_signal" as ThreadId,
+  );
+
+  await controller.followupTask({ taskId: task.id, prompt: "continue" }, context);
+
+  expect(receivedSignal).toBe(context.signal);
+});
+
+test("CLI agent message controllers bind root and child senders and list nested descendants", async () => {
+  const root = await mkdtempName();
+  const repo = join(root, "repo");
+  let harness: CliHarness | undefined;
+  const rootSessionId = "session_message_root" as SessionId;
+  const rootThreadId = "thread_message_root" as ThreadId;
+  const workerSessionId = "session_message_worker" as SessionId;
+  const workerThreadId = "thread_message_worker" as ThreadId;
+
+  try {
+    await mkdir(repo, { recursive: true });
+    harness = await createCliHarness({
+      cwd: repo,
+      model: "fake",
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+    });
+    await harness.events.appendMany([
+      agentMessageTaskCreated({
+        id: "task_message_worker" as TaskId,
+        path: "/root/worker" as AgentPath,
+        parentPath: "/root" as AgentPath,
+        taskName: "worker",
+        parentSessionId: rootSessionId,
+        parentThreadId: rootThreadId,
+        childSessionId: workerSessionId,
+        childThreadId: workerThreadId,
+      }),
+      agentMessageTaskCreated({
+        id: "task_message_nested" as TaskId,
+        path: "/root/worker/reader" as AgentPath,
+        parentPath: "/root/worker" as AgentPath,
+        taskName: "nested-reader",
+        parentSessionId: workerSessionId,
+        parentThreadId: workerThreadId,
+        childSessionId: "session_message_nested" as SessionId,
+        childThreadId: "thread_message_nested" as ThreadId,
+      }),
+    ]);
+
+    type ToolRegistryView = { get(name: string): ChiliToolDefinition | undefined };
+    const rootRegistry = (harness.runtime as unknown as {
+      options: { toolRegistry: ToolRegistryView };
+    }).options.toolRegistry;
+    const childRegistry = (harness.agents as unknown as {
+      options: {
+        runtime?: {
+          options: {
+            runtime: { options: { toolRegistry: ToolRegistryView } };
+          };
+        };
+      };
+    }).options.runtime?.options.runtime.options.toolRegistry;
+    const rootSend = rootRegistry.get("agent_message_send");
+    const rootList = rootRegistry.get("agent_message_list");
+    const childSend = childRegistry?.get("agent_message_send");
+    expect(rootSend).toBeDefined();
+    expect(rootList).toBeDefined();
+    expect(childSend).toBeDefined();
+
+    await expect(rootSend?.execute({
+      messageId: "message_nested_from_root",
+      to: "nested-reader",
+      content: "nested context",
+      delivery: "queueOnly",
+    }, agentMessageToolContext(repo, rootSessionId, rootThreadId))).resolves.toMatchObject({
+      metadata: { messageId: "message_nested_from_root", from: "/root", to: "/root/worker/reader" },
+    });
+    const listed = await rootList?.execute({}, agentMessageToolContext(repo, rootSessionId, rootThreadId));
+    expect(JSON.parse(listed?.output ?? "{}")).toMatchObject({
+      count: 1,
+      messages: [{ message_id: "message_nested_from_root", to_path: "/root/worker/reader" }],
+    });
+
+    await expect(childSend?.execute({
+      from: "/root",
+      to: "parent",
+      content: "spoof",
+    }, agentMessageToolContext(repo, workerSessionId, workerThreadId))).rejects.toThrow(
+      "does not match current agent /root/worker",
+    );
+    await expect(childSend?.execute({
+      to: "parent",
+      content: "orphan must not become root",
+    }, agentMessageToolContext(
+      repo,
+      "session_message_orphan" as SessionId,
+      "thread_message_orphan" as ThreadId,
+    ))).rejects.toThrow("sender is unavailable for child endpoint");
   } finally {
     await harness?.close();
     await rm(root, { recursive: true, force: true });
@@ -459,6 +613,122 @@ test("CLI runPrompt leaves system prompt selection to the harness service", asyn
   expect(submitted[0]).not.toHaveProperty("system");
 });
 
+test("CLI exact-session resume rejects a subagent session and points to task_followup", async () => {
+  const root = await mkdtempName();
+  const repo = join(root, "repo");
+  let harness: CliHarness | undefined;
+  const parentSessionId = "session_cli_parent" as SessionId;
+  const parentThreadId = "thread_cli_parent" as ThreadId;
+  const childSessionId = "session_cli_child" as SessionId;
+  const childThreadId = "thread_cli_child" as ThreadId;
+  try {
+    await mkdir(repo, { recursive: true });
+    harness = await createCliHarness({
+      cwd: repo,
+      model: "fake",
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+    });
+    await harness.events.appendMany([
+      {
+        id: "event_session_cli_child_created",
+        type: "session.created",
+        time: 1 as TimestampMs,
+        sessionId: childSessionId,
+        threadId: childThreadId,
+        payload: { sessionId: childSessionId, cwd: repo },
+      },
+      agentMessageTaskCreated({
+        id: "task_cli_child" as TaskId,
+        path: "/root/task_cli_child" as AgentPath,
+        parentPath: "/root" as AgentPath,
+        taskName: "cli child",
+        parentSessionId,
+        parentThreadId,
+        childSessionId,
+        childThreadId,
+      }),
+    ]);
+
+    await expect(runSessionPrompt({
+      harness,
+      sessionId: childSessionId,
+      threadId: childThreadId,
+      prompt: "resume by raw child session id",
+      maxTurns: 1,
+    })).rejects.toThrow("Use task_followup for the owning task");
+
+    await harness.events.append({
+      id: "event_task_cli_child_terminal",
+      type: "agent.task_completed",
+      time: 2 as TimestampMs,
+      sessionId: parentSessionId,
+      threadId: parentThreadId,
+      payload: {
+        taskId: "task_cli_child" as TaskId,
+        path: "/root/task_cli_child" as AgentPath,
+        status: "completed",
+        generation: 1,
+        summary: "initial child turn complete",
+      },
+    });
+    await expect(harness.tasks.followupTask({
+      taskId: "task_cli_child" as TaskId,
+      text: "resume through the authorized task lifecycle",
+      maxTurns: 1,
+    })).resolves.toMatchObject({
+      task: { id: "task_cli_child" },
+      result: { status: "completed" },
+    });
+  } finally {
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI exact-session resume rejects a pending child before session creation", async () => {
+  const root = await mkdtempName();
+  const repo = join(root, "repo");
+  let harness: CliHarness | undefined;
+  const parentSessionId = "session_cli_pending_parent" as SessionId;
+  const parentThreadId = "thread_cli_pending_parent" as ThreadId;
+  const childSessionId = "session_cli_pending_child" as SessionId;
+  const childThreadId = "thread_cli_pending_child" as ThreadId;
+  try {
+    await mkdir(repo, { recursive: true });
+    harness = await createCliHarness({
+      cwd: repo,
+      model: "fake",
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+    });
+    await harness.events.append(agentMessageTaskCreated({
+      id: "task_cli_pending_child" as TaskId,
+      path: "/root/task_cli_pending_child" as AgentPath,
+      parentPath: "/root" as AgentPath,
+      taskName: "pending CLI child",
+      parentSessionId,
+      parentThreadId,
+      childSessionId,
+      childThreadId,
+    }));
+    expect((await harness.events.sessions()).some((session) => session.id === childSessionId)).toBe(false);
+
+    await expect(runSessionPrompt({
+      harness,
+      sessionId: childSessionId,
+      threadId: childThreadId,
+      prompt: "resume the capacity-queued child directly",
+      maxTurns: 1,
+    })).rejects.toThrow("Use task_followup for the owning task");
+  } finally {
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("CLI session prompts leave harness model defaults to Runtime normalization", async () => {
   const submitted: Record<string, unknown>[] = [];
   const harness = {
@@ -666,6 +936,59 @@ async function writeWorkspaceModelEvent(
   } finally {
     store.close();
   }
+}
+
+function agentMessageTaskCreated(input: {
+  id: TaskId;
+  path: AgentPath;
+  parentPath: AgentPath;
+  taskName: string;
+  parentSessionId: SessionId;
+  parentThreadId: ThreadId;
+  childSessionId: SessionId;
+  childThreadId: ThreadId;
+}): ChiliEvent {
+  return {
+    id: `event_created_${input.id}`,
+    type: "agent.task_created",
+    time: 1 as TimestampMs,
+    sessionId: input.parentSessionId,
+    threadId: input.parentThreadId,
+    payload: {
+      taskId: input.id,
+      path: input.path,
+      parentPath: input.parentPath,
+      parentSessionId: input.parentSessionId,
+      parentThreadId: input.parentThreadId,
+      childSessionId: input.childSessionId,
+      childThreadId: input.childThreadId,
+      taskName: input.taskName,
+      cwd: "/repo",
+      prompt: "work",
+      mode: "resumable",
+    },
+  };
+}
+
+function agentMessageToolContext(
+  cwd: string,
+  sessionId: SessionId,
+  threadId: ThreadId,
+): ChiliToolExecutionContext {
+  const callId = `call_agent_message_${sessionId}` as ToolCallId;
+  return {
+    cwd,
+    sessionId,
+    threadId,
+    turnId: `turn_agent_message_${sessionId}` as TurnId,
+    callId,
+    outputArtifactId: callId,
+    signal: new AbortController().signal,
+    metadata: async () => {},
+    streamOutput: async () => {},
+    requestApproval: async () => ({ action: "allow_once" }),
+    registerPersistedOutput: async () => {},
+  };
 }
 
 function skill(name: string, source: Skill["source"] = "project", baseDir?: string): Skill {

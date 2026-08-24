@@ -22,7 +22,7 @@ import type {
   McpServerStatusChangedPayload,
   McpToolsChangedPayload,
 } from "./mcp.js";
-import type { ModelSelection, ReasoningLevel, ServiceTier, ModelMetadataPayload, RuntimeStatusPayload } from "./runtime.js";
+import type { DelegationPolicy, ModelSelection, ReasoningLevel, ServiceTier, ModelMetadataPayload, RuntimeStatusPayload } from "./runtime.js";
 import type { ApprovalDecisionAction, ApprovalScope, ToolCallStatus, ToolOutputStream } from "./tool.js";
 
 export interface EventEnvelope<TType extends string = string, TPayload = unknown> {
@@ -57,6 +57,7 @@ export type SessionEvent =
   | EventEnvelope<"session.model_changed", { sessionId: SessionId; modelSelection: ModelSelection }>
   | EventEnvelope<"session.reasoning_changed", { sessionId: SessionId; reasoningLevel: ReasoningLevel }>
   | EventEnvelope<"session.service_tier_changed", { sessionId: SessionId; serviceTier: ServiceTier }>
+  | EventEnvelope<"session.delegation_changed", { sessionId: SessionId; policy: DelegationPolicy }>
   | EventEnvelope<"session.archived", { sessionId: SessionId }>;
 
 export type TurnEvent =
@@ -101,9 +102,10 @@ export type McpEvent =
   | EventEnvelope<"mcp.diagnostic", McpDiagnosticPayload>
   | EventEnvelope<"mcp.progress", McpProgressPayload>;
 
-export type AgentTaskStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
+export type AgentTaskStatus = "pending" | "running" | "completed" | "incomplete" | "failed" | "cancelled";
 export type AgentTaskMode = "one_shot" | "resumable" | "background";
-export type AgentMailboxStatus = "queued" | "delivering" | "consumed";
+export type TaskCompletionPolicy = "join" | "notify" | "detached" | "supervised";
+export type AgentMailboxStatus = "queued" | "delivering" | "consumed" | "discarded";
 
 export interface AgentTaskCreatedPayload {
   taskId: TaskId;
@@ -118,6 +120,12 @@ export interface AgentTaskCreatedPayload {
   parentThreadId?: ThreadId;
   mode?: AgentTaskMode;
   workerPolicy?: Record<string, unknown>;
+  sourceCallId?: ToolCallId;
+  batchId?: string;
+  batchIndex?: number;
+  expectedBatchSize?: number;
+  completionPolicy?: TaskCompletionPolicy;
+  maxConcurrency?: number;
 }
 
 export interface AgentSpawnedPayload {
@@ -134,6 +142,12 @@ export interface AgentSpawnedPayload {
   cwd?: string;
   mode?: AgentTaskMode;
   workerPolicy?: Record<string, unknown>;
+  sourceCallId?: ToolCallId;
+  batchId?: string;
+  batchIndex?: number;
+  expectedBatchSize?: number;
+  completionPolicy?: TaskCompletionPolicy;
+  maxConcurrency?: number;
 }
 
 export type AgentMailboxPayload =
@@ -171,6 +185,14 @@ export interface AgentMessageRequeuedPayload {
   error?: string;
 }
 
+export interface AgentMessageDiscardedPayload {
+  messageId: string;
+  path?: AgentPath;
+  taskId?: TaskId;
+  discardedBy?: AgentPath;
+  reason: string;
+}
+
 export interface AgentCompleteTaskPayload {
   taskId: TaskId;
   path: AgentPath;
@@ -198,6 +220,7 @@ export type AgentEvent =
   | EventEnvelope<"agent.message_queued", AgentMessageQueuedPayload>
   | EventEnvelope<"agent.message_claimed", AgentMessageClaimedPayload>
   | EventEnvelope<"agent.message_requeued", AgentMessageRequeuedPayload>
+  | EventEnvelope<"agent.message_discarded", AgentMessageDiscardedPayload>
   | EventEnvelope<"agent.message_consumed", AgentMessageConsumedPayload>
   | EventEnvelope<"agent.task_completed", AgentCompleteTaskPayload>
   | EventEnvelope<"agent.completed", AgentCompletedPayload>;

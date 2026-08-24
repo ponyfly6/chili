@@ -594,14 +594,14 @@ export class SingleAgentRuntime implements AgentRunner {
         }
         await this.finishUnfinishedStreamingToolCalls(input, state, "failed", err.message);
         if (!assistantMutated && attempt < retryPolicy.maxAttempts && retryPolicy.retryable(err)) {
-          const delayMs = retryDelay(retryPolicy, attempt);
+          const delayMs = retryDelay(retryPolicy, attempt, err);
           await this.append(input, "turn.retry_scheduled", {
             turnId,
             attempt: attempt + 1,
             delayMs,
             reason: err.message,
           });
-          await sleep(delayMs);
+          await sleep(delayMs, input.signal);
           attempt++;
           continue;
         }

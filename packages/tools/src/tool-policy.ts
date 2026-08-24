@@ -17,6 +17,7 @@ const SCOPED_TEAM_TOOL_NAMES = new Set([
   "team_message_send",
   "team_message_list",
 ]);
+const SCOPED_AGENT_MESSAGE_TOOL_NAMES = new Set(["agent_message_send", "agent_message_list"]);
 
 export function filterToolsByPolicy(
   tools: readonly ChiliToolDefinition[],
@@ -28,7 +29,12 @@ export function filterToolsByPolicy(
 
 export function isToolVisible(tool: ChiliToolDefinition, policy: ToolAccessPolicy | undefined): boolean {
   if (!policy) return true;
+  if (policy.deniedTools && toolNameDenied(tool, policy.deniedTools)) return false;
   if (policy.allowedTools && !toolNameAllowed(tool, policy.allowedTools)) return false;
+  // A deny-only policy is an overlay, not a scoped-worker capability policy.
+  // This lets callers disable a narrow set of tools without accidentally
+  // removing root filesystem, execution, or team-inspection capabilities.
+  if (!hasScopedWorkerConstraints(policy)) return true;
   if (isScopedTeamTool(tool) && !policy.teamId) return false;
   if (isFilesystemWriteTool(tool) && normalizedList(policy.writeScope).length === 0) return false;
   return true;
@@ -49,7 +55,10 @@ export async function authorizeToolByPolicy<Input>(input: {
     throw new ToolDeniedError(input.tool.name, "Tool is not allowed by the current worker policy.");
   }
 
+  if (!hasScopedWorkerConstraints(policy)) return;
+
   authorizeTeamToolByPolicy(input.tool, input.validatedInput, policy);
+  authorizeAgentMessageToolByPolicy(input.tool, input.validatedInput, policy);
 
   if (normalizeToolName(input.approvalSpec.permission) === "bash.unsandboxed") {
     throw new ToolDeniedError(
@@ -105,6 +114,20 @@ export function toolPolicyContext(input: ExecuteToolInput): ToolPolicyContext {
 function toolNameAllowed(tool: ChiliToolDefinition, allowedTools: readonly string[]): boolean {
   const names = new Set(allowedTools.map((name) => normalizeToolName(name)));
   return names.has("*") || toolNameMatches(tool, names);
+}
+
+function toolNameDenied(tool: ChiliToolDefinition, deniedTools: readonly string[]): boolean {
+  const names = new Set(deniedTools.map((name) => normalizeToolName(name)));
+  return names.has("*") || toolNameMatches(tool, names);
+}
+
+function hasScopedWorkerConstraints(policy: ToolAccessPolicy): boolean {
+  return policy.allowedTools !== undefined ||
+    policy.writeScope !== undefined ||
+    policy.executeScope !== undefined ||
+    policy.teamId !== undefined ||
+    policy.taskId !== undefined ||
+    policy.memberPath !== undefined;
 }
 
 function isFilesystemWriteTool(tool: ChiliToolDefinition): boolean {
@@ -196,6 +219,32 @@ function authorizeOptionalTeamTask(
   const taskId = stringField(input, "taskId");
   if (taskId && policy.taskId && taskId !== policy.taskId) {
     throw new ToolDeniedError(tool.name, "Team tool is outside this worker's team task scope.");
+  }
+}
+
+function authorizeAgentMessageToolByPolicy<Input>(
+  tool: ChiliToolDefinition<Input>,
+  validatedInput: Input,
+  policy: ToolAccessPolicy,
+): void {
+  if (!toolNameMatches(tool, SCOPED_AGENT_MESSAGE_TOOL_NAMES)) return;
+  const input = recordInput(validatedInput);
+  const from = stringField(input, "from");
+  if (from && policy.memberPath && from !== policy.memberPath) {
+    throw new ToolDeniedError(tool.name, "Agent message sender must match this worker's agent path.");
+  }
+  if (normalizeToolName(tool.name) !== "agent_message_send" || !policy.memberPath) return;
+
+  const to = stringField(input, "to");
+  if (!to || to === "parent" || !to.startsWith("/")) return;
+  const segments = policy.memberPath.split("/").filter(Boolean);
+  const parentPath = segments.length > 1 ? `/${segments.slice(0, -1).join("/")}` : undefined;
+  const isSelfOrDescendant = to === policy.memberPath || to.startsWith(`${policy.memberPath}/`);
+  if (to !== parentPath && !isSelfOrDescendant) {
+    throw new ToolDeniedError(
+      tool.name,
+      "Scoped agents may message only their parent or descendants directly; use team_message_send for teammates.",
+    );
   }
 }
 

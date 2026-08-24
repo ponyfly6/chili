@@ -7,6 +7,8 @@ import {
   MINIMAX_ANTHROPIC_BASE_URL,
   MINIMAX_M27_HIGHSPEED_MODEL,
   normalizeAnthropicToolCallId,
+  ProviderBackpressureCoordinator,
+  ProviderError,
 } from "./index.js";
 import type { ModelStreamEvent, ModelTool } from "./types.js";
 
@@ -568,10 +570,143 @@ test("falls back to non-streaming JSON responses", async () => {
   expect(events[4]).toMatchObject({ type: "finish", reason: "end_turn", responseId: "msg_json" });
 });
 
+test("types MiniMax 2062 as non-retryable and short-circuits sibling requests", async () => {
+  let fetchCalls = 0;
+  const coordinator = new ProviderBackpressureCoordinator();
+  const fetchImpl = (async () => {
+    fetchCalls++;
+    return new Response(JSON.stringify({
+      type: "error",
+      error: {
+        type: "rate_limit_error",
+        message: "Traffic is currently high—please retry shortly. (2062)",
+      },
+    }), {
+      status: 429,
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+  const options = {
+    provider: "minimax",
+    model: "MiniMax-M3[1m]",
+    apiKey: "shared-key",
+    baseUrl: "https://api.minimaxi.test/anthropic",
+    fetch: fetchImpl,
+    backpressureCoordinator: coordinator,
+  };
+  const first = new AnthropicCompatibleModel(options);
+  const sibling = new AnthropicCompatibleModel(options);
+
+  const firstError = await caught(collect(first.stream({ messages: [], tools: [], system: [] })));
+  expect(firstError).toBeInstanceOf(ProviderError);
+  expect(firstError).toMatchObject({
+    provider: "minimax",
+    status: 429,
+    code: "2062",
+    category: "plan_capacity",
+    retryable: false,
+    opensCircuit: true,
+  });
+  expect(firstError.message).toBe("Traffic is currently high—please retry shortly. (2062)");
+
+  const siblingError = await caught(collect(sibling.stream({ messages: [], tools: [], system: [] })));
+  expect(siblingError).toMatchObject({ category: "plan_capacity", retryable: false, code: "2062" });
+  expect(fetchCalls).toBe(1);
+});
+
+test("honors Retry-After across Anthropic-compatible requests", async () => {
+  let now = 10_000;
+  const waits: number[] = [];
+  const coordinator = new ProviderBackpressureCoordinator({
+    now: () => now,
+    wait: async (ms) => {
+      waits.push(ms);
+      now += ms;
+    },
+  });
+  let fetchCalls = 0;
+  const fetchImpl = (async () => {
+    fetchCalls++;
+    if (fetchCalls === 1) {
+      return new Response(JSON.stringify({
+        type: "error",
+        error: { type: "rate_limit_error", message: "Too many requests" },
+      }), {
+        status: 429,
+        headers: { "content-type": "application/json", "retry-after": "2" },
+      });
+    }
+    return new Response(JSON.stringify({ id: "msg_after_wait", content: [], stop_reason: "end_turn" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+  const model = new AnthropicCompatibleModel({
+    provider: "minimax",
+    model: "MiniMax-M3[1m]",
+    apiKey: "rate-key",
+    baseUrl: "https://api.minimaxi.test/anthropic",
+    fetch: fetchImpl,
+    backpressureCoordinator: coordinator,
+  });
+
+  const rateError = await caught(collect(model.stream({ messages: [], tools: [], system: [] })));
+  expect(rateError).toMatchObject({
+    category: "rate_limit",
+    retryable: true,
+    opensCircuit: false,
+    retryAfterMs: 2_000,
+  });
+  const events = await collect(model.stream({ messages: [], tools: [], system: [] }));
+
+  expect(waits).toEqual([2_000]);
+  expect(fetchCalls).toBe(2);
+  expect(events.at(-1)).toMatchObject({ type: "finish", responseId: "msg_after_wait" });
+});
+
+test("types Anthropic SSE error events before exposing them to core", async () => {
+  const model = new AnthropicCompatibleModel({
+    provider: "minimax",
+    model: "test-model",
+    apiKey: "sse-error-key",
+    baseUrl: "https://model.test",
+    backpressureCoordinator: new ProviderBackpressureCoordinator(),
+    fetch: sseFetch([
+      event("error", {
+        type: "error",
+        error: { type: "rate_limit_error", code: 1002, message: "Rate limited" },
+      }),
+    ]),
+  });
+
+  const events = await collect(model.stream({ messages: [], tools: [], system: [] }));
+
+  expect(events).toHaveLength(1);
+  expect(events[0]).toMatchObject({
+    type: "error",
+    error: {
+      name: "ProviderError",
+      category: "rate_limit",
+      retryable: true,
+      code: "1002",
+    },
+  });
+});
+
 async function collect(stream: AsyncIterable<ModelStreamEvent>): Promise<ModelStreamEvent[]> {
   const events: ModelStreamEvent[] = [];
   for await (const streamEvent of stream) events.push(streamEvent);
   return events;
+}
+
+async function caught(promise: Promise<unknown>): Promise<Error> {
+  try {
+    await promise;
+  } catch (error) {
+    if (error instanceof Error) return error;
+    return new Error(String(error));
+  }
+  throw new Error("Expected promise to reject");
 }
 
 function message(role: Message["role"], parts: Array<Record<string, unknown>>): Message {

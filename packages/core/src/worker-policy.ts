@@ -20,6 +20,8 @@ export const SCOPED_WORKER_BASE_TOOLS = [
   "tool_search",
   "activate_skill",
   "complete_task",
+  "agent_message_send",
+  "agent_message_list",
   "team_snapshot",
   "team_task_list",
   "team_task_update",

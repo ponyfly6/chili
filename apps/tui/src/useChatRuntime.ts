@@ -7,8 +7,10 @@ import {
 } from "@chili/sdk";
 import type {
   ApprovalId,
+  DelegationPolicy,
   MessageImageContent,
   RuntimeApprovalResolveResult,
+  RuntimeDelegationConfig,
   RuntimeMcpAddServerRequest,
   RuntimeMcpAuthRequest,
   RuntimeMcpAuthResponse,
@@ -45,6 +47,7 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
   chatFeedback?: ChatRuntimeFeedback;
   modelCandidates?: readonly ModelCandidate[];
   modelConfig?: RuntimeModelConfig;
+  delegationConfig?: RuntimeDelegationConfig;
   permissionConfig?: RuntimePermissionConfig;
   commandList?: RuntimePromptCommandList;
   mcpStatus?: RuntimeMcpStatusResponse;
@@ -55,7 +58,9 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
   setRuntimeModel?: (selection: ModelSelection) => Promise<boolean>;
   setRuntimeReasoning?: (level: ReasoningLevel) => Promise<boolean>;
   setRuntimeServiceTier?: (serviceTier: ServiceTier) => Promise<boolean>;
+  setRuntimeDelegationPolicy?: (policy: DelegationPolicy) => Promise<RuntimeDelegationConfig | undefined>;
   refreshModelConfig?: () => Promise<void>;
+  refreshDelegationConfig?: () => Promise<RuntimeDelegationConfig | undefined>;
   refreshPermissionConfig?: () => Promise<void>;
   reloadCommands?: () => Promise<RuntimePromptCommandList | undefined>;
   refreshMcpStatus?: () => Promise<RuntimeMcpStatusResponse | undefined>;
@@ -115,6 +120,8 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   const [chatFeedback, setChatFeedback] = useState<ChatRuntimeFeedback | undefined>();
   const [modelCandidates, setModelCandidates] = useState<readonly ModelCandidate[]>([]);
   const [modelConfig, setModelConfig] = useState<RuntimeModelConfig | undefined>();
+  const [delegationConfig, setDelegationConfig] = useState<RuntimeDelegationConfig | undefined>();
+  const delegationConfigEpochRef = useRef(0);
   const [permissionConfig, setPermissionConfig] = useState<RuntimePermissionConfig | undefined>();
   const [commandList, setCommandList] = useState<RuntimePromptCommandList | undefined>();
   const [mcpStatus, setMcpStatus] = useState<RuntimeMcpStatusResponse | undefined>();
@@ -202,6 +209,33 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     void refreshModelConfig();
   }, [refreshModelConfig]);
 
+  const refreshDelegationConfigForSession = useCallback(async (
+    sessionIdOverride?: SessionId,
+  ): Promise<RuntimeDelegationConfig | undefined> => {
+    const epoch = ++delegationConfigEpochRef.current;
+    const sessionId = sessionIdOverride ?? activeSessionId ?? chatView.sessionId;
+    if (!sessionId) {
+      setDelegationConfig(undefined);
+      return undefined;
+    }
+    try {
+      const config = await withAbort((signal) => client.getDelegationConfig({ sessionId, signal }));
+      if (delegationConfigEpochRef.current === epoch) setDelegationConfig(config);
+      return config;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return undefined;
+    }
+  }, [activeSessionId, chatView.sessionId, client, options.baseUrl, withAbort]);
+
+  const refreshDelegationConfig = useCallback(async (): Promise<RuntimeDelegationConfig | undefined> => {
+    return refreshDelegationConfigForSession();
+  }, [refreshDelegationConfigForSession]);
+
+  useEffect(() => {
+    void refreshDelegationConfig();
+  }, [refreshDelegationConfig]);
+
   const refreshPermissionConfig = useCallback(async (): Promise<void> => {
     try {
       await withAbort(async (signal) => {
@@ -269,10 +303,11 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     refreshedForStreamingRef.current = true;
     setChatFeedback((current) => current?.status === "error" ? undefined : current);
     void refreshModelConfig();
+    void refreshDelegationConfig();
     void refreshPermissionConfig();
     void refreshCommands();
     void refreshMcpStatus();
-  }, [refreshCommands, refreshMcpStatus, refreshModelConfig, refreshPermissionConfig, teamRuntime.connection.status]);
+  }, [refreshCommands, refreshDelegationConfig, refreshMcpStatus, refreshModelConfig, refreshPermissionConfig, teamRuntime.connection.status]);
 
   const getMcpServer = useCallback(async (server: string): Promise<RuntimeMcpServerDescriptor | undefined> => {
     try {
@@ -382,6 +417,43 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     if (!sessionId || !threadId) throw new Error("Unable to determine a session and thread.");
     return { sessionId, threadId };
   }, [activeSessionId, activeThreadId, chatView.sessionId, chatView.threadId, client, options.cwd, submitBlockedReason]);
+
+  const setRuntimeDelegationPolicy = useCallback(async (
+    policy: DelegationPolicy,
+  ): Promise<RuntimeDelegationConfig | undefined> => {
+    try {
+      const updated = await withAbort(async (signal) => {
+        let sessionId = activeSessionId ?? chatView.sessionId;
+        let threadId = activeThreadId ?? chatView.threadId;
+        if (sessionId && !threadId) throw new Error(submitBlockedReason ?? "Session resume needs a thread.");
+        if (!sessionId && !threadId) {
+          const created = await client.createSession({
+            ...(options.cwd ? { cwd: options.cwd } : {}),
+            signal,
+          });
+          sessionId = created.sessionId;
+          threadId = created.threadId;
+        }
+        if (!sessionId || !threadId) throw new Error("Unable to determine a session and thread.");
+        const epoch = ++delegationConfigEpochRef.current;
+        const config = await client.setDelegationPolicy({
+          sessionId,
+          threadId,
+          policy,
+          signal,
+        });
+        setActiveSessionId(sessionId);
+        setActiveThreadId(threadId);
+        return { config, epoch };
+      });
+      if (delegationConfigEpochRef.current === updated.epoch) setDelegationConfig(updated.config);
+      setChatFeedback({ status: "success", message: `agent delegation ${policy}` });
+      return updated.config;
+    } catch (error) {
+      if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
+      return undefined;
+    }
+  }, [activeSessionId, activeThreadId, chatView.sessionId, chatView.threadId, client, options.baseUrl, options.cwd, submitBlockedReason, withAbort]);
 
   const submitPrompt = useCallback(async (text: string, submitOptions: ChatSubmitOptions = {}): Promise<boolean> => {
     const trimmed = text.trim();
@@ -653,6 +725,8 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     setChatFeedback(undefined);
     setActiveSessionId(undefined);
     setActiveThreadId(undefined);
+    delegationConfigEpochRef.current += 1;
+    setDelegationConfig(undefined);
     try {
       const created = await withAbort((signal) => client.createSession({
         ...(options.cwd ? { cwd: options.cwd } : {}),
@@ -660,11 +734,12 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
       }));
       setActiveSessionId(created.sessionId);
       setActiveThreadId(created.threadId);
+      await refreshDelegationConfigForSession(created.sessionId);
       setChatFeedback(undefined);
     } catch (error) {
       if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
     }
-  }, [client, options.baseUrl, options.cwd, withAbort]);
+  }, [client, options.baseUrl, options.cwd, refreshDelegationConfigForSession, withAbort]);
 
   const listSessions = useCallback(async (): Promise<RuntimeSessionSummary[]> => {
     try {
@@ -695,13 +770,14 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
       setSubmitPending(false);
       setActiveSessionId(session.id);
       setActiveThreadId(threadId);
+      await refreshDelegationConfigForSession(session.id);
       setChatFeedback({ status: "success", message: "saved chat resumed" });
       return true;
     } catch (error) {
       if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
       return false;
     }
-  }, [client, options.baseUrl, running, teamRuntime.hydrateEvents, withAbort]);
+  }, [client, options.baseUrl, refreshDelegationConfigForSession, running, teamRuntime.hydrateEvents, withAbort]);
 
   const renameSession = useCallback(async (title: string): Promise<RuntimeSessionSummary | undefined> => {
     const sessionId = activeSessionId ?? chatView.sessionId;
@@ -741,6 +817,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     ...(chatFeedback ? { chatFeedback } : {}),
     modelCandidates,
     ...(modelConfig ? { modelConfig } : {}),
+    ...(delegationConfig ? { delegationConfig } : {}),
     ...(permissionConfig ? { permissionConfig } : {}),
     ...(commandList ? { commandList } : {}),
     ...(mcpStatus ? { mcpStatus } : {}),
@@ -751,7 +828,9 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     setRuntimeModel,
     setRuntimeReasoning,
     setRuntimeServiceTier,
+    setRuntimeDelegationPolicy,
     refreshModelConfig,
+    refreshDelegationConfig,
     refreshPermissionConfig,
     reloadCommands,
     refreshMcpStatus,
@@ -774,7 +853,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     interruptActiveSession,
     approveApproval,
     rejectApproval,
-  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, permissionConfig, commandList, mcpStatus, refreshModelConfig, refreshPermissionConfig, reloadCommands, refreshMcpStatus, getMcpServer, reloadMcp, addMcpServer, removeMcpServer, listMcpTools, authMcpServer, logoutMcpServer, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setRuntimeServiceTier, setGoal, pauseGoal, resumeGoal, clearGoal, startNewSession, listSessions, resumeSession, renameSession, submitBlockedReason, submitCommand, submitPrompt, teamRuntime]);
+  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, delegationConfig, permissionConfig, commandList, mcpStatus, refreshModelConfig, refreshDelegationConfig, refreshPermissionConfig, reloadCommands, refreshMcpStatus, getMcpServer, reloadMcp, addMcpServer, removeMcpServer, listMcpTools, authMcpServer, logoutMcpServer, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setRuntimeServiceTier, setRuntimeDelegationPolicy, setGoal, pauseGoal, resumeGoal, clearGoal, startNewSession, listSessions, resumeSession, renameSession, submitBlockedReason, submitCommand, submitPrompt, teamRuntime]);
 }
 
 function upsertMcpServer(current: RuntimeMcpStatusResponse | undefined, server: RuntimeMcpServerDescriptor): RuntimeMcpStatusResponse {

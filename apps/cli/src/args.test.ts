@@ -138,6 +138,14 @@ test("parses the read-only store doctor command", () => {
   expect(() => parseArgs(["store", "recover"])).toThrow("Unknown store command: recover");
 });
 
+test("parses incomplete as a terminal task close status", () => {
+  expect(parseArgs(["--status", "incomplete", "close", "task_1"])).toMatchObject({
+    command: "task-close",
+    taskId: "task_1",
+    taskStatus: "incomplete",
+  });
+});
+
 test("parses team status and nested team view commands", () => {
   expect(parseArgs(["team", "status", "team_1", "--json"])).toMatchObject({
     command: "team",

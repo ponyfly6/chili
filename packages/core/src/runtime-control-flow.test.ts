@@ -99,6 +99,45 @@ test("retries transient socket failures before assistant output", async () => {
   expect(store.items.some((event) => event.type === "turn.retry_scheduled" && event.payload.reason.includes("socket connection"))).toBe(true);
 });
 
+test("does not retry provider errors explicitly marked non-retryable", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  let modelCalls = 0;
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      modelCalls++;
+      throw Object.assign(new Error("Traffic is currently high (2062)"), {
+        status: 429,
+        retryable: false,
+        category: "plan_capacity",
+      });
+    },
+  };
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+    }),
+    retryPolicy: { maxAttempts: 3, initialDelayMs: 0 },
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const result = await runtime.runTurn({
+    sessionId: "session_plan_capacity" as SessionId,
+    threadId: "thread_plan_capacity" as ThreadId,
+    cwd: "/repo",
+  });
+
+  expect(result.status).toBe("failed");
+  expect(modelCalls).toBe(1);
+  expect(store.items.some((event) => event.type === "turn.retry_scheduled")).toBe(false);
+});
+
 test("consumes rich model streams and executes tool calls after the stream finishes", async () => {
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();

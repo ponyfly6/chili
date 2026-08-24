@@ -8,6 +8,12 @@ import type {
   ModelUsage,
 } from "./types.js";
 import { assertImageInputSupported } from "./image-input.js";
+import {
+  sharedProviderBackpressureCoordinator,
+  type ProviderBackpressureCoordinator,
+  type ProviderRequestScope,
+} from "./provider-backpressure.js";
+import { ProviderError } from "./provider-error.js";
 import { readSseEvents } from "./sse.js";
 import { normalizeAnthropicToolCallId, prependContextualUserMessage, transformModelMessages } from "./transform-messages.js";
 
@@ -24,6 +30,7 @@ export interface AnthropicCompatibleModelOptions {
   fetch?: typeof fetch;
   headers?: Record<string, string>;
   inputCapabilities?: readonly ModelInputCapability[];
+  backpressureCoordinator?: ProviderBackpressureCoordinator;
 }
 
 export interface AnthropicRequestBuildOptions {
@@ -78,6 +85,11 @@ interface AnthropicResponse {
 interface AnthropicErrorPayload {
   message?: string;
   type?: string;
+  code?: string | number;
+  error_code?: string | number;
+  status_code?: string | number;
+  retry_after?: string | number;
+  retry_after_ms?: string | number;
 }
 
 interface AnthropicUsage {
@@ -128,6 +140,8 @@ export class AnthropicCompatibleModel implements ChiliModel {
   readonly provider: string;
   readonly model: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly backpressureCoordinator: ProviderBackpressureCoordinator;
+  private readonly requestScope: ProviderRequestScope;
 
   constructor(private readonly options: AnthropicCompatibleModelOptions) {
     if (!options.apiKey) throw new Error("Anthropic-compatible model requires an API key");
@@ -136,6 +150,12 @@ export class AnthropicCompatibleModel implements ChiliModel {
     this.provider = options.provider ?? "anthropic-compatible";
     this.model = options.model;
     this.fetchImpl = options.fetch ?? fetch;
+    this.backpressureCoordinator = options.backpressureCoordinator ?? sharedProviderBackpressureCoordinator;
+    this.requestScope = {
+      provider: this.provider,
+      endpoint: options.baseUrl,
+      credential: options.apiKey,
+    };
   }
 
   async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
@@ -162,11 +182,19 @@ export class AnthropicCompatibleModel implements ChiliModel {
     };
     if (input.signal) init.signal = input.signal;
 
+    await this.backpressureCoordinator.beforeRequest(this.requestScope, input.signal);
     const response = await this.fetchImpl(resolveMessagesUrl(this.options.baseUrl), init);
     if (!response.ok) {
       const text = await response.text();
-      const payload = parseJson<AnthropicResponse>(text, undefined);
-      throw new Error(payload?.error?.message ?? `Model request failed with HTTP ${response.status}: ${text}`);
+      const payload = parseJson<unknown>(text, undefined);
+      const error = this.providerError(
+        payload,
+        `Model request failed with HTTP ${response.status}: ${text}`,
+        response.status,
+        response.headers.get("retry-after"),
+      );
+      this.backpressureCoordinator.recordError(this.requestScope, error);
+      throw error;
     }
 
     if (isEventStream(response) && response.body) {
@@ -192,7 +220,9 @@ export class AnthropicCompatibleModel implements ChiliModel {
       if (!payload) continue;
 
       if (payload.type === "error" || event.event === "error") {
-        yield errorEvent(payload.error ?? payload, responseId, usage);
+        const error = this.providerError(payload.error ?? payload, "Anthropic-compatible model stream failed");
+        this.backpressureCoordinator.recordError(this.requestScope, error);
+        yield errorEvent(error, responseId, usage);
         return;
       }
 
@@ -290,7 +320,9 @@ export class AnthropicCompatibleModel implements ChiliModel {
     const payload = parseJson<AnthropicResponse>(text, undefined);
     if (!payload) throw new Error(`Model response was not JSON: ${text}`);
     if (payload.error) {
-      yield errorEvent(payload.error, payload.id, undefined);
+      const error = this.providerError(payload.error, "Anthropic-compatible model request failed");
+      this.backpressureCoordinator.recordError(this.requestScope, error);
+      yield errorEvent(error, payload.id, undefined);
       return;
     }
 
@@ -327,6 +359,27 @@ export class AnthropicCompatibleModel implements ChiliModel {
       headers["x-api-key"] = this.options.apiKey;
     }
     return headers;
+  }
+
+  private providerError(
+    value: unknown,
+    fallbackMessage: string,
+    status?: number,
+    retryAfterHeader?: string | null,
+  ): ProviderError {
+    const payload = extractAnthropicErrorPayload(value);
+    const message = payload?.message?.trim() || fallbackMessage;
+    const code = errorCode(payload) ?? errorCodeFromMessage(message);
+    const type = payload?.type;
+    const retryAfterMs = parseRetryAfterMs(retryAfterHeader, payload);
+    return new ProviderError(message, {
+      provider: this.provider,
+      ...(status !== undefined ? { status } : {}),
+      ...(code !== undefined ? { code } : {}),
+      ...(type !== undefined ? { type } : {}),
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+      details: value,
+    });
   }
 }
 
@@ -474,6 +527,54 @@ function parseJson<T>(text: string, fallback: T | undefined): T | undefined {
   } catch {
     return fallback;
   }
+}
+
+function extractAnthropicErrorPayload(value: unknown): AnthropicErrorPayload | undefined {
+  if (!isRecord(value)) return undefined;
+  if (isRecord(value.error)) return value.error as AnthropicErrorPayload;
+  return value as AnthropicErrorPayload;
+}
+
+function errorCode(payload: AnthropicErrorPayload | undefined): string | number | undefined {
+  return payload?.code ?? payload?.error_code ?? payload?.status_code;
+}
+
+function errorCodeFromMessage(message: string): string | undefined {
+  return /\((\d{3,6})\)\s*[.!]?\s*$/.exec(message)?.[1]
+    ?? /\b(?:error|status)[ _-]?code\s*[:=]?\s*(\d{3,6})\b/i.exec(message)?.[1];
+}
+
+function parseRetryAfterMs(
+  retryAfterHeader: string | null | undefined,
+  payload: AnthropicErrorPayload | undefined,
+): number | undefined {
+  const headerDelay = retryAfterHeader === null || retryAfterHeader === undefined
+    ? undefined
+    : retryAfterHeaderMs(retryAfterHeader);
+  if (headerDelay !== undefined) return headerDelay;
+
+  const milliseconds = finiteNumber(payload?.retry_after_ms);
+  if (milliseconds !== undefined && milliseconds >= 0) return Math.round(milliseconds);
+  const seconds = finiteNumber(payload?.retry_after);
+  return seconds !== undefined && seconds >= 0 ? Math.round(seconds * 1_000) : undefined;
+}
+
+function retryAfterHeaderMs(value: string): number | undefined {
+  const seconds = finiteNumber(value);
+  if (seconds !== undefined && seconds >= 0) return Math.round(seconds * 1_000);
+  const at = Date.parse(value);
+  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : undefined;
+}
+
+function finiteNumber(value: string | number | undefined): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function toolCallDeltaEvent(

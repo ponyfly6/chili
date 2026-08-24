@@ -3,9 +3,137 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
 import { TeamControlService, TeamTaskDispatchService, type TeamTaskSubagentRunner } from "@chili/core";
-import type { AgentPath, AgentRunId, ChiliEvent, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
+import type { AgentPath, AgentRunId, ChiliEvent, SessionId, TaskId, TeamId, ThreadId, TimestampMs } from "@chili/protocol";
 import { ObservableEventStore, SqliteEventStore } from "@chili/store";
 import { CliPrinter, PrintingEventStore } from "./printing-store.js";
+
+test("printing and observable wrappers report mailbox CAS capability recursively", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-printing-mailbox-capability-"));
+  const sqlite = new SqliteEventStore(join(dir, "events.sqlite"));
+  const printer = { event: (_event: ChiliEvent) => undefined } as CliPrinter;
+  const projectionOnly = {
+    append: sqlite.append.bind(sqlite),
+    appendMany: sqlite.appendMany.bind(sqlite),
+    events: sqlite.events.bind(sqlite),
+    sessions: sqlite.sessions.bind(sqlite),
+    messages: sqlite.messages.bind(sqlite),
+    pendingApprovals: sqlite.pendingApprovals.bind(sqlite),
+  };
+
+  try {
+    const capable = new PrintingEventStore(sqlite, printer);
+    expect(capable.supportsAgentMailboxCapability("delivery")).toBe(true);
+    expect(new ObservableEventStore(capable).supportsAgentMailboxCapability("delivery")).toBe(true);
+
+    const projectionWrapper = new PrintingEventStore(projectionOnly, printer);
+    expect(projectionWrapper.supportsAgentMailboxCapability("delivery")).toBe(false);
+    expect(new ObservableEventStore(projectionWrapper).supportsAgentMailboxCapability("delivery")).toBe(false);
+  } finally {
+    sqlite.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("printing store forwards atomic agent task run claims", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-printing-task-run-claim-"));
+  const sqlite = new SqliteEventStore(join(dir, "events.sqlite"));
+  const printed: ChiliEvent[] = [];
+  const printer = new CliPrinter();
+  printer.event = (event: ChiliEvent) => {
+    printed.push(event);
+  };
+  const store = new ObservableEventStore(new PrintingEventStore(sqlite, printer));
+  const sessionId = "session_printing_task" as SessionId;
+  const threadId = "thread_printing_task" as ThreadId;
+  const taskId = "task_printing_task" as TaskId;
+  const path = "/root/task_printing_task" as AgentPath;
+  const initialRunId = "agent_printing_initial" as AgentRunId;
+
+  try {
+    await store.appendMany([
+      {
+        id: "event_printing_task_created",
+        type: "agent.task_created",
+        time: 1 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          taskId,
+          path,
+          parentPath: "/root" as AgentPath,
+          parentSessionId: sessionId,
+          parentThreadId: threadId,
+          childSessionId: "session_printing_child" as SessionId,
+          childThreadId: "thread_printing_child" as ThreadId,
+          taskName: "printing worker",
+          cwd: dir,
+          prompt: "initial work",
+          mode: "resumable",
+        },
+      },
+      {
+        id: "event_printing_task_spawned",
+        type: "agent.spawned",
+        time: 2 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          runId: initialRunId,
+          taskId,
+          path,
+          taskName: "printing worker",
+          generation: 1,
+        },
+      },
+      {
+        id: "event_printing_task_completed",
+        type: "agent.completed",
+        time: 3 as TimestampMs,
+        sessionId,
+        threadId,
+        payload: {
+          runId: initialRunId,
+          taskId,
+          path,
+          status: "completed",
+          generation: 1,
+          summary: "initial answer",
+        },
+      },
+    ]);
+    printed.length = 0;
+
+    const result = await store.beginAgentTaskRunCas({
+      taskId,
+      expectedGeneration: 1,
+      expectedRunId: initialRunId,
+      expectedLeaseOwner: null,
+      runId: "agent_printing_followup" as AgentRunId,
+      generation: 2,
+      leaseOwner: "followup:agent_printing_followup",
+      leaseTtlMs: 100,
+      messageEventId: "event_printing_followup_message",
+      messageClaimEventId: "event_printing_followup_message_claimed",
+      spawnEventId: "event_printing_followup_spawned",
+      from: "/root" as AgentPath,
+      message: { role: "user", content: "continue" },
+      sessionId,
+      threadId,
+      time: 4,
+    });
+
+    expect(result.applied).toBe(true);
+    expect(result.task).toMatchObject({ id: taskId, status: "running", generation: 2 });
+    expect(printed.map((event) => event.type)).toEqual([
+      "agent.message_queued",
+      "agent.message_claimed",
+      "agent.spawned",
+    ]);
+  } finally {
+    sqlite.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("printing store forwards team task claims through the observable store", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-printing-team-claim-"));

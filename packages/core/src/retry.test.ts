@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { isRetryableTransientError, normalizeRetryPolicy } from "./retry.js";
+import { isRetryableTransientError, normalizeRetryPolicy, retryDelay, sleep } from "./retry.js";
 
 test("classifies Bun socket closure as retryable", () => {
   expect(
@@ -35,4 +35,65 @@ test("default retry policy uses transient classifier", () => {
   const policy = normalizeRetryPolicy(undefined);
 
   expect(policy.retryable(new Error("The socket connection was closed unexpectedly"))).toBe(true);
+});
+
+test("explicit provider retryability overrides status and message heuristics", () => {
+  expect(isRetryableTransientError(Object.assign(new Error("Too many requests"), {
+    status: 429,
+    retryable: false,
+  }))).toBe(false);
+  expect(isRetryableTransientError(Object.assign(new Error("invalid request"), {
+    status: 400,
+    retryable: true,
+  }))).toBe(true);
+});
+
+test("nested non-retryable provider errors override retryable wrapper heuristics", () => {
+  const cause = Object.assign(new Error("MiniMax plan capacity reached"), {
+    retryable: false,
+  });
+  const wrapper = new Error("Model request failed with HTTP 429") as Error & { cause?: unknown };
+  wrapper.cause = cause;
+
+  expect(isRetryableTransientError(wrapper)).toBe(false);
+});
+
+test("nested retryable provider errors override non-retryable wrapper heuristics", () => {
+  const cause = Object.assign(new Error("provider throttled"), {
+    retryable: true,
+  });
+  const wrapper = new Error("Model request failed with HTTP 400") as Error & { cause?: unknown };
+  wrapper.cause = cause;
+
+  expect(isRetryableTransientError(wrapper)).toBe(true);
+});
+
+test("an explicit non-retryable aggregate member vetoes explicit retryable members", () => {
+  const aggregate = {
+    message: "Multiple provider failures",
+    errors: [
+      Object.assign(new Error("temporary"), { retryable: true }),
+      Object.assign(new Error("quota exhausted"), { retryable: false }),
+    ],
+  };
+
+  expect(isRetryableTransientError(aggregate)).toBe(false);
+});
+
+test("Retry-After is a minimum delay on top of exponential backoff", () => {
+  const policy = normalizeRetryPolicy({ initialDelayMs: 100, maxDelayMs: 500, factor: 2 });
+
+  expect(retryDelay(policy, 1)).toBe(100);
+  expect(retryDelay(policy, 4)).toBe(500);
+  expect(retryDelay(policy, 1, { retryAfterMs: 1_500 })).toBe(1_500);
+  expect(retryDelay(policy, 1, { cause: { retryAfterMs: 900 } })).toBe(900);
+});
+
+test("retry waits remain abortable when Retry-After is long", async () => {
+  const controller = new AbortController();
+  const waiting = sleep(60_000, controller.signal);
+
+  controller.abort();
+
+  await expect(waiting).rejects.toMatchObject({ name: "AbortError" });
 });

@@ -8,15 +8,18 @@ import type {
   SubagentController,
   SubagentControlController,
   SubagentMailboxRecord,
+  SubagentTaskBatchWaitRecord,
   SubagentTaskCompletion,
   SubagentTaskHandle,
   SubagentTaskRecord,
   SubagentTaskStatus,
+  TaskCompletionPolicy,
   TaskBatchToolInput,
   TaskToolInput,
   TaskCloseToolInput,
   TaskFollowupToolInput,
   TaskListToolInput,
+  TaskWaitBatchToolInput,
   TaskWaitToolInput,
 } from "../subagent.js";
 
@@ -32,15 +35,29 @@ export interface SubagentToolResult extends ToolResult {
   metadata: Record<string, unknown>;
 }
 
-const DEFAULT_TASK_BATCH_CONCURRENCY = 8;
+const DEFAULT_TASK_BATCH_CONCURRENCY = 3;
 const MAX_TASK_BATCH_CONCURRENCY = 32;
+const DEFAULT_TASK_BATCH_COMPLETION_POLICY: TaskCompletionPolicy = "join";
+const DEFAULT_TASK_BATCH_JOIN_TIMEOUT_MS = 600_000;
+const MAX_TASK_BATCH_TASKS = 64;
+
+interface TaskBatchSpawnFailure {
+  batchIndex: number;
+  description: string;
+  error: string;
+}
+
+interface TaskBatchSpawnResult {
+  tasks: SubagentTaskHandle[];
+  failures: TaskBatchSpawnFailure[];
+}
 
 export function createTaskTool(controller: SubagentController): ChiliToolDefinition<TaskToolInput, SubagentToolResult> {
   return {
     name: "task",
     aliases: ["agent"],
     description:
-      "Spawn an ad-hoc local subagent task through the injected subagent controller. If you created or assigned a persistent team task, use team_task_dispatch instead so the team board stays linked and synced.",
+      "Spawn one ad-hoc local subagent. For work required by the current response, use one-shot/resumable so the final result returns inline, or use task_batch (default join) for parallel work. Background defaults to completion_policy=notify: it returns a handle immediately and wakes the parent at terminal state; detached never wakes. Do not answer the original request with only a launch status: wait/read the result, follow up or verify gaps, and integrate it. Use team_task_dispatch for persistent team-board work.",
     risk: "execute",
     inputSchema: {
       type: "object",
@@ -50,6 +67,8 @@ export function createTaskTool(controller: SubagentController): ChiliToolDefinit
         prompt: { type: "string" },
         mode: { type: "string" },
         subagent_type: { type: "string" },
+        completionPolicy: { type: "string", enum: ["join", "notify", "detached"] },
+        completion_policy: { type: "string", enum: ["join", "notify", "detached"] },
       },
     },
     validate(input): ValidationResult<TaskToolInput> {
@@ -65,30 +84,44 @@ export function createTaskTool(controller: SubagentController): ChiliToolDefinit
         metadata: {
           description: input.description,
           mode: input.mode ?? "default",
+          completionPolicy: input.completionPolicy ?? (normalizeTaskMode(input.mode) === "background" ? "notify" : "join"),
           promptPreview: preview(input.prompt),
         },
       };
     },
     async execute(input, context) {
+      const completionPolicy = input.completionPolicy
+        ?? (normalizeTaskMode(input.mode) === "background" ? "notify" : "join");
       await context.metadata({
         metadata: {
           description: input.description,
           mode: input.mode ?? "default",
+          sourceCallId: context.callId,
+          completionPolicy,
+          completion_policy: completionPolicy,
+          notificationRequested: completionPolicy === "notify",
         },
       });
 
-      const task = await controller.spawnTask(input, context);
-      return taskToolResult(task, input.mode);
+      const task = await controller.spawnTask({
+        ...input,
+        sourceCallId: context.callId,
+        completionPolicy,
+      }, context);
+      return taskToolResult(task, input.mode, completionPolicy, context.callId);
     },
   };
 }
 
-export function createTaskBatchTool(controller: SubagentController): ChiliToolDefinition<TaskBatchToolInput, SubagentToolResult> {
+export function createTaskBatchTool(
+  controller: SubagentController,
+  lifecycleController?: SubagentControlController,
+): ChiliToolDefinition<TaskBatchToolInput, SubagentToolResult> {
   return {
     name: "task_batch",
     aliases: ["agent_batch", "spawn_tasks", "spawn_agents"],
     description:
-      "Spawn multiple ad-hoc local background subagent tasks in parallel. Use this for independent sidecar work; persistent team tasks should use team_task_dispatch.",
+      "Spawn independent ad-hoc subagents in parallel. Use default join for one-pass work required by the current response; it waits inline and returns terminal summaries. Use completion_policy=supervised for multi-stage collaboration or quality review: it returns handles immediately but keeps this parent turn responsible for task_wait_batch(any), result review/task_followup, a final task_wait_batch(all), verification, and integration. notify is intentionally asynchronous and wakes a later parent turn; detached never wakes. max_concurrency defaults to 3 and is also runtime-capped. Do not finish with only a launch/completion status. Persistent team tasks should use team_task_dispatch.",
     risk: "execute",
     isConcurrencySafe: true,
     inputSchema: {
@@ -97,6 +130,7 @@ export function createTaskBatchTool(controller: SubagentController): ChiliToolDe
       properties: {
         tasks: {
           type: "array",
+          maxItems: MAX_TASK_BATCH_TASKS,
           items: {
             type: "object",
             required: ["description", "prompt"],
@@ -110,6 +144,12 @@ export function createTaskBatchTool(controller: SubagentController): ChiliToolDe
         },
         maxConcurrency: { type: "number" },
         max_concurrency: { type: "number" },
+        completionPolicy: { type: "string", enum: ["join", "notify", "detached", "supervised"] },
+        completion_policy: { type: "string", enum: ["join", "notify", "detached", "supervised"] },
+        timeoutMs: { type: "number" },
+        timeout_ms: { type: "number" },
+        batchId: { type: "string" },
+        batch_id: { type: "string" },
       },
     },
     validate(input): ValidationResult<TaskBatchToolInput> {
@@ -122,6 +162,10 @@ export function createTaskBatchTool(controller: SubagentController): ChiliToolDe
         metadata: {
           count: input.tasks.length,
           maxConcurrency: input.maxConcurrency ?? DEFAULT_TASK_BATCH_CONCURRENCY,
+          requestedMaxConcurrency: input.maxConcurrency ?? DEFAULT_TASK_BATCH_CONCURRENCY,
+          concurrencyLimitScope: "batch_request_capped_by_runtime_global",
+          completionPolicy: input.completionPolicy ?? DEFAULT_TASK_BATCH_COMPLETION_POLICY,
+          ...(input.batchId ? { batchId: input.batchId } : {}),
           tasks: input.tasks.map((task) => ({
             description: task.description,
             promptPreview: preview(task.prompt),
@@ -131,16 +175,75 @@ export function createTaskBatchTool(controller: SubagentController): ChiliToolDe
     },
     async execute(input, context) {
       const maxConcurrency = input.maxConcurrency ?? DEFAULT_TASK_BATCH_CONCURRENCY;
+      const completionPolicy = input.completionPolicy ?? DEFAULT_TASK_BATCH_COMPLETION_POLICY;
+      const timeoutMs = input.timeoutMs ?? DEFAULT_TASK_BATCH_JOIN_TIMEOUT_MS;
+      const batchId = input.batchId ?? context.callId;
       await context.metadata({
         metadata: {
           count: input.tasks.length,
           maxConcurrency,
+          requestedMaxConcurrency: maxConcurrency,
+          concurrencyLimitScope: "batch_request_capped_by_runtime_global",
           mode: "background",
+          batchId,
+          batch_id: batchId,
+          completionPolicy,
+          completion_policy: completionPolicy,
+          expectedBatchSize: input.tasks.length,
+          notificationRequested: completionPolicy === "notify",
         },
       });
 
-      const tasks = await runTaskBatch(input.tasks, maxConcurrency, (task) => controller.spawnTask(task, context));
-      return taskBatchToolResult(tasks, maxConcurrency);
+      const scopedTasks = input.tasks.map((task, batchIndex): TaskToolInput => ({
+        ...task,
+        sourceCallId: context.callId,
+        batchId,
+        batchIndex,
+        expectedBatchSize: input.tasks.length,
+        maxConcurrency,
+        completionPolicy,
+      }));
+      const spawned = await runTaskBatch(scopedTasks, maxConcurrency, (task) => controller.spawnTask(task, context));
+      const tasks = spawned.tasks;
+      if (completionPolicy !== "join") {
+        return taskBatchToolResult(tasks, {
+          batchId,
+          completionPolicy,
+          expectedBatchSize: scopedTasks.length,
+          maxConcurrency,
+          sourceCallId: context.callId,
+          spawnFailures: spawned.failures,
+        });
+      }
+
+      if (!lifecycleController || tasks.length === 0) {
+        return taskBatchToolResult(tasks, {
+          batchId,
+          completionPolicy,
+          joinAvailable: lifecycleController !== undefined,
+          expectedBatchSize: scopedTasks.length,
+          maxConcurrency,
+          sourceCallId: context.callId,
+          spawnFailures: spawned.failures,
+        });
+      }
+
+      const waited = await lifecycleController.waitTasks({
+        taskIds: tasks.map((task) => task.taskId),
+        waitFor: "all",
+        timeoutMs,
+        batchId,
+      }, context);
+      return taskBatchToolResult(tasks, {
+        batchId,
+        completionPolicy,
+        expectedBatchSize: scopedTasks.length,
+        joinAvailable: true,
+        maxConcurrency,
+        sourceCallId: context.callId,
+        spawnFailures: spawned.failures,
+        waited,
+      });
     },
   };
 }
@@ -159,7 +262,7 @@ export function createCompleteTaskTool(
         taskId: { type: "string" },
         task_id: { type: "string" },
         summary: { type: "string" },
-        status: { type: "string", enum: ["completed", "failed", "cancelled"] },
+        status: { type: "string", enum: ["completed", "incomplete", "failed", "cancelled"] },
       },
     },
     validate(input): ValidationResult<CompleteTaskToolInput> {
@@ -189,14 +292,17 @@ export function createTaskListTool(
   return {
     name: "task_list",
     aliases: ["list_tasks", "agent_list"],
-    description: "List local subagent tasks visible to the current session.",
+    description:
+      "List local subagent tasks. Results are scoped to the current session unless all=true; task_ids can inspect an exact set of handles returned by task or task_batch.",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,
     inputSchema: {
       type: "object",
       properties: {
-        status: { type: "string", enum: ["pending", "running", "completed", "failed", "cancelled"] },
+        status: { type: "string", enum: ["pending", "running", "completed", "incomplete", "failed", "cancelled"] },
+        taskIds: { type: "array", items: { type: "string" } },
+        task_ids: { type: "array", items: { type: "string" } },
         limit: { type: "number" },
         all: { type: "boolean" },
       },
@@ -207,7 +313,7 @@ export function createTaskListTool(
     approval: () => false,
     async execute(input, context) {
       const tasks = await controller.listTasks(input, context);
-      return taskListToolResult(tasks);
+      return taskListToolResult(tasks, input);
     },
   };
 }
@@ -218,7 +324,8 @@ export function createTaskWaitTool(
   return {
     name: "task_wait",
     aliases: ["wait_task", "agent_wait"],
-    description: "Wait until a local subagent task reaches a final state.",
+    description:
+      "Wait until one local subagent reaches a final state, then integrate its summary before responding. A timeout is an error; use task_wait_batch for partial batch snapshots.",
     risk: "read",
     isReadOnly: true,
     isConcurrencySafe: true,
@@ -240,6 +347,51 @@ export function createTaskWaitTool(
       await context.metadata({ metadata: { taskId: input.taskId, task_id: input.taskId } });
       const task = await controller.waitTask(input, context);
       return taskRecordToolResult("task_wait", task);
+    },
+  };
+}
+
+export function createTaskWaitBatchTool(
+  controller: SubagentControlController,
+): ChiliToolDefinition<TaskWaitBatchToolInput, SubagentToolResult> {
+  return {
+    name: "task_wait_batch",
+    aliases: ["wait_tasks", "agent_wait_batch"],
+    description:
+      "Wait for any or all task_ids to reach a final state. Defaults to all. Timeout returns the latest partial statuses and preserves every handle; integrate completed summaries and report pending, failed, incomplete, or cancelled work.",
+    risk: "read",
+    isReadOnly: true,
+    isConcurrencySafe: true,
+    inputSchema: {
+      type: "object",
+      required: ["taskIds"],
+      properties: {
+        taskIds: { type: "array", items: { type: "string" } },
+        task_ids: { type: "array", items: { type: "string" } },
+        waitFor: { type: "string", enum: ["any", "all"] },
+        wait_for: { type: "string", enum: ["any", "all"] },
+        timeoutMs: { type: "number" },
+        timeout_ms: { type: "number" },
+        batchId: { type: "string" },
+        batch_id: { type: "string" },
+      },
+    },
+    validate(input): ValidationResult<TaskWaitBatchToolInput> {
+      return validateTaskWaitBatchInput(input);
+    },
+    approval: () => false,
+    async execute(input, context) {
+      await context.metadata({
+        metadata: {
+          taskIds: input.taskIds,
+          task_ids: input.taskIds,
+          waitFor: input.waitFor ?? "all",
+          wait_for: input.waitFor ?? "all",
+          ...(input.batchId ? { batchId: input.batchId, batch_id: input.batchId } : {}),
+        },
+      });
+      const waited = await controller.waitTasks(input, context);
+      return taskWaitBatchToolResult(waited, input.batchId);
     },
   };
 }
@@ -307,7 +459,7 @@ export function createTaskCloseTool(
       properties: {
         taskId: { type: "string" },
         task_id: { type: "string" },
-        status: { type: "string", enum: ["completed", "failed", "cancelled"] },
+        status: { type: "string", enum: ["completed", "incomplete", "failed", "cancelled"] },
         summary: { type: "string" },
         error: { type: "string" },
         interrupt: { type: "boolean" },
@@ -355,7 +507,7 @@ export function createMailboxListTool(
     inputSchema: {
       type: "object",
       properties: {
-        status: { type: "string", enum: ["queued", "delivering", "consumed"] },
+        status: { type: "string", enum: ["queued", "delivering", "consumed", "discarded"] },
         taskId: { type: "string" },
         task_id: { type: "string" },
         path: { type: "string" },
@@ -420,6 +572,11 @@ function validateTaskInput(input: unknown): ValidationResult<TaskToolInput> {
 
   const mode = pickOptionalString(input, ["mode", "subagent_type", "subagentType", "agentType", "type"]);
   if (!mode.ok) return { ok: false, message: "mode must be a string" };
+  const completionPolicy = normalizeTaskCompletionPolicy(input.completionPolicy ?? input.completion_policy);
+  if (!completionPolicy.ok) return completionPolicy;
+  if (completionPolicy.value === "supervised") {
+    return { ok: false, message: "completionPolicy=supervised is only supported by task_batch" };
+  }
 
   const promptValue = nonEmptyString(prompt.value ?? description.value);
   if (promptValue === undefined) {
@@ -441,6 +598,7 @@ function validateTaskInput(input: unknown): ValidationResult<TaskToolInput> {
     return { ok: false, message: "mode must be a non-empty string" };
   }
   if (modeValue !== undefined) value.mode = modeValue;
+  if (completionPolicy.value !== undefined) value.completionPolicy = completionPolicy.value;
 
   return { ok: true, value };
 }
@@ -449,12 +607,22 @@ function validateTaskBatchInput(input: unknown): ValidationResult<TaskBatchToolI
   if (!isRecord(input)) return { ok: false, message: "expected an object" };
   if (!Array.isArray(input.tasks)) return { ok: false, message: "tasks must be an array" };
   if (input.tasks.length === 0) return { ok: false, message: "tasks must contain at least one task" };
+  if (input.tasks.length > MAX_TASK_BATCH_TASKS) {
+    return { ok: false, message: `tasks must contain ${MAX_TASK_BATCH_TASKS} tasks or fewer` };
+  }
 
   const maxConcurrency = optionalPositiveInteger(input.maxConcurrency ?? input.max_concurrency, "maxConcurrency");
   if (!maxConcurrency.ok) return maxConcurrency;
   if (maxConcurrency.value !== undefined && maxConcurrency.value > MAX_TASK_BATCH_CONCURRENCY) {
     return { ok: false, message: `maxConcurrency must be ${MAX_TASK_BATCH_CONCURRENCY} or less` };
   }
+
+  const completionPolicy = normalizeTaskCompletionPolicy(input.completionPolicy ?? input.completion_policy);
+  if (!completionPolicy.ok) return completionPolicy;
+  const timeoutMs = optionalPositiveInteger(input.timeoutMs ?? input.timeout_ms, "timeoutMs");
+  if (!timeoutMs.ok) return timeoutMs;
+  const batchId = optionalNonEmptyString(pickOptionalString(input, ["batchId", "batch_id"]), "batchId");
+  if (!batchId.ok) return batchId;
 
   const tasks: TaskToolInput[] = [];
   for (const [index, item] of input.tasks.entries()) {
@@ -469,6 +637,9 @@ function validateTaskBatchInput(input: unknown): ValidationResult<TaskBatchToolI
 
   const value: TaskBatchToolInput = { tasks };
   if (maxConcurrency.value !== undefined) value.maxConcurrency = maxConcurrency.value;
+  value.completionPolicy = completionPolicy.value ?? DEFAULT_TASK_BATCH_COMPLETION_POLICY;
+  if (timeoutMs.value !== undefined) value.timeoutMs = timeoutMs.value;
+  if (batchId.value !== undefined) value.batchId = batchId.value;
   return { ok: true, value };
 }
 
@@ -509,6 +680,8 @@ function validateTaskListInput(input: unknown): ValidationResult<TaskListToolInp
 
   const status = normalizeTaskStatus(record.value.status);
   if (!status.ok) return status;
+  const taskIds = optionalTaskIds(record.value.taskIds ?? record.value.task_ids, "taskIds");
+  if (!taskIds.ok) return taskIds;
   const limit = optionalPositiveInteger(record.value.limit, "limit");
   if (!limit.ok) return limit;
   const all = optionalBoolean(record.value.all, "all");
@@ -516,6 +689,7 @@ function validateTaskListInput(input: unknown): ValidationResult<TaskListToolInp
 
   const value: TaskListToolInput = {};
   if (status.value) value.status = status.value;
+  if (taskIds.value !== undefined) value.taskIds = taskIds.value;
   if (limit.value !== undefined) value.limit = limit.value;
   if (all.value !== undefined) value.all = all.value;
   return { ok: true, value };
@@ -530,6 +704,33 @@ function validateTaskWaitInput(input: unknown): ValidationResult<TaskWaitToolInp
 
   const value: TaskWaitToolInput = { taskId: taskId.value };
   if (timeoutMs.value !== undefined) value.timeoutMs = timeoutMs.value;
+  return { ok: true, value };
+}
+
+function validateTaskWaitBatchInput(input: unknown): ValidationResult<TaskWaitBatchToolInput> {
+  if (!isRecord(input)) return { ok: false, message: "expected an object" };
+  const taskIds = optionalTaskIds(input.taskIds ?? input.task_ids ?? input.ids, "taskIds");
+  if (!taskIds.ok) return taskIds;
+  if (taskIds.value === undefined || taskIds.value.length === 0) {
+    return { ok: false, message: "taskIds must contain at least one task id" };
+  }
+  if (taskIds.value.length > MAX_TASK_BATCH_TASKS) {
+    return { ok: false, message: `taskIds must contain ${MAX_TASK_BATCH_TASKS} or fewer unique task ids` };
+  }
+
+  const waitFor = normalizeTaskWaitMode(input.waitFor ?? input.wait_for);
+  if (!waitFor.ok) return waitFor;
+  const timeoutMs = optionalPositiveInteger(input.timeoutMs ?? input.timeout_ms, "timeoutMs");
+  if (!timeoutMs.ok) return timeoutMs;
+  const batchId = optionalNonEmptyString(pickOptionalString(input, ["batchId", "batch_id"]), "batchId");
+  if (!batchId.ok) return batchId;
+
+  const value: TaskWaitBatchToolInput = {
+    taskIds: taskIds.value,
+    waitFor: waitFor.value ?? "all",
+  };
+  if (timeoutMs.value !== undefined) value.timeoutMs = timeoutMs.value;
+  if (batchId.value !== undefined) value.batchId = batchId.value;
   return { ok: true, value };
 }
 
@@ -603,35 +804,187 @@ function validateMailboxConsumeInput(input: unknown): ValidationResult<MailboxCo
   return { ok: true, value: { messageId: messageId.value } };
 }
 
-function taskToolResult(task: SubagentTaskHandle, mode?: string): SubagentToolResult {
-  const metadata = metadataFor(task, mode);
+function taskToolResult(
+  task: SubagentTaskHandle,
+  mode: string | undefined,
+  completionPolicy: TaskCompletionPolicy,
+  sourceCallId: string,
+): SubagentToolResult {
+  const metadata = {
+    ...metadataFor(task, mode),
+    completionPolicy,
+    completion_policy: completionPolicy,
+    notificationRequested: completionPolicy === "notify",
+    sourceCallId,
+    source_call_id: sourceCallId,
+  };
+  const background = normalizeTaskMode(mode) === "background";
+  const integrationRequired = completionPolicy !== "detached";
+  const resultDelivery = !background
+    ? "inline_terminal"
+    : completionPolicy === "notify"
+      ? "completion_notification"
+      : completionPolicy === "detached"
+        ? "none"
+        : "task_wait_required";
+  const nextAction = !background
+    ? "Read this final summary, verify or follow up on gaps, and integrate it into the answer to the original request."
+    : completionPolicy === "notify"
+      ? "This is only an interim handle. The parent will be woken at terminal state; then read the final summary and finish the original request instead of only reporting completion."
+      : completionPolicy === "detached"
+        ? "This task is intentionally detached and will not wake the parent; do not promise its result in the current response."
+        : "Call task_wait for this handle, read the terminal summary, and integrate it before answering the original request.";
   return {
     title: `task ${task.taskId}`,
-    output: JSON.stringify({ task_id: task.taskId, summary: task.summary, status: task.status }),
-    metadata,
+    output: JSON.stringify({
+      task_state: { task_id: task.taskId, status: task.status },
+      task_id: task.taskId,
+      status: task.status,
+      summary: task.summary,
+      source_call_id: sourceCallId,
+      completion_policy: completionPolicy,
+      integration_required: integrationRequired,
+      result_delivery: resultDelivery,
+      next_action: nextAction,
+    }),
+    metadata: {
+      ...metadata,
+      integrationRequired,
+      resultDelivery,
+      nextAction,
+    },
   };
 }
 
-function taskBatchToolResult(tasks: readonly SubagentTaskHandle[], maxConcurrency: number): SubagentToolResult {
-  return {
-    title: `task_batch ${tasks.length}`,
-    output: JSON.stringify({
-      count: tasks.length,
-      max_concurrency: maxConcurrency,
-      tasks: tasks.map((task) => ({
+function taskBatchToolResult(
+  handles: readonly SubagentTaskHandle[],
+  options: {
+    batchId: string;
+    completionPolicy: TaskCompletionPolicy;
+    expectedBatchSize: number;
+    maxConcurrency: number;
+    sourceCallId: string;
+    spawnFailures: readonly TaskBatchSpawnFailure[];
+    joinAvailable?: boolean;
+    waited?: SubagentTaskBatchWaitRecord;
+  },
+): SubagentToolResult {
+  const tasks = options.waited?.tasks ?? handles;
+  const finalCount = tasks.filter((task) => isFinalTaskStatus(task.status)).length;
+  const failedCount = tasks.filter((task) => task.status === "failed").length;
+  const incompleteCount = tasks.filter((task) => task.status === "incomplete").length;
+  const cancelledCount = tasks.filter((task) => task.status === "cancelled").length;
+  const pendingTaskIds = tasks.filter((task) => !isFinalTaskStatus(task.status)).map((task) => task.taskId);
+  const satisfied = (options.waited?.satisfied ?? false) && options.spawnFailures.length === 0;
+  const timedOut = options.waited?.timedOut ?? false;
+  const nextAction = batchNextAction(options.completionPolicy, {
+    finalCount,
+    ...(options.joinAvailable !== undefined ? { joinAvailable: options.joinAvailable } : {}),
+    spawnFailureCount: options.spawnFailures.length,
+    taskCount: tasks.length,
+    timedOut,
+  });
+  const taskOutputs = tasks.map((task) => "path" in task
+    ? taskRecordOutput(task)
+    : {
         task_id: task.taskId,
         taskId: task.taskId,
         summary: task.summary,
         status: task.status,
+      });
+
+  return {
+    title: `task_batch ${options.expectedBatchSize}`,
+    output: JSON.stringify({
+      batch_id: options.batchId,
+      batchId: options.batchId,
+      source_call_id: options.sourceCallId,
+      sourceCallId: options.sourceCallId,
+      task_states: taskOutputs.map((task) => ({
+        task_id: task.task_id,
+        status: task.status,
       })),
+      completion_policy: options.completionPolicy,
+      completionPolicy: options.completionPolicy,
+      count: options.expectedBatchSize,
+      expected_batch_size: options.expectedBatchSize,
+      expectedBatchSize: options.expectedBatchSize,
+      spawned_count: handles.length,
+      spawnedCount: handles.length,
+      spawn_failure_count: options.spawnFailures.length,
+      spawnFailureCount: options.spawnFailures.length,
+      spawn_failures: options.spawnFailures.map((failure) => ({
+        batch_index: failure.batchIndex,
+        batchIndex: failure.batchIndex,
+        description: failure.description,
+        error: failure.error,
+      })),
+      max_concurrency: options.maxConcurrency,
+      maxConcurrency: options.maxConcurrency,
+      requested_max_concurrency: options.maxConcurrency,
+      concurrency_limit_scope: "batch_request_capped_by_runtime_global",
+      join_available: options.completionPolicy === "join" ? options.joinAvailable ?? false : undefined,
+      joined: options.completionPolicy === "join" && options.waited !== undefined,
+      satisfied,
+      timed_out: timedOut,
+      timedOut,
+      final_count: finalCount,
+      failed_count: failedCount,
+      incomplete_count: incompleteCount,
+      cancelled_count: cancelledCount,
+      pending_count: pendingTaskIds.length,
+      pending_task_ids: pendingTaskIds,
+      integration_required: options.completionPolicy !== "detached",
+      required_open_batch: options.completionPolicy === "supervised" && handles.length > 0,
+      supervised_confirmation_required: options.completionPolicy === "supervised" && handles.length > 0,
+      supervised_task_ids: options.completionPolicy === "supervised" ? handles.map((task) => task.taskId) : undefined,
+      result_delivery: options.completionPolicy === "join"
+        ? "inline"
+        : options.completionPolicy === "notify"
+          ? "completion_notification"
+          : options.completionPolicy === "supervised" ? "supervised_loop" : "none",
+      next_action: nextAction,
+      tasks: taskOutputs,
     }),
     metadata: {
-      count: tasks.length,
-      maxConcurrency,
-      task_ids: tasks.map((task) => task.taskId),
-      taskIds: tasks.map((task) => task.taskId),
-      status: tasks.every((task) => task.status === "running") ? "running" : "mixed",
+      batchId: options.batchId,
+      batch_id: options.batchId,
+      sourceCallId: options.sourceCallId,
+      source_call_id: options.sourceCallId,
+      completionPolicy: options.completionPolicy,
+      completion_policy: options.completionPolicy,
+      count: options.expectedBatchSize,
+      expectedBatchSize: options.expectedBatchSize,
+      spawnedCount: handles.length,
+      spawnFailureCount: options.spawnFailures.length,
+      spawnFailures: options.spawnFailures,
+      maxConcurrency: options.maxConcurrency,
+      requestedMaxConcurrency: options.maxConcurrency,
+      concurrencyLimitScope: "batch_request_capped_by_runtime_global",
+      task_ids: handles.map((task) => task.taskId),
+      taskIds: handles.map((task) => task.taskId),
+      status: options.spawnFailures.length > 0
+        ? handles.length > 0 ? "partial_spawn" : "spawn_failed"
+        : timedOut ? "timed_out" : satisfied ? "complete" : "running",
       mode: "background",
+      satisfied,
+      timedOut,
+      finalCount,
+      failedCount,
+      incompleteCount,
+      cancelledCount,
+      pendingTaskIds,
+      integrationRequired: options.completionPolicy !== "detached",
+      requiredOpenBatch: options.completionPolicy === "supervised" && handles.length > 0,
+      supervisedConfirmationRequired: options.completionPolicy === "supervised" && handles.length > 0,
+      supervisedTaskIds: options.completionPolicy === "supervised" ? handles.map((task) => task.taskId) : [],
+      resultDelivery: options.completionPolicy === "join"
+        ? "inline"
+        : options.completionPolicy === "notify"
+          ? "completion_notification"
+          : options.completionPolicy === "supervised" ? "supervised_loop" : "none",
+      nextAction,
+      notificationRequested: options.completionPolicy === "notify",
     },
   };
 }
@@ -649,9 +1002,12 @@ function completeTaskToolResult(completion: SubagentTaskCompletion): SubagentToo
   };
 }
 
-function taskListToolResult(tasks: readonly SubagentTaskRecord[]): SubagentToolResult {
+function taskListToolResult(tasks: readonly SubagentTaskRecord[], input: TaskListToolInput): SubagentToolResult {
+  const scope = input.all ? "all_sessions" : "current_session";
   const output = {
     count: tasks.length,
+    scope,
+    ...(input.taskIds ? { task_ids: input.taskIds } : {}),
     tasks: tasks.map(taskRecordOutput),
   };
   return {
@@ -659,6 +1015,61 @@ function taskListToolResult(tasks: readonly SubagentTaskRecord[]): SubagentToolR
     output: JSON.stringify(output),
     metadata: {
       count: tasks.length,
+      scope,
+    },
+  };
+}
+
+function taskWaitBatchToolResult(waited: SubagentTaskBatchWaitRecord, batchId?: string): SubagentToolResult {
+  const finalCount = waited.tasks.filter((task) => isFinalTaskStatus(task.status)).length;
+  const failedCount = waited.tasks.filter((task) => task.status === "failed").length;
+  const incompleteCount = waited.tasks.filter((task) => task.status === "incomplete").length;
+  const cancelledCount = waited.tasks.filter((task) => task.status === "cancelled").length;
+  const pendingTaskIds = waited.tasks.filter((task) => !isFinalTaskStatus(task.status)).map((task) => task.taskId);
+  const batchClosed = pendingTaskIds.length === 0 && waited.waitFor === "all";
+  const output = pruneUndefined({
+    batch_id: batchId,
+    batchId,
+    task_states: waited.tasks.map((task) => ({ task_id: task.taskId, status: task.status })),
+    wait_for: waited.waitFor,
+    waitFor: waited.waitFor,
+    satisfied: waited.satisfied,
+    timed_out: waited.timedOut,
+    timedOut: waited.timedOut,
+    count: waited.tasks.length,
+    final_count: finalCount,
+    failed_count: failedCount,
+    incomplete_count: incompleteCount,
+    cancelled_count: cancelledCount,
+    pending_count: pendingTaskIds.length,
+    pending_task_ids: pendingTaskIds,
+    required_open_batch: !batchClosed,
+    batch_closed: batchClosed,
+    next_action: waited.timedOut
+      ? "Review newly terminal results, preserve the remaining task IDs, and call task_wait_batch again. For supervised work, use wait_for=any while reviewing/following up, then wait_for=all before the final integration."
+      : pendingTaskIds.length > 0
+        ? "Review terminal results and continue task_wait_batch(wait_for=any) on remaining IDs; follow up where needed, then wait_for=all before the final integration."
+        : waited.waitFor !== "all"
+          ? "All observed tasks are terminal, but supervised work still requires task_wait_batch(wait_for=all) over the complete batch before final integration."
+          : "All requested tasks are terminal. Read every summary, follow up or verify gaps, and produce one substantive integrated answer.",
+    tasks: waited.tasks.map(taskRecordOutput),
+  });
+  return {
+    title: `task_wait_batch ${waited.tasks.length}`,
+    output: JSON.stringify(output),
+    metadata: {
+      ...(batchId ? { batchId, batch_id: batchId } : {}),
+      waitFor: waited.waitFor,
+      satisfied: waited.satisfied,
+      timedOut: waited.timedOut,
+      count: waited.tasks.length,
+      finalCount,
+      failedCount,
+      incompleteCount,
+      cancelledCount,
+      pendingTaskIds,
+      requiredOpenBatch: !batchClosed,
+      batchClosed,
     },
   };
 }
@@ -706,6 +1117,7 @@ function mailboxRecordToolResult(title: string, message: SubagentMailboxRecord):
 
 function taskRecordOutput(task: SubagentTaskRecord): Record<string, unknown> {
   return pruneUndefined({
+    task_state: { task_id: task.taskId, status: task.status },
     task_id: task.taskId,
     taskId: task.taskId,
     path: task.path,
@@ -780,12 +1192,15 @@ function normalizeCompleteStatus(value: unknown): ValidationResult<CompleteTaskS
     case "failure":
     case "error":
       return { ok: true, value: "failed" };
+    case "incomplete":
+    case "needs_attention":
+      return { ok: true, value: "incomplete" };
     case "cancelled":
     case "canceled":
     case "cancel":
       return { ok: true, value: "cancelled" };
     default:
-      return { ok: false, message: "status must be completed, failed, or cancelled" };
+      return { ok: false, message: "status must be completed, incomplete, failed, or cancelled" };
   }
 }
 
@@ -796,17 +1211,46 @@ function normalizeTaskStatus(value: unknown): ValidationResult<SubagentTaskStatu
     case "pending":
     case "running":
     case "completed":
+    case "incomplete":
     case "failed":
     case "cancelled":
       return { ok: true, value: value.trim().toLowerCase() as SubagentTaskStatus };
     case "canceled":
       return { ok: true, value: "cancelled" };
     default:
-      return { ok: false, message: "status must be pending, running, completed, failed, or cancelled" };
+      return { ok: false, message: "status must be pending, running, completed, incomplete, failed, or cancelled" };
   }
 }
 
-function normalizeMailboxStatus(value: unknown): ValidationResult<"queued" | "delivering" | "consumed" | undefined> {
+function normalizeTaskCompletionPolicy(value: unknown): ValidationResult<TaskCompletionPolicy | undefined> {
+  if (value === undefined) return { ok: true, value: undefined };
+  if (typeof value !== "string") return { ok: false, message: "completionPolicy must be a string" };
+  switch (value.trim().toLowerCase()) {
+    case "join":
+    case "notify":
+    case "detached":
+    case "supervised":
+      return { ok: true, value: value.trim().toLowerCase() as TaskCompletionPolicy };
+    default:
+      return { ok: false, message: "completionPolicy must be join, notify, detached, or supervised" };
+  }
+}
+
+function normalizeTaskWaitMode(value: unknown): ValidationResult<"any" | "all" | undefined> {
+  if (value === undefined) return { ok: true, value: undefined };
+  if (typeof value !== "string") return { ok: false, message: "waitFor must be a string" };
+  switch (value.trim().toLowerCase()) {
+    case "any":
+    case "all":
+      return { ok: true, value: value.trim().toLowerCase() as "any" | "all" };
+    default:
+      return { ok: false, message: "waitFor must be any or all" };
+  }
+}
+
+function normalizeMailboxStatus(
+  value: unknown,
+): ValidationResult<"queued" | "delivering" | "consumed" | "discarded" | undefined> {
   if (value === undefined) return { ok: true, value: undefined };
   if (typeof value !== "string") return { ok: false, message: "status must be a string" };
   switch (value.trim().toLowerCase()) {
@@ -819,8 +1263,11 @@ function normalizeMailboxStatus(value: unknown): ValidationResult<"queued" | "de
     case "consumed":
     case "done":
       return { ok: true, value: "consumed" };
+    case "discarded":
+    case "skipped":
+      return { ok: true, value: "discarded" };
     default:
-      return { ok: false, message: "status must be queued, delivering, or consumed" };
+      return { ok: false, message: "status must be queued, delivering, consumed, or discarded" };
   }
 }
 
@@ -838,6 +1285,35 @@ function requiredNonEmptyString(
   const value = nonEmptyString(picked.value);
   if (value === undefined) return { ok: false, message: `${name} must be a non-empty string` };
   return { ok: true, value };
+}
+
+function optionalNonEmptyString(
+  picked: { ok: true; value?: string } | { ok: false },
+  name: string,
+): ValidationResult<string | undefined> {
+  if (!picked.ok) return { ok: false, message: `${name} must be a string` };
+  if (picked.value === undefined) return { ok: true, value: undefined };
+  const value = nonEmptyString(picked.value);
+  if (value === undefined) return { ok: false, message: `${name} must be a non-empty string` };
+  return { ok: true, value };
+}
+
+function optionalTaskIds(value: unknown, name: string): ValidationResult<string[] | undefined> {
+  if (value === undefined) return { ok: true, value: undefined };
+  if (!Array.isArray(value)) return { ok: false, message: `${name} must be an array` };
+  const taskIds: string[] = [];
+  const seen = new Set<string>();
+  for (const [index, item] of value.entries()) {
+    if (typeof item !== "string" || nonEmptyString(item) === undefined) {
+      return { ok: false, message: `${name}[${index}] must be a non-empty string` };
+    }
+    const taskId = item.trim();
+    if (!seen.has(taskId)) {
+      seen.add(taskId);
+      taskIds.push(taskId);
+    }
+  }
+  return { ok: true, value: taskIds };
 }
 
 function optionalPositiveInteger(value: unknown, name: string): ValidationResult<number | undefined> {
@@ -858,8 +1334,9 @@ async function runTaskBatch(
   tasks: readonly TaskToolInput[],
   maxConcurrency: number,
   spawn: (task: TaskToolInput) => Promise<SubagentTaskHandle>,
-): Promise<SubagentTaskHandle[]> {
-  const results: SubagentTaskHandle[] = new Array(tasks.length);
+): Promise<TaskBatchSpawnResult> {
+  const results: Array<SubagentTaskHandle | undefined> = new Array(tasks.length);
+  const failures: TaskBatchSpawnFailure[] = [];
   let nextIndex = 0;
   const workerCount = Math.min(maxConcurrency, tasks.length);
 
@@ -869,11 +1346,71 @@ async function runTaskBatch(
       nextIndex += 1;
       const task = tasks[index];
       if (!task) throw new Error(`Missing task at index ${index}`);
-      results[index] = await spawn(task);
+      try {
+        results[index] = await spawn(task);
+      } catch (error) {
+        failures.push({
+          batchIndex: index,
+          description: task.description,
+          error: preview(errorMessage(error)),
+        });
+      }
     }
   }));
 
-  return results;
+  return {
+    tasks: results.filter((task): task is SubagentTaskHandle => task !== undefined),
+    failures: failures.sort((left, right) => left.batchIndex - right.batchIndex),
+  };
+}
+
+function isFinalTaskStatus(status: SubagentTaskStatus): boolean {
+  return status === "completed" || status === "incomplete" || status === "failed" || status === "cancelled";
+}
+
+function batchNextAction(
+  completionPolicy: TaskCompletionPolicy,
+  state: {
+    finalCount: number;
+    joinAvailable?: boolean;
+    spawnFailureCount: number;
+    taskCount: number;
+    timedOut: boolean;
+  },
+): string {
+  if (completionPolicy === "supervised" && state.taskCount > 0) {
+    return state.finalCount < state.taskCount
+      ? "This supervised batch remains required by the current parent turn. Call task_wait_batch(wait_for=any) on remaining task IDs, review each terminal result and use task_followup when needed, then confirm task_wait_batch(wait_for=all) before one integrated answer."
+      : "These supervised handles are already terminal, but the parent must still confirm the complete batch with task_wait_batch(wait_for=all), then verify every result and provide one integrated answer.";
+  }
+  if (completionPolicy === "join" && state.joinAvailable === false) {
+    if (state.spawnFailureCount > 0) {
+      return "Join is unavailable in this runtime; report every spawn failure and call task_wait_batch with successful task IDs before results are needed.";
+    }
+    return "Join is unavailable in this runtime; preserve the task IDs and call task_wait_batch before results are needed.";
+  }
+  if (state.spawnFailureCount > 0 && (state.timedOut || state.finalCount < state.taskCount)) {
+    return "Report every spawn failure, preserve successful task IDs, and call task_wait_batch before responding whenever pending results are required.";
+  }
+  if (state.timedOut || state.finalCount < state.taskCount) {
+    return "Preserve the task IDs and call task_wait_batch before responding whenever pending results are required.";
+  }
+  if (state.spawnFailureCount > 0) {
+    return "Integrate results from spawned tasks and explicitly report every spawn failure; failed spawn attempts have no task handle.";
+  }
+  if (completionPolicy === "join") {
+    return "Read every terminal summary, follow up or verify gaps, and answer the original request with one substantive integration; explicitly report failed, incomplete, or cancelled tasks.";
+  }
+  if (completionPolicy === "notify") {
+    return "This is only an interim handle set. The parent will be woken when the batch is terminal; then read every result and finish the original request instead of only announcing completion.";
+  }
+  if (completionPolicy === "supervised") return "Report every spawn failure and integrate the available evidence; no supervised task handle was created to wait on.";
+  return "This batch is intentionally detached and will not wake the parent; do not promise its results in the current response.";
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
 }
 
 function isBackgroundTaskInput(input: unknown): boolean {

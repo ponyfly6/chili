@@ -1581,6 +1581,48 @@ test("scoped worker policy restricts team messages to the worker identity", asyn
   }
 });
 
+test("scoped worker policy confines direct agent messages to parent and descendants", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-policy-agent-message-"));
+  try {
+    const registry = new InMemoryToolRegistry();
+    registry.register(fakeAgentMessageSendTool());
+    const executor = createExecutor(registry, {
+      resolve: () => ({
+        allowedTools: ["agent_message_send"],
+        writeScope: [],
+        memberPath: "/root/worker",
+      }),
+    });
+
+    for (const to of ["parent", "/root", "/root/worker/reader"]) {
+      const allowed = await executor.execute(toolInput(
+        "agent_message_send",
+        { from: "/root/worker", to, content: "hello" },
+        workspace,
+      ));
+      expect(allowed.status).toBe("completed");
+    }
+
+    const sibling = await executor.execute(toolInput(
+      "agent_message_send",
+      { from: "/root/worker", to: "/root/other", content: "no" },
+      workspace,
+    ));
+    expect(sibling.status).toBe("failed");
+    if (sibling.status === "failed") expect(sibling.error.message).toContain("parent or descendants");
+
+    const impersonation = await executor.execute(toolInput(
+      "agent_message_send",
+      { from: "/root/other", to: "parent", content: "no" },
+      workspace,
+    ));
+    expect(impersonation.status).toBe("failed");
+    if (impersonation.status === "failed") expect(impersonation.error.message).toContain("sender");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 function registryWithCoreTools(): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool());
@@ -1612,6 +1654,17 @@ function fakeTeamMessageSendTool() {
     inputSchema: { type: "object" },
     approval: (): false => false,
     execute: async () => ({ title: "team_message_send", output: "sent" }),
+  };
+}
+
+function fakeAgentMessageSendTool() {
+  return {
+    name: "agent_message_send",
+    description: "Send a direct agent message.",
+    risk: "write" as const,
+    inputSchema: { type: "object" },
+    approval: (): false => false,
+    execute: async () => ({ title: "agent_message_send", output: "sent" }),
   };
 }
 

@@ -1,20 +1,38 @@
-import type { AgentPath, ToolExecutionContext } from "@chili/protocol";
+import type {
+  AgentPath,
+  TaskCompletionPolicy as ProtocolTaskCompletionPolicy,
+  ToolCallId,
+  ToolExecutionContext,
+} from "@chili/protocol";
 
-export type SubagentTaskStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
+export type SubagentTaskStatus = "pending" | "running" | "completed" | "incomplete" | "failed" | "cancelled";
 
-export type CompleteTaskStatus = "completed" | "failed" | "cancelled";
+export type CompleteTaskStatus = "completed" | "incomplete" | "failed" | "cancelled";
 
-export type SubagentMailboxStatus = "queued" | "delivering" | "consumed";
+export type SubagentMailboxStatus = "queued" | "delivering" | "consumed" | "discarded";
+
+export type TaskCompletionPolicy = ProtocolTaskCompletionPolicy;
+
+export type TaskWaitMode = "any" | "all";
 
 export interface TaskToolInput {
   description: string;
   prompt: string;
   mode?: string;
+  sourceCallId?: ToolCallId;
+  batchId?: string;
+  batchIndex?: number;
+  expectedBatchSize?: number;
+  maxConcurrency?: number;
+  completionPolicy?: TaskCompletionPolicy;
 }
 
 export interface TaskBatchToolInput {
   tasks: TaskToolInput[];
   maxConcurrency?: number;
+  completionPolicy?: TaskCompletionPolicy;
+  timeoutMs?: number;
+  batchId?: string;
 }
 
 export interface CompleteTaskToolInput {
@@ -68,6 +86,7 @@ export interface SubagentMailboxRecord {
 
 export interface TaskListToolInput {
   status?: SubagentTaskStatus;
+  taskIds?: string[];
   limit?: number;
   all?: boolean;
 }
@@ -75,6 +94,20 @@ export interface TaskListToolInput {
 export interface TaskWaitToolInput {
   taskId: string;
   timeoutMs?: number;
+}
+
+export interface TaskWaitBatchToolInput {
+  taskIds: string[];
+  waitFor?: TaskWaitMode;
+  timeoutMs?: number;
+  batchId?: string;
+}
+
+export interface SubagentTaskBatchWaitRecord {
+  waitFor: TaskWaitMode;
+  satisfied: boolean;
+  timedOut: boolean;
+  tasks: SubagentTaskRecord[];
 }
 
 export interface TaskFollowupToolInput {
@@ -113,6 +146,7 @@ export interface SubagentController {
 export interface SubagentControlController {
   listTasks(input: TaskListToolInput, context: SubagentToolContext): Promise<SubagentTaskRecord[]>;
   waitTask(input: TaskWaitToolInput, context: SubagentToolContext): Promise<SubagentTaskRecord>;
+  waitTasks(input: TaskWaitBatchToolInput, context: SubagentToolContext): Promise<SubagentTaskBatchWaitRecord>;
   followupTask(input: TaskFollowupToolInput, context: SubagentToolContext): Promise<SubagentTaskRecord>;
   closeTask(input: TaskCloseToolInput, context: SubagentToolContext): Promise<SubagentTaskRecord>;
   listMailbox(input: MailboxListToolInput, context: SubagentToolContext): Promise<SubagentMailboxRecord[]>;

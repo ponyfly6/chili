@@ -50,6 +50,12 @@ jobs:
       - name: Unit tests
         run: bun test --only-failures
 
+      - name: Website build and render test
+        run: |
+          bun --cwd apps/web run typecheck
+          bun --cwd apps/web run build
+          node --test apps/web/tests/rendered-html.mjs
+
       - name: Fake-model smoke gate
         run: bun run smoke:all
 

@@ -15,6 +15,7 @@ import type {
   TeamId,
   ThreadId,
   TimestampMs,
+  ToolCallId,
   TurnId,
 } from "@chili/protocol";
 import { ObservableEventStore } from "./observable-event-store.js";
@@ -255,6 +256,78 @@ test("classifies persisted child agent sessions as subagents", async () => {
     const sessions = await store.sessions();
     expect(sessions.find((session) => session.id === parentSessionId)?.source).toBe("interactive");
     expect(sessions.find((session) => session.id === childSessionId)?.source).toBe("subagent");
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("keeps a team lead session interactive while classifying worker sessions as subagents", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-team-session-source-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const rootSessionId = "session_source_team_root" as SessionId;
+  const rootThreadId = "thread_source_team_root" as ThreadId;
+  const workerSessionId = "session_source_team_worker" as SessionId;
+  const workerThreadId = "thread_source_team_worker" as ThreadId;
+  const teamId = "team_source" as TeamId;
+  const leadPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+
+  try {
+    await store.appendMany([
+      sessionEvent("event_source_team_root", rootSessionId, rootThreadId, 1 as TimestampMs),
+      sessionEvent("event_source_team_worker", workerSessionId, workerThreadId, 2 as TimestampMs),
+      {
+        id: "event_source_team_created",
+        type: "team.created",
+        time: 3 as TimestampMs,
+        sessionId: rootSessionId,
+        threadId: rootThreadId,
+        payload: {
+          teamId,
+          name: "source team",
+          leadPath,
+        },
+      },
+      {
+        id: "event_source_team_lead",
+        type: "team.member_added",
+        time: 4 as TimestampMs,
+        sessionId: rootSessionId,
+        threadId: rootThreadId,
+        payload: {
+          teamId,
+          path: leadPath,
+          name: "team-lead",
+          role: "leader",
+          status: "running",
+          childSessionId: rootSessionId,
+          childThreadId: rootThreadId,
+        },
+      },
+      {
+        id: "event_source_team_worker_member",
+        type: "team.member_added",
+        time: 5 as TimestampMs,
+        sessionId: rootSessionId,
+        threadId: rootThreadId,
+        payload: {
+          teamId,
+          path: workerPath,
+          name: "worker",
+          role: "implementer",
+          childSessionId: workerSessionId,
+          childThreadId: workerThreadId,
+        },
+      },
+    ]);
+
+    const sessions = await store.sessions();
+    expect(sessions.find((session) => session.id === rootSessionId)?.source).toBe("interactive");
+    expect(sessions.find((session) => session.id === workerSessionId)?.source).toBe("subagent");
+    expect(await store.teamMembers({ childSessionId: workerSessionId })).toEqual([
+      expect.objectContaining({ teamId, path: workerPath, childThreadId: workerThreadId }),
+    ]);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -1237,6 +1310,119 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
   }
 });
 
+test("round-trips and queries local subagent scheduling provenance", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-subagent-provenance-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const parentSessionId = "session_provenance_parent" as SessionId;
+  const parentThreadId = "thread_provenance_parent" as ThreadId;
+  const sourceCallId = "call_provenance_batch" as ToolCallId;
+  const batchId = "batch_provenance";
+  const taskId = "task_provenance_created" as TaskId;
+  const spawnedTaskId = "task_provenance_spawned" as TaskId;
+
+  try {
+    await store.append({
+      id: "event_provenance_task_created",
+      type: "agent.task_created",
+      time: 1 as TimestampMs,
+      sessionId: parentSessionId,
+      threadId: parentThreadId,
+      payload: {
+        taskId,
+        path: "/root/task_provenance_created" as AgentPath,
+        parentPath: "/root" as AgentPath,
+        parentSessionId,
+        parentThreadId,
+        childSessionId: "session_provenance_created" as SessionId,
+        childThreadId: "thread_provenance_created" as ThreadId,
+        taskName: "created provenance",
+        cwd: "/repo",
+        prompt: "inspect created provenance",
+        mode: "background",
+        sourceCallId,
+        batchId,
+        batchIndex: 0,
+        expectedBatchSize: 2,
+        completionPolicy: "supervised",
+        maxConcurrency: 1,
+      },
+    });
+    await store.append({
+      id: "event_provenance_task_spawned",
+      type: "agent.spawned",
+      time: 2 as TimestampMs,
+      sessionId: parentSessionId,
+      threadId: parentThreadId,
+      payload: {
+        runId: "agent_provenance_created" as AgentRunId,
+        taskId,
+        path: "/root/task_provenance_created" as AgentPath,
+        parentPath: "/root" as AgentPath,
+        parentSessionId,
+        parentThreadId,
+        childSessionId: "session_provenance_created" as SessionId,
+        childThreadId: "thread_provenance_created" as ThreadId,
+        taskName: "created provenance",
+        cwd: "/repo",
+        mode: "background",
+        generation: 1,
+      },
+    });
+
+    await store.append({
+      id: "event_provenance_spawn_only",
+      type: "agent.spawned",
+      time: 3 as TimestampMs,
+      sessionId: parentSessionId,
+      threadId: parentThreadId,
+      payload: {
+        runId: "agent_provenance_spawned" as AgentRunId,
+        taskId: spawnedTaskId,
+        path: "/root/task_provenance_spawned" as AgentPath,
+        parentPath: "/root" as AgentPath,
+        parentSessionId,
+        parentThreadId,
+        childSessionId: "session_provenance_spawned" as SessionId,
+        childThreadId: "thread_provenance_spawned" as ThreadId,
+        taskName: "spawned provenance",
+        cwd: "/repo",
+        mode: "background",
+        generation: 1,
+        sourceCallId,
+        batchId,
+        batchIndex: 1,
+        expectedBatchSize: 2,
+        completionPolicy: "notify",
+        maxConcurrency: 1,
+      },
+    });
+
+    expect(await store.agentTask(taskId)).toMatchObject({
+      sourceCallId,
+      batchId,
+      batchIndex: 0,
+      expectedBatchSize: 2,
+      completionPolicy: "supervised",
+      maxConcurrency: 1,
+    });
+    expect(await store.agentTask(spawnedTaskId)).toMatchObject({
+      sourceCallId,
+      batchId,
+      batchIndex: 1,
+      expectedBatchSize: 2,
+      completionPolicy: "notify",
+      maxConcurrency: 1,
+    });
+    expect((await store.agentTasks({ sourceCallId, batchId })).map((task) => task.id)).toEqual([
+      taskId,
+      spawnedTaskId,
+    ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("claims, renews, expires, and releases task leases with generation CAS", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-task-lease-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -1288,6 +1474,25 @@ test("claims, renews, expires, and releases task leases with generation CAS", as
       },
     });
 
+    const staleExpirySnapshot = await store.closeAgentTaskCas({
+      taskId,
+      status: "cancelled",
+      eventId: "event_stale_expiry_task_close",
+      agentEventId: "event_stale_expiry_run_close",
+      expectedGeneration: 2,
+      expectedRunId: runId,
+      expectedLeaseOwner: "worker_a",
+      expectedLeaseExpiresAt: 150,
+      requireExpiredLease: true,
+      time: 171,
+    });
+    expect(staleExpirySnapshot.applied).toBe(false);
+    expect(await store.agentTask(taskId)).toMatchObject({
+      status: "running",
+      generation: 2,
+      leaseExpiresAt: 170,
+    });
+
     const expiredClaim = await store.claimAgentTaskLease({ taskId, owner: "worker_b", ttlMs: 50, now: 171 });
     expect(expiredClaim).toMatchObject({
       acquired: true,
@@ -1304,6 +1509,518 @@ test("claims, renews, expires, and releases task leases with generation CAS", as
     expect(await store.agentTask(taskId)).toMatchObject({ generation: 3 });
     expect((await store.agentTask(taskId))?.leaseOwner).toBeUndefined();
     expect((await store.agentTask(taskId))?.leaseExpiresAt).toBeUndefined();
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("rejects stale lease-holder finalization after a takeover generation", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-task-lease-takeover-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const taskId = "task_lease_takeover" as TaskId;
+  const runId = "agent_lease_takeover" as AgentRunId;
+  const path = "/root/task_lease_takeover" as AgentPath;
+
+  try {
+    await appendRunningTask(store, { taskId, runId, path, generation: 1, time: 1 as TimestampMs });
+    const first = await store.claimAgentTaskLease({
+      taskId,
+      runId,
+      generation: 1,
+      owner: "worker_a",
+      ttlMs: 50,
+      now: 100,
+    });
+    expect(first).toMatchObject({ acquired: true, task: { generation: 2, leaseOwner: "worker_a" } });
+
+    const expiredRenewal = await store.renewAgentTaskLease({
+      taskId,
+      owner: "worker_a",
+      generation: 2,
+      ttlMs: 50,
+      now: 150,
+    });
+    expect(expiredRenewal.acquired).toBe(false);
+
+    const takeover = await store.claimAgentTaskLease({
+      taskId,
+      runId,
+      generation: 2,
+      owner: "worker_b",
+      ttlMs: 50,
+      now: 150,
+    });
+    expect(takeover).toMatchObject({ acquired: true, task: { generation: 3, leaseOwner: "worker_b" } });
+    expect(sqliteDatabase(store).query<{ generation: number }, [string]>(
+      "select generation from agent_runs where id = ?",
+    ).get(runId)?.generation).toBe(3);
+
+    await store.append({
+      id: "event_stale_agent_completion",
+      type: "agent.completed",
+      time: 151 as TimestampMs,
+      payload: {
+        runId,
+        taskId,
+        path,
+        status: "failed",
+        generation: 2,
+        error: "stale worker result",
+      },
+    });
+    expect(await store.agentTask(taskId)).toMatchObject({ status: "running", generation: 3 });
+    expect(await store.agentRuns({ taskId })).toEqual([
+      expect.objectContaining({ id: runId, status: "running" }),
+    ]);
+
+    const staleCompletion = await store.completeAgentTaskCas({
+      taskId,
+      path,
+      runId,
+      generation: 2,
+      expectedGeneration: 2,
+      expectedRunId: runId,
+      expectedLeaseOwner: "worker_a",
+      requireActiveLease: true,
+      status: "completed",
+      eventId: "event_stale_task_completion",
+      agentEventId: "event_stale_run_completion",
+      time: 152,
+    });
+    const staleClose = await store.closeAgentTaskCas({
+      taskId,
+      status: "cancelled",
+      eventId: "event_stale_task_close",
+      agentEventId: "event_stale_run_close",
+      expectedGeneration: 2,
+      expectedRunId: runId,
+      expectedLeaseOwner: "worker_a",
+      time: 152,
+    });
+    expect(staleCompletion).toMatchObject({ applied: false, events: [] });
+    expect(staleClose).toMatchObject({ applied: false, events: [] });
+    expect(await store.agentTask(taskId)).toMatchObject({
+      status: "running",
+      generation: 3,
+      leaseOwner: "worker_b",
+    });
+
+    const winner = await store.completeAgentTaskCas({
+      taskId,
+      path: "/caller/supplied/wrong-path" as AgentPath,
+      runId,
+      generation: 3,
+      expectedGeneration: 3,
+      expectedRunId: runId,
+      expectedLeaseOwner: "worker_b",
+      requireActiveLease: true,
+      status: "completed",
+      summary: "winner result",
+      eventId: "event_winner_task_completion",
+      agentEventId: "event_winner_run_completion",
+      time: 160,
+    });
+    expect(winner.applied).toBe(true);
+    expect(winner.events.map((event) => event.id)).toEqual([
+      "event_winner_task_completion",
+      "event_winner_run_completion",
+    ]);
+    expect(winner.events.map((event) => {
+      if (event.type !== "agent.task_completed" && event.type !== "agent.completed") {
+        throw new Error(`Unexpected completion event: ${event.type}`);
+      }
+      return event.payload.path;
+    })).toEqual([path, path]);
+    expect(await store.agentTask(taskId)).toMatchObject({ status: "completed", generation: 3 });
+    expect(await store.agentRuns({ taskId })).toEqual([
+      expect.objectContaining({ id: runId, status: "completed" }),
+    ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("rolls back paired task and run completion when the second event cannot insert", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-task-pair-rollback-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const taskId = "task_pair_rollback" as TaskId;
+  const runId = "agent_pair_rollback" as AgentRunId;
+  const path = "/root/task_pair_rollback" as AgentPath;
+
+  try {
+    await appendRunningTask(store, { taskId, runId, path, generation: 1, time: 1 as TimestampMs });
+    await store.append(sessionEvent(
+      "event_pair_run_conflict",
+      "session_conflict" as SessionId,
+      "thread_conflict" as ThreadId,
+      2 as TimestampMs,
+    ));
+
+    await expect(store.completeAgentTaskCas({
+      taskId,
+      path,
+      runId,
+      generation: 1,
+      expectedGeneration: 1,
+      expectedRunId: runId,
+      expectedLeaseOwner: null,
+      status: "completed",
+      eventId: "event_pair_task_new",
+      agentEventId: "event_pair_run_conflict",
+      time: 3,
+    })).rejects.toThrow();
+
+    expect(await store.agentTask(taskId)).toMatchObject({ status: "running", generation: 1 });
+    expect(await store.agentRuns({ taskId })).toEqual([
+      expect.objectContaining({ id: runId, status: "running" }),
+    ]);
+    expect(await store.events({ type: "agent.task_completed", limit: 10 })).toEqual([]);
+    expect(await store.events({ type: "agent.completed", limit: 10 })).toEqual([]);
+    expect((await store.events({ limit: 20 })).map((event) => event.id)).not.toContain("event_pair_task_new");
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("atomically completes a task and consumes its delivering mailbox message", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-task-mailbox-complete-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const taskId = "task_mailbox_complete" as TaskId;
+  const runId = "agent_mailbox_complete" as AgentRunId;
+  const path = "/root/task_mailbox_complete" as AgentPath;
+  const messageId = "event_mailbox_complete_message";
+
+  try {
+    await appendRunningTask(store, { taskId, runId, path, generation: 1, time: 1 as TimestampMs });
+    await store.append({
+      id: messageId,
+      type: "agent.message_queued",
+      time: 2 as TimestampMs,
+      payload: {
+        taskId,
+        path,
+        from: "/root" as AgentPath,
+        triggerTurn: true,
+        message: { role: "user", content: "finish this" },
+      },
+    });
+    expect((await store.claimAgentMailboxMessage({
+      messageId,
+      eventId: "event_mailbox_complete_claim",
+      time: 3,
+    })).applied).toBe(true);
+
+    const result = await store.completeAgentTaskCas({
+      taskId,
+      path,
+      runId,
+      generation: 1,
+      expectedGeneration: 1,
+      expectedRunId: runId,
+      expectedLeaseOwner: null,
+      status: "completed",
+      summary: "done",
+      eventId: "event_mailbox_complete_task",
+      agentEventId: "event_mailbox_complete_agent",
+      mailboxMessageId: messageId,
+      mailboxConsumeEventId: "event_mailbox_complete_consumed",
+      time: 4,
+    });
+
+    expect(result.applied).toBe(true);
+    expect(result.events.map((event) => event.type)).toEqual([
+      "agent.task_completed",
+      "agent.completed",
+      "agent.message_consumed",
+    ]);
+    expect(await store.agentTask(taskId)).toMatchObject({ status: "completed", generation: 1 });
+    expect(await store.agentRuns({ taskId })).toEqual([
+      expect.objectContaining({ id: runId, status: "completed" }),
+    ]);
+    expect(await store.agentMailbox({ messageId, limit: 1 })).toEqual([
+      expect.objectContaining({ id: messageId, status: "consumed", consumedAt: 4 }),
+    ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("atomically closes a task and requeues its delivering mailbox message", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-task-mailbox-close-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const taskId = "task_mailbox_close" as TaskId;
+  const runId = "agent_mailbox_close" as AgentRunId;
+  const path = "/root/task_mailbox_close" as AgentPath;
+  const messageId = "event_mailbox_close_message";
+
+  try {
+    await appendRunningTask(store, { taskId, runId, path, generation: 1, time: 1 as TimestampMs });
+    await store.append({
+      id: messageId,
+      type: "agent.message_queued",
+      time: 2 as TimestampMs,
+      payload: {
+        taskId,
+        path,
+        from: "/root" as AgentPath,
+        triggerTurn: true,
+        message: { role: "user", content: "retry this" },
+      },
+    });
+    expect((await store.claimAgentMailboxMessage({
+      messageId,
+      eventId: "event_mailbox_close_claim",
+      time: 3,
+    })).applied).toBe(true);
+
+    const result = await store.closeAgentTaskCas({
+      taskId,
+      status: "incomplete",
+      summary: "retry after lost ownership",
+      error: "followup_lease_lost",
+      eventId: "event_mailbox_close_task",
+      agentEventId: "event_mailbox_close_agent",
+      expectedGeneration: 1,
+      expectedRunId: runId,
+      expectedLeaseOwner: null,
+      mailboxMessageId: messageId,
+      mailboxEventId: "event_mailbox_close_requeued",
+      mailboxDisposition: "requeue",
+      mailboxError: "followup_lease_lost",
+      time: 4,
+    });
+
+    expect(result.applied).toBe(true);
+    expect(result.events.map((event) => event.type)).toEqual([
+      "agent.task_completed",
+      "agent.completed",
+      "agent.message_requeued",
+    ]);
+    expect(await store.agentTask(taskId)).toMatchObject({ status: "incomplete", generation: 2 });
+    expect(await store.agentRuns({ taskId })).toEqual([
+      expect.objectContaining({ id: runId, status: "incomplete" }),
+    ]);
+    expect(await store.agentMailbox({ messageId, limit: 1 })).toEqual([
+      expect.objectContaining({ id: messageId, status: "queued" }),
+    ]);
+    expect(result.events.at(-1)).toMatchObject({
+      type: "agent.message_requeued",
+      payload: { messageId, taskId, error: "followup_lease_lost" },
+    });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("rolls back task, run, and mailbox completion when the mailbox event cannot insert", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-task-mailbox-rollback-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const taskId = "task_mailbox_rollback" as TaskId;
+  const runId = "agent_mailbox_rollback" as AgentRunId;
+  const path = "/root/task_mailbox_rollback" as AgentPath;
+  const messageId = "event_mailbox_rollback_message";
+
+  try {
+    await appendRunningTask(store, { taskId, runId, path, generation: 1, time: 1 as TimestampMs });
+    await store.append({
+      id: messageId,
+      type: "agent.message_queued",
+      time: 2 as TimestampMs,
+      payload: {
+        taskId,
+        path,
+        from: "/root" as AgentPath,
+        triggerTurn: true,
+        message: { role: "user", content: "finish atomically" },
+      },
+    });
+    expect((await store.claimAgentMailboxMessage({
+      messageId,
+      eventId: "event_mailbox_rollback_claim",
+      time: 3,
+    })).applied).toBe(true);
+    await store.append(sessionEvent(
+      "event_mailbox_rollback_conflict",
+      "session_mailbox_rollback" as SessionId,
+      "thread_mailbox_rollback" as ThreadId,
+      4 as TimestampMs,
+    ));
+
+    await expect(store.completeAgentTaskCas({
+      taskId,
+      path,
+      runId,
+      generation: 1,
+      expectedGeneration: 1,
+      expectedRunId: runId,
+      expectedLeaseOwner: null,
+      status: "completed",
+      eventId: "event_mailbox_rollback_task",
+      agentEventId: "event_mailbox_rollback_agent",
+      mailboxMessageId: messageId,
+      mailboxConsumeEventId: "event_mailbox_rollback_conflict",
+      time: 5,
+    })).rejects.toThrow();
+
+    expect(await store.agentTask(taskId)).toMatchObject({ status: "running", generation: 1 });
+    expect(await store.agentRuns({ taskId })).toEqual([
+      expect.objectContaining({ id: runId, status: "running" }),
+    ]);
+    expect(await store.agentMailbox({ messageId, limit: 1 })).toEqual([
+      expect.objectContaining({ id: messageId, status: "delivering" }),
+    ]);
+    expect((await store.events({ type: "agent.task_completed", limit: 10 })).map((event) => event.id)).toEqual([]);
+    expect((await store.events({ type: "agent.completed", limit: 10 })).map((event) => event.id)).toEqual([]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("claims exactly one concurrent follow-up generation with its queued message", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-task-run-claim-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const taskId = "task_run_claim" as TaskId;
+  const oldRunId = "agent_run_claim_old" as AgentRunId;
+  const path = "/root/task_run_claim" as AgentPath;
+
+  try {
+    await appendRunningTask(store, { taskId, runId: oldRunId, path, generation: 1, time: 1 as TimestampMs });
+    const initialCompletion = await store.completeAgentTaskCas({
+      taskId,
+      path,
+      runId: oldRunId,
+      generation: 1,
+      expectedGeneration: 1,
+      expectedRunId: oldRunId,
+      expectedLeaseOwner: null,
+      status: "completed",
+      eventId: "event_run_claim_initial_task",
+      agentEventId: "event_run_claim_initial_agent",
+      time: 2,
+    });
+    expect(initialCompletion.applied).toBe(true);
+
+    const contenders = ["a", "b"] as const;
+    const results = await Promise.all(contenders.map((suffix) => store.beginAgentTaskRunCas({
+      taskId,
+      expectedGeneration: 1,
+      expectedRunId: oldRunId,
+      expectedLeaseOwner: null,
+      runId: `agent_run_claim_${suffix}` as AgentRunId,
+      generation: 2,
+      leaseOwner: `followup:agent_run_claim_${suffix}`,
+      leaseTtlMs: 100,
+      spawnEventId: `event_run_claim_spawn_${suffix}`,
+      messageEventId: `event_run_claim_message_${suffix}`,
+      messageClaimEventId: `event_run_claim_message_claim_${suffix}`,
+      from: "/root" as AgentPath,
+      message: { role: "user", content: `follow-up ${suffix}` },
+      time: 3,
+    })));
+
+    expect(results.filter((result) => result.applied)).toHaveLength(1);
+    expect(results.filter((result) => !result.applied)).toHaveLength(1);
+    expect(results.find((result) => result.applied)?.events.map((event) => event.type)).toEqual([
+      "agent.message_queued",
+      "agent.message_claimed",
+      "agent.spawned",
+    ]);
+    const task = await store.agentTask(taskId);
+    expect(task).toMatchObject({
+      status: "running",
+      generation: 2,
+      leaseOwner: expect.stringContaining("followup:agent_run_claim_"),
+      leaseExpiresAt: 103,
+    });
+    const winnerRunId = results.find((result) => result.applied)?.events.find(
+      (event) => event.type === "agent.spawned",
+    )?.payload.runId;
+    expect(task?.currentRunId).toBe(winnerRunId);
+    expect(((await store.events({ type: "agent.message_queued", limit: 10 })) as ChiliEvent[]).filter(
+      (event) => event.type === "agent.message_queued" && event.payload.taskId === taskId,
+    )).toHaveLength(1);
+    expect(await store.agentMailbox({ taskId, status: "delivering", limit: 10 })).toHaveLength(1);
+    expect(((await store.events({ type: "agent.spawned", limit: 10 })) as ChiliEvent[]).filter(
+      (event) => event.type === "agent.spawned"
+        && event.payload.taskId === taskId
+        && event.payload.generation === 2,
+    )).toHaveLength(1);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a source mailbox retry cannot reopen an explicitly cancelled task", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-source-cancelled-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const taskId = "task_source_cancelled" as TaskId;
+  const oldRunId = "agent_source_cancelled_old" as AgentRunId;
+  const path = "/root/task_source_cancelled" as AgentPath;
+  const messageId = "event_source_cancelled_message";
+
+  try {
+    await appendRunningTask(store, { taskId, runId: oldRunId, path, generation: 1, time: 1 as TimestampMs });
+    expect((await store.closeAgentTaskCas({
+      taskId,
+      status: "cancelled",
+      eventId: "event_source_cancelled_task",
+      agentEventId: "event_source_cancelled_agent",
+      expectedGeneration: 1,
+      expectedRunId: oldRunId,
+      expectedLeaseOwner: null,
+      time: 2,
+    })).applied).toBe(true);
+    await store.append({
+      id: messageId,
+      type: "agent.message_queued",
+      time: 3 as TimestampMs,
+      payload: {
+        taskId,
+        path,
+        from: "/root" as AgentPath,
+        triggerTurn: true,
+        message: { role: "user", content: "stale retry" },
+      },
+    });
+    expect((await store.claimAgentMailboxMessage({
+      messageId,
+      eventId: "event_source_cancelled_claim",
+      time: 4,
+    })).applied).toBe(true);
+
+    const result = await store.beginAgentTaskRunCas({
+      taskId,
+      expectedGeneration: 2,
+      expectedRunId: oldRunId,
+      expectedLeaseOwner: null,
+      runId: "agent_source_cancelled_retry" as AgentRunId,
+      generation: 3,
+      leaseOwner: "task-followup:agent_source_cancelled_retry",
+      leaseTtlMs: 100,
+      spawnEventId: "event_source_cancelled_spawn",
+      sourceMailboxMessageId: messageId,
+      time: 5,
+    });
+
+    expect(result).toMatchObject({ applied: false, events: [] });
+    expect(await store.agentTask(taskId)).toMatchObject({
+      status: "cancelled",
+      generation: 2,
+      currentRunId: oldRunId,
+    });
+    expect(await store.agentMailbox({ messageId, limit: 1 })).toEqual([
+      expect.objectContaining({ id: messageId, status: "delivering" }),
+    ]);
+    expect((await store.events({ type: "agent.spawned", limit: 10 })).map((event) => event.id)).not.toContain(
+      "event_source_cancelled_spawn",
+    );
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -1334,6 +2051,10 @@ test("finalizes agent tasks through SQLite CAS without leaking stale events", as
       runId,
       generation: 2,
       owner: "worker_a",
+      expectedGeneration: 2,
+      expectedRunId: runId,
+      expectedLeaseOwner: "worker_a",
+      requireActiveLease: true,
       status: "completed",
       summary: "done",
       eventId: "event_cas_task_completed",
@@ -1365,6 +2086,10 @@ test("finalizes agent tasks through SQLite CAS without leaking stale events", as
       runId,
       generation: 2,
       owner: "worker_a",
+      expectedGeneration: 2,
+      expectedRunId: runId,
+      expectedLeaseOwner: "worker_a",
+      requireActiveLease: true,
       status: "failed",
       error: "late failure",
       eventId: "event_late_cas_task_completed",
@@ -1377,6 +2102,59 @@ test("finalizes agent tasks through SQLite CAS without leaking stale events", as
       "event_cas_task_completed",
     ]);
     expect(mirrored.map((event) => event.id)).not.toContain("event_late_cas_task_completed");
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("persists incomplete as a terminal agent task status", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-task-incomplete-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const taskId = "task_incomplete" as TaskId;
+  const runId = "agent_incomplete" as AgentRunId;
+  const path = "/root/task_incomplete" as AgentPath;
+
+  try {
+    await appendRunningTask(store, { taskId, runId, path, generation: 1, time: 1 as TimestampMs });
+    const result = await store.completeAgentTaskCas({
+      taskId,
+      path,
+      runId,
+      generation: 1,
+      expectedGeneration: 1,
+      expectedRunId: runId,
+      expectedLeaseOwner: null,
+      status: "incomplete",
+      summary: "I'll inspect it next.",
+      error: "planning_only",
+      eventId: "event_incomplete_task",
+      agentEventId: "event_incomplete_agent",
+      time: 20,
+    });
+
+    expect(result.applied).toBe(true);
+    expect(await store.agentTask(taskId)).toMatchObject({
+      status: "incomplete",
+      summary: "I'll inspect it next.",
+      error: "planning_only",
+      completedAt: 20,
+    });
+    expect((await store.agentRuns({ taskId }))[0]).toMatchObject({
+      status: "incomplete",
+      completedAt: 20,
+    });
+
+    const lateClose = await store.closeAgentTaskCas({
+      taskId,
+      status: "cancelled",
+      eventId: "event_late_close_incomplete",
+      expectedGeneration: 1,
+      expectedRunId: runId,
+      expectedLeaseOwner: null,
+      time: 21,
+    });
+    expect(lateClose.applied).toBe(false);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -1403,6 +2181,9 @@ test("close task CAS wins over runner completion CAS and Observable only emits c
       summary: "stopped",
       eventId: "event_close_cas_task",
       agentEventId: "event_close_cas_agent",
+      expectedGeneration: 2,
+      expectedRunId: runId,
+      expectedLeaseOwner: "worker_a",
       time: 20,
     });
     expect(closed.applied).toBe(true);
@@ -1420,6 +2201,10 @@ test("close task CAS wins over runner completion CAS and Observable only emits c
       runId,
       generation: 2,
       owner: "worker_a",
+      expectedGeneration: 2,
+      expectedRunId: runId,
+      expectedLeaseOwner: "worker_a",
+      requireActiveLease: true,
       status: "completed",
       summary: "late",
       eventId: "event_late_complete_cas_task",

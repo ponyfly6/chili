@@ -1,6 +1,7 @@
 import type {
   AgentMessageQueuedPayload,
   AgentPath,
+  AgentRunId,
   ChiliEvent,
   EventEnvelope,
   SessionId,
@@ -14,7 +15,7 @@ import type {
   ThreadId,
   TimestampMs,
 } from "@chili/protocol";
-import { timestampNow } from "@chili/protocol";
+import { normalizeAgentPath, timestampNow } from "@chili/protocol";
 import type {
   EventStore,
   TeamMemberRow,
@@ -23,6 +24,8 @@ import type {
   TeamProjectionStore,
   TeamRow,
   TeamTaskClaimStore,
+  TeamTaskAgentSyncResult,
+  TeamTaskAgentSyncStore,
   TeamTaskMutationResult,
   TeamTaskRow,
   TeamTaskVerificationClaimResult,
@@ -39,13 +42,14 @@ export interface TeamRuntime {
   assignTask(input: AssignTeamTaskInput): Promise<TeamTaskRow>;
   claimTask(input: ClaimTeamTaskInput): Promise<TeamTaskMutationResult>;
   claimTaskVerification(input: ClaimTeamTaskVerificationInput): Promise<TeamTaskVerificationClaimResult>;
+  syncTaskFromAgent(input: SyncTeamTaskFromAgentInput): Promise<TeamTaskAgentSyncResult>;
   updateTask(input: UpdateTeamTaskInput): Promise<TeamTaskRow>;
   sendMessage(input: SendTeamMessageInput): Promise<TeamMessageRow>;
   snapshot(teamId: TeamId): Promise<TeamSnapshot>;
 }
 
 export interface TeamControlServiceOptions {
-  store: EventStore & TeamProjectionStore & Partial<TeamTaskClaimStore> & Partial<TeamTaskVerificationClaimStore>;
+  store: EventStore & TeamProjectionStore & Partial<TeamTaskClaimStore> & Partial<TeamTaskVerificationClaimStore> & Partial<TeamTaskAgentSyncStore>;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
 }
@@ -115,6 +119,19 @@ export interface ClaimTeamTaskVerificationInput extends TeamEventContext {
   stalePendingBefore?: number;
 }
 
+export interface SyncTeamTaskFromAgentInput extends TeamEventContext {
+  teamId: TeamId;
+  taskId: TaskId;
+  agentTaskId: TaskId;
+  agentRunId: AgentRunId;
+  agentGeneration: number;
+  agentStatus: "completed" | "incomplete" | "failed" | "cancelled";
+  status: Exclude<TeamTaskStatus, "pending" | "in_progress">;
+  metadata: Record<string, unknown>;
+  summary?: string;
+  error?: string;
+}
+
 export interface UpdateTeamTaskInput extends TeamEventContext {
   teamId: TeamId;
   taskId: TaskId;
@@ -131,8 +148,10 @@ export interface UpdateTeamTaskInput extends TeamEventContext {
 export interface SendTeamMessageInput extends TeamEventContext {
   teamId: TeamId;
   messageId?: string;
-  from: AgentPath;
-  to: AgentPath | "*";
+  /** Canonical member path or unique member name. */
+  from: AgentPath | string;
+  /** Canonical member path, unique member name, or broadcast marker. */
+  to: AgentPath | string | "*";
   content: string;
   kind?: TeamMessageKind;
   delivery?: TeamMessageDelivery;
@@ -222,6 +241,27 @@ export class TeamMessageDeliveryError extends Error {
   }
 }
 
+export class TeamMemberTargetAmbiguousError extends Error {
+  constructor(readonly teamId: TeamId, readonly target: string, readonly paths: readonly AgentPath[]) {
+    super(`Team member target is ambiguous: ${target} in ${teamId} (${paths.join(", ")})`);
+    this.name = "TeamMemberTargetAmbiguousError";
+  }
+}
+
+export class TeamMessageConflictError extends Error {
+  constructor(readonly teamId: TeamId, readonly messageId: string) {
+    super(`Team message id already exists with different content or routing: ${messageId} in ${teamId}`);
+    this.name = "TeamMessageConflictError";
+  }
+}
+
+export class TeamMessageSenderUnauthorizedError extends Error {
+  constructor(readonly teamId: TeamId, readonly sessionId: SessionId, readonly sender: AgentPath) {
+    super(`Team message sender ${sender} is not authorized for session ${sessionId} in ${teamId}`);
+    this.name = "TeamMessageSenderUnauthorizedError";
+  }
+}
+
 export class TeamControlService implements TeamRuntime {
   constructor(private readonly options: TeamControlServiceOptions) {}
 
@@ -247,6 +287,8 @@ export class TeamControlService implements TeamRuntime {
           name: input.leadName ?? "team-lead",
           role: input.leadRole ?? "leader",
           status: input.leadStatus ?? "running",
+          childSessionId: input.sessionId,
+          childThreadId: input.threadId,
           writeScope: input.leadWriteScope,
         }),
       ),
@@ -406,6 +448,36 @@ export class TeamControlService implements TeamRuntime {
     return result;
   }
 
+  async syncTaskFromAgent(input: SyncTeamTaskFromAgentInput): Promise<TeamTaskAgentSyncResult> {
+    await this.requireTeam(input.teamId);
+    const syncStore = this.options.store.syncTeamTaskFromAgentCas;
+    if (!syncStore) {
+      throw new Error("Team task agent sync CAS store is not available");
+    }
+
+    const result = await syncStore.call(this.options.store, {
+      teamId: input.teamId,
+      taskId: input.taskId,
+      agentTaskId: input.agentTaskId,
+      agentRunId: input.agentRunId,
+      agentGeneration: input.agentGeneration,
+      agentStatus: input.agentStatus,
+      status: input.status,
+      metadata: input.metadata,
+      taskEventId: this.id("event"),
+      memberEventId: this.id("event"),
+      ...(input.summary !== undefined ? { summary: input.summary } : {}),
+      ...(input.error !== undefined ? { error: input.error } : {}),
+      ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      ...(input.threadId ? { threadId: input.threadId } : {}),
+      time: this.now(),
+    });
+    if (!result.applied && result.reason === "not_found") {
+      throw new TeamTaskNotFoundError(input.teamId, input.taskId);
+    }
+    return result;
+  }
+
   async updateTask(input: UpdateTeamTaskInput): Promise<TeamTaskRow> {
     const task = await this.requireTask(input.teamId, input.taskId);
     const ownerPath = input.ownerPath ?? task.ownerPath;
@@ -446,8 +518,28 @@ export class TeamControlService implements TeamRuntime {
   }
 
   async sendMessage(input: SendTeamMessageInput): Promise<TeamMessageRow> {
-    await this.requireTeam(input.teamId);
+    const team = await this.requireTeam(input.teamId);
+    const from = (await this.resolveMemberTarget(input.teamId, input.from)).path;
+    if (input.sessionId) await this.authorizeMessageSender(team, input.sessionId, from);
+    const to = input.to === "*" ? "*" : (await this.resolveMemberTarget(input.teamId, input.to)).path;
+    if (input.taskId) await this.requireTask(input.teamId, input.taskId);
     const messageId = input.messageId ?? this.id("teammsg");
+    const delivery = input.delivery ?? "queueOnly";
+    const expected: TeamMessageIdentity = {
+      teamId: input.teamId,
+      messageId,
+      from,
+      to,
+      content: input.content,
+      kind: input.kind ?? "text",
+      delivery,
+      taskId: input.taskId,
+      summary: input.summary,
+      metadata: input.metadata,
+    };
+    const existing = await this.findTeamMessage(messageId);
+    if (existing) return requireMatchingTeamMessage(existing, expected);
+
     const events: ChiliEvent[] = [
       this.teamEvent(
         input,
@@ -455,38 +547,44 @@ export class TeamControlService implements TeamRuntime {
         pruneUndefined({
           teamId: input.teamId,
           messageId,
-          from: input.from,
-          to: input.to,
+          from,
+          to,
           content: input.content,
-          kind: input.kind,
-          delivery: input.delivery,
+          kind: expected.kind,
+          delivery,
           taskId: input.taskId,
           summary: input.summary,
           metadata: input.metadata,
         }),
+        teamMessageEventId(input.teamId, messageId),
       ),
     ];
-    if (input.delivery) {
-      events.push(
-        ...(await this.teamMessageDeliveryEvents(input, {
-          teamId: input.teamId,
-          messageId,
-          from: input.from,
-          to: input.to,
-          content: input.content,
-          kind: input.kind ?? "text",
-          delivery: input.delivery,
-          taskId: input.taskId,
-          summary: input.summary,
-          metadata: input.metadata,
-          strict: true,
-        })),
-      );
-    }
-    await this.options.store.appendMany(events);
-    const message = (await this.options.store.teamMessages({ teamId: input.teamId, limit: 500 })).find(
-      (item) => item.id === messageId,
+    events.push(
+      ...(await this.teamMessageDeliveryEvents(input, {
+        teamId: input.teamId,
+        messageId,
+        from,
+        to,
+        content: input.content,
+        kind: expected.kind,
+        delivery,
+        taskId: input.taskId,
+        summary: input.summary,
+        metadata: input.metadata,
+        strict: true,
+      })),
     );
+
+    try {
+      await this.options.store.appendMany(events);
+    } catch (error) {
+      const raced = await this.findTeamMessage(messageId);
+      if (raced) return requireMatchingTeamMessage(raced, expected);
+      const conflict = new TeamMessageConflictError(input.teamId, messageId);
+      conflict.cause = error;
+      throw conflict;
+    }
+    const message = await this.findTeamMessage(messageId);
     if (!message) throw new Error(`Team message was not projected: ${messageId}`);
     return message;
   }
@@ -537,6 +635,47 @@ export class TeamControlService implements TeamRuntime {
     return member;
   }
 
+  private async resolveMemberTarget(teamId: TeamId, target: AgentPath | string): Promise<TeamMemberRow> {
+    const members = await this.options.store.teamMembers({ teamId, limit: 1000 });
+    if (target.startsWith("/")) {
+      let path: AgentPath;
+      try {
+        path = normalizeAgentPath(target);
+      } catch {
+        throw new TeamMemberNotFoundError(teamId, target as AgentPath);
+      }
+      const member = members.find((candidate) => candidate.path === path);
+      if (!member) throw new TeamMemberNotFoundError(teamId, path);
+      return member;
+    }
+
+    const exact = members.filter((member) => member.name === target);
+    const matches = exact.length > 0 ? exact : members.filter((member) => member.name.toLowerCase() === target.toLowerCase());
+    if (matches.length === 0) throw new TeamMemberNotFoundError(teamId, target as AgentPath);
+    if (matches.length > 1) {
+      throw new TeamMemberTargetAmbiguousError(teamId, target, matches.map((member) => member.path));
+    }
+    return matches[0] as TeamMemberRow;
+  }
+
+  private async findTeamMessage(messageId: string): Promise<TeamMessageRow | undefined> {
+    return (await this.options.store.teamMessages({ messageId, limit: 1 }))[0];
+  }
+
+  private async authorizeMessageSender(team: TeamRow, sessionId: SessionId, sender: AgentPath): Promise<void> {
+    // The owning session is always the lead, even if corrupt or legacy member
+    // metadata happens to reuse that session id. Do not fall through and let a
+    // root tool impersonate the worker in that case.
+    if (team.sessionId === sessionId) {
+      if (sender === team.leadPath) return;
+      throw new TeamMessageSenderUnauthorizedError(team.id, sessionId, sender);
+    }
+    const sessionMembers = await this.options.store.teamMembers({ teamId: team.id, limit: 1000 });
+    const matchingSessionMembers = sessionMembers.filter((member) => member.childSessionId === sessionId);
+    if (matchingSessionMembers.length === 1 && matchingSessionMembers[0]?.path === sender) return;
+    throw new TeamMessageSenderUnauthorizedError(team.id, sessionId, sender);
+  }
+
   private async requireTask(teamId: TeamId, taskId: TaskId): Promise<TeamTaskRow> {
     const task = (await this.options.store.teamTasks({ teamId, taskId, limit: 1 }))[0];
     if (!task) throw new TeamTaskNotFoundError(teamId, taskId);
@@ -553,9 +692,11 @@ export class TeamControlService implements TeamRuntime {
         : [await this.requireMember(input.teamId, input.to)];
     const events: ChiliEvent[] = [];
     for (const member of members) {
-      if (!isDeliverableTeamMember(member)) {
+      if (!isDeliverableTeamMember(member, input.delivery)) {
         if (input.strict && input.to !== "*") {
-          const reason = member.status === "closed" ? "target member is closed" : "target member has no child session/thread";
+          const reason = input.delivery === "triggerTurn" && member.status === "closed"
+            ? "target member is closed"
+            : "target member has no child session/thread";
           throw new TeamMessageDeliveryError(input.teamId, input.to, reason);
         }
         continue;
@@ -574,6 +715,7 @@ export class TeamControlService implements TeamRuntime {
             summary: input.summary,
             metadata: input.metadata,
           }),
+          teamMessageDeliveryEventId(input.teamId, input.messageId, member.path),
         ),
       );
     }
@@ -587,9 +729,10 @@ export class TeamControlService implements TeamRuntime {
     context: TeamEventContext,
     type: TType,
     payload: TPayload,
+    eventId?: string,
   ): ChiliEvent {
     const event: EventEnvelope<TType, TPayload> = {
-      id: this.id("event"),
+      id: eventId ?? this.id("event"),
       type,
       time: this.now(),
       payload,
@@ -599,9 +742,13 @@ export class TeamControlService implements TeamRuntime {
     return event as ChiliEvent;
   }
 
-  private agentMessageQueuedEvent(context: TeamEventContext, payload: AgentMessageQueuedPayload): ChiliEvent {
+  private agentMessageQueuedEvent(
+    context: TeamEventContext,
+    payload: AgentMessageQueuedPayload,
+    eventId?: string,
+  ): ChiliEvent {
     const event: EventEnvelope<"agent.message_queued", AgentMessageQueuedPayload> = {
-      id: this.id("agentmsg"),
+      id: eventId ?? this.id("agentmsg"),
       type: "agent.message_queued",
       time: this.now(),
       payload,
@@ -635,6 +782,19 @@ interface TeamMessageDeliveryEventInput {
   strict: boolean;
 }
 
+interface TeamMessageIdentity {
+  teamId: TeamId;
+  messageId: string;
+  from: AgentPath;
+  to: AgentPath | "*";
+  content: string;
+  kind: TeamMessageKind;
+  delivery: TeamMessageDelivery;
+  taskId?: TaskId | undefined;
+  summary?: string | undefined;
+  metadata?: Record<string, unknown> | undefined;
+}
+
 interface TeamMessageMailboxInput {
   from: AgentPath;
   content: string;
@@ -652,8 +812,42 @@ type DeliverableTeamMember = TeamMemberRow & {
   childThreadId: ThreadId;
 };
 
-function isDeliverableTeamMember(member: TeamMemberRow): member is DeliverableTeamMember {
-  return member.status !== "closed" && Boolean(member.childSessionId) && Boolean(member.childThreadId);
+function isDeliverableTeamMember(
+  member: TeamMemberRow,
+  delivery: TeamMessageDelivery,
+): member is DeliverableTeamMember {
+  // queueOnly is durable context and does not resume the recipient, so it may
+  // be recorded for a terminal member just like an ad-hoc terminal task.
+  // triggerTurn requires a live member; task_followup/team dispatch owns any
+  // explicit resumption semantics.
+  return (delivery === "queueOnly" || member.status !== "closed") &&
+    Boolean(member.childSessionId) &&
+    Boolean(member.childThreadId);
+}
+
+function requireMatchingTeamMessage(existing: TeamMessageRow, expected: TeamMessageIdentity): TeamMessageRow {
+  if (
+    existing.teamId === expected.teamId &&
+    existing.fromPath === expected.from &&
+    existing.toPath === expected.to &&
+    existing.content === expected.content &&
+    existing.kind === expected.kind &&
+    existing.delivery === expected.delivery &&
+    existing.taskId === expected.taskId &&
+    existing.summary === expected.summary &&
+    stableJson(existing.metadata) === stableJson(expected.metadata)
+  ) {
+    return existing;
+  }
+  throw new TeamMessageConflictError(expected.teamId, expected.messageId);
+}
+
+function teamMessageEventId(teamId: TeamId, messageId: string): string {
+  return `event:team-message:${teamId}:${messageId}`;
+}
+
+function teamMessageDeliveryEventId(teamId: TeamId, messageId: string, path: AgentPath): string {
+  return `agentmsg:team-message:${teamId}:${messageId}:${path}`;
 }
 
 function teamMessageToAgentMailboxPayload(
@@ -840,6 +1034,20 @@ function pruneUndefined<T>(value: T): T {
     if (item !== undefined) output[key] = item;
   }
   return output as T;
+}
+
+function stableJson(value: unknown): string {
+  return JSON.stringify(sortJsonValue(value));
+}
+
+function sortJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortJsonValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, sortJsonValue(item)]),
+  );
 }
 
 function defaultCreateId(prefix: string): string {

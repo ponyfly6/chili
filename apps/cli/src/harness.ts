@@ -5,6 +5,9 @@ import {
   AgentMailboxDeliveryPump,
   AgentTreeControlService,
   AgentTaskControlService,
+  DelegationPolicyGate,
+  DEFAULT_LOCAL_SUBAGENT_MAX_ACTIVE_RUNS,
+  LocalSubagentConcurrencyLimiter,
   LocalSubagentManager,
   RuntimeService,
   SingleAgentRuntime,
@@ -28,16 +31,23 @@ import { ObservableEventStore, SessionTranscriptJsonlMirror, SqliteEventStore } 
 import type { AgentMailboxRow, AgentTaskQuery, AgentTaskRow, TeamMemberRow, TeamMessageRow, TeamRow, TeamTaskRow } from "@chili/store";
 import {
   DeferredApprovalQueue,
+  DELEGATION_OFF_DENIED_TOOL_NAMES,
   FileSystemSnapshotProvider,
   InMemoryToolRegistry,
   PolicyApprovalBroker,
   PolicyApprovalState,
+  type AgentMessageRecord,
+  type AgentMessageToolController,
   type SubagentController,
   type SubagentControlController,
   ToolExecutor,
   createApplyPatchTool,
   createActivateSkillTool,
+  createAgentMessageListTool,
+  createAgentMessageSendTool,
   createBashTool,
+  createDelegationSetTool,
+  createDelegationStatusTool,
   createMailboxConsumeTool,
   createMailboxListTool,
   createCompleteTaskTool,
@@ -59,6 +69,7 @@ import {
   createTaskFollowupTool,
   createTaskListTool,
   createTaskTool,
+  createTaskWaitBatchTool,
   createTaskWaitTool,
   createTeamCreateTool,
   createTeamListTool,
@@ -81,6 +92,7 @@ import {
   createToolSearchTool,
   createWriteFileTool,
   type BashRunner,
+  type DelegationToolController,
   type GoalToolController,
   type MailboxListToolInput,
   type SubagentMailboxRecord,
@@ -100,6 +112,7 @@ import {
   type TeamTaskSyncRecord,
   type TeamToolController,
   type ToolAccessPolicyResolver,
+  type ToolAccessPolicy,
 } from "@chili/tools";
 import {
   discoverSkills,
@@ -194,6 +207,16 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const printableStore = options.quiet ? sqliteStore : new PrintingEventStore(sqliteStore, printer);
   const eventStore = new ObservableEventStore(printableStore);
   const childToolPolicyResolver = createWorkerToolPolicyResolver(eventStore);
+  let delegationPolicyGate: DelegationPolicyGate | undefined;
+  const delegationToolPolicyResolver = createDelegationToolPolicyResolver(() => delegationPolicyGate);
+  const combinedChildToolPolicyResolver = combineToolAccessPolicyResolvers(
+    childToolPolicyResolver,
+    delegationToolPolicyResolver,
+  );
+  const assertDelegationEnabled = (input: { sessionId: SessionId; action: string }): Promise<void> => {
+    if (!delegationPolicyGate) throw new Error("Delegation policy gate is not initialized");
+    return delegationPolicyGate.assertEnabled(input);
+  };
   const cliModelInput: { provider?: string; model?: CliModelName; reasoningLevel?: CliReasoningLevel; serviceTier?: ServiceTier } = {};
   if (options.provider !== undefined) cliModelInput.provider = options.provider;
   if (options.model !== undefined) cliModelInput.model = options.model;
@@ -264,7 +287,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     registry: childRegistry,
     events: { publish: (event: ChiliEvent) => eventStore.append(event) },
     approvals: createApprovalBroker(options, config, approvalState, permissions),
-    policyResolver: childToolPolicyResolver,
+    policyResolver: combinedChildToolPolicyResolver,
     snapshotProvider,
     createId,
     maxResultOutputBytes: 128_000,
@@ -279,7 +302,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     model,
     toolRegistry: childRegistry,
     toolExecutor: childToolExecutor,
-    toolPolicyResolver: childToolPolicyResolver,
+    toolPolicyResolver: combinedChildToolPolicyResolver,
     createId,
     contextBudget: childContextBudget,
     retryPolicy: {
@@ -304,7 +327,9 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
     ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
     onModelChanged: persistUserModelSelection,
+    allowSubagentSessions: true,
   });
+  const childRunLimiter = new LocalSubagentConcurrencyLimiter(DEFAULT_LOCAL_SUBAGENT_MAX_ACTIVE_RUNS);
   const subagents = new LocalSubagentManager({
     store: eventStore,
     runner: new AgentRunnerSubagentRunner({
@@ -314,12 +339,16 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
       promptFragments: subagentPromptFragments,
     }),
     createId,
+    runLimiter: childRunLimiter,
+    assertDelegationEnabled,
   });
   const tasks = new AgentTaskControlService({
     store: eventStore,
     runtime: childService,
-    interruptTask: (taskId) => subagents.interruptTask(taskId),
+    interruptTask: (taskId, fence) => subagents.interruptTask(taskId, fence),
     createId,
+    runLimiter: childRunLimiter,
+    assertDelegationEnabled,
   });
   const teams = new TeamControlService({
     store: eventStore,
@@ -335,6 +364,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     store: eventStore,
     worktrees: teamWorktrees,
     cwd,
+    assertDelegationEnabled,
   });
   const teamVerifier = new TeamTaskVerificationService({
     teams,
@@ -361,12 +391,12 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     },
   };
   registry.register(createTaskTool(subagents));
-  registry.register(createTaskBatchTool(subagents));
   childRegistry.register(createCompleteTaskTool(completeTaskController));
   const toolExecutor = new ToolExecutor({
     registry,
     events: { publish: (event) => eventStore.append(event) },
     approvals: createApprovalBroker(options, config, approvalState, permissions),
+    policyResolver: delegationToolPolicyResolver,
     snapshotProvider,
     createId,
     maxResultOutputBytes: 256_000,
@@ -381,6 +411,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     model,
     toolRegistry: registry,
     toolExecutor,
+    toolPolicyResolver: delegationToolPolicyResolver,
     createId,
     contextBudget: runtimeContextBudget,
     retryPolicy: {
@@ -411,9 +442,16 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
     onModelChanged: persistUserModelSelection,
   });
+  delegationPolicyGate = new DelegationPolicyGate({
+    store: eventStore,
+    getDelegationConfig: (sessionId) => service.getDelegationConfig(sessionId),
+  });
   for (const tool of createGoalTools(createGoalToolController(service))) {
     registry.register(tool);
   }
+  const delegationController = createDelegationToolController(service);
+  registry.register(createDelegationStatusTool(delegationController));
+  registry.register(createDelegationSetTool(delegationController));
   await sqliteStore.reconcileStaleTurns({
     staleBefore: Date.now() - STALE_TURN_RECOVERY_MS,
     now: Date.now(),
@@ -429,10 +467,15 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     events: eventStore,
     cwd,
     createSession: async (input) => service.createSession({ cwd: input.cwd }),
+    assertDelegationEnabled,
   });
   const agents = new AgentTreeControlService({
     store: eventStore,
     runtime: childService,
+    rootRuntime: service,
+    taskTurns: tasks,
+    runLimiter: childRunLimiter,
+    delegationPolicyGate,
     createId,
   });
   const mailboxPump = new AgentMailboxDeliveryPump({
@@ -441,12 +484,16 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   });
   mailboxPump.start();
   const controlController = createSubagentControlController(tasks, agents);
+  registry.register(createTaskBatchTool(subagents, controlController));
   registry.register(createTaskListTool(controlController));
+  registry.register(createTaskWaitBatchTool(controlController));
   registry.register(createTaskWaitTool(controlController));
   registry.register(createTaskFollowupTool(controlController));
   registry.register(createTaskCloseTool(controlController));
   registry.register(createMailboxListTool(controlController));
   registry.register(createMailboxConsumeTool(controlController));
+  registerAgentMessageTools(registry, createAgentMessageToolController(tasks, agents, "root"));
+  registerAgentMessageTools(childRegistry, createAgentMessageToolController(tasks, agents, "child"));
   const teamController = createTeamToolController(teams);
   registerTeamTools(registry, teamController);
   registerTeamTools(childRegistry, teamController);
@@ -531,6 +578,52 @@ function createWorkerToolPolicyResolver(store: ObservableEventStore): ToolAccess
   };
 }
 
+function createDelegationToolPolicyResolver(
+  gate: () => DelegationPolicyGate | undefined,
+): ToolAccessPolicyResolver {
+  return {
+    async resolve(context) {
+      const current = gate();
+      if (!current || !(await current.isOff(context.sessionId))) return undefined;
+      return { deniedTools: DELEGATION_OFF_DENIED_TOOL_NAMES };
+    },
+  };
+}
+
+function combineToolAccessPolicyResolvers(
+  worker: ToolAccessPolicyResolver,
+  delegation: ToolAccessPolicyResolver,
+): ToolAccessPolicyResolver {
+  return {
+    async resolve(context) {
+      const [workerPolicy, delegationPolicy] = await Promise.all([
+        worker.resolve(context),
+        delegation.resolve(context),
+      ]);
+      if (!workerPolicy) return delegationPolicy;
+      if (!delegationPolicy) return workerPolicy;
+      const deniedTools = uniqueStrings([
+        ...(workerPolicy.deniedTools ?? []),
+        ...(delegationPolicy.deniedTools ?? []),
+      ]);
+      const combined: ToolAccessPolicy = {
+        ...workerPolicy,
+        ...delegationPolicy,
+        deniedTools,
+        metadata: {
+          ...workerPolicy.metadata,
+          ...delegationPolicy.metadata,
+        },
+      };
+      return combined;
+    },
+  };
+}
+
+function uniqueStrings(values: readonly string[]): string[] {
+  return [...new Set(values)];
+}
+
 function createGoalToolController(service: RuntimeService): GoalToolController {
   return {
     async getGoal(context) {
@@ -553,6 +646,21 @@ function createGoalToolController(service: RuntimeService): GoalToolController {
         sessionId: context.sessionId,
         threadId,
         status: input.status,
+      });
+    },
+  };
+}
+
+function createDelegationToolController(service: RuntimeService): DelegationToolController {
+  return {
+    getDelegationConfig(context) {
+      return service.getDelegationConfig(context.sessionId);
+    },
+    setDelegationPolicy(input, context) {
+      return service.setDelegationPolicy({
+        sessionId: context.sessionId,
+        ...(context.threadId ? { threadId: context.threadId } : {}),
+        policy: input.policy,
       });
     },
   };
@@ -850,6 +958,11 @@ function registerTeamTools(registry: InMemoryToolRegistry, controller: TeamToolC
   registry.register(createTeamMessageListTool(controller));
 }
 
+function registerAgentMessageTools(registry: InMemoryToolRegistry, controller: AgentMessageToolController): void {
+  registry.register(createAgentMessageSendTool(controller));
+  registry.register(createAgentMessageListTool(controller));
+}
+
 function registerTeamDispatchTools(registry: InMemoryToolRegistry, controller: TeamTaskDispatchToolController): void {
   registry.register(createTeamTaskDispatchTool(controller));
   registry.register(createTeamTaskDispatchBatchTool(controller));
@@ -957,31 +1070,62 @@ export function linkApprovalSessionsFromEvent(state: PolicyApprovalState, event:
   state.linkSession(parentSessionId, childSessionId);
 }
 
-function createSubagentControlController(
+export function createSubagentControlController(
   tasks: AgentTaskControlService,
   agents: AgentTreeControlService,
 ): SubagentControlController {
   return {
     async listTasks(input, context) {
+      if (input.taskIds) {
+        const visible = (await Promise.all(input.taskIds.map((taskId) => tasks.getTask(taskId as TaskId))))
+          .filter((task) => input.all || task.parentSessionId === context.sessionId)
+          .filter((task) => !input.status || task.status === input.status)
+          .map(toSubagentTaskRecord);
+        return limitItems(visible, input.limit);
+      }
       const query: AgentTaskQuery = {};
       if (input.status) query.status = input.status;
       if (input.limit !== undefined) query.limit = input.limit;
       if (!input.all) query.parentSessionId = context.sessionId;
       return (await tasks.listTasks(query)).map(toSubagentTaskRecord);
     },
-    async waitTask(input) {
+    async waitTask(input, context) {
+      const visibleTask = await tasks.getTask(input.taskId as TaskId);
+      if (visibleTask.parentSessionId !== context.sessionId) {
+        throw new Error(`Agent task is not visible to this session: ${input.taskId}`);
+      }
       return toSubagentTaskRecord(
         await tasks.waitForTask({
           taskId: input.taskId as TaskId,
           ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+          signal: context.signal,
         }),
       );
     },
-    async followupTask(input) {
+    async waitTasks(input, context) {
+      const taskIds = input.taskIds.map((taskId) => taskId as TaskId);
+      const visibleTasks = await Promise.all(taskIds.map((taskId) => tasks.getTask(taskId)));
+      const hiddenTask = visibleTasks.find((task) => task.parentSessionId !== context.sessionId);
+      if (hiddenTask) throw new Error(`Agent task is not visible to this session: ${hiddenTask.id}`);
+      const waited = await tasks.waitForTasks({
+        taskIds,
+        waitFor: input.waitFor ?? "all",
+        ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+        signal: context.signal,
+      });
+      return {
+        waitFor: waited.waitFor,
+        satisfied: waited.satisfied,
+        timedOut: waited.timedOut,
+        tasks: waited.tasks.map(toSubagentTaskRecord),
+      };
+    },
+    async followupTask(input, context) {
       const result = await tasks.followupTask({
         taskId: input.taskId as TaskId,
         text: input.prompt,
         ...(input.maxTurns !== undefined ? { maxTurns: input.maxTurns } : {}),
+        signal: context.signal,
       });
       return toSubagentTaskRecord(result.task);
     },
@@ -1020,6 +1164,139 @@ function createSubagentControlController(
       return toSubagentMailboxRecord(await agents.consumeMailbox({ messageId: input.messageId }));
     },
   };
+}
+
+function createAgentMessageToolController(
+  tasks: AgentTaskControlService,
+  agents: AgentTreeControlService,
+  role: "root" | "child",
+): AgentMessageToolController {
+  return {
+    async sendAgentMessage(input, context) {
+      const sender = await resolveAgentMessageSender(
+        tasks,
+        role,
+        context.sessionId,
+        context.threadId,
+        input.from,
+      );
+      const message = await agents.sendMessage({
+        ...(input.messageId ? { messageId: input.messageId } : {}),
+        from: sender,
+        to: input.to,
+        content: input.content,
+        delivery: input.delivery ?? "queueOnly",
+        ...(input.taskId ? { taskId: input.taskId as TaskId } : {}),
+        ...(input.metadata ? { metadata: input.metadata } : {}),
+        sessionId: context.sessionId,
+        ...(context.threadId ? { threadId: context.threadId } : {}),
+      });
+      return toAgentMessageRecord(message);
+    },
+    async listAgentMessages(input, context) {
+      const currentPath = await resolveAgentMessageSender(
+        tasks,
+        role,
+        context.sessionId,
+        context.threadId,
+        undefined,
+      );
+      const visibleTasks = await listAgentMessageScopeTasks(tasks, context.sessionId, context.threadId);
+      const visibleTaskIds = new Set(visibleTasks.map((task) => task.id));
+      const visiblePaths = new Set<AgentPath>([currentPath, ...visibleTasks.map((task) => task.path)]);
+      const messages = await agents.mailbox({
+        ...(input.status ? { status: input.status } : {}),
+        ...(input.taskId ? { taskId: input.taskId as TaskId } : {}),
+        ...(input.path ? { path: input.path as AgentPath } : {}),
+        limit: Math.max(input.limit ?? 500, 1000),
+      });
+      return messages
+        .filter(
+          (message) =>
+            visibleTaskIds.has(message.taskId as TaskId) ||
+            message.childSessionId === context.sessionId ||
+            visiblePaths.has(message.path) ||
+            visiblePaths.has(message.fromPath),
+        )
+        .filter((message) => (input.from ? message.fromPath === input.from : true))
+        .slice(0, input.limit ?? 500)
+        .map(toAgentMessageRecord);
+    },
+  };
+}
+
+async function resolveAgentMessageSender(
+  tasks: AgentTaskControlService,
+  role: "root" | "child",
+  sessionId: SessionId,
+  threadId: ThreadId | undefined,
+  requested: string | undefined,
+): Promise<AgentPath> {
+  if (role === "root") {
+    const root = "/root" as AgentPath;
+    if (requested && requested !== root) {
+      throw new Error(`Agent message sender ${requested} does not match current agent ${root}`);
+    }
+    return root;
+  }
+
+  const ownTasks = (await tasks.listTasks({ childSessionId: sessionId, limit: 1000 }))
+    .filter((task) => threadId === undefined || task.childThreadId === threadId);
+  const paths = [...new Set(ownTasks.map((task) => task.path))];
+  if (paths.length === 0) {
+    const endpoint = threadId ? `${sessionId}/${threadId}` : sessionId;
+    throw new Error(`Agent message sender is unavailable for child endpoint ${endpoint}`);
+  }
+  if (paths.length > 1) {
+    throw new Error(`Agent message sender is ambiguous for session ${sessionId}: ${paths.join(", ")}`);
+  }
+  const inferred = paths[0] as AgentPath;
+  if (requested && requested !== inferred) {
+    throw new Error(`Agent message sender ${requested} does not match current agent ${inferred}`);
+  }
+  return inferred;
+}
+
+async function listAgentMessageScopeTasks(
+  tasks: AgentTaskControlService,
+  sessionId: SessionId,
+  threadId: ThreadId | undefined,
+): Promise<AgentTaskRow[]> {
+  const allTasks = await tasks.listTasks({ limit: 2_147_483_647 });
+  const visible = new Map<TaskId, AgentTaskRow>();
+  const endpoints: Array<{ sessionId: SessionId; threadId?: ThreadId }> = [
+    { sessionId, ...(threadId ? { threadId } : {}) },
+  ];
+  const visitedEndpoints = new Set<string>();
+
+  for (const task of allTasks) {
+    if (
+      task.childSessionId === sessionId &&
+      (threadId === undefined || task.childThreadId === threadId)
+    ) {
+      visible.set(task.id, task);
+    }
+  }
+
+  for (let index = 0; index < endpoints.length; index += 1) {
+    const endpoint = endpoints[index] as { sessionId: SessionId; threadId?: ThreadId };
+    const endpointKey = `${endpoint.sessionId}\0${endpoint.threadId ?? "*"}`;
+    if (visitedEndpoints.has(endpointKey)) continue;
+    visitedEndpoints.add(endpointKey);
+    for (const task of allTasks) {
+      if (task.parentSessionId !== endpoint.sessionId) continue;
+      if (endpoint.threadId !== undefined && task.parentThreadId !== endpoint.threadId) continue;
+      visible.set(task.id, task);
+      if (task.childSessionId) {
+        endpoints.push({
+          sessionId: task.childSessionId,
+          ...(task.childThreadId ? { threadId: task.childThreadId } : {}),
+        });
+      }
+    }
+  }
+
+  return [...visible.values()];
 }
 
 function createTeamToolController(teams: TeamControlService): TeamToolController {
@@ -1187,6 +1464,11 @@ function createTeamTaskDispatchToolController(dispatcher: TeamTaskDispatchServic
       if (input.ownerPath) dispatchInput.ownerPath = input.ownerPath as AgentPath;
       if (input.mode) dispatchInput.mode = input.mode;
       if (input.prompt) dispatchInput.prompt = input.prompt;
+      if (input.sourceCallId !== undefined) dispatchInput.sourceCallId = input.sourceCallId;
+      if (input.batchId !== undefined) dispatchInput.batchId = input.batchId;
+      if (input.batchIndex !== undefined) dispatchInput.batchIndex = input.batchIndex;
+      if (input.expectedBatchSize !== undefined) dispatchInput.expectedBatchSize = input.expectedBatchSize;
+      if (input.maxConcurrency !== undefined) dispatchInput.maxConcurrency = input.maxConcurrency;
       return toTeamTaskDispatchRecord(await dispatcher.dispatchTask(dispatchInput));
     },
     async syncTask(input, context) {
@@ -1266,6 +1548,25 @@ function toSubagentMailboxRecord(message: AgentMailboxRow): SubagentMailboxRecor
     ...(message.childSessionId ? { childSessionId: message.childSessionId } : {}),
     ...(message.childThreadId ? { childThreadId: message.childThreadId } : {}),
     ...(message.message ? { message: message.message } : {}),
+    createdAt: message.createdAt,
+    ...(message.consumedAt ? { consumedAt: message.consumedAt } : {}),
+  };
+}
+
+function toAgentMessageRecord(message: AgentMailboxRow): AgentMessageRecord {
+  const content = message.message && "content" in message.message ? message.message.content : undefined;
+  const metadata = message.message?.metadata;
+  return {
+    messageId: message.id,
+    fromPath: message.fromPath,
+    toPath: message.path,
+    delivery: message.triggerTurn ? "triggerTurn" : "queueOnly",
+    status: message.status,
+    ...(message.taskId ? { taskId: message.taskId } : {}),
+    ...(message.childSessionId ? { recipientSessionId: message.childSessionId } : {}),
+    ...(message.childThreadId ? { recipientThreadId: message.childThreadId } : {}),
+    ...(content ? { content } : {}),
+    ...(metadata ? { metadata } : {}),
     createdAt: message.createdAt,
     ...(message.consumedAt ? { consumedAt: message.consumedAt } : {}),
   };

@@ -2745,6 +2745,14 @@ test("/resume opens a searchable project-scoped picker and switches sessions", a
   });
 
   try {
+    await typeText(app, "/resume session_worker");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(20);
+    await app.renderOnce();
+
+    expect(resumed).toEqual([]);
+    expect(app.captureCharFrame()).toContain("Saved chat not found: session_worker");
+
     await typeText(app, "/resume");
     await press(app, () => app.mockInput.pressEnter());
     await Bun.sleep(40);
@@ -3407,7 +3415,7 @@ test("/status separates the live event stream from execution and reports unsuppo
   const selection = { provider: "minimax", model: "MiniMax-M3[1m]" };
   const models: ModelCandidate[] = [{
     ...selection,
-    capabilities: { reasoning: true },
+    capabilities: { reasoning: true, toolCalls: true },
     reasoningLevels: [],
   }];
   const app = await mountShell(teamLiveFixture(), {
@@ -3417,7 +3425,7 @@ test("/status separates the live event stream from execution and reports unsuppo
         sessionId: "session_minimax_status" as SessionId,
         models: [{
           ...selection,
-          capabilities: { reasoning: true },
+          capabilities: { reasoning: true, toolCalls: true },
           reasoningLevels: [],
         }],
         availableReasoningLevels: [],
@@ -3439,6 +3447,10 @@ test("/status separates the live event stream from execution and reports unsuppo
     let frame = app.captureCharFrame();
     expect(frame).toContain("event stream: connected");
     expect(frame).toContain("execution: idle");
+    expect(frame).toContain("agent capability: available");
+    expect(frame).toContain("delegation: not configured");
+    expect(frame).toContain("ad-hoc agents: 0 active");
+    expect(frame).toContain("persistent teams: none");
     expect(frame).toContain("thinking: unsupported");
     expect(frame).toContain("service tier: unsupported");
     expect(frame).not.toContain("connection: streaming");
@@ -3454,6 +3466,37 @@ test("/status separates the live event stream from execution and reports unsuppo
     await press(app, () => app.mockInput.pressEnter());
     expect(app.captureCharFrame()).toContain("Fast mode is not available for the selected model");
     expect(serviceTierChanges).toBe(0);
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("/agents updates and reads the session delegation policy through runtime APIs", async () => {
+  const sessionId = "session_agents_policy" as SessionId;
+  const policies: string[] = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      activeSessionId: sessionId,
+      delegationConfig: { sessionId, policy: "explicit", source: "default" },
+      setRuntimeDelegationPolicy: async (policy) => {
+        policies.push(policy);
+        return { sessionId, policy, source: "session" };
+      },
+      refreshDelegationConfig: async () => ({ sessionId, policy: "proactive", source: "session" }),
+    },
+  });
+
+  try {
+    await typeText(app, "/agents proactive");
+    await press(app, () => app.mockInput.pressEnter());
+    await app.renderOnce();
+    expect(policies).toEqual(["proactive"]);
+    expect(app.captureCharFrame()).toContain("Agent delegation: proactive (source: session)");
+
+    await typeText(app, "/agents status");
+    await press(app, () => app.mockInput.pressEnter());
+    await app.renderOnce();
+    expect(app.captureCharFrame()).toContain("Chili may delegate useful independent work proactively.");
   } finally {
     app.renderer.destroy();
   }
