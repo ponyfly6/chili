@@ -42,6 +42,7 @@ import {
 } from "./prompt/index.js";
 import { resolveDelegationConfig } from "./delegation.js";
 import { DEFAULT_GOAL_TOKEN_BUDGET, GoalService, type AccountGoalUsageResult } from "./goal.js";
+import { buildFailureCheckpoint } from "./failure-checkpoint.js";
 import type { AgentRunner, RunTurnInput, RunTurnResult } from "./runner.js";
 import type { CompactContextResult } from "./single-agent-runtime.js";
 import {
@@ -244,7 +245,7 @@ export class RuntimeService {
       sessionId?: SessionId;
       cwd: string;
     } = {
-      cwd: input.cwd ?? this.options.cwd,
+      cwd: resolve(input.cwd ?? this.options.cwd),
     };
     if (input.sessionId) createInput.sessionId = input.sessionId;
     const sessionId = await this.options.runtime.createSession(createInput);
@@ -527,12 +528,13 @@ export class RuntimeService {
   private async runReservedPrompt(input: SubmitPromptInput, controller: AbortController): Promise<SubmitPromptResult> {
     const turns: RunTurnResult[] = [];
     const maxTurns = input.maxTurns ?? this.options.maxTurns ?? DEFAULT_MAX_TURNS;
-    const cwd = input.cwd ?? this.options.cwd;
 
     try {
       await this.assertSessionTurnAllowed(input.sessionId);
-      const promptModelState = await this.resolvePromptModelState(input);
-      const promptInput = await this.promptInputForModel(input, promptModelState);
+      const cwd = await this.resolveExistingSessionCwd(input.sessionId, input.cwd);
+      const normalizedInput: SubmitPromptInput = { ...input, cwd };
+      const promptModelState = await this.resolvePromptModelState(normalizedInput);
+      const promptInput = await this.promptInputForModel(normalizedInput, promptModelState);
       await this.assertImageInputAllowed(promptInput, promptModelState);
 
       await this.publishStatus({
@@ -592,11 +594,7 @@ export class RuntimeService {
         await this.accountGoalTurn(promptInput, result, startedAt);
 
         if (result.status !== "completed") {
-          return {
-            status: result.status,
-            turns,
-            error: result.error,
-          };
+          return this.terminalRunFailure(promptInput, turns, result);
         }
 
         if (controller.signal.aborted) {
@@ -743,11 +741,7 @@ export class RuntimeService {
       await this.accountGoalTurn(promptInput, finalResult, finalStartedAt);
 
       if (finalResult.status !== "completed") {
-        return {
-          status: finalResult.status,
-          turns,
-          error: finalResult.error,
-        };
+        return this.terminalRunFailure(promptInput, turns, finalResult);
       }
 
       if (controller.signal.aborted) {
@@ -877,11 +871,7 @@ export class RuntimeService {
       const accounting = await this.accountGoalTurn(args.input, result, startedAt);
 
       if (result.status !== "completed") {
-        return {
-          status: result.status,
-          turns: args.turns,
-          error: result.error,
-        };
+        return this.terminalRunFailure(args.input, args.turns, result);
       }
 
       if (args.controller.signal.aborted) {
@@ -943,11 +933,7 @@ export class RuntimeService {
     await this.accountGoalTurn(args.input, result, startedAt);
 
     if (result.status !== "completed") {
-      return {
-        status: result.status,
-        turns: args.turns,
-        error: result.error,
-      };
+      return this.terminalRunFailure(args.input, args.turns, result);
     }
     return this.completedPrompt(args.input, args.turns, result.status === "completed" ? result : previous);
   }
@@ -957,7 +943,7 @@ export class RuntimeService {
     const continuationInput: SubmitPromptInput = {
       sessionId: input.sessionId,
       text: "",
-      cwd: input.cwd ?? this.options.cwd,
+      ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
     };
     const controller = this.createRunController(continuationInput, "goal");
     queueMicrotask(() => {
@@ -975,13 +961,15 @@ export class RuntimeService {
   private async runStandaloneGoalContinuation(input: SubmitPromptInput, controller: AbortController): Promise<void> {
     try {
       await this.assertSessionTurnAllowed(input.sessionId);
-      const modelState = await this.resolvePromptModelState(input);
+      const cwd = await this.resolveExistingSessionCwd(input.sessionId, input.cwd);
+      const normalizedInput: SubmitPromptInput = { ...input, cwd };
+      const modelState = await this.resolvePromptModelState(normalizedInput);
       const turns: RunTurnResult[] = [];
       const result = await this.runGoalContinuation({
-        input,
+        input: normalizedInput,
         turns,
         controller,
-        cwd: input.cwd ?? this.options.cwd,
+        cwd,
         modelState,
       });
       if (!result) {
@@ -1050,6 +1038,10 @@ export class RuntimeService {
   }
 
   private async publishTurnProgress(input: SubmitPromptInput, result: RunTurnResult): Promise<void> {
+    // A completed model turn is an internal step in a potentially multi-turn
+    // prompt. Keep the prompt-level status running until the prompt publishes a
+    // terminal state, and never bounce cancelling back to running after a turn.
+    if (result.status === "completed") return;
     const turnStatus: {
       sessionId: SessionId;
       status: RuntimeSessionStatus;
@@ -1057,12 +1049,102 @@ export class RuntimeService {
       reason?: string;
     } = {
       sessionId: input.sessionId,
-      status: result.status === "completed" ? "running" : result.status,
+      status: result.status,
       turnId: result.turnId,
     };
-    const turnReason = result.status === "completed" ? result.finishReason : result.error.message;
-    if (turnReason) turnStatus.reason = turnReason;
+    turnStatus.reason = result.error.message;
     await this.publishStatus(turnStatus);
+  }
+
+  private async resolveExistingSessionCwd(sessionId: SessionId, requestedCwd?: string): Promise<string> {
+    const session = (await this.options.store.sessions()).find((candidate) => candidate.id === sessionId);
+    if (!session) throw new RuntimeSessionNotFoundError(sessionId);
+
+    const sessionCwd = resolve(session.cwd);
+    if (requestedCwd !== undefined) {
+      const normalizedRequestedCwd = resolve(requestedCwd);
+      if (normalizedRequestedCwd !== sessionCwd) {
+        throw new Error(
+          `Session cwd mismatch for ${sessionId}: expected ${sessionCwd}, received ${normalizedRequestedCwd}`,
+        );
+      }
+    }
+    return sessionCwd;
+  }
+
+  private async terminalRunFailure(
+    input: SubmitPromptInput,
+    turns: RunTurnResult[],
+    result: Exclude<RunTurnResult, { status: "completed" }>,
+  ): Promise<SubmitPromptResult> {
+    if (result.status === "failed") {
+      try {
+        await this.materializeFailureCheckpoint(input, turns, result);
+      } catch {
+        // The checkpoint is a best-effort recovery artifact. Never replace the
+        // original model failure if projecting or persisting it also fails.
+      }
+    }
+    return {
+      status: result.status,
+      turns,
+      error: result.error,
+    };
+  }
+
+  private async materializeFailureCheckpoint(
+    input: SubmitPromptInput,
+    turns: readonly RunTurnResult[],
+    failedResult: Exclude<RunTurnResult, { status: "completed" }>,
+  ): Promise<void> {
+    const failedTurnIndex = turns.lastIndexOf(failedResult);
+    const priorTurns = failedTurnIndex >= 0 ? turns.slice(0, failedTurnIndex) : turns;
+    const completedTurnIds = priorTurns.flatMap((turn) => (
+      turn.status === "completed" ? [turn.turnId] : []
+    ));
+    if (completedTurnIds.length === 0) return;
+
+    const messages = await this.options.store.messages(input.sessionId);
+    const text = buildFailureCheckpoint({
+      messages,
+      completedTurnIds,
+      failedTurnId: failedResult.turnId,
+    });
+    if (!text) return;
+
+    const messageId = this.id<MessageId>("msg");
+    const partId = this.id<PartId>("part");
+    const time = this.now();
+    const messageCreated: Extract<ChiliEvent, { type: "message.created" }> = {
+      id: this.id("event"),
+      type: "message.created",
+      time,
+      sessionId: input.sessionId,
+      payload: {
+        messageId,
+        role: "assistant",
+        turnId: failedResult.turnId,
+      },
+    };
+    const partAdded: Extract<ChiliEvent, { type: "message.part_added" }> = {
+      id: this.id("event"),
+      type: "message.part_added",
+      time,
+      sessionId: input.sessionId,
+      payload: {
+        messageId,
+        part: {
+          id: partId,
+          messageId,
+          sessionId: input.sessionId,
+          type: "text",
+          text,
+          phase: "final_answer",
+          synthetic: true,
+        },
+      },
+    };
+    await this.options.store.appendMany([messageCreated, partAdded]);
   }
 
   private async completedPrompt(

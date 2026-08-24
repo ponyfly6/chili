@@ -55,11 +55,11 @@ test("RuntimeService accepts an AgentRunner implementation", async () => {
   const handle = await service.createSession({
     cwd: "/workspace",
   });
-  store.addSession(handle.sessionId);
+  store.addSession(handle.sessionId, "interactive", "/workspace");
   const result = await service.submitPrompt({
     sessionId: handle.sessionId,
     text: "hello",
-    cwd: "/workspace/subdir",
+    cwd: "/workspace",
   });
 
   expect(result.status).toBe("completed");
@@ -75,10 +75,10 @@ test("RuntimeService accepts an AgentRunner implementation", async () => {
     text: "hello",
   });
   expect(runner.userMessages[0]?.turnId).toBe(runner.turnInputs[0]?.turnId);
-  expect(runner.turnInputs[0]?.cwd).toBe("/workspace/subdir");
+  expect(runner.turnInputs[0]?.cwd).toBe("/workspace");
   expect(runner.turnInputs[0]?.system).toEqual(["be brief"]);
   expect(runner.turnInputs[0]?.signal?.aborted).toBe(false);
-  expect(statuses(store)).toEqual(["idle", "running", "running", "idle"]);
+  expect(statuses(store)).toEqual(["idle", "running", "idle"]);
 });
 
 test("root RuntimeService rejects direct subagent turns while an explicit child service remains usable", async () => {
@@ -338,7 +338,7 @@ test("RuntimeService converts sourced prompt images to tool-readable text for te
   expect(runner.turnInputs[0]?.promptDebug?.fragments).toContainEqual(expect.objectContaining({
     id: "runtime.path_image_input",
   }));
-  expect(statuses(store)).toEqual(["running", "running", "idle"]);
+  expect(statuses(store)).toEqual(["running", "idle"]);
 });
 
 test("RuntimeService prefers direct image input over external image tools for image-capable turns", async () => {
@@ -1057,7 +1057,7 @@ test("RuntimeService continues after OpenAI-compatible tool_calls finish reason"
   expect(result.status).toBe("completed");
   expect(result.finishReason).toBe("stop");
   expect(runner.turnInputs).toHaveLength(2);
-  expect(statuses(store)).toEqual(["running", "running", "running", "idle"]);
+  expect(statuses(store)).toEqual(["running", "idle"]);
 });
 
 test("RuntimeService adds a no-tool final turn after the tool continuation limit", async () => {
@@ -1092,7 +1092,7 @@ test("RuntimeService adds a no-tool final turn after the tool continuation limit
   expect(runner.turnInputs).toHaveLength(3);
   expect(runner.turnInputs[2]?.toolMode).toBe("disabled");
   expect(runner.turnInputs[2]?.system?.at(-1)).toContain("Do not call tools");
-  expect(statuses(store)).toEqual(["running", "running", "running", "running", "idle"]);
+  expect(statuses(store)).toEqual(["running", "idle"]);
 });
 
 test("RuntimeService uses the last persisted model config for new sessions", async () => {
@@ -1179,7 +1179,7 @@ test("RuntimeService still stops on Anthropic-style end_turn finish reason", asy
   expect(result.status).toBe("completed");
   expect(result.finishReason).toBe("end_turn");
   expect(runner.turnInputs).toHaveLength(1);
-  expect(statuses(store)).toEqual(["running", "running", "idle"]);
+  expect(statuses(store)).toEqual(["running", "idle"]);
 });
 
 test("RuntimeService stops before another tool-use turn when interrupted", async () => {
@@ -1212,7 +1212,7 @@ test("RuntimeService stops before another tool-use turn when interrupted", async
 
   expect(result.status).toBe("cancelled");
   expect(runner.turnInputs).toHaveLength(1);
-  expect(statuses(store)).toEqual(["running", "cancelling", "running", "cancelled"]);
+  expect(statuses(store)).toEqual(["running", "cancelling", "cancelled"]);
   const cancelling = store.items.find(
     (event) => event.type === "session.status_changed" && event.payload.status === "cancelling",
   );
@@ -1541,10 +1541,14 @@ class MemoryEventStore implements EventStore {
     return this.sessionRows.map((row) => ({ ...row }));
   }
 
-  addSession(sessionId: SessionId, source: SessionRow["source"] = "interactive"): void {
+  addSession(
+    sessionId: SessionId,
+    source: SessionRow["source"] = "interactive",
+    cwd = "/repo",
+  ): void {
     this.sessionRows.push({
       id: sessionId,
-      cwd: "/repo",
+      cwd,
       source,
       status: "active",
       createdAt: 1,
