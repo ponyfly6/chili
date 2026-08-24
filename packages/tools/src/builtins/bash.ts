@@ -1,4 +1,5 @@
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
+import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { runProcess, type RunProcessOptions, type RunProcessResult } from "../process.js";
 import { ProcessOutputAccumulator, type ProcessOutputSnapshot } from "../process-output-accumulator.js";
@@ -77,8 +78,8 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
     aliases: ["run_shell_command"],
     searchHint: "Run shell commands; read-only commands can be scheduled concurrently.",
     description: allowEscalation
-      ? "Run a non-interactive shell command in the workspace. Commands that require desktop IPC or other access blocked by the default sandbox may request one-time elevated execution with a justification."
-      : "Run a non-interactive shell command in the workspace.",
+      ? "Run a non-interactive shell command in the authoritative workspace. Relative cwd values resolve from that workspace root, and absolute cwd values must remain inside it. Commands that require desktop IPC or other access blocked by the default sandbox may request one-time elevated execution with a justification."
+      : "Run a non-interactive shell command in the authoritative workspace. Relative cwd values resolve from that workspace root, and absolute cwd values must remain inside it.",
     risk: "execute",
     isReadOnly: (input) => isReadOnlyShellCommand(input.command),
     isConcurrencySafe: (input) => isReadOnlyShellCommand(input.command),
@@ -94,8 +95,18 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
         timeoutMs: { type: "number" },
         timeout: { type: "number" },
         maxOutputBytes: { type: "number" },
-        cwd: { type: "string" },
-        workingDirectory: { type: "string" },
+        cwd: {
+          type: "string",
+          description: "Working directory. Relative paths resolve from the authoritative workspace root; absolute paths must remain inside it.",
+        },
+        workingDirectory: {
+          type: "string",
+          description: "Alias for cwd. Relative paths resolve from the authoritative workspace root; absolute paths must remain inside it.",
+        },
+        working_directory: {
+          type: "string",
+          description: "Alias for cwd. Relative paths resolve from the authoritative workspace root; absolute paths must remain inside it.",
+        },
         env: { type: "object", additionalProperties: { type: "string" } },
         ...(allowEscalation
           ? {
@@ -118,7 +129,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       const description = input.description;
       const timeoutMs = input.timeoutMs ?? input.timeout;
       const maxOutputBytes = input.maxOutputBytes;
-      const cwd = pickString(input, "cwd", "workingDirectory", "working_directory");
+      const cwd = parseCwdAliases(input);
       const env = parseEnv(input.env);
       const sandboxPermissions = parseSandboxPermissions(input);
       const justification = input.justification;
@@ -135,9 +146,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       if (maxOutputBytes !== undefined && !isPositiveInteger(maxOutputBytes)) {
         return { ok: false, message: "maxOutputBytes must be a positive integer" };
       }
-      if (cwd !== undefined && (typeof cwd !== "string" || cwd.trim().length === 0)) {
-        return { ok: false, message: "cwd must be a non-empty string" };
-      }
+      if (!cwd.ok) return cwd;
       if (!env.ok) return env;
       if (!sandboxPermissions.ok) return sandboxPermissions;
       if (!allowEscalation && sandboxPermissions.value === "require_escalated") {
@@ -190,7 +199,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       if (description !== undefined) value.description = description;
       if (timeoutMs !== undefined) value.timeoutMs = timeoutMs;
       if (maxOutputBytes !== undefined) value.maxOutputBytes = maxOutputBytes;
-      if (cwd !== undefined) value.cwd = cwd;
+      if (cwd.value !== undefined) value.cwd = cwd.value;
       if (env.value !== undefined) value.env = env.value;
       if (normalizedJustification !== undefined) value.justification = normalizedJustification;
       return { ok: true, value };
@@ -365,12 +374,25 @@ function isPositiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value > 0;
 }
 
-function pickString(record: Record<string, unknown>, ...keys: string[]): unknown {
-  for (const key of keys) {
-    const value = record[key];
-    if (value !== undefined) return value;
+function parseCwdAliases(record: Record<string, unknown>): ValidationResult<string | undefined> {
+  const entries = (["cwd", "workingDirectory", "working_directory"] as const)
+    .map((key) => ({ key, value: record[key] }))
+    .filter((entry) => entry.value !== undefined);
+
+  for (const entry of entries) {
+    if (typeof entry.value !== "string" || entry.value.trim().length === 0) {
+      return { ok: false, message: `${entry.key} must be a non-empty string` };
+    }
   }
-  return undefined;
+
+  const first = entries[0]?.value as string | undefined;
+  if (entries.some((entry) => entry.value !== first)) {
+    return {
+      ok: false,
+      message: "cwd, workingDirectory, and working_directory must match when multiple aliases are provided",
+    };
+  }
+  return { ok: true, value: first };
 }
 
 function parseEnv(value: unknown): ValidationResult<Record<string, string> | undefined> {
@@ -416,14 +438,20 @@ function containsUnsafeApprovalText(value: string): boolean {
 }
 
 async function resolveWorkspaceDirectory(workspaceInput: string, path: string): Promise<WorkspacePath> {
+  const workspace = resolve(workspaceInput);
   try {
-    const target = resolveWorkspacePath(workspaceInput, path, { allowWorkspaceRoot: true });
-    await assertExistingPathInsideWorkspace(workspaceInput, target, path);
+    const target = resolveWorkspacePath(workspace, path, { allowWorkspaceRoot: true });
+    await assertExistingPathInsideWorkspace(workspace, target, path);
+    const info = await stat(target.absolutePath);
+    if (!info.isDirectory()) {
+      throw new Error("resolved path is not a directory");
+    }
     return target;
   } catch (error) {
     if (error instanceof Error && error.message.includes("inside the workspace")) {
-      throw new Error(`cwd must stay inside the workspace: ${path}`);
+      throw new Error(`cwd must stay inside the authoritative workspace ${workspace}: ${path}`);
     }
-    throw error;
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`cwd must resolve to an existing directory inside the authoritative workspace ${workspace}: ${path} (${reason})`);
   }
 }

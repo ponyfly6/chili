@@ -238,7 +238,7 @@ test("workspace file tools reject symlink escapes", async () => {
 
     const bash = await executor.execute(toolInput("bash", { command: "pwd", cwd: "link" }, workspace));
     expect(bash.status).toBe("failed");
-    if (bash.status === "failed") expect(bash.error.message).toContain("inside the workspace");
+    if (bash.status === "failed") expect(bash.error.message).toContain("inside the authoritative workspace");
     expect(bashRan).toBe(false);
 
     await expectRejectsWith(readFile(join(outside, "write.txt"), "utf8"), "ENOENT");
@@ -268,6 +268,32 @@ test("glob, grep, and tool_search expose repository discovery tools", async () =
     const rootGlob = await executor.execute(toolInput("glob", { pattern: "**/*.ts", path: "." }, workspace));
     expect(rootGlob.status).toBe("completed");
     if (rootGlob.status === "completed") expect(rootGlob.result.output).toContain("alpha.ts");
+
+    const emptyGlob = await executor.execute(toolInput("glob", { pattern: "**/*.missing" }, workspace));
+    expect(emptyGlob.status).toBe("completed");
+    if (emptyGlob.status === "completed") {
+      expect(emptyGlob.result.output).toBe("(no matches)");
+      expect(emptyGlob.result.metadata).toMatchObject({ count: 0, truncated: false });
+    }
+
+    const braceGlob = await executor.execute(toolInput("glob", { pattern: "**/*.{ts,tsx}" }, workspace));
+    expect(braceGlob.status).toBe("failed");
+    if (braceGlob.status === "failed") {
+      expect(braceGlob.error.message).toBe("Invalid glob input: glob brace expansion is not supported; use separate glob calls instead");
+    }
+
+    await writeFile(join(workspace, "literal{draft}.ts"), "export const draft = true;\n", "utf8");
+    const literalBraceGlob = await executor.execute(toolInput("glob", { pattern: "**/*{draft}.ts" }, workspace));
+    expect(literalBraceGlob.status).toBe("completed");
+    if (literalBraceGlob.status === "completed") {
+      expect(literalBraceGlob.result.output).toBe("literal{draft}.ts");
+    }
+
+    const rangeBraceGlob = await executor.execute(toolInput("glob", { pattern: "release-{1..3}.txt" }, workspace));
+    expect(rangeBraceGlob.status).toBe("failed");
+    if (rangeBraceGlob.status === "failed") {
+      expect(rangeBraceGlob.error.message).toContain("glob brace expansion is not supported");
+    }
 
     const grep = await executor.execute(toolInput("grep", { pattern: "alpha", headLimit: 5 }, workspace));
     expect(grep.status).toBe("completed");
@@ -1118,9 +1144,44 @@ test("bash supports workspace-scoped cwd and env overrides", async () => {
       });
     }
 
+    const absoluteInside = await executor.execute(
+      toolInput("bash", { command: "basename \"$PWD\"", cwd: join(workspace, "subdir") }, workspace),
+    );
+    expect(absoluteInside.status).toBe("completed");
+    if (absoluteInside.status === "completed") expect(absoluteInside.result.output).toBe("subdir\n");
+
     const outside = await executor.execute(toolInput("bash", { command: "pwd", cwd: ".." }, workspace));
     expect(outside.status).toBe("failed");
-    if (outside.status === "failed") expect(outside.error.message).toContain("cwd must stay inside the workspace");
+    if (outside.status === "failed") {
+      expect(outside.error.message).toContain("cwd must stay inside the authoritative workspace");
+      expect(outside.error.message).toContain(workspace);
+      expect(outside.error.message).toContain(": ..");
+    }
+
+    const absoluteOutsidePath = join(workspace, "..");
+    const absoluteOutside = await executor.execute(
+      toolInput("bash", { command: "pwd", cwd: absoluteOutsidePath }, workspace),
+    );
+    expect(absoluteOutside.status).toBe("failed");
+    if (absoluteOutside.status === "failed") {
+      expect(absoluteOutside.error.message).toContain(`inside the authoritative workspace ${workspace}`);
+      expect(absoluteOutside.error.message).toContain(`: ${absoluteOutsidePath}`);
+    }
+
+    const missing = await executor.execute(toolInput("bash", { command: "pwd", cwd: "missing" }, workspace));
+    expect(missing.status).toBe("failed");
+    if (missing.status === "failed") {
+      expect(missing.error.message).toContain("cwd must resolve to an existing directory inside the authoritative workspace");
+      expect(missing.error.message).toContain(`${workspace}: missing`);
+    }
+
+    await writeFile(join(workspace, "not-a-directory.txt"), "file\n", "utf8");
+    const fileCwd = await executor.execute(toolInput("bash", { command: "pwd", cwd: "not-a-directory.txt" }, workspace));
+    expect(fileCwd.status).toBe("failed");
+    if (fileCwd.status === "failed") {
+      expect(fileCwd.error.message).toContain("cwd must resolve to an existing directory inside the authoritative workspace");
+      expect(fileCwd.error.message).toContain("resolved path is not a directory");
+    }
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
@@ -1128,6 +1189,33 @@ test("bash supports workspace-scoped cwd and env overrides", async () => {
 
 test("bash validates and normalizes explicit sandbox escalation requests", async () => {
   const tool = createBashTool();
+  const schema = JSON.stringify(tool.inputSchema);
+  expect(schema).toContain("authoritative workspace root");
+  expect(schema).toContain("absolute paths must remain inside it");
+  expect(schema).toContain("working_directory");
+
+  expect(await tool.validate?.({
+    command: "pwd",
+    cwd: "subdir",
+    workingDirectory: "other",
+  })).toEqual({
+    ok: false,
+    message: "cwd, workingDirectory, and working_directory must match when multiple aliases are provided",
+  });
+
+  expect(await tool.validate?.({
+    command: "pwd",
+    workingDirectory: "subdir",
+    working_directory: "subdir",
+  })).toEqual({
+    ok: true,
+    value: {
+      command: "pwd",
+      sandboxPermissions: "use_default",
+      cwd: "subdir",
+    },
+  });
+
   const missingJustification = await tool.validate?.({
     command: "osascript -e 'return 1'",
     sandbox_permissions: "require_escalated",
