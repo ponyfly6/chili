@@ -5,7 +5,7 @@ import { expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import { act, useState, type Dispatch, type SetStateAction } from "react";
 import { createRuntimeView, type ChatTranscriptItem, type HttpRuntimeClient, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
-import type { ApprovalId, ChiliEvent, MessageId, PartId, RuntimeModelDescriptor, SessionId, TaskId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
+import type { ApprovalId, ChiliEvent, MessageId, PartId, RuntimeCommandCatalog, RuntimeModelDescriptor, SessionId, TaskId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import type { ClipboardAccess } from "./clipboard.js";
 import { CONVERSATION_INTERRUPTED_NOTICE, CTRL_C_EXIT_CONFIRM_MS, ChatShellApp, ChatShellSurface, isWithinCtrlCExitWindow, type ChatShellExitInfo } from "./ChatShellApp.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
@@ -245,7 +245,77 @@ test("resumed prompts submit the persisted session workspace instead of the loca
   }
 });
 
-test("resumed chat keeps the stream global so /resume can switch sessions", async () => {
+test("resumed runtime commands submit canonical commandId without a thread field", async () => {
+  const records = chatClientRecords();
+  const sessionId = "session_runtime_command_http" as SessionId;
+  const commandCatalog: RuntimeCommandCatalog = {
+    roots: [{
+      id: "prompt.project",
+      name: "project",
+      path: "/project",
+      title: "Project prompts",
+      description: "Project prompt namespace",
+      group: "prompt",
+      source: "project",
+      argumentMode: "none",
+      argumentHint: "",
+      selectionMode: "drilldown",
+      concurrency: "allow",
+      hidden: false,
+      enabled: true,
+      executionTarget: "prompt",
+      children: [{
+        id: "prompt.project.review",
+        name: "review",
+        path: "/project review",
+        title: "Review",
+        description: "Review code",
+        group: "prompt",
+        source: "project",
+        argumentMode: "variadic",
+        argumentHint: "[files]",
+        selectionMode: "execute",
+        concurrency: "allow",
+        hidden: false,
+        enabled: true,
+        executionTarget: "prompt",
+        children: [],
+      }],
+    }],
+    diagnostics: [],
+  };
+  const client = fakeChatClient(records, [{
+    id: "event_runtime_command_workspace",
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd: "/server/runtime-command-workspace" },
+  }], { commandCatalog });
+  const app = await mountChatApp(client, { sessionId });
+
+  try {
+    await Bun.sleep(80);
+    await app.renderOnce();
+    await typeText(app, "/project review src/index.ts");
+    await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
+
+    expect(records.create).toHaveLength(0);
+    expect(records.submit[0]).toMatchObject({
+      sessionId,
+      commandId: "prompt.project.review",
+      args: "src/index.ts",
+      cwd: "/server/runtime-command-workspace",
+    });
+    expect(records.submit[0]).not.toHaveProperty("name");
+    expect(records.submit[0]).not.toHaveProperty("threadId");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("resumed chat keeps the stream global so /session resume can switch sessions", async () => {
   const records = chatClientRecords();
   const client = fakeChatClient(records);
   const app = await mountChatApp(client, {
@@ -340,7 +410,7 @@ test("default chat ignores streamed history and starts a new session", async () 
   }
 });
 
-test("/new starts a fresh runtime session for following prompts", async () => {
+test("/session new starts a fresh runtime session for following prompts", async () => {
   const records = chatClientRecords();
   const client = fakeChatClient(records);
   const app = await mountChatApp(client);
@@ -357,7 +427,9 @@ test("/new starts a fresh runtime session for following prompts", async () => {
       text: "first session",
     });
 
-    await typeText(app, "/new");
+    await typeText(app, "/session new");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressArrow("right"));
     await press(app, () => app.mockInput.pressEnter());
     await Bun.sleep(80);
     await app.renderOnce();
@@ -475,7 +547,7 @@ test("expired /model notice keeps an empty session draft and caret in the sessio
   }
 });
 
-test("/thinking enters the session layout and /new stably restores Home while it starts", async () => {
+test("/thinking effort enters the session layout and /session new stably restores Home while it starts", async () => {
   const noticeTtlMs = 500;
   let finishNewSession: (() => void) | undefined;
   const newSessionStarted = new Promise<void>((resolve) => {
@@ -490,7 +562,7 @@ test("/thinking enters the session layout and /new stably restores Home while it
   });
 
   try {
-    await typeText(app, "/thinking low");
+    await typeText(app, "/thinking effort low");
     await press(app, () => app.mockInput.pressEnter());
 
     let frame = app.captureCharFrame();
@@ -506,7 +578,9 @@ test("/thinking enters the session layout and /new stably restores Home while it
     expect(frame).not.toContain("Thinking: low");
     expect(hasStandaloneChiliTitle(frame)).toBe(false);
 
-    await typeText(app, "/new");
+    await typeText(app, "/session new");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressArrow("right"));
     await press(app, () => app.mockInput.pressEnter());
 
     frame = app.captureCharFrame();
@@ -550,7 +624,9 @@ test("a stale /model completion cannot move a new-session draft out of Home", as
     expect(app.captureCharFrame()).toContain("Ask anything");
     expect(hasStandaloneChiliTitle(app.captureCharFrame())).toBe(false);
 
-    await typeText(app, "/new");
+    await typeText(app, "/session new");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressArrow("right"));
     await press(app, () => app.mockInput.pressEnter());
     expect(hasStandaloneChiliTitle(app.captureCharFrame())).toBe(true);
 
@@ -736,7 +812,7 @@ test("Escape keeps visible output and adds a persistent red interruption notice"
   }
 });
 
-test("/clear clears local TUI notices and resets prompt history", async () => {
+test("/session new clears local TUI notices and resets prompt history", async () => {
   const submitted: string[] = [];
   let started = 0;
   const clipboard = fakeClipboard({
@@ -763,7 +839,9 @@ test("/clear clears local TUI notices and resets prompt history", async () => {
     await press(app, () => app.mockInput.pressKey("v", { ctrl: true }));
     expect(app.captureCharFrame()).toContain("Clipboard is empty.");
 
-    await typeText(app, "/clear");
+    await typeText(app, "/session new");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressArrow("right"));
     await press(app, () => app.mockInput.pressEnter());
 
     expect(started).toBe(1);
@@ -840,16 +918,16 @@ test("slash completion selection uses Up and Down without switching prompt histo
   try {
     await typeText(app, "history prompt");
     await press(app, () => app.mockInput.pressEnter());
-    await typeText(app, "/");
+    await typeText(app, "/team ");
 
-    expect(app.captureCharFrame()).toContain("> /team - Open the team cockpit");
+    expect(app.captureCharFrame()).toContain("> /team agents — Show the agent tree");
 
     await press(app, () => app.mockInput.pressArrow("down"));
-    expect(app.captureCharFrame()).toContain("> /team run - Start the selected team loop");
+    expect(app.captureCharFrame()).toContain("> /team run — Start the selected team loop");
     expect(app.captureCharFrame()).not.toContain("history prompt");
 
     await press(app, () => app.mockInput.pressArrow("up"));
-    expect(app.captureCharFrame()).toContain("> /team - Open the team cockpit");
+    expect(app.captureCharFrame()).toContain("> /team agents — Show the agent tree");
   } finally {
     app.renderer.destroy();
   }
@@ -863,10 +941,10 @@ test("slash completion Up wraps from the first item to the last item", async () 
   });
 
   try {
-    await typeText(app, "/");
+    await typeText(app, "/team ");
 
     await press(app, () => app.mockInput.pressArrow("up"));
-    expect(app.captureCharFrame()).toContain("> /skills disable [--user|--project] <name> - Disable a skill");
+    expect(app.captureCharFrame()).toContain("> /team merge — Merge pending team work");
   } finally {
     app.renderer.destroy();
   }
@@ -877,7 +955,7 @@ test("Enter executes the selected slash completion without Tab", async () => {
   const app = await mountShell(withRunLoopReady(teamLiveFixture()), { executed });
 
   try {
-    await typeText(app, "/");
+    await typeText(app, "/team ");
     await press(app, () => app.mockInput.pressArrow("down"));
     await press(app, () => app.mockInput.pressEnter());
 
@@ -898,18 +976,18 @@ test("slash completion keeps the input visible in a short frame", async () => {
   });
 
   try {
-    await typeText(app, "/");
+    await typeText(app, "/te");
     const frame = app.captureCharFrame();
 
     expect(frame).toContain("Commands");
     expect(frame).toContain("/team");
-    expect(frame).toContain("> /");
+    expect(frame).toContain("> /te");
   } finally {
     app.renderer.destroy();
   }
 });
 
-test("Tab accepts slash completion without leaving the completion list open", async () => {
+test("Tab drills into a command namespace without executing it", async () => {
   const app = await mountShell(teamLiveFixture(), {
     runtime: {
       submitPrompt: async () => true,
@@ -917,15 +995,15 @@ test("Tab accepts slash completion without leaving the completion list open", as
   });
 
   try {
-    await typeText(app, "/");
-    expect(app.captureCharFrame()).toContain("Open the team cockpit");
+    await typeText(app, "/tea");
+    expect(app.captureCharFrame()).toContain("Inspect and control agent teamwork");
 
     await press(app, () => app.mockInput.pressTab());
     const frame = app.captureCharFrame();
 
     expect(frame).toContain("/team ");
-    expect(frame).not.toContain("Open the team cockpit");
-    expect(frame).not.toContain("Start the selected team loop");
+    expect(frame).toContain("/team agents");
+    expect(frame).toContain("/team run");
   } finally {
     app.renderer.destroy();
   }
@@ -940,13 +1018,31 @@ test("Tab accepts the strongest slash completion for a typed prefix", async () =
 
   try {
     await typeText(app, "/mo");
-    expect(app.captureCharFrame()).toContain("> /model [provider/model] - Select model");
+    expect(app.captureCharFrame()).toContain("> /model — Configure the active model");
 
     await press(app, () => app.mockInput.pressTab());
     const frame = app.captureCharFrame();
 
     expect(frame).toContain("/model ");
-    expect(frame).not.toContain("/commands reload ");
+    expect(frame).toContain("/model select <provider/model>");
+    expect(frame).toContain("/model service <standard|fast>");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("Right drills into a command namespace without executing it", async () => {
+  const executed: TeamLiveAction[] = [];
+  const app = await mountShell(withRunLoopReady(teamLiveFixture()), { executed });
+
+  try {
+    await typeText(app, "/tea");
+    await press(app, () => app.mockInput.pressArrow("right"));
+
+    const frame = app.captureCharFrame();
+    expect(frame).toContain("/team ");
+    expect(frame).toContain("/team run");
+    expect(executed).toEqual([]);
   } finally {
     app.renderer.destroy();
   }
@@ -1174,7 +1270,7 @@ test("/mcp reload refreshes MCP config and prompt commands", async () => {
       },
       reloadCommands: async () => {
         calls.push("commands");
-        return { commands: [], diagnostics: [], directories: [], skippedConflicts: [] };
+        return { roots: [], diagnostics: [] };
       },
     },
   });
@@ -1190,6 +1286,64 @@ test("/mcp reload refreshes MCP config and prompt commands", async () => {
     expect(frame).toContain("MCP reloaded: yes servers=0 errors=1");
     expect(frame).toContain("error bad: config failed");
     expect(frame).toContain("Prompt commands refreshed.");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("nested runtime commands submit their canonical commandId in the current session", async () => {
+  const submissions: Array<{ commandId: string; args: string }> = [];
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      activeSessionId: "session_runtime_command" as SessionId,
+      commandList: {
+        roots: [{
+          id: "prompt.project",
+          name: "project",
+          path: "/project",
+          title: "Project prompts",
+          description: "Project prompt namespace",
+          group: "prompt",
+          source: "project",
+          argumentMode: "none",
+          argumentHint: "",
+          selectionMode: "drilldown",
+          concurrency: "allow",
+          hidden: false,
+          enabled: true,
+          executionTarget: "prompt",
+          children: [{
+            id: "prompt.project.review",
+            name: "review",
+            path: "/project review",
+            title: "Review",
+            description: "Review code",
+            group: "prompt",
+            source: "project",
+            argumentMode: "variadic",
+            argumentHint: "[files]",
+            selectionMode: "execute",
+            concurrency: "allow",
+            hidden: false,
+            enabled: true,
+            executionTarget: "prompt",
+            children: [],
+          }],
+        }],
+        diagnostics: [],
+      },
+      submitCommand: async (commandId, args) => {
+        submissions.push({ commandId, args });
+        return true;
+      },
+    },
+  });
+
+  try {
+    await typeText(app, "/project review src/index.ts");
+    await press(app, () => app.mockInput.pressEnter());
+
+    expect(submissions).toEqual([{ commandId: "prompt.project.review", args: "src/index.ts" }]);
   } finally {
     app.renderer.destroy();
   }
@@ -1244,8 +1398,8 @@ test("$ skill picker distinguishes duplicate names with source and path hints", 
   try {
     await typeText(app, "$same");
     const frame = app.captureCharFrame();
-    expect(frame).toContain("> $same - user /home/.chili/skills/same");
-    expect(frame).toContain("  $same - project /repo/.chili/skills/same");
+    expect(frame).toContain("> $same — user /home/.chili/skills/same");
+    expect(frame).toContain("  $same — project /repo/.chili/skills/same");
   } finally {
     app.renderer.destroy();
   }
@@ -1328,7 +1482,7 @@ test("manual ambiguous skill mention warns locally without picker binding", asyn
     await press(app, () => app.mockInput.pressEnter());
 
     expect(submissions).toEqual(["$same please"]);
-    expect(app.captureCharFrame()).toContain("Skill $same is ambiguous; select it from /skills so Chili can bind the exact SKILL.md.");
+    expect(app.captureCharFrame()).toContain("Skill $same is ambiguous; select it from /skills browse so Chili can bind the exact SKILL.md.");
   } finally {
     app.renderer.destroy();
   }
@@ -1381,7 +1535,7 @@ test("/skills inserts $ and opens the skill picker", async () => {
   }
 });
 
-test("/thinking hide and show toggle reasoning visibility", async () => {
+test("/thinking traces hide and show toggle reasoning visibility", async () => {
   const callId = "call_reasoning_toggle" as ToolCallId;
   const app = await mountShell(teamLiveFixture(), {
     runtime: {
@@ -1434,7 +1588,7 @@ test("/thinking hide and show toggle reasoning visibility", async () => {
     expect(app.captureCharFrame()).toContain("Let me inspect private chain.");
     expect(app.captureCharFrame()).toContain("done");
 
-    await typeText(app, "/thinking hide");
+    await typeText(app, "/thinking traces hide");
     await press(app, () => app.mockInput.pressEnter());
     expect(app.captureCharFrame()).toContain("Thinking traces hidden.");
     expect(app.captureCharFrame()).toContain("🫧");
@@ -1442,7 +1596,7 @@ test("/thinking hide and show toggle reasoning visibility", async () => {
     expect(app.captureCharFrame()).not.toContain("Let me inspect private chain.");
     expect(app.captureCharFrame()).toContain("done");
 
-    await typeText(app, "/thinking show");
+    await typeText(app, "/thinking traces show");
     await press(app, () => app.mockInput.pressEnter());
     expect(app.captureCharFrame()).toContain("Thinking traces shown.");
     expect(app.captureCharFrame()).toContain("Thinking: checking private chain");
@@ -1452,7 +1606,7 @@ test("/thinking hide and show toggle reasoning visibility", async () => {
   }
 });
 
-test("/hide-thinking and /show-thinking toggle reasoning visibility", async () => {
+test("legacy /hide-thinking and /show-thinking aliases are rejected", async () => {
   const app = await mountShell(teamLiveFixture(), {
     runtime: {
       chatView: {
@@ -1479,13 +1633,13 @@ test("/hide-thinking and /show-thinking toggle reasoning visibility", async () =
   try {
     await typeText(app, "/hide-thinking");
     await press(app, () => app.mockInput.pressEnter());
-    expect(app.captureCharFrame()).toContain("Thinking traces hidden.");
-    expect(app.captureCharFrame()).toContain("🫧");
-    expect(app.captureCharFrame()).not.toContain("Thinking: checking command visibility");
+    expect(app.captureCharFrame()).toContain("Unknown command token: hide-thinking");
+    expect(app.captureCharFrame()).toContain("Thinking: checking command visibility");
 
+    await backspace(app, "/hide-thinking".length);
     await typeText(app, "/show-thinking");
     await press(app, () => app.mockInput.pressEnter());
-    expect(app.captureCharFrame()).toContain("Thinking traces shown.");
+    expect(app.captureCharFrame()).toContain("Unknown command token: show-thinking");
     expect(app.captureCharFrame()).toContain("Thinking: checking command visibility");
   } finally {
     app.renderer.destroy();
@@ -1528,10 +1682,10 @@ test("command palette selection uses Up and Down without switching prompt histor
     await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
 
     expect(app.captureCharFrame()).toContain("Command Palette");
-    expect(app.captureCharFrame()).toContain("> /team - Open the team cockpit");
+    expect(app.captureCharFrame()).toContain("> /help — Browse commands and keyboard shortcuts");
 
     await press(app, () => app.mockInput.pressArrow("down"));
-    expect(app.captureCharFrame()).toContain("> /team run - Start the selected team loop");
+    expect(app.captureCharFrame()).toContain("> /status — Show session and team status");
     expect(app.captureCharFrame()).not.toContain("palette history");
   } finally {
     app.renderer.destroy();
@@ -1555,7 +1709,33 @@ test("command palette keeps the draft visible without entering prompt history", 
     await press(app, () => app.mockInput.pressArrow("down"));
     const frame = app.captureCharFrame();
     expect(frame).toContain("draft before palette");
-    expect(frame).toContain("> /team run - Start the selected team loop");
+    expect(frame).toContain("> /status — Show session and team status");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("command palette Tab drills down while Enter executes the selected command", async () => {
+  const app = await mountShell(teamLiveFixture());
+
+  try {
+    await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
+    await typeText(app, "team");
+    expect(app.captureCharFrame()).toContain("> /team — Inspect and control agent teamwork");
+
+    await press(app, () => app.mockInput.pressTab());
+    let frame = app.captureCharFrame();
+    expect(frame).toContain("Command Palette · team");
+    expect(frame).toContain("> /team agents — Show the agent tree");
+    expect(frame).toContain("/team run — Start the selected team loop");
+
+    await press(app, () => app.mockInput.pressEscape());
+    await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
+    await typeText(app, "team");
+    await press(app, () => app.mockInput.pressEnter());
+    frame = app.captureCharFrame();
+    expect(frame).toContain("Chili Team Live");
+    expect(frame).not.toContain("Command Palette");
   } finally {
     app.renderer.destroy();
   }
@@ -2847,11 +3027,12 @@ test("Ctrl+P opens the command palette", async () => {
   try {
     await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
     expect(app.captureCharFrame()).toContain("Command Palette");
-    expect(app.captureCharFrame()).toContain("/team");
-    expect(app.captureCharFrame()).toContain("/model [provider/model] - Select model");
-    expect(app.captureCharFrame()).toContain("/thinking <off|minimal|low");
-    expect(app.captureCharFrame()).toContain("/fast <on|off|status> - Set Codex Fast mode");
-    expect(app.captureCharFrame()).toContain("/theme - Switch theme");
+    expect(app.captureCharFrame()).toContain("/model select <provider/model>");
+    expect(app.captureCharFrame()).toContain("/model service <standard|fast>");
+    expect(app.captureCharFrame()).toContain("/theme — Switch the terminal theme");
+
+    await typeText(app, "team run");
+    expect(app.captureCharFrame()).toContain("> /team run — Start the selected team loop");
   } finally {
     app.renderer.destroy();
   }
@@ -2861,10 +3042,10 @@ test("slash completion includes team command", async () => {
   const app = await mountShell(teamLiveFixture());
 
   try {
-    await typeText(app, "/");
+    await typeText(app, "/te");
     expect(app.captureCharFrame()).toContain("Commands");
     expect(app.captureCharFrame()).toContain("/team");
-    expect(app.captureCharFrame()).toContain("/hide-thinking");
+    expect(app.captureCharFrame()).not.toContain("/hide-thinking");
   } finally {
     app.renderer.destroy();
   }
@@ -2889,7 +3070,7 @@ test("/theme opens the theme picker", async () => {
   }
 });
 
-test("/resume opens a searchable project-scoped picker and switches sessions", async () => {
+test("/session resume opens a searchable project-scoped picker and switches sessions", async () => {
   const resumed: string[] = [];
   const sessions = [
     {
@@ -2949,7 +3130,7 @@ test("/resume opens a searchable project-scoped picker and switches sessions", a
   });
 
   try {
-    await typeText(app, "/resume session_worker");
+    await typeText(app, "/session resume session_worker");
     await press(app, () => app.mockInput.pressEnter());
     await Bun.sleep(20);
     await app.renderOnce();
@@ -2957,7 +3138,8 @@ test("/resume opens a searchable project-scoped picker and switches sessions", a
     expect(resumed).toEqual([]);
     expect(app.captureCharFrame()).toContain("Saved chat not found: session_worker");
 
-    await typeText(app, "/resume");
+    await backspace(app, "/session resume session_worker".length);
+    await typeText(app, "/session resume");
     await press(app, () => app.mockInput.pressEnter());
     await Bun.sleep(40);
     await app.renderOnce();
@@ -2981,7 +3163,7 @@ test("/resume opens a searchable project-scoped picker and switches sessions", a
   }
 });
 
-test("/rename edits and saves the current chat title", async () => {
+test("/session rename edits and saves the current chat title", async () => {
   const renamed: string[] = [];
   const sessionId = "session_rename" as SessionId;
   const app = await mountShell(teamLiveFixture(), {
@@ -3011,7 +3193,7 @@ test("/rename edits and saves the current chat title", async () => {
   });
 
   try {
-    await typeText(app, "/rename");
+    await typeText(app, "/session rename");
     await press(app, () => app.mockInput.pressEnter());
     await Bun.sleep(40);
     await app.renderOnce();
@@ -3595,7 +3777,7 @@ test("/model keeps the old UI state when persistence fails", async () => {
   });
 
   try {
-    await typeText(app, "/model openai-codex/gpt-5.5");
+    await typeText(app, "/model select openai-codex/gpt-5.5");
     await press(app, () => app.mockInput.pressEnter());
     await Bun.sleep(120);
     await app.renderOnce();
@@ -3661,16 +3843,16 @@ test("/status separates the live event stream from execution and reports unsuppo
     expect(frame).toContain("does not support configurable thinking");
     expect(frame).not.toContain("Very brief reasoning");
 
-    await typeText(app, "/fast on");
+    await typeText(app, "/model service fast");
     await press(app, () => app.mockInput.pressEnter());
-    expect(app.captureCharFrame()).toContain("Fast mode is not available for the selected model");
+    expect(app.captureCharFrame()).toContain("Service tiers are not available for the selected model.");
     expect(serviceTierChanges).toBe(0);
   } finally {
     app.renderer.destroy();
   }
 });
 
-test("/agents updates and reads the session delegation policy through runtime APIs", async () => {
+test("/session delegation updates and reads the session delegation policy through runtime APIs", async () => {
   const sessionId = "session_agents_policy" as SessionId;
   const policies: string[] = [];
   const app = await mountShell(teamLiveFixture(), {
@@ -3686,13 +3868,13 @@ test("/agents updates and reads the session delegation policy through runtime AP
   });
 
   try {
-    await typeText(app, "/agents proactive");
+    await typeText(app, "/session delegation proactive");
     await press(app, () => app.mockInput.pressEnter());
     await app.renderOnce();
     expect(policies).toEqual(["proactive"]);
     expect(app.captureCharFrame()).toContain("Agent delegation: proactive (source: session)");
 
-    await typeText(app, "/agents status");
+    await typeText(app, "/session delegation status");
     await press(app, () => app.mockInput.pressEnter());
     await app.renderOnce();
     expect(app.captureCharFrame()).toContain("Chili may delegate useful independent work proactively.");
@@ -4028,6 +4210,8 @@ test("team merge slash command executes SDK merge action", async () => {
 
   try {
     await typeText(app, "/team merge");
+    await press(app, () => app.mockInput.pressEnter());
+    await press(app, () => app.mockInput.pressArrow("right"));
     await press(app, () => app.mockInput.pressEnter());
     expect(executed[0]).toMatchObject({ type: "merge", enabled: true, taskId: "task_live" });
   } finally {
@@ -4566,6 +4750,7 @@ function fakeChatClient(
     reasoningLevel?: ReasoningLevel;
     setModelError?: Error;
     setReasoningError?: Error;
+    commandCatalog?: RuntimeCommandCatalog;
   } = {},
 ): HttpRuntimeClient {
   let currentModelSelection = options.modelSelection;
@@ -4636,18 +4821,8 @@ function fakeChatClient(
       return { status: "accepted", sessionId: input.sessionId as SessionId };
     },
     submitPrompt: async () => ({ status: "completed", turns: [] }),
-    listCommands: async () => ({
-      commands: [],
-      diagnostics: [],
-      directories: [],
-      skippedConflicts: [],
-    }),
-    reloadCommands: async () => ({
-      commands: [],
-      diagnostics: [],
-      directories: [],
-      skippedConflicts: [],
-    }),
+    listCommands: async () => options.commandCatalog ?? ({ roots: [], diagnostics: [] }),
+    reloadCommands: async () => options.commandCatalog ?? ({ roots: [], diagnostics: [] }),
     interruptSession: async (input: Record<string, unknown>) => {
       records.interrupt.push(input);
       return { interrupted: true };

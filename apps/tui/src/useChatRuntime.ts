@@ -23,7 +23,7 @@ import type {
   RuntimeModelConfig,
   RuntimePermissionConfig,
   RuntimePermissionProfileId,
-  RuntimePromptCommandList,
+  RuntimeCommandCatalog,
   RuntimeSkillMention,
   ServiceTier,
   SessionId,
@@ -58,12 +58,12 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
   modelConfig?: RuntimeModelConfig;
   delegationConfig?: RuntimeDelegationConfig;
   permissionConfig?: RuntimePermissionConfig;
-  commandList?: RuntimePromptCommandList;
+  commandList?: RuntimeCommandCatalog;
   mcpStatus?: RuntimeMcpStatusResponse;
   canSubmit: boolean;
   submitBlockedReason?: string;
   submitPrompt: (text: string, options?: ChatSubmitOptions) => Promise<boolean>;
-  submitCommand: (name: string, args: string, options?: ChatCommandSubmitOptions) => Promise<boolean>;
+  submitCommand: (commandId: string, args: string, options?: ChatCommandSubmitOptions) => Promise<boolean>;
   setRuntimeModel?: (selection: ModelSelection) => Promise<boolean>;
   setRuntimeReasoning?: (level: ReasoningLevel) => Promise<boolean>;
   setRuntimeServiceTier?: (serviceTier: ServiceTier) => Promise<boolean>;
@@ -71,7 +71,7 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
   refreshModelConfig?: () => Promise<void>;
   refreshDelegationConfig?: () => Promise<RuntimeDelegationConfig | undefined>;
   refreshPermissionConfig?: () => Promise<void>;
-  reloadCommands?: () => Promise<RuntimePromptCommandList | undefined>;
+  reloadCommands?: () => Promise<RuntimeCommandCatalog | undefined>;
   refreshMcpStatus?: () => Promise<RuntimeMcpStatusResponse | undefined>;
   getMcpServer?: (server: string) => Promise<RuntimeMcpServerDescriptor | undefined>;
   reloadMcp?: () => Promise<RuntimeMcpReloadResponse | undefined>;
@@ -131,7 +131,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   const [delegationConfig, setDelegationConfig] = useState<RuntimeDelegationConfig | undefined>();
   const delegationConfigEpochRef = useRef(0);
   const [permissionConfig, setPermissionConfig] = useState<RuntimePermissionConfig | undefined>();
-  const [commandList, setCommandList] = useState<RuntimePromptCommandList | undefined>();
+  const [commandList, setCommandList] = useState<RuntimeCommandCatalog | undefined>();
   const [mcpStatus, setMcpStatus] = useState<RuntimeMcpStatusResponse | undefined>();
   const requestAbortRefs = useRef(new Set<AbortController>());
   const refreshedForStreamingRef = useRef(false);
@@ -257,7 +257,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     void refreshPermissionConfig();
   }, [refreshPermissionConfig]);
 
-  const refreshCommands = useCallback(async (): Promise<RuntimePromptCommandList | undefined> => {
+  const refreshCommands = useCallback(async (): Promise<RuntimeCommandCatalog | undefined> => {
     try {
       return await withAbort(async (signal) => {
         const commands = await client.listCommands({ signal });
@@ -274,7 +274,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     void refreshCommands();
   }, [refreshCommands]);
 
-  const reloadCommands = useCallback(async (): Promise<RuntimePromptCommandList | undefined> => {
+  const reloadCommands = useCallback(async (): Promise<RuntimeCommandCatalog | undefined> => {
     try {
       return await withAbort(async (signal) => {
         const commands = await client.reloadCommands({ signal });
@@ -503,12 +503,12 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   }, [activeSessionId, chatView.cwd, chatView.pendingApprovals.length, chatView.sessionId, chatView.statusEventId, client, options.baseUrl, options.cwd, running, submitPending, withAbort]);
 
   const submitCommand = useCallback(async (
-    name: string,
+    commandId: string,
     args: string,
     submitOptions: ChatCommandSubmitOptions = {},
   ): Promise<boolean> => {
-    const commandName = name.trim();
-    if (!commandName || submitPending || running || chatView.pendingApprovals.length > 0) return false;
+    const normalizedCommandId = commandId.trim();
+    if (!normalizedCommandId || submitPending || running || chatView.pendingApprovals.length > 0) return false;
     const acceptedAgainstStatusEventId = chatView.statusEventId ?? null;
     setSubmitPending(true);
     setChatFeedback({ status: "pending", message: "sending command" });
@@ -530,7 +530,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
         }
         await client.submitCommandAsync({
           sessionId,
-          name: commandName,
+          commandId: normalizedCommandId,
           ...(args.trim().length > 0 ? { args: args.trim() } : {}),
           ...(executionCwd ? { cwd: executionCwd } : {}),
           ...(submitOptions.modelSelection ? { modelSelection: submitOptions.modelSelection } : {}),

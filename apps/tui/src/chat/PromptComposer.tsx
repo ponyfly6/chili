@@ -1,7 +1,7 @@
 import { decodePasteBytes, type KeyBinding, type KeyEvent, type PasteEvent, type TextareaRenderable } from "@opentui/core";
 import { useCallback, useLayoutEffect, useRef } from "react";
 import type { ChatRequestStatus } from "../useChatRuntime.js";
-import type { SlashCompletion } from "../slash/types.js";
+import type { TuiCommandSuggestion } from "../commands/types.js";
 import type { TuiTheme } from "../theme/index.js";
 import { cleanClipboardText } from "../clipboard.js";
 import { commandListHeight, DEFAULT_COMMAND_LIST_MAX_ITEMS, CommandList } from "./CommandList.js";
@@ -28,10 +28,11 @@ export function PromptComposer(props: {
   resetKey?: number | undefined;
   disabled: boolean;
   disabledReason?: string | undefined;
-  completions: readonly SlashCompletion[];
+  completions: readonly TuiCommandSuggestion[];
   completionOpen?: boolean | undefined;
   paletteOpen: boolean;
-  paletteItems: readonly SlashCompletion[];
+  paletteTitle?: string | undefined;
+  paletteItems: readonly TuiCommandSuggestion[];
   paletteIndex: number;
   completionTitle?: string | undefined;
   emptyCompletionText?: string | undefined;
@@ -149,7 +150,7 @@ export function PromptComposer(props: {
         </text>
       ) : null}
       {props.paletteOpen ? (
-        <CommandList title="Command Palette" items={props.paletteItems} selectedIndex={props.paletteIndex} maxItems={maxCommandItems} compact={compactCommands} theme={props.theme} />
+        <CommandList title={props.paletteTitle ?? "Command Palette"} items={props.paletteItems} selectedIndex={props.paletteIndex} maxItems={maxCommandItems} compact={compactCommands} theme={props.theme} emptyText="no matches" />
       ) : props.completionOpen || props.completions.length > 0 ? (
         <CommandList title={props.completionTitle ?? "Commands"} items={props.completions} selectedIndex={props.completionIndex} maxItems={maxCommandItems} compact={compactCommands} theme={props.theme} emptyText={props.emptyCompletionText} />
       ) : null}
@@ -190,10 +191,10 @@ export function PromptComposer(props: {
 }
 
 export function promptComposerHeight(input: {
-  completions: readonly SlashCompletion[];
+  completions: readonly TuiCommandSuggestion[];
   completionOpen?: boolean | undefined;
   paletteOpen: boolean;
-  paletteItems: readonly SlashCompletion[];
+  paletteItems: readonly TuiCommandSuggestion[];
   feedback?: unknown;
   maxCommandItems?: number | undefined;
   shellMode?: boolean | undefined;

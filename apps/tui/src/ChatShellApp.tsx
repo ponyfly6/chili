@@ -1,11 +1,13 @@
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type Dispatch, type RefObject, type SetStateAction } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useReducer, useRef, useState, type Dispatch, type RefObject, type SetStateAction } from "react";
 import { useAppContext, useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, MouseEvent, ScrollBoxRenderable, Selection } from "@opentui/core";
+import { collectCommandNodes, completeCommandsSync, resolveCommand, type ResolveCommandResult } from "@chili/commands";
 import { runtimeDelegationStatus, type ChatSessionView, type ChatTranscriptItem, type HttpRuntimeClient, type RuntimeSessionSummary, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
 import type {
   ApprovalId,
   DelegationPolicy,
   MessageImageContent,
+  RuntimeCommandNode,
   RuntimeMcpAuthResponse,
   RuntimeMcpLogoutResponse,
   RuntimeMcpReloadResponse,
@@ -77,9 +79,9 @@ import { buildTranscriptLines, buildTranscriptText } from "./chat/transcript.js"
 import { TranscriptView } from "./chat/TranscriptView.js";
 import type { LocalTranscriptItem, PromptPart } from "./chat/types.js";
 import { usePromptHistory } from "./chat/usePromptHistory.js";
-import { customSlashCommandsFromRuntime } from "./slash/custom.js";
-import { createDefaultSlashCommands, resolveSlashCommand, slashCompletions } from "./slash/registry.js";
-import type { SlashCommand, SlashCommandContext, SlashCommandResult, SlashCompletion } from "./slash/types.js";
+import { tuiCommands } from "./commands/catalog.js";
+import { initialCommandMenuState, reduceCommandMenu } from "./commands/menu-state.js";
+import type { TuiCommand, TuiCommandContext, TuiCommandResult, TuiCommandSuggestion } from "./commands/types.js";
 import {
   DEFAULT_TUI_THEME_ID,
   initialTuiThemeId,
@@ -117,7 +119,13 @@ interface PendingInterruptRequest {
   candidate?: InterruptedPromptCandidate | undefined;
 }
 
-interface SlashActions {
+interface CommandConfirmation {
+  title: string;
+  result: TuiCommandResult;
+  selectedIndex: number;
+}
+
+interface CommandActions {
   cwd: string;
   enterSessionLayout: () => void;
   currentSessionUiEpoch: () => number;
@@ -146,6 +154,9 @@ interface SlashActions {
   ensureOpenAICodexDefaultModel: () => Promise<void>;
   reloadSkills: () => Promise<void>;
   reloadCommands: () => Promise<void>;
+  requestConfirmation: (title: string, result: TuiCommandResult) => void;
+  openCommandPalette: () => void;
+  exitApp: () => void;
 }
 
 interface SkillSummariesState {
@@ -261,7 +272,7 @@ export function ChatShellSurface(props: {
   selectedTeamLocked?: boolean;
   onSelectTeam?: (teamId: TeamId) => void;
   onExit?: (info?: ChatShellExitInfo) => void;
-  commands?: readonly SlashCommand[];
+  commands?: readonly TuiCommand[];
   clipboard?: ClipboardAccess | undefined;
   localMessageTtlMs?: number | undefined;
   skills?: readonly SkillSummary[] | undefined;
@@ -295,9 +306,12 @@ export function ChatShellSurface(props: {
   ));
   const [statusClipboardFeedback, setStatusClipboardFeedback] = useState<StatusPageFeedback | undefined>(undefined);
   const deferredLocalItems = useDeferredValue(localItems);
-  const [paletteOpen, setPaletteOpen] = useState(false);
-  const [paletteIndex, setPaletteIndex] = useState(0);
+  const [commandMenu, dispatchCommandMenu] = useReducer(reduceCommandMenu, initialCommandMenuState);
+  const paletteOpen = commandMenu.mode === "palette";
+  const paletteIndex = commandMenu.selectedIndex;
+  const paletteQuery = commandMenu.query;
   const [completionIndex, setCompletionIndex] = useState(0);
+  const [commandConfirmation, setCommandConfirmation] = useState<CommandConfirmation | undefined>(undefined);
   const [acceptedCompletionPrompt, setAcceptedCompletionPrompt] = useState<string | undefined>(undefined);
   const acceptedCompletionPromptRef = useRef<string | undefined>(undefined);
   const [themeId, setThemeId] = useState(() => initialTuiThemeId(props.options?.themeId));
@@ -449,6 +463,18 @@ export function ChatShellSurface(props: {
   const themeOptions = selectableTuiThemeOptions;
   const systemThemeAvailable = Boolean(systemTheme);
   const cwd = props.options?.cwd ?? process.cwd();
+  const closeCommandMenu = useCallback(() => {
+    dispatchCommandMenu({ type: "close" });
+  }, []);
+  const openCommandPalette = useCallback(() => {
+    setResumePicker(undefined);
+    setRenamePrompt(undefined);
+    setModelPicker(undefined);
+    setReasoningPicker(undefined);
+    setPermissionsPicker(undefined);
+    setThemePicker(undefined);
+    dispatchCommandMenu({ type: "open_palette", draft: prompt });
+  }, [prompt]);
   const statusOptions: StatusFooterOptions = {
     modeName: props.options?.modeName ?? "Build",
     modelName: props.options?.modelName ?? "auto",
@@ -500,17 +526,13 @@ export function ChatShellSurface(props: {
     hideThinking,
     transcriptActive: view === "transcript",
   });
-  const defaultSlashCommands = useMemo(() => createDefaultSlashCommands(), []);
-  const customSlashCommands = useMemo(
-    () => customSlashCommandsFromRuntime(props.runtime.commandList),
-    [props.runtime.commandList],
-  );
   const commands = useMemo(
-    () => props.commands ?? [...defaultSlashCommands, ...customSlashCommands.commands],
-    [customSlashCommands.commands, defaultSlashCommands, props.commands],
+    () => props.commands ?? tuiCommands(props.runtime.commandList),
+    [props.commands, props.runtime.commandList],
   );
-  const slashContext = useMemo<SlashCommandContext>(() => ({
+  const commandContext = useMemo<TuiCommandContext>(() => ({
     model: props.model,
+    busy: isInterruptInFlight(props.runtime.chatView.status),
     cwd,
     ...(modelSelection ? { modelSelection } : {}),
     ...(reasoningConfigurable && reasoningLevel ? { reasoningLevel } : {}),
@@ -521,22 +543,28 @@ export function ChatShellSurface(props: {
     skills: props.skills ?? [],
     allSkills: props.allSkills ?? props.skills ?? [],
     mcpServers: props.runtime.mcpStatus?.servers ?? [],
-  }), [availableReasoningLevels, cwd, modelCandidates, modelSelection, props.allSkills, props.model, props.runtime.mcpStatus?.servers, props.skills, reasoningConfigurable, reasoningLevel, serviceTier, serviceTierConfigurable]);
-  const completionSuppressed = acceptedCompletionPrompt !== undefined && prompt === acceptedCompletionPrompt;
+    commandDiagnostics: props.runtime.commandList?.diagnostics ?? [],
+  }), [availableReasoningLevels, cwd, modelCandidates, modelSelection, props.allSkills, props.model, props.runtime.chatView.status, props.runtime.commandList?.diagnostics, props.runtime.mcpStatus?.servers, props.skills, reasoningConfigurable, reasoningLevel, serviceTier, serviceTierConfigurable]);
   const skillTrigger = activeSkillMentionTrigger(prompt);
   const skillCompletionItems = skillTrigger && !prompt.startsWith("/") && !shellInputActive
     ? skillCompletions(props.skills ?? [], skillTrigger.query)
     : [];
   const skillCompletionOpen = Boolean(skillTrigger && !prompt.startsWith("/") && !shellInputActive);
-  const slashCompletionItems = prompt.startsWith("/") && !completionSuppressed
-    ? slashCompletions(commands, slashContext, prompt, SLASH_COMPLETION_LIMIT)
+  const commandCompletionItems = prompt.startsWith("/")
+    ? completeCommandsSync(commands, commandContext, prompt, { scope: "contextual", limit: SLASH_COMPLETION_LIMIT })
     : [];
-  const completions = skillCompletionOpen ? skillCompletionItems : slashCompletionItems;
-  const resolvedSlashPrompt = prompt.startsWith("/") ? resolveSlashCommand(commands, prompt) : undefined;
-  const slashInputActive = prompt.startsWith("/") && (prompt.trim() === "/" || completions.length > 0 || resolvedSlashPrompt !== undefined);
-  const slashCompletionOpen = prompt.startsWith("/") && slashCompletionItems.length > 0;
+  const completions = skillCompletionOpen ? skillCompletionItems : commandCompletionItems;
+  const resolvedCommandPrompt = prompt.startsWith("/") ? resolveCommand(commands, commandContext, prompt) : undefined;
+  const commandInputActive = prompt.startsWith("/")
+    && resolvedCommandPrompt?.status !== "not_command"
+    && (prompt.trim() === "/" || completions.length > 0 || resolvedCommandPrompt !== undefined);
+  const commandCompletionOpen = prompt.startsWith("/") && commandCompletionItems.length > 0;
   const selectedCompletionIndex = clampIndex(completionIndex, completions.length);
-  const paletteItems = slashCompletions(commands, slashContext, "/", SLASH_COMPLETION_LIMIT);
+  const paletteDrilldown = paletteQuery.endsWith(" ");
+  const paletteItems = completeCommandsSync(commands, commandContext, paletteDrilldown ? `/${paletteQuery}` : paletteQuery, {
+    scope: paletteDrilldown ? "contextual" : "global",
+    limit: SLASH_COMPLETION_LIMIT,
+  });
   const firstApproval = props.runtime.chatView.pendingApprovals[0];
   const setPrompt = useMemo(() => setPromptText(setPromptParts, pastedTextByMarkerRef), []);
   const historyPromptValueRef = useRef<string | undefined>(undefined);
@@ -650,7 +678,7 @@ export function ChatShellSurface(props: {
       appendLocalItem("error", "Finish or interrupt the current session before resuming another chat.");
       return;
     }
-    setPaletteOpen(false);
+    closeCommandMenu();
     setModelPicker(undefined);
     setReasoningPicker(undefined);
     setPermissionsPicker(undefined);
@@ -664,7 +692,7 @@ export function ChatShellSurface(props: {
       .catch((error) => {
         setResumePicker((current) => current ? { ...current, loading: false, error: errorMessage(error) } : current);
       });
-  }, [appendLocalItem, props.runtime]);
+  }, [appendLocalItem, closeCommandMenu, props.runtime]);
   const resumeSessionByTarget = useCallback(async (target: string) => {
     if (props.runtime.chatView.status === "running" || props.runtime.chatView.status === "waiting_for_approval") {
       appendLocalItem("error", "Finish or interrupt the current session before resuming another chat.");
@@ -692,7 +720,7 @@ export function ChatShellSurface(props: {
       appendLocalItem("error", "Start a chat before renaming it.");
       return;
     }
-    setPaletteOpen(false);
+    closeCommandMenu();
     setModelPicker(undefined);
     setReasoningPicker(undefined);
     setPermissionsPicker(undefined);
@@ -707,7 +735,7 @@ export function ChatShellSurface(props: {
       .catch(() => {
         setRenamePrompt((current) => current ? { ...current, loading: false } : current);
       });
-  }, [appendLocalItem, props.runtime]);
+  }, [appendLocalItem, closeCommandMenu, props.runtime]);
   const renameChatSession = useCallback(async (title: string) => {
     const normalized = title.trim().replace(/\s+/g, " ");
     if (!normalized) {
@@ -828,7 +856,7 @@ export function ChatShellSurface(props: {
   }, [props.runtime]);
   const openMcpManager = useCallback(() => {
     setView("mcp");
-    setPaletteOpen(false);
+    closeCommandMenu();
     setModelPicker(undefined);
     setReasoningPicker(undefined);
     setPermissionsPicker(undefined);
@@ -838,7 +866,7 @@ export function ChatShellSurface(props: {
     setPrompt("");
     setMcpManager(initialMcpManagerState());
     void refreshMcpManager();
-  }, [refreshMcpManager, setPrompt]);
+  }, [closeCommandMenu, refreshMcpManager, setPrompt]);
   const closeMcpManager = useCallback(() => {
     setView("chat");
     setMcpManager(initialMcpManagerState());
@@ -960,16 +988,13 @@ export function ChatShellSurface(props: {
       appendLocalItem("error", "Could not reload commands.");
       return;
     }
-    const state = customSlashCommandsFromRuntime(commandList);
-    appendLocalItem("info", `Commands reloaded: ${state.commands.length} custom command${state.commands.length === 1 ? "" : "s"}.`);
-    for (const diagnostic of state.diagnostics) {
-      appendLocalItem(diagnostic.level === "error" ? "error" : "info", `/${diagnostic.code}: ${diagnostic.message}`);
-    }
-    for (const name of state.skippedConflicts) {
-      appendLocalItem("info", `Skipped user command /${name}; project command wins.`);
+    const count = countRuntimeCommandNodes(commandList.roots);
+    appendLocalItem("info", `Command catalog reloaded: ${count} node${count === 1 ? "" : "s"}.`);
+    for (const diagnostic of commandList.diagnostics) {
+      appendLocalItem(diagnostic.level === "error" ? "error" : "info", `[${diagnostic.code}] ${diagnostic.message}`);
     }
   }, [appendLocalItem, currentSessionUiEpoch, isSessionUiEpochCurrent, props.runtime]);
-  const slashActions = useMemo<SlashActions>(() => ({
+  const commandActions = useMemo<CommandActions>(() => ({
     cwd,
     enterSessionLayout,
     currentSessionUiEpoch,
@@ -1000,28 +1025,32 @@ export function ChatShellSurface(props: {
       await props.onSkillsChanged?.();
     },
     reloadCommands,
-  }), [appendLocalItem, appendShellItem, currentSessionUiEpoch, cwd, ensureOpenAICodexDefaultModel, enterSessionLayout, isSessionUiEpochCurrent, openMcpManager, openModelPicker, openPermissionsPicker, openReasoningPicker, openRenamePrompt, openResumePicker, openThemePicker, props.onSkillsChanged, reloadCommands, renameChatSession, resumeSessionByTarget, setAuthManualPrompt, setHideThinking, setModelSelection, setPermissionProfile, setPrompt, setReasoningLevel, setServiceTier, startNewChatSession, updateShellItem]);
-  const runSelectedSlashCompletion = useCallback(() => {
-    if (!slashCompletionOpen) return false;
-    const completion = slashCompletionItems[selectedCompletionIndex] ?? slashCompletionItems[0];
+    requestConfirmation: (title, result) => setCommandConfirmation({ title, result, selectedIndex: 0 }),
+    openCommandPalette,
+    exitApp: () => props.onExit?.(chatShellExitInfo(props.runtime, cwd)),
+  }), [appendLocalItem, appendShellItem, currentSessionUiEpoch, cwd, ensureOpenAICodexDefaultModel, enterSessionLayout, isSessionUiEpochCurrent, openCommandPalette, openMcpManager, openModelPicker, openPermissionsPicker, openReasoningPicker, openRenamePrompt, openResumePicker, openThemePicker, props.onExit, props.onSkillsChanged, props.runtime, reloadCommands, renameChatSession, resumeSessionByTarget, setAuthManualPrompt, setHideThinking, setModelSelection, setPermissionProfile, setPrompt, setReasoningLevel, setServiceTier, startNewChatSession, updateShellItem]);
+  const runSelectedCommandCompletion = useCallback(() => {
+    if (!commandCompletionOpen) return false;
+    const completion = commandCompletionItems[selectedCompletionIndex] ?? commandCompletionItems[0];
     if (!completion) return false;
+    if (!completion.value.toLowerCase().startsWith(prompt.trim().toLowerCase())) return false;
     const promptAtSelection = prompt;
     let promptUpdated = false;
-    const trackedSlashActions: SlashActions = {
-      ...slashActions,
+    const trackedCommandActions: CommandActions = {
+      ...commandActions,
       setPrompt: (value) => {
         promptUpdated = true;
-        slashActions.setPrompt(value);
+        commandActions.setPrompt(value);
       },
     };
     updateAcceptedCompletionPrompt(undefined);
     history.resetNavigation();
-    void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, trackedSlashActions)
+    void runCommandInput(completion.value, commands, commandContext, props.model, props.runtime, trackedCommandActions)
       .then(() => {
         if (!promptUpdated) setPrompt((current) => current === promptAtSelection ? "" : current);
       });
     return true;
-  }, [commands, history, prompt, props.model, props.runtime, selectedCompletionIndex, setPrompt, slashActions, slashCompletionItems, slashCompletionOpen, slashContext, updateAcceptedCompletionPrompt]);
+  }, [commandActions, commandCompletionItems, commandCompletionOpen, commandContext, commands, history, prompt, props.model, props.runtime, selectedCompletionIndex, setPrompt, updateAcceptedCompletionPrompt]);
   const runSelectedSkillCompletion = useCallback(() => {
     if (!skillCompletionOpen || !skillTrigger) return false;
     const completion = skillCompletionItems[selectedCompletionIndex] ?? skillCompletionItems[0];
@@ -1049,10 +1078,10 @@ export function ChatShellSurface(props: {
       prompt,
       expandedPrompt,
       commands,
-      slashContext,
+      commandContext,
       props.model,
       props.runtime,
-      slashActions,
+      commandActions,
       history.record,
       skillMentionBindings,
       props.skills ?? [],
@@ -1060,7 +1089,7 @@ export function ChatShellSurface(props: {
       clearPromptAttachments,
       (state) => trackInterruptedPromptCandidate(interruptedPromptCandidateRef, candidate, state),
     );
-  }, [clearPromptAttachments, commands, expandedPrompt, history.record, pastedImages, prompt, promptParts, props.model, props.runtime, props.skills, skillMentionBindings, slashActions, slashContext]);
+  }, [clearPromptAttachments, commandActions, commandContext, commands, expandedPrompt, history.record, pastedImages, prompt, promptParts, props.model, props.runtime, props.skills, skillMentionBindings]);
   useEffect(() => {
     setCompletionIndex(0);
   }, [prompt]);
@@ -1223,7 +1252,7 @@ export function ChatShellSurface(props: {
   );
   const approvalReviewBlocked = firstApproval?.permission === "bash.unsandboxed"
     && approvalReviewHeight > Math.max(6, dimensions.height - 8);
-  const approvalShortcutsEnabled = view === "chat" && Boolean(firstApproval) && props.runtime.chatView.pendingApprovals.length > 0 && !authManualPrompt && !selectorOpen && !themePicker && !paletteOpen && !slashCompletionOpen && !skillCompletionOpen;
+  const approvalShortcutsEnabled = view === "chat" && Boolean(firstApproval) && props.runtime.chatView.pendingApprovals.length > 0 && !authManualPrompt && !selectorOpen && !themePicker && !paletteOpen && !commandCompletionOpen && !skillCompletionOpen;
   const disabledReason = authManualPrompt
     ? undefined
     : modelPicker
@@ -1240,7 +1269,7 @@ export function ChatShellSurface(props: {
     ? "MCP manager open"
     : shellInputActive
     ? undefined
-    : slashInputActive
+    : commandInputActive
     ? undefined
     : props.runtime.chatView.pendingApprovals.length > 0
       ? "Resolve approval to continue"
@@ -1430,6 +1459,27 @@ export function ChatShellSurface(props: {
       requestActiveSessionInterrupt();
       return;
     }
+    if (commandConfirmation) {
+      if (isEscape(key) || (!key.ctrl && key.name === "n")) {
+        setCommandConfirmation(undefined);
+        return;
+      }
+      if (isArrowLeft(key) || isArrowRight(key) || isArrowUp(key) || isArrowDown(key)) {
+        setCommandConfirmation((current) => current ? { ...current, selectedIndex: current.selectedIndex === 0 ? 1 : 0 } : current);
+        return;
+      }
+      if (isEnter(key) || (!key.ctrl && key.name === "y")) {
+        if (commandConfirmation.selectedIndex === 1 || key.name === "y") {
+          const result = commandConfirmation.result;
+          setCommandConfirmation(undefined);
+          void applyCommandResult(result, commandContext, props.model, props.runtime, commandActions);
+        } else {
+          setCommandConfirmation(undefined);
+        }
+        return;
+      }
+      return;
+    }
     if (resumePicker) {
       if (isEscape(key)) {
         setResumePicker(undefined);
@@ -1497,8 +1547,7 @@ export function ChatShellSurface(props: {
       return;
     }
     if (key.ctrl && key.name === "p") {
-      setPaletteOpen(true);
-      setPaletteIndex(0);
+      openCommandPalette();
       return;
     }
     if (key.ctrl && key.name === "o" && !key.shift) {
@@ -1597,10 +1646,42 @@ export function ChatShellSurface(props: {
       return;
     }
     if (paletteOpen) {
-      handlePaletteKey(key, paletteItems, paletteIndex, setPaletteIndex, (completion) => {
-        setPaletteOpen(false);
-        void runSlashInput(completion.value, commands, slashContext, props.model, props.runtime, slashActions);
-      }, () => setPaletteOpen(false));
+      const selected = paletteItems[clampIndex(paletteIndex, paletteItems.length)];
+      if (isEscape(key)) {
+        closeCommandMenu();
+        return;
+      }
+      if (isArrowUp(key) || isArrowDown(key)) {
+        dispatchCommandMenu({ type: "move", delta: isArrowUp(key) ? -1 : 1, itemCount: paletteItems.length });
+        return;
+      }
+      if (isTab(key) || isArrowRight(key)) {
+        if (!selected) return;
+        if (selected.intent === "drilldown") {
+          dispatchCommandMenu({ type: "complete", value: `${selected.value} ` });
+          return;
+        }
+        closeCommandMenu();
+        history.resetNavigation();
+        setPrompt(`${selected.value}${selected.intent === "complete" ? " " : ""}`);
+        return;
+      }
+      if (isEnter(key)) {
+        if (!selected) return;
+        closeCommandMenu();
+        void runCommandInput(selected.value, commands, commandContext, props.model, props.runtime, commandActions);
+        return;
+      }
+      if (isBackspace(key)) {
+        dispatchCommandMenu({ type: "backspace" });
+        return;
+      }
+      if (key.ctrl && key.name === "u") {
+        dispatchCommandMenu({ type: "delete" });
+        return;
+      }
+      const printable = printableKey(key);
+      if (printable) dispatchCommandMenu({ type: "insert", text: printable });
       return;
     }
     if (modelPicker) {
@@ -1643,7 +1724,7 @@ export function ChatShellSurface(props: {
       }
       return;
     }
-    if ((slashCompletionOpen || skillCompletionOpen) && !key.shift && (isArrowUp(key) || isArrowDown(key))) {
+    if ((commandCompletionOpen || skillCompletionOpen) && !key.shift && (isArrowUp(key) || isArrowDown(key))) {
       const delta = isArrowUp(key) ? -1 : 1;
       setCompletionIndex((current) => wrapIndex(current + delta, completions.length));
       return;
@@ -1651,13 +1732,12 @@ export function ChatShellSurface(props: {
     if (skillCompletionOpen && isTab(key)) {
       if (runSelectedSkillCompletion()) return;
     }
-    if (slashCompletionOpen && isTab(key)) {
-      const completion = slashCompletionItems[selectedCompletionIndex] ?? slashCompletionItems[0];
+    if (commandCompletionOpen && (isTab(key) || isArrowRight(key))) {
+      const completion = commandCompletionItems[selectedCompletionIndex] ?? commandCompletionItems[0];
       if (completion) {
-        const accepted = `${completion.value} `;
         history.resetNavigation();
-        updateAcceptedCompletionPrompt(accepted);
-        setPrompt(accepted);
+        updateAcceptedCompletionPrompt(undefined);
+        setPrompt(`${completion.value}${completion.intent === "execute" ? "" : " "}`);
       }
       return;
     }
@@ -1689,7 +1769,7 @@ export function ChatShellSurface(props: {
       }
       // Close palette if open
       if (paletteOpen) {
-        setPaletteOpen(false);
+        closeCommandMenu();
         return;
       }
       // Return to chat view if in another view
@@ -1723,12 +1803,12 @@ export function ChatShellSurface(props: {
       setTranscriptScrollOffset((current) => Math.max(0, current - scrollStep(dimensions.height)));
       return;
     }
-    if (view === "chat" && !promptDisabled && isPlainArrowUp(key) && !slashCompletionOpen && !skillCompletionOpen) {
+    if (view === "chat" && !promptDisabled && isPlainArrowUp(key) && !commandCompletionOpen && !skillCompletionOpen) {
       const previous = history.previous(prompt);
       if (previous !== undefined) setPromptFromHistory(previous);
       return;
     }
-    if (view === "chat" && !promptDisabled && isPlainArrowDown(key) && !slashCompletionOpen && !skillCompletionOpen) {
+    if (view === "chat" && !promptDisabled && isPlainArrowDown(key) && !commandCompletionOpen && !skillCompletionOpen) {
       const next = history.next(prompt);
       if (next !== undefined) setPromptFromHistory(next);
       return;
@@ -1778,6 +1858,23 @@ export function ChatShellSurface(props: {
     : undefined;
   const renamePromptModel = renamePrompt;
 
+  if (commandConfirmation) {
+    return (
+      <box width="100%" height="100%" flexDirection="column" alignItems="center" justifyContent="center" backgroundColor={theme.colors.background}>
+        <box width={Math.min(72, Math.max(36, dimensions.width - 8))} flexDirection="column" border borderStyle="single" borderColor={theme.colors.status.warning} paddingX={2} paddingY={1}>
+          <text fg={theme.colors.status.warning} wrapMode="none" truncate>{"Confirm command"}</text>
+          <box height={1} />
+          <text fg={theme.colors.text.primary} wrapMode="word">{commandConfirmation.title}</text>
+          <box height={1} />
+          <text fg={commandConfirmation.selectedIndex === 0 ? theme.colors.menu.selectedText : theme.colors.menu.text} bg={commandConfirmation.selectedIndex === 0 ? theme.colors.menu.selectedBackground : theme.colors.menu.background} wrapMode="none">{"  Cancel"}</text>
+          <text fg={commandConfirmation.selectedIndex === 1 ? theme.colors.menu.selectedText : theme.colors.menu.text} bg={commandConfirmation.selectedIndex === 1 ? theme.colors.menu.selectedBackground : theme.colors.menu.background} wrapMode="none">{"  Confirm"}</text>
+          <box height={1} />
+          <text fg={theme.colors.text.muted} wrapMode="none" truncate>{"←/→ choose · Enter confirm · Esc cancel"}</text>
+        </box>
+      </box>
+    );
+  }
+
   if (view === "team") {
     return (
       <TeamLiveSurface
@@ -1815,15 +1912,16 @@ export function ChatShellSurface(props: {
           onSubmit={() => {
             if (submitAuthManualInput()) return;
             if (runSelectedSkillCompletion()) return;
-            if (runSelectedSlashCompletion()) return;
+            if (runSelectedCommandCompletion()) return;
             submitCurrentChatPrompt();
           }}
           completions={completions}
-          completionOpen={skillCompletionOpen || slashCompletionOpen}
+          completionOpen={skillCompletionOpen || commandCompletionOpen}
           completionTitle={skillCompletionOpen ? "Skills" : "Commands"}
           emptyCompletionText={skillCompletionOpen ? "no skills" : "no commands"}
           completionIndex={selectedCompletionIndex}
           paletteOpen={paletteOpen}
+          paletteTitle={`Command Palette · ${paletteQuery || "type to search"}`}
           paletteItems={paletteItems}
           paletteIndex={paletteIndex}
           model={props.model}
@@ -1860,7 +1958,7 @@ export function ChatShellSurface(props: {
           onSubmit={() => {
             if (submitAuthManualInput()) return;
             if (runSelectedSkillCompletion()) return;
-            if (runSelectedSlashCompletion()) return;
+            if (runSelectedCommandCompletion()) return;
             scrollMessageToBottom();
             submitCurrentChatPrompt();
           }}
@@ -1882,11 +1980,12 @@ export function ChatShellSurface(props: {
           onOpenFile={openFileLink}
           transcriptScrollOffset={transcriptScrollOffset}
           completions={completions}
-          completionOpen={skillCompletionOpen || slashCompletionOpen}
+          completionOpen={skillCompletionOpen || commandCompletionOpen}
           completionTitle={skillCompletionOpen ? "Skills" : "Commands"}
           emptyCompletionText={skillCompletionOpen ? "no skills" : "no commands"}
           completionIndex={selectedCompletionIndex}
           paletteOpen={paletteOpen}
+          paletteTitle={`Command Palette · ${paletteQuery || "type to search"}`}
           paletteItems={paletteItems}
           paletteIndex={paletteIndex}
           model={props.model}
@@ -1931,13 +2030,14 @@ function HomeScreen(props: {
   onPasteShortcut: () => Promise<string | undefined>;
   onTextPaste: (value: string) => string;
   onSubmit: () => void;
-  completions: readonly SlashCompletion[];
+  completions: readonly TuiCommandSuggestion[];
   completionOpen: boolean;
   completionTitle: string;
   emptyCompletionText: string;
   completionIndex: number;
   paletteOpen: boolean;
-  paletteItems: readonly SlashCompletion[];
+  paletteTitle: string;
+  paletteItems: readonly TuiCommandSuggestion[];
   paletteIndex: number;
   model: TeamLiveView;
   agentExperience: AgentsViewModel;
@@ -2014,6 +2114,7 @@ function HomeScreen(props: {
           emptyCompletionText={props.emptyCompletionText}
           completionIndex={props.completionIndex}
           paletteOpen={props.paletteOpen}
+          paletteTitle={props.paletteTitle}
           paletteItems={props.paletteItems}
           paletteIndex={props.paletteIndex}
           feedback={feedback}
@@ -2044,13 +2145,14 @@ function SessionScreen(props: {
   messageScrollRef: RefObject<ScrollBoxRenderable | null>;
   onOpenFile: (target: FileLinkTarget) => void;
   transcriptScrollOffset: number;
-  completions: readonly SlashCompletion[];
+  completions: readonly TuiCommandSuggestion[];
   completionOpen: boolean;
   completionTitle: string;
   emptyCompletionText: string;
   completionIndex: number;
   paletteOpen: boolean;
-  paletteItems: readonly SlashCompletion[];
+  paletteTitle: string;
+  paletteItems: readonly TuiCommandSuggestion[];
   paletteIndex: number;
   model: TeamLiveView;
   agentExperience: AgentsViewModel;
@@ -2063,7 +2165,7 @@ function SessionScreen(props: {
   showToolDetails: boolean;
   hideThinking: boolean;
   transcriptActive: boolean;
-  commands: readonly SlashCommand[];
+  commands: readonly TuiCommand[];
   approvalReviewBlocked: boolean;
   disabledReason?: string | undefined;
   theme: TuiTheme;
@@ -2195,6 +2297,7 @@ function SessionScreen(props: {
           emptyCompletionText={props.emptyCompletionText}
           completionIndex={props.completionIndex}
           paletteOpen={props.paletteOpen}
+          paletteTitle={props.paletteTitle}
           paletteItems={props.paletteItems}
           paletteIndex={props.paletteIndex}
           feedback={feedback}
@@ -2332,7 +2435,7 @@ interface SkillMentionTrigger {
   query: string;
 }
 
-type SkillCompletion = SlashCompletion & { skill: SkillSummary };
+type SkillCompletion = TuiCommandSuggestion & { skill: SkillSummary };
 
 function pickerHeight(itemCount: number): number {
   return itemCount + 3;
@@ -2706,7 +2809,7 @@ function resolveResumeTarget(
   if (exactId) return exactId;
   const exactTitles = active.filter((session) => session.title?.toLowerCase() === normalized);
   if (exactTitles.length === 1) return exactTitles[0]!;
-  if (exactTitles.length > 1) return `More than one saved chat is named "${target}". Use /resume and select one, or pass its session ID.`;
+  if (exactTitles.length > 1) return `More than one saved chat is named "${target}". Use /session resume and select one, or pass its session ID.`;
   const idPrefixes = active.filter((session) => String(session.id).toLowerCase().startsWith(normalized));
   if (idPrefixes.length === 1) return idPrefixes[0]!;
   if (idPrefixes.length > 1) return `Session ID prefix "${target}" is ambiguous.`;
@@ -2862,10 +2965,16 @@ function skillCompletions(skills: readonly SkillSummary[], query: string): Skill
     })
     .slice(0, 8)
     .map((skill) => ({
+      id: `skill:${skill.filePath}`,
       value: `${skill.name}`,
       label: `$${skill.name}`,
       description: skillDescription(skill),
-      category: "skills",
+      group: "skills",
+      source: "builtin" as const,
+      argumentHint: "",
+      hidden: false,
+      enabled: true,
+      intent: "execute" as const,
       skill,
     }));
 }
@@ -2949,7 +3058,7 @@ function localSkillMentionWarnings(
     if (matches.length === 0) {
       warnings.push(`Skill $${name} was not found; it will not be injected.`);
     } else if (matches.length > 1) {
-      warnings.push(`Skill $${name} is ambiguous; select it from /skills so Chili can bind the exact SKILL.md.`);
+      warnings.push(`Skill $${name} is ambiguous; select it from /skills browse so Chili can bind the exact SKILL.md.`);
     }
   }
   return warnings;
@@ -2974,15 +3083,16 @@ function fuzzyMatchText(value: string, query: string): boolean {
   return true;
 }
 
-function HelpView(props: { commands: readonly SlashCommand[]; theme: TuiTheme; showToolDetails: boolean }) {
+function HelpView(props: { commands: readonly TuiCommand[]; theme: TuiTheme; showToolDetails: boolean }) {
   const detailsText = props.showToolDetails ? "on" : "off";
+  const commandNodes = collectCommandNodes(props.commands).filter((command) => !command.hidden);
   return (
     <box width="100%" height="100%" flexDirection="column">
       <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Commands"}</text>
       <box height={1} />
-      {props.commands.filter((command) => !command.hidden).map((command) => (
-        <text key={command.name} fg={props.theme.colors.text.secondary} wrapMode="none" truncate>
-          {`/${command.name.padEnd(12)} ${command.description}`}
+      {commandNodes.map((command) => (
+        <text key={command.id} fg={props.theme.colors.text.secondary} wrapMode="none" truncate>
+          {`${command.path.padEnd(24)} ${command.description}`}
         </text>
       ))}
       <box height={1} />
@@ -2990,6 +3100,10 @@ function HelpView(props: { commands: readonly SlashCommand[]; theme: TuiTheme; s
       <text fg={props.theme.colors.text.muted} wrapMode="none" truncate>{`Esc closes views. Ctrl+C clears input; press again quickly to exit. Ctrl+P opens commands. Ctrl+O toggles tool details (${detailsText}). Ctrl+T opens transcript. Ctrl+V pastes. Ctrl+Shift+C copies.`}</text>
     </box>
   );
+}
+
+function countRuntimeCommandNodes(nodes: readonly RuntimeCommandNode[]): number {
+  return nodes.reduce((count, node) => count + 1 + countRuntimeCommandNodes(node.children), 0);
 }
 
 type StatusPageRowTone = "heading" | "text" | "error" | "spacer";
@@ -3159,11 +3273,11 @@ function modelToolCallSupport(candidate: ModelCandidate | undefined): boolean | 
 async function submitPrompt(
   prompt: string,
   expandedPrompt: string,
-  commands: readonly SlashCommand[],
-  ctx: SlashCommandContext,
+  commands: readonly TuiCommand[],
+  ctx: TuiCommandContext,
   model: TeamLiveView,
   runtime: ChatRuntimeState,
-  actions: SlashActions,
+  actions: CommandActions,
   onAccepted?: (text: string) => void,
   skillMentionBindings: readonly RuntimeSkillMention[] = [],
   skills: readonly SkillSummary[] = [],
@@ -3188,15 +3302,15 @@ async function submitPrompt(
     return;
   }
   if (commandPrompt.startsWith("/")) {
-    const slashMatch = resolveSlashCommand(commands, commandPrompt);
-    if (slashMatch) {
+    const commandMatch = resolveCommand(commands, ctx, commandPrompt);
+    if (commandMatch.status === "matched") {
       actions.setPrompt("");
       clearPromptAttachments?.();
-      await runResolvedSlashCommand(slashMatch, ctx, model, runtime, actions);
+      await runResolvedCommand(commandMatch, ctx, model, runtime, actions);
       return;
     }
-    if (isSlashCommandCandidate(commands, ctx, commandPrompt)) {
-      actions.appendLocalItem("error", `Unknown command: ${commandPrompt}`);
+    if (commandMatch.status !== "not_command") {
+      actions.appendLocalItem("error", commandResolutionMessage(commandMatch));
       return;
     }
   }
@@ -3234,7 +3348,7 @@ async function submitPrompt(
   }
 }
 
-async function runUserShellCommand(command: string, cwd: string, actions: SlashActions): Promise<void> {
+async function runUserShellCommand(command: string, cwd: string, actions: CommandActions): Promise<void> {
   const id = actions.appendShellItem({
     command,
     cwd,
@@ -3273,33 +3387,37 @@ function formatUserShellOutput(result: RunProcessResult): string {
   return sections.filter((section) => section.length > 0).join("\n\n");
 }
 
-async function runSlashInput(
+async function runCommandInput(
   input: string,
-  commands: readonly SlashCommand[],
-  ctx: SlashCommandContext,
+  commands: readonly TuiCommand[],
+  ctx: TuiCommandContext,
   model: TeamLiveView,
   runtime: ChatRuntimeState,
-  actions: SlashActions,
+  actions: CommandActions,
 ): Promise<void> {
-  const match = resolveSlashCommand(commands, input);
-  if (!match) {
-    actions.appendLocalItem("error", `Unknown command: ${input}`);
+  const match = resolveCommand(commands, ctx, input);
+  if (match.status !== "matched") {
+    actions.appendLocalItem("error", commandResolutionMessage(match));
     return;
   }
-  await runResolvedSlashCommand(match, ctx, model, runtime, actions);
+  await runResolvedCommand(match, ctx, model, runtime, actions);
 }
 
-async function runResolvedSlashCommand(
-  match: { command: SlashCommand; args: string },
-  ctx: SlashCommandContext,
+async function runResolvedCommand(
+  match: Extract<ResolveCommandResult<TuiCommandContext, TuiCommandResult>, { status: "matched" }>,
+  ctx: TuiCommandContext,
   model: TeamLiveView,
   runtime: ChatRuntimeState,
-  actions: SlashActions,
+  actions: CommandActions,
 ): Promise<void> {
+  if (!match.command.run) {
+    actions.appendLocalItem("error", `${match.path} cannot be executed.`);
+    return;
+  }
   const uiEpoch = actions.currentSessionUiEpoch();
   const result = await match.command.run(ctx, match.args);
   if (!actions.isSessionUiEpochCurrent(uiEpoch)) return;
-  const scopedActions: SlashActions = {
+  const scopedActions: CommandActions = {
     ...actions,
     enterSessionLayout: () => {
       if (actions.isSessionUiEpochCurrent(uiEpoch)) actions.enterSessionLayout();
@@ -3313,18 +3431,29 @@ async function runResolvedSlashCommand(
     ensureOpenAICodexDefaultModel: async () => {
       if (actions.isSessionUiEpochCurrent(uiEpoch)) await actions.ensureOpenAICodexDefaultModel();
     },
+    requestConfirmation: (title, result) => {
+      if (actions.isSessionUiEpochCurrent(uiEpoch)) actions.requestConfirmation(title, result);
+    },
   };
-  await applySlashResult(result, ctx, model, runtime, scopedActions);
+  await applyCommandResult(result, ctx, model, runtime, scopedActions);
 }
 
-async function applySlashResult(
-  result: SlashCommandResult,
-  ctx: SlashCommandContext,
+async function applyCommandResult(
+  result: TuiCommandResult,
+  ctx: TuiCommandContext,
   model: TeamLiveView,
   runtime: ChatRuntimeState,
-  actions: SlashActions,
+  actions: CommandActions,
 ): Promise<void> {
+  if (result.type === "confirm") {
+    actions.requestConfirmation(result.title, result.result);
+    return;
+  }
   if (result.type === "open_view") {
+    if (result.view === "help") {
+      actions.openCommandPalette();
+      return;
+    }
     if (result.view === "mcp") {
       actions.openMcpManager();
       return;
@@ -3345,18 +3474,28 @@ async function applySlashResult(
     await actions.reloadCommands();
     return;
   }
+  if (result.type === "reload_skills") {
+    actions.enterSessionLayout();
+    await actions.reloadSkills();
+    actions.appendLocalItem("info", "Skills reloaded.");
+    return;
+  }
+  if (result.type === "exit_app") {
+    actions.exitApp();
+    return;
+  }
   if (result.type === "submit_command") {
     if (!runtime.canSubmit) {
       actions.appendLocalItem("error", runtime.submitBlockedReason ?? "Session is not ready for another prompt.");
       return;
     }
     actions.enterSessionLayout();
-    const accepted = await runtime.submitCommand(result.commandName, result.args, {
+    const accepted = await runtime.submitCommand(result.commandId, result.args, {
       ...(ctx.modelSelection ? { modelSelection: ctx.modelSelection } : {}),
       ...(ctx.reasoningLevel ? { reasoningLevel: ctx.reasoningLevel } : {}),
       ...(ctx.serviceTier ? { serviceTier: ctx.serviceTier } : {}),
     });
-    if (!accepted) actions.appendLocalItem("error", `/${result.commandName} did not submit.`);
+    if (!accepted) actions.appendLocalItem("error", `Command ${result.commandId} did not submit.`);
     return;
   }
   if (result.type === "open_permissions_picker") {
@@ -3441,13 +3580,28 @@ async function applySlashResult(
     return;
   }
   if (result.type === "sdk_action") {
-    const action = actionForSlashResult(result, model);
+    const action = actionForCommandResult(result, model);
     if (action) runtime.executeAction(action);
   }
 }
 
+function commandResolutionMessage(
+  result: Exclude<ResolveCommandResult<TuiCommandContext, TuiCommandResult>, { status: "matched" }>,
+): string {
+  if (result.status === "disabled") return `${result.path} is unavailable: ${result.reason}`;
+  if (result.status === "incomplete") {
+    const available = result.children.length > 0 ? `\nAvailable: ${result.children.join(", ")}` : "";
+    return `Incomplete command. Usage: ${result.usage}${available}`;
+  }
+  if (result.status === "unknown") {
+    const suggestions = result.suggestions.length > 0 ? ` Did you mean ${result.suggestions.join(" or ")}?` : "";
+    return `Unknown command token: ${result.token || result.input}.${suggestions}`;
+  }
+  return `Not a command: ${result.input}`;
+}
+
 async function performDelegationAction(
-  result: Extract<SlashCommandResult, { type: "delegation_action" }>,
+  result: Extract<TuiCommandResult, { type: "delegation_action" }>,
   runtime: ChatRuntimeState,
   appendLocalItem: AppendLocalItem,
 ): Promise<void> {
@@ -3486,7 +3640,7 @@ function delegationConfigMessage(policy: DelegationPolicy, source: string): stri
 }
 
 async function performGoalAction(
-  result: Extract<SlashCommandResult, { type: "goal_action" }>,
+  result: Extract<TuiCommandResult, { type: "goal_action" }>,
   runtime: ChatRuntimeState,
   appendLocalItem: AppendLocalItem,
 ): Promise<void> {
@@ -3536,8 +3690,8 @@ function formatTokenCount(value: number): string {
 }
 
 async function performSkillsAction(
-  result: Extract<SlashCommandResult, { type: "skills_action" }>,
-  actions: SlashActions,
+  result: Extract<TuiCommandResult, { type: "skills_action" }>,
+  actions: CommandActions,
 ): Promise<void> {
   const scope: SkillSettingsScope = result.scope ?? "project";
   try {
@@ -3557,7 +3711,7 @@ async function performSkillsAction(
 }
 
 async function performMcpAction(
-  result: Extract<SlashCommandResult, { type: "mcp_action" }>,
+  result: Extract<TuiCommandResult, { type: "mcp_action" }>,
   runtime: ChatRuntimeState,
   appendLocalItem: AppendLocalItem,
 ): Promise<void> {
@@ -3753,7 +3907,7 @@ function mcpEndpoint(server: RuntimeMcpServerDescriptor): string {
 }
 
 async function performAuthAction(
-  result: Extract<SlashCommandResult, { type: "auth_action" }>,
+  result: Extract<TuiCommandResult, { type: "auth_action" }>,
   appendLocalItem: AppendLocalItem,
   setAuthManualPrompt: (value: AuthManualPrompt | undefined) => void,
   onLoginComplete?: () => Promise<void>,
@@ -3768,7 +3922,7 @@ async function performAuthAction(
     const status = await storage.status(OPENAI_CODEX_PROVIDER_ID);
     const text = status.configured
       ? `ChatGPT Codex auth: ${status.type}${status.accountId ? ` account ${status.accountId}` : ""}${status.expires ? `, expires ${formatAuthTime(status.expires)}` : ""}. Stored at ${status.authPath}.`
-      : `ChatGPT Codex auth: not configured. Run /login to connect a ChatGPT Plus/Pro account. Auth file: ${status.authPath}.`;
+      : `ChatGPT Codex auth: not configured. Run /auth login to connect a ChatGPT Plus/Pro account. Auth file: ${status.authPath}.`;
     appendLocalItem("info", text);
     return;
   }
@@ -3798,7 +3952,7 @@ async function performAuthAction(
         appendLocalItem("info", "If browser login stalls, paste the full redirect URL or authorization code here and press Enter.");
       }),
       onPrompt: async () => {
-        throw new Error("Local callback did not complete. Run /login again and keep the browser redirect window open.");
+        throw new Error("Local callback did not complete. Run /auth login again and keep the browser redirect window open.");
       },
     });
     await storage.setOAuthCredentials(OPENAI_CODEX_PROVIDER_ID, credentials);
@@ -3839,7 +3993,7 @@ function formatAuthTime(value: number): string {
   return new Date(value).toLocaleString();
 }
 
-function actionForSlashResult(result: Extract<SlashCommandResult, { type: "sdk_action" }>, model: TeamLiveView): TeamLiveAction | undefined {
+function actionForCommandResult(result: Extract<TuiCommandResult, { type: "sdk_action" }>, model: TeamLiveView): TeamLiveAction | undefined {
   const actions = model.selected?.availableActions ?? model.availableActions;
   if (result.action === "team_run") {
     return findAction(actions, "run_loop") ?? { type: "run_loop", ...(model.selectedTeamId ? { teamId: model.selectedTeamId } : {}), enabled: false, reason: "no_team" };
@@ -3850,35 +4004,6 @@ function actionForSlashResult(result: Extract<SlashCommandResult, { type: "sdk_a
   if (result.action === "approve") return findAction(actions, "approve");
   if (result.action === "reject") return findAction(actions, "reject");
   return undefined;
-}
-
-function isSlashCommandCandidate(commands: readonly SlashCommand[], ctx: SlashCommandContext, input: string): boolean {
-  if (input.trim() === "/") return true;
-  return slashCompletions(commands, ctx, input, 1).length > 0;
-}
-
-function handlePaletteKey(
-  key: KeyEvent,
-  items: readonly SlashCompletion[],
-  selectedIndex: number,
-  setSelectedIndex: (value: number) => void,
-  onSelect: (completion: SlashCompletion) => void,
-  onCancel: () => void,
-): void {
-  if (isEscape(key)) {
-    onCancel();
-    return;
-  }
-  if (isArrowUp(key) || isArrowDown(key)) {
-    const delta = isArrowUp(key) ? -1 : 1;
-    const next = Math.min(Math.max(0, selectedIndex + delta), Math.max(0, items.length - 1));
-    setSelectedIndex(next);
-    return;
-  }
-  if (isEnter(key)) {
-    const item = items[selectedIndex] ?? items[0];
-    if (item) onSelect(item);
-  }
 }
 
 function handleModelPickerKey(
