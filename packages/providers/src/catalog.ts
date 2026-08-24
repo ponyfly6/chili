@@ -13,6 +13,7 @@ import {
   OPENAI_CODEX_BASE_URL,
   MINIMAX_PROVIDER_ID,
   OPENAI_CODEX_PROVIDER_ID,
+  XAI_PROVIDER_ID,
   ZAI_PROVIDER_ID,
 } from "./models.js";
 import type { ModelDescriptor } from "./types.js";
@@ -54,6 +55,7 @@ export const BUILTIN_PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   [KIMI_PROVIDER_ID]: "Kimi",
   [MINIMAX_PROVIDER_ID]: "MiniMax",
   [OPENAI_CODEX_PROVIDER_ID]: "ChatGPT",
+  [XAI_PROVIDER_ID]: "xAI",
   [ZAI_PROVIDER_ID]: "Z.ai",
 };
 

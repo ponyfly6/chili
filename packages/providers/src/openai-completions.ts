@@ -40,8 +40,13 @@ export interface OpenAICompletionsRequestBuildOptions {
   compatibility?: Partial<ChatCompletionsCompatibility>;
 }
 
+type OpenAIUserContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
 type OpenAIMessage =
-  | { role: "system" | "developer" | "user"; content: string }
+  | { role: "system" | "developer"; content: string }
+  | { role: "user"; content: string | OpenAIUserContentPart[] }
   | { role: "assistant"; content: string | null; tool_calls?: OpenAIToolCall[]; reasoning_content?: string }
   | { role: "tool"; tool_call_id: string; content: string };
 
@@ -158,8 +163,14 @@ export class OpenAICompletionsModel implements ChiliModel {
       baseUrl: this.options.baseUrl,
       stream: true,
     };
-    if (this.options.reasoning !== undefined) requestOptions.reasoning = this.options.reasoning;
-    if (this.options.reasoningEffort !== undefined) requestOptions.reasoningEffort = this.options.reasoningEffort;
+    const inputReasoningLevel = resolveInputReasoningLevel(input);
+    if (inputReasoningLevel !== undefined) {
+      requestOptions.reasoning = inputReasoningLevel !== "off";
+      requestOptions.reasoningEffort = inputReasoningLevel;
+    } else {
+      if (this.options.reasoning !== undefined) requestOptions.reasoning = this.options.reasoning;
+      if (this.options.reasoningEffort !== undefined) requestOptions.reasoningEffort = this.options.reasoningEffort;
+    }
     if (this.options.compatibility !== undefined) requestOptions.compatibility = this.options.compatibility;
     const maxTokens = input.maxTokens ?? this.options.maxTokens;
     const temperature = input.temperature ?? this.options.temperature;
@@ -285,6 +296,14 @@ export class OpenAICompletionsModel implements ChiliModel {
   }
 }
 
+function resolveInputReasoningLevel(input: ModelStreamInput): ReasoningLevel | undefined {
+  return input.reasoningLevel
+    ?? input.reasoning
+    ?? input.thinking
+    ?? input.selection?.reasoning
+    ?? input.selection?.thinking;
+}
+
 export function buildOpenAICompletionsRequestBody(
   input: ModelStreamInput,
   options: OpenAICompletionsRequestBuildOptions,
@@ -309,8 +328,8 @@ export function buildOpenAICompletionsRequestBody(
   if ((options.stream ?? true) && compatibility.supportsUsageInStreaming) {
     body.stream_options = { include_usage: true };
   }
-  if (options.reasoning !== undefined) {
-    applyReasoningOptions(body, compatibility, options.reasoning, options.reasoningEffort);
+  if (options.reasoning !== undefined || compatibility.reasoningParameterStyle === "zai-5.3") {
+    applyReasoningOptions(body, compatibility, options.reasoning ?? true, options.reasoningEffort);
   }
 
   const tools = toOpenAITools(input.tools ?? []);
@@ -329,20 +348,51 @@ function applyReasoningOptions(
   reasoning: boolean,
   reasoningEffort?: ReasoningLevel,
 ): void {
-  if (
-    compatibility.reasoningParameterStyle !== "deepseek"
-    && compatibility.reasoningParameterStyle !== "moonshot"
-    && compatibility.reasoningParameterStyle !== "zai"
-  ) return;
-  body.thinking = { type: reasoning ? "enabled" : "disabled" };
-  if (reasoning && compatibility.supportsReasoningEffort) {
-    const requestedEffort = reasoningEffort === "ultra"
-      ? "max"
-      : reasoningEffort ?? (compatibility.reasoningParameterStyle === "deepseek" ? "high" : undefined);
-    if (requestedEffort) {
-      body.reasoning_effort = compatibility.reasoningEffortMap[requestedEffort] ?? requestedEffort;
-    }
+  const style = compatibility.reasoningParameterStyle;
+  const alwaysReasons = style === "moonshot-k3" || style === "zai-5.3" || style === "xai";
+  if (style === "zai-5.3") {
+    body.thinking = { type: "enabled", clear_thinking: false };
+  } else if (style === "deepseek" || style === "moonshot" || style === "zai") {
+    body.thinking = { type: reasoning ? "enabled" : "disabled" };
+  } else if (!alwaysReasons) {
+    return;
   }
+
+  if (!compatibility.supportsReasoningEffort) return;
+  let requestedEffort: ReasoningLevel | undefined;
+  if (alwaysReasons) {
+    requestedEffort = !reasoning || reasoningEffort === "off" ? "off" : reasoningEffort;
+  } else if (reasoning) {
+    requestedEffort = reasoningEffort ?? (style === "deepseek" ? "high" : undefined);
+  }
+  if (!requestedEffort) return;
+  body.reasoning_effort = normalizeReasoningEffort(style, requestedEffort, compatibility.reasoningEffortMap);
+}
+
+function normalizeReasoningEffort(
+  style: ChatCompletionsCompatibility["reasoningParameterStyle"],
+  effort: ReasoningLevel,
+  effortMap: ChatCompletionsCompatibility["reasoningEffortMap"],
+): string {
+  const mapped = effortMap[effort];
+  if (mapped) return mapped;
+  if (style === "moonshot-k3" || style === "zai-5.3") {
+    if (effort === "off" || effort === "minimal" || effort === "low") return "low";
+    if (effort === "medium" || effort === "high") return "high";
+    return "max";
+  }
+  if (style === "xai") {
+    if (effort === "off" || effort === "minimal" || effort === "low") return "low";
+    if (effort === "medium") return "medium";
+    if (effort === "high") return "high";
+    return "xhigh";
+  }
+  if (style === "deepseek") {
+    if (effort === "off" || effort === "minimal" || effort === "low") return "low";
+    if (effort === "max" || effort === "ultra") return "max";
+    return "high";
+  }
+  return effort === "ultra" ? "max" : effort;
 }
 
 export function resolveChatCompletionsUrl(baseUrl: string): string {
@@ -390,11 +440,13 @@ function toOpenAIAssistantMessage(
   compatibility: ChatCompletionsCompatibility,
 ): OpenAIMessage | undefined {
   const text = message.parts
-    .filter((part): part is Extract<MessagePart, { type: "text" | "reasoning" }> =>
-      part.type === "text" || part.type === "reasoning",
-    )
+    .filter((part): part is Extract<MessagePart, { type: "text" }> => part.type === "text")
     .map((part) => part.text)
     .join("\n");
+  const reasoning = message.parts
+    .filter((part): part is Extract<MessagePart, { type: "reasoning" }> => part.type === "reasoning")
+    .map((part) => part.text)
+    .join("");
   const toolCalls = message.parts
     .filter((part): part is Extract<MessagePart, { type: "tool_call" }> => part.type === "tool_call")
     .map((part) => ({
@@ -406,13 +458,15 @@ function toOpenAIAssistantMessage(
       },
     }));
 
-  if (!text && toolCalls.length === 0) return undefined;
+  if (!text && toolCalls.length === 0 && !(compatibility.requiresReasoningContentOnAssistantMessages && reasoning)) {
+    return undefined;
+  }
   const result: OpenAIMessage = {
     role: "assistant",
-    content: text || null,
+    content: text || (compatibility.reasoningParameterStyle === "deepseek" && toolCalls.length > 0 ? "" : null),
   };
   if (toolCalls.length > 0) result.tool_calls = toolCalls;
-  if (compatibility.requiresReasoningContentOnAssistantMessages) result.reasoning_content = "";
+  if (compatibility.requiresReasoningContentOnAssistantMessages) result.reasoning_content = reasoning;
   return result;
 }
 
@@ -424,7 +478,13 @@ function toOpenAIUserOrToolMessages(message: Message): OpenAIMessage[] {
     )
     .map((part) => part.text)
     .join("\n");
-  if (text) result.push({ role: "user", content: text });
+  const hasImages = message.parts.some((part) => part.type === "image");
+  if (hasImages) {
+    const content = toOpenAIUserContentParts(message.parts);
+    if (content.length > 0) result.push({ role: "user", content });
+  } else if (text) {
+    result.push({ role: "user", content: text });
+  }
 
   for (const part of message.parts) {
     if (part.type !== "tool_result") continue;
@@ -435,6 +495,27 @@ function toOpenAIUserOrToolMessages(message: Message): OpenAIMessage[] {
     });
   }
   return result;
+}
+
+function toOpenAIUserContentParts(parts: readonly MessagePart[]): OpenAIUserContentPart[] {
+  const content: OpenAIUserContentPart[] = [];
+  for (const part of parts) {
+    if (part.type === "text" || part.type === "reasoning") {
+      if (part.text) content.push({ type: "text", text: part.text });
+      continue;
+    }
+    if (part.type === "image") {
+      content.push({
+        type: "image_url",
+        image_url: { url: imageDataUrl(part) },
+      });
+    }
+  }
+  return content;
+}
+
+function imageDataUrl(image: Pick<Extract<MessagePart, { type: "image" }>, "data" | "mimeType">): string {
+  return `data:${image.mimeType};base64,${image.data}`;
 }
 
 function systemMessages(messages: readonly Message[]): string[] {

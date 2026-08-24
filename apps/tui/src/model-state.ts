@@ -114,7 +114,7 @@ export function findExactModelSelection(
   reference: string,
   candidates: readonly ModelCandidate[],
 ): ModelSelection | undefined {
-  const normalized = reference.trim().toLowerCase();
+  const normalized = normalizeModelReferenceAlias(reference);
   if (!normalized) return undefined;
 
   const canonical = candidates.filter((model) => `${model.provider}/${model.model}`.toLowerCase() === normalized);
@@ -123,7 +123,7 @@ export function findExactModelSelection(
 
   const slashIndex = normalized.indexOf("/");
   if (slashIndex !== -1) {
-    const provider = normalized.slice(0, slashIndex);
+    const provider = normalizeProviderAlias(normalized.slice(0, slashIndex));
     const model = normalized.slice(slashIndex + 1);
     const providerMatches = candidates.filter(
       (candidate) => candidate.provider.toLowerCase() === provider && candidate.model.toLowerCase() === model,
@@ -228,12 +228,31 @@ function findProviderDefaultSelection(
   reference: string,
   candidates: readonly ModelCandidate[],
 ): ModelSelection | undefined {
-  const provider = reference.trim().toLowerCase();
+  const provider = normalizeProviderAlias(reference.trim().toLowerCase());
   if (!provider) return undefined;
   const providerCandidates = candidates.filter((candidate) => candidate.provider.toLowerCase() === provider);
   if (providerCandidates.length === 0) return undefined;
   const selected = providerCandidates.find((candidate) => candidate.default) ?? providerCandidates[0];
   return selected ? modelDescriptorSelection(selected) : undefined;
+}
+
+function normalizeModelReferenceAlias(reference: string): string {
+  const normalized = reference.trim().toLowerCase();
+  if (normalized === "gpt-5.6") return "gpt-5.6-sol";
+  const slashIndex = normalized.indexOf("/");
+  if (slashIndex === -1) return normalized;
+  const provider = normalizeProviderAlias(normalized.slice(0, slashIndex));
+  const model = normalized.slice(slashIndex + 1);
+  const canonicalModel = model === "gpt-5.6" && (provider === "openai-codex" || provider === "codex-api")
+    ? "gpt-5.6-sol"
+    : model;
+  return `${provider}/${canonicalModel}`;
+}
+
+function normalizeProviderAlias(provider: string): string {
+  if (provider === "grok" || provider === "x.ai") return "xai";
+  if (provider === "codex") return "openai-codex";
+  return provider;
 }
 
 function modelSearchScore(candidate: ModelCandidate, query: string): number | undefined {

@@ -474,6 +474,12 @@ export class SingleAgentRuntime implements AgentRunner {
             continue;
           }
 
+          if (event.type === "reasoning_item") {
+            assistantMutated = true;
+            await this.appendReasoningItem(input, assistantMessageId, event.output);
+            continue;
+          }
+
           if (event.type === "tool_call") {
             assistantMutated = true;
             await this.queueToolCall(
@@ -773,6 +779,21 @@ export class SingleAgentRuntime implements AgentRunner {
     }
 
     await this.appendPartDelta(input, assistantMessageId, existingPartId, "text", text);
+  }
+
+  private async appendReasoningItem(
+    input: RunTurnInput,
+    assistantMessageId: MessageId,
+    modelOutput: NonNullable<Extract<MessagePart, { type: "reasoning" }>["modelOutput"]>,
+  ): Promise<void> {
+    await this.appendPart(input, assistantMessageId, {
+      id: this.id<PartId>("part"),
+      messageId: assistantMessageId,
+      sessionId: input.sessionId,
+      type: "reasoning",
+      text: "",
+      modelOutput,
+    });
   }
 
   private async queueToolCall(

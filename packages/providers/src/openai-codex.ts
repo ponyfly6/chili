@@ -11,6 +11,8 @@ import { type EnvironmentSource, isAbsoluteHttpUrl, readCodexApiEnvironment } fr
 import {
   assertCodexApiModel,
   assertOpenAICodexModel,
+  canonicalizeCodexApiModel,
+  canonicalizeOpenAICodexModel,
   CODEX_API_DEFAULT_MODEL,
   CODEX_API_PROVIDER_ID,
   findDefaultKnownModel,
@@ -45,7 +47,9 @@ export {
   OPENAI_CODEX_PROVIDER_ID,
 } from "./models.js";
 
-export type OpenAICodexReasoningEffort = Exclude<ReasoningLevel, "off">;
+export type OpenAICodexReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
+export type OpenAICodexReasoningMode = "pro";
+export type OpenAICodexReasoningContext = "auto" | "all_turns" | "current_turn";
 
 export interface OpenAICodexModelOptions {
   /** @deprecated ChatGPT Codex is OAuth-only. Use CodexApiModelOptions with the codex-api provider. */
@@ -63,6 +67,8 @@ export interface OpenAICodexModelOptions {
   authStorage?: FileAuthStorage;
   env?: EnvironmentSource;
   reasoningEffort?: ReasoningLevel;
+  reasoningMode?: OpenAICodexReasoningMode;
+  reasoningContext?: OpenAICodexReasoningContext;
   reasoningSummary?: "auto" | "concise" | "detailed" | "off" | "on" | null;
   serviceTier?: ServiceTier;
   textVerbosity?: "low" | "medium" | "high";
@@ -78,6 +84,8 @@ export interface CodexApiModelOptions {
   headers?: Record<string, string>;
   env?: EnvironmentSource;
   reasoningEffort?: ReasoningLevel;
+  reasoningMode?: OpenAICodexReasoningMode;
+  reasoningContext?: OpenAICodexReasoningContext;
   reasoningSummary?: "auto" | "concise" | "detailed" | "off" | "on" | null;
   serviceTier?: ServiceTier;
   textVerbosity?: "low" | "medium" | "high";
@@ -91,6 +99,8 @@ export interface OpenAICodexRequestBuildOptions {
   temperature?: number;
   sessionId?: string;
   reasoningEffort?: ReasoningLevel;
+  reasoningMode?: OpenAICodexReasoningMode;
+  reasoningContext?: OpenAICodexReasoningContext;
   reasoningSummary?: OpenAICodexModelOptions["reasoningSummary"];
   serviceTier?: ServiceTier;
   textVerbosity?: OpenAICodexModelOptions["textVerbosity"];
@@ -121,7 +131,11 @@ type CodexResponseInputItem =
       type: "function_call_output";
       call_id: string;
       output: string;
-    };
+    }
+  | (Record<string, unknown> & {
+      type: "reasoning";
+      encrypted_content: string;
+    });
 
 interface CodexStreamPayload {
   type?: string;
@@ -154,7 +168,7 @@ interface CodexErrorPayload {
   resets_at?: number;
 }
 
-interface CodexOutputItem {
+interface CodexOutputItem extends Record<string, unknown> {
   id?: string;
   type?: string;
   call_id?: string;
@@ -163,6 +177,7 @@ interface CodexOutputItem {
   content?: Array<{ type?: string; text?: string; refusal?: string }>;
   summary?: Array<{ text?: string }>;
   phase?: string;
+  encrypted_content?: string;
 }
 
 interface CodexUsage {
@@ -189,6 +204,8 @@ interface CodexResponsesModelRuntimeOptions {
   maxTokens?: number;
   temperature?: number;
   reasoningEffort?: ReasoningLevel;
+  reasoningMode?: OpenAICodexReasoningMode;
+  reasoningContext?: OpenAICodexReasoningContext;
   reasoningSummary?: OpenAICodexModelOptions["reasoningSummary"];
   serviceTier?: ServiceTier;
   textVerbosity?: OpenAICodexModelOptions["textVerbosity"];
@@ -260,7 +277,7 @@ export class OpenAICodexProvider implements ChiliModelProvider {
   }
 
   private defaultModel(): string {
-    const model = this.options.model ?? OPENAI_CODEX_DEFAULT_MODEL;
+    const model = canonicalizeOpenAICodexModel(this.options.model ?? OPENAI_CODEX_DEFAULT_MODEL);
     assertOpenAICodexModel(model);
     return model;
   }
@@ -298,7 +315,7 @@ export class CodexApiProvider implements ChiliModelProvider {
 
   private defaultModel(): string {
     const env = readCodexApiEnvironment(this.options.env);
-    const model = this.options.model ?? env.model ?? CODEX_API_DEFAULT_MODEL;
+    const model = canonicalizeCodexApiModel(this.options.model ?? env.model ?? CODEX_API_DEFAULT_MODEL);
     assertCodexApiModel(model);
     return model;
   }
@@ -452,6 +469,19 @@ class CodexResponsesModel implements ChiliModel {
       }
 
       if (payload.type === "response.output_item.done" && payload.item) {
+        if (
+          payload.item.type === "reasoning"
+          && typeof payload.item.encrypted_content === "string"
+        ) {
+          yield {
+            type: "reasoning_item",
+            output: {
+              apiFamily: "openai-responses",
+              ...(payload.output_index === undefined ? {} : { outputIndex: payload.output_index }),
+              item: payload.item,
+            },
+          };
+        }
         if (payload.item.type === "message") {
           recordCodexAssistantPhase(messagePhases, payload.output_index, payload.item.phase);
         }
@@ -490,7 +520,7 @@ class CodexResponsesModel implements ChiliModel {
 export class OpenAICodexResponsesModel extends CodexResponsesModel {
   constructor(options: OpenAICodexModelOptions = {}) {
     assertOpenAICodexOAuthOptions(options);
-    const model = options.model ?? OPENAI_CODEX_DEFAULT_MODEL;
+    const model = canonicalizeOpenAICodexModel(options.model ?? OPENAI_CODEX_DEFAULT_MODEL);
     assertOpenAICodexModel(model);
     const fetchImpl = options.fetch ?? fetch;
     const authStorage = options.authStorage ?? new FileAuthStorage(options.authPath);
@@ -534,7 +564,7 @@ export class CodexApiResponsesModel extends CodexResponsesModel {
         + "use /login for ChatGPT OAuth or set CODEX_API_KEY explicitly for the third-party API",
       );
     }
-    const model = options.model ?? env.model ?? CODEX_API_DEFAULT_MODEL;
+    const model = canonicalizeCodexApiModel(options.model ?? env.model ?? CODEX_API_DEFAULT_MODEL);
     assertCodexApiModel(model);
     const fetchImpl = options.fetch ?? fetch;
     super(codexRuntimeOptions(
@@ -615,7 +645,10 @@ function resolveCodexStreamRequestOptions(
     throw new Error(`${getProviderDisplayLabel(provider)} model cannot stream provider "${selection.provider}"`);
   }
 
-  const model = selection.model ?? options.model;
+  const selectedModel = selection.model ?? options.model;
+  const model = provider === OPENAI_CODEX_PROVIDER_ID
+    ? canonicalizeOpenAICodexModel(selectedModel)
+    : canonicalizeCodexApiModel(selectedModel);
   if (provider === OPENAI_CODEX_PROVIDER_ID) assertOpenAICodexModel(model);
   else assertCodexApiModel(model);
   const descriptor = findKnownModel(provider, model);
@@ -629,6 +662,8 @@ function resolveCodexStreamRequestOptions(
   if (sessionId) requestOptions.sessionId = sessionId;
   if (options.textVerbosity !== undefined) requestOptions.textVerbosity = options.textVerbosity;
   if (reasoningEffort !== undefined) requestOptions.reasoningEffort = reasoningEffort;
+  if (options.reasoningMode !== undefined) requestOptions.reasoningMode = options.reasoningMode;
+  if (options.reasoningContext !== undefined) requestOptions.reasoningContext = options.reasoningContext;
   if (options.reasoningSummary !== undefined) requestOptions.reasoningSummary = options.reasoningSummary;
   if (serviceTier !== undefined) requestOptions.serviceTier = serviceTier;
   if (maxTokens !== undefined) requestOptions.maxTokens = maxTokens;
@@ -682,6 +717,8 @@ function codexRuntimeOptions(
   if (options.maxTokens !== undefined) runtimeOptions.maxTokens = options.maxTokens;
   if (options.temperature !== undefined) runtimeOptions.temperature = options.temperature;
   if (options.reasoningEffort !== undefined) runtimeOptions.reasoningEffort = options.reasoningEffort;
+  if (options.reasoningMode !== undefined) runtimeOptions.reasoningMode = options.reasoningMode;
+  if (options.reasoningContext !== undefined) runtimeOptions.reasoningContext = options.reasoningContext;
   if (options.reasoningSummary !== undefined) runtimeOptions.reasoningSummary = options.reasoningSummary;
   if (options.serviceTier !== undefined) runtimeOptions.serviceTier = options.serviceTier;
   if (options.textVerbosity !== undefined) runtimeOptions.textVerbosity = options.textVerbosity;
@@ -752,12 +789,15 @@ function buildCodexResponsesRequestBody(
   options: OpenAICodexRequestBuildOptions,
   includeMaxOutputTokens: boolean,
 ): Record<string, unknown> {
+  const model = options.model === "gpt-5.6"
+    ? canonicalizeOpenAICodexModel(options.model)
+    : options.model;
   const messages = prependContextualUserMessage(
     transformModelMessages(input.messages, { normalizeToolCallId: normalizeResponsesId }),
     input.contextualUser,
   );
   const body: Record<string, unknown> = {
-    model: options.model,
+    model,
     store: false,
     stream: true,
     input: toResponsesInput(messages, supportsImageInput(options.inputCapabilities)),
@@ -774,10 +814,17 @@ function buildCodexResponsesRequestBody(
   if (options.sessionId) body.prompt_cache_key = options.sessionId;
   const serviceTier = openAICodexWireServiceTier(options.serviceTier);
   if (serviceTier) body.service_tier = serviceTier;
-  const effort = resolveOpenAICodexReasoningEffort(options.model, options.reasoningEffort);
-  if (effort !== undefined || options.reasoningSummary !== undefined) {
+  const effort = resolveOpenAICodexReasoningEffort(model, options.reasoningEffort);
+  if (
+    effort !== undefined
+    || options.reasoningMode !== undefined
+    || options.reasoningContext !== undefined
+    || options.reasoningSummary !== undefined
+  ) {
     const reasoning: Record<string, string> = {};
     if (effort !== undefined) reasoning.effort = effort;
+    if (options.reasoningMode !== undefined) reasoning.mode = options.reasoningMode;
+    if (options.reasoningContext !== undefined) reasoning.context = options.reasoningContext;
     if (options.reasoningSummary !== null) reasoning.summary = options.reasoningSummary ?? "auto";
     if (Object.keys(reasoning).length > 0) body.reasoning = reasoning;
   }
@@ -793,6 +840,10 @@ function toResponsesInput(messages: readonly Message[], includeImageContent = tr
     if (message.role === "system") continue;
     if (message.role === "assistant") {
       for (const part of message.parts) {
+        if (part.type === "reasoning" && isReplayableResponsesReasoningItem(part.modelOutput)) {
+          output.push(part.modelOutput.item);
+          continue;
+        }
         if (part.type === "text") {
           if (!part.text) continue;
           output.push({
@@ -828,6 +879,16 @@ function toResponsesInput(messages: readonly Message[], includeImageContent = tr
     }
   }
   return output;
+}
+
+function isReplayableResponsesReasoningItem(
+  output: Extract<MessagePart, { type: "reasoning" }>["modelOutput"],
+): output is NonNullable<Extract<MessagePart, { type: "reasoning" }>["modelOutput"]> & {
+  item: Record<string, unknown> & { type: "reasoning"; encrypted_content: string };
+} {
+  return output?.apiFamily === "openai-responses"
+    && output.item.type === "reasoning"
+    && typeof output.item.encrypted_content === "string";
 }
 
 function userMessageContent(parts: readonly MessagePart[], includeImageContent = true): CodexResponseMessageContent[] {
@@ -1114,26 +1175,21 @@ function nonEmptyString(value: string | undefined): string | undefined {
 
 export function resolveOpenAICodexReasoningEffort(
   model: string,
-  effort: ReasoningLevel | null | undefined,
+  effort: ReasoningLevel | undefined,
 ): OpenAICodexReasoningEffort | undefined {
-  if (effort === undefined || effort === null || effort === "off") return undefined;
+  if (effort === undefined) return undefined;
   return clampOpenAICodexReasoningEffort(model, effort);
 }
 
 export function clampOpenAICodexReasoningEffort(
   model: string,
-  effort: OpenAICodexReasoningEffort,
+  effort: ReasoningLevel,
 ): OpenAICodexReasoningEffort {
-  const clamped = clampModelReasoningLevel(model, effort);
-  if (clamped === "off") return effort;
+  const canonicalModel = model === "gpt-5.6" ? canonicalizeOpenAICodexModel(model) : model;
+  const clamped = clampModelReasoningLevel(canonicalModel, effort);
+  if (clamped === "off") return "none";
+  if (clamped === "minimal") return "low";
   if (clamped === "ultra") return "max";
-  const id = model.includes("/") ? model.split("/").at(-1) ?? model : model;
-  if (
-    (id.startsWith("gpt-5.5") || id.startsWith("gpt-5.6")) &&
-    clamped === "minimal"
-  ) {
-    return "low";
-  }
   return clamped;
 }
 

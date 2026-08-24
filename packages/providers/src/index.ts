@@ -15,3 +15,4 @@ export * from "./deepseek.js";
 export * from "./kimi.js";
 export * from "./zai.js";
 export * from "./minimax.js";
+export * from "./xai.js";

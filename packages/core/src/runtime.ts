@@ -6,6 +6,7 @@ import type {
   Message,
   ModelSelection,
   ModelUsage as ProtocolModelUsage,
+  PersistedModelOutput,
   ReasoningLevel,
   RuntimeModelDescriptor,
   ServiceTier,
@@ -84,6 +85,7 @@ export type ModelStreamEvent =
   | ModelMetadataEvent
   | ModelTextDeltaEvent
   | ModelReasoningDeltaEvent
+  | ModelReasoningItemEvent
   | ModelToolCallStartEvent
   | ModelToolCallDeltaEvent
   | ModelToolCallEndEvent
@@ -113,6 +115,11 @@ export interface ModelReasoningDeltaEvent {
   text: string;
   index?: number;
   redacted?: boolean;
+}
+
+export interface ModelReasoningItemEvent {
+  type: "reasoning_item";
+  output: PersistedModelOutput;
 }
 
 export interface ModelToolCallStartEvent {

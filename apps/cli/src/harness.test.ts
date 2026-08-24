@@ -766,7 +766,7 @@ test("CLI harness uses the user last model for new workspaces without forcing a 
   try {
     await mkdir(repo, { recursive: true });
     await writeUserModelSelection(
-      { provider: "openai-codex", model: "gpt-5.5" },
+      { provider: "openai-codex", model: "gpt-5.6-sol" },
       { chiliHome: home, now: () => 1 },
     );
 
@@ -782,7 +782,7 @@ test("CLI harness uses the user last model for new workspaces without forcing a 
     });
     const config = await harness.service.getModelConfig(session.sessionId);
 
-    expect(config.modelSelection).toEqual({ provider: "openai-codex", model: "gpt-5.5" });
+    expect(config.modelSelection).toEqual({ provider: "openai-codex", model: "gpt-5.6-sol" });
     expect(harness.defaultModelSelection).toBeUndefined();
   } finally {
     await harness?.close();

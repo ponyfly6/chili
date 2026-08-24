@@ -362,7 +362,13 @@ export class ContextWindowBuilder {
 
   private truncatePart(part: MessagePart, omittedToolCallIds: Set<string>): MessagePart | undefined {
     switch (part.type) {
-      case "text":
+      case "text": {
+        if (part.text.length <= this.maxMessagePartChars) return { ...part };
+        return {
+          ...part,
+          text: truncateContextText(part.text, this.maxMessagePartChars, `${part.type} content`),
+        };
+      }
       case "reasoning": {
         if (part.text.length <= this.maxMessagePartChars) return { ...part };
         return {
@@ -654,7 +660,9 @@ function boundJoinedMessageText(parts: readonly MessagePart[], maxChars: number)
   ).length;
   return parts.flatMap((part): MessagePart[] => {
     if (part.type !== "text" && part.type !== "reasoning") return [part];
-    if (part.text.length === 0) return [];
+    if (part.text.length === 0) {
+      return part.type === "reasoning" && part.modelOutput ? [part] : [];
+    }
     const separatorChars = sawText ? 1 : 0;
     const futureSeparators = Math.max(0, remainingTextParts - 1);
     const available = Math.max(
@@ -802,6 +810,13 @@ function snapshotMessagePart(part: MessagePart): MessagePart {
     case "reasoning": {
       const snapshot: Extract<MessagePart, { type: "reasoning" }> = { ...base, type: "reasoning", text: part.text };
       if (part.redacted !== undefined) snapshot.redacted = part.redacted;
+      if (part.modelOutput !== undefined) {
+        snapshot.modelOutput = {
+          apiFamily: part.modelOutput.apiFamily,
+          ...(part.modelOutput.outputIndex === undefined ? {} : { outputIndex: part.modelOutput.outputIndex }),
+          item: jsonSnapshot(part.modelOutput.item) as Record<string, unknown>,
+        };
+      }
       return snapshot;
     }
     case "image": {
@@ -1030,8 +1045,9 @@ function estimateMessageTokens(message: Message): number {
 function estimatePartTokens(part: MessagePart): number {
   switch (part.type) {
     case "text":
-    case "reasoning":
       return estimateTextTokens(part.text);
+    case "reasoning":
+      return estimateTextTokens(part.text) + estimateModelOutputTokens(part.modelOutput);
     case "image":
       return IMAGE_CONTEXT_ESTIMATE_TOKENS
         + estimateTextTokens(`${part.mimeType}${part.filename ?? ""}${part.sourcePath ?? ""}`)
@@ -1096,8 +1112,9 @@ function estimateMessage(message: Message): number {
 function estimatePart(part: MessagePart): number {
   switch (part.type) {
     case "text":
-    case "reasoning":
       return part.text.length;
+    case "reasoning":
+      return part.text.length + estimateModelOutputChars(part.modelOutput);
     case "image":
       return IMAGE_CONTEXT_ESTIMATE_CHARS + part.mimeType.length + (part.filename?.length ?? 0) + (part.sourcePath?.length ?? 0) + 64;
     case "tool_result":
@@ -1113,6 +1130,20 @@ function estimatePart(part: MessagePart): number {
     case "agent_handoff":
       return 0;
   }
+}
+
+function estimateModelOutputChars(
+  output: Extract<MessagePart, { type: "reasoning" }>["modelOutput"],
+): number {
+  if (!output) return 0;
+  return safeJsonStringify(output.item).length + output.apiFamily.length + 32;
+}
+
+function estimateModelOutputTokens(
+  output: Extract<MessagePart, { type: "reasoning" }>["modelOutput"],
+): number {
+  if (!output) return 0;
+  return estimateTextTokens(safeJsonStringify(output.item)) + estimateTextTokens(output.apiFamily) + 8;
 }
 
 function estimateToolResultPayload(part: ToolResultPart): number {

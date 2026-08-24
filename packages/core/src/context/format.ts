@@ -43,7 +43,7 @@ function formatContextPart(part: Message["parts"][number], options: ContextMessa
     case "image":
       return `[image ${part.mimeType}${part.filename ? ` ${part.filename}` : ""}${part.sourcePath ? ` ${part.sourcePath}` : ""}]`;
     case "reasoning":
-      return `[reasoning]\n${part.text}`;
+      return part.text ? `[reasoning]\n${part.text}` : "";
     case "tool_call": {
       const status = options.includeToolCallStatus ? ` ${part.status}` : "";
       return `[tool_call ${part.toolName} ${part.callId}${status}]\n${safeJson(part.input)}`;

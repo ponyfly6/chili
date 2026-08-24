@@ -3,9 +3,9 @@ import type { Message, MessageId, PartId, SessionId, TimestampMs, ToolCallId } f
 import {
   AnthropicCompatibleModel,
   buildAnthropicRequestBody,
-  createMiniMaxM27HighspeedModel,
+  createMiniMaxM3Model,
   MINIMAX_ANTHROPIC_BASE_URL,
-  MINIMAX_M27_HIGHSPEED_MODEL,
+  MINIMAX_M3_MODEL,
   normalizeAnthropicToolCallId,
   ProviderBackpressureCoordinator,
   ProviderError,
@@ -81,6 +81,63 @@ test("converts Chili messages and tools into an Anthropic request body", () => {
       },
     ],
   });
+});
+
+test("adds MiniMax thinking and priority fields only when explicitly configured", () => {
+  const input = { messages: [], tools: [], system: [] };
+  const plain = buildAnthropicRequestBody(input, {
+    model: "test-model",
+    stream: true,
+  });
+  const adaptiveFast = buildAnthropicRequestBody(input, {
+    model: MINIMAX_M3_MODEL,
+    reasoning: true,
+    serviceTier: "fast",
+    stream: true,
+  });
+  const disabledStandard = buildAnthropicRequestBody(input, {
+    model: MINIMAX_M3_MODEL,
+    reasoning: false,
+    serviceTier: "standard",
+    stream: true,
+  });
+
+  expect(plain).not.toHaveProperty("thinking");
+  expect(plain).not.toHaveProperty("service_tier");
+  expect(adaptiveFast).toMatchObject({
+    thinking: { type: "adaptive" },
+    service_tier: "priority",
+  });
+  expect(disabledStandard).toMatchObject({
+    thinking: { type: "disabled" },
+  });
+  expect(disabledStandard).not.toHaveProperty("service_tier");
+});
+
+test("does not serialize an OpenAI-only encrypted reasoning state as an empty Anthropic block", () => {
+  const body = buildAnthropicRequestBody(
+    {
+      messages: [
+        message("assistant", [{
+          type: "reasoning",
+          text: "",
+          modelOutput: {
+            apiFamily: "openai-responses",
+            outputIndex: 0,
+            item: { type: "reasoning", encrypted_content: "ciphertext" },
+          },
+        }]),
+        message("user", [{ type: "text", text: "Continue." }]),
+      ],
+      tools: [],
+      system: [],
+    },
+    { model: "test-model", stream: true },
+  );
+
+  expect(body.messages).toEqual([
+    { role: "user", content: [{ type: "text", text: "Continue." }] },
+  ]);
 });
 
 test("normalizes Anthropic tool ids and synthesizes missing tool results in request bodies", () => {
@@ -211,19 +268,19 @@ test("converts pasted user images into Anthropic image blocks", () => {
   ]);
 });
 
-test("MiniMax treats image tool results as text-only context", async () => {
+test("MiniMax M3 includes image tool results as multimodal context", async () => {
   const callId = "toolcall_image" as ToolCallId;
   let fetchCalled = false;
   let body: Record<string, unknown> | undefined;
-  const model = createMiniMaxM27HighspeedModel({
+  const model = createMiniMaxM3Model({
     apiKey: "test-key",
-    model: MINIMAX_M27_HIGHSPEED_MODEL,
+    model: MINIMAX_M3_MODEL,
     fetch: (async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       fetchCalled = true;
       body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       return new Response(JSON.stringify({
         id: "msg_text",
-        model: MINIMAX_M27_HIGHSPEED_MODEL,
+        model: MINIMAX_M3_MODEL,
         content: [{ type: "text", text: "ok" }],
         stop_reason: "end_turn",
       }), {
@@ -258,7 +315,10 @@ test("MiniMax treats image tool results as text-only context", async () => {
       {
         type: "tool_result",
         tool_use_id: callId,
-        content: "Image read: pixel.png",
+        content: [
+          { type: "text", text: "Image read: pixel.png" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2U=" } },
+        ],
       },
     ],
   });
@@ -346,7 +406,7 @@ test("passes AbortSignal through to fetch and requests streaming", async () => {
     });
   }) as typeof fetch;
 
-  const model = createMiniMaxM27HighspeedModel({
+  const model = createMiniMaxM3Model({
     apiKey: "test-key",
     baseUrl: MINIMAX_ANTHROPIC_BASE_URL,
     env: {},
@@ -365,10 +425,39 @@ test("passes AbortSignal through to fetch and requests streaming", async () => {
 
   expect(url).toBe(`${MINIMAX_ANTHROPIC_BASE_URL}/v1/messages`);
   expect(signal).toBe(controller.signal);
-  expect(body?.model).toBe(MINIMAX_M27_HIGHSPEED_MODEL);
+  expect(body?.model).toBe(MINIMAX_M3_MODEL);
   expect(body?.max_tokens).toBe(64);
   expect(body?.stream).toBe(true);
+  expect(body?.thinking).toEqual({ type: "adaptive" });
   expect(events.at(-1)).toEqual({ type: "finish", reason: "end_turn", responseId: "msg_json" });
+});
+
+test("does not send MiniMax request controls for other Anthropic-compatible providers", async () => {
+  let body: Record<string, unknown> = {};
+  const model = new AnthropicCompatibleModel({
+    provider: "zai",
+    model: "test-model",
+    apiKey: "test-key",
+    baseUrl: "https://model.test",
+    fetch: (async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ id: "msg_zai", content: [], stop_reason: "end_turn" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch,
+  });
+
+  await collect(model.stream({
+    messages: [],
+    tools: [],
+    system: [],
+    reasoning: "high",
+    serviceTier: "fast",
+  }));
+
+  expect(body).not.toHaveProperty("thinking");
+  expect(body).not.toHaveProperty("service_tier");
 });
 
 test("parses Anthropic SSE text and tool deltas", async () => {
@@ -588,7 +677,7 @@ test("types MiniMax 2062 as non-retryable and short-circuits sibling requests", 
   }) as unknown as typeof fetch;
   const options = {
     provider: "minimax",
-    model: "MiniMax-M3[1m]",
+    model: MINIMAX_M3_MODEL,
     apiKey: "shared-key",
     baseUrl: "https://api.minimaxi.test/anthropic",
     fetch: fetchImpl,
@@ -643,7 +732,7 @@ test("honors Retry-After across Anthropic-compatible requests", async () => {
   }) as unknown as typeof fetch;
   const model = new AnthropicCompatibleModel({
     provider: "minimax",
-    model: "MiniMax-M3[1m]",
+    model: MINIMAX_M3_MODEL,
     apiKey: "rate-key",
     baseUrl: "https://api.minimaxi.test/anthropic",
     fetch: fetchImpl,

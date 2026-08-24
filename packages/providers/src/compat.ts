@@ -4,7 +4,10 @@ export type ReasoningParameterStyle =
   | "openrouter"
   | "deepseek"
   | "moonshot"
+  | "moonshot-k3"
   | "zai"
+  | "zai-5.3"
+  | "xai"
   | "qwen"
   | "qwen-chat-template";
 export type ToolCallDeltaMode = "standard" | "zai-tool-stream";
@@ -119,17 +122,33 @@ function detectChatCompletionsCompatibility(input: CompatibilityResolutionInput)
   const isMoonshot = provider === "kimi" || provider === "moonshot" || baseUrl.includes("moonshot.cn") || baseUrl.includes("moonshot.ai");
   const isCerebras = provider === "cerebras" || baseUrl.includes("cerebras.ai");
   const isChutes = baseUrl.includes("chutes.ai");
+  const isKimiK3 = isMoonshot && model === "kimi-k3";
+  const isGrok46 = isXai && model.startsWith("grok-4.6");
+  const isZai53 = isZai && model.startsWith("glm-5.3");
   const isNonStandard = isZai || isXai || isDeepSeek || isMoonshot || isCerebras || isChutes;
 
   return {
     supportsStore: !isNonStandard,
     supportsDeveloperRole: !isNonStandard,
-    supportsReasoningEffort: !isXai && !isMoonshot,
-    reasoningEffortMap: detectReasoningEffortMap(model, isDeepSeek, isGroq, isZai),
+    supportsReasoningEffort: isKimiK3 || isGrok46 || isZai53 || (!isXai && !isMoonshot),
+    reasoningEffortMap: detectReasoningEffortMap(model, isDeepSeek, isGroq, isZai, isKimiK3, isGrok46, isZai53),
     supportsUsageInStreaming: true,
-    maxTokensField: isDeepSeek || isMoonshot || isZai || isChutes ? "max_tokens" : "max_completion_tokens",
+    maxTokensField: isKimiK3
+      ? "max_completion_tokens"
+      : isDeepSeek || isMoonshot || isZai || isChutes
+        ? "max_tokens"
+        : "max_completion_tokens",
     requiresReasoningContentOnAssistantMessages: isDeepSeek || isMoonshot || isZai,
-    reasoningParameterStyle: detectReasoningParameterStyle(provider, baseUrl, isDeepSeek, isMoonshot, isZai),
+    reasoningParameterStyle: detectReasoningParameterStyle(
+      provider,
+      baseUrl,
+      isDeepSeek,
+      isMoonshot,
+      isZai,
+      isKimiK3,
+      isZai53,
+      isXai,
+    ),
     toolCallDeltaMode: isZai ? "zai-tool-stream" : "standard",
   };
 }
@@ -140,10 +159,16 @@ function detectReasoningParameterStyle(
   isDeepSeek: boolean,
   isMoonshot: boolean,
   isZai: boolean,
+  isKimiK3: boolean,
+  isZai53: boolean,
+  isXai: boolean,
 ): ReasoningParameterStyle {
   if (isDeepSeek) return "deepseek";
+  if (isKimiK3) return "moonshot-k3";
   if (isMoonshot) return "moonshot";
+  if (isZai53) return "zai-5.3";
   if (isZai) return "zai";
+  if (isXai) return "xai";
   if (provider === "openrouter" || baseUrl.includes("openrouter.ai")) return "openrouter";
   return "native";
 }
@@ -153,14 +178,46 @@ function detectReasoningEffortMap(
   isDeepSeek: boolean,
   isGroq: boolean,
   isZai: boolean,
+  isKimiK3: boolean,
+  isGrok46: boolean,
+  isZai53: boolean,
 ): Partial<Record<string, string>> {
-  if (isDeepSeek) {
+  if (isKimiK3 || isZai53) {
     return {
-      minimal: "high",
-      low: "high",
+      off: "low",
+      minimal: "low",
+      low: "low",
       medium: "high",
       high: "high",
       xhigh: "max",
+      max: "max",
+      ultra: "max",
+    };
+  }
+
+  if (isGrok46) {
+    return {
+      off: "low",
+      minimal: "low",
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "xhigh",
+      max: "xhigh",
+      ultra: "xhigh",
+    };
+  }
+
+  if (isDeepSeek) {
+    return {
+      off: "low",
+      minimal: "low",
+      low: "low",
+      medium: "high",
+      high: "high",
+      xhigh: "high",
+      max: "max",
+      ultra: "max",
     };
   }
 
@@ -171,6 +228,8 @@ function detectReasoningEffortMap(
       medium: "high",
       high: "high",
       xhigh: "max",
+      max: "max",
+      ultra: "max",
     };
   }
 

@@ -1,5 +1,10 @@
 import type { ModelDescriptor, ModelSelection, ReasoningLevel, ThinkingLevel } from "./types.js";
 import { REASONING_LEVELS } from "./types.js";
+import {
+  CODEX_API_PROVIDER_ID,
+  OPENAI_CODEX_DEFAULT_MODEL,
+  OPENAI_CODEX_PROVIDER_ID,
+} from "./models.js";
 
 export interface ParsedModelSelectionPattern {
   provider?: string;
@@ -68,8 +73,9 @@ export function resolveModelSelectionPattern(
   models: readonly ModelDescriptor[],
   options: ResolveModelSelectionPatternOptions = {},
 ): ModelSelectionPatternResult {
-  const trimmed = pattern.trim();
-  if (!trimmed) return {};
+  const input = pattern.trim();
+  if (!input) return {};
+  const trimmed = canonicalizeOfficialModelAlias(input, options.defaultProvider);
 
   const matched = tryMatchModel(trimmed, models, options.allowFuzzy ?? true, options.defaultProvider);
   if (matched) {
@@ -137,6 +143,21 @@ export function resolveModelSelectionPattern(
   };
 }
 
+function canonicalizeOfficialModelAlias(pattern: string, defaultProvider: string | undefined): string {
+  const match = /^(?:(openai-codex|codex-api)\/)?gpt-5\.6(.*)$/i.exec(pattern);
+  if (!match) return pattern;
+  const suffix = match[2] ?? "";
+  if (suffix && !suffix.startsWith(":")) return pattern;
+
+  const explicitProvider = match[1]?.toLowerCase();
+  const provider = explicitProvider
+    ?? (defaultProvider === OPENAI_CODEX_PROVIDER_ID || defaultProvider === CODEX_API_PROVIDER_ID
+      ? defaultProvider
+      : undefined);
+  if (!provider) return pattern;
+  return `${provider}/${OPENAI_CODEX_DEFAULT_MODEL}${suffix}`;
+}
+
 export function getModelSelectionAvailableReasoningLevels(model: ModelDescriptor | undefined): readonly ReasoningLevel[] {
   if (model && model.capabilities?.reasoning === false) return [];
   if (model?.reasoningLevels !== undefined) return model.reasoningLevels;
@@ -169,11 +190,8 @@ export function supportsXHighReasoning(model: ModelDescriptor | string | undefin
   if (!modelId) return false;
   const id = modelId.toLowerCase();
   return (
-    id.includes("gpt-5.5") ||
     id.includes("gpt-5.6") ||
-    id.includes("glm-5.2") ||
-    id.includes("deepseek-v4-pro") ||
-    id.includes("deepseek-v4-flash") ||
+    id.includes("grok-4.6") ||
     id.includes("opus-4-6") ||
     id.includes("opus-4.6") ||
     id.includes("opus-4-7") ||
@@ -183,7 +201,12 @@ export function supportsXHighReasoning(model: ModelDescriptor | string | undefin
 
 export function supportsMaxReasoning(model: ModelDescriptor | string | undefined): boolean {
   const modelId = typeof model === "string" ? model : model?.model;
-  return modelId?.toLowerCase().includes("gpt-5.6") ?? false;
+  if (!modelId) return false;
+  const id = modelId.toLowerCase();
+  return id.includes("gpt-5.6")
+    || id.includes("deepseek-v4-")
+    || id.includes("kimi-k3")
+    || id.includes("glm-5.3");
 }
 
 export function supportsUltraReasoning(model: ModelDescriptor | string | undefined): boolean {

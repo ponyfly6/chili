@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { createCliModel } from "../apps/cli/src/model.js";
 
-const model = process.argv.includes("--legacy") ? "legacy-minimax" : "minimax";
+const model = "minimax";
 const mock = process.argv.includes("--mock");
 const router = await createCliModel(model, mock ? mockOptions() : { maxTokens: 128 });
 const events = [];

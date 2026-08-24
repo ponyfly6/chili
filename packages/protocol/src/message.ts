@@ -64,6 +64,14 @@ export interface ReasoningPart extends BasePart {
   type: "reasoning";
   text: string;
   redacted?: boolean;
+  modelOutput?: PersistedModelOutput;
+}
+
+/** Opaque provider output that must be replayed to continue a stateless response. */
+export interface PersistedModelOutput {
+  apiFamily: string;
+  outputIndex?: number;
+  item: Record<string, unknown>;
 }
 
 export interface ToolCallPart extends BasePart {

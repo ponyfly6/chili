@@ -1336,6 +1336,79 @@ test("RuntimeService excludes cancelled prompt with no assistant output from sub
   }
 });
 
+test("RuntimeService persists encrypted reasoning output into the next turn context", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-core-reasoning-output-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const registry = new InMemoryToolRegistry();
+  const createId = createSequentialId();
+  let now = 0;
+  const modelInputs: ModelStreamInput[] = [];
+  const modelOutput = {
+    apiFamily: "openai-responses",
+    outputIndex: 0,
+    item: {
+      id: "reasoning_persisted",
+      type: "reasoning",
+      summary: [{ type: "summary_text", text: "Checked the repository." }],
+      status: "completed",
+      encrypted_content: "complete-ciphertext",
+      provider_extension: { retained: true },
+    },
+  } as const;
+  const model: ModelRouter = {
+    async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+      modelInputs.push(input);
+      if (modelInputs.length === 1) {
+        yield { type: "reasoning_item", output: modelOutput };
+        yield { type: "text_delta", text: "First answer." };
+      } else {
+        yield { type: "text_delta", text: "Second answer." };
+      }
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+    }),
+    createId,
+    now: () => ++now as TimestampMs,
+  });
+  const service = new RuntimeService({
+    runtime,
+    store,
+    cwd: "/repo",
+    createId,
+    now: () => ++now as TimestampMs,
+  });
+  const sessionId = "session_reasoning_output_context" as SessionId;
+
+  try {
+    await service.createSession({ sessionId });
+    expect((await service.submitPrompt({ sessionId, text: "First prompt." })).status).toBe("completed");
+    expect((await service.submitPrompt({ sessionId, text: "Continue." })).status).toBe("completed");
+
+    expect(modelInputs).toHaveLength(2);
+    const replayedPart = modelInputs[1]?.messages
+      .flatMap((message) => message.parts)
+      .find((part) => part.type === "reasoning" && part.modelOutput !== undefined);
+    expect(replayedPart).toMatchObject({ type: "reasoning", text: "", modelOutput });
+
+    const storedPart = (await store.messages(sessionId))
+      .flatMap((message) => message.parts)
+      .find((part) => part.type === "reasoning" && part.modelOutput !== undefined);
+    expect(storedPart).toMatchObject({ type: "reasoning", text: "", modelOutput });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("RuntimeService excludes a failed prompt with only a synthetic error from subsequent model context", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-core-failed-prompt-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));

@@ -33,6 +33,13 @@ test("accepts only cataloged OpenAI Codex models", () => {
     expect(() => createOpenAICodexProvider({ model })).not.toThrow();
   }
 
+  expect(createOpenAICodexModel({ model: "gpt-5.6" }).model).toBe("gpt-5.6-sol");
+  expect(createOpenAICodexProvider({ model: "gpt-5.6" }).models().find((model) => model.default)?.model).toBe(
+    "gpt-5.6-sol",
+  );
+  expect(() => createOpenAICodexModel({ model: "gpt-5.5" })).toThrow(
+    'Unsupported OpenAI Codex model "gpt-5.5"',
+  );
   expect(() => createOpenAICodexModel({ model: "gpt-5.4" })).toThrow(
     'Unsupported OpenAI Codex model "gpt-5.4"',
   );
@@ -47,7 +54,7 @@ test("accepts only cataloged OpenAI Codex models", () => {
   })).not.toThrow();
   expect(() => resolveOpenAICodexStreamRequestOptions(
     { messages: [], model: "gpt-5.1" },
-    { model: "gpt-5.5" },
+    { model: "gpt-5.6-sol" },
   )).toThrow('Unsupported OpenAI Codex model "gpt-5.1"');
 });
 
@@ -61,6 +68,16 @@ test("accepts the same cataloged models for Codex API", () => {
     expect(() => createCodexApiProvider({ model })).not.toThrow();
   }
 
+  expect(createCodexApiModel({
+    model: "gpt-5.6",
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
+  }).model).toBe("gpt-5.6-sol");
+  expect(() => createCodexApiModel({
+    model: "gpt-5.5",
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
+  })).toThrow('Unsupported Codex API model "gpt-5.5"');
   expect(() => createCodexApiModel({
     model: "gpt-5.4",
     apiKey: "api-key",
@@ -99,7 +116,7 @@ test("converts Chili messages and tools into a Codex Responses body", () => {
       metadata: { sessionId: "session_codex" },
     },
     {
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       maxTokens: 123,
       sessionId: "session_codex",
       reasoningEffort: "minimal",
@@ -107,7 +124,7 @@ test("converts Chili messages and tools into a Codex Responses body", () => {
   );
 
   expect(body).toMatchObject({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     store: false,
     stream: true,
     instructions: "runtime system\n\nstored system",
@@ -160,7 +177,7 @@ test("adds controlled execution context to Codex function outputs", () => {
       tools: [],
       system: [],
     },
-    { model: "gpt-5.5" },
+    { model: "gpt-5.6-sol" },
   );
 
   expect((body.input as unknown[]).at(-1)).toEqual({
@@ -184,7 +201,7 @@ test("rejects phase-less assistant text when building Codex history", () => {
       tools: [],
       system: [],
     },
-    { model: "gpt-5.5" },
+    { model: "gpt-5.6-sol" },
   )).toThrow("assistant text part is missing phase");
 
   expect(() => buildOpenAICodexResponsesRequestBody(
@@ -195,7 +212,7 @@ test("rejects phase-less assistant text when building Codex history", () => {
       tools: [],
       system: [],
     },
-    { model: "gpt-5.5" },
+    { model: "gpt-5.6-sol" },
   )).not.toThrow();
 });
 
@@ -209,7 +226,7 @@ test("adds developer fragments to instructions and contextual fragments to input
       contextualUser: ["memory context"],
     },
     {
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
     },
   );
 
@@ -230,7 +247,7 @@ test("sets Codex service tier only for fast mode", () => {
       system: [],
     },
     {
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       serviceTier: "fast",
     },
   );
@@ -243,7 +260,7 @@ test("sets Codex service tier only for fast mode", () => {
       system: [],
     },
     {
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       serviceTier: "standard",
     },
   );
@@ -271,7 +288,7 @@ test("adds image tool results as Codex input images", () => {
       system: [],
     },
     {
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
     },
   );
 
@@ -302,7 +319,7 @@ test("adds pasted user images as Codex input images", () => {
       system: [],
     },
     {
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
     },
   );
 
@@ -374,7 +391,7 @@ test("resolves per-stream Codex model and reasoning request options", () => {
         reasoning: "low",
         metadata: { sessionId: "session_2" },
       },
-      { model: "gpt-5.5", reasoningEffort: "medium" },
+      { model: "gpt-5.6-sol", reasoningEffort: "medium" },
     ),
   ).toMatchObject({
     model: "gpt-5.6-terra",
@@ -388,7 +405,7 @@ test("resolves per-stream Codex model and reasoning request options", () => {
         messages: [],
         model: "openai-codex/gpt-5.6-terra:xhigh",
       },
-      { model: "gpt-5.5", reasoningEffort: "medium" },
+      { model: "gpt-5.6-sol", reasoningEffort: "medium" },
     ),
   ).toMatchObject({
     model: "gpt-5.6-terra",
@@ -399,37 +416,69 @@ test("resolves per-stream Codex model and reasoning request options", () => {
     messages: [],
     model: "codex-api/gpt-5.6-luna:high",
   }, {
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
   })).toMatchObject({
     model: "gpt-5.6-luna",
     reasoningEffort: "high",
   });
+
+  expect(resolveOpenAICodexStreamRequestOptions({
+    messages: [],
+    model: "openai-codex/gpt-5.6:max",
+  }, {
+    model: "gpt-5.6-luna",
+    reasoningMode: "pro",
+    reasoningContext: "current_turn",
+  })).toMatchObject({
+    model: "gpt-5.6-sol",
+    reasoningEffort: "max",
+    reasoningMode: "pro",
+    reasoningContext: "current_turn",
+  });
 });
 
-test("clamps and omits Codex reasoning levels for the request body", () => {
-  expect(clampOpenAICodexReasoningEffort("gpt-5.4", "minimal")).toBe("minimal");
-  expect(clampOpenAICodexReasoningEffort("gpt-5.5", "minimal")).toBe("low");
+test("maps GPT-5.6 reasoning levels and merges Responses reasoning options", () => {
+  expect(clampOpenAICodexReasoningEffort("gpt-5.6-sol", "off")).toBe("none");
   expect(clampOpenAICodexReasoningEffort("gpt-5.6-sol", "minimal")).toBe("low");
   expect(clampOpenAICodexReasoningEffort("gpt-5.6-sol", "max")).toBe("max");
-  expect(clampOpenAICodexReasoningEffort("gpt-5.6-sol", "ultra")).toBe("max");
+  expect(clampOpenAICodexReasoningEffort("gpt-5.6", "ultra")).toBe("max");
   expect(clampOpenAICodexReasoningEffort("gpt-5.6-luna", "ultra")).toBe("max");
-  expect(clampOpenAICodexReasoningEffort("gpt-5.5", "max")).toBe("xhigh");
+
+  const omittedBody = buildOpenAICodexResponsesRequestBody(
+    { messages: [] },
+    { model: "gpt-5.6-sol" },
+  );
+  expect(omittedBody).not.toHaveProperty("reasoning");
 
   const body = buildOpenAICodexResponsesRequestBody(
     { messages: [] },
     {
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       reasoningEffort: "off",
     },
   );
 
-  expect(body).not.toHaveProperty("reasoning");
+  expect(body).toMatchObject({ reasoning: { effort: "none", summary: "auto" } });
 
-  const ultraBody = buildOpenAICodexResponsesRequestBody(
+  const configuredBody = buildOpenAICodexResponsesRequestBody(
     { messages: [] },
-    { model: "gpt-5.6-sol", reasoningEffort: "ultra" },
+    {
+      model: "gpt-5.6",
+      reasoningEffort: "ultra",
+      reasoningMode: "pro",
+      reasoningContext: "all_turns",
+      reasoningSummary: "detailed",
+    },
   );
-  expect(ultraBody).toMatchObject({ reasoning: { effort: "max", summary: "auto" } });
+  expect(configuredBody).toMatchObject({
+    model: "gpt-5.6-sol",
+    reasoning: {
+      effort: "max",
+      mode: "pro",
+      context: "all_turns",
+      summary: "detailed",
+    },
+  });
 });
 
 test("ChatGPT Codex rejects direct credentials and custom endpoints", () => {
@@ -497,8 +546,8 @@ test("ChatGPT OAuth ignores legacy API environment and always uses the fixed end
     requestedUrl = String(input);
     headers = new Headers(init?.headers);
     return new Response(streamText([
-      data({ type: "response.created", response: { id: "resp_oauth_fixed", model: "gpt-5.5" } }),
-      data({ type: "response.completed", response: { id: "resp_oauth_fixed", model: "gpt-5.5", status: "completed" } }),
+      data({ type: "response.created", response: { id: "resp_oauth_fixed", model: "gpt-5.6-sol" } }),
+      data({ type: "response.completed", response: { id: "resp_oauth_fixed", model: "gpt-5.6-sol", status: "completed" } }),
     ].join("")), {
       status: 200,
       headers: { "content-type": "text/event-stream" },
@@ -506,7 +555,7 @@ test("ChatGPT OAuth ignores legacy API environment and always uses the fixed end
   }) as typeof fetch;
   const oauthAccess = jwtWithAccount("acct_oauth_fixed");
   const model = new OpenAICodexResponsesModel({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     authStorage: staticOAuthStorage(oauthAccess, "acct_oauth_fixed"),
     fetch: fetchImpl,
     env: {
@@ -525,14 +574,14 @@ test("ChatGPT OAuth ignores legacy API environment and always uses the fixed end
 test("ChatGPT OAuth keeps its request limit internal and omits max_output_tokens on the wire", async () => {
   let body: Record<string, unknown> = {};
   const model = new OpenAICodexResponsesModel({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     maxTokens: 123,
     authStorage: staticOAuthStorage(jwtWithAccount("acct_oauth_limit"), "acct_oauth_limit"),
     fetch: (async (_input, init) => {
       body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       return new Response(streamText([
-        data({ type: "response.created", response: { id: "resp_oauth_limit", model: "gpt-5.5" } }),
-        data({ type: "response.completed", response: { id: "resp_oauth_limit", model: "gpt-5.5", status: "completed" } }),
+        data({ type: "response.created", response: { id: "resp_oauth_limit", model: "gpt-5.6-sol" } }),
+        data({ type: "response.completed", response: { id: "resp_oauth_limit", model: "gpt-5.6-sol", status: "completed" } }),
       ].join("")), {
         status: 200,
         headers: { "content-type": "text/event-stream" },
@@ -541,7 +590,7 @@ test("ChatGPT OAuth keeps its request limit internal and omits max_output_tokens
   });
 
   const requestOptions = resolveOpenAICodexStreamRequestOptions({ messages: [] }, {
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     maxTokens: 123,
   });
   await collect(model.stream({ messages: [] }));
@@ -553,15 +602,15 @@ test("ChatGPT OAuth keeps its request limit internal and omits max_output_tokens
 test("Codex API sends configured max_output_tokens on the wire", async () => {
   let body: Record<string, unknown> = {};
   const model = new CodexApiResponsesModel({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     apiKey: "api-key",
     baseUrl: "https://gateway.test/v1",
     maxTokens: 456,
     fetch: (async (_input, init) => {
       body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       return new Response(streamText([
-        data({ type: "response.created", response: { id: "resp_api_limit", model: "gpt-5.5" } }),
-        data({ type: "response.completed", response: { id: "resp_api_limit", model: "gpt-5.5", status: "completed" } }),
+        data({ type: "response.created", response: { id: "resp_api_limit", model: "gpt-5.6-sol" } }),
+        data({ type: "response.completed", response: { id: "resp_api_limit", model: "gpt-5.6-sol", status: "completed" } }),
       ].join("")), {
         status: 200,
         headers: { "content-type": "text/event-stream" },
@@ -676,8 +725,8 @@ test("ChatGPT Codex refreshes expiring OAuth credentials, persists them, and use
     modelCalls += 1;
     modelHeaders = new Headers(init?.headers);
     return new Response(streamText([
-      data({ type: "response.created", response: { id: "resp_refreshed", model: "gpt-5.5" } }),
-      data({ type: "response.completed", response: { id: "resp_refreshed", model: "gpt-5.5", status: "completed" } }),
+      data({ type: "response.created", response: { id: "resp_refreshed", model: "gpt-5.6-sol" } }),
+      data({ type: "response.completed", response: { id: "resp_refreshed", model: "gpt-5.6-sol", status: "completed" } }),
     ].join("")), {
       status: 200,
       headers: { "content-type": "text/event-stream" },
@@ -685,7 +734,7 @@ test("ChatGPT Codex refreshes expiring OAuth credentials, persists them, and use
   }) as typeof fetch;
 
   const model = new OpenAICodexResponsesModel({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     authStorage: storage,
     fetch: fetchImpl,
   });
@@ -720,7 +769,7 @@ test("ChatGPT Codex does not request a model or overwrite credentials when OAuth
     return new Response(null, { status: 500 });
   }) as typeof fetch;
   const model = new OpenAICodexResponsesModel({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     authStorage: storage,
     fetch: fetchImpl,
   });
@@ -743,7 +792,7 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
     headers = new Headers(init?.headers);
     body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     return new Response(streamText([
-      data({ type: "response.created", response: { id: "resp_1", model: "gpt-5.5" } }),
+      data({ type: "response.created", response: { id: "resp_1", model: "gpt-5.6-sol" } }),
       data({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: "msg_1", phase: "final_answer" } }),
       data({ type: "response.output_text.delta", output_index: 0, delta: "hello" }),
       data({
@@ -762,7 +811,7 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
         type: "response.completed",
         response: {
           id: "resp_1",
-          model: "gpt-5.5",
+          model: "gpt-5.6-sol",
           status: "completed",
           usage: {
             input_tokens: 5,
@@ -779,8 +828,10 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
   }) as typeof fetch;
 
   const model = new OpenAICodexResponsesModel({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     reasoningEffort: "medium",
+    reasoningMode: "pro",
+    reasoningContext: "current_turn",
     authStorage: staticOAuthStorage(token, "acct_test"),
     fetch: fetchImpl,
     env: {},
@@ -804,7 +855,12 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
   expect(body).toMatchObject({
     model: "gpt-5.6-terra",
     prompt_cache_key: "session_1",
-    reasoning: { effort: "high", summary: "auto" },
+    reasoning: {
+      effort: "high",
+      mode: "pro",
+      context: "current_turn",
+      summary: "auto",
+    },
   });
   expect(events.map((event) => event.type)).toEqual([
     "metadata",
@@ -841,7 +897,7 @@ test("sends ChatGPT Codex headers and parses Responses SSE events", async () => 
 
 test("preserves assistant phase for every Codex message output item", async () => {
   const model = codexStreamModel([
-    data({ type: "response.created", response: { id: "resp_phases", model: "gpt-5.5" } }),
+    data({ type: "response.created", response: { id: "resp_phases", model: "gpt-5.6-sol" } }),
     data({
       type: "response.output_item.added",
       output_index: 0,
@@ -857,7 +913,7 @@ test("preserves assistant phase for every Codex message output item", async () =
     data({ type: "response.output_text.delta", output_index: 2, delta: "Done." }),
     data({
       type: "response.completed",
-      response: { id: "resp_phases", model: "gpt-5.5", status: "completed" },
+      response: { id: "resp_phases", model: "gpt-5.6-sol", status: "completed" },
     }),
   ]);
 
@@ -948,16 +1004,16 @@ for (const scenario of [
 
 test("preserves reasoning summary sections from Codex Responses streams", async () => {
   const model = new CodexApiResponsesModel({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     apiKey: "api-key",
     baseUrl: "https://gateway.test/v1",
     fetch: sseFetch([
-      data({ type: "response.created", response: { id: "resp_reasoning", model: "gpt-5.5" } }),
+      data({ type: "response.created", response: { id: "resp_reasoning", model: "gpt-5.6-sol" } }),
       data({ type: "response.reasoning_summary_text.delta", item_id: "reasoning_1", output_index: 0, summary_index: 0, delta: "**Inspecting " }),
       data({ type: "response.reasoning_summary_text.delta", item_id: "reasoning_1", output_index: 0, summary_index: 0, delta: "core**" }),
       data({ type: "response.reasoning_summary_text.delta", item_id: "reasoning_1", output_index: 0, summary_index: 1, delta: "**Checking " }),
       data({ type: "response.reasoning_summary_text.delta", item_id: "reasoning_1", output_index: 0, summary_index: 1, delta: "schema**" }),
-      data({ type: "response.completed", response: { id: "resp_reasoning", model: "gpt-5.5", status: "completed" } }),
+      data({ type: "response.completed", response: { id: "resp_reasoning", model: "gpt-5.6-sol", status: "completed" } }),
     ]),
     env: {},
   });
@@ -970,13 +1026,82 @@ test("preserves reasoning summary sections from Codex Responses streams", async 
   expect(reasoning.filter((event) => event.index === 1).map((event) => event.text).join("")).toBe("**Checking schema**");
 });
 
+test("replays the completed encrypted reasoning item on the next stateless request", async () => {
+  const addedItem = {
+    id: "reasoning_round_trip",
+    type: "reasoning",
+    summary: [],
+    encrypted_content: "partial-ciphertext",
+  };
+  const completedItem = {
+    id: "reasoning_round_trip",
+    type: "reasoning",
+    summary: [{ type: "summary_text", text: "Checked the repository." }],
+    status: "completed",
+    encrypted_content: "complete-ciphertext",
+    provider_extension: { retained: true },
+  };
+  const model = codexStreamModel([
+    data({ type: "response.created", response: { id: "resp_round_trip", model: "gpt-5.6-sol" } }),
+    data({ type: "response.output_item.added", output_index: 0, item: addedItem }),
+    data({
+      type: "response.reasoning_summary_text.delta",
+      item_id: "reasoning_round_trip",
+      output_index: 0,
+      summary_index: 0,
+      delta: "Checked the repository.",
+    }),
+    data({ type: "response.output_item.done", output_index: 0, item: completedItem }),
+    data({
+      type: "response.completed",
+      response: { id: "resp_round_trip", model: "gpt-5.6-sol", status: "completed" },
+    }),
+  ]);
+
+  const events = await collect(model.stream({ messages: [], tools: [], system: [] }));
+  const reasoningItems = events.filter(
+    (event): event is Extract<ModelStreamEvent, { type: "reasoning_item" }> => event.type === "reasoning_item",
+  );
+
+  expect(reasoningItems).toEqual([{
+    type: "reasoning_item",
+    output: {
+      apiFamily: "openai-responses",
+      outputIndex: 0,
+      item: completedItem,
+    },
+  }]);
+
+  const body = buildOpenAICodexResponsesRequestBody(
+    {
+      messages: [
+        message("assistant", [{
+          type: "reasoning",
+          text: "",
+          modelOutput: reasoningItems[0]?.output,
+        }]),
+        message("user", [{ type: "text", text: "Continue." }]),
+      ],
+      tools: [],
+      system: [],
+    },
+    { model: "gpt-5.6-sol", reasoningContext: "all_turns" },
+  );
+
+  expect(body.reasoning).toEqual({ context: "all_turns", summary: "auto" });
+  expect(body.input).toEqual([
+    completedItem,
+    { role: "user", content: [{ type: "input_text", text: "Continue." }] },
+  ]);
+});
+
 test("maps incomplete Codex tool-call responses to length", async () => {
   const model = new CodexApiResponsesModel({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     apiKey: "api-key",
     baseUrl: "https://gateway.test/v1",
     fetch: sseFetch([
-      data({ type: "response.created", response: { id: "resp_incomplete", model: "gpt-5.5" } }),
+      data({ type: "response.created", response: { id: "resp_incomplete", model: "gpt-5.6-sol" } }),
       data({
         type: "response.output_item.added",
         output_index: 0,
@@ -989,7 +1114,7 @@ test("maps incomplete Codex tool-call responses to length", async () => {
       }),
       data({
         type: "response.incomplete",
-        response: { id: "resp_incomplete", model: "gpt-5.5" },
+        response: { id: "resp_incomplete", model: "gpt-5.6-sol" },
       }),
     ]),
     env: {},
@@ -1003,11 +1128,11 @@ test("maps incomplete Codex tool-call responses to length", async () => {
 
 test("marks invalid Codex tool arguments", async () => {
   const model = new CodexApiResponsesModel({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     apiKey: "api-key",
     baseUrl: "https://gateway.test/v1",
     fetch: sseFetch([
-      data({ type: "response.created", response: { id: "resp_invalid_args", model: "gpt-5.5" } }),
+      data({ type: "response.created", response: { id: "resp_invalid_args", model: "gpt-5.6-sol" } }),
       data({
         type: "response.output_item.added",
         output_index: 0,
@@ -1025,7 +1150,7 @@ test("marks invalid Codex tool arguments", async () => {
       }),
       data({
         type: "response.completed",
-        response: { id: "resp_invalid_args", model: "gpt-5.5", status: "completed" },
+        response: { id: "resp_invalid_args", model: "gpt-5.6-sol", status: "completed" },
       }),
     ]),
     env: {},
@@ -1051,14 +1176,14 @@ test("sends OpenAI-compatible Codex requests without ChatGPT account headers", a
     headers = new Headers(init?.headers);
     body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     return new Response(streamText([
-      data({ type: "response.created", response: { id: "resp_gateway", model: "gpt-5.5" } }),
+      data({ type: "response.created", response: { id: "resp_gateway", model: "gpt-5.6-sol" } }),
       data({
         type: "response.output_item.added",
         output_index: 0,
         item: { type: "message", id: "msg_gateway", phase: "final_answer" },
       }),
       data({ type: "response.output_text.delta", output_index: 0, delta: "ok" }),
-      data({ type: "response.completed", response: { id: "resp_gateway", model: "gpt-5.5", status: "completed" } }),
+      data({ type: "response.completed", response: { id: "resp_gateway", model: "gpt-5.6-sol", status: "completed" } }),
     ].join("")), {
       status: 200,
       headers: { "content-type": "text/event-stream" },
@@ -1067,7 +1192,7 @@ test("sends OpenAI-compatible Codex requests without ChatGPT account headers", a
 
   const apiKey = jwtWithAccount("must_not_be_inferred");
   const model = new CodexApiResponsesModel({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     apiKey,
     baseUrl: "https://api.codexapi.space/v1",
     reasoningEffort: "xhigh",
@@ -1081,21 +1206,21 @@ test("sends OpenAI-compatible Codex requests without ChatGPT account headers", a
   expect(headers.get("chatgpt-account-id")).toBeNull();
   expect(headers.get("openai-beta")).toBeNull();
   expect(body).toMatchObject({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     reasoning: { effort: "xhigh", summary: "auto" },
     service_tier: "priority",
   });
-  expect(events[0]).toMatchObject({ type: "metadata", provider: "codex-api", model: "gpt-5.5" });
+  expect(events[0]).toMatchObject({ type: "metadata", provider: "codex-api", model: "gpt-5.6-sol" });
   expect(events).toContainEqual({ type: "text_delta", text: "ok", index: 0, phase: "final_answer" });
 });
 
 test("surfaces nested OpenAI Codex SSE error details", async () => {
   const model = new CodexApiResponsesModel({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     apiKey: "api-key",
     baseUrl: "https://gateway.test/v1",
     fetch: sseFetch([
-      data({ type: "response.created", response: { id: "resp_error", model: "gpt-5.5" } }),
+      data({ type: "response.created", response: { id: "resp_error", model: "gpt-5.6-sol" } }),
       data({
         type: "error",
         error: {
@@ -1117,7 +1242,7 @@ test("surfaces nested OpenAI Codex SSE error details", async () => {
 
 test("surfaces OpenAI Codex response.failed error details", async () => {
   const model = new CodexApiResponsesModel({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     apiKey: "api-key",
     baseUrl: "https://gateway.test/v1",
     fetch: sseFetch([
@@ -1125,7 +1250,7 @@ test("surfaces OpenAI Codex response.failed error details", async () => {
         type: "response.failed",
         response: {
           id: "resp_failed",
-          model: "gpt-5.5",
+          model: "gpt-5.6-sol",
           status: "failed",
           error: {
             message: "Rate limit reached",
@@ -1145,7 +1270,7 @@ test("surfaces OpenAI Codex response.failed error details", async () => {
 
 test("surfaces OpenAI Codex HTTP error details", async () => {
   const model = new CodexApiResponsesModel({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     apiKey: "api-key",
     baseUrl: "https://gateway.test/v1",
     fetch: (async () =>
@@ -1180,7 +1305,7 @@ test("formats HTTP 429 by provider authentication mode", async () => {
   })) as unknown as typeof fetch;
 
   const apiModel = new CodexApiResponsesModel({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     apiKey: "api-key",
     baseUrl: "https://gateway.test/v1",
     fetch: rateLimitFetch(),
@@ -1190,7 +1315,7 @@ test("formats HTTP 429 by provider authentication mode", async () => {
   );
 
   const oauthModel = new OpenAICodexResponsesModel({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     authStorage: staticOAuthStorage(jwtWithAccount("acct_limit"), "acct_limit"),
     fetch: rateLimitFetch(),
   });
@@ -1235,7 +1360,7 @@ function sseFetch(events: string[]): typeof fetch {
 
 function codexStreamModel(events: readonly string[]): CodexApiResponsesModel {
   return new CodexApiResponsesModel({
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     apiKey: "api-key",
     baseUrl: "https://gateway.test/v1",
     fetch: sseFetch([...events]),

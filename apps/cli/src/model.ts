@@ -6,10 +6,11 @@ import type {
   ModelStreamInput,
 } from "@chili/core";
 import type { ModelSelection, RuntimeModelDescriptor, ServiceTier } from "@chili/protocol";
-import { createMiniMaxM27HighspeedRouter } from "@chili/core";
 import {
   assertCodexApiModel,
   assertOpenAICodexModel,
+  canonicalizeCodexApiModel,
+  canonicalizeOpenAICodexModel,
   CODEX_API_DEFAULT_MODEL,
   CODEX_API_PROVIDER_ID,
   DEEPSEEK_OPENAI_BASE_URL,
@@ -19,13 +20,12 @@ import {
   clampModelReasoningLevel,
   findKnownModel,
   getModelSelectionAvailableReasoningLevels,
-  KIMI_K26_MODEL,
+  KIMI_K3_MODEL,
   KIMI_OPENAI_BASE_URL,
   KIMI_PROVIDER_ID,
   listModelCatalogFromStorage,
   listKnownModels,
   MINIMAX_ANTHROPIC_BASE_URL,
-  MINIMAX_M27_HIGHSPEED_MODEL,
   MINIMAX_M3_MODEL,
   MINIMAX_PROVIDER_ID,
   OPENAI_CODEX_DEFAULT_MODEL,
@@ -34,15 +34,26 @@ import {
   readCodexApiEnvironment,
   readKimiEnvironment,
   readMiniMaxEnvironment,
+  readXaiEnvironment,
   readZaiEnvironment,
-  ZAI_GLM_52_MODEL,
+  XAI_GROK_46_MODEL,
+  XAI_OPENAI_BASE_URL,
+  XAI_PROVIDER_ID,
+  ZAI_GLM_53_MODEL,
   ZAI_OPENAI_BASE_URL,
   ZAI_PROVIDER_ID,
 } from "@chili/providers";
 import { FakeModelRouter } from "./fake-model.js";
 
 export type CliModelName = string;
-export type CliProviderName = "minimax" | "deepseek" | "kimi" | "zai" | "openai-codex" | "codex-api";
+export type CliProviderName =
+  | "minimax"
+  | "deepseek"
+  | "kimi"
+  | "zai"
+  | "xai"
+  | "openai-codex"
+  | "codex-api";
 export type CliReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 export interface CliModelSelection {
@@ -63,6 +74,8 @@ interface ProviderRouterOptions {
   authStorage?: FileAuthStorage;
   reasoning?: boolean;
   reasoningEffort?: CliReasoningLevel;
+  reasoningMode?: "pro";
+  reasoningContext?: "auto" | "all_turns" | "current_turn";
   reasoningSummary?: "auto" | "concise" | "detailed" | "off" | "on" | null;
   serviceTier?: ServiceTier;
 }
@@ -98,22 +111,25 @@ type ProviderModelStreamEvent =
   | ModelStreamEvent
   | { type: "metadata"; [key: string]: unknown }
   | { type: "reasoning_delta"; [key: string]: unknown }
+  | { type: "reasoning_item"; [key: string]: unknown }
   | { type: "tool_call_start"; [key: string]: unknown }
   | { type: "tool_call_delta"; [key: string]: unknown }
   | { type: "tool_call_end"; name: string; input: unknown; [key: string]: unknown };
 
 const PROVIDERS_PACKAGE_NAME = "@chili/providers";
 const DEFAULT_DEEPSEEK_MAX_TOKENS = 128 * 1024;
-const DEFAULT_KIMI_MAX_TOKENS = 32 * 1024;
+const DEFAULT_KIMI_MAX_TOKENS = 128 * 1024;
 const DEFAULT_ZAI_MAX_TOKENS = 128 * 1024;
-const DEFAULT_MINIMAX_MAX_TOKENS = 32 * 1024;
-const DEFAULT_CODEX_MAX_TOKENS = 32 * 1024;
+const DEFAULT_MINIMAX_MAX_TOKENS = 128 * 1024;
+const DEFAULT_XAI_MAX_TOKENS = 128_000;
+const DEFAULT_CODEX_MAX_TOKENS = 128_000;
 const DEFAULT_PROVIDER: CliProviderName = "minimax";
 const PROVIDER_DISPLAY_NAMES: Record<CliProviderName, string> = {
   minimax: "MiniMax",
   deepseek: "DeepSeek",
   kimi: "Kimi",
   zai: "Z.ai",
+  xai: "xAI",
   "openai-codex": "ChatGPT",
   "codex-api": "Api",
 };
@@ -124,12 +140,6 @@ export async function createCliModel(selection?: CliModelName | CliModelSelectio
   const baseOptions = providerBaseOptions(config);
 
   if (defaultSelection.kind === "fake") return new FakeModelRouter();
-  if (defaultSelection.kind === "legacy-minimax") {
-    return createMiniMaxM27HighspeedRouter(readMiniMaxOptionsFromEnv({
-      ...baseOptions,
-      ...(defaultSelection.model ? { model: defaultSelection.model } : {}),
-    }));
-  }
   if (defaultSelection.provider === OPENAI_CODEX_PROVIDER_ID) {
     assertOpenAICodexCliOptions(baseOptions);
   }
@@ -146,24 +156,21 @@ export async function createCliModel(selection?: CliModelName | CliModelSelectio
 export function resolveCliRuntimeModelSelection(selection: CliModelSelection): ModelSelection | undefined {
   const resolved = resolveCliModelSelection(selection.provider, selection.model);
   if (resolved.kind === "fake") return undefined;
-  if (resolved.kind === "legacy-minimax") {
-    return { provider: MINIMAX_PROVIDER_ID, model: resolved.model ?? MINIMAX_M27_HIGHSPEED_MODEL };
-  }
   const providerOptions = readOptionsForProvider(resolved.provider, resolved.model ? { model: resolved.model } : {});
   const model = providerOptions.model;
   if (!model) return undefined;
   return { provider: resolved.provider, model };
 }
 
-async function loadProvidersModule(providerName: "minimax" | "deepseek" | "kimi" | "zai" | "codex" | "codex-api"): Promise<Record<string, unknown>> {
+async function loadProvidersModule(
+  providerName: "minimax" | "deepseek" | "kimi" | "zai" | "xai" | "codex" | "codex-api",
+): Promise<Record<string, unknown>> {
   try {
     return (await import(PROVIDERS_PACKAGE_NAME)) as Record<string, unknown>;
   } catch (error) {
-    const fallback = providerName === "minimax" ? " Use --model legacy-minimax to temporarily use the old @chili/core router," : "";
     throw new Error(
       [
         `Unable to load @chili/providers for --model ${providerName}.`,
-        fallback,
         "or --model fake for local smoke tests until the providers package is merged.",
       ]
         .filter(Boolean)
@@ -178,12 +185,9 @@ function resolveMiniMaxFactory(providers: Record<string, unknown>): ProviderRout
   const defaultObject = isRecord(defaultExport) ? defaultExport : {};
   const candidates = [
     providers.createMiniMaxRouter,
-    providers.createMiniMaxM27HighspeedRouter,
-    providers.createMiniMaxM27HighspeedModel,
     providers.createMiniMaxProvider,
     providers.createMiniMaxProviderRouter,
     defaultObject.createMiniMaxRouter,
-    defaultObject.createMiniMaxM27HighspeedModel,
     typeof defaultExport === "function" ? defaultExport : undefined,
   ];
   const factory = candidates.find((candidate) => typeof candidate === "function");
@@ -252,6 +256,25 @@ function resolveZaiFactory(providers: Record<string, unknown>): ProviderRouterFa
   const factory = candidates.find((candidate) => typeof candidate === "function");
   if (!factory) {
     throw new Error("@chili/providers must export createZaiRouter(options) or another compatible Z.ai factory");
+  }
+  return factory as ProviderRouterFactory;
+}
+
+function resolveXaiFactory(providers: Record<string, unknown>): ProviderRouterFactory {
+  const defaultExport = providers.default;
+  const defaultObject = isRecord(defaultExport) ? defaultExport : {};
+  const candidates = [
+    providers.createXaiRouter,
+    providers.createXaiModel,
+    providers.createXaiProvider,
+    defaultObject.createXaiRouter,
+    defaultObject.createXaiModel,
+    defaultObject.createXaiProvider,
+    typeof defaultExport === "function" ? defaultExport : undefined,
+  ];
+  const factory = candidates.find((candidate) => typeof candidate === "function");
+  if (!factory) {
+    throw new Error("@chili/providers must export createXaiRouter(options) or another compatible xAI factory");
   }
   return factory as ProviderRouterFactory;
 }
@@ -338,12 +361,13 @@ function providerBaseOptions(input: CliModelOptions): ProviderRouterOptions {
   if (input.headers !== undefined) options.headers = input.headers;
   if (input.authStorage !== undefined) options.authStorage = input.authStorage;
   if (input.serviceTier !== undefined) options.serviceTier = input.serviceTier;
+  if (input.reasoningMode !== undefined) options.reasoningMode = input.reasoningMode;
+  if (input.reasoningContext !== undefined) options.reasoningContext = input.reasoningContext;
   return options;
 }
 
 type ResolvedCliModelSelection =
   | { kind: "fake"; model?: string }
-  | { kind: "legacy-minimax"; model?: string }
   | { kind: "provider"; provider: CliProviderName; model?: string };
 
 function resolveCliModelSelection(providerInput: string | undefined, modelInput: string | undefined): ResolvedCliModelSelection {
@@ -366,14 +390,15 @@ function resolveCliModelSelection(providerInput: string | undefined, modelInput:
     if (split && split.provider !== provider) {
       throw new Error(`--model ${model} conflicts with --provider ${provider}`);
     }
-    const resolvedModel = split?.model ?? model;
+    const resolvedModel = canonicalizeCliProviderModel(provider, split?.model ?? model);
     assertCliProviderModel(provider, resolvedModel);
     return { kind: "provider", provider, model: resolvedModel };
   }
 
   if (split) {
-    assertCliProviderModel(split.provider, split.model);
-    return { kind: "provider", provider: split.provider, model: split.model };
+    const resolvedModel = canonicalizeCliProviderModel(split.provider, split.model);
+    assertCliProviderModel(split.provider, resolvedModel);
+    return { kind: "provider", provider: split.provider, model: resolvedModel };
   }
 
   const exact = findKnownModelByBareId(model);
@@ -381,8 +406,9 @@ function resolveCliModelSelection(providerInput: string | undefined, modelInput:
 
   const heuristicProvider = inferProviderFromBareModel(model);
   if (heuristicProvider) {
-    assertCliProviderModel(heuristicProvider, model);
-    return { kind: "provider", provider: heuristicProvider, model };
+    const resolvedModel = canonicalizeCliProviderModel(heuristicProvider, model);
+    assertCliProviderModel(heuristicProvider, resolvedModel);
+    return { kind: "provider", provider: heuristicProvider, model: resolvedModel };
   }
 
   return { kind: "provider", provider: DEFAULT_PROVIDER, model };
@@ -395,6 +421,7 @@ function normalizeProviderName(value: string | undefined): CliProviderName | und
   if (normalized === "deepseek") return "deepseek";
   if (normalized === "kimi" || normalized === "moonshot") return "kimi";
   if (normalized === "zai" || normalized === "z.ai" || normalized === "glm") return "zai";
+  if (normalized === "xai" || normalized === "x.ai" || normalized === "grok") return "xai";
   if (normalized === "codex" || normalized === "openai-codex") return "openai-codex";
   if (normalized === "codex-api") return "codex-api";
   throw new Error(`Unknown provider: ${value}`);
@@ -403,7 +430,6 @@ function normalizeProviderName(value: string | undefined): CliProviderName | und
 function normalizeSpecialModelAlias(value: string): ResolvedCliModelSelection | undefined {
   const normalized = value.trim().toLowerCase();
   if (normalized === "fake") return { kind: "fake" };
-  if (normalized === "legacy-minimax") return { kind: "legacy-minimax" };
   const provider = normalizeProviderAlias(normalized);
   return provider ? { kind: "provider", provider } : undefined;
 }
@@ -413,6 +439,7 @@ function normalizeProviderAlias(value: string): CliProviderName | undefined {
   if (value === "deepseek") return "deepseek";
   if (value === "kimi" || value === "moonshot") return "kimi";
   if (value === "zai" || value === "z.ai" || value === "glm") return "zai";
+  if (value === "xai" || value === "x.ai" || value === "grok") return "xai";
   if (value === "codex" || value === "openai-codex") return "openai-codex";
   if (value === "codex-api") return "codex-api";
   return undefined;
@@ -441,6 +468,7 @@ function inferProviderFromBareModel(model: string): CliProviderName | undefined 
   if (normalized.startsWith("deepseek-")) return "deepseek";
   if (normalized.startsWith("kimi-") || normalized.startsWith("moonshot-")) return "kimi";
   if (normalized.startsWith("glm-")) return "zai";
+  if (normalized.startsWith("grok-")) return "xai";
   if (normalized.startsWith("minimax-")) return "minimax";
   return undefined;
 }
@@ -450,6 +478,7 @@ function isCliProviderName(provider: string): provider is CliProviderName {
     || provider === DEEPSEEK_PROVIDER_ID
     || provider === KIMI_PROVIDER_ID
     || provider === ZAI_PROVIDER_ID
+    || provider === XAI_PROVIDER_ID
     || provider === OPENAI_CODEX_PROVIDER_ID
     || provider === CODEX_API_PROVIDER_ID;
 }
@@ -457,6 +486,12 @@ function isCliProviderName(provider: string): provider is CliProviderName {
 function assertCliProviderModel(provider: CliProviderName, model: string | undefined): void {
   if (provider === OPENAI_CODEX_PROVIDER_ID && model) assertOpenAICodexModel(model);
   if (provider === CODEX_API_PROVIDER_ID && model) assertCodexApiModel(model);
+}
+
+function canonicalizeCliProviderModel(provider: CliProviderName, model: string): string {
+  if (provider === OPENAI_CODEX_PROVIDER_ID) return canonicalizeOpenAICodexModel(model);
+  if (provider === CODEX_API_PROVIDER_ID) return canonicalizeCodexApiModel(model);
+  return model;
 }
 
 function splitReasoningSuffix(value: string): { model: string; reasoningLevel?: CliReasoningLevel } {
@@ -528,19 +563,6 @@ class CliProviderRouter implements ModelRouter {
       yield* new FakeModelRouter().stream(input);
       return;
     }
-    if (selection.kind === "legacy-minimax") {
-      const legacyOptions = readMiniMaxOptionsFromEnv({
-        ...providerScopedBaseOptions(
-          this.options.baseOptions,
-          this.options.defaultSelection.provider,
-          MINIMAX_PROVIDER_ID,
-        ),
-        ...(selection.model ? { model: selection.model } : {}),
-      });
-      yield* createMiniMaxM27HighspeedRouter(legacyOptions).stream(input);
-      return;
-    }
-
     const reasoningLevel = reasoningLevelForInput(extended, this.options.defaultReasoningLevel);
     const serviceTier = serviceTierForInput(extended, this.options.defaultServiceTier);
     const providerOptions = this.optionsForProvider(selection, reasoningLevel, serviceTier);
@@ -558,18 +580,6 @@ class CliProviderRouter implements ModelRouter {
     const extended = input as ExtendedModelStreamInput;
     const selection = this.selectionForInput(extended);
     if (selection.kind === "fake") return undefined;
-    if (selection.kind === "legacy-minimax") {
-      const providerOptions = readMiniMaxOptionsFromEnv({
-        ...providerScopedBaseOptions(
-          this.options.baseOptions,
-          this.options.defaultSelection.provider,
-          MINIMAX_PROVIDER_ID,
-        ),
-        ...(selection.model ? { model: selection.model } : {}),
-      });
-      return requestLimitsForProvider(MINIMAX_PROVIDER_ID, providerOptions);
-    }
-
     const reasoningLevel = reasoningLevelForInput(extended, this.options.defaultReasoningLevel);
     const serviceTier = serviceTierForInput(extended, this.options.defaultServiceTier);
     return requestLimitsForProvider(
@@ -597,15 +607,24 @@ class CliProviderRouter implements ModelRouter {
       ),
       ...(selection.model ? { model: selection.model } : {}),
     };
-    if (
-      (selection.provider === OPENAI_CODEX_PROVIDER_ID || selection.provider === CODEX_API_PROVIDER_ID)
-      && serviceTier !== undefined
-    ) {
+    if (serviceTier !== undefined && (
+      selection.provider === OPENAI_CODEX_PROVIDER_ID
+      || selection.provider === CODEX_API_PROVIDER_ID
+      || selection.provider === MINIMAX_PROVIDER_ID
+    )) {
       input.serviceTier = serviceTier;
     }
     const withEnv = readOptionsForProvider(selection.provider, input);
-    const effectiveReasoningLevel = reasoningLevel
-      ? clampModelReasoningLevel(withEnv.model ?? selection.model, reasoningLevel)
+    const selectedModel = withEnv.model ?? selection.model;
+    const descriptor = selectedModel ? findKnownModel(selection.provider, selectedModel) : undefined;
+    const mappedReasoningLevel = reasoningLevel && reasoningLevel !== "off"
+      ? descriptor?.compatibility?.chatCompletions?.reasoningEffortMap?.[reasoningLevel]
+      : undefined;
+    const levelForModel = mappedReasoningLevel && isReasoningLevel(mappedReasoningLevel)
+      ? mappedReasoningLevel
+      : reasoningLevel;
+    const effectiveReasoningLevel = levelForModel
+      ? clampModelReasoningLevel(descriptor ?? selectedModel, levelForModel)
       : undefined;
     applyReasoningOptions(withEnv, selection.provider, effectiveReasoningLevel);
     return withEnv;
@@ -677,6 +696,7 @@ async function loadFactoryForProvider(provider: CliProviderName): Promise<Provid
   if (provider === "deepseek") return resolveDeepSeekFactory(await loadProvidersModule("deepseek"));
   if (provider === "kimi") return resolveKimiFactory(await loadProvidersModule("kimi"));
   if (provider === "zai") return resolveZaiFactory(await loadProvidersModule("zai"));
+  if (provider === "xai") return resolveXaiFactory(await loadProvidersModule("xai"));
   if (provider === "openai-codex") return resolveOpenAICodexFactory(await loadProvidersModule("codex"));
   if (provider === "codex-api") return resolveCodexApiFactory(await loadProvidersModule("codex-api"));
   return resolveMiniMaxFactory(await loadProvidersModule("minimax"));
@@ -695,6 +715,7 @@ function readMiniMaxOptionsFromEnv(input: CliModelOptions): ProviderRouterOption
   if (input.temperature !== undefined) options.temperature = input.temperature;
   if (input.fetch) options.fetch = input.fetch;
   if (input.headers !== undefined) options.headers = input.headers;
+  if (input.serviceTier !== undefined) options.serviceTier = input.serviceTier;
   return options;
 }
 
@@ -719,7 +740,7 @@ function readKimiOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
   const env = readKimiEnvironment();
   const resolvedApiKey = input.apiKey ?? env.apiKey;
   const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? KIMI_OPENAI_BASE_URL;
-  const resolvedModel = input.model ?? env.model ?? KIMI_K26_MODEL;
+  const resolvedModel = input.model ?? env.model ?? KIMI_K3_MODEL;
 
   if (resolvedApiKey) options.apiKey = resolvedApiKey;
   if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
@@ -734,8 +755,27 @@ function readZaiOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
   const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_ZAI_MAX_TOKENS };
   const env = readZaiEnvironment();
   const resolvedApiKey = input.apiKey ?? env.apiKey;
-  const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? ZAI_OPENAI_BASE_URL;
-  const resolvedModel = input.model ?? env.model ?? ZAI_GLM_52_MODEL;
+  const resolvedModel = input.model ?? env.model ?? ZAI_GLM_53_MODEL;
+  const resolvedBaseUrl = input.baseUrl
+    ?? env.baseUrl
+    ?? findKnownModel(ZAI_PROVIDER_ID, resolvedModel)?.baseUrl
+    ?? ZAI_OPENAI_BASE_URL;
+
+  if (resolvedApiKey) options.apiKey = resolvedApiKey;
+  if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
+  if (resolvedModel) options.model = resolvedModel;
+  if (input.temperature !== undefined) options.temperature = input.temperature;
+  if (input.fetch) options.fetch = input.fetch;
+  if (input.headers !== undefined) options.headers = input.headers;
+  return options;
+}
+
+function readXaiOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
+  const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_XAI_MAX_TOKENS };
+  const env = readXaiEnvironment();
+  const resolvedApiKey = input.apiKey ?? env.apiKey;
+  const resolvedBaseUrl = input.baseUrl ?? env.baseUrl ?? XAI_OPENAI_BASE_URL;
+  const resolvedModel = input.model ?? env.model ?? XAI_GROK_46_MODEL;
 
   if (resolvedApiKey) options.apiKey = resolvedApiKey;
   if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
@@ -749,7 +789,7 @@ function readZaiOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
 function readOpenAICodexOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {
   assertOpenAICodexCliOptions(input);
   const options: ProviderRouterOptions = { maxTokens: input.maxTokens ?? DEFAULT_CODEX_MAX_TOKENS };
-  const resolvedModel = input.model ?? OPENAI_CODEX_DEFAULT_MODEL;
+  const resolvedModel = canonicalizeOpenAICodexModel(input.model ?? OPENAI_CODEX_DEFAULT_MODEL);
 
   if (resolvedModel) options.model = resolvedModel;
   if (input.temperature !== undefined) options.temperature = input.temperature;
@@ -757,6 +797,8 @@ function readOpenAICodexOptionsFromEnv(input: CliModelOptions): ProviderRouterOp
   if (input.headers !== undefined) options.headers = input.headers;
   if (input.authStorage !== undefined) options.authStorage = input.authStorage;
   if (input.serviceTier !== undefined) options.serviceTier = input.serviceTier;
+  if (input.reasoningMode !== undefined) options.reasoningMode = input.reasoningMode;
+  if (input.reasoningContext !== undefined) options.reasoningContext = input.reasoningContext;
   return options;
 }
 
@@ -770,7 +812,7 @@ function readCodexApiOptionsFromEnv(input: CliModelOptions): ProviderRouterOptio
   const env = readCodexApiEnvironment();
   const resolvedApiKey = input.apiKey ?? env.apiKey;
   const resolvedBaseUrl = input.baseUrl ?? env.baseUrl;
-  const resolvedModel = input.model ?? env.model ?? CODEX_API_DEFAULT_MODEL;
+  const resolvedModel = canonicalizeCodexApiModel(input.model ?? env.model ?? CODEX_API_DEFAULT_MODEL);
 
   if (resolvedApiKey) options.apiKey = resolvedApiKey;
   if (resolvedBaseUrl) options.baseUrl = resolvedBaseUrl;
@@ -779,6 +821,8 @@ function readCodexApiOptionsFromEnv(input: CliModelOptions): ProviderRouterOptio
   if (input.fetch) options.fetch = input.fetch;
   if (input.headers !== undefined) options.headers = input.headers;
   if (input.serviceTier !== undefined) options.serviceTier = input.serviceTier;
+  if (input.reasoningMode !== undefined) options.reasoningMode = input.reasoningMode;
+  if (input.reasoningContext !== undefined) options.reasoningContext = input.reasoningContext;
   return options;
 }
 
@@ -786,6 +830,7 @@ function readOptionsForProvider(provider: CliProviderName, input: ProviderRouter
   if (provider === "deepseek") return readDeepSeekOptionsFromEnv(input);
   if (provider === "kimi") return readKimiOptionsFromEnv(input);
   if (provider === "zai") return readZaiOptionsFromEnv(input);
+  if (provider === "xai") return readXaiOptionsFromEnv(input);
   if (provider === "openai-codex") {
     const options = readOpenAICodexOptionsFromEnv(input);
     assertCliProviderModel(provider, options.model);
@@ -809,6 +854,8 @@ function providerScopedBaseOptions(
   if (input.temperature !== undefined) options.temperature = input.temperature;
   if (input.fetch !== undefined) options.fetch = input.fetch;
   if (input.serviceTier !== undefined) options.serviceTier = input.serviceTier;
+  if (input.reasoningMode !== undefined) options.reasoningMode = input.reasoningMode;
+  if (input.reasoningContext !== undefined) options.reasoningContext = input.reasoningContext;
 
   if (targetProvider === defaultProvider) {
     if (input.apiKey !== undefined) options.apiKey = input.apiKey;
@@ -843,14 +890,22 @@ function applyReasoningOptions(
 ): void {
   if (!reasoningLevel) return;
   if (provider === OPENAI_CODEX_PROVIDER_ID || provider === CODEX_API_PROVIDER_ID) {
-    if (reasoningLevel === "off") return;
     options.reasoningEffort = reasoningLevel;
     options.reasoningSummary = "auto";
     return;
   }
-  if (provider === "deepseek" || provider === "kimi" || provider === "zai") {
+  if (provider === "minimax") {
     options.reasoning = reasoningLevel !== "off";
-    if (provider === "zai" && reasoningLevel !== "off") options.reasoningEffort = reasoningLevel;
+    return;
+  }
+  if (provider === "deepseek") {
+    options.reasoning = reasoningLevel !== "off";
+    if (reasoningLevel !== "off") options.reasoningEffort = reasoningLevel;
+    return;
+  }
+  if (provider === "kimi" || provider === "zai" || provider === "xai") {
+    options.reasoning = true;
+    options.reasoningEffort = reasoningLevel;
   }
 }
 
@@ -915,6 +970,7 @@ function isModelStreamEvent(event: ProviderModelStreamEvent): boolean {
     event.type === "metadata" ||
     event.type === "text_delta" ||
     event.type === "reasoning_delta" ||
+    event.type === "reasoning_item" ||
     event.type === "tool_call_start" ||
     event.type === "tool_call_delta" ||
     event.type === "tool_call_end" ||

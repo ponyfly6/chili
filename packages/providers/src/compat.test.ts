@@ -49,7 +49,7 @@ test("detects chat completions differences from provider and baseUrl", () => {
   expect(
     resolveChatCompletionsCompatibility({
       provider: "deepseek",
-      model: "deepseek-reasoner",
+      model: "deepseek-v4-pro",
       apiFamily: "openai-completions",
       baseUrl: "https://api.deepseek.com",
     }),
@@ -60,11 +60,78 @@ test("detects chat completions differences from provider and baseUrl", () => {
     maxTokensField: "max_tokens",
     reasoningParameterStyle: "deepseek",
     reasoningEffortMap: {
-      minimal: "high",
-      low: "high",
+      off: "low",
+      minimal: "low",
+      low: "low",
+      medium: "high",
+      high: "high",
+      xhigh: "high",
+      max: "max",
+      ultra: "max",
+    },
+  });
+
+  expect(
+    resolveChatCompletionsCompatibility({
+      provider: "kimi",
+      model: "kimi-k3",
+      apiFamily: "openai-completions",
+      baseUrl: "https://api.moonshot.cn/v1",
+    }),
+  ).toMatchObject({
+    supportsStore: false,
+    supportsDeveloperRole: false,
+    supportsReasoningEffort: true,
+    requiresReasoningContentOnAssistantMessages: true,
+    maxTokensField: "max_completion_tokens",
+    reasoningParameterStyle: "moonshot-k3",
+    reasoningEffortMap: {
+      off: "low",
+      minimal: "low",
+      low: "low",
       medium: "high",
       high: "high",
       xhigh: "max",
+      max: "max",
+      ultra: "max",
+    },
+  });
+
+  expect(
+    resolveChatCompletionsCompatibility({
+      provider: "moonshot",
+      model: "kimi-k2.6",
+      apiFamily: "openai-completions",
+      baseUrl: "https://api.moonshot.cn/v1",
+    }),
+  ).toMatchObject({
+    supportsReasoningEffort: false,
+    maxTokensField: "max_tokens",
+    reasoningParameterStyle: "moonshot",
+  });
+
+  expect(
+    resolveChatCompletionsCompatibility({
+      provider: "xai",
+      model: "grok-4.6",
+      apiFamily: "openai-completions",
+      baseUrl: "https://api.x.ai/v1",
+    }),
+  ).toMatchObject({
+    supportsStore: false,
+    supportsDeveloperRole: false,
+    supportsReasoningEffort: true,
+    maxTokensField: "max_completion_tokens",
+    reasoningParameterStyle: "xai",
+    reasoningEffortMap: {
+      off: "low",
+      minimal: "low",
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "xhigh",
+      max: "xhigh",
+      ultra: "xhigh",
     },
   });
 
@@ -82,7 +149,7 @@ test("detects chat completions differences from provider and baseUrl", () => {
   expect(
     resolveChatCompletionsCompatibility({
       provider: "zai",
-      model: "glm-5.2",
+      model: "glm-5.3",
       apiFamily: "openai-completions",
       baseUrl: "https://api.z.ai/api/paas/v4",
     }),
@@ -92,6 +159,28 @@ test("detects chat completions differences from provider and baseUrl", () => {
     supportsReasoningEffort: true,
     requiresReasoningContentOnAssistantMessages: true,
     maxTokensField: "max_tokens",
+    reasoningParameterStyle: "zai-5.3",
+    reasoningEffortMap: {
+      off: "low",
+      minimal: "low",
+      low: "low",
+      medium: "high",
+      high: "high",
+      xhigh: "max",
+      max: "max",
+      ultra: "max",
+    },
+    toolCallDeltaMode: "zai-tool-stream",
+  });
+
+  expect(
+    resolveChatCompletionsCompatibility({
+      provider: "zai",
+      model: "glm-5.2",
+      apiFamily: "openai-completions",
+      baseUrl: "https://api.z.ai/api/paas/v4",
+    }),
+  ).toMatchObject({
     reasoningParameterStyle: "zai",
     reasoningEffortMap: {
       minimal: "high",
@@ -99,8 +188,9 @@ test("detects chat completions differences from provider and baseUrl", () => {
       medium: "high",
       high: "high",
       xhigh: "max",
+      max: "max",
+      ultra: "max",
     },
-    toolCallDeltaMode: "zai-tool-stream",
   });
 });
 

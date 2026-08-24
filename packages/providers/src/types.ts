@@ -1,4 +1,4 @@
-import type { AssistantMessagePhase, Message, ServiceTier } from "@chili/protocol";
+import type { AssistantMessagePhase, Message, PersistedModelOutput, ServiceTier } from "@chili/protocol";
 import type { ModelCompatibilityOverrides } from "./compat.js";
 
 export type ModelApiFamily = "anthropic-messages" | "openai-completions" | "openai-responses" | (string & {});
@@ -74,6 +74,7 @@ export interface ModelStreamInput {
   provider?: string;
   model?: string;
   selection?: Partial<ModelSelection>;
+  reasoningLevel?: ReasoningLevel;
   reasoning?: ReasoningLevel;
   thinking?: ThinkingLevel;
   serviceTier?: ServiceTier;
@@ -101,6 +102,7 @@ export type ModelStreamEvent =
   | ModelMetadataEvent
   | ModelTextDeltaEvent
   | ModelReasoningDeltaEvent
+  | ModelReasoningItemEvent
   | ModelToolCallStartEvent
   | ModelToolCallDeltaEvent
   | ModelToolCallEndEvent
@@ -129,6 +131,11 @@ export interface ModelReasoningDeltaEvent {
   text: string;
   index?: number;
   redacted?: boolean;
+}
+
+export interface ModelReasoningItemEvent {
+  type: "reasoning_item";
+  output: PersistedModelOutput;
 }
 
 export interface ModelToolCallStartEvent {

@@ -1,3 +1,4 @@
+import type { ServiceTier } from "@chili/protocol";
 import type { ChiliModelProvider, ModelDescriptor } from "./types.js";
 import {
   AnthropicCompatibleModel,
@@ -11,12 +12,11 @@ import {
   findKnownModel,
   listKnownModels,
   MINIMAX_ANTHROPIC_BASE_URL,
-  MINIMAX_M27_HIGHSPEED_MODEL,
   MINIMAX_M3_MODEL,
   MINIMAX_PROVIDER_ID,
 } from "./models.js";
 
-export { MINIMAX_ANTHROPIC_BASE_URL, MINIMAX_M27_HIGHSPEED_MODEL, MINIMAX_M3_MODEL, MINIMAX_PROVIDER_ID } from "./models.js";
+export { MINIMAX_ANTHROPIC_BASE_URL, MINIMAX_M3_MODEL, MINIMAX_PROVIDER_ID } from "./models.js";
 
 export interface MiniMaxModelOptions {
   apiKey?: string;
@@ -27,11 +27,13 @@ export interface MiniMaxModelOptions {
   fetch?: typeof fetch;
   headers?: Record<string, string>;
   authScheme?: AnthropicAuthScheme;
+  reasoning?: boolean;
+  serviceTier?: ServiceTier;
   backpressureCoordinator?: ProviderBackpressureCoordinator;
   env?: EnvironmentSource;
 }
 
-const DEFAULT_MINIMAX_MAX_TOKENS = 32 * 1024;
+const DEFAULT_MINIMAX_MAX_TOKENS = 128 * 1024;
 
 export class MiniMaxAnthropicProvider implements ChiliModelProvider {
   readonly id = MINIMAX_PROVIDER_ID;
@@ -73,7 +75,7 @@ export class MiniMaxAnthropicProvider implements ChiliModelProvider {
   }
 
   getModel(model?: string): AnthropicCompatibleModel {
-    return createMiniMaxM27HighspeedModel({ ...this.options, ...(model ? { model } : {}) });
+    return createMiniMaxM3Model({ ...this.options, ...(model ? { model } : {}) });
   }
 
   private defaultModel(): string {
@@ -99,12 +101,12 @@ export function createMiniMaxProvider(options: MiniMaxModelOptions = {}): MiniMa
 }
 
 export function createMiniMaxRouter(options: MiniMaxModelOptions = {}): AnthropicCompatibleModel {
-  return createMiniMaxM27HighspeedModel(options);
+  return createMiniMaxM3Model(options);
 }
 
-export function createMiniMaxM27HighspeedModel(options: MiniMaxModelOptions = {}): AnthropicCompatibleModel {
+export function createMiniMaxM3Model(options: MiniMaxModelOptions = {}): AnthropicCompatibleModel {
   const env = readMiniMaxEnvironment(options.env);
-  const model = options.model ?? env.model ?? MINIMAX_M27_HIGHSPEED_MODEL;
+  const model = options.model ?? env.model ?? MINIMAX_M3_MODEL;
   const descriptor = findKnownModel(MINIMAX_PROVIDER_ID, model) ?? findDefaultKnownModel(MINIMAX_PROVIDER_ID);
   const modelOptions: AnthropicCompatibleModelOptions = {
     provider: MINIMAX_PROVIDER_ID,
@@ -112,21 +114,21 @@ export function createMiniMaxM27HighspeedModel(options: MiniMaxModelOptions = {}
     baseUrl: options.baseUrl ?? env.baseUrl ?? descriptor?.baseUrl ?? MINIMAX_ANTHROPIC_BASE_URL,
     apiKey: options.apiKey ?? env.apiKey ?? "",
     authScheme: options.authScheme ?? "bearer",
+    reasoning: options.reasoning ?? true,
     maxTokens: options.maxTokens ?? DEFAULT_MINIMAX_MAX_TOKENS,
   };
-  // The M2.7-highspeed entry is text-only by design, even when the caller lets
-  // env pick a different catalog model. Pin input capabilities here so legacy
-  // "highspeed is text-only" callers keep their existing behavior.
-  if (model === MINIMAX_M27_HIGHSPEED_MODEL) {
-    modelOptions.inputCapabilities = ["text"];
-  } else if (descriptor?.inputCapabilities) {
-    modelOptions.inputCapabilities = descriptor.inputCapabilities;
-  }
+  if (descriptor?.inputCapabilities) modelOptions.inputCapabilities = descriptor.inputCapabilities;
   if (options.temperature !== undefined) modelOptions.temperature = options.temperature;
+  if (options.serviceTier !== undefined) modelOptions.serviceTier = options.serviceTier;
   if (options.fetch !== undefined) modelOptions.fetch = options.fetch;
   if (options.headers !== undefined) modelOptions.headers = options.headers;
   if (options.backpressureCoordinator !== undefined) {
     modelOptions.backpressureCoordinator = options.backpressureCoordinator;
   }
   return new AnthropicCompatibleModel(modelOptions);
+}
+
+/** @deprecated Use createMiniMaxM3Model. */
+export function createMiniMaxM27HighspeedModel(options: MiniMaxModelOptions = {}): AnthropicCompatibleModel {
+  return createMiniMaxM3Model(options);
 }

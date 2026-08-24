@@ -5,13 +5,13 @@ import {
   findDefaultKnownModel,
   findKnownModel,
   listKnownModels,
-  ZAI_GLM_52_MODEL,
+  ZAI_GLM_53_MODEL,
   ZAI_OPENAI_BASE_URL,
   ZAI_PROVIDER_ID,
 } from "./models.js";
 import { OpenAICompletionsModel, type OpenAICompletionsModelOptions } from "./openai-completions.js";
 
-export { ZAI_GLM_52_MODEL, ZAI_OPENAI_BASE_URL, ZAI_PROVIDER_ID } from "./models.js";
+export { ZAI_GLM_53_MODEL, ZAI_OPENAI_BASE_URL, ZAI_PROVIDER_ID } from "./models.js";
 
 export interface ZaiModelOptions {
   apiKey?: string;
@@ -39,8 +39,9 @@ export class ZaiOpenAIProvider implements ChiliModelProvider {
     const defaultModel = this.defaultModel();
     if (models.some((model) => model.model === defaultModel)) {
       return models.map((model) => {
-        const descriptor: ModelDescriptor = { ...model, baseUrl: this.defaultBaseUrl() };
+        const descriptor: ModelDescriptor = { ...model };
         if (model.model === defaultModel) {
+          descriptor.baseUrl = this.defaultBaseUrl();
           descriptor.default = true;
         } else {
           delete descriptor.default;
@@ -72,7 +73,7 @@ export class ZaiOpenAIProvider implements ChiliModelProvider {
 
   private defaultModel(): string {
     const env = readZaiEnvironment(this.options.env);
-    return this.options.model ?? env.model ?? ZAI_GLM_52_MODEL;
+    return this.options.model ?? env.model ?? ZAI_GLM_53_MODEL;
   }
 
   private defaultBaseUrl(): string {
@@ -98,7 +99,7 @@ export function createZaiRouter(options: ZaiModelOptions = {}): ChiliModel {
 
 export function createZaiModel(options: ZaiModelOptions = {}): ChiliModel {
   const env = readZaiEnvironment(options.env);
-  const model = options.model ?? env.model ?? ZAI_GLM_52_MODEL;
+  const model = options.model ?? env.model ?? ZAI_GLM_53_MODEL;
   const apiKey = options.apiKey ?? env.apiKey ?? "";
   if (!apiKey) throw new Error("Z.ai provider requires ZAI_API_KEY");
   const descriptor = findKnownModel(ZAI_PROVIDER_ID, model) ?? findDefaultKnownModel(ZAI_PROVIDER_ID);
@@ -128,8 +129,9 @@ export function createZaiModel(options: ZaiModelOptions = {}): ChiliModel {
   };
   if (descriptor?.inputCapabilities) modelOptions.inputCapabilities = descriptor.inputCapabilities;
   if (descriptor?.compatibility?.chatCompletions) modelOptions.compatibility = descriptor.compatibility.chatCompletions;
-  modelOptions.reasoning = options.reasoning ?? true;
-  if (options.reasoningEffort !== undefined) modelOptions.reasoningEffort = options.reasoningEffort;
+  modelOptions.reasoning = true;
+  const reasoningEffort = options.reasoning === false ? "off" : options.reasoningEffort;
+  if (reasoningEffort !== undefined) modelOptions.reasoningEffort = reasoningEffort;
   if (options.temperature !== undefined) modelOptions.temperature = options.temperature;
   if (options.fetch !== undefined) modelOptions.fetch = options.fetch;
   if (options.headers !== undefined) modelOptions.headers = options.headers;

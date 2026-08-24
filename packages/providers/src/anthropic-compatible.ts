@@ -1,4 +1,4 @@
-import { formatToolResultForModel, type Message, type MessagePart } from "@chili/protocol";
+import { formatToolResultForModel, type Message, type MessagePart, type ServiceTier } from "@chili/protocol";
 import type {
   ChiliModel,
   ModelInputCapability,
@@ -27,6 +27,8 @@ export interface AnthropicCompatibleModelOptions {
   authScheme?: AnthropicAuthScheme;
   maxTokens?: number;
   temperature?: number;
+  reasoning?: boolean;
+  serviceTier?: ServiceTier;
   fetch?: typeof fetch;
   headers?: Record<string, string>;
   inputCapabilities?: readonly ModelInputCapability[];
@@ -37,6 +39,8 @@ export interface AnthropicRequestBuildOptions {
   model: string;
   maxTokens?: number;
   temperature?: number;
+  reasoning?: boolean;
+  serviceTier?: ServiceTier;
   stream?: boolean;
   inputCapabilities?: readonly ModelInputCapability[];
 }
@@ -174,6 +178,14 @@ export class AnthropicCompatibleModel implements ChiliModel {
     const temperature = input.temperature ?? this.options.temperature;
     if (maxTokens !== undefined) requestOptions.maxTokens = maxTokens;
     if (temperature !== undefined) requestOptions.temperature = temperature;
+    const requestReasoning = this.provider === "minimax"
+      ? reasoningEnabledForInput(input) ?? this.options.reasoning
+      : this.options.reasoning;
+    const requestServiceTier = this.provider === "minimax"
+      ? input.serviceTier ?? this.options.serviceTier
+      : this.options.serviceTier;
+    if (requestReasoning !== undefined) requestOptions.reasoning = requestReasoning;
+    if (requestServiceTier !== undefined) requestOptions.serviceTier = requestServiceTier;
 
     const init: RequestInit = {
       method: "POST",
@@ -406,6 +418,10 @@ export function buildAnthropicRequestBody(
   const system = [...(input.system ?? []), ...(input.developer ?? []), ...systemMessages(messages)].filter(Boolean).join("\n\n");
   if (system) body.system = system;
   if (options.temperature !== undefined) body.temperature = options.temperature;
+  if (options.reasoning !== undefined) {
+    body.thinking = { type: options.reasoning ? "adaptive" : "disabled" };
+  }
+  if (options.serviceTier === "fast") body.service_tier = "priority";
   return body;
 }
 
@@ -414,6 +430,14 @@ export function resolveMessagesUrl(baseUrl: string): string {
   if (clean.endsWith("/v1/messages")) return clean;
   if (clean.endsWith("/v1")) return `${clean}/messages`;
   return `${clean}/v1/messages`;
+}
+
+function reasoningEnabledForInput(input: ModelStreamInput): boolean | undefined {
+  const reasoning = input.reasoning
+    ?? input.thinking
+    ?? input.selection?.reasoning
+    ?? input.selection?.thinking;
+  return reasoning === undefined ? undefined : reasoning !== "off";
 }
 
 function toAnthropicMessages(messages: readonly Message[], includeImageContent = true): AnthropicMessage[] {
@@ -431,7 +455,7 @@ function toAnthropicMessages(messages: readonly Message[], includeImageContent =
       } else if (part.type === "image" && includeImageContent) {
         userBlocks.push(formatImageBlock(part));
       } else if (part.type === "reasoning") {
-        assistantBlocks.push({ type: "text", text: part.text });
+        if (part.text) assistantBlocks.push({ type: "text", text: part.text });
       } else if (part.type === "tool_call") {
         assistantBlocks.push({
           type: "tool_use",

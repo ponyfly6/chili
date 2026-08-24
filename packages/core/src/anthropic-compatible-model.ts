@@ -2,6 +2,7 @@ import {
   formatToolResultForModel,
   type Message,
   type MessagePart,
+  type ServiceTier,
   type ToolDefinition,
 } from "@chili/protocol";
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.js";
@@ -15,6 +16,8 @@ export interface AnthropicCompatibleModelOptions {
   authScheme?: AnthropicAuthScheme;
   maxTokens?: number;
   temperature?: number;
+  reasoning?: boolean;
+  serviceTier?: ServiceTier;
   fetch?: typeof fetch;
   inputCapabilities?: readonly ("text" | "image")[];
 }
@@ -25,7 +28,10 @@ export interface MiniMaxModelOptions {
   model?: string;
   maxTokens?: number;
   temperature?: number;
+  reasoning?: boolean;
+  serviceTier?: ServiceTier;
   fetch?: typeof fetch;
+  env?: Readonly<Record<string, string | undefined>>;
 }
 
 interface AnthropicMessage {
@@ -67,8 +73,10 @@ interface AnthropicResponse {
   };
 }
 
-export const MINIMAX_M27_HIGHSPEED_MODEL = "MiniMax-M2.7-highspeed";
+export const MINIMAX_M3_MODEL = "MiniMax-M3";
 export const MINIMAX_ANTHROPIC_BASE_URL = "https://api.minimaxi.com/anthropic";
+
+const DEFAULT_MINIMAX_MAX_TOKENS = 128 * 1024;
 
 export class AnthropicCompatibleModelRouter implements ModelRouter {
   private readonly fetchImpl: typeof fetch;
@@ -131,6 +139,15 @@ export class AnthropicCompatibleModelRouter implements ModelRouter {
     const system = [...input.system, ...(input.developer ?? []), ...systemMessages(messages)].filter(Boolean).join("\n\n");
     if (system) body.system = system;
     if (this.options.temperature !== undefined) body.temperature = this.options.temperature;
+    const miniMaxControlsEnabled = this.options.reasoning !== undefined || this.options.serviceTier !== undefined;
+    if (miniMaxControlsEnabled) {
+      const reasoning = input.reasoningLevel === undefined
+        ? this.options.reasoning
+        : input.reasoningLevel !== "off";
+      if (reasoning !== undefined) body.thinking = { type: reasoning ? "adaptive" : "disabled" };
+      const serviceTier = input.serviceTier ?? this.options.serviceTier;
+      if (serviceTier === "fast") body.service_tier = "priority";
+    }
     return body;
   }
 
@@ -148,18 +165,30 @@ export class AnthropicCompatibleModelRouter implements ModelRouter {
   }
 }
 
-export function createMiniMaxM27HighspeedRouter(options: MiniMaxModelOptions = {}): AnthropicCompatibleModelRouter {
+export function createMiniMaxM3Router(options: MiniMaxModelOptions = {}): AnthropicCompatibleModelRouter {
+  const env = options.env ?? process.env;
   const routerOptions: AnthropicCompatibleModelOptions = {
-    model: options.model ?? process.env.ANTHROPIC_MODEL ?? process.env.MINIMAX_MODEL ?? MINIMAX_M27_HIGHSPEED_MODEL,
-    baseUrl: options.baseUrl ?? process.env.ANTHROPIC_BASE_URL ?? process.env.MINIMAX_ANTHROPIC_BASE_URL ?? MINIMAX_ANTHROPIC_BASE_URL,
-    apiKey: options.apiKey ?? process.env.ANTHROPIC_API_KEY ?? process.env.MINIMAX_API_KEY ?? "",
+    model: options.model ?? env.MINIMAX_MODEL ?? env.ANTHROPIC_MODEL ?? MINIMAX_M3_MODEL,
+    baseUrl: options.baseUrl
+      ?? env.MINIMAX_ANTHROPIC_BASE_URL
+      ?? env.ANTHROPIC_BASE_URL
+      ?? env.MINIMAX_BASE_URL
+      ?? MINIMAX_ANTHROPIC_BASE_URL,
+    apiKey: options.apiKey ?? env.MINIMAX_API_KEY ?? env.ANTHROPIC_API_KEY ?? "",
     authScheme: "bearer",
-    inputCapabilities: ["text"],
+    maxTokens: options.maxTokens ?? DEFAULT_MINIMAX_MAX_TOKENS,
+    reasoning: options.reasoning ?? true,
+    inputCapabilities: ["text", "image"],
   };
-  if (options.maxTokens !== undefined) routerOptions.maxTokens = options.maxTokens;
   if (options.temperature !== undefined) routerOptions.temperature = options.temperature;
+  if (options.serviceTier !== undefined) routerOptions.serviceTier = options.serviceTier;
   if (options.fetch !== undefined) routerOptions.fetch = options.fetch;
   return new AnthropicCompatibleModelRouter(routerOptions);
+}
+
+/** @deprecated Use createMiniMaxM3Router. */
+export function createMiniMaxM27HighspeedRouter(options: MiniMaxModelOptions = {}): AnthropicCompatibleModelRouter {
+  return createMiniMaxM3Router(options);
 }
 
 function messagesContainDirectImageInput(messages: readonly Message[]): boolean {

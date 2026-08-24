@@ -72,6 +72,39 @@ test("context builder snapshots assistant text phases", () => {
   expect(built.messages[0]?.parts).toEqual(message.parts);
 });
 
+test("context builder preserves an encrypted reasoning output with no display text", () => {
+  const sessionId = "session_reasoning_output_snapshot" as SessionId;
+  const messageId = "msg_reasoning_output_snapshot" as MessageId;
+  const message: Message = {
+    id: messageId,
+    sessionId,
+    role: "assistant",
+    createdAt: 1 as TimestampMs,
+    parts: [{
+      id: "part_reasoning_output_snapshot" as MessagePart["id"],
+      messageId,
+      sessionId,
+      type: "reasoning",
+      text: "",
+      modelOutput: {
+        apiFamily: "openai-responses",
+        outputIndex: 0,
+        item: {
+          id: "reasoning_snapshot",
+          type: "reasoning",
+          encrypted_content: "ciphertext",
+          provider_extension: { retained: true },
+        },
+      },
+    }],
+  };
+
+  const built = new ContextWindowBuilder({ maxInputChars: 10_000, maxMessagePartChars: 8 }).build([message]);
+
+  expect(built.messages).toEqual([message]);
+  expect(built.usage.contextChars).toBeGreaterThan(0);
+});
+
 test("compacted message view reorders appended summary before retained messages", () => {
   const sessionId = "session_compacted_order" as SessionId;
   const oldUser = textMessage("msg_order_old_user", sessionId, "user", "old request");

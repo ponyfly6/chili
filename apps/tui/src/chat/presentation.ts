@@ -227,6 +227,7 @@ function messageDisplayItems(
       continue;
     }
     if (part.type === "reasoning") {
+      if (!part.text.trim()) continue;
       if (hideAssistantThinking) {
         if (part.text.trim()) showHiddenTrace(streaming);
         continue;

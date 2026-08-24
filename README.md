@@ -98,14 +98,10 @@ MiniMax 配置优先使用这些环境变量：
 ```bash
 MINIMAX_API_KEY=...
 MINIMAX_BASE_URL=https://api.minimaxi.com/anthropic
-MINIMAX_MODEL=MiniMax-M3[1m]
+MINIMAX_MODEL=MiniMax-M3
 ```
 
-也兼容旧的 `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`、`ANTHROPIC_MODEL` 命名。需要临时回退到 core 里的旧路由时：
-
-```bash
-bun run chili -- --model legacy-minimax "hello"
-```
+也兼容旧的 `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`、`ANTHROPIC_MODEL` 命名。当前只在目录中提供最新的 `MiniMax-M3`：1M context、524,288 最大输出；CLI 默认申请 131,072 输出 token。`--thinking off|high` 对应 disabled/adaptive thinking，`--service-tier fast` 对应 priority tier。
 
 DeepSeek V4 使用 OpenAI-compatible 接入：
 
@@ -121,9 +117,9 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-pro
 ```
 
-可选模型为 `deepseek-v4-pro` 和 `deepseek-v4-flash`。官方 Anthropic 格式端点为 `https://api.deepseek.com/anthropic`，当前 CLI 默认使用 OpenAI 格式端点。
+可选模型为当前 V4 系列的 `deepseek-v4-pro` 和 `deepseek-v4-flash`。两者均为 1,048,576 context、384,000 最大输出，支持 `off|low|high|max` reasoning；兼容输入的 `medium|xhigh` 会映射到 `high`。官方 Anthropic 格式端点为 `https://api.deepseek.com/anthropic`，当前 CLI 默认使用 OpenAI 格式端点。
 
-Kimi 使用月之暗面 OpenAI-compatible 接入，默认模型为当前官方推荐的 `kimi-k2.6`：
+Kimi 使用月之暗面 OpenAI-compatible 接入，默认模型为当前官方推荐的 `kimi-k3`：
 
 ```bash
 MOONSHOT_API_KEY=... bun run chili -- --model kimi "总结这个仓库"
@@ -134,10 +130,38 @@ Kimi 配置优先使用这些环境变量：
 ```bash
 MOONSHOT_API_KEY=
 MOONSHOT_BASE_URL=https://api.moonshot.cn/v1
-MOONSHOT_MODEL=kimi-k2.6
+MOONSHOT_MODEL=kimi-k3
 ```
 
-也兼容 `KIMI_API_KEY`、`KIMI_BASE_URL`、`KIMI_MODEL` 命名。可用 `--model kimi:off` 关闭 K2.6 thinking。
+也兼容 `KIMI_API_KEY`、`KIMI_BASE_URL`、`KIMI_MODEL` 命名。K3 为固定 thinking 模型，支持 `low|high|max` effort，1,048,576 context；CLI 使用 `max_completion_tokens=131072` 作为请求默认值。
+
+Z.ai 默认使用最新 `glm-5.3`：
+
+```bash
+ZAI_API_KEY=... bun run chili -- --model zai "总结这个仓库"
+```
+
+```bash
+ZAI_API_KEY=
+ZAI_BASE_URL=https://api.z.ai/api/paas/v4
+ZAI_MODEL=glm-5.3
+```
+
+GLM-5.3 为固定 thinking 模型，支持 `low|high|max` effort，1M context、131,072 最大输出。目录同时保留官方 Coding Plan Anthropic 协议名 `glm-5.3[1m]`；它是同一代模型的协议 alias，不是旧模型。
+
+xAI 使用 OpenAI-compatible Chat Completions，默认模型为 `grok-4.6`：
+
+```bash
+XAI_API_KEY=... bun run chili -- --model grok "总结这个仓库"
+```
+
+```bash
+XAI_API_KEY=
+XAI_BASE_URL=https://api.x.ai/v1
+XAI_MODEL=grok-4.6
+```
+
+`grok`、`xai` 和 `x.ai` 都可作为 provider alias。Grok 4.6 支持 text/image、500k context 与 `low|medium|high|xhigh` reasoning；reasoning 不能关闭。Chat Completions 未显式设置时使用 128,000 的可见输出默认值。
 
 Codex 有两条独立的连接，通过 provider 明确区分：
 
@@ -160,6 +184,8 @@ bun run tui
 ```bash
 bun run chili -- --model openai-codex/gpt-5.6-sol "总结这个仓库"
 ```
+
+GPT 目录只保留 5.6 系列：`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`；官方 alias `gpt-5.6` 会规范化为 `gpt-5.6-sol`。三者均为 1,050,000 context、128,000 最大输出。`off` 会发送 `reasoning.effort=none`，并支持 GPT-5.6 的 `pro` mode 与 persisted-reasoning context 参数。
 
 也可以用 `/auth` 查看 OAuth 状态，或用 `/logout` 删除本地 ChatGPT Codex 凭据。`openai-codex` 是 OAuth-only provider，不从 API key 或自定义 base URL 取凭据。
 

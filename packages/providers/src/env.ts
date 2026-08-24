@@ -4,6 +4,7 @@ import {
   KIMI_PROVIDER_ID,
   MINIMAX_PROVIDER_ID,
   OPENAI_CODEX_PROVIDER_ID,
+  XAI_PROVIDER_ID,
   ZAI_PROVIDER_ID,
 } from "./models.js";
 
@@ -48,6 +49,12 @@ export const ZAI_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
   model: ["ZAI_MODEL"],
 };
 
+export const XAI_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
+  apiKey: ["XAI_API_KEY"],
+  baseUrl: ["XAI_BASE_URL"],
+  model: ["XAI_MODEL"],
+};
+
 export const OPENAI_CODEX_ENVIRONMENT: Required<ProviderEnvironmentSpec> = {
   apiKey: [],
   baseUrl: [],
@@ -72,6 +79,7 @@ const PROVIDER_ENVIRONMENT: Record<string, ProviderEnvironmentSpec> = {
   [MINIMAX_PROVIDER_ID]: MINIMAX_ENVIRONMENT,
   [OPENAI_CODEX_PROVIDER_ID]: OPENAI_CODEX_ENVIRONMENT,
   [CODEX_API_PROVIDER_ID]: CODEX_API_ENVIRONMENT,
+  [XAI_PROVIDER_ID]: XAI_ENVIRONMENT,
   [ZAI_PROVIDER_ID]: ZAI_ENVIRONMENT,
 };
 
@@ -99,6 +107,10 @@ export function readKimiEnvironment(env: EnvironmentSource = currentEnvironment(
 
 export function readZaiEnvironment(env: EnvironmentSource = currentEnvironment()): ProviderEnvironment {
   return readEnvironmentSpec(ZAI_ENVIRONMENT, env);
+}
+
+export function readXaiEnvironment(env: EnvironmentSource = currentEnvironment()): ProviderEnvironment {
+  return readEnvironmentSpec(XAI_ENVIRONMENT, env);
 }
 
 export function readOpenAICodexEnvironment(env: EnvironmentSource = currentEnvironment()): ProviderEnvironment {
