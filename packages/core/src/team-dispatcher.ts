@@ -5,7 +5,6 @@ import type {
   TaskId,
   TeamId,
   TeamTaskStatus,
-  ThreadId,
   TimestampMs,
   ToolCallId,
 } from "@chili/protocol";
@@ -54,7 +53,6 @@ export interface TeamTaskDispatchInput {
   taskId: TaskId;
   ownerPath?: AgentPath;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   cwd?: string;
   mode?: LocalSubagentMode;
   prompt?: string;
@@ -70,13 +68,11 @@ export interface TeamTaskSyncInput {
   teamId: TeamId;
   taskId: TaskId;
   sessionId?: SessionId;
-  threadId?: ThreadId;
 }
 
 export interface TeamTaskReconcileInput {
   teamId?: TeamId;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   limit?: number;
 }
 
@@ -86,7 +82,6 @@ export interface TeamTaskAgentBinding {
   runId: AgentRunId;
   generation: number;
   childSessionId: SessionId;
-  childThreadId: ThreadId;
   mode: LocalSubagentMode;
   dispatchedAt: number;
   agentStatus: LocalSubagentTaskResult["status"] | AgentTaskRow["status"];
@@ -177,7 +172,6 @@ export class TeamTaskDispatchService {
       };
       if (shouldBlockTask) updateInput.status = "blocked";
       if (shouldBlockTask && dispatchPolicy.reason) updateInput.error = dispatchPolicy.reason;
-      if (input.threadId) updateInput.threadId = input.threadId;
       const blockedTask = await this.options.teams.updateTask(updateInput);
       return { status: "skipped", reason: dispatchPolicy.reason, teamTask: blockedTask };
     }
@@ -188,7 +182,6 @@ export class TeamTaskDispatchService {
       ownerPath,
       claimedBy: ownerPath,
       sessionId: parentSessionId,
-      ...(input.threadId ? { threadId: input.threadId } : {}),
     });
     if (!claim.applied) {
       return {
@@ -208,7 +201,6 @@ export class TeamTaskDispatchService {
           taskId: input.taskId,
           cwd: input.cwd ?? this.options.cwd,
           sessionId: parentSessionId,
-          ...(input.threadId ? { threadId: input.threadId } : {}),
           ...(input.signal ? { signal: input.signal } : {}),
         });
         dispatchTask = worktree.task;
@@ -221,7 +213,6 @@ export class TeamTaskDispatchService {
             error: "",
             sessionId: parentSessionId,
             ...(claimedTask.metadata ? { metadata: claimedTask.metadata } : {}),
-            ...(input.threadId ? { threadId: input.threadId } : {}),
           });
           throw error;
         }
@@ -233,7 +224,6 @@ export class TeamTaskDispatchService {
           error: `worktree_failed: ${err.message}`,
           metadata: mergeDispatchMetadata(claimedTask.metadata, { policy: dispatchPolicy }),
           sessionId: parentSessionId,
-          ...(input.threadId ? { threadId: input.threadId } : {}),
         });
         return { status: "skipped", reason: "blocked", teamTask: blockedTask };
       }
@@ -246,7 +236,6 @@ export class TeamTaskDispatchService {
       const taskCwd = worktree?.path ?? input.cwd ?? this.options.cwd;
       const spawnInput: LocalSubagentTaskInput = {
         parentSessionId,
-        ...(input.threadId ? { parentThreadId: input.threadId } : {}),
         parentPath: ownerPath,
         cwd: taskCwd,
         taskName: taskForPrompt.title,
@@ -282,9 +271,7 @@ export class TeamTaskDispatchService {
         sessionId: parentSessionId,
         ...(policyMetadata ? { policy: policyMetadata } : {}),
       };
-      const teamTask = await this.updateTeamTaskFromAgentResult(
-        input.threadId ? { ...updateInput, threadId: input.threadId } : updateInput,
-      );
+      const teamTask = await this.updateTeamTaskFromAgentResult(updateInput);
       return {
         status: agentTask.status === "pending" ? "running" : agentTask.status,
         teamTask,
@@ -302,7 +289,6 @@ export class TeamTaskDispatchService {
           syncedAt: Number(this.now()),
         }),
         sessionId: parentSessionId,
-        ...(input.threadId ? { threadId: input.threadId } : {}),
       });
       return { status: isAbortError(err) ? "cancelled" : "failed", teamTask };
     }
@@ -361,7 +347,6 @@ export class TeamTaskDispatchService {
         syncedAt: Number(this.now()),
       }),
       ...(input.sessionId ?? teamTask.sessionId ? { sessionId: input.sessionId ?? teamTask.sessionId } : {}),
-      ...(input.threadId ? { threadId: input.threadId } : {}),
     });
     const updated = synced.task ?? (await this.requireTeamTask(input.teamId, input.taskId));
     if (synced.applied) return { applied: true, teamTask: updated, agentTask };
@@ -398,7 +383,6 @@ export class TeamTaskDispatchService {
           };
           const sessionId = input.sessionId ?? task.sessionId ?? team.sessionId;
           if (sessionId) syncInput.sessionId = sessionId;
-          if (input.threadId) syncInput.threadId = input.threadId;
           const synced = await this.syncTask(syncInput);
           if (synced.applied) result.synced.push(synced);
           else result.skipped.push(synced);
@@ -420,7 +404,6 @@ export class TeamTaskDispatchService {
     agentGeneration: number;
     mode: LocalSubagentMode;
     sessionId: SessionId;
-    threadId?: ThreadId;
     policy?: TeamTaskDispatchPolicyMetadata;
   }): Promise<TeamTaskRow> {
     const status = teamStatusFromAgentStatus(input.agentTask.status);
@@ -434,7 +417,6 @@ export class TeamTaskDispatchService {
         runId: input.agentTask.runId,
         generation: input.agentGeneration,
         childSessionId: input.agentTask.childSessionId,
-        childThreadId: input.agentTask.childThreadId,
         mode: input.mode,
         dispatchedAt: Number(this.now()),
         agentStatus: input.agentTask.status,
@@ -443,7 +425,6 @@ export class TeamTaskDispatchService {
       }),
       sessionId: input.sessionId,
     };
-    if (input.threadId) update.threadId = input.threadId;
     if (input.agentTask.summary) update.summary = input.agentTask.summary;
     if (status === "completed" && input.task.error) update.error = "";
     if (input.agentTask.error) update.error = input.agentTask.error.message;
@@ -588,8 +569,7 @@ function dispatchBinding(metadata: Record<string, unknown> | undefined): TeamTas
     typeof value.generation !== "number" ||
     !Number.isInteger(value.generation) ||
     value.generation < 0 ||
-    typeof value.childSessionId !== "string" ||
-    typeof value.childThreadId !== "string"
+    typeof value.childSessionId !== "string"
   ) {
     return undefined;
   }

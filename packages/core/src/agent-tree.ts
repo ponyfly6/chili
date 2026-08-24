@@ -12,7 +12,6 @@ import type {
   TaskId,
   TeamId,
   TeamMessageDelivery,
-  ThreadId,
   TimestampMs,
   ToolCallId,
 } from "@chili/protocol";
@@ -38,6 +37,7 @@ import {
   type AgentTaskFollowupResult,
 } from "./task-control.js";
 import { DelegationPolicyOffError } from "./delegation.js";
+import { assertTeamMemberSessionOwnership } from "./team.js";
 
 export interface AgentTreeControlServiceOptions {
   store: EventStore
@@ -59,7 +59,7 @@ export interface AgentMailboxDelegationPolicyGate {
 }
 
 export interface AgentMailboxRuntime {
-  appendUserMessage(input: { sessionId: SessionId; threadId: ThreadId; text: string }): Promise<unknown>;
+  appendUserMessage(input: { sessionId: SessionId; text: string }): Promise<unknown>;
   submitPrompt(input: SubmitPromptInput): Promise<SubmitPromptResult>;
   isRunning?(sessionId: SessionId): boolean;
 }
@@ -113,7 +113,7 @@ export interface RecoverAgentMailboxDeliveryInput {
  *
  * `queueOnly` records the message without starting a turn. `triggerTurn` is
  * consumed by the mailbox delivery pump and starts a turn for a live target.
- * Explicit recipient session/thread metadata takes precedence over task/path
+ * Explicit recipient session metadata takes precedence over task/path
  * lookup; this is used by child-to-parent completion notifications.
  */
 export interface SendAgentMessageInput {
@@ -124,10 +124,8 @@ export interface SendAgentMessageInput {
   delivery?: TeamMessageDelivery;
   taskId?: TaskId;
   recipientSessionId?: SessionId;
-  recipientThreadId?: ThreadId;
   metadata?: Record<string, unknown>;
   sessionId?: SessionId;
-  threadId?: ThreadId;
 }
 
 export class AgentMailboxNotFoundError extends Error {
@@ -226,8 +224,7 @@ export class AgentTreeControlService {
       path: recipient.path,
       from: input.from,
       triggerTurn: delivery === "triggerTurn",
-      childSessionId: recipient.sessionId,
-      childThreadId: recipient.threadId,
+      recipientSessionId: recipient.sessionId,
       message: {
         role: "user",
         content: input.content,
@@ -246,7 +243,6 @@ export class AgentTreeControlService {
       payload,
     };
     if (input.sessionId) event.sessionId = input.sessionId;
-    if (input.threadId) event.threadId = input.threadId;
 
     try {
       await this.options.store.append(event);
@@ -358,8 +354,7 @@ export class AgentTreeControlService {
 
     const parentPath = completedTask.parentPath ?? parentAgentPath(completedTask.path);
     const parentSessionId = completedTask.parentSessionId;
-    const parentThreadId = completedTask.parentThreadId;
-    if (!parentPath || !parentSessionId || !parentThreadId) {
+    if (!parentPath || !parentSessionId) {
       throw new AgentMessageRecipientMetadataError(
         `Parent completion recipient metadata is unavailable for agent task ${completedTask.id}`,
       );
@@ -367,33 +362,32 @@ export class AgentTreeControlService {
 
     const orderedTasks = [...tasks].sort((left, right) => left.id.localeCompare(right.id));
     const envelope = completionEnvelope(orderedTasks, batchId, expectedBatchSize);
-    const messageId = completionMessageId(parentSessionId, parentThreadId, batchId, orderedTasks);
-    const counts = completionStatusCounts(orderedTasks);
-    const spawned = orderedTasks.filter((task) => task.generation > 0).length;
-    const untracked = Math.max(0, (expectedBatchSize ?? orderedTasks.length) - orderedTasks.length);
+    const senderPath = orderedTasks[0]?.path ?? completedTask.path;
+    const existing = (await this.options.store.agentMailbox({
+      path: parentPath,
+      recipientSessionId: parentSessionId,
+      triggerTurn: true,
+      limit: ALL_AGENT_TASKS_LIMIT,
+    })).find((message) => matchesCompletionNotification(message, {
+      recipientSessionId: parentSessionId,
+      recipientPath: parentPath,
+      senderPath,
+      tasks: orderedTasks,
+      batchId,
+      expectedBatchSize,
+    }));
+    if (existing) return existing;
+
+    const messageId = completionMessageId(parentSessionId, batchId, orderedTasks);
     return this.sendMessage({
       messageId,
-      from: orderedTasks[0]?.path ?? completedTask.path,
+      from: senderPath,
       to: parentPath,
       content: envelope,
       delivery: "triggerTurn",
       recipientSessionId: parentSessionId,
-      recipientThreadId: parentThreadId,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
-      metadata: pruneUndefined({
-        kind: "subagent_completion_batch",
-        completionPolicy: "notify",
-        batchId,
-        parentPath,
-        total: orderedTasks.length,
-        expectedBatchSize: expectedBatchSize ?? orderedTasks.length,
-        spawned,
-        terminal: orderedTasks.length,
-        untracked,
-        counts,
-        taskIds: orderedTasks.map((task) => task.id),
-      }),
+      metadata: completionNotificationMetadata(orderedTasks, batchId, expectedBatchSize, parentPath),
     });
   }
 
@@ -409,7 +403,7 @@ export class AgentTreeControlService {
       && !isTerminalAgentTaskStatus(task.status)
       && !isRecoverableTaskFollowup(task, Number(this.now()))
     ) return false;
-    const sessionId = message.childSessionId ?? task?.childSessionId;
+    const sessionId = message.recipientSessionId ?? task?.childSessionId;
     if (!sessionId) return true;
     const runtime = this.runtimeForMailbox(message);
     return runtime?.isRunning ? !runtime.isRunning(sessionId) : true;
@@ -440,7 +434,6 @@ export class AgentTreeControlService {
       eventId: this.id("event"),
       error: input.error ?? "mailbox_delivery_recovered_after_restart",
       ...(context.sessionId ? { sessionId: context.sessionId } : {}),
-      ...(context.threadId ? { threadId: context.threadId } : {}),
       time: this.now(),
     });
     return recovered.message ?? this.requireMailbox(input.messageId);
@@ -450,16 +443,12 @@ export class AgentTreeControlService {
     const task = await this.options.store.agentTask(taskId);
     if (!task?.childSessionId) return [];
     const messages = await this.options.store.agentMailbox({
-      childSessionId: task.childSessionId,
+      recipientSessionId: task.childSessionId,
       triggerTurn: true,
       status: "queued",
       limit: ALL_AGENT_TASKS_LIMIT,
     });
-    return messages.filter(
-      (message) =>
-        message.triggerTurn &&
-        (task.childThreadId === undefined || message.childThreadId === task.childThreadId),
-    );
+    return messages.filter((message) => message.triggerTurn);
   }
 
   private async completionBatchTasks(completedTask: AgentTaskRow, batchId: string): Promise<AgentTaskRow[]> {
@@ -471,7 +460,6 @@ export class AgentTreeControlService {
     });
     return candidates.filter(
       (task) =>
-        task.parentThreadId === completedTask.parentThreadId &&
         task.sourceCallId === completedTask.sourceCallId &&
         taskBatchId(task) === batchId &&
         shouldNotifyParent(task),
@@ -479,12 +467,11 @@ export class AgentTreeControlService {
   }
 
   private async isCompletionSourceSealed(task: AgentTaskRow): Promise<boolean> {
-    if (!task.sourceCallId || !task.parentSessionId || !task.parentThreadId) return false;
+    if (!task.sourceCallId || !task.parentSessionId) return false;
     let afterEventId: string | undefined;
     while (true) {
       const events = await this.options.store.events({
         sessionId: task.parentSessionId,
-        threadId: task.parentThreadId,
         type: "tool.call_finished",
         ...(afterEventId ? { afterEventId } : {}),
         limit: EVENT_SCAN_PAGE_SIZE,
@@ -508,18 +495,10 @@ export class AgentTreeControlService {
     input: SendAgentMessageInput,
     delivery: TeamMessageDelivery,
   ): Promise<ResolvedAgentMessageRecipient> {
-    const hasSession = input.recipientSessionId !== undefined;
-    const hasThread = input.recipientThreadId !== undefined;
-    if (hasSession !== hasThread) {
-      throw new AgentMessageRecipientMetadataError(
-        "Agent message recipientSessionId and recipientThreadId must be provided together",
-      );
-    }
-    if (input.recipientSessionId && input.recipientThreadId) {
+    if (input.recipientSessionId) {
       return {
         path: explicitRecipientPath(input.to, input.from),
         sessionId: input.recipientSessionId,
-        threadId: input.recipientThreadId,
       };
     }
 
@@ -529,7 +508,7 @@ export class AgentTreeControlService {
         await this.options.store.agentTasks({ path: input.from, limit: 1000 }),
       );
       const sender = await this.resolveTaskCandidates(input.from, senderCandidates);
-      if (!sender.parentSessionId || !sender.parentThreadId) {
+      if (!sender.parentSessionId) {
         throw new AgentMessageRecipientMetadataError(
           `Parent recipient metadata is unavailable for agent task ${sender.id}`,
         );
@@ -539,7 +518,6 @@ export class AgentTreeControlService {
       return {
         path: parentPath,
         sessionId: sender.parentSessionId,
-        threadId: sender.parentThreadId,
       };
     }
 
@@ -574,7 +552,7 @@ export class AgentTreeControlService {
     if (delivery === "triggerTurn" && isTerminalAgentTaskStatus(task.status)) {
       throw new AgentMessageRecipientTerminalError(task.id, task.status);
     }
-    if (!task.childSessionId || !task.childThreadId) {
+    if (!task.childSessionId) {
       throw new AgentMessageRecipientMetadataError(
         `Agent message recipient is missing child session metadata: ${task.id}`,
       );
@@ -583,7 +561,6 @@ export class AgentTreeControlService {
       path: task.path,
       task,
       sessionId: task.childSessionId,
-      threadId: task.childThreadId,
     };
   }
 
@@ -609,8 +586,7 @@ export class AgentTreeControlService {
       existing.path === payload.path &&
       existing.fromPath === payload.from &&
       existing.taskId === payload.taskId &&
-      existing.childSessionId === payload.childSessionId &&
-      existing.childThreadId === payload.childThreadId &&
+      existing.recipientSessionId === payload.recipientSessionId &&
       existing.triggerTurn === payload.triggerTurn &&
       stableJson(existing.message) === stableJson(payload.message)
     ) {
@@ -642,7 +618,6 @@ export class AgentTreeControlService {
       eventId: this.id("event"),
       claimedBy: input.consumedBy ?? message.path,
       ...(context.sessionId ? { sessionId: context.sessionId } : {}),
-      ...(context.threadId ? { threadId: context.threadId } : {}),
       time: this.now(),
     });
     if (!claim.applied) {
@@ -664,7 +639,6 @@ export class AgentTreeControlService {
           discardedBy: input.consumedBy ?? claimedMessage.path,
           reason: discardedReason,
           ...(context.sessionId ? { sessionId: context.sessionId } : {}),
-          ...(context.threadId ? { threadId: context.threadId } : {}),
           time: this.now(),
         });
         if (discarded.message?.status === "discarded") return discarded.message;
@@ -681,7 +655,6 @@ export class AgentTreeControlService {
         eventId: this.id("event"),
         error: toError(error).message,
         ...(context.sessionId ? { sessionId: context.sessionId } : {}),
-        ...(context.threadId ? { threadId: context.threadId } : {}),
         time: this.now(),
       });
       throw error;
@@ -692,7 +665,6 @@ export class AgentTreeControlService {
       eventId: this.id("event"),
       consumedBy: input.consumedBy ?? claimedMessage.path,
       ...(context.sessionId ? { sessionId: context.sessionId } : {}),
-      ...(context.threadId ? { threadId: context.threadId } : {}),
       time: this.now(),
     });
     if (consumed.message?.status === "consumed") return consumed.message;
@@ -721,10 +693,8 @@ export class AgentTreeControlService {
       time: this.now(),
       payload,
     };
-    const sessionId = message.childSessionId ?? task?.parentSessionId;
+    const sessionId = message.recipientSessionId ?? task?.parentSessionId;
     if (sessionId) event.sessionId = sessionId;
-    const threadId = message.childThreadId ?? task?.parentThreadId;
-    if (threadId) event.threadId = threadId;
     await this.options.store.append(event as ChiliEvent);
   }
 
@@ -747,10 +717,8 @@ export class AgentTreeControlService {
       time: this.now(),
       payload,
     };
-    const sessionId = message.childSessionId ?? task?.parentSessionId;
+    const sessionId = message.recipientSessionId ?? task?.parentSessionId;
     if (sessionId) event.sessionId = sessionId;
-    const threadId = message.childThreadId ?? task?.parentThreadId;
-    if (threadId) event.threadId = threadId;
     await this.options.store.append(event as ChiliEvent);
   }
 
@@ -778,10 +746,9 @@ export class AgentTreeControlService {
       );
     }
 
-    const sessionId = message.childSessionId ?? deliveryTask?.childSessionId;
-    const threadId = message.childThreadId ?? deliveryTask?.childThreadId;
-    if (!sessionId || !threadId) {
-      throw new AgentMailboxNotDeliverableError(message.id, `Mailbox message is missing child session metadata: ${message.id}`);
+    const sessionId = message.recipientSessionId ?? deliveryTask?.childSessionId;
+    if (!sessionId) {
+      throw new AgentMailboxNotDeliverableError(message.id, `Mailbox message is missing recipient session metadata: ${message.id}`);
     }
 
     await this.assertMailboxTriggerDelegationEnabled(message, deliveryTask, sessionId);
@@ -794,7 +761,6 @@ export class AgentTreeControlService {
     if (message.triggerTurn) {
       const input: SubmitPromptInput = {
         sessionId,
-        threadId,
         text,
         ...(signal ? { signal } : {}),
       };
@@ -809,7 +775,12 @@ export class AgentTreeControlService {
       }
       try {
         let result: SubmitPromptResult;
-        if (deliveryTask && this.options.taskTurns) {
+        // Team messages own their member lifecycle separately. Their payload
+        // taskId, when present, identifies a team task rather than the
+        // AgentTask that owns the recipient session, so they must not enter the
+        // task-follow-up CAS path for a source mailbox row bound to a different
+        // task identity.
+        if (deliveryTask && this.options.taskTurns && !team) {
           result = (await this.options.taskTurns.followupTask({
             taskId: deliveryTask.id,
             text,
@@ -867,7 +838,7 @@ export class AgentTreeControlService {
     }
 
     throwIfAborted(signal);
-    await runtime.appendUserMessage({ sessionId, threadId, text });
+    await runtime.appendUserMessage({ sessionId, text });
     throwIfAborted(signal);
     return undefined;
   }
@@ -876,25 +847,39 @@ export class AgentTreeControlService {
     message: AgentMailboxRow,
     directTask?: AgentTaskRow,
   ): Promise<AgentTaskRow | undefined> {
-    if (
-      directTask &&
-      (!message.childSessionId || directTask.childSessionId === message.childSessionId) &&
-      (!message.childThreadId || directTask.childThreadId === message.childThreadId)
-    ) {
-      return directTask;
-    }
-    if (!message.childSessionId) return undefined;
+    if (!message.recipientSessionId) return directTask;
     const candidates = await this.options.store.agentTasks({
-      childSessionId: message.childSessionId,
+      childSessionId: message.recipientSessionId,
       limit: ALL_AGENT_TASKS_LIMIT,
     });
-    return candidates
-      .filter(
-        (candidate) =>
-          (!message.childThreadId || candidate.childThreadId === message.childThreadId) &&
-          candidate.path === message.path,
-      )
-      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+    if (candidates.length > 1) {
+      throw new AgentMessageRecipientMetadataError(
+        `Multiple agent tasks share recipient session ${message.recipientSessionId}: ${candidates.map((task) => task.id).join(", ")}`,
+      );
+    }
+    const candidate = candidates[0];
+    if (directTask && directTask.childSessionId !== message.recipientSessionId) {
+      throw new AgentMessageRecipientMetadataError(
+        `Agent mailbox task ${directTask.id} does not own recipient session ${message.recipientSessionId}`,
+      );
+    }
+    if (candidate && directTask && (candidate.id !== directTask.id || candidate.path !== directTask.path)) {
+      throw new AgentMessageRecipientMetadataError(
+        `Agent mailbox task ${directTask.id} conflicts with child session owner ${candidate.id}`,
+      );
+    }
+    const task = candidate ?? directTask;
+    if (task && message.taskId && task.id !== message.taskId) {
+      throw new AgentMessageRecipientMetadataError(
+        `Agent mailbox task ${message.taskId} does not match child session owner ${task.id}`,
+      );
+    }
+    if (task && task.path !== message.path) {
+      throw new AgentMessageRecipientMetadataError(
+        `Agent mailbox path ${message.path} does not match child session owner ${task.path}`,
+      );
+    }
+    return task;
   }
 
   private async mailboxTurnSkipReason(
@@ -905,25 +890,37 @@ export class AgentTreeControlService {
     if (task?.status === "cancelled") return `recipient task is cancelled: ${task.id}`;
     const team = teamDeliveryContext(message);
     if (!team) return undefined;
-    if (this.options.store.teams) {
-      const projectedTeam = (await this.options.store.teams({ teamId: team.teamId, limit: 1 }))[0];
-      if (!projectedTeam) return `recipient team no longer exists: ${team.teamId}`;
-      if (projectedTeam.status === "archived") return `recipient team is archived: ${team.teamId}`;
+    const teams = this.options.store.teams;
+    const teamMembers = this.options.store.teamMembers;
+    if (!teams || !teamMembers) return `recipient team ownership projection is unavailable: ${team.teamId}`;
+    const projectedTeam = (await teams.call(this.options.store, { teamId: team.teamId, limit: 1 }))[0];
+    if (!projectedTeam) return `recipient team no longer exists: ${team.teamId}`;
+    if (projectedTeam.status === "archived") return `recipient team is archived: ${team.teamId}`;
+    const member = (await teamMembers.call(this.options.store, {
+      teamId: team.teamId,
+      path: message.path,
+      limit: 1,
+    }))[0];
+    if (!member) return `recipient team member no longer exists: ${message.path}`;
+    if (member.status === "closed") return `recipient team member is closed: ${message.path}`;
+    if (message.recipientSessionId && member.childSessionId && member.childSessionId !== message.recipientSessionId) {
+      return `recipient team member session changed: ${message.path}`;
     }
-    if (this.options.store.teamMembers) {
-      const member = (await this.options.store.teamMembers({
-        teamId: team.teamId,
-        path: message.path,
-        limit: 1,
-      }))[0];
-      if (!member) return `recipient team member no longer exists: ${message.path}`;
-      if (member.status === "closed") return `recipient team member is closed: ${message.path}`;
-      if (message.childSessionId && member.childSessionId && member.childSessionId !== message.childSessionId) {
-        return `recipient team member session changed: ${message.path}`;
-      }
-      if (message.childThreadId && member.childThreadId && member.childThreadId !== message.childThreadId) {
-        return `recipient team member thread changed: ${message.path}`;
-      }
+    const recipientSessionId = message.recipientSessionId ?? member.childSessionId;
+    if (!recipientSessionId) return `recipient team member has no session: ${message.path}`;
+    try {
+      await assertTeamMemberSessionOwnership({
+        store: {
+          agentTasks: this.options.store.agentTasks.bind(this.options.store),
+          teamMembers: teamMembers.bind(this.options.store),
+        },
+        team: projectedTeam,
+        path: member.path,
+        childSessionId: recipientSessionId,
+        allowOwningLead: true,
+      });
+    } catch (error) {
+      return `recipient team member session ownership is invalid: ${toError(error).message}`;
     }
     if (team.taskId && this.options.store.teamTasks) {
       const teamTask = (await this.options.store.teamTasks({
@@ -972,8 +969,7 @@ export class AgentTreeControlService {
       metadata.parentPath !== message.path ||
       !Array.isArray(metadata.taskIds) ||
       metadata.taskIds.length === 0 ||
-      metadata.taskIds.length > MAX_COMPLETION_ITEMS ||
-      !message.childThreadId
+      metadata.taskIds.length > MAX_COMPLETION_ITEMS
     ) {
       return false;
     }
@@ -997,7 +993,6 @@ export class AgentTreeControlService {
       !isTerminalAgentTaskStatus(task.status) ||
       !shouldNotifyParent(task) ||
       task.parentSessionId !== recipientSessionId ||
-      task.parentThreadId !== message.childThreadId ||
       (task.parentPath ?? parentAgentPath(task.path)) !== message.path
     )) {
       return false;
@@ -1012,34 +1007,14 @@ export class AgentTreeControlService {
     ) {
       return false;
     }
-    const counts = completionStatusCounts(orderedTasks);
-    const spawned = orderedTasks.filter((task) => task.generation > 0).length;
-    const untracked = Math.max(0, (expectedBatchSize ?? orderedTasks.length) - orderedTasks.length);
-    const expectedMetadata = pruneUndefined({
-      kind: "subagent_completion_batch",
-      completionPolicy: "notify",
-      batchId,
-      parentPath: message.path,
-      total: orderedTasks.length,
-      expectedBatchSize: expectedBatchSize ?? orderedTasks.length,
-      spawned,
-      terminal: orderedTasks.length,
-      untracked,
-      counts,
-      taskIds: orderedTasks.map((task) => task.id),
-      agentMessageId: message.id,
-      agentMessageDelivery: "triggerTurn",
-      senderPath: message.fromPath,
-      recipientPath: message.path,
-    });
-    return stableJson(metadata) === stableJson(expectedMetadata) &&
-      textFromMailboxPayload(payload) === completionEnvelope(orderedTasks, batchId, expectedBatchSize) &&
-      message.id === completionMessageId(
+    return matchesCompletionNotification(message, {
       recipientSessionId,
-      message.childThreadId,
+      recipientPath: message.path,
+      senderPath: message.fromPath,
+      tasks: orderedTasks,
       batchId,
-      orderedTasks,
-      );
+      expectedBatchSize,
+    });
   }
 
   private runtimeForMailbox(message: AgentMailboxRow): AgentMailboxRuntime | undefined {
@@ -1076,8 +1051,7 @@ export class AgentTreeControlService {
       time: this.now(),
       payload,
     };
-    if (message.childSessionId) event.sessionId = message.childSessionId;
-    if (message.childThreadId) event.threadId = message.childThreadId;
+    if (message.recipientSessionId) event.sessionId = message.recipientSessionId;
     await this.options.store.append(event);
     return true;
   }
@@ -1117,7 +1091,6 @@ interface ResolvedAgentMessageRecipient {
   path: AgentPath;
   task?: AgentTaskRow;
   sessionId: SessionId;
-  threadId: ThreadId;
 }
 
 type TaskCompletionPolicy = "join" | "notify" | "detached" | "supervised";
@@ -1219,16 +1192,76 @@ function completionEnvelope(
   ].join("\n");
 }
 
+function completionNotificationMetadata(
+  tasks: readonly AgentTaskRow[],
+  batchId: string | undefined,
+  expectedBatchSize: number | undefined,
+  parentPath: AgentPath,
+): Record<string, unknown> {
+  const expected = expectedBatchSize ?? tasks.length;
+  return pruneUndefined({
+    kind: "subagent_completion_batch",
+    completionPolicy: "notify",
+    batchId,
+    parentPath,
+    total: tasks.length,
+    expectedBatchSize: expected,
+    spawned: tasks.filter((task) => task.generation > 0).length,
+    terminal: tasks.length,
+    untracked: Math.max(0, expected - tasks.length),
+    counts: completionStatusCounts(tasks),
+    taskIds: tasks.map((task) => task.id),
+  });
+}
+
+function matchesCompletionNotification(
+  message: AgentMailboxRow,
+  input: {
+    recipientSessionId: SessionId;
+    recipientPath: AgentPath;
+    senderPath: AgentPath;
+    tasks: readonly AgentTaskRow[];
+    batchId: string | undefined;
+    expectedBatchSize: number | undefined;
+  },
+): boolean {
+  if (
+    !message.triggerTurn ||
+    message.recipientSessionId !== input.recipientSessionId ||
+    message.path !== input.recipientPath ||
+    message.fromPath !== input.senderPath
+  ) {
+    return false;
+  }
+  const metadata = {
+    ...completionNotificationMetadata(
+      input.tasks,
+      input.batchId,
+      input.expectedBatchSize,
+      input.recipientPath,
+    ),
+    agentMessageId: message.id,
+    agentMessageDelivery: "triggerTurn",
+    senderPath: input.senderPath,
+    recipientPath: input.recipientPath,
+  };
+  const expectedPayload: AgentMailboxPayload = {
+    role: "user",
+    content: completionEnvelope(input.tasks, input.batchId, input.expectedBatchSize),
+    metadata,
+  };
+  return stableJson(message.message) === stableJson(expectedPayload);
+}
+
 function completionMessageId(
   parentSessionId: SessionId,
-  parentThreadId: ThreadId,
   batchId: string | undefined,
   tasks: readonly AgentTaskRow[],
 ): string {
   const identity = batchId
     ? `batch\0${batchId}\0${tasks.map((task) => `${task.id}:${task.generation}`).join("\0")}`
     : `task\0${tasks[0]?.id ?? "unknown"}\0${tasks[0]?.generation ?? 0}`;
-  return `agent_completion_${fnv1a64(`${parentSessionId}\0${parentThreadId}\0${identity}`)}`;
+  return `agent_completion_${fnv1a64(`${parentSessionId}\0${identity}`)}`;
 }
 
 function fnv1a64(value: string): string {
@@ -1302,12 +1335,7 @@ function scopeMessageCandidates(
   if (!input.sessionId) return candidates;
 
   const allowedTaskIds = new Set<TaskId>();
-  const endpoints: Array<{ sessionId: SessionId; threadId?: ThreadId }> = [
-    {
-      sessionId: input.sessionId,
-      ...(input.threadId ? { threadId: input.threadId } : {}),
-    },
-  ];
+  const endpoints: SessionId[] = [input.sessionId];
   const visitedEndpoints = new Set<string>();
 
   // A child session may send durable context to itself as well as to tasks it
@@ -1315,28 +1343,22 @@ function scopeMessageCandidates(
   // unique path represented by this endpoint.
   for (const task of allTasks) {
     if (
-      task.childSessionId === input.sessionId &&
-      (input.threadId === undefined || task.childThreadId === input.threadId)
+      task.childSessionId === input.sessionId
     ) {
       allowedTaskIds.add(task.id);
     }
   }
 
   for (let index = 0; index < endpoints.length; index += 1) {
-    const endpoint = endpoints[index] as { sessionId: SessionId; threadId?: ThreadId };
-    const endpointKey = `${endpoint.sessionId}\0${endpoint.threadId ?? "*"}`;
-    if (visitedEndpoints.has(endpointKey)) continue;
-    visitedEndpoints.add(endpointKey);
+    const endpoint = endpoints[index] as SessionId;
+    if (visitedEndpoints.has(endpoint)) continue;
+    visitedEndpoints.add(endpoint);
 
     for (const task of allTasks) {
-      if (task.parentSessionId !== endpoint.sessionId) continue;
-      if (endpoint.threadId !== undefined && task.parentThreadId !== endpoint.threadId) continue;
+      if (task.parentSessionId !== endpoint) continue;
       allowedTaskIds.add(task.id);
       if (task.childSessionId) {
-        endpoints.push({
-          sessionId: task.childSessionId,
-          ...(task.childThreadId ? { threadId: task.childThreadId } : {}),
-        });
+        endpoints.push(task.childSessionId);
       }
     }
   }
@@ -1348,10 +1370,7 @@ function scopeSenderCandidates(input: SendAgentMessageInput, candidates: AgentTa
   if (!input.sessionId) return candidates;
   return candidates.filter(
     (task) =>
-      (task.childSessionId === input.sessionId &&
-        (input.threadId === undefined || task.childThreadId === input.threadId)) ||
-      (task.parentSessionId === input.sessionId &&
-        (input.threadId === undefined || task.parentThreadId === input.threadId)),
+      task.childSessionId === input.sessionId || task.parentSessionId === input.sessionId,
   );
 }
 
@@ -1376,12 +1395,10 @@ function sortJsonValue(value: unknown): unknown {
 function mailboxEventContext(
   message: AgentMailboxRow,
   task: AgentTaskRow | undefined,
-): { sessionId?: SessionId; threadId?: ThreadId } {
-  const context: { sessionId?: SessionId; threadId?: ThreadId } = {};
-  const sessionId = message.childSessionId ?? task?.parentSessionId;
+): { sessionId?: SessionId } {
+  const context: { sessionId?: SessionId } = {};
+  const sessionId = message.recipientSessionId ?? task?.parentSessionId;
   if (sessionId) context.sessionId = sessionId;
-  const threadId = message.childThreadId ?? task?.parentThreadId;
-  if (threadId) context.threadId = threadId;
   return context;
 }
 

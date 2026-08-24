@@ -4,7 +4,6 @@ import type {
   DelegationPolicy,
   RuntimeDelegationConfig,
   SessionId,
-  ThreadId,
   TimestampMs,
   TurnId,
 } from "@chili/protocol";
@@ -96,7 +95,6 @@ function createExecutor(controller: DelegationToolController): ToolExecutor {
 function toolInput(toolName: string, input: unknown): ExecuteToolInput {
   return {
     sessionId: "session_delegation_tools" as SessionId,
-    threadId: "thread_delegation_tools" as ThreadId,
     turnId: "turn_delegation_tools" as TurnId,
     toolName,
     input,

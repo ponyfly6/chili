@@ -73,7 +73,6 @@ export interface LargestEventPayload {
   id: string;
   type: string;
   sessionId: string | null;
-  threadId: string | null;
   time: number;
   payloadBytes: number;
 }
@@ -95,7 +94,6 @@ export interface LargestMessagePartPayload {
 export interface LargestToolOutput {
   id: string;
   sessionId: string | null;
-  threadId: string | null;
   toolName: string;
   status: string;
   outputBytes: number;
@@ -158,7 +156,6 @@ export async function inspectSqliteEventStore(path: string): Promise<SqliteEvent
              id,
              type,
              session_id as sessionId,
-             thread_id as threadId,
              time,
              length(cast(payload_json as blob)) as payloadBytes
            from events
@@ -220,7 +217,6 @@ export async function inspectSqliteEventStore(path: string): Promise<SqliteEvent
           `select
              id,
              session_id as sessionId,
-             thread_id as threadId,
              tool_name as toolName,
              status,
              coalesce(length(cast(output as blob)), 0) as outputBytes

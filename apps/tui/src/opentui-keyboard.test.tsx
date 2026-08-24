@@ -5,7 +5,7 @@ import { expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import { act, useState, type Dispatch, type SetStateAction } from "react";
 import { createRuntimeView, type ChatTranscriptItem, type HttpRuntimeClient, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
-import type { ApprovalId, ChiliEvent, MessageId, PartId, RuntimeModelDescriptor, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
+import type { ApprovalId, ChiliEvent, MessageId, PartId, RuntimeModelDescriptor, SessionId, TaskId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import type { ClipboardAccess } from "./clipboard.js";
 import { CONVERSATION_INTERRUPTED_NOTICE, CTRL_C_EXIT_CONFIRM_MS, ChatShellApp, ChatShellSurface, isWithinCtrlCExitWindow, type ChatShellExitInfo } from "./ChatShellApp.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
@@ -33,7 +33,6 @@ test("plain prompt creates a session and submits through the runtime client", as
     expect(records.create[0]?.signal).toBeInstanceOf(AbortSignal);
     expect(records.submit[0]).toMatchObject({
       sessionId: "session_created",
-      threadId: "thread_created",
       text: "fix failing tests",
       cwd: "/repo/chili",
     });
@@ -192,12 +191,11 @@ test("bang prompt switches the composer into shell mode while typing", async () 
   }
 });
 
-test("resume session and thread submit without creating a new session", async () => {
+test("resume session submits without creating a new session", async () => {
   const records = chatClientRecords();
   const client = fakeChatClient(records);
   const app = await mountChatApp(client, {
     sessionId: "session_resume" as SessionId,
-    threadId: "thread_resume" as ThreadId,
   });
 
   try {
@@ -210,7 +208,6 @@ test("resume session and thread submit without creating a new session", async ()
     expect(records.submit).toHaveLength(1);
     expect(records.submit[0]).toMatchObject({
       sessionId: "session_resume",
-      threadId: "thread_resume",
       text: "continue",
     });
   } finally {
@@ -223,7 +220,6 @@ test("resumed chat keeps the stream global so /resume can switch sessions", asyn
   const client = fakeChatClient(records);
   const app = await mountChatApp(client, {
     sessionId: "session_resume" as SessionId,
-    threadId: "thread_resume" as ThreadId,
   });
 
   try {
@@ -231,29 +227,30 @@ test("resumed chat keeps the stream global so /resume can switch sessions", asyn
     await app.renderOnce();
 
     expect(records.stream[0]?.sessionId).toBeUndefined();
-    expect(records.stream[0]?.threadId).toBeUndefined();
   } finally {
     app.renderer.destroy();
   }
 });
 
-test("resume session without a thread blocks submit without creating a new session", async () => {
+test("resume session with empty history still submits without creating a new session", async () => {
   const records = chatClientRecords();
   const client = fakeChatClient(records);
   const app = await mountChatApp(client, {
-    sessionId: "session_resume_missing_thread" as SessionId,
+    sessionId: "session_resume_empty_history" as SessionId,
   });
 
   try {
-    await Bun.sleep(80);
-    await app.renderOnce();
-    expect(app.captureCharFrame()).toContain("Session resume needs a thread");
-
     await typeText(app, "continue");
     await press(app, () => app.mockInput.pressEnter());
+    await Bun.sleep(80);
+    await app.renderOnce();
 
     expect(records.create).toHaveLength(0);
-    expect(records.submit).toHaveLength(0);
+    expect(records.submit).toHaveLength(1);
+    expect(records.submit[0]).toMatchObject({
+      sessionId: "session_resume_empty_history",
+      text: "continue",
+    });
   } finally {
     app.renderer.destroy();
   }
@@ -262,7 +259,6 @@ test("resume session without a thread blocks submit without creating a new sessi
 test("default chat ignores streamed history and starts a new session", async () => {
   const records = chatClientRecords();
   const sessionId = "session_streamed" as SessionId;
-  const threadId = "thread_streamed" as ThreadId;
   const messageId = "msg_streamed" as MessageId;
   const partId = "part_streamed" as PartId;
   const client = fakeChatClient(records, [
@@ -271,7 +267,6 @@ test("default chat ignores streamed history and starts a new session", async () 
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo/chili" },
     },
     {
@@ -279,7 +274,6 @@ test("default chat ignores streamed history and starts a new session", async () 
       type: "message.created",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId, role: "assistant" },
     },
     {
@@ -287,7 +281,6 @@ test("default chat ignores streamed history and starts a new session", async () 
       type: "message.part_added",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId,
         part: { id: partId, messageId, sessionId, type: "text", text: "old streamed answer" },
@@ -310,7 +303,6 @@ test("default chat ignores streamed history and starts a new session", async () 
     expect(records.create).toHaveLength(1);
     expect(records.submit[0]).toMatchObject({
       sessionId: "session_created",
-      threadId: "thread_created",
       text: "start fresh",
     });
   } finally {
@@ -332,7 +324,6 @@ test("/new starts a fresh runtime session for following prompts", async () => {
     expect(records.create).toHaveLength(1);
     expect(records.submit[0]).toMatchObject({
       sessionId: "session_created",
-      threadId: "thread_created",
       text: "first session",
     });
 
@@ -350,7 +341,6 @@ test("/new starts a fresh runtime session for following prompts", async () => {
 
     expect(records.submit[1]).toMatchObject({
       sessionId: "session_created_2",
-      threadId: "thread_created_2",
       text: "second session",
     });
   } finally {
@@ -1741,7 +1731,6 @@ test("local notices clear when the active session changes", async () => {
       app.setRuntime((current) => ({
         ...current,
         activeSessionId: "session_next" as SessionId,
-        activeThreadId: "thread_next" as ThreadId,
       }));
     });
     await app.renderOnce();
@@ -2513,12 +2502,11 @@ test("pending approval shortcuts work when the prompt still has a draft", async 
 test("stale approval resolve failures are shown instead of success", async () => {
   const records = chatClientRecords();
   const sessionId = "session_stale_approval" as SessionId;
-  const threadId = "thread_stale_approval" as ThreadId;
   const approvalId = "approval_stale" as ApprovalId;
-  const client = fakeChatClient(records, approvalEvents(sessionId, threadId, approvalId), {
+  const client = fakeChatClient(records, approvalEvents(sessionId, approvalId), {
     approveResolved: false,
   });
-  const app = await mountChatApp(client, { sessionId, threadId });
+  const app = await mountChatApp(client, { sessionId });
 
   try {
     await Bun.sleep(80);
@@ -2537,10 +2525,9 @@ test("stale approval resolve failures are shown instead of success", async () =>
 test("session approval shortcut sends session-scoped approval", async () => {
   const records = chatClientRecords();
   const sessionId = "session_scoped_approval" as SessionId;
-  const threadId = "thread_scoped_approval" as ThreadId;
   const approvalId = "approval_scoped" as ApprovalId;
-  const client = fakeChatClient(records, approvalEvents(sessionId, threadId, approvalId));
-  const app = await mountChatApp(client, { sessionId, threadId });
+  const client = fakeChatClient(records, approvalEvents(sessionId, approvalId));
+  const app = await mountChatApp(client, { sessionId });
 
   try {
     await Bun.sleep(80);
@@ -2558,10 +2545,9 @@ test("session approval shortcut sends session-scoped approval", async () => {
 test("persistent approval shortcut sends persistent-scoped approval", async () => {
   const records = chatClientRecords();
   const sessionId = "session_persistent_approval" as SessionId;
-  const threadId = "thread_persistent_approval" as ThreadId;
   const approvalId = "approval_persistent" as ApprovalId;
-  const client = fakeChatClient(records, approvalEvents(sessionId, threadId, approvalId));
-  const app = await mountChatApp(client, { sessionId, threadId });
+  const client = fakeChatClient(records, approvalEvents(sessionId, approvalId));
+  const app = await mountChatApp(client, { sessionId });
 
   try {
     await Bun.sleep(80);
@@ -2684,7 +2670,6 @@ test("/resume opens a searchable project-scoped picker and switches sessions", a
   const sessions = [
     {
       id: "session_current" as SessionId,
-      threadId: "thread_current" as ThreadId,
       cwd: "/repo/chili",
       title: "Current chat",
       status: "active" as const,
@@ -2693,7 +2678,6 @@ test("/resume opens a searchable project-scoped picker and switches sessions", a
     },
     {
       id: "session_saved" as SessionId,
-      threadId: "thread_saved" as ThreadId,
       cwd: "/repo/chili",
       title: "Fix resume flow",
       preview: "Wire the saved conversation picker",
@@ -2704,7 +2688,6 @@ test("/resume opens a searchable project-scoped picker and switches sessions", a
     },
     {
       id: "session_other" as SessionId,
-      threadId: "thread_other" as ThreadId,
       cwd: "/repo/other",
       title: "Other project",
       source: "interactive" as const,
@@ -2714,7 +2697,6 @@ test("/resume opens a searchable project-scoped picker and switches sessions", a
     },
     {
       id: "session_worker" as SessionId,
-      threadId: "thread_worker" as ThreadId,
       cwd: "/repo/chili",
       title: "Internal worker",
       source: "subagent" as const,
@@ -2726,10 +2708,8 @@ test("/resume opens a searchable project-scoped picker and switches sessions", a
   const app = await mountShell(teamLiveFixture(), {
     runtime: {
       activeSessionId: "session_current" as SessionId,
-      activeThreadId: "thread_current" as ThreadId,
       chatView: {
         sessionId: "session_current" as SessionId,
-        threadId: "thread_current" as ThreadId,
         status: "idle",
         items: [],
         pendingApprovals: [],
@@ -2780,14 +2760,11 @@ test("/resume opens a searchable project-scoped picker and switches sessions", a
 test("/rename edits and saves the current chat title", async () => {
   const renamed: string[] = [];
   const sessionId = "session_rename" as SessionId;
-  const threadId = "thread_rename" as ThreadId;
   const app = await mountShell(teamLiveFixture(), {
     runtime: {
       activeSessionId: sessionId,
-      activeThreadId: threadId,
       chatView: {
         sessionId,
-        threadId,
         status: "idle",
         items: [],
         pendingApprovals: [],
@@ -2796,7 +2773,6 @@ test("/rename edits and saves the current chat title", async () => {
       },
       listSessions: async () => [{
         id: sessionId,
-        threadId,
         cwd: "/repo/chili",
         title: "Old",
         status: "active",
@@ -2805,7 +2781,7 @@ test("/rename edits and saves the current chat title", async () => {
       }],
       renameSession: async (title) => {
         renamed.push(title);
-        return { id: sessionId, threadId, cwd: "/repo/chili", title, status: "active", createdAt: 1, updatedAt: 2 };
+        return { id: sessionId, cwd: "/repo/chili", title, status: "active", createdAt: 1, updatedAt: 2 };
       },
     },
   });
@@ -2936,7 +2912,6 @@ test("/model uses runtime catalog and persists the selected model", async () => 
     expect(records.create).toHaveLength(1);
     expect(records.setModel[0]).toMatchObject({
       sessionId: "session_created",
-      threadId: "thread_created",
       modelSelection: { provider: "minimax", model: "MiniMax-M2.7-highspeed" },
     });
     const footerLine = app.captureCharFrame().split("\n").find((line) => line.includes("MiniMax-M2.7-highspeed") && line.includes("Build")) ?? "";
@@ -3631,7 +3606,6 @@ test("/status shows status reasons for failed and cancelled executions", async (
 test("/status shortcut copies the complete status page on a narrow screen and shows feedback", async () => {
   const copied: string[] = [];
   const sessionId = "session_status_copy_with_a_value_longer_than_the_visible_status_row" as SessionId;
-  const threadId = "thread_status_copy_with_a_value_longer_than_the_visible_status_row" as ThreadId;
   const reason = "Provider request failed after every response retry was exhausted";
   const cwd = "/repo/chili/a/very/long/path/that/is/not/fully/visible/in/the/status/view";
   const app = await mountShell(teamLiveFixture(), {
@@ -3647,7 +3621,6 @@ test("/status shortcut copies the complete status page on a narrow screen and sh
     }),
     runtime: {
       activeSessionId: sessionId,
-      activeThreadId: threadId,
       chatView: {
         status: "failed",
         statusReason: reason,
@@ -3675,7 +3648,6 @@ test("/status shortcut copies the complete status page on a narrow screen and sh
     expect(copied).toHaveLength(1);
     expect(copied[0]).toContain(`execution: failed\nreason: ${reason}`);
     expect(copied[0]).toContain(`session: ${sessionId}`);
-    expect(copied[0]).toContain(`thread: ${threadId}`);
     expect(copied[0]).toContain(`cwd: ${cwd}`);
     expect(copied[0]).not.toContain("PREVIOUS ASSISTANT REPLY");
     expect(app.captureCharFrame()).toContain("Copied status.");
@@ -3735,14 +3707,11 @@ test("/status discards a pending copy result when the active session changes", a
     resolveWrite = resolve;
   });
   const oldSessionId = "session_status_copy_old" as SessionId;
-  const oldThreadId = "thread_status_copy_old" as ThreadId;
   const newSessionId = "session_status_copy_new" as SessionId;
-  const newThreadId = "thread_status_copy_new" as ThreadId;
   const app = await mountStatefulShell(teamLiveFixture(), {
     clipboard: fakeClipboard({ writeText: async () => writeResult }),
     runtime: {
       activeSessionId: oldSessionId,
-      activeThreadId: oldThreadId,
     },
   });
 
@@ -3755,7 +3724,6 @@ test("/status discards a pending copy result when the active session changes", a
       app.setRuntime((current) => ({
         ...current,
         activeSessionId: newSessionId,
-        activeThreadId: newThreadId,
       }));
       await app.renderOnce();
     });
@@ -3767,7 +3735,6 @@ test("/status discards a pending copy result when the active session changes", a
 
     const frame = app.captureCharFrame();
     expect(frame).toContain(`session: ${newSessionId}`);
-    expect(frame).toContain(`thread: ${newThreadId}`);
     expect(frame).not.toContain("Copied status.");
   } finally {
     resolveWrite?.(false);
@@ -3778,7 +3745,6 @@ test("/status discards a pending copy result when the active session changes", a
 test("/status supports themed multi-click selection and keeps selection copy priority", async () => {
   const copied: string[] = [];
   const sessionId = "session_status_selectable" as SessionId;
-  const threadId = "thread_status_selectable" as ThreadId;
   const app = await mountShell(teamLiveFixture(), {
     width: 100,
     height: 36,
@@ -3792,7 +3758,6 @@ test("/status supports themed multi-click selection and keeps selection copy pri
     }),
     runtime: {
       activeSessionId: sessionId,
-      activeThreadId: threadId,
     },
   });
 
@@ -3815,17 +3780,6 @@ test("/status supports themed multi-click selection and keeps selection copy pri
     copied.length = 0;
     await press(app, () => app.mockInput.pressKey("c", { ctrl: true, shift: true }));
     expect(copied).toEqual([sessionId]);
-
-    const threadTarget = frameTextPosition(app.captureCharFrame(), threadId);
-    await act(async () => {
-      await app.mockMouse.doubleClick(threadTarget.x + 4, threadTarget.y);
-      await app.mockMouse.click(threadTarget.x + 4, threadTarget.y);
-      await Bun.sleep(80);
-      await app.renderOnce();
-    });
-
-    expect(app.renderer.getSelection()?.getSelectedText()).toBe(`thread: ${threadId}`);
-    expect(copied.at(-1)).toBe(`thread: ${threadId}`);
   } finally {
     app.renderer.destroy();
   }
@@ -4292,7 +4246,6 @@ async function mountChatApp(
   client: HttpRuntimeClient,
   options: {
     sessionId?: SessionId;
-    threadId?: ThreadId;
   } = {},
 ) {
   const app = await testRender(
@@ -4434,7 +4387,7 @@ function fakeChatClient(
       records.create.push(input);
       if (options.createError) throw options.createError;
       const suffix = index === 1 ? "" : `_${index}`;
-      return { sessionId: `session_created${suffix}` as SessionId, threadId: `thread_created${suffix}` as ThreadId };
+      return { sessionId: `session_created${suffix}` as SessionId };
     },
     sessionEvents: async (input: Record<string, unknown>) => events.filter((event) => event.sessionId === input.sessionId),
     listSessions: async () => [],
@@ -4448,11 +4401,11 @@ function fakeChatClient(
     }),
     submitPromptAsync: async (input: Record<string, unknown>) => {
       records.submit.push(input);
-      return { status: "accepted", sessionId: input.sessionId as SessionId, threadId: input.threadId as ThreadId };
+      return { status: "accepted", sessionId: input.sessionId as SessionId };
     },
     submitCommandAsync: async (input: Record<string, unknown>) => {
       records.submit.push(input);
-      return { status: "accepted", sessionId: input.sessionId as SessionId, threadId: input.threadId as ThreadId };
+      return { status: "accepted", sessionId: input.sessionId as SessionId };
     },
     submitPrompt: async () => ({ status: "completed", turns: [] }),
     listCommands: async () => ({
@@ -4520,7 +4473,7 @@ function fakeChatClient(
   return client as unknown as HttpRuntimeClient;
 }
 
-function approvalEvents(sessionId: SessionId, threadId: ThreadId, approvalId: ApprovalId): ChiliEvent[] {
+function approvalEvents(sessionId: SessionId, approvalId: ApprovalId): ChiliEvent[] {
   const callId = "toolcall_stale" as ToolCallId;
   return [
     {
@@ -4528,7 +4481,6 @@ function approvalEvents(sessionId: SessionId, threadId: ThreadId, approvalId: Ap
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo/chili" },
     },
     {
@@ -4536,7 +4488,6 @@ function approvalEvents(sessionId: SessionId, threadId: ThreadId, approvalId: Ap
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_stale" as TurnId, callId, toolName: "bash", input: { command: "ls -la" } },
     },
     {
@@ -4544,7 +4495,6 @@ function approvalEvents(sessionId: SessionId, threadId: ThreadId, approvalId: Ap
       type: "tool.call_updated",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId, status: "waiting_for_approval" },
     },
     {
@@ -4552,7 +4502,6 @@ function approvalEvents(sessionId: SessionId, threadId: ThreadId, approvalId: Ap
       type: "approval.requested",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: { approvalId, callId, permission: "bash", patterns: ["ls -la"] },
     },
   ];

@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import type { ModelStreamInput } from "@chili/core";
-import type { SessionId, ThreadId, TurnId } from "@chili/protocol";
+import type { SessionId, TurnId } from "@chili/protocol";
 import { FileAuthStorage, type OAuthCredential } from "@chili/providers";
 import { createCliModel, resolveCliRuntimeModelSelection } from "./model.js";
 
@@ -701,7 +701,6 @@ async function collect(stream: AsyncIterable<unknown>): Promise<unknown[]> {
 function emptyInput(): ModelStreamInput {
   return {
     sessionId: "session_cli_model" as SessionId,
-    threadId: "thread_cli_model" as ThreadId,
     turnId: "turn_cli_model" as TurnId,
     messages: [],
     tools: [],

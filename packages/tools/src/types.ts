@@ -6,7 +6,6 @@ import type {
   EventEnvelope,
   SessionId,
   SnapshotId,
-  ThreadId,
   TimestampMs,
   ToolCallId,
   ToolDefinition,
@@ -110,7 +109,6 @@ export interface ToolEventSink {
 export interface ApprovalBrokerRequest {
   approvalId: ApprovalId;
   sessionId: SessionId;
-  threadId?: ThreadId;
   callId: ToolCallId;
   toolName: string;
   risk: ChiliToolDefinition["risk"];
@@ -150,7 +148,6 @@ export interface ToolExecutorOptions {
 
 export interface ExecuteToolInput {
   sessionId: SessionId;
-  threadId?: ThreadId;
   turnId: TurnId;
   callId?: ToolCallId;
   toolName: string;
@@ -162,7 +159,6 @@ export interface ExecuteToolInput {
 
 export interface ToolPolicyContext {
   sessionId: SessionId;
-  threadId?: ThreadId;
   turnId?: TurnId;
   cwd: string;
 }
@@ -190,7 +186,6 @@ export type ExecuteToolResult =
 export interface SnapshotCreateRequest {
   cwd: string;
   sessionId: SessionId;
-  threadId?: ThreadId;
   callId: ToolCallId;
   toolName: string;
   patterns: string[];

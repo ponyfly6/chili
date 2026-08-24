@@ -1,4 +1,4 @@
-import type { ChiliEvent, EventEnvelope, SessionId, SnapshotId, ThreadId, TimestampMs } from "@chili/protocol";
+import type { ChiliEvent, EventEnvelope, SessionId, SnapshotId, TimestampMs } from "@chili/protocol";
 import { timestampNow } from "@chili/protocol";
 import type { EventStore } from "@chili/store";
 import type { SnapshotProvider, SnapshotRevertResult } from "@chili/tools";
@@ -12,7 +12,6 @@ export interface SnapshotRecoveryServiceOptions {
 
 export interface RevertSnapshotInput {
   sessionId: SessionId;
-  threadId?: ThreadId;
   snapshotId: SnapshotId;
 }
 
@@ -53,7 +52,6 @@ export class SnapshotRecoveryService {
       sessionId: input.sessionId,
       payload,
     };
-    if (input.threadId) event.threadId = input.threadId;
     await this.options.store.append(event as ChiliEvent);
   }
 

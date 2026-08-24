@@ -9,7 +9,6 @@ import type {
   MessageId,
   MessagePart,
   SessionId,
-  ThreadId,
   TimestampMs,
   TurnId,
 } from "@chili/protocol";
@@ -39,7 +38,6 @@ test("spawns a local subagent and records lifecycle events", async () => {
 
   const result = await manager.spawnTask({
     parentSessionId: "session_parent" as SessionId,
-    parentThreadId: "thread_parent" as ThreadId,
     cwd: "/repo",
     taskName: "reader",
     prompt: "Read README",
@@ -51,7 +49,6 @@ test("spawns a local subagent and records lifecycle events", async () => {
     path: "/root/task_1",
     parentPath: "/root",
     childSessionId: "session_3",
-    childThreadId: "thread_4",
     status: "completed",
     summary: "read it",
   });
@@ -60,9 +57,7 @@ test("spawns a local subagent and records lifecycle events", async () => {
     runId: "agent_2",
     path: "/root/task_1",
     parentSessionId: "session_parent",
-    parentThreadId: "thread_parent",
     childSessionId: "session_3",
-    childThreadId: "thread_4",
     cwd: "/repo",
     taskName: "reader",
     prompt: "Read README",
@@ -76,15 +71,12 @@ test("spawns a local subagent and records lifecycle events", async () => {
   ]);
   expect(store.items[0]).toMatchObject({
     sessionId: "session_parent",
-    threadId: "thread_parent",
     payload: {
       taskId: "task_1",
       path: "/root/task_1",
       parentPath: "/root",
       parentSessionId: "session_parent",
-      parentThreadId: "thread_parent",
       childSessionId: "session_3",
-      childThreadId: "thread_4",
       taskName: "reader",
       cwd: "/repo",
       prompt: "Read README",
@@ -93,7 +85,6 @@ test("spawns a local subagent and records lifecycle events", async () => {
   });
   expect(store.items[1]).toMatchObject({
     sessionId: "session_parent",
-    threadId: "thread_parent",
     payload: {
       runId: "agent_2",
       taskId: "task_1",
@@ -115,7 +106,6 @@ test("spawns a local subagent and records lifecycle events", async () => {
   });
   expect(store.items[3]).toMatchObject({
     sessionId: "session_parent",
-    threadId: "thread_parent",
     payload: {
       runId: "agent_2",
       taskId: "task_1",
@@ -179,7 +169,6 @@ test("runs a child task through an AgentRunner", async () => {
     parentPath: "/root",
     parentSessionId: "session_parent" as SessionId,
     childSessionId: "session_child" as SessionId,
-    childThreadId: "thread_child" as ThreadId,
     cwd: "/repo",
     taskName: "reader",
     prompt: "Read README",
@@ -193,20 +182,17 @@ test("runs a child task through an AgentRunner", async () => {
   expect(runner.createInputs).toEqual([
     {
       sessionId: "session_child" as SessionId,
-      threadId: "thread_child" as ThreadId,
       cwd: "/repo",
     },
   ]);
   expect(runner.userMessages).toEqual([
     {
       sessionId: "session_child" as SessionId,
-      threadId: "thread_child" as ThreadId,
       text: "Read README",
     },
   ]);
   expect(runner.turnInputs[0]).toMatchObject({
     sessionId: "session_child",
-    threadId: "thread_child",
     cwd: "/repo",
     system: [
       "You are a local Chili subagent. Work in the assigned repository scope, keep results concise, and return a clear final summary.",
@@ -290,7 +276,6 @@ test("tracks background subagent tasks until they complete", async () => {
 
   const task = await manager.spawnTask({
     parentSessionId: "session_parent" as SessionId,
-    parentThreadId: "thread_parent" as ThreadId,
     cwd: "/repo",
     taskName: "background reader",
     prompt: "Read README",
@@ -335,7 +320,6 @@ test("background subagents run under a durable task lease", async () => {
   try {
     const task = await manager.spawnTask({
       parentSessionId: "session_parent" as SessionId,
-      parentThreadId: "thread_parent" as ThreadId,
       cwd: "/repo",
       taskName: "background reader",
       prompt: "Read README",
@@ -386,7 +370,6 @@ test("an initial lease that expires during the post-spawn gate cannot start the 
   try {
     const result = await manager.spawnTask({
       parentSessionId: "session_parent" as SessionId,
-      parentThreadId: "thread_parent" as ThreadId,
       cwd: "/repo",
       taskName: "expired before runner",
       prompt: "Do not start after ownership expires",
@@ -443,7 +426,6 @@ test("background subagents abort when an external close invalidates the lease", 
   try {
     const task = await manager.spawnTask({
       parentSessionId: "session_parent" as SessionId,
-      parentThreadId: "thread_parent" as ThreadId,
       cwd: "/repo",
       taskName: "background reader",
       prompt: "Read README",
@@ -468,7 +450,6 @@ test("background subagents abort when an external close invalidates the lease", 
       expectedLeaseOwner: leasedTask.leaseOwner ?? null,
       summary: "external close",
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
       time: 101,
     });
     expect(closed.applied).toBe(true);
@@ -526,7 +507,6 @@ test("lease loss detaches the stale runner without closing the takeover generati
   try {
     const task = await manager.spawnTask({
       parentSessionId: "session_parent" as SessionId,
-      parentThreadId: "thread_parent" as ThreadId,
       cwd: "/repo",
       taskName: "lease loser",
       prompt: "Wait",
@@ -601,7 +581,6 @@ test("an expired lease closes its own generation when no takeover occurred", asy
   try {
     const task = await manager.spawnTask({
       parentSessionId: "session_parent" as SessionId,
-      parentThreadId: "thread_parent" as ThreadId,
       cwd: "/repo",
       taskName: "expired owner",
       prompt: "Wait",
@@ -661,7 +640,6 @@ test("background subagents suppress completion when external close wins before h
   try {
     const task = await manager.spawnTask({
       parentSessionId: "session_parent" as SessionId,
-      parentThreadId: "thread_parent" as ThreadId,
       cwd: "/repo",
       taskName: "background reader",
       prompt: "Read README",
@@ -681,7 +659,6 @@ test("background subagents suppress completion when external close wins before h
       expectedLeaseOwner: leasedTask.leaseOwner ?? null,
       summary: "external close",
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
       time: 101,
     });
     expect(closed.applied).toBe(true);
@@ -737,7 +714,6 @@ test("complete_task completes a leased local background task without leaking the
   try {
     const task = await manager.spawnTask({
       parentSessionId: "session_parent" as SessionId,
-      parentThreadId: "thread_parent" as ThreadId,
       cwd: "/repo",
       taskName: "background reader",
       prompt: "Read README",
@@ -815,7 +791,6 @@ test("complete_task completes a local background task without abort overriding i
 
   const task = await manager.spawnTask({
     parentSessionId: "session_parent" as SessionId,
-    parentThreadId: "thread_parent" as ThreadId,
     cwd: "/repo",
     taskName: "background reader",
     prompt: "Read README",
@@ -871,7 +846,6 @@ test("complete_task commits paired terminal projections before an abort-ignoring
   try {
     const first = await manager.spawnTask({
       parentSessionId: "session_parent" as SessionId,
-      parentThreadId: "thread_parent" as ThreadId,
       cwd: "/repo",
       taskName: "first",
       prompt: "Wait even after abort",
@@ -880,7 +854,6 @@ test("complete_task commits paired terminal projections before an abort-ignoring
     await waitUntil(() => started.length === 1);
     const second = await manager.spawnTask({
       parentSessionId: "session_parent" as SessionId,
-      parentThreadId: "thread_parent" as ThreadId,
       cwd: "/repo",
       taskName: "second",
       prompt: "Run after first settles",
@@ -992,7 +965,6 @@ test("external interrupt prevents a late background subagent completion", async 
 
   const task = await manager.spawnTask({
     parentSessionId: "session_parent" as SessionId,
-    parentThreadId: "thread_parent" as ThreadId,
     cwd: "/repo",
     taskName: "background reader",
     prompt: "Read README",
@@ -1039,7 +1011,6 @@ for (const cap of [1, 2]) {
     for (let index = 0; index < 5; index++) {
       handles.push(await manager.spawnTask({
         parentSessionId: "session_parent" as SessionId,
-        parentThreadId: "thread_parent" as ThreadId,
         cwd: "/repo",
         taskName: `task ${index}`,
         prompt: `Run task ${index}`,
@@ -1290,7 +1261,6 @@ class MemoryEventStore implements EventStore {
       .slice(afterIndex + 1)
       .filter((event) => {
         if (query.sessionId && event.sessionId !== query.sessionId) return false;
-        if (query.threadId && event.threadId !== query.threadId) return false;
         if (query.type && event.type !== query.type) return false;
         return true;
       })
@@ -1358,7 +1328,6 @@ class FakeChildRunner implements AgentRunner {
       type: "message.created",
       time: 1 as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: { messageId, role: "assistant" },
     });
     await this.store.append({
@@ -1366,7 +1335,6 @@ class FakeChildRunner implements AgentRunner {
       type: "message.part_added",
       time: 1 as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: { messageId, part },
     });
     return {
@@ -1416,7 +1384,6 @@ class ScriptedChildRunner implements AgentRunner {
         type: "message.created",
         time: this.index as TimestampMs,
         sessionId: input.sessionId,
-        threadId: input.threadId,
         payload: { messageId, role: "assistant" },
       });
       await this.store.append({
@@ -1424,7 +1391,6 @@ class ScriptedChildRunner implements AgentRunner {
         type: "message.part_added",
         time: this.index as TimestampMs,
         sessionId: input.sessionId,
-        threadId: input.threadId,
         payload: { messageId, part },
       });
     }
@@ -1445,7 +1411,6 @@ function localRunInput(): LocalSubagentRunInput {
     parentPath: "/root",
     parentSessionId: "session_parent" as SessionId,
     childSessionId: "session_child" as SessionId,
-    childThreadId: "thread_child" as ThreadId,
     cwd: "/repo",
     taskName: "reader",
     prompt: "Read README",

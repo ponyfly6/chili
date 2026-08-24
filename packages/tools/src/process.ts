@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import type { EventEmitter } from "node:events";
 import { StringDecoder } from "node:string_decoder";
 
 export type RunProcessOutputStream = "stdout" | "stderr";
@@ -48,6 +49,11 @@ export interface RunProcessResult {
   timedOut: boolean;
   aborted: boolean;
 }
+
+type ChildProcessExitEvents = Pick<EventEmitter<{
+  error: [error: Error];
+  close: [exitCode: number | null, signal: NodeJS.Signals | null];
+}>, "once">;
 
 export async function runProcess(
   command: string,
@@ -344,8 +350,9 @@ function utf8Tail(value: string, maxBytes: number): { text: string; truncated: b
 
 function waitForExit(child: ReturnType<typeof spawn>): Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }> {
   return new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("close", (exitCode, signal) => resolve({ exitCode, signal }));
+    const events = child as typeof child & ChildProcessExitEvents;
+    events.once("error", reject);
+    events.once("close", (exitCode, signal) => resolve({ exitCode, signal }));
   });
 }
 

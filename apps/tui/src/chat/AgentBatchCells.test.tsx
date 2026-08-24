@@ -28,7 +28,6 @@ import type {
   PartId,
   SessionId,
   TaskId,
-  ThreadId,
   TimestampMs,
   ToolCallId,
   TurnId,
@@ -285,7 +284,6 @@ test("batch-level launch errors replace the misleading waiting-for-handles row",
 
 test("projected zero-spawn failures report failed-to-start instead of zero failed", () => {
   const sessionId = "session_zero_spawn" as SessionId;
-  const threadId = "thread_zero_spawn" as ThreadId;
   const callId = "call_zero_spawn" as ToolCallId;
   const view = reduceRuntimeEvents([
     {
@@ -293,7 +291,6 @@ test("projected zero-spawn failures report failed-to-start instead of zero faile
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -301,7 +298,6 @@ test("projected zero-spawn failures report failed-to-start instead of zero faile
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         turnId: "turn_zero_spawn" as TurnId,
         callId,
@@ -314,11 +310,10 @@ test("projected zero-spawn failures report failed-to-start instead of zero faile
       type: "tool.call_finished",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId, status: "failed", error: "launch rejected" },
     },
   ], createRuntimeView());
-  const projected = chatAgentBatches(view, { sessionId, threadId });
+  const projected = chatAgentBatches(view, { sessionId });
   const [batch] = inlineAgentBatchDisplays(projected);
   if (!batch) throw new Error("expected zero-spawn batch");
 
@@ -331,14 +326,13 @@ test("projected zero-spawn failures report failed-to-start instead of zero faile
 
 test("a new home without a current session does not inherit historical agent or team cards", () => {
   const sessionId = "session_historical_agents" as SessionId;
-  const threadId = "thread_historical_agents" as ThreadId;
   const turnId = "turn_historical_agents" as TurnId;
   const callId = "call_historical_agents" as ToolCallId;
-  const runtimeView = reduceRuntimeEvents(realTenAgentEvents({ sessionId, threadId, turnId, callId }), createRuntimeView());
+  const runtimeView = reduceRuntimeEvents(realTenAgentEvents({ sessionId, turnId, callId }), createRuntimeView());
   const teamView = teamLiveFixture();
 
   expect(inlineAgentBatchesForSession({ runtimeView, teamView })).toEqual([]);
-  expect(inlineAgentBatchesForSession({ runtimeView, teamView, sessionId, threadId })).not.toHaveLength(0);
+  expect(inlineAgentBatchesForSession({ runtimeView, teamView, sessionId })).not.toHaveLength(0);
   expect(inlineTeamBatchDisplays(teamView, "session_after_resume")).toEqual([]);
 });
 
@@ -483,12 +477,11 @@ test("team message delivery mirrors count and render as one interaction", () => 
 
 test("real projection keeps a 10-agent joined batch visible after the parent returns idle", async () => {
   const sessionId = "session_real_agents" as SessionId;
-  const threadId = "thread_real_agents" as ThreadId;
   const turnId = "turn_real_agents" as TurnId;
   const callId = "call_real_agents" as ToolCallId;
-  const view = reduceRuntimeEvents(realTenAgentEvents({ sessionId, threadId, turnId, callId }), createRuntimeView());
+  const view = reduceRuntimeEvents(realTenAgentEvents({ sessionId, turnId, callId }), createRuntimeView());
 
-  const projected = chatAgentBatches(view, { sessionId, threadId });
+  const projected = chatAgentBatches(view, { sessionId });
   expect(view.sessions[sessionId]?.status).toBe("idle");
   expect(projected).toHaveLength(1);
   expect(projected[0]).toMatchObject({
@@ -513,7 +506,7 @@ test("real projection keeps a 10-agent joined batch visible after the parent ret
   expect(lines).toContain("parent responded after results");
   expect(lines).not.toContain("output hidden");
 
-  const chat = chatSessionView(view, { sessionId, threadId });
+  const chat = chatSessionView(view, { sessionId });
   const app = await testRender(
     <box width={128} height={28} flexDirection="column">
       <MessageList chatView={chat} localItems={[]} width={128} theme={theme} agentBatches={[batch]} />
@@ -641,7 +634,6 @@ function batchFixture(
 
 function realTenAgentEvents(input: {
   sessionId: SessionId;
-  threadId: ThreadId;
   turnId: TurnId;
   callId: ToolCallId;
 }): ChiliEvent[] {
@@ -673,15 +665,12 @@ function realTenAgentEvents(input: {
         type: "agent.task_created",
         time: (spawnAt - 1) as TimestampMs,
         sessionId: input.sessionId,
-        threadId: input.threadId,
         payload: {
           taskId,
           path,
           parentPath: "/root" as AgentPath,
           parentSessionId: input.sessionId,
-          parentThreadId: input.threadId,
           childSessionId: `session_real_child_${index}` as SessionId,
-          childThreadId: `thread_real_child_${index}` as ThreadId,
           taskName: task.description,
           cwd: "/repo",
           prompt: task.prompt,
@@ -699,16 +688,13 @@ function realTenAgentEvents(input: {
         type: "agent.spawned",
         time: spawnAt as TimestampMs,
         sessionId: input.sessionId,
-        threadId: input.threadId,
         payload: {
           runId,
           taskId,
           path,
           parentPath: "/root" as AgentPath,
           parentSessionId: input.sessionId,
-          parentThreadId: input.threadId,
           childSessionId: `session_real_child_${index}` as SessionId,
-          childThreadId: `thread_real_child_${index}` as ThreadId,
           taskName: task.description,
           cwd: "/repo",
           mode: "background",
@@ -726,7 +712,6 @@ function realTenAgentEvents(input: {
         type: "agent.task_completed",
         time: completeAt as TimestampMs,
         sessionId: input.sessionId,
-        threadId: input.threadId,
         payload: terminal,
       },
       {
@@ -734,7 +719,6 @@ function realTenAgentEvents(input: {
         type: "agent.completed",
         time: (completeAt + 1) as TimestampMs,
         sessionId: input.sessionId,
-        threadId: input.threadId,
         payload: terminal,
       },
     ];
@@ -748,7 +732,6 @@ function realTenAgentEvents(input: {
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: { sessionId: input.sessionId, cwd: "/repo" },
     },
     {
@@ -756,7 +739,6 @@ function realTenAgentEvents(input: {
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: {
         turnId: input.turnId,
         callId: input.callId,
@@ -770,7 +752,6 @@ function realTenAgentEvents(input: {
       type: "tool.call_finished",
       time: 60 as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: {
         callId: input.callId,
         status: "completed",
@@ -789,7 +770,6 @@ function realTenAgentEvents(input: {
       type: "turn.started",
       time: 61 as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: { turnId: responseTurnId },
     },
     {
@@ -797,7 +777,6 @@ function realTenAgentEvents(input: {
       type: "message.created",
       time: 62 as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: { messageId: assistantMessageId, role: "assistant", turnId: responseTurnId },
     },
     {
@@ -805,7 +784,6 @@ function realTenAgentEvents(input: {
       type: "message.part_added",
       time: 63 as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: {
         messageId: assistantMessageId,
         part: {
@@ -823,7 +801,6 @@ function realTenAgentEvents(input: {
       type: "turn.completed",
       time: 64 as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: { turnId: responseTurnId, status: "completed" },
     },
   ];

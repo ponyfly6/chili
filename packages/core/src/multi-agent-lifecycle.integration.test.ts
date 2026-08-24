@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { AgentPath, AgentRunId, ChiliEvent, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId } from "@chili/protocol";
+import type { AgentPath, AgentRunId, ChiliEvent, SessionId, TaskId, TimestampMs, ToolCallId } from "@chili/protocol";
 import { ObservableEventStore, SqliteEventStore } from "@chili/store";
 import { AgentMailboxDeliveryPump } from "./agent-mailbox-delivery-pump.js";
 import {
@@ -34,7 +34,6 @@ test("a background child remains visible after the parent spawn call returns", a
   try {
     const handle = await manager.spawnTask({
       parentSessionId: "session_parent" as SessionId,
-      parentThreadId: "thread_parent" as ThreadId,
       parentPath: "/root" as AgentPath,
       cwd: fixture.dir,
       taskName: "long child",
@@ -83,7 +82,6 @@ test("one provider failure does not erase successful sibling results", async () 
       Array.from({ length: 5 }, (_, index) =>
         manager.spawnTask({
           parentSessionId: "session_parent" as SessionId,
-          parentThreadId: "thread_parent" as ThreadId,
           parentPath: "/root" as AgentPath,
           cwd: fixture.dir,
           taskName: `child ${index + 1}`,
@@ -130,7 +128,6 @@ for (const maxActiveRuns of [1, 2]) {
         Array.from({ length: 5 }, (_, index) =>
           manager.spawnTask({
             parentSessionId: "session_parent" as SessionId,
-            parentThreadId: "thread_parent" as ThreadId,
             parentPath: "/root" as AgentPath,
             cwd: fixture.dir,
             taskName: `capped child ${index + 1}`,
@@ -193,19 +190,16 @@ test("trigger-turn team messages make a complete lead-worker-lead round trip", a
   try {
     const team = await teams.createTeam({
       sessionId: "session_lead" as SessionId,
-      threadId: "thread_lead" as ThreadId,
       name: "message roundtrip",
       leadPath,
     });
-    await teams.addMember({
-      teamId: team.id,
-      path: leadPath,
-      name: "lead",
-      role: "leader",
-      status: "running",
-      childSessionId: "session_lead" as SessionId,
-      childThreadId: "thread_lead" as ThreadId,
-    });
+    await fixture.events.appendMany(seedOwnedTeamMemberTask({
+      taskId: "task_message_roundtrip_worker" as TaskId,
+      path: workerPath,
+      parentSessionId: "session_lead" as SessionId,
+      childSessionId: "session_worker" as SessionId,
+      status: "completed",
+    }));
     await teams.addMember({
       teamId: team.id,
       path: workerPath,
@@ -213,12 +207,10 @@ test("trigger-turn team messages make a complete lead-worker-lead round trip", a
       role: "implementer",
       status: "idle",
       childSessionId: "session_worker" as SessionId,
-      childThreadId: "thread_worker" as ThreadId,
     });
 
     await expect(teams.sendMessage({
       sessionId: "session_lead" as SessionId,
-      threadId: "thread_lead" as ThreadId,
       teamId: team.id,
       from: workerPath,
       to: leadPath,
@@ -230,7 +222,6 @@ test("trigger-turn team messages make a complete lead-worker-lead round trip", a
     const outboundInput = {
       messageId: "teammsg_assignment",
       sessionId: "session_lead" as SessionId,
-      threadId: "thread_lead" as ThreadId,
       teamId: team.id,
       from: leadPath,
       to: workerPath,
@@ -246,7 +237,6 @@ test("trigger-turn team messages make a complete lead-worker-lead round trip", a
 
     const reply = await teams.sendMessage({
       sessionId: "session_worker" as SessionId,
-      threadId: "thread_worker" as ThreadId,
       teamId: team.id,
       from: workerPath,
       to: leadPath,
@@ -259,12 +249,10 @@ test("trigger-turn team messages make a complete lead-worker-lead round trip", a
     expect(runtime.prompts).toMatchObject([
       {
         sessionId: "session_worker",
-        threadId: "thread_worker",
         text: "Please inspect the provider path.",
       },
       {
         sessionId: "session_lead",
-        threadId: "thread_lead",
         text: "Provider path inspected; one retry is needed.",
       },
     ]);
@@ -309,7 +297,6 @@ test("direct agent messages are idempotent and reject conflicting or terminal wa
       content: "Inspect the exact provider error.",
       delivery: "queueOnly",
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
       metadata: { purpose: "diagnostic" },
     });
     const retry = await agents.sendMessage({
@@ -319,7 +306,6 @@ test("direct agent messages are idempotent and reject conflicting or terminal wa
       content: "Inspect the exact provider error.",
       delivery: "queueOnly",
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
       metadata: { purpose: "diagnostic" },
     });
 
@@ -356,7 +342,6 @@ test("direct agent messages are idempotent and reject conflicting or terminal wa
       content: "Replace the original message after the fact.",
       delivery: "queueOnly",
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
       metadata: { purpose: "diagnostic" },
     })).rejects.toBeInstanceOf(AgentMessageConflictError);
 
@@ -368,7 +353,6 @@ test("direct agent messages are idempotent and reject conflicting or terminal wa
       content: "Wake the terminal child.",
       delivery: "triggerTurn",
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
     })).rejects.toBeInstanceOf(AgentMessageRecipientTerminalError);
     expect(await fixture.events.agentMailbox({ messageId: "agentmsg_terminal_wakeup" })).toEqual([]);
   } finally {
@@ -405,7 +389,6 @@ test("a notify batch wakes the parent once, waits through busy state, and wraps 
       type: "session.status_changed",
       time: 60 as TimestampMs,
       sessionId: "session_unrelated" as SessionId,
-      threadId: "thread_unrelated" as ThreadId,
       payload: { sessionId: "session_unrelated" as SessionId, status: "idle" },
     });
     await pump.waitForIdle();
@@ -417,7 +400,6 @@ test("a notify batch wakes the parent once, waits through busy state, and wraps 
       type: "session.status_changed",
       time: 61 as TimestampMs,
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
       payload: { sessionId: "session_parent" as SessionId, status: "idle" },
     });
     await pump.waitForIdle();
@@ -425,7 +407,6 @@ test("a notify batch wakes the parent once, waits through busy state, and wraps 
     expect(runtime.prompts).toHaveLength(1);
     expect(runtime.prompts[0]).toMatchObject({
       sessionId: "session_parent",
-      threadId: "thread_parent",
     });
     const prompt = runtime.prompts[0]?.text ?? "";
     expect(prompt).toContain("Background subagent work reached a terminal state.");
@@ -457,8 +438,7 @@ test("a notify batch wakes the parent once, waits through busy state, and wraps 
     expect(consumed[0]).toMatchObject({
       path: "/root",
       triggerTurn: true,
-      childSessionId: "session_parent",
-      childThreadId: "thread_parent",
+      recipientSessionId: "session_parent",
       message: {
         metadata: {
           kind: "subagent_completion_batch",
@@ -514,7 +494,6 @@ test("real manager finalization emits one automatic parent notification for a mi
         const index = offset + 1;
         return manager.spawnTask({
           parentSessionId: "session_parent" as SessionId,
-          parentThreadId: "thread_parent" as ThreadId,
           parentPath: "/root" as AgentPath,
           cwd: fixture.dir,
           taskName: `automatic child ${index}`,
@@ -541,7 +520,6 @@ test("real manager finalization emits one automatic parent notification for a mi
     expect(runtime.prompts).toHaveLength(1);
     expect(runtime.prompts[0]).toMatchObject({
       sessionId: "session_parent",
-      threadId: "thread_parent",
     });
     const envelope = JSON.parse((runtime.prompts[0]?.text ?? "").slice(
       (runtime.prompts[0]?.text ?? "").indexOf("{"),
@@ -622,7 +600,6 @@ test("initial, follow-up, and team turns share one lifecycle cap while pending t
 
     await manager.spawnTask({
       parentSessionId: "session_parent" as SessionId,
-      parentThreadId: "thread_parent" as ThreadId,
       cwd: fixture.dir,
       taskName: "initial gated child",
       prompt: "hold the only permit",
@@ -641,24 +618,14 @@ test("initial, follow-up, and team turns share one lifecycle cap while pending t
       content: "queued until the initial turn is terminal",
       delivery: "triggerTurn",
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
     });
 
     const team = await teams.createTeam({
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
       name: "shared cap team",
       leadPath: "/root" as AgentPath,
     });
-    await teams.addMember({
-      teamId: team.id,
-      path: "/root" as AgentPath,
-      name: "lead",
-      role: "leader",
-      status: "running",
-      childSessionId: "session_parent" as SessionId,
-      childThreadId: "thread_parent" as ThreadId,
-    });
+    await fixture.events.appendMany(seedResumableTask("team_worker", "completed"));
     await teams.addMember({
       teamId: team.id,
       path: "/root/team_worker" as AgentPath,
@@ -666,11 +633,9 @@ test("initial, follow-up, and team turns share one lifecycle cap while pending t
       role: "implementer",
       status: "idle",
       childSessionId: "session_team_worker" as SessionId,
-      childThreadId: "thread_team_worker" as ThreadId,
     });
     await teams.sendMessage({
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
       teamId: team.id,
       from: "/root" as AgentPath,
       to: "/root/team_worker" as AgentPath,
@@ -693,7 +658,6 @@ test("initial, follow-up, and team turns share one lifecycle cap while pending t
       type: "agent.task_completed",
       time: 50 as TimestampMs,
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
       payload: {
         taskId: "task_pending" as TaskId,
         path: "/root/task_pending" as AgentPath,
@@ -776,7 +740,7 @@ class TrackedGatedRunner implements LocalSubagentRunner {
 }
 
 class TrackedMailboxRuntime implements AgentMailboxRuntime {
-  readonly prompts: Array<{ sessionId: SessionId; threadId: ThreadId; text: string }> = [];
+  readonly prompts: Array<{ sessionId: SessionId; text: string }> = [];
 
   constructor(private readonly tracker: TurnConcurrencyTracker) {}
 
@@ -788,7 +752,6 @@ class TrackedMailboxRuntime implements AgentMailboxRuntime {
 
   async submitPrompt(input: {
     sessionId: SessionId;
-    threadId: ThreadId;
     text: string;
   }): Promise<{ status: "completed"; turns: [] }> {
     const leave = this.tracker.enter();
@@ -850,21 +813,20 @@ class GatedMixedOutcomeRunner implements LocalSubagentRunner {
 }
 
 class RecordingMailboxRuntime implements AgentMailboxRuntime {
-  readonly prompts: Array<{ sessionId: SessionId; threadId: ThreadId; text: string }> = [];
-  readonly appended: Array<{ sessionId: SessionId; threadId: ThreadId; text: string }> = [];
+  readonly prompts: Array<{ sessionId: SessionId; text: string }> = [];
+  readonly appended: Array<{ sessionId: SessionId; text: string }> = [];
   busy = false;
 
   isRunning(): boolean {
     return this.busy;
   }
 
-  async appendUserMessage(input: { sessionId: SessionId; threadId: ThreadId; text: string }): Promise<void> {
+  async appendUserMessage(input: { sessionId: SessionId; text: string }): Promise<void> {
     this.appended.push(input);
   }
 
   async submitPrompt(input: {
     sessionId: SessionId;
-    threadId: ThreadId;
     text: string;
   }): Promise<{ status: "completed"; turns: [] }> {
     this.prompts.push(input);
@@ -929,15 +891,12 @@ function seedResumableTask(id: string, status: "pending" | "completed"): ChiliEv
       type: "agent.task_created",
       time: 1 as TimestampMs,
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
       payload: {
         taskId,
         path,
         parentPath: "/root" as AgentPath,
         parentSessionId: "session_parent" as SessionId,
-        parentThreadId: "thread_parent" as ThreadId,
         childSessionId: `session_${id}` as SessionId,
-        childThreadId: `thread_${id}` as ThreadId,
         taskName: id,
         cwd: "/repo",
         prompt: "initial",
@@ -951,8 +910,49 @@ function seedResumableTask(id: string, status: "pending" | "completed"): ChiliEv
       type: "agent.task_completed",
       time: 2 as TimestampMs,
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
       payload: { taskId, path, status: "completed", generation: 1, summary: "initial done" },
+    });
+  }
+  return events;
+}
+
+function seedOwnedTeamMemberTask(input: {
+  taskId: TaskId;
+  path: AgentPath;
+  parentSessionId: SessionId;
+  childSessionId: SessionId;
+  status: "pending" | "completed";
+}): ChiliEvent[] {
+  const events: ChiliEvent[] = [{
+    id: `event_${input.taskId}_created`,
+    type: "agent.task_created",
+    time: 1 as TimestampMs,
+    sessionId: input.parentSessionId,
+    payload: {
+      taskId: input.taskId,
+      path: input.path,
+      parentPath: "/root" as AgentPath,
+      parentSessionId: input.parentSessionId,
+      childSessionId: input.childSessionId,
+      taskName: input.taskId,
+      cwd: "/repo",
+      prompt: "initial team task",
+      mode: "resumable",
+    },
+  }];
+  if (input.status === "completed") {
+    events.push({
+      id: `event_${input.taskId}_completed`,
+      type: "agent.task_completed",
+      time: 2 as TimestampMs,
+      sessionId: input.parentSessionId,
+      payload: {
+        taskId: input.taskId,
+        path: input.path,
+        status: "completed",
+        generation: 1,
+        summary: "initial team task complete",
+      },
     });
   }
   return events;
@@ -965,15 +965,12 @@ function seedRunningAgentTask(input: { taskId: TaskId; childPath: AgentPath }): 
       type: "agent.task_created",
       time: 1 as TimestampMs,
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
       payload: {
         taskId: input.taskId,
         path: input.childPath,
         parentPath: "/root" as AgentPath,
         parentSessionId: "session_parent" as SessionId,
-        parentThreadId: "thread_parent" as ThreadId,
         childSessionId: "session_message_child" as SessionId,
-        childThreadId: "thread_message_child" as ThreadId,
         taskName: "message target",
         cwd: "/repo",
         prompt: "wait for a message",
@@ -985,16 +982,13 @@ function seedRunningAgentTask(input: { taskId: TaskId; childPath: AgentPath }): 
       type: "agent.spawned",
       time: 2 as TimestampMs,
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
       payload: {
         runId: "agent_message_target" as AgentRunId,
         taskId: input.taskId,
         path: input.childPath,
         parentPath: "/root" as AgentPath,
         parentSessionId: "session_parent" as SessionId,
-        parentThreadId: "thread_parent" as ThreadId,
         childSessionId: "session_message_child" as SessionId,
-        childThreadId: "thread_message_child" as ThreadId,
         taskName: "message target",
         cwd: "/repo",
         mode: "background",
@@ -1011,7 +1005,6 @@ function seedTerminalAgentTask(input: { taskId: TaskId; childPath: AgentPath }):
       type: "agent.task_completed",
       time: 3 as TimestampMs,
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
       payload: {
         taskId: input.taskId,
         runId: "agent_message_target" as AgentRunId,
@@ -1026,7 +1019,6 @@ function seedTerminalAgentTask(input: { taskId: TaskId; childPath: AgentPath }):
       type: "agent.completed",
       time: 4 as TimestampMs,
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
       payload: {
         taskId: input.taskId,
         runId: "agent_message_target" as AgentRunId,
@@ -1066,15 +1058,12 @@ function seedNotifyBatch(): ChiliEvent[] {
         type: "agent.task_created",
         time: (100 + index * 10) as TimestampMs,
         sessionId: "session_parent" as SessionId,
-        threadId: "thread_parent" as ThreadId,
         payload: {
           taskId,
           path,
           parentPath: "/root" as AgentPath,
           parentSessionId: "session_parent" as SessionId,
-          parentThreadId: "thread_parent" as ThreadId,
           childSessionId: `session_notify_${index}` as SessionId,
-          childThreadId: `thread_notify_${index}` as ThreadId,
           taskName: `notify child ${index}`,
           cwd: "/repo",
           prompt: `inspect notify slice ${index}`,
@@ -1087,16 +1076,13 @@ function seedNotifyBatch(): ChiliEvent[] {
         type: "agent.spawned",
         time: (101 + index * 10) as TimestampMs,
         sessionId: "session_parent" as SessionId,
-        threadId: "thread_parent" as ThreadId,
         payload: {
           runId,
           taskId,
           path,
           parentPath: "/root" as AgentPath,
           parentSessionId: "session_parent" as SessionId,
-          parentThreadId: "thread_parent" as ThreadId,
           childSessionId: `session_notify_${index}` as SessionId,
-          childThreadId: `thread_notify_${index}` as ThreadId,
           taskName: `notify child ${index}`,
           cwd: "/repo",
           mode: "background",
@@ -1109,7 +1095,6 @@ function seedNotifyBatch(): ChiliEvent[] {
         type: "agent.task_completed",
         time: (102 + index * 10) as TimestampMs,
         sessionId: "session_parent" as SessionId,
-        threadId: "thread_parent" as ThreadId,
         payload: {
           taskId,
           path,
@@ -1126,7 +1111,6 @@ function seedNotifyBatch(): ChiliEvent[] {
         type: "agent.completed",
         time: (103 + index * 10) as TimestampMs,
         sessionId: "session_parent" as SessionId,
-        threadId: "thread_parent" as ThreadId,
         payload: {
           taskId,
           path,

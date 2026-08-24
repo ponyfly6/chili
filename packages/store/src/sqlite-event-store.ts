@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import type {
   AgentCompleteTaskPayload,
   AgentCompletedPayload,
+  AgentRunId,
   AgentMessageClaimedPayload,
   AgentMessageConsumedPayload,
   AgentMessageDiscardedPayload,
@@ -24,17 +25,16 @@ import type {
   TeamId,
   TeamMessageDelivery,
   TeamMessageDeliveryStatus,
-  ThreadGoal,
-  ThreadGoalStatus,
+  SessionGoal,
+  SessionGoalStatus,
   TeamTaskClaimedPayload,
-  ThreadId,
   TimestampMs,
   ToolEvent,
   TurnId,
 } from "@chili/protocol";
 import { isTransientEvent } from "@chili/protocol";
 import { decodeJson, encodeJson } from "./json.js";
-import { SQLITE_SCHEMA } from "./schema.js";
+import { AGENT_TASKS_CHILD_SESSION_UNIQUE_INDEX, SQLITE_SCHEMA } from "./schema.js";
 import type {
   AgentMailboxQuery,
   AgentMailboxRow,
@@ -87,8 +87,8 @@ import type {
   TeamTaskVerificationClaimInput,
   TeamTaskVerificationClaimResult,
   TeamTaskVerificationClaimStore,
-  ThreadGoalQuery,
-  ThreadGoalRow,
+  SessionGoalQuery,
+  SessionGoalRow,
 } from "./types.js";
 
 interface StoredEventRow {
@@ -97,14 +97,12 @@ interface StoredEventRow {
   type: string;
   time: number;
   session_id: string | null;
-  thread_id: string | null;
   payload_json: string;
 }
 
 interface MessageRow {
   id: string;
   session_id: string;
-  thread_id: string | null;
   turn_id: string | null;
   role: "system" | "user" | "assistant" | "tool";
   parent_id: string | null;
@@ -122,11 +120,10 @@ interface PendingPartDeltaRow {
   payload_json: string;
 }
 
-interface ThreadGoalProjectionRow {
-  thread_id: string;
-  session_id: string | null;
+interface SessionGoalProjectionRow {
+  session_id: string;
   objective: string;
-  status: ThreadGoalStatus;
+  status: SessionGoalStatus;
   token_budget: number | null;
   tokens_used: number;
   time_used_seconds: number;
@@ -141,9 +138,7 @@ interface AgentTaskProjectionRow {
   path: string;
   parent_path: string | null;
   parent_session_id: string | null;
-  parent_thread_id: string | null;
   child_session_id: string | null;
-  child_thread_id: string | null;
   task_name: string;
   cwd: string | null;
   prompt: string | null;
@@ -176,9 +171,7 @@ interface AgentTaskStateRow {
   path: string;
   parent_path: string | null;
   parent_session_id: string | null;
-  parent_thread_id: string | null;
   child_session_id: string | null;
-  child_thread_id: string | null;
   task_name: string;
   cwd: string | null;
   mode: string | null;
@@ -187,14 +180,11 @@ interface AgentTaskStateRow {
 interface AgentRunProjectionRow {
   id: string;
   session_id: string | null;
-  thread_id: string | null;
   task_id: string | null;
   path: string;
   parent_path: string | null;
   parent_session_id: string | null;
-  parent_thread_id: string | null;
   child_session_id: string | null;
-  child_thread_id: string | null;
   task_name: string;
   cwd: string | null;
   mode: string | null;
@@ -209,8 +199,7 @@ interface AgentMailboxProjectionRow {
   task_id: string | null;
   path: string;
   from_path: string;
-  child_session_id: string | null;
-  child_thread_id: string | null;
+  recipient_session_id: string | null;
   trigger_turn: number;
   status: AgentMailboxRow["status"];
   message_json: string | null;
@@ -236,7 +225,6 @@ interface TeamMemberProjectionRow {
   role: string;
   status: TeamMemberRow["status"];
   child_session_id: string | null;
-  child_thread_id: string | null;
   model: string | null;
   tool_scope_json: string | null;
   write_scope_json: string | null;
@@ -297,7 +285,6 @@ interface TeamMessageDeliveryProjectionRow {
   team_message_id: string;
   path: string;
   child_session_id: string | null;
-  child_thread_id: string | null;
   trigger_turn: number;
   status: TeamMessageDeliveryStatus;
   error: string | null;
@@ -339,6 +326,7 @@ export class SqliteEventStore
     TeamTaskVerificationClaimStore
 {
   private readonly db: Database;
+  private readonly legacySessionIds = new Map<string, SessionId>();
   private closed = false;
 
   constructor(path = ".chili/chili.sqlite", private readonly options: SqliteEventStoreOptions = {}) {
@@ -354,15 +342,30 @@ export class SqliteEventStore
       if (eventTableStatement) {
         this.db.exec(eventTableStatement);
       }
+      // Some pre-Session databases only carried the legacy event identity.
+      // Add its replacement before sequence indexes reference session_id.
+      this.addColumnIfMissing("events", "session_id", "text");
+      this.backfillScopedEventSessionIds();
       this.migrateEventSequence();
-      for (const statement of remainingStatements) {
+      const tableStatements = remainingStatements.filter((statement) => /^create table\b/i.test(statement.trim()));
+      const indexStatements = remainingStatements.filter((statement) => !/^create table\b/i.test(statement.trim()));
+      for (const statement of tableStatements) {
+        this.db.exec(statement);
+      }
+      this.prepareSessionOnlyReplacementColumns();
+      this.migrateMailboxRecipientSessionSchema();
+      for (const statement of indexStatements) {
+        if (statement === AGENT_TASKS_CHILD_SESSION_UNIQUE_INDEX) continue;
         this.db.exec(statement);
       }
       this.migrateApprovalSchema();
       this.migrateMessageSchema();
       this.migrateGoalSchema();
+      this.migrateLegacyThreadSchema();
+      this.db.exec(AGENT_TASKS_CHILD_SESSION_UNIQUE_INDEX);
       this.migrateSubagentSchema();
       this.migrateTeamSchema();
+      this.loadLegacySessionIdentities();
     } catch (error) {
       try {
         this.db.close();
@@ -406,10 +409,6 @@ export class SqliteEventStore
       clauses.push("session_id = $sessionId");
       params.sessionId = query.sessionId;
     }
-    if (query.threadId) {
-      clauses.push("thread_id = $threadId");
-      params.threadId = query.threadId;
-    }
     if (query.type) {
       clauses.push("type = $type");
       params.type = query.type;
@@ -420,10 +419,6 @@ export class SqliteEventStore
       if (query.sessionId) {
         cursorClauses.push("session_id = $sessionId");
         cursorParams.sessionId = query.sessionId;
-      }
-      if (query.threadId) {
-        cursorClauses.push("thread_id = $threadId");
-        cursorParams.threadId = query.threadId;
       }
       const cursor = this.db
         .query<{ found: number }, any>(
@@ -441,7 +436,7 @@ export class SqliteEventStore
 
     const orderAndLimit = query.tail && !query.afterEventId
       ? `from (
-           select seq, id, type, time, session_id, thread_id, payload_json
+           select seq, id, type, time, session_id, payload_json
            from events
            ${where}
            order by seq desc
@@ -455,7 +450,7 @@ export class SqliteEventStore
 
     const rows = this.db
       .query<StoredEventRow, any>(
-        `select seq, id, type, time, session_id, thread_id, payload_json
+        `select seq, id, type, time, session_id, payload_json
          ${orderAndLimit}`,
       )
       .all(params);
@@ -469,7 +464,6 @@ export class SqliteEventStore
         id: string;
         cwd: string;
         title: string | null;
-        thread_id: string | null;
         preview: string | null;
         source: "interactive" | "subagent";
         status: "active" | "archived";
@@ -490,18 +484,6 @@ export class SqliteEventStore
                   then 'subagent'
                   else 'interactive'
                 end as source,
-                coalesce(
-                  (select e.thread_id
-                   from events e
-                   where e.session_id = s.id and e.thread_id is not null
-                   order by e.seq asc
-                   limit 1),
-                  (select m.thread_id
-                   from messages m
-                   where m.session_id = s.id and m.thread_id is not null
-                   order by m.created_at asc, m.id asc
-                   limit 1)
-                ) as thread_id,
                 (select coalesce(
                           nullif(json_extract(mp.data_json, '$.displayText'), ''),
                           nullif(json_extract(mp.data_json, '$.text'), '')
@@ -521,7 +503,6 @@ export class SqliteEventStore
         id: row.id as SessionRow["id"],
         cwd: row.cwd,
         ...(row.title ? { title: row.title } : {}),
-        ...(row.thread_id ? { threadId: row.thread_id as ThreadId } : {}),
         ...(row.preview ? { preview: row.preview } : {}),
         source: row.source,
         status: row.status,
@@ -533,7 +514,7 @@ export class SqliteEventStore
   async messages(sessionId: Message["sessionId"]): Promise<Message[]> {
     const messages = this.db
       .query<MessageRow, [string]>(
-        `select id, session_id, thread_id, turn_id, role, parent_id, created_at
+        `select id, session_id, turn_id, role, parent_id, created_at
          from messages
          where session_id = ?
          order by created_at asc, id asc`,
@@ -587,18 +568,14 @@ export class SqliteEventStore
     return rows.map((row) => approvalFromRow(row));
   }
 
-  async threadGoal(threadId: ThreadId): Promise<ThreadGoalRow | undefined> {
-    return (await this.threadGoals({ threadId, limit: 1 }))[0];
+  async sessionGoal(sessionId: SessionId): Promise<SessionGoalRow | undefined> {
+    return (await this.sessionGoals({ sessionId, limit: 1 }))[0];
   }
 
-  async threadGoals(query: ThreadGoalQuery = {}): Promise<ThreadGoalRow[]> {
+  async sessionGoals(query: SessionGoalQuery = {}): Promise<SessionGoalRow[]> {
     const clauses: string[] = [];
     const params: Record<string, unknown> = {};
 
-    if (query.threadId) {
-      clauses.push("thread_id = $threadId");
-      params.threadId = query.threadId;
-    }
     if (query.sessionId) {
       clauses.push("session_id = $sessionId");
       params.sessionId = query.sessionId;
@@ -611,16 +588,16 @@ export class SqliteEventStore
     params.limit = query.limit ?? 500;
     const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
     return this.db
-      .query<ThreadGoalProjectionRow, any>(
-        `select thread_id, session_id, objective, status, token_budget, tokens_used,
+      .query<SessionGoalProjectionRow, any>(
+        `select session_id, objective, status, token_budget, tokens_used,
                 time_used_seconds, created_at, updated_at, completed_at, last_reason
-         from thread_goals
+         from session_goals
          ${where}
-         order by updated_at desc, thread_id asc
+         order by updated_at desc, session_id asc
          limit $limit`,
       )
       .all(params)
-      .map((row) => threadGoalFromRow(row));
+      .map((row) => sessionGoalFromRow(row));
   }
 
   async agentTask(taskId: TaskId): Promise<AgentTaskRow | undefined> {
@@ -664,7 +641,7 @@ export class SqliteEventStore
     const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
     return this.db
       .query<AgentTaskProjectionRow, any>(
-        `select id, path, parent_path, parent_session_id, parent_thread_id, child_session_id, child_thread_id,
+        `select id, path, parent_path, parent_session_id, child_session_id,
                 task_name, cwd, prompt, mode, source_call_id, batch_id, batch_index, expected_batch_size,
                 completion_policy, max_concurrency, status, current_run_id, summary, error, completion_json,
                 generation, lease_owner, lease_expires_at, lease_heartbeat_at, created_at, updated_at, completed_at
@@ -706,8 +683,8 @@ export class SqliteEventStore
     const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
     return this.db
       .query<AgentRunProjectionRow, any>(
-        `select id, session_id, thread_id, task_id, path, parent_path, parent_session_id, parent_thread_id,
-                child_session_id, child_thread_id, task_name, cwd, mode, status, generation, created_at, completed_at
+        `select id, session_id, task_id, path, parent_path, parent_session_id,
+                child_session_id, task_name, cwd, mode, status, generation, created_at, completed_at
          from agent_runs
          ${where}
          order by created_at asc, id asc
@@ -733,9 +710,9 @@ export class SqliteEventStore
       clauses.push("path = $path");
       params.path = query.path;
     }
-    if (query.childSessionId) {
-      clauses.push("child_session_id = $childSessionId");
-      params.childSessionId = query.childSessionId;
+    if (query.recipientSessionId) {
+      clauses.push("recipient_session_id = $recipientSessionId");
+      params.recipientSessionId = query.recipientSessionId;
     }
     if (query.triggerTurn !== undefined) {
       clauses.push("trigger_turn = $triggerTurn");
@@ -750,7 +727,7 @@ export class SqliteEventStore
     const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
     return this.db
       .query<AgentMailboxProjectionRow, any>(
-        `select id, task_id, path, from_path, child_session_id, child_thread_id, trigger_turn, status,
+        `select id, task_id, path, from_path, recipient_session_id, trigger_turn, status,
                 message_json, created_at, consumed_at
          from agent_mailbox
          ${where}
@@ -817,7 +794,7 @@ export class SqliteEventStore
     const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
     return this.db
       .query<TeamMemberProjectionRow, any>(
-        `select team_id, path, name, role, status, child_session_id, child_thread_id, model,
+        `select team_id, path, name, role, status, child_session_id, model,
                 tool_scope_json, write_scope_json, current_task_id, created_at, updated_at, closed_at
          from team_members
          ${where}
@@ -957,7 +934,7 @@ export class SqliteEventStore
     const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
     return this.db
       .query<TeamMessageDeliveryProjectionRow, any>(
-        `select mailbox_message_id, team_id, team_message_id, path, child_session_id, child_thread_id,
+        `select mailbox_message_id, team_id, team_message_id, path, child_session_id,
                 trigger_turn, status, error, queued_at, updated_at, delivered_at
          from team_message_deliveries
          ${where}
@@ -1146,7 +1123,6 @@ export class SqliteEventStore
       };
       const sessionId = item.sessionId ?? this.sessionIdForTeamTask(current.id);
       if (sessionId) taskEvent.sessionId = sessionId as SessionId;
-      if (item.threadId) taskEvent.threadId = item.threadId;
 
       const events: ChiliEvent[] = [taskEvent];
       if (current.owner_path) {
@@ -1162,7 +1138,6 @@ export class SqliteEventStore
           },
         };
         if (sessionId) memberEvent.sessionId = sessionId as SessionId;
-        if (item.threadId) memberEvent.threadId = item.threadId;
         events.push(memberEvent);
       }
 
@@ -1379,6 +1354,14 @@ export class SqliteEventStore
       if (item.generation !== item.expectedGeneration + 1) {
         throw new Error("agent task run generation must advance its expected generation fence by one");
       }
+      const existingRun = this.db
+        .query<{ found: number }, [string]>(
+          `select 1 as found from agent_runs where id = ? limit 1`,
+        )
+        .get(item.runId);
+      if (existingRun) {
+        throw new Error(`agent task run cannot reuse existing runId ${item.runId}`);
+      }
       if ((item.messageEventId === undefined) !== (item.message === undefined)) {
         throw new Error("agent task run messageEventId and message must be provided together");
       }
@@ -1425,7 +1408,6 @@ export class SqliteEventStore
 
       const now = item.time ?? Date.now();
       const sessionId = item.sessionId ?? current.parent_session_id ?? current.child_session_id;
-      const threadId = item.threadId ?? current.parent_thread_id;
       const events: ChiliEvent[] = [];
       if (item.messageEventId && item.message && item.from) {
         const messageEvent: Extract<ChiliEvent, { type: "agent.message_queued" }> = {
@@ -1437,13 +1419,11 @@ export class SqliteEventStore
             path: current.path as AgentPath,
             from: item.from,
             triggerTurn: true,
-            ...(current.child_session_id ? { childSessionId: current.child_session_id as SessionId } : {}),
-            ...(current.child_thread_id ? { childThreadId: current.child_thread_id as ThreadId } : {}),
+            ...(current.child_session_id ? { recipientSessionId: current.child_session_id as SessionId } : {}),
             message: item.message,
           },
         };
         if (sessionId) messageEvent.sessionId = sessionId as SessionId;
-        if (threadId) messageEvent.threadId = threadId as ThreadId;
         events.push(messageEvent);
 
         const claimEvent: Extract<ChiliEvent, { type: "agent.message_claimed" }> = {
@@ -1458,7 +1438,6 @@ export class SqliteEventStore
           },
         };
         if (sessionId) claimEvent.sessionId = sessionId as SessionId;
-        if (threadId) claimEvent.threadId = threadId as ThreadId;
         events.push(claimEvent);
       }
 
@@ -1472,9 +1451,7 @@ export class SqliteEventStore
           path: current.path as AgentPath,
           ...(current.parent_path ? { parentPath: current.parent_path as AgentPath } : {}),
           ...(current.parent_session_id ? { parentSessionId: current.parent_session_id as SessionId } : {}),
-          ...(current.parent_thread_id ? { parentThreadId: current.parent_thread_id as ThreadId } : {}),
           ...(current.child_session_id ? { childSessionId: current.child_session_id as SessionId } : {}),
-          ...(current.child_thread_id ? { childThreadId: current.child_thread_id as ThreadId } : {}),
           taskName: current.task_name,
           ...(current.cwd ? { cwd: current.cwd } : {}),
           ...(current.mode ? { mode: current.mode as NonNullable<Extract<ChiliEvent, { type: "agent.spawned" }>["payload"]["mode"]> } : {}),
@@ -1482,7 +1459,6 @@ export class SqliteEventStore
         },
       };
       if (sessionId) spawnEvent.sessionId = sessionId as SessionId;
-      if (threadId) spawnEvent.threadId = threadId as ThreadId;
       events.push(spawnEvent);
       this.writeTransactionEvents(events);
       const lease = this.db.query(
@@ -1583,7 +1559,6 @@ export class SqliteEventStore
           eventId: item.mailboxConsumeEventId,
           consumedBy: mailbox.path as AgentPath,
           ...(item.sessionId ? { sessionId: item.sessionId } : {}),
-          ...(item.threadId ? { threadId: item.threadId } : {}),
           time: now,
         }, mailbox));
       }
@@ -1682,7 +1657,6 @@ export class SqliteEventStore
       if (item.error) completionInput.error = item.error;
       if (item.agentEventId) completionInput.agentEventId = item.agentEventId;
       if (item.sessionId) completionInput.sessionId = item.sessionId;
-      if (item.threadId) completionInput.threadId = item.threadId;
       completionInput.time = now;
 
       const event = this.taskCompletedEvent(completionInput, current, generation);
@@ -1697,7 +1671,6 @@ export class SqliteEventStore
             eventId: item.mailboxEventId,
             consumedBy: mailbox.path as AgentPath,
             ...(item.sessionId ? { sessionId: item.sessionId } : {}),
-            ...(item.threadId ? { threadId: item.threadId } : {}),
             time: now,
           }, mailbox));
         } else {
@@ -1706,7 +1679,6 @@ export class SqliteEventStore
             eventId: item.mailboxEventId,
             ...(item.mailboxError ? { error: item.mailboxError } : {}),
             ...(item.sessionId ? { sessionId: item.sessionId } : {}),
-            ...(item.threadId ? { threadId: item.threadId } : {}),
             time: now,
           }, mailbox));
         }
@@ -1730,6 +1702,7 @@ export class SqliteEventStore
 
   private writeTransactionEvents(events: readonly ChiliEvent[]): void {
     for (const event of events) {
+      validateScopedEventSessionIdentity(event);
       this.insertEvent(event);
       this.applyProjection(event);
     }
@@ -1748,11 +1721,10 @@ export class SqliteEventStore
     const rows = this.db
       .query<{
         session_id: string;
-        thread_id: string | null;
         turn_id: string;
         time: number;
       }, [number]>(
-        `select started.session_id, started.thread_id,
+        `select started.session_id,
                 json_extract(started.payload_json, '$.turnId') as turn_id,
                 started.time
            from events started
@@ -1773,11 +1745,9 @@ export class SqliteEventStore
     for (const row of rows) {
       const sessionId = row.session_id as SessionId;
       const turnId = row.turn_id as TurnId;
-      const threadId = row.thread_id ? (row.thread_id as ThreadId) : undefined;
       const base = {
         time: now,
         sessionId,
-        ...(threadId ? { threadId } : {}),
       };
       events.push({
         ...base,
@@ -1857,8 +1827,6 @@ export class SqliteEventStore
     };
     const sessionId = input.sessionId ?? current.parent_session_id ?? current.child_session_id;
     if (sessionId) event.sessionId = sessionId as SessionId;
-    const threadId = input.threadId ?? current.parent_thread_id;
-    if (threadId) event.threadId = threadId as ThreadId;
     return event;
   }
 
@@ -1888,8 +1856,6 @@ export class SqliteEventStore
     };
     const sessionId = input.sessionId ?? current.parent_session_id ?? current.child_session_id;
     if (sessionId) event.sessionId = sessionId as SessionId;
-    const threadId = input.threadId ?? current.parent_thread_id;
-    if (threadId) event.threadId = threadId as ThreadId;
     return event;
   }
 
@@ -1910,10 +1876,10 @@ export class SqliteEventStore
       time: (input.time ?? Date.now()) as EventEnvelope["time"],
       payload,
     };
-    const sessionId = input.sessionId ?? this.parentSessionIdForTask(current.task_id) ?? current.child_session_id;
+    const sessionId = input.sessionId
+      ?? this.parentSessionIdForTask(current.task_id)
+      ?? current.recipient_session_id;
     if (sessionId) event.sessionId = sessionId as SessionId;
-    const threadId = input.threadId ?? this.parentThreadIdForTask(current.task_id) ?? current.child_thread_id;
-    if (threadId) event.threadId = threadId as ThreadId;
     return event;
   }
 
@@ -1934,10 +1900,10 @@ export class SqliteEventStore
       time: (input.time ?? Date.now()) as EventEnvelope["time"],
       payload,
     };
-    const sessionId = input.sessionId ?? this.parentSessionIdForTask(current.task_id) ?? current.child_session_id;
+    const sessionId = input.sessionId
+      ?? this.parentSessionIdForTask(current.task_id)
+      ?? current.recipient_session_id;
     if (sessionId) event.sessionId = sessionId as SessionId;
-    const threadId = input.threadId ?? this.parentThreadIdForTask(current.task_id) ?? current.child_thread_id;
-    if (threadId) event.threadId = threadId as ThreadId;
     return event;
   }
 
@@ -1958,10 +1924,10 @@ export class SqliteEventStore
       time: (input.time ?? Date.now()) as EventEnvelope["time"],
       payload,
     };
-    const sessionId = input.sessionId ?? this.parentSessionIdForTask(current.task_id) ?? current.child_session_id;
+    const sessionId = input.sessionId
+      ?? this.parentSessionIdForTask(current.task_id)
+      ?? current.recipient_session_id;
     if (sessionId) event.sessionId = sessionId as SessionId;
-    const threadId = input.threadId ?? this.parentThreadIdForTask(current.task_id) ?? current.child_thread_id;
-    if (threadId) event.threadId = threadId as ThreadId;
     return event;
   }
 
@@ -1983,18 +1949,18 @@ export class SqliteEventStore
       time: (input.time ?? Date.now()) as EventEnvelope["time"],
       payload,
     };
-    const sessionId = input.sessionId ?? this.parentSessionIdForTask(current.task_id) ?? current.child_session_id;
+    const sessionId = input.sessionId
+      ?? this.parentSessionIdForTask(current.task_id)
+      ?? current.recipient_session_id;
     if (sessionId) event.sessionId = sessionId as SessionId;
-    const threadId = input.threadId ?? this.parentThreadIdForTask(current.task_id) ?? current.child_thread_id;
-    if (threadId) event.threadId = threadId as ThreadId;
     return event;
   }
 
   private insertEvent(event: ChiliEvent): void {
     this.db
       .query(
-        `insert into events (seq, id, type, time, session_id, thread_id, payload_json)
-         values (?, ?, ?, ?, ?, ?, ?)`,
+        `insert into events (seq, id, type, time, session_id, payload_json)
+         values (?, ?, ?, ?, ?, ?)`,
       )
       .run(
         this.nextEventSeq(),
@@ -2002,9 +1968,33 @@ export class SqliteEventStore
         event.type,
         event.time,
         event.sessionId ?? null,
-        event.threadId ?? null,
         encodeJson(event.payload),
       );
+  }
+
+  private backfillScopedEventSessionIds(): void {
+    this.db.exec(`
+      update events
+         set session_id = case
+           when type like 'session.%' and json_type(payload_json, '$.sessionId') = 'text'
+             then json_extract(payload_json, '$.sessionId')
+           when type = 'goal.updated' and json_type(payload_json, '$.goal.sessionId') = 'text'
+             then json_extract(payload_json, '$.goal.sessionId')
+           when type = 'goal.cleared' and json_type(payload_json, '$.sessionId') = 'text'
+             then json_extract(payload_json, '$.sessionId')
+           when type = 'goal.cleared' and json_type(payload_json, '$.previousGoal.sessionId') = 'text'
+             then json_extract(payload_json, '$.previousGoal.sessionId')
+           else session_id
+         end
+       where session_id is null
+         and json_valid(payload_json)
+         and (
+           (type like 'session.%' and json_type(payload_json, '$.sessionId') = 'text')
+           or (type = 'goal.updated' and json_type(payload_json, '$.goal.sessionId') = 'text')
+           or (type = 'goal.cleared' and json_type(payload_json, '$.sessionId') = 'text')
+           or (type = 'goal.cleared' and json_type(payload_json, '$.previousGoal.sessionId') = 'text')
+         )
+    `);
   }
 
   private migrateEventSequence(): void {
@@ -2017,16 +2007,13 @@ export class SqliteEventStore
     this.db.exec(`create unique index if not exists events_id_idx on events(id)`);
     this.db.exec(`create index if not exists events_session_seq_idx on events(session_id, seq)`);
     this.db.exec(`create index if not exists events_session_type_seq_idx on events(session_id, type, seq)`);
-    this.db.exec(`create index if not exists events_thread_seq_idx on events(thread_id, seq)`);
     this.db.exec(`create index if not exists events_type_seq_idx on events(type, seq)`);
   }
 
   private migrateSubagentSchema(): void {
     this.addColumnIfMissing("agent_runs", "task_id", "text");
     this.addColumnIfMissing("agent_runs", "parent_session_id", "text");
-    this.addColumnIfMissing("agent_runs", "parent_thread_id", "text");
     this.addColumnIfMissing("agent_runs", "child_session_id", "text");
-    this.addColumnIfMissing("agent_runs", "child_thread_id", "text");
     this.addColumnIfMissing("agent_runs", "cwd", "text");
     this.addColumnIfMissing("agent_runs", "mode", "text");
     this.addColumnIfMissing("agent_runs", "generation", "integer not null default 0");
@@ -2043,12 +2030,17 @@ export class SqliteEventStore
     this.addColumnIfMissing("agent_mailbox", "consumed_at", "integer");
     this.db.exec(`create index if not exists agent_runs_task_idx on agent_runs(task_id)`);
     this.db.exec(`create index if not exists agent_runs_child_session_idx on agent_runs(child_session_id)`);
+    this.db.exec(AGENT_TASKS_CHILD_SESSION_UNIQUE_INDEX);
+    this.db.exec(
+      `create index if not exists agent_mailbox_recipient_session_idx
+       on agent_mailbox(recipient_session_id, created_at)`,
+    );
     this.db.exec(`create index if not exists agent_mailbox_status_idx on agent_mailbox(status, created_at)`);
     this.db.exec(`create index if not exists agent_tasks_lease_idx on agent_tasks(status, lease_expires_at)`);
     this.db.exec(`create index if not exists agent_tasks_lease_owner_idx on agent_tasks(lease_owner, status)`);
     this.db.exec(
       `create index if not exists agent_tasks_batch_idx
-       on agent_tasks(parent_session_id, parent_thread_id, source_call_id, batch_id)`,
+       on agent_tasks(parent_session_id, source_call_id, batch_id)`,
     );
   }
 
@@ -2093,11 +2085,525 @@ export class SqliteEventStore
     migrate();
   }
 
+  private prepareSessionOnlyReplacementColumns(): void {
+    for (const [table, column] of [
+      ["events", "session_id"],
+      ["messages", "session_id"],
+      ["tool_calls", "session_id"],
+      ["approvals", "session_id"],
+      ["agent_runs", "session_id"],
+      ["agent_runs", "parent_session_id"],
+      ["agent_runs", "child_session_id"],
+      ["agent_tasks", "parent_session_id"],
+      ["agent_tasks", "child_session_id"],
+      ["agent_mailbox", "recipient_session_id"],
+      ["team_members", "child_session_id"],
+      ["team_message_deliveries", "child_session_id"],
+    ] as const) {
+      this.addColumnIfMissing(table, column, "text");
+    }
+  }
+
+  private migrateMailboxRecipientSessionSchema(): void {
+    const migrate = this.db.transaction(() => {
+      this.db.exec(`
+        create table if not exists schema_migrations (
+          name text primary key
+        )
+      `);
+      const marker = "mailbox_recipient_session_v1";
+      const hasChildSessionColumn = this.columnExists("agent_mailbox", "child_session_id");
+      const alreadyMigrated = this.db
+        .query<{ found: number }, [string]>(
+          `select 1 as found from schema_migrations where name = ? limit 1`,
+        )
+        .get(marker);
+      const payloadConflict = this.db
+        .query<{ id: string; child_session_id: string; recipient_session_id: string }, []>(
+          `select id,
+                  json_extract(payload_json, '$.childSessionId') as child_session_id,
+                  json_extract(payload_json, '$.recipientSessionId') as recipient_session_id
+             from events
+            where type = 'agent.message_queued'
+              and json_type(payload_json, '$.childSessionId') = 'text'
+              and json_type(payload_json, '$.recipientSessionId') = 'text'
+              and json_extract(payload_json, '$.childSessionId')
+                    <> json_extract(payload_json, '$.recipientSessionId')
+            limit 1`,
+        )
+        .get();
+      if (payloadConflict) {
+        throw new Error(
+          `Cannot migrate mailbox event ${payloadConflict.id}: child session ${payloadConflict.child_session_id} conflicts with recipient session ${payloadConflict.recipient_session_id}.`,
+        );
+      }
+      if (alreadyMigrated && !hasChildSessionColumn) return;
+
+      if (hasChildSessionColumn) {
+        const conflict = this.db
+          .query<{ id: string; child_session_id: string; recipient_session_id: string }, []>(
+            `select id, child_session_id, recipient_session_id
+               from agent_mailbox
+              where child_session_id is not null
+                and recipient_session_id is not null
+                and child_session_id <> recipient_session_id
+              limit 1`,
+          )
+          .get();
+        if (conflict) {
+          throw new Error(
+            `Cannot migrate mailbox message ${conflict.id}: child session ${conflict.child_session_id} conflicts with recipient session ${conflict.recipient_session_id}.`,
+          );
+        }
+        this.db.exec(`
+          update agent_mailbox
+             set recipient_session_id = coalesce(recipient_session_id, child_session_id)
+           where child_session_id is not null
+        `);
+        const legacyIndexes = this.db
+          .query<{ name: string }, []>(
+            `select name
+               from sqlite_master
+              where type = 'index'
+                and tbl_name = 'agent_mailbox'
+                and sql is not null
+                and lower(sql) like '%child_session_id%'`,
+          )
+          .all();
+        for (const index of legacyIndexes) {
+          this.db.exec(`drop index if exists "${index.name.replaceAll('"', '""')}"`);
+        }
+        this.dropColumnIfPresent("agent_mailbox", "child_session_id");
+      }
+      this.db.query(`insert or ignore into schema_migrations (name) values (?)`).run(marker);
+    });
+    migrate();
+  }
+
+  /**
+   * One-way compatibility migration for databases created before SessionId
+   * became the sole conversation identity. The legacy identifiers are used
+   * only long enough to prove a lossless one-to-one mapping and backfill any
+   * missing SessionId values; all legacy columns are then removed atomically.
+   */
+  private migrateLegacyThreadSchema(): void {
+    const migrate = this.db.transaction(() => {
+      this.db.exec(`
+        create table if not exists schema_migrations (
+          name text primary key
+        )
+      `);
+
+      const marker = "session_only_schema_v1";
+      const legacyColumns = [
+        ["events", "thread_id"],
+        ["messages", "thread_id"],
+        ["tool_calls", "thread_id"],
+        ["approvals", "thread_id"],
+        ["agent_runs", "thread_id"],
+        ["agent_runs", "parent_thread_id"],
+        ["agent_runs", "child_thread_id"],
+        ["agent_tasks", "parent_thread_id"],
+        ["agent_tasks", "child_thread_id"],
+        ["agent_mailbox", "child_thread_id"],
+        ["team_members", "child_thread_id"],
+        ["team_message_deliveries", "child_thread_id"],
+      ] as const;
+      this.prepareSessionOnlyReplacementColumns();
+      const assertUniqueTaskChildSessions = (): void => {
+        const duplicateChildSession = this.db
+          .query<{ child_session_id: string; task_ids: string }, []>(
+            `select child_session_id, group_concat(id) as task_ids
+               from agent_tasks
+              where child_session_id is not null
+              group by child_session_id
+             having count(*) > 1
+              limit 1`,
+          )
+          .get();
+        if (duplicateChildSession) {
+          throw new Error(
+            `Cannot enforce one task per child session ${duplicateChildSession.child_session_id}: duplicate tasks ${duplicateChildSession.task_ids}.`,
+          );
+        }
+      };
+      assertUniqueTaskChildSessions();
+      const hasLegacyGoalTable = this.tableExists("thread_goals");
+      const hasLegacyColumns = legacyColumns.some(([table, column]) => this.columnExists(table, column));
+      const legacyPayloadIdentityPaths = [
+        ["threadId", "$.threadId"],
+        ["parentThreadId", "$.parentThreadId"],
+        ["childThreadId", "$.childThreadId"],
+        ["recipientThreadId", "$.recipientThreadId"],
+        ["goal.threadId", "$.goal.threadId"],
+        ["previousGoal.threadId", "$.previousGoal.threadId"],
+      ] as const;
+      const legacyPayloadIdentities = legacyPayloadIdentityPaths
+        .map(([field, path]) => `
+          select id as event_id, '${field}' as field,
+                 json_extract(payload_json, '${path}') as legacy_id
+            from events
+           where json_type(payload_json, '${path}') = 'text'`)
+        .join(" union all ");
+      const hasLegacyPayloads = this.db
+        .query<{ found: number }, []>(
+          `select 1 as found from (${legacyPayloadIdentities}) limit 1`,
+        )
+        .get() !== null;
+      const hasLegacySessionIdentities = this.tableExists("legacy_session_identities");
+      const legacyPayloadMappingsAreComplete = !hasLegacyPayloads || (
+        hasLegacySessionIdentities
+        && this.db
+          .query<{ found: number }, []>(
+            `select 1 as found
+               from (${legacyPayloadIdentities}) as payload_identity
+               left join legacy_session_identities as identity
+                 on identity.legacy_id = payload_identity.legacy_id
+              where identity.session_id is null
+              limit 1`,
+          )
+          .get() === null
+      );
+      const alreadyMigrated = this.db
+        .query<{ found: number }, [string]>(
+          `select 1 as found from schema_migrations where name = ? limit 1`,
+        )
+        .get(marker);
+      const childSessionIndex = this.db
+        .query<{ unique: number; partial: number; name: string }, []>(`pragma index_list(agent_tasks)`)
+        .all()
+        .find((index) => index.name === "agent_tasks_child_session_idx");
+      const childSessionIndexColumns = this.db
+        .query<{ name: string | null }, []>(`pragma index_info(agent_tasks_child_session_idx)`)
+        .all();
+      const childSessionIndexSql = this.db
+        .query<{ sql: string | null }, []>(
+          `select sql from sqlite_master where type = 'index' and name = 'agent_tasks_child_session_idx'`,
+        )
+        .get()?.sql
+        ?.toLowerCase()
+        .replaceAll(/\s+/g, " ")
+        .trim();
+      const childSessionIndexIsCanonical = childSessionIndex?.unique === 1
+        && childSessionIndex.partial === 1
+        && childSessionIndexColumns.length === 1
+        && childSessionIndexColumns[0]?.name === "child_session_id"
+        && childSessionIndexSql
+          === "create unique index agent_tasks_child_session_idx on agent_tasks(child_session_id) where child_session_id is not null";
+      if (
+        alreadyMigrated
+        && !hasLegacyGoalTable
+        && !hasLegacyColumns
+        && legacyPayloadMappingsAreComplete
+        && childSessionIndexIsCanonical
+      ) return;
+
+      const identityPairs: string[] = [];
+      if (hasLegacyGoalTable || hasLegacyColumns || hasLegacyPayloads || hasLegacySessionIdentities) {
+        this.db.exec(`
+          create table if not exists legacy_session_identities (
+            legacy_id text primary key,
+            session_id text not null unique
+          )
+        `);
+        identityPairs.push(
+          `select legacy_id, session_id from legacy_session_identities`,
+        );
+      }
+      const addColumnPair = (
+        table: string,
+        legacyColumn: string,
+        sessionColumn: string,
+      ): void => {
+        if (!this.columnExists(table, legacyColumn) || !this.columnExists(table, sessionColumn)) return;
+        identityPairs.push(
+          `select ${legacyColumn} as legacy_id, ${sessionColumn} as session_id
+             from ${table}
+            where ${legacyColumn} is not null and ${sessionColumn} is not null`,
+        );
+      };
+      addColumnPair("events", "thread_id", "session_id");
+      addColumnPair("messages", "thread_id", "session_id");
+      addColumnPair("tool_calls", "thread_id", "session_id");
+      addColumnPair("approvals", "thread_id", "session_id");
+      addColumnPair("agent_runs", "thread_id", "session_id");
+      addColumnPair("agent_runs", "parent_thread_id", "parent_session_id");
+      addColumnPair("agent_runs", "child_thread_id", "child_session_id");
+      addColumnPair("agent_tasks", "parent_thread_id", "parent_session_id");
+      addColumnPair("agent_tasks", "child_thread_id", "child_session_id");
+      addColumnPair("agent_mailbox", "child_thread_id", "recipient_session_id");
+      addColumnPair("team_members", "child_thread_id", "child_session_id");
+      addColumnPair("team_message_deliveries", "child_thread_id", "child_session_id");
+      if (hasLegacyGoalTable) {
+        this.addColumnIfMissing("thread_goals", "session_id", "text");
+        this.addColumnIfMissing("thread_goals", "token_budget", "integer");
+        this.addColumnIfMissing("thread_goals", "tokens_used", "integer not null default 0");
+        this.addColumnIfMissing("thread_goals", "time_used_seconds", "real not null default 0");
+        this.addColumnIfMissing("thread_goals", "completed_at", "integer");
+        this.addColumnIfMissing("thread_goals", "last_reason", "text");
+        addColumnPair("thread_goals", "thread_id", "session_id");
+      }
+      if (this.columnExists("events", "thread_id")) {
+        for (const sessionPath of [
+          "$.sessionId",
+          "$.goal.sessionId",
+          "$.previousGoal.sessionId",
+        ] as const) {
+          identityPairs.push(
+            `select thread_id as legacy_id,
+                    json_extract(payload_json, '${sessionPath}') as session_id
+               from events
+              where thread_id is not null
+                and json_type(payload_json, '${sessionPath}') = 'text'`,
+          );
+        }
+      }
+      for (const [legacyPath, sessionPath] of [
+        ["$.threadId", "$.sessionId"],
+        ["$.goal.threadId", "$.goal.sessionId"],
+        ["$.previousGoal.threadId", "$.previousGoal.sessionId"],
+        ["$.parentThreadId", "$.parentSessionId"],
+        ["$.childThreadId", "$.childSessionId"],
+        ["$.recipientThreadId", "$.recipientSessionId"],
+      ] as const) {
+        identityPairs.push(
+          `select json_extract(payload_json, '${legacyPath}') as legacy_id,
+                  json_extract(payload_json, '${sessionPath}') as session_id
+             from events
+            where json_type(payload_json, '${legacyPath}') = 'text'
+          and json_type(payload_json, '${sessionPath}') = 'text'`,
+        );
+      }
+      identityPairs.push(
+        `select json_extract(payload_json, '$.childThreadId') as legacy_id,
+                json_extract(payload_json, '$.recipientSessionId') as session_id
+           from events
+          where type = 'agent.message_queued'
+            and json_type(payload_json, '$.childThreadId') = 'text'
+            and json_type(payload_json, '$.recipientSessionId') = 'text'`,
+      );
+      for (const legacyPath of [
+        "$.threadId",
+        "$.goal.threadId",
+        "$.previousGoal.threadId",
+      ] as const) {
+        identityPairs.push(
+          `select json_extract(payload_json, '${legacyPath}') as legacy_id,
+                  session_id
+             from events
+            where json_type(payload_json, '${legacyPath}') = 'text'
+              and session_id is not null`,
+        );
+      }
+
+      this.db.exec(`
+        drop table if exists temp._legacy_thread_sessions;
+        create temp table _legacy_thread_sessions (
+          legacy_id text primary key,
+          session_id text not null unique
+        )
+      `);
+      if (identityPairs.length > 0) {
+        const union = identityPairs.join(" union all ");
+        const ambiguousLegacy = this.db
+          .query<{ legacy_id: string; session_ids: string }, []>(
+            `select legacy_id, group_concat(distinct session_id) as session_ids
+               from (${union})
+              group by legacy_id
+             having count(distinct session_id) > 1
+              limit 1`,
+          )
+          .get();
+        if (ambiguousLegacy) {
+          throw new Error(
+            `Cannot migrate legacy conversation ${ambiguousLegacy.legacy_id}: it maps to multiple sessions (${ambiguousLegacy.session_ids}).`,
+          );
+        }
+        const ambiguousSession = this.db
+          .query<{ session_id: string; legacy_ids: string }, []>(
+            `select session_id, group_concat(distinct legacy_id) as legacy_ids
+               from (${union})
+              group by session_id
+             having count(distinct legacy_id) > 1
+              limit 1`,
+          )
+          .get();
+        if (ambiguousSession) {
+          throw new Error(
+            `Cannot migrate session ${ambiguousSession.session_id}: it owns multiple legacy conversations (${ambiguousSession.legacy_ids}).`,
+          );
+        }
+
+        this.db.exec(`
+          insert into _legacy_thread_sessions (legacy_id, session_id)
+          select legacy_id, min(session_id)
+            from (${union})
+           group by legacy_id
+        `);
+      }
+
+      const unresolvedPayloadIdentity = this.db
+        .query<{ event_id: string; field: string; legacy_id: string }, []>(
+          `select payload_identity.event_id, payload_identity.field, payload_identity.legacy_id
+             from (${legacyPayloadIdentities}) as payload_identity
+             left join _legacy_thread_sessions as identity
+               on identity.legacy_id = payload_identity.legacy_id
+            where identity.session_id is null
+            limit 1`,
+        )
+        .get();
+      if (unresolvedPayloadIdentity) {
+        throw new Error(
+          `Cannot migrate legacy event ${unresolvedPayloadIdentity.event_id}: ${unresolvedPayloadIdentity.field} value ${unresolvedPayloadIdentity.legacy_id} has no unambiguous SessionId mapping.`,
+        );
+      }
+      if (this.tableExists("legacy_session_identities")) {
+        this.db.exec(`
+          insert into legacy_session_identities (legacy_id, session_id)
+          select legacy_id, session_id from _legacy_thread_sessions
+          where true
+          on conflict(legacy_id) do update set session_id = excluded.session_id
+        `);
+      }
+
+      const backfill = (
+        table: string,
+        legacyColumn: string,
+        sessionColumn: string,
+      ): void => {
+        if (!this.columnExists(table, legacyColumn) || !this.columnExists(table, sessionColumn)) return;
+        this.db.exec(`
+          update ${table}
+             set ${sessionColumn} = coalesce(
+               ${sessionColumn},
+               (select session_id from _legacy_thread_sessions where legacy_id = ${table}.${legacyColumn})
+             )
+           where ${legacyColumn} is not null
+        `);
+        const unresolved = this.db
+          .query<{ count: number }, []>(
+            `select count(*) as count
+               from ${table}
+              where ${legacyColumn} is not null and ${sessionColumn} is null`,
+          )
+          .get()?.count ?? 0;
+        if (unresolved > 0) {
+          throw new Error(
+            `Cannot migrate ${unresolved} ${table} row(s): ${legacyColumn} has no unambiguous SessionId mapping.`,
+          );
+        }
+      };
+      backfill("events", "thread_id", "session_id");
+      backfill("messages", "thread_id", "session_id");
+      backfill("tool_calls", "thread_id", "session_id");
+      backfill("approvals", "thread_id", "session_id");
+      backfill("agent_runs", "thread_id", "session_id");
+      backfill("agent_runs", "parent_thread_id", "parent_session_id");
+      backfill("agent_runs", "child_thread_id", "child_session_id");
+      backfill("agent_tasks", "parent_thread_id", "parent_session_id");
+      backfill("agent_tasks", "child_thread_id", "child_session_id");
+      backfill("agent_mailbox", "child_thread_id", "recipient_session_id");
+      backfill("team_members", "child_thread_id", "child_session_id");
+      backfill("team_message_deliveries", "child_thread_id", "child_session_id");
+      if (hasLegacyGoalTable) backfill("thread_goals", "thread_id", "session_id");
+
+      // Two distinct legacy task rows can become duplicates only after their
+      // replacement SessionId values are backfilled.
+      assertUniqueTaskChildSessions();
+
+      if (hasLegacyGoalTable) {
+        const legacyGoals = this.db
+          .query<{
+            thread_id: string;
+            session_id: string | null;
+            objective: string;
+            status: string;
+            token_budget: number | null;
+            tokens_used: number;
+            time_used_seconds: number;
+            created_at: number;
+            updated_at: number;
+            completed_at: number | null;
+            last_reason: string | null;
+          }, []>(
+            `select thread_id, session_id, objective, status, token_budget, tokens_used,
+                    time_used_seconds, created_at, updated_at, completed_at, last_reason
+               from thread_goals`,
+          )
+          .all();
+        const sessions = new Set<string>();
+        for (const goal of legacyGoals) {
+          if (!goal.session_id) {
+            throw new Error(`Cannot migrate legacy goal ${goal.thread_id}: no SessionId mapping exists.`);
+          }
+          if (sessions.has(goal.session_id)) {
+            throw new Error(
+              `Cannot migrate legacy goals: session ${goal.session_id} owns more than one goal.`,
+            );
+          }
+          sessions.add(goal.session_id);
+          this.db
+            .query(
+              `insert into session_goals
+                 (session_id, objective, status, token_budget, tokens_used, time_used_seconds,
+                  created_at, updated_at, completed_at, last_reason)
+               values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               on conflict(session_id) do update set
+                 objective = excluded.objective,
+                 status = excluded.status,
+                 token_budget = excluded.token_budget,
+                 tokens_used = excluded.tokens_used,
+                 time_used_seconds = excluded.time_used_seconds,
+                 created_at = excluded.created_at,
+                 updated_at = excluded.updated_at,
+                 completed_at = excluded.completed_at,
+                 last_reason = excluded.last_reason
+               where excluded.updated_at >= session_goals.updated_at`,
+            )
+            .run(
+              goal.session_id,
+              goal.objective,
+              goal.status,
+              goal.token_budget,
+              goal.tokens_used,
+              goal.time_used_seconds,
+              goal.created_at,
+              goal.updated_at,
+              goal.completed_at,
+              goal.last_reason,
+            );
+        }
+      }
+
+      const legacyIndexes = this.db
+        .query<{ name: string }, []>(
+          `select name
+             from sqlite_master
+            where type = 'index'
+              and sql is not null
+              and (lower(name) like '%thread%' or lower(sql) like '%thread%')`,
+        )
+        .all();
+      for (const index of legacyIndexes) {
+        this.db.exec(`drop index if exists "${index.name.replaceAll('"', '""')}"`);
+      }
+      this.db.exec(`drop index if exists agent_tasks_batch_idx`);
+      this.db.exec(`drop index if exists agent_tasks_child_session_idx`);
+      for (const [table, column] of legacyColumns) {
+        this.dropColumnIfPresent(table, column);
+      }
+      if (hasLegacyGoalTable) this.db.exec(`drop table thread_goals`);
+      this.db.exec(`drop table if exists temp._legacy_thread_sessions`);
+      this.db.exec(AGENT_TASKS_CHILD_SESSION_UNIQUE_INDEX);
+      this.db.query(`insert or ignore into schema_migrations (name) values (?)`).run(marker);
+    });
+    migrate();
+  }
+
   private migrateGoalSchema(): void {
     this.db.exec(`
-      create table if not exists thread_goals (
-        thread_id text primary key,
-        session_id text,
+      create table if not exists session_goals (
+        session_id text not null primary key,
         objective text not null,
         status text not null,
         token_budget integer,
@@ -2109,14 +2615,12 @@ export class SqliteEventStore
         last_reason text
       )
     `);
-    this.addColumnIfMissing("thread_goals", "session_id", "text");
-    this.addColumnIfMissing("thread_goals", "token_budget", "integer");
-    this.addColumnIfMissing("thread_goals", "tokens_used", "integer not null default 0");
-    this.addColumnIfMissing("thread_goals", "time_used_seconds", "real not null default 0");
-    this.addColumnIfMissing("thread_goals", "completed_at", "integer");
-    this.addColumnIfMissing("thread_goals", "last_reason", "text");
-    this.db.exec(`create index if not exists thread_goals_session_idx on thread_goals(session_id)`);
-    this.db.exec(`create index if not exists thread_goals_status_idx on thread_goals(status, updated_at)`);
+    this.addColumnIfMissing("session_goals", "token_budget", "integer");
+    this.addColumnIfMissing("session_goals", "tokens_used", "integer not null default 0");
+    this.addColumnIfMissing("session_goals", "time_used_seconds", "real not null default 0");
+    this.addColumnIfMissing("session_goals", "completed_at", "integer");
+    this.addColumnIfMissing("session_goals", "last_reason", "text");
+    this.db.exec(`create index if not exists session_goals_status_idx on session_goals(status, updated_at)`);
   }
 
   private migrateTeamSchema(): void {
@@ -2136,7 +2640,6 @@ export class SqliteEventStore
         team_message_id text not null,
         path text not null,
         child_session_id text,
-        child_thread_id text,
         trigger_turn integer not null,
         status text not null,
         error text,
@@ -2158,12 +2661,45 @@ export class SqliteEventStore
   }
 
   private addColumnIfMissing(table: string, column: string, definition: string): boolean {
-    const columns = this.db.query<{ name: string }, []>(`pragma table_info(${table})`).all();
-    if (!columns.some((item) => item.name === column)) {
+    if (!this.columnExists(table, column)) {
       this.db.exec(`alter table ${table} add column ${column} ${definition}`);
       return true;
     }
     return false;
+  }
+
+  private tableExists(table: string): boolean {
+    return this.db
+      .query<{ found: number }, [string]>(
+        `select 1 as found from sqlite_master where type = 'table' and name = ? limit 1`,
+      )
+      .get(table) !== null;
+  }
+
+  private columnExists(table: string, column: string): boolean {
+    if (!this.tableExists(table)) return false;
+    return this.db
+      .query<{ name: string }, []>(`pragma table_info(${table})`)
+      .all()
+      .some((item) => item.name === column);
+  }
+
+  private dropColumnIfPresent(table: string, column: string): void {
+    if (this.columnExists(table, column)) {
+      this.db.exec(`alter table ${table} drop column ${column}`);
+    }
+  }
+
+  private loadLegacySessionIdentities(): void {
+    if (!this.tableExists("legacy_session_identities")) return;
+    const rows = this.db
+      .query<{ legacy_id: string; session_id: string }, []>(
+        `select legacy_id, session_id from legacy_session_identities`,
+      )
+      .all();
+    for (const row of rows) {
+      this.legacySessionIds.set(row.legacy_id, row.session_id as SessionId);
+    }
   }
 
   private nextEventSeq(): number {
@@ -2216,21 +2752,21 @@ export class SqliteEventStore
              cwd = excluded.cwd,
              updated_at = excluded.updated_at`,
         )
-        .run(event.payload.sessionId, event.payload.cwd, title, event.time, event.time);
+        .run(event.sessionId, event.payload.cwd, title, event.time, event.time);
       return;
     }
 
     if (event.type === "session.archived") {
       this.db
         .query(`update sessions set status = 'archived', updated_at = ? where id = ?`)
-        .run(event.time, event.payload.sessionId);
+        .run(event.time, event.sessionId);
       return;
     }
 
     if (event.type === "session.renamed") {
       this.db
         .query(`update sessions set title = ?, updated_at = ? where id = ?`)
-        .run(event.payload.title, event.time, event.payload.sessionId);
+        .run(event.payload.title, event.time, event.sessionId);
     }
   }
 
@@ -2241,11 +2777,11 @@ export class SqliteEventStore
       }
       this.db
         .query(
-          `insert into messages (id, session_id, thread_id, turn_id, role, parent_id, created_at)
-           values (?, ?, ?, ?, ?, null, ?)
+          `insert into messages (id, session_id, turn_id, role, parent_id, created_at)
+           values (?, ?, ?, ?, null, ?)
            on conflict(id) do nothing`,
         )
-        .run(event.payload.messageId, event.sessionId, event.threadId ?? null, event.payload.turnId ?? null, event.payload.role, event.time);
+        .run(event.payload.messageId, event.sessionId, event.payload.turnId ?? null, event.payload.role, event.time);
       return;
     }
 
@@ -2338,8 +2874,8 @@ export class SqliteEventStore
       this.db
         .query(
           `insert into tool_calls
-             (id, session_id, thread_id, turn_id, tool_name, status, input_json, started_at, updated_at)
-           values (?, ?, ?, ?, ?, 'running', ?, ?, ?)
+             (id, session_id, turn_id, tool_name, status, input_json, started_at, updated_at)
+           values (?, ?, ?, ?, 'running', ?, ?, ?)
            on conflict(id) do update set
              status = excluded.status,
              updated_at = excluded.updated_at`,
@@ -2347,7 +2883,6 @@ export class SqliteEventStore
         .run(
           event.payload.callId,
           event.sessionId ?? null,
-          event.threadId ?? null,
           event.payload.turnId,
           event.payload.toolName,
           encodeJson(event.payload.input),
@@ -2387,8 +2922,8 @@ export class SqliteEventStore
       this.db
         .query(
           `insert into approvals
-             (id, session_id, thread_id, call_id, permission, patterns_json, max_approval_scope, metadata_json, status, created_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+             (id, session_id, call_id, permission, patterns_json, max_approval_scope, metadata_json, status, created_at)
+           values (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
            on conflict(id) do update set
              status = 'pending',
              max_approval_scope = excluded.max_approval_scope,
@@ -2397,7 +2932,6 @@ export class SqliteEventStore
         .run(
           event.payload.approvalId,
           event.sessionId ?? null,
-          event.threadId ?? null,
           event.payload.callId ?? null,
           event.payload.permission,
           encodeJson(event.payload.patterns),
@@ -2424,12 +2958,11 @@ export class SqliteEventStore
       const goal = event.payload.goal;
       this.db
         .query(
-          `insert into thread_goals
-             (thread_id, session_id, objective, status, token_budget, tokens_used,
+          `insert into session_goals
+             (session_id, objective, status, token_budget, tokens_used,
               time_used_seconds, created_at, updated_at, completed_at, last_reason)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           on conflict(thread_id) do update set
-             session_id = excluded.session_id,
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           on conflict(session_id) do update set
              objective = excluded.objective,
              status = excluded.status,
              token_budget = excluded.token_budget,
@@ -2441,8 +2974,7 @@ export class SqliteEventStore
              last_reason = excluded.last_reason`,
         )
         .run(
-          goal.threadId,
-          goal.sessionId ?? event.sessionId ?? null,
+          event.sessionId,
           goal.objective,
           goal.status,
           goal.tokenBudget ?? null,
@@ -2457,8 +2989,8 @@ export class SqliteEventStore
     }
 
     this.db
-      .query(`delete from thread_goals where thread_id = ?`)
-      .run(event.payload.threadId);
+      .query(`delete from session_goals where session_id = ?`)
+      .run(event.sessionId);
   }
 
   private applyAgentEvent(event: AgentEvent): void {
@@ -2466,17 +2998,15 @@ export class SqliteEventStore
       this.db
         .query(
           `insert into agent_tasks
-             (id, path, parent_path, parent_session_id, parent_thread_id, child_session_id, child_thread_id,
+             (id, path, parent_path, parent_session_id, child_session_id,
               task_name, cwd, prompt, mode, source_call_id, batch_id, batch_index, expected_batch_size,
               completion_policy, max_concurrency, status, created_at, updated_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
            on conflict(id) do update set
              path = excluded.path,
              parent_path = excluded.parent_path,
              parent_session_id = excluded.parent_session_id,
-             parent_thread_id = excluded.parent_thread_id,
              child_session_id = excluded.child_session_id,
-             child_thread_id = excluded.child_thread_id,
              task_name = excluded.task_name,
              cwd = excluded.cwd,
              prompt = excluded.prompt,
@@ -2494,9 +3024,7 @@ export class SqliteEventStore
           event.payload.path,
           event.payload.parentPath,
           event.payload.parentSessionId,
-          event.payload.parentThreadId ?? null,
           event.payload.childSessionId,
-          event.payload.childThreadId,
           event.payload.taskName,
           event.payload.cwd,
           event.payload.prompt,
@@ -2515,7 +3043,6 @@ export class SqliteEventStore
 
     if (event.type === "agent.spawned") {
       const parentSessionId = event.payload.parentSessionId ?? event.sessionId ?? null;
-      const parentThreadId = event.payload.parentThreadId ?? event.threadId ?? null;
       const payloadGeneration = normalizedGeneration(event.payload.generation);
       if (event.payload.taskId) {
         const current = this.agentTaskState(event.payload.taskId);
@@ -2524,20 +3051,17 @@ export class SqliteEventStore
       this.db
         .query(
           `insert into agent_runs
-             (id, session_id, thread_id, task_id, path, parent_path, parent_session_id, parent_thread_id,
-              child_session_id, child_thread_id, task_name, cwd, mode, status, generation, created_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)
+             (id, session_id, task_id, path, parent_path, parent_session_id,
+              child_session_id, task_name, cwd, mode, status, generation, created_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)
            on conflict(id) do update set
              status = 'running',
              session_id = coalesce(excluded.session_id, agent_runs.session_id),
-             thread_id = coalesce(excluded.thread_id, agent_runs.thread_id),
              task_id = coalesce(excluded.task_id, agent_runs.task_id),
              path = excluded.path,
              parent_path = coalesce(excluded.parent_path, agent_runs.parent_path),
              parent_session_id = coalesce(excluded.parent_session_id, agent_runs.parent_session_id),
-             parent_thread_id = coalesce(excluded.parent_thread_id, agent_runs.parent_thread_id),
              child_session_id = coalesce(excluded.child_session_id, agent_runs.child_session_id),
-             child_thread_id = coalesce(excluded.child_thread_id, agent_runs.child_thread_id),
              task_name = excluded.task_name,
              cwd = coalesce(excluded.cwd, agent_runs.cwd),
              mode = coalesce(excluded.mode, agent_runs.mode),
@@ -2548,14 +3072,11 @@ export class SqliteEventStore
         .run(
           event.payload.runId,
           event.sessionId ?? null,
-          event.threadId ?? null,
           event.payload.taskId ?? null,
           event.payload.path,
           event.payload.parentPath ?? null,
           parentSessionId,
-          parentThreadId,
           event.payload.childSessionId ?? null,
-          event.payload.childThreadId ?? null,
           event.payload.taskName,
           event.payload.cwd ?? null,
           event.payload.mode ?? null,
@@ -2563,7 +3084,7 @@ export class SqliteEventStore
           event.time,
         );
       if (event.payload.taskId) {
-        this.applyAgentSpawnToTask(event, parentSessionId, parentThreadId, payloadGeneration);
+        this.applyAgentSpawnToTask(event, parentSessionId, payloadGeneration);
       }
       return;
     }
@@ -2572,14 +3093,13 @@ export class SqliteEventStore
       this.db
         .query(
           `insert into agent_mailbox
-             (id, task_id, path, from_path, child_session_id, child_thread_id, trigger_turn, status, message_json, created_at)
-           values (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+             (id, task_id, path, from_path, recipient_session_id, trigger_turn, status, message_json, created_at)
+           values (?, ?, ?, ?, ?, ?, 'queued', ?, ?)
            on conflict(id) do update set
              task_id = excluded.task_id,
              path = excluded.path,
              from_path = excluded.from_path,
-             child_session_id = excluded.child_session_id,
-             child_thread_id = excluded.child_thread_id,
+             recipient_session_id = excluded.recipient_session_id,
              trigger_turn = excluded.trigger_turn,
              message_json = excluded.message_json`,
         )
@@ -2588,8 +3108,7 @@ export class SqliteEventStore
           event.payload.taskId ?? null,
           event.payload.path,
           event.payload.from,
-          event.payload.childSessionId ?? null,
-          event.payload.childThreadId ?? null,
+          event.payload.recipientSessionId ?? null,
           event.payload.triggerTurn ? 1 : 0,
           event.payload.message ? encodeJson(event.payload.message) : null,
           event.time,
@@ -2693,15 +3212,14 @@ export class SqliteEventStore
     this.db
       .query(
         `insert into team_message_deliveries
-           (mailbox_message_id, team_id, team_message_id, path, child_session_id, child_thread_id,
+           (mailbox_message_id, team_id, team_message_id, path, child_session_id,
             trigger_turn, status, error, queued_at, updated_at, delivered_at)
-         values (?, ?, ?, ?, ?, ?, ?, 'queued', null, ?, ?, null)
+         values (?, ?, ?, ?, ?, ?, 'queued', null, ?, ?, null)
          on conflict(mailbox_message_id) do update set
            team_id = excluded.team_id,
            team_message_id = excluded.team_message_id,
            path = excluded.path,
            child_session_id = excluded.child_session_id,
-           child_thread_id = excluded.child_thread_id,
            trigger_turn = excluded.trigger_turn,
            status = 'queued',
            error = null,
@@ -2713,8 +3231,7 @@ export class SqliteEventStore
         metadata.teamId,
         metadata.teamMessageId,
         event.payload.path,
-        event.payload.childSessionId ?? null,
-        event.payload.childThreadId ?? null,
+        event.payload.recipientSessionId ?? null,
         event.payload.triggerTurn ? 1 : 0,
         event.time,
         event.time,
@@ -2742,7 +3259,6 @@ export class SqliteEventStore
   private applyAgentSpawnToTask(
     event: Extract<AgentEvent, { type: "agent.spawned" }>,
     parentSessionId: string | null,
-    parentThreadId: string | null,
     payloadGeneration: number | undefined,
   ): void {
     const taskId = event.payload.taskId;
@@ -2754,11 +3270,11 @@ export class SqliteEventStore
     this.db
       .query(
         `insert into agent_tasks
-           (id, path, parent_path, parent_session_id, parent_thread_id, child_session_id, child_thread_id,
+           (id, path, parent_path, parent_session_id, child_session_id,
             task_name, cwd, mode, source_call_id, batch_id, batch_index, expected_batch_size,
             completion_policy, max_concurrency, status, generation, current_run_id, lease_owner,
             lease_expires_at, lease_heartbeat_at, created_at, updated_at)
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, null, null, null, ?, ?)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, null, null, null, ?, ?)
          on conflict(id) do update set
            status = 'running',
            generation = excluded.generation,
@@ -2766,9 +3282,7 @@ export class SqliteEventStore
            path = excluded.path,
            parent_path = coalesce(excluded.parent_path, agent_tasks.parent_path),
            parent_session_id = coalesce(excluded.parent_session_id, agent_tasks.parent_session_id),
-           parent_thread_id = coalesce(excluded.parent_thread_id, agent_tasks.parent_thread_id),
            child_session_id = coalesce(excluded.child_session_id, agent_tasks.child_session_id),
-           child_thread_id = coalesce(excluded.child_thread_id, agent_tasks.child_thread_id),
            task_name = excluded.task_name,
            cwd = coalesce(excluded.cwd, agent_tasks.cwd),
            mode = coalesce(excluded.mode, agent_tasks.mode),
@@ -2792,9 +3306,7 @@ export class SqliteEventStore
         event.payload.path,
         event.payload.parentPath ?? null,
         parentSessionId,
-        parentThreadId,
         event.payload.childSessionId ?? null,
-        event.payload.childThreadId ?? null,
         event.payload.taskName,
         event.payload.cwd ?? null,
         event.payload.mode ?? null,
@@ -2867,7 +3379,7 @@ export class SqliteEventStore
     const row = this.db
       .query<AgentTaskStateRow, [string]>(
         `select status, generation, current_run_id, lease_owner, path, parent_path, parent_session_id,
-                parent_thread_id, child_session_id, child_thread_id, task_name, cwd, mode
+                child_session_id, task_name, cwd, mode
          from agent_tasks
          where id = ?`,
       )
@@ -2878,7 +3390,7 @@ export class SqliteEventStore
   private agentTaskProjectionState(taskId: TaskId): AgentTaskProjectionRow | undefined {
     const row = this.db
       .query<AgentTaskProjectionRow, [string]>(
-        `select id, path, parent_path, parent_session_id, parent_thread_id, child_session_id, child_thread_id,
+        `select id, path, parent_path, parent_session_id, child_session_id,
                 task_name, cwd, prompt, mode, source_call_id, batch_id, batch_index, expected_batch_size,
                 completion_policy, max_concurrency, status, current_run_id, summary, error, completion_json,
                 generation, lease_owner, lease_expires_at, lease_heartbeat_at, created_at, updated_at, completed_at
@@ -2892,7 +3404,7 @@ export class SqliteEventStore
   private agentMailboxState(messageId: string): AgentMailboxProjectionRow | undefined {
     const row = this.db
       .query<AgentMailboxProjectionRow, [string]>(
-        `select id, task_id, path, from_path, child_session_id, child_thread_id, trigger_turn, status,
+        `select id, task_id, path, from_path, recipient_session_id, trigger_turn, status,
                 message_json, created_at, consumed_at
          from agent_mailbox
          where id = ?`,
@@ -2912,15 +3424,6 @@ export class SqliteEventStore
         `select parent_session_id from agent_tasks where id = ?`,
       )
       .get(taskId)?.parent_session_id ?? undefined;
-  }
-
-  private parentThreadIdForTask(taskId: string | null): string | undefined {
-    if (!taskId) return undefined;
-    return this.db
-      .query<{ parent_thread_id: string | null }, [string]>(
-        `select parent_thread_id from agent_tasks where id = ?`,
-      )
-      .get(taskId)?.parent_thread_id ?? undefined;
   }
 
   private teamTaskState(teamId: TeamId, taskId: TaskId): TeamTaskStateRow | undefined {
@@ -2999,7 +3502,6 @@ export class SqliteEventStore
     };
     const sessionId = input.sessionId ?? this.sessionIdForTeamTask(current.id);
     if (sessionId) event.sessionId = sessionId as SessionId;
-    if (input.threadId) event.threadId = input.threadId;
     return event;
   }
 
@@ -3020,7 +3522,6 @@ export class SqliteEventStore
     };
     const sessionId = input.sessionId ?? this.sessionIdForTeamTask(current.id);
     if (sessionId) event.sessionId = sessionId as SessionId;
-    if (input.threadId) event.threadId = input.threadId;
     return event;
   }
 
@@ -3062,15 +3563,14 @@ export class SqliteEventStore
       this.db
         .query(
           `insert into team_members
-             (team_id, path, name, role, status, child_session_id, child_thread_id, model,
+             (team_id, path, name, role, status, child_session_id, model,
               tool_scope_json, write_scope_json, created_at, updated_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            on conflict(team_id, path) do update set
              name = excluded.name,
              role = excluded.role,
              status = excluded.status,
              child_session_id = coalesce(excluded.child_session_id, team_members.child_session_id),
-             child_thread_id = coalesce(excluded.child_thread_id, team_members.child_thread_id),
              model = coalesce(excluded.model, team_members.model),
              tool_scope_json = coalesce(excluded.tool_scope_json, team_members.tool_scope_json),
              write_scope_json = coalesce(excluded.write_scope_json, team_members.write_scope_json),
@@ -3084,7 +3584,6 @@ export class SqliteEventStore
           event.payload.role,
           event.payload.status ?? "idle",
           event.payload.childSessionId ?? null,
-          event.payload.childThreadId ?? null,
           event.payload.model ?? null,
           event.payload.toolScope ? encodeJson(event.payload.toolScope) : null,
           event.payload.writeScope ? encodeJson(event.payload.writeScope) : null,
@@ -3282,20 +3781,191 @@ export class SqliteEventStore
   }
 
   private eventFromRow(row: StoredEventRow): EventEnvelope {
+    if (
+      (row.type.startsWith("session.") || row.type === "goal.updated" || row.type === "goal.cleared")
+      && !row.session_id
+    ) {
+      throw new Error(`Cannot replay ${row.type}: event has no SessionId.`);
+    }
     const event: EventEnvelope = {
       id: row.id,
       type: row.type,
       time: row.time as EventEnvelope["time"],
-      payload: decodeJson(row.payload_json, {}),
+      payload: canonicalizeLegacyEventPayload(
+        row.type,
+        decodeJson<Record<string, unknown>>(row.payload_json, {}),
+        row.session_id,
+        (legacyId) => this.legacySessionIds.get(legacyId),
+      ),
     };
     if (row.session_id) {
       event.sessionId = row.session_id as SessionId;
     }
-    if (row.thread_id) {
-      event.threadId = row.thread_id as ThreadId;
-    }
     return event;
   }
+}
+
+function validateScopedEventSessionIdentity(event: ChiliEvent): void {
+  if (event.type.startsWith("session.")) {
+    const envelopeSessionId = event.sessionId;
+    const payloadSessionId = (event.payload as { sessionId?: unknown }).sessionId;
+    if (!envelopeSessionId) {
+      throw new Error(`${event.type} requires event.sessionId`);
+    }
+    if (payloadSessionId !== envelopeSessionId) {
+      throw new Error(
+        `${event.type} payload sessionId ${String(payloadSessionId)} does not match event.sessionId ${envelopeSessionId}`,
+      );
+    }
+    return;
+  }
+  if (event.type === "goal.updated") {
+    if (!event.sessionId) {
+      throw new Error("goal.updated requires event.sessionId");
+    }
+    if (event.payload.goal.sessionId !== event.sessionId) {
+      throw new Error(
+        `goal.updated goal sessionId ${event.payload.goal.sessionId} does not match event.sessionId ${event.sessionId}`,
+      );
+    }
+    return;
+  }
+  if (event.type === "goal.cleared") {
+    if (!event.sessionId) {
+      throw new Error("goal.cleared requires event.sessionId");
+    }
+    if (event.payload.sessionId !== event.sessionId) {
+      throw new Error(
+        `goal.cleared payload sessionId ${event.payload.sessionId} does not match event.sessionId ${event.sessionId}`,
+      );
+    }
+    if (event.payload.previousGoal && event.payload.previousGoal.sessionId !== event.sessionId) {
+      throw new Error(
+        `goal.cleared previous goal sessionId ${event.payload.previousGoal.sessionId} does not match event.sessionId ${event.sessionId}`,
+      );
+    }
+  }
+}
+
+/**
+ * Canonicalize protocol-owned fields from legacy event rows at the read
+ * boundary. The append-only payload ledger remains byte-for-byte intact while
+ * callers only observe the current Session-only contract.
+ */
+function canonicalizeLegacyEventPayload(
+  type: string,
+  payload: Record<string, unknown>,
+  sessionId: string | null,
+  resolveLegacySessionId: (legacyId: string) => SessionId | undefined,
+): Record<string, unknown> {
+  const output = { ...payload };
+  const legacyConversationId = output.threadId;
+  delete output.threadId;
+  if (type.startsWith("session.") && sessionId) {
+    output.sessionId = sessionId;
+  }
+  const canonicalizeIdentity = (
+    legacyKey: "parentThreadId" | "childThreadId" | "recipientThreadId",
+    sessionKey: "parentSessionId" | "childSessionId" | "recipientSessionId",
+  ): void => {
+    const legacyId = output[legacyKey];
+    delete output[legacyKey];
+    if (typeof legacyId !== "string") return;
+    const resolved = resolveLegacySessionId(legacyId);
+    const existing = output[sessionKey];
+    if (typeof existing === "string") {
+      if (resolved && existing !== resolved) {
+        throw new Error(
+          `Cannot replay legacy event payload: ${legacyKey} maps to ${resolved}, not ${existing}.`,
+        );
+      }
+      return;
+    }
+    if (!resolved) {
+      throw new Error(
+        `Cannot replay legacy event payload: ${legacyKey} value ${legacyId} has no SessionId mapping.`,
+      );
+    }
+    output[sessionKey] = resolved;
+  };
+
+  canonicalizeIdentity("parentThreadId", "parentSessionId");
+  if (type === "agent.message_queued") {
+    const legacyChildId = output.childThreadId;
+    const previousRecipientId = output.childSessionId;
+    const currentRecipientId = output.recipientSessionId;
+    delete output.childThreadId;
+    delete output.childSessionId;
+    if (
+      typeof previousRecipientId === "string"
+      && typeof currentRecipientId === "string"
+      && previousRecipientId !== currentRecipientId
+    ) {
+      throw new Error(
+        `Cannot replay legacy mailbox payload: child session ${previousRecipientId} conflicts with recipient session ${currentRecipientId}.`,
+      );
+    }
+    const mappedRecipientId = typeof legacyChildId === "string"
+      ? resolveLegacySessionId(legacyChildId)
+      : undefined;
+    const recipientId = typeof currentRecipientId === "string"
+      ? currentRecipientId
+      : typeof previousRecipientId === "string"
+        ? previousRecipientId
+        : mappedRecipientId;
+    if (mappedRecipientId && recipientId && mappedRecipientId !== recipientId) {
+      throw new Error(
+        `Cannot replay legacy mailbox payload: child identity maps to ${mappedRecipientId}, not ${recipientId}.`,
+      );
+    }
+    if (typeof legacyChildId === "string" && !recipientId) {
+      throw new Error(
+        `Cannot replay legacy mailbox payload: childThreadId value ${legacyChildId} has no SessionId mapping.`,
+      );
+    }
+    if (recipientId) output.recipientSessionId = recipientId;
+  } else {
+    canonicalizeIdentity("childThreadId", "childSessionId");
+  }
+  canonicalizeIdentity("recipientThreadId", "recipientSessionId");
+
+  const canonicalGoal = (value: unknown): unknown => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+    const goal = { ...(value as Record<string, unknown>) };
+    const legacyId = goal.threadId;
+    delete goal.threadId;
+    const resolved = sessionId
+      ?? (typeof goal.sessionId === "string" ? goal.sessionId : undefined)
+      ?? (typeof legacyId === "string" ? resolveLegacySessionId(legacyId) : undefined);
+    if (typeof legacyId === "string" && !resolved) {
+      throw new Error(
+        `Cannot replay legacy event goal: threadId value ${legacyId} has no SessionId mapping.`,
+      );
+    }
+    if (resolved) goal.sessionId = resolved;
+    return goal;
+  };
+
+  if (output.goal !== undefined) {
+    output.goal = canonicalGoal(output.goal);
+  }
+  if (output.previousGoal !== undefined) {
+    output.previousGoal = canonicalGoal(output.previousGoal);
+  }
+  if (type === "goal.cleared") {
+    const resolved = sessionId
+      ?? (typeof output.sessionId === "string" ? output.sessionId : undefined)
+      ?? (typeof legacyConversationId === "string"
+        ? resolveLegacySessionId(legacyConversationId)
+        : undefined);
+    if (typeof legacyConversationId === "string" && !resolved) {
+      throw new Error(
+        `Cannot replay legacy goal.cleared event: threadId value ${legacyConversationId} has no SessionId mapping.`,
+      );
+    }
+    if (resolved) output.sessionId = resolved;
+  }
+  return output;
 }
 
 function approvalFromRow(row: Record<string, unknown>): ApprovalRow {
@@ -3307,7 +3977,6 @@ function approvalFromRow(row: Record<string, unknown>): ApprovalRow {
     createdAt: Number(row.created_at),
   };
   if (row.session_id) approval.sessionId = String(row.session_id) as SessionId;
-  if (row.thread_id) approval.threadId = String(row.thread_id) as ThreadId;
   if (row.call_id) approval.callId = String(row.call_id);
   if (isApprovalScope(row.max_approval_scope)) approval.maxApprovalScope = row.max_approval_scope;
   if (row.metadata_json) approval.metadata = decodeJson<Record<string, unknown>>(String(row.metadata_json), {});
@@ -3321,20 +3990,19 @@ function isApprovalScope(value: unknown): value is NonNullable<ApprovalRow["maxA
   return value === "once" || value === "session" || value === "persistent";
 }
 
-function threadGoalFromRow(row: ThreadGoalProjectionRow): ThreadGoalRow {
-  const goal: ThreadGoal = {
-    threadId: row.thread_id as ThreadId,
+function sessionGoalFromRow(row: SessionGoalProjectionRow): SessionGoalRow {
+  const goal: SessionGoal = {
+    sessionId: row.session_id as SessionId,
     objective: row.objective,
     status: row.status,
     tokensUsed: row.tokens_used,
     timeUsedSeconds: row.time_used_seconds,
-    createdAt: row.created_at as ThreadGoal["createdAt"],
-    updatedAt: row.updated_at as ThreadGoal["updatedAt"],
+    createdAt: row.created_at as SessionGoal["createdAt"],
+    updatedAt: row.updated_at as SessionGoal["updatedAt"],
   };
-  if (row.session_id) goal.sessionId = row.session_id as SessionId;
   if (row.token_budget !== null) goal.tokenBudget = row.token_budget;
   if (row.completed_at !== null) goal.completedAt = row.completed_at as TimestampMs;
-  if (row.last_reason) goal.lastReason = row.last_reason as NonNullable<ThreadGoal["lastReason"]>;
+  if (row.last_reason) goal.lastReason = row.last_reason as NonNullable<SessionGoal["lastReason"]>;
   return goal;
 }
 
@@ -3350,9 +4018,7 @@ function agentTaskFromRow(row: AgentTaskProjectionRow): AgentTaskRow {
   };
   if (row.parent_path) task.parentPath = row.parent_path as AgentPath;
   if (row.parent_session_id) task.parentSessionId = row.parent_session_id as SessionId;
-  if (row.parent_thread_id) task.parentThreadId = row.parent_thread_id as ThreadId;
   if (row.child_session_id) task.childSessionId = row.child_session_id as SessionId;
-  if (row.child_thread_id) task.childThreadId = row.child_thread_id as ThreadId;
   if (row.cwd) task.cwd = row.cwd;
   if (row.prompt) task.prompt = row.prompt;
   if (row.mode) task.mode = row.mode as NonNullable<AgentTaskRow["mode"]>;
@@ -3364,7 +4030,7 @@ function agentTaskFromRow(row: AgentTaskProjectionRow): AgentTaskRow {
     task.completionPolicy = row.completion_policy as NonNullable<AgentTaskRow["completionPolicy"]>;
   }
   if (row.max_concurrency !== null) task.maxConcurrency = row.max_concurrency;
-  if (row.current_run_id) task.currentRunId = row.current_run_id;
+  if (row.current_run_id) task.currentRunId = row.current_run_id as AgentRunId;
   if (row.summary) task.summary = row.summary;
   if (row.error) task.error = row.error;
   if (row.completion_json) task.completion = decodeJson<Record<string, unknown>>(row.completion_json, {});
@@ -3377,20 +4043,17 @@ function agentTaskFromRow(row: AgentTaskProjectionRow): AgentTaskRow {
 
 function agentRunFromRow(row: AgentRunProjectionRow): AgentRunRow {
   const run: AgentRunRow = {
-    id: row.id,
+    id: row.id as AgentRunId,
     path: row.path as AgentPath,
     taskName: row.task_name,
     status: row.status,
     createdAt: row.created_at,
   };
   if (row.session_id) run.sessionId = row.session_id as SessionId;
-  if (row.thread_id) run.threadId = row.thread_id as ThreadId;
   if (row.task_id) run.taskId = row.task_id as TaskId;
   if (row.parent_path) run.parentPath = row.parent_path as AgentPath;
   if (row.parent_session_id) run.parentSessionId = row.parent_session_id as SessionId;
-  if (row.parent_thread_id) run.parentThreadId = row.parent_thread_id as ThreadId;
   if (row.child_session_id) run.childSessionId = row.child_session_id as SessionId;
-  if (row.child_thread_id) run.childThreadId = row.child_thread_id as ThreadId;
   if (row.cwd) run.cwd = row.cwd;
   if (row.mode) run.mode = row.mode as NonNullable<AgentRunRow["mode"]>;
   if (row.completed_at) run.completedAt = row.completed_at;
@@ -3407,8 +4070,9 @@ function agentMailboxFromRow(row: AgentMailboxProjectionRow): AgentMailboxRow {
     createdAt: row.created_at,
   };
   if (row.task_id) message.taskId = row.task_id as TaskId;
-  if (row.child_session_id) message.childSessionId = row.child_session_id as SessionId;
-  if (row.child_thread_id) message.childThreadId = row.child_thread_id as ThreadId;
+  if (row.recipient_session_id) {
+    message.recipientSessionId = row.recipient_session_id as SessionId;
+  }
   if (row.message_json) {
     message.message = decodeJson<AgentMailboxPayload>(row.message_json, { content: "" });
   }
@@ -3441,7 +4105,6 @@ function teamMemberFromRow(row: TeamMemberProjectionRow): TeamMemberRow {
     updatedAt: row.updated_at,
   };
   if (row.child_session_id) member.childSessionId = row.child_session_id as SessionId;
-  if (row.child_thread_id) member.childThreadId = row.child_thread_id as ThreadId;
   if (row.model) member.model = row.model;
   if (row.tool_scope_json) member.toolScope = decodeJson<string[]>(row.tool_scope_json, []);
   if (row.write_scope_json) member.writeScope = decodeJson<string[]>(row.write_scope_json, []);
@@ -3538,7 +4201,6 @@ function teamMessageDeliveryFromRow(row: TeamMessageDeliveryProjectionRow): Team
     updatedAt: row.updated_at,
   };
   if (row.child_session_id) delivery.childSessionId = row.child_session_id as SessionId;
-  if (row.child_thread_id) delivery.childThreadId = row.child_thread_id as ThreadId;
   if (row.error) delivery.error = row.error;
   if (row.delivered_at) delivery.deliveredAt = row.delivered_at;
   return delivery;

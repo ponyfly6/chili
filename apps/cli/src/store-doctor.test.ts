@@ -38,7 +38,6 @@ test("formatStoreDoctorText surfaces file and largest-payload diagnostics", () =
         id: "event_big",
         type: "tool.call_finished",
         sessionId: "session_hot",
-        threadId: "thread_hot",
         time: 1,
         payloadBytes: 4_096,
       }],
@@ -63,7 +62,6 @@ test("formatStoreDoctorText surfaces file and largest-payload diagnostics", () =
       largestOutputs: [{
         id: "tool_big",
         sessionId: "session_hot",
-        threadId: "thread_hot",
         toolName: "bash",
         status: "completed",
         outputBytes: 12_000,

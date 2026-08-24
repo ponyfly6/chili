@@ -6,7 +6,6 @@ import type {
   AgentRunId,
   SessionId,
   TaskId,
-  ThreadId,
 } from "@chili/protocol";
 import {
   createRuntimeView,
@@ -20,7 +19,6 @@ const theme = resolveTuiTheme("chili-dark", {});
 
 test("the Agents view renders ad-hoc outcomes while the parent is idle and teams are absent", async () => {
   const sessionId = "session_agents_view" as SessionId;
-  const threadId = "thread_agents_view" as ThreadId;
   const items: RuntimeDelegatedAgent[] = [
     delegatedAgent(5, "failed", { error: "provider quota 2062" }),
     delegatedAgent(4, "incomplete", { summary: "needs repository evidence" }),
@@ -37,7 +35,6 @@ test("the Agents view renders ad-hoc outcomes while the parent is idle and teams
     },
     parent: {
       sessionId,
-      threadId,
       status: "idle",
       active: false,
     },
@@ -142,7 +139,6 @@ function delegatedAgent(
     status,
     mode: "background",
     childSessionId: `session_child_${index}` as SessionId,
-    childThreadId: `thread_child_${index}` as ThreadId,
     ...(outcome.summary ? { summary: outcome.summary } : {}),
     ...(outcome.error ? { error: outcome.error } : {}),
     updatedAt: index * 10,

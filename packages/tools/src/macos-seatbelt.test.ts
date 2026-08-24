@@ -1,7 +1,8 @@
 import { access, link, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import type { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createServer } from "node:net";
+import { createServer, type Socket } from "node:net";
 import { expect, test } from "bun:test";
 import type { BashRunRequest } from "./builtins/bash.js";
 import {
@@ -10,6 +11,11 @@ import {
   createMacOsSeatbeltBashRunner,
 } from "./macos-seatbelt.js";
 import type { RunProcessOptions, RunProcessResult } from "./process.js";
+
+type TestServerEvents = Pick<EventEmitter<{
+  connection: [socket: Socket];
+  error: [error: Error];
+}>, "on" | "once">;
 
 test("macOS Seatbelt runner uses a fixed executable and forwards process controls", async () => {
   const workspace = "/tmp";
@@ -209,15 +215,16 @@ macOsTest("macOS Seatbelt protects gitdir pointer targets", async () => {
 macOsTest("macOS Seatbelt blocks loopback network access by default", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-seatbelt-network-"));
   const server = createServer();
+  const events = server as typeof server & TestServerEvents;
   let connections = 0;
-  server.on("connection", (socket) => {
+  events.on("connection", (socket) => {
     connections += 1;
     socket.destroy();
   });
 
   try {
     await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
+      events.once("error", reject);
       server.listen(0, "127.0.0.1", resolve);
     });
     const address = server.address();

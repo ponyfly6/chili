@@ -1,17 +1,15 @@
-import type { MessageId, MessageImageContent, ModelSelection, ModelUsage, ReasoningLevel, ServiceTier, SessionId, ThreadId, TurnId } from "@chili/protocol";
+import type { MessageId, MessageImageContent, ModelSelection, ModelUsage, ReasoningLevel, ServiceTier, SessionId, TurnId } from "@chili/protocol";
 import type { ToolAccessPolicy } from "@chili/tools";
 import type { ContextUsage } from "./context/index.js";
 import type { PromptDebugManifest } from "./prompt/index.js";
 
 export interface CreateSessionInput {
   sessionId?: SessionId;
-  threadId: ThreadId;
   cwd: string;
 }
 
 export interface AppendUserMessageInput {
   sessionId: SessionId;
-  threadId: ThreadId;
   turnId?: TurnId;
   text: string;
   displayText?: string;
@@ -20,7 +18,6 @@ export interface AppendUserMessageInput {
 
 export interface RunTurnInput {
   sessionId: SessionId;
-  threadId: ThreadId;
   turnId?: TurnId;
   cwd: string;
   system?: string[];

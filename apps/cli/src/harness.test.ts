@@ -7,10 +7,11 @@ import {
   type AgentTaskControlService,
   type AgentTreeControlService,
   type PromptFragment,
+  type TeamControlService,
 } from "@chili/core";
-import type { AgentPath, ApprovalId, ChiliEvent, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
+import type { AgentPath, ApprovalId, ChiliEvent, SessionId, TaskId, TeamId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import { SkillRegistry, type Skill } from "@chili/skills";
-import { SqliteEventStore, type AgentTaskRow } from "@chili/store";
+import { SqliteEventStore, type AgentMailboxRow, type AgentTaskRow } from "@chili/store";
 import {
   PolicyApprovalBroker,
   PolicyApprovalState,
@@ -23,7 +24,9 @@ import {
   buildCliChildPromptFragments,
   buildCliPromptFragments,
   createCliHarness,
+  createCompleteTaskController,
   createSubagentControlController,
+  createTeamToolController,
   linkApprovalSessionsFromEvent,
   type CliHarness,
 } from "./harness.js";
@@ -79,12 +82,11 @@ test("CLI harness promptFragments provider includes chili.base", async () => {
 
     const service = harness.service as unknown as {
       options: {
-        promptFragments?: (input: { sessionId: SessionId; threadId: ThreadId; cwd: string }) => Promise<PromptFragment[]> | PromptFragment[];
+        promptFragments?: (input: { sessionId: SessionId; cwd: string }) => Promise<PromptFragment[]> | PromptFragment[];
       };
     };
     const fragments = await service.options.promptFragments?.({
       sessionId: "session_harness" as SessionId,
-      threadId: "thread_harness" as ThreadId,
       cwd: repo,
     });
     expect(fragments?.some((fragment) => fragment.id === "chili.base")).toBe(true);
@@ -146,12 +148,16 @@ test("CLI task tool adapter forwards the tool AbortSignal to task follow-up", as
     id: "task_signal" as TaskId,
     path: "/root/task_signal" as AgentPath,
     taskName: "signal worker",
+    parentSessionId: "session_signal" as SessionId,
     status: "completed",
     generation: 1,
     createdAt: 1,
     updatedAt: 2,
   };
   const tasks = {
+    async getTask() {
+      return task;
+    },
     async followupTask(input: { signal?: AbortSignal }) {
       receivedSignal = input.signal;
       return {
@@ -167,7 +173,6 @@ test("CLI task tool adapter forwards the tool AbortSignal to task follow-up", as
   const context = agentMessageToolContext(
     "/repo",
     "session_signal" as SessionId,
-    "thread_signal" as ThreadId,
   );
 
   await controller.followupTask({ taskId: task.id, prompt: "continue" }, context);
@@ -175,14 +180,357 @@ test("CLI task tool adapter forwards the tool AbortSignal to task follow-up", as
   expect(receivedSignal).toBe(context.signal);
 });
 
-test("CLI agent message controllers bind root and child senders and list nested descendants", async () => {
+test("CLI task and mailbox controls reject targets owned by another root session", async () => {
+  const sessionId = "session_control_current" as SessionId;
+  const otherSessionId = "session_control_other" as SessionId;
+  const currentChildSessionId = "session_control_current_child" as SessionId;
+  const otherChildSessionId = "session_control_other_child" as SessionId;
+  const sharedPath = "/root/shared" as AgentPath;
+  const currentTask: AgentTaskRow = {
+    id: "task_control_current" as TaskId,
+    path: sharedPath,
+    taskName: "current worker",
+    parentSessionId: sessionId,
+    childSessionId: currentChildSessionId,
+    status: "completed",
+    generation: 1,
+    createdAt: 1,
+    updatedAt: 2,
+  };
+  const otherTask: AgentTaskRow = {
+    id: "task_control_other" as TaskId,
+    path: sharedPath,
+    taskName: "other worker",
+    parentSessionId: otherSessionId,
+    childSessionId: otherChildSessionId,
+    status: "completed",
+    generation: 1,
+    createdAt: 1,
+    updatedAt: 2,
+  };
+  const mailbox: AgentMailboxRow[] = [
+    {
+      id: "message_control_current",
+      path: sharedPath,
+      fromPath: "/root" as AgentPath,
+      triggerTurn: false,
+      status: "queued",
+      taskId: currentTask.id,
+      recipientSessionId: currentChildSessionId,
+      createdAt: 1,
+    },
+    {
+      id: "message_control_other",
+      path: sharedPath,
+      fromPath: "/root" as AgentPath,
+      triggerTurn: false,
+      status: "queued",
+      taskId: otherTask.id,
+      recipientSessionId: otherChildSessionId,
+      createdAt: 2,
+    },
+    {
+      id: "message_control_mismatched",
+      path: sharedPath,
+      fromPath: "/root" as AgentPath,
+      triggerTurn: false,
+      status: "queued",
+      taskId: currentTask.id,
+      recipientSessionId: otherChildSessionId,
+      createdAt: 3,
+    },
+  ];
+  let followupCalls = 0;
+  let closeCalls = 0;
+  let consumeCalls = 0;
+  const tasks = {
+    async getTask(taskId: TaskId) {
+      const task = [currentTask, otherTask].find((candidate) => candidate.id === taskId);
+      if (!task) throw new Error(`Agent task not found: ${taskId}`);
+      return task;
+    },
+    async listTasks() {
+      // Deliberately ignore the query so the controller must enforce ownership itself.
+      return [currentTask, otherTask];
+    },
+    async followupTask() {
+      followupCalls += 1;
+      return {
+        task: otherTask,
+        result: { status: "completed", turns: [], finishReason: "stop" },
+      };
+    },
+    async closeTask() {
+      closeCalls += 1;
+      return otherTask;
+    },
+  } as unknown as AgentTaskControlService;
+  const agents = {
+    async mailbox(query?: { messageId?: string }) {
+      return query?.messageId
+        ? mailbox.filter((message) => message.id === query.messageId)
+        : mailbox;
+    },
+    async consumeMailbox() {
+      consumeCalls += 1;
+      return mailbox[0];
+    },
+  } as unknown as AgentTreeControlService;
+  const controller = createSubagentControlController(tasks, agents);
+  const context = agentMessageToolContext("/repo", sessionId);
+
+  await expect(controller.followupTask({
+    taskId: otherTask.id,
+    prompt: "continue foreign work",
+  }, context)).rejects.toThrow(`Agent task is not visible to this session: ${otherTask.id}`);
+  await expect(controller.closeTask({ taskId: otherTask.id }, context)).rejects.toThrow(
+    `Agent task is not visible to this session: ${otherTask.id}`,
+  );
+  expect(followupCalls).toBe(0);
+  expect(closeCalls).toBe(0);
+  expect(await controller.listTasks({ all: true }, context)).toEqual([
+    expect.objectContaining({ taskId: currentTask.id }),
+  ]);
+
+  for (const input of [
+    { all: true },
+    { path: sharedPath },
+  ]) {
+    expect(await controller.listMailbox(input, context)).toEqual([
+      expect.objectContaining({ messageId: "message_control_current" }),
+    ]);
+  }
+  expect(await controller.listMailbox({ taskId: otherTask.id }, context)).toEqual([]);
+  await expect(controller.consumeMailbox({
+    messageId: "message_control_mismatched",
+  }, context)).rejects.toThrow("Mailbox message is not visible to this session");
+  expect(consumeCalls).toBe(0);
+});
+
+test("CLI complete_task cannot complete or abort sibling and foreign runs", async () => {
+  const sessionId = "session_complete_owner" as SessionId;
+  const siblingSessionId = "session_complete_sibling" as SessionId;
+  const otherSessionId = "session_complete_other" as SessionId;
+  const rows: AgentTaskRow[] = [
+    {
+      id: "task_complete_owner" as TaskId,
+      path: "/root/owner" as AgentPath,
+      taskName: "owner",
+      parentSessionId: "session_complete_parent" as SessionId,
+      childSessionId: sessionId,
+      status: "running",
+      generation: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: "task_complete_sibling" as TaskId,
+      path: "/root/sibling" as AgentPath,
+      taskName: "sibling",
+      parentSessionId: "session_complete_parent" as SessionId,
+      childSessionId: siblingSessionId,
+      status: "running",
+      generation: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: "task_complete_foreign" as TaskId,
+      path: "/root/foreign" as AgentPath,
+      taskName: "foreign",
+      parentSessionId: otherSessionId,
+      childSessionId: "session_complete_foreign_child" as SessionId,
+      status: "running",
+      generation: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+  ];
+  let targetRunAbortCalls = 0;
+  const tasks = {
+    async getTask(taskId: TaskId) {
+      const task = rows.find((candidate) => candidate.id === taskId);
+      if (!task) throw new Error(`Agent task not found: ${taskId}`);
+      return task;
+    },
+    async listTasks(query: { childSessionId?: SessionId }) {
+      return rows.filter((task) => task.childSessionId === query.childSessionId);
+    },
+    async completeTask() {
+      targetRunAbortCalls += 1;
+      throw new Error("must not abort target run");
+    },
+  } as unknown as AgentTaskControlService;
+  const fallback = {
+    async completeTask() {
+      targetRunAbortCalls += 1;
+      throw new Error("must not abort fallback run");
+    },
+  } as unknown as import("@chili/tools").SubagentController;
+  const controller = createCompleteTaskController(tasks, fallback);
+  const context = agentMessageToolContext("/repo", sessionId);
+
+  for (const taskId of [rows[1]?.id, rows[2]?.id]) {
+    await expect(controller.completeTask({
+      taskId: taskId as TaskId,
+      summary: "forged completion",
+    }, context)).rejects.toThrow(`Agent task cannot be completed by this session: ${taskId}`);
+  }
+  expect(targetRunAbortCalls).toBe(0);
+});
+
+test("CLI team tools isolate teams and descendant session bindings between roots", async () => {
+  const sessionId = "session_team_scope_current" as SessionId;
+  const otherSessionId = "session_team_scope_other" as SessionId;
+  const teamId = "team_scope_current" as TeamId;
+  const otherTeamId = "team_scope_other" as TeamId;
+  const teamPath = "/root" as AgentPath;
+  const memberPath = "/root/member" as AgentPath;
+  const teamRows = [
+    {
+      id: teamId,
+      sessionId,
+      name: "current team",
+      leadPath: teamPath,
+      status: "active" as const,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: otherTeamId,
+      sessionId: otherSessionId,
+      name: "other team",
+      leadPath: teamPath,
+      status: "active" as const,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+  ];
+  let addMemberCalls = 0;
+  let createTaskCalls = 0;
+  let createTeamCalls = 0;
+  const teams = {
+    async listTeams() {
+      return teamRows;
+    },
+    async members(targetTeamId: TeamId) {
+      const ownerSessionId = targetTeamId === teamId ? sessionId : otherSessionId;
+      return [{
+        teamId: targetTeamId,
+        path: teamPath,
+        name: "lead",
+        role: "leader",
+        status: "running" as const,
+        childSessionId: ownerSessionId,
+        createdAt: 1,
+        updatedAt: 1,
+      }];
+    },
+    async addMember() {
+      addMemberCalls += 1;
+      throw new Error("must not mutate");
+    },
+    async createTeam() {
+      createTeamCalls += 1;
+      throw new Error("must not mutate");
+    },
+    async createTask() {
+      createTaskCalls += 1;
+      throw new Error("must not mutate");
+    },
+  } as unknown as TeamControlService;
+  const directChildSessionId = "session_team_scope_child" as SessionId;
+  const foreignChildSessionId = "session_team_scope_foreign_child" as SessionId;
+  const duplicateChildSessionId = "session_team_scope_duplicate_child" as SessionId;
+  const taskRows: AgentTaskRow[] = [
+    {
+      id: "task_team_scope_child" as TaskId,
+      path: memberPath,
+      taskName: "member",
+      parentSessionId: sessionId,
+      childSessionId: directChildSessionId,
+      status: "completed",
+      generation: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: "task_team_scope_foreign" as TaskId,
+      path: memberPath,
+      taskName: "foreign member",
+      parentSessionId: otherSessionId,
+      childSessionId: foreignChildSessionId,
+      status: "completed",
+      generation: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    ...[0, 1].map((index): AgentTaskRow => ({
+      id: `task_team_scope_duplicate_${index}` as TaskId,
+      path: memberPath,
+      taskName: `duplicate ${index}`,
+      parentSessionId: sessionId,
+      childSessionId: duplicateChildSessionId,
+      status: "completed",
+      generation: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    })),
+  ];
+  const tasks = {
+    async listTasks(query: { childSessionId?: SessionId }) {
+      return taskRows.filter((task) => (
+        query.childSessionId ? task.childSessionId === query.childSessionId : true
+      ));
+    },
+  } as unknown as AgentTaskControlService;
+  const controller = createTeamToolController(teams, tasks, "root");
+  const context = agentMessageToolContext("/repo", sessionId);
+
+  await expect(controller.createTeam({
+    name: "spoofed root team",
+    leadPath: "/root/fake",
+  }, context)).rejects.toThrow("does not match current agent /root");
+  const childController = createTeamToolController(teams, tasks, "child");
+  await expect(childController.createTeam({
+    name: "spoofed child team",
+    leadPath: "/root",
+  }, agentMessageToolContext("/repo", directChildSessionId))).rejects.toThrow(
+    "does not match current agent /root/member",
+  );
+  expect(createTeamCalls).toBe(0);
+
+  expect(await controller.listTeams({}, context)).toEqual([
+    expect.objectContaining({ teamId }),
+  ]);
+  await expect(controller.createTask({
+    teamId: otherTeamId,
+    title: "cross-root mutation",
+  }, context)).rejects.toThrow(`Team is not visible to this session: ${otherTeamId}`);
+  expect(createTaskCalls).toBe(0);
+
+  for (const childSessionId of [
+    foreignChildSessionId,
+    sessionId,
+    duplicateChildSessionId,
+  ]) {
+    await expect(controller.addMember({
+      teamId,
+      path: memberPath,
+      name: "attacker",
+      role: "worker",
+      childSessionId,
+    }, context)).rejects.toThrow("Team member session is not a unique visible descendant");
+  }
+  expect(addMemberCalls).toBe(0);
+});
+
+test("CLI agent message controllers bind senders, list descendants, and isolate root sessions", async () => {
   const root = await mkdtempName();
   const repo = join(root, "repo");
   let harness: CliHarness | undefined;
   const rootSessionId = "session_message_root" as SessionId;
-  const rootThreadId = "thread_message_root" as ThreadId;
   const workerSessionId = "session_message_worker" as SessionId;
-  const workerThreadId = "thread_message_worker" as ThreadId;
 
   try {
     await mkdir(repo, { recursive: true });
@@ -200,9 +548,7 @@ test("CLI agent message controllers bind root and child senders and list nested 
         parentPath: "/root" as AgentPath,
         taskName: "worker",
         parentSessionId: rootSessionId,
-        parentThreadId: rootThreadId,
         childSessionId: workerSessionId,
-        childThreadId: workerThreadId,
       }),
       agentMessageTaskCreated({
         id: "task_message_nested" as TaskId,
@@ -210,9 +556,7 @@ test("CLI agent message controllers bind root and child senders and list nested 
         parentPath: "/root/worker" as AgentPath,
         taskName: "nested-reader",
         parentSessionId: workerSessionId,
-        parentThreadId: workerThreadId,
         childSessionId: "session_message_nested" as SessionId,
-        childThreadId: "thread_message_nested" as ThreadId,
       }),
     ]);
 
@@ -241,20 +585,59 @@ test("CLI agent message controllers bind root and child senders and list nested 
       to: "nested-reader",
       content: "nested context",
       delivery: "queueOnly",
-    }, agentMessageToolContext(repo, rootSessionId, rootThreadId))).resolves.toMatchObject({
+    }, agentMessageToolContext(repo, rootSessionId))).resolves.toMatchObject({
       metadata: { messageId: "message_nested_from_root", from: "/root", to: "/root/worker/reader" },
     });
-    const listed = await rootList?.execute({}, agentMessageToolContext(repo, rootSessionId, rootThreadId));
-    expect(JSON.parse(listed?.output ?? "{}")).toMatchObject({
-      count: 1,
-      messages: [{ message_id: "message_nested_from_root", to_path: "/root/worker/reader" }],
+    await harness.agents.sendMessage({
+      messageId: "message_current_root",
+      from: "/root/worker" as AgentPath,
+      to: "/root",
+      content: "private to the current root session",
+      delivery: "queueOnly",
+      recipientSessionId: rootSessionId,
+      sessionId: workerSessionId,
     });
+    await harness.agents.sendMessage({
+      messageId: "message_other_root",
+      from: "/root" as AgentPath,
+      to: "/root",
+      content: "private to another root session",
+      delivery: "queueOnly",
+      recipientSessionId: "session_message_other_root" as SessionId,
+      sessionId: "session_message_other_root" as SessionId,
+    });
+    await harness.events.append({
+      id: "message_mismatched_scope",
+      type: "agent.message_queued",
+      time: 2 as TimestampMs,
+      sessionId: rootSessionId,
+      payload: {
+        path: "/root" as AgentPath,
+        from: "/root/worker" as AgentPath,
+        triggerTurn: false,
+        taskId: "task_message_worker" as TaskId,
+        recipientSessionId: "session_message_other_root" as SessionId,
+        message: { role: "user", content: "corrupt mixed ownership metadata" },
+      },
+    });
+    const listed = await rootList?.execute({}, agentMessageToolContext(repo, rootSessionId));
+    const listedOutput = JSON.parse(listed?.output ?? "{}") as {
+      count?: number;
+      messages?: Array<{ message_id?: string; to_path?: string }>;
+    };
+    expect(listedOutput.count).toBe(2);
+    expect(listedOutput.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ message_id: "message_nested_from_root", to_path: "/root/worker/reader" }),
+      expect.objectContaining({ message_id: "message_current_root", to_path: "/root" }),
+    ]));
+    expect(listed?.output).not.toContain("message_other_root");
+    expect(listed?.output).not.toContain("message_mismatched_scope");
 
     await expect(childSend?.execute({
       from: "/root",
       to: "parent",
       content: "spoof",
-    }, agentMessageToolContext(repo, workerSessionId, workerThreadId))).rejects.toThrow(
+    }, agentMessageToolContext(repo, workerSessionId))).rejects.toThrow(
       "does not match current agent /root/worker",
     );
     await expect(childSend?.execute({
@@ -263,8 +646,7 @@ test("CLI agent message controllers bind root and child senders and list nested 
     }, agentMessageToolContext(
       repo,
       "session_message_orphan" as SessionId,
-      "thread_message_orphan" as ThreadId,
-    ))).rejects.toThrow("sender is unavailable for child endpoint");
+    ))).rejects.toThrow("sender is unavailable for child session");
   } finally {
     await harness?.close();
     await rm(root, { recursive: true, force: true });
@@ -304,7 +686,6 @@ test("CLI harness keeps failed MCP status out of root and child prompt fragments
 
     type PromptFragmentsProvider = (input: {
       sessionId: SessionId;
-      threadId: ThreadId;
       cwd: string;
     }) => Promise<PromptFragment[]> | PromptFragment[];
     const rootProvider = (harness.service as unknown as {
@@ -321,7 +702,6 @@ test("CLI harness keeps failed MCP status out of root and child prompt fragments
     expect(childProvider).toBeDefined();
     const input = {
       sessionId: "session_mcp_prompt" as SessionId,
-      threadId: "thread_mcp_prompt" as ThreadId,
       cwd: repo,
     };
     const [rootFragments, childFragments] = await Promise.all([
@@ -364,7 +744,6 @@ test("CLI harness approval session linker joins spawned children to the parent g
     type: "agent.spawned",
     time: 1 as TimestampMs,
     sessionId: childSessionId,
-    threadId: "thread_approval_child" as ThreadId,
     payload: {
       runId: "run_approval_child" as never,
       path: "/root/child" as AgentPath,
@@ -400,7 +779,6 @@ test("CLI harness uses the user last model for new workspaces without forcing a 
     });
     const session = await harness.service.createSession({
       sessionId: "session_user_model" as SessionId,
-      threadId: "thread_user_model" as ThreadId,
     });
     const config = await harness.service.getModelConfig(session.sessionId);
 
@@ -430,7 +808,6 @@ test("CLI harness applies default reasoning and service tier", async () => {
     });
     const session = await harness.service.createSession({
       sessionId: "session_default_tier" as SessionId,
-      threadId: "thread_default_tier" as ThreadId,
     });
     const config = await harness.service.getModelConfig(session.sessionId);
 
@@ -469,7 +846,6 @@ test("CLI harness prefers workspace model history over user last model", async (
     });
     const session = await harness.service.createSession({
       sessionId: "session_workspace_model" as SessionId,
-      threadId: "thread_workspace_model" as ThreadId,
     });
     const config = await harness.service.getModelConfig(session.sessionId);
 
@@ -497,7 +873,6 @@ test("CLI harness persists setModel to the user last model state", async () => {
     });
     const session = await harness.service.createSession({
       sessionId: "session_set_model" as SessionId,
-      threadId: "thread_set_model" as ThreadId,
     });
 
     await harness.service.setModel({
@@ -601,7 +976,6 @@ test("CLI runPrompt leaves system prompt selection to the harness service", asyn
     await runPrompt({
       harness,
       sessionId: "session_prompt" as SessionId,
-      threadId: "thread_prompt" as ThreadId,
       prompt: "hello",
       maxTurns: 3,
     });
@@ -618,9 +992,7 @@ test("CLI exact-session resume rejects a subagent session and points to task_fol
   const repo = join(root, "repo");
   let harness: CliHarness | undefined;
   const parentSessionId = "session_cli_parent" as SessionId;
-  const parentThreadId = "thread_cli_parent" as ThreadId;
   const childSessionId = "session_cli_child" as SessionId;
-  const childThreadId = "thread_cli_child" as ThreadId;
   try {
     await mkdir(repo, { recursive: true });
     harness = await createCliHarness({
@@ -636,7 +1008,6 @@ test("CLI exact-session resume rejects a subagent session and points to task_fol
         type: "session.created",
         time: 1 as TimestampMs,
         sessionId: childSessionId,
-        threadId: childThreadId,
         payload: { sessionId: childSessionId, cwd: repo },
       },
       agentMessageTaskCreated({
@@ -645,16 +1016,13 @@ test("CLI exact-session resume rejects a subagent session and points to task_fol
         parentPath: "/root" as AgentPath,
         taskName: "cli child",
         parentSessionId,
-        parentThreadId,
         childSessionId,
-        childThreadId,
       }),
     ]);
 
     await expect(runSessionPrompt({
       harness,
       sessionId: childSessionId,
-      threadId: childThreadId,
       prompt: "resume by raw child session id",
       maxTurns: 1,
     })).rejects.toThrow("Use task_followup for the owning task");
@@ -664,7 +1032,6 @@ test("CLI exact-session resume rejects a subagent session and points to task_fol
       type: "agent.task_completed",
       time: 2 as TimestampMs,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         taskId: "task_cli_child" as TaskId,
         path: "/root/task_cli_child" as AgentPath,
@@ -692,9 +1059,7 @@ test("CLI exact-session resume rejects a pending child before session creation",
   const repo = join(root, "repo");
   let harness: CliHarness | undefined;
   const parentSessionId = "session_cli_pending_parent" as SessionId;
-  const parentThreadId = "thread_cli_pending_parent" as ThreadId;
   const childSessionId = "session_cli_pending_child" as SessionId;
-  const childThreadId = "thread_cli_pending_child" as ThreadId;
   try {
     await mkdir(repo, { recursive: true });
     harness = await createCliHarness({
@@ -710,16 +1075,13 @@ test("CLI exact-session resume rejects a pending child before session creation",
       parentPath: "/root" as AgentPath,
       taskName: "pending CLI child",
       parentSessionId,
-      parentThreadId,
       childSessionId,
-      childThreadId,
     }));
     expect((await harness.events.sessions()).some((session) => session.id === childSessionId)).toBe(false);
 
     await expect(runSessionPrompt({
       harness,
       sessionId: childSessionId,
-      threadId: childThreadId,
       prompt: "resume the capacity-queued child directly",
       maxTurns: 1,
     })).rejects.toThrow("Use task_followup for the owning task");
@@ -748,7 +1110,6 @@ test("CLI session prompts leave harness model defaults to Runtime normalization"
     await runSessionPrompt({
       harness,
       sessionId: "session_normalized_defaults" as SessionId,
-      threadId: "thread_normalized_defaults" as ThreadId,
       prompt: "hello",
       maxTurns: 3,
     });
@@ -780,7 +1141,6 @@ test("CLI runPrompt warns for every output-limit finish reason", async () => {
       await runPrompt({
         harness,
         sessionId: "session_output_limit_warning" as SessionId,
-        threadId: "thread_output_limit_warning" as ThreadId,
         prompt: "hello",
         maxTurns: 1,
       });
@@ -803,7 +1163,6 @@ test("CLI prompt-debug text output shows manifest without content by default", (
 
   expect(text).toContain("totalChars=31");
   expect(text).toContain("sessionId=session_prompt_debug");
-  expect(text).toContain("threadId=thread_prompt_debug");
   expect(text).toContain("cwd=/repo");
   expect(text).toContain("created=true");
   expect(text).toContain("id=debug.project");
@@ -833,7 +1192,6 @@ test("CLI prompt-debug json output is machine-readable and omits content unless 
   const parsed = JSON.parse(formatPromptDebugJson(promptDebugOutput(false))) as Record<string, unknown>;
   expect(parsed).toMatchObject({
     sessionId: "session_prompt_debug",
-    threadId: "thread_prompt_debug",
     cwd: "/repo",
     created: true,
   });
@@ -846,7 +1204,7 @@ test("CLI prompt-debug json output is machine-readable and omits content unless 
   expect(parsedWithContent.fragments?.some((fragment) => fragment.content === "SECRET fragment content")).toBe(true);
 });
 
-test("CLI child prompt fragments only inject follow-up context for the matching child thread", async () => {
+test("CLI child prompt fragments only inject follow-up context for the matching child session", async () => {
   const root = await mkdtempName();
   const home = join(root, "home");
   const repo = join(root, "repo");
@@ -860,15 +1218,14 @@ test("CLI child prompt fragments only inject follow-up context for the matching 
       taskName: "reader",
       generation: 1,
       childSessionId: "session_child" as SessionId,
-      childThreadId: "thread_actual" as ThreadId,
       cwd: repo,
       createdAt: 1,
       updatedAt: 1,
     } satisfies AgentTaskRow;
     const store = {
       agentTasks: async (query?: { childSessionId?: SessionId; limit?: number }) => {
-        expect(query).toMatchObject({ childSessionId: "session_child", limit: 10 });
-        return [task];
+        expect(query?.limit).toBe(10);
+        return query?.childSessionId === task.childSessionId ? [task] : [];
       },
     } as unknown as Parameters<typeof buildCliChildPromptFragments>[0]["store"];
     const common = {
@@ -880,22 +1237,30 @@ test("CLI child prompt fragments only inject follow-up context for the matching 
       projectRoot: repo,
     };
 
-    const mismatched = await buildCliChildPromptFragments({
-      ...common,
-      threadId: "thread_other" as ThreadId,
-    });
+    const mismatched = await buildCliChildPromptFragments({ ...common, sessionId: "session_other" as SessionId });
     expect(mismatched.some((fragment) => fragment.id.startsWith("chili.task.followup."))).toBe(false);
 
-    const matched = await buildCliChildPromptFragments({
-      ...common,
-      threadId: "thread_actual" as ThreadId,
-    });
+    const matched = await buildCliChildPromptFragments(common);
     expect(matched.find((fragment) => fragment.id.startsWith("chili.task.followup."))).toEqual(
       expect.objectContaining({
         id: "chili.task.followup.task_reader",
         layer: "developer",
         source: "runtime",
       }),
+    );
+
+    const duplicateStore = {
+      agentTasks: async () => [
+        task,
+        {
+          ...task,
+          id: "task_duplicate" as TaskId,
+          path: "/root/task_duplicate" as AgentPath,
+        },
+      ],
+    } as unknown as Parameters<typeof buildCliChildPromptFragments>[0]["store"];
+    await expect(buildCliChildPromptFragments({ ...common, store: duplicateStore })).rejects.toThrow(
+      "Agent task metadata invariant violated: child session session_child maps to 2 tasks",
     );
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -911,7 +1276,6 @@ async function writeWorkspaceModelEvent(
   modelSelection: { provider: string; model: string },
 ): Promise<void> {
   const sessionId = "session_previous_model" as SessionId;
-  const threadId = "thread_previous_model" as ThreadId;
   const store = new SqliteEventStore(join(repo, ".chili", "chili.sqlite"));
   const events: ChiliEvent[] = [
     {
@@ -919,7 +1283,6 @@ async function writeWorkspaceModelEvent(
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: repo },
     },
     {
@@ -927,7 +1290,6 @@ async function writeWorkspaceModelEvent(
       type: "session.model_changed",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, modelSelection },
     },
   ];
@@ -944,24 +1306,19 @@ function agentMessageTaskCreated(input: {
   parentPath: AgentPath;
   taskName: string;
   parentSessionId: SessionId;
-  parentThreadId: ThreadId;
   childSessionId: SessionId;
-  childThreadId: ThreadId;
 }): ChiliEvent {
   return {
     id: `event_created_${input.id}`,
     type: "agent.task_created",
     time: 1 as TimestampMs,
     sessionId: input.parentSessionId,
-    threadId: input.parentThreadId,
     payload: {
       taskId: input.id,
       path: input.path,
       parentPath: input.parentPath,
       parentSessionId: input.parentSessionId,
-      parentThreadId: input.parentThreadId,
       childSessionId: input.childSessionId,
-      childThreadId: input.childThreadId,
       taskName: input.taskName,
       cwd: "/repo",
       prompt: "work",
@@ -973,13 +1330,11 @@ function agentMessageTaskCreated(input: {
 function agentMessageToolContext(
   cwd: string,
   sessionId: SessionId,
-  threadId: ThreadId,
 ): ChiliToolExecutionContext {
   const callId = `call_agent_message_${sessionId}` as ToolCallId;
   return {
     cwd,
     sessionId,
-    threadId,
     turnId: `turn_agent_message_${sessionId}` as TurnId,
     callId,
     outputArtifactId: callId,
@@ -1010,7 +1365,6 @@ function skill(name: string, source: Skill["source"] = "project", baseDir?: stri
 function promptDebugOutput(includeContent: boolean): CliPromptDebugOutput {
   const output: CliPromptDebugOutput = {
     sessionId: "session_prompt_debug" as SessionId,
-    threadId: "thread_prompt_debug" as ThreadId,
     cwd: "/repo",
     created: true,
     debug: {

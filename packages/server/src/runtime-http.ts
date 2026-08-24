@@ -1,6 +1,7 @@
 import { DELEGATION_POLICIES, isTransientEvent, RUNTIME_PERMISSION_PROFILE_IDS } from "@chili/protocol";
 import type {
   ChiliEvent,
+  EventEnvelope,
   AgentPath,
   AgentTaskMode,
   AgentTaskStatus,
@@ -34,12 +35,11 @@ import type {
   ReasoningLevel,
   ServiceTier,
   SessionId,
-  ThreadId,
   TaskId,
   TeamId,
   TeamMessageDelivery,
-  ThreadGoal,
-  ThreadGoalStatus,
+  SessionGoal,
+  SessionGoalStatus,
 } from "@chili/protocol";
 import type {
   AgentTreeSnapshot,
@@ -94,19 +94,19 @@ import type {
 import { projectRuntimeAgents } from "./agent-projection.js";
 
 export interface RuntimeHttpService {
-  createSession(input?: { sessionId?: SessionId; threadId?: ThreadId; cwd?: string }): Promise<RuntimeSessionRef>;
+  createSession(input?: { sessionId?: SessionId; cwd?: string }): Promise<RuntimeSessionRef>;
   listModels?(input?: { provider?: string }): Promise<RuntimeModelDescriptor[]>;
   getModelConfig?(sessionId: SessionId): Promise<RuntimeModelConfig>;
-  setModel?(input: { sessionId: SessionId; threadId?: ThreadId; modelSelection: ModelSelection }): Promise<RuntimeModelConfig>;
-  setReasoning?(input: { sessionId: SessionId; threadId?: ThreadId; reasoningLevel: ReasoningLevel }): Promise<RuntimeModelConfig>;
-  setServiceTier?(input: { sessionId: SessionId; threadId?: ThreadId; serviceTier: ServiceTier }): Promise<RuntimeModelConfig>;
+  setModel?(input: { sessionId: SessionId; modelSelection: ModelSelection }): Promise<RuntimeModelConfig>;
+  setReasoning?(input: { sessionId: SessionId; reasoningLevel: ReasoningLevel }): Promise<RuntimeModelConfig>;
+  setServiceTier?(input: { sessionId: SessionId; serviceTier: ServiceTier }): Promise<RuntimeModelConfig>;
   getDelegationConfig?(sessionId: SessionId): Promise<RuntimeDelegationConfig>;
-  setDelegationPolicy?(input: { sessionId: SessionId; threadId?: ThreadId; policy: DelegationPolicy }): Promise<RuntimeDelegationConfig>;
-  getGoal?(input: { sessionId: SessionId; threadId: ThreadId }): Promise<ThreadGoal | undefined>;
-  setGoal?(input: { sessionId: SessionId; threadId: ThreadId; objective: string; tokenBudget?: number; replace?: boolean }): Promise<ThreadGoal>;
-  updateGoal?(input: { sessionId: SessionId; threadId: ThreadId; status?: ThreadGoalStatus; objective?: string; tokenBudget?: number }): Promise<ThreadGoal>;
-  clearGoal?(input: { sessionId: SessionId; threadId: ThreadId }): Promise<{ cleared: boolean; previousGoal?: ThreadGoal }>;
-  assertSessionTurnAllowed(sessionId: SessionId, threadId?: ThreadId): Promise<void>;
+  setDelegationPolicy?(input: { sessionId: SessionId; policy: DelegationPolicy }): Promise<RuntimeDelegationConfig>;
+  getGoal?(input: { sessionId: SessionId }): Promise<SessionGoal | undefined>;
+  setGoal?(input: { sessionId: SessionId; objective: string; tokenBudget?: number; replace?: boolean }): Promise<SessionGoal>;
+  updateGoal?(input: { sessionId: SessionId; status?: SessionGoalStatus; objective?: string; tokenBudget?: number }): Promise<SessionGoal>;
+  clearGoal?(input: { sessionId: SessionId }): Promise<{ cleared: boolean; previousGoal?: SessionGoal }>;
+  assertSessionTurnAllowed(sessionId: SessionId): Promise<void>;
   submitPrompt(input: SubmitPromptInput): Promise<SubmitPromptResult>;
   submitPromptAsync(input: SubmitPromptInput, onError?: RuntimeBackgroundErrorHandler): void;
   interrupt(sessionId: SessionId, reason?: string): Promise<boolean>;
@@ -380,14 +380,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       }
 
       if (route.name === "agents") {
-        const query = {
-          limit: maxBacklogEvents,
-        } as {
-          sessionId?: SessionId;
-          limit: number;
-        };
-        if (route.sessionId) query.sessionId = route.sessionId;
-        const events = await options.store.events(query);
+        const events = await readAllProjectionEvents(options.store, route.sessionId, maxBacklogEvents);
         return json(projectRuntimeAgents(events, route.sessionId));
       }
 
@@ -507,9 +500,8 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "createSession") {
         const body = await readJson<CreateSessionBody>(request);
-        const input: { sessionId?: SessionId; threadId?: ThreadId; cwd?: string } = {};
+        const input: { sessionId?: SessionId; cwd?: string } = {};
         if (body.sessionId) input.sessionId = body.sessionId;
-        if (body.threadId) input.threadId = body.threadId;
         if (body.cwd) input.cwd = body.cwd;
         return json(await options.service.createSession(input), 201);
       }
@@ -556,7 +548,6 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         if (!isModelSelection(body.modelSelection)) throw badRequest("modelSelection with provider and model is required");
         return json(await requireModelControl(options).setModel({
           sessionId: route.sessionId,
-          ...(body.threadId ? { threadId: body.threadId } : {}),
           modelSelection: body.modelSelection,
         }));
       }
@@ -569,7 +560,6 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         }
         return json(await requireModelControl(options).setReasoning({
           sessionId: route.sessionId,
-          ...(body.threadId ? { threadId: body.threadId } : {}),
           reasoningLevel: body.reasoningLevel,
         }));
       }
@@ -582,7 +572,6 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         }
         return json(await requireServiceTierControl(options).setServiceTier({
           sessionId: route.sessionId,
-          ...(body.threadId ? { threadId: body.threadId } : {}),
           serviceTier: body.serviceTier,
         }));
       }
@@ -600,7 +589,6 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         }
         return json(await requireDelegationControl(options).setDelegationPolicy({
           sessionId: route.sessionId,
-          ...(body.threadId ? { threadId: body.threadId } : {}),
           policy: body.policy,
         }));
       }
@@ -608,15 +596,15 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "goal") {
         const goals = requireGoalControl(options);
         if (request.method === "GET") {
+          rejectUnknownQueryParameters(url, []);
           await requireSession(options.store, route.sessionId);
-          const threadId = requiredThreadId(url.searchParams.get("threadId"));
-          const goal = await goals.getGoal({ sessionId: route.sessionId, threadId });
+          const goal = await goals.getGoal({ sessionId: route.sessionId });
           return goal ? json(goal) : new Response(null, { status: 204 });
         }
         if (request.method === "POST") {
           const body = await readJson<GoalBody>(request);
           const input = goalSetInput(route.sessionId, body);
-          await options.service.assertSessionTurnAllowed(route.sessionId, input.threadId);
+          await options.service.assertSessionTurnAllowed(route.sessionId);
           await requireSession(options.store, route.sessionId);
           return json(await goals.setGoal(input), 201);
         }
@@ -624,25 +612,24 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
           const body = await readJson<GoalBody>(request);
           const input = goalUpdateInput(route.sessionId, body);
           if (input.status === undefined || input.status === "active") {
-            await options.service.assertSessionTurnAllowed(route.sessionId, input.threadId);
+            await options.service.assertSessionTurnAllowed(route.sessionId);
           }
           await requireSession(options.store, route.sessionId);
           return json(await goals.updateGoal(input));
         }
         if (request.method === "DELETE") {
+          rejectUnknownQueryParameters(url, []);
           await requireSession(options.store, route.sessionId);
-          const threadId = requiredThreadId(url.searchParams.get("threadId"));
-          return json(await goals.clearGoal({ sessionId: route.sessionId, threadId }));
+          return json(await goals.clearGoal({ sessionId: route.sessionId }));
         }
       }
 
       if (route.name === "prompt" || route.name === "promptAsync") {
         const body = await readJson<PromptBody>(request);
         rejectLegacySystemField(body);
-        if (!body.threadId) throw badRequest("threadId is required");
         const promptImages = parsePromptImages(body.images);
         if (!body.text && promptImages.length === 0) throw badRequest("text is required");
-        await options.service.assertSessionTurnAllowed(route.sessionId, body.threadId);
+        await options.service.assertSessionTurnAllowed(route.sessionId);
         await requireSession(options.store, route.sessionId);
 
         const input = buildSubmitPromptInput(route.sessionId, body, promptImages);
@@ -655,18 +642,16 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         const accepted: RuntimePromptAccepted = {
           status: "accepted",
           sessionId: route.sessionId,
-          threadId: body.threadId,
         };
         return json(accepted, 202);
       }
 
       if (route.name === "commandAsync") {
         const body = await readJson<CommandPromptBody>(request);
-        if (!body.threadId) throw badRequest("threadId is required");
         if (typeof body.name !== "string" || body.name.trim().length === 0) throw badRequest("name is required");
         if (body.args !== undefined && typeof body.args !== "string") throw badRequest("args must be a string when provided");
         if (body.cwd !== undefined && typeof body.cwd !== "string") throw badRequest("cwd must be a string when provided");
-        await options.service.assertSessionTurnAllowed(route.sessionId, body.threadId);
+        await options.service.assertSessionTurnAllowed(route.sessionId);
         await requireSession(options.store, route.sessionId);
 
         const command = await requireCommandControl(options).run({
@@ -678,7 +663,6 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
           ? `/${command.command.name} ${body.args.trim()}`
           : `/${command.command.name}`;
         const input = buildSubmitPromptInput(route.sessionId, {
-          threadId: body.threadId,
           text: command.prompt,
           displayText,
           ...(body.cwd ? { cwd: body.cwd } : {}),
@@ -692,7 +676,6 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         const accepted: RuntimePromptAccepted = {
           status: "accepted",
           sessionId: route.sessionId,
-          threadId: body.threadId,
         };
         return json(accepted, 202);
       }
@@ -731,16 +714,15 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       }
 
       if (route.name === "events") {
+        rejectUnknownQueryParameters(url, ["sessionId", "afterEventId"]);
         const streamOptions: EventStreamOptions = {
           store: options.store,
           request,
           maxBacklogEvents,
         };
         const sessionId = asSessionId(url.searchParams.get("sessionId"));
-        const threadId = asThreadId(url.searchParams.get("threadId"));
         const afterEventId = url.searchParams.get("afterEventId");
         if (sessionId) streamOptions.sessionId = sessionId;
-        if (threadId) streamOptions.threadId = threadId;
         if (afterEventId) streamOptions.afterEventId = afterEventId;
         return await eventStream(streamOptions);
       }
@@ -834,7 +816,6 @@ type Route =
 
 interface CreateSessionBody {
   sessionId?: SessionId;
-  threadId?: ThreadId;
   cwd?: string;
 }
 
@@ -843,7 +824,6 @@ interface RenameSessionBody {
 }
 
 interface PromptBody {
-  threadId?: ThreadId;
   text?: string;
   displayText?: string;
   images?: unknown;
@@ -856,7 +836,6 @@ interface PromptBody {
 }
 
 interface CommandPromptBody {
-  threadId?: ThreadId;
   name?: string;
   args?: string;
   cwd?: string;
@@ -866,27 +845,22 @@ interface CommandPromptBody {
 }
 
 interface ModelBody {
-  threadId?: ThreadId;
   modelSelection?: unknown;
 }
 
 interface ReasoningBody {
-  threadId?: ThreadId;
   reasoningLevel?: unknown;
 }
 
 interface ServiceTierBody {
-  threadId?: ThreadId;
   serviceTier?: unknown;
 }
 
 interface DelegationBody {
-  threadId?: ThreadId;
   policy?: unknown;
 }
 
 interface GoalBody {
-  threadId?: ThreadId;
   objective?: unknown;
   status?: unknown;
   tokenBudget?: unknown;
@@ -941,7 +915,6 @@ interface TaskReconcileStaleBody {
 
 interface TeamContextBody {
   sessionId?: SessionId;
-  threadId?: ThreadId;
 }
 
 interface TeamCreateBody extends TeamContextBody {
@@ -961,7 +934,6 @@ interface TeamMemberBody extends TeamContextBody {
   role?: string;
   status?: unknown;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   model?: string;
   toolScope?: string[];
   writeScope?: string[];
@@ -1047,7 +1019,6 @@ interface EventStreamOptions {
   store: EventStore & EventPublisher;
   request: Request;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   afterEventId?: string;
   maxBacklogEvents: number;
 }
@@ -1186,7 +1157,6 @@ function routeRequest(method: string, pathname: string): Route {
 function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody, parsedImages?: readonly MessageImageContent[]): SubmitPromptInput {
   const input: SubmitPromptInput = {
     sessionId,
-    threadId: body.threadId as ThreadId,
     text: body.text ?? "",
   };
   if (body.displayText) input.displayText = body.displayText;
@@ -1222,24 +1192,20 @@ function metadataStringArray(value: unknown): string[] | undefined {
 
 function goalSetInput(sessionId: SessionId, body: GoalBody): {
   sessionId: SessionId;
-  threadId: ThreadId;
   objective: string;
   tokenBudget?: number;
   replace?: boolean;
 } {
-  const threadId = requiredThreadId(body.threadId);
   if (typeof body.objective !== "string" || body.objective.trim().length === 0) {
     throw badRequest("objective is required");
   }
   const input: {
     sessionId: SessionId;
-    threadId: ThreadId;
     objective: string;
     tokenBudget?: number;
     replace?: boolean;
   } = {
     sessionId,
-    threadId,
     objective: body.objective.trim(),
   };
   const tokenBudget = optionalPositiveInteger(body.tokenBudget, "tokenBudget");
@@ -1250,20 +1216,17 @@ function goalSetInput(sessionId: SessionId, body: GoalBody): {
 
 function goalUpdateInput(sessionId: SessionId, body: GoalBody): {
   sessionId: SessionId;
-  threadId: ThreadId;
-  status?: ThreadGoalStatus;
+  status?: SessionGoalStatus;
   objective?: string;
   tokenBudget?: number;
 } {
   const input: {
     sessionId: SessionId;
-    threadId: ThreadId;
-    status?: ThreadGoalStatus;
+    status?: SessionGoalStatus;
     objective?: string;
     tokenBudget?: number;
   } = {
     sessionId,
-    threadId: requiredThreadId(body.threadId),
   };
   const status = optionalGoalStatus(body.status);
   if (status) input.status = status;
@@ -1281,12 +1244,7 @@ function goalUpdateInput(sessionId: SessionId, body: GoalBody): {
   return input;
 }
 
-function requiredThreadId(value: unknown): ThreadId {
-  if (typeof value !== "string" || value.trim().length === 0) throw badRequest("threadId is required");
-  return value.trim() as ThreadId;
-}
-
-function optionalGoalStatus(value: unknown): ThreadGoalStatus | undefined {
+function optionalGoalStatus(value: unknown): SessionGoalStatus | undefined {
   if (value === undefined) return undefined;
   if (value === "active" || value === "paused" || value === "budgetLimited" || value === "complete") return value;
   throw badRequest("status must be active, paused, budgetLimited, or complete");
@@ -1420,6 +1378,35 @@ function rejectLegacySystemField(body: unknown): void {
   }
 }
 
+function rejectUnknownQueryParameters(url: URL, allowed: readonly string[]): void {
+  const supported = new Set(allowed);
+  for (const key of url.searchParams.keys()) {
+    if (!supported.has(key)) throw badRequest(`Query parameter ${JSON.stringify(key)} is not supported`);
+  }
+}
+
+async function readAllProjectionEvents(
+  store: EventStore,
+  sessionId: SessionId | undefined,
+  requestedPageSize: number,
+): Promise<EventEnvelope[]> {
+  const events: EventEnvelope[] = [];
+  const pageSize = Math.max(1, Math.trunc(requestedPageSize));
+  let afterEventId: string | undefined;
+
+  while (true) {
+    const batch = await store.events({
+      ...(sessionId ? { sessionId } : {}),
+      ...(afterEventId ? { afterEventId } : {}),
+      limit: pageSize,
+    });
+    events.push(...batch);
+    if (batch.length < pageSize) return events;
+    afterEventId = batch.at(-1)?.id;
+    if (!afterEventId) return events;
+  }
+}
+
 async function eventStream(options: EventStreamOptions): Promise<Response> {
   const encoder = new TextEncoder();
   const pending: ChiliEvent[] = [];
@@ -1443,7 +1430,6 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
 
   type BacklogQuery = {
     sessionId?: SessionId;
-    threadId?: ThreadId;
     afterEventId?: string;
     limit: number;
     tail: boolean;
@@ -1451,7 +1437,6 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
   const query = (input: { afterEventId?: string; limit: number; tail: boolean }): BacklogQuery => ({
     ...input,
     ...(options.sessionId ? { sessionId: options.sessionId } : {}),
-    ...(options.threadId ? { threadId: options.threadId } : {}),
   });
 
   unsubscribe = options.store.subscribe((event) => {
@@ -1555,7 +1540,6 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
 
 function matchesEvent(event: ChiliEvent, options: EventStreamOptions): boolean {
   if (options.sessionId && event.sessionId !== options.sessionId) return false;
-  if (options.threadId && event.threadId !== options.threadId) return false;
   return true;
 }
 
@@ -1732,12 +1716,11 @@ function isHttpError(error: unknown): error is HttpError {
   );
 }
 
-function asSessionId(value: string | null): SessionId | undefined {
-  return value ? (value as SessionId) : undefined;
-}
-
-function asThreadId(value: string | null): ThreadId | undefined {
-  return value ? (value as ThreadId) : undefined;
+function asSessionId(value: string | null, parameterName = "sessionId"): SessionId | undefined {
+  if (value === null) return undefined;
+  const normalized = value.trim();
+  if (!normalized) throw badRequest(`${parameterName} must not be empty`);
+  return normalized as SessionId;
 }
 
 function requireModelControl(options: RuntimeHttpHandlerOptions): Required<Pick<RuntimeHttpService, "listModels" | "getModelConfig" | "setModel" | "setReasoning">> {
@@ -1886,11 +1869,12 @@ function requireTeamMerger(options: RuntimeHttpHandlerOptions): RuntimeTeamMerge
 function teamContext(body: TeamContextBody): TeamEventContextInput {
   const input: TeamEventContextInput = {};
   if (body.sessionId) input.sessionId = body.sessionId;
-  if (body.threadId) input.threadId = body.threadId;
   return input;
 }
 
-type TeamEventContextInput = Pick<CreateTeamInput, "sessionId" | "threadId">;
+interface TeamEventContextInput {
+  sessionId?: SessionId;
+}
 
 function mcpAddInput(body: McpAddBody): RuntimeMcpAddServerRequest {
   if (typeof body.name !== "string" || body.name.trim().length === 0) throw badRequest("name is required");
@@ -1955,7 +1939,6 @@ function teamMemberInput(teamId: TeamId, body: TeamMemberBody): AddTeamMemberInp
   const status = teamMemberStatus(body.status);
   if (status) input.status = status;
   if (body.childSessionId) input.childSessionId = body.childSessionId;
-  if (body.childThreadId) input.childThreadId = body.childThreadId;
   if (body.model) input.model = body.model;
   if (body.toolScope) input.toolScope = body.toolScope;
   if (body.writeScope) input.writeScope = body.writeScope;
@@ -2132,7 +2115,7 @@ function agentTreeQueryFromUrl(url: URL): AgentTreeSnapshotQuery {
 function agentRunQueryFromUrl(url: URL): AgentRunQuery {
   const query: AgentRunQuery = {};
   const sessionId = asSessionId(url.searchParams.get("sessionId"));
-  const childSessionId = asSessionId(url.searchParams.get("childSessionId"));
+  const childSessionId = asSessionId(url.searchParams.get("childSessionId"), "childSessionId");
   const path = url.searchParams.get("path");
   const status = url.searchParams.get("status");
   const limit = numberParam(url.searchParams.get("limit"));
@@ -2147,12 +2130,13 @@ function agentRunQueryFromUrl(url: URL): AgentRunQuery {
 }
 
 function mailboxQueryFromUrl(url: URL): AgentMailboxQuery {
+  rejectUnknownQueryParameters(url, ["messageId", "taskId", "status", "path", "recipientSessionId", "limit"]);
   const query: AgentMailboxQuery = {};
   const messageId = url.searchParams.get("messageId");
   const taskId = url.searchParams.get("taskId");
   const status = url.searchParams.get("status");
   const path = url.searchParams.get("path");
-  const childSessionId = asSessionId(url.searchParams.get("childSessionId"));
+  const recipientSessionId = asSessionId(url.searchParams.get("recipientSessionId"), "recipientSessionId");
   const limit = numberParam(url.searchParams.get("limit"));
   if (messageId) query.messageId = messageId;
   if (taskId) query.taskId = taskId as TaskId;
@@ -2160,7 +2144,7 @@ function mailboxQueryFromUrl(url: URL): AgentMailboxQuery {
     query.status = status;
   }
   if (path) query.path = path as AgentPath;
-  if (childSessionId) query.childSessionId = childSessionId;
+  if (recipientSessionId) query.recipientSessionId = recipientSessionId;
   if (limit !== undefined) query.limit = limit;
   return query;
 }
@@ -2168,8 +2152,8 @@ function mailboxQueryFromUrl(url: URL): AgentMailboxQuery {
 function taskQueryFromUrl(url: URL): AgentTaskQuery {
   const query: AgentTaskQuery = {};
   const status = taskStatus(url.searchParams.get("status"));
-  const parentSessionId = asSessionId(url.searchParams.get("parentSessionId"));
-  const childSessionId = asSessionId(url.searchParams.get("childSessionId"));
+  const parentSessionId = asSessionId(url.searchParams.get("parentSessionId"), "parentSessionId");
+  const childSessionId = asSessionId(url.searchParams.get("childSessionId"), "childSessionId");
   const limit = numberParam(url.searchParams.get("limit"));
   if (status) query.status = status;
   if (parentSessionId) query.parentSessionId = parentSessionId;

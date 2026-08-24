@@ -10,7 +10,6 @@ import type {
   PartId,
   SessionId,
   TaskId,
-  ThreadId,
   TimestampMs,
   TurnId,
 } from "@chili/protocol";
@@ -43,7 +42,6 @@ test("follows up an existing task through the child session and records a new ru
 
     expect(runtime.inputs[0]).toMatchObject({
       sessionId: "session_child",
-      threadId: "thread_child",
       cwd: "/repo",
       text: "check the package name again",
       maxTurns: 3,
@@ -54,6 +52,8 @@ test("follows up an existing task through the child session and records a new ru
       id: taskId,
       status: "completed",
       currentRunId: "agent_1",
+      generation: 1,
+      childSessionId: "session_child",
       summary: "follow-up answer",
     });
 
@@ -160,8 +160,7 @@ test("projection-only fallback requeues a failed source mailbox turn", async () 
         taskId,
         path: task.path,
         from: "/root" as AgentPath,
-        childSessionId: task.childSessionId!,
-        childThreadId: task.childThreadId!,
+        recipientSessionId: task.childSessionId!,
         triggerTurn: true,
         message: { role: "user", content: "retry from mailbox" },
       },
@@ -258,7 +257,6 @@ test("consumes a directly claimed follow-up message when runtime submission fail
 
     expect(runtime.inputs[0]).toMatchObject({
       sessionId: "session_child",
-      threadId: "thread_child",
       text: "try the follow-up again",
     });
     expect(await store.agentMailbox({ taskId })).toMatchObject([
@@ -892,13 +890,13 @@ test("two task control services claim a follow-up generation exactly once", asyn
     const serviceA = new AgentTaskControlService({
       store: storeA,
       runtime: runtimeA,
-      createId: createSequentialId(),
+      createId: createSequentialId("service-a"),
       assertDelegationEnabled,
     });
     const serviceB = new AgentTaskControlService({
       store: storeB,
       runtime: runtimeB,
-      createId: createSequentialId(),
+      createId: createSequentialId("service-b"),
       assertDelegationEnabled,
     });
     const outcomeA = serviceA.followupTask({ taskId, text: "race A" })
@@ -950,12 +948,12 @@ test("a permit-queued follow-up cannot retarget a newer terminal generation", as
       store: storeA,
       runtime: runtimeA,
       runLimiter: limiter,
-      createId: createSequentialId(),
+      createId: createSequentialId("queued"),
     });
     const competingService = new AgentTaskControlService({
       store: storeB,
       runtime: runtimeB,
-      createId: createSequentialId(),
+      createId: createSequentialId("competing"),
     });
     const queuedOutcome = queuedService.followupTask({ taskId, text: "stale queued request" })
       .then((value) => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }));
@@ -1037,7 +1035,13 @@ test("reconciles stale running background tasks without touching live task ids",
 
   try {
     await seedTask(store, { taskId: staleTaskId, status: "running", mode: "background", time: 10 as TimestampMs });
-    await seedTask(store, { taskId: liveTaskId, status: "running", mode: "background", time: 20 as TimestampMs });
+    await seedTask(store, {
+      taskId: liveTaskId,
+      status: "running",
+      mode: "background",
+      time: 20 as TimestampMs,
+      childSessionId: "session_child_live" as SessionId,
+    });
     const service = new AgentTaskControlService({
       store,
       runtime,
@@ -1193,6 +1197,7 @@ test("stale reconciliation rechecks task activity after its scan", async () => {
             taskId,
             path: `/root/${taskId}` as AgentPath,
             from: "/root" as AgentPath,
+            recipientSessionId: "session_child" as SessionId,
             triggerTurn: false,
             message: { role: "user", content: "new activity" },
           },
@@ -1265,7 +1270,11 @@ test("waits for any task in a batch and returns every current task record", asyn
 
   try {
     await seedTask(store, { taskId: completedTaskId, status: "completed" });
-    await seedTask(store, { taskId: runningTaskId, status: "running" });
+    await seedTask(store, {
+      taskId: runningTaskId,
+      status: "running",
+      childSessionId: "session_child_running" as SessionId,
+    });
     const service = new AgentTaskControlService({ store, runtime, createId: createSequentialId() });
 
     const result = await service.waitForTasks({
@@ -1298,7 +1307,11 @@ test("batch wait timeout returns partial statuses without losing task handles", 
 
   try {
     await seedTask(store, { taskId: completedTaskId, status: "completed" });
-    await seedTask(store, { taskId: runningTaskId, status: "running" });
+    await seedTask(store, {
+      taskId: runningTaskId,
+      status: "running",
+      childSessionId: "session_child_running" as SessionId,
+    });
     const service = new AgentTaskControlService({
       store,
       runtime,
@@ -1329,12 +1342,16 @@ test("batch wait timeout returns partial statuses without losing task handles", 
 
 async function seedTask(
   store: SqliteEventStore,
-  input: { taskId: TaskId; status: "running" | "completed"; mode?: "one_shot" | "resumable" | "background"; time?: TimestampMs },
+  input: {
+    taskId: TaskId;
+    status: "running" | "completed";
+    mode?: "one_shot" | "resumable" | "background";
+    time?: TimestampMs;
+    childSessionId?: SessionId;
+  },
 ): Promise<void> {
   const parentSessionId = "session_parent" as SessionId;
-  const parentThreadId = "thread_parent" as ThreadId;
-  const childSessionId = "session_child" as SessionId;
-  const childThreadId = "thread_child" as ThreadId;
+  const childSessionId = input.childSessionId ?? ("session_child" as SessionId);
   const runId = `agent_initial_${input.taskId}` as AgentRunId;
   const path = `/root/${input.taskId}` as AgentPath;
   const parentPath = "/root" as AgentPath;
@@ -1347,15 +1364,12 @@ async function seedTask(
       type: "agent.task_created",
       time,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         taskId: input.taskId,
         path,
         parentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId,
-        childThreadId,
         taskName: "reader",
         cwd: "/repo",
         prompt: "read package",
@@ -1367,16 +1381,13 @@ async function seedTask(
       type: "agent.spawned",
       time,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         runId,
         taskId: input.taskId,
         path,
         parentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId,
-        childThreadId,
         taskName: "reader",
         cwd: "/repo",
         mode,
@@ -1390,7 +1401,6 @@ async function seedTask(
       type: "agent.completed",
       time,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         runId,
         taskId: input.taskId,
@@ -1425,7 +1435,6 @@ class FakeTaskRuntime implements AgentTaskPromptRuntime {
       type: "message.created",
       time: 10 as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: { messageId, role: "assistant" },
     });
     await this.store.append({
@@ -1433,7 +1442,6 @@ class FakeTaskRuntime implements AgentTaskPromptRuntime {
       type: "message.part_added",
       time: 10 as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: {
         messageId,
         part: {
@@ -1467,9 +1475,9 @@ class FakeTaskRuntime implements AgentTaskPromptRuntime {
   }
 }
 
-function createSequentialId(): (prefix: string) => string {
+function createSequentialId(namespace?: string): (prefix: string) => string {
   let index = 0;
-  return (prefix) => `${prefix}_${++index}`;
+  return (prefix) => `${prefix}_${namespace ? `${namespace}_` : ""}${++index}`;
 }
 
 async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 500): Promise<void> {

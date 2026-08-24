@@ -8,7 +8,6 @@ const events = [];
 
 for await (const event of router.stream({
   sessionId: "session_probe" as never,
-  threadId: "thread_probe" as never,
   turnId: "turn_probe" as never,
   system: ["Reply with exactly: ok"],
   tools: [],

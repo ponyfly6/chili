@@ -2,10 +2,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { AgentPath, SessionId, TaskId, ThreadId, TimestampMs } from "@chili/protocol";
+import type { AgentPath, SessionId, TaskId, TimestampMs } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import {
   TeamControlService,
+  TeamMemberSessionOwnershipError,
   TeamMemberTargetAmbiguousError,
   TeamMessageConflictError,
   TeamMessageDeliveryError,
@@ -18,7 +19,6 @@ test("creates a persistent team with leader, members, task assignment, claim, an
   const leadPath = "/root" as AgentPath;
   const reviewerPath = "/root/reviewer" as AgentPath;
   const sessionId = "session_team_control" as SessionId;
-  const threadId = "thread_team_control" as ThreadId;
 
   try {
     const service = new TeamControlService({
@@ -29,7 +29,6 @@ test("creates a persistent team with leader, members, task assignment, claim, an
 
     const team = await service.createTeam({
       sessionId,
-      threadId,
       name: "runtime-core",
       leadPath,
       description: "runtime implementation team",
@@ -53,15 +52,21 @@ test("creates a persistent team with leader, members, task assignment, claim, an
       },
     ]);
 
+    await seedMemberTask(store, {
+      taskId: "task_reviewer_agent" as TaskId,
+      path: reviewerPath,
+      parentPath: leadPath,
+      parentSessionId: sessionId,
+      childSessionId: "session_reviewer" as SessionId,
+      time: 9,
+    });
     const reviewer = await service.addMember({
       sessionId,
-      threadId,
       teamId: team.id,
       path: reviewerPath,
       name: "reviewer",
       role: "code-reviewer",
       childSessionId: "session_reviewer" as SessionId,
-      childThreadId: "thread_reviewer" as ThreadId,
       toolScope: ["read", "git_diff"],
       writeScope: ["packages/core"],
     });
@@ -73,14 +78,12 @@ test("creates a persistent team with leader, members, task assignment, claim, an
     });
     const task = await service.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Review team control service",
       createdBy: leadPath,
     });
     const assigned = await service.assignTask({
       sessionId,
-      threadId,
       teamId: team.id,
       taskId: task.id,
       ownerPath: reviewerPath,
@@ -111,8 +114,7 @@ test("creates a persistent team with leader, members, task assignment, claim, an
         fromPath: leadPath,
         triggerTurn: false,
         taskId: task.id,
-        childSessionId: "session_reviewer",
-        childThreadId: "thread_reviewer",
+        recipientSessionId: "session_reviewer",
         message: {
           role: "user",
           content: "Please review the team control service.",
@@ -128,7 +130,6 @@ test("creates a persistent team with leader, members, task assignment, claim, an
 
     const claimed = await service.claimTask({
       sessionId,
-      threadId,
       teamId: team.id,
       taskId: task.id,
       ownerPath: reviewerPath,
@@ -182,7 +183,6 @@ test("creates a persistent team with leader, members, task assignment, claim, an
 
     const completed = await service.updateTask({
       sessionId,
-      threadId,
       teamId: team.id,
       taskId: task.id,
       status: "completed",
@@ -203,6 +203,7 @@ test("creates a persistent team with leader, members, task assignment, claim, an
     expect((await store.events({ limit: 100 })).map((event) => event.type)).toEqual([
       "team.created",
       "team.member_added",
+      "agent.task_created",
       "team.member_added",
       "team.task_created",
       "team.task_assigned",
@@ -223,6 +224,8 @@ test("delivers explicit team messages to agent mailbox when requested", async ()
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
+  const sessionId = "session_delivery_root" as SessionId;
+  const workerSessionId = "session_worker" as SessionId;
 
   try {
     const service = new TeamControlService({
@@ -231,14 +234,21 @@ test("delivers explicit team messages to agent mailbox when requested", async ()
       now: () => 30 as TimestampMs,
     });
 
-    const team = await service.createTeam({ name: "delivery-team", leadPath });
+    const team = await service.createTeam({ sessionId, name: "delivery-team", leadPath });
+    await seedMemberTask(store, {
+      taskId: "task_delivery_worker" as TaskId,
+      path: workerPath,
+      parentPath: leadPath,
+      parentSessionId: sessionId,
+      childSessionId: workerSessionId,
+      time: 29,
+    });
     await service.addMember({
       teamId: team.id,
       path: workerPath,
       name: "worker",
       role: "implementer",
-      childSessionId: "session_worker" as SessionId,
-      childThreadId: "thread_worker" as ThreadId,
+      childSessionId: workerSessionId,
     });
 
     const message = await service.sendMessage({
@@ -264,8 +274,7 @@ test("delivers explicit team messages to agent mailbox when requested", async ()
         path: workerPath,
         fromPath: leadPath,
         triggerTurn: true,
-        childSessionId: "session_worker",
-        childThreadId: "thread_worker",
+        recipientSessionId: "session_worker",
         message: {
           role: "user",
           content: "Please pick up the next step.",
@@ -331,17 +340,26 @@ test("resolves team member names and deduplicates complete message delivery", as
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
+  const sessionId = "session_message_root" as SessionId;
+  const workerSessionId = "session_worker" as SessionId;
 
   try {
     const service = new TeamControlService({ store, now: () => 40 as TimestampMs });
-    const team = await service.createTeam({ name: "message-team", leadPath, leadName: "lead" });
+    const team = await service.createTeam({ sessionId, name: "message-team", leadPath, leadName: "lead" });
+    await seedMemberTask(store, {
+      taskId: "task_message_worker" as TaskId,
+      path: workerPath,
+      parentPath: leadPath,
+      parentSessionId: sessionId,
+      childSessionId: workerSessionId,
+      time: 39,
+    });
     await service.addMember({
       teamId: team.id,
       path: workerPath,
       name: "worker",
       role: "implementer",
-      childSessionId: "session_worker" as SessionId,
-      childThreadId: "thread_worker" as ThreadId,
+      childSessionId: workerSessionId,
     });
     const input = {
       teamId: team.id,
@@ -378,18 +396,26 @@ test("reports ambiguous and closed team message recipients clearly", async () =>
   const dir = await mkdtemp(join(tmpdir(), "chili-team-message-targets-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const leadPath = "/root" as AgentPath;
+  const sessionId = "session_targets_root" as SessionId;
 
   try {
     const service = new TeamControlService({ store, now: () => 50 as TimestampMs });
-    const team = await service.createTeam({ name: "target-team", leadPath });
+    const team = await service.createTeam({ sessionId, name: "target-team", leadPath });
     for (const suffix of ["one", "two"]) {
+      await seedMemberTask(store, {
+        taskId: `task_target_${suffix}` as TaskId,
+        path: `/root/${suffix}` as AgentPath,
+        parentPath: leadPath,
+        parentSessionId: sessionId,
+        childSessionId: `session_${suffix}` as SessionId,
+        time: 49,
+      });
       await service.addMember({
         teamId: team.id,
         path: `/root/${suffix}` as AgentPath,
         name: "worker",
         role: "implementer",
         childSessionId: `session_${suffix}` as SessionId,
-        childThreadId: `thread_${suffix}` as ThreadId,
       });
     }
     await expect(service.sendMessage({
@@ -442,17 +468,27 @@ test("reports ambiguous and closed team message recipients clearly", async () =>
 test("lists team messages in insertion FIFO order when timestamps tie", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-message-fifo-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const sessionId = "session_fifo_root" as SessionId;
+  const workerPath = "/root/worker" as AgentPath;
+  const workerSessionId = "session_worker" as SessionId;
 
   try {
     const service = new TeamControlService({ store, now: () => 60 as TimestampMs });
-    const team = await service.createTeam({ name: "fifo-team", leadPath: "/root" as AgentPath });
+    const team = await service.createTeam({ sessionId, name: "fifo-team", leadPath: "/root" as AgentPath });
+    await seedMemberTask(store, {
+      taskId: "task_fifo_worker" as TaskId,
+      path: workerPath,
+      parentPath: "/root" as AgentPath,
+      parentSessionId: sessionId,
+      childSessionId: workerSessionId,
+      time: 59,
+    });
     await service.addMember({
       teamId: team.id,
-      path: "/root/worker" as AgentPath,
+      path: workerPath,
       name: "worker",
       role: "implementer",
-      childSessionId: "session_worker" as SessionId,
-      childThreadId: "thread_worker" as ThreadId,
+      childSessionId: workerSessionId,
     });
     await service.sendMessage({ teamId: team.id, messageId: "z_first", from: "/root", to: "worker", content: "first" });
     await service.sendMessage({ teamId: team.id, messageId: "a_second", from: "/root", to: "worker", content: "second" });
@@ -485,13 +521,28 @@ test("binds team message sender identity to the calling session", async () => {
       leadPath: rootPath,
       leadName: "lead",
     });
+    await seedMemberTask(store, {
+      taskId: "task_auth_worker" as TaskId,
+      path: workerPath,
+      parentPath: rootPath,
+      parentSessionId: rootSessionId,
+      childSessionId: workerSessionId,
+      time: 69,
+    });
+    await seedMemberTask(store, {
+      taskId: "task_auth_peer" as TaskId,
+      path: peerPath,
+      parentPath: rootPath,
+      parentSessionId: rootSessionId,
+      childSessionId: peerSessionId,
+      time: 69,
+    });
     await service.addMember({
       teamId: team.id,
       path: workerPath,
       name: "worker",
       role: "implementer",
       childSessionId: workerSessionId,
-      childThreadId: "thread_worker" as ThreadId,
     });
     await service.addMember({
       teamId: team.id,
@@ -499,16 +550,14 @@ test("binds team message sender identity to the calling session", async () => {
       name: "peer",
       role: "reviewer",
       childSessionId: peerSessionId,
-      childThreadId: "thread_peer" as ThreadId,
     });
-    await service.addMember({
+    await expect(service.addMember({
       teamId: team.id,
       path: "/root/colliding" as AgentPath,
       name: "colliding",
       role: "legacy-worker",
       childSessionId: rootSessionId,
-      childThreadId: "thread_colliding" as ThreadId,
-    });
+    })).rejects.toBeInstanceOf(TeamMemberSessionOwnershipError);
 
     await expect(service.sendMessage({
       teamId: team.id,
@@ -516,13 +565,6 @@ test("binds team message sender identity to the calling session", async () => {
       from: "worker",
       to: "peer",
       content: "root impersonation",
-    })).rejects.toBeInstanceOf(TeamMessageSenderUnauthorizedError);
-    await expect(service.sendMessage({
-      teamId: team.id,
-      sessionId: rootSessionId,
-      from: "colliding",
-      to: "peer",
-      content: "root session collision impersonation",
     })).rejects.toBeInstanceOf(TeamMessageSenderUnauthorizedError);
     await expect(service.sendMessage({
       teamId: team.id,
@@ -547,21 +589,20 @@ test("binds team message sender identity to the calling session", async () => {
       content: "authorized worker",
     })).resolves.toMatchObject({ fromPath: workerPath, toPath: peerPath });
 
-    await service.addMember({
+    await expect(service.addMember({
       teamId: team.id,
       path: "/root/duplicate-session" as AgentPath,
       name: "duplicate-session",
       role: "legacy-worker",
       childSessionId: workerSessionId,
-      childThreadId: "thread_duplicate" as ThreadId,
-    });
+    })).rejects.toBeInstanceOf(TeamMemberSessionOwnershipError);
     await expect(service.sendMessage({
       teamId: team.id,
       sessionId: workerSessionId,
       from: "worker",
       to: "peer",
-      content: "ambiguous child session",
-    })).rejects.toBeInstanceOf(TeamMessageSenderUnauthorizedError);
+      content: "session remains bound to the original worker",
+    })).resolves.toMatchObject({ fromPath: workerPath, toPath: peerPath });
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -572,7 +613,6 @@ test("routes a worker team message back to the owning lead endpoint", async () =
   const dir = await mkdtemp(join(tmpdir(), "chili-team-message-lead-roundtrip-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const rootSessionId = "session_root" as SessionId;
-  const rootThreadId = "thread_root" as ThreadId;
   const workerSessionId = "session_worker" as SessionId;
   const rootPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
@@ -581,10 +621,17 @@ test("routes a worker team message back to the owning lead endpoint", async () =
     const service = new TeamControlService({ store, now: () => 80 as TimestampMs });
     const team = await service.createTeam({
       sessionId: rootSessionId,
-      threadId: rootThreadId,
       name: "roundtrip-team",
       leadPath: rootPath,
       leadName: "lead",
+    });
+    await seedMemberTask(store, {
+      taskId: "task_roundtrip_worker" as TaskId,
+      path: workerPath,
+      parentPath: rootPath,
+      parentSessionId: rootSessionId,
+      childSessionId: workerSessionId,
+      time: 79,
     });
     await service.addMember({
       teamId: team.id,
@@ -592,7 +639,6 @@ test("routes a worker team message back to the owning lead endpoint", async () =
       name: "worker",
       role: "implementer",
       childSessionId: workerSessionId,
-      childThreadId: "thread_worker" as ThreadId,
     });
 
     const message = await service.sendMessage({
@@ -608,8 +654,7 @@ test("routes a worker team message back to the owning lead endpoint", async () =
     expect(await store.agentMailbox({ path: rootPath })).toEqual([
       expect.objectContaining({
         fromPath: workerPath,
-        childSessionId: rootSessionId,
-        childThreadId: rootThreadId,
+        recipientSessionId: rootSessionId,
         triggerTurn: true,
       }),
     ]);
@@ -618,6 +663,160 @@ test("routes a worker team message back to the owning lead endpoint", async () =
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("team member sessions must have unique descendant task ownership", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-member-session-ownership-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const rootSessionId = "session_owner_root" as SessionId;
+  const workerSessionId = "session_owner_worker" as SessionId;
+  const nestedSessionId = "session_owner_nested" as SessionId;
+  const victimSessionId = "session_other_interactive_root" as SessionId;
+  const rootPath = "/root" as AgentPath;
+  const workerPath = "/root/worker" as AgentPath;
+  const nestedPath = "/root/worker/reader" as AgentPath;
+  const victimPath = "/root/victim" as AgentPath;
+
+  try {
+    const service = new TeamControlService({ store, now: () => 90 as TimestampMs });
+    const team = await service.createTeam({
+      sessionId: rootSessionId,
+      name: "ownership-team",
+      leadPath: rootPath,
+      leadName: "lead",
+    });
+    await store.append({
+      id: "event_other_interactive_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId: victimSessionId,
+      payload: { sessionId: victimSessionId, cwd: "/other" },
+    });
+    await seedMemberTask(store, {
+      taskId: "task_owner_worker" as TaskId,
+      path: workerPath,
+      parentPath: rootPath,
+      parentSessionId: rootSessionId,
+      childSessionId: workerSessionId,
+      time: 2,
+    });
+    await seedMemberTask(store, {
+      taskId: "task_owner_nested" as TaskId,
+      path: nestedPath,
+      parentPath: workerPath,
+      parentSessionId: workerSessionId,
+      childSessionId: nestedSessionId,
+      time: 3,
+    });
+
+    await expect(service.addMember({
+      teamId: team.id,
+      path: workerPath,
+      name: "worker",
+      role: "implementer",
+      childSessionId: workerSessionId,
+    })).resolves.toMatchObject({ path: workerPath, childSessionId: workerSessionId });
+    await expect(service.addMember({
+      teamId: team.id,
+      path: nestedPath,
+      name: "reader",
+      role: "reviewer",
+      childSessionId: nestedSessionId,
+    })).resolves.toMatchObject({ path: nestedPath, childSessionId: nestedSessionId });
+
+    await expect(service.addMember({
+      teamId: team.id,
+      path: victimPath,
+      name: "victim",
+      role: "worker",
+      childSessionId: victimSessionId,
+    })).rejects.toBeInstanceOf(TeamMemberSessionOwnershipError);
+    await expect(service.addMember({
+      teamId: team.id,
+      path: workerPath,
+      name: "worker",
+      role: "implementer",
+      childSessionId: victimSessionId,
+    })).rejects.toBeInstanceOf(TeamMemberSessionOwnershipError);
+    expect(await store.teamMembers({ teamId: team.id, path: workerPath })).toMatchObject([
+      { childSessionId: workerSessionId },
+    ]);
+
+    const corruptStore = new Proxy(store, {
+      get(target, property, receiver) {
+        if (property === "agentTasks") {
+          return async (...args: Parameters<SqliteEventStore["agentTasks"]>) => {
+            const tasks = await target.agentTasks(...args);
+            if (args[0]?.childSessionId !== nestedSessionId || tasks.length !== 1) return tasks;
+            return [...tasks, { ...tasks[0]!, id: "task_duplicate_owner" as TaskId }];
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const corruptService = new TeamControlService({ store: corruptStore, now: () => 91 as TimestampMs });
+    await expect(corruptService.addMember({
+      teamId: team.id,
+      path: nestedPath,
+      name: "reader",
+      role: "reviewer",
+      childSessionId: nestedSessionId,
+    })).rejects.toBeInstanceOf(TeamMemberSessionOwnershipError);
+
+    await store.append({
+      id: "event_corrupt_victim_member",
+      type: "team.member_added",
+      time: 92 as TimestampMs,
+      sessionId: rootSessionId,
+      payload: {
+        teamId: team.id,
+        path: victimPath,
+        name: "victim",
+        role: "worker",
+        childSessionId: victimSessionId,
+      },
+    });
+    await expect(service.sendMessage({
+      teamId: team.id,
+      sessionId: rootSessionId,
+      from: rootPath,
+      to: victimPath,
+      content: "must not wake another interactive session",
+      delivery: "triggerTurn",
+    })).rejects.toBeInstanceOf(TeamMemberSessionOwnershipError);
+    expect(await store.agentMailbox({ recipientSessionId: victimSessionId })).toEqual([]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+async function seedMemberTask(store: SqliteEventStore, input: {
+  taskId: TaskId;
+  path: AgentPath;
+  parentPath: AgentPath;
+  parentSessionId: SessionId;
+  childSessionId: SessionId;
+  time: number;
+}): Promise<void> {
+  await store.append({
+    id: `event_${input.taskId}`,
+    type: "agent.task_created",
+    time: input.time as TimestampMs,
+    sessionId: input.parentSessionId,
+    payload: {
+      taskId: input.taskId,
+      path: input.path,
+      parentPath: input.parentPath,
+      parentSessionId: input.parentSessionId,
+      childSessionId: input.childSessionId,
+      taskName: input.taskId,
+      cwd: "/repo",
+      prompt: `run ${input.taskId}`,
+      mode: "background",
+    },
+  });
+}
 
 function createSequentialId(): (prefix: string) => string {
   let next = 0;

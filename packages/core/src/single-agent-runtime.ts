@@ -12,7 +12,6 @@ import type {
   ServiceTier,
   PartId,
   SessionId,
-  ThreadId,
   TimestampMs,
   ToolCallId,
   ToolResultExecutionContext,
@@ -61,7 +60,6 @@ export interface SingleAgentRuntimeOptions {
 
 interface EventContext {
   sessionId: SessionId;
-  threadId?: ThreadId;
 }
 
 interface PendingToolCall {
@@ -97,7 +95,6 @@ interface CompactionAttemptResult {
 
 export interface CompactContextInput {
   sessionId: SessionId;
-  threadId: ThreadId;
   turnId?: TurnId;
   reason?: "manual" | "token_budget" | "recovery";
   instructions?: string;
@@ -139,10 +136,7 @@ export class SingleAgentRuntime implements AgentRunner {
   async createSession(input: CreateSessionInput): Promise<SessionId> {
     const sessionId = input.sessionId ?? this.id<SessionId>("session");
     await this.append(
-      {
-        sessionId,
-        threadId: input.threadId,
-      },
+      { sessionId },
       "session.created",
       { sessionId, cwd: input.cwd },
     );
@@ -298,7 +292,6 @@ export class SingleAgentRuntime implements AgentRunner {
 
       let modelInput: ModelStreamInput = {
         sessionId: input.sessionId,
-        threadId: input.threadId,
         turnId,
         messages: context.messages,
         tools: context.surface.tools,
@@ -434,7 +427,6 @@ export class SingleAgentRuntime implements AgentRunner {
     if (input.toolMode === "disabled") return [];
     const resolvedPolicy = await this.options.toolPolicyResolver?.resolve({
       sessionId: input.sessionId,
-      threadId: input.threadId,
       turnId,
       cwd: input.cwd,
     });
@@ -654,7 +646,6 @@ export class SingleAgentRuntime implements AgentRunner {
     });
     const compactInput: {
       sessionId: SessionId;
-      threadId: ThreadId;
       turnId: TurnId;
       messages: readonly Message[];
       boundary: CompactionBoundary;
@@ -665,7 +656,6 @@ export class SingleAgentRuntime implements AgentRunner {
       signal?: AbortSignal;
     } = {
       sessionId: input.sessionId,
-      threadId: input.threadId,
       turnId,
       messages,
       boundary,
@@ -1014,7 +1004,6 @@ export class SingleAgentRuntime implements AgentRunner {
   ): Promise<{ part: MessagePart; cancelledError?: Error }> {
     const executeInput = {
       sessionId: input.sessionId,
-      threadId: input.threadId,
       turnId,
       callId: toolCall.callId,
       toolName: toolCall.toolName,
@@ -1116,7 +1105,6 @@ export class SingleAgentRuntime implements AgentRunner {
       sessionId: input.sessionId,
       payload,
     };
-    if (input.threadId) event.threadId = input.threadId;
     await this.options.store.append(event as ChiliEvent);
   }
 

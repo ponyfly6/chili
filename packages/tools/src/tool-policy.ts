@@ -107,7 +107,6 @@ export function toolPolicyContext(input: ExecuteToolInput): ToolPolicyContext {
     turnId: input.turnId,
     cwd: input.cwd,
   };
-  if (input.threadId) context.threadId = input.threadId;
   return context;
 }
 

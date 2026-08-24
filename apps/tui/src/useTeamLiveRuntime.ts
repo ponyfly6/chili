@@ -13,13 +13,12 @@ import {
   type TeamLiveConnectionState,
   type TeamLiveView,
 } from "@chili/sdk";
-import type { ApprovalId, ChiliEvent, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
+import type { ApprovalId, ChiliEvent, SessionId, TaskId, TeamId } from "@chili/protocol";
 
 export interface TeamLiveTuiOptions {
   baseUrl: string;
   teamId?: TeamId;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   cwd?: string;
   streamScope?: "all" | "session";
   runLoop: boolean;
@@ -31,7 +30,6 @@ export interface TeamLiveTuiOptions {
 
 export interface TeamLiveStreamScopeInput {
   sessionId?: SessionId;
-  threadId?: ThreadId;
   streamScope?: "all" | "session";
 }
 
@@ -44,7 +42,6 @@ export function teamLiveStreamInput(
   const input: StreamEventsRequest = { signal };
   if (_scope.streamScope === "session") {
     if (_scope.sessionId) input.sessionId = _scope.sessionId;
-    if (_scope.threadId) input.threadId = _scope.threadId;
   }
   if (afterEventId) input.afterEventId = afterEventId;
   return input;
@@ -156,14 +153,13 @@ export function useTeamLiveRuntime(input: UseTeamLiveRuntimeInput): TeamLiveRunt
       once: options.once,
     };
     if (options.sessionId) request.sessionId = options.sessionId;
-    if (options.threadId) request.threadId = options.threadId;
     if (options.cwd) request.cwd = options.cwd;
     if (options.maxCycles !== undefined) request.maxCycles = options.maxCycles;
     if (options.timeoutMs !== undefined) request.timeoutMs = options.timeoutMs;
     if (options.pollIntervalMs !== undefined) request.pollIntervalMs = options.pollIntervalMs;
     if (signal) request.signal = signal;
     return client.runTeamLoop(request);
-  }, [client, options.cwd, options.maxCycles, options.once, options.pollIntervalMs, options.sessionId, options.threadId, options.timeoutMs]);
+  }, [client, options.cwd, options.maxCycles, options.once, options.pollIntervalMs, options.sessionId, options.timeoutMs]);
 
   const executeAction = useCallback((action: TeamLiveAction) => {
     const key = actionKey(action);
@@ -306,7 +302,6 @@ async function callAction(
     const request: MergeTeamTasksRequest = { teamId: requireTeamId(action.teamId, action.type) };
     if (action.taskId) request.taskId = action.taskId;
     if (options.sessionId) request.sessionId = options.sessionId;
-    if (options.threadId) request.threadId = options.threadId;
     if (options.cwd) request.cwd = options.cwd;
     if (signal) request.signal = signal;
     return client.mergeTeamTasks(request);

@@ -7,7 +7,6 @@ import type {
   ReasoningLevel,
   ServiceTier,
   SessionId,
-  ThreadId,
   TimestampMs,
   TurnId,
 } from "@chili/protocol";
@@ -33,7 +32,6 @@ export interface ContextCompactionOptions {
 
 export interface ContextCompactionInput {
   sessionId: SessionId;
-  threadId: ThreadId;
   turnId: TurnId;
   messages: readonly Message[];
   boundary: CompactionBoundary;
@@ -210,7 +208,6 @@ export class ContextCompactionService {
     const boundedPrompt = budgetSourceText(prompt, this.maxPromptChars);
     const modelInput: ModelStreamInput = {
       sessionId: input.sessionId,
-      threadId: input.threadId,
       turnId: input.turnId,
       messages: [syntheticPromptMessage(input.sessionId, input.turnId, boundedPrompt, this.now())],
       tools: [],

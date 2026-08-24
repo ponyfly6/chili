@@ -10,7 +10,6 @@ import type {
   RuntimeModelDescriptor,
   ServiceTier,
   SessionId,
-  ThreadId,
   ToolDefinition,
   TurnId,
 } from "@chili/protocol";
@@ -65,7 +64,6 @@ export interface ModelRequestLimits {
 
 export interface ModelStreamInput {
   sessionId: SessionId;
-  threadId: ThreadId;
   turnId: TurnId;
   messages: Message[];
   tools: ToolDefinition[];

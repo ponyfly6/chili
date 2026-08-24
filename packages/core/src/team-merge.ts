@@ -1,7 +1,7 @@
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import type { SessionId, TaskId, TeamId, ThreadId, TimestampMs } from "@chili/protocol";
+import type { SessionId, TaskId, TeamId, TimestampMs } from "@chili/protocol";
 import { timestampNow } from "@chili/protocol";
 import type { TeamTaskRow } from "@chili/store";
 import { runProcess } from "@chili/tools";
@@ -48,7 +48,6 @@ export interface TeamMergeInput {
   taskId?: TaskId;
   cwd?: string;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   signal?: AbortSignal;
 }
 
@@ -121,7 +120,6 @@ interface FinalizeMergeInput {
   summary: TeamMergeDiffSummary;
   mergedAt: number;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   error?: string;
   conflicts?: string[];
   reason?: string;
@@ -222,7 +220,6 @@ export class TeamMergeService {
         summary,
         mergedAt,
         ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-        ...(input.threadId ? { threadId: input.threadId } : {}),
         error,
         reason: "missing_worktree",
       });
@@ -246,7 +243,6 @@ export class TeamMergeService {
         summary: patch.summary,
         mergedAt,
         ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-        ...(input.threadId ? { threadId: input.threadId } : {}),
         ...(mainHead ? { mainHead } : {}),
         ...(worktreeHead ? { worktreeHead } : {}),
       });
@@ -264,7 +260,6 @@ export class TeamMergeService {
         summary: patch.summary,
         mergedAt,
         ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-        ...(input.threadId ? { threadId: input.threadId } : {}),
         error: "Main workspace has local changes in files touched by the task patch",
         conflicts,
         ...(mainHead ? { mainHead } : {}),
@@ -283,7 +278,6 @@ export class TeamMergeService {
         summary: patch.summary,
         mergedAt,
         ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-        ...(input.threadId ? { threadId: input.threadId } : {}),
         ...(checked.error ? { error: checked.error } : {}),
         ...(checked.conflicts ? { conflicts: checked.conflicts } : {}),
         ...(mainHead ? { mainHead } : {}),
@@ -325,7 +319,6 @@ export class TeamMergeService {
         summary: patch.summary,
         mergedAt,
         ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-        ...(input.threadId ? { threadId: input.threadId } : {}),
         error: "Main workspace has local changes in files touched by the task patch",
         conflicts,
         ...(mainHead ? { mainHead } : {}),
@@ -344,7 +337,6 @@ export class TeamMergeService {
         summary: patch.summary,
         mergedAt,
         ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-        ...(input.threadId ? { threadId: input.threadId } : {}),
         ...(checked.error ? { error: checked.error } : {}),
         ...(checked.conflicts ? { conflicts: checked.conflicts } : {}),
         ...(mainHead ? { mainHead } : {}),
@@ -376,7 +368,6 @@ export class TeamMergeService {
           summary: patch.summary,
           mergedAt,
           ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-          ...(input.threadId ? { threadId: input.threadId } : {}),
           error,
           ...(mainHead ? { mainHead } : {}),
           ...(worktreeHead ? { worktreeHead } : {}),
@@ -395,7 +386,6 @@ export class TeamMergeService {
       summary: patch.summary,
       mergedAt,
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-      ...(input.threadId ? { threadId: input.threadId } : {}),
       ...(mainHead ? { mainHead } : {}),
       ...(worktreeHead ? { worktreeHead } : {}),
     });
@@ -536,7 +526,6 @@ export class TeamMergeService {
       taskId: input.task.id,
       metadata,
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-      ...(input.threadId ? { threadId: input.threadId } : {}),
     });
   }
 

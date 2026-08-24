@@ -4,7 +4,7 @@ import {
   HttpRuntimeClient,
   isEventCursorResyncRequiredError,
 } from "./client.js";
-import type { SessionId, ThreadId } from "@chili/protocol";
+import type { SessionId } from "@chili/protocol";
 
 test("streamEvents exposes a cursor resync signal for rejected resume cursors", async () => {
   const client = new HttpRuntimeClient({
@@ -63,7 +63,6 @@ test("streamEvents keeps non-resume HTTP conflicts as ordinary errors", async ()
 test("delegation client reads and updates the deterministic session policy endpoint", async () => {
   const requests: Request[] = [];
   const sessionId = "session_1" as SessionId;
-  const threadId = "thread_1" as ThreadId;
   const client = new HttpRuntimeClient({
     baseUrl: "http://chili.test/api",
     fetch: (async (input, init) => {
@@ -83,7 +82,6 @@ test("delegation client reads and updates the deterministic session policy endpo
   });
   expect(await client.setDelegationPolicy({
     sessionId,
-    threadId,
     policy: "proactive",
   })).toEqual({
     sessionId,
@@ -95,5 +93,42 @@ test("delegation client reads and updates the deterministic session policy endpo
     ["GET", "http://chili.test/api/sessions/session_1/delegation"],
     ["POST", "http://chili.test/api/sessions/session_1/delegation"],
   ]);
-  expect(await requests[1]!.json()).toEqual({ threadId: "thread_1", policy: "proactive" });
+  expect(await requests[1]!.json()).toEqual({ policy: "proactive" });
+});
+
+test("mailbox filters by the canonical recipient session query", async () => {
+  const requests: Request[] = [];
+  const recipientSessionId = "session_mailbox_recipient" as SessionId;
+  const client = new HttpRuntimeClient({
+    baseUrl: "http://chili.test/api",
+    fetch: (async (input, init) => {
+      requests.push(new Request(input, init));
+      return Response.json([{
+        id: "mailbox_1",
+        path: "/root/worker",
+        fromPath: "/root",
+        triggerTurn: true,
+        status: "queued",
+        recipientSessionId,
+        createdAt: 1,
+      }]);
+    }) as typeof fetch,
+  });
+
+  expect(await client.mailbox({
+    path: "/root/worker",
+    recipientSessionId,
+    status: "queued",
+    limit: 25,
+  })).toMatchObject([{ recipientSessionId }]);
+
+  const requestUrl = new URL(requests[0]!.url);
+  expect(requestUrl.pathname).toBe("/api/mailbox");
+  expect(Object.fromEntries(requestUrl.searchParams)).toEqual({
+    path: "/root/worker",
+    recipientSessionId,
+    status: "queued",
+    limit: "25",
+  });
+  expect(requestUrl.searchParams.has("childSessionId")).toBe(false);
 });

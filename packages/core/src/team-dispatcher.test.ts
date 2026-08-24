@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { AgentPath, AgentRunId, SessionId, TaskId, ThreadId, TimestampMs, ToolCallId } from "@chili/protocol";
+import type { AgentPath, AgentRunId, SessionId, TaskId, TimestampMs, ToolCallId } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import { LocalSubagentManager, type LocalSubagentRunInput, type LocalSubagentRunResult, type LocalSubagentRunner } from "./subagent.js";
 import { TeamTaskDispatchService } from "./team-dispatcher.js";
@@ -16,7 +16,6 @@ test("dispatches a one-shot team task to a local subagent and syncs the final re
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_dispatch" as SessionId;
-  const threadId = "thread_team_dispatch" as ThreadId;
   const runner = new FakeLocalSubagentRunner({ status: "completed", summary: "Implemented the task" });
 
   try {
@@ -24,11 +23,10 @@ test("dispatches a one-shot team task to a local subagent and syncs the final re
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "core", leadPath });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const team = await teams.createTeam({ sessionId, name: "core", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
     const task = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Implement dispatch",
       description: "Wire team task to subagent execution.",
@@ -41,7 +39,6 @@ test("dispatches a one-shot team task to a local subagent and syncs the final re
       taskId: task.id,
       mode: "one_shot",
       sessionId,
-      threadId,
       cwd: dir,
     });
 
@@ -86,7 +83,6 @@ test("includes failed verifier feedback in retry prompts and clears stale task e
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_dispatch_verifier_feedback" as SessionId;
-  const threadId = "thread_team_dispatch_verifier_feedback" as ThreadId;
   const runner = new FakeLocalSubagentRunner({ status: "completed", summary: "Fixed verifier feedback" });
 
   try {
@@ -94,11 +90,10 @@ test("includes failed verifier feedback in retry prompts and clears stale task e
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "feedback", leadPath });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const team = await teams.createTeam({ sessionId, name: "feedback", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
     const task = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Retry after verifier failure",
       ownerPath: workerPath,
@@ -111,7 +106,6 @@ test("includes failed verifier feedback in retry prompts and clears stale task e
     });
     await teams.updateTask({
       sessionId,
-      threadId,
       teamId: team.id,
       taskId: task.id,
       error: "verification_failed",
@@ -122,7 +116,6 @@ test("includes failed verifier feedback in retry prompts and clears stale task e
       taskId: task.id,
       mode: "one_shot",
       sessionId,
-      threadId,
       cwd: dir,
     });
 
@@ -147,7 +140,6 @@ test("applies one concurrent background sync and fences stale sync after verifie
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/verifier" as AgentPath;
   const sessionId = "session_team_background" as SessionId;
-  const threadId = "thread_team_background" as ThreadId;
   const runner = new DeferredLocalSubagentRunner({ status: "completed", summary: "Verified independently" });
 
   try {
@@ -155,11 +147,10 @@ test("applies one concurrent background sync and fences stale sync after verifie
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "review", leadPath });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "verifier", role: "reviewer" });
+    const team = await teams.createTeam({ sessionId, name: "review", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "verifier", role: "reviewer" });
     const task = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Verify runtime",
       ownerPath: workerPath,
@@ -170,7 +161,6 @@ test("applies one concurrent background sync and fences stale sync after verifie
       taskId: task.id,
       mode: "background",
       sessionId,
-      threadId,
       cwd: dir,
     });
     expect(dispatched.status).toBe("running");
@@ -185,7 +175,6 @@ test("applies one concurrent background sync and fences stale sync after verifie
         agentPath: dispatchedAgentTask.path,
         runId: dispatchedAgentTask.runId,
         childSessionId: dispatchedAgentTask.childSessionId,
-        childThreadId: dispatchedAgentTask.childThreadId,
         mode: "background",
         dispatchedAt: 200,
         agentStatus: "pending",
@@ -214,8 +203,8 @@ test("applies one concurrent background sync and fences stale sync after verifie
     runner.complete();
     await subagents.waitForBackgroundTasks();
     const syncs = await Promise.all([
-      dispatcher.syncTask({ teamId: team.id, taskId: task.id, sessionId, threadId }),
-      dispatcher.syncTask({ teamId: team.id, taskId: task.id, sessionId, threadId }),
+      dispatcher.syncTask({ teamId: team.id, taskId: task.id, sessionId }),
+      dispatcher.syncTask({ teamId: team.id, taskId: task.id, sessionId }),
     ]);
     expect(syncs.filter((result) => result.applied)).toHaveLength(1);
     expect(syncs.filter((result) => !result.applied)).toMatchObject([{ reason: "team_already_final" }]);
@@ -240,7 +229,6 @@ test("applies one concurrent background sync and fences stale sync after verifie
         agentPath: dispatchedAgentTask.path,
         runId: dispatchedAgentTask.runId,
         childSessionId: dispatchedAgentTask.childSessionId,
-        childThreadId: dispatchedAgentTask.childThreadId,
         mode: "background",
         dispatchedAt: 200,
         agentStatus: "completed",
@@ -272,7 +260,6 @@ test("applies one concurrent background sync and fences stale sync after verifie
       error: "verification_failed",
       metadata: reopenedMetadata,
       sessionId,
-      threadId,
     });
     const terminalAgentTask = synced.agentTask;
     if (!terminalAgentTask?.currentRunId || terminalAgentTask.status !== "completed") {
@@ -289,7 +276,6 @@ test("applies one concurrent background sync and fences stale sync after verifie
       ...(terminalAgentTask.summary ? { summary: terminalAgentTask.summary } : {}),
       metadata: synced.teamTask.metadata ?? {},
       sessionId,
-      threadId,
     });
     expect(stale).toMatchObject({
       applied: false,
@@ -314,7 +300,6 @@ for (const maxConcurrency of [1, 2]) {
     const now = () => 205 as TimestampMs;
     const leadPath = "/root" as AgentPath;
     const sessionId = `session_team_batch_cap_${maxConcurrency}` as SessionId;
-    const threadId = `thread_team_batch_cap_${maxConcurrency}` as ThreadId;
     const sourceCallId = `call_team_batch_cap_${maxConcurrency}` as ToolCallId;
     const batchId = sourceCallId;
     const runner = new RollingDeferredLocalSubagentRunner();
@@ -324,13 +309,12 @@ for (const maxConcurrency of [1, 2]) {
       const teams = new TeamControlService({ store, createId: ids, now });
       subagents = new LocalSubagentManager({ store, runner, createId: ids, now, maxActiveRuns: 5 });
       const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
-      const team = await teams.createTeam({ sessionId, threadId, name: `batch-cap-${maxConcurrency}`, leadPath });
+      const team = await teams.createTeam({ sessionId, name: `batch-cap-${maxConcurrency}`, leadPath });
       const tasks = [];
       for (let index = 0; index < 5; index++) {
         const ownerPath = `/root/batch-worker-${index}` as AgentPath;
         await teams.addMember({
           sessionId,
-          threadId,
           teamId: team.id,
           path: ownerPath,
           name: `batch-worker-${index}`,
@@ -338,7 +322,6 @@ for (const maxConcurrency of [1, 2]) {
         });
         tasks.push(await teams.createTask({
           sessionId,
-          threadId,
           teamId: team.id,
           title: `Batch task ${index}`,
           ownerPath,
@@ -350,7 +333,6 @@ for (const maxConcurrency of [1, 2]) {
         taskId: task.id,
         mode: "background",
         sessionId,
-        threadId,
         cwd: dir,
         sourceCallId,
         batchId,
@@ -410,7 +392,6 @@ test("syncs an incomplete child as a blocked team task with an actionable error"
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/reviewer" as AgentPath;
   const sessionId = "session_team_incomplete" as SessionId;
-  const threadId = "thread_team_incomplete" as ThreadId;
   const runner = new DeferredLocalSubagentRunner({
     status: "incomplete",
     summary: "I'll inspect the repository next.",
@@ -421,10 +402,9 @@ test("syncs an incomplete child as a blocked team task with an actionable error"
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "incomplete", leadPath });
+    const team = await teams.createTeam({ sessionId, name: "incomplete", leadPath });
     await teams.addMember({
       sessionId,
-      threadId,
       teamId: team.id,
       path: workerPath,
       name: "reviewer",
@@ -432,7 +412,6 @@ test("syncs an incomplete child as a blocked team task with an actionable error"
     });
     const task = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Inspect architecture",
       ownerPath: workerPath,
@@ -443,7 +422,6 @@ test("syncs an incomplete child as a blocked team task with an actionable error"
       taskId: task.id,
       mode: "background",
       sessionId,
-      threadId,
       cwd: dir,
     });
     expect(dispatched).toMatchObject({
@@ -454,7 +432,7 @@ test("syncs an incomplete child as a blocked team task with an actionable error"
     await runner.started;
     runner.complete();
     await subagents.waitForBackgroundTasks();
-    const synced = await dispatcher.syncTask({ teamId: team.id, taskId: task.id, sessionId, threadId });
+    const synced = await dispatcher.syncTask({ teamId: team.id, taskId: task.id, sessionId });
 
     expect(synced).toMatchObject({
       applied: true,
@@ -475,7 +453,7 @@ test("syncs an incomplete child as a blocked team task with an actionable error"
       },
     });
     expect(await store.teamMembers({ teamId: team.id, path: workerPath })).toMatchObject([{ status: "idle" }]);
-    const duplicate = await dispatcher.syncTask({ teamId: team.id, taskId: task.id, sessionId, threadId });
+    const duplicate = await dispatcher.syncTask({ teamId: team.id, taskId: task.id, sessionId });
     expect(duplicate).toMatchObject({
       applied: false,
       reason: "team_not_in_progress",
@@ -502,7 +480,6 @@ test("reports skipped reasons for dispatch, sync, and reconcile", async () => {
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_skips" as SessionId;
-  const threadId = "thread_team_skips" as ThreadId;
   const runner = new FakeLocalSubagentRunner({ status: "completed", summary: "should not run" });
 
   try {
@@ -510,16 +487,15 @@ test("reports skipped reasons for dispatch, sync, and reconcile", async () => {
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "skips", leadPath });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const team = await teams.createTeam({ sessionId, name: "skips", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
     const unownedTask = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Missing owner",
     });
 
-    const dispatchSkipped = await dispatcher.dispatchTask({ teamId: team.id, taskId: unownedTask.id, sessionId, threadId });
+    const dispatchSkipped = await dispatcher.dispatchTask({ teamId: team.id, taskId: unownedTask.id, sessionId });
     expect(dispatchSkipped).toMatchObject({
       status: "skipped",
       reason: "missing_owner",
@@ -527,7 +503,7 @@ test("reports skipped reasons for dispatch, sync, and reconcile", async () => {
     });
     expect(runner.runs).toEqual([]);
 
-    const syncSkipped = await dispatcher.syncTask({ teamId: team.id, taskId: unownedTask.id, sessionId, threadId });
+    const syncSkipped = await dispatcher.syncTask({ teamId: team.id, taskId: unownedTask.id, sessionId });
     expect(syncSkipped).toMatchObject({
       applied: false,
       reason: "not_dispatched",
@@ -536,7 +512,6 @@ test("reports skipped reasons for dispatch, sync, and reconcile", async () => {
 
     const missingAgentTask = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Missing agent task",
       ownerPath: workerPath,
@@ -548,7 +523,6 @@ test("reports skipped reasons for dispatch, sync, and reconcile", async () => {
           runId: "agentrun_missing_agent" as AgentRunId,
           generation: 2,
           childSessionId: "session_missing_agent" as SessionId,
-          childThreadId: "thread_missing_agent" as ThreadId,
           mode: "background",
           dispatchedAt: 100,
           agentStatus: "running",
@@ -556,7 +530,7 @@ test("reports skipped reasons for dispatch, sync, and reconcile", async () => {
       },
     });
 
-    const reconciled = await dispatcher.reconcileTasks({ teamId: team.id, sessionId, threadId });
+    const reconciled = await dispatcher.reconcileTasks({ teamId: team.id, sessionId });
     expect(reconciled).toMatchObject({
       scanned: 1,
       synced: [],
@@ -584,7 +558,6 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
   const workerPath = "/root/worker" as AgentPath;
   const reviewerPath = "/root/reviewer" as AgentPath;
   const sessionId = "session_team_policy" as SessionId;
-  const threadId = "thread_team_policy" as ThreadId;
   const runner = new FakeLocalSubagentRunner({ status: "completed", summary: "policy ok" });
 
   try {
@@ -592,10 +565,9 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "policy", leadPath });
+    const team = await teams.createTeam({ sessionId, name: "policy", leadPath });
     await teams.addMember({
       sessionId,
-      threadId,
       teamId: team.id,
       path: workerPath,
       name: "worker",
@@ -605,7 +577,6 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
     });
     await teams.addMember({
       sessionId,
-      threadId,
       teamId: team.id,
       path: reviewerPath,
       name: "reviewer",
@@ -615,7 +586,6 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
 
     const blockedByDependency = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Needs setup",
       ownerPath: workerPath,
@@ -625,7 +595,6 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
       teamId: team.id,
       taskId: blockedByDependency.id,
       sessionId,
-      threadId,
       cwd: dir,
     });
     expect(dependencyResult).toMatchObject({
@@ -636,7 +605,6 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
 
     const missingMemberTask = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Missing member",
       ownerPath: "/root/missing" as AgentPath,
@@ -645,7 +613,6 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
       teamId: team.id,
       taskId: missingMemberTask.id,
       sessionId,
-      threadId,
       cwd: dir,
     });
     expect(missingMember).toMatchObject({
@@ -661,7 +628,6 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
 
     const scopeMismatchTask = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Outside scope",
       ownerPath: workerPath,
@@ -671,7 +637,6 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
       teamId: team.id,
       taskId: scopeMismatchTask.id,
       sessionId,
-      threadId,
       cwd: dir,
     });
     expect(scopeMismatch).toMatchObject({
@@ -701,7 +666,6 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
 
     const scopedWriteTask = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Scoped writer",
       ownerPath: workerPath,
@@ -712,7 +676,6 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
       taskId: scopedWriteTask.id,
       mode: "one_shot",
       sessionId,
-      threadId,
       cwd: dir,
     });
     expect(scopedWrite).toMatchObject({
@@ -743,7 +706,6 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
 
     const existingWriter = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Existing writer",
       ownerPath: reviewerPath,
@@ -755,7 +717,6 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
           agentPath: reviewerPath,
           runId: "agentrun_existing_writer" as AgentRunId,
           childSessionId: "session_existing_writer" as SessionId,
-          childThreadId: "thread_existing_writer" as ThreadId,
           mode: "background",
           dispatchedAt: 200,
           agentStatus: "running",
@@ -764,7 +725,6 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
     });
     const conflictTask = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Overlapping writer",
       ownerPath: workerPath,
@@ -775,7 +735,6 @@ test("gates dispatch by dependencies, member scopes, and write conflicts", async
       taskId: conflictTask.id,
       mode: "one_shot",
       sessionId,
-      threadId,
       cwd: dir,
     });
     expect(conflictDispatch).toMatchObject({
@@ -817,7 +776,6 @@ test("reconciles dispatched background team tasks", async () => {
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/reconciler" as AgentPath;
   const sessionId = "session_team_reconcile" as SessionId;
-  const threadId = "thread_team_reconcile" as ThreadId;
   const runner = new DeferredLocalSubagentRunner({ status: "completed", summary: "Reconciled result" });
 
   try {
@@ -825,18 +783,16 @@ test("reconciles dispatched background team tasks", async () => {
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "reconcile", leadPath });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "reconciler", role: "worker" });
+    const team = await teams.createTeam({ sessionId, name: "reconcile", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "reconciler", role: "worker" });
     const task = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Background task",
       ownerPath: workerPath,
     });
     const plainTask = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Plain in-progress task",
       ownerPath: workerPath,
@@ -848,12 +804,11 @@ test("reconciles dispatched background team tasks", async () => {
       taskId: task.id,
       mode: "background",
       sessionId,
-      threadId,
       cwd: dir,
     });
     await runner.started;
 
-    const beforeComplete = await dispatcher.reconcileTasks({ teamId: team.id, sessionId, threadId });
+    const beforeComplete = await dispatcher.reconcileTasks({ teamId: team.id, sessionId });
     expect(beforeComplete).toMatchObject({
       scanned: 1,
       synced: [],
@@ -863,7 +818,7 @@ test("reconciles dispatched background team tasks", async () => {
 
     runner.complete();
     await subagents.waitForBackgroundTasks();
-    const afterComplete = await dispatcher.reconcileTasks({ teamId: team.id, sessionId, threadId });
+    const afterComplete = await dispatcher.reconcileTasks({ teamId: team.id, sessionId });
 
     expect(afterComplete).toMatchObject({
       scanned: 1,
@@ -904,7 +859,6 @@ test("skips dispatch for dependency-blocked team tasks without spawning a subage
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_dependency_blocked" as SessionId;
-  const threadId = "thread_team_dependency_blocked" as ThreadId;
   const runner = new FakeLocalSubagentRunner({ status: "completed", summary: "should not run" });
 
   try {
@@ -912,18 +866,16 @@ test("skips dispatch for dependency-blocked team tasks without spawning a subage
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "dependency-blocked", leadPath });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const team = await teams.createTeam({ sessionId, name: "dependency-blocked", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
     const setup = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Prepare shared context",
       ownerPath: workerPath,
     });
     const blocked = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Implement after setup",
       ownerPath: workerPath,
@@ -935,7 +887,6 @@ test("skips dispatch for dependency-blocked team tasks without spawning a subage
       taskId: blocked.id,
       mode: "one_shot",
       sessionId,
-      threadId,
       cwd: dir,
     });
 
@@ -965,7 +916,6 @@ test("blocks dispatch when member writeScope or toolScope cannot satisfy task me
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_scope_blocked" as SessionId;
-  const threadId = "thread_team_scope_blocked" as ThreadId;
   const runner = new FakeLocalSubagentRunner({ status: "completed", summary: "should not run" });
 
   try {
@@ -973,10 +923,9 @@ test("blocks dispatch when member writeScope or toolScope cannot satisfy task me
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "scope-blocked", leadPath });
+    const team = await teams.createTeam({ sessionId, name: "scope-blocked", leadPath });
     await teams.addMember({
       sessionId,
-      threadId,
       teamId: team.id,
       path: workerPath,
       name: "worker",
@@ -986,7 +935,6 @@ test("blocks dispatch when member writeScope or toolScope cannot satisfy task me
     });
     const task = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Edit store with shell",
       ownerPath: workerPath,
@@ -1001,7 +949,6 @@ test("blocks dispatch when member writeScope or toolScope cannot satisfy task me
       taskId: task.id,
       mode: "one_shot",
       sessionId,
-      threadId,
       cwd: dir,
     });
 
@@ -1045,7 +992,6 @@ test("blocks dispatch when required write or execute tools lack explicit scopes"
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_required_scope" as SessionId;
-  const threadId = "thread_team_required_scope" as ThreadId;
   const runner = new FakeLocalSubagentRunner({ status: "completed", summary: "should not run" });
 
   try {
@@ -1053,10 +999,9 @@ test("blocks dispatch when required write or execute tools lack explicit scopes"
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "required-scope", leadPath });
+    const team = await teams.createTeam({ sessionId, name: "required-scope", leadPath });
     await teams.addMember({
       sessionId,
-      threadId,
       teamId: team.id,
       path: workerPath,
       name: "worker",
@@ -1067,7 +1012,6 @@ test("blocks dispatch when required write or execute tools lack explicit scopes"
 
     const editTask = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Edit without write scope",
       ownerPath: workerPath,
@@ -1078,7 +1022,6 @@ test("blocks dispatch when required write or execute tools lack explicit scopes"
       taskId: editTask.id,
       mode: "one_shot",
       sessionId,
-      threadId,
       cwd: dir,
     });
     expect(editDispatch).toMatchObject({
@@ -1094,7 +1037,6 @@ test("blocks dispatch when required write or execute tools lack explicit scopes"
 
     const bashTask = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Shell without execute scope",
       ownerPath: workerPath,
@@ -1105,7 +1047,6 @@ test("blocks dispatch when required write or execute tools lack explicit scopes"
       taskId: bashTask.id,
       mode: "one_shot",
       sessionId,
-      threadId,
       cwd: dir,
     });
     expect(bashDispatch).toMatchObject({
@@ -1134,7 +1075,6 @@ test("skips unavailable members without permanently blocking the task", async ()
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_member_unavailable" as SessionId;
-  const threadId = "thread_team_member_unavailable" as ThreadId;
   const runner = new DeferredLocalSubagentRunner({ status: "completed", summary: "busy task done" });
 
   try {
@@ -1142,18 +1082,16 @@ test("skips unavailable members without permanently blocking the task", async ()
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "member-unavailable", leadPath });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const team = await teams.createTeam({ sessionId, name: "member-unavailable", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
     const runningTask = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Already running",
       ownerPath: workerPath,
     });
     const waitingTask = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Wait for worker",
       ownerPath: workerPath,
@@ -1164,7 +1102,6 @@ test("skips unavailable members without permanently blocking the task", async ()
       taskId: runningTask.id,
       mode: "background",
       sessionId,
-      threadId,
       cwd: dir,
     });
     expect(runningDispatch.status).toBe("running");
@@ -1175,7 +1112,6 @@ test("skips unavailable members without permanently blocking the task", async ()
       taskId: waitingTask.id,
       mode: "one_shot",
       sessionId,
-      threadId,
       cwd: dir,
     });
     expect(waitingDispatch).toMatchObject({
@@ -1215,7 +1151,6 @@ test("blocks dispatch for overlapping running write scopes", async () => {
   const workerPath = "/root/worker" as AgentPath;
   const busyPath = "/root/busy" as AgentPath;
   const sessionId = "session_team_conflicts" as SessionId;
-  const threadId = "thread_team_conflicts" as ThreadId;
   const runner = new FakeLocalSubagentRunner({ status: "completed", summary: "Implemented with conflict noted" });
 
   try {
@@ -1223,20 +1158,18 @@ test("blocks dispatch for overlapping running write scopes", async () => {
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "conflicts", leadPath });
+    const team = await teams.createTeam({ sessionId, name: "conflicts", leadPath });
     await teams.addMember({
       sessionId,
-      threadId,
       teamId: team.id,
       path: workerPath,
       name: "worker",
       role: "implementer",
       writeScope: ["packages/core"],
     });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: busyPath, name: "busy", role: "implementer" });
+    await teams.addMember({ sessionId, teamId: team.id, path: busyPath, name: "busy", role: "implementer" });
     const busyTask = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Touch core broadly",
       ownerPath: busyPath,
@@ -1245,7 +1178,6 @@ test("blocks dispatch for overlapping running write scopes", async () => {
     });
     const task = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Touch a nested core file",
       ownerPath: workerPath,
@@ -1257,7 +1189,6 @@ test("blocks dispatch for overlapping running write scopes", async () => {
       taskId: task.id,
       mode: "one_shot",
       sessionId,
-      threadId,
       cwd: dir,
     });
 

@@ -2,7 +2,7 @@
 import { createCliRenderer, type CliRendererConfig } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { HttpRuntimeClient } from "@chili/sdk";
-import type { SessionId, TeamId, ThreadId } from "@chili/protocol";
+import type { SessionId, TeamId } from "@chili/protocol";
 import { basename, resolve } from "node:path";
 import { ChatShellApp, type ChatShellExitInfo, type ChatShellOptions } from "./ChatShellApp.js";
 import { TeamLiveApp } from "./TeamLiveApp.js";
@@ -38,10 +38,6 @@ export function parseArgs(argv: readonly string[]): TuiOptions | "help" {
     }
     if (arg === "--session" || arg === "--resume") {
       options.sessionId = requireValue(argv, ++index, arg) as SessionId;
-      continue;
-    }
-    if (arg === "--thread") {
-      options.threadId = requireValue(argv, ++index, arg) as ThreadId;
       continue;
     }
     if (arg === "--cwd") {
@@ -96,12 +92,11 @@ function rendererConfig(): CliRendererConfig {
 
 function usage(): string {
   return [
-    "Usage: chili-tui --url <runtime-url> [--team <team-id>] [--resume <session-id>] [--thread <thread-id>]",
+    "Usage: chili-tui --url <runtime-url> [--team <team-id>] [--resume <session-id>]",
     "",
     "Options:",
     "  --resume <session-id> Resume a chat session. Alias for --session.",
     "  --session <session-id> Select a chat session.",
-    "  --thread <thread-id>  Select a chat thread.",
     "  --team-live           Open the team cockpit directly.",
     "  --run-loop             Trigger SDK runTeamLoop for --team.",
     "  --once                 Pass once=true to runTeamLoop.",
@@ -147,9 +142,9 @@ function toError(error: unknown): Error {
 }
 
 export function formatResumeCommand(info: ChatShellExitInfo | undefined): string | undefined {
-  if (!info?.sessionId || !info.threadId) return undefined;
+  if (!info?.sessionId) return undefined;
   const cwd = info.cwd ? ` --cwd ${shellQuote(info.cwd)}` : "";
-  return `chili${cwd} --resume ${shellQuote(info.sessionId)} --thread ${shellQuote(info.threadId)}`;
+  return `chili${cwd} --resume ${shellQuote(info.sessionId)}`;
 }
 
 async function main(): Promise<void> {

@@ -42,7 +42,6 @@ export interface CliArgs {
   host: string;
   port: number;
   resume?: string;
-  threadId?: string;
   snapshotId?: string;
   taskId?: string;
   teamId?: string;
@@ -291,10 +290,6 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       result.resume = requireValue(arg, args);
       continue;
     }
-    if (arg === "--thread") {
-      result.threadId = requireValue(arg, args);
-      continue;
-    }
     if (arg === "--provider") {
       result.provider = requireValue(arg, args);
       continue;
@@ -435,7 +430,7 @@ export function usage(): string {
     "  bun run chili -- mcp remove <server-name>",
     "  bun run chili -- mcp auth <server-name>",
     "  bun run chili -- mcp logout <server-name>",
-    "  bun run chili -- prompt-debug [--resume <session-id>] [--thread <thread-id>] [--text <prompt>] [--content] [--json]",
+    "  bun run chili -- prompt-debug [--resume <session-id>] [--text <prompt>] [--content] [--json]",
     "  bun run chili -- consume <mailbox-message-id>",
     "  bun run chili -- task <task-id>",
     "  bun run chili -- followup <task-id> \"continue this task\"",
@@ -459,7 +454,6 @@ export function usage(): string {
     "  --host <host>       Runtime server host, default 127.0.0.1",
     "  --port <port>       Runtime server port for serve, default 4777",
     "  --resume, -r <id>   Resume a session",
-    "  --thread <id>       Select a thread for prompt-debug",
     "  --provider <name>   Provider name: minimax | deepseek | kimi | zai | codex | openai-codex | codex-api",
     "  --model <pattern>   Provider alias, provider/model, or bare model id; default last selected model, then minimax",
     "  --thinking <level>  Thinking level: off | minimal | low | medium | high | xhigh | max | ultra",

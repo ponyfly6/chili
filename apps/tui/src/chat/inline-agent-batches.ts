@@ -5,7 +5,7 @@ import {
   type RuntimeInlineAgentMessage,
   type TeamLiveView,
 } from "@chili/sdk";
-import type { SessionId, ThreadId } from "@chili/protocol";
+import type { SessionId } from "@chili/protocol";
 import type {
   InlineAgentBatchDisplay,
   InlineAgentDisplay,
@@ -47,14 +47,12 @@ export function inlineAgentBatchesForSession(input: {
   runtimeView: ChiliRuntimeView;
   teamView: TeamLiveView;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   limit?: number;
 }): InlineAgentBatchDisplay[] {
   if (!input.sessionId) return [];
   return [
     ...inlineAgentBatchDisplays(chatAgentBatches(input.runtimeView, {
       sessionId: input.sessionId,
-      ...(input.threadId ? { threadId: input.threadId } : {}),
       limit: input.limit ?? 20,
     })),
     ...inlineTeamBatchDisplays(input.teamView, input.sessionId),

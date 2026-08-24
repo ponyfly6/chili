@@ -6,7 +6,6 @@ import type {
   ChiliEvent,
   SessionId,
   TaskId,
-  ThreadId,
   TimestampMs,
 } from "@chili/protocol";
 import {
@@ -19,14 +18,12 @@ import {
 
 test("ad-hoc agents remain visible when the parent is idle and no persistent team exists", () => {
   const sessionId = "session_ad_hoc_agents" as SessionId;
-  const threadId = "thread_ad_hoc_agents" as ThreadId;
   const events: ChiliEvent[] = [
     {
       id: "event_session",
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -34,21 +31,19 @@ test("ad-hoc agents remain visible when the parent is idle and no persistent tea
       type: "session.status_changed",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, status: "idle" },
     },
-    ...agentLifecycleEvents({ index: 1, sessionId, threadId, status: "completed", summary: "routes mapped" }),
-    ...agentLifecycleEvents({ index: 2, sessionId, threadId, status: "completed", summary: "shell mapped" }),
-    ...agentLifecycleEvents({ index: 3, sessionId, threadId, status: "completed", summary: "workbench mapped" }),
-    ...agentLifecycleEvents({ index: 4, sessionId, threadId, status: "incomplete", summary: "needs repository evidence" }),
-    ...agentLifecycleEvents({ index: 5, sessionId, threadId, status: "failed", error: "provider quota 2062" }),
+    ...agentLifecycleEvents({ index: 1, sessionId, status: "completed", summary: "routes mapped" }),
+    ...agentLifecycleEvents({ index: 2, sessionId, status: "completed", summary: "shell mapped" }),
+    ...agentLifecycleEvents({ index: 3, sessionId, status: "completed", summary: "workbench mapped" }),
+    ...agentLifecycleEvents({ index: 4, sessionId, status: "incomplete", summary: "needs repository evidence" }),
+    ...agentLifecycleEvents({ index: 5, sessionId, status: "failed", error: "provider quota 2062" }),
   ];
 
   const view = reduceRuntimeEvents(events, createRuntimeView());
   const snapshot = runtimeAgentsSnapshot(view, sessionId);
   const status = runtimeDelegationStatus(view, {
     sessionId,
-    threadId,
     generatedAt: "2026-08-19T00:00:00.000Z",
   });
 
@@ -68,7 +63,6 @@ test("ad-hoc agents remain visible when the parent is idle and no persistent tea
 
   expect(status.parent).toMatchObject({
     sessionId,
-    threadId,
     status: "idle",
     active: false,
   });
@@ -108,7 +102,6 @@ test("ad-hoc agents remain visible when the parent is idle and no persistent tea
 function agentLifecycleEvents(input: {
   index: number;
   sessionId: SessionId;
-  threadId: ThreadId;
   status: Exclude<AgentTaskStatus, "pending" | "running">;
   summary?: string;
   error?: string;
@@ -133,15 +126,12 @@ function agentLifecycleEvents(input: {
       type: "agent.task_created",
       time: time as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: {
         taskId,
         path,
         parentPath: "/root" as AgentPath,
         parentSessionId: input.sessionId,
-        parentThreadId: input.threadId,
         childSessionId: `session_child_${input.index}` as SessionId,
-        childThreadId: `thread_child_${input.index}` as ThreadId,
         taskName: `slice ${input.index}`,
         cwd: "/repo",
         prompt: `inspect slice ${input.index}`,
@@ -153,16 +143,13 @@ function agentLifecycleEvents(input: {
       type: "agent.spawned",
       time: (time + 1) as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: {
         runId,
         taskId,
         path,
         parentPath: "/root" as AgentPath,
         parentSessionId: input.sessionId,
-        parentThreadId: input.threadId,
         childSessionId: `session_child_${input.index}` as SessionId,
-        childThreadId: `thread_child_${input.index}` as ThreadId,
         taskName: `slice ${input.index}`,
         cwd: "/repo",
         mode: "background",
@@ -174,7 +161,6 @@ function agentLifecycleEvents(input: {
       type: "agent.task_completed",
       time: (time + 2) as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: terminal,
     },
     {
@@ -182,7 +168,6 @@ function agentLifecycleEvents(input: {
       type: "agent.completed",
       time: (time + 3) as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: terminal,
     },
   ];

@@ -856,7 +856,6 @@ class FakeTeamToolController implements TeamToolController, TeamTaskDispatchTool
         path: input.ownerPath ?? "/worker",
         runId: "run_team",
         childSessionId: "session_child",
-        childThreadId: "thread_child",
         status,
       };
       if (status === "completed") agentTask.summary = "done";

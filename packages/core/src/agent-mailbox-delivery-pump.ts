@@ -171,7 +171,7 @@ export class AgentMailboxDeliveryPump {
       const messages = await this.options.agents.mailbox({
         status: "queued",
         triggerTurn: true,
-        ...(sessionId ? { childSessionId: sessionId } : {}),
+        ...(sessionId ? { recipientSessionId: sessionId } : {}),
         limit: ALL_AGENT_MAILBOX_MESSAGES,
       });
       for (const message of messages) {
@@ -296,8 +296,8 @@ export class AgentMailboxDeliveryPump {
     const candidates = await this.options.agents.mailbox({
       status: "queued",
       triggerTurn: true,
-      ...(message.childSessionId
-        ? { childSessionId: message.childSessionId }
+      ...(message.recipientSessionId
+        ? { recipientSessionId: message.recipientSessionId }
         : { path: message.path }),
       limit: ALL_AGENT_MAILBOX_MESSAGES,
     });
@@ -375,7 +375,7 @@ export class AgentMailboxDeliveryPump {
       this.retryNotBefore.delete(entry.messageId);
       if (this.closed) return;
       const message = entry.message;
-      this.trackWork(() => this.enqueueExisting(message?.childSessionId));
+      this.trackWork(() => this.enqueueExisting(message?.recipientSessionId));
       this.resolveIdleIfReady();
     }, delayMs);
     this.retryTimerByMessage.set(entry.messageId, timer);
@@ -388,7 +388,7 @@ export class AgentMailboxDeliveryPump {
       this.retryTimers.delete(timer);
       this.retryTimerByMessage.delete(entry.messageId);
       if (this.closed) return;
-      this.trackWork(() => this.enqueueExisting(entry.message?.childSessionId));
+      this.trackWork(() => this.enqueueExisting(entry.message?.recipientSessionId));
       this.resolveIdleIfReady();
     }, Math.max(1, delayMs));
     this.retryTimerByMessage.set(entry.messageId, timer);
@@ -506,11 +506,11 @@ interface ActiveMailboxDelivery {
 
 function mailboxRecipientKey(input: {
   path: string;
-  childSessionId?: SessionId;
+  recipientSessionId?: SessionId;
 }): string {
   const route = input.path === ROOT_AGENT_PATH ? "root" : "child";
-  return input.childSessionId
-    ? `${route}\u0000${input.childSessionId}`
+  return input.recipientSessionId
+    ? `${route}\u0000${input.recipientSessionId}`
     : `${route}\u0000path:${input.path}`;
 }
 

@@ -11,8 +11,8 @@ import type {
   Message,
   MessageId,
   SessionId,
-  ThreadGoal,
-  ThreadGoalStatus,
+  SessionGoal,
+  SessionGoalStatus,
   TaskId,
   TeamId,
   TeamMessageDelivery,
@@ -20,16 +20,15 @@ import type {
   TeamMemberStatus,
   TeamMessageKind,
   TeamTaskStatus,
-  ThreadId,
   ToolCallId,
   ToolCallStatus,
+  TurnId,
   ApprovalDecisionAction,
   ApprovalScope,
 } from "@chili/protocol";
 
 export interface EventQuery {
   sessionId?: SessionId;
-  threadId?: ThreadId;
   type?: string;
   afterEventId?: string;
   limit?: number;
@@ -40,7 +39,6 @@ export interface SessionRow {
   id: SessionId;
   cwd: string;
   title?: string;
-  threadId?: ThreadId;
   preview?: string;
   source?: "interactive" | "subagent";
   status: "active" | "archived";
@@ -51,8 +49,7 @@ export interface SessionRow {
 export interface ToolCallRow {
   id: string;
   sessionId?: SessionId;
-  threadId?: ThreadId;
-  turnId?: string;
+  turnId?: TurnId;
   toolName: string;
   status: ToolCallStatus;
   input?: unknown;
@@ -66,7 +63,6 @@ export interface ToolCallRow {
 export interface ApprovalRow {
   id: string;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   callId?: string;
   permission: string;
   patterns: string[];
@@ -79,26 +75,22 @@ export interface ApprovalRow {
   resolvedAt?: number;
 }
 
-export interface ThreadGoalRow extends ThreadGoal {}
+export interface SessionGoalRow extends SessionGoal {}
 
-export interface ThreadGoalQuery {
+export interface SessionGoalQuery {
   sessionId?: SessionId;
-  threadId?: ThreadId;
-  status?: ThreadGoalStatus;
+  status?: SessionGoalStatus;
   limit?: number;
 }
 
 export interface AgentRunRow {
-  id: string;
+  id: AgentRunId;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   taskId?: TaskId;
   path: AgentPath;
   parentPath?: AgentPath;
   parentSessionId?: SessionId;
-  parentThreadId?: ThreadId;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   taskName: string;
   cwd?: string;
   mode?: AgentTaskMode;
@@ -115,9 +107,7 @@ export interface AgentTaskRow {
   generation: number;
   parentPath?: AgentPath;
   parentSessionId?: SessionId;
-  parentThreadId?: ThreadId;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   cwd?: string;
   prompt?: string;
   mode?: AgentTaskMode;
@@ -127,7 +117,7 @@ export interface AgentTaskRow {
   expectedBatchSize?: number;
   completionPolicy?: TaskCompletionPolicy;
   maxConcurrency?: number;
-  currentRunId?: string;
+  currentRunId?: AgentRunId;
   summary?: string;
   error?: string;
   completion?: Record<string, unknown>;
@@ -146,8 +136,7 @@ export interface AgentMailboxRow {
   triggerTurn: boolean;
   status: AgentMailboxStatus;
   taskId?: TaskId;
-  childSessionId?: SessionId;
-  childThreadId?: ThreadId;
+  recipientSessionId?: SessionId;
   message?: AgentMailboxPayload;
   createdAt: number;
   consumedAt?: number;
@@ -177,7 +166,7 @@ export interface AgentMailboxQuery {
   messageId?: string;
   taskId?: TaskId;
   path?: AgentPath;
-  childSessionId?: SessionId;
+  recipientSessionId?: SessionId;
   triggerTurn?: boolean;
   status?: AgentMailboxStatus;
   limit?: number;
@@ -188,7 +177,7 @@ export interface AgentTaskLeaseClaimInput {
   owner: string;
   ttlMs: number;
   now?: number;
-  runId?: string;
+  runId?: AgentRunId;
   generation?: number;
 }
 
@@ -238,7 +227,6 @@ export interface AgentTaskCompleteCasInput {
   /** Event that consumes mailboxMessageId in the same transaction as task/run completion. */
   mailboxConsumeEventId?: string;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   time?: number;
 }
 
@@ -270,7 +258,6 @@ export interface AgentTaskCloseCasInput {
   mailboxDisposition?: "consume" | "requeue";
   mailboxError?: string;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   time?: number;
 }
 
@@ -296,7 +283,6 @@ export interface AgentTaskBeginRunCasInput {
   from?: AgentPath;
   message?: AgentMailboxPayload;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   time?: number;
 }
 
@@ -311,7 +297,6 @@ export interface AgentMailboxClaimInput {
   eventId: string;
   claimedBy?: AgentPath;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   time?: number;
 }
 
@@ -320,7 +305,6 @@ export interface AgentMailboxConsumeInput {
   eventId: string;
   consumedBy?: AgentPath;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   time?: number;
 }
 
@@ -329,7 +313,6 @@ export interface AgentMailboxRequeueInput {
   eventId: string;
   error?: string;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   time?: number;
 }
 
@@ -339,7 +322,6 @@ export interface AgentMailboxDiscardInput {
   discardedBy?: AgentPath;
   reason: string;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   time?: number;
 }
 
@@ -367,7 +349,6 @@ export interface TeamMemberRow {
   role: string;
   status: TeamMemberStatus;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   model?: string;
   toolScope?: string[];
   writeScope?: string[];
@@ -452,7 +433,6 @@ export interface TeamMessageDeliveryRow {
   status: TeamMessageDeliveryStatus;
   triggerTurn: boolean;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   error?: string;
   queuedAt: number;
   updatedAt: number;
@@ -475,7 +455,6 @@ export interface TeamTaskClaimInput {
   eventId: string;
   claimedBy?: AgentPath;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   time?: number;
 }
 
@@ -492,7 +471,6 @@ export interface TeamTaskVerificationClaimInput {
   eventId: string;
   metadata: Record<string, unknown>;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   stalePendingBefore?: number;
   time?: number;
 }
@@ -516,7 +494,6 @@ export interface TeamTaskAgentSyncInput {
   taskEventId: string;
   memberEventId: string;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   summary?: string;
   error?: string;
   time?: number;
@@ -539,8 +516,8 @@ export interface EventStore {
 }
 
 export interface GoalProjectionStore {
-  threadGoal(threadId: ThreadId): Promise<ThreadGoalRow | undefined>;
-  threadGoals(query?: ThreadGoalQuery): Promise<ThreadGoalRow[]>;
+  sessionGoal(sessionId: SessionId): Promise<SessionGoalRow | undefined>;
+  sessionGoals(query?: SessionGoalQuery): Promise<SessionGoalRow[]>;
 }
 
 export interface SubagentProjectionStore {

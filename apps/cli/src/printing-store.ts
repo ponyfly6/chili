@@ -31,6 +31,9 @@ import type {
   ApprovalRow,
   EventQuery,
   EventStore,
+  GoalProjectionStore,
+  SessionGoalQuery,
+  SessionGoalRow,
   SessionRow,
   SubagentProjectionStore,
   TeamMemberQuery,
@@ -55,6 +58,7 @@ import type {
 export class PrintingEventStore
   implements
     EventStore,
+    GoalProjectionStore,
     SubagentProjectionStore,
     AgentTaskLeaseStore,
     AgentTaskCapabilityStore,
@@ -92,6 +96,14 @@ export class PrintingEventStore
 
   pendingApprovals(sessionId?: SessionId): Promise<ApprovalRow[]> {
     return this.inner.pendingApprovals(sessionId);
+  }
+
+  sessionGoal(sessionId: SessionId): Promise<SessionGoalRow | undefined> {
+    return this.goalProjectionStore()?.sessionGoal(sessionId) ?? Promise.resolve(undefined);
+  }
+
+  sessionGoals(query?: SessionGoalQuery): Promise<SessionGoalRow[]> {
+    return this.goalProjectionStore()?.sessionGoals(query) ?? Promise.resolve([]);
   }
 
   agentTasks(query?: AgentTaskQuery): Promise<AgentTaskRow[]> {
@@ -227,6 +239,14 @@ export class PrintingEventStore
     const inner = this.inner as EventStore & Partial<SubagentProjectionStore>;
     if (inner.agentTasks && inner.agentTask && inner.agentRuns && inner.agentMailbox) {
       return inner as SubagentProjectionStore;
+    }
+    return undefined;
+  }
+
+  private goalProjectionStore(): GoalProjectionStore | undefined {
+    const inner = this.inner as EventStore & Partial<GoalProjectionStore>;
+    if (inner.sessionGoal && inner.sessionGoals) {
+      return inner as EventStore & GoalProjectionStore;
     }
     return undefined;
   }

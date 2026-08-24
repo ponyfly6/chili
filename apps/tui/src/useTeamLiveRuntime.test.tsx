@@ -6,7 +6,7 @@ import {
   type HttpRuntimeClient,
   type StreamEventsRequest,
 } from "@chili/sdk";
-import type { ChiliEvent, SessionId, ThreadId, TimestampMs } from "@chili/protocol";
+import type { ChiliEvent, SessionId, TimestampMs } from "@chili/protocol";
 import {
   useTeamLiveRuntime,
   type TeamLiveRuntimeState,
@@ -89,7 +89,6 @@ function sessionCreatedEvent(id: string, sessionId: string, time: number): Chili
     type: "session.created",
     time: time as TimestampMs,
     sessionId: typedSessionId,
-    threadId: `thread_${sessionId}` as ThreadId,
     payload: { sessionId: typedSessionId, cwd: "/repo/chili" },
   };
 }

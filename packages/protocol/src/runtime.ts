@@ -1,4 +1,4 @@
-import type { ApprovalId, MessageId, SessionId, ThreadId, TurnId } from "./ids.js";
+import type { ApprovalId, MessageId, SessionId, TurnId } from "./ids.js";
 import type { ApprovalDecisionAction } from "./tool.js";
 
 export type RuntimeSessionStatus =
@@ -253,14 +253,12 @@ export type RuntimeCommand =
 export interface RuntimeCreateSessionCommand {
   type: "session.create";
   sessionId?: SessionId;
-  threadId?: ThreadId;
   cwd: string;
 }
 
 export interface RuntimeSubmitPromptCommand {
   type: "session.prompt";
   sessionId: SessionId;
-  threadId: ThreadId;
   text: string;
   skillMentions?: RuntimeSkillMention[];
   maxTurns?: number;
@@ -316,13 +314,11 @@ export interface ModelMetadataPayload {
 
 export interface RuntimeSessionRef {
   sessionId: SessionId;
-  threadId: ThreadId;
 }
 
 export interface RuntimePromptAccepted {
   status: "accepted";
   sessionId: SessionId;
-  threadId: ThreadId;
 }
 
 export interface RuntimeInterruptResult {

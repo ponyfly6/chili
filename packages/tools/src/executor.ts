@@ -5,7 +5,6 @@ import type {
   ChiliEvent,
   EventEnvelope,
   SessionId,
-  ThreadId,
   TimestampMs,
   ToolCallId,
   ToolMetadataUpdate,
@@ -248,7 +247,6 @@ export class ToolExecutor {
       return await this.options.snapshotProvider?.create({
         cwd: input.cwd,
         sessionId: input.sessionId,
-        ...(input.threadId ? { threadId: input.threadId } : {}),
         callId,
         toolName: tool.name,
         patterns: spec.patterns,
@@ -367,7 +365,6 @@ export class ToolExecutor {
     let outputSequence = 0;
     return {
       sessionId: input.sessionId,
-      ...(input.threadId ? { threadId: input.threadId } : {}),
       turnId: input.turnId,
       callId,
       outputArtifactId,
@@ -446,7 +443,6 @@ export class ToolExecutor {
       rawDecision = await withAbort(this.options.approvals.decide({
         approvalId,
         sessionId: input.sessionId,
-        ...(input.threadId ? { threadId: input.threadId } : {}),
         callId,
         toolName: tool.name,
         risk: tool.risk,
@@ -496,7 +492,6 @@ export class ToolExecutor {
     }
     return this.options.approvals.preflight({
       sessionId: input.sessionId,
-      ...(input.threadId ? { threadId: input.threadId } : {}),
       callId,
       toolName: tool.name,
       risk: tool.risk,
@@ -588,9 +583,6 @@ export class ToolExecutor {
       sessionId: input.sessionId,
       payload,
     };
-    if (input.threadId) {
-      event.threadId = input.threadId;
-    }
     await this.options.events.publish(event as ChiliEvent);
   }
 

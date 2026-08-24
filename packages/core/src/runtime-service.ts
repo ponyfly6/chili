@@ -15,10 +15,9 @@ import type {
   RuntimeSessionStatus,
   RuntimeSkillMention,
   ServiceTier,
+  SessionGoal,
+  SessionGoalStatus,
   SessionId,
-  ThreadGoal,
-  ThreadGoalStatus,
-  ThreadId,
   TimestampMs,
   ToolCallId,
   TurnId,
@@ -94,13 +93,11 @@ export interface RuntimeServiceOptions {
 
 export interface RuntimeModelChangedInput {
   sessionId: SessionId;
-  threadId?: ThreadId;
   modelSelection: ModelSelection;
 }
 
 export type RuntimePromptFragmentsProvider = (input: {
   sessionId: SessionId;
-  threadId: ThreadId;
   cwd: string;
   turn?: RuntimePromptTurnContext;
 }) => Promise<PromptFragment[]> | PromptFragment[];
@@ -112,18 +109,15 @@ export interface RuntimePromptTurnContext {
 
 export interface CreateRuntimeSessionInput {
   sessionId?: SessionId;
-  threadId?: ThreadId;
   cwd?: string;
 }
 
 export interface RuntimeSessionHandle {
   sessionId: SessionId;
-  threadId: ThreadId;
 }
 
 export interface SubmitPromptInput {
   sessionId: SessionId;
-  threadId: ThreadId;
   text: string;
   displayText?: string;
   images?: readonly MessageImageContent[];
@@ -139,7 +133,6 @@ export interface SubmitPromptInput {
 
 export interface InspectPromptInput {
   sessionId: SessionId;
-  threadId: ThreadId;
   cwd: string;
   text?: string;
   skillMentions?: readonly RuntimeSkillMention[];
@@ -153,32 +146,27 @@ export interface InspectPromptWithContentResult {
 
 export interface CompactSessionInput {
   sessionId: SessionId;
-  threadId: ThreadId;
   instructions?: string;
   signal?: AbortSignal;
 }
 
 export interface SetRuntimeModelInput {
   sessionId: SessionId;
-  threadId?: ThreadId;
   modelSelection: ModelSelection;
 }
 
 export interface SetRuntimeReasoningInput {
   sessionId: SessionId;
-  threadId?: ThreadId;
   reasoningLevel: ReasoningLevel;
 }
 
 export interface SetRuntimeServiceTierInput {
   sessionId: SessionId;
-  threadId?: ThreadId;
   serviceTier: ServiceTier;
 }
 
 export interface SetRuntimeDelegationPolicyInput {
   sessionId: SessionId;
-  threadId?: ThreadId;
   policy: DelegationPolicy;
 }
 
@@ -190,7 +178,6 @@ interface RuntimeSessionModelState {
 
 interface RuntimeRunState {
   controller: AbortController;
-  threadId?: ThreadId;
   purpose: "prompt" | "goal" | "compaction";
 }
 
@@ -217,12 +204,19 @@ export class RuntimeBusyError extends Error {
 }
 
 export class RuntimeSubagentSessionAccessError extends Error {
-  constructor(readonly sessionId: SessionId, readonly threadId?: ThreadId) {
+  constructor(readonly sessionId: SessionId) {
     super(
       `Session ${sessionId} belongs to a subagent and cannot be run through the root runtime. ` +
       "Use task_followup for the owning task so child tool policy and lifecycle concurrency limits are preserved.",
     );
     this.name = "RuntimeSubagentSessionAccessError";
+  }
+}
+
+export class RuntimeSessionNotFoundError extends Error {
+  constructor(readonly sessionId: SessionId) {
+    super(`Session not found: ${sessionId}`);
+    this.name = "RuntimeSessionNotFoundError";
   }
 }
 
@@ -246,32 +240,33 @@ export class RuntimeService {
   }
 
   async createSession(input: CreateRuntimeSessionInput = {}): Promise<RuntimeSessionHandle> {
-    const threadId = input.threadId ?? this.id<ThreadId>("thread");
     const createInput: {
       sessionId?: SessionId;
-      threadId: ThreadId;
       cwd: string;
     } = {
-      threadId,
       cwd: input.cwd ?? this.options.cwd,
     };
     if (input.sessionId) createInput.sessionId = input.sessionId;
     const sessionId = await this.options.runtime.createSession(createInput);
-    await this.publishStatus({ sessionId, threadId, status: "idle", reason: "session_created" });
-    return { sessionId, threadId };
+    await this.publishStatus({ sessionId, status: "idle", reason: "session_created" });
+    return { sessionId };
   }
 
-  async appendUserMessage(input: { sessionId: SessionId; threadId: ThreadId; turnId?: TurnId; text: string; displayText?: string; images?: readonly MessageImageContent[] }): Promise<MessageId> {
-    await this.assertSessionTurnAllowed(input.sessionId, input.threadId);
+  async appendUserMessage(input: { sessionId: SessionId; turnId?: TurnId; text: string; displayText?: string; images?: readonly MessageImageContent[] }): Promise<MessageId> {
+    await this.assertSessionTurnAllowed(input.sessionId);
     return this.options.runtime.appendUserMessage(input);
   }
 
-  async assertSessionTurnAllowed(sessionId: SessionId, threadId?: ThreadId): Promise<void> {
-    if (this.options.allowSubagentSessions) return;
+  async assertSessionTurnAllowed(sessionId: SessionId): Promise<void> {
+    const sessions = await this.options.store.sessions();
+    const session = sessions.find((candidate) => candidate.id === sessionId);
+    if (this.options.allowSubagentSessions) {
+      if (!session) throw new RuntimeSessionNotFoundError(sessionId);
+      return;
+    }
     const teamMemberQuery: NonNullable<Parameters<TeamProjectionStore["teamMembers"]>[0]>
       & { childSessionId: SessionId } = { childSessionId: sessionId, limit: 500 };
-    const [sessions, tasks, runs, members] = await Promise.all([
-      this.options.store.sessions(),
+    const [tasks, runs, members] = await Promise.all([
       this.options.store.agentTasks?.({ childSessionId: sessionId, limit: 1 }) ?? [],
       this.options.store.agentRuns?.({ childSessionId: sessionId, limit: 1 }) ?? [],
       this.options.store.teamMembers?.(teamMemberQuery) ?? [],
@@ -281,7 +276,6 @@ export class RuntimeService {
       ? (await Promise.all(teamIds.map((teamId) => this.options.store.teams?.({ teamId, limit: 1 }) ?? []))).flat()
       : [];
     const teamLeadPaths = new Map(teams.map((team) => [team.id, team.leadPath]));
-    const session = sessions.find((candidate) => candidate.id === sessionId);
     const taskOwnsSession = tasks.some((task) => task.childSessionId === sessionId);
     const runOwnsSession = runs.some((run) => run.childSessionId === sessionId);
     const teamWorkerOwnsSession = members.some((member) => {
@@ -289,8 +283,9 @@ export class RuntimeService {
       return member.childSessionId === sessionId && leadPath !== undefined && leadPath !== member.path;
     });
     if (session?.source === "subagent" || taskOwnsSession || runOwnsSession || teamWorkerOwnsSession) {
-      throw new RuntimeSubagentSessionAccessError(sessionId, threadId);
+      throw new RuntimeSubagentSessionAccessError(sessionId);
     }
+    if (!session) throw new RuntimeSessionNotFoundError(sessionId);
   }
 
   async listModels(input: { provider?: string } = {}): Promise<RuntimeModelDescriptor[]> {
@@ -324,7 +319,6 @@ export class RuntimeService {
     }
     await this.options.onModelChanged?.({
       sessionId: input.sessionId,
-      ...(input.threadId ? { threadId: input.threadId } : {}),
       modelSelection: cloneModelSelection(modelSelection),
     });
     return this.buildModelConfig(input.sessionId, state);
@@ -386,18 +380,17 @@ export class RuntimeService {
     });
   }
 
-  getGoal(input: { sessionId: SessionId; threadId: ThreadId }): Promise<ThreadGoal | undefined> {
-    return this.goals.getGoal({ threadId: input.threadId });
+  getGoal(input: { sessionId: SessionId }): Promise<SessionGoal | undefined> {
+    return this.goals.getGoal({ sessionId: input.sessionId });
   }
 
   async setGoal(input: {
     sessionId: SessionId;
-    threadId: ThreadId;
     objective: string;
     tokenBudget?: number;
     replace?: boolean;
-  }): Promise<ThreadGoal> {
-    await this.assertSessionTurnAllowed(input.sessionId, input.threadId);
+  }): Promise<SessionGoal> {
+    await this.assertSessionTurnAllowed(input.sessionId);
     const goal = await this.goals.setGoal(input);
     this.submitGoalContinuationAsync(input);
     return goal;
@@ -405,39 +398,37 @@ export class RuntimeService {
 
   async updateGoal(input: {
     sessionId: SessionId;
-    threadId: ThreadId;
-    status?: ThreadGoalStatus;
+    status?: SessionGoalStatus;
     objective?: string;
     tokenBudget?: number;
-  }): Promise<ThreadGoal> {
+  }): Promise<SessionGoal> {
     if (input.status === undefined || input.status === "active") {
-      await this.assertSessionTurnAllowed(input.sessionId, input.threadId);
+      await this.assertSessionTurnAllowed(input.sessionId);
     }
     const goal = await this.goals.updateGoal(input);
     if (goal.status === "active") {
       this.submitGoalContinuationAsync(input);
     }
     if (goal.status === "paused" || goal.status === "budgetLimited") {
-      this.abortRunForThread(input.sessionId, input.threadId);
+      this.abortRunForSession(input.sessionId);
     }
     return goal;
   }
 
-  async clearGoal(input: { sessionId: SessionId; threadId: ThreadId }): Promise<{ cleared: boolean; previousGoal?: ThreadGoal }> {
+  async clearGoal(input: { sessionId: SessionId }): Promise<{ cleared: boolean; previousGoal?: SessionGoal }> {
     const result = await this.goals.clearGoal(input);
-    if (result.cleared) this.abortRunForThread(input.sessionId, input.threadId);
+    if (result.cleared) this.abortRunForSession(input.sessionId);
     return result;
   }
 
   async compactSession(input: CompactSessionInput): Promise<CompactContextResult> {
-    await this.assertSessionTurnAllowed(input.sessionId, input.threadId);
+    await this.assertSessionTurnAllowed(input.sessionId);
     if (this.running.has(input.sessionId)) {
       throw new RuntimeBusyError(input.sessionId);
     }
     const runtime = this.options.runtime as AgentRunner & {
       compactContext?: (compactInput: {
         sessionId: SessionId;
-        threadId: ThreadId;
         reason: "manual";
         instructions?: string;
         modelSelection?: ModelSelection;
@@ -455,13 +446,11 @@ export class RuntimeService {
       const modelState = await this.resolveSessionModelState(input.sessionId);
       await this.publishStatus({
         sessionId: input.sessionId,
-        threadId: input.threadId,
         status: "running",
         reason: "manual_compaction",
       });
       const compactInput: {
         sessionId: SessionId;
-        threadId: ThreadId;
         reason: "manual";
         instructions?: string;
         modelSelection?: ModelSelection;
@@ -470,7 +459,6 @@ export class RuntimeService {
         signal?: AbortSignal;
       } = {
         sessionId: input.sessionId,
-        threadId: input.threadId,
         reason: "manual",
         signal: controller.signal,
       };
@@ -483,7 +471,6 @@ export class RuntimeService {
       await this.accountGoalUsage(input, result.turnId, result.usage, startedAt);
       await this.publishStatus({
         sessionId: input.sessionId,
-        threadId: input.threadId,
         status: result.status === "failed" || result.status === "cancelled" ? result.status : "idle",
         ...(result.status === "failed" || result.status === "cancelled" ? { reason: result.error.message } : {}),
       });
@@ -509,7 +496,6 @@ export class RuntimeService {
     const modelState = await this.resolveSessionModelState(input.sessionId);
     const prompt = await this.resolvePromptAssembly({
       sessionId: input.sessionId,
-      threadId: input.threadId,
       cwd: input.cwd,
       ...(modelState.reasoningLevel ? { reasoningLevel: modelState.reasoningLevel } : {}),
       ...(input.text !== undefined ? { turn: turnContext(input), previewTurnInConversation: true } : {}),
@@ -544,14 +530,13 @@ export class RuntimeService {
     const cwd = input.cwd ?? this.options.cwd;
 
     try {
-      await this.assertSessionTurnAllowed(input.sessionId, input.threadId);
+      await this.assertSessionTurnAllowed(input.sessionId);
       const promptModelState = await this.resolvePromptModelState(input);
       const promptInput = await this.promptInputForModel(input, promptModelState);
       await this.assertImageInputAllowed(promptInput, promptModelState);
 
       await this.publishStatus({
         sessionId: promptInput.sessionId,
-        threadId: promptInput.threadId,
         status: "running",
         reason: "prompt_submitted",
       });
@@ -559,7 +544,6 @@ export class RuntimeService {
       const promptTurnId = this.id<TurnId>("turn");
       await this.options.runtime.appendUserMessage({
         sessionId: promptInput.sessionId,
-        threadId: promptInput.threadId,
         turnId: promptTurnId,
         text: promptInput.text,
         ...(promptInput.displayText ? { displayText: promptInput.displayText } : {}),
@@ -584,7 +568,6 @@ export class RuntimeService {
 
         const prompt = await this.resolvePromptAssembly({
           sessionId: promptInput.sessionId,
-          threadId: promptInput.threadId,
           cwd,
           ...(promptModelState.reasoningLevel ? { reasoningLevel: promptModelState.reasoningLevel } : {}),
           turn: turnContext(promptInput),
@@ -626,7 +609,6 @@ export class RuntimeService {
           await this.recoverUnreadableSupervisedActivity(
             activity,
             promptInput.sessionId,
-            promptInput.threadId,
           );
           for (const task of activity.taskResults) {
             const previous = delegatedResultsByTask.get(task.taskId);
@@ -696,13 +678,12 @@ export class RuntimeService {
           ) {
             delegationIntegrationRepairs += 1;
             delegationIntegrationRepair = delegationIntegrationRepairPromptFragment(
-              promptInput.threadId,
+              promptInput.sessionId,
               delegationIntegrationRepairs,
               repairContent,
             );
             await this.publishStatus({
               sessionId: promptInput.sessionId,
-              threadId: promptInput.threadId,
               status: "running",
               turnId: result.turnId,
               reason: "delegation_integration_repair",
@@ -738,7 +719,6 @@ export class RuntimeService {
 
       const prompt = await this.resolvePromptAssembly({
         sessionId: promptInput.sessionId,
-        threadId: promptInput.threadId,
         cwd,
         ...(promptModelState.reasoningLevel ? { reasoningLevel: promptModelState.reasoningLevel } : {}),
         turn: turnContext(promptInput),
@@ -794,7 +774,6 @@ export class RuntimeService {
 
       await this.publishStatus({
         sessionId: promptInput.sessionId,
-        threadId: promptInput.threadId,
         status: "failed",
         turnId: finalResult.turnId,
         reason: "max_turns",
@@ -806,11 +785,10 @@ export class RuntimeService {
       };
     } catch (error) {
       const err = toError(error);
-      if (err instanceof RuntimeSubagentSessionAccessError) throw err;
+      if (err instanceof RuntimeSubagentSessionAccessError || err instanceof RuntimeSessionNotFoundError) throw err;
       const status: Extract<RuntimeSessionStatus, "cancelled" | "failed"> = isAbortError(err) ? "cancelled" : "failed";
       await this.publishStatus({
         sessionId: input.sessionId,
-        threadId: input.threadId,
         status,
         reason: err.message,
       });
@@ -859,7 +837,7 @@ export class RuntimeService {
         return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
       }
 
-      const goal = await this.goals.getGoal({ threadId: args.input.threadId });
+      const goal = await this.goals.getGoal({ sessionId: args.input.sessionId });
       const continueAfterToolUse = lastCompleted?.status === "completed" && isToolUseFinishReason(lastCompleted.finishReason);
       if ((!goal || goal.status !== "active") && !continueAfterToolUse) {
         return ranContinuation && lastCompleted?.status === "completed"
@@ -869,14 +847,12 @@ export class RuntimeService {
 
       await this.publishStatus({
         sessionId: args.input.sessionId,
-        threadId: args.input.threadId,
         status: "running",
         reason: goal?.status === "active" ? "goal_continuation" : "goal_finalizing",
       });
 
       const prompt = await this.resolvePromptAssembly({
         sessionId: args.input.sessionId,
-        threadId: args.input.threadId,
         cwd: args.cwd,
         ...(args.modelState.reasoningLevel ? { reasoningLevel: args.modelState.reasoningLevel } : {}),
         extraFragments: [
@@ -919,7 +895,6 @@ export class RuntimeService {
 
     await this.publishStatus({
       sessionId: args.input.sessionId,
-      threadId: args.input.threadId,
       status: "failed",
       reason: "max_goal_turns",
     });
@@ -944,10 +919,9 @@ export class RuntimeService {
       return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
     }
 
-    const goal = await this.goals.getGoal({ threadId: args.input.threadId });
+    const goal = await this.goals.getGoal({ sessionId: args.input.sessionId });
     const prompt = await this.resolvePromptAssembly({
       sessionId: args.input.sessionId,
-      threadId: args.input.threadId,
       cwd: args.cwd,
       extraFragments: [
         ...pathImagePromptFragments(args.input),
@@ -978,11 +952,10 @@ export class RuntimeService {
     return this.completedPrompt(args.input, args.turns, result.status === "completed" ? result : previous);
   }
 
-  private submitGoalContinuationAsync(input: { sessionId: SessionId; threadId: ThreadId; cwd?: string }): void {
+  private submitGoalContinuationAsync(input: { sessionId: SessionId; cwd?: string }): void {
     if (this.running.has(input.sessionId)) return;
     const continuationInput: SubmitPromptInput = {
       sessionId: input.sessionId,
-      threadId: input.threadId,
       text: "",
       cwd: input.cwd ?? this.options.cwd,
     };
@@ -992,7 +965,6 @@ export class RuntimeService {
         const err = toError(error);
         await this.publishStatus({
           sessionId: continuationInput.sessionId,
-          threadId: continuationInput.threadId,
           status: isAbortError(err) ? "cancelled" : "failed",
           reason: err.message,
         });
@@ -1002,7 +974,7 @@ export class RuntimeService {
 
   private async runStandaloneGoalContinuation(input: SubmitPromptInput, controller: AbortController): Promise<void> {
     try {
-      await this.assertSessionTurnAllowed(input.sessionId, input.threadId);
+      await this.assertSessionTurnAllowed(input.sessionId);
       const modelState = await this.resolvePromptModelState(input);
       const turns: RunTurnResult[] = [];
       const result = await this.runGoalContinuation({
@@ -1015,7 +987,6 @@ export class RuntimeService {
       if (!result) {
         await this.publishStatus({
           sessionId: input.sessionId,
-          threadId: input.threadId,
           status: "idle",
           reason: "goal_not_active",
         });
@@ -1036,7 +1007,6 @@ export class RuntimeService {
   }): RunTurnInput {
     const runInput: RunTurnInput = {
       sessionId: input.input.sessionId,
-      threadId: input.input.threadId,
       cwd: input.cwd,
       system: input.prompt.system,
       signal: input.signal,
@@ -1056,7 +1026,7 @@ export class RuntimeService {
   }
 
   private async accountGoalTurn(
-    input: { sessionId: SessionId; threadId: ThreadId },
+    input: { sessionId: SessionId },
     result: RunTurnResult,
     startedAt: TimestampMs,
   ): Promise<AccountGoalUsageResult | undefined> {
@@ -1064,7 +1034,7 @@ export class RuntimeService {
   }
 
   private async accountGoalUsage(
-    input: { sessionId: SessionId; threadId: ThreadId },
+    input: { sessionId: SessionId },
     turnId: TurnId,
     usage: ModelUsage | undefined,
     startedAt: TimestampMs,
@@ -1072,7 +1042,6 @@ export class RuntimeService {
     const elapsedSeconds = Math.max(0, (Number(this.now()) - Number(startedAt)) / 1000);
     const accountInput: Parameters<GoalService["accountUsage"]>[0] = {
       sessionId: input.sessionId,
-      threadId: input.threadId,
       turnId,
       timeSeconds: elapsedSeconds,
     };
@@ -1083,13 +1052,11 @@ export class RuntimeService {
   private async publishTurnProgress(input: SubmitPromptInput, result: RunTurnResult): Promise<void> {
     const turnStatus: {
       sessionId: SessionId;
-      threadId: ThreadId;
       status: RuntimeSessionStatus;
       turnId: TurnId;
       reason?: string;
     } = {
       sessionId: input.sessionId,
-      threadId: input.threadId,
       status: result.status === "completed" ? "running" : result.status,
       turnId: result.turnId,
     };
@@ -1105,13 +1072,11 @@ export class RuntimeService {
   ): Promise<Extract<SubmitPromptResult, { status: "completed" }>> {
     const idleStatus: {
       sessionId: SessionId;
-      threadId: ThreadId;
       status: RuntimeSessionStatus;
       turnId: TurnId;
       reason?: string;
     } = {
       sessionId: input.sessionId,
-      threadId: input.threadId,
       status: "idle",
       turnId: result.turnId,
     };
@@ -1128,7 +1093,6 @@ export class RuntimeService {
 
   private async resolvePromptAssembly(input: {
     sessionId: SessionId;
-    threadId: ThreadId;
     cwd: string;
     reasoningLevel?: ReasoningLevel;
     turn?: RuntimePromptTurnContext;
@@ -1138,11 +1102,10 @@ export class RuntimeService {
     const delegation = await this.resolveSessionDelegationConfig(input.sessionId, input.reasoningLevel);
     const fragments = await this.options.promptFragments?.({
       sessionId: input.sessionId,
-      threadId: input.threadId,
       cwd: input.cwd,
       ...(input.turn ? { turn: input.turn } : {}),
     });
-    const goal = await this.goals.getGoal({ threadId: input.threadId });
+    const goal = await this.goals.getGoal({ sessionId: input.sessionId });
     const conversation = await this.resolveConversationPromptFragment(input);
     return new PromptAssembler()
       .addMany(fragments)
@@ -1190,7 +1153,6 @@ export class RuntimeService {
 
   private async resolveConversationPromptFragment(input: {
     sessionId: SessionId;
-    threadId: ThreadId;
     turn?: RuntimePromptTurnContext;
     previewTurnInConversation?: boolean;
   }): Promise<PromptFragment | undefined> {
@@ -1215,15 +1177,14 @@ export class RuntimeService {
   private async recoverUnreadableSupervisedActivity(
     activity: DelegationTurnActivity,
     parentSessionId: SessionId,
-    parentThreadId: ThreadId,
   ): Promise<void> {
     if (!this.options.store.agentTasks || activity.unreadableTaskResultCallIds.size === 0) return;
     for (const callId of [...activity.unreadableTaskResultCallIds]) {
-      const tasks = (await this.options.store.agentTasks({
+      const tasks = await this.options.store.agentTasks({
         sourceCallId: callId as ToolCallId,
         parentSessionId,
         limit: 64,
-      })).filter((task) => task.parentThreadId === undefined || task.parentThreadId === parentThreadId);
+      });
       const expected = tasks.reduce((size, task) => Math.max(size, task.expectedBatchSize ?? 0), 0);
       if (expected === 0 || tasks.length < expected) continue;
 
@@ -1255,7 +1216,6 @@ export class RuntimeService {
   ): Promise<SubmitPromptResult> {
     await this.publishStatus({
       sessionId: input.sessionId,
-      threadId: input.threadId,
       status: "failed",
       turnId,
       reason,
@@ -1517,13 +1477,10 @@ export class RuntimeService {
     if (!run) return false;
     await this.publishStatus({
       sessionId,
-      ...(run.threadId ? { threadId: run.threadId } : {}),
       status: "cancelling",
       reason,
     });
-    if (run.threadId) {
-      await this.pauseActiveGoalForInterrupt(sessionId, run.threadId);
-    }
+    await this.pauseActiveGoalForInterrupt(sessionId);
     run.controller.abort();
     return true;
   }
@@ -1536,13 +1493,10 @@ export class RuntimeService {
     const normalized = title.trim().replace(/\s+/g, " ");
     if (!normalized) throw new Error("Session title cannot be empty.");
     if (normalized.length > 120) throw new Error("Session title must be 120 characters or fewer.");
-    const session = (await this.options.store.sessions()).find((item) => item.id === sessionId);
-    if (!session) throw new Error(`Session not found: ${sessionId}`);
-    await this.append(
-      { sessionId, ...(session.threadId ? { threadId: session.threadId } : {}) },
-      "session.renamed",
-      { sessionId, title: normalized },
-    );
+    if (!(await this.options.store.sessions()).some((item) => item.id === sessionId)) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+    await this.append({ sessionId }, "session.renamed", { sessionId, title: normalized });
   }
 
   private async cancelledPrompt(
@@ -1555,7 +1509,6 @@ export class RuntimeService {
     const turnId = turns.at(-1)?.turnId ?? pendingTurnId;
     await this.publishStatus({
       sessionId: input.sessionId,
-      threadId: input.threadId,
       status: "cancelled",
       ...(turnId ? { turnId } : {}),
       reason,
@@ -1576,27 +1529,26 @@ export class RuntimeService {
         input.signal.addEventListener("abort", () => controller.abort(), { once: true });
       }
     }
-    this.running.set(input.sessionId, { controller, threadId: input.threadId, purpose });
+    this.running.set(input.sessionId, { controller, purpose });
     return controller;
   }
 
-  private abortRunForThread(sessionId: SessionId, threadId: ThreadId): void {
+  private abortRunForSession(sessionId: SessionId): void {
     const run = this.running.get(sessionId);
-    if (run?.threadId === threadId && !run.controller.signal.aborted) {
+    if (run && !run.controller.signal.aborted) {
       run.controller.abort();
     }
   }
 
-  private async pauseActiveGoalForInterrupt(sessionId: SessionId, threadId: ThreadId): Promise<void> {
-    const goal = await this.goals.getGoal({ threadId });
+  private async pauseActiveGoalForInterrupt(sessionId: SessionId): Promise<void> {
+    const goal = await this.goals.getGoal({ sessionId });
     if (goal?.status === "active") {
-      await this.goals.updateGoal({ sessionId, threadId, status: "paused", reason: "pause" });
+      await this.goals.updateGoal({ sessionId, status: "paused", reason: "pause" });
     }
   }
 
   private async publishStatus(input: {
     sessionId: SessionId;
-    threadId?: ThreadId;
     status: RuntimeSessionStatus;
     turnId?: TurnId;
     reason?: string;
@@ -1616,7 +1568,7 @@ export class RuntimeService {
   }
 
   private async append<TType extends ChiliEvent["type"], TPayload>(
-    input: { sessionId: SessionId; threadId?: ThreadId },
+    input: { sessionId: SessionId },
     type: TType,
     payload: TPayload,
   ): Promise<void> {
@@ -1627,7 +1579,6 @@ export class RuntimeService {
       sessionId: input.sessionId,
       payload,
     };
-    if (input.threadId) event.threadId = input.threadId;
     await this.options.store.append(event as ChiliEvent);
   }
 
@@ -1714,12 +1665,12 @@ function pathImagePromptFragments(input: Pick<SubmitPromptInput, "text">): Promp
 }
 
 function delegationIntegrationRepairPromptFragment(
-  threadId: ThreadId,
+  sessionId: SessionId,
   attempt: number,
   content: string,
 ): PromptFragment {
   return {
-    id: `runtime.delegation.integration_repair.${threadId}.${attempt}`,
+    id: `runtime.delegation.integration_repair.${sessionId}.${attempt}`,
     layer: "developer",
     source: "runtime",
     priority: 100,
@@ -2114,9 +2065,9 @@ function defaultSessionModelState(options: RuntimeServiceOptions): RuntimeSessio
   return state;
 }
 
-function goalStatusPromptFragment(goal: ThreadGoal): PromptFragment {
+function goalStatusPromptFragment(goal: SessionGoal): PromptFragment {
   return {
-    id: `runtime.goal.status.${goal.threadId}`,
+    id: `runtime.goal.status.${goal.sessionId}`,
     layer: "developer",
     source: "runtime",
     priority: 80,
@@ -2135,9 +2086,9 @@ function goalStatusPromptFragment(goal: ThreadGoal): PromptFragment {
   };
 }
 
-function goalContinuationPromptFragment(goal: ThreadGoal): PromptFragment {
+function goalContinuationPromptFragment(goal: SessionGoal): PromptFragment {
   return {
-    id: `runtime.goal.continuation.${goal.threadId}`,
+    id: `runtime.goal.continuation.${goal.sessionId}`,
     layer: "developer",
     source: "runtime",
     priority: 90,
@@ -2152,9 +2103,9 @@ function goalContinuationPromptFragment(goal: ThreadGoal): PromptFragment {
   };
 }
 
-function goalBudgetLimitPromptFragment(goal: ThreadGoal | undefined): PromptFragment {
+function goalBudgetLimitPromptFragment(goal: SessionGoal | undefined): PromptFragment {
   return {
-    id: `runtime.goal.budget_limit.${goal?.threadId ?? "unknown"}`,
+    id: `runtime.goal.budget_limit.${goal?.sessionId ?? "unknown"}`,
     layer: "developer",
     source: "runtime",
     priority: 100,
@@ -2168,7 +2119,7 @@ function goalBudgetLimitPromptFragment(goal: ThreadGoal | undefined): PromptFrag
   };
 }
 
-function formatGoalBudget(goal: ThreadGoal): string {
+function formatGoalBudget(goal: SessionGoal): string {
   const used = formatTokenCount(goal.tokensUsed);
   return goal.tokenBudget !== undefined ? `${used} / ${formatTokenCount(goal.tokenBudget)} tokens` : `${used} tokens used`;
 }

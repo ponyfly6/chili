@@ -198,8 +198,6 @@ function agentMessageOutput(message: AgentMessageRecord): Record<string, unknown
     taskId: message.taskId,
     recipient_session_id: message.recipientSessionId,
     recipientSessionId: message.recipientSessionId,
-    recipient_thread_id: message.recipientThreadId,
-    recipientThreadId: message.recipientThreadId,
     content: message.content,
     metadata: message.metadata,
     created_at: message.createdAt,

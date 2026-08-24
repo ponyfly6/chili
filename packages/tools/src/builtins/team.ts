@@ -157,8 +157,6 @@ export function createTeamMemberAddTool(
         status: { type: "string" },
         childSessionId: { type: "string" },
         child_session_id: { type: "string" },
-        childThreadId: { type: "string" },
-        child_thread_id: { type: "string" },
         model: { type: "string" },
         toolScope: { type: "array", items: { type: "string" } },
         tool_scope: { type: "array", items: { type: "string" } },
@@ -879,7 +877,6 @@ function validateTeamMemberAddInput(input: unknown): ValidationResult<TeamMember
   const value: TeamMemberAddToolInput = { teamId: teamId.value, path: path.value, name: name.value, role: role.value };
   if (status.value) value.status = status.value;
   assignString(value, "childSessionId", pickString(input, ["childSessionId", "child_session_id"]));
-  assignString(value, "childThreadId", pickString(input, ["childThreadId", "child_thread_id"]));
   assignString(value, "model", pickString(input, ["model"]));
   if (toolScope.value) value.toolScope = toolScope.value;
   if (writeScope.value) value.writeScope = writeScope.value;
@@ -1607,8 +1604,6 @@ function teamMemberRecordOutput(member: TeamMemberRecord): Record<string, unknow
     status: member.status,
     child_session_id: member.childSessionId,
     childSessionId: member.childSessionId,
-    child_thread_id: member.childThreadId,
-    childThreadId: member.childThreadId,
     model: member.model,
     tool_scope: member.toolScope,
     toolScope: member.toolScope,
@@ -1742,8 +1737,6 @@ function agentTaskRecordOutput(task: NonNullable<TeamTaskDispatchRecord["agentTa
     runId: task.runId,
     child_session_id: task.childSessionId,
     childSessionId: task.childSessionId,
-    child_thread_id: task.childThreadId,
-    childThreadId: task.childThreadId,
     status: task.status,
     summary: task.summary,
     error: task.error,
@@ -1794,8 +1787,6 @@ function teamMessageDeliveryRecordOutput(delivery: TeamSnapshotRecord["messageDe
     triggerTurn: delivery.triggerTurn,
     child_session_id: delivery.childSessionId,
     childSessionId: delivery.childSessionId,
-    child_thread_id: delivery.childThreadId,
-    childThreadId: delivery.childThreadId,
     error: delivery.error,
     queued_at: delivery.queuedAt,
     queuedAt: delivery.queuedAt,

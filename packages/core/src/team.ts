@@ -12,12 +12,12 @@ import type {
   TeamMessageDelivery,
   TeamMessageKind,
   TeamTaskStatus as ProtocolTeamTaskStatus,
-  ThreadId,
   TimestampMs,
 } from "@chili/protocol";
 import { normalizeAgentPath, timestampNow } from "@chili/protocol";
 import type {
   EventStore,
+  SubagentProjectionStore,
   TeamMemberRow,
   TeamMessageDeliveryRow,
   TeamMessageRow,
@@ -49,14 +49,18 @@ export interface TeamRuntime {
 }
 
 export interface TeamControlServiceOptions {
-  store: EventStore & TeamProjectionStore & Partial<TeamTaskClaimStore> & Partial<TeamTaskVerificationClaimStore> & Partial<TeamTaskAgentSyncStore>;
+  store: EventStore
+    & TeamProjectionStore
+    & SubagentProjectionStore
+    & Partial<TeamTaskClaimStore>
+    & Partial<TeamTaskVerificationClaimStore>
+    & Partial<TeamTaskAgentSyncStore>;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
 }
 
 export interface TeamEventContext {
   sessionId?: SessionId;
-  threadId?: ThreadId;
 }
 
 export interface CreateTeamInput extends TeamEventContext {
@@ -77,7 +81,6 @@ export interface AddTeamMemberInput extends TeamEventContext {
   role: string;
   status?: TeamMemberStatus;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   model?: string;
   toolScope?: string[];
   writeScope?: string[];
@@ -262,6 +265,74 @@ export class TeamMessageSenderUnauthorizedError extends Error {
   }
 }
 
+export class TeamMemberSessionOwnershipError extends Error {
+  constructor(
+    readonly teamId: TeamId,
+    readonly path: AgentPath,
+    readonly childSessionId: SessionId,
+    readonly reason: string,
+  ) {
+    super(`Team member session ${childSessionId} is not owned by ${path} in ${teamId}: ${reason}`);
+    this.name = "TeamMemberSessionOwnershipError";
+  }
+}
+
+export async function assertTeamMemberSessionOwnership(input: {
+  store: Pick<SubagentProjectionStore, "agentTasks"> & Pick<TeamProjectionStore, "teamMembers">;
+  team: TeamRow;
+  path: AgentPath;
+  childSessionId: SessionId;
+  allowOwningLead?: boolean;
+}): Promise<void> {
+  const { team, path, childSessionId } = input;
+  const fail = (reason: string): never => {
+    throw new TeamMemberSessionOwnershipError(team.id, path, childSessionId, reason);
+  };
+  if (!team.sessionId) fail("team has no owning session");
+  const ownerSessionId = team.sessionId as SessionId;
+  if (childSessionId === ownerSessionId) {
+    if (input.allowOwningLead && path === team.leadPath) return;
+    fail("the owning session is reserved for the team lead");
+  }
+
+  const conflictingMembers = (await input.store.teamMembers({ childSessionId, limit: 2 }))
+    .filter((member) => member.childSessionId === childSessionId)
+    .filter((member) => member.teamId !== team.id || member.path !== path);
+  if (conflictingMembers.length > 0) {
+    fail(`session is already bound to ${conflictingMembers[0]?.path ?? "another member"}`);
+  }
+
+  const visited = new Set<SessionId>();
+  let currentSessionId = childSessionId;
+  let expectedPath = path;
+  for (let depth = 0; depth < 64; depth += 1) {
+    if (visited.has(currentSessionId)) fail("agent task ancestry contains a cycle");
+    visited.add(currentSessionId);
+
+    const tasks = (await input.store.agentTasks({
+      childSessionId: currentSessionId,
+      limit: 2,
+    })).filter((task) => task.childSessionId === currentSessionId);
+    if (tasks.length === 0) fail(`no agent task owns descendant session ${currentSessionId}`);
+    if (tasks.length > 1) fail(`multiple agent tasks own descendant session ${currentSessionId}`);
+    const task = tasks[0]!;
+    if (task.path !== expectedPath) {
+      fail(`agent task path ${task.path} does not match expected path ${expectedPath}`);
+    }
+    if (task.parentSessionId === ownerSessionId) {
+      if (task.parentPath !== team.leadPath) {
+        fail(`agent task parent path ${task.parentPath} does not match team lead ${team.leadPath}`);
+      }
+      return;
+    }
+    if (!task.parentSessionId) fail(`agent task ${task.id} has no parent session`);
+    if (!task.parentPath) fail(`agent task ${task.id} has no parent path`);
+    currentSessionId = task.parentSessionId as SessionId;
+    expectedPath = task.parentPath as AgentPath;
+  }
+  fail("agent task ancestry exceeds the maximum depth");
+}
+
 export class TeamControlService implements TeamRuntime {
   constructor(private readonly options: TeamControlServiceOptions) {}
 
@@ -288,7 +359,6 @@ export class TeamControlService implements TeamRuntime {
           role: input.leadRole ?? "leader",
           status: input.leadStatus ?? "running",
           childSessionId: input.sessionId,
-          childThreadId: input.threadId,
           writeScope: input.leadWriteScope,
         }),
       ),
@@ -297,7 +367,10 @@ export class TeamControlService implements TeamRuntime {
   }
 
   async addMember(input: AddTeamMemberInput): Promise<TeamMemberRow> {
-    await this.requireTeam(input.teamId);
+    const team = await this.requireTeam(input.teamId);
+    if (input.childSessionId) {
+      await this.assertMemberSessionOwnership(team, input.path, input.childSessionId);
+    }
     await this.options.store.append(
       this.teamEvent(
         input,
@@ -309,7 +382,6 @@ export class TeamControlService implements TeamRuntime {
           role: input.role,
           status: input.status,
           childSessionId: input.childSessionId,
-          childThreadId: input.childThreadId,
           model: input.model,
           toolScope: input.toolScope,
           writeScope: input.writeScope,
@@ -416,7 +488,6 @@ export class TeamControlService implements TeamRuntime {
       eventId: this.id("event"),
       ...(input.claimedBy ? { claimedBy: input.claimedBy } : {}),
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-      ...(input.threadId ? { threadId: input.threadId } : {}),
       time: this.now(),
     });
     if (!result.applied && result.reason === "not_found") {
@@ -438,7 +509,6 @@ export class TeamControlService implements TeamRuntime {
       metadata: input.metadata,
       eventId: this.id("event"),
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-      ...(input.threadId ? { threadId: input.threadId } : {}),
       ...(input.stalePendingBefore !== undefined ? { stalePendingBefore: input.stalePendingBefore } : {}),
       time: this.now(),
     });
@@ -469,7 +539,6 @@ export class TeamControlService implements TeamRuntime {
       ...(input.summary !== undefined ? { summary: input.summary } : {}),
       ...(input.error !== undefined ? { error: input.error } : {}),
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-      ...(input.threadId ? { threadId: input.threadId } : {}),
       time: this.now(),
     });
     if (!result.applied && result.reason === "not_found") {
@@ -635,6 +704,21 @@ export class TeamControlService implements TeamRuntime {
     return member;
   }
 
+  private async assertMemberSessionOwnership(
+    team: TeamRow,
+    path: AgentPath,
+    childSessionId: SessionId,
+    allowOwningLead = false,
+  ): Promise<void> {
+    await assertTeamMemberSessionOwnership({
+      store: this.options.store,
+      team,
+      path,
+      childSessionId,
+      allowOwningLead,
+    });
+  }
+
   private async resolveMemberTarget(teamId: TeamId, target: AgentPath | string): Promise<TeamMemberRow> {
     const members = await this.options.store.teamMembers({ teamId, limit: 1000 });
     if (target.startsWith("/")) {
@@ -686,6 +770,7 @@ export class TeamControlService implements TeamRuntime {
     context: TeamEventContext,
     input: TeamMessageDeliveryEventInput,
   ): Promise<ChiliEvent[]> {
+    const team = await this.requireTeam(input.teamId);
     const members =
       input.to === "*"
         ? (await this.options.store.teamMembers({ teamId: input.teamId })).filter((member) => member.path !== input.from)
@@ -696,11 +781,17 @@ export class TeamControlService implements TeamRuntime {
         if (input.strict && input.to !== "*") {
           const reason = input.delivery === "triggerTurn" && member.status === "closed"
             ? "target member is closed"
-            : "target member has no child session/thread";
+            : "target member has no child session";
           throw new TeamMessageDeliveryError(input.teamId, input.to, reason);
         }
         continue;
       }
+      await this.assertMemberSessionOwnership(
+        team,
+        member.path,
+        member.childSessionId,
+        true,
+      );
       events.push(
         this.agentMessageQueuedEvent(
           context,
@@ -738,7 +829,6 @@ export class TeamControlService implements TeamRuntime {
       payload,
     };
     if (context.sessionId) event.sessionId = context.sessionId;
-    if (context.threadId) event.threadId = context.threadId;
     return event as ChiliEvent;
   }
 
@@ -754,7 +844,6 @@ export class TeamControlService implements TeamRuntime {
       payload,
     };
     if (context.sessionId) event.sessionId = context.sessionId;
-    if (context.threadId) event.threadId = context.threadId;
     return event;
   }
 
@@ -809,7 +898,6 @@ interface TeamMessageMailboxInput {
 
 type DeliverableTeamMember = TeamMemberRow & {
   childSessionId: SessionId;
-  childThreadId: ThreadId;
 };
 
 function isDeliverableTeamMember(
@@ -821,8 +909,7 @@ function isDeliverableTeamMember(
   // triggerTurn requires a live member; task_followup/team dispatch owns any
   // explicit resumption semantics.
   return (delivery === "queueOnly" || member.status !== "closed") &&
-    Boolean(member.childSessionId) &&
-    Boolean(member.childThreadId);
+    Boolean(member.childSessionId);
 }
 
 function requireMatchingTeamMessage(existing: TeamMessageRow, expected: TeamMessageIdentity): TeamMessageRow {
@@ -858,8 +945,7 @@ function teamMessageToAgentMailboxPayload(
     path: member.path,
     from: input.from,
     triggerTurn: input.delivery === "triggerTurn",
-    childSessionId: member.childSessionId,
-    childThreadId: member.childThreadId,
+    recipientSessionId: member.childSessionId,
     message: {
       role: "user",
       content: input.content,

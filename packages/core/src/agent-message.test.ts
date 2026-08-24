@@ -2,19 +2,20 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { AgentPath, SessionId, TaskId, ThreadId, TimestampMs } from "@chili/protocol";
+import type { AgentPath, SessionId, TaskId, TimestampMs } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
-import { AgentMessageRecipientNotFoundError, AgentTreeControlService } from "./agent-tree.js";
+import {
+  AgentMessageRecipientMetadataError,
+  AgentMessageRecipientNotFoundError,
+  AgentTreeControlService,
+} from "./agent-tree.js";
 
 test("scopes direct agent recipients to the caller's recursive task tree", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-agent-message-descendant-scope-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const rootSessionId = "session_root" as SessionId;
-  const rootThreadId = "thread_root" as ThreadId;
   const workerSessionId = "session_worker" as SessionId;
-  const workerThreadId = "thread_worker" as ThreadId;
   const nestedSessionId = "session_nested" as SessionId;
-  const nestedThreadId = "thread_nested" as ThreadId;
 
   try {
     await seedTask(store, {
@@ -23,9 +24,7 @@ test("scopes direct agent recipients to the caller's recursive task tree", async
       parentPath: "/root" as AgentPath,
       taskName: "worker",
       parentSessionId: rootSessionId,
-      parentThreadId: rootThreadId,
       childSessionId: workerSessionId,
-      childThreadId: workerThreadId,
     });
     await seedTask(store, {
       id: "task_nested" as TaskId,
@@ -33,9 +32,7 @@ test("scopes direct agent recipients to the caller's recursive task tree", async
       parentPath: "/root/worker" as AgentPath,
       taskName: "nested-reader",
       parentSessionId: workerSessionId,
-      parentThreadId: workerThreadId,
       childSessionId: nestedSessionId,
-      childThreadId: nestedThreadId,
     });
     await seedTask(store, {
       id: "task_unrelated" as TaskId,
@@ -43,9 +40,7 @@ test("scopes direct agent recipients to the caller's recursive task tree", async
       parentPath: "/root/unrelated" as AgentPath,
       taskName: "nested-reader",
       parentSessionId: "session_unrelated" as SessionId,
-      parentThreadId: "thread_unrelated" as ThreadId,
       childSessionId: "session_unrelated_reader" as SessionId,
-      childThreadId: "thread_unrelated_reader" as ThreadId,
     });
 
     const service = new AgentTreeControlService({ store, now: () => 10 as TimestampMs });
@@ -55,12 +50,11 @@ test("scopes direct agent recipients to the caller's recursive task tree", async
       to: "nested-reader",
       content: "root can address a nested descendant",
       sessionId: rootSessionId,
-      threadId: rootThreadId,
     });
     expect(fromRoot).toMatchObject({
       taskId: "task_nested",
       path: "/root/worker/reader",
-      childSessionId: nestedSessionId,
+      recipientSessionId: nestedSessionId,
     });
 
     const fromWorker = await service.sendMessage({
@@ -69,9 +63,20 @@ test("scopes direct agent recipients to the caller's recursive task tree", async
       to: "/root/worker/reader",
       content: "worker can address its own descendant",
       sessionId: workerSessionId,
-      threadId: workerThreadId,
     });
     expect(fromWorker.taskId).toBe("task_nested" as TaskId);
+
+    const fromNestedToParent = await service.sendMessage({
+      messageId: "message_nested_to_parent",
+      from: "/root/worker/reader" as AgentPath,
+      to: "parent",
+      content: "child can address its owning parent session",
+      sessionId: nestedSessionId,
+    });
+    expect(fromNestedToParent).toMatchObject({
+      path: "/root/worker",
+      recipientSessionId: workerSessionId,
+    });
 
     await expect(service.sendMessage({
       messageId: "message_worker_cross_tree",
@@ -79,8 +84,25 @@ test("scopes direct agent recipients to the caller's recursive task tree", async
       to: "task_unrelated",
       content: "must not escape the worker tree",
       sessionId: workerSessionId,
-      threadId: workerThreadId,
     })).rejects.toBeInstanceOf(AgentMessageRecipientNotFoundError);
+
+    await store.append({
+      id: "message_corrupt_cross_session",
+      type: "agent.message_queued",
+      time: 11 as TimestampMs,
+      sessionId: rootSessionId,
+      payload: {
+        taskId: "task_nested" as TaskId,
+        path: "/root/worker/reader" as AgentPath,
+        from: "/root" as AgentPath,
+        recipientSessionId: rootSessionId,
+        triggerTurn: true,
+        message: { role: "user", content: "must not route into the wrong session" },
+      },
+    });
+    await expect(service.canDeliverMailbox("message_corrupt_cross_session")).rejects.toBeInstanceOf(
+      AgentMessageRecipientMetadataError,
+    );
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -95,9 +117,7 @@ async function seedTask(
     parentPath: AgentPath;
     taskName: string;
     parentSessionId: SessionId;
-    parentThreadId: ThreadId;
     childSessionId: SessionId;
-    childThreadId: ThreadId;
   },
 ): Promise<void> {
   await store.append({
@@ -105,15 +125,12 @@ async function seedTask(
     type: "agent.task_created",
     time: 1 as TimestampMs,
     sessionId: input.parentSessionId,
-    threadId: input.parentThreadId,
     payload: {
       taskId: input.id,
       path: input.path,
       parentPath: input.parentPath,
       parentSessionId: input.parentSessionId,
-      parentThreadId: input.parentThreadId,
       childSessionId: input.childSessionId,
-      childThreadId: input.childThreadId,
       taskName: input.taskName,
       cwd: "/repo",
       prompt: "work",

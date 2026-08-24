@@ -4,7 +4,6 @@ import type {
   MessageId,
   PartId,
   SessionId,
-  ThreadId,
   TimestampMs,
   ToolCallId,
   TurnId,
@@ -29,7 +28,6 @@ test("passes AbortSignal through to the provider fetch", async () => {
   const events = [];
   for await (const event of router.stream({
     sessionId: "session_test" as SessionId,
-    threadId: "thread_test" as ThreadId,
     turnId: "turn_test" as TurnId,
     messages: [],
     tools: [],
@@ -59,7 +57,6 @@ test("fixed Anthropic-compatible router ignores cross-provider model selections"
 
   for await (const _event of router.stream({
     sessionId: "session_test" as SessionId,
-    threadId: "thread_test" as ThreadId,
     turnId: "turn_test" as TurnId,
     messages: [],
     tools: [],
@@ -128,7 +125,6 @@ test("legacy Anthropic-compatible router sends controlled tool execution context
 
   for await (const _event of router.stream({
     sessionId,
-    threadId: "thread_test" as ThreadId,
     turnId: "turn_test" as TurnId,
     messages,
     tools: [],

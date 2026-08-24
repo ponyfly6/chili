@@ -1,6 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import type { SessionId, TaskId, TeamId, ThreadId, TimestampMs } from "@chili/protocol";
+import type { SessionId, TaskId, TeamId, TimestampMs } from "@chili/protocol";
 import { timestampNow } from "@chili/protocol";
 import type { TeamTaskRow } from "@chili/store";
 import { runProcess } from "@chili/tools";
@@ -40,7 +40,6 @@ export interface TeamWorktreeEnsureInput {
   cwd?: string;
   baseRef?: string;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   signal?: AbortSignal;
 }
 
@@ -115,7 +114,6 @@ export class TeamWorktreeService {
       taskId: input.taskId,
       metadata,
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-      ...(input.threadId ? { threadId: input.threadId } : {}),
     });
 
     return {

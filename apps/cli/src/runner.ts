@@ -1,10 +1,9 @@
-import type { ModelSelection, ReasoningLevel, ServiceTier, SessionId, ThreadId } from "@chili/protocol";
+import type { ModelSelection, ReasoningLevel, ServiceTier, SessionId } from "@chili/protocol";
 import type { CliHarness } from "./harness.js";
 
 export interface RunPromptOptions {
   harness: CliHarness;
   sessionId: SessionId;
-  threadId: ThreadId;
   prompt: string;
   maxTurns: number;
   modelSelection?: ModelSelection;
@@ -30,7 +29,6 @@ export function runSessionPrompt(options: RunSessionPromptOptions): Promise<void
 export async function runPrompt(options: RunPromptOptions): Promise<void> {
   const input = {
     sessionId: options.sessionId,
-    threadId: options.threadId,
     text: options.prompt,
     maxTurns: options.maxTurns,
   };

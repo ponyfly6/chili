@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { ChiliEvent, SessionId, ThreadId, TimestampMs } from "@chili/protocol";
+import type { ChiliEvent, SessionId, TimestampMs } from "@chili/protocol";
 import { ObservableEventStore, SqliteEventStore } from "@chili/store";
 import { DelegationPolicyGate } from "./delegation.js";
 import type { AgentRunner } from "./runner.js";
@@ -15,14 +15,13 @@ test("delegation policy reads the durable latest value across runtime instances 
   const firstStore = new SqliteEventStore(path);
   const secondStore = new SqliteEventStore(path);
   const sessionId = "session_shared_delegation" as SessionId;
-  const threadId = "thread_shared_delegation" as ThreadId;
   const first = runtimeService(firstStore);
   const second = runtimeService(secondStore);
 
   try {
     expect((await first.getDelegationConfig(sessionId)).policy).toBe("explicit");
 
-    await second.setDelegationPolicy({ sessionId, threadId, policy: "off" });
+    await second.setDelegationPolicy({ sessionId, policy: "off" });
     expect(await first.getDelegationConfig(sessionId)).toMatchObject({
       sessionId,
       policy: "off",
@@ -34,7 +33,6 @@ test("delegation policy reads the durable latest value across runtime instances 
       type: "session.delegation_changed",
       time: (index + 10) as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         sessionId,
         policy: index === 500 ? "proactive" : index % 2 === 0 ? "explicit" : "off",
@@ -80,7 +78,6 @@ test("a task cancelled during the post-permit delegation check never spawns a gh
   try {
     const task = await manager.spawnTask({
       parentSessionId: "session_cancel_race" as SessionId,
-      parentThreadId: "thread_cancel_race" as ThreadId,
       cwd: "/repo",
       taskName: "cancel during delegation gate",
       prompt: "must not run",
@@ -116,7 +113,6 @@ test("a durable off written by another runtime after spawn prevents the local ru
   const policyReader = runtimeService(managerStoreBase);
   const policyWriter = runtimeService(policyWriterStore);
   const parentSessionId = "session_post_spawn_policy" as SessionId;
-  const parentThreadId = "thread_post_spawn_policy" as ThreadId;
   const gate = new DelegationPolicyGate({
     store: managerStore,
     getDelegationConfig: (sessionId) => policyReader.getDelegationConfig(sessionId),
@@ -128,7 +124,6 @@ test("a durable off written by another runtime after spawn prevents the local ru
     if (event.type === "agent.spawned") {
       policyWrite = policyWriter.setDelegationPolicy({
         sessionId: parentSessionId,
-        threadId: parentThreadId,
         policy: "off",
       });
     }
@@ -151,7 +146,6 @@ test("a durable off written by another runtime after spawn prevents the local ru
   try {
     const task = await manager.spawnTask({
       parentSessionId,
-      parentThreadId,
       cwd: "/repo",
       taskName: "post-spawn policy fence",
       prompt: "must not run",

@@ -24,7 +24,7 @@ import type {
   SessionRow,
   TeamTaskRow,
 } from "@chili/store";
-import { ObservableEventStore, SqliteEventStore } from "@chili/store";
+import { ObservableEventStore, SqliteEventStore, UnknownEventCursorError } from "@chili/store";
 import type {
   AgentPath,
   AgentRunId,
@@ -48,9 +48,8 @@ import type {
   SessionId,
   TaskId,
   TeamId,
-  ThreadGoal,
-  ThreadGoalStatus,
-  ThreadId,
+  SessionGoal,
+  SessionGoalStatus,
   TimestampMs,
   TurnId,
 } from "@chili/protocol";
@@ -104,6 +103,36 @@ test("serves sessions and event backlog over the runtime HTTP handler", async ()
   expect(new TextDecoder().decode(chunk.value)).toContain("session.created");
 });
 
+test("rejects unknown event and goal query parameters", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const handler = createRuntimeHttpHandler({ service, store });
+  const session = await service.createSession();
+
+  const eventsResponse = await handler(new Request(
+    `http://chili.test/events?sessionId=${session.sessionId}&legacyScope=obsolete`,
+  ));
+  expect(eventsResponse.status).toBe(400);
+  expect(await eventsResponse.json()).toEqual({
+    error: { message: "Query parameter \"legacyScope\" is not supported" },
+  });
+
+  const emptyScopeResponse = await handler(new Request("http://chili.test/events?sessionId="));
+  expect(emptyScopeResponse.status).toBe(400);
+  expect(await emptyScopeResponse.json()).toEqual({
+    error: { message: "sessionId must not be empty" },
+  });
+
+  const goalResponse = await handler(new Request(
+    `http://chili.test/sessions/${session.sessionId}/goal?legacyScope=obsolete`,
+  ));
+  expect(goalResponse.status).toBe(400);
+  expect(await goalResponse.json()).toEqual({
+    error: { message: "Query parameter \"legacyScope\" is not supported" },
+  });
+});
+
 test("loads resumable session events and renames a saved session", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
@@ -126,7 +155,6 @@ test("loads resumable session events and renames a saved session", async () => {
   expect(await renameResponse.json()).toMatchObject({
     id: session.sessionId,
     title: "Saved investigation",
-    threadId: session.threadId,
   });
 });
 
@@ -137,7 +165,6 @@ test("event backlog stays bounded and oversized resume cursors require a tail re
   const service = new FakeRuntimeService(store);
   const handler = createRuntimeHttpHandler({ service, store, maxBacklogEvents: 5 });
   const sessionId = "session_tail_backlog" as SessionId;
-  const threadId = "thread_tail_backlog" as ThreadId;
 
   try {
     await store.appendMany([
@@ -146,7 +173,6 @@ test("event backlog stays bounded and oversized resume cursors require a tail re
         type: "session.created",
         time: 1 as TimestampMs,
         sessionId,
-        threadId,
         payload: { sessionId, cwd: "/repo" },
       },
       ...Array.from({ length: 5 }, (_, index): ChiliEvent => ({
@@ -154,7 +180,6 @@ test("event backlog stays bounded and oversized resume cursors require a tail re
         type: "turn.started",
         time: (2 + index) as TimestampMs,
         sessionId,
-        threadId,
         payload: { turnId: `turn_tail_${index}` as TurnId },
       })),
       {
@@ -162,7 +187,6 @@ test("event backlog stays bounded and oversized resume cursors require a tail re
         type: "turn.completed",
         time: 10 as TimestampMs,
         sessionId,
-        threadId,
         payload: { turnId: "turn_tail_final" as TurnId, status: "failed" },
       },
       {
@@ -170,7 +194,6 @@ test("event backlog stays bounded and oversized resume cursors require a tail re
         type: "session.status_changed",
         time: 11 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           sessionId,
           status: "failed",
@@ -182,7 +205,7 @@ test("event backlog stays bounded and oversized resume cursors require a tail re
 
     const controller = new AbortController();
     const eventsResponse = await handler(
-      new Request(`http://chili.test/events?sessionId=${sessionId}&threadId=${threadId}`, {
+      new Request(`http://chili.test/events?sessionId=${sessionId}`, {
         signal: controller.signal,
       }),
     );
@@ -206,7 +229,7 @@ test("event backlog stays bounded and oversized resume cursors require a tail re
     expect(text).toContain("unexpected EOF");
 
     const oversizedResume = await handler(new Request(
-      `http://chili.test/events?sessionId=${sessionId}&threadId=${threadId}&afterEventId=event_tail_started_0`,
+      `http://chili.test/events?sessionId=${sessionId}&afterEventId=event_tail_started_0`,
     ));
     expect(oversizedResume.status).toBe(409);
     expect(await oversizedResume.json()).toMatchObject({
@@ -217,7 +240,7 @@ test("event backlog stays bounded and oversized resume cursors require a tail re
 
     const resumed = await collectEventStreamText(
       handler,
-      `http://chili.test/events?sessionId=${sessionId}&threadId=${threadId}&afterEventId=event_tail_started_1`,
+      `http://chili.test/events?sessionId=${sessionId}&afterEventId=event_tail_started_1`,
     );
     expect(resumed).not.toContain("event_tail_session");
     expect(resumed).not.toContain('"id":"event_tail_started_1"');
@@ -236,7 +259,6 @@ test("rejects unknown SSE cursors but keeps a known tip cursor live without tran
   const service = new FakeRuntimeService(store);
   const handler = createRuntimeHttpHandler({ service, store, maxBacklogEvents: 5 });
   const sessionId = "session_event_cursor" as SessionId;
-  const threadId = "thread_event_cursor" as ThreadId;
 
   try {
     await store.append({
@@ -244,12 +266,11 @@ test("rejects unknown SSE cursors but keeps a known tip cursor live without tran
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     });
 
     const unknown = await handler(new Request(
-      `http://chili.test/events?sessionId=${sessionId}&threadId=${threadId}&afterEventId=event_cursor_missing`,
+      `http://chili.test/events?sessionId=${sessionId}&afterEventId=event_cursor_missing`,
     ));
     expect(unknown.status).toBe(409);
     expect(await unknown.json()).toMatchObject({
@@ -258,7 +279,7 @@ test("rejects unknown SSE cursors but keeps a known tip cursor live without tran
 
     const controller = new AbortController();
     const response = await handler(new Request(
-      `http://chili.test/events?sessionId=${sessionId}&threadId=${threadId}&afterEventId=event_cursor_tip`,
+      `http://chili.test/events?sessionId=${sessionId}&afterEventId=event_cursor_tip`,
       { signal: controller.signal },
     ));
     expect(response.status).toBe(200);
@@ -270,7 +291,6 @@ test("rejects unknown SSE cursors but keeps a known tip cursor live without tran
       type: "tool.output_delta",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         callId: "toolcall_cursor" as import("@chili/protocol").ToolCallId,
         stream: "stdout",
@@ -287,7 +307,6 @@ test("rejects unknown SSE cursors but keeps a known tip cursor live without tran
       type: "turn.started",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_cursor" as TurnId },
     });
     const durableChunk = await reader.read();
@@ -323,7 +342,6 @@ test("serves subagent runs and tasks through an event replay projection", async 
       type: "agent.spawned",
       time: 2 as TimestampMs,
       sessionId: session.sessionId,
-      threadId: session.threadId,
       payload: { runId: rootRunId, path: rootPath, taskName: "lead" },
     },
     {
@@ -331,7 +349,6 @@ test("serves subagent runs and tasks through an event replay projection", async 
       type: "agent.spawned",
       time: 3 as TimestampMs,
       sessionId: session.sessionId,
-      threadId: session.threadId,
       payload: { runId: childRunId, path: childPath, parentPath: rootPath, taskName: "review" },
     },
     {
@@ -339,7 +356,6 @@ test("serves subagent runs and tasks through an event replay projection", async 
       type: "team.task_created",
       time: 4 as TimestampMs,
       sessionId: session.sessionId,
-      threadId: session.threadId,
       payload: { teamId, taskId, ownerPath: childPath },
     },
     {
@@ -347,15 +363,18 @@ test("serves subagent runs and tasks through an event replay projection", async 
       type: "agent.message_queued",
       time: 5 as TimestampMs,
       sessionId: session.sessionId,
-      threadId: session.threadId,
-      payload: { path: childPath, from: rootPath, triggerTurn: true },
+      payload: {
+        path: childPath,
+        from: rootPath,
+        triggerTurn: true,
+        recipientSessionId: "session_mailbox_projection" as SessionId,
+      },
     },
     {
       id: "event_task_done",
       type: "team.task_updated",
       time: 6 as TimestampMs,
       sessionId: session.sessionId,
-      threadId: session.threadId,
       payload: { teamId, taskId, status: "completed" },
     },
     {
@@ -363,15 +382,12 @@ test("serves subagent runs and tasks through an event replay projection", async 
       type: "agent.task_created",
       time: 7 as TimestampMs,
       sessionId: session.sessionId,
-      threadId: session.threadId,
       payload: {
         taskId: localTaskId,
         path: localPath,
         parentPath: rootPath,
         parentSessionId: session.sessionId,
-        parentThreadId: session.threadId,
         childSessionId: "session_child_http" as SessionId,
-        childThreadId: "thread_child_http" as ThreadId,
         taskName: "local reader",
         cwd: "/repo",
         prompt: "read",
@@ -382,7 +398,6 @@ test("serves subagent runs and tasks through an event replay projection", async 
       type: "agent.task_completed",
       time: 8 as TimestampMs,
       sessionId: session.sessionId,
-      threadId: session.threadId,
       payload: {
         taskId: localTaskId,
         path: localPath,
@@ -396,16 +411,13 @@ test("serves subagent runs and tasks through an event replay projection", async 
       type: "agent.spawned",
       time: 9 as TimestampMs,
       sessionId: session.sessionId,
-      threadId: session.threadId,
       payload: {
         runId: localRunId,
         taskId: localTaskId,
         path: localPath,
         parentPath: rootPath,
         parentSessionId: session.sessionId,
-        parentThreadId: session.threadId,
         childSessionId: "session_child_http" as SessionId,
-        childThreadId: "thread_child_http" as ThreadId,
         taskName: "local reader",
         generation: 2,
       },
@@ -424,6 +436,105 @@ test("serves subagent runs and tasks through an event replay projection", async 
   expect(localTask?.status).toBe("running");
   expect(localTask?.completedAt).toBeUndefined();
   expect(body.mailbox[0]?.triggerTurn).toBe(true);
+  expect(body.mailbox[0]?.recipientSessionId).toBe("session_mailbox_projection" as SessionId);
+});
+
+test("paginates the full event history for global and session agent projections", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const handler = createRuntimeHttpHandler({ service, store, maxBacklogEvents: 2 });
+  const session = await service.createSession({ cwd: "/repo" });
+  const sessionId = session.sessionId;
+  const childSessionId = "session_paged_child" as SessionId;
+  const taskId = "task_paged_projection" as TaskId;
+  const runId = "agentrun_paged_projection" as AgentRunId;
+  const path = "/root/paged" as AgentPath;
+
+  await store.appendMany([
+    ...Array.from({ length: 5 }, (_, index): ChiliEvent => ({
+      id: `event_paged_filler_${index}`,
+      type: "session.renamed",
+      time: (index + 2) as TimestampMs,
+      sessionId,
+      payload: { sessionId, title: `filler ${index}` },
+    })),
+    {
+      id: "event_paged_task",
+      type: "agent.task_created",
+      time: 7 as TimestampMs,
+      sessionId,
+      payload: {
+        taskId,
+        path,
+        parentPath: "/root" as AgentPath,
+        parentSessionId: sessionId,
+        childSessionId,
+        taskName: "paged projection",
+        cwd: "/repo",
+        prompt: "finish after the first event page",
+      },
+    },
+    {
+      id: "event_paged_spawned",
+      type: "agent.spawned",
+      time: 8 as TimestampMs,
+      sessionId,
+      payload: {
+        runId,
+        taskId,
+        path,
+        parentPath: "/root" as AgentPath,
+        parentSessionId: sessionId,
+        childSessionId,
+        taskName: "paged projection",
+        generation: 1,
+      },
+    },
+    {
+      id: "event_paged_task_completed",
+      type: "agent.task_completed",
+      time: 9 as TimestampMs,
+      sessionId,
+      payload: { taskId, path, status: "completed", generation: 1, summary: "done" },
+    },
+    {
+      id: "event_paged_completed",
+      type: "agent.completed",
+      time: 10 as TimestampMs,
+      sessionId,
+      payload: { runId, taskId, path, status: "completed", generation: 1, summary: "done" },
+    },
+    {
+      id: "event_paged_mailbox",
+      type: "agent.message_queued",
+      time: 11 as TimestampMs,
+      sessionId,
+      payload: {
+        taskId,
+        path,
+        from: "/root" as AgentPath,
+        triggerTurn: true,
+        recipientSessionId: childSessionId,
+      },
+    },
+  ]);
+
+  for (const url of [
+    "http://chili.test/agents",
+    `http://chili.test/sessions/${sessionId}/agents`,
+  ]) {
+    const response = await handler(new Request(url));
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as RuntimeAgentsSnapshot;
+    expect(body.agents).toMatchObject([{ id: runId, status: "completed", completedAt: 10 }]);
+    expect(body.tasks).toMatchObject([{ id: taskId, status: "completed", completedAt: 9 }]);
+    expect(body.mailbox).toMatchObject([{
+      id: "event_paged_mailbox",
+      recipientSessionId: childSessionId,
+      status: "queued",
+    }]);
+  }
 });
 
 test("serves task control routes", async () => {
@@ -593,7 +704,6 @@ test("task close HTTP requests cancel a capacity-queued follow-up without changi
 
 test("projects incomplete agent tasks and runs as terminal", () => {
   const sessionId = "session_incomplete_projection" as SessionId;
-  const threadId = "thread_incomplete_projection" as ThreadId;
   const taskId = "task_incomplete_projection" as TaskId;
   const runId = "agent_incomplete_projection" as AgentRunId;
   const path = "/root/task_incomplete_projection" as AgentPath;
@@ -603,14 +713,12 @@ test("projects incomplete agent tasks and runs as terminal", () => {
       type: "agent.task_created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         taskId,
         path,
         parentPath: "/root" as AgentPath,
         parentSessionId: sessionId,
         childSessionId: "session_incomplete_child" as SessionId,
-        childThreadId: "thread_incomplete_child" as ThreadId,
         taskName: "Inspect repository",
         cwd: "/repo",
         prompt: "Inspect repository",
@@ -621,7 +729,6 @@ test("projects incomplete agent tasks and runs as terminal", () => {
       type: "agent.spawned",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { runId, taskId, path, taskName: "Inspect repository", generation: 1 },
     },
     {
@@ -629,7 +736,6 @@ test("projects incomplete agent tasks and runs as terminal", () => {
       type: "agent.task_completed",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: { taskId, runId, path, status: "incomplete", generation: 1, error: "planning_only" },
     },
     {
@@ -637,7 +743,6 @@ test("projects incomplete agent tasks and runs as terminal", () => {
       type: "agent.completed",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: { runId, taskId, path, status: "incomplete", generation: 1, error: "planning_only" },
     },
   ];
@@ -645,6 +750,25 @@ test("projects incomplete agent tasks and runs as terminal", () => {
   const snapshot = projectRuntimeAgents(events, sessionId);
   expect(snapshot.tasks).toMatchObject([{ id: taskId, status: "incomplete", completedAt: 3 }]);
   expect(snapshot.agents).toMatchObject([{ id: runId, status: "incomplete", completedAt: 4 }]);
+});
+
+test("upcasts a legacy mailbox child session in the runtime agent projection", () => {
+  const recipientSessionId = "session_legacy_http_recipient" as SessionId;
+  const snapshot = projectRuntimeAgents([{
+    id: "event_legacy_http_mailbox",
+    type: "agent.message_queued",
+    time: 1 as TimestampMs,
+    sessionId: "session_legacy_http_sender" as SessionId,
+    payload: {
+      path: "/root/legacy" as AgentPath,
+      from: "/root" as AgentPath,
+      triggerTurn: true,
+      childSessionId: recipientSessionId,
+    },
+  } as unknown as ChiliEvent]);
+
+  expect(snapshot.mailbox[0]?.recipientSessionId).toBe(recipientSessionId);
+  expect(Object.prototype.hasOwnProperty.call(snapshot.mailbox[0], "childSessionId")).toBe(false);
 });
 
 test("serves agent tree and mailbox control routes", async () => {
@@ -671,10 +795,36 @@ test("serves agent tree and mailbox control routes", async () => {
   expect(await mailboxResponse.json()).toMatchObject([{ id: "event_mailbox", status: "queued" }]);
   expect(agents.mailboxQueries.at(-1)).toMatchObject({ status: "queued" });
 
-  const taskMailboxResponse = await handler(new Request("http://chili.test/mailbox?taskId=task_http&status=queued"));
+  const taskMailboxResponse = await handler(new Request(
+    "http://chili.test/mailbox?taskId=task_http&recipientSessionId=session_mailbox_recipient&status=queued",
+  ));
   expect(taskMailboxResponse.status).toBe(200);
-  expect(await taskMailboxResponse.json()).toMatchObject([{ id: "event_mailbox", status: "queued" }]);
-  expect(agents.mailboxQueries.at(-1)).toMatchObject({ taskId: "task_http", status: "queued" });
+  expect(await taskMailboxResponse.json()).toMatchObject([{
+    id: "event_mailbox",
+    status: "queued",
+    recipientSessionId: "session_mailbox_recipient",
+  }]);
+  expect(agents.mailboxQueries.at(-1)).toMatchObject({
+    taskId: "task_http",
+    recipientSessionId: "session_mailbox_recipient",
+    status: "queued",
+  });
+
+  const legacyMailboxResponse = await handler(new Request(
+    "http://chili.test/mailbox?childSessionId=session_mailbox_recipient",
+  ));
+  expect(legacyMailboxResponse.status).toBe(400);
+  expect(await legacyMailboxResponse.json()).toEqual({
+    error: { message: "Query parameter \"childSessionId\" is not supported" },
+  });
+
+  const unknownMailboxResponse = await handler(new Request(
+    "http://chili.test/mailbox?legacyScope=obsolete",
+  ));
+  expect(unknownMailboxResponse.status).toBe(400);
+  expect(await unknownMailboxResponse.json()).toEqual({
+    error: { message: "Query parameter \"legacyScope\" is not supported" },
+  });
 
   const consumeResponse = await handler(
     new Request("http://chili.test/mailbox/event_mailbox/consume", {
@@ -702,18 +852,42 @@ test("serves team control routes", async () => {
   const teamMerger = new FakeTeamMergeService();
   const teamRunner = new FakeTeamExecutionRunnerService();
   const handler = createRuntimeHttpHandler({ service, store, teams, teamDispatcher, teamMerger, teamRunner });
+  const ownerSession = await service.createSession({ cwd: "/repo" });
+  const reviewerSessionId = "session_reviewer" as SessionId;
 
   try {
     const createTeamResponse = await handler(
       new Request("http://chili.test/teams", {
         method: "POST",
-        body: JSON.stringify({ name: "alpha", leadPath: "/root", description: "team api" }),
+        body: JSON.stringify({
+          sessionId: ownerSession.sessionId,
+          name: "alpha",
+          leadPath: "/root",
+          description: "team api",
+        }),
         headers: { "content-type": "application/json" },
       }),
     );
     expect(createTeamResponse.status).toBe(201);
     const team = (await createTeamResponse.json()) as { id: TeamId };
     expect(team).toMatchObject({ id: "team_1", name: "alpha", leadPath: "/root" });
+
+    await store.append({
+      id: "event_http_reviewer_ownership",
+      type: "agent.task_created",
+      time: 9 as TimestampMs,
+      sessionId: ownerSession.sessionId,
+      payload: {
+        taskId: "task_http_reviewer_ownership" as TaskId,
+        path: "/root/reviewer" as AgentPath,
+        parentPath: "/root" as AgentPath,
+        parentSessionId: ownerSession.sessionId,
+        childSessionId: reviewerSessionId,
+        taskName: "reviewer ownership",
+        cwd: "/repo",
+        prompt: "own reviewer session",
+      },
+    });
 
     const addMemberResponse = await handler(
       new Request(`http://chili.test/teams/${team.id}/members`, {
@@ -722,8 +896,7 @@ test("serves team control routes", async () => {
           path: "/root/reviewer",
           name: "reviewer",
           role: "reviewer",
-          childSessionId: "session_reviewer",
-          childThreadId: "thread_reviewer",
+          childSessionId: reviewerSessionId,
           toolScope: ["read"],
         }),
         headers: { "content-type": "application/json" },
@@ -770,7 +943,7 @@ test("serves team control routes", async () => {
     const dispatchResponse = await handler(
       new Request(`http://chili.test/teams/${team.id}/tasks/${task.id}/dispatch`, {
         method: "POST",
-        body: JSON.stringify({ mode: "background", sessionId: "session_dispatch", threadId: "thread_dispatch" }),
+        body: JSON.stringify({ mode: "background", sessionId: "session_dispatch" }),
         headers: { "content-type": "application/json" },
       }),
     );
@@ -790,7 +963,7 @@ test("serves team control routes", async () => {
       agent_task: runningAgentTask,
     });
     expect(teamDispatcher.dispatchInputs).toMatchObject([
-      { teamId: team.id, taskId: task.id, mode: "background", sessionId: "session_dispatch", threadId: "thread_dispatch" },
+      { teamId: team.id, taskId: task.id, mode: "background", sessionId: "session_dispatch" },
     ]);
 
     teamDispatcher.nextDispatchResult = {
@@ -859,14 +1032,14 @@ test("serves team control routes", async () => {
     const mergeResponse = await handler(
       new Request(`http://chili.test/teams/${team.id}/merge`, {
         method: "POST",
-        body: JSON.stringify({ sessionId: "session_dispatch", threadId: "thread_dispatch", taskId: task.id, cwd: "/repo" }),
+        body: JSON.stringify({ sessionId: "session_dispatch", taskId: task.id, cwd: "/repo" }),
         headers: { "content-type": "application/json" },
       }),
     );
     expect(mergeResponse.status).toBe(200);
     expect(await mergeResponse.json()).toEqual(teamMergeResultJson(team.id, task.id));
     expect(teamMerger.mergeInputs).toMatchObject([
-      { teamId: team.id, taskId: task.id, sessionId: "session_dispatch", threadId: "thread_dispatch", cwd: "/repo" },
+      { teamId: team.id, taskId: task.id, sessionId: "session_dispatch", cwd: "/repo" },
     ]);
 
     const runLoopResponse = await handler(
@@ -874,7 +1047,6 @@ test("serves team control routes", async () => {
         method: "POST",
         body: JSON.stringify({
           sessionId: "session_dispatch",
-          threadId: "thread_dispatch",
           cwd: "/repo",
           mode: "background",
           once: true,
@@ -891,7 +1063,6 @@ test("serves team control routes", async () => {
       {
         teamId: team.id,
         sessionId: "session_dispatch",
-        threadId: "thread_dispatch",
         cwd: "/repo",
         mode: "background",
         once: true,
@@ -956,8 +1127,7 @@ test("serves team control routes", async () => {
         path: "/root/reviewer",
         fromPath: "/root",
         triggerTurn: true,
-        childSessionId: "session_reviewer",
-        childThreadId: "thread_reviewer",
+        recipientSessionId: "session_reviewer",
         taskId: task.id,
       },
     ]);
@@ -1127,7 +1297,6 @@ test("serves prompt commands and submits expanded command prompts", async () => 
     new Request(`http://chili.test/sessions/${session.sessionId}/command_async`, {
       method: "POST",
       body: JSON.stringify({
-        threadId: session.threadId,
         name: "joke",
         args: "typescript",
         modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
@@ -1138,8 +1307,10 @@ test("serves prompt commands and submits expanded command prompts", async () => 
   );
 
   expect(submitResponse.status).toBe(202);
+  expect(await submitResponse.json()).toEqual({ status: "accepted", sessionId: session.sessionId });
   expect(commands.lastRun).toEqual({ name: "joke", args: "typescript" });
   expect(service.lastPrompt).toMatchObject({
+    sessionId: session.sessionId,
     text: "Tell a short joke about typescript.",
     displayText: "/joke typescript",
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
@@ -1159,29 +1330,28 @@ test("rejects direct HTTP prompts, commands, and goal continuations for subagent
   const handler = createRuntimeHttpHandler({ service, store, commands });
   const session = await service.createSession({
     sessionId: "session_http_child" as SessionId,
-    threadId: "thread_http_child" as ThreadId,
   });
   service.blockedSubagentSessions.add(session.sessionId);
 
   const requests = [
     new Request(`http://chili.test/sessions/${session.sessionId}/prompt`, {
       method: "POST",
-      body: JSON.stringify({ threadId: session.threadId, text: "bypass synchronously" }),
+      body: JSON.stringify({ text: "bypass synchronously" }),
       headers: { "content-type": "application/json" },
     }),
     new Request(`http://chili.test/sessions/${session.sessionId}/prompt_async`, {
       method: "POST",
-      body: JSON.stringify({ threadId: session.threadId, text: "bypass" }),
+      body: JSON.stringify({ text: "bypass" }),
       headers: { "content-type": "application/json" },
     }),
     new Request(`http://chili.test/sessions/${session.sessionId}/command_async`, {
       method: "POST",
-      body: JSON.stringify({ threadId: session.threadId, name: "joke" }),
+      body: JSON.stringify({ name: "joke" }),
       headers: { "content-type": "application/json" },
     }),
     new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
       method: "POST",
-      body: JSON.stringify({ threadId: session.threadId, objective: "bypass through goal" }),
+      body: JSON.stringify({ objective: "bypass through goal" }),
       headers: { "content-type": "application/json" },
     }),
   ];
@@ -1205,23 +1375,22 @@ test("rejects a known pending child over HTTP before its session row exists", as
   const commands = new FakePromptCommandControl();
   const handler = createRuntimeHttpHandler({ service, store, commands });
   const sessionId = "session_http_pending_child" as SessionId;
-  const threadId = "thread_http_pending_child" as ThreadId;
   service.blockedSubagentSessions.add(sessionId);
 
   const requests = [
     new Request(`http://chili.test/sessions/${sessionId}/prompt_async`, {
       method: "POST",
-      body: JSON.stringify({ threadId, text: "race the pending child" }),
+      body: JSON.stringify({text: "race the pending child" }),
       headers: { "content-type": "application/json" },
     }),
     new Request(`http://chili.test/sessions/${sessionId}/command_async`, {
       method: "POST",
-      body: JSON.stringify({ threadId, name: "joke" }),
+      body: JSON.stringify({name: "joke" }),
       headers: { "content-type": "application/json" },
     }),
     new Request(`http://chili.test/sessions/${sessionId}/goal`, {
       method: "POST",
-      body: JSON.stringify({ threadId, objective: "race through a goal continuation" }),
+      body: JSON.stringify({objective: "race through a goal continuation" }),
       headers: { "content-type": "application/json" },
     }),
   ];
@@ -1457,7 +1626,6 @@ test("serves model control routes and prompt model overrides", async () => {
   const setModelResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/model`, {
     method: "POST",
     body: JSON.stringify({
-      threadId: session.threadId,
       modelSelection: { provider: "openai-codex", model: "gpt-5.6-terra" },
     }),
     headers: { "content-type": "application/json" },
@@ -1467,7 +1635,7 @@ test("serves model control routes and prompt model overrides", async () => {
 
   const setReasoningResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/reasoning`, {
     method: "POST",
-    body: JSON.stringify({ threadId: session.threadId, reasoningLevel: "ultra" }),
+    body: JSON.stringify({ reasoningLevel: "ultra" }),
     headers: { "content-type": "application/json" },
   }));
   expect(setReasoningResponse.status).toBe(200);
@@ -1475,7 +1643,7 @@ test("serves model control routes and prompt model overrides", async () => {
 
   const setServiceTierResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/service-tier`, {
     method: "POST",
-    body: JSON.stringify({ threadId: session.threadId, serviceTier: "fast" }),
+    body: JSON.stringify({ serviceTier: "fast" }),
     headers: { "content-type": "application/json" },
   }));
   expect(setServiceTierResponse.status).toBe(200);
@@ -1495,7 +1663,7 @@ test("serves model control routes and prompt model overrides", async () => {
     `http://chili.test/sessions/${session.sessionId}/delegation`,
     {
       method: "POST",
-      body: JSON.stringify({ threadId: session.threadId, policy: "proactive" }),
+      body: JSON.stringify({ policy: "proactive" }),
       headers: { "content-type": "application/json" },
     },
   ));
@@ -1510,7 +1678,6 @@ test("serves model control routes and prompt model overrides", async () => {
   const promptResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/prompt_async`, {
     method: "POST",
     body: JSON.stringify({
-      threadId: session.threadId,
       text: "hello",
       skillMentions: [{ name: "reviewer", path: "/repo/.chili/skills/reviewer/SKILL.md" }],
       modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
@@ -1520,7 +1687,9 @@ test("serves model control routes and prompt model overrides", async () => {
     headers: { "content-type": "application/json" },
   }));
   expect(promptResponse.status).toBe(202);
+  expect(await promptResponse.json()).toEqual({ status: "accepted", sessionId: session.sessionId });
   expect(service.lastPrompt).toMatchObject({
+    sessionId: session.sessionId,
     skillMentions: [{ name: "reviewer", path: "/repo/.chili/skills/reviewer/SKILL.md" }],
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
     reasoningLevel: "xhigh",
@@ -1530,7 +1699,6 @@ test("serves model control routes and prompt model overrides", async () => {
   const legacyPromptResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/prompt_async`, {
     method: "POST",
     body: JSON.stringify({
-      threadId: session.threadId,
       text: "hello",
       system: ["old"],
     }),
@@ -1552,7 +1720,6 @@ test("serves persistent goal control routes", async () => {
   const setResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
     method: "POST",
     body: JSON.stringify({
-      threadId: session.threadId,
       objective: "Ship the goal route",
       tokenBudget: 50_000,
       replace: true,
@@ -1564,17 +1731,17 @@ test("serves persistent goal control routes", async () => {
 
   const pauseResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
     method: "PATCH",
-    body: JSON.stringify({ threadId: session.threadId, status: "paused" }),
+    body: JSON.stringify({ status: "paused" }),
     headers: { "content-type": "application/json" },
   }));
   expect(pauseResponse.status).toBe(200);
   expect(await pauseResponse.json()).toMatchObject({ status: "paused" });
 
-  const getResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/goal?threadId=${session.threadId}`));
+  const getResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/goal`));
   expect(getResponse.status).toBe(200);
   expect(await getResponse.json()).toMatchObject({ objective: "Ship the goal route", status: "paused" });
 
-  const clearResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/goal?threadId=${session.threadId}`, {
+  const clearResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/goal`, {
     method: "DELETE",
   }));
   expect(clearResponse.status).toBe(200);
@@ -1590,7 +1757,7 @@ test("does not accept async prompts for missing or busy sessions", async () => {
   const missingResponse = await handler(
     new Request("http://chili.test/sessions/session_missing/prompt_async", {
       method: "POST",
-      body: JSON.stringify({ threadId: "thread_missing", text: "hello" }),
+      body: JSON.stringify({ text: "hello" }),
       headers: { "content-type": "application/json" },
     }),
   );
@@ -1601,7 +1768,7 @@ test("does not accept async prompts for missing or busy sessions", async () => {
   const busyResponse = await handler(
     new Request(`http://chili.test/sessions/${created.sessionId}/prompt_async`, {
       method: "POST",
-      body: JSON.stringify({ threadId: created.threadId, text: "hello" }),
+      body: JSON.stringify({ text: "hello" }),
       headers: { "content-type": "application/json" },
     }),
   );
@@ -1630,7 +1797,7 @@ class FakeRuntimeService implements RuntimeHttpService {
   delegationPolicy: DelegationPolicy = "explicit";
   delegationSource: DelegationPolicySource = "default";
   lastPrompt: SubmitPromptInput | undefined;
-  goal: ThreadGoal | undefined;
+  goal: SessionGoal | undefined;
   readonly blockedSubagentSessions = new Set<SessionId>();
 
   constructor(private readonly store: EventStore & EventPublisher) {}
@@ -1641,18 +1808,16 @@ class FakeRuntimeService implements RuntimeHttpService {
     }
   }
 
-  async createSession(input: { sessionId?: SessionId; threadId?: ThreadId; cwd?: string } = {}): Promise<RuntimeSessionRef> {
+  async createSession(input: { sessionId?: SessionId; cwd?: string } = {}): Promise<RuntimeSessionRef> {
     const sessionId = input.sessionId ?? ("session_http" as SessionId);
-    const threadId = input.threadId ?? ("thread_http" as ThreadId);
     await this.store.append({
       id: "event_session_created",
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: input.cwd ?? "/repo" },
     });
-    return { sessionId, threadId };
+    return { sessionId };
   }
 
   async listModels(input: { provider?: string } = {}): Promise<RuntimeModelDescriptor[]> {
@@ -1710,14 +1875,13 @@ class FakeRuntimeService implements RuntimeHttpService {
     return this.getDelegationConfig(input.sessionId);
   }
 
-  async getGoal(input: { threadId: ThreadId }): Promise<ThreadGoal | undefined> {
-    return this.goal?.threadId === input.threadId ? this.goal : undefined;
+  async getGoal(input: { sessionId: SessionId }): Promise<SessionGoal | undefined> {
+    return this.goal?.sessionId === input.sessionId ? this.goal : undefined;
   }
 
-  async setGoal(input: { sessionId: SessionId; threadId: ThreadId; objective: string; tokenBudget?: number }): Promise<ThreadGoal> {
+  async setGoal(input: { sessionId: SessionId; objective: string; tokenBudget?: number }): Promise<SessionGoal> {
     this.goal = {
       sessionId: input.sessionId,
-      threadId: input.threadId,
       objective: input.objective,
       status: "active",
       ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
@@ -1729,8 +1893,8 @@ class FakeRuntimeService implements RuntimeHttpService {
     return this.goal;
   }
 
-  async updateGoal(input: { sessionId: SessionId; threadId: ThreadId; status?: ThreadGoalStatus }): Promise<ThreadGoal> {
-    if (!this.goal || this.goal.threadId !== input.threadId) throw new Error("No goal");
+  async updateGoal(input: { sessionId: SessionId; status?: SessionGoalStatus }): Promise<SessionGoal> {
+    if (!this.goal || this.goal.sessionId !== input.sessionId) throw new Error("No goal");
     this.goal = {
       ...this.goal,
       sessionId: input.sessionId,
@@ -1740,8 +1904,8 @@ class FakeRuntimeService implements RuntimeHttpService {
     return this.goal;
   }
 
-  async clearGoal(input: { threadId: ThreadId }): Promise<{ cleared: boolean; previousGoal?: ThreadGoal }> {
-    if (!this.goal || this.goal.threadId !== input.threadId) return { cleared: false };
+  async clearGoal(input: { sessionId: SessionId }): Promise<{ cleared: boolean; previousGoal?: SessionGoal }> {
+    if (!this.goal || this.goal.sessionId !== input.sessionId) return { cleared: false };
     const previousGoal = this.goal;
     this.goal = undefined;
     return { cleared: true, previousGoal };
@@ -2193,7 +2357,6 @@ function teamDispatchMetadata(agentStatus: "running" | "completed", syncedAt?: n
       agentPath: "/root/reviewer/task_agent_http",
       runId: "agent_http_dispatch",
       childSessionId: "session_child_dispatch",
-      childThreadId: "thread_child_dispatch",
       mode: "background",
       dispatchedAt: 101,
       agentStatus,
@@ -2208,7 +2371,6 @@ function localSubagentTaskRow(input: { status: "running" | "completed" | "incomp
   path: AgentPath;
   parentPath: AgentPath;
   childSessionId: SessionId;
-  childThreadId: ThreadId;
   status: "running" | "completed" | "incomplete" | "failed" | "cancelled";
 } {
   return {
@@ -2217,7 +2379,6 @@ function localSubagentTaskRow(input: { status: "running" | "completed" | "incomp
     path: "/root/reviewer/task_agent_http" as AgentPath,
     parentPath: "/root/reviewer" as AgentPath,
     childSessionId: "session_child_dispatch" as SessionId,
-    childThreadId: "thread_child_dispatch" as ThreadId,
     status: input.status,
   };
 }
@@ -2266,7 +2427,6 @@ function taskRow(input: { status: AgentTaskRow["status"]; summary?: string }): A
     status: input.status,
     generation: 0,
     childSessionId: "session_child" as SessionId,
-    childThreadId: "thread_child" as ThreadId,
     createdAt: 1,
     updatedAt: 2,
   };
@@ -2276,7 +2436,7 @@ function taskRow(input: { status: AgentTaskRow["status"]; summary?: string }): A
 
 function agentRunRow(input: { id: string; path: string; parentPath?: string; taskName: string }): AgentRunRow {
   const row: AgentRunRow = {
-    id: input.id,
+    id: input.id as AgentRunId,
     path: input.path as AgentPath,
     taskName: input.taskName,
     status: "running",
@@ -2294,6 +2454,7 @@ function mailboxRow(input: { status: AgentMailboxRow["status"] }): AgentMailboxR
     triggerTurn: true,
     status: input.status,
     taskId: "task_http" as TaskId,
+    recipientSessionId: "session_mailbox_recipient" as SessionId,
     createdAt: 3,
   };
   if (input.status === "consumed") row.consumedAt = 4;
@@ -2386,9 +2547,7 @@ async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs 
 
 async function seedCompletedHttpTask(store: SqliteEventStore, taskId: TaskId): Promise<void> {
   const sessionId = "session_http_parent" as SessionId;
-  const threadId = "thread_http_parent" as ThreadId;
   const childSessionId = "session_http_child" as SessionId;
-  const childThreadId = "thread_http_child" as ThreadId;
   const path = `/root/${taskId}` as AgentPath;
   const runId = `agent_initial_${taskId}` as AgentRunId;
   await store.appendMany([
@@ -2397,15 +2556,12 @@ async function seedCompletedHttpTask(store: SqliteEventStore, taskId: TaskId): P
       type: "agent.task_created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         taskId,
         path,
         parentPath: "/root" as AgentPath,
         parentSessionId: sessionId,
-        parentThreadId: threadId,
         childSessionId,
-        childThreadId,
         taskName: "queued worker",
         cwd: "/repo",
         prompt: "initial work",
@@ -2417,16 +2573,13 @@ async function seedCompletedHttpTask(store: SqliteEventStore, taskId: TaskId): P
       type: "agent.spawned",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         runId,
         taskId,
         path,
         parentPath: "/root" as AgentPath,
         parentSessionId: sessionId,
-        parentThreadId: threadId,
         childSessionId,
-        childThreadId,
         taskName: "queued worker",
         cwd: "/repo",
         mode: "resumable",
@@ -2438,7 +2591,6 @@ async function seedCompletedHttpTask(store: SqliteEventStore, taskId: TaskId): P
       type: "agent.completed",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         runId,
         taskId,
@@ -2468,7 +2620,6 @@ class MemoryEventStore implements EventStore {
         id: event.payload.sessionId,
         cwd: event.payload.cwd,
         title: "repo",
-        ...(event.threadId ? { threadId: event.threadId } : {}),
         status: "active",
         createdAt: event.time,
         updatedAt: event.time,
@@ -2486,12 +2637,18 @@ class MemoryEventStore implements EventStore {
   }
 
   async events(query: EventQuery = {}): Promise<EventEnvelope[]> {
-    return this.items.filter((event) => {
+    let events = this.items.filter((event) => {
       if (query.sessionId && event.sessionId !== query.sessionId) return false;
-      if (query.threadId && event.threadId !== query.threadId) return false;
       if (query.type && event.type !== query.type) return false;
       return true;
     });
+    if (query.afterEventId) {
+      const cursorIndex = events.findIndex((event) => event.id === query.afterEventId);
+      if (cursorIndex < 0) throw new UnknownEventCursorError(query.afterEventId);
+      events = events.slice(cursorIndex + 1);
+    }
+    const limit = query.limit ?? events.length;
+    return query.tail && !query.afterEventId ? events.slice(-limit) : events.slice(0, limit);
   }
 
   async sessions(): Promise<SessionRow[]> {

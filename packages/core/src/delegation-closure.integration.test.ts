@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { SessionId, ThreadId, TimestampMs } from "@chili/protocol";
+import type { SessionId, TimestampMs } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import {
   InMemoryToolRegistry,
@@ -80,7 +80,6 @@ test("join task_batch repairs a launch-only parent response and integrates termi
   try {
     const result = await service.submitPrompt({
       sessionId: fixture.sessionId,
-      threadId: fixture.threadId,
       text: "请并行用两个代理审计认证与测试，并给我综合结论",
     });
 
@@ -138,7 +137,6 @@ test("notify completion wake repairs a completion-only response before the paren
   try {
     const result = await service.submitPrompt({
       sessionId: fixture.sessionId,
-      threadId: fixture.threadId,
       text: completionEnvelope,
     });
 
@@ -232,7 +230,6 @@ test("supervised batch keeps the parent turn open through wait-any, follow-up, w
   try {
     const result = await service.submitPrompt({
       sessionId: fixture.sessionId,
-      threadId: fixture.threadId,
       text: "用两个代理交互审阅，必要时追问，最后综合",
       maxTurns: 12,
     });
@@ -322,7 +319,6 @@ test("supervised batch requires wait-all to cover every task in the original bat
   try {
     const result = await service.submitPrompt({
       sessionId: fixture.sessionId,
-      threadId: fixture.threadId,
       text: "supervise both reviews and integrate them",
       maxTurns: 10,
     });
@@ -389,7 +385,6 @@ test("split wait-all calls close parallel supervised batches without being block
   try {
     const result = await fixture.service(model).submitPrompt({
       sessionId: fixture.sessionId,
-      threadId: fixture.threadId,
       text: "supervise two batches while joined work also runs",
       maxTurns: 10,
     });
@@ -434,7 +429,6 @@ test("a later supervised batch can close after an earlier batch was integrated i
   try {
     const result = await fixture.service(model).submitPrompt({
       sessionId: fixture.sessionId,
-      threadId: fixture.threadId,
       text: "review two supervised batches in sequence",
       maxTurns: 8,
     });
@@ -474,7 +468,6 @@ test("supervised batch fails closed instead of idling when the model repeatedly 
   try {
     const result = await service.submitPrompt({
       sessionId: fixture.sessionId,
-      threadId: fixture.threadId,
       text: "supervise this work",
       maxTurns: 5,
     });
@@ -535,7 +528,6 @@ test("supervised batch repairs generic verdicts and fails closed if no result is
   try {
     const result = await service.submitPrompt({
       sessionId: fixture.sessionId,
-      threadId: fixture.threadId,
       text: "supervise the review and give the concrete result",
       maxTurns: 8,
     });
@@ -597,7 +589,6 @@ test("a failed follow-up after closure is integrated as a blocker instead of reo
   try {
     const result = await fixture.service(model).submitPrompt({
       sessionId: fixture.sessionId,
-      threadId: fixture.threadId,
       text: "supervise and verify auth",
       maxTurns: 8,
     });
@@ -646,7 +637,6 @@ test("a supervised task_batch execution error must be reported before the parent
   try {
     const result = await fixture.service(model).submitPrompt({
       sessionId: fixture.sessionId,
-      threadId: fixture.threadId,
       text: "supervise auth",
       maxTurns: 6,
     });
@@ -688,7 +678,6 @@ test("an explicit all-spawn-failure result requires the parent to report its con
   try {
     const result = await fixture.service(model).submitPrompt({
       sessionId: fixture.sessionId,
-      threadId: fixture.threadId,
       text: "supervise auth",
       maxTurns: 6,
     });
@@ -745,7 +734,6 @@ test.each([
   try {
     const result = await fixture.service(model).submitPrompt({
       sessionId: fixture.sessionId,
-      threadId: fixture.threadId,
       text: "supervise the review",
       maxTurns: 6,
     });
@@ -788,7 +776,6 @@ test("forced final assessment ignores substantive commentary and rejects a gener
   try {
     const result = await fixture.service(model).submitPrompt({
       sessionId: fixture.sessionId,
-      threadId: fixture.threadId,
       text: "supervise auth",
       maxTurns: 2,
     });
@@ -807,16 +794,22 @@ async function createFixture(label: string) {
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const registry = new InMemoryToolRegistry();
   const sessionId = `session_closure_${label}` as SessionId;
-  const threadId = `thread_closure_${label}` as ThreadId;
   let id = 0;
   const createId = (prefix: string) => `${prefix}_${++id}`;
+
+  await store.append({
+    id: `event_session_${label}`,
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd: "/repo" },
+  });
 
   return {
     dir,
     store,
     registry,
     sessionId,
-    threadId,
     service(model: ModelRouter) {
       const runtime = new SingleAgentRuntime({
         store,

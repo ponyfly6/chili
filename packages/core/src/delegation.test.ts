@@ -85,10 +85,10 @@ test("delegation policy gate falls back through persistent team membership", asy
     },
     async teamMembers(query: { childSessionId?: SessionId; limit?: number }) {
       memberQueries.push(query);
-      return [{ teamId: "team_1", childSessionId, updatedAt: 1 }];
+      return [{ teamId: "team_1", path: "/root/worker", childSessionId, updatedAt: 1 }];
     },
     async teams() {
-      return [{ id: "team_1", sessionId: rootSessionId }];
+      return [{ id: "team_1", sessionId: rootSessionId, leadPath: "/root" }];
     },
   } as unknown as DelegationPolicyGateOptions["store"];
   const gate = new DelegationPolicyGate({
@@ -99,7 +99,29 @@ test("delegation policy gate falls back through persistent team membership", asy
   });
 
   expect(await gate.rootSessionId(childSessionId)).toBe(rootSessionId);
-  expect(memberQueries).toContainEqual({ childSessionId, limit: 2 });
+  expect(memberQueries).toContainEqual({ childSessionId, limit: 10_000 });
+});
+
+test("delegation policy gate fails closed for duplicate agent task session ownership", async () => {
+  const childSessionId = "session_task_duplicate" as SessionId;
+  const store = {
+    async agentTasks(query: { childSessionId?: SessionId; limit?: number }) {
+      expect(query).toEqual({ childSessionId, limit: 2 });
+      return [
+        { id: "task_one", childSessionId, parentSessionId: "session_root_one", updatedAt: 1 },
+        { id: "task_two", childSessionId, parentSessionId: "session_root_two", updatedAt: 2 },
+      ];
+    },
+  } as unknown as DelegationPolicyGateOptions["store"];
+  const gate = new DelegationPolicyGate({
+    store,
+    async getDelegationConfig(requestedSessionId) {
+      return { sessionId: requestedSessionId, policy: "explicit", source: "default" };
+    },
+  });
+
+  await expect(gate.assertEnabled({ sessionId: childSessionId, action: "task.spawn" }))
+    .rejects.toThrow(`Ambiguous delegation ancestry for agent task session ${childSessionId}`);
 });
 
 test("delegation policy gate fails closed for duplicate team session ancestry", async () => {
@@ -109,14 +131,16 @@ test("delegation policy gate fails closed for duplicate team session ancestry", 
       return [];
     },
     async teamMembers(query: { childSessionId?: SessionId; limit?: number }) {
-      expect(query).toEqual({ childSessionId, limit: 2 });
+      expect(query).toEqual({ childSessionId, limit: 10_000 });
       return [
-        { teamId: "team_1", childSessionId, updatedAt: 1 },
-        { teamId: "team_2", childSessionId, updatedAt: 2 },
+        { teamId: "team_1", path: "/root/one", childSessionId, updatedAt: 1 },
+        { teamId: "team_2", path: "/root/two", childSessionId, updatedAt: 2 },
       ];
     },
-    async teams() {
-      throw new Error("ambiguous membership must be rejected before resolving a team");
+    async teams(query: { teamId?: string }) {
+      return query.teamId === "team_1"
+        ? [{ id: "team_1", sessionId: "session_parent_one", leadPath: "/root" }]
+        : [{ id: "team_2", sessionId: "session_parent_two", leadPath: "/root" }];
     },
   } as unknown as DelegationPolicyGateOptions["store"];
   const gate = new DelegationPolicyGate({
@@ -128,4 +152,32 @@ test("delegation policy gate fails closed for duplicate team session ancestry", 
 
   await expect(gate.assertEnabled({ sessionId: childSessionId, action: "task.spawn" }))
     .rejects.toThrow(`Ambiguous delegation ancestry for team member session ${childSessionId}`);
+});
+
+test("delegation policy ignores lead self-memberships across multiple teams", async () => {
+  const rootSessionId = "session_multi_team_root" as SessionId;
+  const store = {
+    async agentTasks() {
+      return [];
+    },
+    async teamMembers(query: { childSessionId?: SessionId; limit?: number }) {
+      expect(query).toEqual({ childSessionId: rootSessionId, limit: 10_000 });
+      return [
+        { teamId: "team_one", path: "/root", childSessionId: rootSessionId },
+        { teamId: "team_two", path: "/root", childSessionId: rootSessionId },
+      ];
+    },
+    async teams(query: { teamId?: string }) {
+      return [{ id: query.teamId, sessionId: rootSessionId, leadPath: "/root" }];
+    },
+  } as unknown as DelegationPolicyGateOptions["store"];
+  const gate = new DelegationPolicyGate({
+    store,
+    async getDelegationConfig(requestedSessionId) {
+      return { sessionId: requestedSessionId, policy: "proactive", source: "session" };
+    },
+  });
+
+  expect(await gate.rootSessionId(rootSessionId)).toBe(rootSessionId);
+  await expect(gate.assertEnabled({ sessionId: rootSessionId, action: "task.spawn" })).resolves.toBeUndefined();
 });

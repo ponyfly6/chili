@@ -1,10 +1,10 @@
-import type { SessionId, ThreadId, TimestampMs, TurnId } from "./ids.js";
+import type { SessionId, TimestampMs, TurnId } from "./ids.js";
 
-export const THREAD_GOAL_STATUSES = ["active", "paused", "budgetLimited", "complete"] as const;
+export const SESSION_GOAL_STATUSES = ["active", "paused", "budgetLimited", "complete"] as const;
 
-export type ThreadGoalStatus = (typeof THREAD_GOAL_STATUSES)[number];
+export type SessionGoalStatus = (typeof SESSION_GOAL_STATUSES)[number];
 
-export type ThreadGoalUpdateReason =
+export type SessionGoalUpdateReason =
   | "set"
   | "replace"
   | "pause"
@@ -15,21 +15,20 @@ export type ThreadGoalUpdateReason =
   | "usage"
   | "external";
 
-export interface ThreadGoal {
-  sessionId?: SessionId;
-  threadId: ThreadId;
+export interface SessionGoal {
+  sessionId: SessionId;
   objective: string;
-  status: ThreadGoalStatus;
+  status: SessionGoalStatus;
   tokenBudget?: number;
   tokensUsed: number;
   timeUsedSeconds: number;
   createdAt: TimestampMs;
   updatedAt: TimestampMs;
   completedAt?: TimestampMs;
-  lastReason?: ThreadGoalUpdateReason;
+  lastReason?: SessionGoalUpdateReason;
 }
 
-export interface ThreadGoalUsageDelta {
+export interface SessionGoalUsageDelta {
   turnId?: TurnId;
   tokens: number;
   timeSeconds: number;

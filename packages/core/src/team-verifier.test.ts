@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { AgentPath, SessionId, TaskId, TeamId, TimestampMs, ThreadId, TurnId } from "@chili/protocol";
+import type { AgentPath, SessionId, TaskId, TeamId, TimestampMs, TurnId } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import {
   authorizeToolByPolicy,
@@ -28,7 +28,6 @@ test("team runner auto-verifies worker completion before accepting the task", as
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_verifier_runner" as SessionId;
-  const threadId = "thread_team_verifier_runner" as ThreadId;
   const runner = new RoutingLocalSubagentRunner();
 
   try {
@@ -44,11 +43,10 @@ test("team runner auto-verifies worker completion before accepting the task", as
     });
     const execution = new TeamExecutionRunner({ teams, dispatcher, verifier, cwd: dir, now });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "verifier-runner", leadPath });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const team = await teams.createTeam({ sessionId, name: "verifier-runner", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
     const task = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Implement verifier target",
       ownerPath: workerPath,
@@ -58,7 +56,7 @@ test("team runner auto-verifies worker completion before accepting the task", as
       },
     });
 
-    const summary = await execution.run({ teamId: team.id, sessionId, threadId, mode: "one_shot", maxCycles: 3 });
+    const summary = await execution.run({ teamId: team.id, sessionId, mode: "one_shot", maxCycles: 3 });
 
     expect(summary).toMatchObject({
       stopReason: "drained",
@@ -94,26 +92,24 @@ test("failed verifier reopens the task with feedback", async () => {
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_verifier_failed" as SessionId;
-  const threadId = "thread_team_verifier_failed" as ThreadId;
   const runner = new FixedVerifierRunner("VERDICT: failed\nMissing coverage for retry timeout.");
 
   try {
     const teams = new TeamControlService({ store, createId: ids, now });
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
     const verifier = new TeamTaskVerificationService({ teams, subagents, cwd: dir, now, gitDiff: async () => "(no diff)" });
-    const team = await teams.createTeam({ sessionId, threadId, name: "verifier-failed", leadPath });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
-    const task = await teams.createTask({ sessionId, threadId, teamId: team.id, title: "Needs verification", ownerPath: workerPath });
+    const team = await teams.createTeam({ sessionId, name: "verifier-failed", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const task = await teams.createTask({ sessionId, teamId: team.id, title: "Needs verification", ownerPath: workerPath });
     await teams.updateTask({
       sessionId,
-      threadId,
       teamId: team.id,
       taskId: task.id,
       status: "completed",
       summary: "Worker says done",
     });
 
-    const result = await verifier.verifyCompletedTasks({ teamId: team.id, sessionId, threadId });
+    const result = await verifier.verifyCompletedTasks({ teamId: team.id, sessionId });
 
     expect(result.verified).toMatchObject([
       { status: "failed", feedback: "VERDICT: failed\nMissing coverage for retry timeout." },
@@ -139,7 +135,6 @@ test("abort during verifier setup does not mark verification pending or reopen t
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_verifier_abort" as SessionId;
-  const threadId = "thread_team_verifier_abort" as ThreadId;
   const controller = new AbortController();
   const runner = new FixedVerifierRunner("VERDICT: failed\nShould not run.");
 
@@ -160,19 +155,18 @@ test("abort during verifier setup does not mark verification pending or reopen t
       },
     });
     const execution = new TeamExecutionRunner({ teams, dispatcher, verifier, cwd: dir, now });
-    const team = await teams.createTeam({ sessionId, threadId, name: "verifier-abort", leadPath });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
-    const task = await teams.createTask({ sessionId, threadId, teamId: team.id, title: "Abort verifier setup", ownerPath: workerPath });
+    const team = await teams.createTeam({ sessionId, name: "verifier-abort", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const task = await teams.createTask({ sessionId, teamId: team.id, title: "Abort verifier setup", ownerPath: workerPath });
     await teams.updateTask({
       sessionId,
-      threadId,
       teamId: team.id,
       taskId: task.id,
       status: "completed",
       summary: "Worker says done",
     });
 
-    const summary = await execution.run({ teamId: team.id, sessionId, threadId, signal: controller.signal });
+    const summary = await execution.run({ teamId: team.id, sessionId, signal: controller.signal });
 
     expect(summary).toMatchObject({
       stopReason: "aborted",
@@ -302,7 +296,6 @@ test("verifier policy is read-only and denies write tools", async () => {
       tool: bash,
       executeInput: {
         sessionId: "session_policy" as SessionId,
-        threadId: "thread_policy" as ThreadId,
         turnId: "turn_policy" as TurnId,
         toolName: "bash",
         input: { command: "bun test packages/core/src/team-verifier.test.ts" },
@@ -319,7 +312,6 @@ test("verifier policy is read-only and denies write tools", async () => {
       tool: bash,
       executeInput: {
         sessionId: "session_policy" as SessionId,
-        threadId: "thread_policy" as ThreadId,
         turnId: "turn_policy" as TurnId,
         toolName: "bash",
         input: { command: "bun test packages/core/src/other.test.ts" },
@@ -336,7 +328,6 @@ test("verifier policy is read-only and denies write tools", async () => {
       tool: bash,
       executeInput: {
         sessionId: "session_policy" as SessionId,
-        threadId: "thread_policy" as ThreadId,
         turnId: "turn_policy" as TurnId,
         toolName: "bash",
         input: { command: "bun test packages/core/src/team-verifier.test.ts; rm -rf ." },
@@ -353,7 +344,6 @@ test("verifier policy is read-only and denies write tools", async () => {
       tool: edit,
       executeInput: {
         sessionId: "session_policy" as SessionId,
-        threadId: "thread_policy" as ThreadId,
         turnId: "turn_policy" as TurnId,
         toolName: "edit",
         input: {},

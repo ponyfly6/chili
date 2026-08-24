@@ -27,8 +27,7 @@ import type {
   RuntimeSkillMention,
   ServiceTier,
   SessionId,
-  ThreadGoal,
-  ThreadId,
+  SessionGoal,
 } from "@chili/protocol";
 import { useTeamLiveRuntime, type TeamLiveRuntimeState, type TeamLiveTuiOptions } from "./useTeamLiveRuntime.js";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
@@ -42,7 +41,6 @@ export interface ChatRuntimeFeedback {
 
 export interface ChatRuntimeState extends TeamLiveRuntimeState {
   activeSessionId?: SessionId;
-  activeThreadId?: ThreadId;
   chatView: ChatSessionView;
   chatFeedback?: ChatRuntimeFeedback;
   modelCandidates?: readonly ModelCandidate[];
@@ -72,13 +70,13 @@ export interface ChatRuntimeState extends TeamLiveRuntimeState {
   authMcpServer?: (server: string, request?: RuntimeMcpAuthRequest) => Promise<RuntimeMcpAuthResponse | undefined>;
   logoutMcpServer?: (server: string) => Promise<RuntimeMcpLogoutResponse | undefined>;
   setRuntimePermissionProfile?: (profile: RuntimePermissionProfileId) => Promise<boolean>;
-  setGoal: (input: { objective: string; tokenBudget?: number }) => Promise<ThreadGoal | undefined>;
-  pauseGoal: () => Promise<ThreadGoal | undefined>;
-  resumeGoal: () => Promise<ThreadGoal | undefined>;
+  setGoal: (input: { objective: string; tokenBudget?: number }) => Promise<SessionGoal | undefined>;
+  pauseGoal: () => Promise<SessionGoal | undefined>;
+  resumeGoal: () => Promise<SessionGoal | undefined>;
   clearGoal: () => Promise<boolean>;
   startNewSession: () => Promise<void>;
   listSessions: () => Promise<RuntimeSessionSummary[]>;
-  resumeSession: (session: Pick<RuntimeSessionSummary, "id" | "threadId">) => Promise<boolean>;
+  resumeSession: (session: Pick<RuntimeSessionSummary, "id">) => Promise<boolean>;
   renameSession: (title: string) => Promise<RuntimeSessionSummary | undefined>;
   interruptActiveSession: () => Promise<void>;
   approveApproval: (approvalId: ApprovalId, options?: ChatApproveOptions) => Promise<void>;
@@ -115,7 +113,6 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   const { client, options } = input;
   const teamRuntime = useTeamLiveRuntime(input);
   const [activeSessionId, setActiveSessionId] = useState<SessionId | undefined>(options.sessionId);
-  const [activeThreadId, setActiveThreadId] = useState<ThreadId | undefined>(options.threadId);
   const [submitPending, setSubmitPending] = useState(false);
   const [chatFeedback, setChatFeedback] = useState<ChatRuntimeFeedback | undefined>();
   const [modelCandidates, setModelCandidates] = useState<readonly ModelCandidate[]>([]);
@@ -130,8 +127,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
 
   useEffect(() => {
     setActiveSessionId(options.sessionId);
-    setActiveThreadId(options.threadId);
-  }, [options.sessionId, options.threadId]);
+  }, [options.sessionId]);
 
   useEffect(() => {
     const sessionId = options.sessionId;
@@ -141,36 +137,25 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
       .then((events) => {
         if (controller.signal.aborted) return;
         teamRuntime.hydrateEvents(events);
-        if (!options.threadId) {
-          const threadId = events.find((event) => event.threadId)?.threadId;
-          if (threadId) setActiveThreadId(threadId);
-        }
       })
       .catch((error) => {
         if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
       });
     return () => controller.abort();
-  }, [client, options.baseUrl, options.sessionId, options.threadId, teamRuntime.hydrateEvents]);
+  }, [client, options.baseUrl, options.sessionId, teamRuntime.hydrateEvents]);
 
   const chatView = useMemo(() => {
     const request: Parameters<typeof chatSessionView>[1] = { limit: 120, requireSession: true };
     if (activeSessionId) request.sessionId = activeSessionId;
-    if (activeThreadId) request.threadId = activeThreadId;
     return chatSessionView(teamRuntime.runtimeView, request);
-  }, [activeSessionId, activeThreadId, teamRuntime.revision, teamRuntime.runtimeView]);
+  }, [activeSessionId, teamRuntime.revision, teamRuntime.runtimeView]);
 
   useEffect(() => {
     if (activeSessionId && chatView.sessionId && activeSessionId !== chatView.sessionId) setActiveSessionId(chatView.sessionId);
-    if (!activeThreadId && chatView.threadId) setActiveThreadId(chatView.threadId);
-  }, [activeSessionId, activeThreadId, chatView.sessionId, chatView.threadId]);
+  }, [activeSessionId, chatView.sessionId]);
 
   const running = chatView.status === "running" || chatView.status === "waiting_for_approval" || chatView.status === "cancelling";
-  const resolvedThreadId = activeThreadId ?? chatView.threadId;
-  const resumeThreadMissing = Boolean(activeSessionId && !resolvedThreadId);
-  const submitBlockedReason = resumeThreadMissing
-    ? "Session resume needs a thread. Pass --thread or wait for history to load."
-    : undefined;
-  const canSubmit = !submitPending && !running && chatView.pendingApprovals.length === 0 && !submitBlockedReason;
+  const canSubmit = !submitPending && !running && chatView.pendingApprovals.length === 0;
 
   const withAbort = useCallback(<T,>(run: (signal: AbortSignal) => Promise<T>): Promise<T> => {
     const controller = new AbortController();
@@ -398,25 +383,19 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     }
   }, [client, options.baseUrl, refreshMcpStatus, withAbort]);
 
-  const ensureSession = useCallback(async (signal: AbortSignal): Promise<{ sessionId: SessionId; threadId: ThreadId }> => {
+  const ensureSession = useCallback(async (signal: AbortSignal): Promise<{ sessionId: SessionId }> => {
     let sessionId = activeSessionId ?? chatView.sessionId;
-    let threadId = activeThreadId ?? chatView.threadId;
-    if (sessionId && !threadId) {
-      throw new Error(submitBlockedReason ?? "Session resume needs a thread.");
-    }
-    if (!sessionId && !threadId) {
+    if (!sessionId) {
       const created = await client.createSession({
         ...(options.cwd ? { cwd: options.cwd } : {}),
         signal,
       });
       sessionId = created.sessionId;
-      threadId = created.threadId;
       setActiveSessionId(sessionId);
-      setActiveThreadId(threadId);
     }
-    if (!sessionId || !threadId) throw new Error("Unable to determine a session and thread.");
-    return { sessionId, threadId };
-  }, [activeSessionId, activeThreadId, chatView.sessionId, chatView.threadId, client, options.cwd, submitBlockedReason]);
+    if (!sessionId) throw new Error("Unable to determine a session.");
+    return { sessionId };
+  }, [activeSessionId, chatView.sessionId, client, options.cwd]);
 
   const setRuntimeDelegationPolicy = useCallback(async (
     policy: DelegationPolicy,
@@ -424,26 +403,21 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     try {
       const updated = await withAbort(async (signal) => {
         let sessionId = activeSessionId ?? chatView.sessionId;
-        let threadId = activeThreadId ?? chatView.threadId;
-        if (sessionId && !threadId) throw new Error(submitBlockedReason ?? "Session resume needs a thread.");
-        if (!sessionId && !threadId) {
+        if (!sessionId) {
           const created = await client.createSession({
             ...(options.cwd ? { cwd: options.cwd } : {}),
             signal,
           });
           sessionId = created.sessionId;
-          threadId = created.threadId;
         }
-        if (!sessionId || !threadId) throw new Error("Unable to determine a session and thread.");
+        if (!sessionId) throw new Error("Unable to determine a session.");
         const epoch = ++delegationConfigEpochRef.current;
         const config = await client.setDelegationPolicy({
           sessionId,
-          threadId,
           policy,
           signal,
         });
         setActiveSessionId(sessionId);
-        setActiveThreadId(threadId);
         return { config, epoch };
       });
       if (delegationConfigEpochRef.current === updated.epoch) setDelegationConfig(updated.config);
@@ -453,40 +427,29 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
       if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
       return undefined;
     }
-  }, [activeSessionId, activeThreadId, chatView.sessionId, chatView.threadId, client, options.baseUrl, options.cwd, submitBlockedReason, withAbort]);
+  }, [activeSessionId, chatView.sessionId, client, options.baseUrl, options.cwd, withAbort]);
 
   const submitPrompt = useCallback(async (text: string, submitOptions: ChatSubmitOptions = {}): Promise<boolean> => {
     const trimmed = text.trim();
     if (!trimmed || submitPending || running || chatView.pendingApprovals.length > 0) return false;
-    if (resumeThreadMissing) {
-      setChatFeedback({ status: "error", message: submitBlockedReason ?? "Session resume needs a thread." });
-      return false;
-    }
     setSubmitPending(true);
     setChatFeedback({ status: "pending", message: "sending prompt" });
     try {
       await withAbort(async (signal) => {
         let sessionId = activeSessionId ?? chatView.sessionId;
-        let threadId = activeThreadId ?? chatView.threadId;
-        if (sessionId && !threadId) {
-          throw new Error(submitBlockedReason ?? "Session resume needs a thread.");
-        }
-        if (!sessionId && !threadId) {
+        if (!sessionId) {
           const created = await client.createSession({
             ...(options.cwd ? { cwd: options.cwd } : {}),
             signal,
           });
           sessionId = created.sessionId;
-          threadId = created.threadId;
           setActiveSessionId(sessionId);
-          setActiveThreadId(threadId);
         }
-        if (!sessionId || !threadId) {
-          throw new Error("Unable to determine a session and thread for this prompt.");
+        if (!sessionId) {
+          throw new Error("Unable to determine a session for this prompt.");
         }
         const request = {
           sessionId,
-          threadId,
           text: trimmed,
           ...(submitOptions.displayText ? { displayText: submitOptions.displayText } : {}),
           ...(options.cwd ? { cwd: options.cwd } : {}),
@@ -507,7 +470,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     } finally {
       setSubmitPending(false);
     }
-  }, [activeSessionId, activeThreadId, chatView.pendingApprovals.length, chatView.sessionId, chatView.threadId, client, options.baseUrl, options.cwd, resumeThreadMissing, running, submitBlockedReason, submitPending, withAbort]);
+  }, [activeSessionId, chatView.pendingApprovals.length, chatView.sessionId, client, options.baseUrl, options.cwd, running, submitPending, withAbort]);
 
   const submitCommand = useCallback(async (
     name: string,
@@ -516,35 +479,24 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   ): Promise<boolean> => {
     const commandName = name.trim();
     if (!commandName || submitPending || running || chatView.pendingApprovals.length > 0) return false;
-    if (resumeThreadMissing) {
-      setChatFeedback({ status: "error", message: submitBlockedReason ?? "Session resume needs a thread." });
-      return false;
-    }
     setSubmitPending(true);
     setChatFeedback({ status: "pending", message: "sending command" });
     try {
       await withAbort(async (signal) => {
         let sessionId = activeSessionId ?? chatView.sessionId;
-        let threadId = activeThreadId ?? chatView.threadId;
-        if (sessionId && !threadId) {
-          throw new Error(submitBlockedReason ?? "Session resume needs a thread.");
-        }
-        if (!sessionId && !threadId) {
+        if (!sessionId) {
           const created = await client.createSession({
             ...(options.cwd ? { cwd: options.cwd } : {}),
             signal,
           });
           sessionId = created.sessionId;
-          threadId = created.threadId;
           setActiveSessionId(sessionId);
-          setActiveThreadId(threadId);
         }
-        if (!sessionId || !threadId) {
-          throw new Error("Unable to determine a session and thread for this command.");
+        if (!sessionId) {
+          throw new Error("Unable to determine a session for this command.");
         }
         await client.submitCommandAsync({
           sessionId,
-          threadId,
           name: commandName,
           ...(args.trim().length > 0 ? { args: args.trim() } : {}),
           ...(options.cwd ? { cwd: options.cwd } : {}),
@@ -562,7 +514,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     } finally {
       setSubmitPending(false);
     }
-  }, [activeSessionId, activeThreadId, chatView.pendingApprovals.length, chatView.sessionId, chatView.threadId, client, options.baseUrl, options.cwd, resumeThreadMissing, running, submitBlockedReason, submitPending, withAbort]);
+  }, [activeSessionId, chatView.pendingApprovals.length, chatView.sessionId, client, options.baseUrl, options.cwd, running, submitPending, withAbort]);
 
   const setRuntimeModel = useCallback(async (selection: ModelSelection): Promise<boolean> => {
     let updatedSessionId: SessionId | undefined;
@@ -641,7 +593,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     }
   }, [client, options.baseUrl, withAbort]);
 
-  const setGoal = useCallback(async (goalInput: { objective: string; tokenBudget?: number }): Promise<ThreadGoal | undefined> => {
+  const setGoal = useCallback(async (goalInput: { objective: string; tokenBudget?: number }): Promise<SessionGoal | undefined> => {
     try {
       const goal = await withAbort(async (signal) => {
         const session = await ensureSession(signal);
@@ -661,7 +613,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     }
   }, [client, ensureSession, options.baseUrl, withAbort]);
 
-  const pauseGoal = useCallback(async (): Promise<ThreadGoal | undefined> => {
+  const pauseGoal = useCallback(async (): Promise<SessionGoal | undefined> => {
     try {
       const goal = await withAbort(async (signal) => {
         const session = await ensureSession(signal);
@@ -675,7 +627,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     }
   }, [client, ensureSession, options.baseUrl, withAbort]);
 
-  const resumeGoal = useCallback(async (): Promise<ThreadGoal | undefined> => {
+  const resumeGoal = useCallback(async (): Promise<SessionGoal | undefined> => {
     try {
       const goal = await withAbort(async (signal) => {
         const session = await ensureSession(signal);
@@ -724,7 +676,6 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     setSubmitPending(false);
     setChatFeedback(undefined);
     setActiveSessionId(undefined);
-    setActiveThreadId(undefined);
     delegationConfigEpochRef.current += 1;
     setDelegationConfig(undefined);
     try {
@@ -733,7 +684,6 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
         signal,
       }));
       setActiveSessionId(created.sessionId);
-      setActiveThreadId(created.threadId);
       await refreshDelegationConfigForSession(created.sessionId);
       setChatFeedback(undefined);
     } catch (error) {
@@ -751,7 +701,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   }, [client, options.baseUrl]);
 
   const resumeSession = useCallback(async (
-    session: Pick<RuntimeSessionSummary, "id" | "threadId">,
+    session: Pick<RuntimeSessionSummary, "id">,
   ): Promise<boolean> => {
     if (running) {
       setChatFeedback({ status: "error", message: "Cannot resume another session while the current session is running." });
@@ -764,12 +714,9 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
         limit: 5_000,
         signal,
       }));
-      const threadId = session.threadId ?? events.find((event) => event.threadId)?.threadId;
-      if (!threadId) throw new Error(`Session ${session.id} has no resumable thread.`);
       teamRuntime.hydrateEvents(events);
       setSubmitPending(false);
       setActiveSessionId(session.id);
-      setActiveThreadId(threadId);
       await refreshDelegationConfigForSession(session.id);
       setChatFeedback({ status: "success", message: "saved chat resumed" });
       return true;
@@ -812,7 +759,6 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   return useMemo(() => ({
     ...teamRuntime,
     ...(activeSessionId ? { activeSessionId } : {}),
-    ...(activeThreadId ? { activeThreadId } : {}),
     chatView,
     ...(chatFeedback ? { chatFeedback } : {}),
     modelCandidates,
@@ -822,7 +768,6 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     ...(commandList ? { commandList } : {}),
     ...(mcpStatus ? { mcpStatus } : {}),
     canSubmit,
-    ...(submitBlockedReason ? { submitBlockedReason } : {}),
     submitPrompt,
     submitCommand,
     setRuntimeModel,
@@ -853,7 +798,7 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
     interruptActiveSession,
     approveApproval,
     rejectApproval,
-  }), [activeSessionId, activeThreadId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, delegationConfig, permissionConfig, commandList, mcpStatus, refreshModelConfig, refreshDelegationConfig, refreshPermissionConfig, reloadCommands, refreshMcpStatus, getMcpServer, reloadMcp, addMcpServer, removeMcpServer, listMcpTools, authMcpServer, logoutMcpServer, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setRuntimeServiceTier, setRuntimeDelegationPolicy, setGoal, pauseGoal, resumeGoal, clearGoal, startNewSession, listSessions, resumeSession, renameSession, submitBlockedReason, submitCommand, submitPrompt, teamRuntime]);
+  }), [activeSessionId, canSubmit, chatFeedback, chatView, interruptActiveSession, approveApproval, rejectApproval, modelCandidates, modelConfig, delegationConfig, permissionConfig, commandList, mcpStatus, refreshModelConfig, refreshDelegationConfig, refreshPermissionConfig, reloadCommands, refreshMcpStatus, getMcpServer, reloadMcp, addMcpServer, removeMcpServer, listMcpTools, authMcpServer, logoutMcpServer, setRuntimeModel, setRuntimePermissionProfile, setRuntimeReasoning, setRuntimeServiceTier, setRuntimeDelegationPolicy, setGoal, pauseGoal, resumeGoal, clearGoal, startNewSession, listSessions, resumeSession, renameSession, submitCommand, submitPrompt, teamRuntime]);
 }
 
 function upsertMcpServer(current: RuntimeMcpStatusResponse | undefined, server: RuntimeMcpServerDescriptor): RuntimeMcpStatusResponse {

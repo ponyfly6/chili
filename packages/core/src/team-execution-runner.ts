@@ -9,7 +9,6 @@ import type {
   TeamRunStopReason,
   TeamRunSummaryCounts,
   TeamTaskStatus,
-  ThreadId,
   TimestampMs,
 } from "@chili/protocol";
 import { timestampNow } from "@chili/protocol";
@@ -77,13 +76,11 @@ export interface TeamExecutionSessionRequest {
 
 export interface TeamExecutionSession {
   sessionId: SessionId;
-  threadId?: ThreadId;
 }
 
 export interface TeamExecutionRunInput {
   teamId: TeamId;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   cwd?: string;
   mode?: LocalSubagentMode;
   once?: boolean;
@@ -210,7 +207,6 @@ interface TeamExecutionState {
 
 interface SessionState {
   sessionId?: SessionId;
-  threadId?: ThreadId;
 }
 
 interface TeamDispatchWork {
@@ -269,7 +265,6 @@ export class TeamExecutionRunner {
     const startedMonotonic = Date.now();
     const sessionState: SessionState = {};
     if (input.sessionId) sessionState.sessionId = input.sessionId;
-    if (input.threadId) sessionState.threadId = input.threadId;
     const summary: TeamExecutionRunSummary = {
       teamId: input.teamId,
       cycles: 0,
@@ -434,8 +429,6 @@ export class TeamExecutionRunner {
         dispatchInput.ownerPath = ownerPath;
         const sessionId = sessionState.sessionId ?? dispatchTask.sessionId ?? state.team.sessionId;
         if (sessionId) dispatchInput.sessionId = sessionId;
-        const threadId = sessionState.threadId ?? input.threadId;
-        if (threadId) dispatchInput.threadId = threadId;
         if (input.signal) dispatchInput.signal = input.signal;
         dispatches.push({ task: dispatchTask, input: dispatchInput });
       }
@@ -537,9 +530,7 @@ export class TeamExecutionRunner {
         teamId: input.teamId,
       };
       const sessionId = sessionState.sessionId ?? input.sessionId;
-      const threadId = sessionState.threadId ?? input.threadId;
       if (sessionId) reconcileInput.sessionId = sessionId;
-      if (threadId) reconcileInput.threadId = threadId;
       return await this.options.dispatcher.reconcileTasks(reconcileInput);
     } catch (error) {
       summary.errors.push({
@@ -596,9 +587,7 @@ export class TeamExecutionRunner {
         maxConcurrentVerifications: summary.maxConcurrentVerifications,
       };
       const sessionId = sessionState.sessionId ?? input.sessionId;
-      const threadId = sessionState.threadId ?? input.threadId;
       if (sessionId) verifierInput.sessionId = sessionId;
-      if (threadId) verifierInput.threadId = threadId;
       if (input.signal) verifierInput.signal = input.signal;
       return await this.options.verifier.verifyCompletedTasks(verifierInput);
     } catch (error) {
@@ -652,9 +641,7 @@ export class TeamExecutionRunner {
         cwd: input.cwd ?? this.options.cwd,
       };
       const sessionId = sessionState.sessionId ?? input.sessionId;
-      const threadId = sessionState.threadId ?? input.threadId;
       if (sessionId) mergeInput.sessionId = sessionId;
-      if (threadId) mergeInput.threadId = threadId;
       if (input.signal) mergeInput.signal = input.signal;
       return await this.options.merger.mergeTeamTasks(mergeInput);
     } catch (error) {
@@ -752,7 +739,6 @@ export class TeamExecutionRunner {
     if (input.signal) request.signal = input.signal;
     const created = await this.options.createSession(request);
     state.sessionId = created.sessionId;
-    if (created.threadId) state.threadId = created.threadId;
     return state;
   }
 
@@ -883,8 +869,6 @@ export class TeamExecutionRunner {
     };
     const sessionId = sessionState.sessionId ?? input.sessionId ?? team.sessionId;
     if (sessionId) event.sessionId = sessionId;
-    const threadId = sessionState.threadId ?? input.threadId;
-    if (threadId) event.threadId = threadId;
     await this.options.events.append(event as ChiliEvent);
   }
 

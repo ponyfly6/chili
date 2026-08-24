@@ -78,10 +78,21 @@ test("agent control mailbox tools normalize inputs and return mailbox records", 
   const list = await executor.execute(toolInput("agent_mailbox", { status: "pending", task_id: "task_done", limit: 3 }));
   expect(list.status).toBe("completed");
   if (list.status === "completed") {
-    expect(JSON.parse(list.result.output)).toMatchObject({
+    const output = JSON.parse(list.result.output) as {
+      messages: Array<Record<string, unknown>>;
+    };
+    expect(output).toMatchObject({
       count: 1,
-      messages: [{ message_id: "event_mailbox", status: "queued", task_id: "task_done" }],
+      messages: [{
+        message_id: "event_mailbox",
+        status: "queued",
+        task_id: "task_done",
+        recipient_session_id: "session_child",
+        recipientSessionId: "session_child",
+      }],
     });
+    expect(output.messages[0]).not.toHaveProperty("child_session_id");
+    expect(output.messages[0]).not.toHaveProperty("childSessionId");
   }
   expect(controller.mailboxListInputs).toEqual([{ status: "queued", taskId: "task_done", limit: 3 }]);
 
@@ -657,7 +668,6 @@ function taskRecord(status: SubagentTaskRecord["status"], taskId = "task_done"):
     generation: 2,
     currentRunId: "agent_done",
     childSessionId: "session_child",
-    childThreadId: "thread_child",
     summary: "done",
     createdAt: 1,
     updatedAt: 2,
@@ -673,8 +683,7 @@ function mailboxRecord(status: SubagentMailboxRecord["status"]): SubagentMailbox
     status,
     triggerTurn: true,
     taskId: "task_done",
-    childSessionId: "session_child",
-    childThreadId: "thread_child",
+    recipientSessionId: "session_child",
     message: { role: "user", content: "continue" },
     createdAt: 1,
     ...(status === "consumed" ? { consumedAt: 2 } : {}),

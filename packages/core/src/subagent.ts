@@ -5,7 +5,6 @@ import type {
   EventEnvelope,
   SessionId,
   TaskId,
-  ThreadId,
   TimestampMs,
   ToolCallId,
 } from "@chili/protocol";
@@ -75,7 +74,6 @@ export interface LocalSubagentSchedulingMetadata {
 
 export interface LocalSubagentTaskInput extends LocalSubagentSchedulingMetadata {
   parentSessionId: SessionId;
-  parentThreadId?: ThreadId;
   parentPath?: AgentPath;
   cwd: string;
   taskName: string;
@@ -91,9 +89,7 @@ export interface LocalSubagentRunInput extends LocalSubagentSchedulingMetadata {
   path: AgentPath;
   parentPath: AgentPath;
   parentSessionId: SessionId;
-  parentThreadId?: ThreadId;
   childSessionId: SessionId;
-  childThreadId: ThreadId;
   cwd: string;
   taskName: string;
   prompt: string;
@@ -115,7 +111,6 @@ export interface LocalSubagentTaskResult extends LocalSubagentSchedulingMetadata
   path: AgentPath;
   parentPath: AgentPath;
   childSessionId: SessionId;
-  childThreadId: ThreadId;
   status: LocalSubagentStatus;
   workerPolicy?: WorkerToolPolicy;
   summary?: string;
@@ -307,13 +302,12 @@ export class LocalSubagentManager implements SubagentController {
     const parentPath = input.parentPath ?? ROOT_AGENT_PATH;
     const path = joinAgentPath(parentPath, taskId);
     const childSessionId = this.id<SessionId>("session");
-    const childThreadId = this.id<ThreadId>("thread");
     const mode = input.mode ?? "one_shot";
     const generation = 1;
     const controller = linkedAbortController(input.signal);
     const batchLimiter = this.retainBatchLimiter(input);
     const workerPolicy = input.workerPolicy
-      ? completeWorkerToolPolicy(input.workerPolicy, childSessionId, childThreadId)
+      ? completeWorkerToolPolicy(input.workerPolicy, childSessionId)
       : undefined;
 
     const task: LocalSubagentTaskResult = {
@@ -322,7 +316,6 @@ export class LocalSubagentManager implements SubagentController {
       path,
       parentPath,
       childSessionId,
-      childThreadId,
       status: "pending",
     };
     if (workerPolicy) task.workerPolicy = workerPolicy;
@@ -330,7 +323,7 @@ export class LocalSubagentManager implements SubagentController {
 
     try {
       await this.append(
-        eventContext(input.parentSessionId, input.parentThreadId),
+        eventContext(input.parentSessionId),
         "agent.task_created",
         {
           taskId,
@@ -338,11 +331,9 @@ export class LocalSubagentManager implements SubagentController {
           parentPath,
           parentSessionId: input.parentSessionId,
           childSessionId,
-          childThreadId,
           taskName: input.taskName,
           cwd: input.cwd,
           prompt: input.prompt,
-          ...(input.parentThreadId ? { parentThreadId: input.parentThreadId } : {}),
           ...(mode ? { mode } : {}),
           ...(workerPolicy ? { workerPolicy } : {}),
           ...schedulingEventPayload(input),
@@ -360,14 +351,12 @@ export class LocalSubagentManager implements SubagentController {
       parentPath,
       parentSessionId: input.parentSessionId,
       childSessionId,
-      childThreadId,
       cwd: input.cwd,
       taskName: input.taskName,
       prompt: input.prompt,
       mode,
       generation,
     };
-    if (input.parentThreadId) runInput.parentThreadId = input.parentThreadId;
     if (workerPolicy) runInput.workerPolicy = workerPolicy;
     assignSchedulingMetadata(runInput, input);
     runInput.signal = controller.signal;
@@ -525,7 +514,7 @@ export class LocalSubagentManager implements SubagentController {
   private async appendAgentSpawned(state: LocalSubagentTaskState): Promise<void> {
     const input = state.runInput;
     await this.append(
-      eventContext(input.parentSessionId, input.parentThreadId),
+      eventContext(input.parentSessionId),
       "agent.spawned",
       {
         runId: input.runId,
@@ -534,11 +523,9 @@ export class LocalSubagentManager implements SubagentController {
         taskId: input.taskId,
         parentSessionId: input.parentSessionId,
         childSessionId: input.childSessionId,
-        childThreadId: input.childThreadId,
         taskName: input.taskName,
         cwd: input.cwd,
         generation: input.generation,
-        ...(input.parentThreadId ? { parentThreadId: input.parentThreadId } : {}),
         ...(input.mode ? { mode: input.mode } : {}),
         ...(input.workerPolicy ? { workerPolicy: input.workerPolicy } : {}),
         ...schedulingEventPayload(input),
@@ -611,7 +598,6 @@ export class LocalSubagentManager implements SubagentController {
         if (state.leaseLost) closeInput.expectedLeaseExpiresAt = state.lease.expiresAt;
         else closeInput.requireActiveLease = true;
       }
-      if (input.parentThreadId) closeInput.threadId = input.parentThreadId;
       if (task.summary) closeInput.summary = task.summary;
       if (task.error) closeInput.error = task.error.message;
       if (state.spawned) closeInput.agentEventId = this.id("event");
@@ -771,7 +757,6 @@ export class LocalSubagentManager implements SubagentController {
         time: this.now(),
       };
       if (state.lease) casInput.requireActiveLease = true;
-      if (input.parentThreadId) casInput.threadId = input.parentThreadId;
       if (task.summary) casInput.summary = task.summary;
       if (task.error) casInput.error = task.error.message;
       if (state.spawned) casInput.agentEventId = this.id("event");
@@ -842,7 +827,6 @@ export class LocalSubagentManager implements SubagentController {
         ...(task.error ? { error: task.error.message } : {}),
       },
     };
-    if (input.parentThreadId) taskEvent.threadId = input.parentThreadId;
     const events: ChiliEvent[] = [taskEvent];
     if (includeAgentEvent) {
       const agentEvent: EventEnvelope<"agent.completed", Extract<ChiliEvent, { type: "agent.completed" }>["payload"]> = {
@@ -860,14 +844,13 @@ export class LocalSubagentManager implements SubagentController {
           ...(task.error ? { error: task.error.message } : {}),
         },
       };
-      if (input.parentThreadId) agentEvent.threadId = input.parentThreadId;
       events.push(agentEvent);
     }
     await this.options.store.appendMany(events);
   }
 
   private async append<TType extends ChiliEvent["type"], TPayload>(
-    input: { sessionId: SessionId; threadId?: ThreadId },
+    input: { sessionId: SessionId },
     type: TType,
     payload: TPayload,
   ): Promise<void> {
@@ -878,7 +861,6 @@ export class LocalSubagentManager implements SubagentController {
       sessionId: input.sessionId,
       payload,
     };
-    if (input.threadId) event.threadId = input.threadId;
     await this.options.store.append(event as ChiliEvent);
   }
 
@@ -898,12 +880,10 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
   async run(input: LocalSubagentRunInput): Promise<LocalSubagentRunResult> {
     await this.options.runner.createSession({
       sessionId: input.childSessionId,
-      threadId: input.childThreadId,
       cwd: input.cwd,
     });
     await this.options.runner.appendUserMessage({
       sessionId: input.childSessionId,
-      threadId: input.childThreadId,
       text: input.prompt,
     });
 
@@ -934,7 +914,6 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
         repairAttempted = true;
         await this.options.runner.appendUserMessage({
           sessionId: input.childSessionId,
-          threadId: input.childThreadId,
           text: subagentCompletionRepairPrompt(assessment),
         });
         if (index + 1 >= maxTurns) extraRepairTurn = true;
@@ -944,7 +923,6 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
     const finalPrompt = this.withFinalResponsePrompt(prompt);
     const finalInput: RunTurnInput = {
       sessionId: input.childSessionId,
-      threadId: input.childThreadId,
       cwd: input.cwd,
       system: finalPrompt.system,
       toolMode: "disabled",
@@ -976,7 +954,6 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
   private async resolvePromptAssembly(input: LocalSubagentRunInput): Promise<PromptAssembly> {
     const fragments = await this.options.promptFragments?.({
       sessionId: input.childSessionId,
-      threadId: input.childThreadId,
       cwd: input.cwd,
     });
     return new PromptAssembler()
@@ -1022,7 +999,6 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
 function runTurnInputFromPrompt(input: LocalSubagentRunInput, prompt: PromptAssembly): RunTurnInput {
   const runInput: RunTurnInput = {
     sessionId: input.childSessionId,
-    threadId: input.childThreadId,
     cwd: input.cwd,
     system: prompt.system,
     promptDebug: prompt.debug,
@@ -1144,10 +1120,8 @@ function unrefTimer(timer: ReturnType<typeof setInterval>): void {
   maybeTimer.unref?.();
 }
 
-function eventContext(sessionId: SessionId, threadId: ThreadId | undefined): { sessionId: SessionId; threadId?: ThreadId } {
-  const context: { sessionId: SessionId; threadId?: ThreadId } = { sessionId };
-  if (threadId) context.threadId = threadId;
-  return context;
+function eventContext(sessionId: SessionId): { sessionId: SessionId } {
+  return { sessionId };
 }
 
 function linkedAbortController(signal: AbortSignal | undefined): AbortController {
@@ -1204,8 +1178,6 @@ function fromToolTaskInput(input: TaskToolInput, context: SubagentToolContext): 
     signal: context.signal,
     sourceCallId: context.callId,
   };
-  const threadId = toolContextThreadId(context);
-  if (threadId) task.parentThreadId = threadId;
   const mode = normalizeToolMode(input.mode);
   if (mode) task.mode = mode;
   if (input.batchId !== undefined) task.batchId = input.batchId;
@@ -1214,10 +1186,6 @@ function fromToolTaskInput(input: TaskToolInput, context: SubagentToolContext): 
   if (input.maxConcurrency !== undefined) task.maxConcurrency = input.maxConcurrency;
   if (input.completionPolicy !== undefined) task.completionPolicy = input.completionPolicy;
   return task;
-}
-
-function toolContextThreadId(context: SubagentToolContext): ThreadId | undefined {
-  return (context as SubagentToolContext & { threadId?: ThreadId }).threadId;
 }
 
 function normalizeToolMode(mode: string | undefined): LocalSubagentMode | undefined {

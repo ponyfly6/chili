@@ -10,7 +10,6 @@ import type {
   SessionId,
   TaskId,
   TeamId,
-  ThreadId,
   TimestampMs,
   TurnId,
 } from "@chili/protocol";
@@ -46,7 +45,6 @@ test("observable wrappers fall back to append events when the inner mailbox proj
       "message_projection_only",
       "/root/projection_only" as AgentPath,
       "session_projection_only",
-      "thread_projection_only",
       1,
     ));
     const agents = new AgentTreeControlService({ store, runtime, createId: sequentialId() });
@@ -72,7 +70,7 @@ test("outer mailbox consumption is idempotent when the task turn atomically cons
 
   try {
     await store.appendMany([
-      taskCreatedEvent(taskId, path, "session_atomic", "thread_atomic", 1),
+      taskCreatedEvent(taskId, path, "session_atomic", 1),
       {
         id: "event_atomic_initial_completed",
         type: "agent.task_completed",
@@ -83,7 +81,6 @@ test("outer mailbox consumption is idempotent when the task turn atomically cons
         "message_atomic_source",
         path,
         "session_atomic",
-        "thread_atomic",
         3,
         { taskId },
       ),
@@ -136,7 +133,7 @@ test("cancelled tasks and closed team members discard stale trigger turns", asyn
 
   try {
     await store.appendMany([
-      taskCreatedEvent(taskId, taskPath, "session_cancelled", "thread_cancelled", 1),
+      taskCreatedEvent(taskId, taskPath, "session_cancelled", 1),
       {
         id: "event_task_cancelled",
         type: "agent.task_completed",
@@ -147,7 +144,6 @@ test("cancelled tasks and closed team members discard stale trigger turns", asyn
         "message_cancelled_task",
         taskPath,
         "session_cancelled",
-        "thread_cancelled",
         3,
         { taskId },
       ),
@@ -168,7 +164,6 @@ test("cancelled tasks and closed team members discard stale trigger turns", asyn
           role: "worker",
           status: "idle",
           childSessionId: "session_closed" as SessionId,
-          childThreadId: "thread_closed" as ThreadId,
         },
       },
       {
@@ -181,7 +176,6 @@ test("cancelled tasks and closed team members discard stale trigger turns", asyn
         "message_closed_member",
         memberPath,
         "session_closed",
-        "thread_closed",
         7,
         { metadata: { teamId, teamMessageId: "team_message_closed" } },
       ),
@@ -273,7 +267,7 @@ test("a task cancelled between mailbox preparation and run claim is discarded wi
 
   try {
     await store.appendMany([
-      taskCreatedEvent(taskId, path, "session_cancel_claim", "thread_cancel_claim", 1),
+      taskCreatedEvent(taskId, path, "session_cancel_claim", 1),
       {
         id: "event_cancel_claim_initial_completed",
         type: "agent.task_completed",
@@ -284,7 +278,6 @@ test("a task cancelled between mailbox preparation and run claim is discarded wi
         "message_cancel_claim_race",
         path,
         "session_cancel_claim",
-        "thread_cancel_claim",
         3,
         { taskId },
       ),
@@ -328,7 +321,6 @@ test("startup reclaims an interrupted delivering trigger in a single-process sto
       "message_interrupted",
       "/root/worker" as AgentPath,
       "session_worker",
-      "thread_worker",
       1,
     ));
     const claim = await store.claimAgentMailboxMessage({
@@ -379,7 +371,6 @@ test("non-completed prompt results requeue and honor retryAfter before succeedin
       "message_retry",
       "/root/worker" as AgentPath,
       "session_worker",
-      "thread_worker",
       1,
     ));
     const agents = new AgentTreeControlService({
@@ -422,7 +413,6 @@ test("explicitly non-retryable prompt failures stay parked for the pump lifetime
       "message_nonretryable",
       "/root/worker" as AgentPath,
       "session_worker",
-      "thread_worker",
       1,
     ));
     const agents = new AgentTreeControlService({ store, runtime, createId: sequentialId() });
@@ -463,7 +453,6 @@ test("runtime idle events do not reset retry attempts or defeat max-attempt park
         type: "session.status_changed",
         time: (10 + idleSequence) as TimestampMs,
         sessionId: input.sessionId,
-        threadId: input.threadId,
         payload: { sessionId: input.sessionId, status: "idle" },
       });
     },
@@ -474,7 +463,6 @@ test("runtime idle events do not reset retry attempts or defeat max-attempt park
       "message_idle_retry",
       "/root/worker" as AgentPath,
       "session_worker",
-      "thread_worker",
       1,
     ));
     const agents = new AgentTreeControlService({ store, runtime, createId: sequentialId() });
@@ -508,7 +496,7 @@ test("aborting a mailbox-owned task turn leaves it incomplete and retryable, not
 
   try {
     await store.appendMany([
-      taskCreatedEvent(taskId, path, "session_abort", "thread_abort", 1),
+      taskCreatedEvent(taskId, path, "session_abort", 1),
       {
         id: "event_initial_completed",
         type: "agent.task_completed",
@@ -519,7 +507,6 @@ test("aborting a mailbox-owned task turn leaves it incomplete and retryable, not
         "message_abort",
         path,
         "session_abort",
-        "thread_abort",
         3,
         { taskId },
       ),
@@ -573,7 +560,6 @@ function taskCreatedEvent(
   taskId: TaskId,
   path: AgentPath,
   childSessionId: string,
-  childThreadId: string,
   time: number,
 ): Extract<ChiliEvent, { type: "agent.task_created" }> {
   return {
@@ -585,9 +571,7 @@ function taskCreatedEvent(
       path,
       parentPath: "/root" as AgentPath,
       parentSessionId: "session_parent" as SessionId,
-      parentThreadId: "thread_parent" as ThreadId,
       childSessionId: childSessionId as SessionId,
-      childThreadId: childThreadId as ThreadId,
       taskName: "cancelled",
       cwd: "/repo",
       prompt: "run",
@@ -600,8 +584,7 @@ function taskCreatedEvent(
 function mailboxEvent(
   id: string,
   path: AgentPath,
-  childSessionId: string,
-  childThreadId: string,
+  recipientSessionId: string,
   time: number,
   options: {
     taskId?: TaskId;
@@ -616,8 +599,7 @@ function mailboxEvent(
       ...(options.taskId ? { taskId: options.taskId } : {}),
       path,
       from: "/root" as AgentPath,
-      childSessionId: childSessionId as SessionId,
-      childThreadId: childThreadId as ThreadId,
+      recipientSessionId: recipientSessionId as SessionId,
       triggerTurn: true,
       message: {
         role: "user",

@@ -5,14 +5,13 @@ import type {
   SessionId,
   TaskId,
   TeamId,
-  ThreadId,
   TimestampMs,
   SnapshotId,
   ToolCallId,
   TurnId,
 } from "./ids.js";
 import type { AgentPath } from "./agent-path.js";
-import type { ThreadGoal, ThreadGoalUpdateReason, ThreadGoalUsageDelta } from "./goal.js";
+import type { SessionGoal, SessionGoalUpdateReason, SessionGoalUsageDelta } from "./goal.js";
 import type { MessagePart } from "./message.js";
 import type {
   McpDiagnosticPayload,
@@ -30,9 +29,11 @@ export interface EventEnvelope<TType extends string = string, TPayload = unknown
   type: TType;
   time: TimestampMs;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   payload: TPayload;
 }
+
+export type SessionScopedEventEnvelope<TType extends string, TPayload> =
+  EventEnvelope<TType, TPayload> & { sessionId: SessionId };
 
 export type ChiliEvent =
   | SessionEvent
@@ -51,14 +52,14 @@ export function isTransientEvent(event: Pick<EventEnvelope, "type">): boolean {
 }
 
 export type SessionEvent =
-  | EventEnvelope<"session.created", { sessionId: SessionId; cwd: string }>
-  | EventEnvelope<"session.renamed", { sessionId: SessionId; title: string }>
-  | EventEnvelope<"session.status_changed", RuntimeStatusPayload>
-  | EventEnvelope<"session.model_changed", { sessionId: SessionId; modelSelection: ModelSelection }>
-  | EventEnvelope<"session.reasoning_changed", { sessionId: SessionId; reasoningLevel: ReasoningLevel }>
-  | EventEnvelope<"session.service_tier_changed", { sessionId: SessionId; serviceTier: ServiceTier }>
-  | EventEnvelope<"session.delegation_changed", { sessionId: SessionId; policy: DelegationPolicy }>
-  | EventEnvelope<"session.archived", { sessionId: SessionId }>;
+  | SessionScopedEventEnvelope<"session.created", { sessionId: SessionId; cwd: string }>
+  | SessionScopedEventEnvelope<"session.renamed", { sessionId: SessionId; title: string }>
+  | SessionScopedEventEnvelope<"session.status_changed", RuntimeStatusPayload>
+  | SessionScopedEventEnvelope<"session.model_changed", { sessionId: SessionId; modelSelection: ModelSelection }>
+  | SessionScopedEventEnvelope<"session.reasoning_changed", { sessionId: SessionId; reasoningLevel: ReasoningLevel }>
+  | SessionScopedEventEnvelope<"session.service_tier_changed", { sessionId: SessionId; serviceTier: ServiceTier }>
+  | SessionScopedEventEnvelope<"session.delegation_changed", { sessionId: SessionId; policy: DelegationPolicy }>
+  | SessionScopedEventEnvelope<"session.archived", { sessionId: SessionId }>;
 
 export type TurnEvent =
   | EventEnvelope<"turn.started", { turnId: TurnId }>
@@ -87,8 +88,8 @@ export type ApprovalEvent =
   | EventEnvelope<"approval.resolved", { approvalId: ApprovalId; decision: ApprovalDecisionAction; feedback?: string }>;
 
 export type GoalEvent =
-  | EventEnvelope<"goal.updated", { goal: ThreadGoal; reason?: ThreadGoalUpdateReason; usageDelta?: ThreadGoalUsageDelta }>
-  | EventEnvelope<"goal.cleared", { threadId: ThreadId; previousGoal?: ThreadGoal; reason?: ThreadGoalUpdateReason }>;
+  | SessionScopedEventEnvelope<"goal.updated", { goal: SessionGoal; reason?: SessionGoalUpdateReason; usageDelta?: SessionGoalUsageDelta }>
+  | SessionScopedEventEnvelope<"goal.cleared", { sessionId: SessionId; previousGoal?: SessionGoal; reason?: SessionGoalUpdateReason }>;
 
 export type RecoveryEvent =
   | EventEnvelope<"snapshot.created", { snapshotId: SnapshotId; callId?: ToolCallId; toolName?: string; paths: string[]; reason: string }>
@@ -113,11 +114,9 @@ export interface AgentTaskCreatedPayload {
   parentPath: AgentPath;
   parentSessionId: SessionId;
   childSessionId: SessionId;
-  childThreadId: ThreadId;
   taskName: string;
   cwd: string;
   prompt: string;
-  parentThreadId?: ThreadId;
   mode?: AgentTaskMode;
   workerPolicy?: Record<string, unknown>;
   sourceCallId?: ToolCallId;
@@ -136,9 +135,7 @@ export interface AgentSpawnedPayload {
   parentPath?: AgentPath;
   taskId?: TaskId;
   parentSessionId?: SessionId;
-  parentThreadId?: ThreadId;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   cwd?: string;
   mode?: AgentTaskMode;
   workerPolicy?: Record<string, unknown>;
@@ -159,8 +156,7 @@ export interface AgentMessageQueuedPayload {
   from: AgentPath;
   triggerTurn: boolean;
   taskId?: TaskId;
-  childSessionId?: SessionId;
-  childThreadId?: ThreadId;
+  recipientSessionId?: SessionId;
   message?: AgentMailboxPayload;
 }
 
@@ -245,7 +241,6 @@ export interface TeamMemberAddedPayload {
   role: string;
   status?: TeamMemberStatus;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   model?: string;
   toolScope?: string[];
   writeScope?: string[];

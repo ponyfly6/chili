@@ -1,4 +1,4 @@
-import type { AgentPath, AgentRunId, EventEnvelope, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
+import type { AgentPath, AgentRunId, EventEnvelope, SessionId, TaskId, TeamId } from "@chili/protocol";
 
 export type RuntimeAgentStatus = "running" | "completed" | "incomplete" | "failed" | "cancelled";
 export type RuntimeTaskStatus = "pending" | "running" | "in_progress" | "blocked" | "completed" | "incomplete" | "failed" | "cancelled";
@@ -16,7 +16,6 @@ export interface RuntimeAgentView {
   updatedAt: number;
   parentPath?: AgentPath;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   completedAt?: number;
 }
 
@@ -28,7 +27,7 @@ export interface RuntimeAgentMailboxMessageView {
   status: "queued" | "delivering" | "consumed" | "discarded";
   queuedAt: number;
   sessionId?: SessionId;
-  threadId?: ThreadId;
+  recipientSessionId?: SessionId;
   claimedAt?: number;
   consumedAt?: number;
 }
@@ -44,7 +43,6 @@ export interface RuntimeTaskView {
   ownerPath?: AgentPath;
   path?: AgentPath;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   completedAt?: number;
 }
 
@@ -129,7 +127,6 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
     agent.updatedAt = event.time;
     assignOptional(agent, "parentPath", stringValue(payload.parentPath) as AgentPath | undefined);
     assignOptional(agent, "sessionId", event.sessionId);
-    assignOptional(agent, "threadId", event.threadId);
     if (taskId) {
       if (!agent.taskIds.includes(taskId)) agent.taskIds.push(taskId);
       const task = upsertTask(view, taskId, event.time);
@@ -141,7 +138,6 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
       task.ownerPath = path;
       assignOptional(task, "sessionId", (stringValue(payload.parentSessionId) as SessionId | undefined) ?? event.sessionId);
       assignOptional(task, "childSessionId", stringValue(payload.childSessionId) as SessionId | undefined);
-      assignOptional(task, "childThreadId", stringValue(payload.childThreadId) as ThreadId | undefined);
       linkTaskToOwnerAgent(view, task, event.time);
     }
     view.agentRunIdsByPath[path] = runId;
@@ -166,7 +162,6 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
     agent.completedAt = event.time;
     agent.updatedAt = event.time;
     assignOptional(agent, "sessionId", event.sessionId);
-    assignOptional(agent, "threadId", event.threadId);
     const taskId = stringValue(payload.taskId) as TaskId | undefined;
     if (taskId && !agent.taskIds.includes(taskId)) agent.taskIds.push(taskId);
     view.agentRunIdsByPath[path] = runId;
@@ -187,7 +182,11 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
       queuedAt: event.time,
     };
     assignOptional(message, "sessionId", event.sessionId);
-    assignOptional(message, "threadId", event.threadId);
+    assignOptional(
+      message,
+      "recipientSessionId",
+      stringValue(payload.recipientSessionId ?? payload.childSessionId) as SessionId | undefined,
+    );
     view.mailboxMessages[message.id] = message;
     if (!view.mailboxMessageIds.includes(message.id)) view.mailboxMessageIds.push(message.id);
 
@@ -244,7 +243,6 @@ function applyAgentEvent(view: MutableAgentsView, event: EventEnvelope): void {
     task.ownerPath = path;
     assignOptional(task, "sessionId", stringValue(payload.parentSessionId) as SessionId | undefined);
     assignOptional(task, "childSessionId", stringValue(payload.childSessionId) as SessionId | undefined);
-    assignOptional(task, "childThreadId", stringValue(payload.childThreadId) as ThreadId | undefined);
     linkTaskToOwnerAgent(view, task, event.time);
     return;
   }

@@ -10,7 +10,6 @@ import type {
   SessionId,
   TaskId,
   TeamId,
-  ThreadId,
   TimestampMs,
   ToolCallId,
   TurnId,
@@ -27,7 +26,6 @@ test("terminal background policies notify only the parent runtime and remain ide
   const childRuntime = new RecordingMailboxRuntime();
   const rootRuntime = new RecordingMailboxRuntime();
   const parentSessionId = "session_parent" as SessionId;
-  const parentThreadId = "thread_parent" as ThreadId;
   const rootPath = "/root" as AgentPath;
   const cases = [
     { id: "task_notify", mode: "background", policy: "notify", shouldNotify: true },
@@ -46,9 +44,7 @@ test("terminal background policies notify only the parent runtime and remain ide
         path: `/root/${item.id}` as AgentPath,
         parentPath: rootPath,
         parentSessionId,
-        parentThreadId,
         childSessionId: `session_${item.id}` as SessionId,
-        childThreadId: `thread_${item.id}` as ThreadId,
         mode: item.mode,
         time: index + 1,
       })),
@@ -71,7 +67,6 @@ test("terminal background policies notify only the parent runtime and remain ide
       summary: `summary for ${item.id}`,
       ...(item.policy ? { policy: item.policy } : {}),
       parentSessionId,
-      parentThreadId,
       time: 10 + index,
     }));
     await store.appendMany(completions);
@@ -80,7 +75,6 @@ test("terminal background policies notify only the parent runtime and remain ide
     expect(childRuntime.prompts).toEqual([]);
     expect(rootRuntime.prompts).toHaveLength(cases.filter((item) => item.shouldNotify).length);
     expect(rootRuntime.prompts.map((prompt) => prompt.sessionId)).toEqual([parentSessionId, parentSessionId]);
-    expect(rootRuntime.prompts.map((prompt) => prompt.threadId)).toEqual([parentThreadId, parentThreadId]);
     const completionMessages = (await service.mailbox({ limit: 20 })).filter(
       (message) => message.message?.metadata?.kind === "subagent_completion_batch",
     );
@@ -106,13 +100,131 @@ test("terminal background policies notify only the parent runtime and remain ide
   }
 });
 
+for (const legacyStatus of ["queued", "consumed"] as const) {
+  test(`legacy ${legacyStatus} completion notifications are semantically deduplicated after upgrade`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), `chili-agent-completion-upgrade-${legacyStatus}-`));
+    const canonicalStore = new SqliteEventStore(join(dir, "canonical.sqlite"));
+    const store = new SqliteEventStore(join(dir, "events.sqlite"));
+    const parentSessionId = "session_parent_upgrade" as SessionId;
+    const childSessionId = "session_child_upgrade" as SessionId;
+    const taskId = "task_upgrade" as TaskId;
+    const rootPath = "/root" as AgentPath;
+    const taskPath = "/root/task_upgrade" as AgentPath;
+    const created = taskCreatedEvent({
+      id: "event_upgrade_created",
+      taskId,
+      path: taskPath,
+      parentPath: rootPath,
+      parentSessionId,
+      childSessionId,
+      mode: "background",
+      completionPolicy: "notify",
+      time: 1,
+    });
+    const completed = taskCompletedEvent({
+      id: "event_upgrade_completed",
+      taskId,
+      path: taskPath,
+      status: "completed",
+      summary: "upgrade result",
+      policy: "notify",
+      parentSessionId,
+      time: 2,
+    });
+
+    try {
+      await canonicalStore.appendMany([created, completed]);
+      const canonical = await new AgentTreeControlService({
+        store: canonicalStore,
+      }).notifyTaskCompletion(completed);
+      if (!canonical?.message || !("content" in canonical.message)) {
+        throw new Error("Canonical completion notification was not created");
+      }
+
+      const legacyMessageId = `agent_completion_legacy_identity_hash_${legacyStatus}`;
+      const legacyQueued: Extract<ChiliEvent, { type: "agent.message_queued" }> = {
+        id: legacyMessageId,
+        type: "agent.message_queued",
+        time: 3 as TimestampMs,
+        sessionId: parentSessionId,
+        payload: {
+          path: canonical.path,
+          from: canonical.fromPath,
+          recipientSessionId: parentSessionId,
+          triggerTurn: true,
+          message: {
+            role: "user",
+            content: canonical.message.content,
+            metadata: {
+              ...canonical.message.metadata,
+              agentMessageId: legacyMessageId,
+            },
+          },
+        },
+      };
+      const events: ChiliEvent[] = [created, completed, legacyQueued];
+      if (legacyStatus === "consumed") {
+        events.push({
+          id: "event_upgrade_consumed",
+          type: "agent.message_consumed",
+          time: 4 as TimestampMs,
+          sessionId: parentSessionId,
+          payload: { messageId: legacyMessageId, path: rootPath, consumedBy: rootPath },
+        });
+      }
+      await store.appendMany(events);
+
+      const rootRuntime = new RecordingMailboxRuntime();
+      let delegationChecks = 0;
+      const service = new AgentTreeControlService({
+        store,
+        rootRuntime,
+        delegationPolicyGate: {
+          assertEnabled() {
+            delegationChecks += 1;
+            throw new Error("completion notification should bypass the delegation gate");
+          },
+        },
+      });
+
+      expect(await service.notifyExistingTaskCompletions()).toMatchObject([{
+        id: legacyMessageId,
+        status: legacyStatus,
+      }]);
+      expect(await store.agentMailbox({ recipientSessionId: parentSessionId })).toHaveLength(1);
+      expect(await store.events({ type: "agent.message_queued", limit: 10 })).toHaveLength(1);
+
+      if (legacyStatus === "queued") {
+        await expect(service.consumeMailbox({ messageId: legacyMessageId })).resolves.toMatchObject({
+          id: legacyMessageId,
+          status: "consumed",
+        });
+        expect(rootRuntime.prompts).toHaveLength(1);
+      } else {
+        expect(rootRuntime.prompts).toEqual([]);
+      }
+      expect(delegationChecks).toBe(0);
+
+      expect(await service.notifyExistingTaskCompletions()).toMatchObject([{
+        id: legacyMessageId,
+        status: "consumed",
+      }]);
+      expect(await store.agentMailbox({ recipientSessionId: parentSessionId })).toHaveLength(1);
+      expect(await store.events({ type: "agent.message_queued", limit: 10 })).toHaveLength(1);
+    } finally {
+      store.close();
+      canonicalStore.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 test("completion notification retries only after the matching parent becomes idle", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-agent-completion-retry-"));
   const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
   const store = new ObservableEventStore(baseStore);
   const rootRuntime = new FailOnceMailboxRuntime();
   const parentSessionId = "session_parent" as SessionId;
-  const parentThreadId = "thread_parent" as ThreadId;
   const taskId = "task_notify" as TaskId;
   const path = "/root/task_notify" as AgentPath;
 
@@ -123,9 +235,7 @@ test("completion notification retries only after the matching parent becomes idl
       path,
       parentPath: "/root" as AgentPath,
       parentSessionId,
-      parentThreadId,
       childSessionId: "session_child" as SessionId,
-      childThreadId: "thread_child" as ThreadId,
       mode: "background",
       time: 1,
     }));
@@ -147,26 +257,25 @@ test("completion notification retries only after the matching parent becomes idl
       error: "provider unavailable",
       policy: "notify",
       parentSessionId,
-      parentThreadId,
       time: 2,
     }));
     await pump.waitForIdle();
     expect(rootRuntime.attempts).toBe(1);
     expect(await service.mailbox({ status: "queued" })).toHaveLength(1);
 
-    await store.append(sessionStatusEvent("event_unrelated_idle", "session_other" as SessionId, "thread_other" as ThreadId, "idle", 3));
+    await store.append(sessionStatusEvent("event_unrelated_idle", "session_other" as SessionId, "idle", 3));
     await pump.waitForIdle();
-    await store.append(sessionStatusEvent("event_parent_running", parentSessionId, parentThreadId, "running", 4));
+    await store.append(sessionStatusEvent("event_parent_running", parentSessionId, "running", 4));
     await pump.waitForIdle();
     expect(rootRuntime.attempts).toBe(1);
 
-    await store.append(sessionStatusEvent("event_parent_idle", parentSessionId, parentThreadId, "idle", 5));
+    await store.append(sessionStatusEvent("event_parent_idle", parentSessionId, "idle", 5));
     await pump.waitForIdle();
     expect(rootRuntime.attempts).toBe(2);
     expect(rootRuntime.prompts).toHaveLength(1);
     expect(await service.mailbox({ status: "queued" })).toEqual([]);
 
-    await store.append(sessionStatusEvent("event_parent_idle_again", parentSessionId, parentThreadId, "idle", 6));
+    await store.append(sessionStatusEvent("event_parent_idle_again", parentSessionId, "idle", 6));
     await pump.waitForIdle();
     await pump.stop();
     expect(rootRuntime.attempts).toBe(2);
@@ -183,7 +292,6 @@ test("startup recovery scans terminal task rows instead of a bounded event tail"
   const store = new ObservableEventStore(baseStore);
   const rootRuntime = new RecordingMailboxRuntime();
   const parentSessionId = "session_parent" as SessionId;
-  const parentThreadId = "thread_parent" as ThreadId;
 
   try {
     await store.appendMany([
@@ -193,9 +301,7 @@ test("startup recovery scans terminal task rows instead of a bounded event tail"
         path: "/root/task_notify" as AgentPath,
         parentPath: "/root" as AgentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId: "session_notify" as SessionId,
-        childThreadId: "thread_notify" as ThreadId,
         mode: "background",
         completionPolicy: "notify",
         time: 1,
@@ -207,7 +313,6 @@ test("startup recovery scans terminal task rows instead of a bounded event tail"
         status: "completed",
         summary: "recover this older completion",
         parentSessionId,
-        parentThreadId,
         time: 2,
       }),
       taskCreatedEvent({
@@ -216,9 +321,7 @@ test("startup recovery scans terminal task rows instead of a bounded event tail"
         path: "/root/task_detached" as AgentPath,
         parentPath: "/root" as AgentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId: "session_detached" as SessionId,
-        childThreadId: "thread_detached" as ThreadId,
         mode: "background",
         completionPolicy: "detached",
         time: 3,
@@ -230,7 +333,6 @@ test("startup recovery scans terminal task rows instead of a bounded event tail"
         status: "completed",
         summary: "newer terminal event must not hide notify",
         parentSessionId,
-        parentThreadId,
         time: 4,
       }),
     ]);
@@ -266,7 +368,6 @@ test("startup delivery is not starved by more than maxInitialDrain queue-only me
   const store = new ObservableEventStore(baseStore);
   const runtime = new RecordingMailboxRuntime();
   const childSessionId = "session_startup_filter" as SessionId;
-  const childThreadId = "thread_startup_filter" as ThreadId;
   const path = "/root/startup_filter" as AgentPath;
 
   try {
@@ -275,12 +376,10 @@ test("startup delivery is not starved by more than maxInitialDrain queue-only me
       type: "agent.message_queued",
       time: (index + 1) as TimestampMs,
       sessionId: childSessionId,
-      threadId: childThreadId,
       payload: {
         path,
         from: "/root" as AgentPath,
-        childSessionId,
-        childThreadId,
+        recipientSessionId: childSessionId,
         triggerTurn: false,
         message: { role: "user", content: `queue only ${index}` },
       },
@@ -292,12 +391,10 @@ test("startup delivery is not starved by more than maxInitialDrain queue-only me
         type: "agent.message_queued",
         time: 1_002 as TimestampMs,
         sessionId: childSessionId,
-        threadId: childThreadId,
         payload: {
           path,
           from: "/root" as AgentPath,
-          childSessionId,
-          childThreadId,
+          recipientSessionId: childSessionId,
           triggerTurn: true,
           message: { role: "user", content: "deliver after restart" },
         },
@@ -353,9 +450,7 @@ test("a trigger message for a pending child stays queued until the initial task 
   const store = new ObservableEventStore(baseStore);
   const childRuntime = new RecordingMailboxRuntime();
   const parentSessionId = "session_parent" as SessionId;
-  const parentThreadId = "thread_parent" as ThreadId;
   const childSessionId = "session_child" as SessionId;
-  const childThreadId = "thread_child" as ThreadId;
   const taskId = "task_pending" as TaskId;
   const path = "/root/task_pending" as AgentPath;
   const followups: string[] = [];
@@ -367,9 +462,7 @@ test("a trigger message for a pending child stays queued until the initial task 
       path,
       parentPath: "/root" as AgentPath,
       parentSessionId,
-      parentThreadId,
       childSessionId,
-      childThreadId,
       mode: "resumable",
       completionPolicy: "join",
       time: 1,
@@ -396,13 +489,11 @@ test("a trigger message for a pending child stays queued until the initial task 
       type: "agent.message_queued",
       time: 2 as TimestampMs,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         taskId,
         path,
         from: "/root" as AgentPath,
-        childSessionId,
-        childThreadId,
+        recipientSessionId: childSessionId,
         triggerTurn: true,
         message: { role: "user", content: "follow up after the initial run" },
       },
@@ -420,16 +511,13 @@ test("a trigger message for a pending child stays queued until the initial task 
       type: "agent.spawned",
       time: 3 as TimestampMs,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         runId: "agent_initial" as AgentRunId,
         taskId,
         path,
         parentPath: "/root" as AgentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId,
-        childThreadId,
         taskName: taskId,
         cwd: "/repo",
         mode: "resumable",
@@ -437,7 +525,7 @@ test("a trigger message for a pending child stays queued until the initial task 
         completionPolicy: "join",
       },
     });
-    await store.append(sessionStatusEvent("event_child_idle_while_running", childSessionId, childThreadId, "idle", 4));
+    await store.append(sessionStatusEvent("event_child_idle_while_running", childSessionId, "idle", 4));
     await within(
       pump.waitForIdle(),
       500,
@@ -452,7 +540,6 @@ test("a trigger message for a pending child stays queued until the initial task 
       status: "completed",
       summary: "initial run done",
       parentSessionId,
-      parentThreadId,
       time: 5,
     });
     await store.append(completed);
@@ -482,7 +569,6 @@ test("notify batches wait for every expected task and wake the parent once", asy
   const store = new ObservableEventStore(baseStore);
   const rootRuntime = new RecordingMailboxRuntime();
   const parentSessionId = "session_parent" as SessionId;
-  const parentThreadId = "thread_parent" as ThreadId;
   const sourceCallId = "call_batch" as ToolCallId;
   const batchId = "batch_shared";
   const firstTaskId = "task_first" as TaskId;
@@ -495,9 +581,7 @@ test("notify batches wait for every expected task and wake the parent once", asy
       path: "/root/task_first" as AgentPath,
       parentPath: "/root" as AgentPath,
       parentSessionId,
-      parentThreadId,
       childSessionId: "session_first" as SessionId,
-      childThreadId: "thread_first" as ThreadId,
       mode: "background",
       sourceCallId,
       batchId,
@@ -523,7 +607,6 @@ test("notify batches wait for every expected task and wake the parent once", asy
       status: "completed",
       summary: "x".repeat(2000),
       parentSessionId,
-      parentThreadId,
       time: 3,
     }));
     await pump.waitForIdle();
@@ -536,9 +619,7 @@ test("notify batches wait for every expected task and wake the parent once", asy
       path: "/root/task_second" as AgentPath,
       parentPath: "/root" as AgentPath,
       parentSessionId,
-      parentThreadId,
       childSessionId: "session_second" as SessionId,
-      childThreadId: "thread_second" as ThreadId,
       mode: "background",
       sourceCallId,
       batchId,
@@ -554,7 +635,6 @@ test("notify batches wait for every expected task and wake the parent once", asy
       status: "failed",
       error: "provider rate limited",
       parentSessionId,
-      parentThreadId,
       time: 5,
     }));
     await pump.waitForIdle();
@@ -574,16 +654,13 @@ test("notify batches wait for every expected task and wake the parent once", asy
       type: "agent.spawned",
       time: 6 as TimestampMs,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         runId: "agent_second_generation" as AgentRunId,
         taskId: secondTaskId,
         path: "/root/task_second" as AgentPath,
         parentPath: "/root" as AgentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId: "session_second" as SessionId,
-        childThreadId: "thread_second" as ThreadId,
         taskName: secondTaskId,
         cwd: "/repo",
         mode: "background",
@@ -603,7 +680,6 @@ test("notify batches wait for every expected task and wake the parent once", asy
       summary: "retry completed",
       generation: 2,
       parentSessionId,
-      parentThreadId,
       time: 7,
     });
     await store.append(secondGeneration);
@@ -628,7 +704,6 @@ test("a sealed partial notify batch uses the tasks that were actually created", 
   const store = new ObservableEventStore(baseStore);
   const rootRuntime = new RecordingMailboxRuntime();
   const parentSessionId = "session_parent" as SessionId;
-  const parentThreadId = "thread_parent" as ThreadId;
   const sourceCallId = "call_partial" as ToolCallId;
   const taskId = "task_only_created" as TaskId;
 
@@ -639,9 +714,7 @@ test("a sealed partial notify batch uses the tasks that were actually created", 
       path: "/root/task_only_created" as AgentPath,
       parentPath: "/root" as AgentPath,
       parentSessionId,
-      parentThreadId,
       childSessionId: "session_child" as SessionId,
-      childThreadId: "thread_child" as ThreadId,
       mode: "background",
       sourceCallId,
       batchId: "batch_partial",
@@ -667,7 +740,6 @@ test("a sealed partial notify batch uses the tasks that were actually created", 
       status: "completed",
       summary: "only successful spawn",
       parentSessionId,
-      parentThreadId,
       time: 2,
     }));
     await pump.waitForIdle();
@@ -678,7 +750,6 @@ test("a sealed partial notify batch uses the tasks that were actually created", 
       type: "tool.call_finished",
       time: 3 as TimestampMs,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         callId: sourceCallId,
         status: "failed",
@@ -708,40 +779,19 @@ test("explicit parent recipients override child task routing", async () => {
   const childRuntime = new RecordingMailboxRuntime();
   const rootRuntime = new RecordingMailboxRuntime();
   const parentSessionId = "session_parent" as SessionId;
-  const parentThreadId = "thread_parent" as ThreadId;
   const taskId = "task_child" as TaskId;
 
   try {
-    await store.appendMany([
-      taskCreatedEvent({
-        id: "event_created",
-        taskId,
-        path: "/root/task_child" as AgentPath,
-        parentPath: "/root" as AgentPath,
-        parentSessionId,
-        parentThreadId,
-        childSessionId: "session_child" as SessionId,
-        childThreadId: "thread_child" as ThreadId,
-        mode: "background",
-        time: 1,
-      }),
-      {
-        id: "event_parent_mailbox",
-        type: "agent.message_queued",
-        time: 2 as TimestampMs,
-        sessionId: parentSessionId,
-        threadId: parentThreadId,
-        payload: {
-          taskId,
-          path: "/root" as AgentPath,
-          from: "/root/task_child" as AgentPath,
-          childSessionId: parentSessionId,
-          childThreadId: parentThreadId,
-          triggerTurn: true,
-          message: { role: "user", content: "parent completion" },
-        },
-      },
-    ]);
+    await store.append(taskCreatedEvent({
+      id: "event_created",
+      taskId,
+      path: "/root/task_child" as AgentPath,
+      parentPath: "/root" as AgentPath,
+      parentSessionId,
+      childSessionId: "session_child" as SessionId,
+      mode: "background",
+      time: 1,
+    }));
     const service = new AgentTreeControlService({
       store,
       runtime: childRuntime,
@@ -750,15 +800,25 @@ test("explicit parent recipients override child task routing", async () => {
       now: () => 3 as TimestampMs,
     });
 
+    await service.sendMessage({
+      messageId: "event_parent_mailbox",
+      from: "/root/task_child" as AgentPath,
+      to: "/root",
+      content: "parent completion",
+      delivery: "triggerTurn",
+      taskId,
+      recipientSessionId: parentSessionId,
+      sessionId: parentSessionId,
+    });
+
     await service.consumeMailbox({ messageId: "event_parent_mailbox" });
 
     expect(childRuntime.prompts).toEqual([]);
     expect(rootRuntime.prompts).toMatchObject([
-      { sessionId: parentSessionId, threadId: parentThreadId, text: "parent completion" },
+      { sessionId: parentSessionId, text: "parent completion" },
     ]);
     const consumed = (await store.events({ type: "agent.message_consumed", limit: 10 }))[0];
     expect(consumed?.sessionId).toBe(parentSessionId);
-    expect(consumed?.threadId).toBe(parentThreadId);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -771,7 +831,7 @@ test("failed team trigger delivery leaves the member blocked and mailbox queued"
   const teamId = "team_mailbox" as TeamId;
   const workerPath = "/root/worker" as AgentPath;
   const childSessionId = "session_worker" as SessionId;
-  const childThreadId = "thread_worker" as ThreadId;
+  const rootSessionId = "session_team_root" as SessionId;
 
   try {
     await store.appendMany([
@@ -779,12 +839,33 @@ test("failed team trigger delivery leaves the member blocked and mailbox queued"
         id: "event_team_created",
         type: "team.created",
         time: 1 as TimestampMs,
+        sessionId: rootSessionId,
         payload: { teamId, name: "mailbox team", leadPath: "/root" as AgentPath },
       },
+      taskCreatedEvent({
+        id: "event_team_worker_created",
+        taskId: "task_team_worker" as TaskId,
+        path: workerPath,
+        parentPath: "/root" as AgentPath,
+        parentSessionId: rootSessionId,
+        childSessionId,
+        mode: "resumable",
+        time: 2,
+      }),
+      taskCompletedEvent({
+        id: "event_team_worker_completed",
+        taskId: "task_team_worker" as TaskId,
+        path: workerPath,
+        status: "completed",
+        summary: "initial team worker turn complete",
+        parentSessionId: rootSessionId,
+        time: 3,
+      }),
       {
         id: "event_member_added",
         type: "team.member_added",
-        time: 2 as TimestampMs,
+        time: 4 as TimestampMs,
+        sessionId: rootSessionId,
         payload: {
           teamId,
           path: workerPath,
@@ -792,10 +873,9 @@ test("failed team trigger delivery leaves the member blocked and mailbox queued"
           role: "implementer",
           status: "idle",
           childSessionId,
-          childThreadId,
         },
       },
-      teamMailboxEvent("event_team_failure", teamId, "teammsg_failure", workerPath, childSessionId, childThreadId, 3),
+      teamMailboxEvent("event_team_failure", teamId, "teammsg_failure", workerPath, childSessionId, 5),
     ]);
     const service = new AgentTreeControlService({
       store,
@@ -824,9 +904,7 @@ function taskCreatedEvent(input: {
   path: AgentPath;
   parentPath: AgentPath;
   parentSessionId: SessionId;
-  parentThreadId: ThreadId;
   childSessionId: SessionId;
-  childThreadId: ThreadId;
   mode: "background" | "one_shot" | "resumable";
   sourceCallId?: ToolCallId;
   batchId?: string;
@@ -840,15 +918,12 @@ function taskCreatedEvent(input: {
     type: "agent.task_created",
     time: input.time as TimestampMs,
     sessionId: input.parentSessionId,
-    threadId: input.parentThreadId,
     payload: {
       taskId: input.taskId,
       path: input.path,
       parentPath: input.parentPath,
       parentSessionId: input.parentSessionId,
-      parentThreadId: input.parentThreadId,
       childSessionId: input.childSessionId,
-      childThreadId: input.childThreadId,
       taskName: input.taskId,
       cwd: "/repo",
       prompt: `run ${input.taskId}`,
@@ -873,7 +948,6 @@ function taskCompletedEvent(input: {
   policy?: "join" | "notify" | "detached" | "supervised";
   batchId?: string;
   parentSessionId: SessionId;
-  parentThreadId: ThreadId;
   time: number;
 }): Extract<ChiliEvent, { type: "agent.task_completed" }> {
   const payload: Extract<ChiliEvent, { type: "agent.task_completed" }>["payload"] = {
@@ -895,7 +969,6 @@ function taskCompletedEvent(input: {
     type: "agent.task_completed",
     time: input.time as TimestampMs,
     sessionId: input.parentSessionId,
-    threadId: input.parentThreadId,
     payload,
   };
 }
@@ -903,7 +976,6 @@ function taskCompletedEvent(input: {
 function sessionStatusEvent(
   id: string,
   sessionId: SessionId,
-  threadId: ThreadId,
   status: "running" | "idle",
   time: number,
 ): Extract<ChiliEvent, { type: "session.status_changed" }> {
@@ -912,7 +984,6 @@ function sessionStatusEvent(
     type: "session.status_changed",
     time: time as TimestampMs,
     sessionId,
-    threadId,
     payload: { sessionId, status },
   };
 }
@@ -923,7 +994,6 @@ function teamMailboxEvent(
   teamMessageId: string,
   path: AgentPath,
   childSessionId: SessionId,
-  childThreadId: ThreadId,
   time: number,
 ): Extract<ChiliEvent, { type: "agent.message_queued" }> {
   return {
@@ -931,12 +1001,10 @@ function teamMailboxEvent(
     type: "agent.message_queued",
     time: time as TimestampMs,
     sessionId: childSessionId,
-    threadId: childThreadId,
     payload: {
       path,
       from: "/root" as AgentPath,
-      childSessionId,
-      childThreadId,
+      recipientSessionId: childSessionId,
       triggerTurn: true,
       message: {
         role: "user",
@@ -953,12 +1021,12 @@ function createSequentialId(): (prefix: string) => string {
 }
 
 class RecordingMailboxRuntime {
-  readonly messages: Array<{ sessionId: SessionId; threadId: ThreadId; text: string }> = [];
+  readonly messages: Array<{ sessionId: SessionId; text: string }> = [];
   readonly prompts: SubmitPromptInput[] = [];
 
   constructor(private readonly error?: Error) {}
 
-  async appendUserMessage(input: { sessionId: SessionId; threadId: ThreadId; text: string }): Promise<MessageId> {
+  async appendUserMessage(input: { sessionId: SessionId; text: string }): Promise<MessageId> {
     this.messages.push(input);
     return "message_mailbox" as MessageId;
   }

@@ -60,6 +60,10 @@ bun run chili -- sessions
 bun run chili -- --resume <session-id> "继续"
 ```
 
+运行时会话现在只使用 `session-id` 标识；旧的 `--thread` 参数不再支持。`--resume` 只接受已存在且活跃的交互式 session，子代理 session 请通过 `task_followup` 继续。多代理任务仍以 `task-id` 作为用户可见标识，每个子代理对应唯一的 child session，后续消息会复用同一个 `task-id` 和 child session。邮箱工具输出中的接收方字段已从 `child_session_id` / `childSessionId` 更名为 `recipient_session_id` / `recipientSessionId`。
+
+身份职责保持正交：`SessionId` 标识可恢复的对话上下文，`TaskId` 标识逻辑代理任务，`AgentRunId` 标识该任务的一次执行尝试，`TurnId` 只标识一次模型轮次。Follow-up 会复用 `TaskId + SessionId`，同时创建新的 `AgentRunId` 并递增 generation。
+
 使用 fake model 做本地 smoke test：
 
 ```bash

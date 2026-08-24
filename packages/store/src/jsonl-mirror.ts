@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, appendFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import type { ChiliEvent, MessageId, MessagePart, MessageRole, SessionId, ThreadId, TimestampMs, TurnId } from "@chili/protocol";
+import type { ChiliEvent, MessageId, MessagePart, MessageRole, SessionId, TimestampMs, TurnId } from "@chili/protocol";
 import type { EventMirror } from "./types.js";
 
 export class JsonlMirror implements EventMirror {
@@ -98,7 +98,6 @@ export class SessionJsonlMirror implements EventMirror {
 interface TranscriptMessageState {
   messageId: MessageId;
   sessionId: SessionId;
-  threadId?: ThreadId;
   turnId?: TurnId;
   role: MessageRole;
   createdAt: TimestampMs;
@@ -132,7 +131,6 @@ export class SessionTranscriptJsonlMirror implements EventMirror {
         parts: [],
         flushed: false,
       };
-      if (event.threadId) state.threadId = event.threadId;
       if (event.payload.turnId) state.turnId = event.payload.turnId;
       this.messages.set(event.payload.messageId, state);
       return;
@@ -166,7 +164,6 @@ export class SessionTranscriptJsonlMirror implements EventMirror {
     if (!sessionId) return;
     for (const message of this.messages.values()) {
       if (message.flushed || message.sessionId !== sessionId) continue;
-      if (event.threadId && message.threadId && event.threadId !== message.threadId) continue;
       if (event.type === "turn.started" && message.role === "assistant") continue;
       await this.writeMessage(message);
       message.flushed = true;
@@ -178,7 +175,6 @@ export class SessionTranscriptJsonlMirror implements EventMirror {
       timestamp: new Date(message.createdAt).toISOString(),
       type: "message",
       sessionId: message.sessionId,
-      ...(message.threadId ? { threadId: message.threadId } : {}),
       ...(message.turnId ? { turnId: message.turnId } : {}),
       messageId: message.messageId,
       role: message.role,

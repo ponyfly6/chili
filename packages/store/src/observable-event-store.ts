@@ -1,4 +1,4 @@
-import type { ChiliEvent, EventEnvelope, Message, SessionId, TaskId, ThreadId } from "@chili/protocol";
+import type { ChiliEvent, EventEnvelope, Message, SessionId, TaskId } from "@chili/protocol";
 import type {
   AgentMailboxQuery,
   AgentMailboxRow,
@@ -54,8 +54,8 @@ import type {
   TeamTaskVerificationClaimInput,
   TeamTaskVerificationClaimResult,
   TeamTaskVerificationClaimStore,
-  ThreadGoalQuery,
-  ThreadGoalRow,
+  SessionGoalQuery,
+  SessionGoalRow,
 } from "./types.js";
 
 export interface EventPublisher {
@@ -116,12 +116,12 @@ export class ObservableEventStore
     return this.inner.pendingApprovals(sessionId);
   }
 
-  threadGoal(threadId: ThreadId): Promise<ThreadGoalRow | undefined> {
-    return this.goalStore()?.threadGoal(threadId) ?? Promise.resolve(undefined);
+  sessionGoal(sessionId: SessionId): Promise<SessionGoalRow | undefined> {
+    return this.goalStore()?.sessionGoal(sessionId) ?? Promise.resolve(undefined);
   }
 
-  threadGoals(query?: ThreadGoalQuery): Promise<ThreadGoalRow[]> {
-    return this.goalStore()?.threadGoals(query) ?? Promise.resolve([]);
+  sessionGoals(query?: SessionGoalQuery): Promise<SessionGoalRow[]> {
+    return this.goalStore()?.sessionGoals(query) ?? Promise.resolve([]);
   }
 
   agentTasks(query?: AgentTaskQuery): Promise<AgentTaskRow[]> {
@@ -290,7 +290,7 @@ export class ObservableEventStore
 
   private goalStore(): GoalProjectionStore | undefined {
     const inner = this.inner as EventStore & Partial<GoalProjectionStore>;
-    if (inner.threadGoal && inner.threadGoals) {
+    if (inner.sessionGoal && inner.sessionGoals) {
       return inner as EventStore & GoalProjectionStore;
     }
     return undefined;

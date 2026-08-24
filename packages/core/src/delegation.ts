@@ -8,8 +8,8 @@ import type {
 import type { SubagentProjectionStore, TeamProjectionStore } from "@chili/store";
 
 const MAX_DELEGATION_PARENT_DEPTH = 64;
-const DELEGATION_PROJECTION_LIMIT = 10_000;
 const DELEGATION_PARENT_QUERY_LIMIT = 2;
+const DELEGATION_TEAM_MEMBERSHIP_LIMIT = 10_000;
 
 export interface ResolveDelegationConfigInput {
   sessionId: SessionId;
@@ -82,31 +82,41 @@ export class DelegationPolicyGate {
   }
 
   private async parentSessionId(sessionId: SessionId): Promise<SessionId | undefined> {
-    const task = (await this.options.store.agentTasks({
+    const tasks = (await this.options.store.agentTasks({
       childSessionId: sessionId,
-      limit: DELEGATION_PROJECTION_LIMIT,
-    }))
-      .filter((candidate) => candidate.parentSessionId && candidate.parentSessionId !== sessionId)
-      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
-    if (task?.parentSessionId) return task.parentSessionId;
+      limit: DELEGATION_PARENT_QUERY_LIMIT,
+    })).filter((candidate) => candidate.childSessionId === sessionId);
+    if (tasks.length > 1) {
+      throw new Error(`Ambiguous delegation ancestry for agent task session ${sessionId}`);
+    }
+    const task = tasks[0];
+    if (task?.parentSessionId) {
+      if (task.parentSessionId === sessionId) {
+        throw new Error(`Cyclic delegation ancestry for agent task session ${sessionId}`);
+      }
+      return task.parentSessionId;
+    }
 
     const teamMembers = this.options.store.teamMembers;
     const teams = this.options.store.teams;
     if (!teamMembers || !teams) return undefined;
     const matchingMembers = (await teamMembers.call(this.options.store, {
       childSessionId: sessionId,
-      limit: DELEGATION_PARENT_QUERY_LIMIT,
+      limit: DELEGATION_TEAM_MEMBERSHIP_LIMIT,
     })).filter((candidate) => candidate.childSessionId === sessionId);
-    if (matchingMembers.length > 1) {
+    const memberships = await Promise.all(matchingMembers.map(async (member) => ({
+      member,
+      team: (await teams.call(this.options.store, { teamId: member.teamId, limit: 1 }))[0],
+    })));
+    const parentSessionIds = [...new Set(memberships.flatMap(({ member, team }) => {
+      if (!team?.sessionId) return [];
+      if (team.sessionId === sessionId || member.path === team.leadPath) return [];
+      return [team.sessionId];
+    }))];
+    if (parentSessionIds.length > 1) {
       throw new Error(`Ambiguous delegation ancestry for team member session ${sessionId}`);
     }
-    const member = matchingMembers[0];
-    if (!member) return undefined;
-    const team = (await teams.call(this.options.store, {
-      teamId: member.teamId,
-      limit: 1,
-    }))[0];
-    return team?.sessionId && team.sessionId !== sessionId ? team.sessionId : undefined;
+    return parentSessionIds[0];
   }
 }
 

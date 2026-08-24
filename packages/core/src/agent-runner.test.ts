@@ -13,7 +13,6 @@ import type {
   SessionId,
   TaskId,
   TeamId,
-  ThreadId,
   TimestampMs,
   ToolCallId,
   TurnId,
@@ -24,6 +23,7 @@ import type { AgentRunner, AppendUserMessageInput, CreateSessionInput, RunTurnIn
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.js";
 import {
   RuntimeBusyError,
+  RuntimeSessionNotFoundError,
   RuntimeService,
   RuntimeSubagentSessionAccessError,
 } from "./runtime-service.js";
@@ -33,7 +33,6 @@ test("RuntimeService accepts an AgentRunner implementation", async () => {
   const store = new MemoryEventStore();
   const runner = new FakeAgentRunner();
   const sessionId = "session_fake" as SessionId;
-  const threadId = "thread_fake" as ThreadId;
   const service = new RuntimeService({
     runtime: runner,
     store,
@@ -54,12 +53,11 @@ test("RuntimeService accepts an AgentRunner implementation", async () => {
   });
 
   const handle = await service.createSession({
-    threadId,
     cwd: "/workspace",
   });
+  store.addSession(handle.sessionId);
   const result = await service.submitPrompt({
     sessionId: handle.sessionId,
-    threadId: handle.threadId,
     text: "hello",
     cwd: "/workspace/subdir",
   });
@@ -68,13 +66,12 @@ test("RuntimeService accepts an AgentRunner implementation", async () => {
   if (result.status === "completed") {
     expect(result.finishReason).toBe("stop");
   }
+  expect(handle).toEqual({ sessionId });
   expect(runner.createInputs[0]).toEqual({
-    threadId,
     cwd: "/workspace",
   });
   expect(runner.userMessages[0]).toMatchObject({
     sessionId,
-    threadId,
     text: "hello",
   });
   expect(runner.userMessages[0]?.turnId).toBe(runner.turnInputs[0]?.turnId);
@@ -86,11 +83,9 @@ test("RuntimeService accepts an AgentRunner implementation", async () => {
 
 test("root RuntimeService rejects direct subagent turns while an explicit child service remains usable", async () => {
   const sessionId = "session_guarded_child" as SessionId;
-  const threadId = "thread_guarded_child" as ThreadId;
   const store = new SessionSourceEventStore({
     id: sessionId,
     cwd: "/repo",
-    threadId,
     source: "subagent",
     status: "active",
     createdAt: 1,
@@ -98,7 +93,7 @@ test("root RuntimeService rejects direct subagent turns while an explicit child 
   });
   const rootRunner = new FakeAgentRunner();
   const root = new RuntimeService({ runtime: rootRunner, store, cwd: "/repo" });
-  const input = { sessionId, threadId, text: "bypass child policy" };
+  const input = { sessionId, text: "bypass child policy" };
 
   await expect(root.submitPrompt(input)).rejects.toBeInstanceOf(RuntimeSubagentSessionAccessError);
   const asyncError = new Promise<unknown>((resolve) => {
@@ -107,10 +102,10 @@ test("root RuntimeService rejects direct subagent turns while an explicit child 
   await expect(asyncError).resolves.toBeInstanceOf(RuntimeSubagentSessionAccessError);
   expect(root.isRunning(sessionId)).toBe(false);
   await expect(root.appendUserMessage(input)).rejects.toThrow("Use task_followup for the owning task");
-  await expect(root.compactSession({ sessionId, threadId })).rejects.toBeInstanceOf(
+  await expect(root.compactSession({ sessionId })).rejects.toBeInstanceOf(
     RuntimeSubagentSessionAccessError,
   );
-  await expect(root.setGoal({ sessionId, threadId, objective: "bypass through goal continuation" })).rejects.toBeInstanceOf(
+  await expect(root.setGoal({ sessionId, objective: "bypass through goal continuation" })).rejects.toBeInstanceOf(
     RuntimeSubagentSessionAccessError,
   );
   expect(rootRunner.userMessages).toEqual([]);
@@ -130,13 +125,11 @@ test("root RuntimeService rejects direct subagent turns while an explicit child 
   expect(childRunner.turnInputs).toHaveLength(1);
 });
 
-test("root RuntimeService rejects a pending child before its session row exists", async () => {
+test("RuntimeService rejects a pending child before its session row exists", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-runtime-pending-child-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const parentSessionId = "session_guard_pending_parent" as SessionId;
-  const parentThreadId = "thread_guard_pending_parent" as ThreadId;
   const childSessionId = "session_guard_pending_child" as SessionId;
-  const childThreadId = "thread_guard_pending_child" as ThreadId;
   const runner = new FakeAgentRunner();
 
   try {
@@ -145,15 +138,12 @@ test("root RuntimeService rejects a pending child before its session row exists"
       type: "agent.task_created",
       time: 1 as TimestampMs,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         taskId: "task_guard_pending_child" as TaskId,
         path: "/root/pending-child" as AgentPath,
         parentPath: "/root" as AgentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId,
-        childThreadId,
         taskName: "pending child",
         cwd: "/repo",
         prompt: "wait for a lifecycle permit",
@@ -163,7 +153,7 @@ test("root RuntimeService rejects a pending child before its session row exists"
     expect(await store.sessions()).toEqual([]);
 
     const root = new RuntimeService({ runtime: runner, store, cwd: "/repo" });
-    const input = { sessionId: childSessionId, threadId: childThreadId, text: "race the pending child" };
+    const input = { sessionId: childSessionId, text: "race the pending child" };
     await expect(root.submitPrompt(input)).rejects.toBeInstanceOf(RuntimeSubagentSessionAccessError);
     const asyncError = new Promise<unknown>((resolve) => {
       root.submitPromptAsync({ ...input, text: "race asynchronously" }, resolve);
@@ -180,13 +170,11 @@ test("root RuntimeService rejects a pending child before its session row exists"
   }
 });
 
-test("root RuntimeService rejects a direct team worker before session creation but preserves the lead", async () => {
+test("RuntimeService rejects team sessions before their session rows exist", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-runtime-pending-team-worker-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const rootSessionId = "session_guard_team_root" as SessionId;
-  const rootThreadId = "thread_guard_team_root" as ThreadId;
   const workerSessionId = "session_guard_team_worker" as SessionId;
-  const workerThreadId = "thread_guard_team_worker" as ThreadId;
   const teamId = "team_guard_pending_worker" as TeamId;
   const runner = new FakeAgentRunner();
 
@@ -197,7 +185,6 @@ test("root RuntimeService rejects a direct team worker before session creation b
         type: "team.created",
         time: 1 as TimestampMs,
         sessionId: rootSessionId,
-        threadId: rootThreadId,
         payload: { teamId, name: "pending worker guard", leadPath: "/root" as AgentPath },
       },
       {
@@ -205,14 +192,12 @@ test("root RuntimeService rejects a direct team worker before session creation b
         type: "team.member_added",
         time: 2 as TimestampMs,
         sessionId: rootSessionId,
-        threadId: rootThreadId,
         payload: {
           teamId,
           path: "/root" as AgentPath,
           name: "lead",
           role: "leader",
           childSessionId: rootSessionId,
-          childThreadId: rootThreadId,
         },
       },
       {
@@ -220,24 +205,21 @@ test("root RuntimeService rejects a direct team worker before session creation b
         type: "team.member_added",
         time: 3 as TimestampMs,
         sessionId: rootSessionId,
-        threadId: rootThreadId,
         payload: {
           teamId,
           path: "/root/worker" as AgentPath,
           name: "worker",
           role: "implementer",
           childSessionId: workerSessionId,
-          childThreadId: workerThreadId,
         },
       },
     ]);
     expect(await store.sessions()).toEqual([]);
 
     const root = new RuntimeService({ runtime: runner, store, cwd: "/repo" });
-    await expect(root.assertSessionTurnAllowed(rootSessionId, rootThreadId)).resolves.toBeUndefined();
+    await expect(root.assertSessionTurnAllowed(rootSessionId)).rejects.toBeInstanceOf(RuntimeSessionNotFoundError);
     await expect(root.submitPrompt({
       sessionId: workerSessionId,
-      threadId: workerThreadId,
       text: "race the team worker",
     })).rejects.toBeInstanceOf(RuntimeSubagentSessionAccessError);
 
@@ -247,6 +229,22 @@ test("root RuntimeService rejects a direct team worker before session creation b
     store.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("RuntimeService rejects an unknown session without writing orphan events", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeAgentRunner();
+  const service = new RuntimeService({ runtime: runner, store, cwd: "/repo" });
+  const sessionId = "session_unknown" as SessionId;
+
+  await expect(service.submitPrompt({ sessionId, text: "do not persist this" })).rejects.toBeInstanceOf(
+    RuntimeSessionNotFoundError,
+  );
+
+  expect(store.items).toEqual([]);
+  expect(runner.userMessages).toEqual([]);
+  expect(runner.turnInputs).toEqual([]);
+  expect(service.isRunning(sessionId)).toBe(false);
 });
 
 test("RuntimeService preserves safe model connection metadata", async () => {
@@ -278,6 +276,7 @@ test("RuntimeService preserves safe model connection metadata", async () => {
 
 test("RuntimeService rejects prompt images for text-only models before appending user messages", async () => {
   const store = new MemoryEventStore();
+  store.addSession("session_text_only_image" as SessionId);
   const runner = new FakeAgentRunner();
   const model = textOnlyModel();
   const service = new RuntimeService({
@@ -291,7 +290,6 @@ test("RuntimeService rejects prompt images for text-only models before appending
 
   const result = await service.submitPrompt({
     sessionId: "session_text_only_image" as SessionId,
-    threadId: "thread_text_only_image" as ThreadId,
     text: "[Image #1] what is this?",
     images: [{ data: "aW1hZ2U=", mimeType: "image/png" }],
     modelSelection: { provider: model.provider, model: model.model },
@@ -307,6 +305,7 @@ test("RuntimeService rejects prompt images for text-only models before appending
 
 test("RuntimeService converts sourced prompt images to tool-readable text for text-only models", async () => {
   const store = new MemoryEventStore();
+  store.addSession("session_text_only_image_path" as SessionId);
   const runner = new FakeAgentRunner();
   const model = textOnlyModel();
   const service = new RuntimeService({
@@ -320,7 +319,6 @@ test("RuntimeService converts sourced prompt images to tool-readable text for te
 
   const result = await service.submitPrompt({
     sessionId: "session_text_only_image_path" as SessionId,
-    threadId: "thread_text_only_image_path" as ThreadId,
     text: "[Image #1] what is this?",
     images: [{ data: "aW1hZ2U=", mimeType: "image/png", sourcePath: ".chili/clipboard-images/paste.png" }],
     modelSelection: { provider: model.provider, model: model.model },
@@ -345,6 +343,7 @@ test("RuntimeService converts sourced prompt images to tool-readable text for te
 
 test("RuntimeService prefers direct image input over external image tools for image-capable turns", async () => {
   const store = new MemoryEventStore();
+  store.addSession("session_direct_image" as SessionId);
   const runner = new FakeAgentRunner();
   const service = new RuntimeService({
     runtime: runner,
@@ -356,7 +355,6 @@ test("RuntimeService prefers direct image input over external image tools for im
 
   const result = await service.submitPrompt({
     sessionId: "session_direct_image" as SessionId,
-    threadId: "thread_direct_image" as ThreadId,
     text: "[Image #1] what is this?",
     images: [{ data: "aW1hZ2U=", mimeType: "image/png", sourcePath: ".chili/clipboard-images/paste.png" }],
   });
@@ -373,6 +371,7 @@ test("RuntimeService prefers direct image input over external image tools for im
 
 test("RuntimeService allows external image tools when the prompt explicitly asks for tools", async () => {
   const store = new MemoryEventStore();
+  store.addSession("session_direct_image_tool" as SessionId);
   const runner = new FakeAgentRunner();
   const service = new RuntimeService({
     runtime: runner,
@@ -384,7 +383,6 @@ test("RuntimeService allows external image tools when the prompt explicitly asks
 
   const result = await service.submitPrompt({
     sessionId: "session_direct_image_tool" as SessionId,
-    threadId: "thread_direct_image_tool" as ThreadId,
     text: "[Image #1] 用 MCP 工具识别",
     images: [{ data: "aW1hZ2U=", mimeType: "image/png", sourcePath: ".chili/clipboard-images/paste.png" }],
   });
@@ -397,6 +395,7 @@ test("RuntimeService allows text-only model turns when retained tool history con
   const sessionId = "session_text_only_tool_image" as SessionId;
   const callId = "call_read_image" as ToolCallId;
   const store = new MemoryEventStore();
+  store.addSession(sessionId);
   store.messageRows.push({
     id: "msg_tool_result_image_history" as MessageId,
     sessionId,
@@ -427,7 +426,6 @@ test("RuntimeService allows text-only model turns when retained tool history con
 
   const result = await service.submitPrompt({
     sessionId,
-    threadId: "thread_text_only_tool_image" as ThreadId,
     text: "hi",
     modelSelection: { provider: model.provider, model: model.model },
   });
@@ -439,6 +437,7 @@ test("RuntimeService allows text-only model turns when retained tool history con
 
 test("RuntimeService passes promptFragments by prompt layer", async () => {
   const store = new MemoryEventStore();
+  store.addSession("session_prompt_layers" as SessionId);
   const runner = new FakeAgentRunner();
   const service = new RuntimeService({
     runtime: runner,
@@ -479,7 +478,6 @@ test("RuntimeService passes promptFragments by prompt layer", async () => {
 
   const result = await service.submitPrompt({
     sessionId: "session_prompt_layers" as SessionId,
-    threadId: "thread_prompt_layers" as ThreadId,
     text: "hello",
   });
 
@@ -498,6 +496,7 @@ test("RuntimeService passes promptFragments by prompt layer", async () => {
 
 test("RuntimeService passes current turn text and skill mentions to prompt fragments", async () => {
   const store = new MemoryEventStore();
+  store.addSession("session_skill_turn" as SessionId);
   const runner = new FakeAgentRunner();
   const observed: unknown[] = [];
   const service = new RuntimeService({
@@ -526,7 +525,6 @@ test("RuntimeService passes current turn text and skill mentions to prompt fragm
 
   const result = await service.submitPrompt({
     sessionId: "session_skill_turn" as SessionId,
-    threadId: "thread_skill_turn" as ThreadId,
     text: "use $reviewer",
     skillMentions: [{ name: "reviewer", path: "/repo/.chili/skills/reviewer/SKILL.md" }],
   });
@@ -549,7 +547,7 @@ test("RuntimeService assembles turn prompt after appending submitted user messag
   const store = new MemoryEventStore();
   const runner = new FakeAgentRunner();
   const sessionId = "session_prompt_after_append" as SessionId;
-  const threadId = "thread_prompt_after_append" as ThreadId;
+  store.addSession(sessionId);
   const observedUserMessages: AppendUserMessageInput[][] = [];
   const service = new RuntimeService({
     runtime: runner,
@@ -575,14 +573,12 @@ test("RuntimeService assembles turn prompt after appending submitted user messag
 
   const result = await service.submitPrompt({
     sessionId,
-    threadId,
     text: "what changed?",
   });
 
   expect(result.status).toBe("completed");
   expect(observedUserMessages[0]?.[0]).toMatchObject({
     sessionId,
-    threadId,
     text: "what changed?",
   });
   expect(runner.turnInputs[0]?.contextualUser).toEqual(["latest user: what changed?"]);
@@ -592,7 +588,6 @@ test("RuntimeService inspectPrompt includes conversation context as a prompt fra
   const store = new MemoryEventStore();
   const runner = new FakeAgentRunner();
   const sessionId = "session_prompt_conversation" as SessionId;
-  const threadId = "thread_prompt_conversation" as ThreadId;
   store.messageRows.push(textMessage({
     id: "msg_existing_user" as MessageId,
     sessionId,
@@ -620,7 +615,6 @@ test("RuntimeService inspectPrompt includes conversation context as a prompt fra
 
   const inspected = await service.inspectPrompt({
     sessionId,
-    threadId,
     cwd: "/repo",
     text: "current turn",
     includeContent: true,
@@ -656,7 +650,6 @@ test("RuntimeService injects proactive delegation guidance for ultra reasoning",
 
   const inspected = await service.inspectPrompt({
     sessionId: "session_ultra_prompt" as SessionId,
-    threadId: "thread_ultra_prompt" as ThreadId,
     cwd: "/repo",
     includeContent: true,
   });
@@ -674,7 +667,6 @@ test("RuntimeService injects proactive delegation guidance for ultra reasoning",
 test("RuntimeService applies session delegation policy independently of model reasoning support", async () => {
   const store = new MemoryEventStore();
   const sessionId = "session_delegation_policy" as SessionId;
-  const threadId = "thread_delegation_policy" as ThreadId;
   const service = new RuntimeService({
     runtime: new FakeAgentRunner(),
     store,
@@ -697,10 +689,10 @@ test("RuntimeService applies session delegation policy independently of model re
     policy: "proactive",
     source: "default",
   });
-  const proactive = await service.inspectPrompt({ sessionId, threadId, cwd: "/repo", includeContent: true });
+  const proactive = await service.inspectPrompt({ sessionId, cwd: "/repo", includeContent: true });
   expect(proactive.fragments.some((fragment) => fragment.id === "chili.delegation.proactive")).toBe(true);
 
-  expect(await service.setDelegationPolicy({ sessionId, threadId, policy: "off" })).toEqual({
+  expect(await service.setDelegationPolicy({ sessionId, policy: "off" })).toEqual({
     sessionId,
     policy: "off",
     source: "session",
@@ -721,7 +713,7 @@ test("RuntimeService applies session delegation policy independently of model re
     policy: "off",
     source: "session",
   });
-  const disabled = await resumed.inspectPrompt({ sessionId, threadId, cwd: "/repo", includeContent: true });
+  const disabled = await resumed.inspectPrompt({ sessionId, cwd: "/repo", includeContent: true });
   expect(disabled.fragments.find((fragment) => fragment.id === "chili.delegation.off")?.content).toContain(
     "Do not spawn",
   );
@@ -752,7 +744,6 @@ test("RuntimeService reports model-specific advanced reasoning levels", async ()
     now: () => 1 as TimestampMs,
   });
   const sessionId = "session_reasoning_levels" as SessionId;
-  const threadId = "thread_reasoning_levels" as ThreadId;
 
   const solConfig = await service.getModelConfig(sessionId);
   expect(solConfig.availableReasoningLevels).toEqual([
@@ -767,7 +758,6 @@ test("RuntimeService reports model-specific advanced reasoning levels", async ()
   expect(solConfig.reasoningLevel).toBe("ultra");
   const lunaConfig = await service.setModel({
     sessionId,
-    threadId,
     modelSelection: { provider: "openai-codex", model: "gpt-5.6-luna" },
   });
   expect(lunaConfig.availableReasoningLevels).toEqual(["off", "low", "medium", "high", "xhigh", "max"]);
@@ -778,12 +768,11 @@ test("RuntimeService reports model-specific advanced reasoning levels", async ()
 
   const requestedUltra = await service.setReasoning({
     sessionId,
-    threadId,
     reasoningLevel: "ultra",
   });
   expect(requestedUltra.reasoningLevel).toBe("max");
 
-  const inspected = await service.inspectPrompt({ sessionId, threadId, cwd: "/repo", includeContent: true });
+  const inspected = await service.inspectPrompt({ sessionId, cwd: "/repo", includeContent: true });
   expect(inspected.fragments.some((fragment) => fragment.id === "chili.delegation.proactive")).toBe(false);
   expect(inspected.fragments.some((fragment) => fragment.id === "chili.delegation.explicit")).toBe(true);
 });
@@ -816,7 +805,7 @@ test("RuntimeService clears and rejects controls unsupported by a known model", 
     now: () => 1 as TimestampMs,
   });
   const sessionId = "session_unsupported_model_controls" as SessionId;
-  const threadId = "thread_unsupported_model_controls" as ThreadId;
+  store.addSession(sessionId);
 
   const minimaxConfig = await service.getModelConfig(sessionId);
   expect(minimaxConfig.availableReasoningLevels).toEqual([]);
@@ -824,36 +813,33 @@ test("RuntimeService clears and rejects controls unsupported by a known model", 
   expect(minimaxConfig.serviceTier).toBeUndefined();
   const minimaxPrompt = await service.submitPrompt({
     sessionId,
-    threadId,
     text: "hello from MiniMax",
   });
   expect(minimaxPrompt.status).toBe("completed");
   expect(runner.turnInputs[0]?.modelSelection).toEqual({ provider: "minimax", model: "MiniMax-M3[1m]" });
   expect(runner.turnInputs[0]?.reasoningLevel).toBeUndefined();
   expect(runner.turnInputs[0]?.serviceTier).toBeUndefined();
-  await expect(service.setReasoning({ sessionId, threadId, reasoningLevel: "high" })).rejects.toThrow(
+  await expect(service.setReasoning({ sessionId, reasoningLevel: "high" })).rejects.toThrow(
     "does not support configurable reasoning",
   );
-  await expect(service.setServiceTier({ sessionId, threadId, serviceTier: "fast" })).rejects.toThrow(
+  await expect(service.setServiceTier({ sessionId, serviceTier: "fast" })).rejects.toThrow(
     "does not support service tier fast",
   );
 
   await service.setModel({
     sessionId,
-    threadId,
     modelSelection: { provider: "openai-codex", model: "gpt-5.6-sol" },
   });
-  const reasoningConfig = await service.setReasoning({ sessionId, threadId, reasoningLevel: "high" });
-  const serviceTierConfig = await service.setServiceTier({ sessionId, threadId, serviceTier: "fast" });
+  const reasoningConfig = await service.setReasoning({ sessionId, reasoningLevel: "high" });
+  const serviceTierConfig = await service.setServiceTier({ sessionId, serviceTier: "fast" });
   expect(reasoningConfig.reasoningLevel).toBe("high");
   expect(serviceTierConfig.serviceTier).toBe("fast");
 
   await service.setModel({
     sessionId,
-    threadId,
     modelSelection: { provider: "custom", model: "future-model" },
   });
-  await expect(service.setServiceTier({ sessionId, threadId, serviceTier: "fast" })).rejects.toThrow(
+  await expect(service.setServiceTier({ sessionId, serviceTier: "fast" })).rejects.toThrow(
     "does not support service tier fast",
   );
 });
@@ -906,7 +892,6 @@ test("RuntimeService inspectPrompt only assembles prompt debug output", async ()
 
   const debug = await service.inspectPrompt({
     sessionId: "session_prompt_debug" as SessionId,
-    threadId: "thread_prompt_debug" as ThreadId,
     cwd: "/repo/app",
   });
 
@@ -959,13 +944,11 @@ test("RuntimeService inspectPrompt only returns fragment content when requested"
 
   const debug = await service.inspectPrompt({
     sessionId: "session_prompt_debug_no_content" as SessionId,
-    threadId: "thread_prompt_debug_no_content" as ThreadId,
     cwd: "/repo",
     includeContent: false,
   });
   const withContent = await service.inspectPrompt({
     sessionId: "session_prompt_debug_content" as SessionId,
-    threadId: "thread_prompt_debug_content" as ThreadId,
     cwd: "/repo",
     includeContent: true,
   });
@@ -990,11 +973,11 @@ test("RuntimeService clears running reservation when initial running status writ
     now: () => 1 as TimestampMs,
   });
   const sessionId = "session_status_failure" as SessionId;
+  store.addSession(sessionId);
 
   await expect(
     service.submitPrompt({
       sessionId,
-      threadId: "thread_status_failure" as ThreadId,
       text: "hello",
     }),
   ).rejects.toThrow("status write failed");
@@ -1015,11 +998,10 @@ test("RuntimeService reserves busy sessions before the runner reaches runTurn", 
     now: () => 1 as TimestampMs,
   });
   const sessionId = "session_busy" as SessionId;
-  const threadId = "thread_busy" as ThreadId;
+  store.addSession(sessionId);
 
   const first = service.submitPrompt({
     sessionId,
-    threadId,
     text: "first",
   });
 
@@ -1027,14 +1009,12 @@ test("RuntimeService reserves busy sessions before the runner reaches runTurn", 
   await expect(
     service.submitPrompt({
       sessionId,
-      threadId,
       text: "second",
     }),
   ).rejects.toThrow(RuntimeBusyError);
   expect(() =>
     service.submitPromptAsync({
       sessionId,
-      threadId,
       text: "third",
     }),
   ).toThrow(RuntimeBusyError);
@@ -1049,6 +1029,7 @@ test("RuntimeService reserves busy sessions before the runner reaches runTurn", 
 
 test("RuntimeService continues after OpenAI-compatible tool_calls finish reason", async () => {
   const store = new MemoryEventStore();
+  store.addSession("session_tool_calls" as SessionId);
   const runner = new FakeAgentRunner();
   const service = new RuntimeService({
     runtime: runner,
@@ -1069,7 +1050,6 @@ test("RuntimeService continues after OpenAI-compatible tool_calls finish reason"
 
   const result = await service.submitPrompt({
     sessionId: "session_tool_calls" as SessionId,
-    threadId: "thread_tool_calls" as ThreadId,
     text: "use a tool",
     maxTurns: 3,
   });
@@ -1082,6 +1062,7 @@ test("RuntimeService continues after OpenAI-compatible tool_calls finish reason"
 
 test("RuntimeService adds a no-tool final turn after the tool continuation limit", async () => {
   const store = new MemoryEventStore();
+  store.addSession("session_final_after_tools" as SessionId);
   const runner = new FakeAgentRunner();
   const service = new RuntimeService({
     runtime: runner,
@@ -1102,7 +1083,6 @@ test("RuntimeService adds a no-tool final turn after the tool continuation limit
 
   const result = await service.submitPrompt({
     sessionId: "session_final_after_tools" as SessionId,
-    threadId: "thread_final_after_tools" as ThreadId,
     text: "inspect deeply",
     maxTurns: 2,
   });
@@ -1130,17 +1110,14 @@ test("RuntimeService uses the last persisted model config for new sessions", asy
 
   await firstService.setModel({
     sessionId: "session_previous" as SessionId,
-    threadId: "thread_previous" as ThreadId,
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
   });
   await firstService.setReasoning({
     sessionId: "session_previous" as SessionId,
-    threadId: "thread_previous" as ThreadId,
     reasoningLevel: "high",
   });
   await firstService.setServiceTier({
     sessionId: "session_previous" as SessionId,
-    threadId: "thread_previous" as ThreadId,
     serviceTier: "fast",
   });
 
@@ -1157,8 +1134,8 @@ test("RuntimeService uses the last persisted model config for new sessions", asy
 
   await nextService.createSession({
     sessionId: "session_next" as SessionId,
-    threadId: "thread_next" as ThreadId,
   });
+  store.addSession("session_next" as SessionId);
   const config = await nextService.getModelConfig("session_next" as SessionId);
   expect(config.modelSelection).toEqual({ provider: "openai-codex", model: "gpt-5.5" });
   expect(config.reasoningLevel).toBe("high");
@@ -1166,7 +1143,6 @@ test("RuntimeService uses the last persisted model config for new sessions", asy
 
   const result = await nextService.submitPrompt({
     sessionId: "session_next" as SessionId,
-    threadId: "thread_next" as ThreadId,
     text: "hello",
   });
 
@@ -1178,6 +1154,7 @@ test("RuntimeService uses the last persisted model config for new sessions", asy
 
 test("RuntimeService still stops on Anthropic-style end_turn finish reason", async () => {
   const store = new MemoryEventStore();
+  store.addSession("session_end_turn" as SessionId);
   const runner = new FakeAgentRunner();
   const service = new RuntimeService({
     runtime: runner,
@@ -1195,7 +1172,6 @@ test("RuntimeService still stops on Anthropic-style end_turn finish reason", asy
 
   const result = await service.submitPrompt({
     sessionId: "session_end_turn" as SessionId,
-    threadId: "thread_end_turn" as ThreadId,
     text: "answer directly",
     maxTurns: 3,
   });
@@ -1210,7 +1186,7 @@ test("RuntimeService stops before another tool-use turn when interrupted", async
   const store = new MemoryEventStore();
   const runner = new FakeAgentRunner();
   const sessionId = "session_interrupt_loop" as SessionId;
-  const threadId = "thread_interrupt_loop" as ThreadId;
+  store.addSession(sessionId);
   const service = new RuntimeService({
     runtime: runner,
     store,
@@ -1230,7 +1206,6 @@ test("RuntimeService stops before another tool-use turn when interrupted", async
 
   const result = await service.submitPrompt({
     sessionId,
-    threadId,
     text: "finish by tool",
     maxTurns: 3,
   });
@@ -1241,7 +1216,7 @@ test("RuntimeService stops before another tool-use turn when interrupted", async
   const cancelling = store.items.find(
     (event) => event.type === "session.status_changed" && event.payload.status === "cancelling",
   );
-  expect(cancelling?.threadId).toBe(threadId);
+  expect(cancelling?.sessionId).toBe(sessionId);
 });
 
 test("SingleAgentRuntime satisfies AgentRunner without changing aborted turn behavior", async () => {
@@ -1274,7 +1249,6 @@ test("SingleAgentRuntime satisfies AgentRunner without changing aborted turn beh
 
   const result = await runner.runTurn({
     sessionId: "session_abort" as SessionId,
-    threadId: "thread_abort" as ThreadId,
     cwd: "/repo",
     signal: controller.signal,
   });
@@ -1330,12 +1304,11 @@ test("RuntimeService excludes cancelled prompt with no assistant output from sub
     now: () => ++now as TimestampMs,
   });
   const sessionId = "session_cancelled_prompt_context" as SessionId;
-  const threadId = "thread_cancelled_prompt_context" as ThreadId;
 
   try {
+    await service.createSession({ sessionId });
     const cancelled = service.submitPrompt({
       sessionId,
-      threadId,
       text: "理解一下这个幕落",
     });
     await firstCallStarted.promise;
@@ -1346,7 +1319,6 @@ test("RuntimeService excludes cancelled prompt with no assistant output from sub
 
     const completedResult = await service.submitPrompt({
       sessionId,
-      threadId,
       text: "理解一下这个目录",
     });
 
@@ -1400,19 +1372,17 @@ test("RuntimeService excludes a failed prompt with only a synthetic error from s
     now: () => ++now as TimestampMs,
   });
   const sessionId = "session_failed_prompt_context" as SessionId;
-  const threadId = "thread_failed_prompt_context" as ThreadId;
 
   try {
+    await service.createSession({ sessionId });
     const failedResult = await service.submitPrompt({
       sessionId,
-      threadId,
       text: "prompt that fails",
     });
     expect(failedResult.status).toBe("failed");
 
     const completedResult = await service.submitPrompt({
       sessionId,
-      threadId,
       text: "prompt that succeeds",
     });
 
@@ -1469,6 +1439,7 @@ class FakeAgentRunner implements AgentRunner {
 class MemoryEventStore implements EventStore {
   readonly items: ChiliEvent[] = [];
   readonly messageRows: Message[] = [];
+  readonly sessionRows: SessionRow[] = [];
 
   async append(event: ChiliEvent): Promise<void> {
     this.items.push(event);
@@ -1487,7 +1458,6 @@ class MemoryEventStore implements EventStore {
       .slice(afterIndex + 1)
       .filter((event) => {
         if (query.sessionId && event.sessionId !== query.sessionId) return false;
-        if (query.threadId && event.threadId !== query.threadId) return false;
         if (query.type && event.type !== query.type) return false;
         return true;
       })
@@ -1495,7 +1465,18 @@ class MemoryEventStore implements EventStore {
   }
 
   async sessions(): Promise<SessionRow[]> {
-    return [];
+    return this.sessionRows.map((row) => ({ ...row }));
+  }
+
+  addSession(sessionId: SessionId, source: SessionRow["source"] = "interactive"): void {
+    this.sessionRows.push({
+      id: sessionId,
+      cwd: "/repo",
+      source,
+      status: "active",
+      createdAt: 1,
+      updatedAt: 1,
+    });
   }
 
   async messages(sessionId: SessionId): Promise<Message[]> {

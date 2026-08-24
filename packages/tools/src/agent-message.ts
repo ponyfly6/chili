@@ -1,4 +1,4 @@
-import type { AgentPath, SessionId, TaskId, ThreadId, ToolExecutionContext } from "@chili/protocol";
+import type { AgentPath, SessionId, TaskId, ToolExecutionContext } from "@chili/protocol";
 
 export type AgentMessageDelivery = "queueOnly" | "triggerTurn";
 export type AgentMessageStatus = "queued" | "delivering" | "consumed" | "discarded";
@@ -30,7 +30,6 @@ export interface AgentMessageRecord {
   status: AgentMessageStatus;
   taskId?: TaskId | string;
   recipientSessionId?: SessionId | string;
-  recipientThreadId?: ThreadId | string;
   content?: string;
   metadata?: Record<string, unknown>;
   createdAt?: number;

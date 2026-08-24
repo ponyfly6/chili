@@ -1,4 +1,4 @@
-import type { AgentPath, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
+import type { AgentPath, SessionId, TaskId, TeamId } from "@chili/protocol";
 import type { ToolAccessPolicy } from "@chili/tools";
 
 export interface WorkerToolPolicy extends ToolAccessPolicy {
@@ -7,10 +7,9 @@ export interface WorkerToolPolicy extends ToolAccessPolicy {
   memberPath?: AgentPath;
   parentSessionId?: SessionId;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
 }
 
-export type WorkerToolPolicyTemplate = Omit<WorkerToolPolicy, "childSessionId" | "childThreadId">;
+export type WorkerToolPolicyTemplate = Omit<WorkerToolPolicy, "childSessionId">;
 
 export const SCOPED_WORKER_BASE_TOOLS = [
   "read",
@@ -43,12 +42,10 @@ export function defaultScopedWorkerPolicy(): WorkerToolPolicy {
 export function completeWorkerToolPolicy(
   template: WorkerToolPolicyTemplate,
   childSessionId: SessionId,
-  childThreadId: ThreadId,
 ): WorkerToolPolicy {
   return {
     ...template,
     childSessionId,
-    childThreadId,
   };
 }
 

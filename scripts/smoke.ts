@@ -143,13 +143,12 @@ async function smokeRuntimeToolSurface(): Promise<void> {
     });
 
     try {
-      const sessionId = await harness.runtime.createSession({ threadId: "thread_tools" as never, cwd: workspace });
+      const sessionId = await harness.runtime.createSession({ cwd: workspace });
       await harness.runtime.appendUserMessage({
         sessionId,
-        threadId: "thread_tools" as never,
         text: "exercise the core local tools",
       });
-      const result = await harness.runtime.runTurn({ sessionId, threadId: "thread_tools" as never, cwd: workspace });
+      const result = await harness.runtime.runTurn({ sessionId, cwd: workspace });
 
       assert.equal(result.status, "completed", result.status === "failed" ? result.error.message : undefined);
       assert.equal(await readFile(join(workspace, "src", "beta.ts"), "utf8"), "beta=new\n");
@@ -194,19 +193,17 @@ async function smokeRuntimeCompaction(): Promise<void> {
     );
 
     try {
-      const sessionId = await harness.runtime.createSession({ threadId: "thread_compact" as never, cwd: workspace });
+      const sessionId = await harness.runtime.createSession({ cwd: workspace });
       await harness.runtime.appendUserMessage({
         sessionId,
-        threadId: "thread_compact" as never,
         text: `older context ${"x".repeat(800)}`,
       });
       await harness.runtime.appendUserMessage({
         sessionId,
-        threadId: "thread_compact" as never,
         text: "continue with compacted context",
       });
 
-      const result = await harness.runtime.runTurn({ sessionId, threadId: "thread_compact" as never, cwd: workspace });
+      const result = await harness.runtime.runTurn({ sessionId, cwd: workspace });
       assert.equal(result.status, "completed", result.status === "failed" ? result.error.message : undefined);
       assert.equal(compactionCalls, 1);
 

@@ -11,13 +11,11 @@ import type {
   McpServerStatus,
   McpToolRef,
   SessionId,
-  ThreadId,
   TimestampMs,
 } from "./index.js";
 
 const time = 1 as TimestampMs;
 const sessionId = "session-1" as SessionId;
-const threadId = "thread-1" as ThreadId;
 
 test("MCP refs and summaries are constructible", () => {
   const config: McpServerConfigSummary = {
@@ -80,7 +78,6 @@ test("MCP events are accepted by ChiliEvent", () => {
     type: "mcp.server_status_changed",
     time,
     sessionId,
-    threadId,
     payload: {
       serverName: "filesystem",
       status: "running",
@@ -104,7 +101,6 @@ test("MCP events are accepted by ChiliEvent", () => {
     type: "mcp.tools_changed",
     time,
     sessionId,
-    threadId,
     payload: {
       serverName: "filesystem",
       toolCount: 1,
@@ -123,7 +119,6 @@ test("MCP events are accepted by ChiliEvent", () => {
     type: "mcp.prompts_changed",
     time,
     sessionId,
-    threadId,
     payload: {
       serverName: "filesystem",
       promptCount: 1,
@@ -141,7 +136,6 @@ test("MCP events are accepted by ChiliEvent", () => {
     type: "mcp.resources_changed",
     time,
     sessionId,
-    threadId,
     payload: {
       serverName: "filesystem",
       resourceCount: 1,
@@ -159,7 +153,6 @@ test("MCP events are accepted by ChiliEvent", () => {
     type: "mcp.diagnostic",
     time,
     sessionId,
-    threadId,
     payload: {
       serverName: "filesystem",
       level: "warning",
@@ -172,7 +165,6 @@ test("MCP events are accepted by ChiliEvent", () => {
     type: "mcp.progress",
     time,
     sessionId,
-    threadId,
     payload: {
       serverName: "filesystem",
       operation: "list_tools",

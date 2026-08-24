@@ -7,7 +7,6 @@ import type {
   MessageId,
   MessagePart,
   SessionId,
-  ThreadId,
   TimestampMs,
   ToolDefinition,
   ToolResultExecutionContext,
@@ -805,15 +804,13 @@ test("runtime sends the bounded request surface to the model", async () => {
     },
   });
 
-  const sessionId = await runtime.createSession({ threadId: "thread_bounded_surface" as ThreadId, cwd: "/repo" });
+  const sessionId = await runtime.createSession({ cwd: "/repo" });
   await runtime.appendUserMessage({
     sessionId,
-    threadId: "thread_bounded_surface" as ThreadId,
     text: "hello",
   });
   const result = await runtime.runTurn({
     sessionId,
-    threadId: "thread_bounded_surface" as ThreadId,
     cwd: "/repo",
     system: ["s".repeat(400)],
     developer: ["d".repeat(400)],
@@ -859,15 +856,13 @@ test("runtime fails before model streaming when fixed input exhausts the model w
     },
   });
 
-  const sessionId = await runtime.createSession({ threadId: "thread_surface_overflow" as ThreadId, cwd: "/repo" });
+  const sessionId = await runtime.createSession({ cwd: "/repo" });
   await runtime.appendUserMessage({
     sessionId,
-    threadId: "thread_surface_overflow" as ThreadId,
     text: "u".repeat(100),
   });
   const result = await runtime.runTurn({
     sessionId,
-    threadId: "thread_surface_overflow" as ThreadId,
     cwd: "/repo",
     system: ["s".repeat(200)],
   });
@@ -880,7 +875,6 @@ test("runtime fails before model streaming when fixed input exhausts the model w
 
 test("conversation and compaction formatting preserve controlled tool execution context", async () => {
   const sessionId = "session_compaction_execution_context" as SessionId;
-  const threadId = "thread_compaction_execution_context" as ThreadId;
   const turnId = "turn_compaction_execution_context" as TurnId;
   const source = toolResultMessage(
     "msg_compaction_execution_context",
@@ -926,7 +920,6 @@ test("conversation and compaction formatting preserve controlled tool execution 
 
   await compactor.compact({
     sessionId,
-    threadId,
     turnId,
     messages: [source],
     boundary: {
@@ -942,7 +935,6 @@ test("conversation and compaction formatting preserve controlled tool execution 
 
 test("compaction fits draft and verification requests to the selected model limits", async () => {
   const sessionId = "session_compaction_limits" as SessionId;
-  const threadId = "thread_compaction_limits" as ThreadId;
   const turnId = "turn_compaction_limits" as TurnId;
   const source = textMessage("msg_compaction_limits", sessionId, "user", `old context ${"x".repeat(80_000)}`);
   const modelInputs: ModelStreamInput[] = [];
@@ -991,7 +983,6 @@ test("compaction fits draft and verification requests to the selected model limi
 
   const result = await compactor.compact({
     sessionId,
-    threadId,
     turnId,
     messages: [source],
     boundary: {
@@ -1045,7 +1036,6 @@ test("compaction hard-limits every synthesized model prompt", async () => {
 
   await compactor.compact({
     sessionId,
-    threadId: "thread_compaction_prompt_limit" as ThreadId,
     turnId: "turn_compaction_prompt_limit" as TurnId,
     messages: [source],
     boundary: {
@@ -1091,7 +1081,6 @@ test("compaction budgets the exact prompt that it sends", async () => {
 
   await compactor.compact({
     sessionId,
-    threadId: "thread_compaction_exact_prompt" as ThreadId,
     turnId: "turn_compaction_exact_prompt" as TurnId,
     messages: [source],
     boundary: {
@@ -1122,7 +1111,6 @@ test("compaction preserves usage when an empty model summary fails validation", 
   try {
     await compactor.compact({
       sessionId,
-      threadId: "thread_compaction_empty" as ThreadId,
       turnId: "turn_compaction_empty" as TurnId,
       messages: [source],
       boundary: {
@@ -1165,7 +1153,6 @@ test("compaction preserves draft and verifier usage when verification fails", as
   try {
     await compactor.compact({
       sessionId,
-      threadId: "thread_compaction_verify_error" as ThreadId,
       turnId: "turn_compaction_verify_error" as TurnId,
       messages: [source],
       boundary: {
@@ -1246,15 +1233,13 @@ test("runtime auto-compacts before the main model request and sends the summary 
     },
   });
 
-  const sessionId = await runtime.createSession({ threadId: "thread_auto_compact" as ThreadId, cwd: "/repo" });
+  const sessionId = await runtime.createSession({ cwd: "/repo" });
   await runtime.appendUserMessage({
     sessionId,
-    threadId: "thread_auto_compact" as ThreadId,
     text: `old context ${"x".repeat(500)}`,
   });
   const result = await runtime.runTurn({
     sessionId,
-    threadId: "thread_auto_compact" as ThreadId,
     cwd: "/repo",
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
   });
@@ -1341,15 +1326,13 @@ test("runtime reactively compacts and retries context limit failures before outp
     },
   });
 
-  const sessionId = await runtime.createSession({ threadId: "thread_reactive_compact" as ThreadId, cwd: "/repo" });
+  const sessionId = await runtime.createSession({ cwd: "/repo" });
   await runtime.appendUserMessage({
     sessionId,
-    threadId: "thread_reactive_compact" as ThreadId,
     text: "please continue after recovery",
   });
   const result = await runtime.runTurn({
     sessionId,
-    threadId: "thread_reactive_compact" as ThreadId,
     cwd: "/repo",
   });
 
@@ -1385,7 +1368,6 @@ class ProjectingEventStore implements EventStore {
       .slice(afterIndex + 1)
       .filter((event) => {
         if (query.sessionId && event.sessionId !== query.sessionId) return false;
-        if (query.threadId && event.threadId !== query.threadId) return false;
         if (query.type && event.type !== query.type) return false;
         return true;
       })

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
 import { TeamControlService, TeamTaskDispatchService, type TeamTaskSubagentRunner } from "@chili/core";
-import type { AgentPath, AgentRunId, ChiliEvent, SessionId, TaskId, TeamId, ThreadId, TimestampMs } from "@chili/protocol";
+import type { AgentPath, AgentRunId, ChiliEvent, SessionId, TaskId, TeamId, TimestampMs } from "@chili/protocol";
 import { ObservableEventStore, SqliteEventStore } from "@chili/store";
 import { CliPrinter, PrintingEventStore } from "./printing-store.js";
 
@@ -34,6 +34,46 @@ test("printing and observable wrappers report mailbox CAS capability recursively
   }
 });
 
+test("printing and observable wrappers forward session goal projections", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-printing-session-goal-"));
+  const sqlite = new SqliteEventStore(join(dir, "events.sqlite"));
+  const printer = { event: (_event: ChiliEvent) => undefined } as CliPrinter;
+  const store = new ObservableEventStore(new PrintingEventStore(sqlite, printer));
+  const sessionId = "session_printing_goal" as SessionId;
+
+  try {
+    await store.append({
+      id: "event_printing_goal_updated",
+      type: "goal.updated",
+      time: 2 as TimestampMs,
+      sessionId,
+      payload: {
+        reason: "set",
+        goal: {
+          sessionId,
+          objective: "finish the CLI migration",
+          status: "active",
+          tokenBudget: 10_000,
+          tokensUsed: 25,
+          timeUsedSeconds: 2,
+          createdAt: 1 as TimestampMs,
+          updatedAt: 2 as TimestampMs,
+        },
+      },
+    });
+
+    expect(await store.sessionGoal(sessionId)).toMatchObject({
+      sessionId,
+      objective: "finish the CLI migration",
+      tokensUsed: 25,
+    });
+    expect(await store.sessionGoals({ sessionId, limit: 1 })).toHaveLength(1);
+  } finally {
+    sqlite.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("printing store forwards atomic agent task run claims", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-printing-task-run-claim-"));
   const sqlite = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -44,7 +84,6 @@ test("printing store forwards atomic agent task run claims", async () => {
   };
   const store = new ObservableEventStore(new PrintingEventStore(sqlite, printer));
   const sessionId = "session_printing_task" as SessionId;
-  const threadId = "thread_printing_task" as ThreadId;
   const taskId = "task_printing_task" as TaskId;
   const path = "/root/task_printing_task" as AgentPath;
   const initialRunId = "agent_printing_initial" as AgentRunId;
@@ -56,15 +95,12 @@ test("printing store forwards atomic agent task run claims", async () => {
         type: "agent.task_created",
         time: 1 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           taskId,
           path,
           parentPath: "/root" as AgentPath,
           parentSessionId: sessionId,
-          parentThreadId: threadId,
           childSessionId: "session_printing_child" as SessionId,
-          childThreadId: "thread_printing_child" as ThreadId,
           taskName: "printing worker",
           cwd: dir,
           prompt: "initial work",
@@ -76,7 +112,6 @@ test("printing store forwards atomic agent task run claims", async () => {
         type: "agent.spawned",
         time: 2 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           runId: initialRunId,
           taskId,
@@ -90,7 +125,6 @@ test("printing store forwards atomic agent task run claims", async () => {
         type: "agent.completed",
         time: 3 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           runId: initialRunId,
           taskId,
@@ -118,7 +152,6 @@ test("printing store forwards atomic agent task run claims", async () => {
       from: "/root" as AgentPath,
       message: { role: "user", content: "continue" },
       sessionId,
-      threadId,
       time: 4,
     });
 
@@ -181,7 +214,6 @@ test("team dispatcher can claim through printing store before spawning a worker"
         path: "/agents/worker/task" as AgentPath,
         parentPath: input.parentPath ?? ("/root" as AgentPath),
         childSessionId: "session_child_printing_dispatch" as SessionId,
-        childThreadId: "thread_child_printing_dispatch" as ThreadId,
         status: "completed",
         summary: "worker completed",
       };

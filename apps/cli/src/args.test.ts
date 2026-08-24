@@ -245,14 +245,14 @@ test("parses memory commands", () => {
   });
 });
 
-test("parses prompt-debug command and flags", () => {
-  expect(parseArgs(["prompt-debug", "--resume", "session_1", "--thread", "thread_1", "--content", "--json"])).toMatchObject({
+test("parses prompt-debug command and session-only flags", () => {
+  expect(parseArgs(["prompt-debug", "--resume", "session_1", "--content", "--json"])).toMatchObject({
     command: "prompt-debug",
     resume: "session_1",
-    threadId: "thread_1",
     content: true,
     json: true,
   });
+  expect(() => parseArgs(["prompt-debug", "--thread", "thread_1"])).toThrow("Unknown option: --thread");
   expect(parseArgs(["prompt-debug", "--text", "use $reviewer"])).toMatchObject({
     command: "prompt-debug",
     prompt: "use $reviewer",

@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentPath, ApprovalDecision, SessionId, TeamId, ThreadId, TimestampMs, ToolCallId, TurnId } from "../packages/protocol/src/index.js";
+import type { AgentPath, ApprovalDecision, SessionId, TeamId, TimestampMs, ToolCallId, TurnId } from "../packages/protocol/src/index.js";
 import {
   LocalSubagentManager,
   TeamControlService,
@@ -34,7 +34,6 @@ try {
   const ids = createSequentialId();
   const now = () => 10_000 as TimestampMs;
   const sessionId = "session_team_parallel_smoke" as SessionId;
-  const threadId = "thread_team_parallel_smoke" as ThreadId;
   const leadPath = "/root" as AgentPath;
   const coreWorker = "/root/core" as AgentPath;
   const docsWorker = "/root/docs" as AgentPath;
@@ -46,10 +45,9 @@ try {
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: workspace, now });
     const execution = new TeamExecutionRunner({ teams, dispatcher, cwd: workspace, now });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "parallel smoke", leadPath });
+    const team = await teams.createTeam({ sessionId, name: "parallel smoke", leadPath });
     await teams.addMember({
       sessionId,
-      threadId,
       teamId: team.id,
       path: coreWorker,
       name: "core",
@@ -59,7 +57,6 @@ try {
     });
     await teams.addMember({
       sessionId,
-      threadId,
       teamId: team.id,
       path: docsWorker,
       name: "docs",
@@ -68,9 +65,9 @@ try {
       toolScope: ["edit"],
     });
 
-    await createScopedTasksWithTool(teams, team.id, sessionId, threadId, workspace);
+    await createScopedTasksWithTool(teams, team.id, sessionId, workspace);
 
-    const dispatch = await runTeamLoopWithTool(execution, team.id, sessionId, threadId, workspace, {
+    const dispatch = await runTeamLoopWithTool(execution, team.id, sessionId, workspace, {
       teamId: team.id,
       once: true,
       maxConcurrentDispatches: 2,
@@ -87,7 +84,7 @@ try {
     assert.ok(runner.runs.some((run) => run.taskName === "Core implementation" && run.workerPolicy?.allowedTools?.includes("edit")));
     assert.ok(runner.runs.some((run) => run.taskName === "Docs implementation" && run.workerPolicy?.writeScope?.includes("docs")));
 
-    const reconciled = await runTeamLoopWithTool(execution, team.id, sessionId, threadId, workspace, {
+    const reconciled = await runTeamLoopWithTool(execution, team.id, sessionId, workspace, {
       teamId: team.id,
       once: true,
       maxConcurrentDispatches: 2,
@@ -111,7 +108,6 @@ async function runTeamLoopWithTool(
   execution: TeamExecutionRunner,
   teamId: TeamId,
   sessionId: SessionId,
-  threadId: ThreadId,
   cwd: string,
   input: TeamRunLoopToolInput,
 ): Promise<TeamRunLoopRecord> {
@@ -120,7 +116,6 @@ async function runTeamLoopWithTool(
       return execution.run({
         teamId: runInput.teamId as TeamId,
         sessionId,
-        threadId,
         cwd,
         once: runInput.once,
         mode: runInput.mode,
@@ -134,7 +129,7 @@ async function runTeamLoopWithTool(
   const tool = createTeamRunLoopTool(controller);
   const validated = await tool.validate?.({ ...input, team_id: teamId, timeout_ms: 10_000 });
   assert.ok(validated?.ok, validated && "message" in validated ? validated.message : "validation failed");
-  const result = await tool.execute(validated.value, toolContext(sessionId, threadId, cwd));
+  const result = await tool.execute(validated.value, toolContext(sessionId, cwd));
   return JSON.parse(result.output) as TeamRunLoopRecord;
 }
 
@@ -142,7 +137,6 @@ async function createScopedTasksWithTool(
   teams: TeamControlService,
   teamId: TeamId,
   sessionId: SessionId,
-  threadId: ThreadId,
   cwd: string,
 ): Promise<void> {
   const controller = {
@@ -152,7 +146,6 @@ async function createScopedTasksWithTool(
         taskId: input.taskId,
         title: input.title,
         sessionId,
-        threadId,
         ...(input.description ? { description: input.description } : {}),
         ...(input.createdBy ? { createdBy: input.createdBy as AgentPath } : {}),
         ...(input.ownerPath ? { ownerPath: input.ownerPath as AgentPath } : {}),
@@ -185,15 +178,14 @@ async function createScopedTasksWithTool(
   };
   const validated = await tool.validate?.(input);
   assert.ok(validated?.ok, validated && "message" in validated ? validated.message : "validation failed");
-  const result = await tool.execute(validated.value, toolContext(sessionId, threadId, cwd));
+  const result = await tool.execute(validated.value, toolContext(sessionId, cwd));
   const output = JSON.parse(result.output) as { count?: number };
   assert.equal(output.count, 2);
 }
 
-function toolContext(sessionId: SessionId, threadId: ThreadId, cwd: string): TeamToolContext {
+function toolContext(sessionId: SessionId, cwd: string): TeamToolContext {
   return {
     sessionId,
-    threadId,
     turnId: "turn_team_parallel_smoke" as TurnId,
     callId: "toolcall_team_parallel_smoke" as ToolCallId,
     signal: new AbortController().signal,

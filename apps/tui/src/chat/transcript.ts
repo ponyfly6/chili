@@ -26,7 +26,6 @@ function messageLines(item: Extract<ChatTranscriptItem, { kind: "message" }>, is
   const lines: TranscriptSourceLine[] = [
     sourceLine(`message:${item.id}:header`, `message ${item.role} ${item.id}`, "heading"),
   ];
-  appendOptionalField(lines, `message:${item.id}`, "threadId", item.threadId);
   appendOptionalField(lines, `message:${item.id}`, "createdAt", String(item.createdAt));
   appendOptionalField(lines, `message:${item.id}`, "completedAt", item.completedAt === undefined ? undefined : String(item.completedAt));
 
@@ -113,7 +112,6 @@ function toolLines(item: Extract<ChatTranscriptItem, { kind: "tool" }>, isLast: 
     sourceLine(`tool:${item.id}:waiting`, `  waitingForApproval: ${item.waitingForApproval ? "true" : "false"}`, "muted"),
   ];
   appendOptionalField(lines, `tool:${item.id}`, "sessionId", item.sessionId);
-  appendOptionalField(lines, `tool:${item.id}`, "threadId", item.threadId);
   appendOptionalField(lines, `tool:${item.id}`, "approvalId", item.approvalId);
   appendOptionalField(lines, `tool:${item.id}`, "approvalStatus", item.approvalStatus);
   appendOptionalField(lines, `tool:${item.id}`, "approvalDecision", item.approvalDecision);
@@ -144,7 +142,6 @@ function approvalLines(item: Extract<ChatTranscriptItem, { kind: "approval" }>, 
   appendOptionalField(lines, `approval:${item.id}`, "decision", item.decision);
   appendOptionalField(lines, `approval:${item.id}`, "feedback", item.feedback);
   appendOptionalField(lines, `approval:${item.id}`, "sessionId", item.sessionId);
-  appendOptionalField(lines, `approval:${item.id}`, "threadId", item.threadId);
   lines.push(...listBlockLines(`approval:${item.id}:patterns`, "  patterns", item.patterns));
   lines.push(...summaryBlockLines(`approval:${item.id}:summary`, item.inputSummary));
   if (item.toolInput !== undefined) {

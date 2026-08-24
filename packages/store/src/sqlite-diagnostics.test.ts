@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ChiliEvent, MessageId, SessionId, ThreadId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
+import type { ChiliEvent, MessageId, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import { inspectSqliteEventStore } from "./sqlite-diagnostics.js";
 import { SqliteEventStore } from "./sqlite-event-store.js";
 
@@ -11,7 +11,6 @@ test("inspectSqliteEventStore reports files and the largest storage rows", async
   const dbPath = join(dir, "chili.sqlite");
   const store = new SqliteEventStore(dbPath);
   const sessionId = "session_doctor" as SessionId;
-  const threadId = "thread_doctor" as ThreadId;
   const turnId = "turn_doctor" as TurnId;
   const messageId = "message_doctor" as MessageId;
   const toolCallId = "toolcall_doctor" as ToolCallId;
@@ -22,20 +21,20 @@ test("inspectSqliteEventStore reports files and the largest storage rows", async
     await writeFile(join(dir, "tool-results", "toolcall_small.txt"), "tiny", "utf8");
 
     await store.appendMany([
-      event("event_session", "session.created", sessionId, threadId, { sessionId, cwd: "/repo" }),
-      event("event_message", "message.created", sessionId, threadId, { messageId, role: "assistant", turnId }),
-      event("event_tool_started", "tool.call_started", sessionId, threadId, {
+      event("event_session", "session.created", sessionId, { sessionId, cwd: "/repo" }),
+      event("event_message", "message.created", sessionId, { messageId, role: "assistant", turnId }),
+      event("event_tool_started", "tool.call_started", sessionId, {
         turnId,
         callId: toolCallId,
         toolName: "bash",
         input: { command: "printf large" },
       }),
-      event("event_tool_finished", "tool.call_finished", sessionId, threadId, {
+      event("event_tool_finished", "tool.call_finished", sessionId, {
         callId: toolCallId,
         status: "completed",
         output: "x".repeat(2_048),
       }),
-      event("event_tool_result", "message.part_added", sessionId, threadId, {
+      event("event_tool_result", "message.part_added", sessionId, {
         messageId,
         part: {
           id: "part_tool_result" as never,
@@ -92,7 +91,6 @@ function event<TType extends ChiliEvent["type"]>(
   id: string,
   type: TType,
   sessionId: SessionId,
-  threadId: ThreadId,
   payload: Extract<ChiliEvent, { type: TType }>["payload"],
 ): Extract<ChiliEvent, { type: TType }> {
   return {
@@ -100,7 +98,6 @@ function event<TType extends ChiliEvent["type"]>(
     type,
     time: 1 as TimestampMs,
     sessionId,
-    threadId,
     payload,
   } as Extract<ChiliEvent, { type: TType }>;
 }

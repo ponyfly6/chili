@@ -8,7 +8,6 @@ import type {
   Message,
   SessionId,
   TaskId,
-  ThreadId,
   TimestampMs,
 } from "@chili/protocol";
 import { ROOT_AGENT_PATH, timestampNow } from "@chili/protocol";
@@ -493,7 +492,7 @@ export class AgentTaskControlService {
 
   private async requireRunnableTask(taskId: TaskId): Promise<AgentTaskRow> {
     const task = await this.requireTask(taskId);
-    if (!task.childSessionId || !task.childThreadId) {
+    if (!task.childSessionId) {
       throw new AgentTaskNotRunnableError(taskId, `Agent task is missing child session metadata: ${taskId}`);
     }
     if (!isFinalTaskStatus(task.status)) {
@@ -541,13 +540,12 @@ export class AgentTaskControlService {
   }
 
   private submitPromptInput(task: AgentTaskRow, input: AgentTaskFollowupInput, signal: AbortSignal): SubmitPromptInput {
-    if (!task.childSessionId || !task.childThreadId) {
+    if (!task.childSessionId) {
       throw new AgentTaskNotRunnableError(task.id, `Agent task is missing child session metadata: ${task.id}`);
     }
 
     const promptInput: SubmitPromptInput = {
       sessionId: task.childSessionId,
-      threadId: task.childThreadId,
       text: input.text,
     };
     if (task.cwd) promptInput.cwd = task.cwd;
@@ -588,7 +586,6 @@ export class AgentTaskControlService {
       }
       const sessionId = initialTask.parentSessionId ?? initialTask.childSessionId;
       if (sessionId) claimInput.sessionId = sessionId;
-      if (initialTask.parentThreadId) claimInput.threadId = initialTask.parentThreadId;
 
       const result = await store.beginAgentTaskRunCas(claimInput);
       if (!result.applied) {
@@ -634,8 +631,7 @@ export class AgentTaskControlService {
       // This service executes the turn directly. Marking the audit message as
       // triggerTurn would let the mailbox pump execute the same prompt again.
       triggerTurn: false,
-      childSessionId: task.childSessionId,
-      childThreadId: task.childThreadId,
+      recipientSessionId: task.childSessionId,
       message: { role: "user", content: text },
     });
 
@@ -645,9 +641,7 @@ export class AgentTaskControlService {
       path: task.path,
       parentPath: task.parentPath,
       parentSessionId: task.parentSessionId,
-      parentThreadId: task.parentThreadId,
       childSessionId: task.childSessionId,
-      childThreadId: task.childThreadId,
       taskName: task.taskName,
       cwd: task.cwd,
       mode: task.mode,
@@ -822,7 +816,6 @@ export class AgentTaskControlService {
       }
       const sessionId = task.parentSessionId ?? task.childSessionId;
       if (sessionId) input.sessionId = sessionId;
-      if (task.parentThreadId) input.threadId = task.parentThreadId;
       input.time = this.now();
       const result = await store.completeAgentTaskCas(input);
       return result.applied;
@@ -893,7 +886,6 @@ export class AgentTaskControlService {
       }
       const sessionId = task.parentSessionId ?? task.childSessionId;
       if (sessionId) input.sessionId = sessionId;
-      if (task.parentThreadId) input.threadId = task.parentThreadId;
       input.time = this.now();
       const result = await store.closeAgentTaskCas(input);
       return {
@@ -1125,7 +1117,6 @@ export class AgentTaskControlService {
     };
     const sessionId = task.parentSessionId ?? task.childSessionId;
     if (sessionId) event.sessionId = sessionId;
-    if (task.parentThreadId) event.threadId = task.parentThreadId;
     return event;
   }
 

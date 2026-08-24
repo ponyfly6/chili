@@ -13,7 +13,6 @@ import type {
   SessionId,
   TaskId,
   TeamId,
-  ThreadId,
   TimestampMs,
   ToolCallId,
   TurnId,
@@ -25,7 +24,6 @@ test("round-trips assistant text phase without transforming the event payload", 
   const dir = await mkdtemp(join(tmpdir(), "chili-store-assistant-phase-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const sessionId = "session_assistant_phase" as SessionId;
-  const threadId = "thread_assistant_phase" as ThreadId;
   const messageId = "message_assistant_phase" as MessageId;
   const partId = "part_assistant_phase" as PartId;
   const event: ChiliEvent = {
@@ -33,7 +31,6 @@ test("round-trips assistant text phase without transforming the event payload", 
     type: "message.part_added",
     time: 1 as TimestampMs,
     sessionId,
-    threadId,
     payload: {
       messageId,
       part: {
@@ -69,6 +66,26 @@ test("configures SQLite for bounded WAL maintenance", async () => {
     expect(db.query<{ name: string }, []>(
       "select name from sqlite_master where type = 'index' and name = 'events_session_type_seq_idx'",
     ).get()?.name).toBe("events_session_type_seq_idx");
+    expect(db.query<{ name: string }, []>(
+      "select name from sqlite_master where name = 'legacy_session_identities'",
+    ).get()).toBeNull();
+    expect(db.query<{ name: string }, []>(
+      "select name from sqlite_master where sql is not null and lower(sql) like '%thread%'",
+    ).all()).toEqual([]);
+    const mailboxColumns = db
+      .query<{ name: string }, []>("pragma table_info(agent_mailbox)")
+      .all()
+      .map((column) => column.name);
+    expect(mailboxColumns).toContain("recipient_session_id");
+    expect(mailboxColumns).not.toContain("child_session_id");
+    expect(db
+      .query<{ name: string }, []>("pragma index_info(agent_mailbox_recipient_session_idx)")
+      .all()
+      .map((column) => column.name))
+      .toEqual(["recipient_session_id", "created_at"]);
+    expect(db.query<{ name: string }, []>(
+      "select name from sqlite_master where type = 'index' and name = 'agent_mailbox_child_session_idx'",
+    ).get()).toBeNull();
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -84,7 +101,6 @@ test("close checkpoints and truncates the WAL file", async () => {
     const events = Array.from({ length: 1_000 }, (_, index) => sessionEvent(
       `event_wal_${index}`,
       `session_wal_${index}` as SessionId,
-      "thread_wal" as ThreadId,
       index as TimestampMs,
     ));
     await store.appendMany(events);
@@ -111,7 +127,6 @@ test("broadcasts transient tool output deltas without persisting or mirroring th
     type: "tool.output_delta",
     time: 1 as TimestampMs,
     sessionId: "session_tool_output_delta" as SessionId,
-    threadId: "thread_tool_output_delta" as ThreadId,
     payload: {
       callId: "toolcall_tool_output_delta" as import("@chili/protocol").ToolCallId,
       stream: "stdout",
@@ -148,7 +163,6 @@ test("isolates observable listener failures after the durable commit", async () 
   const event = sessionEvent(
     "event_observer_failure",
     "session_observer_failure" as SessionId,
-    "thread_observer_failure" as ThreadId,
     1 as TimestampMs,
   );
 
@@ -163,23 +177,21 @@ test("isolates observable listener failures after the durable commit", async () 
   }
 });
 
-test("session summaries include the resumable thread, recent prompt preview, and renamed title", async () => {
+test("session summaries include the recent prompt preview and renamed title", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-session-summary-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const sessionId = "session_summary" as SessionId;
-  const threadId = "thread_summary" as ThreadId;
   const messageId = "message_summary" as MessageId;
   const partId = "part_summary" as PartId;
 
   try {
     await store.appendMany([
-      sessionEvent("event_summary_created", sessionId, threadId, 1 as TimestampMs),
+      sessionEvent("event_summary_created", sessionId, 1 as TimestampMs),
       {
         id: "event_summary_message",
         type: "message.created",
         time: 2 as TimestampMs,
         sessionId,
-        threadId,
         payload: { messageId, role: "user" },
       },
       {
@@ -187,7 +199,6 @@ test("session summaries include the resumable thread, recent prompt preview, and
         type: "message.part_added",
         time: 3 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           messageId,
           part: { id: partId, messageId, sessionId, type: "text", text: "internal prompt", displayText: "Visible saved prompt" },
@@ -198,7 +209,6 @@ test("session summaries include the resumable thread, recent prompt preview, and
         type: "session.renamed",
         time: 4 as TimestampMs,
         sessionId,
-        threadId,
         payload: { sessionId, title: "Important work" },
       },
     ]);
@@ -207,7 +217,6 @@ test("session summaries include the resumable thread, recent prompt preview, and
       id: sessionId,
       cwd: "/repo",
       title: "Important work",
-      threadId,
       preview: "Visible saved prompt",
       source: "interactive",
       status: "active",
@@ -224,28 +233,23 @@ test("classifies persisted child agent sessions as subagents", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-session-source-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const parentSessionId = "session_source_parent" as SessionId;
-  const parentThreadId = "thread_source_parent" as ThreadId;
   const childSessionId = "session_source_child" as SessionId;
-  const childThreadId = "thread_source_child" as ThreadId;
 
   try {
     await store.appendMany([
-      sessionEvent("event_source_parent", parentSessionId, parentThreadId, 1 as TimestampMs),
-      sessionEvent("event_source_child", childSessionId, childThreadId, 2 as TimestampMs),
+      sessionEvent("event_source_parent", parentSessionId, 1 as TimestampMs),
+      sessionEvent("event_source_child", childSessionId, 2 as TimestampMs),
       {
         id: "event_source_task",
         type: "agent.task_created",
         time: 3 as TimestampMs,
         sessionId: parentSessionId,
-        threadId: parentThreadId,
         payload: {
           taskId: "task_source_child" as TaskId,
           path: "/root/task_source_child" as AgentPath,
           parentPath: "/root" as AgentPath,
           parentSessionId,
-          parentThreadId,
           childSessionId,
-          childThreadId,
           taskName: "worker",
           cwd: "/repo",
           prompt: "inspect the repository",
@@ -266,23 +270,20 @@ test("keeps a team lead session interactive while classifying worker sessions as
   const dir = await mkdtemp(join(tmpdir(), "chili-store-team-session-source-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const rootSessionId = "session_source_team_root" as SessionId;
-  const rootThreadId = "thread_source_team_root" as ThreadId;
   const workerSessionId = "session_source_team_worker" as SessionId;
-  const workerThreadId = "thread_source_team_worker" as ThreadId;
   const teamId = "team_source" as TeamId;
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
 
   try {
     await store.appendMany([
-      sessionEvent("event_source_team_root", rootSessionId, rootThreadId, 1 as TimestampMs),
-      sessionEvent("event_source_team_worker", workerSessionId, workerThreadId, 2 as TimestampMs),
+      sessionEvent("event_source_team_root", rootSessionId, 1 as TimestampMs),
+      sessionEvent("event_source_team_worker", workerSessionId, 2 as TimestampMs),
       {
         id: "event_source_team_created",
         type: "team.created",
         time: 3 as TimestampMs,
         sessionId: rootSessionId,
-        threadId: rootThreadId,
         payload: {
           teamId,
           name: "source team",
@@ -294,7 +295,6 @@ test("keeps a team lead session interactive while classifying worker sessions as
         type: "team.member_added",
         time: 4 as TimestampMs,
         sessionId: rootSessionId,
-        threadId: rootThreadId,
         payload: {
           teamId,
           path: leadPath,
@@ -302,7 +302,6 @@ test("keeps a team lead session interactive while classifying worker sessions as
           role: "leader",
           status: "running",
           childSessionId: rootSessionId,
-          childThreadId: rootThreadId,
         },
       },
       {
@@ -310,14 +309,12 @@ test("keeps a team lead session interactive while classifying worker sessions as
         type: "team.member_added",
         time: 5 as TimestampMs,
         sessionId: rootSessionId,
-        threadId: rootThreadId,
         payload: {
           teamId,
           path: workerPath,
           name: "worker",
           role: "implementer",
           childSessionId: workerSessionId,
-          childThreadId: workerThreadId,
         },
       },
     ]);
@@ -326,7 +323,7 @@ test("keeps a team lead session interactive while classifying worker sessions as
     expect(sessions.find((session) => session.id === rootSessionId)?.source).toBe("interactive");
     expect(sessions.find((session) => session.id === workerSessionId)?.source).toBe("subagent");
     expect(await store.teamMembers({ childSessionId: workerSessionId })).toEqual([
-      expect.objectContaining({ teamId, path: workerPath, childThreadId: workerThreadId }),
+      expect.objectContaining({ teamId, path: workerPath, childSessionId: workerSessionId }),
     ]);
   } finally {
     store.close();
@@ -340,8 +337,8 @@ test("orders event replay and afterEventId cursors by insertion sequence", async
   const time = 1 as TimestampMs;
 
   try {
-    await store.append(sessionEvent("z_event", "session_z" as SessionId, "thread_z" as ThreadId, time));
-    await store.append(sessionEvent("a_event", "session_a" as SessionId, "thread_a" as ThreadId, time));
+    await store.append(sessionEvent("z_event", "session_z" as SessionId, time));
+    await store.append(sessionEvent("a_event", "session_a" as SessionId, time));
 
     expect((await store.events({ limit: 10 })).map((event) => event.id)).toEqual(["z_event", "a_event"]);
     expect((await store.events({ afterEventId: "z_event", limit: 10 })).map((event) => event.id)).toEqual(["a_event"]);
@@ -356,13 +353,12 @@ test("tail event replay returns the latest bounded window in insertion order", a
   const dir = await mkdtemp(join(tmpdir(), "chili-store-tail-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const sessionId = "session_tail" as SessionId;
-  const threadId = "thread_tail" as ThreadId;
 
   try {
-    await store.append(sessionEvent("event_1", sessionId, threadId, 1 as TimestampMs));
-    await store.append(sessionEvent("event_2", sessionId, threadId, 2 as TimestampMs));
-    await store.append(sessionEvent("event_3", sessionId, threadId, 3 as TimestampMs));
-    await store.append(sessionEvent("event_4", sessionId, threadId, 4 as TimestampMs));
+    await store.append(sessionEvent("event_1", sessionId, 1 as TimestampMs));
+    await store.append(sessionEvent("event_2", sessionId, 2 as TimestampMs));
+    await store.append(sessionEvent("event_3", sessionId, 3 as TimestampMs));
+    await store.append(sessionEvent("event_4", sessionId, 4 as TimestampMs));
 
     expect((await store.events({ sessionId, limit: 2 })).map((event) => event.id)).toEqual(["event_1", "event_2"]);
     expect((await store.events({ sessionId, limit: 2, tail: true })).map((event) => event.id)).toEqual(["event_3", "event_4"]);
@@ -376,17 +372,15 @@ test("reconciles stale turns without completion events", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-stale-turn-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const sessionId = "session_stale_turn" as SessionId;
-  const threadId = "thread_stale_turn" as ThreadId;
   let recoveredIds = 0;
 
   try {
-    await store.append(sessionEvent("event_session", sessionId, threadId, 100 as TimestampMs));
+    await store.append(sessionEvent("event_session", sessionId, 100 as TimestampMs));
     await store.append({
       id: "event_turn_started",
       type: "turn.started",
       time: 110 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_stale" as TurnId },
     });
 
@@ -411,6 +405,344 @@ test("reconciles stale turns without completion events", async () => {
       reason: "stale_turn_recovered",
     });
     expect(await store.reconcileStaleTurns({ staleBefore: 2_000, createId: (prefix) => `${prefix}_again` })).toEqual([]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("fails closed when scoped session and goal events lack or conflict with envelope identity", async () => {
+  const store = new SqliteEventStore(":memory:");
+  const sessionId = "session_identity_primary" as SessionId;
+  const conflictingSessionId = "session_identity_conflict" as SessionId;
+  const time = 1 as TimestampMs;
+  const goalFor = (goalSessionId: SessionId) => ({
+    sessionId: goalSessionId,
+    objective: "preserve scoped event identity",
+    status: "active" as const,
+    tokensUsed: 0,
+    timeUsedSeconds: 0,
+    createdAt: time,
+    updatedAt: time,
+  });
+  // These casts model untyped/external callers bypassing the compile-time scoped envelope requirement.
+  const invalidEvents: Array<{ event: ChiliEvent; error: string }> = [
+    {
+      event: {
+        id: "event_identity_session_missing_envelope",
+        type: "session.created",
+        time,
+        payload: { sessionId, cwd: "/repo" },
+      } as unknown as ChiliEvent,
+      error: "session.created requires event.sessionId",
+    },
+    {
+      event: {
+        id: "event_identity_session_payload_mismatch",
+        type: "session.renamed",
+        time,
+        sessionId,
+        payload: { sessionId: conflictingSessionId, title: "wrong session" },
+      },
+      error: "session.renamed payload sessionId session_identity_conflict does not match event.sessionId session_identity_primary",
+    },
+    {
+      event: {
+        id: "event_identity_goal_missing_envelope",
+        type: "goal.updated",
+        time,
+        payload: { goal: goalFor(sessionId) },
+      } as unknown as ChiliEvent,
+      error: "goal.updated requires event.sessionId",
+    },
+    {
+      event: {
+        id: "event_identity_goal_payload_mismatch",
+        type: "goal.updated",
+        time,
+        sessionId,
+        payload: { goal: goalFor(conflictingSessionId) },
+      },
+      error: "goal.updated goal sessionId session_identity_conflict does not match event.sessionId session_identity_primary",
+    },
+    {
+      event: {
+        id: "event_identity_goal_clear_missing_envelope",
+        type: "goal.cleared",
+        time,
+        payload: { sessionId },
+      } as unknown as ChiliEvent,
+      error: "goal.cleared requires event.sessionId",
+    },
+    {
+      event: {
+        id: "event_identity_goal_clear_payload_mismatch",
+        type: "goal.cleared",
+        time,
+        sessionId,
+        payload: { sessionId: conflictingSessionId },
+      },
+      error: "goal.cleared payload sessionId session_identity_conflict does not match event.sessionId session_identity_primary",
+    },
+    {
+      event: {
+        id: "event_identity_previous_goal_mismatch",
+        type: "goal.cleared",
+        time,
+        sessionId,
+        payload: { sessionId, previousGoal: goalFor(conflictingSessionId) },
+      },
+      error: "goal.cleared previous goal sessionId session_identity_conflict does not match event.sessionId session_identity_primary",
+    },
+  ];
+
+  try {
+    for (const item of invalidEvents) {
+      await expect(store.append(item.event)).rejects.toThrow(item.error);
+    }
+    expect(await store.events({ limit: 20 })).toEqual([]);
+    expect(await store.sessions()).toEqual([]);
+    expect(await store.sessionGoals()).toEqual([]);
+
+    await expect(store.appendMany([
+      sessionEvent("event_identity_atomic_valid", sessionId, time),
+      invalidEvents[3]!.event,
+    ])).rejects.toThrow("goal.updated goal sessionId");
+    expect(await store.events({ limit: 20 })).toEqual([]);
+    expect(await store.sessions()).toEqual([]);
+  } finally {
+    store.close();
+  }
+});
+
+test("canonicalizes conflicting historical scoped payload identity from the event row", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-row-identity-authority-"));
+  const dbPath = join(dir, "events.sqlite");
+  const authoritativeSessionId = "session_row_authority" as SessionId;
+  const stalePayloadSessionId = "session_stale_payload" as SessionId;
+  let store = new SqliteEventStore(dbPath);
+  store.close();
+
+  const rawDb = new Database(dbPath, { create: true, strict: true });
+  rawDb.query(
+    `insert into events (id, type, time, session_id, payload_json)
+     values ('event_row_authority_session', 'session.created', 1, ?, ?)`,
+  ).run(
+    authoritativeSessionId,
+    JSON.stringify({ sessionId: stalePayloadSessionId, cwd: "/row-authority" }),
+  );
+  rawDb.query(
+    `insert into events (id, type, time, session_id, payload_json)
+     values ('event_row_authority_goal', 'goal.updated', 2, ?, ?)`,
+  ).run(
+    authoritativeSessionId,
+    JSON.stringify({
+      reason: "external",
+      goal: {
+        sessionId: stalePayloadSessionId,
+        objective: "trust the durable row",
+        status: "active",
+        tokensUsed: 2,
+        timeUsedSeconds: 3,
+        createdAt: 1,
+        updatedAt: 2,
+      },
+    }),
+  );
+  rawDb.query(
+    `insert into events (id, type, time, session_id, payload_json)
+     values ('event_row_authority_goal_clear', 'goal.cleared', 3, ?, ?)`,
+  ).run(
+    authoritativeSessionId,
+    JSON.stringify({
+      sessionId: stalePayloadSessionId,
+      reason: "external",
+      previousGoal: {
+        sessionId: stalePayloadSessionId,
+        objective: "trust the durable row",
+        status: "active",
+        tokensUsed: 2,
+        timeUsedSeconds: 3,
+        createdAt: 1,
+        updatedAt: 2,
+      },
+    }),
+  );
+  rawDb.close();
+
+  try {
+    store = new SqliteEventStore(dbPath);
+    expect(await store.events({ sessionId: authoritativeSessionId, limit: 10 })).toEqual([
+      {
+        id: "event_row_authority_session",
+        type: "session.created",
+        time: 1 as TimestampMs,
+        sessionId: authoritativeSessionId,
+        payload: { sessionId: authoritativeSessionId, cwd: "/row-authority" },
+      },
+      {
+        id: "event_row_authority_goal",
+        type: "goal.updated",
+        time: 2 as TimestampMs,
+        sessionId: authoritativeSessionId,
+        payload: {
+          reason: "external",
+          goal: {
+            sessionId: authoritativeSessionId,
+            objective: "trust the durable row",
+            status: "active",
+            tokensUsed: 2,
+            timeUsedSeconds: 3,
+            createdAt: 1,
+            updatedAt: 2,
+          },
+        },
+      },
+      {
+        id: "event_row_authority_goal_clear",
+        type: "goal.cleared",
+        time: 3 as TimestampMs,
+        sessionId: authoritativeSessionId,
+        payload: {
+          sessionId: authoritativeSessionId,
+          reason: "external",
+          previousGoal: {
+            sessionId: authoritativeSessionId,
+            objective: "trust the durable row",
+            status: "active",
+            tokensUsed: 2,
+            timeUsedSeconds: 3,
+            createdAt: 1,
+            updatedAt: 2,
+          },
+        },
+      },
+    ]);
+    const persistedPayloads = sqliteDatabase(store).query<{
+      id: string;
+      payload_session_id: string | null;
+    }, []>(
+      `select id,
+              coalesce(
+                json_extract(payload_json, '$.sessionId'),
+                json_extract(payload_json, '$.goal.sessionId'),
+                json_extract(payload_json, '$.previousGoal.sessionId')
+              ) as payload_session_id
+         from events
+        where id like 'event_row_authority_%'
+        order by seq`,
+    ).all();
+    expect(persistedPayloads).toEqual([
+      { id: "event_row_authority_session", payload_session_id: stalePayloadSessionId },
+      { id: "event_row_authority_goal", payload_session_id: stalePayloadSessionId },
+      { id: "event_row_authority_goal_clear", payload_session_id: stalePayloadSessionId },
+    ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("backfills missing historical event row identity from scoped payloads on reopen", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-scoped-identity-backfill-"));
+  const dbPath = join(dir, "events.sqlite");
+  const sessionPayloadId = "session_backfill_session_payload" as SessionId;
+  const goalPayloadId = "session_backfill_goal_payload" as SessionId;
+  const previousGoalPayloadId = "session_backfill_previous_goal" as SessionId;
+  let store = new SqliteEventStore(dbPath);
+  store.close();
+
+  const rawDb = new Database(dbPath, { create: true, strict: true });
+  rawDb.query(
+    `insert into events (id, type, time, session_id, payload_json)
+     values ('event_backfill_session_payload', 'session.created', 1, null, ?)`,
+  ).run(JSON.stringify({ sessionId: sessionPayloadId, cwd: "/backfilled" }));
+  rawDb.query(
+    `insert into events (id, type, time, session_id, payload_json)
+     values ('event_backfill_goal_payload', 'goal.updated', 2, null, ?)`,
+  ).run(JSON.stringify({
+    goal: {
+      sessionId: goalPayloadId,
+      objective: "recover the goal identity",
+      status: "active",
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      createdAt: 2,
+      updatedAt: 2,
+    },
+  }));
+  rawDb.query(
+    `insert into events (id, type, time, session_id, payload_json)
+     values ('event_backfill_previous_goal_payload', 'goal.cleared', 3, null, ?)`,
+  ).run(JSON.stringify({
+    previousGoal: {
+      sessionId: previousGoalPayloadId,
+      objective: "recover the previous goal identity",
+      status: "active",
+      tokensUsed: 1,
+      timeUsedSeconds: 1,
+      createdAt: 2,
+      updatedAt: 3,
+    },
+  }));
+  rawDb.close();
+
+  try {
+    store = new SqliteEventStore(dbPath);
+    expect(sqliteDatabase(store).query<{ id: string; session_id: string | null }, []>(
+      `select id, session_id
+         from events
+        where id like 'event_backfill_%'
+        order by seq`,
+    ).all()).toEqual([
+      { id: "event_backfill_session_payload", session_id: sessionPayloadId },
+      { id: "event_backfill_goal_payload", session_id: goalPayloadId },
+      { id: "event_backfill_previous_goal_payload", session_id: previousGoalPayloadId },
+    ]);
+    expect(await store.events({ limit: 10 })).toEqual([
+      {
+        id: "event_backfill_session_payload",
+        type: "session.created",
+        time: 1 as TimestampMs,
+        sessionId: sessionPayloadId,
+        payload: { sessionId: sessionPayloadId, cwd: "/backfilled" },
+      },
+      {
+        id: "event_backfill_goal_payload",
+        type: "goal.updated",
+        time: 2 as TimestampMs,
+        sessionId: goalPayloadId,
+        payload: {
+          goal: {
+            sessionId: goalPayloadId,
+            objective: "recover the goal identity",
+            status: "active",
+            tokensUsed: 0,
+            timeUsedSeconds: 0,
+            createdAt: 2,
+            updatedAt: 2,
+          },
+        },
+      },
+      {
+        id: "event_backfill_previous_goal_payload",
+        type: "goal.cleared",
+        time: 3 as TimestampMs,
+        sessionId: previousGoalPayloadId,
+        payload: {
+          sessionId: previousGoalPayloadId,
+          previousGoal: {
+            sessionId: previousGoalPayloadId,
+            objective: "recover the previous goal identity",
+            status: "active",
+            tokensUsed: 1,
+            timeUsedSeconds: 1,
+            createdAt: 2,
+            updatedAt: 3,
+          },
+        },
+      },
+    ]);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -445,6 +777,552 @@ test("migrates older event tables without seq and uses row insertion order", asy
   try {
     expect((await store.events({ limit: 10 })).map((event) => event.id)).toEqual(["z_event", "a_event"]);
     expect((await store.events({ afterEventId: "z_event", limit: 10 })).map((event) => event.id)).toEqual(["a_event"]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("migrates the complete legacy thread schema to canonical session-only storage idempotently", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-session-only-migration-"));
+  const dbPath = join(dir, "events.sqlite");
+  const sessionId = "session_legacy_canonical" as SessionId;
+  const legacyThreadId = "thread_legacy_canonical";
+  const legacyColumns = [
+    ["events", "thread_id"],
+    ["messages", "thread_id"],
+    ["tool_calls", "thread_id"],
+    ["approvals", "thread_id"],
+    ["agent_runs", "thread_id"],
+    ["agent_runs", "parent_thread_id"],
+    ["agent_runs", "child_thread_id"],
+    ["agent_tasks", "parent_thread_id"],
+    ["agent_tasks", "child_thread_id"],
+    ["agent_mailbox", "child_session_id"],
+    ["agent_mailbox", "child_thread_id"],
+    ["team_members", "child_thread_id"],
+    ["team_message_deliveries", "child_thread_id"],
+  ] as const;
+  let store = new SqliteEventStore(dbPath);
+  store.close();
+
+  const legacyDb = new Database(dbPath, { create: true, strict: true });
+  legacyDb.exec(`
+    alter table events add column thread_id text;
+    alter table messages add column thread_id text;
+    alter table tool_calls add column thread_id text;
+    alter table approvals add column thread_id text;
+    alter table agent_runs add column thread_id text;
+    alter table agent_runs add column parent_thread_id text;
+    alter table agent_runs add column child_thread_id text;
+    alter table agent_tasks add column parent_thread_id text;
+    alter table agent_tasks add column child_thread_id text;
+    alter table agent_mailbox add column child_session_id text;
+    alter table agent_mailbox add column child_thread_id text;
+    alter table team_members add column child_thread_id text;
+    alter table team_message_deliveries add column child_thread_id text;
+    create index events_thread_seq_idx on events(thread_id, seq);
+    create index events_thread_time_idx on events(thread_id, time, id);
+    create table thread_goals (
+      thread_id text primary key,
+      session_id text,
+      objective text not null,
+      status text not null,
+      token_budget integer,
+      tokens_used integer not null default 0,
+      time_used_seconds real not null default 0,
+      created_at integer not null,
+      updated_at integer not null,
+      completed_at integer,
+      last_reason text
+    );
+    create index thread_goals_session_idx on thread_goals(session_id);
+  `);
+  legacyDb.query(
+    `insert into events (id, type, time, session_id, thread_id, payload_json)
+     values (?, 'session.created', 1, ?, ?, ?)`,
+  ).run(
+    "event_legacy_session",
+    sessionId,
+    legacyThreadId,
+    JSON.stringify({ sessionId, cwd: "/legacy/repo" }),
+  );
+  legacyDb.query(
+    `insert into events (id, type, time, session_id, thread_id, payload_json)
+     values (?, 'goal.updated', 2, null, ?, ?)`,
+  ).run(
+    "event_legacy_goal_updated",
+    legacyThreadId,
+    JSON.stringify({
+      threadId: legacyThreadId,
+      parentThreadId: "thread_legacy_parent",
+      parentSessionId: "session_legacy_parent",
+      childThreadId: "thread_legacy_child",
+      childSessionId: "session_legacy_child",
+      recipientThreadId: "thread_legacy_recipient",
+      recipientSessionId: "session_legacy_recipient",
+      reason: "external",
+      goal: {
+        threadId: legacyThreadId,
+        objective: "finish the legacy migration",
+        status: "active",
+        tokenBudget: 10_000,
+        tokensUsed: 123,
+        timeUsedSeconds: 4,
+        createdAt: 1,
+        updatedAt: 2,
+      },
+    }),
+  );
+  legacyDb.query(
+    `insert into events (id, type, time, session_id, thread_id, payload_json)
+     values (?, 'goal.cleared', 3, null, ?, ?)`,
+  ).run(
+    "event_legacy_goal_cleared",
+    legacyThreadId,
+    JSON.stringify({
+      threadId: legacyThreadId,
+      parentThreadId: "thread_legacy_parent",
+      childThreadId: "thread_legacy_child",
+      recipientThreadId: "thread_legacy_recipient",
+      reason: "external",
+      previousGoal: {
+        threadId: legacyThreadId,
+        objective: "finish the legacy migration",
+        status: "active",
+        tokenBudget: 10_000,
+        tokensUsed: 123,
+        timeUsedSeconds: 4,
+        createdAt: 1,
+        updatedAt: 2,
+      },
+    }),
+  );
+  legacyDb.query(
+    `insert into events (id, type, time, session_id, thread_id, payload_json)
+     values (?, 'agent.message_queued', 4, ?, null, ?)`,
+  ).run(
+    "event_legacy_mailbox",
+    sessionId,
+    JSON.stringify({
+      taskId: "task_legacy_mailbox",
+      path: "/root/legacy-recipient",
+      from: "/root",
+      childSessionId: "session_legacy_recipient",
+      triggerTurn: true,
+      message: { role: "user", content: "legacy mailbox message" },
+    }),
+  );
+  legacyDb.query(
+    `insert into agent_mailbox
+       (id, task_id, path, from_path, recipient_session_id, child_session_id, child_thread_id,
+        trigger_turn, status, message_json, created_at)
+     values (?, ?, ?, ?, null, ?, ?, 1, 'queued', ?, 4)`,
+  ).run(
+    "event_legacy_mailbox",
+    "task_legacy_mailbox",
+    "/root/legacy-recipient",
+    "/root",
+    "session_legacy_recipient",
+    "thread_legacy_recipient",
+    JSON.stringify({ role: "user", content: "legacy mailbox message" }),
+  );
+  legacyDb.query(
+    `insert into thread_goals
+       (thread_id, session_id, objective, status, token_budget, tokens_used,
+        time_used_seconds, created_at, updated_at, last_reason)
+     values (?, null, ?, 'active', 10000, 123, 4, 1, 2, 'external')`,
+  ).run(legacyThreadId, "finish the legacy migration");
+  legacyDb.close();
+
+  const assertCanonicalSchema = (db: Database): void => {
+    const remainingColumns = legacyColumns.filter(([table, column]) => db
+      .query<{ name: string }, []>(`pragma table_info(${table})`)
+      .all()
+      .some((item) => item.name === column));
+    expect(remainingColumns).toEqual([]);
+    expect(db.query<{ name: string }, []>(
+      "select name from sqlite_master where type = 'table' and name = 'thread_goals'",
+    ).get()).toBeNull();
+    expect(db.query<{ name: string }, []>(
+      "select name from sqlite_master where type = 'index' and lower(name) like '%thread%' order by name",
+    ).all()).toEqual([]);
+    expect(db.query<{ name: string }, []>(
+      "select name from schema_migrations where name = 'session_only_schema_v1'",
+    ).get()).toEqual({ name: "session_only_schema_v1" });
+  };
+
+  try {
+    store = new SqliteEventStore(dbPath);
+    const canonicalEvents = await store.events({ sessionId, limit: 10 });
+    expect(canonicalEvents).toEqual([
+      {
+        id: "event_legacy_session",
+        type: "session.created",
+        time: 1 as TimestampMs,
+        sessionId,
+        payload: { sessionId, cwd: "/legacy/repo" },
+      },
+      {
+        id: "event_legacy_goal_updated",
+        type: "goal.updated",
+        time: 2 as TimestampMs,
+        sessionId,
+        payload: {
+          parentSessionId: "session_legacy_parent",
+          childSessionId: "session_legacy_child",
+          recipientSessionId: "session_legacy_recipient",
+          reason: "external",
+          goal: {
+            sessionId,
+            objective: "finish the legacy migration",
+            status: "active",
+            tokenBudget: 10_000,
+            tokensUsed: 123,
+            timeUsedSeconds: 4,
+            createdAt: 1,
+            updatedAt: 2,
+          },
+        },
+      },
+      {
+        id: "event_legacy_goal_cleared",
+        type: "goal.cleared",
+        time: 3 as TimestampMs,
+        sessionId,
+        payload: {
+          parentSessionId: "session_legacy_parent",
+          childSessionId: "session_legacy_child",
+          recipientSessionId: "session_legacy_recipient",
+          sessionId,
+          reason: "external",
+          previousGoal: {
+            sessionId,
+            objective: "finish the legacy migration",
+            status: "active",
+            tokenBudget: 10_000,
+            tokensUsed: 123,
+            timeUsedSeconds: 4,
+            createdAt: 1,
+            updatedAt: 2,
+          },
+        },
+      },
+      {
+        id: "event_legacy_mailbox",
+        type: "agent.message_queued",
+        time: 4 as TimestampMs,
+        sessionId,
+        payload: {
+          taskId: "task_legacy_mailbox" as TaskId,
+          path: "/root/legacy-recipient" as AgentPath,
+          from: "/root" as AgentPath,
+          recipientSessionId: "session_legacy_recipient" as SessionId,
+          triggerTurn: true,
+          message: { role: "user", content: "legacy mailbox message" },
+        },
+      },
+    ]);
+    expect(await store.sessionGoal(sessionId)).toEqual({
+      sessionId,
+      objective: "finish the legacy migration",
+      status: "active",
+      tokenBudget: 10_000,
+      tokensUsed: 123,
+      timeUsedSeconds: 4,
+      createdAt: 1 as TimestampMs,
+      updatedAt: 2 as TimestampMs,
+      lastReason: "external",
+    });
+    const rawClearedPayload = JSON.parse(String(sqliteDatabase(store)
+      .query<{ payload_json: string }, []>(
+        "select payload_json from events where id = 'event_legacy_goal_cleared'",
+      )
+      .get()?.payload_json)) as Record<string, unknown>;
+    expect(rawClearedPayload).toMatchObject({
+      childThreadId: "thread_legacy_child",
+      recipientThreadId: "thread_legacy_recipient",
+    });
+    expect(rawClearedPayload).not.toHaveProperty("childSessionId");
+    const rawMailboxPayload = JSON.parse(String(sqliteDatabase(store)
+      .query<{ payload_json: string }, []>(
+        "select payload_json from events where id = 'event_legacy_mailbox'",
+      )
+      .get()?.payload_json)) as Record<string, unknown>;
+    expect(rawMailboxPayload).toMatchObject({
+      childSessionId: "session_legacy_recipient",
+    });
+    expect(rawMailboxPayload).not.toHaveProperty("recipientSessionId");
+    expect(await store.agentMailbox({
+      recipientSessionId: "session_legacy_recipient" as SessionId,
+    })).toEqual([
+      expect.objectContaining({
+        id: "event_legacy_mailbox",
+        recipientSessionId: "session_legacy_recipient",
+      }),
+    ]);
+    expect(sqliteDatabase(store)
+      .query<{ session_id: string }, [string]>(
+        "select session_id from legacy_session_identities where legacy_id = ?",
+      )
+      .get("thread_legacy_child"))
+      .toEqual({ session_id: "session_legacy_child" });
+    assertCanonicalSchema(sqliteDatabase(store));
+
+    store.close();
+    store = new SqliteEventStore(dbPath);
+    expect(await store.events({ sessionId, limit: 10 })).toEqual(canonicalEvents);
+    expect(await store.sessionGoal(sessionId)).toMatchObject({
+      sessionId,
+      objective: "finish the legacy migration",
+      tokensUsed: 123,
+    });
+    expect(await store.agentMailbox({
+      recipientSessionId: "session_legacy_recipient" as SessionId,
+    })).toEqual([
+      expect.objectContaining({
+        id: "event_legacy_mailbox",
+        recipientSessionId: "session_legacy_recipient",
+      }),
+    ]);
+    assertCanonicalSchema(sqliteDatabase(store));
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("rejects duplicate legacy task child sessions and rolls the migration back", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-session-only-duplicate-child-"));
+  const dbPath = join(dir, "events.sqlite");
+  const bootstrap = new SqliteEventStore(dbPath);
+  bootstrap.close();
+
+  const legacyDb = new Database(dbPath, { create: true, strict: true });
+  legacyDb.exec(`
+    drop index agent_tasks_child_session_idx;
+    delete from schema_migrations where name = 'session_only_schema_v1';
+    alter table events add column thread_id text;
+    alter table agent_tasks add column child_thread_id text;
+  `);
+  legacyDb.query(
+    `insert into events (id, type, time, session_id, thread_id, payload_json)
+     values ('event_duplicate_child_session', 'session.created', 1, ?, ?, ?)`,
+  ).run(
+    "session_duplicate_child",
+    "thread_duplicate_child",
+    JSON.stringify({ sessionId: "session_duplicate_child", cwd: "/repo" }),
+  );
+  const insert = legacyDb.query(
+    `insert into agent_tasks
+       (id, path, child_session_id, child_thread_id, task_name, status, created_at, updated_at)
+     values (?, ?, ?, ?, ?, 'running', 1, 1)`,
+  );
+  insert.run(
+    "task_duplicate_child_a",
+    "/root/task_duplicate_child_a",
+    null,
+    "thread_duplicate_child",
+    "duplicate child a",
+  );
+  insert.run(
+    "task_duplicate_child_b",
+    "/root/task_duplicate_child_b",
+    null,
+    "thread_duplicate_child",
+    "duplicate child b",
+  );
+  legacyDb.close();
+
+  try {
+    expect(() => new SqliteEventStore(dbPath)).toThrow(
+      "Cannot enforce one task per child session session_duplicate_child",
+    );
+
+    const auditDb = new Database(dbPath, { create: false, strict: true });
+    try {
+      expect(auditDb.query<{ count: number }, []>(
+        "select count(*) as count from agent_tasks where child_session_id is null",
+      ).get()?.count).toBe(2);
+      expect(auditDb.query<{ name: string }, []>("pragma table_info(agent_tasks)").all())
+        .toContainEqual(expect.objectContaining({ name: "child_thread_id" }));
+      expect(auditDb.query<{ name: string }, []>(
+        "select name from schema_migrations where name = 'session_only_schema_v1'",
+      ).get()).toBeNull();
+      expect(auditDb.query<{ name: string }, []>(
+        "select name from sqlite_master where type = 'index' and name = 'agent_tasks_child_session_idx'",
+      ).get()).toBeNull();
+    } finally {
+      auditDb.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("rebuilds a misleading same-named child session index on the canonical column", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-session-only-wrong-index-"));
+  const dbPath = join(dir, "events.sqlite");
+  let store = new SqliteEventStore(dbPath);
+  store.close();
+
+  const legacyDb = new Database(dbPath, { create: true, strict: true });
+  legacyDb.exec(`
+    drop index agent_tasks_child_session_idx;
+    create unique index agent_tasks_child_session_idx on agent_tasks(path);
+  `);
+  legacyDb.close();
+
+  try {
+    store = new SqliteEventStore(dbPath);
+    const migratedDb = sqliteDatabase(store);
+    expect(migratedDb
+      .query<{ name: string }, []>(
+        "select name from pragma_index_info('agent_tasks_child_session_idx') order by seqno",
+      )
+      .all())
+      .toEqual([{ name: "child_session_id" }]);
+    expect(migratedDb
+      .query<{ unique: number; partial: number; name: string }, []>(
+        `select name, [unique], partial from pragma_index_list('agent_tasks')`,
+      )
+      .all())
+      .toContainEqual({
+        name: "agent_tasks_child_session_idx",
+        unique: 1,
+        partial: 1,
+      });
+
+    const insert = migratedDb.query(
+      `insert into agent_tasks
+         (id, path, child_session_id, task_name, status, created_at, updated_at)
+       values (?, ?, 'session_unique_child', ?, 'running', 1, 1)`,
+    );
+    insert.run("task_unique_child_a", "/root/task_unique_child_a", "unique child a");
+    expect(() => insert.run(
+      "task_unique_child_b",
+      "/root/task_unique_child_b",
+      "unique child b",
+    )).toThrow();
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("rejects ambiguous legacy conversation mappings and rolls the migration back", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-session-only-ambiguous-"));
+  const dbPath = join(dir, "events.sqlite");
+  const bootstrap = new SqliteEventStore(dbPath);
+  bootstrap.close();
+
+  const legacyDb = new Database(dbPath, { create: true, strict: true });
+  legacyDb.exec(`
+    delete from schema_migrations where name = 'session_only_schema_v1';
+    alter table events add column thread_id text;
+  `);
+  const insert = legacyDb.query(
+    `insert into events (id, type, time, session_id, thread_id, payload_json)
+     values (?, 'session.created', ?, ?, 'thread_ambiguous', ?)`,
+  );
+  insert.run(
+    "event_ambiguous_a",
+    1,
+    "session_ambiguous_a",
+    JSON.stringify({ sessionId: "session_ambiguous_a", cwd: "/repo/a" }),
+  );
+  insert.run(
+    "event_ambiguous_b",
+    2,
+    "session_ambiguous_b",
+    JSON.stringify({ sessionId: "session_ambiguous_b", cwd: "/repo/b" }),
+  );
+  legacyDb.close();
+
+  try {
+    expect(() => new SqliteEventStore(dbPath)).toThrow(
+      "Cannot migrate legacy conversation thread_ambiguous: it maps to multiple sessions",
+    );
+
+    const auditDb = new Database(dbPath, { create: false, strict: true });
+    try {
+      expect(auditDb.query<{ count: number }, []>(
+        "select count(*) as count from events where thread_id = 'thread_ambiguous'",
+      ).get()?.count).toBe(2);
+      expect(auditDb.query<{ name: string }, []>("pragma table_info(events)").all())
+        .toContainEqual(expect.objectContaining({ name: "thread_id" }));
+      expect(auditDb.query<{ name: string }, []>(
+        "select name from schema_migrations where name = 'session_only_schema_v1'",
+      ).get()).toBeNull();
+    } finally {
+      auditDb.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("adds and backfills missing replacement session columns before dropping legacy columns", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-session-only-missing-replacement-"));
+  const dbPath = join(dir, "events.sqlite");
+  const sessionId = "session_missing_replacement" as SessionId;
+  const taskId = "task_missing_replacement" as TaskId;
+  let store = new SqliteEventStore(dbPath);
+  store.close();
+
+  const legacyDb = new Database(dbPath, { create: true, strict: true });
+  legacyDb.exec(`
+    drop index agent_tasks_child_session_idx;
+    drop index events_session_seq_idx;
+    drop index events_session_type_seq_idx;
+    drop index events_session_time_idx;
+    delete from schema_migrations where name = 'session_only_schema_v1';
+    alter table events add column thread_id text;
+    alter table events drop column session_id;
+    alter table agent_tasks drop column child_session_id;
+    alter table agent_tasks add column child_thread_id text;
+  `);
+  legacyDb.query(
+    `insert into events (id, type, time, thread_id, payload_json)
+     values ('event_missing_replacement_session', 'session.created', 1, ?, ?)`,
+  ).run(
+    "thread_missing_replacement",
+    JSON.stringify({ sessionId, cwd: "/repo" }),
+  );
+  legacyDb.query(
+    `insert into agent_tasks
+       (id, path, child_thread_id, task_name, status, created_at, updated_at)
+     values (?, '/root/task_missing_replacement', 'thread_missing_replacement',
+             'missing replacement', 'running', 1, 1)`,
+  ).run(taskId);
+  legacyDb.close();
+
+  try {
+    store = new SqliteEventStore(dbPath);
+    expect(await store.events({ sessionId, limit: 10 })).toEqual([
+      {
+        id: "event_missing_replacement_session",
+        type: "session.created",
+        time: 1 as TimestampMs,
+        sessionId,
+        payload: { sessionId, cwd: "/repo" },
+      },
+    ]);
+    expect(await store.agentTask(taskId)).toMatchObject({
+      id: taskId,
+      childSessionId: sessionId,
+      status: "running",
+    });
+    const migratedDb = sqliteDatabase(store);
+    const columns = migratedDb.query<{ name: string }, []>("pragma table_info(agent_tasks)").all();
+    expect(columns).toContainEqual(expect.objectContaining({ name: "child_session_id" }));
+    expect(columns).not.toContainEqual(expect.objectContaining({ name: "child_thread_id" }));
+    expect(migratedDb.query<{ name: string }, []>(
+      "select name from sqlite_master where type = 'index' and name = 'agent_tasks_child_session_idx'",
+    ).get()).toEqual({ name: "agent_tasks_child_session_idx" });
+    expect(migratedDb.query<{ name: string }, []>(
+      "select name from schema_migrations where name = 'session_only_schema_v1'",
+    ).get()).toEqual({ name: "session_only_schema_v1" });
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -583,7 +1461,6 @@ test("migrates older approval tables and reads added projection fields", async (
       type: "approval.requested",
       time: 1 as TimestampMs,
       sessionId,
-      threadId: "thread_approval_metadata" as ThreadId,
       payload: {
         approvalId: "approval_metadata" as ApprovalId,
         permission: "tool.bash",
@@ -662,7 +1539,6 @@ test("migrates older message tables without turn_id before creating turn indexes
 
   const store = new SqliteEventStore(dbPath);
   const sessionId = "session_message_turn_migration" as SessionId;
-  const threadId = "thread_message_turn_migration" as ThreadId;
   const turnId = "turn_message_turn_migration" as TurnId;
   const messageId = "message_message_turn_migration" as MessageId;
 
@@ -672,7 +1548,6 @@ test("migrates older message tables without turn_id before creating turn indexes
       type: "message.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId, role: "user", turnId },
     });
 
@@ -692,25 +1567,22 @@ test("migrates older message tables without turn_id before creating turn indexes
   }
 });
 
-test("projects persistent thread goals and clears them", async () => {
+test("projects persistent session goals and clears them", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-goal-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const sessionId = "session_goal_store" as SessionId;
-  const threadId = "thread_goal_store" as ThreadId;
 
   try {
-    await store.append(sessionEvent("event_goal_session", sessionId, threadId, 1 as TimestampMs));
+    await store.append(sessionEvent("event_goal_session", sessionId, 1 as TimestampMs));
     await store.append({
       id: "event_goal_set",
       type: "goal.updated",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         reason: "set",
         goal: {
           sessionId,
-          threadId,
           objective: "ship /goal",
           status: "active",
           tokenBudget: 50_000,
@@ -722,8 +1594,8 @@ test("projects persistent thread goals and clears them", async () => {
       },
     });
 
-    expect(await store.threadGoal(threadId)).toMatchObject({
-      threadId,
+    expect(await store.sessionGoal(sessionId)).toMatchObject({
+      sessionId,
       objective: "ship /goal",
       status: "active",
       tokenBudget: 50_000,
@@ -735,10 +1607,9 @@ test("projects persistent thread goals and clears them", async () => {
       type: "goal.cleared",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
-      payload: { threadId, reason: "clear" },
+      payload: { sessionId, reason: "clear" },
     });
-    expect(await store.threadGoal(threadId)).toBeUndefined();
+    expect(await store.sessionGoal(sessionId)).toBeUndefined();
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -749,20 +1620,18 @@ test("replays message part deltas without rewriting the full projection until tu
   const dir = await mkdtemp(join(tmpdir(), "chili-store-part-delta-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const sessionId = "session_delta" as SessionId;
-  const threadId = "thread_delta" as ThreadId;
   const messageId = "message_delta" as MessageId;
   const partId = "part_delta" as PartId;
   const turnId = "turn_delta" as TurnId;
   const time = 1 as TimestampMs;
 
   try {
-    await store.append(sessionEvent("event_session", sessionId, threadId, time));
+    await store.append(sessionEvent("event_session", sessionId, time));
     await store.append({
       id: "event_message",
       type: "message.created",
       time,
       sessionId,
-      threadId,
       payload: { messageId, role: "assistant", turnId },
     });
     await store.append({
@@ -770,7 +1639,6 @@ test("replays message part deltas without rewriting the full projection until tu
       type: "message.part_added",
       time,
       sessionId,
-      threadId,
       payload: {
         messageId,
         part: {
@@ -787,7 +1655,6 @@ test("replays message part deltas without rewriting the full projection until tu
       type: "message.part_delta",
       time,
       sessionId,
-      threadId,
       payload: { messageId, partId, field: "text", delta: "lo" },
     });
 
@@ -817,7 +1684,6 @@ test("replays message part deltas without rewriting the full projection until tu
       type: "turn.completed",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId, status: "completed" },
     });
 
@@ -967,7 +1833,6 @@ test("finishes checkpoint backfill when the column exists without a migration ma
       .get()?.name).toBe("message_part_delta_checkpoints_v1");
 
     const sessionId = "session_after_checkpoint_marker" as SessionId;
-    const threadId = "thread_after_checkpoint_marker" as ThreadId;
     const messageId = "message_after_checkpoint_marker" as MessageId;
     const partId = "part_after_checkpoint_marker" as PartId;
     const turnId = "turn_after_checkpoint_marker" as TurnId;
@@ -977,7 +1842,6 @@ test("finishes checkpoint backfill when the column exists without a migration ma
         type: "message.created",
         time: 3 as TimestampMs,
         sessionId,
-        threadId,
         payload: { messageId, role: "assistant", turnId },
       },
       {
@@ -985,7 +1849,6 @@ test("finishes checkpoint backfill when the column exists without a migration ma
         type: "message.part_added",
         time: 4 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           messageId,
           part: { id: partId, messageId, sessionId, type: "text", text: "new" },
@@ -996,7 +1859,6 @@ test("finishes checkpoint backfill when the column exists without a migration ma
         type: "message.part_delta",
         time: 5 as TimestampMs,
         sessionId,
-        threadId,
         payload: { messageId, partId, field: "text", delta: "!" },
       },
     ]);
@@ -1021,20 +1883,18 @@ test("finishes checkpoint backfill when the column exists without a migration ma
 test("writes a growing message projection once instead of once per streamed delta", async () => {
   const store = new SqliteEventStore(":memory:");
   const sessionId = "session_delta_amplification" as SessionId;
-  const threadId = "thread_delta_amplification" as ThreadId;
   const turnId = "turn_delta_amplification" as TurnId;
   const messageId = "message_delta_amplification" as MessageId;
   const partId = "part_delta_amplification" as PartId;
 
   try {
     await store.appendMany([
-      sessionEvent("event_delta_amplification_session", sessionId, threadId, 1 as TimestampMs),
+      sessionEvent("event_delta_amplification_session", sessionId, 1 as TimestampMs),
       {
         id: "event_delta_amplification_message",
         type: "message.created",
         time: 2 as TimestampMs,
         sessionId,
-        threadId,
         payload: { messageId, role: "assistant", turnId },
       },
       {
@@ -1042,7 +1902,6 @@ test("writes a growing message projection once instead of once per streamed delt
         type: "message.part_added",
         time: 3 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           messageId,
           part: { id: partId, messageId, sessionId, type: "text", text: "seed" },
@@ -1066,7 +1925,6 @@ test("writes a growing message projection once instead of once per streamed delt
       type: "message.part_delta",
       time: (4 + index) as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId, partId, field: "text", delta: chunk },
     }));
     await store.appendMany(deltas);
@@ -1080,7 +1938,6 @@ test("writes a growing message projection once instead of once per streamed delt
       type: "turn.completed",
       time: 200 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId, status: "completed" },
     });
     expect(db.query<{ count: number }, []>("select count from message_part_update_count").get()?.count).toBe(1);
@@ -1093,9 +1950,7 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
   const dir = await mkdtemp(join(tmpdir(), "chili-store-subagent-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const parentSessionId = "session_parent" as SessionId;
-  const parentThreadId = "thread_parent" as ThreadId;
   const childSessionId = "session_child" as SessionId;
-  const childThreadId = "thread_child" as ThreadId;
   const taskId = "task_review" as TaskId;
   const runId = "agent_review" as AgentRunId;
   const path = "/root/task_review" as AgentPath;
@@ -1103,21 +1958,18 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
   const time = 1 as TimestampMs;
 
   try {
-    await store.append(sessionEvent("event_session", parentSessionId, parentThreadId, time));
+    await store.append(sessionEvent("event_session", parentSessionId, time));
     await store.append({
       id: "event_task_created",
       type: "agent.task_created",
       time,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         taskId,
         path,
         parentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId,
-        childThreadId,
         taskName: "review",
         cwd: "/repo",
         prompt: "Review this",
@@ -1129,16 +1981,13 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
       type: "agent.spawned",
       time,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         runId,
         taskId,
         path,
         parentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId,
-        childThreadId,
         taskName: "review",
         cwd: "/repo",
         mode: "one_shot",
@@ -1149,13 +1998,11 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
       type: "agent.message_queued",
       time,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         taskId,
         path,
         from: parentPath,
-        childSessionId,
-        childThreadId,
+        recipientSessionId: childSessionId,
         triggerTurn: true,
         message: { role: "user", content: "go" },
       },
@@ -1165,7 +2012,6 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
       type: "agent.message_consumed",
       time,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         messageId: "event_mailbox",
         taskId,
@@ -1178,7 +2024,6 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
       type: "agent.task_completed",
       time,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         taskId,
         runId,
@@ -1192,7 +2037,6 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
       type: "agent.completed",
       time,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         runId,
         taskId,
@@ -1208,9 +2052,7 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
         path,
         parentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId,
-        childThreadId,
         taskName: "review",
         cwd: "/repo",
         prompt: "Review this",
@@ -1235,28 +2077,24 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
       {
         id: runId,
         sessionId: parentSessionId,
-        threadId: parentThreadId,
         taskId,
         path,
         parentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId,
-        childThreadId,
         taskName: "review",
         cwd: "/repo",
         mode: "one_shot",
         status: "completed",
       },
     ]);
-    expect(await store.agentMailbox({ taskId })).toMatchObject([
+    expect(await store.agentMailbox({ taskId, recipientSessionId: childSessionId })).toMatchObject([
       {
         id: "event_mailbox",
         taskId,
         path,
         fromPath: parentPath,
-        childSessionId,
-        childThreadId,
+        recipientSessionId: childSessionId,
         triggerTurn: true,
         status: "consumed",
         message: { role: "user", content: "go" },
@@ -1277,16 +2115,13 @@ test("projects local subagent tasks, runs, mailbox, and completion", async () =>
       type: "agent.spawned",
       time: (time + 1) as TimestampMs,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         runId: "agent_review_followup" as AgentRunId,
         taskId,
         path,
         parentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId,
-        childThreadId,
         taskName: "review",
         cwd: "/repo",
         mode: "one_shot",
@@ -1314,7 +2149,6 @@ test("round-trips and queries local subagent scheduling provenance", async () =>
   const dir = await mkdtemp(join(tmpdir(), "chili-store-subagent-provenance-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const parentSessionId = "session_provenance_parent" as SessionId;
-  const parentThreadId = "thread_provenance_parent" as ThreadId;
   const sourceCallId = "call_provenance_batch" as ToolCallId;
   const batchId = "batch_provenance";
   const taskId = "task_provenance_created" as TaskId;
@@ -1326,15 +2160,12 @@ test("round-trips and queries local subagent scheduling provenance", async () =>
       type: "agent.task_created",
       time: 1 as TimestampMs,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         taskId,
         path: "/root/task_provenance_created" as AgentPath,
         parentPath: "/root" as AgentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId: "session_provenance_created" as SessionId,
-        childThreadId: "thread_provenance_created" as ThreadId,
         taskName: "created provenance",
         cwd: "/repo",
         prompt: "inspect created provenance",
@@ -1352,16 +2183,13 @@ test("round-trips and queries local subagent scheduling provenance", async () =>
       type: "agent.spawned",
       time: 2 as TimestampMs,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         runId: "agent_provenance_created" as AgentRunId,
         taskId,
         path: "/root/task_provenance_created" as AgentPath,
         parentPath: "/root" as AgentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId: "session_provenance_created" as SessionId,
-        childThreadId: "thread_provenance_created" as ThreadId,
         taskName: "created provenance",
         cwd: "/repo",
         mode: "background",
@@ -1374,16 +2202,13 @@ test("round-trips and queries local subagent scheduling provenance", async () =>
       type: "agent.spawned",
       time: 3 as TimestampMs,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         runId: "agent_provenance_spawned" as AgentRunId,
         taskId: spawnedTaskId,
         path: "/root/task_provenance_spawned" as AgentPath,
         parentPath: "/root" as AgentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId: "session_provenance_spawned" as SessionId,
-        childThreadId: "thread_provenance_spawned" as ThreadId,
         taskName: "spawned provenance",
         cwd: "/repo",
         mode: "background",
@@ -1654,7 +2479,6 @@ test("rolls back paired task and run completion when the second event cannot ins
     await store.append(sessionEvent(
       "event_pair_run_conflict",
       "session_conflict" as SessionId,
-      "thread_conflict" as ThreadId,
       2 as TimestampMs,
     ));
 
@@ -1847,7 +2671,6 @@ test("rolls back task, run, and mailbox completion when the mailbox event cannot
     await store.append(sessionEvent(
       "event_mailbox_rollback_conflict",
       "session_mailbox_rollback" as SessionId,
-      "thread_mailbox_rollback" as ThreadId,
       4 as TimestampMs,
     ));
 
@@ -1957,6 +2780,58 @@ test("claims exactly one concurrent follow-up generation with its queued message
   }
 });
 
+test("rejects reusing a completed agent run id for a follow-up generation", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-task-run-reuse-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const taskId = "task_run_reuse" as TaskId;
+  const runId = "agent_run_reuse" as AgentRunId;
+  const path = "/root/task_run_reuse" as AgentPath;
+
+  try {
+    await appendRunningTask(store, { taskId, runId, path, generation: 1, time: 1 as TimestampMs });
+    expect((await store.completeAgentTaskCas({
+      taskId,
+      path,
+      runId,
+      generation: 1,
+      expectedGeneration: 1,
+      expectedRunId: runId,
+      expectedLeaseOwner: null,
+      status: "completed",
+      eventId: "event_run_reuse_completed_task",
+      agentEventId: "event_run_reuse_completed_agent",
+      time: 2,
+    })).applied).toBe(true);
+
+    await expect(store.beginAgentTaskRunCas({
+      taskId,
+      expectedGeneration: 1,
+      expectedRunId: runId,
+      expectedLeaseOwner: null,
+      runId,
+      generation: 2,
+      leaseOwner: "followup:agent_run_reuse",
+      leaseTtlMs: 100,
+      spawnEventId: "event_run_reuse_spawn",
+      time: 3,
+    })).rejects.toThrow("agent task run cannot reuse existing runId agent_run_reuse");
+
+    expect(await store.agentTask(taskId)).toMatchObject({
+      status: "completed",
+      generation: 1,
+      currentRunId: runId,
+    });
+    expect(await store.agentRuns({ taskId })).toEqual([
+      expect.objectContaining({ id: runId, status: "completed" }),
+    ]);
+    expect((await store.events({ type: "agent.spawned", limit: 100 })).map((event) => event.id))
+      .not.toContain("event_run_reuse_spawn");
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("a source mailbox retry cannot reopen an explicitly cancelled task", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-source-cancelled-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -2060,7 +2935,6 @@ test("finalizes agent tasks through SQLite CAS without leaking stale events", as
       eventId: "event_cas_task_completed",
       agentEventId: "event_cas_agent_completed",
       sessionId: "session_parent" as SessionId,
-      threadId: "thread_parent" as ThreadId,
       time: 20,
     });
 
@@ -2232,8 +3106,7 @@ test("claims, requeues, and consumes mailbox messages through SQLite CAS", async
   const taskId = "task_mailbox_cas" as TaskId;
   const path = "/root/task_mailbox_cas" as AgentPath;
   const parentPath = "/root" as AgentPath;
-  const childSessionId = "session_child" as SessionId;
-  const childThreadId = "thread_child" as ThreadId;
+  const recipientSessionId = "session_child" as SessionId;
 
   try {
     await baseStore.append({
@@ -2244,8 +3117,7 @@ test("claims, requeues, and consumes mailbox messages through SQLite CAS", async
         taskId,
         path,
         from: parentPath,
-        childSessionId,
-        childThreadId,
+        recipientSessionId,
         triggerTurn: true,
         message: { role: "user", content: "continue" },
       },
@@ -2259,7 +3131,7 @@ test("claims, requeues, and consumes mailbox messages through SQLite CAS", async
     });
     expect(firstClaim).toMatchObject({
       applied: true,
-      message: { id: "event_mailbox", status: "delivering" },
+      message: { id: "event_mailbox", recipientSessionId, status: "delivering" },
     });
 
     const blockedClaim = await store.claimAgentMailboxMessage({
@@ -2438,7 +3310,6 @@ test("projects team members, task board, and messages", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-team-projection-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const sessionId = "session_team" as SessionId;
-  const threadId = "thread_team" as ThreadId;
   const teamId = "team_alpha" as TeamId;
   const leadPath = "/root" as AgentPath;
   const reviewerPath = "/root/reviewer" as AgentPath;
@@ -2447,13 +3318,12 @@ test("projects team members, task board, and messages", async () => {
 
   try {
     await store.appendMany([
-      sessionEvent("event_session_team", sessionId, threadId, 1 as TimestampMs),
+      sessionEvent("event_session_team", sessionId, 1 as TimestampMs),
       {
         id: "event_team_created",
         type: "team.created",
         time: 2 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           name: "alpha",
@@ -2466,7 +3336,6 @@ test("projects team members, task board, and messages", async () => {
         type: "team.member_added",
         time: 3 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           path: leadPath,
@@ -2481,14 +3350,12 @@ test("projects team members, task board, and messages", async () => {
         type: "team.member_added",
         time: 4 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           path: reviewerPath,
           name: "reviewer",
           role: "code-reviewer",
           childSessionId: "session_reviewer" as SessionId,
-          childThreadId: "thread_reviewer" as ThreadId,
           model: "test-model",
           toolScope: ["read", "git_diff"],
           writeScope: ["packages/core"],
@@ -2499,7 +3366,6 @@ test("projects team members, task board, and messages", async () => {
         type: "team.task_created",
         time: 5 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           taskId: setupTaskId,
@@ -2514,7 +3380,6 @@ test("projects team members, task board, and messages", async () => {
         type: "team.task_created",
         time: 6 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           taskId: reviewTaskId,
@@ -2529,7 +3394,6 @@ test("projects team members, task board, and messages", async () => {
         type: "team.task_assigned",
         time: 7 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           taskId: reviewTaskId,
@@ -2542,7 +3406,6 @@ test("projects team members, task board, and messages", async () => {
         type: "team.message_sent",
         time: 8 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           messageId: "message_review_assignment",
@@ -2560,7 +3423,6 @@ test("projects team members, task board, and messages", async () => {
         type: "team.task_updated",
         time: 9 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           taskId: reviewTaskId,
@@ -2573,7 +3435,6 @@ test("projects team members, task board, and messages", async () => {
         type: "team.member_status_changed",
         time: 10 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           path: reviewerPath,
@@ -2610,7 +3471,6 @@ test("projects team members, task board, and messages", async () => {
         role: "code-reviewer",
         status: "idle",
         childSessionId: "session_reviewer",
-        childThreadId: "thread_reviewer",
         model: "test-model",
         toolScope: ["read", "git_diff"],
         writeScope: ["packages/core"],
@@ -2662,7 +3522,6 @@ test("projects team message delivery status from agent mailbox lifecycle", async
   const mailboxMessageId = "agentmsg_delivery";
   const workerPath = "/root/worker" as AgentPath;
   const childSessionId = "session_worker" as SessionId;
-  const childThreadId = "thread_worker" as ThreadId;
 
   try {
     await store.append({
@@ -2686,8 +3545,7 @@ test("projects team message delivery status from agent mailbox lifecycle", async
       payload: {
         path: workerPath,
         from: "/root" as AgentPath,
-        childSessionId,
-        childThreadId,
+        recipientSessionId: childSessionId,
         triggerTurn: true,
         message: {
           role: "user",
@@ -2714,7 +3572,6 @@ test("projects team message delivery status from agent mailbox lifecycle", async
         status: "queued",
         triggerTurn: true,
         childSessionId,
-        childThreadId,
       },
     ]);
 
@@ -2775,7 +3632,6 @@ test("claims team tasks with dependency-aware CAS", async () => {
     },
   });
   const sessionId = "session_team_claim" as SessionId;
-  const threadId = "thread_team_claim" as ThreadId;
   const teamId = "team_claim" as TeamId;
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
@@ -2791,13 +3647,12 @@ test("claims team tasks with dependency-aware CAS", async () => {
 
   try {
     await store.appendMany([
-      sessionEvent("event_team_claim_session", sessionId, threadId, 1 as TimestampMs),
+      sessionEvent("event_team_claim_session", sessionId, 1 as TimestampMs),
       {
         id: "event_team_claim_created",
         type: "team.created",
         time: 2 as TimestampMs,
         sessionId,
-        threadId,
         payload: { teamId, name: "claimers", leadPath },
       },
       {
@@ -2805,7 +3660,6 @@ test("claims team tasks with dependency-aware CAS", async () => {
         type: "team.member_added",
         time: 3 as TimestampMs,
         sessionId,
-        threadId,
         payload: { teamId, path: workerPath, name: "worker", role: "implementer" },
       },
       {
@@ -2813,7 +3667,6 @@ test("claims team tasks with dependency-aware CAS", async () => {
         type: "team.member_added",
         time: 4 as TimestampMs,
         sessionId,
-        threadId,
         payload: { teamId, path: otherPath, name: "other", role: "implementer" },
       },
       {
@@ -2821,7 +3674,6 @@ test("claims team tasks with dependency-aware CAS", async () => {
         type: "team.task_created",
         time: 5 as TimestampMs,
         sessionId,
-        threadId,
         payload: { teamId, taskId: setupTaskId, title: "setup", status: "completed" },
       },
       {
@@ -2829,7 +3681,6 @@ test("claims team tasks with dependency-aware CAS", async () => {
         type: "team.task_created",
         time: 6 as TimestampMs,
         sessionId,
-        threadId,
         payload: { teamId, taskId: readyTaskId, title: "ready", dependsOn: [setupTaskId] },
       },
       {
@@ -2837,7 +3688,6 @@ test("claims team tasks with dependency-aware CAS", async () => {
         type: "team.task_created",
         time: 7 as TimestampMs,
         sessionId,
-        threadId,
         payload: { teamId, taskId: busyTaskId, title: "busy" },
       },
       {
@@ -2845,7 +3695,6 @@ test("claims team tasks with dependency-aware CAS", async () => {
         type: "team.task_created",
         time: 8 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           taskId: runningWriteTaskId,
@@ -2860,7 +3709,6 @@ test("claims team tasks with dependency-aware CAS", async () => {
         type: "team.task_created",
         time: 9 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           taskId: conflictingWriteTaskId,
@@ -2873,7 +3721,6 @@ test("claims team tasks with dependency-aware CAS", async () => {
         type: "team.task_created",
         time: 10 as TimestampMs,
         sessionId,
-        threadId,
         payload: { teamId, taskId: blockedTaskId, title: "blocked", dependsOn: ["task_missing" as TaskId] },
       },
       {
@@ -2881,7 +3728,6 @@ test("claims team tasks with dependency-aware CAS", async () => {
         type: "team.task_created",
         time: 11 as TimestampMs,
         sessionId,
-        threadId,
         payload: { teamId, taskId: failedDependencyTaskId, title: "failed dependency", status: "failed" },
       },
       {
@@ -2889,7 +3735,6 @@ test("claims team tasks with dependency-aware CAS", async () => {
         type: "team.task_created",
         time: 12 as TimestampMs,
         sessionId,
-        threadId,
         payload: { teamId, taskId: waitsOnFailedTaskId, title: "waits on failed", dependsOn: [failedDependencyTaskId] },
       },
     ]);
@@ -2901,7 +3746,6 @@ test("claims team tasks with dependency-aware CAS", async () => {
       claimedBy: workerPath,
       eventId: "event_team_claim_ready_cas",
       sessionId,
-      threadId,
       time: 9,
     });
     expect(claimed).toMatchObject({
@@ -3037,9 +3881,7 @@ async function appendRunningTask(
   },
 ): Promise<void> {
   const parentSessionId = "session_parent" as SessionId;
-  const parentThreadId = "thread_parent" as ThreadId;
   const childSessionId = "session_child" as SessionId;
-  const childThreadId = "thread_child" as ThreadId;
   const path = input.path ?? (`/root/${input.taskId}` as AgentPath);
   const parentPath = "/root" as AgentPath;
 
@@ -3049,15 +3891,12 @@ async function appendRunningTask(
       type: "agent.task_created",
       time: input.time,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         taskId: input.taskId,
         path,
         parentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId,
-        childThreadId,
         taskName: "review",
         cwd: "/repo",
         prompt: "Review this",
@@ -3069,16 +3908,13 @@ async function appendRunningTask(
       type: "agent.spawned",
       time: input.time,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       payload: {
         runId: input.runId,
         taskId: input.taskId,
         path,
         parentPath,
         parentSessionId,
-        parentThreadId,
         childSessionId,
-        childThreadId,
         taskName: "review",
         cwd: "/repo",
         mode: "background",
@@ -3088,13 +3924,12 @@ async function appendRunningTask(
   ]);
 }
 
-function sessionEvent(id: string, sessionId: SessionId, threadId: ThreadId, time: TimestampMs): ChiliEvent {
+function sessionEvent(id: string, sessionId: SessionId, time: TimestampMs): ChiliEvent {
   return {
     id,
     type: "session.created",
     time,
     sessionId,
-    threadId,
     payload: { sessionId, cwd: "/repo" },
   };
 }

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AgentPath, AgentRunId, SessionId, TaskId, TeamId, ThreadId, TimestampMs } from "@chili/protocol";
+import type { AgentPath, AgentRunId, SessionId, TaskId, TeamId, TimestampMs } from "@chili/protocol";
 import { timestampNow } from "@chili/protocol";
 import type { TeamMemberRow, TeamRow, TeamTaskRow } from "@chili/store";
 import { runProcess } from "@chili/tools";
@@ -56,7 +56,6 @@ export interface TeamTaskVerifierGitDiffInput {
 export interface TeamTaskVerifierSweepInput {
   teamId: TeamId;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   cwd?: string;
   maxConcurrentVerifications?: number;
   signal?: AbortSignal;
@@ -197,7 +196,6 @@ export class TeamTaskVerificationService {
       metadata: pendingMetadata,
       sessionId: parentSessionId,
       stalePendingBefore: startedAt - VERIFICATION_PENDING_TTL_MS,
-      ...(input.threadId ? { threadId: input.threadId } : {}),
     });
     if (!pendingClaim.applied) {
       return {
@@ -217,7 +215,7 @@ export class TeamTaskVerificationService {
       throwIfAborted(input.signal);
     } catch (error) {
       if (isSignalAbort(error, input.signal)) {
-        await this.clearPendingVerificationClaim(task, claimId, parentSessionId, input.threadId);
+        await this.clearPendingVerificationClaim(task, claimId, parentSessionId);
       }
       throw error;
     }
@@ -233,13 +231,11 @@ export class TeamTaskVerificationService {
         gitDiff,
       })),
       sessionId: parentSessionId,
-      ...(input.threadId ? { threadId: input.threadId } : {}),
     });
     throwIfAborted(input.signal);
 
     const verifierInput = {
       parentSessionId,
-      ...(input.threadId ? { parentThreadId: input.threadId } : {}),
       parentPath: task.ownerPath,
       cwd,
       taskName: `Verify ${task.title}`,
@@ -284,7 +280,6 @@ export class TeamTaskVerificationService {
         taskId: task.id,
         metadata,
         sessionId: parentSessionId,
-        ...(input.threadId ? { threadId: input.threadId } : {}),
       });
       return { status: "passed", teamTask: acceptedTask, verifierTask, feedback };
     }
@@ -305,7 +300,6 @@ export class TeamTaskVerificationService {
         gitDiff,
       })),
       sessionId: parentSessionId,
-      ...(input.threadId ? { threadId: input.threadId } : {}),
     });
     return { status: "failed", teamTask: reopenedTask, verifierTask, feedback };
   }
@@ -314,7 +308,6 @@ export class TeamTaskVerificationService {
     task: TeamTaskRow,
     claimId: string,
     sessionId: SessionId,
-    threadId: ThreadId | undefined,
   ): Promise<void> {
     const current = (await this.options.teams.tasks(task.teamId)).find((item) => item.id === task.id);
     if (!current || verificationMetadata(current.metadata)?.status !== "pending") return;
@@ -324,7 +317,6 @@ export class TeamTaskVerificationService {
       taskId: task.id,
       metadata: restoreVerificationMetadata(current.metadata, task.metadata),
       sessionId,
-      ...(threadId ? { threadId } : {}),
     });
   }
 

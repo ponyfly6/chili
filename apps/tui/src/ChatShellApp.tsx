@@ -20,7 +20,6 @@ import type {
   ServiceTier,
   SessionId,
   TeamId,
-  ThreadId,
 } from "@chili/protocol";
 import { FileAuthStorage, loginOpenAICodex, OPENAI_CODEX_PROVIDER_ID } from "@chili/providers";
 import { discoverSkills, updateSkillDisabledSetting, type SkillSettingsScope, type SkillSummary } from "@chili/skills";
@@ -164,7 +163,6 @@ export interface ChatShellOptions extends TeamLiveTuiOptions {
 
 export interface ChatShellExitInfo {
   sessionId?: SessionId;
-  threadId?: ThreadId;
   cwd?: string;
 }
 
@@ -379,7 +377,7 @@ export function ChatShellSurface(props: {
       statusClipboardFeedbackTimerRef.current = undefined;
     };
   }, []);
-  const sessionKey = `${props.runtime.activeSessionId ?? ""}\0${props.runtime.activeThreadId ?? ""}`;
+  const sessionKey = props.runtime.activeSessionId ?? "";
   const previousSessionKey = useRef(sessionKey);
   useEffect(() => {
     if (previousSessionKey.current === sessionKey) return;
@@ -432,7 +430,6 @@ export function ChatShellSurface(props: {
   };
   const delegationStatus = runtimeDelegationStatus(props.runtime.runtimeView, {
     ...(props.runtime.activeSessionId ? { sessionId: props.runtime.activeSessionId } : {}),
-    ...(props.runtime.activeThreadId ? { threadId: props.runtime.activeThreadId } : {}),
     ...(props.selectedTeamId ? { teamId: props.selectedTeamId } : {}),
     ...(props.runtime.delegationConfig ? { delegationConfig: props.runtime.delegationConfig } : {}),
   });
@@ -452,12 +449,10 @@ export function ChatShellSurface(props: {
     runtimeView: props.runtime.runtimeView,
     teamView: props.model,
     ...(currentSessionId ? { sessionId: currentSessionId } : {}),
-    ...(props.runtime.activeThreadId ? { threadId: props.runtime.activeThreadId } : {}),
     limit: 20,
   }), [
     currentSessionId,
     props.model,
-    props.runtime.activeThreadId,
     props.runtime.revision,
     props.runtime.runtimeView,
   ]);
@@ -3028,7 +3023,6 @@ function statusPageModel(input: StatusPageInput): StatusPageModel {
     { key: "status:ad-hoc-agents", text: `ad-hoc agents: ${input.agentExperience.adHocSummary}`, tone: "text" },
     { key: "status:persistent-team", text: `persistent teams: ${input.agentExperience.persistentTeamSummary}`, tone: "text" },
     { key: "status:session", text: `session: ${input.runtime.activeSessionId ?? "none"}`, tone: "text" },
-    { key: "status:thread", text: `thread: ${input.runtime.activeThreadId ?? "none"}`, tone: "text" },
     { key: "status:mode", text: `mode: ${input.options.modeName}`, tone: "text" },
     { key: "status:model", text: `model: ${modelLabel}`, tone: "text" },
     { key: "status:connection", text: `connection: ${connection}`, tone: "text" },
@@ -3409,7 +3403,7 @@ async function performGoalAction(
 ): Promise<void> {
   if (result.action === "show") {
     const goal = runtime.chatView.goal;
-    appendLocalItem("info", goal ? goalSummary(goal) : "No goal set for this thread.");
+    appendLocalItem("info", goal ? goalSummary(goal) : "No goal set for this session.");
     return;
   }
   if (result.action === "set") {
@@ -4040,11 +4034,9 @@ function latestAssistantText(items: readonly ChatTranscriptItem[]): string | und
 
 function chatShellExitInfo(runtime: ChatRuntimeState, cwd: string | undefined): ChatShellExitInfo | undefined {
   const sessionId = runtime.activeSessionId ?? runtime.chatView.sessionId;
-  const threadId = runtime.activeThreadId ?? runtime.chatView.threadId;
-  if (!sessionId && !threadId && !cwd) return undefined;
+  if (!sessionId && !cwd) return undefined;
   const info: ChatShellExitInfo = {};
   if (sessionId) info.sessionId = sessionId;
-  if (threadId) info.threadId = threadId;
   if (cwd) info.cwd = cwd;
   return info;
 }

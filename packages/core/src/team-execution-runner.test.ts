@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { AgentPath, AgentRunId, SessionId, TaskId, TeamId, TimestampMs, ThreadId } from "@chili/protocol";
+import type { AgentPath, AgentRunId, SessionId, TaskId, TeamId, TimestampMs } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import { LocalSubagentManager, type LocalSubagentRunInput, type LocalSubagentRunResult, type LocalSubagentRunner } from "./subagent.js";
 import { TeamTaskDispatchService, type TeamTaskDispatchResult } from "./team-dispatcher.js";
@@ -20,7 +20,6 @@ test("runs team tasks through dependencies until the board is drained", async ()
   const setupPath = "/root/setup" as AgentPath;
   const featurePath = "/root/feature" as AgentPath;
   const sessionId = "session_team_runner" as SessionId;
-  const threadId = "thread_team_runner" as ThreadId;
   const runner = new DeferredLocalSubagentRunner();
   let subagents: LocalSubagentManager | undefined;
 
@@ -40,24 +39,22 @@ test("runs team tasks through dependencies until the board is drained", async ()
       },
     });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "runner", leadPath });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: setupPath, name: "setup", role: "implementer" });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: featurePath, name: "feature", role: "implementer" });
-    const setup = await teams.createTask({ sessionId, threadId, teamId: team.id, title: "Prepare", ownerPath: setupPath });
+    const team = await teams.createTeam({ sessionId, name: "runner", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: setupPath, name: "setup", role: "implementer" });
+    await teams.addMember({ sessionId, teamId: team.id, path: featurePath, name: "feature", role: "implementer" });
+    const setup = await teams.createTask({ sessionId, teamId: team.id, title: "Prepare", ownerPath: setupPath });
     const feature = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Build feature",
       ownerPath: featurePath,
       dependsOn: [setup.id],
     });
-    const unowned = await teams.createTask({ sessionId, threadId, teamId: team.id, title: "Needs owner" });
+    const unowned = await teams.createTask({ sessionId, teamId: team.id, title: "Needs owner" });
 
     const summary = await execution.run({
       teamId: team.id,
       sessionId,
-      threadId,
       maxCycles: 5,
       timeoutMs: 10_000,
       pollIntervalMs: 1,
@@ -362,7 +359,6 @@ test("emits team run lifecycle events", async () => {
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_runner_lifecycle" as SessionId;
-  const threadId = "thread_team_runner_lifecycle" as ThreadId;
   const runner = new ImmediateLocalSubagentRunner();
   let subagents: LocalSubagentManager | undefined;
 
@@ -372,11 +368,11 @@ test("emits team run lifecycle events", async () => {
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, cwd: dir, now });
     const execution = new TeamExecutionRunner({ teams, dispatcher, events: store, cwd: dir, now, createId: ids });
 
-    const team = await teams.createTeam({ sessionId, threadId, name: "runner-lifecycle", leadPath });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
-    const task = await teams.createTask({ sessionId, threadId, teamId: team.id, title: "Emit events", ownerPath: workerPath });
+    const team = await teams.createTeam({ sessionId, name: "runner-lifecycle", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+    const task = await teams.createTask({ sessionId, teamId: team.id, title: "Emit events", ownerPath: workerPath });
 
-    const summary = await execution.run({ teamId: team.id, sessionId, threadId, mode: "one_shot", maxCycles: 3 });
+    const summary = await execution.run({ teamId: team.id, sessionId, mode: "one_shot", maxCycles: 3 });
 
     expect(summary).toMatchObject({
       stopReason: "drained",
@@ -398,7 +394,6 @@ test("emits team run lifecycle events", async () => {
     expect(lifecycleEvents[0]).toMatchObject({
       type: "team.run_started",
       sessionId,
-      threadId,
       payload: {
         teamId: team.id,
         mode: "one_shot",
@@ -419,7 +414,6 @@ test("emits team run lifecycle events", async () => {
     expect(lifecycleEvents.at(-1)).toMatchObject({
       type: "team.run_completed",
       sessionId,
-      threadId,
       payload: {
         teamId: team.id,
         cycles: 1,
@@ -565,7 +559,6 @@ test("creates a parent session when runnable team tasks do not have one", async 
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const createdSessionId = "session_created_for_runner" as SessionId;
-  const createdThreadId = "thread_created_for_runner" as ThreadId;
   const runner = new ImmediateLocalSubagentRunner();
   let subagents: LocalSubagentManager | undefined;
   const createdSessions: Array<{ teamId: string; cwd: string }> = [];
@@ -581,7 +574,7 @@ test("creates a parent session when runnable team tasks do not have one", async 
       now,
       createSession: async (input) => {
         createdSessions.push(input);
-        return { sessionId: createdSessionId, threadId: createdThreadId };
+        return { sessionId: createdSessionId };
       },
     });
 
@@ -601,7 +594,6 @@ test("creates a parent session when runnable team tasks do not have one", async 
     expect(createdSessions).toEqual([{ teamId: team.id, cwd: dir }]);
     expect(runner.runs[0]).toMatchObject({
       parentSessionId: createdSessionId,
-      parentThreadId: createdThreadId,
       taskName: "Needs session",
     });
   } finally {
@@ -619,7 +611,6 @@ test("uses the auto-created parent session when reconciling background tasks", a
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const createdSessionId = "session_created_for_reconcile" as SessionId;
-  const createdThreadId = "thread_created_for_reconcile" as ThreadId;
   const runner = new DeferredLocalSubagentRunner();
   let subagents: LocalSubagentManager | undefined;
 
@@ -632,7 +623,7 @@ test("uses the auto-created parent session when reconciling background tasks", a
       dispatcher,
       cwd: dir,
       now,
-      createSession: async () => ({ sessionId: createdSessionId, threadId: createdThreadId }),
+      createSession: async () => ({ sessionId: createdSessionId }),
       sleep: async () => {
         runner.completeNext();
         if (!subagents) throw new Error("subagents not initialized");
@@ -655,7 +646,6 @@ test("uses the auto-created parent session when reconciling background tasks", a
     const completion = updates.find((event) => isRecord(event.payload) && event.payload.taskId === task.id && event.payload.status === "completed");
     expect(completion).toMatchObject({
       sessionId: createdSessionId,
-      threadId: createdThreadId,
     });
   } finally {
     runner.completeAll();
@@ -673,7 +663,6 @@ test("does not dispatch after slow session creation exceeds the deadline", async
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const createdSessionId = "session_created_after_deadline" as SessionId;
-  const createdThreadId = "thread_created_after_deadline" as ThreadId;
   const dispatches: Array<Parameters<TeamTaskDispatchService["dispatchTask"]>[0]> = [];
 
   try {
@@ -700,7 +689,7 @@ test("does not dispatch after slow session creation exceeds the deadline", async
       now,
       createSession: async () => {
         await delay(30);
-        return { sessionId: createdSessionId, threadId: createdThreadId };
+        return { sessionId: createdSessionId };
       },
     });
 
@@ -727,7 +716,6 @@ test("passes abort signals into session creation and stops before dispatch when 
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const createdSessionId = "session_created_after_abort" as SessionId;
-  const createdThreadId = "thread_created_after_abort" as ThreadId;
   const controller = new AbortController();
   const createSessionSignals: Array<AbortSignal | undefined> = [];
   const dispatches: Array<Parameters<TeamTaskDispatchService["dispatchTask"]>[0]> = [];
@@ -757,7 +745,7 @@ test("passes abort signals into session creation and stops before dispatch when 
       createSession: async (input) => {
         createSessionSignals.push(input.signal);
         controller.abort();
-        return { sessionId: createdSessionId, threadId: createdThreadId };
+        return { sessionId: createdSessionId };
       },
     });
 
@@ -1175,7 +1163,6 @@ class PendingMergeVerifier implements TeamTaskVerifier {
         taskId: task.id,
         metadata: pendingMergeMetadata(Number(this.now())),
         ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-        ...(input.threadId ? { threadId: input.threadId } : {}),
       });
       result.verified.push({
         status: "passed",
@@ -1186,7 +1173,6 @@ class PendingMergeVerifier implements TeamTaskVerifier {
           path: "/root/worker/verifier" as AgentPath,
           parentPath: "/root/worker" as AgentPath,
           childSessionId: "session_verifier" as SessionId,
-          childThreadId: "thread_verifier" as ThreadId,
           status: "completed",
           summary: "VERDICT: passed",
         },
@@ -1234,7 +1220,6 @@ class MetadataMergeService implements TeamTaskMerger {
         taskId: task.id,
         metadata,
         ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-        ...(input.threadId ? { threadId: input.threadId } : {}),
       });
       const item = {
         status: this.status,

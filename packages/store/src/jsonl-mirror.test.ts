@@ -2,14 +2,14 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { ChiliEvent, MessageId, PartId, SessionId, ThreadId, TimestampMs, TurnId } from "@chili/protocol";
+import type { ChiliEvent, MessageId, PartId, SessionId, TimestampMs, TurnId } from "@chili/protocol";
 import { JsonlMirror, SessionJsonlMirror, SessionTranscriptJsonlMirror } from "./jsonl-mirror.js";
 
 test("JsonlMirror appends raw events to one JSONL file", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-jsonl-mirror-"));
   const path = join(dir, "events.jsonl");
   const mirror = new JsonlMirror(path);
-  const event = sessionCreatedEvent("session_static" as SessionId, "thread_static" as ThreadId);
+  const event = sessionCreatedEvent("session_static" as SessionId);
 
   try {
     await mirror.write(event);
@@ -23,18 +23,16 @@ test("JsonlMirror appends raw events to one JSONL file", async () => {
 test("SessionJsonlMirror appends timestamped events to per-session JSONL files", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-session-jsonl-mirror-"));
   const sessionId = "session_with/slash" as SessionId;
-  const threadId = "thread_jsonl" as ThreadId;
   const mirror = new SessionJsonlMirror(join(dir, "sessions"), { filePrefix: "session-" });
   const messageId = "message_jsonl" as MessageId;
 
   try {
-    await mirror.write(sessionCreatedEvent(sessionId, threadId));
+    await mirror.write(sessionCreatedEvent(sessionId));
     await mirror.write({
       id: "event_part",
       type: "message.part_added",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId,
         part: {
@@ -56,7 +54,6 @@ test("SessionJsonlMirror appends timestamped events to per-session JSONL files",
       id: "event_session",
       type: "session.created",
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     });
     expect(lines[1]).toMatchObject({
@@ -80,7 +77,6 @@ test("SessionJsonlMirror can group session files under a home root by cwd", asyn
   const homeSessionsRoot = join(dir, "home", ".chili", "sessions");
   const project = join(dir, "project");
   const sessionId = "session_cwd" as SessionId;
-  const threadId = "thread_cwd" as ThreadId;
   const mirror = new SessionJsonlMirror(homeSessionsRoot, { groupByCwd: true });
 
   try {
@@ -89,7 +85,6 @@ test("SessionJsonlMirror can group session files under a home root by cwd", asyn
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: project },
     };
     await mirror.write(sessionEvent);
@@ -98,7 +93,6 @@ test("SessionJsonlMirror can group session files under a home root by cwd", asyn
       type: "message.created",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "message_cwd" as MessageId, role: "user" },
     });
 
@@ -116,7 +110,6 @@ test("SessionJsonlMirror can resolve cwd for resumed sessions", async () => {
   const homeSessionsRoot = join(dir, "home", ".chili", "sessions");
   const project = join(dir, "project");
   const sessionId = "session_resumed" as SessionId;
-  const threadId = "thread_resumed" as ThreadId;
   const mirror = new SessionJsonlMirror(homeSessionsRoot, {
     groupByCwd: true,
     resolveSessionCwd: (requestedSessionId) => requestedSessionId === sessionId ? project : undefined,
@@ -128,7 +121,6 @@ test("SessionJsonlMirror can resolve cwd for resumed sessions", async () => {
       type: "message.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "message_resumed" as MessageId, role: "user" },
     });
 
@@ -155,7 +147,6 @@ test("SessionJsonlMirror falls back to the sessions root when cwd is unknown", a
       type: "message.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId: "thread_unknown" as ThreadId,
       payload: { messageId: "message_unknown" as MessageId, role: "user" },
     });
 
@@ -172,7 +163,6 @@ test("SessionTranscriptJsonlMirror writes one JSONL line per completed message",
   const dir = await mkdtemp(join(tmpdir(), "chili-transcript-jsonl-"));
   const root = join(dir, "sessions");
   const sessionId = "session_transcript" as SessionId;
-  const threadId = "thread_transcript" as ThreadId;
   const userMessageId = "message_user" as MessageId;
   const assistantMessageId = "message_assistant" as MessageId;
   const assistantPartId = "part_assistant" as PartId;
@@ -184,7 +174,6 @@ test("SessionTranscriptJsonlMirror writes one JSONL line per completed message",
       type: "message.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: userMessageId, role: "user" },
     });
     await mirror.write({
@@ -192,7 +181,6 @@ test("SessionTranscriptJsonlMirror writes one JSONL line per completed message",
       type: "message.part_added",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId: userMessageId,
         part: {
@@ -209,7 +197,6 @@ test("SessionTranscriptJsonlMirror writes one JSONL line per completed message",
       type: "turn.started",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_transcript" as TurnId },
     });
     await mirror.write({
@@ -217,7 +204,6 @@ test("SessionTranscriptJsonlMirror writes one JSONL line per completed message",
       type: "message.created",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: assistantMessageId, role: "assistant" },
     });
     await mirror.write({
@@ -225,7 +211,6 @@ test("SessionTranscriptJsonlMirror writes one JSONL line per completed message",
       type: "message.part_added",
       time: 5 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId: assistantMessageId,
         part: {
@@ -242,7 +227,6 @@ test("SessionTranscriptJsonlMirror writes one JSONL line per completed message",
       type: "message.part_delta",
       time: 6 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: assistantMessageId, partId: assistantPartId, field: "text", delta: "lo" },
     });
     await mirror.write({
@@ -250,13 +234,13 @@ test("SessionTranscriptJsonlMirror writes one JSONL line per completed message",
       type: "turn.completed",
       time: 7 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_transcript" as TurnId, status: "completed" },
     });
 
     const lines = (await readFile(join(root, "session_transcript.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
 
     expect(lines).toHaveLength(2);
+    expect(lines.every((line) => line.sessionId === sessionId && !("threadId" in line))).toBe(true);
     expect(lines.map((line) => [line.type, line.role, line.text])).toEqual([
       ["message", "user", "hello"],
       ["message", "assistant", "hello"],
@@ -266,13 +250,12 @@ test("SessionTranscriptJsonlMirror writes one JSONL line per completed message",
   }
 });
 
-function sessionCreatedEvent(sessionId: SessionId, threadId: ThreadId): ChiliEvent {
+function sessionCreatedEvent(sessionId: SessionId): ChiliEvent {
   return {
     id: "event_session",
     type: "session.created",
     time: 1 as TimestampMs,
     sessionId,
-    threadId,
     payload: { sessionId, cwd: "/repo" },
   };
 }

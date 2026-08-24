@@ -1,4 +1,4 @@
-import type { ApprovalId, ArtifactId, SessionId, ThreadId, ToolCallId, TurnId } from "./ids.js";
+import type { ApprovalId, ArtifactId, SessionId, ToolCallId, TurnId } from "./ids.js";
 
 export type ToolRisk = "read" | "write" | "execute" | "network" | "dangerous";
 
@@ -23,7 +23,6 @@ export interface ToolDefinition<Input = unknown, Output extends ToolResult = Too
 
 export interface ToolExecutionContext {
   sessionId: SessionId;
-  threadId?: ThreadId;
   turnId: TurnId;
   callId: ToolCallId;
   signal: AbortSignal;

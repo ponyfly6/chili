@@ -62,7 +62,6 @@ export interface SubagentTaskRecord {
   generation?: number;
   currentRunId?: string;
   childSessionId?: string;
-  childThreadId?: string;
   summary?: string;
   error?: string;
   createdAt?: number;
@@ -77,8 +76,7 @@ export interface SubagentMailboxRecord {
   status: SubagentMailboxStatus;
   triggerTurn: boolean;
   taskId?: string;
-  childSessionId?: string;
-  childThreadId?: string;
+  recipientSessionId?: string;
   message?: unknown;
   createdAt?: number;
   consumedAt?: number;

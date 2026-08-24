@@ -26,7 +26,7 @@ import {
   type RuntimePromptTurnContext,
   type WorkerToolPolicy,
 } from "@chili/core";
-import type { AgentPath, ApprovalDecision, ChiliEvent, EventEnvelope, ModelSelection, RuntimePermissionConfig, RuntimePermissionProfileId, ServiceTier, SessionId, TaskId, TeamId, ThreadId } from "@chili/protocol";
+import type { AgentPath, ApprovalDecision, ChiliEvent, EventEnvelope, ModelSelection, RuntimePermissionConfig, RuntimePermissionProfileId, ServiceTier, SessionId, TaskId, TeamId } from "@chili/protocol";
 import { ObservableEventStore, SessionTranscriptJsonlMirror, SqliteEventStore } from "@chili/store";
 import type { AgentMailboxRow, AgentTaskQuery, AgentTaskRow, TeamMemberRow, TeamMessageRow, TeamRow, TeamTaskRow } from "@chili/store";
 import {
@@ -269,11 +269,10 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
       skillRegistry,
       ...(context.turn ? { turn: context.turn } : {}),
     });
-  const childPromptFragments = (context: { sessionId: SessionId; threadId: ThreadId; cwd: string; turn?: RuntimePromptTurnContext }) =>
+  const childPromptFragments = (context: { sessionId: SessionId; cwd: string; turn?: RuntimePromptTurnContext }) =>
     buildCliChildPromptFragments({
       cwd: context.cwd,
       sessionId: context.sessionId,
-      threadId: context.threadId,
       skillRegistry,
       store: eventStore,
       ...(context.turn ? { turn: context.turn } : {}),
@@ -375,21 +374,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     teams,
     cwd,
   });
-  const completeTaskController: SubagentController = {
-    spawnTask(input, context) {
-      return subagents.spawnTask(input, context);
-    },
-    async completeTask(input) {
-      try {
-        return await tasks.completeTask(input);
-      } catch (error) {
-        if (error instanceof Error && error.name === "AgentTaskNotRunnableError") {
-          return subagents.completeTask(input);
-        }
-        throw error;
-      }
-    },
-  };
+  const completeTaskController = createCompleteTaskController(tasks, subagents);
   registry.register(createTaskTool(subagents));
   childRegistry.register(createCompleteTaskTool(completeTaskController));
   const toolExecutor = new ToolExecutor({
@@ -494,12 +479,11 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   registry.register(createMailboxConsumeTool(controlController));
   registerAgentMessageTools(registry, createAgentMessageToolController(tasks, agents, "root"));
   registerAgentMessageTools(childRegistry, createAgentMessageToolController(tasks, agents, "child"));
-  const teamController = createTeamToolController(teams);
-  registerTeamTools(registry, teamController);
-  registerTeamTools(childRegistry, teamController);
-  const teamDispatchController = createTeamTaskDispatchToolController(teamDispatcher);
+  registerTeamTools(registry, createTeamToolController(teams, tasks, "root"));
+  registerTeamTools(childRegistry, createTeamToolController(teams, tasks, "child"));
+  const teamDispatchController = createTeamTaskDispatchToolController(teamDispatcher, teams);
   registerTeamDispatchTools(registry, teamDispatchController);
-  registry.register(createTeamRunLoopTool(createTeamRunLoopToolController(teamRunner)));
+  registry.register(createTeamRunLoopTool(createTeamRunLoopToolController(teamRunner, teams)));
   mcpRuntime = await createCliMcpRuntime({
     cwd,
     chiliHome,
@@ -556,23 +540,10 @@ function registerMcpResourceTools(registry: InMemoryToolRegistry, runtime: CliMc
   registry.register(createMcpResourceReadTool(runtime.resources));
 }
 
-export async function latestThreadId(store: SqliteEventStore, sessionId: SessionId): Promise<ThreadId | undefined> {
-  const events = await store.events({ sessionId, limit: 5000 });
-  for (let index = events.length - 1; index >= 0; index--) {
-    const event = events[index];
-    if (event?.threadId) return event.threadId;
-  }
-  return undefined;
-}
-
-export function newThreadId(): ThreadId {
-  return createIdFactory()("thread") as ThreadId;
-}
-
 function createWorkerToolPolicyResolver(store: ObservableEventStore): ToolAccessPolicyResolver {
   return {
     async resolve(context) {
-      const policy = await findWorkerToolPolicy(store, context.sessionId, context.threadId);
+      const policy = await findWorkerToolPolicy(store, context.sessionId);
       return policy ?? defaultScopedWorkerPolicy();
     },
   };
@@ -627,24 +598,19 @@ function uniqueStrings(values: readonly string[]): string[] {
 function createGoalToolController(service: RuntimeService): GoalToolController {
   return {
     async getGoal(context) {
-      const threadId = requireToolThreadId(context.threadId);
-      return service.getGoal({ sessionId: context.sessionId, threadId });
+      return service.getGoal({ sessionId: context.sessionId });
     },
     async createGoal(input, context) {
-      const threadId = requireToolThreadId(context.threadId);
       return service.setGoal({
         sessionId: context.sessionId,
-        threadId,
         objective: input.objective,
         ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
         replace: false,
       });
     },
     async updateGoal(input, context) {
-      const threadId = requireToolThreadId(context.threadId);
       return service.updateGoal({
         sessionId: context.sessionId,
-        threadId,
         status: input.status,
       });
     },
@@ -659,22 +625,15 @@ function createDelegationToolController(service: RuntimeService): DelegationTool
     setDelegationPolicy(input, context) {
       return service.setDelegationPolicy({
         sessionId: context.sessionId,
-        ...(context.threadId ? { threadId: context.threadId } : {}),
         policy: input.policy,
       });
     },
   };
 }
 
-function requireToolThreadId(threadId: ThreadId | undefined): ThreadId {
-  if (!threadId) throw new Error("Goal tools require a thread id.");
-  return threadId;
-}
-
 async function findWorkerToolPolicy(
   store: ObservableEventStore,
   sessionId: SessionId,
-  threadId: ThreadId | undefined,
 ): Promise<WorkerToolPolicy | undefined> {
   let afterEventId: string | undefined;
   let found: WorkerToolPolicy | undefined;
@@ -684,7 +643,7 @@ async function findWorkerToolPolicy(
     if (afterEventId) query.afterEventId = afterEventId;
     const events = await store.events(query);
     for (const event of events) {
-      const policy = workerToolPolicyFromEvent(event, sessionId, threadId);
+      const policy = workerToolPolicyFromEvent(event, sessionId);
       if (policy) found = policy;
     }
     if (events.length < query.limit) return found;
@@ -697,12 +656,10 @@ async function findWorkerToolPolicy(
 function workerToolPolicyFromEvent(
   event: EventEnvelope | undefined,
   sessionId: SessionId,
-  threadId: ThreadId | undefined,
 ): WorkerToolPolicy | undefined {
   const payload = event?.payload;
   if (!isRecord(payload)) return undefined;
   if (payload.childSessionId !== sessionId) return undefined;
-  if (threadId && payload.childThreadId !== threadId) return undefined;
   const policy = payload.workerPolicy;
   if (!isRecord(policy)) return undefined;
   return {
@@ -748,7 +705,6 @@ export async function buildCliPromptFragments(input: {
 export async function buildCliChildPromptFragments(input: {
   cwd: string;
   sessionId: SessionId;
-  threadId: ThreadId;
   skillRegistry: SkillRegistry;
   store: ObservableEventStore;
   turn?: RuntimePromptTurnContext;
@@ -764,7 +720,7 @@ export async function buildCliChildPromptFragments(input: {
       ...(input.projectRoot ? { projectRoot: input.projectRoot } : {}),
     })),
     chiliChildRuntimeBasePromptFragment(),
-    ...(await buildTaskFollowupPromptFragments(input.store, input.sessionId, input.threadId)),
+    ...(await buildTaskFollowupPromptFragments(input.store, input.sessionId)),
   ];
 }
 
@@ -784,11 +740,15 @@ function chiliChildRuntimeBasePromptFragment(): PromptFragment {
 async function buildTaskFollowupPromptFragments(
   store: ObservableEventStore,
   sessionId: SessionId,
-  threadId: ThreadId,
 ): Promise<PromptFragment[]> {
   const tasks = await store.agentTasks({ childSessionId: sessionId, limit: 10 });
-  const task = tasks.find((candidate) => candidate.childThreadId === threadId);
-  return task ? [taskFollowupPromptFragment(task)] : [];
+  if (tasks.length === 0) return [];
+  if (tasks.length > 1) {
+    throw new Error(
+      `Agent task metadata invariant violated: child session ${sessionId} maps to ${tasks.length} tasks`,
+    );
+  }
+  return [taskFollowupPromptFragment(tasks[0] as AgentTaskRow)];
 }
 
 function taskFollowupPromptFragment(task: AgentTaskRow): PromptFragment {
@@ -1078,7 +1038,7 @@ export function createSubagentControlController(
     async listTasks(input, context) {
       if (input.taskIds) {
         const visible = (await Promise.all(input.taskIds.map((taskId) => tasks.getTask(taskId as TaskId))))
-          .filter((task) => input.all || task.parentSessionId === context.sessionId)
+          .filter((task) => task.parentSessionId === context.sessionId)
           .filter((task) => !input.status || task.status === input.status)
           .map(toSubagentTaskRecord);
         return limitItems(visible, input.limit);
@@ -1086,8 +1046,10 @@ export function createSubagentControlController(
       const query: AgentTaskQuery = {};
       if (input.status) query.status = input.status;
       if (input.limit !== undefined) query.limit = input.limit;
-      if (!input.all) query.parentSessionId = context.sessionId;
-      return (await tasks.listTasks(query)).map(toSubagentTaskRecord);
+      query.parentSessionId = context.sessionId;
+      return (await tasks.listTasks(query))
+        .filter((task) => task.parentSessionId === context.sessionId)
+        .map(toSubagentTaskRecord);
     },
     async waitTask(input, context) {
       const visibleTask = await tasks.getTask(input.taskId as TaskId);
@@ -1121,6 +1083,7 @@ export function createSubagentControlController(
       };
     },
     async followupTask(input, context) {
+      await requireVisibleAgentTask(tasks, input.taskId as TaskId, context.sessionId);
       const result = await tasks.followupTask({
         taskId: input.taskId as TaskId,
         text: input.prompt,
@@ -1129,7 +1092,8 @@ export function createSubagentControlController(
       });
       return toSubagentTaskRecord(result.task);
     },
-    async closeTask(input) {
+    async closeTask(input, context) {
+      await requireVisibleAgentTask(tasks, input.taskId as TaskId, context.sessionId);
       return toSubagentTaskRecord(
         await tasks.closeTask({
           taskId: input.taskId as TaskId,
@@ -1141,27 +1105,83 @@ export function createSubagentControlController(
       );
     },
     async listMailbox(input, context) {
+      const taskQuery: AgentTaskQuery = {
+        parentSessionId: context.sessionId,
+        limit: mailboxTaskLimit(input),
+      };
+      if (input.taskId) taskQuery.taskId = input.taskId as TaskId;
+      if (input.path) taskQuery.path = input.path as AgentPath;
+      const visibleTasks = (await tasks.listTasks(taskQuery))
+        .filter((task) => task.parentSessionId === context.sessionId)
+        .filter((task) => (input.taskId ? task.id === input.taskId : true))
+        .filter((task) => (input.path ? task.path === input.path : true));
+      if ((input.taskId || input.path) && visibleTasks.length === 0) return [];
+      const visibleTaskIds = new Set(visibleTasks.map((task) => task.id));
+      const visibleRecipientSessionIds = new Set<SessionId>([context.sessionId]);
+      for (const task of visibleTasks) {
+        if (task.childSessionId) visibleRecipientSessionIds.add(task.childSessionId);
+      }
+
       const messages = await agents.mailbox({
         status: input.status ?? "queued",
-        ...(input.taskId ? { taskId: input.taskId as TaskId } : {}),
-        ...(input.path ? { path: input.path as AgentPath } : {}),
-        ...(input.limit !== undefined ? { limit: input.limit } : {}),
+        limit: mailboxTaskLimit(input),
       });
-      if (input.all || input.taskId || input.path) return messages.map(toSubagentMailboxRecord);
-
-      const visibleTaskIds = new Set(
-        (await tasks.listTasks({ parentSessionId: context.sessionId, limit: mailboxTaskLimit(input) })).map((task) => task.id),
-      );
-      return messages.filter((message) => message.taskId && visibleTaskIds.has(message.taskId)).map(toSubagentMailboxRecord);
+      return messages
+        .filter((message) => mailboxMessageMatchesScope(
+          message,
+          visibleTaskIds,
+          visibleRecipientSessionIds,
+        ))
+        .filter((message) => (input.taskId ? message.taskId === input.taskId : true))
+        .filter((message) => (input.path ? message.path === input.path : true))
+        .slice(0, input.limit ?? 500)
+        .map(toSubagentMailboxRecord);
     },
     async consumeMailbox(input, context) {
       const message = (await agents.mailbox({ messageId: input.messageId, limit: 1 }))[0];
       if (!message?.taskId) throw new Error(`Mailbox message is not visible to this session: ${input.messageId}`);
       const task = await tasks.getTask(message.taskId);
-      if (task.parentSessionId !== context.sessionId) {
+      const visibleRecipients = new Set<SessionId>([context.sessionId]);
+      if (task.childSessionId) visibleRecipients.add(task.childSessionId);
+      if (
+        task.parentSessionId !== context.sessionId ||
+        (message.recipientSessionId !== undefined && !visibleRecipients.has(message.recipientSessionId))
+      ) {
         throw new Error(`Mailbox message is not visible to this session: ${input.messageId}`);
       }
       return toSubagentMailboxRecord(await agents.consumeMailbox({ messageId: input.messageId }));
+    },
+  };
+}
+
+export function createCompleteTaskController(
+  tasks: AgentTaskControlService,
+  subagents: SubagentController,
+): SubagentController {
+  return {
+    spawnTask(input, context) {
+      return subagents.spawnTask(input, context);
+    },
+    async completeTask(input, context) {
+      const taskId = input.taskId as TaskId;
+      const task = await tasks.getTask(taskId);
+      const mappings = (await tasks.listTasks({ childSessionId: context.sessionId, limit: 2 }))
+        .filter((candidate) => candidate.childSessionId === context.sessionId);
+      if (
+        task.childSessionId !== context.sessionId ||
+        mappings.length !== 1 ||
+        mappings[0]?.id !== taskId
+      ) {
+        throw new Error(`Agent task cannot be completed by this session: ${taskId}`);
+      }
+      try {
+        return await tasks.completeTask(input);
+      } catch (error) {
+        if (error instanceof Error && error.name === "AgentTaskNotRunnableError") {
+          return subagents.completeTask(input, context);
+        }
+        throw error;
+      }
     },
   };
 }
@@ -1177,7 +1197,6 @@ function createAgentMessageToolController(
         tasks,
         role,
         context.sessionId,
-        context.threadId,
         input.from,
       );
       const message = await agents.sendMessage({
@@ -1189,21 +1208,22 @@ function createAgentMessageToolController(
         ...(input.taskId ? { taskId: input.taskId as TaskId } : {}),
         ...(input.metadata ? { metadata: input.metadata } : {}),
         sessionId: context.sessionId,
-        ...(context.threadId ? { threadId: context.threadId } : {}),
       });
       return toAgentMessageRecord(message);
     },
     async listAgentMessages(input, context) {
-      const currentPath = await resolveAgentMessageSender(
+      await resolveAgentMessageSender(
         tasks,
         role,
         context.sessionId,
-        context.threadId,
         undefined,
       );
-      const visibleTasks = await listAgentMessageScopeTasks(tasks, context.sessionId, context.threadId);
+      const visibleTasks = await listAgentMessageScopeTasks(tasks, context.sessionId);
       const visibleTaskIds = new Set(visibleTasks.map((task) => task.id));
-      const visiblePaths = new Set<AgentPath>([currentPath, ...visibleTasks.map((task) => task.path)]);
+      const visibleSessionIds = new Set<SessionId>([context.sessionId]);
+      for (const task of visibleTasks) {
+        if (task.childSessionId) visibleSessionIds.add(task.childSessionId);
+      }
       const messages = await agents.mailbox({
         ...(input.status ? { status: input.status } : {}),
         ...(input.taskId ? { taskId: input.taskId as TaskId } : {}),
@@ -1211,13 +1231,16 @@ function createAgentMessageToolController(
         limit: Math.max(input.limit ?? 500, 1000),
       });
       return messages
-        .filter(
-          (message) =>
-            visibleTaskIds.has(message.taskId as TaskId) ||
-            message.childSessionId === context.sessionId ||
-            visiblePaths.has(message.path) ||
-            visiblePaths.has(message.fromPath),
-        )
+        .filter((message) => {
+          const taskMatches = message.taskId === undefined ? undefined : visibleTaskIds.has(message.taskId);
+          const sessionMatches = message.recipientSessionId === undefined
+            ? undefined
+            : visibleSessionIds.has(message.recipientSessionId);
+          if (taskMatches !== undefined && sessionMatches !== undefined) {
+            return taskMatches && sessionMatches;
+          }
+          return taskMatches ?? sessionMatches ?? false;
+        })
         .filter((message) => (input.from ? message.fromPath === input.from : true))
         .slice(0, input.limit ?? 500)
         .map(toAgentMessageRecord);
@@ -1229,7 +1252,6 @@ async function resolveAgentMessageSender(
   tasks: AgentTaskControlService,
   role: "root" | "child",
   sessionId: SessionId,
-  threadId: ThreadId | undefined,
   requested: string | undefined,
 ): Promise<AgentPath> {
   if (role === "root") {
@@ -1240,17 +1262,14 @@ async function resolveAgentMessageSender(
     return root;
   }
 
-  const ownTasks = (await tasks.listTasks({ childSessionId: sessionId, limit: 1000 }))
-    .filter((task) => threadId === undefined || task.childThreadId === threadId);
-  const paths = [...new Set(ownTasks.map((task) => task.path))];
-  if (paths.length === 0) {
-    const endpoint = threadId ? `${sessionId}/${threadId}` : sessionId;
-    throw new Error(`Agent message sender is unavailable for child endpoint ${endpoint}`);
+  const ownTasks = await tasks.listTasks({ childSessionId: sessionId, limit: 1000 });
+  if (ownTasks.length === 0) {
+    throw new Error(`Agent message sender is unavailable for child session ${sessionId}`);
   }
-  if (paths.length > 1) {
-    throw new Error(`Agent message sender is ambiguous for session ${sessionId}: ${paths.join(", ")}`);
+  if (ownTasks.length > 1) {
+    throw new Error(`Agent message sender is ambiguous for session ${sessionId}: ${ownTasks.map((task) => task.id).join(", ")}`);
   }
-  const inferred = paths[0] as AgentPath;
+  const inferred = ownTasks[0]?.path as AgentPath;
   if (requested && requested !== inferred) {
     throw new Error(`Agent message sender ${requested} does not match current agent ${inferred}`);
   }
@@ -1260,38 +1279,27 @@ async function resolveAgentMessageSender(
 async function listAgentMessageScopeTasks(
   tasks: AgentTaskControlService,
   sessionId: SessionId,
-  threadId: ThreadId | undefined,
 ): Promise<AgentTaskRow[]> {
   const allTasks = await tasks.listTasks({ limit: 2_147_483_647 });
   const visible = new Map<TaskId, AgentTaskRow>();
-  const endpoints: Array<{ sessionId: SessionId; threadId?: ThreadId }> = [
-    { sessionId, ...(threadId ? { threadId } : {}) },
-  ];
-  const visitedEndpoints = new Set<string>();
+  const endpoints: SessionId[] = [sessionId];
+  const visitedEndpoints = new Set<SessionId>();
 
   for (const task of allTasks) {
-    if (
-      task.childSessionId === sessionId &&
-      (threadId === undefined || task.childThreadId === threadId)
-    ) {
+    if (task.childSessionId === sessionId) {
       visible.set(task.id, task);
     }
   }
 
   for (let index = 0; index < endpoints.length; index += 1) {
-    const endpoint = endpoints[index] as { sessionId: SessionId; threadId?: ThreadId };
-    const endpointKey = `${endpoint.sessionId}\0${endpoint.threadId ?? "*"}`;
-    if (visitedEndpoints.has(endpointKey)) continue;
-    visitedEndpoints.add(endpointKey);
+    const endpoint = endpoints[index] as SessionId;
+    if (visitedEndpoints.has(endpoint)) continue;
+    visitedEndpoints.add(endpoint);
     for (const task of allTasks) {
-      if (task.parentSessionId !== endpoint.sessionId) continue;
-      if (endpoint.threadId !== undefined && task.parentThreadId !== endpoint.threadId) continue;
+      if (task.parentSessionId !== endpoint) continue;
       visible.set(task.id, task);
       if (task.childSessionId) {
-        endpoints.push({
-          sessionId: task.childSessionId,
-          ...(task.childThreadId ? { threadId: task.childThreadId } : {}),
-        });
+        endpoints.push(task.childSessionId);
       }
     }
   }
@@ -1299,15 +1307,93 @@ async function listAgentMessageScopeTasks(
   return [...visible.values()];
 }
 
-function createTeamToolController(teams: TeamControlService): TeamToolController {
+async function visibleTeamsForSession(
+  teams: TeamControlService,
+  sessionId: SessionId,
+): Promise<TeamRow[]> {
+  const allTeams = await teams.listTeams();
+  const visibility = await Promise.all(allTeams.map(async (team) => {
+    if (team.sessionId === sessionId) return true;
+    return (await teams.members(team.id)).some((member) => member.childSessionId === sessionId);
+  }));
+  return allTeams.filter((_team, index) => visibility[index]);
+}
+
+async function requireVisibleTeam(
+  teams: TeamControlService,
+  teamId: TeamId,
+  sessionId: SessionId,
+): Promise<TeamRow> {
+  const team = (await visibleTeamsForSession(teams, sessionId)).find((candidate) => candidate.id === teamId);
+  if (!team) throw new Error(`Team is not visible to this session: ${teamId}`);
+  return team;
+}
+
+async function requireTeamOwnerOrLead(
+  teams: TeamControlService,
+  teamId: TeamId,
+  sessionId: SessionId,
+): Promise<TeamRow> {
+  const team = (await teams.listTeams()).find((candidate) => candidate.id === teamId);
+  if (!team) throw new Error(`Team is not visible to this session: ${teamId}`);
+  if (team.sessionId === sessionId) return team;
+  const lead = (await teams.members(teamId)).find((member) => member.path === team.leadPath);
+  if (lead?.childSessionId !== sessionId) {
+    throw new Error(`Team membership cannot be changed by this session: ${teamId}`);
+  }
+  return team;
+}
+
+async function requireUniqueDescendantAgentTask(
+  tasks: AgentTaskControlService,
+  childSessionId: SessionId,
+  path: AgentPath,
+  parentSessionId: SessionId,
+): Promise<AgentTaskRow> {
+  if (childSessionId === parentSessionId) {
+    throw new Error(`Team member session is not a unique visible descendant: ${childSessionId}`);
+  }
+
+  const visited = new Set<SessionId>();
+  let endpoint = childSessionId;
+  let descendant: AgentTaskRow | undefined;
+  while (endpoint !== parentSessionId) {
+    if (visited.has(endpoint)) {
+      throw new Error(`Team member session is not a unique visible descendant: ${childSessionId}`);
+    }
+    visited.add(endpoint);
+    const mappings = (await tasks.listTasks({ childSessionId: endpoint, limit: 2 }))
+      .filter((task) => task.childSessionId === endpoint);
+    if (mappings.length !== 1) {
+      throw new Error(`Team member session is not a unique visible descendant: ${childSessionId}`);
+    }
+    const task = mappings[0] as AgentTaskRow;
+    descendant ??= task;
+    if (!task.parentSessionId) {
+      throw new Error(`Team member session is not a unique visible descendant: ${childSessionId}`);
+    }
+    endpoint = task.parentSessionId;
+  }
+
+  if (!descendant || descendant.path !== path) {
+    throw new Error(`Team member session is not a unique visible descendant: ${childSessionId}`);
+  }
+  return descendant;
+}
+
+export function createTeamToolController(
+  teams: TeamControlService,
+  tasks: AgentTaskControlService,
+  role: "root" | "child",
+): TeamToolController {
   return {
     async createTeam(input, context) {
+      const leadPath = await resolveAgentMessageSender(tasks, role, context.sessionId, input.leadPath);
       const createInput: Parameters<TeamControlService["createTeam"]>[0] = {
         name: input.name,
-        leadPath: input.leadPath as AgentPath,
+        leadPath,
         sessionId: context.sessionId,
       };
-      if (context.threadId) createInput.threadId = context.threadId;
       if (input.teamId) createInput.teamId = input.teamId as TeamId;
       if (input.description) createInput.description = input.description;
       if (input.leadName) createInput.leadName = input.leadName;
@@ -1316,16 +1402,27 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       if (input.leadWriteScope) createInput.leadWriteScope = input.leadWriteScope;
       return toTeamRecord(await teams.createTeam(createInput));
     },
-    async listTeams(input) {
+    async listTeams(input, context) {
+      const visible = await visibleTeamsForSession(teams, context.sessionId);
       return limitItems(
-        (await teams.listTeams()).filter((team) => (input.status ? team.status === input.status : true)).map(toTeamRecord),
+        visible.filter((team) => (input.status ? team.status === input.status : true)).map(toTeamRecord),
         input.limit,
       );
     },
-    async snapshotTeam(input) {
+    async snapshotTeam(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       return toTeamSnapshotRecord(await teams.snapshot(input.teamId as TeamId));
     },
     async addMember(input, context) {
+      await requireTeamOwnerOrLead(teams, input.teamId as TeamId, context.sessionId);
+      if (input.childSessionId) {
+        await requireUniqueDescendantAgentTask(
+          tasks,
+          input.childSessionId as SessionId,
+          input.path as AgentPath,
+          context.sessionId,
+        );
+      }
       const addInput: Parameters<TeamControlService["addMember"]>[0] = {
         teamId: input.teamId as TeamId,
         path: input.path as AgentPath,
@@ -1333,16 +1430,15 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
         role: input.role,
         sessionId: context.sessionId,
       };
-      if (context.threadId) addInput.threadId = context.threadId;
       if (input.status) addInput.status = input.status;
       if (input.childSessionId) addInput.childSessionId = input.childSessionId as SessionId;
-      if (input.childThreadId) addInput.childThreadId = input.childThreadId as ThreadId;
       if (input.model) addInput.model = input.model;
       if (input.toolScope) addInput.toolScope = input.toolScope;
       if (input.writeScope) addInput.writeScope = input.writeScope;
       return toTeamMemberRecord(await teams.addMember(addInput));
     },
-    async listMembers(input) {
+    async listMembers(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       return limitItems(
         (await teams.members(input.teamId as TeamId))
           .filter((member) => (input.status ? member.status === input.status : true))
@@ -1351,12 +1447,12 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       );
     },
     async createTask(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       const createInput: Parameters<TeamControlService["createTask"]>[0] = {
         teamId: input.teamId as TeamId,
         title: input.title,
         sessionId: context.sessionId,
       };
-      if (context.threadId) createInput.threadId = context.threadId;
       if (input.taskId) createInput.taskId = input.taskId as TaskId;
       if (input.description) createInput.description = input.description;
       if (input.createdBy) createInput.createdBy = input.createdBy as AgentPath;
@@ -1366,7 +1462,8 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       if (input.metadata) createInput.metadata = input.metadata;
       return toTeamTaskRecord(await teams.createTask(createInput));
     },
-    async listTasks(input) {
+    async listTasks(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       return limitItems(
         (await teams.tasks(input.teamId as TeamId))
           .filter((task) => (input.status ? task.status === input.status : true))
@@ -1376,13 +1473,13 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       );
     },
     async assignTask(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       const assignInput: Parameters<TeamControlService["assignTask"]>[0] = {
         teamId: input.teamId as TeamId,
         taskId: input.taskId as TaskId,
         ownerPath: input.ownerPath as AgentPath,
         sessionId: context.sessionId,
       };
-      if (context.threadId) assignInput.threadId = context.threadId;
       if (input.assignedBy) assignInput.assignedBy = input.assignedBy as AgentPath;
       if (input.message) assignInput.message = input.message;
       if (input.messageDelivery) assignInput.messageDelivery = input.messageDelivery;
@@ -1390,13 +1487,13 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       return toTeamTaskRecord(await teams.assignTask(assignInput));
     },
     async claimTask(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       const claimInput: Parameters<TeamControlService["claimTask"]>[0] = {
         teamId: input.teamId as TeamId,
         taskId: input.taskId as TaskId,
         ownerPath: input.ownerPath as AgentPath,
         sessionId: context.sessionId,
       };
-      if (context.threadId) claimInput.threadId = context.threadId;
       if (input.claimedBy) claimInput.claimedBy = input.claimedBy as AgentPath;
       const claim = await teams.claimTask(claimInput);
       const result: TeamTaskClaimRecord = { applied: claim.applied };
@@ -1405,12 +1502,12 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       return result;
     },
     async updateTask(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       const updateInput: Parameters<TeamControlService["updateTask"]>[0] = {
         teamId: input.teamId as TeamId,
         taskId: input.taskId as TaskId,
         sessionId: context.sessionId,
       };
-      if (context.threadId) updateInput.threadId = context.threadId;
       if (input.status) updateInput.status = input.status;
       if (input.ownerPath) updateInput.ownerPath = input.ownerPath as AgentPath;
       if (input.title) updateInput.title = input.title;
@@ -1422,6 +1519,7 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       return toTeamTaskRecord(await teams.updateTask(updateInput));
     },
     async sendMessage(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       const messageInput: Parameters<TeamControlService["sendMessage"]>[0] = {
         teamId: input.teamId as TeamId,
         from: input.from as AgentPath,
@@ -1429,7 +1527,6 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
         content: input.content,
         sessionId: context.sessionId,
       };
-      if (context.threadId) messageInput.threadId = context.threadId;
       if (input.messageId) messageInput.messageId = input.messageId;
       if (input.kind) messageInput.kind = input.kind;
       if (input.delivery) messageInput.delivery = input.delivery;
@@ -1438,7 +1535,8 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
       if (input.metadata) messageInput.metadata = input.metadata;
       return toTeamMessageRecord(await teams.sendMessage(messageInput));
     },
-    async listMessages(input) {
+    async listMessages(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       return limitItems(
         (await teams.messages(input.teamId as TeamId))
           .filter((message) => (input.path ? message.fromPath === input.path || message.toPath === input.path || message.toPath === "*" : true))
@@ -1450,9 +1548,13 @@ function createTeamToolController(teams: TeamControlService): TeamToolController
   };
 }
 
-function createTeamTaskDispatchToolController(dispatcher: TeamTaskDispatchService): TeamTaskDispatchToolController {
+function createTeamTaskDispatchToolController(
+  dispatcher: TeamTaskDispatchService,
+  teams: TeamControlService,
+): TeamTaskDispatchToolController {
   return {
     async dispatchTask(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       const dispatchInput: Parameters<TeamTaskDispatchService["dispatchTask"]>[0] = {
         teamId: input.teamId as TeamId,
         taskId: input.taskId as TaskId,
@@ -1460,7 +1562,6 @@ function createTeamTaskDispatchToolController(dispatcher: TeamTaskDispatchServic
         cwd: context.cwd,
         signal: context.signal,
       };
-      if (context.threadId) dispatchInput.threadId = context.threadId;
       if (input.ownerPath) dispatchInput.ownerPath = input.ownerPath as AgentPath;
       if (input.mode) dispatchInput.mode = input.mode;
       if (input.prompt) dispatchInput.prompt = input.prompt;
@@ -1472,19 +1573,44 @@ function createTeamTaskDispatchToolController(dispatcher: TeamTaskDispatchServic
       return toTeamTaskDispatchRecord(await dispatcher.dispatchTask(dispatchInput));
     },
     async syncTask(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       const syncInput: Parameters<TeamTaskDispatchService["syncTask"]>[0] = {
         teamId: input.teamId as TeamId,
         taskId: input.taskId as TaskId,
         sessionId: context.sessionId,
       };
-      if (context.threadId) syncInput.threadId = context.threadId;
       return toTeamTaskSyncRecord(await dispatcher.syncTask(syncInput));
     },
     async reconcileTasks(input, context) {
+      if (input.teamId) {
+        await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
+      } else {
+        const visibleTeams = (await visibleTeamsForSession(teams, context.sessionId))
+          .filter((team) => team.status === "active");
+        const reconciled: TeamTaskReconcileRecord = {
+          scanned: 0,
+          synced: [],
+          skipped: [],
+          errors: [],
+        };
+        const limit = input.limit ?? 500;
+        for (const team of visibleTeams) {
+          if (reconciled.scanned >= limit) break;
+          const result = toTeamTaskReconcileRecord(await dispatcher.reconcileTasks({
+            teamId: team.id,
+            sessionId: context.sessionId,
+            limit: limit - reconciled.scanned,
+          }));
+          reconciled.scanned += result.scanned;
+          reconciled.synced.push(...result.synced);
+          reconciled.skipped.push(...result.skipped);
+          reconciled.errors.push(...result.errors);
+        }
+        return reconciled;
+      }
       const reconcileInput: Parameters<TeamTaskDispatchService["reconcileTasks"]>[0] = {
         sessionId: context.sessionId,
       };
-      if (context.threadId) reconcileInput.threadId = context.threadId;
       if (input.teamId) reconcileInput.teamId = input.teamId as TeamId;
       if (input.limit !== undefined) reconcileInput.limit = input.limit;
       return toTeamTaskReconcileRecord(await dispatcher.reconcileTasks(reconcileInput));
@@ -1492,9 +1618,13 @@ function createTeamTaskDispatchToolController(dispatcher: TeamTaskDispatchServic
   };
 }
 
-function createTeamRunLoopToolController(teamRunner: TeamExecutionRunner): TeamRunLoopToolController {
+function createTeamRunLoopToolController(
+  teamRunner: TeamExecutionRunner,
+  teams: TeamControlService,
+): TeamRunLoopToolController {
   return {
     async runTeam(input, context) {
+      await requireVisibleTeam(teams, input.teamId as TeamId, context.sessionId);
       const runInput: Parameters<TeamExecutionRunner["run"]>[0] = {
         teamId: input.teamId as TeamId,
         sessionId: context.sessionId,
@@ -1502,7 +1632,6 @@ function createTeamRunLoopToolController(teamRunner: TeamExecutionRunner): TeamR
         once: input.once ?? true,
         signal: context.signal,
       };
-      if (context.threadId) runInput.threadId = context.threadId;
       if (input.mode) runInput.mode = input.mode;
       if (input.maxCycles !== undefined) runInput.maxCycles = input.maxCycles;
       if (input.timeoutMs !== undefined) runInput.timeoutMs = input.timeoutMs;
@@ -1518,6 +1647,35 @@ function mailboxTaskLimit(input: MailboxListToolInput): number {
   return Math.max(input.limit ?? 500, 500);
 }
 
+async function requireVisibleAgentTask(
+  tasks: AgentTaskControlService,
+  taskId: TaskId,
+  sessionId: SessionId,
+): Promise<AgentTaskRow> {
+  const task = await tasks.getTask(taskId);
+  if (task.parentSessionId !== sessionId) {
+    throw new Error(`Agent task is not visible to this session: ${taskId}`);
+  }
+  return task;
+}
+
+function mailboxMessageMatchesScope(
+  message: AgentMailboxRow,
+  visibleTaskIds: ReadonlySet<TaskId>,
+  visibleRecipientSessionIds: ReadonlySet<SessionId>,
+): boolean {
+  const taskMatches = message.taskId === undefined
+    ? undefined
+    : visibleTaskIds.has(message.taskId);
+  const recipientMatches = message.recipientSessionId === undefined
+    ? undefined
+    : visibleRecipientSessionIds.has(message.recipientSessionId);
+  if (taskMatches !== undefined && recipientMatches !== undefined) {
+    return taskMatches && recipientMatches;
+  }
+  return taskMatches ?? recipientMatches ?? false;
+}
+
 function toSubagentTaskRecord(task: AgentTaskRow): SubagentTaskRecord {
   return {
     taskId: task.id,
@@ -1528,7 +1686,6 @@ function toSubagentTaskRecord(task: AgentTaskRow): SubagentTaskRecord {
     generation: task.generation,
     ...(task.currentRunId ? { currentRunId: task.currentRunId } : {}),
     ...(task.childSessionId ? { childSessionId: task.childSessionId } : {}),
-    ...(task.childThreadId ? { childThreadId: task.childThreadId } : {}),
     ...(task.summary ? { summary: task.summary } : {}),
     ...(task.error ? { error: task.error } : {}),
     createdAt: task.createdAt,
@@ -1545,8 +1702,7 @@ function toSubagentMailboxRecord(message: AgentMailboxRow): SubagentMailboxRecor
     status: message.status,
     triggerTurn: message.triggerTurn,
     ...(message.taskId ? { taskId: message.taskId } : {}),
-    ...(message.childSessionId ? { childSessionId: message.childSessionId } : {}),
-    ...(message.childThreadId ? { childThreadId: message.childThreadId } : {}),
+    ...(message.recipientSessionId ? { recipientSessionId: message.recipientSessionId } : {}),
     ...(message.message ? { message: message.message } : {}),
     createdAt: message.createdAt,
     ...(message.consumedAt ? { consumedAt: message.consumedAt } : {}),
@@ -1563,8 +1719,7 @@ function toAgentMessageRecord(message: AgentMailboxRow): AgentMessageRecord {
     delivery: message.triggerTurn ? "triggerTurn" : "queueOnly",
     status: message.status,
     ...(message.taskId ? { taskId: message.taskId } : {}),
-    ...(message.childSessionId ? { recipientSessionId: message.childSessionId } : {}),
-    ...(message.childThreadId ? { recipientThreadId: message.childThreadId } : {}),
+    ...(message.recipientSessionId ? { recipientSessionId: message.recipientSessionId } : {}),
     ...(content ? { content } : {}),
     ...(metadata ? { metadata } : {}),
     createdAt: message.createdAt,
@@ -1628,7 +1783,6 @@ function toTeamMemberRecord(member: TeamMemberRow): TeamMemberRecord {
     role: member.role,
     status: member.status,
     ...(member.childSessionId ? { childSessionId: member.childSessionId } : {}),
-    ...(member.childThreadId ? { childThreadId: member.childThreadId } : {}),
     ...(member.model ? { model: member.model } : {}),
     ...(member.toolScope ? { toolScope: member.toolScope } : {}),
     ...(member.writeScope ? { writeScope: member.writeScope } : {}),
@@ -1728,7 +1882,6 @@ function toTeamDispatchAgentTaskRecord(task: TeamDispatchAgentTaskLike): TeamDis
   const runId = task.runId ?? task.currentRunId;
   if (runId) record.runId = runId;
   if (task.childSessionId) record.childSessionId = task.childSessionId;
-  if (task.childThreadId) record.childThreadId = task.childThreadId;
   if (task.summary) record.summary = task.summary;
   const error = task.error;
   if (error) record.error = error instanceof Error ? error.message : error;
@@ -1766,7 +1919,6 @@ function toTeamMessageDeliveryRecord(
     status: delivery.status,
     triggerTurn: delivery.triggerTurn,
     ...(delivery.childSessionId ? { childSessionId: delivery.childSessionId } : {}),
-    ...(delivery.childThreadId ? { childThreadId: delivery.childThreadId } : {}),
     ...(delivery.error ? { error: delivery.error } : {}),
     queuedAt: delivery.queuedAt,
     updatedAt: delivery.updatedAt,
@@ -1792,7 +1944,6 @@ type TeamDispatchAgentTaskLike = (
   runId?: string;
   currentRunId?: string;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   status: string;
   summary?: string;
   error?: string | Error;

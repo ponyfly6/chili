@@ -2,12 +2,11 @@ import type {
   ChiliEvent,
   EventEnvelope,
   ModelUsage,
+  SessionGoal,
+  SessionGoalStatus,
+  SessionGoalUpdateReason,
+  SessionGoalUsageDelta,
   SessionId,
-  ThreadGoal,
-  ThreadGoalStatus,
-  ThreadGoalUpdateReason,
-  ThreadGoalUsageDelta,
-  ThreadId,
   TimestampMs,
   TurnId,
 } from "@chili/protocol";
@@ -15,6 +14,7 @@ import { timestampNow } from "@chili/protocol";
 import type { EventStore, GoalProjectionStore } from "@chili/store";
 
 export const DEFAULT_GOAL_TOKEN_BUDGET = 50_000;
+const GOAL_REPLAY_PAGE_SIZE = 1_000;
 
 export interface GoalServiceOptions {
   store: EventStore & Partial<GoalProjectionStore>;
@@ -25,7 +25,6 @@ export interface GoalServiceOptions {
 
 export interface SetGoalInput {
   sessionId: SessionId;
-  threadId: ThreadId;
   objective: string;
   tokenBudget?: number;
   replace?: boolean;
@@ -33,42 +32,39 @@ export interface SetGoalInput {
 
 export interface UpdateGoalInput {
   sessionId: SessionId;
-  threadId: ThreadId;
-  status?: ThreadGoalStatus;
+  status?: SessionGoalStatus;
   objective?: string;
   tokenBudget?: number;
-  reason?: ThreadGoalUpdateReason;
+  reason?: SessionGoalUpdateReason;
 }
 
 export interface ClearGoalInput {
   sessionId: SessionId;
-  threadId: ThreadId;
 }
 
 export interface AccountGoalUsageInput {
   sessionId: SessionId;
-  threadId: ThreadId;
   turnId: TurnId;
   usage?: ModelUsage;
   timeSeconds: number;
 }
 
 export interface AccountGoalUsageResult {
-  goal?: ThreadGoal;
+  goal?: SessionGoal;
   budgetLimited: boolean;
-  usageDelta?: ThreadGoalUsageDelta;
+  usageDelta?: SessionGoalUsageDelta;
 }
 
 export class GoalAlreadyExistsError extends Error {
-  constructor(readonly threadId: ThreadId) {
-    super(`Goal already exists for thread: ${threadId}`);
+  constructor(readonly sessionId: SessionId) {
+    super(`Goal already exists for session: ${sessionId}`);
     this.name = "GoalAlreadyExistsError";
   }
 }
 
 export class GoalNotFoundError extends Error {
-  constructor(readonly threadId: ThreadId) {
-    super(`No goal exists for thread: ${threadId}`);
+  constructor(readonly sessionId: SessionId) {
+    super(`No goal exists for session: ${sessionId}`);
     this.name = "GoalNotFoundError";
   }
 }
@@ -76,22 +72,21 @@ export class GoalNotFoundError extends Error {
 export class GoalService {
   constructor(private readonly options: GoalServiceOptions) {}
 
-  async getGoal(input: { threadId: ThreadId }): Promise<ThreadGoal | undefined> {
-    const projected = await this.projection()?.threadGoal(input.threadId);
+  async getGoal(input: { sessionId: SessionId }): Promise<SessionGoal | undefined> {
+    const projected = await this.projection()?.sessionGoal(input.sessionId);
     if (projected) return cloneGoal(projected);
-    return this.replayGoal(input.threadId);
+    return this.replayGoal(input.sessionId);
   }
 
-  async setGoal(input: SetGoalInput): Promise<ThreadGoal> {
+  async setGoal(input: SetGoalInput): Promise<SessionGoal> {
     const objective = input.objective.trim();
     if (!objective) throw new Error("Goal objective is required.");
-    const existing = await this.getGoal({ threadId: input.threadId });
-    if (existing && !input.replace) throw new GoalAlreadyExistsError(input.threadId);
+    const existing = await this.getGoal({ sessionId: input.sessionId });
+    if (existing && !input.replace) throw new GoalAlreadyExistsError(input.sessionId);
 
     const now = this.now();
-    const goal: ThreadGoal = {
+    const goal: SessionGoal = {
       sessionId: input.sessionId,
-      threadId: input.threadId,
       objective,
       status: "active",
       tokenBudget: input.tokenBudget ?? existing?.tokenBudget ?? this.defaultTokenBudget(),
@@ -105,14 +100,14 @@ export class GoalService {
     return cloneGoal(goal);
   }
 
-  async updateGoal(input: UpdateGoalInput): Promise<ThreadGoal> {
-    const existing = await this.getGoal({ threadId: input.threadId });
-    if (!existing) throw new GoalNotFoundError(input.threadId);
+  async updateGoal(input: UpdateGoalInput): Promise<SessionGoal> {
+    const existing = await this.getGoal({ sessionId: input.sessionId });
+    if (!existing) throw new GoalNotFoundError(input.sessionId);
     const now = this.now();
     const reason = input.reason ?? reasonForStatus(input.status) ?? "external";
-    const goal: ThreadGoal = {
+    const goal: SessionGoal = {
       ...existing,
-      sessionId: existing.sessionId ?? input.sessionId,
+      sessionId: input.sessionId,
       updatedAt: now,
       lastReason: reason,
     };
@@ -134,17 +129,16 @@ export class GoalService {
     return cloneGoal(goal);
   }
 
-  async clearGoal(input: ClearGoalInput): Promise<{ cleared: boolean; previousGoal?: ThreadGoal }> {
-    const previousGoal = await this.getGoal({ threadId: input.threadId });
+  async clearGoal(input: ClearGoalInput): Promise<{ cleared: boolean; previousGoal?: SessionGoal }> {
+    const previousGoal = await this.getGoal({ sessionId: input.sessionId });
     if (!previousGoal) return { cleared: false };
     const event: EventEnvelope<"goal.cleared", Extract<ChiliEvent, { type: "goal.cleared" }>["payload"]> = {
       id: this.id("event"),
       type: "goal.cleared",
       time: this.now(),
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: {
-        threadId: input.threadId,
+        sessionId: input.sessionId,
         previousGoal,
         reason: "clear",
       },
@@ -154,7 +148,7 @@ export class GoalService {
   }
 
   async accountUsage(input: AccountGoalUsageInput): Promise<AccountGoalUsageResult> {
-    const existing = await this.getGoal({ threadId: input.threadId });
+    const existing = await this.getGoal({ sessionId: input.sessionId });
     if (!existing || (existing.status !== "active" && existing.status !== "complete")) return { budgetLimited: false };
 
     const tokenDelta = goalTokenDelta(input.usage);
@@ -163,7 +157,7 @@ export class GoalService {
       return { goal: cloneGoal(existing), budgetLimited: false };
     }
 
-    const usageDelta: ThreadGoalUsageDelta = {
+    const usageDelta: SessionGoalUsageDelta = {
       turnId: input.turnId,
       tokens: tokenDelta,
       timeSeconds,
@@ -178,9 +172,9 @@ export class GoalService {
 
     const tokensUsed = existing.tokensUsed + tokenDelta;
     const budgetLimited = existing.status === "active" && existing.tokenBudget !== undefined && tokensUsed >= existing.tokenBudget;
-    const goal: ThreadGoal = {
+    const goal: SessionGoal = {
       ...existing,
-      sessionId: existing.sessionId ?? input.sessionId,
+      sessionId: input.sessionId,
       status: budgetLimited ? "budgetLimited" : existing.status,
       tokensUsed,
       timeUsedSeconds: existing.timeUsedSeconds + timeSeconds,
@@ -191,25 +185,36 @@ export class GoalService {
     return { goal: cloneGoal(goal), budgetLimited, usageDelta };
   }
 
-  private async replayGoal(threadId: ThreadId): Promise<ThreadGoal | undefined> {
-    const events = await this.options.store.events({ threadId, limit: 10_000 });
-    let goal: ThreadGoal | undefined;
-    for (const event of events) {
-      if (event.type === "goal.updated") {
-        const payload = event.payload as Extract<ChiliEvent, { type: "goal.updated" }>["payload"];
-        goal = cloneGoal(payload.goal);
-      } else if (event.type === "goal.cleared") {
-        goal = undefined;
+  private async replayGoal(sessionId: SessionId): Promise<SessionGoal | undefined> {
+    let goal: SessionGoal | undefined;
+    let afterEventId: string | undefined;
+    while (true) {
+      const events = await this.options.store.events({
+        sessionId,
+        ...(afterEventId ? { afterEventId } : {}),
+        limit: GOAL_REPLAY_PAGE_SIZE,
+      });
+      for (const event of events) {
+        if (event.type === "goal.updated") {
+          const payload = event.payload as Extract<ChiliEvent, { type: "goal.updated" }>["payload"];
+          goal = cloneGoal({ ...payload.goal, sessionId });
+        } else if (event.type === "goal.cleared") {
+          goal = undefined;
+        }
       }
+      if (events.length < GOAL_REPLAY_PAGE_SIZE) break;
+      const nextAfterEventId = events.at(-1)?.id;
+      if (!nextAfterEventId || nextAfterEventId === afterEventId) break;
+      afterEventId = nextAfterEventId;
     }
     return goal;
   }
 
   private appendGoalUpdated(
-    input: { sessionId: SessionId; threadId: ThreadId },
-    goal: ThreadGoal,
-    reason: ThreadGoalUpdateReason,
-    usageDelta?: ThreadGoalUsageDelta,
+    input: { sessionId: SessionId },
+    goal: SessionGoal,
+    reason: SessionGoalUpdateReason,
+    usageDelta?: SessionGoalUsageDelta,
   ): Promise<void> {
     const payload: Extract<ChiliEvent, { type: "goal.updated" }>["payload"] = { goal, reason };
     if (usageDelta) payload.usageDelta = usageDelta;
@@ -218,7 +223,6 @@ export class GoalService {
       type: "goal.updated",
       time: this.now(),
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload,
     };
     return this.options.store.append(event as ChiliEvent);
@@ -226,7 +230,7 @@ export class GoalService {
 
   private projection(): GoalProjectionStore | undefined {
     const store = this.options.store;
-    return store.threadGoal && store.threadGoals ? (store as EventStore & GoalProjectionStore) : undefined;
+    return store.sessionGoal && store.sessionGoals ? (store as EventStore & GoalProjectionStore) : undefined;
   }
 
   private defaultTokenBudget(): number {
@@ -253,9 +257,9 @@ export function goalTokenDelta(usage: ModelUsage | undefined): number {
   return inputTokens + cacheReadInputTokens + cacheCreationInputTokens + outputTokens;
 }
 
-export function cloneGoal(goal: ThreadGoal): ThreadGoal {
-  const output: ThreadGoal = {
-    threadId: goal.threadId,
+export function cloneGoal(goal: SessionGoal): SessionGoal {
+  const output: SessionGoal = {
+    sessionId: goal.sessionId,
     objective: goal.objective,
     status: goal.status,
     tokensUsed: goal.tokensUsed,
@@ -263,14 +267,13 @@ export function cloneGoal(goal: ThreadGoal): ThreadGoal {
     createdAt: goal.createdAt,
     updatedAt: goal.updatedAt,
   };
-  if (goal.sessionId) output.sessionId = goal.sessionId;
   if (goal.tokenBudget !== undefined) output.tokenBudget = goal.tokenBudget;
   if (goal.completedAt !== undefined) output.completedAt = goal.completedAt;
   if (goal.lastReason) output.lastReason = goal.lastReason;
   return output;
 }
 
-function reasonForStatus(status: ThreadGoalStatus | undefined): ThreadGoalUpdateReason | undefined {
+function reasonForStatus(status: SessionGoalStatus | undefined): SessionGoalUpdateReason | undefined {
   if (status === "active") return "resume";
   if (status === "paused") return "pause";
   if (status === "complete") return "complete";

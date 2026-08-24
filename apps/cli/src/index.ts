@@ -17,7 +17,6 @@ import type {
   SessionId,
   TaskId,
   TeamId,
-  ThreadId,
 } from "@chili/protocol";
 import { ROOT_AGENT_PATH } from "@chili/protocol";
 import { startRuntimeHttpServer } from "@chili/server";
@@ -299,7 +298,6 @@ async function main(): Promise<void> {
       await runSessionPrompt({
         harness,
         sessionId: session.sessionId,
-        threadId: session.threadId,
         prompt: args.prompt,
         maxTurns: args.maxTurns,
         signal: controller.signal,
@@ -310,7 +308,6 @@ async function main(): Promise<void> {
     await repl({
       harness,
       sessionId: session.sessionId,
-      threadId: session.threadId,
       maxTurns: args.maxTurns,
     });
   } finally {
@@ -328,20 +325,17 @@ async function printPromptDebug(
     cwd: harness.cwd,
   };
   if (args.resume) sessionInput.resume = args.resume;
-  if (args.threadId) sessionInput.threadId = args.threadId;
   const session = await resolveSession(sessionInput);
 
   if (args.content) {
     const inspected = await harness.service.inspectPrompt({
       sessionId: session.sessionId,
-      threadId: session.threadId,
       cwd: harness.cwd,
       ...(args.prompt !== undefined ? { text: args.prompt } : {}),
       includeContent: true,
     });
     const output: CliPromptDebugOutput = {
       sessionId: session.sessionId,
-      threadId: session.threadId,
       cwd: harness.cwd,
       created: session.isNew,
       debug: inspected.debug,
@@ -353,13 +347,11 @@ async function printPromptDebug(
 
   const debug = await harness.service.inspectPrompt({
     sessionId: session.sessionId,
-    threadId: session.threadId,
     cwd: harness.cwd,
     ...(args.prompt !== undefined ? { text: args.prompt } : {}),
   });
   const output: CliPromptDebugOutput = {
     sessionId: session.sessionId,
-    threadId: session.threadId,
     cwd: harness.cwd,
     created: session.isNew,
     debug,
@@ -804,11 +796,9 @@ async function dispatchTeamTask(
   if (!task) throw new Error(`Team task not found: ${taskId}`);
 
   let sessionId = task.sessionId ?? team.sessionId;
-  let threadId: import("@chili/protocol").ThreadId | undefined;
   if (!sessionId) {
     const session = await harness.service.createSession({ cwd: harness.cwd });
     sessionId = session.sessionId;
-    threadId = session.threadId;
   }
 
   const result = await harness.teamDispatcher.dispatchTask({
@@ -817,7 +807,6 @@ async function dispatchTeamTask(
     mode,
     cwd: harness.cwd,
     sessionId,
-    ...(threadId ? { threadId } : {}),
   });
   console.log(jsonStringify(result));
 }
@@ -1092,7 +1081,6 @@ function jsonStringify(value: unknown): string {
 async function repl(input: {
   harness: Awaited<ReturnType<typeof createCliHarness>>;
   sessionId: SessionId;
-  threadId: import("@chili/protocol").ThreadId;
   maxTurns: number;
 }): Promise<void> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -1156,12 +1144,10 @@ async function repl(input: {
         const controller = installInterruptHandler();
         const compactInput: {
           sessionId: SessionId;
-          threadId: import("@chili/protocol").ThreadId;
           instructions?: string;
           signal: AbortSignal;
         } = {
           sessionId: input.sessionId,
-          threadId: input.threadId,
           signal: controller.signal,
         };
         if (instructions) compactInput.instructions = instructions;
@@ -1175,7 +1161,7 @@ async function repl(input: {
       }
       if (line.startsWith("/revert ")) {
         const snapshotId = line.slice("/revert ".length).trim();
-        await input.harness.recovery.revert({ sessionId: input.sessionId, threadId: input.threadId, snapshotId: snapshotId as never });
+        await input.harness.recovery.revert({ sessionId: input.sessionId, snapshotId: snapshotId as never });
         console.log(`Reverted snapshot ${snapshotId}`);
         continue;
       }
@@ -1184,7 +1170,6 @@ async function repl(input: {
       await runSessionPrompt({
         harness: input.harness,
         sessionId: input.sessionId,
-        threadId: input.threadId,
         prompt: line,
         maxTurns: input.maxTurns,
         signal: controller.signal,

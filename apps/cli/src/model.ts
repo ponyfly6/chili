@@ -932,7 +932,6 @@ function toProviderInput(input: ModelStreamInput): ProviderModelStreamInput {
     system: input.system,
     metadata: {
       sessionId: input.sessionId,
-      threadId: input.threadId,
       turnId: input.turnId,
     },
   };

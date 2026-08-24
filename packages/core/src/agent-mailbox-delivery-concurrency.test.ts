@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { AgentPath, ChiliEvent, SessionId, ThreadId, TimestampMs } from "@chili/protocol";
+import type { AgentPath, ChiliEvent, SessionId, TimestampMs } from "@chili/protocol";
 import type { AgentMailboxQuery, AgentMailboxRow, EventPublisher } from "@chili/store";
 import {
   AgentMailboxDeliveryPump,
@@ -13,8 +13,8 @@ import {
 
 test("starts different mailbox recipients concurrently", async () => {
   const controller = new FakeMailboxDeliveryController([
-    mailboxRow("message_alpha", "session_alpha", "thread_alpha"),
-    mailboxRow("message_beta", "session_beta", "thread_beta"),
+    mailboxRow("message_alpha", "session_alpha"),
+    mailboxRow("message_beta", "session_beta"),
   ]);
   controller.hold("message_alpha");
   controller.hold("message_beta");
@@ -39,10 +39,10 @@ test("starts different mailbox recipients concurrently", async () => {
   }
 });
 
-test("keeps one session FIFO and single-flight even when its threads differ", async () => {
+test("keeps one session FIFO and single-flight", async () => {
   const controller = new FakeMailboxDeliveryController([
-    mailboxRow("message_first", "session_shared", "thread_first", 1),
-    mailboxRow("message_second", "session_shared", "thread_second", 2),
+    mailboxRow("message_first", "session_shared", 1),
+    mailboxRow("message_second", "session_shared", 2),
   ]);
   controller.hold("message_first");
   controller.hold("message_second");
@@ -70,9 +70,9 @@ test("keeps one session FIFO and single-flight even when its threads differ", as
 test("composes recipient parallelism with a shared delivery cap", async () => {
   const controller = new FakeMailboxDeliveryController(
     [
-      mailboxRow("message_one", "session_one", "thread_one", 1),
-      mailboxRow("message_two", "session_two", "thread_two", 2),
-      mailboxRow("message_three", "session_three", "thread_three", 3),
+      mailboxRow("message_one", "session_one", 1),
+      mailboxRow("message_two", "session_two", 2),
+      mailboxRow("message_three", "session_three", 3),
     ],
     2,
   );
@@ -105,8 +105,8 @@ test("composes recipient parallelism with a shared delivery cap", async () => {
 test("stop aborts active and permit-waiting deliveries while leaving messages queued", async () => {
   const controller = new FakeMailboxDeliveryController(
     [
-      mailboxRow("message_active", "session_active", "thread_active", 1),
-      mailboxRow("message_waiting", "session_waiting", "thread_waiting", 2),
+      mailboxRow("message_active", "session_active", 1),
+      mailboxRow("message_waiting", "session_waiting", 2),
     ],
     1,
   );
@@ -135,7 +135,7 @@ test("retries AgentMailboxTurnRetryError no earlier than retryAfter and then con
     retryAfterMs,
   });
   const controller = new FakeMailboxDeliveryController([
-    mailboxRow("message_retry", "session_retry", "thread_retry"),
+    mailboxRow("message_retry", "session_retry"),
   ]);
   controller.failNext(
     "message_retry",
@@ -170,7 +170,7 @@ test("retries AgentMailboxTurnRetryError no earlier than retryAfter and then con
 
 test("startup recovers an interrupted delivering row before consuming it", async () => {
   const controller = new FakeMailboxDeliveryController([
-    mailboxRow("message_recovered", "session_recovered", "thread_recovered", 1, "delivering"),
+    mailboxRow("message_recovered", "session_recovered", 1, "delivering"),
   ]);
   const pump = new AgentMailboxDeliveryPump({ agents: controller });
 
@@ -190,7 +190,6 @@ test("startup requeues an interrupted queue-only claim without auto-delivering i
   const row = mailboxRow(
     "message_queue_only_recovered",
     "session_recovered",
-    "thread_recovered",
     1,
     "delivering",
   );
@@ -212,7 +211,7 @@ test("startup requeues an interrupted queue-only claim without auto-delivering i
 test("re-enable during a claimed delegation pause rescans after the message is requeued", async () => {
   const events = new FakeEventPublisher();
   const controller = new DelegationRaceController(
-    mailboxRow("message_policy_race", "session_policy", "thread_policy"),
+    mailboxRow("message_policy_race", "session_policy"),
   );
   const pump = new AgentMailboxDeliveryPump({ agents: controller, events });
 
@@ -239,8 +238,8 @@ test("re-enable during a claimed delegation pause rescans after the message is r
 
 test("a process-local parked lane preserves FIFO until an explicit pump restart", async () => {
   const events = new FakeEventPublisher();
-  const first = mailboxRow("message_parked", "session_shared", "thread_first", 1);
-  const second = mailboxRow("message_after_parked", "session_shared", "thread_second", 2);
+  const first = mailboxRow("message_parked", "session_shared", 1);
+  const second = mailboxRow("message_after_parked", "session_shared", 2);
   const controller = new FakeMailboxDeliveryController([first, second]);
   controller.failNext(
     first.id,
@@ -261,7 +260,6 @@ test("a process-local parked lane preserves FIFO until an explicit pump restart"
     type: "session.status_changed",
     time: 3 as TimestampMs,
     sessionId: "session_shared" as SessionId,
-    threadId: "thread_first" as ThreadId,
     payload: { sessionId: "session_shared" as SessionId, status: "idle" },
   });
   await pump.waitForIdle();
@@ -337,7 +335,9 @@ class FakeMailboxDeliveryController implements AgentMailboxDeliveryController {
     if (query.messageId) rows = rows.filter((row) => row.id === query.messageId);
     if (query.taskId) rows = rows.filter((row) => row.taskId === query.taskId);
     if (query.path) rows = rows.filter((row) => row.path === query.path);
-    if (query.childSessionId) rows = rows.filter((row) => row.childSessionId === query.childSessionId);
+    if (query.recipientSessionId) {
+      rows = rows.filter((row) => row.recipientSessionId === query.recipientSessionId);
+    }
     if (query.triggerTurn !== undefined) {
       rows = rows.filter((row) => row.triggerTurn === query.triggerTurn);
     }
@@ -454,7 +454,7 @@ class DelegationRaceController implements AgentMailboxDeliveryController {
 
   async mailbox(query: AgentMailboxQuery = {}): Promise<AgentMailboxRow[]> {
     if (query.messageId && query.messageId !== this.row.id) return [];
-    if (query.childSessionId && query.childSessionId !== this.row.childSessionId) return [];
+    if (query.recipientSessionId && query.recipientSessionId !== this.row.recipientSessionId) return [];
     if (query.triggerTurn !== undefined && query.triggerTurn !== this.row.triggerTurn) return [];
     if (query.status && query.status !== this.row.status) return [];
     return [this.row];
@@ -500,7 +500,6 @@ interface PermitWaiter {
 function mailboxRow(
   id: string,
   sessionId: string,
-  threadId: string,
   createdAt = 1,
   status: AgentMailboxRow["status"] = "queued",
 ): AgentMailboxRow {
@@ -510,8 +509,7 @@ function mailboxRow(
     fromPath: "/root" as AgentPath,
     triggerTurn: true,
     status,
-    childSessionId: sessionId as SessionId,
-    childThreadId: threadId as ThreadId,
+    recipientSessionId: sessionId as SessionId,
     message: { role: "user", content: `deliver ${id}` },
     createdAt,
   };

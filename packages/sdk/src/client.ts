@@ -1,6 +1,7 @@
 import type {
   ChiliEvent,
   AgentPath,
+  AgentRunId,
   AgentMailboxStatus,
   AgentTaskMode,
   AgentTaskStatus,
@@ -44,9 +45,8 @@ import type {
   TeamMessageDeliveryStatus,
   TeamMessageKind,
   TeamTaskStatus,
-  ThreadGoal,
-  ThreadGoalStatus,
-  ThreadId,
+  SessionGoal,
+  SessionGoalStatus,
 } from "@chili/protocol";
 import type { RuntimeAgentsSnapshot } from "./projection.js";
 
@@ -61,9 +61,9 @@ export interface RuntimeClient {
   setDelegationPolicy(input: SetDelegationPolicyRequest): Promise<RuntimeDelegationConfig>;
   getPermissionConfig(input?: GetPermissionConfigRequest): Promise<RuntimePermissionConfig>;
   setPermissionProfile(input: SetPermissionProfileRequest): Promise<RuntimePermissionConfig>;
-  getGoal(input: GetGoalRequest): Promise<ThreadGoal | undefined>;
-  setGoal(input: SetGoalRequest): Promise<ThreadGoal>;
-  updateGoal(input: UpdateGoalRequest): Promise<ThreadGoal>;
+  getGoal(input: GetGoalRequest): Promise<SessionGoal | undefined>;
+  setGoal(input: SetGoalRequest): Promise<SessionGoal>;
+  updateGoal(input: UpdateGoalRequest): Promise<SessionGoal>;
   clearGoal(input: ClearGoalRequest): Promise<ClearGoalResult>;
   listCommands(input?: ListCommandsRequest): Promise<RuntimePromptCommandList>;
   reloadCommands(input?: ReloadCommandsRequest): Promise<RuntimePromptCommandList>;
@@ -121,14 +121,12 @@ export interface RuntimeClient {
 
 export interface CreateSessionRequest {
   sessionId?: SessionId;
-  threadId?: ThreadId;
   cwd?: string;
   signal?: AbortSignal;
 }
 
 export interface SubmitPromptRequest {
   sessionId: SessionId;
-  threadId: ThreadId;
   text: string;
   displayText?: string;
   images?: MessageImageContent[];
@@ -152,21 +150,18 @@ export interface GetModelConfigRequest {
 
 export interface SetModelRequest {
   sessionId: SessionId;
-  threadId?: ThreadId;
   modelSelection: ModelSelection;
   signal?: AbortSignal;
 }
 
 export interface SetReasoningRequest {
   sessionId: SessionId;
-  threadId?: ThreadId;
   reasoningLevel: ReasoningLevel;
   signal?: AbortSignal;
 }
 
 export interface SetServiceTierRequest {
   sessionId: SessionId;
-  threadId?: ThreadId;
   serviceTier: ServiceTier;
   signal?: AbortSignal;
 }
@@ -178,7 +173,6 @@ export interface GetDelegationConfigRequest {
 
 export interface SetDelegationPolicyRequest {
   sessionId: SessionId;
-  threadId?: ThreadId;
   policy: DelegationPolicy;
   signal?: AbortSignal;
 }
@@ -194,13 +188,11 @@ export interface SetPermissionProfileRequest {
 
 export interface GetGoalRequest {
   sessionId: SessionId;
-  threadId: ThreadId;
   signal?: AbortSignal;
 }
 
 export interface SetGoalRequest {
   sessionId: SessionId;
-  threadId: ThreadId;
   objective: string;
   tokenBudget?: number;
   replace?: boolean;
@@ -209,8 +201,7 @@ export interface SetGoalRequest {
 
 export interface UpdateGoalRequest {
   sessionId: SessionId;
-  threadId: ThreadId;
-  status?: ThreadGoalStatus;
+  status?: SessionGoalStatus;
   objective?: string;
   tokenBudget?: number;
   signal?: AbortSignal;
@@ -218,13 +209,12 @@ export interface UpdateGoalRequest {
 
 export interface ClearGoalRequest {
   sessionId: SessionId;
-  threadId: ThreadId;
   signal?: AbortSignal;
 }
 
 export interface ClearGoalResult {
   cleared: boolean;
-  previousGoal?: ThreadGoal;
+  previousGoal?: SessionGoal;
 }
 
 export interface ListCommandsRequest {
@@ -278,7 +268,6 @@ export interface LogoutMcpServerRequest {
 
 export interface SubmitCommandRequest extends RuntimePromptCommandInvocation {
   sessionId: SessionId;
-  threadId: ThreadId;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
   serviceTier?: ServiceTier;
@@ -317,7 +306,6 @@ export interface RuntimeSessionSummary {
   id: SessionId;
   cwd: string;
   title?: string;
-  threadId?: ThreadId;
   preview?: string;
   source?: "interactive" | "subagent";
   status: "active" | "archived";
@@ -361,7 +349,7 @@ export interface RuntimeAgentTreeNode {
   parentPath?: AgentPath;
   taskName: string;
   status: RuntimeAgentRunRecord["status"] | AgentTaskStatus | AgentMailboxStatus | "empty";
-  runIds: string[];
+  runIds: AgentRunId[];
   runs: RuntimeAgentRunRecord[];
   tasks: RuntimeAgentTaskRecord[];
   mailbox: RuntimeAgentMailboxRecord[];
@@ -379,16 +367,13 @@ export interface ListAgentRunsRequest {
 }
 
 export interface RuntimeAgentRunRecord {
-  id: string;
+  id: AgentRunId;
   sessionId?: SessionId;
-  threadId?: ThreadId;
   taskId?: TaskId;
   path: AgentPath;
   parentPath?: AgentPath;
   parentSessionId?: SessionId;
-  parentThreadId?: ThreadId;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   taskName: string;
   cwd?: string;
   mode?: AgentTaskMode;
@@ -401,7 +386,7 @@ export interface ListMailboxRequest {
   messageId?: string;
   taskId?: TaskId;
   path?: AgentPath;
-  childSessionId?: SessionId;
+  recipientSessionId?: SessionId;
   status?: AgentMailboxStatus;
   limit?: number;
 }
@@ -413,8 +398,7 @@ export interface RuntimeAgentMailboxRecord {
   triggerTurn: boolean;
   status: AgentMailboxStatus;
   taskId?: TaskId;
-  childSessionId?: SessionId;
-  childThreadId?: ThreadId;
+  recipientSessionId?: SessionId;
   message?: unknown;
   createdAt: number;
   consumedAt?: number;
@@ -438,7 +422,6 @@ export interface RuntimeTeamMemberRecord {
   role: string;
   status: TeamMemberStatus;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   model?: string;
   toolScope?: string[];
   writeScope?: string[];
@@ -492,7 +475,6 @@ export interface RuntimeTeamMessageDeliveryRecord {
   status: TeamMessageDeliveryStatus;
   triggerTurn: boolean;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   error?: string;
   queuedAt: number;
   updatedAt: number;
@@ -543,7 +525,6 @@ export interface RuntimeTeamSnapshotStats {
 
 export interface TeamRequestContext {
   sessionId?: SessionId;
-  threadId?: ThreadId;
 }
 
 export interface CreateTeamRequest extends TeamRequestContext {
@@ -564,7 +545,6 @@ export interface AddTeamMemberRequest extends TeamRequestContext {
   role: string;
   status?: TeamMemberStatus;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   model?: string;
   toolScope?: string[];
   writeScope?: string[];
@@ -608,11 +588,10 @@ export interface RuntimeTeamTaskClaimResult {
 
 export interface RuntimeLocalSubagentTaskRecord {
   taskId: TaskId;
-  runId: string;
+  runId: AgentRunId;
   path: AgentPath;
   parentPath: AgentPath;
   childSessionId: SessionId;
-  childThreadId: ThreadId;
   status: AgentTaskStatus;
   summary?: string;
   error?: string;
@@ -878,13 +857,11 @@ export interface RuntimeAgentTaskRecord {
   generation: number;
   parentPath?: AgentPath;
   parentSessionId?: SessionId;
-  parentThreadId?: ThreadId;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   cwd?: string;
   prompt?: string;
   mode?: AgentTaskMode;
-  currentRunId?: string;
+  currentRunId?: AgentRunId;
   summary?: string;
   error?: string;
   completion?: Record<string, unknown>;
@@ -935,7 +912,6 @@ export interface RuntimeTaskReconcileStaleResult {
 
 export interface StreamEventsRequest {
   sessionId?: SessionId;
-  threadId?: ThreadId;
   afterEventId?: string;
   signal?: AbortSignal;
 }
@@ -989,21 +965,18 @@ export class HttpRuntimeClient implements RuntimeClient {
 
   setModel(input: SetModelRequest): Promise<RuntimeModelConfig> {
     return this.post(`sessions/${encodeURIComponent(input.sessionId)}/model`, {
-      threadId: input.threadId,
       modelSelection: input.modelSelection,
     }, input.signal);
   }
 
   setReasoning(input: SetReasoningRequest): Promise<RuntimeModelConfig> {
     return this.post(`sessions/${encodeURIComponent(input.sessionId)}/reasoning`, {
-      threadId: input.threadId,
       reasoningLevel: input.reasoningLevel,
     }, input.signal);
   }
 
   setServiceTier(input: SetServiceTierRequest): Promise<RuntimeModelConfig> {
     return this.post(`sessions/${encodeURIComponent(input.sessionId)}/service-tier`, {
-      threadId: input.threadId,
       serviceTier: input.serviceTier,
     }, input.signal);
   }
@@ -1014,7 +987,6 @@ export class HttpRuntimeClient implements RuntimeClient {
 
   setDelegationPolicy(input: SetDelegationPolicyRequest): Promise<RuntimeDelegationConfig> {
     return this.post(`sessions/${encodeURIComponent(input.sessionId)}/delegation`, {
-      threadId: input.threadId,
       policy: input.policy,
     }, input.signal);
   }
@@ -1027,24 +999,22 @@ export class HttpRuntimeClient implements RuntimeClient {
     return this.post("permissions", { profile: input.profile }, input.signal);
   }
 
-  getGoal(input: GetGoalRequest): Promise<ThreadGoal | undefined> {
-    const params = new URLSearchParams({ threadId: input.threadId });
-    return this.get(`sessions/${encodeURIComponent(input.sessionId)}/goal?${params.toString()}`, input.signal);
+  getGoal(input: GetGoalRequest): Promise<SessionGoal | undefined> {
+    return this.get(`sessions/${encodeURIComponent(input.sessionId)}/goal`, input.signal);
   }
 
-  setGoal(input: SetGoalRequest): Promise<ThreadGoal> {
-    const { signal, ...body } = input;
-    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/goal`, body, signal);
+  setGoal(input: SetGoalRequest): Promise<SessionGoal> {
+    const { sessionId, signal, ...body } = input;
+    return this.post(`sessions/${encodeURIComponent(sessionId)}/goal`, body, signal);
   }
 
-  updateGoal(input: UpdateGoalRequest): Promise<ThreadGoal> {
-    const { signal, ...body } = input;
-    return this.patch(`sessions/${encodeURIComponent(input.sessionId)}/goal`, body, signal);
+  updateGoal(input: UpdateGoalRequest): Promise<SessionGoal> {
+    const { sessionId, signal, ...body } = input;
+    return this.patch(`sessions/${encodeURIComponent(sessionId)}/goal`, body, signal);
   }
 
   clearGoal(input: ClearGoalRequest): Promise<ClearGoalResult> {
-    const params = new URLSearchParams({ threadId: input.threadId });
-    return this.delete(`sessions/${encodeURIComponent(input.sessionId)}/goal?${params.toString()}`, input.signal);
+    return this.delete(`sessions/${encodeURIComponent(input.sessionId)}/goal`, input.signal);
   }
 
   listCommands(input: ListCommandsRequest = {}): Promise<RuntimePromptCommandList> {
@@ -1094,18 +1064,18 @@ export class HttpRuntimeClient implements RuntimeClient {
   }
 
   submitPrompt(input: SubmitPromptRequest): Promise<RuntimePromptResult> {
-    const { signal, ...body } = input;
-    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/prompt`, body, signal);
+    const { sessionId, signal, ...body } = input;
+    return this.post(`sessions/${encodeURIComponent(sessionId)}/prompt`, body, signal);
   }
 
   submitPromptAsync(input: SubmitPromptRequest): Promise<RuntimePromptAccepted> {
-    const { signal, ...body } = input;
-    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/prompt_async`, body, signal);
+    const { sessionId, signal, ...body } = input;
+    return this.post(`sessions/${encodeURIComponent(sessionId)}/prompt_async`, body, signal);
   }
 
   submitCommandAsync(input: SubmitCommandRequest): Promise<RuntimePromptAccepted> {
-    const { signal, ...body } = input;
-    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/command_async`, body, signal);
+    const { sessionId, signal, ...body } = input;
+    return this.post(`sessions/${encodeURIComponent(sessionId)}/command_async`, body, signal);
   }
 
   interruptSession(input: InterruptSessionRequest): Promise<RuntimeInterruptResult> {
@@ -1191,7 +1161,7 @@ export class HttpRuntimeClient implements RuntimeClient {
     if (input.messageId) params.set("messageId", input.messageId);
     if (input.taskId) params.set("taskId", input.taskId);
     if (input.path) params.set("path", input.path);
-    if (input.childSessionId) params.set("childSessionId", input.childSessionId);
+    if (input.recipientSessionId) params.set("recipientSessionId", input.recipientSessionId);
     if (input.status) params.set("status", input.status);
     if (input.limit !== undefined) params.set("limit", String(input.limit));
     const query = params.toString();
@@ -1322,7 +1292,6 @@ export class HttpRuntimeClient implements RuntimeClient {
   async *streamEvents(input: StreamEventsRequest = {}): AsyncIterable<ChiliEvent> {
     const url = this.url("events");
     if (input.sessionId) url.searchParams.set("sessionId", input.sessionId);
-    if (input.threadId) url.searchParams.set("threadId", input.threadId);
     if (input.afterEventId) url.searchParams.set("afterEventId", input.afterEventId);
 
     const init: RequestInit = {

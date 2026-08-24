@@ -9,15 +9,16 @@ import type {
   MessageId,
   SessionId,
   TaskId,
-  ThreadId,
   TimestampMs,
   TurnId,
 } from "@chili/protocol";
+import type { AgentMailboxRow, AgentTaskRow } from "@chili/store";
 import { ObservableEventStore, SqliteEventStore } from "@chili/store";
 import type { SubmitPromptInput, SubmitPromptResult } from "./runtime-service.js";
 import {
   AgentMessageConflictError,
   AgentMessageRecipientAmbiguousError,
+  AgentMessageRecipientMetadataError,
   AgentMessageRecipientTerminalError,
   AgentTreeControlService,
 } from "./agent-tree.js";
@@ -28,9 +29,7 @@ test("builds an agent path tree and consumes mailbox messages", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-agent-tree-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const parentSessionId = "session_parent" as SessionId;
-  const parentThreadId = "thread_parent" as ThreadId;
   const childSessionId = "session_child" as SessionId;
-  const childThreadId = "thread_child" as ThreadId;
   const taskId = "task_child" as TaskId;
   const rootPath = "/root" as AgentPath;
   const childPath = "/root/task_child" as AgentPath;
@@ -43,15 +42,12 @@ test("builds an agent path tree and consumes mailbox messages", async () => {
         type: "agent.task_created",
         time: 2 as TimestampMs,
         sessionId: parentSessionId,
-        threadId: parentThreadId,
         payload: {
           taskId,
           path: childPath,
           parentPath: rootPath,
           parentSessionId,
-          parentThreadId,
           childSessionId,
-          childThreadId,
           taskName: "reader",
           cwd: "/repo",
           prompt: "read",
@@ -63,16 +59,13 @@ test("builds an agent path tree and consumes mailbox messages", async () => {
         type: "agent.spawned",
         time: 3 as TimestampMs,
         sessionId: parentSessionId,
-        threadId: parentThreadId,
         payload: {
           runId: "agent_child_1" as AgentRunId,
           taskId,
           path: childPath,
           parentPath: rootPath,
           parentSessionId,
-          parentThreadId,
           childSessionId,
-          childThreadId,
           taskName: "reader",
           cwd: "/repo",
           mode: "one_shot",
@@ -83,16 +76,13 @@ test("builds an agent path tree and consumes mailbox messages", async () => {
         type: "agent.spawned",
         time: 4 as TimestampMs,
         sessionId: parentSessionId,
-        threadId: parentThreadId,
         payload: {
           runId: "agent_child_2" as AgentRunId,
           taskId,
           path: childPath,
           parentPath: rootPath,
           parentSessionId,
-          parentThreadId,
           childSessionId,
-          childThreadId,
           taskName: "reader followup",
           cwd: "/repo",
           mode: "one_shot",
@@ -103,13 +93,11 @@ test("builds an agent path tree and consumes mailbox messages", async () => {
         type: "agent.message_queued",
         time: 5 as TimestampMs,
         sessionId: parentSessionId,
-        threadId: parentThreadId,
         payload: {
           taskId,
           path: childPath,
           from: rootPath,
-          childSessionId,
-          childThreadId,
+          recipientSessionId: childSessionId,
           triggerTurn: true,
           message: { role: "user", content: "continue" },
         },
@@ -208,9 +196,7 @@ test("delivers mailbox messages to child sessions before consuming them", async 
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const runtime = new FakeMailboxRuntime();
   const parentSessionId = "session_parent" as SessionId;
-  const parentThreadId = "thread_parent" as ThreadId;
   const childSessionId = "session_child" as SessionId;
-  const childThreadId = "thread_child" as ThreadId;
   const taskId = "task_child" as TaskId;
   const rootPath = "/root" as AgentPath;
   const childPath = "/root/task_child" as AgentPath;
@@ -222,15 +208,12 @@ test("delivers mailbox messages to child sessions before consuming them", async 
         type: "agent.task_created",
         time: 1 as TimestampMs,
         sessionId: parentSessionId,
-        threadId: parentThreadId,
         payload: {
           taskId,
           path: childPath,
           parentPath: rootPath,
           parentSessionId,
-          parentThreadId,
           childSessionId,
-          childThreadId,
           taskName: "reader",
           cwd: "/repo",
           prompt: "read",
@@ -242,7 +225,6 @@ test("delivers mailbox messages to child sessions before consuming them", async 
         type: "agent.task_completed",
         time: 2 as TimestampMs,
         sessionId: parentSessionId,
-        threadId: parentThreadId,
         payload: { taskId, path: childPath, status: "completed" },
       },
       {
@@ -250,13 +232,11 @@ test("delivers mailbox messages to child sessions before consuming them", async 
         type: "agent.message_queued",
         time: 2 as TimestampMs,
         sessionId: parentSessionId,
-        threadId: parentThreadId,
         payload: {
           taskId,
           path: childPath,
           from: rootPath,
-          childSessionId,
-          childThreadId,
+          recipientSessionId: childSessionId,
           triggerTurn: true,
           message: { role: "user", content: "continue from mailbox" },
         },
@@ -275,7 +255,6 @@ test("delivers mailbox messages to child sessions before consuming them", async 
     expect(runtime.prompts).toMatchObject([
       {
         sessionId: childSessionId,
-        threadId: childThreadId,
         cwd: "/repo",
         text: "continue from mailbox",
       },
@@ -297,7 +276,6 @@ test("mailbox delivery pump drains trigger-turn messages without consuming queue
   const store = new ObservableEventStore(baseStore);
   const runtime = new FakeMailboxRuntime();
   const childSessionId = "session_child" as SessionId;
-  const childThreadId = "thread_child" as ThreadId;
   const childPath = "/root/worker" as AgentPath;
 
   try {
@@ -309,8 +287,7 @@ test("mailbox delivery pump drains trigger-turn messages without consuming queue
         payload: {
           path: childPath,
           from: "/root" as AgentPath,
-          childSessionId,
-          childThreadId,
+          recipientSessionId: childSessionId,
           triggerTurn: true,
           message: { role: "user", content: "wake up" },
         },
@@ -322,8 +299,7 @@ test("mailbox delivery pump drains trigger-turn messages without consuming queue
         payload: {
           path: childPath,
           from: "/root" as AgentPath,
-          childSessionId,
-          childThreadId,
+          recipientSessionId: childSessionId,
           triggerTurn: false,
           message: { role: "user", content: "remember this" },
         },
@@ -345,7 +321,6 @@ test("mailbox delivery pump drains trigger-turn messages without consuming queue
     expect(runtime.prompts).toMatchObject([
       {
         sessionId: childSessionId,
-        threadId: childThreadId,
         text: "wake up",
       },
     ]);
@@ -364,7 +339,6 @@ test("mailbox delivery pump subscribes to live trigger-turn messages", async () 
   const store = new ObservableEventStore(baseStore);
   const runtime = new FakeMailboxRuntime();
   const childSessionId = "session_child" as SessionId;
-  const childThreadId = "thread_child" as ThreadId;
   const childPath = "/root/worker" as AgentPath;
 
   try {
@@ -384,8 +358,7 @@ test("mailbox delivery pump subscribes to live trigger-turn messages", async () 
       payload: {
         path: childPath,
         from: "/root" as AgentPath,
-        childSessionId,
-        childThreadId,
+        recipientSessionId: childSessionId,
         triggerTurn: true,
         message: { role: "user", content: "run now" },
       },
@@ -396,7 +369,6 @@ test("mailbox delivery pump subscribes to live trigger-turn messages", async () 
     expect(runtime.prompts).toMatchObject([
       {
         sessionId: childSessionId,
-        threadId: childThreadId,
         text: "run now",
       },
     ]);
@@ -413,7 +385,6 @@ test("mailbox delivery pump reports failures and leaves messages queued", async 
   const store = new ObservableEventStore(baseStore);
   const runtime = new FakeMailboxRuntime(new Error("child session is busy"));
   const childSessionId = "session_child" as SessionId;
-  const childThreadId = "thread_child" as ThreadId;
   const childPath = "/root/worker" as AgentPath;
   const failures: Array<{ messageId: string | undefined; error: unknown }> = [];
 
@@ -441,8 +412,7 @@ test("mailbox delivery pump reports failures and leaves messages queued", async 
       payload: {
         path: childPath,
         from: "/root" as AgentPath,
-        childSessionId,
-        childThreadId,
+        recipientSessionId: childSessionId,
         triggerTurn: true,
         message: { role: "user", content: "try run" },
       },
@@ -467,9 +437,7 @@ test("claims mailbox before delivery so concurrent consumers only deliver once",
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const runtime = new BlockingMailboxRuntime();
   const parentSessionId = "session_parent" as SessionId;
-  const parentThreadId = "thread_parent" as ThreadId;
   const childSessionId = "session_child" as SessionId;
-  const childThreadId = "thread_child" as ThreadId;
   const taskId = "task_child" as TaskId;
   const rootPath = "/root" as AgentPath;
   const childPath = "/root/task_child" as AgentPath;
@@ -482,15 +450,12 @@ test("claims mailbox before delivery so concurrent consumers only deliver once",
         type: "agent.task_created",
         time: 1 as TimestampMs,
         sessionId: parentSessionId,
-        threadId: parentThreadId,
         payload: {
           taskId,
           path: childPath,
           parentPath: rootPath,
           parentSessionId,
-          parentThreadId,
           childSessionId,
-          childThreadId,
           taskName: "reader",
           cwd: "/repo",
           prompt: "read",
@@ -502,7 +467,6 @@ test("claims mailbox before delivery so concurrent consumers only deliver once",
         type: "agent.task_completed",
         time: 2 as TimestampMs,
         sessionId: parentSessionId,
-        threadId: parentThreadId,
         payload: { taskId, path: childPath, status: "completed" },
       },
       {
@@ -510,13 +474,11 @@ test("claims mailbox before delivery so concurrent consumers only deliver once",
         type: "agent.message_queued",
         time: 2 as TimestampMs,
         sessionId: parentSessionId,
-        threadId: parentThreadId,
         payload: {
           taskId,
           path: childPath,
           from: rootPath,
-          childSessionId,
-          childThreadId,
+          recipientSessionId: childSessionId,
           triggerTurn: true,
           message: { role: "user", content: "continue from mailbox" },
         },
@@ -563,7 +525,6 @@ test("keeps mailbox queued when delivery fails", async () => {
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const runtime = new FakeMailboxRuntime(new Error("child session is busy"));
   const childSessionId = "session_child" as SessionId;
-  const childThreadId = "thread_child" as ThreadId;
   const childPath = "/root/task_child" as AgentPath;
 
   try {
@@ -574,8 +535,7 @@ test("keeps mailbox queued when delivery fails", async () => {
       payload: {
         path: childPath,
         from: "/root" as AgentPath,
-        childSessionId,
-        childThreadId,
+        recipientSessionId: childSessionId,
         triggerTurn: true,
         message: { role: "user", content: "continue" },
       },
@@ -613,18 +573,55 @@ test("trigger-turn team messages keep member lifecycle in sync", async () => {
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const runtime = new FakeMailboxRuntime();
   const workerPath = "/root/worker" as AgentPath;
+  const rootSessionId = "session_team_root" as SessionId;
+  const workerSessionId = "session_worker" as SessionId;
 
   try {
     const teams = new TeamControlService({ store, createId: createSequentialId(), now: () => 6 as TimestampMs });
-    const team = await teams.createTeam({ name: "lifecycle-team", leadPath: "/root" as AgentPath });
+    const team = await teams.createTeam({
+      sessionId: rootSessionId,
+      name: "lifecycle-team",
+      leadPath: "/root" as AgentPath,
+    });
+    await store.appendMany([
+      {
+        id: "event_team_worker_task_created",
+        type: "agent.task_created",
+        time: 4 as TimestampMs,
+        sessionId: rootSessionId,
+        payload: {
+          taskId: "task_team_worker" as TaskId,
+          path: workerPath,
+          parentPath: "/root" as AgentPath,
+          parentSessionId: rootSessionId,
+          childSessionId: workerSessionId,
+          taskName: "team worker",
+          cwd: "/repo",
+          prompt: "initial team task",
+          mode: "resumable",
+        },
+      },
+      {
+        id: "event_team_worker_task_completed",
+        type: "agent.task_completed",
+        time: 5 as TimestampMs,
+        sessionId: rootSessionId,
+        payload: {
+          taskId: "task_team_worker" as TaskId,
+          path: workerPath,
+          status: "completed",
+          generation: 1,
+          summary: "initial team task complete",
+        },
+      },
+    ]);
     await teams.addMember({
       teamId: team.id,
       path: workerPath,
       name: "worker",
       role: "implementer",
       status: "idle",
-      childSessionId: "session_worker" as SessionId,
-      childThreadId: "thread_worker" as ThreadId,
+      childSessionId: workerSessionId,
     });
     await teams.sendMessage({
       teamId: team.id,
@@ -665,7 +662,6 @@ test("sends idempotent agent messages and keeps consumed messages terminal", asy
   const dir = await mkdtemp(join(tmpdir(), "chili-agent-message-idempotency-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const parentSessionId = "session_parent" as SessionId;
-  const parentThreadId = "thread_parent" as ThreadId;
   const taskId = "task_reader" as TaskId;
   const childPath = "/root/reader" as AgentPath;
 
@@ -675,7 +671,6 @@ test("sends idempotent agent messages and keeps consumed messages terminal", asy
       path: childPath,
       taskName: "reader",
       parentSessionId,
-      parentThreadId,
       status: "completed",
     });
     const service = new AgentTreeControlService({ store, now: () => 10 as TimestampMs });
@@ -686,7 +681,6 @@ test("sends idempotent agent messages and keeps consumed messages terminal", asy
       content: "Use this if you are resumed later.",
       delivery: "queueOnly" as const,
       sessionId: parentSessionId,
-      threadId: parentThreadId,
       metadata: { reason: "followup-context" },
     };
 
@@ -719,8 +713,6 @@ test("scopes named agent recipients to the sending session", async () => {
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const sessionA = "session_a" as SessionId;
   const sessionB = "session_b" as SessionId;
-  const threadA = "thread_a" as ThreadId;
-  const threadB = "thread_b" as ThreadId;
 
   try {
     await seedMessageTask(store, {
@@ -728,7 +720,6 @@ test("scopes named agent recipients to the sending session", async () => {
       path: "/root/reader_a" as AgentPath,
       taskName: "reader",
       parentSessionId: sessionA,
-      parentThreadId: threadA,
       status: "running",
     });
     await seedMessageTask(store, {
@@ -736,7 +727,6 @@ test("scopes named agent recipients to the sending session", async () => {
       path: "/root/reader_b" as AgentPath,
       taskName: "reader",
       parentSessionId: sessionB,
-      parentThreadId: threadB,
       status: "running",
     });
     const service = new AgentTreeControlService({ store, now: () => 10 as TimestampMs });
@@ -747,7 +737,6 @@ test("scopes named agent recipients to the sending session", async () => {
       to: "reader",
       content: "session A only",
       sessionId: sessionA,
-      threadId: threadA,
     });
     expect(scoped).toMatchObject({ taskId: "task_reader_a", path: "/root/reader_a" });
 
@@ -767,7 +756,6 @@ test("explicit recipient metadata wins over terminal task lookup and mailbox rea
   const dir = await mkdtemp(join(tmpdir(), "chili-agent-message-explicit-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const parentSessionId = "session_parent" as SessionId;
-  const parentThreadId = "thread_parent" as ThreadId;
   const taskId = "task_done" as TaskId;
 
   try {
@@ -776,7 +764,6 @@ test("explicit recipient metadata wins over terminal task lookup and mailbox rea
       path: "/root/done" as AgentPath,
       taskName: "done",
       parentSessionId,
-      parentThreadId,
       status: "completed",
     });
     const service = new AgentTreeControlService({ store, now: () => 20 as TimestampMs });
@@ -788,7 +775,6 @@ test("explicit recipient metadata wins over terminal task lookup and mailbox rea
       content: "first",
       delivery: "triggerTurn",
       recipientSessionId: parentSessionId,
-      recipientThreadId: parentThreadId,
     });
     await service.sendMessage({
       messageId: "a_second",
@@ -797,7 +783,6 @@ test("explicit recipient metadata wins over terminal task lookup and mailbox rea
       taskId,
       content: "second",
       recipientSessionId: parentSessionId,
-      recipientThreadId: parentThreadId,
     });
 
     expect((await store.agentMailbox({ path: "/root" as AgentPath })).map((message) => message.id)).toEqual([
@@ -807,8 +792,7 @@ test("explicit recipient metadata wins over terminal task lookup and mailbox rea
     const explicit = await store.agentMailbox({ messageId: "z_first" });
     expect(explicit).toMatchObject([{
       path: "/root",
-      childSessionId: parentSessionId,
-      childThreadId: parentThreadId,
+      recipientSessionId: parentSessionId,
       triggerTurn: true,
     }]);
     expect(explicit[0]?.taskId).toBeUndefined();
@@ -818,6 +802,71 @@ test("explicit recipient metadata wins over terminal task lookup and mailbox rea
   }
 });
 
+test("rejects every corrupt projection that shares one child session across tasks", async () => {
+  const childSessionId = "session_duplicate" as SessionId;
+  const directTask: AgentTaskRow = {
+    id: "task_direct" as TaskId,
+    path: "/root/direct" as AgentPath,
+    status: "running",
+    taskName: "direct",
+    generation: 1,
+    childSessionId,
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  const otherTask: AgentTaskRow = {
+    ...directTask,
+    id: "task_other" as TaskId,
+    path: "/root/other" as AgentPath,
+    taskName: "other",
+  };
+  const message: AgentMailboxRow = {
+    id: "message_duplicate_session",
+    path: directTask.path,
+    fromPath: "/root" as AgentPath,
+    triggerTurn: true,
+    status: "queued",
+    taskId: directTask.id,
+    recipientSessionId: childSessionId,
+    message: { role: "user", content: "continue" },
+    createdAt: 1,
+  };
+  const service = new AgentTreeControlService({
+    store: {
+      agentTasks: async () => [directTask, otherTask],
+    } as never,
+  });
+  const internal = service as unknown as {
+    resolveMailboxAgentTask(
+      mailbox: AgentMailboxRow,
+      task?: AgentTaskRow,
+    ): Promise<AgentTaskRow | undefined>;
+  };
+
+  await expect(internal.resolveMailboxAgentTask(message, directTask)).rejects.toBeInstanceOf(
+    AgentMessageRecipientMetadataError,
+  );
+
+  const mismatchedDirectTask: AgentTaskRow = {
+    ...directTask,
+    childSessionId: "session_direct_owner" as SessionId,
+  };
+  const soleSessionOwner: AgentTaskRow = {
+    ...otherTask,
+    path: message.path,
+  };
+  const mismatchService = new AgentTreeControlService({
+    store: {
+      agentTasks: async () => [soleSessionOwner],
+    } as never,
+  });
+  const mismatchInternal = mismatchService as unknown as typeof internal;
+
+  await expect(
+    mismatchInternal.resolveMailboxAgentTask(message, mismatchedDirectTask),
+  ).rejects.toBeInstanceOf(AgentMessageRecipientMetadataError);
+});
+
 async function seedMessageTask(
   store: SqliteEventStore,
   input: {
@@ -825,26 +874,21 @@ async function seedMessageTask(
     path: AgentPath;
     taskName: string;
     parentSessionId: SessionId;
-    parentThreadId: ThreadId;
     status: "running" | "completed";
   },
 ): Promise<void> {
   const childSessionId = `child_${input.taskId}` as SessionId;
-  const childThreadId = `thread_${input.taskId}` as ThreadId;
   await store.append({
     id: `created_${input.taskId}`,
     type: "agent.task_created",
     time: 1 as TimestampMs,
     sessionId: input.parentSessionId,
-    threadId: input.parentThreadId,
     payload: {
       taskId: input.taskId,
       path: input.path,
       parentPath: "/root" as AgentPath,
       parentSessionId: input.parentSessionId,
-      parentThreadId: input.parentThreadId,
       childSessionId,
-      childThreadId,
       taskName: input.taskName,
       cwd: "/repo",
       prompt: "work",
@@ -857,7 +901,6 @@ async function seedMessageTask(
       type: "agent.task_completed",
       time: 2 as TimestampMs,
       sessionId: input.parentSessionId,
-      threadId: input.parentThreadId,
       payload: {
         taskId: input.taskId,
         path: input.path,
@@ -895,12 +938,12 @@ function createSequentialId(): (prefix: string) => string {
 }
 
 class FakeMailboxRuntime {
-  readonly messages: Array<{ sessionId: SessionId; threadId: ThreadId; text: string }> = [];
+  readonly messages: Array<{ sessionId: SessionId; text: string }> = [];
   readonly prompts: SubmitPromptInput[] = [];
 
   constructor(private readonly error?: Error) {}
 
-  async appendUserMessage(input: { sessionId: SessionId; threadId: ThreadId; text: string }): Promise<MessageId> {
+  async appendUserMessage(input: { sessionId: SessionId; text: string }): Promise<MessageId> {
     this.messages.push(input);
     return "message_mailbox" as MessageId;
   }
@@ -924,7 +967,7 @@ class FakeMailboxRuntime {
 }
 
 class BlockingMailboxRuntime {
-  readonly messages: Array<{ sessionId: SessionId; threadId: ThreadId; text: string }> = [];
+  readonly messages: Array<{ sessionId: SessionId; text: string }> = [];
   readonly prompts: SubmitPromptInput[] = [];
   readonly started: Promise<void>;
   private readonly released: Promise<void>;
@@ -941,7 +984,7 @@ class BlockingMailboxRuntime {
     });
   }
 
-  async appendUserMessage(input: { sessionId: SessionId; threadId: ThreadId; text: string }): Promise<MessageId> {
+  async appendUserMessage(input: { sessionId: SessionId; text: string }): Promise<MessageId> {
     this.messages.push(input);
     return "message_mailbox" as MessageId;
   }

@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { AgentPath, SessionId, TaskId, TimestampMs, ThreadId } from "@chili/protocol";
+import type { AgentPath, SessionId, TaskId, TimestampMs } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import { runProcess } from "@chili/tools";
 import { LocalSubagentManager, type LocalSubagentRunInput, type LocalSubagentRunResult, type LocalSubagentRunner } from "./subagent.js";
@@ -20,7 +20,6 @@ test("writing task dispatch runs the worker in an isolated worktree", async () =
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_worktree_writing" as SessionId;
-  const threadId = "thread_team_worktree_writing" as ThreadId;
   const runner = new WritingRunner("packages/core/src/feature.ts", "export const value = 2;\n");
 
   try {
@@ -28,18 +27,17 @@ test("writing task dispatch runs the worker in an isolated worktree", async () =
     const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
     const worktrees = new TeamWorktreeService({ teams, cwd: dir, now });
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, worktrees, cwd: dir, now });
-    const team = await teams.createTeam({ sessionId, threadId, name: "worktree-writing", leadPath });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "worker", role: "implementer", writeScope: ["packages/core"] });
+    const team = await teams.createTeam({ sessionId, name: "worktree-writing", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer", writeScope: ["packages/core"] });
     const task = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Write isolated feature",
       ownerPath: workerPath,
       metadata: { writeScope: ["packages/core"], requiredTools: ["edit"] },
     });
 
-    const result = await dispatcher.dispatchTask({ teamId: team.id, taskId: task.id, mode: "one_shot", sessionId, threadId, cwd: dir });
+    const result = await dispatcher.dispatchTask({ teamId: team.id, taskId: task.id, mode: "one_shot", sessionId, cwd: dir });
 
     const metadata = worktreeMetadata(result.teamTask.metadata);
     expect(metadata).toMatchObject({ status: "active", baseRef: "HEAD", createdAt: 1300 });
@@ -276,7 +274,6 @@ test("verifier uses the task worktree and records pending merge diff without tou
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_worktree_verifier" as SessionId;
-  const threadId = "thread_team_worktree_verifier" as ThreadId;
   const runner = new WritingThenVerifyingRunner("packages/core/src/feature.ts", "export const value = 42;\n");
 
   try {
@@ -285,11 +282,10 @@ test("verifier uses the task worktree and records pending merge diff without tou
     const worktrees = new TeamWorktreeService({ teams, cwd: dir, now });
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, worktrees, cwd: dir, now });
     const verifier = new TeamTaskVerificationService({ teams, subagents, cwd: dir, now });
-    const team = await teams.createTeam({ sessionId, threadId, name: "worktree-verifier", leadPath });
-    await teams.addMember({ sessionId, threadId, teamId: team.id, path: workerPath, name: "worker", role: "implementer", writeScope: ["packages/core"] });
+    const team = await teams.createTeam({ sessionId, name: "worktree-verifier", leadPath });
+    await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer", writeScope: ["packages/core"] });
     const task = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Implement isolated change",
       ownerPath: workerPath,
@@ -299,7 +295,7 @@ test("verifier uses the task worktree and records pending merge diff without tou
       },
     });
 
-    const dispatched = await dispatcher.dispatchTask({ teamId: team.id, taskId: task.id, mode: "one_shot", sessionId, threadId, cwd: dir });
+    const dispatched = await dispatcher.dispatchTask({ teamId: team.id, taskId: task.id, mode: "one_shot", sessionId, cwd: dir });
     const worktree = worktreeMetadata(dispatched.teamTask.metadata);
     if (!worktree) throw new Error("expected task worktree metadata");
     expect(await readFile(join(worktree.path, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 42;\n");
@@ -309,7 +305,7 @@ test("verifier uses the task worktree and records pending merge diff without tou
       maxOutputBytes: 128_000,
     });
     expect(directDiff.stdout).toContain("export const value = 42;");
-    const verified = await verifier.verifyCompletedTasks({ teamId: team.id, sessionId, threadId, cwd: dir });
+    const verified = await verifier.verifyCompletedTasks({ teamId: team.id, sessionId, cwd: dir });
 
     expect(verified.verified).toMatchObject([{ status: "passed" }]);
     expect(runner.runs.map((run) => run.cwd)).toEqual([worktree.path, worktree.path]);
@@ -336,7 +332,6 @@ test("verifier merge diff includes staged and untracked worktree changes", async
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_worktree_merge_diff" as SessionId;
-  const threadId = "thread_team_worktree_merge_diff" as ThreadId;
   const runner = new MixedChangeRunner();
 
   try {
@@ -345,10 +340,9 @@ test("verifier merge diff includes staged and untracked worktree changes", async
     const worktrees = new TeamWorktreeService({ teams, cwd: dir, now });
     const dispatcher = new TeamTaskDispatchService({ teams, subagents, store, worktrees, cwd: dir, now });
     const verifier = new TeamTaskVerificationService({ teams, subagents, cwd: dir, now });
-    const team = await teams.createTeam({ sessionId, threadId, name: "worktree-merge-diff", leadPath });
+    const team = await teams.createTeam({ sessionId, name: "worktree-merge-diff", leadPath });
     await teams.addMember({
       sessionId,
-      threadId,
       teamId: team.id,
       path: workerPath,
       name: "worker",
@@ -357,17 +351,16 @@ test("verifier merge diff includes staged and untracked worktree changes", async
     });
     const task = await teams.createTask({
       sessionId,
-      threadId,
       teamId: team.id,
       title: "Create mixed worktree changes",
       ownerPath: workerPath,
       metadata: { writeScope: ["packages/core", "docs"] },
     });
 
-    const dispatched = await dispatcher.dispatchTask({ teamId: team.id, taskId: task.id, mode: "one_shot", sessionId, threadId, cwd: dir });
+    const dispatched = await dispatcher.dispatchTask({ teamId: team.id, taskId: task.id, mode: "one_shot", sessionId, cwd: dir });
     const worktree = worktreeMetadata(dispatched.teamTask.metadata);
     if (!worktree) throw new Error("expected task worktree metadata");
-    const verified = await verifier.verifyCompletedTasks({ teamId: team.id, sessionId, threadId, cwd: dir });
+    const verified = await verifier.verifyCompletedTasks({ teamId: team.id, sessionId, cwd: dir });
 
     expect(verified.verified).toMatchObject([{ status: "passed" }]);
     const [storedTask] = await teams.tasks(team.id);

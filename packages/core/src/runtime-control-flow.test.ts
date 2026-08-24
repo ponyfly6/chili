@@ -5,7 +5,6 @@ import type {
   Message,
   MessagePart,
   SessionId,
-  ThreadId,
   TimestampMs,
   ToolCallId,
 } from "@chili/protocol";
@@ -44,7 +43,6 @@ test("does not retry aborted model requests", async () => {
 
   const result = await runtime.runTurn({
     sessionId: "session_abort" as SessionId,
-    threadId: "thread_abort" as ThreadId,
     cwd: "/repo",
     signal: controller.signal,
   });
@@ -88,7 +86,6 @@ test("retries transient socket failures before assistant output", async () => {
 
   const result = await runtime.runTurn({
     sessionId: "session_socket_retry" as SessionId,
-    threadId: "thread_socket_retry" as ThreadId,
     cwd: "/repo",
   });
 
@@ -129,7 +126,6 @@ test("does not retry provider errors explicitly marked non-retryable", async () 
 
   const result = await runtime.runTurn({
     sessionId: "session_plan_capacity" as SessionId,
-    threadId: "thread_plan_capacity" as ThreadId,
     cwd: "/repo",
   });
 
@@ -196,7 +192,6 @@ test("consumes rich model streams and executes tool calls after the stream finis
 
   const result = await runtime.runTurn({
     sessionId: "session_rich_stream" as SessionId,
-    threadId: "thread_rich_stream" as ThreadId,
     cwd: "/repo",
   });
 
@@ -295,7 +290,6 @@ test("copies only allowlisted tool metadata into model-visible execution context
 
   const result = await testRuntime(store, registry, model).runTurn({
     sessionId: "session_tool_context" as SessionId,
-    threadId: "thread_tool_context" as ThreadId,
     cwd: "/repo",
   });
 
@@ -341,7 +335,6 @@ test("keeps indexed reasoning sections in separate message parts", async () => {
 
   const result = await runtime.runTurn({
     sessionId: "session_reasoning_sections" as SessionId,
-    threadId: "thread_reasoning_sections" as ThreadId,
     cwd: "/repo",
   });
 
@@ -367,7 +360,6 @@ test("keeps indexed assistant phases in separate text parts", async () => {
 
   const result = await runtime.runTurn({
     sessionId: "session_text_phases" as SessionId,
-    threadId: "thread_text_phases" as ThreadId,
     cwd: "/repo",
   });
 
@@ -391,7 +383,6 @@ test("fails when one assistant text index changes phase", async () => {
 
   const result = await runtime.runTurn({
     sessionId: "session_phase_conflict" as SessionId,
-    threadId: "thread_phase_conflict" as ThreadId,
     cwd: "/repo",
   });
 
@@ -429,7 +420,6 @@ test("does not execute tool calls from output-limited model responses", async ()
 
   const result = await runtime.runTurn({
     sessionId: "session_output_limited" as SessionId,
-    threadId: "thread_output_limited" as ThreadId,
     cwd: "/repo",
   });
 
@@ -481,7 +471,6 @@ test("does not execute tool calls when the provider reports invalid JSON argumen
 
   const result = await runtime.runTurn({
     sessionId: "session_invalid_tool_args" as SessionId,
-    threadId: "thread_invalid_tool_args" as ThreadId,
     cwd: "/repo",
   });
 
@@ -524,7 +513,6 @@ test("keeps live tool output deltas out of model-facing tool result parts", asyn
 
   const result = await runtime.runTurn({
     sessionId: "session_tool_output_delta" as SessionId,
-    threadId: "thread_tool_output_delta" as ThreadId,
     cwd: "/repo",
   });
 
@@ -552,7 +540,6 @@ test("finishes live streaming tool rows as failed when the model errors before t
 
   const result = await runtime.runTurn({
     sessionId: "session_stream_error" as SessionId,
-    threadId: "thread_stream_error" as ThreadId,
     cwd: "/repo",
   });
 
@@ -575,7 +562,6 @@ test("surfaces model startup failures in the assistant message", async () => {
 
   const result = await runtime.runTurn({
     sessionId: "session_model_startup_error" as SessionId,
-    threadId: "thread_model_startup_error" as ThreadId,
     cwd: "/repo",
   });
 
@@ -623,7 +609,6 @@ test("suppresses MCP image understanding tools when direct image input is availa
 
   const result = await runtime.runTurn({
     sessionId: "session_suppress_image_tools" as SessionId,
-    threadId: "thread_suppress_image_tools" as ThreadId,
     cwd: "/repo",
     suppressExternalImageTools: true,
   });
@@ -670,7 +655,6 @@ test("prefers MCP image understanding tools over read_image for path-only image 
 
   const result = await runtime.runTurn({
     sessionId: "session_prefer_external_image_tools" as SessionId,
-    threadId: "thread_prefer_external_image_tools" as ThreadId,
     cwd: "/repo",
     preferExternalImageTools: true,
   });
@@ -694,7 +678,6 @@ test("finishes live streaming tool rows as cancelled when aborted before tool_ca
 
   const result = await runtime.runTurn({
     sessionId: "session_stream_abort" as SessionId,
-    threadId: "thread_stream_abort" as ThreadId,
     cwd: "/repo",
     signal: controller.signal,
   });
@@ -720,7 +703,6 @@ test("finishes live streaming tool rows as failed when finish arrives before too
 
   const result = await runtime.runTurn({
     sessionId: "session_stream_finish" as SessionId,
-    threadId: "thread_stream_finish" as ThreadId,
     cwd: "/repo",
   });
 
@@ -750,7 +732,6 @@ test("finishes live streaming tool rows as failed when the stream ends before to
 
   const result = await runtime.runTurn({
     sessionId: "session_stream_eof" as SessionId,
-    threadId: "thread_stream_eof" as ThreadId,
     cwd: "/repo",
   });
 
@@ -815,7 +796,6 @@ test("runtime hides unauthorized tools from model input", async () => {
 
   const result = await runtime.runTurn({
     sessionId: "session_scoped_tools" as SessionId,
-    threadId: "thread_scoped_tools" as ThreadId,
     cwd: "/repo",
   });
 
@@ -845,7 +825,6 @@ test("runtime hides all tools when tool mode is disabled", async () => {
 
   const result = await runtime.runTurn({
     sessionId: "session_no_tools" as SessionId,
-    threadId: "thread_no_tools" as ThreadId,
     cwd: "/repo",
     toolMode: "disabled",
   });
@@ -879,7 +858,6 @@ test("runtime refuses model-emitted tool calls when tool mode is disabled", asyn
 
   const result = await runtime.runTurn({
     sessionId: "session_no_tool_execution" as SessionId,
-    threadId: "thread_no_tool_execution" as ThreadId,
     cwd: "/repo",
     toolMode: "disabled",
   });
@@ -940,7 +918,6 @@ test("runtime applies per-turn tool policy to visible and executed tools", async
 
   const result = await runtime.runTurn({
     sessionId: "session_turn_policy" as SessionId,
-    threadId: "thread_turn_policy" as ThreadId,
     cwd: "/repo",
     toolPolicy: { allowedTools: ["read"] },
   });
@@ -1000,7 +977,6 @@ test("runs concurrency-safe tool calls in parallel and preserves result order", 
 
   const result = await runtime.runTurn({
     sessionId: "session_parallel_tools" as SessionId,
-    threadId: "thread_parallel_tools" as ThreadId,
     cwd: "/repo",
   });
 
@@ -1019,11 +995,11 @@ test("clears the reserved runtime when the initial running status write fails", 
     now: () => 1 as TimestampMs,
   });
   const sessionId = "session_status_failure" as SessionId;
+  store.addSession(sessionId);
 
   await expect(
     service.submitPrompt({
       sessionId,
-      threadId: "thread_status_failure" as ThreadId,
       text: "hello",
     }),
   ).rejects.toThrow("status write failed");
@@ -1035,7 +1011,7 @@ test("accounts failed model event usage against an active goal", async () => {
   const registry = new InMemoryToolRegistry();
   const createId = createSequentialId();
   const sessionId = "session_goal_model_error" as SessionId;
-  const threadId = "thread_goal_model_error" as ThreadId;
+  store.addSession(sessionId);
   const model: ModelRouter = {
     async *stream(): AsyncIterable<ModelStreamEvent> {
       yield {
@@ -1075,12 +1051,10 @@ test("accounts failed model event usage against an active goal", async () => {
     type: "goal.updated",
     time: 1 as TimestampMs,
     sessionId,
-    threadId,
     payload: {
       reason: "set",
       goal: {
         sessionId,
-        threadId,
         objective: "account all provider usage",
         status: "active",
         tokenBudget: 1_000,
@@ -1092,7 +1066,7 @@ test("accounts failed model event usage against an active goal", async () => {
     },
   });
 
-  const result = await service.submitPrompt({ sessionId, threadId, text: "run once" });
+  const result = await service.submitPrompt({ sessionId, text: "run once" });
 
   expect(result.status).toBe("failed");
   expect(result.turns[0]?.usage).toEqual({
@@ -1115,22 +1089,20 @@ test("continues an active persistent goal and lets update_goal complete it", asy
   const registry = new InMemoryToolRegistry();
   const createId = createSequentialId();
   const sessionId = "session_goal" as SessionId;
-  const threadId = "thread_goal" as ThreadId;
+  store.addSession(sessionId);
   let service!: RuntimeService;
   let modelCalls = 0;
 
   for (const tool of createGoalTools({
-    getGoal: (context) => service.getGoal({ sessionId: context.sessionId, threadId: context.threadId ?? threadId }),
+    getGoal: (context) => service.getGoal({ sessionId: context.sessionId }),
     createGoal: (input, context) => service.setGoal({
       sessionId: context.sessionId,
-      threadId: context.threadId ?? threadId,
       objective: input.objective,
       ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
       replace: false,
     }),
     updateGoal: (input, context) => service.updateGoal({
       sessionId: context.sessionId,
-      threadId: context.threadId ?? threadId,
       status: input.status,
     }),
   })) {
@@ -1178,12 +1150,10 @@ test("continues an active persistent goal and lets update_goal complete it", asy
     type: "goal.updated",
     time: 1 as TimestampMs,
     sessionId,
-    threadId,
     payload: {
       reason: "set",
       goal: {
         sessionId,
-        threadId,
         objective: "finish the goal",
         status: "active",
         tokenBudget: 1_000,
@@ -1195,7 +1165,7 @@ test("continues an active persistent goal and lets update_goal complete it", asy
     },
   });
 
-  const result = await service.submitPrompt({ sessionId, threadId, text: "start" });
+  const result = await service.submitPrompt({ sessionId, text: "start" });
 
   expect(result.status).toBe("completed");
   expect(modelCalls).toBe(3);
@@ -1207,6 +1177,7 @@ test("continues an active persistent goal and lets update_goal complete it", asy
 
 class MemoryEventStore implements EventStore {
   readonly items: ChiliEvent[] = [];
+  readonly sessionRows: SessionRow[] = [];
 
   async append(event: ChiliEvent): Promise<void> {
     this.items.push(event);
@@ -1225,7 +1196,6 @@ class MemoryEventStore implements EventStore {
       .slice(afterIndex + 1)
       .filter((event) => {
         if (query.sessionId && event.sessionId !== query.sessionId) return false;
-        if (query.threadId && event.threadId !== query.threadId) return false;
         if (query.type && event.type !== query.type) return false;
         return true;
       })
@@ -1233,7 +1203,18 @@ class MemoryEventStore implements EventStore {
   }
 
   async sessions(): Promise<SessionRow[]> {
-    return [];
+    return this.sessionRows.map((row) => ({ ...row }));
+  }
+
+  addSession(sessionId: SessionId, source: SessionRow["source"] = "interactive"): void {
+    this.sessionRows.push({
+      id: sessionId,
+      cwd: "/repo",
+      source,
+      status: "active",
+      createdAt: 1,
+      updatedAt: 1,
+    });
   }
 
   async messages(): Promise<Message[]> {

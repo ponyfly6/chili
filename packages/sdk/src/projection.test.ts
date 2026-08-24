@@ -10,7 +10,6 @@ import type {
   TaskId,
   TeamId,
   TeamRunSummaryCounts,
-  ThreadId,
   TimestampMs,
   ToolCallId,
   ToolResultExecutionContext,
@@ -28,11 +27,10 @@ import {
   type RuntimeTeamTaskSyncResult,
   type RuntimeTeamSnapshot,
 } from "./client.js";
-import { chatAgentBatches, chatSessionView, createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, runtimeDelegationStatus, sessionMessages, teamLiveCockpit, teamLiveView, type ChatTranscriptItem } from "./projection.js";
+import { applyRuntimeEvent, chatAgentBatches, chatSessionView, createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, runtimeDelegationStatus, sessionMessages, teamLiveCockpit, teamLiveView, type ChatTranscriptItem } from "./projection.js";
 
 test("projects the selected failed session status reason", () => {
   const sessionId = "session_status_reason" as SessionId;
-  const threadId = "thread_status_reason" as ThreadId;
   const otherSessionId = "session_status_reason_other" as SessionId;
   const view = reduceRuntimeEvents([
     {
@@ -40,7 +38,6 @@ test("projects the selected failed session status reason", () => {
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -48,7 +45,6 @@ test("projects the selected failed session status reason", () => {
       type: "session.status_changed",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, status: "failed", reason: "provider stream disconnected" },
     },
     {
@@ -67,7 +63,7 @@ test("projects the selected failed session status reason", () => {
     },
   ], createRuntimeView());
 
-  const chat = chatSessionView(view, { sessionId, threadId });
+  const chat = chatSessionView(view, { sessionId });
 
   expect(chat.status).toBe("failed");
   expect(chat.statusReason).toBe("provider stream disconnected");
@@ -75,7 +71,6 @@ test("projects the selected failed session status reason", () => {
 
 test("clears stale session status reasons across explicit and turn status transitions", () => {
   const sessionId = "session_status_reason_transitions" as SessionId;
-  const threadId = "thread_status_reason_transitions" as ThreadId;
   const turnId = "turn_status_reason_transitions" as TurnId;
   const view = reduceRuntimeEvents([
     {
@@ -83,7 +78,6 @@ test("clears stale session status reasons across explicit and turn status transi
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -91,23 +85,21 @@ test("clears stale session status reasons across explicit and turn status transi
       type: "session.status_changed",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, status: "failed", reason: "old failure" },
     },
   ], createRuntimeView());
 
-  expect(chatSessionView(view, { sessionId, threadId }).statusReason).toBe("old failure");
+  expect(chatSessionView(view, { sessionId }).statusReason).toBe("old failure");
 
   reduceRuntimeEvents([{
     id: "event_status_reason_transition_running",
     type: "session.status_changed",
     time: 3 as TimestampMs,
     sessionId,
-    threadId,
     payload: { sessionId, status: "running" },
   }], view);
-  expect(chatSessionView(view, { sessionId, threadId })).toMatchObject({ status: "running" });
-  expect(chatSessionView(view, { sessionId, threadId }).statusReason).toBeUndefined();
+  expect(chatSessionView(view, { sessionId })).toMatchObject({ status: "running" });
+  expect(chatSessionView(view, { sessionId }).statusReason).toBeUndefined();
 
   reduceRuntimeEvents([
     {
@@ -115,7 +107,6 @@ test("clears stale session status reasons across explicit and turn status transi
       type: "session.status_changed",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, status: "running", reason: "prompt_submitted" },
     },
     {
@@ -123,11 +114,10 @@ test("clears stale session status reasons across explicit and turn status transi
       type: "turn.started",
       time: 5 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId },
     },
   ], view);
-  expect(chatSessionView(view, { sessionId, threadId }).statusReason).toBeUndefined();
+  expect(chatSessionView(view, { sessionId }).statusReason).toBeUndefined();
 
   reduceRuntimeEvents([
     {
@@ -135,7 +125,6 @@ test("clears stale session status reasons across explicit and turn status transi
       type: "session.status_changed",
       time: 6 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, status: "running", turnId, reason: "streaming" },
     },
     {
@@ -143,11 +132,10 @@ test("clears stale session status reasons across explicit and turn status transi
       type: "turn.completed",
       time: 7 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId, status: "failed" },
     },
   ], view);
-  const failedBeforeReason = chatSessionView(view, { sessionId, threadId });
+  const failedBeforeReason = chatSessionView(view, { sessionId });
   expect(failedBeforeReason.status).toBe("failed");
   expect(failedBeforeReason.statusReason).toBeUndefined();
 
@@ -156,15 +144,13 @@ test("clears stale session status reasons across explicit and turn status transi
     type: "session.status_changed",
     time: 8 as TimestampMs,
     sessionId,
-    threadId,
     payload: { sessionId, status: "failed", turnId, reason: "fresh failure" },
   }], view);
-  expect(chatSessionView(view, { sessionId, threadId }).statusReason).toBe("fresh failure");
+  expect(chatSessionView(view, { sessionId }).statusReason).toBe("fresh failure");
 });
 
 test("projects exact assistant text phases without classifying missing metadata", () => {
   const sessionId = "session_project_phases" as SessionId;
-  const threadId = "thread_project_phases" as ThreadId;
   const messageId = "message_project_phases" as MessageId;
   const commentaryPartId = "part_project_commentary" as PartId;
   const finalPartId = "part_project_final" as PartId;
@@ -175,7 +161,6 @@ test("projects exact assistant text phases without classifying missing metadata"
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -183,7 +168,6 @@ test("projects exact assistant text phases without classifying missing metadata"
       type: "message.created",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId, role: "assistant" },
     },
     {
@@ -191,7 +175,6 @@ test("projects exact assistant text phases without classifying missing metadata"
       type: "message.part_added",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId,
         part: {
@@ -209,7 +192,6 @@ test("projects exact assistant text phases without classifying missing metadata"
       type: "message.part_added",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId,
         part: {
@@ -227,7 +209,6 @@ test("projects exact assistant text phases without classifying missing metadata"
       type: "message.part_added",
       time: 5 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId,
         part: {
@@ -241,7 +222,7 @@ test("projects exact assistant text phases without classifying missing metadata"
     },
   ], createRuntimeView());
 
-  const assistant = chatSessionView(view, { sessionId, threadId }).items.find(
+  const assistant = chatSessionView(view, { sessionId }).items.find(
     (item) => item.kind === "message" && item.role === "assistant",
   );
 
@@ -254,7 +235,6 @@ test("projects exact assistant text phases without classifying missing metadata"
 
 test("projects only controlled tool execution context into message and tool rows", () => {
   const sessionId = "session_execution_context" as SessionId;
-  const threadId = "thread_execution_context" as ThreadId;
   const turnId = "turn_execution_context" as TurnId;
   const messageId = "message_execution_context" as MessageId;
   const partId = "part_execution_context" as PartId;
@@ -274,7 +254,6 @@ test("projects only controlled tool execution context into message and tool rows
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -282,7 +261,6 @@ test("projects only controlled tool execution context into message and tool rows
       type: "message.created",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId, role: "assistant", turnId },
     },
     {
@@ -290,7 +268,6 @@ test("projects only controlled tool execution context into message and tool rows
       type: "tool.call_started",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId, callId, toolName: "bash", input: { command: "echo ok" } },
     },
     {
@@ -298,7 +275,6 @@ test("projects only controlled tool execution context into message and tool rows
       type: "message.part_added",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId,
         part: {
@@ -317,12 +293,11 @@ test("projects only controlled tool execution context into message and tool rows
       type: "tool.call_finished",
       time: 5 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId, status: "completed", output: "ok" },
     },
   ], createRuntimeView());
 
-  const chat = chatSessionView(view, { sessionId, threadId, generatedAt: "now" });
+  const chat = chatSessionView(view, { sessionId, generatedAt: "now" });
   const message = chat.items.find((item) => item.kind === "message");
   const result = message?.kind === "message"
     ? message.parts.find((part) => part.type === "tool_result")
@@ -345,7 +320,6 @@ test("projects only controlled tool execution context into message and tool rows
 
 test("replays session, message, tool, and approval events into a runtime view", () => {
   const sessionId = "session_test" as SessionId;
-  const threadId = "thread_test" as ThreadId;
   const turnId = "turn_test" as TurnId;
   const messageId = "msg_test" as MessageId;
   const partId = "part_test" as PartId;
@@ -357,7 +331,6 @@ test("replays session, message, tool, and approval events into a runtime view", 
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -365,7 +338,6 @@ test("replays session, message, tool, and approval events into a runtime view", 
       type: "message.created",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId, role: "assistant" },
     },
     {
@@ -373,7 +345,6 @@ test("replays session, message, tool, and approval events into a runtime view", 
       type: "message.part_added",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId,
         part: { id: partId, messageId, sessionId, type: "text", text: "hello" },
@@ -384,7 +355,6 @@ test("replays session, message, tool, and approval events into a runtime view", 
       type: "message.part_delta",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId, partId, field: "text", delta: " world" },
     },
     {
@@ -392,7 +362,6 @@ test("replays session, message, tool, and approval events into a runtime view", 
       type: "tool.call_started",
       time: 5 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId, callId, toolName: "read", input: { filePath: "README.md" } },
     },
     {
@@ -400,7 +369,6 @@ test("replays session, message, tool, and approval events into a runtime view", 
       type: "tool.call_updated",
       time: 6 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId, status: "waiting_for_approval" },
     },
     {
@@ -408,7 +376,6 @@ test("replays session, message, tool, and approval events into a runtime view", 
       type: "approval.requested",
       time: 7 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         approvalId: "approval_test" as never,
         callId,
@@ -423,7 +390,6 @@ test("replays session, message, tool, and approval events into a runtime view", 
       type: "approval.resolved",
       time: 8 as TimestampMs,
       sessionId,
-      threadId,
       payload: { approvalId: "approval_test" as never, decision: "allow_once" },
     },
     {
@@ -431,7 +397,6 @@ test("replays session, message, tool, and approval events into a runtime view", 
       type: "tool.call_finished",
       time: 9 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId, status: "completed", output: "ok" },
     },
     {
@@ -439,7 +404,6 @@ test("replays session, message, tool, and approval events into a runtime view", 
       type: "turn.completed",
       time: 10 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId, status: "completed" },
     },
   ];
@@ -462,7 +426,6 @@ test("replays session, message, tool, and approval events into a runtime view", 
 
 test("restores a waiting session to running only after all approvals clear and a tool resumes", () => {
   const sessionId = "session_resume_after_approval" as SessionId;
-  const threadId = "thread_resume_after_approval" as ThreadId;
   const turnId = "turn_resume_after_approval" as TurnId;
   const firstCallId = "toolcall_resume_first" as ToolCallId;
   const secondCallId = "toolcall_resume_second" as ToolCallId;
@@ -474,7 +437,6 @@ test("restores a waiting session to running only after all approvals clear and a
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -482,7 +444,6 @@ test("restores a waiting session to running only after all approvals clear and a
       type: "session.status_changed",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, status: "running" },
     },
     {
@@ -490,7 +451,6 @@ test("restores a waiting session to running only after all approvals clear and a
       type: "tool.call_started",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId, callId: firstCallId, toolName: "read", input: { path: "first.ts" } },
     },
     {
@@ -498,7 +458,6 @@ test("restores a waiting session to running only after all approvals clear and a
       type: "tool.call_updated",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId: firstCallId, status: "waiting_for_approval" },
     },
     {
@@ -506,7 +465,6 @@ test("restores a waiting session to running only after all approvals clear and a
       type: "approval.requested",
       time: 5 as TimestampMs,
       sessionId,
-      threadId,
       payload: { approvalId: firstApprovalId, callId: firstCallId, permission: "tool.read", patterns: ["first.ts"] },
     },
     {
@@ -514,7 +472,6 @@ test("restores a waiting session to running only after all approvals clear and a
       type: "tool.call_started",
       time: 6 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId, callId: secondCallId, toolName: "read", input: { path: "second.ts" } },
     },
     {
@@ -522,7 +479,6 @@ test("restores a waiting session to running only after all approvals clear and a
       type: "tool.call_updated",
       time: 7 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId: secondCallId, status: "waiting_for_approval" },
     },
     {
@@ -530,7 +486,6 @@ test("restores a waiting session to running only after all approvals clear and a
       type: "approval.requested",
       time: 8 as TimestampMs,
       sessionId,
-      threadId,
       payload: { approvalId: secondApprovalId, callId: secondCallId, permission: "tool.read", patterns: ["second.ts"] },
     },
   ], createRuntimeView());
@@ -541,7 +496,6 @@ test("restores a waiting session to running only after all approvals clear and a
       type: "approval.resolved",
       time: 9 as TimestampMs,
       sessionId,
-      threadId,
       payload: { approvalId: firstApprovalId, decision: "allow_once" },
     },
     {
@@ -549,13 +503,12 @@ test("restores a waiting session to running only after all approvals clear and a
       type: "tool.call_updated",
       time: 10 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId: firstCallId, status: "running" },
     },
   ], waitingView);
 
   expect(waitingView.sessions[sessionId]?.status).toBe("waiting_for_approval");
-  expect(chatSessionView(waitingView, { sessionId, threadId }).status).toBe("waiting_for_approval");
+  expect(chatSessionView(waitingView, { sessionId }).status).toBe("waiting_for_approval");
   expect(pendingApprovals(waitingView, sessionId).map((approval) => approval.id)).toEqual([secondApprovalId]);
 
   reduceRuntimeEvents([
@@ -564,7 +517,6 @@ test("restores a waiting session to running only after all approvals clear and a
       type: "approval.resolved",
       time: 11 as TimestampMs,
       sessionId,
-      threadId,
       payload: { approvalId: secondApprovalId, decision: "allow_once" },
     },
     {
@@ -572,19 +524,17 @@ test("restores a waiting session to running only after all approvals clear and a
       type: "tool.call_updated",
       time: 12 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId: secondCallId, status: "running" },
     },
   ], waitingView);
 
   expect(waitingView.sessions[sessionId]?.status).toBe("running");
-  expect(chatSessionView(waitingView, { sessionId, threadId }).status).toBe("running");
+  expect(chatSessionView(waitingView, { sessionId }).status).toBe("running");
   expect(pendingApprovals(waitingView, sessionId)).toEqual([]);
 });
 
 test("chat view hides output-free cancelled turns but keeps interrupted visible output", () => {
   const sessionId = "session_cancelled_chat" as SessionId;
-  const threadId = "thread_cancelled_chat" as ThreadId;
   const emptyTurnId = "turn_cancelled_empty" as TurnId;
   const visibleTurnId = "turn_cancelled_visible" as TurnId;
   const emptyUserId = "msg_cancelled_empty_user" as MessageId;
@@ -597,7 +547,6 @@ test("chat view hides output-free cancelled turns but keeps interrupted visible 
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -605,7 +554,6 @@ test("chat view hides output-free cancelled turns but keeps interrupted visible 
       type: "turn.started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: emptyTurnId },
     },
     {
@@ -613,7 +561,6 @@ test("chat view hides output-free cancelled turns but keeps interrupted visible 
       type: "message.created",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: emptyUserId, role: "user", turnId: emptyTurnId },
     },
     {
@@ -621,7 +568,6 @@ test("chat view hides output-free cancelled turns but keeps interrupted visible 
       type: "message.part_added",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId: emptyUserId,
         part: { id: "part_cancelled_empty_user" as PartId, messageId: emptyUserId, sessionId, type: "text", text: "hi" },
@@ -632,7 +578,6 @@ test("chat view hides output-free cancelled turns but keeps interrupted visible 
       type: "message.created",
       time: 5 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: emptyAssistantId, role: "assistant", turnId: emptyTurnId },
     },
     {
@@ -640,7 +585,6 @@ test("chat view hides output-free cancelled turns but keeps interrupted visible 
       type: "message.part_added",
       time: 6 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId: emptyAssistantId,
         part: { id: "part_cancelled_empty_reasoning" as PartId, messageId: emptyAssistantId, sessionId, type: "reasoning", text: "Thinking" },
@@ -651,7 +595,6 @@ test("chat view hides output-free cancelled turns but keeps interrupted visible 
       type: "turn.completed",
       time: 7 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: emptyTurnId, status: "cancelled" },
     },
     {
@@ -659,7 +602,6 @@ test("chat view hides output-free cancelled turns but keeps interrupted visible 
       type: "turn.started",
       time: 8 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: visibleTurnId },
     },
     {
@@ -667,7 +609,6 @@ test("chat view hides output-free cancelled turns but keeps interrupted visible 
       type: "message.created",
       time: 9 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: visibleUserId, role: "user", turnId: visibleTurnId },
     },
     {
@@ -675,7 +616,6 @@ test("chat view hides output-free cancelled turns but keeps interrupted visible 
       type: "message.part_added",
       time: 10 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId: visibleUserId,
         part: { id: "part_cancelled_visible_user" as PartId, messageId: visibleUserId, sessionId, type: "text", text: "explain" },
@@ -686,7 +626,6 @@ test("chat view hides output-free cancelled turns but keeps interrupted visible 
       type: "message.created",
       time: 11 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: visibleAssistantId, role: "assistant", turnId: visibleTurnId },
     },
     {
@@ -694,7 +633,6 @@ test("chat view hides output-free cancelled turns but keeps interrupted visible 
       type: "message.part_added",
       time: 12 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId: visibleAssistantId,
         part: { id: "part_cancelled_visible_assistant" as PartId, messageId: visibleAssistantId, sessionId, type: "text", text: "partial answer" },
@@ -705,13 +643,12 @@ test("chat view hides output-free cancelled turns but keeps interrupted visible 
       type: "turn.completed",
       time: 13 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: visibleTurnId, status: "cancelled" },
     },
   ];
 
   const view = reduceRuntimeEvents(events, createRuntimeView());
-  const chat = chatSessionView(view, { sessionId, threadId });
+  const chat = chatSessionView(view, { sessionId });
 
   expect(view.turnStatuses).toMatchObject({
     [emptyTurnId]: "cancelled",
@@ -721,16 +658,14 @@ test("chat view hides output-free cancelled turns but keeps interrupted visible 
   expect(chat.items.map((item) => item.id)).toEqual([visibleUserId, visibleAssistantId]);
 });
 
-test("projects persistent goals into chat session views", () => {
+test("projects and clears persistent goals by session", () => {
   const sessionId = "session_goal_projection" as SessionId;
-  const threadId = "thread_goal_projection" as ThreadId;
   const view = reduceRuntimeEvents([
     {
       id: "event_goal_session",
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -738,12 +673,10 @@ test("projects persistent goals into chat session views", () => {
       type: "goal.updated",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         reason: "set",
         goal: {
           sessionId,
-          threadId,
           objective: "finish goal projection",
           status: "active",
           tokenBudget: 50_000,
@@ -756,16 +689,105 @@ test("projects persistent goals into chat session views", () => {
     },
   ], createRuntimeView());
 
-  expect(chatSessionView(view, { sessionId, threadId }).goal).toMatchObject({
+  expect(chatSessionView(view, { sessionId }).goal).toMatchObject({
     objective: "finish goal projection",
     status: "active",
     tokensUsed: 1_200,
   });
+
+  applyRuntimeEvent(view, {
+    id: "event_goal_cleared",
+    type: "goal.cleared",
+    time: 3 as TimestampMs,
+    sessionId,
+    payload: { sessionId },
+  });
+  expect(chatSessionView(view, { sessionId }).goal).toBeUndefined();
+});
+
+test("ignores session and goal events with conflicting envelope and payload identities", () => {
+  const sessionId = "session_identity_authority" as SessionId;
+  const conflictingSessionId = "session_identity_conflict" as SessionId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_identity_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      payload: { sessionId, cwd: "/trusted" },
+    },
+    {
+      id: "event_identity_conflicting_session",
+      type: "session.created",
+      time: 2 as TimestampMs,
+      sessionId,
+      payload: { sessionId: conflictingSessionId, cwd: "/untrusted" },
+    },
+    {
+      id: "event_identity_goal",
+      type: "goal.updated",
+      time: 3 as TimestampMs,
+      sessionId,
+      payload: {
+        goal: {
+          sessionId,
+          objective: "trusted goal",
+          status: "active",
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          createdAt: 3 as TimestampMs,
+          updatedAt: 3 as TimestampMs,
+        },
+      },
+    },
+    {
+      id: "event_identity_conflicting_goal",
+      type: "goal.updated",
+      time: 4 as TimestampMs,
+      sessionId,
+      payload: {
+        goal: {
+          sessionId: conflictingSessionId,
+          objective: "untrusted goal",
+          status: "active",
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          createdAt: 4 as TimestampMs,
+          updatedAt: 4 as TimestampMs,
+        },
+      },
+    },
+    {
+      id: "event_identity_conflicting_clear",
+      type: "goal.cleared",
+      time: 5 as TimestampMs,
+      sessionId,
+      payload: { sessionId: conflictingSessionId },
+    },
+  ], createRuntimeView());
+
+  applyRuntimeEvent(view, {
+    id: "event_identity_missing_goal",
+    type: "goal.updated",
+    time: 6 as TimestampMs,
+    sessionId,
+    payload: {},
+  } as unknown as ChiliEvent);
+  applyRuntimeEvent(view, {
+    id: "event_identity_missing_envelope",
+    type: "session.created",
+    time: 7 as TimestampMs,
+    payload: { sessionId: conflictingSessionId, cwd: "/untrusted" },
+  } as unknown as ChiliEvent);
+
+  expect(view.sessions[sessionId]).toMatchObject({ cwd: "/trusted" });
+  expect(view.sessions[conflictingSessionId]).toBeUndefined();
+  expect(view.goalsBySession[sessionId]).toMatchObject({ objective: "trusted goal", sessionId });
+  expect(view.goalsBySession[conflictingSessionId]).toBeUndefined();
 });
 
 test("projects live tool input updates before the final assistant tool part", () => {
   const sessionId = "session_live_tool" as SessionId;
-  const threadId = "thread_live_tool" as ThreadId;
   const turnId = "turn_live_tool" as TurnId;
   const messageId = "msg_live_tool" as MessageId;
   const partId = "part_live_tool_call" as PartId;
@@ -778,7 +800,6 @@ test("projects live tool input updates before the final assistant tool part", ()
         type: "session.created",
         time: 1 as TimestampMs,
         sessionId,
-        threadId,
         payload: { sessionId, cwd: "/repo" },
       },
       {
@@ -786,7 +807,6 @@ test("projects live tool input updates before the final assistant tool part", ()
         type: "message.created",
         time: 2 as TimestampMs,
         sessionId,
-        threadId,
         payload: { messageId, role: "assistant" },
       },
       {
@@ -794,7 +814,6 @@ test("projects live tool input updates before the final assistant tool part", ()
         type: "tool.call_updated",
         time: 3 as TimestampMs,
         sessionId,
-        threadId,
         payload: { callId, status: "running", toolName: "bash", input: {} },
       },
       {
@@ -802,14 +821,13 @@ test("projects live tool input updates before the final assistant tool part", ()
         type: "tool.call_updated",
         time: 4 as TimestampMs,
         sessionId,
-        threadId,
         payload: { callId, status: "running", toolName: "bash", input: { command: "bun test" } },
       },
     ],
     createRuntimeView(),
   );
 
-  const live = chatSessionView(view, { sessionId, threadId, generatedAt: "now" });
+  const live = chatSessionView(view, { sessionId, generatedAt: "now" });
   const liveTools = live.items.filter((item): item is Extract<ChatTranscriptItem, { kind: "tool" }> => item.kind === "tool");
   const liveAssistant = live.items.find((item) => item.kind === "message");
   expect(liveTools).toHaveLength(1);
@@ -831,7 +849,6 @@ test("projects live tool input updates before the final assistant tool part", ()
         type: "tool.call_updated",
         time: 5 as TimestampMs,
         sessionId,
-        threadId,
         payload: { callId, status: "running", toolName: "bash", input: { command: "bun test --run" } },
       },
       {
@@ -839,7 +856,6 @@ test("projects live tool input updates before the final assistant tool part", ()
         type: "message.part_added",
         time: 6 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           messageId,
           part: {
@@ -859,7 +875,6 @@ test("projects live tool input updates before the final assistant tool part", ()
         type: "tool.call_started",
         time: 7 as TimestampMs,
         sessionId,
-        threadId,
         payload: { turnId, callId, toolName: "bash", input: { command: "bun test --run" } },
       },
       {
@@ -867,13 +882,12 @@ test("projects live tool input updates before the final assistant tool part", ()
         type: "tool.call_finished",
         time: 8 as TimestampMs,
         sessionId,
-        threadId,
         payload: { callId, status: "completed", output: "ok" },
       },
     ],
     view,
   );
-  const completed = chatSessionView(completedView, { sessionId, threadId, generatedAt: "now" });
+  const completed = chatSessionView(completedView, { sessionId, generatedAt: "now" });
   const completedTools = completed.items.filter((item): item is Extract<ChatTranscriptItem, { kind: "tool" }> => item.kind === "tool");
   const completedAssistant = completed.items.find((item) => item.kind === "message");
 
@@ -892,7 +906,6 @@ test("projects live tool input updates before the final assistant tool part", ()
 
 test("projects live tool output deltas without duplicating final output", () => {
   const sessionId = "session_live_tool_output" as SessionId;
-  const threadId = "thread_live_tool_output" as ThreadId;
   const turnId = "turn_live_tool_output" as TurnId;
   const callId = "toolcall_live_output" as ToolCallId;
 
@@ -903,7 +916,6 @@ test("projects live tool output deltas without duplicating final output", () => 
         type: "session.created",
         time: 1 as TimestampMs,
         sessionId,
-        threadId,
         payload: { sessionId, cwd: "/repo" },
       },
       {
@@ -911,7 +923,6 @@ test("projects live tool output deltas without duplicating final output", () => 
         type: "tool.call_started",
         time: 2 as TimestampMs,
         sessionId,
-        threadId,
         payload: { turnId, callId, toolName: "bash", input: { command: "bun test" } },
       },
       {
@@ -919,7 +930,6 @@ test("projects live tool output deltas without duplicating final output", () => 
         type: "tool.output_delta",
         time: 3 as TimestampMs,
         sessionId,
-        threadId,
         payload: { callId, stream: "stdout", delta: "pass 1\n", bytes: 7, sequence: 1 },
       },
       {
@@ -927,14 +937,13 @@ test("projects live tool output deltas without duplicating final output", () => 
         type: "tool.output_delta",
         time: 4 as TimestampMs,
         sessionId,
-        threadId,
         payload: { callId, stream: "stderr", delta: "warn\n", bytes: 5, sequence: 2 },
       },
     ],
     createRuntimeView(),
   );
 
-  const running = chatSessionView(runningView, { sessionId, threadId, generatedAt: "now" });
+  const running = chatSessionView(runningView, { sessionId, generatedAt: "now" });
   const runningTool = running.items.find((item): item is Extract<ChatTranscriptItem, { kind: "tool" }> => item.kind === "tool");
   expect(runningTool).toMatchObject({ id: callId, status: "running" });
   expect(runningTool?.output).toBeUndefined();
@@ -953,13 +962,12 @@ test("projects live tool output deltas without duplicating final output", () => 
         type: "tool.call_finished",
         time: 5 as TimestampMs,
         sessionId,
-        threadId,
         payload: { callId, status: "completed", output: finalOutput },
       },
     ],
     runningView,
   );
-  const completed = chatSessionView(completedView, { sessionId, threadId, generatedAt: "now" });
+  const completed = chatSessionView(completedView, { sessionId, generatedAt: "now" });
   const completedTool = completed.items.find((item): item is Extract<ChatTranscriptItem, { kind: "tool" }> => item.kind === "tool");
   expect(completedTool?.output).toBe(finalOutput);
   expect(completedTool?.liveOutput?.map((delta) => delta.delta).join("")).toBe("pass 1\nwarn\n");
@@ -968,7 +976,6 @@ test("projects live tool output deltas without duplicating final output", () => 
 
 test("projects chat session transcript rows from message, tool, and approval events", () => {
   const sessionId = "session_chat_view" as SessionId;
-  const threadId = "thread_chat_view" as ThreadId;
   const turnId = "turn_chat_view" as TurnId;
   const userMessageId = "msg_chat_user" as MessageId;
   const assistantMessageId = "msg_chat_assistant" as MessageId;
@@ -986,7 +993,6 @@ test("projects chat session transcript rows from message, tool, and approval eve
         type: "session.created",
         time: 1 as TimestampMs,
         sessionId,
-        threadId,
         payload: { sessionId, cwd: "/repo" },
       },
       {
@@ -994,7 +1000,6 @@ test("projects chat session transcript rows from message, tool, and approval eve
         type: "turn.started",
         time: 2 as TimestampMs,
         sessionId,
-        threadId,
         payload: { turnId },
       },
       {
@@ -1002,7 +1007,6 @@ test("projects chat session transcript rows from message, tool, and approval eve
         type: "message.created",
         time: 3 as TimestampMs,
         sessionId,
-        threadId,
         payload: { messageId: userMessageId, role: "user" },
       },
       {
@@ -1010,7 +1014,6 @@ test("projects chat session transcript rows from message, tool, and approval eve
         type: "message.part_added",
         time: 4 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           messageId: userMessageId,
           part: { id: userPartId, messageId: userMessageId, sessionId, type: "text", text: "please test" },
@@ -1021,7 +1024,6 @@ test("projects chat session transcript rows from message, tool, and approval eve
         type: "message.created",
         time: 5 as TimestampMs,
         sessionId,
-        threadId,
         payload: { messageId: assistantMessageId, role: "assistant" },
       },
       {
@@ -1029,7 +1031,6 @@ test("projects chat session transcript rows from message, tool, and approval eve
         type: "message.part_added",
         time: 6 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           messageId: assistantMessageId,
           part: { id: reasoningPartId, messageId: assistantMessageId, sessionId, type: "reasoning", text: "thinking" },
@@ -1040,7 +1041,6 @@ test("projects chat session transcript rows from message, tool, and approval eve
         type: "message.part_delta",
         time: 7 as TimestampMs,
         sessionId,
-        threadId,
         payload: { messageId: assistantMessageId, partId: reasoningPartId, field: "text", delta: " through" },
       },
       {
@@ -1048,7 +1048,6 @@ test("projects chat session transcript rows from message, tool, and approval eve
         type: "message.part_added",
         time: 8 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           messageId: assistantMessageId,
           part: { id: textPartId, messageId: assistantMessageId, sessionId, type: "text", text: "hello" },
@@ -1059,7 +1058,6 @@ test("projects chat session transcript rows from message, tool, and approval eve
         type: "message.part_delta",
         time: 9 as TimestampMs,
         sessionId,
-        threadId,
         payload: { messageId: assistantMessageId, partId: textPartId, field: "text", delta: " world" },
       },
       {
@@ -1067,7 +1065,6 @@ test("projects chat session transcript rows from message, tool, and approval eve
         type: "message.part_added",
         time: 10 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           messageId: assistantMessageId,
           part: {
@@ -1087,7 +1084,6 @@ test("projects chat session transcript rows from message, tool, and approval eve
         type: "tool.call_started",
         time: 11 as TimestampMs,
         sessionId,
-        threadId,
         payload: { turnId, callId, toolName: "bash", input: { command: "bun test" } },
       },
       {
@@ -1095,7 +1091,6 @@ test("projects chat session transcript rows from message, tool, and approval eve
         type: "tool.call_updated",
         time: 12 as TimestampMs,
         sessionId,
-        threadId,
         payload: { callId, status: "waiting_for_approval" },
       },
       {
@@ -1103,14 +1098,13 @@ test("projects chat session transcript rows from message, tool, and approval eve
         type: "approval.requested",
         time: 13 as TimestampMs,
         sessionId,
-        threadId,
         payload: { approvalId, callId, permission: "tool.bash", patterns: ["bun test"] },
       },
     ],
     createRuntimeView(),
   );
 
-  const pending = chatSessionView(pendingView, { sessionId, threadId, generatedAt: "now" });
+  const pending = chatSessionView(pendingView, { sessionId, generatedAt: "now" });
   const blank = chatSessionView(pendingView, { requireSession: true, generatedAt: "now" });
   const assistant = pending.items.find((item) => item.kind === "message" && item.role === "assistant");
   const tool = pending.items.find((item) => item.kind === "tool");
@@ -1118,7 +1112,6 @@ test("projects chat session transcript rows from message, tool, and approval eve
   expect(blank.sessionId).toBeUndefined();
   expect(blank.items).toEqual([]);
   expect(pending.sessionId).toBe(sessionId);
-  expect(pending.threadId).toBe(threadId);
   expect(pending.status).toBe("waiting_for_approval");
   expect(assistant?.kind === "message" ? assistant.parts : []).toContainEqual({ type: "reasoning", id: reasoningPartId, text: "thinking through" });
   expect(assistant?.kind === "message" ? assistant.parts : []).toContainEqual({ type: "text", id: textPartId, text: "hello world" });
@@ -1150,7 +1143,6 @@ test("projects chat session transcript rows from message, tool, and approval eve
         type: "approval.resolved",
         time: 14 as TimestampMs,
         sessionId,
-        threadId,
         payload: { approvalId, decision: "allow_once" },
       },
       {
@@ -1158,7 +1150,6 @@ test("projects chat session transcript rows from message, tool, and approval eve
         type: "tool.call_finished",
         time: 15 as TimestampMs,
         sessionId,
-        threadId,
         payload: { callId, status: "completed", output: "ok" },
       },
       {
@@ -1166,13 +1157,12 @@ test("projects chat session transcript rows from message, tool, and approval eve
         type: "turn.completed",
         time: 16 as TimestampMs,
         sessionId,
-        threadId,
         payload: { turnId, status: "completed" },
       },
     ],
     pendingView,
   );
-  const resolved = chatSessionView(resolvedView, { sessionId, threadId });
+  const resolved = chatSessionView(resolvedView, { sessionId });
   const resolvedApproval = resolved.items.find((item) => item.kind === "approval");
   const completedTool = resolved.items.find((item) => item.kind === "tool");
 
@@ -1184,7 +1174,6 @@ test("projects chat session transcript rows from message, tool, and approval eve
 
 test("projects latest model metadata and stable usage summaries for chat sessions", () => {
   const sessionId = "session_model_metadata" as SessionId;
-  const threadId = "thread_model_metadata" as ThreadId;
   const firstTurnId = "turn_model_metadata_first" as TurnId;
   const secondTurnId = "turn_model_metadata_second" as TurnId;
 
@@ -1195,7 +1184,6 @@ test("projects latest model metadata and stable usage summaries for chat session
         type: "session.created",
         time: 1 as TimestampMs,
         sessionId,
-        threadId,
         payload: { sessionId, cwd: "/repo" },
       },
       {
@@ -1203,7 +1191,6 @@ test("projects latest model metadata and stable usage summaries for chat session
         type: "turn.model_metadata",
         time: 2 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           turnId: firstTurnId,
           provider: "minimax",
@@ -1217,7 +1204,6 @@ test("projects latest model metadata and stable usage summaries for chat session
         type: "turn.model_metadata",
         time: 3 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           turnId: firstTurnId,
           responseId: "response_first",
@@ -1229,7 +1215,6 @@ test("projects latest model metadata and stable usage summaries for chat session
         type: "turn.model_metadata",
         time: 4 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           turnId: firstTurnId,
           usage: { inputTokens: 75, outputTokens: 55, totalTokens: 130 },
@@ -1240,7 +1225,6 @@ test("projects latest model metadata and stable usage summaries for chat session
         type: "turn.model_metadata",
         time: 5 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           turnId: secondTurnId,
           provider: "deepseek",
@@ -1254,7 +1238,6 @@ test("projects latest model metadata and stable usage summaries for chat session
         type: "turn.model_metadata",
         time: 6 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           turnId: secondTurnId,
           responseId: "response_second",
@@ -1265,7 +1248,7 @@ test("projects latest model metadata and stable usage summaries for chat session
     createRuntimeView(),
   );
 
-  const chat = chatSessionView(view, { sessionId, threadId });
+  const chat = chatSessionView(view, { sessionId });
 
   expect(chat.latestModelMetadata).toMatchObject({
     turnId: secondTurnId,
@@ -1293,7 +1276,6 @@ test("projects latest model metadata and stable usage summaries for chat session
 
 test("projects model metadata without optional model limits", () => {
   const sessionId = "session_model_metadata_limits" as SessionId;
-  const threadId = "thread_model_metadata_limits" as ThreadId;
   const turnId = "turn_model_metadata_limits" as TurnId;
 
   const view = reduceRuntimeEvents(
@@ -1303,7 +1285,6 @@ test("projects model metadata without optional model limits", () => {
         type: "session.created",
         time: 1 as TimestampMs,
         sessionId,
-        threadId,
         payload: { sessionId, cwd: "/repo" },
       },
       {
@@ -1311,7 +1292,6 @@ test("projects model metadata without optional model limits", () => {
         type: "turn.model_metadata",
         time: 2 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           turnId,
           provider: "custom",
@@ -1323,7 +1303,7 @@ test("projects model metadata without optional model limits", () => {
     createRuntimeView(),
   );
 
-  const chat = chatSessionView(view, { sessionId, threadId });
+  const chat = chatSessionView(view, { sessionId });
 
   expect(chat.latestModelMetadata).toMatchObject({
     turnId,
@@ -1337,7 +1317,6 @@ test("projects model metadata without optional model limits", () => {
 
 test("projects tool-specific approval summaries for chat TUI", () => {
   const sessionId = "session_approval_summaries" as SessionId;
-  const threadId = "thread_approval_summaries" as ThreadId;
   const turnId = "turn_approval_summaries" as TurnId;
   const bashCallId = "toolcall_summary_bash" as ToolCallId;
   const editCallId = "toolcall_summary_edit" as ToolCallId;
@@ -1355,13 +1334,11 @@ test("projects tool-specific approval summaries for chat TUI", () => {
         type: "session.created",
         time: 1 as TimestampMs,
         sessionId,
-        threadId,
         payload: { sessionId, cwd: "/repo" },
       },
       ...toolApprovalEvents({
         time: 2,
         sessionId,
-        threadId,
         turnId,
         callId: bashCallId,
         approvalId: bashApprovalId,
@@ -1373,7 +1350,6 @@ test("projects tool-specific approval summaries for chat TUI", () => {
       ...toolApprovalEvents({
         time: 5,
         sessionId,
-        threadId,
         turnId,
         callId: editCallId,
         approvalId: editApprovalId,
@@ -1385,7 +1361,6 @@ test("projects tool-specific approval summaries for chat TUI", () => {
       ...toolApprovalEvents({
         time: 8,
         sessionId,
-        threadId,
         turnId,
         callId: grepCallId,
         approvalId: grepApprovalId,
@@ -1397,7 +1372,6 @@ test("projects tool-specific approval summaries for chat TUI", () => {
       ...toolApprovalEvents({
         time: 11,
         sessionId,
-        threadId,
         turnId,
         callId: patchCallId,
         approvalId: patchApprovalId,
@@ -1410,7 +1384,7 @@ test("projects tool-specific approval summaries for chat TUI", () => {
     createRuntimeView(),
   );
 
-  const chat = chatSessionView(view, { sessionId, threadId });
+  const chat = chatSessionView(view, { sessionId });
   const approval = (id: ApprovalId) => chat.pendingApprovals.find((row) => row.id === id);
   const tool = (id: ToolCallId) => chat.activeTools.find((row) => row.id === id);
 
@@ -1435,9 +1409,7 @@ test("projects tool-specific approval summaries for chat TUI", () => {
 
 test("keeps parent execution idle while an ad-hoc child agent is running", () => {
   const sessionId = "session_parent_idle_child_running" as SessionId;
-  const threadId = "thread_parent_idle_child_running" as ThreadId;
   const childSessionId = "session_child_running" as SessionId;
-  const childThreadId = "thread_child_running" as ThreadId;
   const taskId = "task_child_running" as TaskId;
   const runId = "agent_child_running" as AgentRunId;
   const path = "/root/child-running" as AgentPath;
@@ -1448,7 +1420,6 @@ test("keeps parent execution idle while an ad-hoc child agent is running", () =>
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -1456,7 +1427,6 @@ test("keeps parent execution idle while an ad-hoc child agent is running", () =>
       type: "session.delegation_changed",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, policy: "proactive" },
     },
     {
@@ -1464,15 +1434,12 @@ test("keeps parent execution idle while an ad-hoc child agent is running", () =>
       type: "agent.task_created",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         taskId,
         path,
         parentPath: "/root" as AgentPath,
         parentSessionId: sessionId,
-        parentThreadId: threadId,
         childSessionId,
-        childThreadId,
         taskName: "inspect child state",
         cwd: "/repo",
         prompt: "Inspect the child state.",
@@ -1484,16 +1451,13 @@ test("keeps parent execution idle while an ad-hoc child agent is running", () =>
       type: "agent.spawned",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         runId,
         taskId,
         path,
         parentPath: "/root" as AgentPath,
         parentSessionId: sessionId,
-        parentThreadId: threadId,
         childSessionId,
-        childThreadId,
         taskName: "inspect child state",
         mode: "background",
         generation: 1,
@@ -1504,7 +1468,6 @@ test("keeps parent execution idle while an ad-hoc child agent is running", () =>
       type: "session.created",
       time: 5 as TimestampMs,
       sessionId: childSessionId,
-      threadId: childThreadId,
       payload: { sessionId: childSessionId, cwd: "/repo" },
     },
     {
@@ -1512,7 +1475,6 @@ test("keeps parent execution idle while an ad-hoc child agent is running", () =>
       type: "session.status_changed",
       time: 6 as TimestampMs,
       sessionId: childSessionId,
-      threadId: childThreadId,
       payload: { sessionId: childSessionId, status: "running" },
     },
     {
@@ -1520,7 +1482,6 @@ test("keeps parent execution idle while an ad-hoc child agent is running", () =>
       type: "tool.call_started",
       time: 7 as TimestampMs,
       sessionId: childSessionId,
-      threadId: childThreadId,
       payload: { turnId: "turn_child_running" as TurnId, callId, toolName: "read_file", input: { path: "README.md" } },
     },
     {
@@ -1528,14 +1489,13 @@ test("keeps parent execution idle while an ad-hoc child agent is running", () =>
       type: "session.status_changed",
       time: 8 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, status: "idle" },
     },
   ], createRuntimeView());
 
-  const status = runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" });
+  const status = runtimeDelegationStatus(view, { sessionId, generatedAt: "now" });
 
-  expect(status.parent).toMatchObject({ sessionId, threadId, status: "idle", active: false });
+  expect(status.parent).toMatchObject({ sessionId, status: "idle", active: false });
   expect(status.delegation).toEqual({ supported: true, observed: true, policy: "proactive", source: "session" });
   expect(status.agents.counts).toEqual({
     total: 1,
@@ -1558,7 +1518,6 @@ test("keeps parent execution idle while an ad-hoc child agent is running", () =>
 
 test("projects the last agent batch with one incomplete and four failed tasks", () => {
   const sessionId = "session_partial_agent_batch" as SessionId;
-  const threadId = "thread_partial_agent_batch" as ThreadId;
   const callId = "tool_partial_agent_batch" as ToolCallId;
   const batchId = "batch_partial_agent_batch";
   const taskStatuses = ["incomplete", "failed", "failed", "failed", "failed"] as const;
@@ -1572,15 +1531,12 @@ test("projects the last agent batch with one incomplete and four failed tasks", 
         type: "agent.task_created",
         time: (10 + index * 3) as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           taskId,
           path,
           parentPath: "/root" as AgentPath,
           parentSessionId: sessionId,
-          parentThreadId: threadId,
           childSessionId: `session_partial_${index}` as SessionId,
-          childThreadId: `thread_partial_${index}` as ThreadId,
           taskName: `partial slice ${index}`,
           cwd: "/repo",
           prompt: `Inspect slice ${index}`,
@@ -1598,16 +1554,13 @@ test("projects the last agent batch with one incomplete and four failed tasks", 
         type: "agent.spawned",
         time: (11 + index * 3) as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           runId: `agent_partial_${index}` as AgentRunId,
           taskId,
           path,
           parentPath: "/root" as AgentPath,
           parentSessionId: sessionId,
-          parentThreadId: threadId,
           childSessionId: `session_partial_${index}` as SessionId,
-          childThreadId: `thread_partial_${index}` as ThreadId,
           taskName: `partial slice ${index}`,
           mode: "background",
           generation: 1,
@@ -1624,7 +1577,6 @@ test("projects the last agent batch with one incomplete and four failed tasks", 
         type: "agent.task_completed",
         time: (12 + index * 3) as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           taskId,
           path,
@@ -1642,7 +1594,6 @@ test("projects the last agent batch with one incomplete and four failed tasks", 
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -1650,7 +1601,6 @@ test("projects the last agent batch with one incomplete and four failed tasks", 
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         turnId: "turn_partial_batch" as TurnId,
         callId,
@@ -1664,7 +1614,6 @@ test("projects the last agent batch with one incomplete and four failed tasks", 
       type: "tool.call_finished",
       time: 40 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId, status: "completed", output: JSON.stringify({ tasks: taskIds.map((taskId) => ({ task_id: taskId })) }) },
     },
     {
@@ -1672,12 +1621,11 @@ test("projects the last agent batch with one incomplete and four failed tasks", 
       type: "session.status_changed",
       time: 41 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, status: "idle" },
     },
   ], createRuntimeView());
 
-  const status = runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" });
+  const status = runtimeDelegationStatus(view, { sessionId, generatedAt: "now" });
 
   expect(status.parent).toMatchObject({ status: "idle", active: false });
   expect(status.agents.counts).toEqual({
@@ -1710,7 +1658,6 @@ test("projects the last agent batch with one incomplete and four failed tasks", 
 
 test("keeps the newest batch selected while an older batch finishes late", () => {
   const sessionId = "session_latest_batch" as SessionId;
-  const threadId = "thread_latest_batch" as ThreadId;
   const oldCallId = "tool_old_batch" as ToolCallId;
   const newCallId = "tool_new_batch" as ToolCallId;
   const oldTaskId = "task_old_batch" as TaskId;
@@ -1720,7 +1667,6 @@ test("keeps the newest batch selected while an older batch finishes late", () =>
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -1728,14 +1674,12 @@ test("keeps the newest batch selected while an older batch finishes late", () =>
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_old_batch" as TurnId, callId: oldCallId, toolName: "task_batch", input: { tasks: [{}] } },
     },
     agentTaskCreatedEvent({
       id: "event_old_batch_task",
       time: 3,
       sessionId,
-      threadId,
       taskId: oldTaskId,
       sourceCallId: oldCallId,
       batchId: "batch_old",
@@ -1747,7 +1691,6 @@ test("keeps the newest batch selected while an older batch finishes late", () =>
       type: "tool.call_started",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         turnId: "turn_new_batch" as TurnId,
         callId: newCallId,
@@ -1760,7 +1703,6 @@ test("keeps the newest batch selected while an older batch finishes late", () =>
       type: "agent.task_completed",
       time: 10 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         taskId: oldTaskId,
         path: "/root/task_old_batch" as AgentPath,
@@ -1770,7 +1712,7 @@ test("keeps the newest batch selected while an older batch finishes late", () =>
     },
   ], createRuntimeView());
 
-  const launching = runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" });
+  const launching = runtimeDelegationStatus(view, { sessionId, generatedAt: "now" });
   expect(launching.delegation.observed).toBe(true);
   expect(launching.lastBatch).toMatchObject({
     callId: newCallId,
@@ -1787,10 +1729,9 @@ test("keeps the newest batch selected while an older batch finishes late", () =>
     type: "tool.call_finished",
     time: 11 as TimestampMs,
     sessionId,
-    threadId,
     payload: { callId: newCallId, status: "failed", error: "launch rejected" },
   }], view);
-  const failed = runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" });
+  const failed = runtimeDelegationStatus(view, { sessionId, generatedAt: "now" });
   expect(failed.lastBatch).toMatchObject({
     callId: newCallId,
     total: 0,
@@ -1804,7 +1745,6 @@ test("keeps the newest batch selected while an older batch finishes late", () =>
 
 test("uses partial only when a terminal batch tracks fewer tasks than planned", () => {
   const sessionId = "session_structural_partial" as SessionId;
-  const threadId = "thread_structural_partial" as ThreadId;
   const callId = "tool_structural_partial" as ToolCallId;
   const taskId = "task_structural_partial" as TaskId;
   const view = reduceRuntimeEvents([
@@ -1813,7 +1753,6 @@ test("uses partial only when a terminal batch tracks fewer tasks than planned", 
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -1821,7 +1760,6 @@ test("uses partial only when a terminal batch tracks fewer tasks than planned", 
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         turnId: "turn_structural_partial" as TurnId,
         callId,
@@ -1833,7 +1771,6 @@ test("uses partial only when a terminal batch tracks fewer tasks than planned", 
       id: "event_structural_partial_task",
       time: 3,
       sessionId,
-      threadId,
       taskId,
       sourceCallId: callId,
       batchId: "batch_structural_partial",
@@ -1845,7 +1782,6 @@ test("uses partial only when a terminal batch tracks fewer tasks than planned", 
       type: "agent.task_completed",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: { taskId, path: "/root/task_structural_partial" as AgentPath, status: "completed", summary: "done" },
     },
     {
@@ -1853,12 +1789,11 @@ test("uses partial only when a terminal batch tracks fewer tasks than planned", 
       type: "tool.call_finished",
       time: 5 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId, status: "completed" },
     },
   ], createRuntimeView());
 
-  expect(runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" }).lastBatch).toMatchObject({
+  expect(runtimeDelegationStatus(view, { sessionId, generatedAt: "now" }).lastBatch).toMatchObject({
     callId,
     expected: 3,
     total: 1,
@@ -1872,7 +1807,6 @@ test("uses partial only when a terminal batch tracks fewer tasks than planned", 
 
 test("projects a completed tool envelope with zero successful spawns as a failed batch", () => {
   const sessionId = "session_all_spawns_failed" as SessionId;
-  const threadId = "thread_all_spawns_failed" as ThreadId;
   const callId = "tool_all_spawns_failed" as ToolCallId;
   const view = reduceRuntimeEvents([
     {
@@ -1880,7 +1814,6 @@ test("projects a completed tool envelope with zero successful spawns as a failed
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -1888,7 +1821,6 @@ test("projects a completed tool envelope with zero successful spawns as a failed
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         turnId: "turn_all_spawns_failed" as TurnId,
         callId,
@@ -1901,7 +1833,6 @@ test("projects a completed tool envelope with zero successful spawns as a failed
       type: "tool.call_finished",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         callId,
         status: "completed",
@@ -1920,7 +1851,7 @@ test("projects a completed tool envelope with zero successful spawns as a failed
     },
   ], createRuntimeView());
 
-  const status = runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" });
+  const status = runtimeDelegationStatus(view, { sessionId, generatedAt: "now" });
   expect(status.delegation.observed).toBe(true);
   expect(status.lastBatch).toMatchObject({
     callId,
@@ -1943,7 +1874,6 @@ test("projects a completed tool envelope with zero successful spawns as a failed
 
 test("keeps a partially spawned completed tool envelope structurally partial", () => {
   const sessionId = "session_partial_spawn" as SessionId;
-  const threadId = "thread_partial_spawn" as ThreadId;
   const callId = "tool_partial_spawn" as ToolCallId;
   const firstTaskId = "task_partial_spawn_first" as TaskId;
   const thirdTaskId = "task_partial_spawn_third" as TaskId;
@@ -1953,7 +1883,6 @@ test("keeps a partially spawned completed tool envelope structurally partial", (
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -1961,7 +1890,6 @@ test("keeps a partially spawned completed tool envelope structurally partial", (
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         turnId: "turn_partial_spawn" as TurnId,
         callId,
@@ -1973,7 +1901,6 @@ test("keeps a partially spawned completed tool envelope structurally partial", (
       id: "event_partial_spawn_first_task",
       time: 3,
       sessionId,
-      threadId,
       taskId: firstTaskId,
       sourceCallId: callId,
       batchId: "batch_partial_spawn",
@@ -1984,7 +1911,6 @@ test("keeps a partially spawned completed tool envelope structurally partial", (
       id: "event_partial_spawn_third_task",
       time: 4,
       sessionId,
-      threadId,
       taskId: thirdTaskId,
       sourceCallId: callId,
       batchId: "batch_partial_spawn",
@@ -1996,7 +1922,6 @@ test("keeps a partially spawned completed tool envelope structurally partial", (
       type: "tool.call_updated",
       time: 5 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         callId,
         status: "running",
@@ -2012,7 +1937,6 @@ test("keeps a partially spawned completed tool envelope structurally partial", (
       type: "tool.call_finished",
       time: 6 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         callId,
         status: "completed",
@@ -2024,7 +1948,7 @@ test("keeps a partially spawned completed tool envelope structurally partial", (
     },
   ], createRuntimeView());
 
-  expect(runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" }).lastBatch).toMatchObject({
+  expect(runtimeDelegationStatus(view, { sessionId, generatedAt: "now" }).lastBatch).toMatchObject({
     callId,
     expected: 3,
     taskIds: [firstTaskId, thirdTaskId],
@@ -2043,7 +1967,6 @@ test("keeps a partially spawned completed tool envelope structurally partial", (
 
 test("keeps historical team workers out of ad-hoc agents after redispatch", () => {
   const sessionId = "session_team_redispatch" as SessionId;
-  const threadId = "thread_team_redispatch" as ThreadId;
   const teamId = "team_redispatch" as TeamId;
   const teamTaskId = "task_team_redispatch" as TaskId;
   const firstWorkerTaskId = "task_team_worker_first" as TaskId;
@@ -2054,7 +1977,6 @@ test("keeps historical team workers out of ad-hoc agents after redispatch", () =
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -2062,7 +1984,6 @@ test("keeps historical team workers out of ad-hoc agents after redispatch", () =
       type: "team.created",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { teamId, name: "redispatch", leadPath: "/root" as AgentPath },
     },
     {
@@ -2070,90 +1991,80 @@ test("keeps historical team workers out of ad-hoc agents after redispatch", () =
       type: "team.task_created",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: { teamId, taskId: teamTaskId, title: "retry work" },
     },
-    agentTaskCreatedEvent({ id: "event_first_team_worker", time: 4, sessionId, threadId, taskId: firstWorkerTaskId }),
+    agentTaskCreatedEvent({ id: "event_first_team_worker", time: 4, sessionId, taskId: firstWorkerTaskId }),
     {
       id: "event_first_team_binding",
       type: "team.task_updated",
       time: 5 as TimestampMs,
       sessionId,
-      threadId,
       payload: { teamId, taskId: teamTaskId, metadata: { chiliTeamDispatch: { agentTaskId: firstWorkerTaskId } } },
     },
-    agentTaskCreatedEvent({ id: "event_second_team_worker", time: 6, sessionId, threadId, taskId: secondWorkerTaskId }),
+    agentTaskCreatedEvent({ id: "event_second_team_worker", time: 6, sessionId, taskId: secondWorkerTaskId }),
     {
       id: "event_second_team_binding",
       type: "team.task_updated",
       time: 7 as TimestampMs,
       sessionId,
-      threadId,
       payload: { teamId, taskId: teamTaskId, metadata: { chiliTeamDispatch: { agentTaskId: secondWorkerTaskId } } },
     },
   ], createRuntimeView());
 
-  const status = runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" });
+  const status = runtimeDelegationStatus(view, { sessionId, generatedAt: "now" });
   expect(status.agents.counts.total).toBe(0);
   expect(status.agents.items).toEqual([]);
   expect(status.team).toMatchObject({ count: 1, activeCount: 1, selectedTeamId: teamId });
 });
 
-test("resolves thread-only scope without admitting unscoped sibling records", () => {
-  const firstSessionId = "session_thread_scope_first" as SessionId;
-  const firstThreadId = "thread_scope_first" as ThreadId;
-  const secondSessionId = "session_thread_scope_second" as SessionId;
-  const secondThreadId = "thread_scope_second" as ThreadId;
-  const firstTaskId = "task_thread_scope_first" as TaskId;
+test("scopes delegation records by session", () => {
+  const firstSessionId = "session_scope_first" as SessionId;
+  const secondSessionId = "session_scope_second" as SessionId;
+  const firstTaskId = "task_scope_first" as TaskId;
+  const firstSiblingTaskId = "task_scope_first_sibling" as TaskId;
   const view = reduceRuntimeEvents([
     {
-      id: "event_thread_scope_first_session",
+      id: "event_scope_first_session",
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId: firstSessionId,
-      threadId: firstThreadId,
       payload: { sessionId: firstSessionId, cwd: "/repo" },
     },
     agentTaskCreatedEvent({
-      id: "event_thread_scope_exact_task",
+      id: "event_scope_first_task",
       time: 2,
       sessionId: firstSessionId,
-      threadId: firstThreadId,
       taskId: firstTaskId,
     }),
     agentTaskCreatedEvent({
-      id: "event_thread_scope_unscoped_task",
+      id: "event_scope_first_sibling_task",
       time: 3,
       sessionId: firstSessionId,
-      taskId: "task_thread_scope_unscoped" as TaskId,
+      taskId: firstSiblingTaskId,
     }),
     {
-      id: "event_thread_scope_second_session",
+      id: "event_scope_second_session",
       type: "session.created",
       time: 4 as TimestampMs,
       sessionId: secondSessionId,
-      threadId: secondThreadId,
       payload: { sessionId: secondSessionId, cwd: "/repo" },
     },
     agentTaskCreatedEvent({
-      id: "event_thread_scope_second_task",
+      id: "event_scope_second_task",
       time: 5,
       sessionId: secondSessionId,
-      threadId: secondThreadId,
-      taskId: "task_thread_scope_second" as TaskId,
+      taskId: "task_scope_second" as TaskId,
     }),
   ], createRuntimeView());
 
-  const status = runtimeDelegationStatus(view, { threadId: firstThreadId, generatedAt: "now" });
-  expect(status.parent).toMatchObject({ sessionId: firstSessionId, threadId: firstThreadId });
-  expect(status.agents.items.map((item) => item.taskId)).toEqual([firstTaskId]);
+  const status = runtimeDelegationStatus(view, { sessionId: firstSessionId, generatedAt: "now" });
+  expect(status.parent).toMatchObject({ sessionId: firstSessionId });
+  expect(status.agents.items.map((item) => item.taskId)).toEqual([firstSiblingTaskId, firstTaskId]);
 });
 
 test("prefers the highest agent generation and current child turn activity", () => {
   const sessionId = "session_generation_activity" as SessionId;
-  const threadId = "thread_generation_activity" as ThreadId;
   const childSessionId = "session_generation_activity_child" as SessionId;
-  const childThreadId = "thread_generation_activity_child" as ThreadId;
   const taskId = "task_generation_activity" as TaskId;
   const currentRunId = "agent_generation_current" as AgentRunId;
   const staleRunId = "agent_generation_stale" as AgentRunId;
@@ -2165,16 +2076,14 @@ test("prefers the highest agent generation and current child turn activity", () 
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
-    agentTaskCreatedEvent({ id: "event_generation_task", time: 2, sessionId, threadId, taskId, path, childSessionId, childThreadId }),
+    agentTaskCreatedEvent({ id: "event_generation_task", time: 2, sessionId, taskId, path, childSessionId }),
     {
       id: "event_generation_current_spawn",
       type: "agent.spawned",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         runId: currentRunId,
         taskId,
@@ -2183,9 +2092,7 @@ test("prefers the highest agent generation and current child turn activity", () 
         generation: 2,
         parentPath: "/root" as AgentPath,
         parentSessionId: sessionId,
-        parentThreadId: threadId,
         childSessionId,
-        childThreadId,
         mode: "background",
       },
     },
@@ -2194,7 +2101,6 @@ test("prefers the highest agent generation and current child turn activity", () 
       type: "session.created",
       time: 4 as TimestampMs,
       sessionId: childSessionId,
-      threadId: childThreadId,
       payload: { sessionId: childSessionId, cwd: "/repo" },
     },
     {
@@ -2202,7 +2108,6 @@ test("prefers the highest agent generation and current child turn activity", () 
       type: "turn.started",
       time: 5 as TimestampMs,
       sessionId: childSessionId,
-      threadId: childThreadId,
       payload: { turnId: "turn_generation_old" as TurnId },
     },
     {
@@ -2210,7 +2115,6 @@ test("prefers the highest agent generation and current child turn activity", () 
       type: "tool.call_started",
       time: 6 as TimestampMs,
       sessionId: childSessionId,
-      threadId: childThreadId,
       payload: {
         turnId: "turn_generation_old" as TurnId,
         callId: "tool_generation_old" as ToolCallId,
@@ -2223,7 +2127,6 @@ test("prefers the highest agent generation and current child turn activity", () 
       type: "turn.started",
       time: 7 as TimestampMs,
       sessionId: childSessionId,
-      threadId: childThreadId,
       payload: { turnId: currentTurnId },
     },
     {
@@ -2231,7 +2134,6 @@ test("prefers the highest agent generation and current child turn activity", () 
       type: "tool.call_started",
       time: 8 as TimestampMs,
       sessionId: childSessionId,
-      threadId: childThreadId,
       payload: {
         turnId: currentTurnId,
         callId: "tool_generation_current" as ToolCallId,
@@ -2244,7 +2146,6 @@ test("prefers the highest agent generation and current child turn activity", () 
       type: "agent.completed",
       time: 9 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         runId: staleRunId,
         taskId,
@@ -2256,7 +2157,7 @@ test("prefers the highest agent generation and current child turn activity", () 
     },
   ], createRuntimeView());
 
-  const status = runtimeDelegationStatus(view, { sessionId, threadId, generatedAt: "now" });
+  const status = runtimeDelegationStatus(view, { sessionId, generatedAt: "now" });
   expect(status.agents.items[0]).toMatchObject({
     taskId,
     runId: currentRunId,
@@ -2267,7 +2168,6 @@ test("prefers the highest agent generation and current child turn activity", () 
 
 test("a higher-generation completion supersedes a stale completion for the same run", () => {
   const sessionId = "session_completion_generation" as SessionId;
-  const threadId = "thread_completion_generation" as ThreadId;
   const taskId = "task_completion_generation" as TaskId;
   const runId = "agent_completion_generation" as AgentRunId;
   const path = "/root/completion-generation" as AgentPath;
@@ -2277,7 +2177,6 @@ test("a higher-generation completion supersedes a stale completion for the same 
       type: "agent.spawned",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { runId, taskId, path, taskName: "generation", generation: 1 },
     },
     {
@@ -2285,7 +2184,6 @@ test("a higher-generation completion supersedes a stale completion for the same 
       type: "agent.completed",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         runId,
         taskId,
@@ -2300,7 +2198,6 @@ test("a higher-generation completion supersedes a stale completion for the same 
       type: "agent.completed",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         runId,
         taskId,
@@ -2315,7 +2212,6 @@ test("a higher-generation completion supersedes a stale completion for the same 
       type: "agent.completed",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         runId,
         taskId,
@@ -2336,7 +2232,6 @@ test("a higher-generation completion supersedes a stale completion for the same 
 
 test("projects inline batch progress, interactions, terminal errors, and stable resume history", () => {
   const sessionId = "session_inline_batch" as SessionId;
-  const threadId = "thread_inline_batch" as ThreadId;
   const callId = "call_inline_batch" as ToolCallId;
   const batchId = "batch_inline";
   const taskSpecs = [
@@ -2350,7 +2245,6 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -2358,7 +2252,6 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         turnId: "turn_inline_spawn" as TurnId,
         callId,
@@ -2376,7 +2269,6 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       createdAt: 3 + index,
       spawnedAt: 6,
       sessionId,
-      threadId,
       callId,
       batchId,
       batchIndex: index,
@@ -2395,7 +2287,6 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       type: "tool.call_finished",
       time: 8 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         callId,
         status: "completed",
@@ -2413,7 +2304,6 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       id: "inline_routes_first",
       time: 9,
       sessionId,
-      threadId,
       taskId: taskSpecs[0]!.taskId,
       path: taskSpecs[0]!.path,
       runId: "run_inline_0_first" as AgentRunId,
@@ -2426,14 +2316,12 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       type: "agent.message_queued",
       time: 10 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         taskId: taskSpecs[0]!.taskId,
         path: taskSpecs[0]!.path,
         from: "/root" as AgentPath,
         triggerTurn: true,
-        childSessionId: "session_inline_0" as SessionId,
-        childThreadId: "thread_inline_0" as ThreadId,
+        recipientSessionId: "session_inline_0" as SessionId,
         message: { role: "user", content: "Recheck the cache edge.\nReport concrete evidence.\u0007" },
       },
     },
@@ -2442,7 +2330,6 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       type: "agent.message_claimed",
       time: 11 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "mail_inline_followup", taskId: taskSpecs[0]!.taskId, path: taskSpecs[0]!.path },
     },
     ...inlineTaskStartEvents({
@@ -2450,7 +2337,6 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       createdAt: 3,
       spawnedAt: 12,
       sessionId,
-      threadId,
       callId,
       batchId,
       batchIndex: 0,
@@ -2469,7 +2355,6 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       id: "inline_shell_terminal",
       time: 13,
       sessionId,
-      threadId,
       taskId: taskSpecs[1]!.taskId,
       path: taskSpecs[1]!.path,
       runId: "run_inline_1_first" as AgentRunId,
@@ -2481,7 +2366,6 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       id: "inline_routes_terminal",
       time: 14,
       sessionId,
-      threadId,
       taskId: taskSpecs[0]!.taskId,
       path: taskSpecs[0]!.path,
       runId: "run_inline_0_followup" as AgentRunId,
@@ -2494,13 +2378,12 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       type: "agent.message_consumed",
       time: 15 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "mail_inline_followup", taskId: taskSpecs[0]!.taskId, path: taskSpecs[0]!.path },
     },
   ];
   const view = reduceRuntimeEvents(events, createRuntimeView());
 
-  const live = chatAgentBatches(view, { sessionId, threadId });
+  const live = chatAgentBatches(view, { sessionId });
   expect(live).toHaveLength(1);
   expect(live[0]).toMatchObject({
     callId,
@@ -2530,6 +2413,9 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
     followupCount: 1,
     summary: "cache edge verified",
   });
+  expect(view.mailboxMessages.mail_inline_followup).toMatchObject({
+    recipientSessionId: "session_inline_0",
+  });
   expect(live[0]!.agents[0]!.error).toBeUndefined();
   expect(live[0]!.messages[0]).toMatchObject({
     id: "mail_inline_followup",
@@ -2544,7 +2430,6 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
     id: "inline_tests_terminal",
     time: 16,
     sessionId,
-    threadId,
     taskId: taskSpecs[2]!.taskId,
     path: taskSpecs[2]!.path,
     runId: "run_inline_2_first" as AgentRunId,
@@ -2554,7 +2439,7 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
   });
   reduceRuntimeEvents(terminalEvents, view);
   events.push(...terminalEvents);
-  expect(chatAgentBatches(view, { sessionId, threadId })[0]).toMatchObject({
+  expect(chatAgentBatches(view, { sessionId })[0]).toMatchObject({
     status: "mixed",
     terminal: true,
     progress: { terminal: 3, expected: 3 },
@@ -2572,13 +2457,11 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
     type: "agent.message_queued",
     time: 17 as TimestampMs,
     sessionId,
-    threadId,
     payload: {
       path: "/root" as AgentPath,
       from: taskSpecs[0]!.path,
       triggerTurn: true,
-      childSessionId: sessionId,
-      childThreadId: threadId,
+      recipientSessionId: sessionId,
       message: {
         role: "user",
         content: completionText,
@@ -2595,7 +2478,7 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
   };
   reduceRuntimeEvents([completionQueued], view);
   events.push(completionQueued);
-  const notified = chatAgentBatches(view, { sessionId, threadId })[0];
+  const notified = chatAgentBatches(view, { sessionId })[0];
   expect(notified).toMatchObject({
     integration: { required: true, status: "ready", evidence: "mailbox_queued", messageId: "mail_inline_completion" },
   });
@@ -2606,6 +2489,7 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
     kind: "subagent_completion_batch",
     metadataSummary: { batchId, completionPolicy: "notify", total: 3, expectedBatchSize: 3 },
   });
+  expect(view.mailboxMessages.mail_inline_completion).toMatchObject({ recipientSessionId: sessionId });
 
   const integrationStarted: ChiliEvent[] = [
     {
@@ -2613,7 +2497,6 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       type: "turn.started",
       time: 18 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_integrate" as TurnId },
     },
     {
@@ -2621,7 +2504,6 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       type: "message.created",
       time: 19 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "message_inline_prompt" as MessageId, role: "user", turnId: "turn_inline_integrate" as TurnId },
     },
     {
@@ -2629,7 +2511,6 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       type: "message.part_added",
       time: 20 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId: "message_inline_prompt" as MessageId,
         part: { id: "part_inline_prompt" as PartId, messageId: "message_inline_prompt" as MessageId, sessionId, type: "text", text: completionText },
@@ -2638,7 +2519,7 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
   ];
   reduceRuntimeEvents(integrationStarted, view);
   events.push(...integrationStarted);
-  expect(chatAgentBatches(view, { sessionId, threadId })[0]?.integration).toMatchObject({
+  expect(chatAgentBatches(view, { sessionId })[0]?.integration).toMatchObject({
     status: "integrating",
     evidence: "parent_turn_started",
     turnId: "turn_inline_integrate",
@@ -2650,7 +2531,6 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       type: "message.created",
       time: 21 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "message_inline_response" as MessageId, role: "assistant", turnId: "turn_inline_integrate" as TurnId },
     },
     {
@@ -2658,7 +2538,6 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       type: "message.part_added",
       time: 22 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId: "message_inline_response" as MessageId,
         part: { id: "part_inline_response" as PartId, messageId: "message_inline_response" as MessageId, sessionId, type: "text", text: "Routes verified; shell evidence is incomplete; tests hit quota.", phase: "final_answer" },
@@ -2669,7 +2548,6 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       type: "turn.completed",
       time: 23 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_integrate" as TurnId, status: "completed" },
     },
     {
@@ -2677,13 +2555,12 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
       type: "agent.message_consumed",
       time: 24 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "mail_inline_completion" },
     },
   ];
   reduceRuntimeEvents(integrationFinished, view);
   events.push(...integrationFinished);
-  const completed = chatAgentBatches(view, { sessionId, threadId });
+  const completed = chatAgentBatches(view, { sessionId });
   expect(completed[0]?.integration).toMatchObject({
     status: "responded",
     evidence: "assistant_response_after_terminal_result",
@@ -2697,13 +2574,12 @@ test("projects inline batch progress, interactions, terminal errors, and stable 
 
   const once = structuredClone(completed);
   reduceRuntimeEvents(events, view);
-  expect(chatAgentBatches(view, { sessionId, threadId })).toEqual(once);
-  expect(chatAgentBatches(reduceRuntimeEvents(events, createRuntimeView()), { sessionId, threadId })).toEqual(once);
+  expect(chatAgentBatches(view, { sessionId })).toEqual(once);
+  expect(chatAgentBatches(reduceRuntimeEvents(events, createRuntimeView()), { sessionId })).toEqual(once);
 });
 
 test("projects a single task as an expected-one card with initial generation two", () => {
   const sessionId = "session_inline_single" as SessionId;
-  const threadId = "thread_inline_single" as ThreadId;
   const callId = "call_inline_single" as ToolCallId;
   const taskId = "task_inline_single_hash" as TaskId;
   const path = "/root/task_inline_single_hash" as AgentPath;
@@ -2713,7 +2589,6 @@ test("projects a single task as an expected-one card with initial generation two
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -2721,7 +2596,6 @@ test("projects a single task as an expected-one card with initial generation two
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         turnId: "turn_inline_single" as TurnId,
         callId,
@@ -2734,7 +2608,6 @@ test("projects a single task as an expected-one card with initial generation two
       createdAt: 3,
       spawnedAt: 4,
       sessionId,
-      threadId,
       callId,
       completionPolicy: "detached",
       taskId,
@@ -2748,7 +2621,6 @@ test("projects a single task as an expected-one card with initial generation two
       id: "inline_single_terminal",
       time: 5,
       sessionId,
-      threadId,
       taskId,
       path,
       runId: "run_inline_single" as AgentRunId,
@@ -2761,11 +2633,10 @@ test("projects a single task as an expected-one card with initial generation two
       type: "tool.call_finished",
       time: 6 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId, status: "completed", output: JSON.stringify({ taskId, status: "completed", summary: "single result" }) },
     },
   ];
-  const card = chatAgentBatches(reduceRuntimeEvents(events, createRuntimeView()), { sessionId, threadId })[0];
+  const card = chatAgentBatches(reduceRuntimeEvents(events, createRuntimeView()), { sessionId })[0];
 
   expect(card).toMatchObject({
     callId,
@@ -2786,7 +2657,6 @@ test("projects a single task as an expected-one card with initial generation two
 
 test("does not infer a follow-up turn from an external generation-three cancellation", () => {
   const sessionId = "session_inline_cancelled_generation" as SessionId;
-  const threadId = "thread_inline_cancelled_generation" as ThreadId;
   const callId = "call_inline_cancelled_generation" as ToolCallId;
   const taskId = "task_inline_cancelled_generation" as TaskId;
   const path = "/root/task_inline_cancelled_generation" as AgentPath;
@@ -2797,7 +2667,6 @@ test("does not infer a follow-up turn from an external generation-three cancella
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -2805,7 +2674,6 @@ test("does not infer a follow-up turn from an external generation-three cancella
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         turnId: "turn_inline_cancelled_generation" as TurnId,
         callId,
@@ -2823,7 +2691,6 @@ test("does not infer a follow-up turn from an external generation-three cancella
       createdAt: 3,
       spawnedAt: 4,
       sessionId,
-      threadId,
       callId,
       completionPolicy: "detached",
       taskId,
@@ -2838,14 +2705,12 @@ test("does not infer a follow-up turn from an external generation-three cancella
       type: "tool.call_finished",
       time: 5 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId, status: "completed", output: JSON.stringify({ taskId, status: "running" }) },
     },
     ...inlineTaskTerminalEvents({
       id: "inline_cancelled_generation_terminal",
       time: 6,
       sessionId,
-      threadId,
       taskId,
       path,
       runId,
@@ -2855,7 +2720,7 @@ test("does not infer a follow-up turn from an external generation-three cancella
     }),
   ];
   const view = reduceRuntimeEvents(events, createRuntimeView());
-  const card = chatAgentBatches(view, { sessionId, threadId })[0];
+  const card = chatAgentBatches(view, { sessionId })[0];
 
   expect(view.agentRunIds).toEqual([runId]);
   expect(view.tasks[taskId]).toMatchObject({ status: "cancelled", generation: 3 });
@@ -2871,7 +2736,6 @@ test("does not infer a follow-up turn from an external generation-three cancella
 
 test("computes observed peak concurrency independently from the requested batch cap", () => {
   const sessionId = "session_inline_peak" as SessionId;
-  const threadId = "thread_inline_peak" as ThreadId;
   const callId = "call_inline_peak" as ToolCallId;
   const batchId = "batch_inline_peak";
   const taskIds = Array.from({ length: 10 }, (_, index) => `task_inline_peak_${index}` as TaskId);
@@ -2881,7 +2745,6 @@ test("computes observed peak concurrency independently from the requested batch 
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -2889,7 +2752,6 @@ test("computes observed peak concurrency independently from the requested batch 
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         turnId: "turn_inline_peak" as TurnId,
         callId,
@@ -2913,7 +2775,6 @@ test("computes observed peak concurrency independently from the requested batch 
           createdAt: 3 + index,
           spawnedAt: start,
           sessionId,
-          threadId,
           callId,
           batchId,
           batchIndex: index,
@@ -2931,7 +2792,6 @@ test("computes observed peak concurrency independently from the requested batch 
           id: `inline_peak_terminal_${index}`,
           time: start + 10,
           sessionId,
-          threadId,
           taskId,
           path,
           runId,
@@ -2946,11 +2806,10 @@ test("computes observed peak concurrency independently from the requested batch 
       type: "tool.call_finished",
       time: 51 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId, status: "completed", output: JSON.stringify({ expectedBatchSize: 10, spawnedCount: 10, tasks: taskIds.map((taskId) => ({ taskId, status: "completed" })) }) },
     },
   ];
-  const card = chatAgentBatches(reduceRuntimeEvents(events, createRuntimeView()), { sessionId, threadId })[0];
+  const card = chatAgentBatches(reduceRuntimeEvents(events, createRuntimeView()), { sessionId })[0];
 
   expect(card).toMatchObject({
     expected: 10,
@@ -2964,7 +2823,6 @@ test("computes observed peak concurrency independently from the requested batch 
 
 test("associates cross-turn join continuation but rejects an unrelated later user turn", () => {
   const sessionId = "session_inline_join" as SessionId;
-  const threadId = "thread_inline_join" as ThreadId;
   const callId = "call_inline_join" as ToolCallId;
   const taskId = "task_inline_join" as TaskId;
   const path = "/root/join" as AgentPath;
@@ -2974,7 +2832,6 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -2982,7 +2839,6 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_join_tool" as TurnId, callId, toolName: "task_batch", input: { completionPolicy: "join", tasks: [{ description: "join", prompt: "join prompt" }] } },
     },
     ...inlineTaskStartEvents({
@@ -2990,7 +2846,6 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       createdAt: 3,
       spawnedAt: 3,
       sessionId,
-      threadId,
       callId,
       batchId: "batch_inline_join",
       batchIndex: 0,
@@ -3007,7 +2862,6 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       id: "inline_join_terminal",
       time: 4,
       sessionId,
-      threadId,
       taskId,
       path,
       runId: "run_inline_join" as AgentRunId,
@@ -3020,7 +2874,6 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       type: "tool.call_finished",
       time: 5 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId, status: "completed", output: JSON.stringify({ tasks: [{ taskId, status: "completed", summary: "joined result" }] }) },
     },
     {
@@ -3028,7 +2881,6 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       type: "turn.completed",
       time: 6 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_join_tool" as TurnId, status: "completed" },
     },
   ];
@@ -3039,7 +2891,6 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       type: "turn.started",
       time: 7 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_join_commentary" as TurnId },
     },
     {
@@ -3047,7 +2898,6 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       type: "message.created",
       time: 8 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "message_inline_join_commentary" as MessageId, role: "assistant", turnId: "turn_inline_join_commentary" as TurnId },
     },
     {
@@ -3055,14 +2905,13 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       type: "message.part_added",
       time: 9 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId: "message_inline_join_commentary" as MessageId,
         part: { id: "part_inline_join_commentary" as PartId, messageId: "message_inline_join_commentary" as MessageId, sessionId, type: "text", text: "Still checking the joined result.", phase: "commentary" },
       },
     },
   ], createRuntimeView());
-  expect(chatAgentBatches(commentaryView, { sessionId, threadId })[0]?.integration).toMatchObject({
+  expect(chatAgentBatches(commentaryView, { sessionId })[0]?.integration).toMatchObject({
     status: "integrating",
     evidence: "parent_turn_started",
     turnId: "turn_inline_join_commentary",
@@ -3075,7 +2924,6 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       type: "turn.started",
       time: 7 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_join_continuation" as TurnId },
     },
     {
@@ -3083,7 +2931,6 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       type: "message.created",
       time: 8 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "message_inline_join_answer" as MessageId, role: "assistant", turnId: "turn_inline_join_continuation" as TurnId },
     },
     {
@@ -3091,7 +2938,6 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       type: "message.part_added",
       time: 9 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "message_inline_join_answer" as MessageId, part: { id: "part_inline_join_answer" as PartId, messageId: "message_inline_join_answer" as MessageId, sessionId, type: "text", text: "Integrated joined result.", phase: "final_answer" } },
     },
     {
@@ -3099,11 +2945,10 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       type: "turn.completed",
       time: 10 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_join_continuation" as TurnId, status: "completed" },
     },
   ], createRuntimeView());
-  expect(chatAgentBatches(continuationView, { sessionId, threadId })[0]?.integration).toMatchObject({
+  expect(chatAgentBatches(continuationView, { sessionId })[0]?.integration).toMatchObject({
     status: "responded",
     evidence: "assistant_response_after_terminal_result",
     turnId: "turn_inline_join_continuation",
@@ -3117,7 +2962,6 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       type: "message.created",
       time: 7 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "message_inline_join_unrelated_prompt" as MessageId, role: "user", turnId: "turn_inline_join_unrelated" as TurnId },
     },
     {
@@ -3125,7 +2969,6 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       type: "message.part_added",
       time: 8 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "message_inline_join_unrelated_prompt" as MessageId, part: { id: "part_inline_join_unrelated_prompt" as PartId, messageId: "message_inline_join_unrelated_prompt" as MessageId, sessionId, type: "text", text: "A separate new question." } },
     },
     {
@@ -3133,7 +2976,6 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       type: "turn.started",
       time: 9 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_join_unrelated" as TurnId },
     },
     {
@@ -3141,7 +2983,6 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       type: "message.created",
       time: 10 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "message_inline_join_unrelated_answer" as MessageId, role: "assistant", turnId: "turn_inline_join_unrelated" as TurnId },
     },
     {
@@ -3149,11 +2990,10 @@ test("associates cross-turn join continuation but rejects an unrelated later use
       type: "message.part_added",
       time: 11 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "message_inline_join_unrelated_answer" as MessageId, part: { id: "part_inline_join_unrelated_answer" as PartId, messageId: "message_inline_join_unrelated_answer" as MessageId, sessionId, type: "text", text: "Unrelated answer.", phase: "final_answer" } },
     },
   ], createRuntimeView());
-  expect(chatAgentBatches(unrelatedView, { sessionId, threadId })[0]?.integration).toMatchObject({
+  expect(chatAgentBatches(unrelatedView, { sessionId })[0]?.integration).toMatchObject({
     status: "ready",
     evidence: "tool_result",
   });
@@ -3161,7 +3001,6 @@ test("associates cross-turn join continuation but rejects an unrelated later use
 
 test("uses an exact terminal task_followup result to associate a later tool continuation", () => {
   const sessionId = "session_inline_followup_integration" as SessionId;
-  const threadId = "thread_inline_followup_integration" as ThreadId;
   const callId = "call_inline_followup_origin" as ToolCallId;
   const taskId = "task_inline_followup_integration" as TaskId;
   const path = "/root/followup-integration" as AgentPath;
@@ -3171,7 +3010,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -3179,7 +3017,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_followup_origin" as TurnId, callId, toolName: "task_batch", input: { completionPolicy: "join", tasks: [{ description: "review", prompt: "initial review" }] } },
     },
     ...inlineTaskStartEvents({
@@ -3187,7 +3024,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       createdAt: 3,
       spawnedAt: 3,
       sessionId,
-      threadId,
       callId,
       batchId: "batch_inline_followup_integration",
       batchIndex: 0,
@@ -3204,7 +3040,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       id: "inline_followup_initial_terminal",
       time: 4,
       sessionId,
-      threadId,
       taskId,
       path,
       runId: "run_inline_followup_initial" as AgentRunId,
@@ -3217,7 +3052,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       type: "tool.call_finished",
       time: 5 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId, status: "completed", output: JSON.stringify({ tasks: [{ taskId, status: "completed", generation: 2, summary: "initial answer" }] }) },
     },
     {
@@ -3225,7 +3059,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       type: "turn.completed",
       time: 6 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_followup_origin" as TurnId, status: "completed" },
     },
     {
@@ -3233,7 +3066,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       type: "message.created",
       time: 8 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "message_inline_followup_user" as MessageId, role: "user", turnId: "turn_inline_followup_tool" as TurnId },
     },
     {
@@ -3241,7 +3073,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       type: "message.part_added",
       time: 9 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId: "message_inline_followup_user" as MessageId,
         part: { id: "part_inline_followup_user" as PartId, messageId: "message_inline_followup_user" as MessageId, sessionId, type: "text", text: "Please recheck the edge case." },
@@ -3252,7 +3083,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       type: "turn.started",
       time: 10 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_followup_tool" as TurnId },
     },
     {
@@ -3260,7 +3090,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       type: "tool.call_started",
       time: 11 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         turnId: "turn_inline_followup_tool" as TurnId,
         callId: "call_inline_followup_exact" as ToolCallId,
@@ -3273,7 +3102,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       createdAt: 3,
       spawnedAt: 12,
       sessionId,
-      threadId,
       callId,
       batchId: "batch_inline_followup_integration",
       batchIndex: 0,
@@ -3291,7 +3119,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       id: "inline_followup_second_terminal",
       time: 13,
       sessionId,
-      threadId,
       taskId,
       path,
       runId: "run_inline_followup_second" as AgentRunId,
@@ -3304,7 +3131,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       type: "tool.call_finished",
       time: 14 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         callId: "call_inline_followup_exact" as ToolCallId,
         status: "completed",
@@ -3316,7 +3142,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       type: "turn.completed",
       time: 15 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_followup_tool" as TurnId, status: "completed" },
     },
     {
@@ -3324,7 +3149,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       type: "turn.started",
       time: 16 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_followup_continuation" as TurnId },
     },
     {
@@ -3332,7 +3156,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       type: "message.created",
       time: 17 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "message_inline_followup_answer" as MessageId, role: "assistant", turnId: "turn_inline_followup_continuation" as TurnId },
     },
     {
@@ -3340,7 +3163,6 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       type: "message.part_added",
       time: 18 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId: "message_inline_followup_answer" as MessageId,
         part: { id: "part_inline_followup_answer" as PartId, messageId: "message_inline_followup_answer" as MessageId, sessionId, type: "text", text: "The rechecked answer covers the edge case.", phase: "final_answer" },
@@ -3351,12 +3173,11 @@ test("uses an exact terminal task_followup result to associate a later tool cont
       type: "turn.completed",
       time: 19 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_followup_continuation" as TurnId, status: "completed" },
     },
   ];
 
-  const matched = chatAgentBatches(reduceRuntimeEvents(followupEvents(taskId, taskId), createRuntimeView()), { sessionId, threadId })[0];
+  const matched = chatAgentBatches(reduceRuntimeEvents(followupEvents(taskId, taskId), createRuntimeView()), { sessionId })[0];
   expect(matched?.agents[0]).toMatchObject({
     taskId,
     runId: "run_inline_followup_second",
@@ -3375,14 +3196,13 @@ test("uses an exact terminal task_followup result to associate a later tool cont
   const unrelatedTaskId = "task_inline_followup_unrelated" as TaskId;
   const mismatched = chatAgentBatches(
     reduceRuntimeEvents(followupEvents(unrelatedTaskId, unrelatedTaskId), createRuntimeView()),
-    { sessionId, threadId },
+    { sessionId },
   )[0];
   expect(mismatched?.integration).toMatchObject({ status: "ready", evidence: "results_ready" });
 });
 
 test("uses a plain zero-spawn tool failure as continuation evidence", () => {
   const sessionId = "session_inline_plain_failure" as SessionId;
-  const threadId = "thread_inline_plain_failure" as ThreadId;
   const callId = "call_inline_plain_failure" as ToolCallId;
   const view = reduceRuntimeEvents([
     {
@@ -3390,7 +3210,6 @@ test("uses a plain zero-spawn tool failure as continuation evidence", () => {
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -3398,7 +3217,6 @@ test("uses a plain zero-spawn tool failure as continuation evidence", () => {
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_plain_failure_tool" as TurnId, callId, toolName: "task_batch", input: { tasks: [{}, {}, {}] } },
     },
     {
@@ -3406,7 +3224,6 @@ test("uses a plain zero-spawn tool failure as continuation evidence", () => {
       type: "tool.call_finished",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId, status: "failed", error: "provider rejected every spawn" },
     },
     {
@@ -3414,7 +3231,6 @@ test("uses a plain zero-spawn tool failure as continuation evidence", () => {
       type: "turn.completed",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_plain_failure_tool" as TurnId, status: "completed" },
     },
     {
@@ -3422,7 +3238,6 @@ test("uses a plain zero-spawn tool failure as continuation evidence", () => {
       type: "turn.started",
       time: 5 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_plain_failure_continuation" as TurnId },
     },
     {
@@ -3430,7 +3245,6 @@ test("uses a plain zero-spawn tool failure as continuation evidence", () => {
       type: "message.created",
       time: 6 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "message_inline_plain_failure_answer" as MessageId, role: "assistant", turnId: "turn_inline_plain_failure_continuation" as TurnId },
     },
     {
@@ -3438,7 +3252,6 @@ test("uses a plain zero-spawn tool failure as continuation evidence", () => {
       type: "message.part_added",
       time: 7 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId: "message_inline_plain_failure_answer" as MessageId,
         part: { id: "part_inline_plain_failure_answer" as PartId, messageId: "message_inline_plain_failure_answer" as MessageId, sessionId, type: "text", text: "All three agents failed to start, so no delegated result is available.", phase: "final_answer" },
@@ -3449,11 +3262,10 @@ test("uses a plain zero-spawn tool failure as continuation evidence", () => {
       type: "turn.completed",
       time: 8 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_plain_failure_continuation" as TurnId, status: "completed" },
     },
   ], createRuntimeView());
-  const batch = chatAgentBatches(view, { sessionId, threadId })[0];
+  const batch = chatAgentBatches(view, { sessionId })[0];
 
   expect(batch).toMatchObject({
     status: "failed",
@@ -3471,7 +3283,6 @@ test("uses a plain zero-spawn tool failure as continuation evidence", () => {
 
 test("associates one continuation response with overlapping batches from the same parent prompt", () => {
   const sessionId = "session_inline_overlap" as SessionId;
-  const threadId = "thread_inline_overlap" as ThreadId;
   const turnId = "turn_inline_overlap_tools" as TurnId;
   const specs = [
     { callId: "call_inline_overlap_a" as ToolCallId, taskId: "task_inline_overlap_a" as TaskId, path: "/root/overlap-a" as AgentPath, start: 2, terminal: 10, finished: 12 },
@@ -3483,7 +3294,6 @@ test("associates one continuation response with overlapping batches from the sam
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     ...specs.flatMap((spec, index): ChiliEvent[] => [
@@ -3492,7 +3302,6 @@ test("associates one continuation response with overlapping batches from the sam
         type: "tool.call_started",
         time: spec.start as TimestampMs,
         sessionId,
-        threadId,
         payload: { turnId, callId: spec.callId, toolName: "task_batch", input: { completionPolicy: "join", tasks: [{ description: `overlap ${index}`, prompt: `inspect overlap ${index}` }] } },
       },
       ...inlineTaskStartEvents({
@@ -3500,7 +3309,6 @@ test("associates one continuation response with overlapping batches from the sam
         createdAt: 4 + index,
         spawnedAt: 6,
         sessionId,
-        threadId,
         callId: spec.callId,
         batchId: `batch_inline_overlap_${index}`,
         batchIndex: 0,
@@ -3517,7 +3325,6 @@ test("associates one continuation response with overlapping batches from the sam
         id: `inline_overlap_terminal_${index}`,
         time: spec.terminal,
         sessionId,
-        threadId,
         taskId: spec.taskId,
         path: spec.path,
         runId: `run_inline_overlap_${index}` as AgentRunId,
@@ -3530,7 +3337,6 @@ test("associates one continuation response with overlapping batches from the sam
         type: "tool.call_finished",
         time: spec.finished as TimestampMs,
         sessionId,
-        threadId,
         payload: { callId: spec.callId, status: "completed", output: JSON.stringify({ tasks: [{ taskId: spec.taskId, status: "completed" }] }) },
       },
     ]),
@@ -3539,7 +3345,6 @@ test("associates one continuation response with overlapping batches from the sam
       type: "turn.completed",
       time: 14 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId, status: "completed" },
     },
     {
@@ -3547,7 +3352,6 @@ test("associates one continuation response with overlapping batches from the sam
       type: "turn.started",
       time: 15 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_overlap_continuation" as TurnId },
     },
     {
@@ -3555,7 +3359,6 @@ test("associates one continuation response with overlapping batches from the sam
       type: "message.created",
       time: 16 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "message_inline_overlap_answer" as MessageId, role: "assistant", turnId: "turn_inline_overlap_continuation" as TurnId },
     },
     {
@@ -3563,7 +3366,6 @@ test("associates one continuation response with overlapping batches from the sam
       type: "message.part_added",
       time: 17 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         messageId: "message_inline_overlap_answer" as MessageId,
         part: {
@@ -3581,11 +3383,10 @@ test("associates one continuation response with overlapping batches from the sam
       type: "turn.completed",
       time: 18 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_overlap_continuation" as TurnId, status: "completed" },
     },
   ];
-  const batches = chatAgentBatches(reduceRuntimeEvents(events, createRuntimeView()), { sessionId, threadId });
+  const batches = chatAgentBatches(reduceRuntimeEvents(events, createRuntimeView()), { sessionId });
 
   expect(batches).toHaveLength(2);
   expect(batches.map((batch) => batch.callId)).toEqual(specs.map((spec) => spec.callId));
@@ -3597,7 +3398,6 @@ test("associates one continuation response with overlapping batches from the sam
 
 test("requires a supervised wait-all to cover every task before integration can proceed", () => {
   const sessionId = "session_inline_supervised" as SessionId;
-  const threadId = "thread_inline_supervised" as ThreadId;
   const callId = "call_inline_supervised" as ToolCallId;
   const taskIds = ["task_inline_supervised_a", "task_inline_supervised_b"] as TaskId[];
   const batchId = "batch_inline_supervised";
@@ -3607,7 +3407,6 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -3615,7 +3414,6 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_supervised" as TurnId, callId, toolName: "task_batch", input: { batchId, completionPolicy: "supervised", tasks: [{}, {}] } },
     },
     ...taskIds.flatMap((taskId, index) => [
@@ -3624,7 +3422,6 @@ test("requires a supervised wait-all to cover every task before integration can 
         createdAt: 3 + index,
         spawnedAt: 5,
         sessionId,
-        threadId,
         callId,
         batchId,
         batchIndex: index,
@@ -3641,7 +3438,6 @@ test("requires a supervised wait-all to cover every task before integration can 
         id: `inline_supervised_terminal_${index}`,
         time: 6 + index,
         sessionId,
-        threadId,
         taskId,
         path: `/root/supervised-${index}` as AgentPath,
         runId: `run_inline_supervised_${index}` as AgentRunId,
@@ -3655,12 +3451,11 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_finished",
       time: 8 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId, status: "completed", output: JSON.stringify({ completionPolicy: "supervised", tasks: taskIds.map((taskId) => ({ taskId, status: "running" })) }) },
     },
   ];
   const view = reduceRuntimeEvents(baseEvents, createRuntimeView());
-  expect(chatAgentBatches(view, { sessionId, threadId })[0]?.integration).toMatchObject({
+  expect(chatAgentBatches(view, { sessionId })[0]?.integration).toMatchObject({
     completionPolicy: "supervised",
     status: "pending",
     evidence: "results_ready",
@@ -3672,7 +3467,6 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_started",
       time: 9 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_supervised_partial_wait" as TurnId, callId: "call_inline_supervised_partial_wait" as ToolCallId, toolName: "task_wait_batch", input: { batchId, taskIds: [taskIds[0]], waitFor: "all" } },
     },
     {
@@ -3680,11 +3474,10 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_finished",
       time: 10 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId: "call_inline_supervised_partial_wait" as ToolCallId, status: "completed", output: JSON.stringify({ tasks: [{ taskId: taskIds[0], status: "completed" }] }) },
     },
   ], view);
-  expect(chatAgentBatches(view, { sessionId, threadId })[0]?.integration.status).toBe("pending");
+  expect(chatAgentBatches(view, { sessionId })[0]?.integration.status).toBe("pending");
 
   reduceRuntimeEvents([
     {
@@ -3692,7 +3485,6 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_started",
       time: 11 as TimestampMs,
       sessionId,
-      threadId,
       payload: { turnId: "turn_inline_supervised_full_wait" as TurnId, callId: "call_inline_supervised_full_wait" as ToolCallId, toolName: "task_wait_batch", input: { batchId, taskIds, waitFor: "all" } },
     },
     {
@@ -3700,11 +3492,10 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_finished",
       time: 12 as TimestampMs,
       sessionId,
-      threadId,
       payload: { callId: "call_inline_supervised_full_wait" as ToolCallId, status: "completed", output: JSON.stringify({ tasks: taskIds.map((taskId) => ({ taskId, status: "completed" })) }) },
     },
   ], view);
-  expect(chatAgentBatches(view, { sessionId, threadId })[0]?.integration).toMatchObject({
+  expect(chatAgentBatches(view, { sessionId })[0]?.integration).toMatchObject({
     completionPolicy: "supervised",
     status: "ready",
     evidence: "tool_result",
@@ -3717,7 +3508,6 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_started",
       time: 13 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         turnId: "turn_inline_supervised_followup" as TurnId,
         callId: "call_inline_supervised_followup" as ToolCallId,
@@ -3730,7 +3520,6 @@ test("requires a supervised wait-all to cover every task before integration can 
       createdAt: 3,
       spawnedAt: 14,
       sessionId,
-      threadId,
       callId,
       batchId,
       batchIndex: 0,
@@ -3748,7 +3537,6 @@ test("requires a supervised wait-all to cover every task before integration can 
       id: "inline_supervised_followup_terminal",
       time: 15,
       sessionId,
-      threadId,
       taskId: taskIds[0]!,
       path: "/root/supervised-0" as AgentPath,
       runId: "run_inline_supervised_followup" as AgentRunId,
@@ -3761,7 +3549,6 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_finished",
       time: 16 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         callId: "call_inline_supervised_followup" as ToolCallId,
         status: "completed",
@@ -3769,7 +3556,7 @@ test("requires a supervised wait-all to cover every task before integration can 
       },
     },
   ], view);
-  const invalidated = chatAgentBatches(view, { sessionId, threadId })[0];
+  const invalidated = chatAgentBatches(view, { sessionId })[0];
   expect(invalidated?.agents[0]).toMatchObject({ taskId: taskIds[0], turns: 2, followupCount: 1 });
   expect(invalidated?.integration).toMatchObject({
     completionPolicy: "supervised",
@@ -3783,7 +3570,6 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_started",
       time: 17 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         turnId: "turn_inline_supervised_reconfirmed_wait" as TurnId,
         callId: "call_inline_supervised_reconfirmed_wait" as ToolCallId,
@@ -3796,7 +3582,6 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_finished",
       time: 18 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         callId: "call_inline_supervised_reconfirmed_wait" as ToolCallId,
         status: "completed",
@@ -3804,7 +3589,7 @@ test("requires a supervised wait-all to cover every task before integration can 
       },
     },
   ], view);
-  expect(chatAgentBatches(view, { sessionId, threadId })[0]?.integration).toMatchObject({
+  expect(chatAgentBatches(view, { sessionId })[0]?.integration).toMatchObject({
     completionPolicy: "supervised",
     status: "ready",
     evidence: "tool_result",
@@ -3812,7 +3597,6 @@ test("requires a supervised wait-all to cover every task before integration can 
   });
 
   const singleSessionId = "session_inline_supervised_single" as SessionId;
-  const singleThreadId = "thread_inline_supervised_single" as ThreadId;
   const singleCallId = "call_inline_supervised_single" as ToolCallId;
   const singleTaskId = "task_inline_supervised_single" as TaskId;
   const singlePath = "/root/supervised-single" as AgentPath;
@@ -3822,7 +3606,6 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId: singleSessionId,
-      threadId: singleThreadId,
       payload: { sessionId: singleSessionId, cwd: "/repo" },
     },
     {
@@ -3830,7 +3613,6 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_started",
       time: 2 as TimestampMs,
       sessionId: singleSessionId,
-      threadId: singleThreadId,
       payload: {
         turnId: "turn_inline_supervised_single" as TurnId,
         callId: singleCallId,
@@ -3843,7 +3625,6 @@ test("requires a supervised wait-all to cover every task before integration can 
       createdAt: 3,
       spawnedAt: 4,
       sessionId: singleSessionId,
-      threadId: singleThreadId,
       callId: singleCallId,
       batchId: "batch_inline_supervised_single",
       batchIndex: 0,
@@ -3860,7 +3641,6 @@ test("requires a supervised wait-all to cover every task before integration can 
       id: "inline_supervised_single_terminal",
       time: 5,
       sessionId: singleSessionId,
-      threadId: singleThreadId,
       taskId: singleTaskId,
       path: singlePath,
       runId: "run_inline_supervised_single" as AgentRunId,
@@ -3873,7 +3653,6 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_finished",
       time: 6 as TimestampMs,
       sessionId: singleSessionId,
-      threadId: singleThreadId,
       payload: { callId: singleCallId, status: "completed", output: JSON.stringify({ tasks: [{ taskId: singleTaskId, status: "running" }] }) },
     },
     {
@@ -3881,7 +3660,6 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_started",
       time: 7 as TimestampMs,
       sessionId: singleSessionId,
-      threadId: singleThreadId,
       payload: { turnId: "turn_inline_supervised_single_wait" as TurnId, callId: "call_inline_supervised_single_wait" as ToolCallId, toolName: "task_wait", input: { taskId: singleTaskId } },
     },
     {
@@ -3889,11 +3667,10 @@ test("requires a supervised wait-all to cover every task before integration can 
       type: "tool.call_finished",
       time: 8 as TimestampMs,
       sessionId: singleSessionId,
-      threadId: singleThreadId,
       payload: { callId: "call_inline_supervised_single_wait" as ToolCallId, status: "completed", output: JSON.stringify({ taskId: singleTaskId, status: "completed" }) },
     },
   ], createRuntimeView());
-  expect(chatAgentBatches(singleView, { sessionId: singleSessionId, threadId: singleThreadId })[0]?.integration).toMatchObject({
+  expect(chatAgentBatches(singleView, { sessionId: singleSessionId })[0]?.integration).toMatchObject({
     completionPolicy: "supervised",
     status: "pending",
     evidence: "results_ready",
@@ -3905,7 +3682,6 @@ function inlineTaskStartEvents(input: {
   createdAt: number;
   spawnedAt: number;
   sessionId: SessionId;
-  threadId: ThreadId;
   callId: ToolCallId;
   batchId?: string;
   batchIndex?: number;
@@ -3929,21 +3705,17 @@ function inlineTaskStartEvents(input: {
     ...(input.maxConcurrency === undefined ? {} : { maxConcurrency: input.maxConcurrency }),
   };
   const childSessionId = `session_${input.id}` as SessionId;
-  const childThreadId = `thread_${input.id}` as ThreadId;
   const created: ChiliEvent = {
     id: `event_${input.id}_created`,
     type: "agent.task_created",
     time: input.createdAt as TimestampMs,
     sessionId: input.sessionId,
-    threadId: input.threadId,
     payload: {
       taskId: input.taskId,
       path: input.path,
       parentPath: "/root" as AgentPath,
       parentSessionId: input.sessionId,
-      parentThreadId: input.threadId,
       childSessionId,
-      childThreadId,
       taskName: input.taskName,
       cwd: "/repo",
       prompt: input.prompt,
@@ -3956,16 +3728,13 @@ function inlineTaskStartEvents(input: {
     type: "agent.spawned",
     time: input.spawnedAt as TimestampMs,
     sessionId: input.sessionId,
-    threadId: input.threadId,
     payload: {
       runId: input.runId,
       taskId: input.taskId,
       path: input.path,
       parentPath: "/root" as AgentPath,
       parentSessionId: input.sessionId,
-      parentThreadId: input.threadId,
       childSessionId,
-      childThreadId,
       taskName: input.taskName,
       mode: "background",
       generation: input.generation,
@@ -3979,7 +3748,6 @@ function inlineTaskTerminalEvents(input: {
   id: string;
   time: number;
   sessionId: SessionId;
-  threadId: ThreadId;
   taskId: TaskId;
   path: AgentPath;
   runId: AgentRunId;
@@ -3998,7 +3766,6 @@ function inlineTaskTerminalEvents(input: {
       type: "agent.completed",
       time: input.time as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: {
         runId: input.runId,
         taskId: input.taskId,
@@ -4013,7 +3780,6 @@ function inlineTaskTerminalEvents(input: {
       type: "agent.task_completed",
       time: input.time as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: {
         runId: input.runId,
         taskId: input.taskId,
@@ -4030,11 +3796,9 @@ function agentTaskCreatedEvent(input: {
   id: string;
   time: number;
   sessionId: SessionId;
-  threadId?: ThreadId;
   taskId: TaskId;
   path?: AgentPath;
   childSessionId?: SessionId;
-  childThreadId?: ThreadId;
   sourceCallId?: ToolCallId;
   batchId?: string;
   batchIndex?: number;
@@ -4042,21 +3806,17 @@ function agentTaskCreatedEvent(input: {
 }): ChiliEvent {
   const path = input.path ?? (`/root/${input.taskId}` as AgentPath);
   const childSessionId = input.childSessionId ?? (`session_${input.taskId}` as SessionId);
-  const childThreadId = input.childThreadId ?? (`thread_${input.taskId}` as ThreadId);
   return {
     id: input.id,
     type: "agent.task_created",
     time: input.time as TimestampMs,
     sessionId: input.sessionId,
-    ...(input.threadId ? { threadId: input.threadId } : {}),
     payload: {
       taskId: input.taskId,
       path,
       parentPath: "/root" as AgentPath,
       parentSessionId: input.sessionId,
-      ...(input.threadId ? { parentThreadId: input.threadId } : {}),
       childSessionId,
-      childThreadId,
       taskName: String(input.taskId),
       cwd: "/repo",
       prompt: "inspect",
@@ -4071,7 +3831,6 @@ function agentTaskCreatedEvent(input: {
 
 test("projects subagent runs, mailbox messages, and team tasks", () => {
   const sessionId = "session_agents" as SessionId;
-  const threadId = "thread_agents" as ThreadId;
   const rootRunId = "agentrun_root" as AgentRunId;
   const childRunId = "agentrun_child" as AgentRunId;
   const teamId = "team_agents" as TeamId;
@@ -4085,7 +3844,6 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
       type: "session.created",
       time: 1 as TimestampMs,
       sessionId,
-      threadId,
       payload: { sessionId, cwd: "/repo" },
     },
     {
@@ -4093,7 +3851,6 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
       type: "agent.spawned",
       time: 2 as TimestampMs,
       sessionId,
-      threadId,
       payload: { runId: rootRunId, path: rootPath, taskName: "lead" },
     },
     {
@@ -4101,7 +3858,6 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
       type: "agent.spawned",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: { runId: childRunId, path: childPath, parentPath: rootPath, taskName: "review" },
     },
     {
@@ -4109,7 +3865,6 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
       type: "team.created",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: { teamId, name: "agents", leadPath: rootPath, description: "projection team" },
     },
     {
@@ -4117,7 +3872,6 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
       type: "team.member_added",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: { teamId, path: rootPath, name: "team-lead", role: "leader", status: "running" },
     },
     {
@@ -4125,7 +3879,6 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
       type: "team.member_added",
       time: 3 as TimestampMs,
       sessionId,
-      threadId,
       payload: { teamId, path: childPath, name: "reviewer", role: "reviewer", status: "idle", toolScope: ["read"] },
     },
     {
@@ -4133,7 +3886,6 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
       type: "team.task_created",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: { teamId, taskId, title: "Review projection", ownerPath: childPath },
     },
     {
@@ -4141,7 +3893,6 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
       type: "team.task_claimed",
       time: 4 as TimestampMs,
       sessionId,
-      threadId,
       payload: { teamId, taskId, ownerPath: childPath, claimedBy: childPath },
     },
     {
@@ -4149,11 +3900,11 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
       type: "agent.message_queued",
       time: 5 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         path: childPath,
         from: rootPath,
         triggerTurn: true,
+        recipientSessionId: "session_projection_recipient" as SessionId,
         message: {
           role: "user",
           content: "Please review projection",
@@ -4166,7 +3917,6 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
       type: "agent.message_consumed",
       time: 6 as TimestampMs,
       sessionId,
-      threadId,
       payload: { messageId: "event_5", path: childPath },
     },
     {
@@ -4174,7 +3924,6 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
       type: "team.message_sent",
       time: 6 as TimestampMs,
       sessionId,
-      threadId,
       payload: {
         teamId,
         messageId: "teammsg_projection",
@@ -4191,7 +3940,6 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
       type: "team.task_updated",
       time: 7 as TimestampMs,
       sessionId,
-      threadId,
       payload: { teamId, taskId, status: "completed" },
     },
     {
@@ -4199,7 +3947,6 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
       type: "agent.completed",
       time: 8 as TimestampMs,
       sessionId,
-      threadId,
       payload: { runId: childRunId, path: childPath, status: "completed" },
     },
   ];
@@ -4244,13 +3991,34 @@ test("projects subagent runs, mailbox messages, and team tasks", () => {
   expect(view.tasks[taskId]?.completedAt).toBe(7);
   expect(snapshot.agents.map((agent) => agent.id)).toEqual([rootRunId, childRunId]);
   expect(snapshot.mailbox[0]?.triggerTurn).toBe(true);
+  expect(snapshot.mailbox[0]?.recipientSessionId).toBe("session_projection_recipient" as SessionId);
   expect(snapshot.mailbox[0]?.status).toBe("consumed");
   expect(snapshot.mailbox[0]?.consumedAt).toBe(6);
 });
 
+test("upcasts a legacy queued mailbox child session to the canonical recipient field", () => {
+  const recipientSessionId = "session_legacy_mailbox_recipient" as SessionId;
+  const legacyEvent = {
+    id: "event_legacy_mailbox_recipient",
+    type: "agent.message_queued",
+    time: 1 as TimestampMs,
+    sessionId: "session_legacy_mailbox_sender" as SessionId,
+    payload: {
+      path: "/root/legacy" as AgentPath,
+      from: "/root" as AgentPath,
+      triggerTurn: true,
+      childSessionId: recipientSessionId,
+    },
+  } as unknown as ChiliEvent;
+
+  const view = reduceRuntimeEvents([legacyEvent], createRuntimeView());
+  const message = view.mailboxMessages.event_legacy_mailbox_recipient;
+  expect(message?.recipientSessionId).toBe(recipientSessionId);
+  expect(Object.prototype.hasOwnProperty.call(message, "childSessionId")).toBe(false);
+});
+
 test("projects team run lifecycle events into run view models", () => {
   const sessionId = "session_team_run" as SessionId;
-  const threadId = "thread_team_run" as ThreadId;
   const teamId = "team_run_projection" as TeamId;
   const leadPath = "/root" as AgentPath;
   const runCounts = teamRunCounts({ dispatched: 2, completed: 1, stillRunning: 1 });
@@ -4262,7 +4030,6 @@ test("projects team run lifecycle events into run view models", () => {
         type: "team.created",
         time: 1 as TimestampMs,
         sessionId,
-        threadId,
         payload: { teamId, name: "runner", leadPath },
       },
       {
@@ -4270,7 +4037,6 @@ test("projects team run lifecycle events into run view models", () => {
         type: "team.run_started",
         time: 2 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           runId: "teamrun_test",
@@ -4288,7 +4054,6 @@ test("projects team run lifecycle events into run view models", () => {
         type: "team.run_progress",
         time: 3 as TimestampMs,
         sessionId,
-        threadId,
         payload: { teamId, runId: "teamrun_test", cycle: 1, phase: "dispatch", counts: runCounts },
       },
       {
@@ -4296,7 +4061,6 @@ test("projects team run lifecycle events into run view models", () => {
         type: "team.run_completed",
         time: 4 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           runId: "teamrun_test",
@@ -4330,13 +4094,9 @@ test("projects team run lifecycle events into run view models", () => {
 
 test("derives Team Live cockpit view from team projection state", () => {
   const sessionId = "session_team_live" as SessionId;
-  const threadId = "thread_team_live" as ThreadId;
   const otherSessionId = "session_team_live_other" as SessionId;
-  const otherThreadId = "thread_team_live_other" as ThreadId;
   const childSessionId = "session_team_live_child" as SessionId;
-  const childThreadId = "thread_team_live_child" as ThreadId;
   const verifierSessionId = "session_team_live_verifier" as SessionId;
-  const verifierThreadId = "thread_team_live_verifier" as ThreadId;
   const teamId = "team_live" as TeamId;
   const otherTeamId = "team_live_other" as TeamId;
   const taskId = "task_live" as TaskId;
@@ -4358,7 +4118,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "session.created",
         time: 1 as TimestampMs,
         sessionId,
-        threadId,
         payload: { sessionId, cwd: "/repo" },
       },
       {
@@ -4366,7 +4125,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "team.created",
         time: 2 as TimestampMs,
         sessionId: otherSessionId,
-        threadId: otherThreadId,
         payload: { teamId: otherTeamId, name: "other", leadPath },
       },
       {
@@ -4374,7 +4132,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "team.created",
         time: 3 as TimestampMs,
         sessionId,
-        threadId,
         payload: { teamId, name: "live", leadPath },
       },
       {
@@ -4382,7 +4139,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "team.member_added",
         time: 3 as TimestampMs,
         sessionId,
-        threadId,
         payload: { teamId, path: leadPath, name: "lead", role: "leader", status: "running" },
       },
       {
@@ -4390,7 +4146,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "team.member_added",
         time: 4 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           path: memberPath,
@@ -4398,7 +4153,6 @@ test("derives Team Live cockpit view from team projection state", () => {
           role: "builder",
           status: "idle",
           childSessionId,
-          childThreadId,
           toolScope: ["read_file"],
           writeScope: ["packages/sdk"],
         },
@@ -4408,7 +4162,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "team.task_created",
         time: 5 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           taskId,
@@ -4427,14 +4180,12 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "agent.task_created",
         time: 5 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           taskId: verifierTaskId,
           path: "/root/worker/verifier" as AgentPath,
           parentPath: memberPath,
           parentSessionId: sessionId,
           childSessionId: verifierSessionId,
-          childThreadId: verifierThreadId,
           taskName: "Verify live cockpit",
           cwd: "/repo",
           prompt: "verify",
@@ -4445,7 +4196,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "team.task_created",
         time: 5 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           taskId: conflictedTaskId,
@@ -4460,7 +4210,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "team.task_created",
         time: 5 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           taskId: failedMergeTaskId,
@@ -4475,7 +4224,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "team.task_created",
         time: 5 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           taskId: appliedMergeTaskId,
@@ -4490,7 +4238,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "team.task_claimed",
         time: 6 as TimestampMs,
         sessionId,
-        threadId,
         payload: { teamId, taskId, ownerPath: memberPath, claimedBy: memberPath },
       },
       {
@@ -4498,7 +4245,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "team.message_sent",
         time: 7 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           messageId: "teammsg_live",
@@ -4515,14 +4261,12 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "agent.message_queued",
         time: 8 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           path: memberPath,
           from: leadPath,
           triggerTurn: true,
           taskId,
-          childSessionId,
-          childThreadId,
+          recipientSessionId: childSessionId,
           message: {
             role: "user",
             content: "Build the cockpit",
@@ -4535,7 +4279,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "team.run_started",
         time: 9 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           teamId,
           runId: "teamrun_live",
@@ -4553,7 +4296,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "team.run_progress",
         time: 10 as TimestampMs,
         sessionId,
-        threadId,
         payload: { teamId, runId: "teamrun_live", cycle: 1, phase: "dispatch", counts: teamRunCounts({ dispatched: 1 }) },
       },
       {
@@ -4561,7 +4303,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "turn.started",
         time: 11 as TimestampMs,
         sessionId: childSessionId,
-        threadId: childThreadId,
         payload: { turnId: "turn_live" as TurnId },
       },
       {
@@ -4569,7 +4310,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "tool.call_started",
         time: 11 as TimestampMs,
         sessionId: childSessionId,
-        threadId: childThreadId,
         payload: { turnId: "turn_live" as TurnId, callId, toolName: "read_file", input: { path: "README.md" } },
       },
       {
@@ -4577,7 +4317,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "approval.requested",
         time: 12 as TimestampMs,
         sessionId,
-        threadId,
         payload: { approvalId, callId, permission: "tool.edit", patterns: ["packages/sdk/*"] },
       },
       {
@@ -4585,7 +4324,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "approval.requested",
         time: 13 as TimestampMs,
         sessionId: childSessionId,
-        threadId: childThreadId,
         payload: { approvalId: childApprovalId, callId, permission: "tool.bash", patterns: ["bun test"] },
       },
       {
@@ -4593,7 +4331,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "approval.requested",
         time: 14 as TimestampMs,
         sessionId: childSessionId,
-        threadId: childThreadId,
         payload: { approvalId: resolvedApprovalId, callId, permission: "tool.read", patterns: ["README.md"] },
       },
       {
@@ -4601,7 +4338,6 @@ test("derives Team Live cockpit view from team projection state", () => {
         type: "approval.resolved",
         time: 15 as TimestampMs,
         sessionId: childSessionId,
-        threadId: childThreadId,
         payload: { approvalId: resolvedApprovalId, decision: "allow_once" },
       },
     ],
@@ -4643,6 +4379,7 @@ test("derives Team Live cockpit view from team projection state", () => {
     deliveryStatus: "queued",
     taskId,
   });
+  expect(view.mailboxMessages.event_mailbox?.recipientSessionId).toBe(childSessionId);
   expect(cockpit.toolCounts).toEqual([{ toolName: "read_file", total: 1, running: 1, completed: 0, failed: 0 }]);
   expect(cockpit.metadata.worktrees).toHaveLength(1);
   expect(cockpit.recentActivity.map((item) => item.kind)).toContain("run");
@@ -4693,7 +4430,6 @@ test("Team Live v1 scopes selected teams through run sessions without falling ba
   const emptyTeamId = "team_empty_scope" as TeamId;
   const runSessionId = "session_run_scoped" as SessionId;
   const otherSessionId = "session_run_other" as SessionId;
-  const threadId = "thread_run_scoped" as ThreadId;
   const leadPath = "/root" as AgentPath;
   const callId = "tool_run_scoped" as ToolCallId;
   const otherCallId = "tool_run_other" as ToolCallId;
@@ -4719,7 +4455,6 @@ test("Team Live v1 scopes selected teams through run sessions without falling ba
         type: "team.run_started",
         time: 2 as TimestampMs,
         sessionId: runSessionId,
-        threadId,
         payload: { teamId, runId: "teamrun_scoped" },
       },
       {
@@ -4727,7 +4462,6 @@ test("Team Live v1 scopes selected teams through run sessions without falling ba
         type: "tool.call_started",
         time: 3 as TimestampMs,
         sessionId: runSessionId,
-        threadId,
         payload: { turnId: "turn_run_scoped" as TurnId, callId, toolName: "read_file", input: { path: "README.md" } },
       },
       {
@@ -4735,7 +4469,6 @@ test("Team Live v1 scopes selected teams through run sessions without falling ba
         type: "approval.requested",
         time: 4 as TimestampMs,
         sessionId: runSessionId,
-        threadId,
         payload: { approvalId, callId, permission: "tool.read", patterns: ["README.md"] },
       },
       {
@@ -4743,7 +4476,6 @@ test("Team Live v1 scopes selected teams through run sessions without falling ba
         type: "tool.call_started",
         time: 5 as TimestampMs,
         sessionId: otherSessionId,
-        threadId,
         payload: { turnId: "turn_run_other" as TurnId, callId: otherCallId, toolName: "bash", input: { command: "bun test" } },
       },
       {
@@ -4751,7 +4483,6 @@ test("Team Live v1 scopes selected teams through run sessions without falling ba
         type: "approval.requested",
         time: 6 as TimestampMs,
         sessionId: otherSessionId,
-        threadId,
         payload: { approvalId: otherApprovalId, callId: otherCallId, permission: "tool.bash", patterns: ["bun test"] },
       },
     ],
@@ -4812,10 +4543,8 @@ test("Team Live v1 exposes disabled actions for no-team and inactive-team states
 
 test("replays completed local subagent tasks as running on newer-generation spawn without completedAt", () => {
   const sessionId = "session_local_agents" as SessionId;
-  const threadId = "thread_local_agents" as ThreadId;
   const taskId = "task_local" as TaskId;
   const childSessionId = "session_child_local" as SessionId;
-  const childThreadId = "thread_child_local" as ThreadId;
   const path = "/root/task_local" as AgentPath;
 
   const view = reduceRuntimeEvents(
@@ -4825,15 +4554,12 @@ test("replays completed local subagent tasks as running on newer-generation spaw
         type: "agent.task_created",
         time: 1 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           taskId,
           path,
           parentPath: "/root" as AgentPath,
           parentSessionId: sessionId,
-          parentThreadId: threadId,
           childSessionId,
-          childThreadId,
           taskName: "reader",
           cwd: "/repo",
           prompt: "read",
@@ -4844,7 +4570,6 @@ test("replays completed local subagent tasks as running on newer-generation spaw
         type: "agent.task_completed",
         time: 2 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           taskId,
           path,
@@ -4858,16 +4583,13 @@ test("replays completed local subagent tasks as running on newer-generation spaw
         type: "agent.spawned",
         time: 3 as TimestampMs,
         sessionId,
-        threadId,
         payload: {
           runId: "agent_local" as AgentRunId,
           taskId,
           path,
           parentPath: "/root" as AgentPath,
           parentSessionId: sessionId,
-          parentThreadId: threadId,
           childSessionId,
-          childThreadId,
           taskName: "reader",
           generation: 2,
         },
@@ -4883,7 +4605,6 @@ test("replays completed local subagent tasks as running on newer-generation spaw
     path,
     sessionId,
     childSessionId,
-    childThreadId,
   });
   expect(view.tasks[taskId]?.completedAt).toBeUndefined();
   expect(view.sessions[sessionId]?.taskIds).toEqual([taskId]);
@@ -4893,7 +4614,6 @@ test("client preserves team dispatcher JSON shapes for dispatch, sync, and recon
   const teamId = "team_sdk" as TeamId;
   const taskId = "task_sdk" as TaskId;
   const sessionId = "session_sdk" as SessionId;
-  const threadId = "thread_sdk" as ThreadId;
   const ownerPath = "/root/reviewer" as AgentPath;
   const teamTask = sdkTeamTaskJson({ teamId, taskId, status: "in_progress", ownerPath });
   const skippedTeamTask = sdkTeamTaskJson({ teamId, taskId, status: "pending", ownerPath, includeMetadata: false });
@@ -4976,21 +4696,19 @@ test("client preserves team dispatcher JSON shapes for dispatch, sync, and recon
       taskId,
       ownerPath,
       sessionId,
-      threadId,
       mode: "background",
       cwd: "/repo",
       prompt: "verify",
     }),
   ).toEqual(dispatchJson);
-  expect(await client.dispatchTeamTask({ teamId, taskId, sessionId, threadId })).toEqual(skippedDispatchJson);
-  expect(await client.syncTeamTask({ teamId, taskId, sessionId, threadId })).toEqual(syncResult);
-  expect(await client.reconcileTeamTasks({ teamId, sessionId, threadId, limit: 5 })).toEqual(reconcileJson);
-  expect(await client.mergeTeamTasks({ teamId, taskId, sessionId, threadId, cwd: "/repo" })).toEqual(mergeJson);
+  expect(await client.dispatchTeamTask({ teamId, taskId, sessionId })).toEqual(skippedDispatchJson);
+  expect(await client.syncTeamTask({ teamId, taskId, sessionId })).toEqual(syncResult);
+  expect(await client.reconcileTeamTasks({ teamId, sessionId, limit: 5 })).toEqual(reconcileJson);
+  expect(await client.mergeTeamTasks({ teamId, taskId, sessionId, cwd: "/repo" })).toEqual(mergeJson);
   expect(
     await client.runTeamLoop({
       teamId,
       sessionId,
-      threadId,
       mode: "background",
       cwd: "/repo",
       once: true,
@@ -5003,27 +4721,27 @@ test("client preserves team dispatcher JSON shapes for dispatch, sync, and recon
     {
       url: "http://runtime.test/api/teams/team_sdk/tasks/task_sdk/dispatch",
       method: "POST",
-      body: { teamId, taskId, ownerPath, sessionId, threadId, mode: "background", cwd: "/repo", prompt: "verify" },
+      body: { teamId, taskId, ownerPath, sessionId, mode: "background", cwd: "/repo", prompt: "verify" },
     },
     {
       url: "http://runtime.test/api/teams/team_sdk/tasks/task_sdk/dispatch",
       method: "POST",
-      body: { teamId, taskId, sessionId, threadId },
+      body: { teamId, taskId, sessionId },
     },
     {
       url: "http://runtime.test/api/teams/team_sdk/tasks/task_sdk/sync",
       method: "POST",
-      body: { teamId, taskId, sessionId, threadId },
+      body: { teamId, taskId, sessionId },
     },
     {
       url: "http://runtime.test/api/teams/team_sdk/reconcile_dispatches",
       method: "POST",
-      body: { teamId, sessionId, threadId, limit: 5 },
+      body: { teamId, sessionId, limit: 5 },
     },
     {
       url: "http://runtime.test/api/teams/team_sdk/merge",
       method: "POST",
-      body: { teamId, taskId, sessionId, threadId, cwd: "/repo" },
+      body: { teamId, taskId, sessionId, cwd: "/repo" },
     },
     {
       url: "http://runtime.test/api/teams/team_sdk/run_loop",
@@ -5031,7 +4749,6 @@ test("client preserves team dispatcher JSON shapes for dispatch, sync, and recon
       body: {
         teamId,
         sessionId,
-        threadId,
         mode: "background",
         cwd: "/repo",
         once: true,
@@ -5112,7 +4829,6 @@ test("client can cancel team run and merge commands without serializing AbortSig
 
 test("client can cancel chat commands without serializing AbortSignal", async () => {
   const sessionId = "session_sdk_abort" as SessionId;
-  const threadId = "thread_sdk_abort" as ThreadId;
   const controller = new AbortController();
   const records: { url: string; body: unknown; signalled: boolean }[] = [];
   const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
@@ -5123,9 +4839,9 @@ test("client can cancel chat commands without serializing AbortSignal", async ()
       signalled: init?.signal === controller.signal,
     });
     const body = url.endsWith("/sessions")
-      ? ({ sessionId, threadId })
+      ? ({ sessionId })
       : url.endsWith("/prompt_async")
-        ? ({ status: "accepted", sessionId, threadId })
+        ? ({ status: "accepted", sessionId })
         : url.endsWith("/interrupt")
           ? ({ interrupted: true })
           : ({ resolved: true });
@@ -5139,7 +4855,6 @@ test("client can cancel chat commands without serializing AbortSignal", async ()
   await client.createSession({ cwd: "/repo", signal: controller.signal });
   await client.submitPromptAsync({
     sessionId,
-    threadId,
     text: "hello",
     cwd: "/repo",
     skillMentions: [{ name: "reviewer", path: "/repo/.chili/skills/reviewer/SKILL.md" }],
@@ -5158,8 +4873,6 @@ test("client can cancel chat commands without serializing AbortSignal", async ()
     {
       url: "http://runtime.test/api/sessions/session_sdk_abort/prompt_async",
       body: {
-        sessionId,
-        threadId,
         text: "hello",
         cwd: "/repo",
         skillMentions: [{ name: "reviewer", path: "/repo/.chili/skills/reviewer/SKILL.md" }],
@@ -5186,7 +4899,6 @@ test("client can cancel chat commands without serializing AbortSignal", async ()
 
 test("client sends model control requests and prompt overrides", async () => {
   const sessionId = "session_sdk_model" as SessionId;
-  const threadId = "thread_sdk_model" as ThreadId;
   const records: { url: string; method: string | undefined; body: unknown }[] = [];
   const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     const url = String(input);
@@ -5206,9 +4918,9 @@ test("client sends model control requests and prompt overrides", async () => {
       : url.endsWith("/commands") || url.endsWith("/commands/reload")
         ? ({ commands: [], diagnostics: [], directories: [], skippedConflicts: [] })
         : url.endsWith("/command_async")
-          ? ({ status: "accepted", sessionId, threadId })
+          ? ({ status: "accepted", sessionId })
       : url.endsWith("/prompt_async")
-        ? ({ status: "accepted", sessionId, threadId })
+        ? ({ status: "accepted", sessionId })
         : ({ sessionId, models: [], availableReasoningLevels: ["off", "high"] });
     return new Response(JSON.stringify(body), {
       status: 200,
@@ -5219,20 +4931,18 @@ test("client sends model control requests and prompt overrides", async () => {
 
   const models = await client.listModels();
   await client.getModelConfig({ sessionId });
-  await client.setModel({ sessionId, threadId, modelSelection: { provider: "openai-codex", model: "gpt-5.5" } });
-  await client.setReasoning({ sessionId, threadId, reasoningLevel: "high" });
+  await client.setModel({ sessionId, modelSelection: { provider: "openai-codex", model: "gpt-5.5" } });
+  await client.setReasoning({ sessionId, reasoningLevel: "high" });
   await client.listCommands();
   await client.reloadCommands();
   await client.submitPromptAsync({
     sessionId,
-    threadId,
     text: "hello",
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
     reasoningLevel: "xhigh",
   });
   await client.submitCommandAsync({
     sessionId,
-    threadId,
     name: "joke",
     args: "typescript",
     modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
@@ -5261,12 +4971,12 @@ test("client sends model control requests and prompt overrides", async () => {
     {
       url: "http://runtime.test/api/sessions/session_sdk_model/model",
       method: "POST",
-      body: { threadId, modelSelection: { provider: "openai-codex", model: "gpt-5.5" } },
+      body: { modelSelection: { provider: "openai-codex", model: "gpt-5.5" } },
     },
     {
       url: "http://runtime.test/api/sessions/session_sdk_model/reasoning",
       method: "POST",
-      body: { threadId, reasoningLevel: "high" },
+      body: { reasoningLevel: "high" },
     },
     {
       url: "http://runtime.test/api/commands",
@@ -5282,8 +4992,6 @@ test("client sends model control requests and prompt overrides", async () => {
       url: "http://runtime.test/api/sessions/session_sdk_model/prompt_async",
       method: "POST",
       body: {
-        sessionId,
-        threadId,
         text: "hello",
         modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
         reasoningLevel: "xhigh",
@@ -5293,8 +5001,6 @@ test("client sends model control requests and prompt overrides", async () => {
       url: "http://runtime.test/api/sessions/session_sdk_model/command_async",
       method: "POST",
       body: {
-        sessionId,
-        threadId,
         name: "joke",
         args: "typescript",
         modelSelection: { provider: "openai-codex", model: "gpt-5.5" },
@@ -5470,7 +5176,6 @@ function sdkTeamTaskJson(input: {
               agentPath: "/root/reviewer/task_agent_sdk",
               runId: "agentrun_agent_sdk",
               childSessionId: "session_child_sdk",
-              childThreadId: "thread_child_sdk",
               mode: "background",
               dispatchedAt: 101,
               agentStatus: "running",
@@ -5488,11 +5193,10 @@ function sdkAgentTaskJson(input: {
 }): RuntimeLocalSubagentTaskRecord {
   return {
     taskId: "task_agent_sdk" as TaskId,
-    runId: "agentrun_agent_sdk",
+    runId: "agentrun_agent_sdk" as AgentRunId,
     path: "/root/reviewer/task_agent_sdk" as AgentPath,
     parentPath: input.ownerPath,
     childSessionId: "session_child_sdk" as SessionId,
-    childThreadId: "thread_child_sdk" as ThreadId,
     status: input.status,
   };
 }
@@ -5505,7 +5209,6 @@ function sdkAgentTaskRecord(input: { status: "running" | "completed" | "failed" 
     status: input.status,
     generation: 0,
     childSessionId: "session_child_sdk" as SessionId,
-    childThreadId: "thread_child_sdk" as ThreadId,
     createdAt: 1,
     updatedAt: 2,
   };
@@ -5514,7 +5217,6 @@ function sdkAgentTaskRecord(input: { status: "running" | "completed" | "failed" 
 function toolApprovalEvents(input: {
   time: number;
   sessionId: SessionId;
-  threadId: ThreadId;
   turnId: TurnId;
   callId: ToolCallId;
   approvalId: ApprovalId;
@@ -5529,7 +5231,6 @@ function toolApprovalEvents(input: {
       type: "tool.call_started",
       time: input.time as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: { turnId: input.turnId, callId: input.callId, toolName: input.toolName, input: input.input },
     },
     {
@@ -5537,7 +5238,6 @@ function toolApprovalEvents(input: {
       type: "tool.call_updated",
       time: (input.time + 1) as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: { callId: input.callId, status: "waiting_for_approval" },
     },
     {
@@ -5545,7 +5245,6 @@ function toolApprovalEvents(input: {
       type: "approval.requested",
       time: (input.time + 2) as TimestampMs,
       sessionId: input.sessionId,
-      threadId: input.threadId,
       payload: { approvalId: input.approvalId, callId: input.callId, permission: input.permission, patterns: input.patterns },
     },
   ];
