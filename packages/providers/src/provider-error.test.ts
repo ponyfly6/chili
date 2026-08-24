@@ -184,7 +184,7 @@ test("sweeps expired state and bounds one-off backpressure keys", () => {
   expect(states.size).toBe(1);
 });
 
-test("preserves safe structured fields, numeric codes, and bounded Retry-After", async () => {
+test("preserves safe metadata without exposing structured supplier text", async () => {
   const error = await providerHttpError(new Response(JSON.stringify({
     error: {
       message: "Traffic high at 10.20.30.40, 2001:db8::1234, and ::ffff:192.0.2.1 with Bearer bearer-secret-123, api_key=api-secret-456, API key is SUPERSECRET12345, sk-live-secret-789, and eyJheaderlong.eyJpayloadlong.signaturelong",
@@ -210,12 +210,9 @@ test("preserves safe structured fields, numeric codes, and bounded Retry-After",
     category: "plan_capacity",
     retryable: false,
     opensCircuit: true,
+    message: "Model request failed with HTTP 429 Too Many Requests (request id: req_json_1)",
   });
-  expect(error.message).toContain("[REDACTED_IP]");
-  expect(error.message).toContain("Bearer [REDACTED]");
-  expect(error.message).toContain("api_key=[REDACTED]");
-  expect(error.message).toContain("sk-[REDACTED]");
-  expect(error.message).toContain("[REDACTED_JWT]");
+  expect(error.message).not.toContain("Traffic high");
   expect(error.message).not.toContain("10.20.30.40");
   expect(error.message).not.toContain("2001:db8::1234");
   expect(error.message).not.toContain("192.0.2.1");
@@ -230,8 +227,12 @@ test("preserves safe structured fields, numeric codes, and bounded Retry-After",
 
 test("bounds public messages by UTF-8 bytes", async () => {
   const error = await providerHttpError(new Response(JSON.stringify({
-    error: { message: "界".repeat(1_000) },
-  }), { status: 400 }), { provider: "openai", label: "Model request" });
+    error: { message: "provider-private-message" },
+  }), { status: 400 }), {
+    provider: "openai",
+    label: "Model request",
+    selectJson: () => ({ publicMessage: "界".repeat(1_000) }),
+  });
 
   expect(new TextEncoder().encode(error.message).byteLength).toBeLessThanOrEqual(PROVIDER_PUBLIC_ERROR_MAX_BYTES);
   expect(error.message.endsWith("…")).toBe(true);
@@ -336,7 +337,56 @@ test("sanitizes and bounds SSE payload errors", () => {
     },
   }, { provider: "openai", label: "Model stream failed" });
 
-  expect(error.message).toBe("stream_failed (request id: req_stream_1)");
+  expect(error.message).toBe("Model stream failed (request id: req_stream_1)");
   expect(error.message).not.toContain("private-stream-token");
   expect(new TextEncoder().encode(error.message).byteLength).toBeLessThanOrEqual(PROVIDER_PUBLIC_ERROR_MAX_BYTES);
+});
+
+test("rejects sensitive and non-machine structured fields from the public error object", () => {
+  const error = providerPayloadError({
+    publicMessage: "payload-controlled public message",
+    error: {
+      message: "credential=hunter2 password=swordfish client_secret=private-client",
+      code: "credential",
+      type: "client_secret",
+      param: "session_cookie",
+      request_id: "password:private-request-id",
+    },
+  }, { provider: "openai", label: "Model response failed" });
+
+  expect(error.message).toBe("Model response failed");
+  expect(error.code).toBeUndefined();
+  expect(error.type).toBeUndefined();
+  expect(error.param).toBeUndefined();
+  expect(error.requestId).toBeUndefined();
+  const serialized = `${error.message} ${JSON.stringify(error)}`;
+  for (const probe of [
+    "payload-controlled public message",
+    "hunter2",
+    "swordfish",
+    "private-client",
+    "private-request-id",
+    "credential",
+    "client_secret",
+    "session_cookie",
+  ]) {
+    expect(serialized).not.toContain(probe);
+  }
+});
+
+test("drops non-machine code, type, and param values while retaining classification", async () => {
+  const error = await providerHttpError(new Response(JSON.stringify({
+    error: {
+      message: "Quota exhausted",
+      code: "quota exhausted / credential=private",
+      type: "rate limit error with password",
+      param: "input field with spaces",
+    },
+  }), { status: 429 }), { provider: "openai", label: "Model request" });
+
+  expect(error).toMatchObject({ category: "quota_exhausted", retryable: false, opensCircuit: true });
+  expect(error.code).toBeUndefined();
+  expect(error.type).toBeUndefined();
+  expect(error.param).toBeUndefined();
+  expect(error.message).toBe("Model request failed with HTTP 429 Too Many Requests");
 });

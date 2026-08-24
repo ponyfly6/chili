@@ -87,6 +87,7 @@ const HTTP_STATUS_LABELS: Readonly<Record<number, string>> = {
 const MARKUP_PATTERN = /(?:<!doctype\s+html|<!--|<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]{0,512})?\s*\/?>)/i;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:/-]{1,128}$/;
 const MACHINE_TAG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/;
+const SENSITIVE_FIELD_NAME_PATTERN = /(?:credentials?|password|passwd|secrets?|cookies?|authorization|bearer|api[_ -]?keys?|tokens?)/i;
 const IPV6_CANDIDATE_PATTERN = /(?<![A-Za-z0-9:])(?:[A-Fa-f0-9]{0,4}:){2,7}[A-Fa-f0-9]{0,4}(?![A-Za-z0-9:])/g;
 
 export class ProviderError extends Error {
@@ -117,9 +118,9 @@ export class ProviderError extends Error {
     this.retryable = options.retryable ?? classification.retryable;
     this.opensCircuit = options.opensCircuit ?? classification.opensCircuit;
     if (isFiniteStatus(options.status)) this.status = options.status;
-    const code = safeDetailText(normalizeCode(options.code));
-    const type = safeDetailText(typeof options.type === "string" ? options.type : undefined);
-    const param = safeDetailText(typeof options.param === "string" ? options.param : undefined);
+    const code = safeMachineTag(normalizeCode(options.code));
+    const type = safeMachineTag(typeof options.type === "string" ? options.type : undefined);
+    const param = safeMachineTag(typeof options.param === "string" ? options.param : undefined);
     const requestId = safeRequestId(typeof options.requestId === "string" ? options.requestId : undefined);
     const retryAfterMs = clampProviderRetryAfterMs(options.retryAfterMs);
     if (code) this.code = code;
@@ -385,7 +386,7 @@ function createProviderError(input: {
   const requestId = safeRequestId(details?.requestId) ?? safeRequestId(input.requestId);
   const publicMessage = details && Object.prototype.hasOwnProperty.call(details, "publicMessage")
     ? safePublicText(details.publicMessage)
-    : formatProviderErrorDetails(details);
+    : undefined;
   let message = publicMessage ?? httpFailureMessage(input.label, input.status);
   if (!publicMessage && requestId && !message.includes(requestId)) {
     message = `${message} (request id: ${requestId})`;
@@ -431,32 +432,23 @@ function mergeProviderErrorDetails(
   return merged;
 }
 
-function formatProviderErrorDetails(details: ProviderErrorDetails | undefined): string | undefined {
-  if (!details) return undefined;
-  const message = safePublicText(details.message);
-  const code = safeDetailText(normalizeCode(details.code));
-  const type = safeDetailText(details.type);
-  const param = safeDetailText(details.param);
-  const requestId = safeRequestId(details.requestId);
-  const primary = message ?? code ?? type;
-  if (!primary) return undefined;
-  const suffixes: string[] = [];
-  if (code && code !== primary && !primary.includes(code)) suffixes.push(`code: ${code}`);
-  if (type && type !== primary && type !== code && !primary.includes(type)) suffixes.push(`type: ${type}`);
-  if (param && !primary.includes(param)) suffixes.push(`param: ${param}`);
-  if (requestId && !primary.includes(requestId)) suffixes.push(`request id: ${requestId}`);
-  return safePublicText(suffixes.length > 0 ? `${primary} (${suffixes.join(", ")})` : primary);
-}
-
 function safeDetailText(value: string | undefined): string | undefined {
   const safe = safePublicText(value);
   if (!safe || safe.length > 160) return undefined;
   return safe;
 }
 
+function safeMachineTag(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  if (!normalized || !MACHINE_TAG_PATTERN.test(normalized)) return undefined;
+  if (SENSITIVE_FIELD_NAME_PATTERN.test(normalized)) return undefined;
+  return redactSensitiveText(normalized) === normalized ? normalized : undefined;
+}
+
 function safeRequestId(value: string | undefined): string | undefined {
   const normalized = value?.trim();
   if (!normalized || !REQUEST_ID_PATTERN.test(normalized)) return undefined;
+  if (SENSITIVE_FIELD_NAME_PATTERN.test(normalized)) return undefined;
   return redactSensitiveText(normalized) === normalized ? normalized : undefined;
 }
 
@@ -515,7 +507,7 @@ function redactSensitiveText(value: string): string {
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer [REDACTED]")
     .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/gi, "sk-[REDACTED]")
     .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*\b/g, "[REDACTED_JWT]")
-    .replace(/\b((?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|id[_ -]?token|authorization|token)\s*(?::|=|\bis\b)\s*)["']?[A-Za-z0-9._~+/=-]{4,}["']?/gi, "$1[REDACTED]")
+    .replace(/\b((?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|id[_ -]?token|client[_ -]?secret|session[_ -]?cookie|credentials?|password|passwd|authorization|token)\s*(?::|=|\bis\b)\s*)["']?[^\s,;'"<>]{3,}["']?/gi, "$1[REDACTED]")
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[REDACTED_IP]")
     .replace(IPV6_CANDIDATE_PATTERN, (candidate) => isIP(candidate) === 6 ? "[REDACTED_IP]" : candidate);
 }

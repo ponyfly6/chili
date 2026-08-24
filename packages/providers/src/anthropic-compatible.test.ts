@@ -696,7 +696,8 @@ test("types MiniMax 2062 as non-retryable and short-circuits sibling requests", 
     retryable: false,
     opensCircuit: true,
   });
-  expect(firstError.message).toBe("Traffic is currently high—please retry shortly. (2062) (type: rate_limit_error)");
+  expect(firstError.message).toBe("Model request failed with HTTP 429 Too Many Requests");
+  expect(firstError.message).not.toContain("Traffic is currently high");
 
   const siblingError = await caught(collect(sibling.stream({ messages: [], tools: [], system: [] })));
   expect(siblingError).toMatchObject({ category: "plan_capacity", retryable: false, code: "2062" });
@@ -831,9 +832,10 @@ test("preserves structured safe fields on Anthropic SSE errors", async () => {
     fetch: sseFetch([event("error", {
       type: "error",
       error: {
-        message: "Quota exhausted",
+        message: "Quota exhausted credential=hunter2 password=swordfish client_secret=private-client",
         code: 2056,
         type: "rate_limit_error",
+        param: "session_cookie",
       },
     })], { "x-request-id": "req_anthropic_sse_1", "retry-after": "7" }),
   });
@@ -848,9 +850,15 @@ test("preserves structured safe fields on Anthropic SSE errors", async () => {
       status: 200,
       category: "quota_exhausted",
       retryable: false,
-      message: "Quota exhausted (code: 2056, type: rate_limit_error)",
+      message: "Model stream failed (request id: req_anthropic_sse_1)",
     },
   });
+  const error = events[0]?.type === "error" ? events[0].error : undefined;
+  expect(error).toBeInstanceOf(ProviderError);
+  expect((error as ProviderError | undefined)?.param).toBeUndefined();
+  expect(String(error)).not.toContain("hunter2");
+  expect(String(error)).not.toContain("swordfish");
+  expect(String(error)).not.toContain("private-client");
 });
 
 test("preserves header hints on Anthropic 2xx JSON error envelopes", async () => {

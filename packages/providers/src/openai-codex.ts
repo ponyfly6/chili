@@ -235,7 +235,6 @@ interface FinalToolInput {
 
 interface CodexProviderErrorDetails {
   message?: string;
-  publicMessage?: string;
   code?: string | number;
   type?: string;
   param?: string;
@@ -1168,11 +1167,9 @@ async function parseCodexErrorResponse(
         chatGptUsageMessage
         && /(?:^|[_-])usage(?:[_-]limit[_-]reached|[_-]not[_-]included)(?:$|[_-])/i.test(code)
       ) {
-        const planType = typeof error === "string" ? undefined : nonEmptyString(error.plan_type);
         const resetsAt = typeof error === "string" || typeof error.resets_at !== "number" || !Number.isFinite(error.resets_at)
           ? undefined
           : error.resets_at;
-        const plan = planType ? ` (${planType.toLowerCase()} plan)` : "";
         const minutes = resetsAt === undefined
           ? undefined
           : Math.max(0, Math.round((resetsAt * 1000 - Date.now()) / 60000));
@@ -1182,7 +1179,7 @@ async function parseCodexErrorResponse(
         const retry = minutes !== undefined ? ` Try again in ~${minutes} min.` : "";
         return {
           ...(details ?? {}),
-          publicMessage: `You have hit your ChatGPT usage limit${plan}.${retry}`.trim(),
+          publicMessage: `You have hit your ChatGPT usage limit.${retry}`.trim(),
           ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
           category: "quota_exhausted",
           retryable: false,
@@ -1272,43 +1269,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function codexProviderErrorDetails(
   error: CodexErrorPayload | string | undefined,
 ): CodexProviderErrorDetails | undefined {
-  const publicMessage = formatCodexError(error);
-  if (!error || !publicMessage) return undefined;
-  if (typeof error === "string") return { message: error, publicMessage };
+  if (!error) return undefined;
+  if (typeof error === "string") return { message: error };
 
   const message = nonEmptyString(error.message);
   const code = nonEmptyCode(error.code);
   const type = nonEmptyString(error.type);
   const param = nonEmptyString(error.param);
   const requestId = nonEmptyString(error.request_id ?? error.requestId);
+  if (!message && !code && !type && !param && !requestId) return undefined;
   return {
-    publicMessage,
     ...(message ? { message } : {}),
     ...(code ? { code } : {}),
     ...(type ? { type } : {}),
     ...(param ? { param } : {}),
     ...(requestId ? { requestId } : {}),
   };
-}
-
-function formatCodexError(error: CodexErrorPayload | string | undefined): string | undefined {
-  if (!error) return undefined;
-  if (typeof error === "string") return nonEmptyString(error);
-
-  const message = nonEmptyString(error.message);
-  const code = nonEmptyCode(error.code);
-  const type = nonEmptyString(error.type);
-  const param = nonEmptyString(error.param);
-  const requestId = nonEmptyString(error.request_id ?? error.requestId);
-  const primary = message ?? code ?? type;
-  if (!primary) return undefined;
-
-  const details: string[] = [];
-  if (code && code !== primary && !primary.includes(code)) details.push(`code: ${code}`);
-  if (type && type !== primary && type !== code && !primary.includes(type)) details.push(`type: ${type}`);
-  if (param && !primary.includes(param)) details.push(`param: ${param}`);
-  if (requestId && !primary.includes(requestId)) details.push(`request id: ${requestId}`);
-  return details.length > 0 ? `${primary} (${details.join(", ")})` : primary;
 }
 
 function nonEmptyCode(value: unknown): string | undefined {

@@ -770,8 +770,8 @@ test("normalizes raw and structured OpenAI-compatible SSE errors", async () => {
     },
   });
   const structuredError = eventProviderError(structuredEvents[0]);
-  expect(structuredError.message).toContain("[REDACTED_IP]");
-  expect(structuredError.message).toContain("api_key=[REDACTED]");
+  expect(structuredError.message).toBe("Model stream failed (request id: req_openai_sse_1)");
+  expect(structuredError.message).not.toContain("Quota exhausted");
   expect(structuredError.message).not.toContain("10.1.2.3");
   expect(structuredError.message).not.toContain("private-stream-token");
 });
@@ -811,7 +811,8 @@ test("normalizes OpenAI-compatible 2xx JSON error envelopes", async () => {
     },
   });
   const error = eventProviderError(events[0]);
-  expect(error.message).toContain("Bearer [REDACTED]");
+  expect(error.message).toBe("Model response failed (request id: req_openai_json_1)");
+  expect(error.message).not.toContain("Quota exhausted");
   expect(error.message).not.toContain("bearer-secret-789");
 });
 

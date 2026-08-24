@@ -682,6 +682,7 @@ test("types and sanitizes OAuth 2xx error envelopes", async () => {
     requestId: "req_oauth_2xx",
     retryAfterMs: PROVIDER_RETRY_AFTER_MAX_MS,
     retryable: false,
+    message: "OpenAI Codex token response failed (request id: req_oauth_2xx)",
   });
   expect(error.message).not.toContain("SUPERSECRET12345");
   expect(error.message).not.toContain("192.0.2.1");
@@ -1309,7 +1310,7 @@ test("surfaces nested OpenAI Codex SSE error details", async () => {
     type: "invalid_request_error",
     param: "input",
     requestId: "req_sse_1",
-    message: "Request too large for model (code: context_length_exceeded, type: invalid_request_error, param: input, request id: req_sse_1)",
+    message: "OpenAI Codex stream error (request id: req_sse_1)",
   });
 });
 
@@ -1346,7 +1347,7 @@ test("surfaces OpenAI Codex response.failed error details", async () => {
     code: "rate_limit_exceeded",
     requestId: "req_failed_1",
     retryAfterMs: PROVIDER_RETRY_AFTER_MAX_MS,
-    message: "Rate limit reached (code: rate_limit_exceeded, request id: req_failed_1)",
+    message: "OpenAI Codex response failed (request id: req_failed_1)",
   });
 });
 
@@ -1432,6 +1433,7 @@ test("types missing-body and 2xx JSON Codex response failures", async () => {
     category: "quota_exhausted",
     retryable: false,
     opensCircuit: true,
+    message: "OpenAI Codex response failed (request id: req_codex_2xx)",
   });
   expect(envelopeError.message).not.toContain("SUPERSECRET12345");
   expect(envelopeError.message).not.toContain("2001:db8::1234");
@@ -1462,10 +1464,10 @@ test("surfaces OpenAI Codex HTTP error details", async () => {
     status: 401,
     category: "authentication",
     retryable: false,
-    code: "invalid_api_key",
     requestId: "req_http_1",
-    message: "Invalid token (code: invalid_api_key, request id: req_http_1)",
+    message: "Codex API request failed with HTTP 401 Unauthorized (request id: req_http_1)",
   });
+  expect(error.code).toBeUndefined();
 });
 
 test("validates structured Codex error fields before selecting a public message", async () => {
@@ -1493,12 +1495,47 @@ test("validates structured Codex error fields before selecting a public message"
     status: 400,
     category: "invalid_request",
     code: "1234",
-    message: "1234",
+    message: "Codex API request failed with HTTP 400 Bad Request",
   });
   expect(error.message).not.toContain("private-message");
   expect(error.message).not.toContain("private-type");
   expect(error.message).not.toContain("private-request-id");
   expect(error.message).not.toContain("10.9.8.7");
+});
+
+test("does not expose sensitive Codex machine fields", async () => {
+  const model = new CodexApiResponsesModel({
+    model: "gpt-5.6-sol",
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
+    fetch: (async () => new Response(JSON.stringify({
+      error: {
+        message: "credential=hunter2 password=swordfish",
+        code: "credential",
+        type: "client_secret",
+        param: "session_cookie",
+        request_id: "password:private-request-id",
+      },
+    }), {
+      status: 400,
+      headers: { "content-type": "application/json", "x-request-id": "req_safe_codex" },
+    })) as unknown as typeof fetch,
+    env: {},
+  });
+
+  const error = await rejectedProviderError(() => collect(model.stream({ messages: [] })));
+  expect(error).toMatchObject({
+    provider: "codex-api",
+    status: 400,
+    requestId: "req_safe_codex",
+    message: "Codex API request failed with HTTP 400 Bad Request (request id: req_safe_codex)",
+  });
+  expect(error.code).toBeUndefined();
+  expect(error.type).toBeUndefined();
+  expect(error.param).toBeUndefined();
+  for (const probe of ["hunter2", "swordfish", "credential", "client_secret", "session_cookie", "private-request-id"]) {
+    expect(`${error.message} ${JSON.stringify(error)}`).not.toContain(probe);
+  }
 });
 
 test("normalizes Codex API HTTP and raw SSE failures without exposing provider bodies", async () => {
@@ -1557,7 +1594,7 @@ test("keeps transient ChatGPT 429 failures retryable", async () => {
     fetch: rateLimitFetch(),
   });
   await expect(collect(apiModel.stream({ messages: [] }))).rejects.toThrow(
-    "Gateway rate limit reached (code: rate_limit_exceeded, request id: req_rate_limit)",
+    "Codex API request failed with HTTP 429 Too Many Requests (request id: req_rate_limit)",
   );
 
   const oauthModel = new OpenAICodexResponsesModel({
@@ -1574,7 +1611,7 @@ test("keeps transient ChatGPT 429 failures retryable", async () => {
     opensCircuit: false,
     code: "rate_limit_exceeded",
   });
-  expect(error.message).toBe("Gateway rate limit reached (code: rate_limit_exceeded, request id: req_rate_limit)");
+  expect(error.message).toBe("OpenAI Codex request failed with HTTP 429 Too Many Requests (request id: req_rate_limit)");
 });
 
 test.each(["usage_limit_reached", "usage_not_included"])(
@@ -1607,7 +1644,8 @@ test.each(["usage_limit_reached", "usage_not_included"])(
       code,
       requestId: "req_usage_limit",
     });
-    expect(error.message).toContain("You have hit your ChatGPT usage limit (plus plan).");
+    expect(error.message).toContain("You have hit your ChatGPT usage limit.");
+    expect(error.message).not.toContain("plus plan");
     expect(error.message).not.toContain("Provider-specific private quota detail");
   },
 );
