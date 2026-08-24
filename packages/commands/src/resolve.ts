@@ -1,38 +1,39 @@
-import { CommandRegistry, commandNames, splitCommandName } from "./registry.js";
+import { CommandRegistry } from "./registry.js";
 import { createCommandRunInput } from "./template.js";
-import type { CommandDefinition } from "./types.js";
+import type { CommandDefinition, CommandRunInput } from "./types.js";
 
-export interface ResolveCommandOptions {
-  allowPrefix?: boolean;
-  includeHidden?: boolean;
-}
-
-export type ResolveCommandResult =
+export type ResolveCommandResult<TContext, TResult> =
   | {
       status: "matched";
-      command: CommandDefinition;
-      args: ReturnType<typeof createCommandRunInput>;
-      path: readonly string[];
+      command: CommandDefinition<TContext, TResult>;
+      args: CommandRunInput;
+      path: string;
       invocation: string;
-      matchType: "exact" | "prefix";
     }
   | {
-      status: "ambiguous";
-      input: string;
-      candidates: readonly CommandCandidate[];
+      status: "incomplete";
+      command: CommandDefinition<TContext, TResult>;
+      path: string;
+      reason: "children_required" | "arguments_required";
+      usage: string;
+      children: readonly string[];
+    }
+  | {
+      status: "disabled";
+      command: CommandDefinition<TContext, TResult>;
+      path: string;
+      reason: string;
     }
   | {
       status: "unknown";
       input: string;
-      normalized: string;
+      token: string;
+      suggestions: readonly string[];
+    }
+  | {
+      status: "not_command";
+      input: string;
     };
-
-export interface CommandCandidate {
-  command: CommandDefinition;
-  path: readonly string[];
-  invocationTokens: readonly string[];
-  value: string;
-}
 
 export interface ParsedCommandInput {
   body: string;
@@ -47,61 +48,78 @@ export interface ParsedCommandToken {
   end: number;
 }
 
-export function resolveCommand(
-  commands: CommandRegistry | readonly CommandDefinition[],
+export function resolveCommand<TContext, TResult>(
+  commands: CommandRegistry<TContext, TResult> | readonly CommandDefinition<TContext, TResult>[],
+  context: TContext,
   input: string,
-  options: ResolveCommandOptions = {},
-): ResolveCommandResult {
+): ResolveCommandResult<TContext, TResult> {
+  if (!input.trimStart().startsWith("/")) return { status: "not_command", input };
+
+  const roots = commandsOf(commands, true);
   const parsed = parseCommandInput(input);
   if (parsed.tokens.length === 0) {
-    return { status: "unknown", input, normalized: parsed.body };
-  }
-
-  const candidates = collectCommandCandidates(commandsOf(commands, options.includeHidden));
-  const exact = dedupeCandidates(
-    candidates.filter((candidate) => exactCandidateMatch(candidate, parsed.tokens)),
-  ).sort((left, right) => right.invocationTokens.length - left.invocationTokens.length);
-
-  if (exact.length > 0) {
-    const longest = exact[0]?.invocationTokens.length ?? 0;
-    const matches = exact.filter((candidate) => candidate.invocationTokens.length === longest);
-    if (matches.length > 1) {
-      return { status: "ambiguous", input, candidates: matches };
-    }
-    const match = matches[0];
-    if (!match) return { status: "unknown", input, normalized: parsed.body };
-    const raw = rawArgsAfter(parsed, match.invocationTokens.length);
     return {
-      status: "matched",
-      command: match.command,
-      args: createCommandRunInput(input, raw, match.value),
-      path: match.path,
-      invocation: match.value,
-      matchType: "exact",
+      status: "unknown",
+      input,
+      token: "",
+      suggestions: roots.filter((command) => !command.hidden).map((command) => command.path),
     };
   }
 
-  if (options.allowPrefix) {
-    const prefix = dedupeCandidates(candidates.filter((candidate) => prefixCandidateMatch(candidate, parsed.tokens)));
-    if (prefix.length > 1) return { status: "ambiguous", input, candidates: prefix };
-    const match = prefix[0];
-    if (match) {
-      return {
-        status: "matched",
-        command: match.command,
-        args: createCommandRunInput(input, "", match.value),
-        path: match.path,
-        invocation: match.value,
-        matchType: "prefix",
-      };
-    }
+  const first = parsed.tokens[0];
+  const root = roots.find((command) => command.name === first?.normalized);
+  if (!root) {
+    if (looksLikeAbsolutePath(input)) return { status: "not_command", input };
+    return unknownResult(input, first?.value ?? "", roots);
   }
 
-  return { status: "unknown", input, normalized: parsed.body };
+  let command = root;
+  let consumed = 1;
+  while (consumed < parsed.tokens.length && command.children.length > 0) {
+    const token = parsed.tokens[consumed];
+    const child = command.children.find((candidate) => candidate.name === token?.normalized);
+    if (!child) {
+      return unknownResult(input, token?.value ?? "", command.children);
+    }
+    command = child;
+    consumed += 1;
+  }
+
+  const raw = rawArgsAfter(parsed, consumed);
+  if (raw && command.argumentMode === "none") {
+    return unknownResult(input, parsed.tokens[consumed]?.value ?? raw, command.children);
+  }
+
+  if (!raw && command.argumentMode === "required") {
+    return incompleteResult(command, "arguments_required");
+  }
+
+  if (!raw && command.children.length > 0 && command.run === undefined) {
+    return incompleteResult(command, "children_required");
+  }
+
+  const availability = command.available?.(context) ?? { enabled: true };
+  if (!availability.enabled) {
+    return {
+      status: "disabled",
+      command,
+      path: command.path,
+      reason: availability.reason ?? "Command is unavailable.",
+    };
+  }
+
+  return {
+    status: "matched",
+    command,
+    args: createCommandRunInput(input, raw, command.path),
+    path: command.path,
+    invocation: command.path,
+  };
 }
 
 export function parseCommandInput(input: string): ParsedCommandInput {
-  const body = input.trimStart().replace(/^\//, "");
+  const trimmed = input.trimStart();
+  const body = trimmed.startsWith("/") ? trimmed.slice(1) : trimmed;
   const tokens: ParsedCommandToken[] = [];
   const pattern = /\S+/g;
   let match: RegExpExecArray | null;
@@ -114,7 +132,6 @@ export function parseCommandInput(input: string): ParsedCommandInput {
       end: match.index + value.length,
     });
   }
-
   return {
     body,
     tokens,
@@ -122,71 +139,92 @@ export function parseCommandInput(input: string): ParsedCommandInput {
   };
 }
 
-export function collectCommandCandidates(commands: readonly CommandDefinition[]): CommandCandidate[] {
-  return collectCommandCandidatesInner(commands, [[]], []);
+export function commandsOf<TContext, TResult>(
+  commands: CommandRegistry<TContext, TResult> | readonly CommandDefinition<TContext, TResult>[],
+  includeHidden = false,
+): readonly CommandDefinition<TContext, TResult>[] {
+  const roots = commands instanceof CommandRegistry ? commands.roots() : commands;
+  return includeHidden ? roots : visibleCommands(roots);
 }
 
-export function commandsOf(
-  commands: CommandRegistry | readonly CommandDefinition[],
-  includeHidden = true,
-): readonly CommandDefinition[] {
-  if (commands instanceof CommandRegistry) {
-    return includeHidden ? commands.all() : commands.list();
-  }
-  if (includeHidden) return commands;
-  return commands.filter((command) => !command.hidden);
+export function collectCommandNodes<TContext, TResult>(
+  commands: readonly CommandDefinition<TContext, TResult>[],
+): CommandDefinition<TContext, TResult>[] {
+  return commands.flatMap((command) => [command, ...collectCommandNodes(command.children)]);
 }
 
-function collectCommandCandidatesInner(
-  commands: readonly CommandDefinition[],
-  parentInvocations: readonly (readonly string[])[],
-  parentPath: readonly string[],
-): CommandCandidate[] {
-  const output: CommandCandidate[] = [];
+export function looksLikeAbsolutePath(input: string): boolean {
+  const trimmed = input.trimStart();
+  if (/^[A-Za-z]:[\\/]/.test(trimmed)) return true;
+  if (!trimmed.startsWith("/")) return false;
+  const token = trimmed.split(/\s+/, 1)[0] ?? "";
+  if (token.startsWith("//") || token.slice(1).includes("/")) return true;
+  return /^\/(?:Applications|Library|System|Users|Volumes|dev|etc|home|opt|private|tmp|usr|var)$/i.test(token);
+}
 
-  for (const command of commands) {
-    const alternatives = commandNames(command).map((name) => splitCommandName(name)).filter((tokens) => tokens.length > 0);
-    const invocations = parentInvocations.flatMap((parent) =>
-      alternatives.map((alternative) => [...parent, ...alternative]),
-    );
-    const path = [...parentPath, ...splitCommandName(command.name)];
+function incompleteResult<TContext, TResult>(
+  command: CommandDefinition<TContext, TResult>,
+  reason: "children_required" | "arguments_required",
+): Extract<ResolveCommandResult<TContext, TResult>, { status: "incomplete" }> {
+  return {
+    status: "incomplete",
+    command,
+    path: command.path,
+    reason,
+    usage: `${command.path}${command.argumentHint ? ` ${command.argumentHint}` : ""}`,
+    children: command.children.filter((child) => !child.hidden).map((child) => child.path),
+  };
+}
 
-    for (const invocationTokens of invocations) {
-      output.push({
-        command,
-        path,
-        invocationTokens,
-        value: `/${path.join(" ")}`,
-      });
+function unknownResult<TContext, TResult>(
+  input: string,
+  token: string,
+  commands: readonly CommandDefinition<TContext, TResult>[],
+): Extract<ResolveCommandResult<TContext, TResult>, { status: "unknown" }> {
+  return {
+    status: "unknown",
+    input,
+    token,
+    suggestions: strongestSuggestions(token, commands),
+  };
+}
+
+function strongestSuggestions<TContext, TResult>(
+  token: string,
+  commands: readonly CommandDefinition<TContext, TResult>[],
+): string[] {
+  const query = token.toLowerCase();
+  const ranked = commands
+    .filter((command) => !command.hidden)
+    .map((command, index) => ({ command, index, rank: suggestionRank(command.name, query) }))
+    .filter((candidate): candidate is typeof candidate & { rank: number } => candidate.rank !== undefined)
+    .sort((left, right) => left.rank - right.rank || left.index - right.index);
+  const best = ranked[0]?.rank;
+  return ranked.filter((candidate) => candidate.rank === best).slice(0, 5).map((candidate) => candidate.command.path);
+}
+
+function suggestionRank(value: string, query: string): number | undefined {
+  if (!query) return 0;
+  if (value === query) return 0;
+  if (value.startsWith(query)) return 1;
+  const distance = levenshtein(value, query);
+  return distance <= Math.max(2, Math.floor(value.length / 3)) ? 2 + distance : undefined;
+}
+
+function levenshtein(left: string, right: string): number {
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    const current = [leftIndex];
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      current[rightIndex] = Math.min(
+        (current[rightIndex - 1] ?? 0) + 1,
+        (previous[rightIndex] ?? 0) + 1,
+        (previous[rightIndex - 1] ?? 0) + (left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1),
+      );
     }
-
-    if (command.subCommands.length > 0) {
-      output.push(...collectCommandCandidatesInner(command.subCommands, invocations, path));
-    }
+    previous.splice(0, previous.length, ...current);
   }
-
-  return output;
-}
-
-function exactCandidateMatch(candidate: CommandCandidate, tokens: readonly ParsedCommandToken[]): boolean {
-  if (tokens.length < candidate.invocationTokens.length) return false;
-  if (tokens.length > candidate.invocationTokens.length && candidate.command.argumentMode === "none") return false;
-  return candidate.invocationTokens.every((token, index) => tokens[index]?.normalized === token);
-}
-
-function prefixCandidateMatch(candidate: CommandCandidate, tokens: readonly ParsedCommandToken[]): boolean {
-  if (tokens.length > candidate.invocationTokens.length) return false;
-  for (let index = 0; index < tokens.length; index += 1) {
-    const inputToken = tokens[index];
-    const candidateToken = candidate.invocationTokens[index];
-    if (!inputToken || !candidateToken) return false;
-    if (index === tokens.length - 1) {
-      if (!candidateToken.startsWith(inputToken.normalized)) return false;
-    } else if (candidateToken !== inputToken.normalized) {
-      return false;
-    }
-  }
-  return true;
+  return previous[right.length] ?? 0;
 }
 
 function rawArgsAfter(parsed: ParsedCommandInput, tokenCount: number): string {
@@ -195,20 +233,10 @@ function rawArgsAfter(parsed: ParsedCommandInput, tokenCount: number): string {
   return parsed.body.slice(token.end).trimStart();
 }
 
-function dedupeCandidates(candidates: readonly CommandCandidate[]): CommandCandidate[] {
-  const seen = new Set<string>();
-  const commandIds = new Map<CommandDefinition, number>();
-  const output: CommandCandidate[] = [];
-  for (const candidate of candidates) {
-    let commandId = commandIds.get(candidate.command);
-    if (commandId === undefined) {
-      commandId = commandIds.size;
-      commandIds.set(candidate.command, commandId);
-    }
-    const key = `${commandId}\0${candidate.value}\0${candidate.invocationTokens.join(" ")}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    output.push(candidate);
-  }
-  return output;
+function visibleCommands<TContext, TResult>(
+  commands: readonly CommandDefinition<TContext, TResult>[],
+): CommandDefinition<TContext, TResult>[] {
+  return commands
+    .filter((command) => !command.hidden)
+    .map((command) => ({ ...command, children: visibleCommands(command.children) }));
 }

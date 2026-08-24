@@ -6,10 +6,11 @@ import { createCommandRegistry } from "./registry.js";
 import { loadCommandDirectory, loadProjectCommands, loadUserCommands } from "./project-loader.js";
 import { resolveCommand } from "./resolve.js";
 
-test("project loader reads markdown commands with frontmatter", async () => {
+test("project loader derives a recursive /prompt project namespace", async () => {
   const cwd = await tempProject();
+  await mkdir(path.join(cwd, ".chili/commands/review"), { recursive: true });
   await writeFile(
-    path.join(cwd, ".chili/commands/review.md"),
+    path.join(cwd, ".chili/commands/review/security.md"),
     [
       "---",
       "description: Review the current change",
@@ -19,25 +20,27 @@ test("project loader reads markdown commands with frontmatter", async () => {
       "writeScope: [AGENTS.md]",
       "executeScope: [bun test]",
       "subtask: true",
-      "category: quality",
       "hidden: false",
       "---",
       "Review $ARGUMENTS with focus on $1 and $2.",
-      "",
     ].join("\n"),
   );
 
   const result = await loadProjectCommands({ cwd });
+  const registry = createCommandRegistry(result.commands);
+  const command = registry.findByPath("/prompt project review security");
 
   expect(result.diagnostics).toEqual([]);
-  expect(result.commands).toHaveLength(1);
-
-  const command = result.commands[0];
-  expect(command?.name).toBe("review");
-  expect(command?.description).toBe("Review the current change");
-  expect(command?.argumentHint).toBe("<files>");
-  expect(command?.category).toBe("quality");
-  expect(command?.hidden).toBe(false);
+  expect(command).toMatchObject({
+    id: "prompt.project.review.security",
+    name: "security",
+    path: "/prompt project review security",
+    description: "Review the current change",
+    argumentHint: "<files>",
+    group: "prompt",
+    source: "project",
+    executionTarget: "prompt",
+  });
   expect(command?.metadata).toMatchObject({
     model: "chili-reviewer",
     allowedTools: ["Read", "Grep"],
@@ -47,81 +50,84 @@ test("project loader reads markdown commands with frontmatter", async () => {
   });
 });
 
-test("project prompt command expands arguments without shell execution", async () => {
+test("project prompt expansion runs only at its canonical namespace", async () => {
   const cwd = await tempProject();
   await writeFile(
     path.join(cwd, ".chili/commands/review.md"),
     "Review $ARGUMENTS\nfirst=$1\nsecond=$2\nliteral=@file\nshell=!{echo no}\n",
   );
+  const result = await loadProjectCommands({ cwd });
+  const registry = createCommandRegistry(result.commands);
 
-  const { commands } = await loadProjectCommands({ cwd });
-  const resolved = resolveCommand(commands, "/review src/index.ts tests/index.test.ts");
-
+  expect(resolveCommand(registry, {}, "/review src/index.ts").status).toBe("unknown");
+  const resolved = resolveCommand(registry, {}, "/prompt project review src/index.ts tests/index.test.ts");
   expect(resolved.status).toBe("matched");
-  if (resolved.status !== "matched") return;
+  if (resolved.status !== "matched" || !resolved.command.run) return;
 
   const output = await resolved.command.run({}, resolved.args);
-  expect(output.type).toBe("prompt");
-  if (output.type !== "prompt") return;
-
   expect(output.prompt).toContain("Review src/index.ts tests/index.test.ts");
   expect(output.prompt).toContain("first=src/index.ts");
   expect(output.prompt).toContain("second=tests/index.test.ts");
   expect(output.prompt).toContain("literal=@file");
   expect(output.prompt).toContain("shell=!{echo no}");
-});
-
-test("loader reads nested markdown commands as multi-token command names", async () => {
-  const cwd = await tempProject();
-  await mkdir(path.join(cwd, ".chili/commands/review"), { recursive: true });
-  await writeFile(path.join(cwd, ".chili/commands/review/security.md"), "Review security for $ARGUMENTS");
-
-  const { commands } = await loadProjectCommands({ cwd });
-  const resolved = resolveCommand(commands, "/review security src/auth.ts");
-  expect(resolved.status).toBe("matched");
-  if (resolved.status !== "matched") return;
-
-  expect(resolved.command.name).toBe("review security");
-  expect(resolved.path).toEqual(["review", "security"]);
-  const output = await resolved.command.run({}, resolved.args);
-  expect(output.prompt).toBe("Review security for src/auth.ts");
-});
-
-test("registry keeps first command when user and project commands conflict", async () => {
-  const root = await mkdtemp(path.join(tmpdir(), "chili-commands-conflict-"));
-  await mkdir(path.join(root, "project-commands"), { recursive: true });
-  await mkdir(path.join(root, "user-commands"), { recursive: true });
-  await writeFile(path.join(root, "project-commands/review.md"), "project review");
-  await writeFile(path.join(root, "user-commands/review.md"), "user review");
-
-  const project = await loadCommandDirectory({ directory: path.join(root, "project-commands"), source: "project" });
-  const user = await loadCommandDirectory({ directory: path.join(root, "user-commands"), source: "user" });
-  const registry = createCommandRegistry(project.commands);
-  const results = registry.registerMany(user.commands);
-
-  expect(results).toHaveLength(1);
-  expect(results[0]).toMatchObject({
-    status: "skipped",
-    reason: "name_conflict",
-    name: "review",
+  expect(output.metadata).toMatchObject({
+    commandId: "prompt.project.review",
+    commandPath: "/prompt project review",
+    source: "project",
   });
-
-  const resolved = resolveCommand(registry, "/review");
-  expect(resolved.status).toBe("matched");
-  if (resolved.status !== "matched") return;
-  expect(resolved.command.source).toBe("project");
 });
 
-test("user loader reads commands from a chili home directory", async () => {
+test("user loader derives a distinct /prompt user namespace", async () => {
   const chiliHome = await mkdtemp(path.join(tmpdir(), "chili-home-"));
   await mkdir(path.join(chiliHome, "commands"), { recursive: true });
   await writeFile(path.join(chiliHome, "commands/fix-test.md"), "Fix $ARGUMENTS");
 
   const result = await loadUserCommands({ chiliHome });
+  const registry = createCommandRegistry(result.commands);
 
-  expect(result.commands).toHaveLength(1);
-  expect(result.commands[0]?.name).toBe("fix-test");
-  expect(result.commands[0]?.source).toBe("user");
+  expect(registry.findByPath("/prompt user fix-test")).toMatchObject({
+    id: "prompt.user.fix-test",
+    source: "user",
+  });
+  expect(registry.findByPath("/prompt project fix-test")).toBeUndefined();
+});
+
+test("removed frontmatter fields reject the prompt instead of acting as compatibility input", async () => {
+  const cwd = await tempProject();
+  await writeFile(
+    path.join(cwd, ".chili/commands/legacy.md"),
+    "---\ncategory: quality\naliases: [old-review]\n---\nLegacy prompt",
+  );
+
+  const result = await loadProjectCommands({ cwd });
+
+  expect(createCommandRegistry(result.commands).findByPath("/prompt project legacy")).toBeUndefined();
+  expect(result.diagnostics).toEqual([
+    expect.objectContaining({
+      level: "error",
+      code: "unsupported_frontmatter_field",
+      message: "Unsupported command frontmatter field: category",
+    }),
+  ]);
+});
+
+test("normalized source-local path collisions are diagnosed and never overwritten", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "chili-commands-conflict-"));
+  await writeFile(path.join(root, "Code Review.md"), "first");
+  await writeFile(path.join(root, "code-review.md"), "second");
+
+  const result = await loadCommandDirectory({ directory: root, source: "project" });
+  const registry = createCommandRegistry(result.commands);
+
+  expect(registry.findByPath("/prompt project code-review")?.origin).toEndWith("Code Review.md");
+  expect(result.diagnostics).toEqual([
+    expect.objectContaining({
+      level: "error",
+      code: "duplicate_command_path",
+      path: "/prompt project code-review",
+      commandIds: ["prompt.project.code-review", "prompt.project.code-review"],
+    }),
+  ]);
 });
 
 test("malformed frontmatter returns a diagnostic and skips the command", async () => {
@@ -130,12 +136,9 @@ test("malformed frontmatter returns a diagnostic and skips the command", async (
 
   const result = await loadProjectCommands({ cwd });
 
-  expect(result.commands).toEqual([]);
+  expect(createCommandRegistry(result.commands).findByPath("/prompt project broken")).toBeUndefined();
   expect(result.diagnostics).toEqual([
-    expect.objectContaining({
-      level: "error",
-      code: "malformed_frontmatter",
-    }),
+    expect.objectContaining({ level: "error", code: "malformed_frontmatter" }),
   ]);
 });
 

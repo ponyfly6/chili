@@ -1,10 +1,20 @@
-export type CommandSource = "project" | "user" | "mcp" | "builtin";
-
-export type CommandArgumentMode = "none" | "optional" | "required" | "variadic";
+import type {
+  RuntimeCommandArgumentMode,
+  RuntimeCommandConcurrency,
+  RuntimeCommandExecutionTarget,
+  RuntimeCommandNode,
+  RuntimeCommandSelectionMode,
+  RuntimeCommandSource,
+} from "@chili/protocol";
 
 export interface CommandContext {
   cwd?: string;
   metadata?: Readonly<Record<string, unknown>>;
+}
+
+export interface CommandAvailability {
+  enabled: boolean;
+  reason?: string;
 }
 
 export interface CommandRunInput {
@@ -14,9 +24,18 @@ export interface CommandRunInput {
   input: string;
 }
 
+export interface CommandCompletionInput {
+  raw: string;
+  query: string;
+  argv: readonly string[];
+  invocation: string;
+}
+
 export interface PromptCommandMetadata {
-  commandName: string;
-  source: CommandSource;
+  readonly [key: string]: unknown;
+  commandId: string;
+  commandPath: string;
+  source: RuntimeCommandSource;
   filePath?: string;
   model?: string;
   allowedTools?: readonly string[];
@@ -31,48 +50,56 @@ export interface CommandRunResult {
   metadata: PromptCommandMetadata;
 }
 
-export interface CommandCompletion {
+export interface CommandSuggestion {
+  id: string;
   value: string;
   label: string;
   description: string;
-  category: string;
-  source: CommandSource;
+  group: string;
+  source: RuntimeCommandSource;
   argumentHint: string;
   hidden: boolean;
+  enabled: boolean;
+  disabledReason?: string;
+  intent: RuntimeCommandSelectionMode;
 }
 
-export interface CommandDefinition {
-  name: string;
-  aliases: readonly string[];
-  category: string;
-  description: string;
-  argumentHint: string;
-  source: CommandSource;
-  hidden: boolean;
-  argumentMode: CommandArgumentMode;
-  supportsNonInteractive: boolean;
-  isSafeConcurrent: boolean;
-  isEnabled: (ctx: CommandContext) => boolean;
-  subCommands: readonly CommandDefinition[];
-  complete: (ctx: CommandContext, input: string) => readonly CommandCompletion[];
-  run: (ctx: CommandContext, args: CommandRunInput) => CommandRunResult | Promise<CommandRunResult>;
-  metadata?: Readonly<Record<string, unknown>>;
+export interface CommandDefinition<TContext = CommandContext, TResult = CommandRunResult>
+  extends Omit<RuntimeCommandNode, "children" | "enabled" | "disabledReason"> {
+  children: readonly CommandDefinition<TContext, TResult>[];
+  origin?: string;
+  available?: (context: TContext) => CommandAvailability;
+  complete?: (
+    context: TContext,
+    input: CommandCompletionInput,
+  ) => readonly CommandSuggestion[] | Promise<readonly CommandSuggestion[]>;
+  run?: (context: TContext, input: CommandRunInput) => TResult | Promise<TResult>;
+  metadata?: PromptCommandMetadata | Readonly<Record<string, unknown>>;
 }
 
-export interface CommandDefinitionInput {
+export interface CommandDefinitionInput<TContext = CommandContext, TResult = CommandRunResult> {
+  id: string;
   name: string;
-  category: string;
+  title: string;
   description: string;
-  source: CommandSource;
-  aliases?: readonly string[];
+  group: string;
+  source: RuntimeCommandSource;
+  argumentMode?: RuntimeCommandArgumentMode;
   argumentHint?: string;
+  selectionMode?: RuntimeCommandSelectionMode;
+  concurrency?: RuntimeCommandConcurrency;
   hidden?: boolean;
-  argumentMode?: CommandArgumentMode;
-  supportsNonInteractive?: boolean;
-  isSafeConcurrent?: boolean;
-  isEnabled?: (ctx: CommandContext) => boolean;
-  subCommands?: readonly CommandDefinitionInput[];
-  complete?: (ctx: CommandContext, input: string) => readonly CommandCompletion[];
-  run?: (ctx: CommandContext, args: CommandRunInput) => CommandRunResult | Promise<CommandRunResult>;
-  metadata?: Readonly<Record<string, unknown>>;
+  executionTarget: RuntimeCommandExecutionTarget;
+  children?: readonly CommandDefinitionInput<TContext, TResult>[];
+  origin?: string;
+  available?: (context: TContext) => CommandAvailability;
+  complete?: (
+    context: TContext,
+    input: CommandCompletionInput,
+  ) => readonly CommandSuggestion[] | Promise<readonly CommandSuggestion[]>;
+  run?: (context: TContext, input: CommandRunInput) => TResult | Promise<TResult>;
+  metadata?: PromptCommandMetadata | Readonly<Record<string, unknown>>;
 }
+
+export type CommandSource = RuntimeCommandSource;
+export type CommandArgumentMode = RuntimeCommandArgumentMode;

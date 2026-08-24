@@ -102,34 +102,52 @@ export interface RuntimePermissionConfig {
   profiles: RuntimePermissionProfileDescriptor[];
 }
 
-export type RuntimePromptCommandSource = "project" | "user" | "mcp" | "builtin";
+export type RuntimeCommandSource = "project" | "user" | "mcp" | "builtin";
 
-export interface RuntimePromptCommandDescriptor {
+export type RuntimeCommandArgumentMode = "none" | "optional" | "required" | "variadic";
+
+export type RuntimeCommandSelectionMode = "execute" | "complete" | "drilldown";
+
+export type RuntimeCommandConcurrency = "allow" | "deny";
+
+export type RuntimeCommandExecutionTarget = "client" | "runtime" | "prompt";
+
+export interface RuntimeCommandNode {
+  id: string;
   name: string;
-  aliases: string[];
+  path: string;
+  title: string;
   description: string;
-  category: string;
-  source: RuntimePromptCommandSource;
+  group: string;
+  source: RuntimeCommandSource;
+  argumentMode: RuntimeCommandArgumentMode;
   argumentHint: string;
+  selectionMode: RuntimeCommandSelectionMode;
+  concurrency: RuntimeCommandConcurrency;
   hidden: boolean;
+  enabled: boolean;
+  disabledReason?: string;
+  executionTarget: RuntimeCommandExecutionTarget;
+  children: RuntimeCommandNode[];
 }
 
-export interface RuntimePromptCommandDiagnostic {
+export interface RuntimeCommandDiagnostic {
   level: "warning" | "error";
   code: string;
   message: string;
+  path?: string;
   filePath?: string;
+  commandIds?: string[];
+  origins?: string[];
 }
 
-export interface RuntimePromptCommandList {
-  commands: RuntimePromptCommandDescriptor[];
-  diagnostics: RuntimePromptCommandDiagnostic[];
-  directories: string[];
-  skippedConflicts: string[];
+export interface RuntimeCommandCatalog {
+  roots: RuntimeCommandNode[];
+  diagnostics: RuntimeCommandDiagnostic[];
 }
 
-export interface RuntimePromptCommandInvocation {
-  name: string;
+export interface RuntimeCommandInvocation {
+  commandId: string;
   args?: string;
   cwd?: string;
 }
