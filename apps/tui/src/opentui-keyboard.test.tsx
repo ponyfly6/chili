@@ -1047,6 +1047,27 @@ test("slash completion selection uses Up and Down without switching prompt histo
   }
 });
 
+test("slash completion visits thinking after model", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    runtime: {
+      submitPrompt: async () => true,
+    },
+  });
+
+  try {
+    await typeText(app, "/");
+    for (let index = 0; index < 4; index += 1) {
+      await press(app, () => app.mockInput.pressArrow("down"));
+    }
+    expect(app.captureCharFrame()).toContain("> /model — Configure the active model");
+
+    await press(app, () => app.mockInput.pressArrow("down"));
+    expect(app.captureCharFrame()).toContain("> /thinking — Configure reasoning and traces");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
 test("slash completion Up wraps from the first item to the last item", async () => {
   const app = await mountShell(teamLiveFixture(), {
     runtime: {

@@ -41,8 +41,12 @@ export function CommandList(props: {
 
 export const DEFAULT_COMMAND_LIST_MAX_ITEMS = 5;
 
-export function commandListHeight(items: readonly TuiCommandSuggestion[], maxItems = DEFAULT_COMMAND_LIST_MAX_ITEMS): number {
-  const visible = items.slice(0, Math.max(1, maxItems));
+export function commandListHeight(
+  items: readonly TuiCommandSuggestion[],
+  maxItems = DEFAULT_COMMAND_LIST_MAX_ITEMS,
+  selectedIndex = 0,
+): number {
+  const visible = visibleItems(items, selectedIndex, Math.max(1, maxItems)).map(({ item }) => item);
   const itemRows = Math.max(visible.length, 1);
   const groupRows = new Set(visible.map((item) => item.group)).size;
   return itemRows + groupRows + 4;

@@ -135,8 +135,10 @@ export function PromptComposer(props: {
   const height = promptComposerHeight({
     completions: props.completions,
     completionOpen: props.completionOpen,
+    completionIndex: props.completionIndex,
     paletteOpen: props.paletteOpen,
     paletteItems: props.paletteItems,
+    paletteIndex: props.paletteIndex,
     feedback: props.feedback,
     maxCommandItems,
     prompt: promptValue,
@@ -193,8 +195,10 @@ export function PromptComposer(props: {
 export function promptComposerHeight(input: {
   completions: readonly TuiCommandSuggestion[];
   completionOpen?: boolean | undefined;
+  completionIndex?: number | undefined;
   paletteOpen: boolean;
   paletteItems: readonly TuiCommandSuggestion[];
+  paletteIndex?: number | undefined;
   feedback?: unknown;
   maxCommandItems?: number | undefined;
   shellMode?: boolean | undefined;
@@ -203,8 +207,9 @@ export function promptComposerHeight(input: {
 }): number {
   const maxCommandItems = input.maxCommandItems ?? DEFAULT_COMMAND_LIST_MAX_ITEMS;
   const commandItems = input.paletteOpen ? input.paletteItems : input.completions;
+  const commandIndex = input.paletteOpen ? input.paletteIndex : input.completionIndex;
   const commandHeight = input.paletteOpen || input.completionOpen || input.completions.length > 0
-    ? commandListHeight(commandItems, maxCommandItems)
+    ? commandListHeight(commandItems, maxCommandItems, commandIndex)
     : 0;
   const inputWidth = Math.max(1, (input.width ?? 80) - PROMPT_PREFIX_WIDTH - PROMPT_HORIZONTAL_PADDING - 1);
   const promptRows = promptTextareaRows(input.prompt ?? "", inputWidth);
