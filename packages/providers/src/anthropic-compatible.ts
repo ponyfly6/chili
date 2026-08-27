@@ -1,4 +1,10 @@
-import { formatToolResultForModel, type Message, type MessagePart, type ServiceTier } from "@chili/protocol";
+import {
+  formatToolResultForModel,
+  normalizeToolCallId,
+  type Message,
+  type MessagePart,
+  type ServiceTier,
+} from "@chili/protocol";
 import type {
   ChiliModel,
   ModelInputCapability,
@@ -270,7 +276,7 @@ export class AnthropicCompatibleModel implements ChiliModel {
           continue;
         }
         if (block.type === "tool_use") {
-          const toolCallId = block.id ?? `tool_${payload.index}`;
+          const toolCallId = normalizeToolCallId(block.id ?? `tool_${payload.index}`, payload.index);
           const name = block.name ?? "";
           toolBlocks.set(payload.index, {
             toolCallId,
@@ -366,7 +372,7 @@ export class AnthropicCompatibleModel implements ChiliModel {
     const metadata = metadataEvent(this.provider, payload.model ?? this.model, payload.id, usage);
     if (metadata) yield metadata;
 
-    for (const block of payload.content ?? []) {
+    for (const [blockIndex, block] of (payload.content ?? []).entries()) {
       if (block.type === "text") {
         yield { type: "text_delta", text: block.text };
       } else if (block.type === "thinking") {
@@ -374,8 +380,9 @@ export class AnthropicCompatibleModel implements ChiliModel {
       } else if (block.type === "redacted_thinking") {
         yield { type: "reasoning_delta", text: "[Reasoning redacted]", redacted: true };
       } else if (block.type === "tool_use") {
-        yield { type: "tool_call_start", toolCallId: block.id, name: block.name };
-        yield { type: "tool_call_end", toolCallId: block.id, name: block.name, input: block.input };
+        const toolCallId = normalizeToolCallId(block.id, blockIndex);
+        yield { type: "tool_call_start", toolCallId, name: block.name };
+        yield { type: "tool_call_end", toolCallId, name: block.name, input: block.input };
       }
     }
 

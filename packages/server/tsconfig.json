@@ -16,6 +16,9 @@
       "path": "../protocol"
     },
     {
+      "path": "../sdk"
+    },
+    {
       "path": "../store"
     },
     {

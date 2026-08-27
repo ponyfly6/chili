@@ -6,13 +6,17 @@ import {
   chiliBasePromptFragment,
   type AgentTaskControlService,
   type AgentTreeControlService,
+  type ModelRouter,
+  type ModelStreamEvent,
+  type ModelStreamInput,
   type PromptFragment,
   type TeamControlService,
 } from "@chili/core";
-import type { AgentPath, ApprovalId, ChiliEvent, SessionId, TaskId, TeamId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
+import type { AgentPath, AgentRunId, ApprovalId, ChiliEvent, SessionId, TaskId, TeamId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import { SkillRegistry, type Skill } from "@chili/skills";
 import { SqliteEventStore, type AgentMailboxRow, type AgentTaskRow } from "@chili/store";
 import {
+  DeferredUserInputQueue,
   PolicyApprovalBroker,
   PolicyApprovalState,
   type BashRunner,
@@ -29,8 +33,688 @@ import {
   type CliHarness,
 } from "./harness.js";
 import { formatPromptDebugJson, formatPromptDebugText, type CliPromptDebugOutput } from "./prompt-debug.js";
+import { createCliMcpRuntime } from "./mcp-control.js";
 import { runPrompt, runSessionPrompt } from "./runner.js";
 import { readUserModelSelection, writeUserModelSelection } from "./user-model-state.js";
+
+test("CLI harness close interrupts and settles an active root prompt before closing SQLite", async () => {
+  const root = await mkdtempName();
+  const repo = join(root, "repo");
+  const sessionId = "session_harness_graceful_close" as SessionId;
+  const model = new AbortAwareSlowModel();
+  let harness: CliHarness | undefined;
+  let restarted: CliHarness | undefined;
+  try {
+    await mkdir(repo, { recursive: true });
+    harness = await createCliHarness({
+      cwd: repo,
+      quiet: true,
+      yes: true,
+      modelRouter: model,
+      mcpConnectMode: "manual",
+      staleTurnRecoveryIntervalMs: false,
+    });
+    await harness.service.createSession({ sessionId, cwd: repo });
+    const prompt = harness.service.submitPrompt({ sessionId, text: "wait until shutdown" });
+    await model.started.promise;
+
+    const closingHarness = harness;
+    const close = closingHarness.close();
+    await model.abortObserved.promise;
+    let closeSettled = false;
+    void close.then(() => {
+      closeSettled = true;
+    });
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+
+    model.finish.resolve();
+    expect((await prompt).status).toBe("cancelled");
+    await close;
+    expect(closeSettled).toBe(true);
+    harness = undefined;
+
+    const persisted = new SqliteEventStore(join(repo, ".chili", "chili.sqlite"));
+    try {
+      const statuses = (await persisted.events({ sessionId, type: "session.status_changed", limit: 20 }))
+        .map((event) => (event.payload as { status?: string }).status);
+      expect(statuses).not.toContain("cancelling");
+      expect(statuses.at(-1)).toBe("cancelled");
+      expect(persisted.claimSessionRun({
+        sessionId,
+        claimId: "claim_after_graceful_close",
+        allowSubagentSessions: false,
+        time: Date.now(),
+        leaseDurationMs: 1_000,
+      })).toEqual({ status: "claimed" });
+      persisted.releaseSessionRun({ sessionId, claimId: "claim_after_graceful_close" });
+    } finally {
+      persisted.close();
+    }
+
+    restarted = await createCliHarness({
+      cwd: repo,
+      model: "fake",
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+      staleTurnRecoveryIntervalMs: false,
+    });
+    expect((await restarted.service.submitPrompt({ sessionId, text: "reused immediately" })).status).toBe("completed");
+  } finally {
+    model.finish.resolve();
+    await restarted?.close();
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI harness publishes one close promise before an abort listener synchronously reenters", async () => {
+  const root = await mkdtempName();
+  const repo = join(root, "repo");
+  const sessionId = "session_harness_reentrant_close" as SessionId;
+  const model = new AbortAwareSlowModel();
+  let harness: CliHarness | undefined;
+  let mcpCloseCalls = 0;
+  let storeCloseCalls = 0;
+  try {
+    await mkdir(repo, { recursive: true });
+    harness = await createCliHarness({
+      cwd: repo,
+      quiet: true,
+      yes: true,
+      modelRouter: model,
+      mcpConnectMode: "manual",
+      staleTurnRecoveryIntervalMs: false,
+      async mcpRuntimeFactory(options, baseCommands) {
+        const runtime = await createCliMcpRuntime(options, baseCommands);
+        return new Proxy(runtime, {
+          get(target, property, receiver) {
+            if (property === "close") {
+              return async () => {
+                mcpCloseCalls += 1;
+                await target.close();
+              };
+            }
+            const value = Reflect.get(target, property, receiver) as unknown;
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+    });
+    await harness.service.createSession({ sessionId, cwd: repo });
+    const prompt = harness.service.submitPrompt({ sessionId, text: "reenter close from abort" });
+    await model.started.promise;
+
+    const closingHarness = harness;
+    const originalStoreClose = closingHarness.store.close.bind(closingHarness.store);
+    closingHarness.store.close = () => {
+      storeCloseCalls += 1;
+      originalStoreClose();
+    };
+    let reentrantClose: Promise<void> | undefined;
+    model.onAbort = () => {
+      reentrantClose = closingHarness.close();
+    };
+
+    const firstClose = closingHarness.close();
+    expect(reentrantClose).toBe(firstClose);
+    expect(closingHarness.close()).toBe(firstClose);
+    model.finish.resolve();
+
+    expect((await prompt).status).toBe("cancelled");
+    await firstClose;
+    expect(mcpCloseCalls).toBe(1);
+    expect(storeCloseCalls).toBe(1);
+    harness = undefined;
+  } finally {
+    model.finish.resolve();
+    await harness?.close().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI harness close observes rejected MCP and synchronous SQLite cleanup failures once", async () => {
+  const root = await mkdtempName();
+  const repo = join(root, "repo");
+  let harness: CliHarness | undefined;
+  let mcpCloseCalls = 0;
+  try {
+    await mkdir(repo, { recursive: true });
+    harness = await createCliHarness({
+      cwd: repo,
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+      staleTurnRecoveryIntervalMs: false,
+      async mcpRuntimeFactory(options, baseCommands) {
+        const runtime = await createCliMcpRuntime(options, baseCommands);
+        return new Proxy(runtime, {
+          get(target, property, receiver) {
+            if (property === "close") {
+              return async () => {
+                mcpCloseCalls += 1;
+                await target.close();
+                throw new Error("injected MCP close failure");
+              };
+            }
+            const value = Reflect.get(target, property, receiver) as unknown;
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+    });
+    const dbPath = join(repo, ".chili", "chili.sqlite");
+    const originalClose = harness.store.close.bind(harness.store);
+    let storeCloseCalls = 0;
+    harness.store.close = () => {
+      storeCloseCalls += 1;
+      originalClose();
+      throw new Error("injected synchronous SQLite close failure");
+    };
+
+    const first = harness.close();
+    const second = harness.close();
+    expect(second).toBe(first);
+    const firstError = await first.catch((error: unknown) => error);
+    const secondError = await second.catch((error: unknown) => error);
+    expect(firstError).toBe(secondError);
+    expect(firstError).toBeInstanceOf(AggregateError);
+    expect((firstError as AggregateError).errors.map((error) => String(error))).toEqual([
+      "Error: injected MCP close failure",
+      "Error: injected synchronous SQLite close failure",
+    ]);
+    expect(mcpCloseCalls).toBe(1);
+    expect(storeCloseCalls).toBe(1);
+
+    const reopened = new SqliteEventStore(dbPath);
+    try {
+      expect(await reopened.sessions()).toEqual([]);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    await harness?.close().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI harness retries stale-turn reconciliation after a crashed run claim lease expires", async () => {
+  const root = await mkdtempName();
+  const repo = join(root, "repo");
+  const stateDir = join(repo, ".chili");
+  const dbPath = join(stateDir, "chili.sqlite");
+  const sessionId = "session_harness_crash_recovery" as SessionId;
+  const turnId = "turn_harness_crash_recovery" as TurnId;
+  let harness: CliHarness | undefined;
+  const observedRecoveryEvents: ChiliEvent[] = [];
+  let unsubscribe: (() => void) | undefined;
+  try {
+    await mkdir(stateDir, { recursive: true });
+    const crashed = new SqliteEventStore(dbPath);
+    const now = Date.now();
+    try {
+      await crashed.appendMany([
+        {
+          id: "event_harness_crash_session",
+          type: "session.created",
+          time: (now - 1_000) as TimestampMs,
+          sessionId,
+          payload: { sessionId, cwd: repo },
+        },
+        {
+          id: "event_harness_crash_running",
+          type: "session.status_changed",
+          time: (now - 900) as TimestampMs,
+          sessionId,
+          payload: { sessionId, status: "running", reason: "prompt_submitted" },
+        },
+        {
+          id: "event_harness_crash_turn",
+          type: "turn.started",
+          time: (now - 800) as TimestampMs,
+          sessionId,
+          payload: { turnId },
+        },
+      ]);
+      expect(crashed.claimSessionRun({
+        sessionId,
+        claimId: "claim_harness_crashed_process",
+        allowSubagentSessions: false,
+        time: now,
+        leaseDurationMs: 60,
+      })).toEqual({ status: "claimed" });
+    } finally {
+      // Closing a crashed owner's connection deliberately leaves its durable
+      // lease behind, matching SIGKILL semantics.
+      crashed.close();
+    }
+
+    harness = await createCliHarness({
+      cwd: repo,
+      model: "fake",
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+      staleTurnRecoveryMs: 0,
+      staleTurnRecoveryIntervalMs: 10,
+    });
+    unsubscribe = harness.events.subscribe((event) => observedRecoveryEvents.push(event));
+    expect((await harness.events.events({ sessionId, type: "session.status_changed", limit: 20 })).at(-1)?.payload).toMatchObject({
+      status: "running",
+    });
+
+    await waitFor(async () => {
+      const statuses = await harness?.events.events({ sessionId, type: "session.status_changed", limit: 20 });
+      return (statuses?.at(-1)?.payload as { status?: string } | undefined)?.status === "failed";
+    });
+    const events = await harness.events.events({ sessionId, limit: 20 });
+    expect(events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+    expect(observedRecoveryEvents.map((event) => event.type)).toEqual([
+      "turn.completed",
+      "session.status_changed",
+    ]);
+    expect(events.at(-1)?.payload).toMatchObject({
+      sessionId,
+      status: "failed",
+      reason: "stale_turn_recovered",
+    });
+    expect((await harness.service.submitPrompt({ sessionId, text: "usable after recovery" })).status).toBe("completed");
+  } finally {
+    unsubscribe?.();
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI harness recovers an expired child task, agent run, and child turn through live events exactly once", async () => {
+  const root = await mkdtempName();
+  const repo = join(root, "repo");
+  const stateDir = join(repo, ".chili");
+  const dbPath = join(stateDir, "chili.sqlite");
+  const parentSessionId = "session_harness_child_parent" as SessionId;
+  const childSessionId = "session_harness_child_crash" as SessionId;
+  const taskId = "task_harness_child_crash" as TaskId;
+  const runId = "agent_harness_child_crash" as AgentRunId;
+  const turnId = "turn_harness_child_crash" as TurnId;
+  const path = "/root/task_harness_child_crash" as AgentPath;
+  let harness: CliHarness | undefined;
+  let unsubscribe: (() => void) | undefined;
+  const observed: ChiliEvent[] = [];
+  try {
+    await mkdir(stateDir, { recursive: true });
+    const crashed = new SqliteEventStore(dbPath);
+    const now = Date.now();
+    try {
+      await crashed.appendMany([
+        {
+          id: "event_harness_child_parent",
+          type: "session.created",
+          time: (now - 1_000) as TimestampMs,
+          sessionId: parentSessionId,
+          payload: { sessionId: parentSessionId, cwd: repo },
+        },
+        {
+          id: "event_harness_child_task",
+          type: "agent.task_created",
+          time: (now - 950) as TimestampMs,
+          sessionId: parentSessionId,
+          payload: {
+            taskId,
+            path,
+            parentPath: "/root" as AgentPath,
+            parentSessionId,
+            childSessionId,
+            taskName: "crashed child",
+            cwd: repo,
+            prompt: "keep working",
+            mode: "background",
+          },
+        },
+        {
+          id: "event_harness_child_spawned",
+          type: "agent.spawned",
+          time: (now - 900) as TimestampMs,
+          sessionId: parentSessionId,
+          payload: {
+            runId,
+            taskId,
+            path,
+            parentPath: "/root" as AgentPath,
+            parentSessionId,
+            childSessionId,
+            taskName: "crashed child",
+            cwd: repo,
+            mode: "background",
+            generation: 1,
+          },
+        },
+        {
+          id: "event_harness_child_session",
+          type: "session.created",
+          time: (now - 850) as TimestampMs,
+          sessionId: childSessionId,
+          payload: { sessionId: childSessionId, cwd: repo },
+        },
+        {
+          id: "event_harness_child_running",
+          type: "session.status_changed",
+          time: (now - 800) as TimestampMs,
+          sessionId: childSessionId,
+          payload: { sessionId: childSessionId, status: "running" },
+        },
+        {
+          id: "event_harness_child_turn",
+          type: "turn.started",
+          time: (now - 750) as TimestampMs,
+          sessionId: childSessionId,
+          payload: { turnId },
+        },
+      ]);
+      expect(await crashed.claimAgentTaskLease({
+        taskId,
+        runId,
+        generation: 1,
+        owner: "crashed-child-owner",
+        ttlMs: 100,
+        now,
+      })).toMatchObject({ acquired: true });
+    } finally {
+      crashed.close();
+    }
+
+    harness = await createCliHarness({
+      cwd: repo,
+      model: "fake",
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+      staleTurnRecoveryMs: 0,
+      staleTurnRecoveryIntervalMs: 10,
+    });
+    unsubscribe = harness.events.subscribe((event) => observed.push(event));
+
+    await waitFor(async () => {
+      const task = await harness?.events.agentTask(taskId);
+      const statuses = await harness?.events.events({
+        sessionId: childSessionId,
+        type: "session.status_changed",
+        limit: 20,
+      });
+      const childStatus = (statuses?.at(-1)?.payload as { status?: string } | undefined)?.status;
+      return task?.status === "cancelled" && childStatus === "failed";
+    });
+
+    expect(await harness.events.agentTask(taskId)).toMatchObject({
+      id: taskId,
+      status: "cancelled",
+      error: "stale_agent_worker",
+    });
+    expect((await harness.events.agentRuns({ taskId, limit: 10 }))[0]).toMatchObject({
+      id: runId,
+      status: "cancelled",
+    });
+    expect(observed.filter((event) => event.type === "agent.task_completed")).toHaveLength(1);
+    expect(observed.filter((event) => event.type === "agent.completed")).toHaveLength(1);
+    expect(observed.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+    expect(observed.filter((event) => event.type === "session.status_changed")).toHaveLength(1);
+
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 30));
+    const durable = await harness.events.events({ limit: 100 });
+    expect(durable.filter((event) => event.type === "agent.task_completed"
+      && (event.payload as { taskId?: TaskId }).taskId === taskId)).toHaveLength(1);
+    expect(durable.filter((event) => event.type === "agent.completed"
+      && (event.payload as { runId?: AgentRunId }).runId === runId)).toHaveLength(1);
+    expect(durable.filter((event) => event.type === "turn.completed"
+      && (event.payload as { turnId?: TurnId }).turnId === turnId)).toHaveLength(1);
+  } finally {
+    unsubscribe?.();
+    await harness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI harness recovery never steals another store's pending or lease-null running task", async () => {
+  const root = await mkdtempName();
+  const repo = join(root, "repo");
+  const stateDir = join(repo, ".chili");
+  const dbPath = join(stateDir, "chili.sqlite");
+  const parentSessionId = "session_harness_live_peer" as SessionId;
+  const pendingTaskId = "task_harness_peer_pending" as TaskId;
+  const runningTaskId = "task_harness_peer_running" as TaskId;
+  const runningRunId = "agent_harness_peer_running" as AgentRunId;
+  const leasedTaskId = "task_harness_peer_leased" as TaskId;
+  const leasedRunId = "agent_harness_peer_leased" as AgentRunId;
+  const pendingPath = "/root/task_harness_peer_pending" as AgentPath;
+  const runningPath = "/root/task_harness_peer_running" as AgentPath;
+  const leasedPath = "/root/task_harness_peer_leased" as AgentPath;
+  let peer: SqliteEventStore | undefined;
+  let harness: CliHarness | undefined;
+  try {
+    await mkdir(stateDir, { recursive: true });
+    peer = new SqliteEventStore(dbPath);
+    const now = Date.now();
+    await peer.appendMany([
+      {
+        id: "event_harness_peer_session",
+        type: "session.created",
+        time: (now - 1_000) as TimestampMs,
+        sessionId: parentSessionId,
+        payload: { sessionId: parentSessionId, cwd: repo },
+      },
+      {
+        id: "event_harness_peer_pending",
+        type: "agent.task_created",
+        time: (now - 900) as TimestampMs,
+        sessionId: parentSessionId,
+        payload: {
+          taskId: pendingTaskId,
+          path: pendingPath,
+          parentPath: "/root" as AgentPath,
+          parentSessionId,
+          childSessionId: "session_harness_peer_pending" as SessionId,
+          taskName: "peer pending",
+          cwd: repo,
+          prompt: "queued behind a peer limiter",
+          mode: "background",
+        },
+      },
+      {
+        id: "event_harness_peer_running_task",
+        type: "agent.task_created",
+        time: (now - 850) as TimestampMs,
+        sessionId: parentSessionId,
+        payload: {
+          taskId: runningTaskId,
+          path: runningPath,
+          parentPath: "/root" as AgentPath,
+          parentSessionId,
+          childSessionId: "session_harness_peer_running" as SessionId,
+          taskName: "peer beginning",
+          cwd: repo,
+          prompt: "between spawn commit and lease claim",
+          mode: "background",
+        },
+      },
+      {
+        id: "event_harness_peer_spawned",
+        type: "agent.spawned",
+        time: (now - 800) as TimestampMs,
+        sessionId: parentSessionId,
+        payload: {
+          runId: runningRunId,
+          taskId: runningTaskId,
+          path: runningPath,
+          parentPath: "/root" as AgentPath,
+          parentSessionId,
+          childSessionId: "session_harness_peer_running" as SessionId,
+          taskName: "peer beginning",
+          cwd: repo,
+          mode: "background",
+          generation: 1,
+        },
+      },
+      {
+        id: "event_harness_peer_leased_task",
+        type: "agent.task_created",
+        time: (now - 750) as TimestampMs,
+        sessionId: parentSessionId,
+        payload: {
+          taskId: leasedTaskId,
+          path: leasedPath,
+          parentPath: "/root" as AgentPath,
+          parentSessionId,
+          childSessionId: "session_harness_peer_leased" as SessionId,
+          taskName: "peer leased",
+          cwd: repo,
+          prompt: "owned by a live peer before startup recovery",
+          mode: "background",
+        },
+      },
+      {
+        id: "event_harness_peer_leased_spawned",
+        type: "agent.spawned",
+        time: (now - 700) as TimestampMs,
+        sessionId: parentSessionId,
+        payload: {
+          runId: leasedRunId,
+          taskId: leasedTaskId,
+          path: leasedPath,
+          parentPath: "/root" as AgentPath,
+          parentSessionId,
+          childSessionId: "session_harness_peer_leased" as SessionId,
+          taskName: "peer leased",
+          cwd: repo,
+          mode: "background",
+          generation: 1,
+        },
+      },
+    ]);
+    expect(await peer.claimAgentTaskLease({
+      taskId: leasedTaskId,
+      runId: leasedRunId,
+      generation: 1,
+      owner: "startup-live-peer-owner",
+      ttlMs: 10_000,
+      now,
+    })).toMatchObject({ acquired: true });
+
+    harness = await createCliHarness({
+      cwd: repo,
+      model: "fake",
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+      staleTurnRecoveryMs: 0,
+      staleTurnRecoveryIntervalMs: 5,
+    });
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 30));
+
+    expect(await peer.agentTask(pendingTaskId)).toMatchObject({ status: "pending" });
+    expect(await peer.agentTask(leasedTaskId)).toMatchObject({
+      status: "running",
+      leaseOwner: "startup-live-peer-owner",
+    });
+    const runningBeforeLease = await peer.agentTask(runningTaskId);
+    expect(runningBeforeLease).toMatchObject({ status: "running" });
+    expect(runningBeforeLease?.leaseOwner).toBeUndefined();
+
+    expect(await peer.claimAgentTaskLease({
+      taskId: runningTaskId,
+      runId: runningRunId,
+      generation: 1,
+      owner: "live-peer-owner",
+      ttlMs: 1_000,
+      now: Date.now(),
+    })).toMatchObject({ acquired: true });
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+    expect(await peer.agentTask(runningTaskId)).toMatchObject({
+      status: "running",
+      leaseOwner: "live-peer-owner",
+    });
+  } finally {
+    await harness?.close();
+    peer?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI harness isolates a stale-recovery reporter that throws", async () => {
+  const root = await mkdtempName();
+  const repo = join(root, "repo");
+  let harness: CliHarness | undefined;
+  let reports = 0;
+  const unhandled: unknown[] = [];
+  const onUnhandled = (error: unknown): void => {
+    unhandled.push(error);
+  };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    await mkdir(repo, { recursive: true });
+    harness = await createCliHarness({
+      cwd: repo,
+      model: "fake",
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+      staleTurnRecoveryMs: 0,
+      staleTurnRecoveryIntervalMs: 5,
+      onStaleTurnRecoveryError() {
+        reports += 1;
+        throw new Error("reporter failure must be isolated");
+      },
+    });
+    harness.store.close();
+
+    await waitFor(async () => reports > 0);
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+    expect(unhandled).toEqual([]);
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+    await harness?.close().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI harness exposes one shared request_user_input tool only when a queue is injected", async () => {
+  const root = await mkdtempName();
+  const plainRepo = join(root, "plain");
+  const controlledRepo = join(root, "controlled");
+  let plainHarness: CliHarness | undefined;
+  let controlledHarness: CliHarness | undefined;
+  try {
+    await mkdir(plainRepo, { recursive: true });
+    await mkdir(controlledRepo, { recursive: true });
+    plainHarness = await createCliHarness({
+      cwd: plainRepo,
+      model: "fake",
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+    });
+    const plain = harnessToolRegistries(plainHarness);
+    expect(plain.root.get("request_user_input")).toBeUndefined();
+    expect(plain.child?.get("request_user_input")).toBeUndefined();
+
+    controlledHarness = await createCliHarness({
+      cwd: controlledRepo,
+      model: "fake",
+      quiet: true,
+      yes: true,
+      mcpConnectMode: "manual",
+      userInputQueue: new DeferredUserInputQueue(),
+    });
+    const controlled = harnessToolRegistries(controlledHarness);
+    const rootTool = controlled.root.get("request_user_input");
+    const childTool = controlled.child?.get("request_user_input");
+    expect(rootTool).toBeDefined();
+    expect(childTool).toBe(rootTool);
+  } finally {
+    await controlledHarness?.close();
+    await plainHarness?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("CLI prompt fragments include base, memory/project context, and skills catalog", async () => {
   const root = await mkdtempName();
@@ -1679,6 +2363,54 @@ async function mkdtempName(): Promise<string> {
   return mkdtemp(join(tmpdir(), "chili-harness-"));
 }
 
+class AbortAwareSlowModel implements ModelRouter {
+  readonly started = deferred<void>();
+  readonly abortObserved = deferred<void>();
+  readonly finish = deferred<void>();
+  onAbort?: () => void;
+
+  async *stream(input: ModelStreamInput): AsyncIterable<ModelStreamEvent> {
+    this.started.resolve();
+    await new Promise<void>((resolvePromise) => {
+      const onAbort = (): void => {
+        this.onAbort?.();
+        this.abortObserved.resolve();
+        resolvePromise();
+      };
+      if (input.signal?.aborted) onAbort();
+      else input.signal?.addEventListener("abort", onAbort, { once: true });
+    });
+    await this.finish.promise;
+    const error = new Error("slow model aborted during harness close");
+    error.name = "AbortError";
+    throw error;
+  }
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value: T | PromiseLike<T>): void;
+} {
+  let resolvePromise: ((value: T | PromiseLike<T>) => void) | undefined;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return {
+    promise,
+    resolve(value) {
+      resolvePromise?.(value);
+    },
+  };
+}
+
+async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await predicate())) {
+    if (Date.now() >= deadline) throw new Error(`Condition was not met within ${timeoutMs}ms`);
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+  }
+}
+
 async function writeWorkspaceModelEvent(
   repo: string,
   modelSelection: { provider: string; model: string },
@@ -1768,6 +2500,24 @@ function skill(name: string, source: Skill["source"] = "project", baseDir?: stri
     },
     body: "review body",
   };
+}
+
+function harnessToolRegistries(harness: CliHarness): {
+  root: { get(name: string): ChiliToolDefinition | undefined };
+  child?: { get(name: string): ChiliToolDefinition | undefined };
+} {
+  type Registry = { get(name: string): ChiliToolDefinition | undefined };
+  const root = (harness.runtime as unknown as { options: { toolRegistry: Registry } }).options.toolRegistry;
+  const child = (harness.agents as unknown as {
+    options: {
+      runtime?: {
+        options: {
+          runtime: { options: { toolRegistry: Registry } };
+        };
+      };
+    };
+  }).options.runtime?.options.runtime.options.toolRegistry;
+  return { root, ...(child ? { child } : {}) };
 }
 
 function promptDebugOutput(includeContent: boolean): CliPromptDebugOutput {

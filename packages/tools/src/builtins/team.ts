@@ -1,5 +1,5 @@
 import type { AgentPath, ToolResult } from "@chili/protocol";
-import { ROOT_AGENT_PATH, normalizeAgentPath } from "@chili/protocol";
+import { ROOT_AGENT_PATH, normalizeAgentPath, normalizePersistedError } from "@chili/protocol";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
 import type {
   TeamCreateToolInput,
@@ -1345,7 +1345,7 @@ function teamTaskDispatchBatchToolResult(result: TeamTaskDispatchBatchRecord): T
       taskId: error.taskId,
       owner_path: error.ownerPath,
       ownerPath: error.ownerPath,
-      error: error.error,
+      error: normalizePersistedError(error.error).message,
     })),
   };
   return {
@@ -1394,7 +1394,7 @@ function teamTaskReconcileToolResult(result: TeamTaskReconcileRecord): TeamToolR
       teamId: error.teamId,
       task_id: error.taskId,
       taskId: error.taskId,
-      error: error.error,
+      error: normalizePersistedError(error.error).message,
     })),
   };
   return {
@@ -1636,7 +1636,7 @@ function teamTaskRecordOutput(task: TeamTaskRecord): Record<string, unknown> {
     depends_on: task.dependsOn,
     dependsOn: task.dependsOn,
     summary: task.summary,
-    error: task.error,
+    error: task.error === undefined ? undefined : normalizePersistedError(task.error).message,
     metadata: task.metadata,
     created_at: task.createdAt,
     createdAt: task.createdAt,
@@ -1711,6 +1711,12 @@ function teamRunTaskOutput(task: object): Record<string, unknown> {
   const record = task as Record<string, unknown>;
   return pruneUndefined({
     ...record,
+    error: record.error === undefined ? undefined : normalizePersistedError(record.error).message,
+    conflicts: Array.isArray(record.conflicts)
+      ? record.conflicts
+          .slice(0, 20)
+          .map((conflict) => normalizePersistedError(conflict).message)
+      : undefined,
     team_id: record.teamId,
     teamId: record.teamId,
     task_id: record.taskId,
@@ -1739,11 +1745,14 @@ function agentTaskRecordOutput(task: NonNullable<TeamTaskDispatchRecord["agentTa
     childSessionId: task.childSessionId,
     status: task.status,
     summary: task.summary,
-    error: task.error,
+    error: task.error === undefined ? undefined : normalizePersistedError(task.error).message,
   });
 }
 
 function teamMessageRecordOutput(message: TeamMessageRecord): Record<string, unknown> {
+  const deliveryError = message.deliveryError === undefined
+    ? undefined
+    : normalizePersistedError(message.deliveryError).message;
   return pruneUndefined({
     message_id: message.messageId,
     messageId: message.messageId,
@@ -1758,8 +1767,8 @@ function teamMessageRecordOutput(message: TeamMessageRecord): Record<string, unk
     delivery: message.delivery,
     delivery_status: message.deliveryStatus,
     deliveryStatus: message.deliveryStatus,
-    delivery_error: message.deliveryError,
-    deliveryError: message.deliveryError,
+    delivery_error: deliveryError,
+    deliveryError,
     delivery_updated_at: message.deliveryUpdatedAt,
     deliveryUpdatedAt: message.deliveryUpdatedAt,
     delivered_at: message.deliveredAt,
@@ -1774,6 +1783,9 @@ function teamMessageRecordOutput(message: TeamMessageRecord): Record<string, unk
 }
 
 function teamMessageDeliveryRecordOutput(delivery: TeamSnapshotRecord["messageDeliveries"][number]): Record<string, unknown> {
+  const error = delivery.error === undefined
+    ? undefined
+    : normalizePersistedError(delivery.error).message;
   return pruneUndefined({
     mailbox_message_id: delivery.mailboxMessageId,
     mailboxMessageId: delivery.mailboxMessageId,
@@ -1787,7 +1799,7 @@ function teamMessageDeliveryRecordOutput(delivery: TeamSnapshotRecord["messageDe
     triggerTurn: delivery.triggerTurn,
     child_session_id: delivery.childSessionId,
     childSessionId: delivery.childSessionId,
-    error: delivery.error,
+    error,
     queued_at: delivery.queuedAt,
     queuedAt: delivery.queuedAt,
     updated_at: delivery.updatedAt,
@@ -2074,5 +2086,5 @@ function isAbortError(error: unknown): boolean {
 }
 
 function toErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return normalizePersistedError(error).message;
 }

@@ -22,6 +22,7 @@ import {
   chiliBasePromptFragment,
   createMemoryTool,
   defaultScopedWorkerPolicy,
+  type ModelRouter,
   type PromptFragment,
   type RuntimePromptTurnContext,
   type WorkerToolPolicy,
@@ -31,6 +32,7 @@ import { ObservableEventStore, SessionTranscriptJsonlMirror, SqliteEventStore } 
 import type { AgentMailboxRow, AgentTaskQuery, AgentTaskRow, TeamMemberRow, TeamMessageRow, TeamRow, TeamTaskRow } from "@chili/store";
 import {
   DeferredApprovalQueue,
+  DeferredUserInputQueue,
   DELEGATION_OFF_DENIED_TOOL_NAMES,
   FileSystemSnapshotProvider,
   InMemoryToolRegistry,
@@ -64,6 +66,7 @@ import {
   createMcpResourcesListTool,
   createReadFileTool,
   createReadImageTool,
+  createRequestUserInputTool,
   createTaskCloseTool,
   createTaskBatchTool,
   createTaskFollowupTool,
@@ -141,7 +144,11 @@ import { loadCliConfig, type CliConfig } from "./config.js";
 import { createIdFactory } from "./id.js";
 import type { CliModelName, CliReasoningLevel } from "./model.js";
 import { createCliModel, resolveCliRuntimeModelSelection } from "./model.js";
-import { createCliMcpRuntime, type CliMcpRuntime } from "./mcp-control.js";
+import {
+  createCliMcpRuntime,
+  type CliMcpRuntime,
+  type CliMcpRuntimeOptions,
+} from "./mcp-control.js";
 import { CliPrinter, PrintingEventStore } from "./printing-store.js";
 import { readUserModelSelection, writeUserModelSelection } from "./user-model-state.js";
 
@@ -150,6 +157,7 @@ const DEV_MAX_REPEATED_TOOL_CALLS = 20;
 const DEV_MAX_TOOL_CALLS_PER_TURN = 200;
 const DEV_MAX_CONCURRENT_TOOL_CALLS = 32;
 const STALE_TURN_RECOVERY_MS = 30 * 60 * 1000;
+const STALE_TURN_RECOVERY_INTERVAL_MS = 30_000;
 const CLI_DEFAULT_READ_MAX_BYTES = 32 * 1024;
 const CLI_READ_MAX_BYTES_LIMIT = 256 * 1024;
 
@@ -178,10 +186,21 @@ export interface CliHarnessOptions {
   yes?: boolean;
   quiet?: boolean;
   approvalQueue?: DeferredApprovalQueue;
+  userInputQueue?: DeferredUserInputQueue;
   chiliHome?: string;
   deferMcpConnect?: boolean;
   mcpConnectMode?: "eager" | "background" | "manual";
   bashRunner?: BashRunner;
+  modelRouter?: ModelRouter;
+  staleTurnRecoveryMs?: number;
+  staleTurnRecoveryIntervalMs?: number | false;
+  sessionClaimLeaseMs?: number;
+  sessionClaimHeartbeatMs?: number;
+  onStaleTurnRecoveryError?: (error: unknown) => void;
+  mcpRuntimeFactory?: (
+    options: CliMcpRuntimeOptions,
+    baseCommands: PromptCommandControl,
+  ) => Promise<CliMcpRuntime>;
 }
 
 export interface CliHarness {
@@ -204,6 +223,7 @@ export interface CliHarness {
   defaultModelSelection?: ModelSelection;
   defaultReasoningLevel?: CliReasoningLevel;
   defaultServiceTier?: ServiceTier;
+  waitForBackgroundTasks(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -230,7 +250,64 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const printer = new CliPrinter();
   const printableStore = options.quiet ? sqliteStore : new PrintingEventStore(sqliteStore, printer);
   const eventStore = new ObservableEventStore(printableStore);
-  const childToolPolicyResolver = createWorkerToolPolicyResolver(eventStore);
+  const staleTurnRecoveryMs = nonNegativeDuration(
+    options.staleTurnRecoveryMs,
+    STALE_TURN_RECOVERY_MS,
+    "staleTurnRecoveryMs",
+  );
+  const staleTurnRecoveryIntervalMs = options.staleTurnRecoveryIntervalMs === false
+    ? false
+    : positiveDuration(
+        options.staleTurnRecoveryIntervalMs,
+        STALE_TURN_RECOVERY_INTERVAL_MS,
+        "staleTurnRecoveryIntervalMs",
+      );
+  let staleTurnRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
+  let staleTurnRecoveryRun: Promise<void> | undefined;
+  let harnessClosing = false;
+  const reconcileStaleRuntimeState = async (): Promise<void> => {
+    const now = Date.now();
+    await tasks.reconcileStaleTasks({
+      staleAfterMs: staleTurnRecoveryMs,
+      modes: ["one_shot", "resumable", "background"],
+      liveTaskIds: subagents.liveTaskIds(),
+      requireLeaseEvidence: true,
+      limit: 500,
+      summary: "Recovered after the owning runtime stopped",
+      error: "stale_agent_worker",
+    });
+    await eventStore.reconcileStaleTurns({
+      staleBefore: now - staleTurnRecoveryMs,
+      now,
+      createId,
+      status: "failed",
+      reason: "stale_turn_recovered",
+    });
+  };
+  const scheduleStaleTurnRecovery = (): void => {
+    if (harnessClosing || staleTurnRecoveryIntervalMs === false) return;
+    staleTurnRecoveryTimer = setTimeout(() => {
+      staleTurnRecoveryTimer = undefined;
+      if (harnessClosing) return;
+      const run = reconcileStaleRuntimeState();
+      staleTurnRecoveryRun = run;
+      void run.catch((error: unknown) => {
+        if (!harnessClosing) {
+          try {
+            options.onStaleTurnRecoveryError?.(error);
+          } catch {
+            // Recovery diagnostics must not turn a retryable maintenance error
+            // into an unhandled rejection that crashes the host process.
+          }
+        }
+      }).finally(() => {
+        if (staleTurnRecoveryRun === run) staleTurnRecoveryRun = undefined;
+        scheduleStaleTurnRecovery();
+      }).catch(() => undefined);
+    }, staleTurnRecoveryIntervalMs);
+    (staleTurnRecoveryTimer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+  };
+  const childToolPolicyResolver = createWorkerToolPolicyResolver(eventStore, Boolean(options.userInputQueue));
   let delegationPolicyGate: DelegationPolicyGate | undefined;
   const delegationToolPolicyResolver = createDelegationToolPolicyResolver(() => delegationPolicyGate);
   const combinedChildToolPolicyResolver = combineToolAccessPolicyResolvers(
@@ -253,7 +330,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     modelInput.provider = persistedUserModelSelection.provider;
     modelInput.model = persistedUserModelSelection.model;
   }
-  const model = await createCliModel(modelInput);
+  const model = options.modelRouter ?? await createCliModel(modelInput);
   const runtimeModelSelection = explicitModelSelection ? resolveCliRuntimeModelSelection(cliModelInput) : undefined;
   const serviceDefaultModelSelection = runtimeModelSelection ?? persistedUserModelSelection;
   const persistUserModelSelection = async (input: { modelSelection: ModelSelection }): Promise<void> => {
@@ -317,6 +394,15 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
       });
   const registry = createToolRegistry(skillRegistryForCwd, bashRunner);
   const childRegistry = createChildToolRegistry(skillRegistryForCwd, childBashRunner);
+  if (options.userInputQueue) {
+    const userInputTool = createRequestUserInputTool(
+      options.userInputQueue,
+      { publish: (event) => eventStore.append(event) },
+      createId,
+    );
+    registry.register(userInputTool);
+    childRegistry.register(userInputTool);
+  }
   let mcpRuntime: CliMcpRuntime | undefined;
   const promptFragments = async (context: { cwd: string; turn?: RuntimePromptTurnContext }) =>
     buildCliPromptFragments({
@@ -385,6 +471,8 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
     onModelChanged: persistUserModelSelection,
     allowSubagentSessions: true,
+    ...(options.sessionClaimLeaseMs !== undefined ? { sessionClaimLeaseMs: options.sessionClaimLeaseMs } : {}),
+    ...(options.sessionClaimHeartbeatMs !== undefined ? { sessionClaimHeartbeatMs: options.sessionClaimHeartbeatMs } : {}),
   });
   const childRunLimiter = new LocalSubagentConcurrencyLimiter(DEFAULT_LOCAL_SUBAGENT_MAX_ACTIVE_RUNS);
   const subagents = new LocalSubagentManager({
@@ -459,6 +547,8 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
     ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
     onModelChanged: persistUserModelSelection,
+    ...(options.sessionClaimLeaseMs !== undefined ? { sessionClaimLeaseMs: options.sessionClaimLeaseMs } : {}),
+    ...(options.sessionClaimHeartbeatMs !== undefined ? { sessionClaimHeartbeatMs: options.sessionClaimHeartbeatMs } : {}),
   });
   const teams = new TeamControlService({
     store: eventStore,
@@ -510,13 +600,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const delegationController = createDelegationToolController(service);
   registry.register(createDelegationStatusTool(delegationController));
   registry.register(createDelegationSetTool(delegationController));
-  await sqliteStore.reconcileStaleTurns({
-    staleBefore: Date.now() - STALE_TURN_RECOVERY_MS,
-    now: Date.now(),
-    createId,
-    status: "failed",
-    reason: "stale_turn_recovered",
-  });
+  await reconcileStaleRuntimeState();
   const teamRunner = new TeamExecutionRunner({
     teams,
     dispatcher: teamDispatcher,
@@ -565,7 +649,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const teamDispatchController = createTeamTaskDispatchToolController(teamDispatcher, teams);
   registerTeamDispatchTools(registry, teamDispatchController);
   registry.register(createTeamRunLoopTool(createTeamRunLoopToolController(teamRunner, teams)));
-  mcpRuntime = await createCliMcpRuntime({
+  mcpRuntime = await (options.mcpRuntimeFactory ?? createCliMcpRuntime)({
     cwd,
     chiliHome,
     registries: [registry, childRegistry],
@@ -576,6 +660,69 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   commands = mcpRuntime.commands;
   registerMcpResourceTools(registry, mcpRuntime);
   registerMcpResourceTools(childRegistry, mcpRuntime);
+  scheduleStaleTurnRecovery();
+
+  let closePromise: Promise<void> | undefined;
+  const close = (): Promise<void> => {
+    if (closePromise) return closePromise;
+
+    let resolveClose!: () => void;
+    let rejectClose!: (error: unknown) => void;
+    closePromise = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolveClose = resolvePromise;
+      rejectClose = rejectPromise;
+    });
+
+    // Publish the one close promise before any shutdown call can synchronously
+    // abort a model/tool and let its listener reenter close().
+    harnessClosing = true;
+    if (staleTurnRecoveryTimer) clearTimeout(staleTurnRecoveryTimer);
+    staleTurnRecoveryTimer = undefined;
+    const errors: unknown[] = [];
+    const pendingDrains: Promise<unknown>[] = [];
+    const startDrain = (operation: () => unknown): void => {
+      try {
+        pendingDrains.push(Promise.resolve(operation()));
+      } catch (error) {
+        errors.push(error);
+      }
+    };
+
+    // Start every admission/abort path even if one of its peers throws
+    // synchronously. The single cleanup actor below observes all outcomes.
+    startDrain(() => service.shutdown("runtime_closed"));
+    startDrain(() => childService.shutdown("runtime_closed"));
+    startDrain(() => subagents.shutdown("runtime_closed"));
+    startDrain(() => tasks.shutdown("runtime_closed"));
+    startDrain(() => options.approvalQueue?.denyAll("Runtime closed while waiting for approval."));
+    startDrain(() => options.userInputQueue?.denyAll("Runtime closed while waiting for user input."));
+    startDrain(() => mailboxPump.stop());
+    startDrain(() => staleTurnRecoveryRun?.catch(() => undefined));
+
+    const cleanupActor = (async (): Promise<void> => {
+      const drainResults = await Promise.allSettled(pendingDrains);
+      for (const result of drainResults) {
+        if (result.status === "rejected") errors.push(result.reason);
+      }
+      try {
+        await mcpRuntime?.close();
+      } catch (error) {
+        errors.push(error);
+      } finally {
+        try {
+          sqliteStore.close();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      if (errors.length === 1) throw errors[0];
+      if (errors.length > 1) {
+        throw new AggregateError(errors, "CLI harness shutdown encountered multiple errors");
+      }
+    })();
+    void cleanupActor.then(resolveClose, rejectClose);
+    return closePromise;
+  };
 
   return {
     cwd,
@@ -597,13 +744,25 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     ...(runtimeModelSelection ? { defaultModelSelection: runtimeModelSelection } : {}),
     ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
     ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
-    close: async () => {
-      await mailboxPump.stop();
-      await subagents.waitForBackgroundTasks();
-      await mcpRuntime?.close();
-      sqliteStore.close();
-    },
+    waitForBackgroundTasks: () => subagents.waitForBackgroundTasks(),
+    close,
   };
+}
+
+function nonNegativeDuration(value: number | undefined, fallback: number, name: string): number {
+  const duration = value ?? fallback;
+  if (!Number.isFinite(duration) || duration < 0) {
+    throw new Error(`${name} must be a non-negative finite number`);
+  }
+  return duration;
+}
+
+function positiveDuration(value: number | undefined, fallback: number, name: string): number {
+  const duration = value ?? fallback;
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new Error(`${name} must be a positive finite number`);
+  }
+  return duration;
 }
 
 async function readPersistedUserModelSelection(chiliHome: string): Promise<ModelSelection | undefined> {
@@ -621,11 +780,18 @@ function registerMcpResourceTools(registry: InMemoryToolRegistry, runtime: CliMc
   registry.register(createMcpResourceReadTool(runtime.resources));
 }
 
-function createWorkerToolPolicyResolver(store: ObservableEventStore): ToolAccessPolicyResolver {
+function createWorkerToolPolicyResolver(
+  store: ObservableEventStore,
+  allowUserInput = false,
+): ToolAccessPolicyResolver {
   return {
     async resolve(context) {
       const policy = await findWorkerToolPolicy(store, context.sessionId);
-      return policy ?? defaultScopedWorkerPolicy();
+      const resolved = policy ?? defaultScopedWorkerPolicy();
+      if (!allowUserInput || !resolved.allowedTools || resolved.allowedTools.includes("request_user_input")) {
+        return resolved;
+      }
+      return { ...resolved, allowedTools: [...resolved.allowedTools, "request_user_input"] };
     },
   };
 }

@@ -365,6 +365,67 @@ test("team read tools forward filters and emit list-shaped JSON", async () => {
   expect(approvals).toEqual([]);
 });
 
+test("team message reads normalize hostile legacy delivery diagnostics in successful output", async () => {
+  const controller = new FakeTeamToolController();
+  const hostileError = hostileSuccessfulOutputError("team message delivery failed").message;
+  controller.listMessages = async (input) => [{
+    ...messageRecord({
+      teamId: input.teamId,
+      from: "/lead",
+      to: input.path ?? "/worker",
+      content: "Status check",
+    }),
+    deliveryStatus: "failed",
+    deliveryError: hostileError,
+  }];
+  controller.snapshotTeam = async (input) => {
+    const snapshot = snapshotRecord(input.teamId);
+    const message = snapshot.messages[0];
+    const nestedDelivery = message?.deliveries[0];
+    const delivery = snapshot.messageDeliveries[0];
+    if (!message || !nestedDelivery || !delivery) throw new Error("invalid snapshot fixture");
+    message.deliveryStatus = "failed";
+    message.deliveryError = hostileError;
+    nestedDelivery.status = "failed";
+    nestedDelivery.error = hostileError;
+    delivery.status = "failed";
+    delivery.error = hostileError;
+    return snapshot;
+  };
+  const executor = createExecutor(registryWithTeamTools(controller), []);
+
+  const messagesResult = await executor.execute(toolInput("team_message_list", { team_id: "team_core" }));
+  expect(messagesResult.status).toBe("completed");
+  if (messagesResult.status === "completed") {
+    const output = JSON.parse(messagesResult.result.output) as {
+      messages: Array<{ delivery_error: string; deliveryError: string }>;
+    };
+    expectBoundedSanitizedDiagnostic(output.messages[0]?.delivery_error, 16 * 1024);
+    expectBoundedSanitizedDiagnostic(output.messages[0]?.deliveryError, 16 * 1024);
+    expect(utf8Bytes(messagesResult.result.output)).toBeLessThan(64 * 1024);
+  }
+
+  const snapshotResult = await executor.execute(toolInput("team_snapshot", { team_id: "team_core" }));
+  expect(snapshotResult.status).toBe("completed");
+  if (snapshotResult.status === "completed") {
+    const output = JSON.parse(snapshotResult.result.output) as {
+      messages: Array<{
+        delivery_error: string;
+        deliveryError: string;
+        deliveries: Array<{ error: string }>;
+      }>;
+      message_deliveries: Array<{ error: string }>;
+      messageDeliveries: Array<{ error: string }>;
+    };
+    expectBoundedSanitizedDiagnostic(output.messages[0]?.delivery_error, 16 * 1024);
+    expectBoundedSanitizedDiagnostic(output.messages[0]?.deliveryError, 16 * 1024);
+    expectBoundedSanitizedDiagnostic(output.messages[0]?.deliveries[0]?.error, 16 * 1024);
+    expectBoundedSanitizedDiagnostic(output.message_deliveries[0]?.error, 16 * 1024);
+    expectBoundedSanitizedDiagnostic(output.messageDeliveries[0]?.error, 16 * 1024);
+    expect(utf8Bytes(snapshotResult.result.output)).toBeLessThan(128 * 1024);
+  }
+});
+
 test("team dispatch tools expose subagent dispatch, sync, and reconcile", async () => {
   const controller = new FakeTeamToolController();
   const approvals: ApprovalBrokerRequest[] = [];
@@ -527,6 +588,39 @@ test("team run loop tool schedules scoped team work through the runner", async (
     until_drained: true,
   }));
   expect(rejectedConflict.status).toBe("failed");
+});
+
+test("team run loop normalizes hostile diagnostics in successful tool output", async () => {
+  const controller = new FakeTeamToolController();
+  controller.runLoopErrors = [{
+    teamId: "team_core",
+    taskId: "task_hostile",
+    error: hostileSuccessfulOutputError("team run failed").message,
+  }];
+  controller.runLoopMergeConflicted = [{
+    teamId: "team_core",
+    taskId: "task_conflict",
+    status: "conflicted",
+    conflicts: [hostileSuccessfulOutputError("team merge conflict").message],
+  }];
+  const registry = new InMemoryToolRegistry();
+  registry.register(createTeamRunLoopTool(controller));
+  const executor = createExecutor(registry, []);
+
+  const result = await executor.execute(toolInput("team_run_loop", { team_id: "team_core" }));
+
+  expect(result.status).toBe("completed");
+  if (result.status === "completed") {
+    const output = JSON.parse(result.result.output) as {
+      errors: Array<{ error: string }>;
+      merge_conflicted: Array<{ conflicts: string[] }>;
+    };
+    expect(output.errors).toHaveLength(1);
+    expectBoundedSanitizedDiagnostic(output.errors[0]?.error, 16 * 1024);
+    expect(output.merge_conflicted).toHaveLength(1);
+    expectBoundedSanitizedDiagnostic(output.merge_conflicted[0]?.conflicts[0], 16 * 1024);
+    expect(utf8Bytes(result.result.output)).toBeLessThan(64 * 1024);
+  }
 });
 
 test("team dispatch batch launches background tasks with bounded parallelism", async () => {
@@ -695,6 +789,27 @@ test("team dispatch batch preserves lifecycle identity after a partial dispatch 
   }
 });
 
+test("team dispatch batch normalizes hostile failures in successful tool output", async () => {
+  const controller = new FakeTeamToolController();
+  controller.dispatchErrors.set("task_hostile", hostileSuccessfulOutputError("team dispatch failed"));
+  const registry = new InMemoryToolRegistry();
+  registry.register(createTeamTaskDispatchBatchTool(controller));
+  const executor = createExecutor(registry, []);
+
+  const result = await executor.execute(toolInput("team_task_dispatch_batch", {
+    team_id: "team_core",
+    task_ids: ["task_hostile"],
+  }));
+
+  expect(result.status).toBe("completed");
+  if (result.status === "completed") {
+    const output = JSON.parse(result.result.output) as { errors: Array<{ error: string }> };
+    expect(output.errors).toHaveLength(1);
+    expectBoundedSanitizedDiagnostic(output.errors[0]?.error, 16 * 1024);
+    expect(utf8Bytes(result.result.output)).toBeLessThan(64 * 1024);
+  }
+});
+
 test("team tools reject non-absolute agent paths", async () => {
   const controller = new FakeTeamToolController();
   const executor = createExecutor(registryWithTeamTools(controller), []);
@@ -784,6 +899,9 @@ class FakeTeamToolController implements TeamToolController, TeamTaskDispatchTool
   messageListInputs: TeamMessageListToolInput[] = [];
   dispatchDelayMs = 0;
   dispatchFailures = new Set<string>();
+  dispatchErrors = new Map<string, unknown>();
+  runLoopErrors: TeamRunLoopRecord["errors"] = [];
+  runLoopMergeConflicted: TeamRunLoopRecord["mergeConflicted"] = [];
   runningDispatches = 0;
   maxRunningDispatches = 0;
 
@@ -843,6 +961,7 @@ class FakeTeamToolController implements TeamToolController, TeamTaskDispatchTool
     this.taskDispatchInputs.push(input);
     try {
       if (this.dispatchDelayMs > 0) await sleepMs(this.dispatchDelayMs);
+      if (this.dispatchErrors.has(input.taskId)) throw this.dispatchErrors.get(input.taskId);
       if (this.dispatchFailures.has(input.taskId)) throw new Error(`dispatch failed: ${input.taskId}`);
       const status = input.mode === "one_shot" ? "completed" : "running";
       const teamTaskInput: Partial<TeamTaskCreateToolInput & TeamTaskAssignToolInput & TeamTaskClaimToolInput & TeamTaskUpdateToolInput> = {
@@ -925,7 +1044,7 @@ class FakeTeamToolController implements TeamToolController, TeamTaskDispatchTool
       reopened: [],
       merged: [],
       mergeFailed: [],
-      mergeConflicted: [],
+      mergeConflicted: this.runLoopMergeConflicted,
       mergeSkipped: [],
       failed: [],
       blocked: [],
@@ -933,7 +1052,7 @@ class FakeTeamToolController implements TeamToolController, TeamTaskDispatchTool
       stillRunning: [
         { teamId: input.teamId, taskId: "task_team", ownerPath: "/worker", title: "Implement team tools", agentTaskId: "agent_task" },
       ],
-      errors: [],
+      errors: this.runLoopErrors,
     };
   }
 
@@ -1072,4 +1191,29 @@ function snapshotRecord(teamId: string): TeamSnapshotRecord {
 function createSequentialId(): (prefix: string) => string {
   let index = 0;
   return (prefix) => `${prefix}_${++index}`;
+}
+
+const HOSTILE_SUCCESS_OUTPUT_SECRET = "sk-team-success-output-secret-123456789";
+
+function hostileSuccessfulOutputError(label: string): Error {
+  return new Error([
+    `${label}: password=${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    `Authorization: Bearer ${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    `http://127.0.0.1:4567/callback?token=${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    "\u0000".repeat(5 * 1024 * 1024),
+  ].join("\n"));
+}
+
+function expectBoundedSanitizedDiagnostic(value: string | undefined, maxBytes: number): void {
+  expect(value).toBeDefined();
+  if (value === undefined) return;
+  expect(value).toContain("[REDACTED]");
+  expect(value).not.toContain(HOSTILE_SUCCESS_OUTPUT_SECRET);
+  expect(value).not.toContain("127.0.0.1");
+  expect(value).not.toContain("\u0000");
+  expect(utf8Bytes(value)).toBeLessThanOrEqual(maxBytes);
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }

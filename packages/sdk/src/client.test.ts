@@ -1,10 +1,12 @@
 import { expect, test } from "bun:test";
 import {
   EventCursorResyncRequiredError,
+  EventTransportResyncRequiredError,
   HttpRuntimeClient,
   isEventCursorResyncRequiredError,
+  isEventTransportResyncRequiredError,
 } from "./client.js";
-import type { SessionId } from "@chili/protocol";
+import type { SessionId, UserInputId } from "@chili/protocol";
 
 test("streamEvents exposes a cursor resync signal for rejected resume cursors", async () => {
   const client = new HttpRuntimeClient({
@@ -58,6 +60,34 @@ test("streamEvents keeps non-resume HTTP conflicts as ordinary errors", async ()
   expect(caught).toBeInstanceOf(Error);
   expect(isEventCursorResyncRequiredError(caught)).toBe(false);
   expect((caught as Error).message).toBe("conflict");
+});
+
+test("streamEvents exposes a bounded transport resync cursor without yielding a synthetic event", async () => {
+  const client = new HttpRuntimeClient({
+    baseUrl: "http://chili.test",
+    fetch: (async () => new Response(
+      "event: chili.resync\ndata: {\"reason\":\"event_transport_limit\",\"afterEventId\":\"event_poison\",\"message\":\"Authoritative resync required\"}\n\n",
+      { headers: { "content-type": "text/event-stream" } },
+    )) as unknown as typeof fetch,
+  });
+
+  const yielded: unknown[] = [];
+  let caught: unknown;
+  try {
+    for await (const event of client.streamEvents()) yielded.push(event);
+  } catch (error) {
+    caught = error;
+  }
+
+  expect(yielded).toEqual([]);
+  expect(isEventTransportResyncRequiredError(caught)).toBe(true);
+  expect(caught).toBeInstanceOf(EventTransportResyncRequiredError);
+  expect(caught).toMatchObject({
+    code: "EVENT_TRANSPORT_RESYNC_REQUIRED",
+    resumeAfterEventId: "event_poison",
+    message: "Authoritative resync required",
+  });
+  expect(isEventCursorResyncRequiredError(caught)).toBe(false);
 });
 
 test("delegation client reads and updates the deterministic session policy endpoint", async () => {
@@ -160,4 +190,42 @@ test("mailbox filters by the canonical recipient session query", async () => {
     limit: "25",
   });
   expect(requestUrl.searchParams.has("childSessionId")).toBe(false);
+});
+
+test("user input client lists pending requests and resolves answers with the expected URL and body", async () => {
+  const requests: Request[] = [];
+  const client = new HttpRuntimeClient({
+    baseUrl: "http://chili.test/api",
+    fetch: (async (input, init) => {
+      const request = new Request(input, init);
+      requests.push(request);
+      if (request.method === "GET") {
+        return Response.json([{
+          id: "userinput_sdk",
+          sessionId: "session_sdk",
+          callId: "toolcall_sdk",
+          questions: [],
+          createdAt: 123,
+        }]);
+      }
+      return Response.json({ resolved: true });
+    }) as typeof fetch,
+  });
+
+  expect(await client.listUserInputs({ sessionId: "session_sdk" as SessionId })).toMatchObject([{
+    id: "userinput_sdk",
+    sessionId: "session_sdk",
+  }]);
+  expect(await client.pendingUserInputs()).toHaveLength(1);
+  expect(await client.resolveUserInput({
+    inputId: "userinput_sdk/choice" as UserInputId,
+    answers: { theme: ["Dark"] },
+  })).toEqual({ resolved: true });
+
+  expect(requests.map((request) => [request.method, request.url])).toEqual([
+    ["GET", "http://chili.test/api/user-inputs?sessionId=session_sdk"],
+    ["GET", "http://chili.test/api/user-inputs"],
+    ["POST", "http://chili.test/api/user-inputs/userinput_sdk%2Fchoice/resolve"],
+  ]);
+  expect(await requests[2]!.json()).toEqual({ answers: { theme: ["Dark"] } });
 });

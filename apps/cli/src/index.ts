@@ -75,11 +75,34 @@ async function main(): Promise<void> {
   if (modelDefaults.model !== undefined) harnessInput.model = modelDefaults.model;
   if (modelDefaults.reasoningLevel !== undefined) harnessInput.reasoningLevel = modelDefaults.reasoningLevel;
   if (modelDefaults.serviceTier !== undefined) harnessInput.serviceTier = modelDefaults.serviceTier;
-  const harness = await createCliHarness(harnessInput);
+  const signalLifecycle = createCliShutdownLifecycle({
+    signalSource: process,
+    forceExit: ({ exitCode }) => process.exit(exitCode),
+    onFirstSignal: ({ signal, exitCode }) => {
+      const currentExitCode = typeof process.exitCode === "number" ? process.exitCode : 0;
+      process.exitCode = Math.max(currentExitCode, exitCode);
+      console.log(`\n[interrupt] ${signal} received; shutting down...`);
+    },
+  });
+  let harness: Awaited<ReturnType<typeof createCliHarness>>;
+  try {
+    harness = await createCliHarness(harnessInput);
+    signalLifecycle.attachHarness(harness);
+  } catch (error) {
+    signalLifecycle.dispose();
+    throw error;
+  }
+  let lifecycleOwnsHarness = true;
 
   try {
+    if (signalLifecycle.signal.aborted) {
+      await signalLifecycle.close();
+      return;
+    }
     if (args.command === "serve") {
       if (!approvalQueue) throw new Error("approval queue was not initialized");
+      lifecycleOwnsHarness = false;
+      signalLifecycle.dispose();
       await serve({ harness, approvalQueue, host: args.host, port: args.port });
       return;
     }
@@ -146,23 +169,34 @@ async function main(): Promise<void> {
 
     if (args.command === "team-dispatch") {
       if (!args.teamId || !args.taskId) throw new Error("team-dispatch requires a team id and task id");
-      await dispatchTeamTask(harness, args.teamId as TeamId, args.taskId as TaskId, "background");
+      await dispatchTeamTask(
+        harness,
+        args.teamId as TeamId,
+        args.taskId as TaskId,
+        "background",
+        signalLifecycle.signal,
+      );
       return;
     }
 
     if (args.command === "team-run") {
       if (!args.teamId || !args.taskId) throw new Error("team-run requires a team id and task id");
-      await dispatchTeamTask(harness, args.teamId as TeamId, args.taskId as TaskId, "one_shot");
+      await dispatchTeamTask(
+        harness,
+        args.teamId as TeamId,
+        args.taskId as TaskId,
+        "one_shot",
+        signalLifecycle.signal,
+      );
       return;
     }
 
     if (args.command === "team-run-loop") {
       if (!args.teamId) throw new Error("team-run-loop requires a team id");
-      const controller = installInterruptHandler();
       const input: Parameters<typeof harness.teamRunner.run>[0] = {
         teamId: args.teamId as TeamId,
         once: args.once,
-        signal: controller.signal,
+        signal: signalLifecycle.signal,
       };
       if (args.maxCycles !== undefined) input.maxCycles = args.maxCycles;
       if (args.timeoutMs !== undefined) input.timeoutMs = args.timeoutMs;
@@ -178,6 +212,7 @@ async function main(): Promise<void> {
       if (!args.teamId) throw new Error("team-merge requires a team id");
       const input: Parameters<typeof harness.teamMerger.mergeTeamTasks>[0] = {
         teamId: args.teamId as TeamId,
+        signal: signalLifecycle.signal,
       };
       if (args.taskId) input.taskId = args.taskId as TaskId;
       const result = await harness.teamMerger.mergeTeamTasks(input);
@@ -246,12 +281,11 @@ async function main(): Promise<void> {
     if (args.command === "task-followup") {
       if (!args.taskId) throw new Error("followup requires a task id");
       if (!args.prompt) throw new Error("followup requires prompt text");
-      const controller = installInterruptHandler();
       const result = await harness.tasks.followupTask({
         taskId: args.taskId as TaskId,
         text: args.prompt,
         maxTurns: args.maxTurns,
-        signal: controller.signal,
+        signal: signalLifecycle.signal,
       });
       console.log(`[task] ${result.task.id}\t${result.task.status}\t${result.task.summary ?? ""}`);
       return;
@@ -259,7 +293,10 @@ async function main(): Promise<void> {
 
     if (args.command === "task-wait") {
       if (!args.taskId) throw new Error("wait requires a task id");
-      const input: { taskId: TaskId; timeoutMs?: number } = { taskId: args.taskId as TaskId };
+      const input: { taskId: TaskId; timeoutMs?: number; signal: AbortSignal } = {
+        taskId: args.taskId as TaskId,
+        signal: signalLifecycle.signal,
+      };
       if (args.timeoutMs !== undefined) input.timeoutMs = args.timeoutMs;
       const task = await harness.tasks.waitForTask(input);
       console.log(`[task] ${task.id}\t${task.status}\t${task.summary ?? ""}`);
@@ -302,24 +339,36 @@ async function main(): Promise<void> {
 
     console.log(`[session] ${session.sessionId}${session.isNew ? " (new)" : " (resumed)"}`);
     if (args.prompt) {
-      const controller = installInterruptHandler();
       await runSessionPrompt({
         harness,
         sessionId: session.sessionId,
         prompt: args.prompt,
         maxTurns: args.maxTurns,
-        signal: controller.signal,
+        signal: signalLifecycle.signal,
       });
+      // A one-shot CLI process owns any background agents it started. Let
+      // successful work reach its durable terminal state before the finally
+      // block invokes the cancellation-oriented host shutdown path.
+      if (!signalLifecycle.signal.aborted) await harness.waitForBackgroundTasks();
       return;
     }
 
+    // Readline owns interactive SIGINT semantics. Keep SIGTERM under the host
+    // lifecycle so service-manager shutdown still drains detached tool groups.
+    signalLifecycle.releaseSigint();
     await repl({
       harness,
       sessionId: session.sessionId,
       maxTurns: args.maxTurns,
+      shutdownSignal: signalLifecycle.signal,
     });
   } finally {
-    await harness.close();
+    try {
+      if (lifecycleOwnsHarness) await signalLifecycle.close();
+      else await harness.close();
+    } finally {
+      signalLifecycle.dispose();
+    }
   }
 }
 
@@ -396,17 +445,310 @@ async function serve(input: {
   console.log(`[server] ${server.url}`);
   console.log("Press Ctrl+C to stop.");
 
-  await new Promise<void>((resolve) => {
-    const stop = () => {
-      process.removeListener("SIGINT", stop);
-      process.removeListener("SIGTERM", stop);
-      input.approvalQueue.denyAll("Runtime server stopped.");
-      server.close();
-      resolve();
-    };
-    process.once("SIGINT", stop);
-    process.once("SIGTERM", stop);
+  await waitForServeShutdown({
+    signalSource: process,
+    denyPending: () => input.approvalQueue.denyAll("Runtime server stopped."),
+    closeServer: () => server.close(),
+    closeHarness: () => input.harness.close(),
+    forceExit: ({ exitCode }) => process.exit(exitCode),
   });
+}
+
+export type ServeShutdownSignal = "SIGINT" | "SIGTERM";
+export type ServeShutdownForceReason = "deadline" | "repeated_signal";
+
+export interface ServeShutdownForceExit {
+  signal: ServeShutdownSignal;
+  reason: ServeShutdownForceReason;
+  exitCode: number;
+}
+
+export interface ServeShutdownDeadline {
+  cancel(): void;
+}
+
+export interface ServeShutdownSignalSource {
+  on(signal: ServeShutdownSignal, listener: () => void): unknown;
+  removeListener(signal: ServeShutdownSignal, listener: () => void): unknown;
+}
+
+const SERVE_SHUTDOWN_DEADLINE_MS = 12_000;
+const CLI_SHUTDOWN_DEADLINE_MS = 12_000;
+
+export interface CliShutdownLifecycle {
+  readonly signal: AbortSignal;
+  attachHarness(harness: { close(): Promise<void> }): void;
+  close(): Promise<void>;
+  releaseSigint(): void;
+  dispose(): void;
+}
+
+export function createCliShutdownLifecycle(input: {
+  signalSource: ServeShutdownSignalSource;
+  forceExit(input: ServeShutdownForceExit): void;
+  shutdownDeadlineMs?: number;
+  armDeadline?(callback: () => void, delayMs: number): ServeShutdownDeadline;
+  onFirstSignal?(input: { signal: ServeShutdownSignal; exitCode: number }): void;
+}): CliShutdownLifecycle {
+  const shutdownDeadlineMs = input.shutdownDeadlineMs ?? CLI_SHUTDOWN_DEADLINE_MS;
+  if (!Number.isSafeInteger(shutdownDeadlineMs) || shutdownDeadlineMs <= 0) {
+    throw new RangeError("CLI shutdown deadline must be a positive safe integer");
+  }
+
+  const controller = new AbortController();
+  let harness: { close(): Promise<void> } | undefined;
+  let closeStarted = false;
+  let closePromise: Promise<void> | undefined;
+  let resolveClose: (() => void) | undefined;
+  let rejectClose: ((error: unknown) => void) | undefined;
+  let deadline: ServeShutdownDeadline | undefined;
+  let firstSignal: ServeShutdownSignal | undefined;
+  let settled = false;
+  let disposed = false;
+  let sigintReleased = false;
+
+  const removeSignalListeners = (): void => {
+    input.signalSource.removeListener("SIGINT", onSigint);
+    input.signalSource.removeListener("SIGTERM", onSigterm);
+  };
+  const cancelDeadline = (): void => {
+    deadline?.cancel();
+    deadline = undefined;
+  };
+  const publishClosePromise = (): Promise<void> => {
+    if (!closePromise) {
+      closePromise = new Promise<void>((resolvePromise, rejectPromise) => {
+        resolveClose = resolvePromise;
+        rejectClose = rejectPromise;
+      });
+      // A signal can force shutdown while harness construction is still
+      // pending and before main has a chance to await this promise.
+      void closePromise.catch(() => undefined);
+    }
+    return closePromise;
+  };
+  const finish = (error?: unknown): void => {
+    if (settled) return;
+    settled = true;
+    disposed = true;
+    cancelDeadline();
+    removeSignalListeners();
+    if (error === undefined) resolveClose?.();
+    else rejectClose?.(error);
+  };
+  const startHarnessClose = (): void => {
+    if (closeStarted || !harness) return;
+    closeStarted = true;
+    const cleanup = invokeServeShutdownOperation(() => harness?.close() ?? Promise.resolve());
+    void cleanup.then(
+      () => finish(),
+      (error: unknown) => finish(error),
+    );
+  };
+  const forceShutdown = (signal: ServeShutdownSignal, reason: ServeShutdownForceReason): void => {
+    if (settled) return;
+    settled = true;
+    disposed = true;
+    cancelDeadline();
+    removeSignalListeners();
+    const exitCode = signal === "SIGINT" ? 130 : 143;
+    const error = new Error(
+      reason === "deadline"
+        ? `CLI shutdown exceeded ${shutdownDeadlineMs}ms`
+        : `CLI shutdown was forced by repeated ${signal}`,
+    );
+    try {
+      input.forceExit({ signal, reason, exitCode });
+    } catch (forceError) {
+      rejectClose?.(forceError);
+      return;
+    }
+    rejectClose?.(error);
+  };
+  const armDeadline = (signal: ServeShutdownSignal): void => {
+    const arm = input.armDeadline ?? armServeShutdownDeadline;
+    try {
+      const armedDeadline = arm(
+        () => forceShutdown(signal, "deadline"),
+        shutdownDeadlineMs,
+      );
+      if (settled) armedDeadline.cancel();
+      else deadline = armedDeadline;
+    } catch {
+      forceShutdown(signal, "deadline");
+    }
+  };
+  const stop = (signal: ServeShutdownSignal): void => {
+    if (firstSignal) {
+      forceShutdown(signal, "repeated_signal");
+      return;
+    }
+    firstSignal = signal;
+    if (signal === "SIGTERM" && sigintReleased) {
+      // Readline owns Ctrl+C while the REPL is healthy. Once host shutdown
+      // starts, restore SIGINT as an immediate forced-escape path.
+      input.signalSource.on("SIGINT", onSigint);
+      sigintReleased = false;
+    }
+    const exitCode = signal === "SIGINT" ? 130 : 143;
+    publishClosePromise();
+    try {
+      input.onFirstSignal?.({ signal, exitCode });
+    } catch {
+      // An observer must not prevent abort or cleanup admission from closing.
+    }
+    controller.abort(new Error(`CLI received ${signal}`));
+    startHarnessClose();
+    if (!settled) armDeadline(signal);
+  };
+  const onSigint = (): void => stop("SIGINT");
+  const onSigterm = (): void => stop("SIGTERM");
+
+  input.signalSource.on("SIGINT", onSigint);
+  input.signalSource.on("SIGTERM", onSigterm);
+
+  return {
+    signal: controller.signal,
+    attachHarness(attachedHarness) {
+      if (harness && harness !== attachedHarness) throw new Error("CLI shutdown harness is already attached");
+      harness = attachedHarness;
+      if (closePromise) startHarnessClose();
+    },
+    close() {
+      const promise = publishClosePromise();
+      startHarnessClose();
+      return promise;
+    },
+    releaseSigint() {
+      if (sigintReleased || disposed) return;
+      sigintReleased = true;
+      input.signalSource.removeListener("SIGINT", onSigint);
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      cancelDeadline();
+      removeSignalListeners();
+      if (closePromise && !settled && !closeStarted) {
+        settled = true;
+        resolveClose?.();
+      }
+    },
+  };
+}
+
+export function waitForServeShutdown(input: {
+  signalSource: ServeShutdownSignalSource;
+  denyPending(): void;
+  closeServer(): Promise<void>;
+  closeHarness(): Promise<void>;
+  forceExit(input: ServeShutdownForceExit): void;
+  shutdownDeadlineMs?: number;
+  armDeadline?(callback: () => void, delayMs: number): ServeShutdownDeadline;
+}): Promise<void> {
+  const shutdownDeadlineMs = input.shutdownDeadlineMs ?? SERVE_SHUTDOWN_DEADLINE_MS;
+  if (!Number.isSafeInteger(shutdownDeadlineMs) || shutdownDeadlineMs <= 0) {
+    throw new RangeError("Serve shutdown deadline must be a positive safe integer");
+  }
+
+  return new Promise<void>((resolvePromise, rejectPromise) => {
+    let stopping = false;
+    let settled = false;
+    let deadline: ServeShutdownDeadline | undefined;
+    const removeSignalListeners = (): void => {
+      input.signalSource.removeListener("SIGINT", onSigint);
+      input.signalSource.removeListener("SIGTERM", onSigterm);
+    };
+    const forceShutdown = (signal: ServeShutdownSignal, reason: ServeShutdownForceReason): void => {
+      if (settled) return;
+      settled = true;
+      deadline?.cancel();
+      deadline = undefined;
+      removeSignalListeners();
+      const exitCode = signal === "SIGINT" ? 130 : 143;
+      const error = new Error(
+        reason === "deadline"
+          ? `Runtime server shutdown exceeded ${shutdownDeadlineMs}ms`
+          : `Runtime server shutdown was forced by repeated ${signal}`,
+      );
+      try {
+        input.forceExit({ signal, reason, exitCode });
+      } catch (forceError) {
+        rejectPromise(forceError);
+        return;
+      }
+      // The production hook does not return. Settling here keeps injected unit
+      // test hooks deterministic without pretending the shutdown was graceful.
+      rejectPromise(error);
+    };
+    const stop = (signal: ServeShutdownSignal): void => {
+      if (stopping) {
+        forceShutdown(signal, "repeated_signal");
+        return;
+      }
+      stopping = true;
+
+      const errors: unknown[] = [];
+      try {
+        input.denyPending();
+      } catch (error) {
+        errors.push(error);
+      }
+
+      // Calling closeServer synchronously closes HTTP admission. Calling
+      // closeHarness immediately afterwards closes runtime admission and aborts
+      // in-flight prompts, allowing Bun's force-stop drain to finish.
+      const serverClose = invokeServeShutdownOperation(input.closeServer);
+      const harnessClose = invokeServeShutdownOperation(input.closeHarness);
+      void Promise.allSettled([serverClose, harnessClose]).then((results) => {
+        for (const result of results) {
+          if (result.status === "rejected") errors.push(result.reason);
+        }
+        if (settled) return;
+        settled = true;
+        deadline?.cancel();
+        deadline = undefined;
+        removeSignalListeners();
+        if (errors.length === 1) rejectPromise(errors[0]);
+        else if (errors.length > 1) {
+          rejectPromise(new AggregateError(errors, "Runtime server shutdown encountered multiple errors"));
+        } else {
+          resolvePromise();
+        }
+      });
+
+      const armDeadline = input.armDeadline ?? armServeShutdownDeadline;
+      try {
+        const armedDeadline = armDeadline(
+          () => forceShutdown(signal, "deadline"),
+          shutdownDeadlineMs,
+        );
+        if (settled) armedDeadline.cancel();
+        else deadline = armedDeadline;
+      } catch {
+        // Failure to install the only bound must itself fail closed.
+        forceShutdown(signal, "deadline");
+      }
+    };
+    const onSigint = (): void => stop("SIGINT");
+    const onSigterm = (): void => stop("SIGTERM");
+
+    input.signalSource.on("SIGINT", onSigint);
+    input.signalSource.on("SIGTERM", onSigterm);
+  });
+}
+
+function armServeShutdownDeadline(callback: () => void, delayMs: number): ServeShutdownDeadline {
+  const timer = setTimeout(callback, delayMs);
+  return { cancel: () => clearTimeout(timer) };
+}
+
+function invokeServeShutdownOperation(operation: () => Promise<void>): Promise<void> {
+  try {
+    return Promise.resolve(operation());
+  } catch (error) {
+    return Promise.reject(error);
+  }
 }
 
 interface CliMcpControl {
@@ -816,6 +1158,7 @@ async function dispatchTeamTask(
   teamId: TeamId,
   taskId: TaskId,
   mode: "background" | "one_shot",
+  signal: AbortSignal,
 ): Promise<void> {
   const team = (await harness.teams.listTeams()).find((item) => item.id === teamId);
   if (!team) throw new Error(`Team not found: ${teamId}`);
@@ -838,6 +1181,7 @@ async function dispatchTeamTask(
     taskId,
     mode,
     sessionId,
+    signal,
   });
   console.log(jsonStringify(result));
 }
@@ -1127,6 +1471,7 @@ async function repl(input: {
   harness: Awaited<ReturnType<typeof createCliHarness>>;
   sessionId: SessionId;
   maxTurns: number;
+  shutdownSignal: AbortSignal;
 }): Promise<void> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const persistedSession = (await input.harness.store.sessions()).find((session) => session.id === input.sessionId);
@@ -1150,19 +1495,23 @@ async function repl(input: {
       console.log(`[service] ${config.serviceTier ?? serviceTier}`);
     },
     compactSession: async (sessionId, focus) => {
-      const controller = installInterruptHandler();
+      const interrupt = installReplInterruptHandler(input.shutdownSignal);
       const compactInput: {
         sessionId: SessionId;
         instructions?: string;
         signal: AbortSignal;
       } = {
         sessionId,
-        signal: controller.signal,
+        signal: interrupt.signal,
       };
       if (focus) compactInput.instructions = focus;
-      const result = await input.harness.service.compactSession(compactInput);
-      if (result.status === "skipped") console.log(`[context] compact skipped: ${result.reason}`);
-      else if (result.status === "failed" || result.status === "cancelled") console.error(`[context] compact ${result.status}: ${result.error.message}`);
+      try {
+        const result = await input.harness.service.compactSession(compactInput);
+        if (result.status === "skipped") console.log(`[context] compact skipped: ${result.reason}`);
+        else if (result.status === "failed" || result.status === "cancelled") console.error(`[context] compact ${result.status}: ${result.error.message}`);
+      } finally {
+        interrupt.dispose();
+      }
     },
     revertSession: async (sessionId, snapshotId) => {
       await input.harness.recovery.revert({ sessionId, snapshotId: snapshotId as never });
@@ -1194,22 +1543,36 @@ async function repl(input: {
         ...(args ? { args } : {}),
         cwd: sessionCwd,
       });
-      const controller = installInterruptHandler();
-      await runSessionPrompt({
-        harness: input.harness,
-        sessionId,
-        prompt: command.prompt,
-        maxTurns: input.maxTurns,
-        signal: controller.signal,
-      });
+      const interrupt = installReplInterruptHandler(input.shutdownSignal);
+      try {
+        await runSessionPrompt({
+          harness: input.harness,
+          sessionId,
+          prompt: command.prompt,
+          maxTurns: input.maxTurns,
+          signal: interrupt.signal,
+        });
+      } finally {
+        interrupt.dispose();
+      }
     },
   };
   console.log("Type /help for commands, /app exit to quit.");
   try {
     while (true) {
-      const line = (await rl.question("chili> ")).trim();
+      if (input.shutdownSignal.aborted) return;
+      let answer: string;
+      try {
+        answer = await rl.question("chili> ", { signal: input.shutdownSignal });
+      } catch (error) {
+        if (input.shutdownSignal.aborted) return;
+        throw error;
+      }
+      if (input.shutdownSignal.aborted) return;
+      const line = answer.trim();
       if (!line) continue;
       const command = await dispatchCliReplCommand(commandRegistry, commandContext, line);
+      if (input.shutdownSignal.aborted) return;
       if (command.status === "exit") return;
       if (command.status === "handled") {
         if (command.output) console.log(command.output);
@@ -1220,14 +1583,18 @@ async function repl(input: {
         continue;
       }
 
-      const controller = installInterruptHandler();
-      await runSessionPrompt({
-        harness: input.harness,
-        sessionId: input.sessionId,
-        prompt: line,
-        maxTurns: input.maxTurns,
-        signal: controller.signal,
-      });
+      const interrupt = installReplInterruptHandler(input.shutdownSignal);
+      try {
+        await runSessionPrompt({
+          harness: input.harness,
+          sessionId: input.sessionId,
+          prompt: line,
+          maxTurns: input.maxTurns,
+          signal: interrupt.signal,
+        });
+      } finally {
+        interrupt.dispose();
+      }
     }
   } finally {
     rl.close();
@@ -1305,26 +1672,34 @@ function preview(value: string, max = 96): string {
   return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1)}...`;
 }
 
-function installInterruptHandler(): AbortController {
+function installReplInterruptHandler(shutdownSignal: AbortSignal): { signal: AbortSignal; dispose(): void } {
   const controller = new AbortController();
-  const onSigint = () => {
-    if (controller.signal.aborted) process.exit(130);
+  let disposed = false;
+  const onSigint = (): void => {
     console.log("\n[interrupt] cancelling current turn...");
-    controller.abort();
+    controller.abort(new Error("CLI received SIGINT"));
+  };
+  const dispose = (): void => {
+    if (disposed) return;
+    disposed = true;
+    process.removeListener("SIGINT", onSigint);
+    shutdownSignal.removeEventListener("abort", onShutdown);
+  };
+  const onShutdown = (): void => {
+    controller.abort(shutdownSignal.reason ?? new Error("CLI is shutting down"));
   };
   process.once("SIGINT", onSigint);
-  controller.signal.addEventListener(
-    "abort",
-    () => {
-      process.removeListener("SIGINT", onSigint);
-    },
-    { once: true },
-  );
-  return controller;
+  if (shutdownSignal.aborted) onShutdown();
+  else shutdownSignal.addEventListener("abort", onShutdown, { once: true });
+  controller.signal.addEventListener("abort", dispose, { once: true });
+  return { signal: controller.signal, dispose };
 }
 
-main().catch((error: unknown) => {
-  const err = error instanceof Error ? error : new Error(String(error));
-  console.error(`chili: ${err.message}`);
-  process.exitCode = 1;
-});
+if (import.meta.main) {
+  void main().catch((error: unknown) => {
+    const err = error instanceof Error ? error : new Error(String(error));
+    console.error(`chili: ${err.message}`);
+    const currentExitCode = typeof process.exitCode === "number" ? process.exitCode : 0;
+    process.exitCode = Math.max(currentExitCode, 1);
+  });
+}

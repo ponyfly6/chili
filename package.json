@@ -13,6 +13,11 @@
     "check": "bun run typecheck",
     "cli": "bun run apps/cli/src/index.ts",
     "chili": "bun run apps/cli/src/index.ts",
+    "desktop": "bun run --cwd apps/desktop dev",
+    "desktop:build": "bun run --cwd apps/desktop build",
+    "desktop:package": "bun run --cwd apps/desktop package:mac",
+    "desktop:package:dir": "bun run --cwd apps/desktop package:dir",
+    "smoke:desktop": "bun run scripts/smoke-desktop.ts",
     "tui": "bun run apps/tui/src/index.tsx",
     "probe:minimax": "bun run scripts/probe-minimax.ts",
     "smoke": "bun run scripts/smoke.ts",
@@ -28,7 +33,7 @@
     "smoke:p3-team-model": "bun run scripts/smoke-p3-team-model.ts",
     "smoke:p3-team-parallel": "bun run scripts/smoke-p3-team-parallel.ts",
     "test:index": "bun run scripts/test-index.ts",
-    "typecheck": "tsc -b"
+    "typecheck": "tsc -b && bun run --cwd apps/desktop typecheck"
   },
   "devDependencies": {
     "@types/react": "19.2.14",

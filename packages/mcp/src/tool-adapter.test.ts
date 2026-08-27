@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { PERSISTED_ERROR_LIMITS } from "@chili/protocol";
 import type { McpServerConfig } from "./config.js";
 import { createMcpChiliTool, createMcpChiliTools, inferConcurrencySafe, inferRisk, sanitizeMcpToolDescription } from "./tool-adapter.js";
 
@@ -117,6 +118,138 @@ test("preserves MCP image content for model tool results", async () => {
   ]);
 });
 
+test("omits oversized MCP image data before it can enter tool results", async () => {
+  const data = "A".repeat(4_000_001);
+  const tool = createMcpChiliTool({
+    server,
+    tool: { name: "huge_screenshot", annotations: { readOnlyHint: true } },
+    manager: {
+      callTool: async () => ({
+        content: [{ type: "image", data, mimeType: "image/png" }],
+      }),
+    },
+  });
+
+  const result = await tool.execute({}, executionContext());
+  expect(result.output).toContain("MCP image omitted");
+  expect(result.content).toEqual([{
+    type: "text",
+    text: "[MCP image omitted: 4000001 encoded bytes exceeds content limit]",
+  }]);
+  expect(JSON.stringify(result)).not.toContain(data.slice(0, 1_000_000));
+});
+
+test("bounds MCP resource, structured strings, depth, and content item count", async () => {
+  const huge = "RESOURCE_SECRET_".repeat(40_000);
+  const circular: Record<string, unknown> = { huge };
+  circular.self = circular;
+  const tool = createMcpChiliTool({
+    server,
+    tool: { name: "huge_resource", annotations: { readOnlyHint: true } },
+    manager: {
+      callTool: async () => ({
+        content: [
+          { type: "resource", resource: circular },
+          ...Array.from({ length: 100 }, (_, index) => ({ type: "text", text: `item-${index}` })),
+        ],
+        structuredContent: { huge, circular },
+      }),
+    },
+  });
+
+  const result = await tool.execute({}, executionContext());
+  expect(result.content?.length).toBeLessThanOrEqual(64);
+  expect(result.content?.at(-1)).toMatchObject({ type: "text" });
+  expect(result.output).toContain("truncated");
+  expect(result.output).toContain("circular structured content");
+  expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThan(2_000_000);
+});
+
+test("normalizes a 5 MiB MCP isError aggregate with stable semantics", async () => {
+  const bearerToken = "mcp-secret-token._~+/==";
+  const loopbackUrl = "https://localhost:9443/private/mcp?token=mcp-url-secret";
+  const huge = `MCP failed with Bearer ${bearerToken} at ${loopbackUrl}\n`
+    + "错".repeat(Math.ceil((5 * 1024 * 1024) / 3));
+  const tool = createMcpChiliTool({
+    server,
+    tool: { name: "remote_failure", annotations: { readOnlyHint: true } },
+    manager: {
+      callTool: async () => ({ content: [{ type: "text", text: huge }], isError: true }),
+    },
+  });
+
+  const error = await captureError(() => tool.execute({}, executionContext()));
+  expect(error.name).toBe("McpToolError");
+  expect((error as Error & { code?: string }).code).toBe("MCP_TOOL_ERROR");
+  expect(Buffer.byteLength(error.message, "utf8")).toBeLessThanOrEqual(PERSISTED_ERROR_LIMITS.messageBytes);
+  expect(error.message).toContain("error message truncated from");
+  expect(error.message).toContain("Bearer [REDACTED]");
+  expect(error.message).toContain("[loopback URL redacted]");
+  expect(error.message).not.toContain(bearerToken);
+  expect(error.message).not.toContain(loopbackUrl);
+  expect(error.message).not.toContain("\uFFFD");
+});
+
+test("normalizes 5 MiB MCP manager rejections without copying cause or stack", async () => {
+  const huge = "拒".repeat(Math.ceil((5 * 1024 * 1024) / 3));
+  const source = Object.assign(new Error(huge), {
+    name: "McpRemoteError",
+    code: -32_001,
+    cause: { response: huge },
+  });
+  const tool = createMcpChiliTool({
+    server,
+    tool: { name: "manager_rejection", annotations: { readOnlyHint: true } },
+    manager: { callTool: async () => { throw source; } },
+  });
+
+  const error = await captureError(() => tool.execute({}, executionContext()));
+  expect(error).not.toBe(source);
+  expect(error.name).toBe("McpRemoteError");
+  expect((error as Error & { code?: number }).code).toBe(-32_001);
+  expect((error as Error & { cause?: unknown }).cause).toBeUndefined();
+  expect(Buffer.byteLength(error.message, "utf8")).toBeLessThanOrEqual(PERSISTED_ERROR_LIMITS.messageBytes);
+  expect(error.message).not.toContain("\uFFFD");
+});
+
+test("caps actual serialized MCP structured content including escaped strings", async () => {
+  const structuredContent: Record<string, unknown> = {};
+  for (let index = 0; index < 128; index += 1) {
+    structuredContent[`${"S".repeat(500)}-${index}`] = "\u0000\n\t\"\\".repeat(40_000);
+  }
+  const tool = createMcpChiliTool({
+    server,
+    tool: { name: "escaped_structured", annotations: { readOnlyHint: true } },
+    manager: { callTool: async () => ({ content: [], structuredContent }) },
+  });
+
+  const result = await tool.execute({}, executionContext());
+  const bounded = result.metadata?.structuredContent;
+  expect(Buffer.byteLength(JSON.stringify(bounded), "utf8")).toBeLessThanOrEqual(512_000);
+});
+
+test("preserves prototype-named MCP keys without changing the bounded object prototype", async () => {
+  const structuredContent = Object.create(null) as Record<string, unknown>;
+  Object.defineProperty(structuredContent, "__proto__", { enumerable: true, value: { polluted: true } });
+  Object.defineProperty(structuredContent, "constructor", { enumerable: true, value: "constructor-value" });
+  Object.defineProperty(structuredContent, "prototype", { enumerable: true, value: "prototype-value" });
+  structuredContent.large = "\u0000".repeat(600_000);
+  const tool = createMcpChiliTool({
+    server,
+    tool: { name: "prototype_structured", annotations: { readOnlyHint: true } },
+    manager: { callTool: async () => ({ content: [], structuredContent }) },
+  });
+
+  const result = await tool.execute({}, executionContext());
+  const bounded = result.metadata?.structuredContent as Record<string, unknown>;
+  expect(Object.getPrototypeOf(bounded)).toBeNull();
+  expect(Reflect.get(bounded, "__proto__")).toEqual({ polluted: true });
+  expect(Reflect.get(bounded, "constructor")).toBe("constructor-value");
+  expect(Reflect.get(bounded, "prototype")).toBe("prototype-value");
+  expect((Object.prototype as { polluted?: boolean }).polluted).toBeUndefined();
+  expect(Buffer.byteLength(JSON.stringify(bounded), "utf8")).toBeLessThanOrEqual(512_000);
+});
+
 test("adds stable suffixes when sanitized MCP tool names collide", () => {
   const tools = createMcpChiliTools(server, [
     { name: "issues.search" },
@@ -131,3 +264,28 @@ test("adds stable suffixes when sanitized MCP tool names collide", () => {
   expect(tools[0]?.mcp.modelName).toBe(tools[0]?.name);
   expect(tools[1]?.mcp.modelName).toBe(tools[1]?.name);
 });
+
+function executionContext() {
+  return {
+    sessionId: "session_mcp" as never,
+    turnId: "turn_mcp" as never,
+    callId: "toolcall_mcp" as never,
+    outputArtifactId: "tooloutput_mcp" as never,
+    cwd: "/tmp",
+    signal: new AbortController().signal,
+    registerPersistedOutput: async () => {},
+    metadata: async () => {},
+    streamOutput: async () => {},
+    requestApproval: async () => ({ action: "allow_once" as const }),
+  };
+}
+
+async function captureError(run: () => Promise<unknown>): Promise<Error> {
+  try {
+    await run();
+  } catch (error) {
+    expect(error).toBeInstanceOf(Error);
+    return error as Error;
+  }
+  throw new Error("Expected promise to reject");
+}

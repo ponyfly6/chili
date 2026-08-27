@@ -1,10 +1,6 @@
 import type { ModelUsage } from "@chili/protocol";
 
-const MODEL_USAGE_ERROR = Symbol("chili.modelUsage");
-
-interface ModelUsageError extends Error {
-  [MODEL_USAGE_ERROR]?: ModelUsage;
-}
+const modelUsageByError = new WeakMap<object, ModelUsage>();
 
 export function addModelUsage(
   current: ModelUsage | undefined,
@@ -20,8 +16,10 @@ export function addModelUsage(
     "cacheReadInputTokens",
     "cacheCreationInputTokens",
   ] as const) {
-    const value = finiteNonNegative(current?.[field]) + finiteNonNegative(next?.[field]);
-    if (value > 0 || current?.[field] === 0 || next?.[field] === 0) {
+    const currentValue = usageNumber(current, field);
+    const nextValue = usageNumber(next, field);
+    const value = finiteNonNegative(currentValue) + finiteNonNegative(nextValue);
+    if (value > 0 || currentValue === 0 || nextValue === 0) {
       output[field] = value;
       hasNumericUsage = true;
     }
@@ -34,37 +32,53 @@ export function addModelUsage(
     hasNumericUsage = true;
   }
 
-  if (!current && next?.raw !== undefined) output.raw = next.raw;
-  if (!next && current?.raw !== undefined) output.raw = current.raw;
+  const currentRaw = usageProperty(current, "raw");
+  const nextRaw = usageProperty(next, "raw");
+  if (!current && nextRaw !== undefined) output.raw = nextRaw;
+  if (!next && currentRaw !== undefined) output.raw = currentRaw;
   return hasNumericUsage || output.raw !== undefined ? output : undefined;
 }
 
 export function attachModelUsage(error: Error, usage: ModelUsage | undefined): Error {
   if (!usage) return error;
-  const target = error as ModelUsageError;
-  const combined = addModelUsage(target[MODEL_USAGE_ERROR], usage);
-  if (combined) target[MODEL_USAGE_ERROR] = combined;
+  const combined = addModelUsage(modelUsageByError.get(error), usage);
+  if (combined) modelUsageByError.set(error, combined);
   return error;
 }
 
-export function takeModelUsage(error: Error): ModelUsage | undefined {
-  const target = error as ModelUsageError;
-  const usage = target[MODEL_USAGE_ERROR];
-  delete target[MODEL_USAGE_ERROR];
+export function takeModelUsage(error: unknown): ModelUsage | undefined {
+  if ((typeof error !== "object" && typeof error !== "function") || error === null) return undefined;
+  const usage = modelUsageByError.get(error);
+  modelUsageByError.delete(error);
   return usage;
 }
 
 function usageTokenTotal(usage: ModelUsage | undefined): number | undefined {
   if (!usage) return undefined;
-  if (isFiniteNonNegative(usage.totalTokens)) return usage.totalTokens;
+  const totalTokens = usageNumber(usage, "totalTokens");
+  if (isFiniteNonNegative(totalTokens)) return totalTokens;
   const fields = [
-    usage.inputTokens,
-    usage.outputTokens,
-    usage.cacheReadInputTokens,
-    usage.cacheCreationInputTokens,
+    usageNumber(usage, "inputTokens"),
+    usageNumber(usage, "outputTokens"),
+    usageNumber(usage, "cacheReadInputTokens"),
+    usageNumber(usage, "cacheCreationInputTokens"),
   ];
   if (!fields.some(isFiniteNonNegative)) return undefined;
   return fields.reduce<number>((total, value) => total + finiteNonNegative(value), 0);
+}
+
+function usageNumber(usage: ModelUsage | undefined, key: keyof ModelUsage): number | undefined {
+  const value = usageProperty(usage, key);
+  return typeof value === "number" ? value : undefined;
+}
+
+function usageProperty(usage: ModelUsage | undefined, key: keyof ModelUsage): unknown {
+  if (!usage) return undefined;
+  try {
+    return Reflect.get(usage, key);
+  } catch {
+    return undefined;
+  }
 }
 
 function finiteNonNegative(value: number | undefined): number {

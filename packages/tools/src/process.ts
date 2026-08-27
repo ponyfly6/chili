@@ -30,6 +30,20 @@ export interface RunProcessOptions {
   maxLiveOutputBytes?: number;
 }
 
+export interface RunProcessLifecycleEvent {
+  type: "started" | "finished";
+  pid: number;
+}
+
+export type RunProcessLifecycleObserver = (event: RunProcessLifecycleEvent) => void;
+
+const processLifecycleObservers = new Set<RunProcessLifecycleObserver>();
+
+export function observeRunProcessLifecycle(observer: RunProcessLifecycleObserver): () => void {
+  processLifecycleObservers.add(observer);
+  return () => processLifecycleObservers.delete(observer);
+}
+
 const DEFAULT_OUTPUT_FLUSH_INTERVAL_MS = 75;
 const DEFAULT_LIVE_OUTPUT_PENDING_BYTES = 64 * 1024;
 const DEFAULT_LIVE_OUTPUT_DELTA_BYTES = 8 * 1024;
@@ -52,6 +66,7 @@ export interface RunProcessResult {
 
 type ChildProcessExitEvents = Pick<EventEmitter<{
   error: [error: Error];
+  exit: [exitCode: number | null, signal: NodeJS.Signals | null];
   close: [exitCode: number | null, signal: NodeJS.Signals | null];
 }>, "once">;
 
@@ -69,6 +84,8 @@ export async function runProcess(
     detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
   });
+  const childPid = child.pid;
+  if (childPid) publishProcessLifecycle({ type: "started", pid: childPid });
 
   let timedOut = false;
   let aborted = false;
@@ -109,12 +126,16 @@ export async function runProcess(
   }
 
   try {
+    const statusPromise = waitForExit(child).then(async (status) => {
+      exited = true;
+      if (childPid) await terminateResidualProcessGroup(childPid, killGraceMs);
+      return status;
+    });
     const [stdout, stderr, status] = await Promise.all([
       collect(child.stdout, maxOutputBytes, "stdout", outputDispatcher, options.onRawOutput),
       collect(child.stderr, maxOutputBytes, "stderr", outputDispatcher, options.onRawOutput),
-      waitForExit(child),
+      statusPromise,
     ]);
-    exited = true;
     await outputDispatcher?.flushAll();
 
     if (aborted) {
@@ -142,6 +163,31 @@ export async function runProcess(
     if (timeout) clearTimeout(timeout);
     if (escalation) clearTimeout(escalation);
     options.signal?.removeEventListener("abort", abort);
+    if (childPid) await terminateResidualProcessGroup(childPid, killGraceMs);
+    if (childPid && !processGroupStillExists(childPid)) {
+      publishProcessLifecycle({ type: "finished", pid: childPid });
+    }
+  }
+}
+
+function publishProcessLifecycle(event: RunProcessLifecycleEvent): void {
+  for (const observer of processLifecycleObservers) {
+    try {
+      observer(event);
+    } catch {
+      // Lifecycle reporting must never change tool process behavior.
+    }
+  }
+}
+
+function processGroupStillExists(pid: number): boolean {
+  try {
+    process.kill(process.platform === "win32" ? pid : -pid, 0);
+    return true;
+  } catch (error) {
+    return error instanceof Error
+      && "code" in error
+      && (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 
@@ -352,6 +398,7 @@ function waitForExit(child: ReturnType<typeof spawn>): Promise<{ exitCode: numbe
   return new Promise((resolve, reject) => {
     const events = child as typeof child & ChildProcessExitEvents;
     events.once("error", reject);
+    events.once("exit", (exitCode, signal) => resolve({ exitCode, signal }));
     events.once("close", (exitCode, signal) => resolve({ exitCode, signal }));
   });
 }
@@ -378,6 +425,33 @@ function terminateProcessGroup(child: ReturnType<typeof spawn>, signal: NodeJS.S
   }
 
   child.kill(signal);
+}
+
+async function terminateResidualProcessGroup(pid: number, graceMs: number): Promise<void> {
+  if (process.platform === "win32" || !processGroupStillExists(pid)) return;
+  signalProcessGroup(pid, "SIGTERM");
+  if (await waitForProcessGroupExit(pid, graceMs)) return;
+  signalProcessGroup(pid, "SIGKILL");
+  await waitForProcessGroupExit(pid, Math.max(250, Math.min(graceMs, 1_000)));
+}
+
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal);
+  } catch (error) {
+    if (!isNoSuchProcess(error)) {
+      // A lifecycle observer keeps the group registered if signaling fails.
+    }
+  }
+}
+
+async function waitForProcessGroupExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (processGroupStillExists(pid)) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return true;
 }
 
 function isNoSuchProcess(error: unknown): boolean {

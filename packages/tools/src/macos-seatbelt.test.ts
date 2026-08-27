@@ -66,7 +66,10 @@ test("macOS Seatbelt runner uses a fixed executable and forwards process control
 });
 
 test("macOS Seatbelt profile is deny-first and protects workspace metadata", () => {
-  const profile = buildMacOsSeatbeltProfile("/tmp/chili-seatbelt-workspace");
+  const profile = buildMacOsSeatbeltProfile(
+    "/tmp/chili-seatbelt-workspace",
+    ["/tmp/chili-seatbelt-workspace/metadata-link-target"],
+  );
 
   expect(profile).toContain("(deny default)");
   expect(profile).toContain("(allow file-read*)");
@@ -74,6 +77,8 @@ test("macOS Seatbelt profile is deny-first and protects workspace metadata", () 
   expect(profile).toContain('(subpath (param "TEMP_ROOT"))');
   expect(profile).toContain('(literal (param "PROTECTED_GIT"))');
   expect(profile).toContain('(literal (param "PROTECTED_CHILI"))');
+  expect(profile).toContain('(literal "/tmp/chili-seatbelt-workspace/metadata-link-target")');
+  expect(profile).toContain('(subpath "/tmp/chili-seatbelt-workspace/metadata-link-target")');
   expect(profile).not.toContain("(allow network-outbound");
   expect(profile).not.toContain("(allow network-inbound");
 });
@@ -82,6 +87,13 @@ test("macOS Seatbelt profile safely handles shell metacharacters in workspace pa
   const workspace = "/tmp/chili seatbelt/$value;$(echo nope)'(test)";
   const profile = buildMacOsSeatbeltProfile(workspace);
   expect(profile).toContain("chili seatbelt/\\$value;\\$\\(echo nope\\)'\\(test\\)");
+});
+
+test("macOS Seatbelt profile bounds protected symlink target clauses", () => {
+  const targets = Array.from({ length: 4_097 }, (_, index) => `/tmp/chili-seatbelt-target-${index}`);
+  expect(() => buildMacOsSeatbeltProfile("/tmp/chili-seatbelt-workspace", targets)).toThrow(
+    "more than 4096 protected symlink targets",
+  );
 });
 
 test("macOS Seatbelt runner fails closed when sandbox launch fails", async () => {
@@ -96,6 +108,55 @@ test("macOS Seatbelt runner fails closed when sandbox launch fails", async () =>
   await expect(runner.run(bashRequest("/tmp", "printf unsafe")))
     .rejects.toThrow("sandbox-exec unavailable");
   expect(calls).toBe(1);
+});
+
+test("macOS Seatbelt runner profiles linked-worktree metadata symlink targets", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-seatbelt-profile-symlink-"));
+  let profile = "";
+  try {
+    const gitDirectory = join(workspace, "actual-gitdir");
+    await mkdir(gitDirectory);
+    await writeFile(join(workspace, ".git"), "gitdir: actual-gitdir\n", "utf8");
+    const target = join(workspace, "metadata-link-target");
+    await writeFile(target, "original\n", "utf8");
+    await symlink("../metadata-link-target", join(gitDirectory, "config-link"));
+    const runner = createMacOsSeatbeltBashRunner({
+      processRunner: async (_command, args) => {
+        profile = args[1] ?? "";
+        return processResult();
+      },
+    });
+
+    await runner.run(bashRequest(workspace, "printf ok"));
+
+    const canonicalTarget = await realpath(target);
+    expect(profile).toContain(`(literal "${canonicalTarget}")`);
+    expect(profile).toContain(`(subpath "${canonicalTarget}")`);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("macOS Seatbelt runner fails closed on dangling protected symlinks", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-seatbelt-dangling-symlink-"));
+  let processCalls = 0;
+  try {
+    await mkdir(join(workspace, ".chili"));
+    await symlink("missing-target", join(workspace, ".chili", "dangling"));
+    const runner = createMacOsSeatbeltBashRunner({
+      processRunner: async () => {
+        processCalls += 1;
+        return processResult();
+      },
+    });
+
+    await expect(runner.run(bashRequest(workspace, "printf unsafe"))).rejects.toThrow(
+      "cannot safely inspect protected metadata path",
+    );
+    expect(processCalls).toBe(0);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
 });
 
 const macOsTest = process.platform === "darwin" ? test : test.skip;
@@ -188,6 +249,24 @@ macOsTest("macOS Seatbelt protects metadata symlink targets inside the workspace
 
     expect(denied.exitCode).not.toBe(0);
     expect(await readFile(targetConfig, "utf8")).toBe("original\n");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+macOsTest("macOS Seatbelt protects targets of symlinks inside metadata trees", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-seatbelt-internal-symlink-"));
+  const target = join(workspace, "ordinary-target");
+  try {
+    await mkdir(join(workspace, ".git"));
+    await writeFile(target, "original\n", "utf8");
+    await symlink("../ordinary-target", join(workspace, ".git", "config-link"));
+    const runner = createMacOsSeatbeltBashRunner();
+
+    const denied = await runner.run(bashRequest(workspace, "printf hacked > ordinary-target"));
+
+    expect(denied.exitCode).not.toBe(0);
+    expect(await readFile(target, "utf8")).toBe("original\n");
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }

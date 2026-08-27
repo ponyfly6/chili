@@ -1,3 +1,4 @@
+import { normalizePersistedError } from "@chili/protocol";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -275,7 +276,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
           delete outputSnapshot.persistedBytes;
           delete outputSnapshot.persistedTruncated;
           delete outputSnapshot.persistedOutput;
-          outputSnapshot.persistenceError = error instanceof Error ? error.message : String(error);
+          outputSnapshot.persistenceError = normalizePersistedError(error).message;
         }
       }
       const sandbox = result.sandbox ?? "none";

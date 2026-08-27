@@ -111,11 +111,17 @@ test("root RuntimeService rejects direct subagent turns while an explicit child 
   const root = new RuntimeService({ runtime: rootRunner, store, cwd: "/repo" });
   const input = { sessionId, text: "bypass child policy" };
 
-  await expect(root.submitPrompt(input)).rejects.toBeInstanceOf(RuntimeSubagentSessionAccessError);
+  await expect(root.submitPrompt(input)).rejects.toMatchObject({
+    name: "RuntimeSubagentSessionAccessError",
+    message: expect.stringContaining("Use task_followup for the owning task"),
+  });
   const asyncError = new Promise<unknown>((resolve) => {
     root.submitPromptAsync({ ...input, text: "async bypass" }, resolve);
   });
-  await expect(asyncError).resolves.toBeInstanceOf(RuntimeSubagentSessionAccessError);
+  await expect(asyncError).resolves.toMatchObject({
+    name: "RuntimeSubagentSessionAccessError",
+    message: expect.stringContaining("Use task_followup for the owning task"),
+  });
   expect(root.isRunning(sessionId)).toBe(false);
   await expect(root.appendUserMessage(input)).rejects.toThrow("Use task_followup for the owning task");
   await expect(root.compactSession({ sessionId })).rejects.toBeInstanceOf(
@@ -633,13 +639,17 @@ test("RuntimeService rethrows inactive prompt boundaries without status side eff
     for (const operation of operations) {
       await expect(operation()).rejects.toBeInstanceOf(RuntimeSessionInactiveError);
     }
-    await expect(service.submitPrompt({ sessionId, text: "blocked sync prompt" })).rejects.toBeInstanceOf(
-      RuntimeSessionInactiveError,
-    );
+    await expect(service.submitPrompt({ sessionId, text: "blocked sync prompt" })).rejects.toMatchObject({
+      name: "RuntimeSessionInactiveError",
+      message: `Session is not active: ${sessionId} (archived)`,
+    });
     const asyncError = new Promise<unknown>((resolve) => {
       service.submitPromptAsync({ sessionId, text: "blocked async prompt" }, resolve);
     });
-    await expect(asyncError).resolves.toBeInstanceOf(RuntimeSessionInactiveError);
+    await expect(asyncError).resolves.toMatchObject({
+      name: "RuntimeSessionInactiveError",
+      message: `Session is not active: ${sessionId} (archived)`,
+    });
     expect(service.isRunning(sessionId)).toBe(false);
     expect(statuses(store)).toEqual([]);
     expect(store.items).toEqual([]);
@@ -823,9 +833,10 @@ test("RuntimeService rejects an unknown session without writing orphan events", 
   const service = new RuntimeService({ runtime: runner, store, cwd: "/repo" });
   const sessionId = "session_unknown" as SessionId;
 
-  await expect(service.submitPrompt({ sessionId, text: "do not persist this" })).rejects.toBeInstanceOf(
-    RuntimeSessionNotFoundError,
-  );
+  await expect(service.submitPrompt({ sessionId, text: "do not persist this" })).rejects.toMatchObject({
+    name: "RuntimeSessionNotFoundError",
+    message: `Session not found: ${sessionId}`,
+  });
 
   expect(store.items).toEqual([]);
   expect(runner.userMessages).toEqual([]);

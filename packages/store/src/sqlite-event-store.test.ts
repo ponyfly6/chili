@@ -446,7 +446,7 @@ test("keeps a team lead session interactive while classifying worker sessions as
   }
 });
 
-test("orders event replay and afterEventId cursors by insertion sequence", async () => {
+test("orders event replay and forward/backward cursors by insertion sequence", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-seq-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const time = 1 as TimestampMs;
@@ -458,6 +458,11 @@ test("orders event replay and afterEventId cursors by insertion sequence", async
     expect((await store.events({ limit: 10 })).map((event) => event.id)).toEqual(["z_event", "a_event"]);
     expect((await store.events({ afterEventId: "z_event", limit: 10 })).map((event) => event.id)).toEqual(["a_event"]);
     expect((await store.events({ afterEventId: "a_event", limit: 10 })).map((event) => event.id)).toEqual([]);
+    expect((await store.events({ beforeEventId: "a_event", limit: 10, tail: true })).map((event) => event.id)).toEqual(["z_event"]);
+    expect((await store.events({ beforeEventId: "z_event", limit: 10, tail: true })).map((event) => event.id)).toEqual([]);
+    await expect(store.events({ afterEventId: "z_event", beforeEventId: "a_event", limit: 10 })).rejects.toThrow(
+      "cannot combine",
+    );
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -1400,6 +1405,108 @@ test("stale-turn recovery does not finalize a turn protected by a live run claim
     runner.releaseSessionRun({ sessionId, claimId: "run_claim_live_turn_recovery" });
     recovery.close();
     runner.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("stale-turn recovery respects a live child task lease and recovers once after expiry", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-live-child-turn-recovery-"));
+  const dbPath = join(dir, "events.sqlite");
+  const worker = new SqliteEventStore(dbPath);
+  const recovery = new SqliteEventStore(dbPath);
+  const parentSessionId = "session_live_child_parent" as SessionId;
+  const childSessionId = "session_live_child_recovery" as SessionId;
+  const taskId = "task_live_child_recovery" as TaskId;
+  const runId = "agent_live_child_recovery" as AgentRunId;
+  const turnId = "turn_live_child_recovery" as TurnId;
+  const now = Date.now();
+  let recoveredIds = 0;
+
+  try {
+    await worker.appendMany([
+      sessionEvent("event_live_child_parent_session", parentSessionId, (now - 1_000) as TimestampMs),
+      {
+        id: "event_live_child_task_created",
+        type: "agent.task_created",
+        time: (now - 950) as TimestampMs,
+        sessionId: parentSessionId,
+        payload: {
+          taskId,
+          path: "/root/live-child" as AgentPath,
+          parentPath: "/root" as AgentPath,
+          parentSessionId,
+          childSessionId,
+          taskName: "live child",
+          cwd: "/repo",
+          prompt: "keep working",
+          mode: "background",
+        },
+      },
+      {
+        id: "event_live_child_spawned",
+        type: "agent.spawned",
+        time: (now - 900) as TimestampMs,
+        sessionId: parentSessionId,
+        payload: {
+          runId,
+          taskId,
+          path: "/root/live-child" as AgentPath,
+          parentPath: "/root" as AgentPath,
+          parentSessionId,
+          childSessionId,
+          taskName: "live child",
+          cwd: "/repo",
+          mode: "background",
+          generation: 1,
+        },
+      },
+      sessionEvent("event_live_child_session", childSessionId, (now - 850) as TimestampMs),
+      {
+        id: "event_live_child_running",
+        type: "session.status_changed",
+        time: (now - 800) as TimestampMs,
+        sessionId: childSessionId,
+        payload: { sessionId: childSessionId, status: "running" },
+      },
+      {
+        id: "event_live_child_turn",
+        type: "turn.started",
+        time: (now - 750) as TimestampMs,
+        sessionId: childSessionId,
+        payload: { turnId },
+      },
+    ]);
+    expect(await worker.claimAgentTaskLease({
+      taskId,
+      runId,
+      generation: 1,
+      owner: "worker_live_child",
+      ttlMs: 100,
+      now,
+    })).toMatchObject({ acquired: true, task: { leaseExpiresAt: now + 100 } });
+
+    expect(await recovery.reconcileStaleTurns({
+      staleBefore: now,
+      now: now + 99,
+      createId: (prefix) => `${prefix}_live_child_${recoveredIds++}`,
+    })).toEqual([]);
+    expect((await recovery.events({ sessionId: childSessionId, limit: 20 })).at(-1)?.id).toBe(
+      "event_live_child_turn",
+    );
+
+    expect((await recovery.reconcileStaleTurns({
+      staleBefore: now,
+      now: now + 100,
+      createId: (prefix) => `${prefix}_expired_child_${recoveredIds++}`,
+    })).map((event) => event.type)).toEqual(["turn.completed", "session.status_changed"]);
+    expect(await recovery.reconcileStaleTurns({
+      staleBefore: now + 200,
+      now: now + 200,
+      createId: (prefix) => `${prefix}_duplicate_child_${recoveredIds++}`,
+    })).toEqual([]);
+  } finally {
+    recovery.close();
+    worker.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -4235,6 +4342,159 @@ test("rolls back paired task and run completion when the second event cannot ins
   }
 });
 
+test("bounds direct agent and team CAS callers before persistence", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-cas-persistence-bounds-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const taskId = "task_direct_cas_bounds" as TaskId;
+  const runId = "agent_direct_cas_bounds" as AgentRunId;
+  const path = "/root/direct_cas_bounds" as AgentPath;
+  const summaryPrefix =
+    `Ordinary direct summary keeps ${STORE_HOSTILE_SECRET} and `
+    + `http://127.0.0.1:4777/result?token=${STORE_HOSTILE_SECRET}.\n`;
+  const hugeOrdinarySummary = `${summaryPrefix}${storeWorstEscapedText()}`;
+
+  try {
+    await appendRunningTask(store, { taskId, runId, path, generation: 1, time: 1 as TimestampMs });
+    const completed = await store.completeAgentTaskCas({
+      taskId,
+      path,
+      runId,
+      generation: 1,
+      expectedGeneration: 1,
+      expectedRunId: runId,
+      expectedLeaseOwner: null,
+      status: "failed",
+      summary: hugeOrdinarySummary,
+      error: hostileStoreDiagnostic("direct task failed", true),
+      eventId: "event_direct_cas_task_completed",
+      agentEventId: "event_direct_cas_agent_completed",
+      time: 2,
+    });
+
+    expect(completed.applied).toBe(true);
+    expect(completed.task?.summary?.startsWith(summaryPrefix)).toBe(true);
+    expect(completed.task?.summary).not.toContain("[REDACTED]");
+    expectStoreSafeDiagnostic(completed.task?.error);
+    expect(completed.events).toHaveLength(2);
+    for (const event of completed.events) {
+      if (event.type === "agent.task_completed" || event.type === "agent.completed") {
+        expectStoreSafeDiagnostic(event.payload.error);
+      }
+      expect(jsonByteLength(event)).toBeLessThanOrEqual(192 * 1024);
+    }
+
+    await store.append({
+      id: "event_direct_cas_mailbox",
+      type: "agent.message_queued",
+      time: 3 as TimestampMs,
+      payload: {
+        path,
+        from: "/root" as AgentPath,
+        triggerTurn: true,
+        message: { role: "user", content: "retry directly" },
+      },
+    });
+    expect((await store.claimAgentMailboxMessage({
+      messageId: "event_direct_cas_mailbox",
+      eventId: "event_direct_cas_mailbox_claim",
+      time: 4,
+    })).applied).toBe(true);
+    const requeued = await store.requeueAgentMailboxMessage({
+      messageId: "event_direct_cas_mailbox",
+      eventId: "event_direct_cas_mailbox_requeue",
+      error: hostileStoreDiagnostic("direct mailbox failed", true),
+      time: 5,
+    });
+    expect(requeued.applied).toBe(true);
+    const requeuedEvent = requeued.events[0] as Extract<ChiliEvent, { type: "agent.message_requeued" }>;
+    expectStoreSafeDiagnostic(requeuedEvent.payload.error);
+    expect(jsonByteLength(requeuedEvent)).toBeLessThanOrEqual(128 * 1024);
+    expect((await store.claimAgentMailboxMessage({
+      messageId: "event_direct_cas_mailbox",
+      eventId: "event_direct_cas_mailbox_reclaim",
+      time: 6,
+    })).applied).toBe(true);
+    const discarded = await store.discardAgentMailboxMessage({
+      messageId: "event_direct_cas_mailbox",
+      eventId: "event_direct_cas_mailbox_discard",
+      reason: hostileStoreDiagnostic("direct mailbox discarded", false),
+      time: 7,
+    });
+    expect(discarded.applied).toBe(true);
+    const discardedEvent = discarded.events[0] as Extract<ChiliEvent, { type: "agent.message_discarded" }>;
+    expectStoreSafeDiagnostic(discardedEvent.payload.reason);
+    expect(jsonByteLength(discardedEvent)).toBeLessThanOrEqual(32 * 1024);
+
+    const teamId = "team_direct_cas_bounds" as TeamId;
+    const teamTaskId = "task_direct_team_cas_bounds" as TaskId;
+    const leadPath = "/root" as AgentPath;
+    const workerPath = "/root/direct_worker" as AgentPath;
+    await store.appendMany([
+      {
+        id: "event_direct_cas_team_created",
+        type: "team.created",
+        time: 6 as TimestampMs,
+        payload: { teamId, name: "direct bounds", leadPath },
+      },
+      {
+        id: "event_direct_cas_team_member",
+        type: "team.member_added",
+        time: 7 as TimestampMs,
+        payload: { teamId, path: workerPath, name: "worker", role: "implementer" },
+      },
+      {
+        id: "event_direct_cas_team_task",
+        type: "team.task_created",
+        time: 8 as TimestampMs,
+        payload: { teamId, taskId: teamTaskId, title: "Direct CAS task" },
+      },
+    ]);
+    const ordinaryFeedback = `Ordinary feedback keeps ${STORE_HOSTILE_SECRET}`;
+    const metadata: Record<string, unknown> = {
+      feedback: ordinaryFeedback,
+      verification: { status: "failed", feedback: hostileStoreDiagnostic("verification failed", false) },
+      nested: { failureReason: hostileStoreDiagnostic("claim failed", false) },
+      "failure reason": hostileStoreDiagnostic("spaced claim failure", false),
+      ordinaryBlob: hugeOrdinarySummary,
+      values: Array.from({ length: 300 }, (_, index) => index),
+    };
+    Object.defineProperty(metadata, "__proto__", {
+      configurable: true,
+      enumerable: true,
+      value: { error: hostileStoreDiagnostic("prototype key failure", false) },
+    });
+    metadata.circular = metadata;
+    const claimed = await store.claimTeamTask({
+      teamId,
+      taskId: teamTaskId,
+      ownerPath: workerPath,
+      claimedBy: workerPath,
+      metadata,
+      eventId: "event_direct_cas_team_claim",
+      time: 9,
+    });
+
+    expect(claimed.applied).toBe(true);
+    expect(claimed.task?.metadata?.feedback).toBe(ordinaryFeedback);
+    expectStoreSafeDiagnostic(
+      ((claimed.task?.metadata?.verification as Record<string, unknown> | undefined)?.feedback as string | undefined),
+    );
+    expectStoreSafeDiagnostic(
+      ((claimed.task?.metadata?.nested as Record<string, unknown> | undefined)?.failureReason as string | undefined),
+    );
+    expectStoreSafeDiagnostic(claimed.task?.metadata?.["failure reason"] as string | undefined);
+    expect(Object.prototype.hasOwnProperty.call(claimed.task?.metadata, "__proto__")).toBe(true);
+    expectStoreSafeDiagnostic(
+      ((claimed.task?.metadata?.["__proto__"] as Record<string, unknown> | undefined)?.error as string | undefined),
+    );
+    expect(jsonByteLength(claimed.task?.metadata)).toBeLessThanOrEqual(256 * 1024);
+    expect(jsonByteLength(claimed.events[0])).toBeLessThanOrEqual(320 * 1024);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("atomically completes a task and consumes its delivering mailbox message", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-task-mailbox-complete-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -5891,6 +6151,30 @@ async function appendRunningTask(
       },
     },
   ]);
+}
+
+const STORE_HOSTILE_SECRET = "sk-store-cas-secret-123456789";
+
+function hostileStoreDiagnostic(label: string, includeWorstEscaped: boolean): string {
+  return `${label}\nAuthorization: Bearer ${STORE_HOSTILE_SECRET}\n`
+    + `http://127.0.0.1:4777/private?token=${STORE_HOSTILE_SECRET}\n`
+    + (includeWorstEscaped ? storeWorstEscapedText() : "diagnostic detail");
+}
+
+function storeWorstEscapedText(): string {
+  return "\u0000\"\\\n".repeat(Math.ceil((5 * 1024 * 1024) / 4));
+}
+
+function expectStoreSafeDiagnostic(value: string | undefined): void {
+  expect(value).toBeDefined();
+  expect(value).toContain("[REDACTED]");
+  expect(value).not.toContain(STORE_HOSTILE_SECRET);
+  expect(value).not.toContain("127.0.0.1");
+  expect(new TextEncoder().encode(value ?? "").byteLength).toBeLessThanOrEqual(16 * 1024);
+}
+
+function jsonByteLength(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
 function sessionEvent(id: string, sessionId: SessionId, time: TimestampMs): ChiliEvent {

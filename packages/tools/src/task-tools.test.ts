@@ -468,6 +468,31 @@ test("task_batch reports partial spawn failures without losing successful handle
   }
 });
 
+test("task_batch normalizes hostile spawn failures in successful tool output", async () => {
+  const controller = new FakeSubagentController();
+  controller.spawnErrors.set("hostile", hostileSuccessfulOutputError("task batch spawn failed"));
+  const registry = new InMemoryToolRegistry();
+  registry.register(createTaskBatchTool(controller));
+  const executor = createExecutor(registry, []);
+
+  const result = await executor.execute(toolInput("task_batch", {
+    completion_policy: "notify",
+    tasks: [{ description: "hostile", prompt: "trigger hostile spawn failure" }],
+  }));
+
+  expect(result.status).toBe("completed");
+  if (result.status === "completed") {
+    const output = JSON.parse(result.result.output) as {
+      spawn_failures: Array<{ error: string }>;
+    };
+    expect(output.spawn_failures).toHaveLength(1);
+    expectBoundedSanitizedDiagnostic(output.spawn_failures[0]?.error, 512);
+    expect(utf8Bytes(result.result.output)).toBeLessThan(8 * 1024);
+    const metadataFailures = result.result.metadata?.spawnFailures as Array<{ error: string }> | undefined;
+    expectBoundedSanitizedDiagnostic(metadataFailures?.[0]?.error, 512);
+  }
+});
+
 test("task_wait_batch supports any semantics and returns partial timeout state", async () => {
   const controller = new FakeSubagentControlController();
   controller.batchWaitResult = {
@@ -578,12 +603,16 @@ function toolInput(toolName: string, input: unknown, callId?: ToolCallId): Execu
 class FakeSubagentController implements SubagentController {
   spawnInputs: TaskToolInput[] = [];
   failDescriptions = new Set<string>();
+  spawnErrors = new Map<string, unknown>();
   running = 0;
   maxRunning = 0;
 
   async spawnTask(input: TaskToolInput) {
     this.spawnInputs.push(input);
     const taskId = `task_${this.spawnInputs.length}`;
+    if (this.spawnErrors.has(input.description)) {
+      throw this.spawnErrors.get(input.description);
+    }
     if (this.failDescriptions.has(input.description)) {
       throw new Error(`spawn failed: ${input.description}`);
     }
@@ -697,4 +726,29 @@ function createSequentialId(): (prefix: string) => string {
 
 function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const HOSTILE_SUCCESS_OUTPUT_SECRET = "sk-team-success-output-secret-123456789";
+
+function hostileSuccessfulOutputError(label: string): Error {
+  return new Error([
+    `${label}: password=${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    `Authorization: Bearer ${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    `http://127.0.0.1:4567/callback?token=${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    "\u0000".repeat(5 * 1024 * 1024),
+  ].join("\n"));
+}
+
+function expectBoundedSanitizedDiagnostic(value: string | undefined, maxBytes: number): void {
+  expect(value).toBeDefined();
+  if (value === undefined) return;
+  expect(value).toContain("[REDACTED]");
+  expect(value).not.toContain(HOSTILE_SUCCESS_OUTPUT_SECRET);
+  expect(value).not.toContain("127.0.0.1");
+  expect(value).not.toContain("\u0000");
+  expect(utf8Bytes(value)).toBeLessThanOrEqual(maxBytes);
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }

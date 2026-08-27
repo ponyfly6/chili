@@ -1,0 +1,5 @@
+out/
+release/
+resources/chili-sidecar
+resources/*.map
+*.tsbuildinfo

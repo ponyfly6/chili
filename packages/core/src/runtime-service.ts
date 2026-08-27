@@ -22,7 +22,13 @@ import type {
   ToolCallId,
   TurnId,
 } from "@chili/protocol";
-import { DELEGATION_POLICIES, REASONING_LEVELS, SERVICE_TIERS, timestampNow } from "@chili/protocol";
+import {
+  DELEGATION_POLICIES,
+  normalizePersistedError,
+  REASONING_LEVELS,
+  SERVICE_TIERS,
+  timestampNow,
+} from "@chili/protocol";
 import {
   SessionAlreadyExistsError,
   SessionCreationClaimConflictError,
@@ -102,6 +108,8 @@ export interface RuntimeServiceOptions {
   defaultReasoningLevel?: ReasoningLevel;
   defaultServiceTier?: ServiceTier;
   defaultDelegationPolicy?: DelegationPolicy;
+  sessionClaimLeaseMs?: number;
+  sessionClaimHeartbeatMs?: number;
   /** Internal child runtime only. Root/user-facing services must leave this false. */
   allowSubagentSessions?: boolean;
   onModelChanged?: (input: RuntimeModelChangedInput) => Promise<void> | void;
@@ -200,6 +208,10 @@ interface RuntimeRunState {
   durableClaimId?: string;
   durableClaimHeartbeat?: ReturnType<typeof setInterval>;
   operationContext: RuntimeSessionOperationContext;
+  interruptMetadataAdmissionOpen: boolean;
+  interruptMetadataSettlements: Set<Promise<void>>;
+  settlement: Promise<void>;
+  settle(): void;
 }
 
 interface RuntimeSessionOperationContext {
@@ -332,17 +344,42 @@ export class RuntimeSessionInactiveError extends Error {
   }
 }
 
+export class RuntimeServiceClosedError extends Error {
+  constructor() {
+    super("Runtime service is closing or closed");
+    this.name = "RuntimeServiceClosedError";
+  }
+}
+
 export class RuntimeService {
   private readonly running = new Map<SessionId, RuntimeRunState>();
   private readonly sessionOperationStorage = new AsyncLocalStorage<RuntimeSessionOperationContext>();
   private readonly creatingSessions = new Set<SessionId>();
+  private readonly creationSettlements = new Set<Promise<void>>();
+  private readonly mutationSettlements = new Set<Promise<void>>();
   private readonly goals: GoalService;
   private readonly sessionModelState = new Map<SessionId, RuntimeSessionModelState>();
   private globalModelState?: RuntimeSessionModelState;
+  private lifecycle: "open" | "closing" | "closed" = "open";
+  private shutdownPromise?: Promise<void>;
+  private readonly sessionClaimLeaseMs: number;
+  private readonly sessionClaimHeartbeatMs: number;
 
   constructor(private readonly options: RuntimeServiceOptions) {
     if (options.defaultDelegationPolicy !== undefined && !isDelegationPolicy(options.defaultDelegationPolicy)) {
       throw new Error(`Invalid default delegation policy: ${options.defaultDelegationPolicy}`);
+    }
+    this.sessionClaimLeaseMs = options.sessionClaimLeaseMs ?? SESSION_CLAIM_LEASE_MS;
+    this.sessionClaimHeartbeatMs = options.sessionClaimHeartbeatMs ?? SESSION_CLAIM_HEARTBEAT_MS;
+    if (!Number.isSafeInteger(this.sessionClaimLeaseMs) || this.sessionClaimLeaseMs <= 0) {
+      throw new Error("sessionClaimLeaseMs must be a positive safe integer");
+    }
+    if (
+      !Number.isSafeInteger(this.sessionClaimHeartbeatMs)
+      || this.sessionClaimHeartbeatMs <= 0
+      || this.sessionClaimHeartbeatMs >= this.sessionClaimLeaseMs
+    ) {
+      throw new Error("sessionClaimHeartbeatMs must be a positive safe integer smaller than sessionClaimLeaseMs");
     }
     const goalOptions: ConstructorParameters<typeof GoalService>[0] = {
       store: options.store,
@@ -354,14 +391,17 @@ export class RuntimeService {
   }
 
   async createSession(input: CreateRuntimeSessionInput = {}): Promise<RuntimeSessionHandle> {
+    this.assertOpen();
     const sessionId = input.sessionId ?? this.id<SessionId>("session");
-    const cwd = await canonicalWorkspacePath(input.cwd ?? this.options.cwd);
     if (this.creatingSessions.has(sessionId)) {
       throw new RuntimeSessionAlreadyExistsError(sessionId);
     }
+    const creationSettlement = createSettlement();
+    this.creationSettlements.add(creationSettlement.promise);
     this.creatingSessions.add(sessionId);
 
     try {
+      const cwd = await canonicalWorkspacePath(input.cwd ?? this.options.cwd);
       if (
         (await this.options.store.sessions()).some((session) => session.id === sessionId)
       ) {
@@ -386,7 +426,7 @@ export class RuntimeService {
           cwd,
           owner: this.options.allowSubagentSessions ? "child" : "root",
           time: Date.now(),
-          leaseDurationMs: SESSION_CLAIM_LEASE_MS,
+          leaseDurationMs: this.sessionClaimLeaseMs,
         });
         if (claimed.status === "already_exists") {
           throw new RuntimeSessionAlreadyExistsError(sessionId);
@@ -401,7 +441,7 @@ export class RuntimeService {
               sessionId,
               claimId,
               time: Date.now(),
-              leaseDurationMs: SESSION_CLAIM_LEASE_MS,
+              leaseDurationMs: this.sessionClaimLeaseMs,
             }) === true,
             () => {
               creationClaimLost = true;
@@ -430,7 +470,7 @@ export class RuntimeService {
                 sessionId,
                 claimId,
                 time: Date.now(),
-                leaseDurationMs: SESSION_CLAIM_LEASE_MS,
+                leaseDurationMs: this.sessionClaimLeaseMs,
               });
             } catch {
               creationClaimLost = true;
@@ -490,12 +530,16 @@ export class RuntimeService {
       }
     } finally {
       this.creatingSessions.delete(sessionId);
+      creationSettlement.settle();
+      this.creationSettlements.delete(creationSettlement.promise);
     }
   }
 
   async appendUserMessage(input: { sessionId: SessionId; turnId?: TurnId; text: string; displayText?: string; images?: readonly MessageImageContent[] }): Promise<MessageId> {
-    await this.assertSessionTurnAllowed(input.sessionId);
-    return this.options.runtime.appendUserMessage(input);
+    return this.withMutationAdmission(async () => {
+      await this.assertSessionTurnAllowed(input.sessionId);
+      return this.options.runtime.appendUserMessage(input);
+    });
   }
 
   async assertSessionTurnAllowed(sessionId: SessionId): Promise<void> {
@@ -592,68 +636,74 @@ export class RuntimeService {
   }
 
   async setModel(input: SetRuntimeModelInput): Promise<RuntimeModelConfig> {
-    await this.assertSessionTurnAllowed(input.sessionId);
-    const modelSelection = normalizeModelSelection(input.modelSelection);
-    const state = await this.resolveSessionModelState(input.sessionId);
-    const previousReasoningLevel = state.reasoningLevel;
-    state.modelSelection = modelSelection;
-    await this.normalizeModelStateForCapabilities(state);
-    this.sessionModelState.set(input.sessionId, cloneSessionModelState(state));
-    this.globalModelState = cloneSessionModelState(state);
-    await this.append(input, "session.model_changed", {
-      sessionId: input.sessionId,
-      modelSelection,
+    return this.withMutationAdmission(async () => {
+      await this.assertSessionTurnAllowed(input.sessionId);
+      const modelSelection = normalizeModelSelection(input.modelSelection);
+      const state = await this.resolveSessionModelState(input.sessionId);
+      const previousReasoningLevel = state.reasoningLevel;
+      state.modelSelection = modelSelection;
+      await this.normalizeModelStateForCapabilities(state);
+      this.sessionModelState.set(input.sessionId, cloneSessionModelState(state));
+      this.globalModelState = cloneSessionModelState(state);
+      await this.append(input, "session.model_changed", {
+        sessionId: input.sessionId,
+        modelSelection,
+      });
+      if (state.reasoningLevel !== undefined && state.reasoningLevel !== previousReasoningLevel) {
+        await this.append(input, "session.reasoning_changed", {
+          sessionId: input.sessionId,
+          reasoningLevel: state.reasoningLevel,
+        });
+      }
+      await this.options.onModelChanged?.({
+        sessionId: input.sessionId,
+        modelSelection: cloneModelSelection(modelSelection),
+      });
+      return this.buildModelConfig(input.sessionId, state);
     });
-    if (state.reasoningLevel !== undefined && state.reasoningLevel !== previousReasoningLevel) {
+  }
+
+  async setReasoning(input: SetRuntimeReasoningInput): Promise<RuntimeModelConfig> {
+    return this.withMutationAdmission(async () => {
+      await this.assertSessionTurnAllowed(input.sessionId);
+      if (!isReasoningLevel(input.reasoningLevel)) {
+        throw new Error(`Invalid reasoning level: ${input.reasoningLevel}`);
+      }
+      const state = await this.resolveSessionModelState(input.sessionId);
+      const reasoningLevel = await this.clampReasoningLevelForState(state, input.reasoningLevel);
+      if (reasoningLevel === undefined) {
+        throw new Error(`${modelStateLabel(state)} does not support configurable reasoning`);
+      }
+      state.reasoningLevel = reasoningLevel;
+      this.sessionModelState.set(input.sessionId, cloneSessionModelState(state));
+      this.globalModelState = cloneSessionModelState(state);
       await this.append(input, "session.reasoning_changed", {
         sessionId: input.sessionId,
         reasoningLevel: state.reasoningLevel,
       });
-    }
-    await this.options.onModelChanged?.({
-      sessionId: input.sessionId,
-      modelSelection: cloneModelSelection(modelSelection),
+      return this.buildModelConfig(input.sessionId, state);
     });
-    return this.buildModelConfig(input.sessionId, state);
-  }
-
-  async setReasoning(input: SetRuntimeReasoningInput): Promise<RuntimeModelConfig> {
-    await this.assertSessionTurnAllowed(input.sessionId);
-    if (!isReasoningLevel(input.reasoningLevel)) {
-      throw new Error(`Invalid reasoning level: ${input.reasoningLevel}`);
-    }
-    const state = await this.resolveSessionModelState(input.sessionId);
-    const reasoningLevel = await this.clampReasoningLevelForState(state, input.reasoningLevel);
-    if (reasoningLevel === undefined) {
-      throw new Error(`${modelStateLabel(state)} does not support configurable reasoning`);
-    }
-    state.reasoningLevel = reasoningLevel;
-    this.sessionModelState.set(input.sessionId, cloneSessionModelState(state));
-    this.globalModelState = cloneSessionModelState(state);
-    await this.append(input, "session.reasoning_changed", {
-      sessionId: input.sessionId,
-      reasoningLevel: state.reasoningLevel,
-    });
-    return this.buildModelConfig(input.sessionId, state);
   }
 
   async setServiceTier(input: SetRuntimeServiceTierInput): Promise<RuntimeModelConfig> {
-    await this.assertSessionTurnAllowed(input.sessionId);
-    if (!isServiceTier(input.serviceTier)) {
-      throw new Error(`Invalid service tier: ${input.serviceTier}`);
-    }
-    const state = await this.resolveSessionModelState(input.sessionId);
-    if (await this.serviceTierSupportForState(state, input.serviceTier) === false) {
-      throw new Error(`${modelStateLabel(state)} does not support service tier ${input.serviceTier}`);
-    }
-    state.serviceTier = input.serviceTier;
-    this.sessionModelState.set(input.sessionId, cloneSessionModelState(state));
-    this.globalModelState = cloneSessionModelState(state);
-    await this.append(input, "session.service_tier_changed", {
-      sessionId: input.sessionId,
-      serviceTier: input.serviceTier,
+    return this.withMutationAdmission(async () => {
+      await this.assertSessionTurnAllowed(input.sessionId);
+      if (!isServiceTier(input.serviceTier)) {
+        throw new Error(`Invalid service tier: ${input.serviceTier}`);
+      }
+      const state = await this.resolveSessionModelState(input.sessionId);
+      if (await this.serviceTierSupportForState(state, input.serviceTier) === false) {
+        throw new Error(`${modelStateLabel(state)} does not support service tier ${input.serviceTier}`);
+      }
+      state.serviceTier = input.serviceTier;
+      this.sessionModelState.set(input.sessionId, cloneSessionModelState(state));
+      this.globalModelState = cloneSessionModelState(state);
+      await this.append(input, "session.service_tier_changed", {
+        sessionId: input.sessionId,
+        serviceTier: input.serviceTier,
+      });
+      return this.buildModelConfig(input.sessionId, state);
     });
-    return this.buildModelConfig(input.sessionId, state);
   }
 
   async getDelegationConfig(sessionId: SessionId): Promise<RuntimeDelegationConfig> {
@@ -662,17 +712,19 @@ export class RuntimeService {
   }
 
   async setDelegationPolicy(input: SetRuntimeDelegationPolicyInput): Promise<RuntimeDelegationConfig> {
-    await this.assertSessionTurnAllowed(input.sessionId);
-    if (!isDelegationPolicy(input.policy)) {
-      throw new Error(`Invalid delegation policy: ${input.policy}`);
-    }
-    await this.append(input, "session.delegation_changed", {
-      sessionId: input.sessionId,
-      policy: input.policy,
-    });
-    return resolveDelegationConfig({
-      sessionId: input.sessionId,
-      sessionPolicy: input.policy,
+    return this.withMutationAdmission(async () => {
+      await this.assertSessionTurnAllowed(input.sessionId);
+      if (!isDelegationPolicy(input.policy)) {
+        throw new Error(`Invalid delegation policy: ${input.policy}`);
+      }
+      await this.append(input, "session.delegation_changed", {
+        sessionId: input.sessionId,
+        policy: input.policy,
+      });
+      return resolveDelegationConfig({
+        sessionId: input.sessionId,
+        sessionPolicy: input.policy,
+      });
     });
   }
 
@@ -686,10 +738,12 @@ export class RuntimeService {
     tokenBudget?: number;
     replace?: boolean;
   }): Promise<SessionGoal> {
-    await this.assertSessionTurnAllowed(input.sessionId);
-    const goal = await this.goals.setGoal(input);
-    this.submitGoalContinuationAsync(input);
-    return goal;
+    return this.withMutationAdmission(async () => {
+      await this.assertSessionTurnAllowed(input.sessionId);
+      const goal = await this.goals.setGoal(input);
+      this.submitGoalContinuationAsync(input);
+      return goal;
+    });
   }
 
   async updateGoal(input: {
@@ -698,25 +752,33 @@ export class RuntimeService {
     objective?: string;
     tokenBudget?: number;
   }): Promise<SessionGoal> {
-    await this.assertSessionTurnAllowed(input.sessionId);
-    const goal = await this.goals.updateGoal(input);
-    if (goal.status === "active") {
-      this.submitGoalContinuationAsync(input);
-    }
-    if (goal.status === "paused" || goal.status === "budgetLimited") {
-      this.abortRunForSession(input.sessionId);
-    }
-    return goal;
+    return this.withMutationAdmission(async () => {
+      await this.assertSessionTurnAllowed(input.sessionId);
+      const goal = await this.goals.updateGoal(input);
+      if (goal.status === "active") {
+        this.submitGoalContinuationAsync(input);
+      }
+      if (goal.status === "paused" || goal.status === "budgetLimited") {
+        this.abortRunForSession(input.sessionId);
+      }
+      return goal;
+    });
   }
 
   async clearGoal(input: { sessionId: SessionId }): Promise<{ cleared: boolean; previousGoal?: SessionGoal }> {
-    await this.assertSessionTurnAllowed(input.sessionId);
-    const result = await this.goals.clearGoal(input);
-    if (result.cleared) this.abortRunForSession(input.sessionId);
-    return result;
+    return this.withMutationAdmission(async () => {
+      await this.assertSessionTurnAllowed(input.sessionId);
+      const result = await this.goals.clearGoal(input);
+      if (result.cleared) this.abortRunForSession(input.sessionId);
+      return result;
+    });
   }
 
-  async compactSession(input: CompactSessionInput): Promise<CompactContextResult> {
+  compactSession(input: CompactSessionInput): Promise<CompactContextResult> {
+    return this.withMutationAdmission(() => this.compactAdmittedSession(input));
+  }
+
+  private async compactAdmittedSession(input: CompactSessionInput): Promise<CompactContextResult> {
     await this.assertSessionTurnAllowed(input.sessionId);
     if (this.running.has(input.sessionId)) {
       throw new RuntimeBusyError(input.sessionId);
@@ -739,38 +801,58 @@ export class RuntimeService {
 
     const controller = this.createRunController({ ...input, text: "" }, "compaction");
     return this.runWithSessionOperation(input.sessionId, async () => {
-      const modelState = await this.resolveSessionModelState(input.sessionId);
-      await this.publishStatus({
-        sessionId: input.sessionId,
-        status: "running",
-        reason: "manual_compaction",
-      });
-      const compactInput: {
-        sessionId: SessionId;
-        reason: "manual";
-        instructions?: string;
-        modelSelection?: ModelSelection;
-        reasoningLevel?: ReasoningLevel;
-        serviceTier?: ServiceTier;
-        signal?: AbortSignal;
-      } = {
-        sessionId: input.sessionId,
-        reason: "manual",
-        signal: controller.signal,
-      };
-      if (input.instructions) compactInput.instructions = input.instructions;
-      if (modelState.modelSelection) compactInput.modelSelection = modelState.modelSelection;
-      if (modelState.reasoningLevel !== undefined) compactInput.reasoningLevel = modelState.reasoningLevel;
-      if (modelState.serviceTier !== undefined) compactInput.serviceTier = modelState.serviceTier;
-      const startedAt = this.now();
-      const result = await compactContext(compactInput);
-      await this.accountGoalUsage(input, result.turnId, result.usage, startedAt);
-      await this.publishStatus({
-        sessionId: input.sessionId,
-        status: result.status === "failed" || result.status === "cancelled" ? result.status : "idle",
-        ...(result.status === "failed" || result.status === "cancelled" ? { reason: result.error.message } : {}),
-      });
-      return result;
+      try {
+        if (controller.signal.aborted) throw abortError("Compaction aborted");
+        const modelState = await this.resolveSessionModelState(input.sessionId);
+        if (controller.signal.aborted) throw abortError("Compaction aborted");
+        await this.publishStatus({
+          sessionId: input.sessionId,
+          status: "running",
+          reason: "manual_compaction",
+        });
+        if (controller.signal.aborted) throw abortError("Compaction aborted");
+        const compactInput: {
+          sessionId: SessionId;
+          reason: "manual";
+          instructions?: string;
+          modelSelection?: ModelSelection;
+          reasoningLevel?: ReasoningLevel;
+          serviceTier?: ServiceTier;
+          signal?: AbortSignal;
+        } = {
+          sessionId: input.sessionId,
+          reason: "manual",
+          signal: controller.signal,
+        };
+        if (input.instructions) compactInput.instructions = input.instructions;
+        if (modelState.modelSelection) compactInput.modelSelection = modelState.modelSelection;
+        if (modelState.reasoningLevel !== undefined) compactInput.reasoningLevel = modelState.reasoningLevel;
+        if (modelState.serviceTier !== undefined) compactInput.serviceTier = modelState.serviceTier;
+        const startedAt = this.now();
+        const result = normalizeCompactContextResult(await compactContext(compactInput));
+        if (controller.signal.aborted) throw abortError("Compaction aborted");
+        await this.accountGoalUsage(input, result.turnId, result.usage, startedAt);
+        await this.publishStatus({
+          sessionId: input.sessionId,
+          status: result.status === "failed" || result.status === "cancelled" ? result.status : "idle",
+          ...(result.status === "failed" || result.status === "cancelled" ? { reason: result.error.message } : {}),
+        });
+        return result;
+      } catch (error) {
+        const err = toError(error);
+        if (isRuntimeSessionBoundaryError(err) || isSessionRunClaimConflictError(err)) throw err;
+        const status: "cancelled" | "failed" = isAbortError(err) ? "cancelled" : "failed";
+        await this.publishStatus({
+          sessionId: input.sessionId,
+          status,
+          reason: err.message,
+        });
+        return {
+          status,
+          turnId: this.id<TurnId>("turn"),
+          error: err,
+        };
+      }
     });
   }
 
@@ -835,18 +917,39 @@ export class RuntimeService {
     const maxTurns = input.maxTurns ?? this.options.maxTurns ?? DEFAULT_MAX_TURNS;
 
     try {
+      if (controller.signal.aborted) {
+        return await this.cancelledPrompt(input, turns, "Prompt aborted");
+      }
       await this.assertSessionTurnAllowed(input.sessionId);
+      if (controller.signal.aborted) {
+        return await this.cancelledPrompt(input, turns, "Prompt aborted");
+      }
       const cwd = await this.resolveExistingSessionCwd(input.sessionId, input.cwd);
       const normalizedInput: SubmitPromptInput = { ...input, cwd };
+      if (controller.signal.aborted) {
+        return await this.cancelledPrompt(normalizedInput, turns, "Prompt aborted");
+      }
       const promptModelState = await this.resolvePromptModelState(normalizedInput);
+      if (controller.signal.aborted) {
+        return await this.cancelledPrompt(normalizedInput, turns, "Prompt aborted");
+      }
       const promptInput = await this.promptInputForModel(normalizedInput, promptModelState);
+      if (controller.signal.aborted) {
+        return await this.cancelledPrompt(promptInput, turns, "Prompt aborted");
+      }
       await this.assertImageInputAllowed(promptInput, promptModelState);
+      if (controller.signal.aborted) {
+        return await this.cancelledPrompt(promptInput, turns, "Prompt aborted");
+      }
 
       await this.publishStatus({
         sessionId: promptInput.sessionId,
         status: "running",
         reason: "prompt_submitted",
       });
+      if (controller.signal.aborted) {
+        return await this.cancelledPrompt(promptInput, turns, "Prompt aborted");
+      }
 
       const promptTurnId = this.id<TurnId>("turn");
       await this.options.runtime.appendUserMessage({
@@ -884,6 +987,9 @@ export class RuntimeService {
             ...(delegationIntegrationRepair ? [delegationIntegrationRepair] : []),
           ],
         });
+        if (controller.signal.aborted) {
+          return await this.cancelledPrompt(promptInput, turns, "Prompt aborted", promptTurnId);
+        }
         const runInput = this.buildRunTurnInput({
           input: promptInput,
           cwd,
@@ -893,7 +999,7 @@ export class RuntimeService {
           ...(index === 0 ? { turnId: promptTurnId } : {}),
         });
         const startedAt = this.now();
-        const result = await this.options.runtime.runTurn(runInput);
+        const result = normalizeRunTurnResult(await this.options.runtime.runTurn(runInput));
         turns.push(result);
         await this.publishTurnProgress(promptInput, result);
         await this.accountGoalTurn(promptInput, result, startedAt);
@@ -1031,6 +1137,9 @@ export class RuntimeService {
           ...(delegationIntegrationRepair ? [delegationIntegrationRepair] : []),
         ],
       });
+      if (controller.signal.aborted) {
+        return await this.cancelledPrompt(promptInput, turns, "Prompt aborted", promptTurnId);
+      }
       const finalRunInput = this.buildRunTurnInput({
         input: promptInput,
         cwd,
@@ -1040,7 +1149,7 @@ export class RuntimeService {
         toolMode: "disabled",
       });
       const finalStartedAt = this.now();
-      const finalResult = await this.options.runtime.runTurn(finalRunInput);
+      const finalResult = normalizeRunTurnResult(await this.options.runtime.runTurn(finalRunInput));
       turns.push(finalResult);
       await this.publishTurnProgress(promptInput, finalResult);
       await this.accountGoalTurn(promptInput, finalResult, finalStartedAt);
@@ -1134,7 +1243,10 @@ export class RuntimeService {
         return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
       }
 
-      const goal = await this.goals.getGoal({ sessionId: args.input.sessionId });
+    const goal = await this.goals.getGoal({ sessionId: args.input.sessionId });
+      if (args.controller.signal.aborted) {
+        return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
+      }
       const continueAfterToolUse = lastCompleted?.status === "completed" && isToolUseFinishReason(lastCompleted.finishReason);
       if ((!goal || goal.status !== "active") && !continueAfterToolUse) {
         return ranContinuation && lastCompleted?.status === "completed"
@@ -1147,6 +1259,9 @@ export class RuntimeService {
         status: "running",
         reason: goal?.status === "active" ? "goal_continuation" : "goal_finalizing",
       });
+      if (args.controller.signal.aborted) {
+        return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
+      }
 
       const prompt = await this.resolvePromptAssembly({
         sessionId: args.input.sessionId,
@@ -1158,6 +1273,9 @@ export class RuntimeService {
           ...(goal?.status === "active" ? [goalContinuationPromptFragment(goal)] : []),
         ],
       });
+      if (args.controller.signal.aborted) {
+        return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
+      }
       const runInput = this.buildRunTurnInput({
         input: args.input,
         cwd: args.cwd,
@@ -1166,7 +1284,7 @@ export class RuntimeService {
         modelState: args.modelState,
       });
       const startedAt = this.now();
-      const result = await this.options.runtime.runTurn(runInput);
+      const result = normalizeRunTurnResult(await this.options.runtime.runTurn(runInput));
       ranContinuation = true;
       lastCompleted = result;
       args.turns.push(result);
@@ -1212,7 +1330,10 @@ export class RuntimeService {
       return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
     }
 
-    const goal = await this.goals.getGoal({ sessionId: args.input.sessionId });
+      const goal = await this.goals.getGoal({ sessionId: args.input.sessionId });
+    if (args.controller.signal.aborted) {
+      return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
+    }
     const prompt = await this.resolvePromptAssembly({
       sessionId: args.input.sessionId,
       cwd: args.cwd,
@@ -1221,6 +1342,9 @@ export class RuntimeService {
         goalBudgetLimitPromptFragment(goal),
       ],
     });
+    if (args.controller.signal.aborted) {
+      return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
+    }
     const runInput = this.buildRunTurnInput({
       input: args.input,
       cwd: args.cwd,
@@ -1230,7 +1354,7 @@ export class RuntimeService {
       toolMode: "disabled",
     });
     const startedAt = this.now();
-    const result = await this.options.runtime.runTurn(runInput);
+    const result = normalizeRunTurnResult(await this.options.runtime.runTurn(runInput));
     args.turns.push(result);
     await this.publishTurnProgress(args.input, result);
     await this.accountGoalTurn(args.input, result, startedAt);
@@ -1259,25 +1383,45 @@ export class RuntimeService {
     queueMicrotask(() => {
       void this.runWithSessionOperation(
         continuationInput.sessionId,
-        () => this.runStandaloneGoalContinuation(continuationInput, controller),
-      ).catch(async (error: unknown) => {
-        const err = toError(error);
-        if (isRuntimeSessionBoundaryError(err) || isSessionRunClaimConflictError(err)) return;
-        await this.publishStatus({
-          sessionId: continuationInput.sessionId,
-          status: isAbortError(err) ? "cancelled" : "failed",
-          reason: err.message,
-        });
+        async () => {
+          try {
+            await this.runStandaloneGoalContinuation(continuationInput, controller);
+          } catch (error) {
+            const err = toError(error);
+            if (isRuntimeSessionBoundaryError(err) || isSessionRunClaimConflictError(err)) throw err;
+            await this.publishStatus({
+              sessionId: continuationInput.sessionId,
+              status: isAbortError(err) ? "cancelled" : "failed",
+              reason: err.message,
+            });
+          }
+        },
+      ).catch(() => {
+        // The exact run claim has already been released here. Boundary and
+        // terminalization failures must never publish from this outer layer,
+        // because a peer may have acquired the session in the meantime.
       });
     });
   }
 
   private async runStandaloneGoalContinuation(input: SubmitPromptInput, controller: AbortController): Promise<void> {
     await this.assertSessionTurnAllowed(input.sessionId);
+    if (controller.signal.aborted) {
+      await this.cancelledPrompt(input, [], "Prompt aborted");
+      return;
+    }
     const cwd = await this.resolveExistingSessionCwd(input.sessionId, input.cwd);
     const normalizedInput: SubmitPromptInput = { ...input, cwd };
+    if (controller.signal.aborted) {
+      await this.cancelledPrompt(normalizedInput, [], "Prompt aborted");
+      return;
+    }
     const modelState = await this.resolvePromptModelState(normalizedInput);
     const turns: RunTurnResult[] = [];
+    if (controller.signal.aborted) {
+      await this.cancelledPrompt(normalizedInput, turns, "Prompt aborted");
+      return;
+    }
     const result = await this.runGoalContinuation({
       input: normalizedInput,
       turns,
@@ -1362,7 +1506,7 @@ export class RuntimeService {
       status: result.status,
       turnId: result.turnId,
     };
-    turnStatus.reason = result.error.message;
+    turnStatus.reason = toError(result.error).message;
     await this.publishStatus(turnStatus);
   }
 
@@ -1395,10 +1539,11 @@ export class RuntimeService {
         // original model failure if projecting or persisting it also fails.
       }
     }
+    const error = toError(result.error);
     return {
       status: result.status,
       turns,
-      error: result.error,
+      error,
     };
   }
 
@@ -1865,46 +2010,77 @@ export class RuntimeService {
   }
 
   async interrupt(sessionId: SessionId, reason = "user_interrupt"): Promise<boolean> {
-    const run = this.running.get(sessionId);
-    if (!run) return false;
-    await this.publishStatus({
-      sessionId,
-      status: "cancelling",
-      reason,
+    return this.withMutationAdmission(async () => {
+      const run = this.running.get(sessionId);
+      if (!run) return false;
+      await this.interruptRun(sessionId, run, reason);
+      return true;
     });
-    await this.pauseActiveGoalForInterrupt(sessionId);
-    run.controller.abort();
-    return true;
+  }
+
+  shutdown(reason = "runtime_shutdown"): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+
+    // Closing the admission gate is deliberately synchronous. Every top-level
+    // run reserves through createRunController(), so no run can appear between
+    // this transition and the snapshot below.
+    this.lifecycle = "closing";
+    const runs = [...this.running.entries()];
+    const creations = [...this.creationSettlements];
+    const mutations = [...this.mutationSettlements];
+    this.shutdownPromise = (async () => {
+      try {
+        await Promise.all([
+          ...runs.map(([, run]) => run.settlement),
+          ...creations,
+          ...mutations,
+        ]);
+      } finally {
+        this.lifecycle = "closed";
+      }
+    })();
+    // Publish the idempotency promise before dispatching AbortSignal events:
+    // abort listeners run synchronously and may reenter shutdown().
+    for (const [sessionId, run] of runs) {
+      if (this.running.get(sessionId) === run && !run.controller.signal.aborted) {
+        run.controller.abort(abortError(reason));
+      }
+    }
+    return this.shutdownPromise;
   }
 
   async archiveSession(sessionId: SessionId): Promise<void> {
-    await this.assertSessionTurnAllowed(sessionId);
-    if (this.running.has(sessionId)) throw new RuntimeBusyError(sessionId);
-    try {
-      await this.append({ sessionId }, "session.archived", { sessionId });
-    } catch (error) {
-      if (error instanceof SessionRunClaimConflictError || (
-        error instanceof Error && error.name === "SessionRunClaimConflictError"
-      )) {
-        throw new RuntimeBusyError(sessionId);
+    return this.withMutationAdmission(async () => {
+      await this.assertSessionTurnAllowed(sessionId);
+      if (this.running.has(sessionId)) throw new RuntimeBusyError(sessionId);
+      try {
+        await this.append({ sessionId }, "session.archived", { sessionId });
+      } catch (error) {
+        if (error instanceof SessionRunClaimConflictError || (
+          error instanceof Error && error.name === "SessionRunClaimConflictError"
+        )) {
+          throw new RuntimeBusyError(sessionId);
+        }
+        if (error instanceof SessionStateConflictError || (
+          error instanceof Error && error.name === "SessionStateConflictError"
+        )) {
+          const status = (error as SessionStateConflictError).status;
+          if (!status) throw new RuntimeSessionNotFoundError(sessionId);
+          throw new RuntimeSessionInactiveError(sessionId, status);
+        }
+        throw error;
       }
-      if (error instanceof SessionStateConflictError || (
-        error instanceof Error && error.name === "SessionStateConflictError"
-      )) {
-        const status = (error as SessionStateConflictError).status;
-        if (!status) throw new RuntimeSessionNotFoundError(sessionId);
-        throw new RuntimeSessionInactiveError(sessionId, status);
-      }
-      throw error;
-    }
+    });
   }
 
   async renameSession(sessionId: SessionId, title: string): Promise<void> {
-    await this.assertSessionTurnAllowed(sessionId);
-    const normalized = title.trim().replace(/\s+/g, " ");
-    if (!normalized) throw new Error("Session title cannot be empty.");
-    if (normalized.length > 120) throw new Error("Session title must be 120 characters or fewer.");
-    await this.append({ sessionId }, "session.renamed", { sessionId, title: normalized });
+    return this.withMutationAdmission(async () => {
+      await this.assertSessionTurnAllowed(sessionId);
+      const normalized = title.trim().replace(/\s+/g, " ");
+      if (!normalized) throw new Error("Session title cannot be empty.");
+      if (normalized.length > 120) throw new Error("Session title must be 120 characters or fewer.");
+      await this.append({ sessionId }, "session.renamed", { sessionId, title: normalized });
+    });
   }
 
   private async cancelledPrompt(
@@ -1929,6 +2105,7 @@ export class RuntimeService {
   }
 
   private createRunController(input: SubmitPromptInput, purpose: RuntimeRunState["purpose"]): AbortController {
+    this.assertOpen();
     const atomicStore = this.atomicSessionStore("run");
     let durableClaimId: string | undefined;
     if (atomicStore.claimSessionRun && atomicStore.releaseSessionRun) {
@@ -1938,7 +2115,7 @@ export class RuntimeService {
         claimId,
         allowSubagentSessions: this.options.allowSubagentSessions === true,
         time: Date.now(),
-        leaseDurationMs: SESSION_CLAIM_LEASE_MS,
+        leaseDurationMs: this.sessionClaimLeaseMs,
       });
       if (claimed.status === "busy") throw new RuntimeBusyError(input.sessionId);
       if (claimed.status === "not_found") throw new RuntimeSessionNotFoundError(input.sessionId);
@@ -1980,10 +2157,15 @@ export class RuntimeService {
         input.signal.addEventListener("abort", () => controller.abort(), { once: true });
       }
     }
+    const settlement = createSettlement();
     this.running.set(input.sessionId, {
       controller,
       purpose,
       operationContext,
+      interruptMetadataAdmissionOpen: true,
+      interruptMetadataSettlements: new Set(),
+      settlement: settlement.promise,
+      settle: settlement.settle,
       ...(durableClaimId ? { durableClaimId } : {}),
       ...(durableClaimHeartbeat ? { durableClaimHeartbeat } : {}),
     });
@@ -2007,6 +2189,7 @@ export class RuntimeService {
       }
     } finally {
       if (this.running.get(sessionId) === run) this.running.delete(sessionId);
+      run?.settle();
     }
   }
 
@@ -2031,6 +2214,7 @@ export class RuntimeService {
               outcome = { status: "failed", error };
             }
             await this.awaitNestedSessionOperations(context);
+            await this.sealAndDrainInterruptMetadata(context.sessionId, context);
             // A lost durable lease is authoritative even when the operation or
             // one of its nested scopes observes the abort signal first.
             context.capability.assertCurrent();
@@ -2095,7 +2279,7 @@ export class RuntimeService {
         sessionId: context.sessionId,
         claimId: context.durableClaimId,
         time: Date.now(),
-        leaseDurationMs: SESSION_CLAIM_LEASE_MS,
+        leaseDurationMs: this.sessionClaimLeaseMs,
       }) === true;
     } catch {
       return false;
@@ -2150,7 +2334,7 @@ export class RuntimeService {
       if (renewed) return;
       clearInterval(heartbeat);
       onLost?.();
-    }, SESSION_CLAIM_HEARTBEAT_MS);
+    }, this.sessionClaimHeartbeatMs);
     (heartbeat as ReturnType<typeof setInterval> & { unref?: () => void }).unref?.();
     return heartbeat;
   }
@@ -2159,6 +2343,87 @@ export class RuntimeService {
     const run = this.running.get(sessionId);
     if (run && !run.controller.signal.aborted) {
       run.controller.abort();
+    }
+  }
+
+  private assertOpen(): void {
+    if (this.lifecycle !== "open") throw new RuntimeServiceClosedError();
+  }
+
+  private async withMutationAdmission<T>(operation: () => Promise<T> | T): Promise<T> {
+    this.assertOpen();
+    const mutationSettlement = createSettlement();
+    this.mutationSettlements.add(mutationSettlement.promise);
+    try {
+      return await operation();
+    } finally {
+      mutationSettlement.settle();
+      this.mutationSettlements.delete(mutationSettlement.promise);
+    }
+  }
+
+  private async interruptRun(
+    sessionId: SessionId,
+    run: RuntimeRunState,
+    reason: string,
+  ): Promise<void> {
+    if (this.running.get(sessionId) !== run) return;
+    let cancellingPublication: Promise<void> | undefined;
+    if (run.interruptMetadataAdmissionOpen) {
+      cancellingPublication = this.publishStatus({
+        sessionId,
+        status: "cancelling",
+        reason,
+      });
+      // Register before abort listeners can advance the run to a terminal
+      // status. The observed settlement also keeps rejection from stranding
+      // terminal publication or the exact run claim.
+      this.trackInterruptMetadata(run, cancellingPublication);
+    }
+    if (!run.controller.signal.aborted) {
+      run.controller.abort(abortError(reason));
+    }
+    let firstError: unknown;
+    if (cancellingPublication) {
+      try {
+        await cancellingPublication;
+      } catch (error) {
+        firstError = error;
+      }
+    }
+    try {
+      await this.pauseActiveGoalForInterrupt(sessionId);
+    } catch (error) {
+      firstError ??= error;
+    }
+    if (firstError !== undefined) throw firstError;
+  }
+
+  private trackInterruptMetadata(
+    run: RuntimeRunState,
+    publication: Promise<void>,
+  ): void {
+    let settlement: Promise<void>;
+    settlement = publication.then(
+      () => undefined,
+      () => undefined,
+    ).finally(() => {
+      run.interruptMetadataSettlements.delete(settlement);
+    });
+    run.interruptMetadataSettlements.add(settlement);
+  }
+
+  private async sealAndDrainInterruptMetadata(
+    sessionId: SessionId,
+    expectedContext?: RuntimeSessionOperationContext,
+  ): Promise<void> {
+    const run = this.running.get(sessionId);
+    if (!run || (expectedContext && run.operationContext !== expectedContext)) return;
+    // Once terminalization starts, a later interrupt may still abort the work
+    // but must not enqueue metadata that could commit after the terminal event.
+    run.interruptMetadataAdmissionOpen = false;
+    while (run.interruptMetadataSettlements.size > 0) {
+      await Promise.all([...run.interruptMetadataSettlements]);
     }
   }
 
@@ -2175,6 +2440,9 @@ export class RuntimeService {
     turnId?: TurnId;
     reason?: string;
   }, options?: EventAppendOptions): Promise<void> {
+    if (isTerminalRuntimeSessionStatus(input.status)) {
+      await this.sealAndDrainInterruptMetadata(input.sessionId);
+    }
     const payload: {
       sessionId: SessionId;
       status: RuntimeSessionStatus;
@@ -2185,7 +2453,7 @@ export class RuntimeService {
       status: input.status,
     };
     if (input.turnId) payload.turnId = input.turnId;
-    if (input.reason) payload.reason = input.reason;
+    if (input.reason) payload.reason = normalizePersistedError(input.reason).message;
     await this.append(input, "session.status_changed", payload, options);
   }
 
@@ -2910,7 +3178,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
+  return normalizePersistedError(error);
 }
 
 function isErrorNamed(error: unknown, name: string): error is Error {
@@ -2923,13 +3191,22 @@ function errorSessionId(error: unknown): SessionId | undefined {
 }
 
 function isRuntimeSessionBoundaryError(error: Error): boolean {
-  return error instanceof RuntimeSessionInactiveError
+  return error instanceof RuntimeServiceClosedError
+    || error instanceof RuntimeSessionInactiveError
     || error instanceof RuntimeSubagentSessionAccessError
-    || error instanceof RuntimeSessionNotFoundError;
+    || error instanceof RuntimeSessionNotFoundError
+    || error.name === "RuntimeServiceClosedError"
+    || error.name === "RuntimeSessionInactiveError"
+    || error.name === "RuntimeSubagentSessionAccessError"
+    || error.name === "RuntimeSessionNotFoundError";
 }
 
 function isSessionRunClaimConflictError(error: Error): boolean {
   return error instanceof SessionRunClaimConflictError || error.name === "SessionRunClaimConflictError";
+}
+
+function isTerminalRuntimeSessionStatus(status: RuntimeSessionStatus): boolean {
+  return status === "idle" || status === "cancelled" || status === "failed";
 }
 
 function abortError(message: string): Error {
@@ -2938,8 +3215,59 @@ function abortError(message: string): Error {
   return error;
 }
 
+function createSettlement(): { promise: Promise<void>; settle(): void } {
+  let settled = false;
+  let resolvePromise: (() => void) | undefined;
+  const promise = new Promise<void>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return {
+    promise,
+    settle() {
+      if (settled) return;
+      settled = true;
+      resolvePromise?.();
+    },
+  };
+}
+
 function isAbortError(error: Error): boolean {
-  return error.name === "AbortError" || error.message.toLowerCase().includes("aborted");
+  const normalized = normalizePersistedError(error);
+  return normalized.name === "AbortError" || normalized.message.toLowerCase().includes("aborted");
+}
+
+function normalizeRunTurnResult(result: RunTurnResult): RunTurnResult {
+  if (result.status === "completed") {
+    const finishReason = result.finishReason
+      ? normalizePersistedError(result.finishReason).message
+      : undefined;
+    return {
+      status: "completed",
+      turnId: result.turnId,
+      assistantMessageId: result.assistantMessageId,
+      ...(result.contextUsage ? { contextUsage: result.contextUsage } : {}),
+      ...(result.usage ? { usage: result.usage } : {}),
+      ...(finishReason ? { finishReason } : {}),
+    };
+  }
+  return {
+    status: result.status,
+    turnId: result.turnId,
+    ...(result.assistantMessageId ? { assistantMessageId: result.assistantMessageId } : {}),
+    ...(result.contextUsage ? { contextUsage: result.contextUsage } : {}),
+    ...(result.usage ? { usage: result.usage } : {}),
+    error: toError(result.error),
+  };
+}
+
+function normalizeCompactContextResult(result: CompactContextResult): CompactContextResult {
+  if (result.status !== "failed" && result.status !== "cancelled") return result;
+  return {
+    status: result.status,
+    turnId: result.turnId,
+    error: toError(result.error),
+    ...(result.usage ? { usage: result.usage } : {}),
+  };
 }
 
 function isToolUseFinishReason(reason: string | undefined): boolean {

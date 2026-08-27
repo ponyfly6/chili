@@ -1104,6 +1104,34 @@ test("does not downgrade a merge authority revocation into a per-task error", as
   }
 });
 
+test("normalizes hostile merge sweep failures before returning them", async () => {
+  const context = await createPendingMergeContext("chili-team-merge-hostile-error-");
+
+  try {
+    const merger = new TeamMergeService({
+      teams: context.teams,
+      cwd: context.dir,
+      resolveSession: persistedRootSessionResolver(context.store),
+      sessionOperations: passthroughSessionOperations,
+      runGit: async () => {
+        throw hostileSuccessfulOutputError("merge precheck failed");
+      },
+    });
+
+    const result = await merger.mergeTeamTasks({
+      teamId: context.teamId,
+      sessionId: context.sessionId,
+      cwd: context.dir,
+    });
+
+    expect(result.errors).toHaveLength(1);
+    expectBoundedSanitizedDiagnostic(result.errors[0]?.error);
+    expect(utf8Bytes(JSON.stringify(result))).toBeLessThan(64 * 1024);
+  } finally {
+    await context.close();
+  }
+});
+
 async function createPendingMergeContext(prefix: string): Promise<{
   dir: string;
   store: SqliteEventStore;
@@ -1230,6 +1258,31 @@ function persistedRootSessionResolver(store: SqliteEventStore) {
 function createSequentialId(): (prefix: string) => string {
   let next = 0;
   return (prefix: string) => `${prefix}_${++next}`;
+}
+
+const HOSTILE_SUCCESS_OUTPUT_SECRET = "sk-team-success-output-secret-123456789";
+
+function hostileSuccessfulOutputError(label: string): Error {
+  return new Error([
+    `${label}: password=${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    `Authorization: Bearer ${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    `http://127.0.0.1:4567/callback?token=${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    "\u0000".repeat(5 * 1024 * 1024),
+  ].join("\n"));
+}
+
+function expectBoundedSanitizedDiagnostic(value: string | undefined): void {
+  expect(value).toBeDefined();
+  if (value === undefined) return;
+  expect(value).toContain("[REDACTED]");
+  expect(value).not.toContain(HOSTILE_SUCCESS_OUTPUT_SECRET);
+  expect(value).not.toContain("127.0.0.1");
+  expect(value).not.toContain("\u0000");
+  expect(utf8Bytes(value)).toBeLessThanOrEqual(16 * 1024);
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }
 
 function delay(ms: number): Promise<void> {

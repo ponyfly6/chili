@@ -1,4 +1,5 @@
 import type {
+  AgentMailboxPayload,
   AgentMessageQueuedPayload,
   AgentPath,
   AgentRunId,
@@ -15,7 +16,10 @@ import type {
   TimestampMs,
 } from "@chili/protocol";
 import {
+  boundPersistedJsonValue,
   normalizeAgentPath,
+  normalizePersistedError,
+  PERSISTED_JSON_LIMITS,
   TEAM_TASK_RUNTIME_METADATA_KEYS,
   timestampNow,
 } from "@chili/protocol";
@@ -44,6 +48,8 @@ export type TeamMemberStatus = ProtocolTeamMemberStatus;
 export type TeamTaskStatus = ProtocolTeamTaskStatus;
 
 const TEAM_TASK_RUNTIME_METADATA_KEY_SET = new Set<string>(TEAM_TASK_RUNTIME_METADATA_KEYS);
+const TEAM_EVENT_TEXT_JSON_BYTES = 64 * 1024;
+const TEAM_EVENT_METADATA_JSON_BYTES = 256 * 1024;
 
 export interface TeamRuntime {
   createTeam(input: CreateTeamInput): Promise<TeamRow>;
@@ -640,7 +646,9 @@ export class TeamControlService implements TeamRuntime {
       ownerPath: input.ownerPath,
       eventId: this.id("event"),
       ...(input.claimedBy ? { claimedBy: input.claimedBy } : {}),
-      ...(input.metadata ? { metadata: input.metadata } : {}),
+      ...(input.metadata
+        ? { metadata: boundedTeamMetadata(input.metadata, "team task claim metadata") }
+        : {}),
       ...(eventSessionId ? { sessionId: eventSessionId } : {}),
       ...(operation?.runClaim ? { runClaim: operation.runClaim } : {}),
       time: this.now(),
@@ -674,7 +682,11 @@ export class TeamControlService implements TeamRuntime {
     const result = await claimStore.call(this.options.store, {
       teamId: input.teamId,
       taskId: input.taskId,
-      metadata: input.metadata,
+      metadata: boundedTeamMetadata(
+        input.metadata,
+        "team task verification metadata",
+        ["verification"],
+      ),
       eventId: this.id("event"),
       ...(eventSessionId ? { sessionId: eventSessionId } : {}),
       ...(operation?.runClaim ? { runClaim: operation.runClaim } : {}),
@@ -715,11 +727,15 @@ export class TeamControlService implements TeamRuntime {
       agentGeneration: input.agentGeneration,
       agentStatus: input.agentStatus,
       status: input.status,
-      metadata: input.metadata,
+      metadata: boundedTeamMetadata(input.metadata, "team task sync metadata"),
       taskEventId: this.id("event"),
       memberEventId: this.id("event"),
-      ...(input.summary !== undefined ? { summary: input.summary } : {}),
-      ...(input.error !== undefined ? { error: input.error } : {}),
+      ...(input.summary !== undefined
+        ? { summary: boundedTeamText(input.summary, "team task summary") }
+        : {}),
+      ...(input.error !== undefined
+        ? { error: normalizePersistedError(input.error).message }
+        : {}),
       ...(eventSessionId ? { sessionId: eventSessionId } : {}),
       ...(operation?.runClaim ? { runClaim: operation.runClaim } : {}),
       time: this.now(),
@@ -904,17 +920,24 @@ export class TeamControlService implements TeamRuntime {
     if (input.taskId) await this.requireTask(input.teamId, input.taskId);
     const messageId = input.messageId ?? this.id("teammsg");
     const delivery = input.delivery ?? "queueOnly";
+    const content = boundedTeamText(input.content, "team message content");
+    const summary = input.summary === undefined
+      ? undefined
+      : boundedTeamText(input.summary, "team message summary");
+    const metadata = input.metadata === undefined
+      ? undefined
+      : boundedTeamMetadata(input.metadata, "team message metadata");
     const expected: TeamMessageIdentity = {
       teamId: input.teamId,
       messageId,
       from,
       to,
-      content: input.content,
+      content,
       kind: input.kind ?? "text",
       delivery,
       taskId: input.taskId,
-      summary: input.summary,
-      metadata: input.metadata,
+      summary,
+      metadata,
     };
     const existing = await this.findTeamMessage(messageId);
     if (existing) return requireMatchingTeamMessage(existing, expected);
@@ -928,12 +951,12 @@ export class TeamControlService implements TeamRuntime {
           messageId,
           from,
           to,
-          content: input.content,
+          content,
           kind: expected.kind,
           delivery,
           taskId: input.taskId,
-          summary: input.summary,
-          metadata: input.metadata,
+          summary,
+          metadata,
         }),
         teamMessageEventId(input.teamId, messageId),
       ),
@@ -944,12 +967,12 @@ export class TeamControlService implements TeamRuntime {
         messageId,
         from,
         to,
-        content: input.content,
+        content,
         kind: expected.kind,
         delivery,
         taskId: input.taskId,
-        summary: input.summary,
-        metadata: input.metadata,
+        summary,
+        metadata,
         strict: true,
       })),
     );
@@ -1161,7 +1184,7 @@ export class TeamControlService implements TeamRuntime {
       id: eventId ?? this.id("event"),
       type,
       time: this.now(),
-      payload,
+      payload: boundedTeamEventPayload(type, payload),
     };
     if (context.sessionId) event.sessionId = context.sessionId;
     return event as ChiliEvent;
@@ -1184,7 +1207,7 @@ export class TeamControlService implements TeamRuntime {
       id: eventId ?? this.id("agentmsg"),
       type: "agent.message_queued",
       time: this.now(),
-      payload,
+      payload: boundedAgentMailboxPayload(payload),
     };
     if (context.sessionId) event.sessionId = context.sessionId;
     return event;
@@ -1460,6 +1483,269 @@ const TEAM_TASK_STATUSES = [
 
 function isFinalTeamTaskStatus(status: TeamTaskStatus): boolean {
   return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+function boundedTeamEventPayload<T>(type: string, payload: T): T {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+  const output = { ...(payload as Record<string, unknown>) };
+  for (const key of ["name", "role", "model", "title", "description", "content", "summary"] as const) {
+    const value = output[key];
+    if (typeof value === "string") output[key] = boundedTeamText(value, `${type} ${key}`);
+  }
+  for (const key of ["error", "reason", "failureReason"] as const) {
+    const value = output[key];
+    if (typeof value === "string") output[key] = normalizePersistedError(value).message;
+  }
+  if (recordValue(output.metadata)) {
+    output.metadata = boundedTeamMetadata(output.metadata as Record<string, unknown>, `${type} metadata`);
+  }
+  for (const key of ["dependsOn", "toolScope", "writeScope"] as const) {
+    const value = output[key];
+    if (Array.isArray(value)) output[key] = boundedTeamStringArray(value, `${type} ${key}`);
+  }
+  const prioritized = prioritizedTeamMetadata(output, [
+    "teamId",
+    "taskId",
+    "messageId",
+    "path",
+    "fromPath",
+    "toPath",
+    "from",
+    "to",
+    "ownerPath",
+    "leadPath",
+    "status",
+    "kind",
+    "delivery",
+    "triggerTurn",
+    "recipientSessionId",
+    "childSessionId",
+    "summary",
+    "error",
+    "reason",
+    "failureReason",
+    "metadata",
+  ]);
+  const bounded = boundPersistedJsonValue(prioritized, {
+    maxBytes: PERSISTED_JSON_LIMITS.eventValueBytes,
+    maxStringBytes: PERSISTED_JSON_LIMITS.stringBytes,
+    maxItems: PERSISTED_JSON_LIMITS.items,
+    maxDepth: PERSISTED_JSON_LIMITS.depth,
+    maxNodes: PERSISTED_JSON_LIMITS.nodes,
+    label: `${type} payload`,
+  });
+  const result = recordValue(bounded) ?? {};
+  if (recordValue(result.metadata)) {
+    result.metadata = boundedTeamMetadata(
+      result.metadata as Record<string, unknown>,
+      `${type} metadata`,
+    );
+  }
+  return result as T;
+}
+
+function boundedAgentMailboxPayload(payload: AgentMessageQueuedPayload): AgentMessageQueuedPayload {
+  const message = payload.message;
+  if (!message) return payload;
+  if ("content" in message) {
+    return {
+      ...payload,
+      message: {
+        ...message,
+        content: boundedTeamText(message.content, "team mailbox content"),
+        ...(message.metadata
+          ? { metadata: boundedTeamMetadata(message.metadata, "team mailbox metadata", [
+              "teamId",
+              "teamMessageId",
+              "teamMessageKind",
+              "taskId",
+              "summary",
+              "teamMessageMetadata",
+            ]) }
+          : {}),
+      },
+    };
+  }
+  const bounded = boundPersistedJsonValue(message, {
+    maxBytes: TEAM_EVENT_METADATA_JSON_BYTES,
+    maxStringBytes: TEAM_EVENT_TEXT_JSON_BYTES,
+    maxItems: PERSISTED_JSON_LIMITS.items,
+    maxDepth: PERSISTED_JSON_LIMITS.depth,
+    maxNodes: PERSISTED_JSON_LIMITS.nodes,
+    label: "team mailbox message",
+  });
+  return recordValue(bounded)
+    ? { ...payload, message: bounded as unknown as AgentMailboxPayload }
+    : { ...payload, message: { role: "user", content: "[team mailbox message omitted]" } };
+}
+
+function boundedTeamText(value: string, label: string): string {
+  const bounded = boundPersistedJsonValue(value, {
+    maxBytes: TEAM_EVENT_TEXT_JSON_BYTES,
+    maxStringBytes: TEAM_EVENT_TEXT_JSON_BYTES - 2,
+    maxItems: 1,
+    maxDepth: 1,
+    maxNodes: 1,
+    label,
+  });
+  return typeof bounded === "string" ? bounded : "";
+}
+
+function boundedTeamMetadata(
+  value: Record<string, unknown>,
+  label: string,
+  priorityKeys: readonly string[] = TEAM_TASK_RUNTIME_METADATA_KEYS,
+): Record<string, unknown> {
+  const prioritized = prioritizedTeamMetadata(value, priorityKeys);
+  const normalized = normalizeTeamMetadataDiagnostics(prioritized, value);
+  const bounded = boundPersistedJsonValue(normalized, {
+    maxBytes: TEAM_EVENT_METADATA_JSON_BYTES,
+    maxStringBytes: PERSISTED_JSON_LIMITS.stringBytes,
+    maxItems: PERSISTED_JSON_LIMITS.items,
+    maxDepth: PERSISTED_JSON_LIMITS.depth,
+    maxNodes: PERSISTED_JSON_LIMITS.nodes,
+    label,
+  });
+  return recordValue(bounded) ?? {};
+}
+
+function prioritizedTeamMetadata(
+  value: Record<string, unknown>,
+  priorityKeys: readonly string[],
+): Record<string, unknown> {
+  const prioritized = Object.create(null) as Record<string, unknown>;
+  for (const key of priorityKeys) {
+    if (!safeMetadataHasOwn(value, key)) continue;
+    prioritized[key] = safeMetadataGet(value, key);
+  }
+  try {
+    for (const key in value) {
+      if (Object.keys(prioritized).length >= PERSISTED_JSON_LIMITS.items) break;
+      if (!safeMetadataHasOwn(value, key) || Object.prototype.hasOwnProperty.call(prioritized, key)) continue;
+      prioritized[key] = safeMetadataGet(value, key);
+    }
+  } catch {
+    prioritized.__omitted__ = "additional team metadata keys could not be enumerated";
+  }
+  return prioritized;
+}
+
+function normalizeTeamMetadataDiagnostics(
+  value: Record<string, unknown>,
+  originalRoot?: object,
+): Record<string, unknown> {
+  const seen = new WeakSet<object>();
+  if (originalRoot && originalRoot !== value) seen.add(originalRoot);
+  const normalized = normalizeTeamMetadataValue(value, [], {
+    nodes: 0,
+    seen,
+  });
+  return recordValue(normalized) ?? {};
+}
+
+function normalizeTeamMetadataValue(
+  value: unknown,
+  path: readonly string[],
+  state: { nodes: number; seen: WeakSet<object> },
+): unknown {
+  state.nodes += 1;
+  if (state.nodes > PERSISTED_JSON_LIMITS.nodes) return "[omitted: team metadata node limit exceeded]";
+  if (value === null || typeof value !== "object") return value;
+  if (path.length >= PERSISTED_JSON_LIMITS.depth) return "[omitted: team metadata depth limit exceeded]";
+  if (state.seen.has(value)) return "[omitted: circular team metadata]";
+  state.seen.add(value);
+
+  if (Array.isArray(value)) {
+    const result: unknown[] = [];
+    const length = safeMetadataArrayLength(value);
+    for (let index = 0; index < Math.min(length, PERSISTED_JSON_LIMITS.items); index += 1) {
+      result.push(normalizeTeamMetadataValue(
+        safeMetadataGet(value, String(index)),
+        path,
+        state,
+      ));
+    }
+    if (length > result.length) result.push(`[${length - result.length} team metadata items omitted]`);
+    state.seen.delete(value);
+    return result;
+  }
+
+  const result = Object.create(null) as Record<string, unknown>;
+  let entries = 0;
+  try {
+    for (const key in value) {
+      if (entries >= PERSISTED_JSON_LIMITS.items) {
+        result.__omitted__ = "additional team metadata keys omitted";
+        break;
+      }
+      if (!safeMetadataHasOwn(value, key)) continue;
+      entries += 1;
+      const item = safeMetadataGet(value, key);
+      const normalizedKey = normalizedMetadataKey(key);
+      result[key] = isDiagnosticMetadataField(normalizedKey, path)
+        ? normalizePersistedError(item).message
+        : normalizeTeamMetadataValue(item, [...path, normalizedKey], state);
+    }
+  } catch {
+    result.__omitted__ = "additional team metadata keys could not be enumerated";
+  }
+  state.seen.delete(value);
+  return result;
+}
+
+function isDiagnosticMetadataField(key: string, path: readonly string[]): boolean {
+  if (key === "error" || key === "reason" || key === "failurereason") return true;
+  if (key !== "feedback") return false;
+  return path.some((segment) =>
+    segment === "diagnostic"
+      || segment === "diagnostics"
+      || segment === "failure"
+      || segment === "failures"
+      || segment === "error"
+      || segment === "errors"
+      || segment === "preflight"
+      || segment === "verification"
+  );
+}
+
+function normalizedMetadataKey(value: string): string {
+  return value.replace(/[_ -]/gu, "").toLowerCase();
+}
+
+function safeMetadataGet(value: object, key: string): unknown {
+  try {
+    return Reflect.get(value, key);
+  } catch {
+    return `[omitted: ${key} metadata getter threw]`;
+  }
+}
+
+function safeMetadataHasOwn(value: object, key: string): boolean {
+  try {
+    return Object.prototype.hasOwnProperty.call(value, key);
+  } catch {
+    return false;
+  }
+}
+
+function safeMetadataArrayLength(value: unknown[]): number {
+  const length = safeMetadataGet(value, "length");
+  return typeof length === "number" && Number.isSafeInteger(length) && length >= 0 ? length : 0;
+}
+
+function boundedTeamStringArray(value: unknown[], label: string): string[] {
+  const strings = value.filter((item): item is string => typeof item === "string");
+  const bounded = boundPersistedJsonValue(strings, {
+    maxBytes: TEAM_EVENT_TEXT_JSON_BYTES,
+    maxStringBytes: 4 * 1024,
+    maxItems: PERSISTED_JSON_LIMITS.items,
+    maxDepth: 2,
+    maxNodes: PERSISTED_JSON_LIMITS.items + 1,
+    label,
+  });
+  return Array.isArray(bounded)
+    ? bounded.filter((item): item is string => typeof item === "string")
+    : [];
 }
 
 function pruneUndefined<T>(value: T): T {

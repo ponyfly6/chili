@@ -1,4 +1,4 @@
-import { formatToolResultForModel, type Message, type MessagePart } from "@chili/protocol";
+import { formatToolResultForModel, normalizeToolCallId, type Message, type MessagePart } from "@chili/protocol";
 import { resolveChatCompletionsCompatibility, type ChatCompletionsCompatibility } from "./compat.js";
 import { assertImageInputSupported } from "./image-input.js";
 import { providerHttpError, providerPayloadError } from "./provider-error.js";
@@ -302,8 +302,8 @@ export class OpenAICompletionsModel implements ChiliModel {
       if (message?.content) {
         yield { type: "text_delta", text: message.content, index };
       }
-      for (const toolCall of message?.tool_calls ?? []) {
-        const tool = toolStateFromCompleteToolCall(toolCall, index);
+      for (const [toolIndex, toolCall] of (message?.tool_calls ?? []).entries()) {
+        const tool = toolStateFromCompleteToolCall(toolCall, index, toolIndex);
         yield { type: "tool_call_start", toolCallId: tool.toolCallId, name: tool.name, index };
         yield finishToolCallEvent(tool, index);
       }
@@ -571,13 +571,13 @@ function* applyToolCallDelta(
 ): Iterable<ModelStreamEvent> {
   const index = delta.index ?? fallbackIndex;
   const tool = toolCalls.get(index) ?? {
-    toolCallId: delta.id ?? `tool_${index}`,
+    toolCallId: normalizeToolCallId(delta.id ?? `tool_${index}`, index),
     name: delta.function?.name ?? "",
     partialJson: "",
     started: false,
   };
 
-  if (delta.id) tool.toolCallId = delta.id;
+  if (delta.id && !tool.started) tool.toolCallId = normalizeToolCallId(delta.id, index);
   if (delta.function?.name) tool.name = delta.function.name;
   toolCalls.set(index, tool);
 
@@ -594,10 +594,14 @@ function* applyToolCallDelta(
   }
 }
 
-function toolStateFromCompleteToolCall(toolCall: OpenAIChoiceToolCall, fallbackIndex: number): ToolStreamState {
+function toolStateFromCompleteToolCall(
+  toolCall: OpenAIChoiceToolCall,
+  fallbackIndex: number,
+  discriminator: number = toolCall.index ?? fallbackIndex,
+): ToolStreamState {
   const index = toolCall.index ?? fallbackIndex;
   return {
-    toolCallId: toolCall.id ?? `tool_${index}`,
+    toolCallId: normalizeToolCallId(toolCall.id ?? `tool_${index}`, discriminator),
     name: toolCall.function?.name ?? "",
     partialJson: toolCall.function?.arguments ?? "",
     started: true,

@@ -89,6 +89,67 @@ test("follows up an existing task through the child session and records a new ru
   }
 });
 
+test("shutdown publishes one promise before a prompt abort listener reenters", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-task-control-shutdown-reentry-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const runtime = new FakeTaskRuntime(store);
+  const taskId = "task_shutdown_reentry" as TaskId;
+  const promptStarted = deferred<void>();
+  let service!: AgentTaskControlService;
+  let reentrantShutdown: Promise<void> | undefined;
+  let abortCallbacks = 0;
+  let promptCleanups = 0;
+
+  try {
+    await seedTask(store, { taskId, status: "completed" });
+    service = new AgentTaskControlService({
+      store,
+      runtime,
+      createId: createSequentialId(),
+      now: () => 10 as TimestampMs,
+    });
+    runtime.onSubmit = async (input) => {
+      const signal = input.signal;
+      if (!signal) throw new Error("Expected a shutdown-linked prompt signal");
+      promptStarted.resolve();
+      try {
+        await new Promise<void>((_resolve, reject) => {
+          const onAbort = (): void => {
+            abortCallbacks++;
+            reentrantShutdown = service.shutdown();
+            reject(signal.reason ?? abortTestError());
+          };
+          if (signal.aborted) onAbort();
+          else signal.addEventListener("abort", onAbort, { once: true });
+        });
+      } finally {
+        promptCleanups++;
+      }
+    };
+
+    const followup = service.followupTask({ taskId, text: "wait for shutdown" });
+    const observedFollowup = followup.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await promptStarted.promise;
+
+    const shutdown = service.shutdown();
+    expect(reentrantShutdown).toBe(shutdown);
+    expect(service.shutdown()).toBe(shutdown);
+    await shutdown;
+
+    expect(await observedFollowup).toMatchObject({ name: "AbortError" });
+    expect(abortCallbacks).toBe(1);
+    expect(promptCleanups).toBe(1);
+    expect(await store.agentTask(taskId)).toMatchObject({ status: "cancelled" });
+    expect(await store.events({ type: "agent.task_completed", limit: 100 })).toHaveLength(1);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("rejects direct follow-up of a terminal crash-safe dispatch reservation", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-task-control-reserved-followup-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -241,7 +302,7 @@ test("projection-only fallback requeues a failed source mailbox turn", async () 
     agentMailbox: sqlite.agentMailbox.bind(sqlite),
   };
   const store = new ObservableEventStore(projectionOnly);
-  const runtime = new FakeTaskRuntime(sqlite, new Error("source runtime unavailable"));
+  const runtime = new FakeTaskRuntime(sqlite, hostileTaskControlError("source runtime unavailable"));
   const taskId = "task_projection_source" as TaskId;
   const messageId = "message_projection_source";
 
@@ -281,7 +342,11 @@ test("projection-only fallback requeues a failed source mailbox turn", async () 
     })).rejects.toThrow("source runtime unavailable");
 
     expect(await sqlite.agentMailbox({ messageId })).toMatchObject([{ status: "queued", triggerTurn: true }]);
-    expect(await sqlite.events({ type: "agent.message_requeued", limit: 100 })).toHaveLength(1);
+    const requeuedEvents = await sqlite.events({ type: "agent.message_requeued", limit: 100 });
+    expect(requeuedEvents).toHaveLength(1);
+    const requeued = requeuedEvents[0] as Extract<ChiliEvent, { type: "agent.message_requeued" }>;
+    expectTaskControlSafeDiagnostic(requeued.payload.error);
+    expect(jsonByteLength(requeued)).toBeLessThanOrEqual(128 * 1024);
   } finally {
     sqlite.close();
     await rm(dir, { recursive: true, force: true });
@@ -332,7 +397,7 @@ test("marks a planning-only non-tool follow-up result incomplete", async () => {
 test("consumes a directly claimed follow-up message when runtime submission fails", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-task-control-followup-failure-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
-  const runtime = new FakeTaskRuntime(store, new Error("runtime unavailable"));
+  const runtime = new FakeTaskRuntime(store, hostileTaskControlError("runtime unavailable"));
   const taskId = "task_reader" as TaskId;
 
   try {
@@ -367,12 +432,23 @@ test("consumes a directly claimed follow-up message when runtime submission fail
     expect((await store.agentMailbox({ taskId }))[0]?.consumedAt).toBe(10);
     expect(await store.agentMailbox({ status: "queued" })).toEqual([]);
     expect((await store.events({ limit: 100 })).map((event) => event.type)).toContain("agent.message_consumed");
-    expect(await store.agentTask(taskId)).toMatchObject({
+    const persistedTask = await store.agentTask(taskId);
+    expect(persistedTask).toMatchObject({
       id: taskId,
       status: "failed",
       currentRunId: "agent_1",
-      error: "runtime unavailable",
     });
+    expectTaskControlSafeDiagnostic(persistedTask?.error);
+    const completionEvents = ((await store.events({ limit: 100 })) as ChiliEvent[]).filter(
+      (event): event is Extract<ChiliEvent, { type: "agent.task_completed" | "agent.completed" }> =>
+        (event.type === "agent.task_completed" || event.type === "agent.completed")
+          && event.payload.runId === "agent_1",
+    );
+    expect(completionEvents).toHaveLength(2);
+    for (const event of completionEvents) {
+      expectTaskControlSafeDiagnostic(event.payload.error);
+      expect(jsonByteLength(event)).toBeLessThanOrEqual(128 * 1024);
+    }
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -1669,6 +1745,37 @@ class FakeTaskRuntime implements AgentTaskPromptRuntime {
 function createSequentialId(namespace?: string): (prefix: string) => string {
   let index = 0;
   return (prefix) => `${prefix}_${namespace ? `${namespace}_` : ""}${++index}`;
+}
+
+const TASK_CONTROL_HOSTILE_SECRET = "sk-task-control-secret-123456789";
+
+function hostileTaskControlError(label: string): Error {
+  const error = new Error(
+    `${label}\nAuthorization: Bearer ${TASK_CONTROL_HOSTILE_SECRET}\n`
+      + `http://localhost:4321/private?token=${TASK_CONTROL_HOSTILE_SECRET}\n`
+      + "\u0000\"\\\n".repeat(Math.ceil((5 * 1024 * 1024) / 4)),
+  ) as Error & { code?: string };
+  error.name = "TaskRuntimeFailure";
+  error.code = "TOKEN_INVALIDATED";
+  return error;
+}
+
+function expectTaskControlSafeDiagnostic(value: string | undefined): void {
+  expect(value).toBeDefined();
+  expect(value).toContain("[REDACTED]");
+  expect(value).not.toContain(TASK_CONTROL_HOSTILE_SECRET);
+  expect(value).not.toContain("localhost:4321");
+  expect(new TextEncoder().encode(value ?? "").byteLength).toBeLessThanOrEqual(16 * 1024);
+}
+
+function jsonByteLength(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+function abortTestError(): Error {
+  const error = new Error("aborted");
+  error.name = "AbortError";
+  return error;
 }
 
 async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 500): Promise<void> {

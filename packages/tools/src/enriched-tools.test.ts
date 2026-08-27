@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChiliEvent, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
@@ -246,6 +246,88 @@ test("workspace file tools reject symlink escapes", async () => {
     await expectRejectsWith(readFile(join(outside, "patch.txt"), "utf8"), "ENOENT");
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("direct write tools reject root workspace control metadata", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-tools-protected-metadata-"));
+  try {
+    await mkdir(join(workspace, ".git"));
+    await mkdir(join(workspace, ".chili"));
+    await writeFile(join(workspace, ".git", "config"), "safe\n", "utf8");
+    await writeFile(join(workspace, ".chili", "state.json"), "safe\n", "utf8");
+    await writeFile(join(workspace, "move-source.txt"), "safe\n", "utf8");
+    await link(join(workspace, ".git", "config"), join(workspace, "config-alias"));
+    await writeFile(join(workspace, "linked-metadata-target"), "safe\n", "utf8");
+    await symlink("../linked-metadata-target", join(workspace, ".git", "linked-config"));
+
+    const registry = registryWithCoreTools();
+    registry.register(createApplyPatchTool());
+    const executor = createExecutor(registry);
+    const attempts = [
+      toolInput("write", { filePath: ".git/new-config", content: "unsafe\n" }, workspace),
+      toolInput("edit", { filePath: ".chili/state.json", oldString: "", newString: "unsafe\n" }, workspace),
+      toolInput("write", { filePath: "linked-metadata-target", content: "unsafe\n" }, workspace),
+      toolInput("apply_patch", {
+        operations: [{ type: "create", path: ".chili/new-state.json", content: "unsafe\n" }],
+      }, workspace),
+      toolInput("apply_patch", {
+        operations: [{ type: "replace", path: ".git/config", oldText: "safe", newText: "unsafe" }],
+      }, workspace),
+      toolInput("apply_patch", {
+        operations: [{ type: "delete", path: ".chili/state.json" }],
+      }, workspace),
+      toolInput("apply_patch", {
+        patchText: [
+          "*** Begin Patch",
+          "*** Update File: move-source.txt",
+          "*** Move to: .chili/moved.txt",
+          "@@",
+          "-safe",
+          "+unsafe",
+          "*** End Patch",
+        ].join("\n"),
+      }, workspace),
+      toolInput("apply_patch", {
+        patchText: [
+          "*** Begin Patch",
+          "*** Update File: .git/config",
+          "*** Move to: moved-config",
+          "@@",
+          "-safe",
+          "+unsafe",
+          "*** End Patch",
+        ].join("\n"),
+      }, workspace),
+    ];
+
+    for (const attempt of attempts) {
+      const result = await executor.execute(attempt);
+      expect(result.status).toBe("failed");
+      if (result.status === "failed") expect(result.error.message).toContain("protected workspace metadata");
+    }
+
+    for (const hardLinkAttempt of [
+      toolInput("write", { filePath: "config-alias", content: "unsafe\n" }, workspace),
+      toolInput("edit", { filePath: "config-alias", oldString: "", newString: "unsafe\n" }, workspace),
+      toolInput("apply_patch", {
+        operations: [{ type: "replace", path: "config-alias", oldText: "safe", newText: "unsafe" }],
+      }, workspace),
+      toolInput("apply_patch", {
+        operations: [{ type: "delete", path: "config-alias" }],
+      }, workspace),
+    ]) {
+      const result = await executor.execute(hardLinkAttempt);
+      expect(result.status).toBe("failed");
+      if (result.status === "failed") expect(result.error.message).toContain("multi-link targets");
+    }
+
+    expect(await readFile(join(workspace, ".git", "config"), "utf8")).toBe("safe\n");
+    expect(await readFile(join(workspace, ".chili", "state.json"), "utf8")).toBe("safe\n");
+    expect(await readFile(join(workspace, "move-source.txt"), "utf8")).toBe("safe\n");
+    expect(await readFile(join(workspace, "linked-metadata-target"), "utf8")).toBe("safe\n");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
   }
 });
 

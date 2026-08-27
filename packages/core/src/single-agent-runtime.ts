@@ -17,7 +17,14 @@ import type {
   ToolResultExecutionContext,
   TurnId,
 } from "@chili/protocol";
-import { timestampNow } from "@chili/protocol";
+import {
+  boundPersistedErrorMessage,
+  boundPersistedJsonValue,
+  normalizePersistedError,
+  normalizeToolCallId,
+  PERSISTED_JSON_LIMITS,
+  timestampNow,
+} from "@chili/protocol";
 import type { EventStore } from "@chili/store";
 import type { ChiliToolDefinition, ToolAccessPolicy, ToolAccessPolicyResolver, ToolRegistry } from "@chili/tools";
 import { ToolExecutor, filterToolsByPolicy } from "@chili/tools";
@@ -35,7 +42,14 @@ import {
 import { messagesForContext } from "./cancelled-turn-context.js";
 import { DoomLoopError, DoomLoopGuard, type DoomLoopGuardOptions } from "./doom-loop-guard.js";
 import { addModelUsage, attachModelUsage, takeModelUsage } from "./model-usage.js";
-import { normalizeRetryPolicy, retryDelay, sleep, type RetryPolicy } from "./retry.js";
+import {
+  isRetryableTransientError,
+  normalizeRetryPolicy,
+  retryAfterDelayHint,
+  retryDelay,
+  sleep,
+  type RetryPolicy,
+} from "./retry.js";
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.js";
 import type { AgentRunner, AppendUserMessageInput, CreateSessionInput, RunTurnInput, RunTurnResult } from "./runner.js";
 
@@ -92,6 +106,9 @@ interface CompactionAttemptResult {
   completed: boolean;
   usage?: ModelUsage;
 }
+
+const MAX_MODEL_METADATA_TEXT_BYTES = 4_096;
+const MAX_MODEL_RESPONSE_ID_CHARS = 512;
 
 export interface CompactContextInput {
   sessionId: SessionId;
@@ -188,6 +205,7 @@ export class SingleAgentRuntime implements AgentRunner {
       const rawMessages = await messagesForContext(this.options.store, input.sessionId);
       boundary = this.contextBuilder().compactionBoundary(rawMessages, reason);
       if (!boundary) {
+        throwIfTurnAborted(input.signal);
         await this.append(input, "turn.completed", { turnId, status: "completed" });
         return { status: "skipped", turnId, reason: "No messages available to compact" };
       }
@@ -201,6 +219,7 @@ export class SingleAgentRuntime implements AgentRunner {
       });
       const result = await this.compactMessages(input, turnId, rawMessages, boundary);
       usage = addModelUsage(usage, result.usage);
+      throwIfTurnAborted(input.signal);
       await this.append(input, "turn.completed", { turnId, status: "completed" });
       const completed: Extract<CompactContextResult, { status: "completed" }> = {
         status: "completed",
@@ -214,18 +233,20 @@ export class SingleAgentRuntime implements AgentRunner {
     } catch (error) {
       const err = toError(error);
       usage = addModelUsage(usage, takeModelUsage(err));
-      const status = isAbortError(err) ? "cancelled" : "failed";
+      const aborted = input.signal?.aborted === true || isAbortError(err);
+      const persistedError = terminalPersistedError(err, aborted);
+      const status = aborted ? "cancelled" : "failed";
       await this.append(input, "turn.compaction_failed", {
         turnId,
         reason,
         ...(boundary ? { boundaryMessageId: boundary.boundaryMessageId } : {}),
-        error: err.message,
+        error: persistedError.message,
       });
       await this.append(input, "turn.completed", { turnId, status });
       const failed: Extract<CompactContextResult, { status: "failed" | "cancelled" }> = {
         status,
         turnId,
-        error: err,
+        error: persistedError,
       };
       if (usage) failed.usage = usage;
       return failed;
@@ -347,6 +368,7 @@ export class SingleAgentRuntime implements AgentRunner {
         streamResult = await this.consumeModelStream(input, turnId, assistantMessageId, modelInput, guard);
       }
       turnUsage = addModelUsage(turnUsage, streamResult.usage);
+      throwIfTurnAborted(input.signal);
       let finishReason = streamResult.finishReason;
       if (isOutputLimitFinishReason(streamResult.finishReason) && streamResult.toolCalls.length > 0) {
         await this.failOutputLimitedToolCalls(
@@ -358,6 +380,7 @@ export class SingleAgentRuntime implements AgentRunner {
         );
         finishReason = "tool_use";
       } else {
+        throwIfTurnAborted(input.signal);
         await this.executeToolCalls(
           input,
           turnId,
@@ -371,6 +394,7 @@ export class SingleAgentRuntime implements AgentRunner {
         );
       }
 
+      throwIfTurnAborted(input.signal);
       await this.append(input, "turn.completed", {
         turnId,
         status: "completed",
@@ -388,9 +412,11 @@ export class SingleAgentRuntime implements AgentRunner {
     } catch (error) {
       const err = toError(error);
       turnUsage = addModelUsage(turnUsage, takeModelUsage(err));
-      const status = isAbortError(err) ? "cancelled" : "failed";
+      const aborted = input.signal?.aborted === true || isAbortError(err);
+      const persistedError = terminalPersistedError(err, aborted);
+      const status = aborted ? "cancelled" : "failed";
       if (status === "failed" && assistantMessageId && !didAssistantMutate(err)) {
-        await this.appendModelFailureMessage(input, assistantMessageId, err);
+        await this.appendModelFailureMessage(input, assistantMessageId, persistedError);
       }
       await this.append(input, "turn.completed", {
         turnId,
@@ -399,7 +425,7 @@ export class SingleAgentRuntime implements AgentRunner {
       const result: Extract<RunTurnResult, { status: "failed" | "cancelled" }> = {
         status,
         turnId,
-        error: err,
+        error: persistedError,
       };
       if (assistantMessageId) result.assistantMessageId = assistantMessageId;
       if (contextUsage) result.contextUsage = contextUsage;
@@ -413,12 +439,13 @@ export class SingleAgentRuntime implements AgentRunner {
     assistantMessageId: MessageId,
     error: Error,
   ): Promise<void> {
+    const message = normalizePersistedError(error).message;
     await this.appendPart(input, assistantMessageId, {
       id: this.id<PartId>("part"),
       messageId: assistantMessageId,
       sessionId: input.sessionId,
       type: "text",
-      text: `Model request failed: ${error.message}`,
+      text: boundPersistedErrorMessage(`Model request failed: ${message}`).text,
       synthetic: true,
     });
   }
@@ -508,7 +535,7 @@ export class SingleAgentRuntime implements AgentRunner {
           if (event.type === "tool_call_start") {
             assistantMutated = true;
             const toolCall: StreamingToolCall = {
-              callId: event.toolCallId as ToolCallId,
+              callId: normalizeToolCallId(event.toolCallId, event.index),
               toolName: event.name,
               input: {},
             };
@@ -523,7 +550,7 @@ export class SingleAgentRuntime implements AgentRunner {
             if (!toolCall && event.name) {
               assistantMutated = true;
               toolCall = {
-                callId: event.toolCallId as ToolCallId,
+                callId: normalizeToolCallId(event.toolCallId, event.index),
                 toolName: event.name,
                 input: {},
               };
@@ -545,7 +572,7 @@ export class SingleAgentRuntime implements AgentRunner {
             const existing = state.streamingToolCalls.get(key);
             state.streamingToolCalls.delete(key);
             const toolCall = {
-              callId: (existing?.callId ?? event.toolCallId) as ToolCallId,
+              callId: existing?.callId ?? normalizeToolCallId(event.toolCallId, event.index),
               toolName: event.name || existing?.toolName || "",
               input: event.input,
               ...(event.inputParseError ? { inputParseError: event.inputParseError } : {}),
@@ -563,48 +590,55 @@ export class SingleAgentRuntime implements AgentRunner {
           }
 
           if (event.type === "finish") {
-            if (event.usage) latestUsage = event.usage;
+            if (event.usage) latestUsage = persistedModelUsage(event.usage);
             if (event.responseId || event.usage) {
               await this.appendModelMetadata(input, turnId, event);
             }
+            throwIfTurnAborted(input.signal);
             await this.finishUnfinishedStreamingToolCalls(input, state, "failed", "Tool call stream ended before tool_call_end");
             const usage = addModelUsage(previousAttemptUsage, latestUsage);
-            return { finishReason: event.reason, toolCalls: state.toolCalls, ...(usage ? { usage } : {}) };
+            return {
+              finishReason: normalizePersistedError(event.reason).message,
+              toolCalls: state.toolCalls,
+              ...(usage ? { usage } : {}),
+            };
           }
 
           if (event.type === "metadata") {
-            if (event.usage) latestUsage = event.usage;
+            if (event.usage) latestUsage = persistedModelUsage(event.usage);
             await this.appendModelMetadata(input, turnId, event);
             continue;
           }
 
-          if (event.usage) latestUsage = event.usage;
+          if (event.usage) latestUsage = persistedModelUsage(event.usage);
           if (event.responseId || event.usage) {
             await this.appendModelMetadata(input, turnId, event);
           }
           throw toError(event.error);
         }
+        throwIfTurnAborted(input.signal);
         await this.finishUnfinishedStreamingToolCalls(input, state, "failed", "Tool call stream ended before tool_call_end");
         const usage = addModelUsage(previousAttemptUsage, latestUsage);
         return { toolCalls: state.toolCalls, ...(usage ? { usage } : {}) };
       } catch (error) {
         const err = toError(error);
+        const persistedError = normalizePersistedError(err);
         previousAttemptUsage = addModelUsage(
           previousAttemptUsage,
           addModelUsage(latestUsage, takeModelUsage(err)),
         );
         if (input.signal?.aborted || isAbortError(err)) {
-          await this.finishUnfinishedStreamingToolCalls(input, state, "cancelled", err.message);
+          await this.finishUnfinishedStreamingToolCalls(input, state, "cancelled", persistedError);
           throw attachModelUsage(err, previousAttemptUsage);
         }
-        await this.finishUnfinishedStreamingToolCalls(input, state, "failed", err.message);
+        await this.finishUnfinishedStreamingToolCalls(input, state, "failed", persistedError);
         if (!assistantMutated && attempt < retryPolicy.maxAttempts && retryPolicy.retryable(err)) {
           const delayMs = retryDelay(retryPolicy, attempt, err);
           await this.append(input, "turn.retry_scheduled", {
             turnId,
             attempt: attempt + 1,
             delayMs,
-            reason: err.message,
+            reason: persistedError.message,
           });
           await sleep(delayMs, input.signal);
           attempt++;
@@ -633,13 +667,15 @@ export class SingleAgentRuntime implements AgentRunner {
       return { completed: true, ...(result.usage ? { usage: result.usage } : {}) };
     } catch (error) {
       const err = toError(error);
+      const persistedError = normalizePersistedError(err);
       const usage = takeModelUsage(err);
       await this.append(input, "turn.compaction_failed", {
         turnId,
         reason: boundary.reason,
         boundaryMessageId: boundary.boundaryMessageId,
-        error: err.message,
+        error: persistedError.message,
       });
+      if (input.signal?.aborted || isAbortError(err)) throw signalAbortError(input.signal, persistedError.message);
       return { completed: false, ...(usage ? { usage } : {}) };
     }
   }
@@ -678,8 +714,11 @@ export class SingleAgentRuntime implements AgentRunner {
     if (input.reasoningLevel !== undefined) compactInput.reasoningLevel = input.reasoningLevel;
     if (input.serviceTier !== undefined) compactInput.serviceTier = input.serviceTier;
     if (input.signal !== undefined) compactInput.signal = input.signal;
+    throwIfTurnAborted(input.signal);
     const result = await this.compactor().compact(compactInput);
+    throwIfTurnAborted(input.signal);
     const messageId = await this.appendCompactionMessage(input, turnId, result);
+    throwIfTurnAborted(input.signal);
     await this.append(input, "turn.compaction_completed", {
       turnId,
       messageId,
@@ -811,14 +850,17 @@ export class SingleAgentRuntime implements AgentRunner {
     guard: DoomLoopGuard,
     state: AssistantStreamState,
   ): Promise<void> {
+    toolCall.callId = normalizeToolCallId(toolCall.callId);
+    const persistedInput = boundedToolInput(toolCall.input);
+    const persistedToolName = boundedToolName(toolCall.toolName);
     await this.appendPart(input, assistantMessageId, {
       id: this.id<PartId>("part"),
       messageId: assistantMessageId,
       sessionId: input.sessionId,
       type: "tool_call",
       callId: toolCall.callId,
-      toolName: toolCall.toolName,
-      input: toolCall.input,
+      toolName: persistedToolName,
+      input: persistedInput,
       status: "pending",
     });
 
@@ -832,19 +874,21 @@ export class SingleAgentRuntime implements AgentRunner {
       await this.append(input, "turn.guard_triggered", {
         turnId,
         reason: guardResult.reason,
-        toolName: toolCall.toolName,
+        toolName: persistedToolName,
         count: guardResult.count,
       });
       await this.append(input, "tool.call_started", {
         turnId,
         callId: toolCall.callId,
-        toolName: toolCall.toolName,
-        input: toolCall.input,
+        toolName: persistedToolName,
+        input: persistedInput,
       });
+      const persistedError = normalizePersistedError(error);
       await this.append(input, "tool.call_finished", {
         callId: toolCall.callId,
         status: "failed",
-        error: error.message,
+        error: persistedError.message,
+        ...persistedErrorDetailsPayload(persistedError),
         synthetic: true,
       });
       await this.appendPart(input, assistantMessageId, {
@@ -854,7 +898,7 @@ export class SingleAgentRuntime implements AgentRunner {
         type: "tool_result",
         callId: toolCall.callId,
         output: "",
-        error: error.message,
+        error: persistedError.message,
         synthetic: true,
       });
       throw error;
@@ -864,11 +908,12 @@ export class SingleAgentRuntime implements AgentRunner {
   }
 
   private async updateStreamingToolCall(input: EventContext, toolCall: StreamingToolCall): Promise<void> {
+    toolCall.callId = normalizeToolCallId(toolCall.callId);
     await this.append(input, "tool.call_updated", {
       callId: toolCall.callId,
       status: "running",
-      toolName: toolCall.toolName,
-      input: toolCall.input,
+      toolName: boundedToolName(toolCall.toolName),
+      input: boundedToolInput(toolCall.input),
     });
   }
 
@@ -876,8 +921,9 @@ export class SingleAgentRuntime implements AgentRunner {
     input: EventContext,
     state: AssistantStreamState,
     status: "failed" | "cancelled",
-    error: string,
+    error: unknown,
   ): Promise<void> {
+    const persistedError = normalizePersistedError(error);
     const unfinished = [...state.streamingToolCalls.values()];
     state.streamingToolCalls.clear();
     const seen = new Set<ToolCallId>();
@@ -887,7 +933,8 @@ export class SingleAgentRuntime implements AgentRunner {
       await this.append(input, "tool.call_finished", {
         callId: toolCall.callId,
         status,
-        error,
+        error: persistedError.message,
+        ...persistedErrorDetailsPayload(persistedError),
         synthetic: true,
       });
     }
@@ -983,16 +1030,18 @@ export class SingleAgentRuntime implements AgentRunner {
     toolCall: PendingToolCall,
     error: string,
   ): Promise<MessagePart> {
+    const persistedError = normalizePersistedError(error);
     await this.append(input, "tool.call_started", {
       turnId,
       callId: toolCall.callId,
-      toolName: toolCall.toolName,
-      input: toolCall.input,
+      toolName: boundedToolName(toolCall.toolName),
+      input: boundedToolInput(toolCall.input),
     });
     await this.append(input, "tool.call_finished", {
       callId: toolCall.callId,
       status: "failed",
-      error,
+      error: persistedError.message,
+      ...persistedErrorDetailsPayload(persistedError),
       synthetic: true,
     });
     return {
@@ -1002,7 +1051,7 @@ export class SingleAgentRuntime implements AgentRunner {
       type: "tool_result",
       callId: toolCall.callId,
       output: "",
-      error,
+      error: persistedError.message,
       synthetic: true,
     };
   }
@@ -1071,6 +1120,7 @@ export class SingleAgentRuntime implements AgentRunner {
       return { part };
     }
 
+    const persistedError = normalizePersistedError(result.error);
     const part: MessagePart = {
       id: this.id<PartId>("part"),
       messageId: assistantMessageId,
@@ -1078,11 +1128,11 @@ export class SingleAgentRuntime implements AgentRunner {
       type: "tool_result",
       callId: toolCall.callId,
       output: "",
-      error: result.error.message,
+      error: persistedError.message,
       synthetic: true,
     };
     if (result.status === "cancelled") {
-      return { part, cancelledError: result.error };
+      return { part, cancelledError: persistedError };
     }
     return { part };
   }
@@ -1114,14 +1164,28 @@ export class SingleAgentRuntime implements AgentRunner {
     turnId: TurnId,
     metadata: Extract<ModelStreamEvent, { type: "metadata" | "finish" | "error" }>,
   ): Promise<void> {
+    const provider = isModelMetadataEvent(metadata)
+      ? boundedModelMetadataText(unknownErrorField(metadata, "provider"), "model provider")
+      : undefined;
+    const model = isModelMetadataEvent(metadata)
+      ? boundedModelMetadataText(unknownErrorField(metadata, "model"), "model name")
+      : undefined;
+    const responseId = persistedModelResponseId(unknownErrorField(metadata, "responseId"));
+    const usage = persistedModelUsage(unknownErrorField(metadata, "usage"));
+    const contextWindowTokens = isModelMetadataEvent(metadata)
+      ? persistedModelMetadataNumber(unknownErrorField(metadata, "contextWindowTokens"))
+      : undefined;
+    const maxOutputTokens = isModelMetadataEvent(metadata)
+      ? persistedModelMetadataNumber(unknownErrorField(metadata, "maxOutputTokens"))
+      : undefined;
     await this.append(input, "turn.model_metadata", {
       turnId,
-      ...(isModelMetadataEvent(metadata) && metadata.provider ? { provider: metadata.provider } : {}),
-      ...(isModelMetadataEvent(metadata) && metadata.model ? { model: metadata.model } : {}),
-      ...(metadata.responseId ? { responseId: metadata.responseId } : {}),
-      ...(metadata.usage ? { usage: metadata.usage } : {}),
-      ...(isModelMetadataEvent(metadata) && metadata.contextWindowTokens !== undefined ? { contextWindowTokens: metadata.contextWindowTokens } : {}),
-      ...(isModelMetadataEvent(metadata) && metadata.maxOutputTokens !== undefined ? { maxOutputTokens: metadata.maxOutputTokens } : {}),
+      ...(provider ? { provider } : {}),
+      ...(model ? { model } : {}),
+      ...(responseId ? { responseId } : {}),
+      ...(usage ? { usage } : {}),
+      ...(contextWindowTokens !== undefined ? { contextWindowTokens } : {}),
+      ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
     });
   }
 
@@ -1200,28 +1264,110 @@ function isProcessSignal(value: unknown): value is string {
 }
 
 function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
+  const usage = takeModelUsage(error);
+  const assistantMutated = didAssistantMutate(error);
+  const retryable = isRetryableTransientError(error);
+  const retryAfterMs = retryAfterDelayHint(error);
+  const contextLimit = isContextLimitErrorValue(error, new Set<object>(), 0);
+  const normalized = normalizePersistedError(error);
+  copyRuntimeErrorScalar(error, normalized, "retryable", "boolean");
+  copyRuntimeErrorScalar(error, normalized, "status", "number");
+  copyRuntimeErrorScalar(error, normalized, "statusCode", "number");
+  copyRuntimeErrorScalar(error, normalized, "httpStatus", "number");
+  copyRuntimeErrorScalar(error, normalized, "retryAfterMs", "number");
+  copyRuntimeErrorScalar(error, normalized, "errno", "string");
+  copyRuntimeErrorScalar(error, normalized, "category", "string");
+  copyRuntimeErrorScalar(error, normalized, "type", "string");
+  copyRuntimeErrorScalar(error, normalized, "reason", "string");
+  copyRuntimeErrorScalar(error, normalized, "errorCode", "string");
+  Object.defineProperty(normalized, "retryable", {
+    configurable: true,
+    enumerable: true,
+    value: retryable,
+    writable: true,
+  });
+  if (retryAfterMs !== undefined) {
+    Object.defineProperty(normalized, "retryAfterMs", {
+      configurable: true,
+      enumerable: true,
+      value: retryAfterMs,
+      writable: true,
+    });
+  }
+  if (contextLimit) {
+    Object.defineProperty(normalized, "type", {
+      configurable: true,
+      enumerable: true,
+      value: "context_length_exceeded",
+      writable: true,
+    });
+  }
+  if (usage) attachModelUsage(normalized, usage);
+  if (assistantMutated) markAssistantMutation(normalized, true);
+  return normalized;
 }
 
-interface AssistantMutationError extends Error {
-  assistantMutated?: boolean;
+function copyRuntimeErrorScalar(
+  source: unknown,
+  target: Error,
+  key: string,
+  expectedType: "boolean" | "number" | "string",
+): void {
+  if ((typeof source !== "object" && typeof source !== "function") || source === null) return;
+  let value: unknown;
+  try {
+    value = Reflect.get(source, key);
+  } catch {
+    return;
+  }
+  if (typeof value !== expectedType) return;
+  if (expectedType === "number" && !Number.isFinite(value)) return;
+  if (expectedType === "string" && !isSafeRuntimeErrorTag(value as string)) return;
+  Object.defineProperty(target, key, { configurable: true, enumerable: true, value, writable: true });
 }
+
+function isSafeRuntimeErrorTag(value: string): boolean {
+  if (Buffer.byteLength(value, "utf8") > 256 || !/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/u.test(value)) return false;
+  const probe = normalizePersistedError(Object.assign(new Error("classification tag"), { code: value }));
+  return probe.code === value;
+}
+
+function persistedErrorDetailsPayload(
+  error: ReturnType<typeof normalizePersistedError>,
+): { errorDetails?: ReturnType<typeof normalizePersistedError>["persistedErrorDetails"] } {
+  const details = error.persistedErrorDetails;
+  return (details.name !== "Error" && details.name !== "AbortError")
+    || details.code !== undefined
+    || details.truncated === true
+    ? { errorDetails: details }
+    : {};
+}
+
+function terminalPersistedError(error: Error, aborted: boolean): ReturnType<typeof normalizePersistedError> {
+  const normalized = normalizePersistedError(error);
+  if (!aborted) return normalized;
+  normalized.name = "AbortError";
+  return normalizePersistedError(normalized);
+}
+
+const assistantMutationByError = new WeakMap<object, boolean>();
 
 function markAssistantMutation(error: Error, assistantMutated: boolean): void {
-  (error as AssistantMutationError).assistantMutated = assistantMutated;
+  assistantMutationByError.set(error, assistantMutated);
 }
 
-function didAssistantMutate(error: Error): boolean {
-  return (error as AssistantMutationError).assistantMutated === true;
+function didAssistantMutate(error: unknown): boolean {
+  if ((typeof error !== "object" && typeof error !== "function") || error === null) return false;
+  return assistantMutationByError.get(error) === true;
 }
 
 function isContextLimitError(error: Error): boolean {
-  return isContextLimitErrorValue(error, new Set<object>());
+  return isContextLimitErrorValue(error, new Set<object>(), 0);
 }
 
-function isContextLimitErrorValue(value: unknown, seen: Set<object>): boolean {
+function isContextLimitErrorValue(value: unknown, seen: Set<object>, depth: number): boolean {
   if (typeof value === "string") return isContextLimitMessage(value);
-  if (typeof value !== "object" || value === null || seen.has(value)) return false;
+  if (typeof value !== "object" || value === null || seen.has(value) || depth > 8 || seen.size >= 256) return false;
   seen.add(value);
 
   const status = numericErrorField(value, "status")
@@ -1240,9 +1386,23 @@ function isContextLimitErrorValue(value: unknown, seen: Set<object>): boolean {
   if (message && isContextLimitMessage(message)) return true;
 
   const cause = unknownErrorField(value, "cause");
-  if (cause !== undefined && isContextLimitErrorValue(cause, seen)) return true;
+  if (cause !== undefined && isContextLimitErrorValue(cause, seen, depth + 1)) return true;
   const errors = unknownErrorField(value, "errors");
-  return Array.isArray(errors) && errors.some((item) => isContextLimitErrorValue(item, seen));
+  const errorCount = safeErrorArrayLength(errors);
+  for (let index = 0; index < Math.min(errorCount, 64); index += 1) {
+    if (isContextLimitErrorValue(unknownErrorField(errors, String(index)), seen, depth + 1)) return true;
+  }
+  return false;
+}
+
+function safeErrorArrayLength(value: unknown): number {
+  try {
+    if (!Array.isArray(value)) return 0;
+    const length = Reflect.get(value, "length");
+    return typeof length === "number" && Number.isSafeInteger(length) && length >= 0 ? length : 0;
+  } catch {
+    return 0;
+  }
 }
 
 function isContextLimitMessage(value: string): boolean {
@@ -1286,7 +1446,8 @@ function numericErrorField(value: object, key: string): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function unknownErrorField(value: object, key: string): unknown {
+function unknownErrorField(value: unknown, key: string): unknown {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return undefined;
   try {
     return (value as Record<string, unknown>)[key];
   } catch {
@@ -1322,7 +1483,8 @@ function isMcpTool(tool: { mcp?: unknown }): tool is { mcp: Record<string, unkno
 }
 
 function isAbortError(error: Error): boolean {
-  return error.name === "AbortError" || error.message.toLowerCase().includes("aborted");
+  const persisted = normalizePersistedError(error);
+  return persisted.name === "AbortError" || persisted.message.toLowerCase().includes("aborted");
 }
 
 function abortError(message: string): Error {
@@ -1331,8 +1493,102 @@ function abortError(message: string): Error {
   return error;
 }
 
+function throwIfTurnAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw signalAbortError(signal, "Turn aborted");
+}
+
+function signalAbortError(signal: AbortSignal | undefined, fallbackMessage: string): Error {
+  if (!signal?.aborted) return terminalPersistedError(toError(fallbackMessage), true);
+  let reason: unknown;
+  try {
+    reason = signal.reason;
+  } catch {
+    return abortError(fallbackMessage);
+  }
+  if (reason === undefined
+    || (typeof DOMException !== "undefined" && reason instanceof DOMException && reason.name === "AbortError")) {
+    return abortError(fallbackMessage);
+  }
+  return terminalPersistedError(toError(reason), true);
+}
+
+function boundedToolInput(value: unknown): unknown {
+  return boundPersistedJsonValue(value, {
+    maxBytes: PERSISTED_JSON_LIMITS.eventValueBytes,
+    maxStringBytes: PERSISTED_JSON_LIMITS.stringBytes,
+    maxItems: PERSISTED_JSON_LIMITS.items,
+    maxDepth: PERSISTED_JSON_LIMITS.depth,
+    maxNodes: PERSISTED_JSON_LIMITS.nodes,
+    label: "tool input",
+  });
+}
+
+function boundedToolName(value: string): string {
+  const sanitized = value.replace(/[\u0000-\u001f\u007f]/gu, " ").trim();
+  if (!sanitized) return "unknown_tool";
+  const bounded = boundPersistedJsonValue(sanitized, {
+    maxBytes: 514,
+    maxStringBytes: 512,
+    maxItems: 1,
+    maxDepth: 1,
+    maxNodes: 1,
+    label: "tool name",
+  });
+  return typeof bounded === "string" && bounded.trim() ? bounded : "unknown_tool";
+}
+
+function boundedModelMetadataText(value: unknown, label: string): string | undefined {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  const redacted = normalizePersistedError(value).message;
+  const sanitized = redacted.replace(/[\u0000-\u001f\u007f]/gu, " ").trim();
+  if (!sanitized) return undefined;
+  const bounded = boundPersistedJsonValue(sanitized, {
+    maxBytes: MAX_MODEL_METADATA_TEXT_BYTES,
+    maxStringBytes: MAX_MODEL_METADATA_TEXT_BYTES - 2,
+    maxItems: 1,
+    maxDepth: 1,
+    maxNodes: 1,
+    label,
+  });
+  return typeof bounded === "string" && bounded.trim() ? bounded : undefined;
+}
+
+function persistedModelResponseId(value: unknown): string | undefined {
+  if (typeof value !== "string"
+    || value.length === 0
+    || value.length > MAX_MODEL_RESPONSE_ID_CHARS
+    || value !== value.trim()
+    || /[\u0000-\u001f\u007f]/u.test(value)
+    || value === "__proto__"
+    || value === "prototype"
+    || value === "constructor") {
+    return undefined;
+  }
+  return value;
+}
+
+function persistedModelUsage(value: unknown): ModelUsage | undefined {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return undefined;
+  const result: ModelUsage = {};
+  for (const key of [
+    "inputTokens",
+    "outputTokens",
+    "cacheReadInputTokens",
+    "cacheCreationInputTokens",
+    "totalTokens",
+  ] as const) {
+    const candidate = persistedModelMetadataNumber(unknownErrorField(value, key));
+    if (candidate !== undefined) result[key] = candidate;
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function persistedModelMetadataNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
 function toolCallKey(toolCallId: string, index: number | undefined): string {
-  return `${toolCallId}:${index ?? ""}`;
+  return `${normalizeToolCallId(toolCallId, index)}:${index ?? ""}`;
 }
 
 function isOutputLimitFinishReason(reason: string | undefined): boolean {

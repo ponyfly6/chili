@@ -1,0 +1,433 @@
+import { expect, test } from "bun:test";
+import type { ChiliEvent } from "@chili/protocol";
+import type { RuntimeSnapshot, UserInputRequest } from "../shared/contracts.js";
+import type { RuntimePendingApprovalRequest } from "@chili/sdk";
+import {
+  appendRuntimeEvent,
+  boundedToolLiveOutput,
+  presentSession,
+  runtimeEventRelated,
+  runtimeEventRetentionDiagnostics,
+  runtimeEventSerializedBytes,
+  visibleToolLiveOutput,
+} from "./view-model.js";
+
+test("uses authoritative restored approvals even when their event anchors are unavailable", () => {
+  const snapshot = baseSnapshot([
+    event("session.created", "root", { sessionId: "root", cwd: "/repo" }, 1),
+  ], [], [
+    approval("approval_root", "root", "call_root", 6),
+    approval("approval_child", "child", "call_child", 10),
+  ]);
+
+  expect(presentSession(snapshot).pendingApprovals.map((approval) => String(approval.id))).toEqual([
+    "approval_root",
+    "approval_child",
+  ]);
+});
+
+test("an empty authoritative approval set replaces stale approval event projection", () => {
+  const activeEvents = [
+    event("session.created", "root", { sessionId: "root", cwd: "/repo" }, 1),
+    event("session.status_changed", "root", { sessionId: "root", status: "running" }, 2),
+    event("tool.call_started", "root", {
+      turnId: "turn_root",
+      callId: "call_root",
+      toolName: "bash",
+      input: {},
+    }, 3),
+    event("tool.call_updated", "root", { callId: "call_root", status: "waiting_for_approval" }, 4),
+    event("approval.requested", "root", {
+      approvalId: "approval_root",
+      callId: "call_root",
+      permission: "tool.bash",
+      patterns: ["bun test"],
+    }, 5),
+  ];
+  expect(presentSession(baseSnapshot(activeEvents)).pendingApprovals).toEqual([]);
+});
+
+test("live approval request and resolution update the authoritative set immediately", () => {
+  const requested = event("approval.requested", "root", {
+    approvalId: "approval_live",
+    callId: "call_live",
+    permission: "tool.edit",
+    patterns: ["README.md"],
+  }, 5);
+  const waiting = appendRuntimeEvent(baseSnapshot([]), requested);
+  expect(presentSession(waiting).pendingApprovals.map((row) => String(row.id))).toEqual(["approval_live"]);
+  const resolved = appendRuntimeEvent(waiting, event("approval.resolved", "root", {
+    approvalId: "approval_live",
+    decision: "allow_once",
+  }, 6));
+  expect(presentSession(resolved).pendingApprovals).toEqual([]);
+});
+
+test("replaces duplicate streamed events instead of duplicating timeline state", () => {
+  const first = event("session.status_changed", "root", { status: "running" }, 1);
+  const replacement = { ...first, payload: { status: "idle" } } as ChiliEvent;
+  const snapshot = appendRuntimeEvent(appendRuntimeEvent(baseSnapshot([]), first), replacement);
+  expect(snapshot.events).toHaveLength(1);
+  expect(snapshot.events[0]?.payload as unknown).toEqual({ status: "idle" });
+});
+
+test("uses the pending-input query as truth and removes it on cancellation", () => {
+  const requested = event("user_input.requested", "root", {
+    inputId: "userinput_live",
+    callId: "toolcall_live",
+    questions: userInput("userinput_live").questions,
+  }, 1);
+  const cancelled = event("user_input.cancelled", "root", {
+    inputId: "userinput_live",
+    reason: "session interrupted",
+  }, 2);
+
+  const replayed = appendRuntimeEvent(baseSnapshot([]), requested);
+  expect(replayed.pendingInputs).toEqual([]);
+  expect(presentSession(replayed).pendingInputs).toEqual([]);
+
+  const waiting = appendRuntimeEvent(baseSnapshot([], [userInput("userinput_live")]), requested);
+  expect(presentSession(waiting).pendingInputs).toEqual([userInput("userinput_live")]);
+
+  const stopped = appendRuntimeEvent(waiting, cancelled);
+  expect(stopped.pendingInputs).toEqual([]);
+  expect(presentSession(stopped).pendingInputs).toEqual([]);
+});
+
+test("terminal user input events remove stale pending rows after snapshot reload", () => {
+  const stale = userInput("userinput_stale");
+  const snapshot = baseSnapshot([
+    event("user_input.requested", "root", {
+      inputId: stale.id,
+      callId: stale.callId,
+      questions: stale.questions,
+    }, 1),
+    event("user_input.resolved", "root", { inputId: stale.id, answers: { editor: ["Zed"] } }, 2),
+  ], [stale]);
+
+  expect(presentSession(snapshot).pendingInputs).toEqual([]);
+});
+
+test("recognizes root and descendant runtime events for snapshot replay", () => {
+  const snapshot = baseSnapshot([]);
+  snapshot.agentTree.agents = [{ sessionId: "agent_session", childSessionId: "child_session" } as never];
+  snapshot.agentTree.tasks = [{ childSessionId: "tree_task_session" } as never];
+  snapshot.tasks = [{ childSessionId: "listed_task_session" } as never];
+
+  for (const sessionId of ["root", "agent_session", "child_session", "tree_task_session", "listed_task_session"]) {
+    expect(runtimeEventRelated(snapshot, event("session.status_changed", sessionId, { status: "running" }, 20))).toBe(true);
+  }
+  expect(runtimeEventRelated(snapshot, event("session.status_changed", "unrelated", { status: "running" }, 21))).toBe(false);
+});
+
+test("bounds live event bytes exactly and marks a visible truncation warning", () => {
+  const escaped = event("event_escaped", "root", {
+    status: `quote_\"_slash_\\_emoji_😀_${"界".repeat(30)}`,
+  }, 30);
+  expect(runtimeEventSerializedBytes(escaped)).toBe(new TextEncoder().encode(JSON.stringify(escaped)).byteLength);
+  const second = { ...escaped, id: "event_escaped_2" };
+  const third = { ...escaped, id: "event_escaped_3" };
+  const byteBudget = new TextEncoder().encode(JSON.stringify([second, third])).byteLength;
+  const limits = { maxEvents: 100, maxBytes: byteBudget };
+  let snapshot = baseSnapshot([]);
+  snapshot = appendRuntimeEvent(snapshot, escaped, limits);
+  snapshot = appendRuntimeEvent(snapshot, second, limits);
+  snapshot = appendRuntimeEvent(snapshot, third, limits);
+
+  expect(snapshot.events.map((row) => row.id)).toEqual(["event_escaped_3"]);
+  expect(new TextEncoder().encode(JSON.stringify(snapshot.events)).byteLength).toBeLessThanOrEqual(byteBudget);
+  expect(snapshot.truncated).toBe(true);
+  expect(snapshot.warning).toContain("renderer budget");
+});
+
+test("a single oversized live event is dropped rather than retained without a warning", () => {
+  const oversized = event("event_oversized", "root", { status: "😀".repeat(100) }, 31);
+  const snapshot = appendRuntimeEvent(baseSnapshot([]), oversized, { maxEvents: 10, maxBytes: 100 });
+  expect(snapshot.events).toEqual([]);
+  expect(snapshot.truncated).toBe(true);
+  expect(snapshot.warning).toContain("100-byte");
+});
+
+test("tiny live budgets retain message anchors with the newest visible delta", () => {
+  const created = event("message.created", "root", { messageId: "message_live", role: "assistant" }, 41);
+  const part = event("message.part_added", "root", {
+    messageId: "message_live",
+    part: { id: "part_live", messageId: "message_live", sessionId: "root", type: "text", text: "" },
+  }, 42);
+  const delta = event("message.part_delta", "root", {
+    messageId: "message_live",
+    partId: "part_live",
+    field: "text",
+    delta: "visible tail",
+  }, 43);
+  const maxBytes = new TextEncoder().encode(JSON.stringify([created, part, delta])).byteLength;
+  let snapshot = baseSnapshot([]);
+  for (const row of [created, part, delta]) {
+    snapshot = appendRuntimeEvent(snapshot, row, { maxEvents: 3, maxBytes });
+  }
+  expect(snapshot.events.map((row) => row.type)).toEqual([
+    "message.created",
+    "message.part_added",
+    "message.part_delta",
+  ]);
+  expect(presentSession(snapshot).runtime.messages.message_live?.parts[0]).toMatchObject({ text: "visible tail" });
+});
+
+test("10k live deltas use bounded retained state and amortized closure passes", () => {
+  const limits = { maxEvents: 200, maxBytes: 500_000 };
+  const started = event("tool.call_started", "root", {
+    turnId: "turn_live",
+    callId: "call_live",
+    toolName: "bash",
+    input: {},
+  }, 50);
+  let snapshot = appendRuntimeEvent(baseSnapshot([]), started, limits);
+  for (let index = 0; index < 10_000; index += 1) {
+    snapshot = appendRuntimeEvent(snapshot, {
+      ...event("tool.output_delta", "root", {
+        callId: "call_live",
+        stream: "stdout",
+        delta: `${index}\n`,
+        sequence: index,
+      }, 51 + index),
+      id: `event_delta_${index}`,
+    }, limits);
+  }
+  const diagnostics = runtimeEventRetentionDiagnostics(snapshot);
+  expect(diagnostics.retainedEvents).toBeLessThanOrEqual(limits.maxEvents);
+  expect(diagnostics.bytes).toBeLessThanOrEqual(limits.maxBytes);
+  expect(diagnostics.fullRetentionPasses).toBeLessThan(300);
+  expect(snapshot.events.some((row) => row.type === "tool.call_started")).toBe(true);
+  expect(snapshot.events.at(-1)?.id).toBe("event_delta_9999");
+});
+
+test("long streamed messages project incrementally and show one per-part omission marker through completion", () => {
+  const turnStarted = event("turn.started", "root", { turnId: "turn_stream" }, 1);
+  const created = event("message.created", "root", {
+    turnId: "turn_stream",
+    messageId: "message_stream",
+    role: "assistant",
+  }, 2);
+  const streamedPart = event("message.part_added", "root", {
+    messageId: "message_stream",
+    part: {
+      id: "part_stream",
+      messageId: "message_stream",
+      sessionId: "root",
+      type: "text",
+      text: "START|",
+    },
+  }, 3);
+  const untouchedPart = event("message.part_added", "root", {
+    messageId: "message_stream",
+    part: {
+      id: "part_untouched",
+      messageId: "message_stream",
+      sessionId: "root",
+      type: "text",
+      text: "UNCHANGED",
+    },
+  }, 4);
+  let snapshot = baseSnapshot([]);
+  for (const row of [turnStarted, created, streamedPart]) {
+    snapshot = appendRuntimeEvent(snapshot, row);
+  }
+  for (let index = 0; index < 3_000; index += 1) {
+    snapshot = appendRuntimeEvent(snapshot, {
+      ...event("message.part_delta", "root", {
+        messageId: "message_stream",
+        partId: "part_stream",
+        field: "text",
+        delta: `${index}|`,
+      }, 5 + index),
+      id: `event_message_delta_${index}`,
+    });
+    presentSession(snapshot);
+  }
+  snapshot = appendRuntimeEvent(snapshot, {
+    ...untouchedPart,
+    id: "event_untouched_part_recent",
+    time: 3_499,
+  } as ChiliEvent);
+  snapshot = appendRuntimeEvent(snapshot, {
+    ...event("message.part_delta", "root", {
+      messageId: "message_stream",
+      partId: "part_untouched",
+      field: "text",
+      delta: "|TAIL",
+    }, 3_500),
+    id: "event_untouched_tail",
+  });
+  snapshot = appendRuntimeEvent(snapshot, {
+    ...event("turn.completed", "root", { turnId: "turn_stream", status: "completed" }, 4_000),
+    id: "event_turn_stream_completed",
+  });
+
+  const presentation = presentSession(snapshot);
+  const message = presentation.runtime.messages.message_stream;
+  const streamed = message?.parts.find((part) => part.id === "part_stream");
+  const untouched = message?.parts.find((part) => part.id === "part_untouched");
+  const streamedText = streamed?.type === "text" ? streamed.text : "";
+  const untouchedText = untouched?.type === "text" ? untouched.text : "";
+  const diagnostics = runtimeEventRetentionDiagnostics(snapshot);
+  expect(streamedText).toStartWith("START|\n[Earlier message content omitted]\n");
+  expect(streamedText).toEndWith("2999|");
+  expect(streamedText.match(/Earlier message content omitted/g)).toHaveLength(1);
+  expect(untouchedText).toBe("UNCHANGED|TAIL");
+  expect(snapshot.omittedMessageParts).toEqual([{
+    messageId: "message_stream",
+    partId: "part_stream",
+    field: "text",
+  }]);
+  expect(diagnostics.fullProjectionReplays).toBeLessThan(16);
+  expect(diagnostics.incrementalProjectionUpdates).toBeGreaterThan(2_900);
+
+  const authoritative = baseSnapshot([
+    turnStarted,
+    created,
+    event("message.part_added", "root", {
+      messageId: "message_stream",
+      part: {
+        id: "part_stream",
+        messageId: "message_stream",
+        sessionId: "root",
+        type: "text",
+        text: "START|complete authoritative content|2999|",
+      },
+    }, 3),
+  ]);
+  expect(presentSession(authoritative).runtime.messages.message_stream?.parts[0]).toMatchObject({
+    text: "START|complete authoritative content|2999|",
+  });
+  expect(authoritative.omittedMessageParts).toBeUndefined();
+});
+
+test("incremental message projection does not mutate sibling snapshot branches", () => {
+  const anchors = [
+    event("message.created", "root", { messageId: "message_branch", role: "assistant" }, 1),
+    event("message.part_added", "root", {
+      messageId: "message_branch",
+      part: {
+        id: "part_branch",
+        messageId: "message_branch",
+        sessionId: "root",
+        type: "text",
+        text: "seed|",
+      },
+    }, 2),
+  ];
+  let base = baseSnapshot([]);
+  for (const anchor of anchors) base = appendRuntimeEvent(base, anchor);
+  const left = appendRuntimeEvent(base, {
+    ...event("message.part_delta", "root", {
+      messageId: "message_branch",
+      partId: "part_branch",
+      field: "text",
+      delta: "left",
+    }, 3),
+    id: "event_branch_left",
+  });
+  const right = appendRuntimeEvent(base, {
+    ...event("message.part_delta", "root", {
+      messageId: "message_branch",
+      partId: "part_branch",
+      field: "text",
+      delta: "right",
+    }, 3),
+    id: "event_branch_right",
+  });
+  expect(presentSession(left).runtime.messages.message_branch?.parts[0]).toMatchObject({ text: "seed|left" });
+  expect(presentSession(right).runtime.messages.message_branch?.parts[0]).toMatchObject({ text: "seed|right" });
+  expect(presentSession(base).runtime.messages.message_branch?.parts[0]).toMatchObject({ text: "seed|" });
+});
+
+test("shows an inline omission marker after the SDK drops the oldest of 81 tool deltas", () => {
+  const started = event("tool.call_started", "root", {
+    turnId: "turn_tool_81",
+    callId: "call_tool_81",
+    toolName: "bash",
+    input: {},
+  }, 1);
+  let snapshot = appendRuntimeEvent(baseSnapshot([]), started);
+  for (let index = 0; index < 81; index += 1) {
+    snapshot = appendRuntimeEvent(snapshot, {
+      ...event("tool.output_delta", "root", {
+        callId: "call_tool_81",
+        stream: "stdout",
+        delta: `${index}|`,
+        sequence: index,
+      }, 2 + index),
+      id: `event_tool_81_${index}`,
+    });
+  }
+  const liveOutput = presentSession(snapshot).runtime.toolCalls.call_tool_81?.liveOutput;
+  const visible = boundedToolLiveOutput(liveOutput);
+  expect(liveOutput).toHaveLength(80);
+  expect(liveOutput?.[0]).toMatchObject({ delta: "1|", truncated: true });
+  expect(visible).toStartWith("[Earlier tool output omitted]\n");
+  expect(visible).toEndWith("80|");
+});
+
+test("bounds active tool output by UTF-8 bytes and preserves its newest tail", () => {
+  const output = boundedToolLiveOutput([
+    { stream: "stdout", delta: `old-${"界".repeat(100)}` },
+    { stream: "stderr", delta: "newest-😀" },
+  ], 96);
+  expect(output).toContain("Earlier tool output omitted");
+  expect(output).toEndWith("newest-😀");
+  expect(new TextEncoder().encode(output).byteLength).toBeLessThanOrEqual(96);
+  expect(boundedToolLiveOutput([{ delta: "complete", truncated: true }])).toContain("Earlier tool output omitted");
+  expect(boundedToolLiveOutput([
+    { stream: "stdout", delta: "building\n" },
+    { stream: "stderr", delta: "warning\n" },
+  ])).toBe("[stdout]\nbuilding\n[stderr]\nwarning\n");
+  expect(visibleToolLiveOutput("final result", [{ stream: "stdout", delta: "duplicate" }])).toBeUndefined();
+});
+
+function baseSnapshot(
+  events: ChiliEvent[],
+  pendingInputs: UserInputRequest[] = [],
+  pendingApprovals: RuntimePendingApprovalRequest[] = [],
+): RuntimeSnapshot {
+  return {
+    sessionId: "root",
+    events,
+    agentTree: { nodes: [], agents: [], tasks: [], mailbox: [] },
+    tasks: [],
+    pendingApprovals,
+    pendingInputs,
+  };
+}
+
+function approval(id: string, sessionId: string, callId: string, createdAt: number): RuntimePendingApprovalRequest {
+  return {
+    id,
+    sessionId: sessionId as never,
+    callId,
+    permission: "tool.bash",
+    patterns: ["bun test"],
+    createdAt,
+  };
+}
+
+function event(type: string, sessionId: string, payload: unknown, time: number): ChiliEvent {
+  return { id: `event_${time}`, type, sessionId, time, payload } as ChiliEvent;
+}
+
+function userInput(id: string): UserInputRequest {
+  return {
+    id,
+    sessionId: "root",
+    callId: "toolcall_live",
+    createdAt: 1,
+    questions: [{
+      id: "editor",
+      header: "Editor",
+      question: "Which editor should Chili use?",
+      options: [
+        { label: "VS Code", description: "Use Visual Studio Code." },
+        { label: "Zed", description: "Use Zed." },
+      ],
+    }],
+  };
+}

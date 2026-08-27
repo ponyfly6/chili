@@ -1,4 +1,4 @@
-import type { ToolCallId } from "@chili/protocol";
+import { normalizePersistedError, type ToolCallId } from "@chili/protocol";
 import { StringDecoder } from "node:string_decoder";
 import type { RunProcessOutputStream, RunProcessRawOutputChunk } from "./process.js";
 import { StreamingToolOutputFile, type PersistedOutput } from "./tool-output-storage.js";
@@ -97,7 +97,7 @@ export class ProcessOutputAccumulator {
         try {
           this.persisted = await this.outputFile.close();
         } catch (error) {
-          this.persistenceError = errorMessage(error);
+          this.persistenceError = normalizePersistedError(error).message;
         } finally {
           this.outputFile = undefined;
         }
@@ -181,7 +181,7 @@ export class ProcessOutputAccumulator {
       try {
         await outputFile.append(rendered.text);
       } catch (error) {
-        this.persistenceError = errorMessage(error);
+        this.persistenceError = normalizePersistedError(error).message;
         this.outputFile = undefined;
         await outputFile.close().catch(() => undefined);
       }
@@ -254,7 +254,7 @@ export class ProcessOutputAccumulator {
       await outputFile.append(this.pending);
       this.outputFile = outputFile;
     } catch (error) {
-      this.persistenceError = errorMessage(error);
+      this.persistenceError = normalizePersistedError(error).message;
       this.outputFile = undefined;
       await outputFile?.close().catch(() => undefined);
     } finally {
@@ -352,8 +352,4 @@ function removePartialMarkerPrefix(
     (transition) => transition.offset < bodyStart && bodyStart < transition.endOffset,
   );
   return partial ? tail.slice(partial.endOffset) : body;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

@@ -60,6 +60,26 @@ bun run chili -- sessions
 bun run chili -- --resume <session-id> "继续"
 ```
 
+### 桌面控制端
+
+Electron 桌面端复用同一个 Chili runtime，通过受限 preload bridge 控制本地 Bun sidecar；renderer 不接触 Node、sidecar URL 或 bearer token。
+
+开发运行：
+
+```bash
+bun run desktop
+```
+
+构建、生成 macOS `.app` 目录并执行完整打包烟测：
+
+```bash
+bun run desktop:build
+bun run desktop:package:dir
+bun run smoke:desktop
+```
+
+桌面端支持选择工作区、创建/恢复 session、实时 timeline、Queue/Steer/Stop、agent tree、tasks、审批、用户输入和 turn/workspace diff。详细运行说明与安全边界见 [apps/desktop/README.md](apps/desktop/README.md)，架构说明见 [docs/desktop-architecture.md](docs/desktop-architecture.md)。
+
 运行时会话现在只使用 `session-id` 标识；旧的 `--thread` 参数不再支持。`--resume` 只接受已存在且活跃的交互式 session，子代理 session 请通过 `task_followup` 继续。多代理任务仍以 `task-id` 作为用户可见标识，每个子代理对应唯一的 child session，后续消息会复用同一个 `task-id` 和 child session。邮箱工具输出中的接收方字段已从 `child_session_id` / `childSessionId` 更名为 `recipient_session_id` / `recipientSessionId`。
 
 身份职责保持正交：`SessionId` 标识可恢复的对话上下文，`TaskId` 标识逻辑代理任务，`AgentRunId` 标识该任务的一次执行尝试，`TurnId` 只标识一次模型轮次。Follow-up 会复用 `TaskId + SessionId`，同时创建新的 `AgentRunId` 并递增 generation。
@@ -241,9 +261,9 @@ bun run test:index
 bun run scripts/probe-minimax.ts --mock
 ```
 
-`bun run smoke:all` 是 CI 和提交前唯一推荐的完整 fake-model smoke 入口。它会顺序运行全部 smoke suites，不需要 API key 或网络访问。
+`bun run smoke:all` 是跨平台 CLI/runtime 的完整 fake-model smoke 入口，不需要 API key 或网络访问。Electron 的 macOS 打包与实机生命周期门禁独立运行 `bun run smoke:desktop`；发布或修改桌面代码时两者都必须通过。
 
-局部开发验证可单独运行 `smoke`、`smoke:cli`、`smoke:p0p1`、`smoke:p2`、`smoke:p2-control`、`smoke:p3`、`smoke:p3-background`、`smoke:p3-team-model` 或 `smoke:p3-team-parallel`。`smoke:p0` 是 `smoke` 的别名。`bun run smoke` 会在系统临时目录创建 fixture workspace，覆盖 CLI fake model 基础工具循环、`--resume`、runtime `read`/`glob`/`grep`/`edit`/`apply_patch`/`bash` 工具面，以及最小 context compaction 路径。通过的 fixture 会清理；失败的 fixture 会保留并打印路径。需要保留全部 fixture 时可设置 `CHILI_SMOKE_KEEP_WORKSPACE=1`。
+局部开发验证可单独运行 `smoke`、`smoke:cli`、`smoke:p0p1`、`smoke:p2`、`smoke:p2-control`、`smoke:p3`、`smoke:p3-background`、`smoke:p3-team-model`、`smoke:p3-team-parallel` 或 `smoke:p3-multi-agent-lifecycle`。`smoke:p0` 是 `smoke` 的别名。`bun run smoke` 会在系统临时目录创建 fixture workspace，覆盖 CLI fake model 基础工具循环、`--resume`、runtime `read`/`glob`/`grep`/`edit`/`apply_patch`/`bash` 工具面，以及最小 context compaction 路径。通过的 fixture 会清理；失败的 fixture 会保留并打印路径。需要保留全部 fixture 时可设置 `CHILI_SMOKE_KEEP_WORKSPACE=1`。
 
 `bun run test:index` 会输出当前 smoke 脚本和按 workspace 分组的 `*.test.ts` 清单，便于后续 worker 快速选择验证范围。
 

@@ -15,7 +15,15 @@ import type {
   TimestampMs,
   ToolCallId,
 } from "@chili/protocol";
-import { normalizeAgentPath, parentAgentPath, ROOT_AGENT_PATH, timestampNow } from "@chili/protocol";
+import {
+  boundPersistedJsonValue,
+  normalizeAgentPath,
+  normalizePersistedError,
+  parentAgentPath,
+  PERSISTED_JSON_LIMITS,
+  ROOT_AGENT_PATH,
+  timestampNow,
+} from "@chili/protocol";
 import type {
   AgentMailboxDeliveryStore,
   AgentMailboxCapabilityStore,
@@ -147,9 +155,10 @@ export class AgentMailboxTurnRetryError extends Error {
     readonly messageId: string,
     readonly result: Exclude<SubmitPromptResult, { status: "completed" }>,
   ) {
+    const failure = result.error ? normalizePersistedError(result.error).message : undefined;
     super(
       `Mailbox turn ${messageId} ended with ${result.status}` +
-      (result.error?.message ? `: ${result.error.message}` : ""),
+      (failure ? `: ${failure}` : ""),
     );
     this.name = "AgentMailboxTurnRetryError";
     if (result.error) this.cause = result.error;
@@ -212,14 +221,21 @@ export class AgentTreeControlService {
     const messageId = input.messageId ?? this.id("agentmsg");
     const delivery = input.delivery ?? "queueOnly";
     const recipient = await this.resolveMessageRecipient(input, delivery);
-    const metadata = pruneUndefined({
+    const content = boundedPersistedText(input.content, "agent mailbox content");
+    const metadata = boundedPersistedMetadata(pruneUndefined({
       ...input.metadata,
       agentMessageId: messageId,
       agentMessageDelivery: delivery,
       senderPath: input.from,
       recipientPath: recipient.path,
       recipientTaskId: recipient.task?.id,
-    });
+    }), "agent mailbox metadata", [
+      "agentMessageId",
+      "agentMessageDelivery",
+      "senderPath",
+      "recipientPath",
+      "recipientTaskId",
+    ]);
     const payload: Extract<ChiliEvent, { type: "agent.message_queued" }>["payload"] = {
       path: recipient.path,
       from: input.from,
@@ -227,7 +243,7 @@ export class AgentTreeControlService {
       recipientSessionId: recipient.sessionId,
       message: {
         role: "user",
-        content: input.content,
+        content,
         metadata,
       },
     };
@@ -432,7 +448,9 @@ export class AgentTreeControlService {
     const recovered = await deliveryStore.requeueAgentMailboxMessage({
       messageId: input.messageId,
       eventId: this.id("event"),
-      error: input.error ?? "mailbox_delivery_recovered_after_restart",
+      error: normalizePersistedError(
+        input.error ?? "mailbox_delivery_recovered_after_restart",
+      ).message,
       ...(context.sessionId ? { sessionId: context.sessionId } : {}),
       time: this.now(),
     });
@@ -637,7 +655,7 @@ export class AgentTreeControlService {
           messageId: input.messageId,
           eventId: this.id("event"),
           discardedBy: input.consumedBy ?? claimedMessage.path,
-          reason: discardedReason,
+          reason: normalizePersistedError(discardedReason).message,
           ...(context.sessionId ? { sessionId: context.sessionId } : {}),
           time: this.now(),
         });
@@ -653,7 +671,7 @@ export class AgentTreeControlService {
       await deliveryStore.requeueAgentMailboxMessage({
         messageId: input.messageId,
         eventId: this.id("event"),
-        error: toError(error).message,
+        error: normalizePersistedError(error).message,
         ...(context.sessionId ? { sessionId: context.sessionId } : {}),
         time: this.now(),
       });
@@ -708,7 +726,7 @@ export class AgentTreeControlService {
       messageId: message.id,
       path: message.path,
       discardedBy: discardedBy ?? message.path,
-      reason,
+      reason: normalizePersistedError(reason).message,
     };
     if (message.taskId) payload.taskId = message.taskId;
     const event: EventEnvelope<"agent.message_discarded", AgentMessageDiscardedPayload> = {
@@ -828,7 +846,12 @@ export class AgentTreeControlService {
         }
         if (team) {
           try {
-            await this.appendTeamMemberStatus(message, team, "blocked", `mailbox_turn_failed: ${boundedText(toError(error).message, 240)}`);
+            await this.appendTeamMemberStatus(
+              message,
+              team,
+              "blocked",
+              normalizePersistedError(`mailbox_turn_failed: ${normalizePersistedError(error).message}`).message,
+            );
           } catch {
             // Preserve the delivery failure so the mailbox retry path remains authoritative.
           }
@@ -1043,7 +1066,7 @@ export class AgentTreeControlService {
       teamId: team.teamId,
       path: message.path,
       status,
-      reason,
+      reason: normalizePersistedError(reason).message,
     };
     if (team.taskId) payload.taskId = team.taskId;
     const event: Extract<ChiliEvent, { type: "team.member_status_changed" }> = {
@@ -1109,6 +1132,8 @@ interface TeamDeliveryContext {
 const MAX_COMPLETION_ITEMS = 64;
 const MAX_COMPLETION_ID_CHARS = 160;
 const MAX_COMPLETION_DETAIL_CHARS = 512;
+const AGENT_MAILBOX_TEXT_JSON_BYTES = 64 * 1024;
+const AGENT_MAILBOX_METADATA_JSON_BYTES = 256 * 1024;
 const ALL_AGENT_TASKS_LIMIT = 2_147_483_647;
 const EVENT_SCAN_PAGE_SIZE = 1000;
 
@@ -1182,7 +1207,9 @@ function completionEnvelope(
       status: task.status,
       generation: task.generation,
       ...(task.summary ? { summary: boundedText(task.summary, MAX_COMPLETION_DETAIL_CHARS) } : {}),
-      ...(task.error ? { error: boundedText(task.error, MAX_COMPLETION_DETAIL_CHARS) } : {}),
+      ...(task.error
+        ? { error: boundedText(normalizePersistedError(task.error).message, MAX_COMPLETION_DETAIL_CHARS) }
+        : {}),
     })),
   };
   return [
@@ -1200,7 +1227,7 @@ function completionNotificationMetadata(
   parentPath: AgentPath,
 ): Record<string, unknown> {
   const expected = expectedBatchSize ?? tasks.length;
-  return pruneUndefined({
+  return boundedPersistedMetadata(pruneUndefined({
     kind: "subagent_completion_batch",
     completionPolicy: "notify",
     batchId,
@@ -1211,8 +1238,22 @@ function completionNotificationMetadata(
     terminal: tasks.length,
     untracked: Math.max(0, expected - tasks.length),
     counts: completionStatusCounts(tasks),
-    taskIds: tasks.map((task) => task.id),
-  });
+    taskIds: tasks.slice(0, MAX_COMPLETION_ITEMS).map((task) => boundedText(task.id, MAX_COMPLETION_ID_CHARS)),
+    omittedTaskIds: Math.max(0, tasks.length - MAX_COMPLETION_ITEMS),
+  }), "subagent completion metadata", [
+    "kind",
+    "completionPolicy",
+    "batchId",
+    "parentPath",
+    "total",
+    "expectedBatchSize",
+    "spawned",
+    "terminal",
+    "untracked",
+    "counts",
+    "taskIds",
+    "omittedTaskIds",
+  ]);
 }
 
 function matchesCompletionNotification(
@@ -1279,6 +1320,146 @@ function boundedText(value: string, limit: number): string {
   const normalized = value.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
   if (normalized.length <= limit) return normalized;
   return `${normalized.slice(0, Math.max(0, limit - 1))}…`;
+}
+
+function boundedPersistedText(value: string, label: string): string {
+  const bounded = boundPersistedJsonValue(value, {
+    maxBytes: AGENT_MAILBOX_TEXT_JSON_BYTES,
+    maxStringBytes: AGENT_MAILBOX_TEXT_JSON_BYTES - 2,
+    maxItems: 1,
+    maxDepth: 1,
+    maxNodes: 1,
+    label,
+  });
+  return typeof bounded === "string" ? bounded : "";
+}
+
+function boundedPersistedMetadata(
+  value: Record<string, unknown>,
+  label: string,
+  priorityKeys: readonly string[] = [],
+): Record<string, unknown> {
+  const prioritized = Object.create(null) as Record<string, unknown>;
+  for (const key of priorityKeys) {
+    if (safeMetadataHasOwn(value, key)) prioritized[key] = safeMetadataGet(value, key);
+  }
+  try {
+    for (const key in value) {
+      if (Object.keys(prioritized).length >= PERSISTED_JSON_LIMITS.items) break;
+      if (!safeMetadataHasOwn(value, key) || Object.prototype.hasOwnProperty.call(prioritized, key)) continue;
+      prioritized[key] = safeMetadataGet(value, key);
+    }
+  } catch {
+    prioritized.__omitted__ = "additional agent metadata keys could not be enumerated";
+  }
+  const bounded = boundPersistedJsonValue(normalizeMetadataDiagnostics(prioritized, value), {
+    maxBytes: AGENT_MAILBOX_METADATA_JSON_BYTES,
+    maxStringBytes: PERSISTED_JSON_LIMITS.stringBytes,
+    maxItems: PERSISTED_JSON_LIMITS.items,
+    maxDepth: PERSISTED_JSON_LIMITS.depth,
+    maxNodes: PERSISTED_JSON_LIMITS.nodes,
+    label,
+  });
+  return isRecord(bounded) ? bounded : {};
+}
+
+function normalizeMetadataDiagnostics(
+  value: Record<string, unknown>,
+  originalRoot?: object,
+): Record<string, unknown> {
+  const seen = new WeakSet<object>();
+  if (originalRoot && originalRoot !== value) seen.add(originalRoot);
+  const normalized = normalizeMetadataValue(value, [], {
+    nodes: 0,
+    seen,
+  });
+  return isRecord(normalized) ? normalized : {};
+}
+
+function normalizeMetadataValue(
+  value: unknown,
+  path: readonly string[],
+  state: { nodes: number; seen: WeakSet<object> },
+): unknown {
+  state.nodes += 1;
+  if (state.nodes > PERSISTED_JSON_LIMITS.nodes) return "[omitted: agent metadata node limit exceeded]";
+  if (value === null || typeof value !== "object") return value;
+  if (path.length >= PERSISTED_JSON_LIMITS.depth) return "[omitted: agent metadata depth limit exceeded]";
+  if (state.seen.has(value)) return "[omitted: circular agent metadata]";
+  state.seen.add(value);
+
+  if (Array.isArray(value)) {
+    const result: unknown[] = [];
+    const length = safeMetadataArrayLength(value);
+    for (let index = 0; index < Math.min(length, PERSISTED_JSON_LIMITS.items); index += 1) {
+      result.push(normalizeMetadataValue(safeMetadataGet(value, String(index)), path, state));
+    }
+    if (length > result.length) result.push(`[${length - result.length} agent metadata items omitted]`);
+    state.seen.delete(value);
+    return result;
+  }
+
+  const result = Object.create(null) as Record<string, unknown>;
+  let entries = 0;
+  try {
+    for (const key in value) {
+      if (entries >= PERSISTED_JSON_LIMITS.items) {
+        result.__omitted__ = "additional agent metadata keys omitted";
+        break;
+      }
+      if (!safeMetadataHasOwn(value, key)) continue;
+      entries += 1;
+      const item = safeMetadataGet(value, key);
+      const normalizedKey = normalizedMetadataKey(key);
+      result[key] = isDiagnosticMetadataField(normalizedKey, path)
+        ? normalizePersistedError(item).message
+        : normalizeMetadataValue(item, [...path, normalizedKey], state);
+    }
+  } catch {
+    result.__omitted__ = "additional agent metadata keys could not be enumerated";
+  }
+  state.seen.delete(value);
+  return result;
+}
+
+function isDiagnosticMetadataField(key: string, path: readonly string[]): boolean {
+  if (key === "error" || key === "reason" || key === "failurereason") return true;
+  if (key !== "feedback") return false;
+  return path.some((segment) =>
+    segment === "diagnostic"
+      || segment === "diagnostics"
+      || segment === "failure"
+      || segment === "failures"
+      || segment === "error"
+      || segment === "errors"
+      || segment === "preflight"
+      || segment === "verification"
+  );
+}
+
+function normalizedMetadataKey(value: string): string {
+  return value.replace(/[_ -]/gu, "").toLowerCase();
+}
+
+function safeMetadataGet(value: object, key: string): unknown {
+  try {
+    return Reflect.get(value, key);
+  } catch {
+    return `[omitted: ${key} metadata getter threw]`;
+  }
+}
+
+function safeMetadataHasOwn(value: object, key: string): boolean {
+  try {
+    return Object.prototype.hasOwnProperty.call(value, key);
+  } catch {
+    return false;
+  }
+}
+
+function safeMetadataArrayLength(value: unknown[]): number {
+  const length = safeMetadataGet(value, "length");
+  return typeof length === "number" && Number.isSafeInteger(length) && length >= 0 ? length : 0;
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
@@ -1546,5 +1727,5 @@ function defaultCreateId(prefix: string): string {
 }
 
 function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
+  return normalizePersistedError(error);
 }

@@ -4,7 +4,7 @@ import { lstat, mkdtemp, readlink, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { SessionId, TaskId, TeamId, TimestampMs } from "@chili/protocol";
-import { timestampNow } from "@chili/protocol";
+import { normalizePersistedError, timestampNow } from "@chili/protocol";
 import type { TeamRow, TeamTaskRow } from "@chili/store";
 import { runProcess } from "@chili/tools";
 import {
@@ -1107,9 +1107,13 @@ export class TeamMergeService {
       merge.worktreePath = revalidated.worktree.path;
       merge.baseRef = input.baseCommit ?? revalidated.worktree.baseRef;
     }
-    if (input.error) merge.error = input.error;
-    if (input.conflicts) merge.conflicts = input.conflicts;
-    if (input.reason) merge.reason = input.reason;
+    if (input.error) merge.error = normalizePersistedError(input.error).message;
+    if (input.conflicts) {
+      merge.conflicts = input.conflicts
+        .slice(0, 20)
+        .map((conflict) => normalizePersistedError(conflict).message);
+    }
+    if (input.reason) merge.reason = normalizePersistedError(input.reason).message;
     if (input.mainHead) merge.mainHead = input.mainHead;
     if (input.worktreeHead) merge.worktreeHead = input.worktreeHead;
     const metadata = mergeMergeMetadata(revalidated.task.metadata, merge);
@@ -1233,18 +1237,33 @@ function pendingMergeSkipReason(task: TeamTaskRow): TeamMergeSkippedReason | und
 }
 
 function collectMergeResult(result: TeamMergeSweepResult, item: TeamMergeTaskResult | TeamMergeTaskSkipped): void {
+  if (item.status === "skipped") {
+    result.skipped.push({
+      ...item,
+      ...(item.error ? { error: normalizePersistedError(item.error).message } : {}),
+    });
+    return;
+  }
+  const normalized: TeamMergeTaskResult = {
+    ...item,
+    ...(item.error ? { error: normalizePersistedError(item.error).message } : {}),
+    ...(item.conflicts
+      ? {
+          conflicts: item.conflicts
+            .slice(0, 20)
+            .map((conflict) => normalizePersistedError(conflict).message),
+        }
+      : {}),
+  };
   switch (item.status) {
     case "applied":
-      result.applied.push(item);
+      result.applied.push(normalized);
       return;
     case "failed":
-      result.failed.push(item);
+      result.failed.push(normalized);
       return;
     case "conflicted":
-      result.conflicted.push(item);
-      return;
-    case "skipped":
-      result.skipped.push(item);
+      result.conflicted.push(normalized);
       return;
   }
 }
@@ -1464,7 +1483,7 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 }
 
 function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
+  return normalizePersistedError(error);
 }
 
 function isSignalAbort(error: unknown, signal: AbortSignal | undefined): boolean {

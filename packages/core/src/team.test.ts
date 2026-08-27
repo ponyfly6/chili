@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { AgentPath, SessionId, TaskId, TeamId, TimestampMs } from "@chili/protocol";
+import type { AgentPath, ChiliEvent, SessionId, TaskId, TeamId, TimestampMs } from "@chili/protocol";
 import { SessionRunClaimConflictError, SqliteEventStore } from "@chili/store";
 import {
   TeamControlService,
@@ -215,6 +215,96 @@ test("creates a persistent team with leader, members, task assignment, claim, an
       "team.task_updated",
       "team.member_status_changed",
     ]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("bounds team task persistence while normalizing only diagnostic metadata paths", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-task-persistence-bounds-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const sessionId = "session_team_persistence_bounds" as SessionId;
+  const leadPath = "/root" as AgentPath;
+  const summaryPrefix =
+    `Ordinary team summary keeps ${TEAM_HOSTILE_SECRET} and `
+    + `http://127.0.0.1:4888/result?token=${TEAM_HOSTILE_SECRET}.\n`;
+  const hugeOrdinarySummary = `${summaryPrefix}${teamWorstEscapedText()}`;
+  const ordinaryFeedback = `User feedback keeps ${TEAM_HOSTILE_SECRET}`;
+  const metadata: Record<string, unknown> = {
+    feedback: ordinaryFeedback,
+    verification: { status: "failed", feedback: hostileTeamDiagnostic("verification feedback", false) },
+    diagnostics: { failureReason: hostileTeamDiagnostic("nested task failure", false) },
+    "failure reason": hostileTeamDiagnostic("spaced task failure", false),
+    ordinaryBlob: hugeOrdinarySummary,
+    items: Array.from({ length: 300 }, (_, index) => ({ index, content: "ordinary" })),
+  };
+  Object.defineProperty(metadata, "__proto__", {
+    configurable: true,
+    enumerable: true,
+    value: { error: hostileTeamDiagnostic("prototype key failure", false) },
+  });
+  let deep: Record<string, unknown> = {};
+  metadata.deep = deep;
+  for (let index = 0; index < 20; index += 1) {
+    const next: Record<string, unknown> = {};
+    deep.next = next;
+    deep = next;
+  }
+  metadata.circular = metadata;
+
+  try {
+    const service = new TeamControlService({
+      store,
+      createId: createSequentialId(),
+      now: () => 20 as TimestampMs,
+    });
+    const team = await service.createTeam({ sessionId, name: "bounds", leadPath });
+    const task = await service.createTask({
+      sessionId,
+      teamId: team.id,
+      title: "Persist hostile result safely",
+      createdBy: leadPath,
+    });
+
+    const updated = await service.updateTask({
+      sessionId,
+      teamId: team.id,
+      taskId: task.id,
+      status: "failed",
+      title: hugeOrdinarySummary,
+      description: hugeOrdinarySummary,
+      summary: hugeOrdinarySummary,
+      error: hostileTeamDiagnostic("team task failed", true),
+      metadata,
+    });
+
+    expect(updated.status).toBe("failed");
+    expect(updated.summary?.startsWith(summaryPrefix)).toBe(true);
+    expect(updated.summary).not.toContain("[REDACTED]");
+    expectTeamSafeDiagnostic(updated.error);
+    expect(updated.metadata?.feedback).toBe(ordinaryFeedback);
+    expectTeamSafeDiagnostic(
+      ((updated.metadata?.verification as Record<string, unknown> | undefined)?.feedback as string | undefined),
+    );
+    expectTeamSafeDiagnostic(
+      ((updated.metadata?.diagnostics as Record<string, unknown> | undefined)?.failureReason as string | undefined),
+    );
+    expectTeamSafeDiagnostic(updated.metadata?.["failure reason"] as string | undefined);
+    expect(Object.prototype.hasOwnProperty.call(updated.metadata, "__proto__")).toBe(true);
+    expectTeamSafeDiagnostic(
+      ((updated.metadata?.["__proto__"] as Record<string, unknown> | undefined)?.error as string | undefined),
+    );
+    expect(jsonByteLength(updated.metadata)).toBeLessThanOrEqual(256 * 1024);
+
+    const event = (await store.events({ type: "team.task_updated", limit: 10 })).at(-1) as
+      | Extract<ChiliEvent, { type: "team.task_updated" }>
+      | undefined;
+    expect(event).toBeDefined();
+    expect(event!.payload.summary?.startsWith(summaryPrefix)).toBe(true);
+    expectTeamSafeDiagnostic(event!.payload.error);
+    expect(jsonByteLength(event!.payload)).toBeLessThanOrEqual(512_000);
+    expect(jsonByteLength(event)).toBeLessThanOrEqual(576_000);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -1257,4 +1347,28 @@ async function seedMemberTask(store: SqliteEventStore, input: {
 function createSequentialId(): (prefix: string) => string {
   let next = 0;
   return (prefix: string) => `${prefix}_${++next}`;
+}
+
+const TEAM_HOSTILE_SECRET = "sk-team-persistence-secret-123456789";
+
+function hostileTeamDiagnostic(label: string, includeWorstEscaped: boolean): string {
+  return `${label}\nAuthorization: Bearer ${TEAM_HOSTILE_SECRET}\n`
+    + `http://127.0.0.1:4888/private?token=${TEAM_HOSTILE_SECRET}\n`
+    + (includeWorstEscaped ? teamWorstEscapedText() : "diagnostic detail");
+}
+
+function teamWorstEscapedText(): string {
+  return "\u0000\"\\\n".repeat(Math.ceil((5 * 1024 * 1024) / 4));
+}
+
+function expectTeamSafeDiagnostic(value: string | undefined): void {
+  expect(value).toBeDefined();
+  expect(value).toContain("[REDACTED]");
+  expect(value).not.toContain(TEAM_HOSTILE_SECRET);
+  expect(value).not.toContain("127.0.0.1");
+  expect(new TextEncoder().encode(value ?? "").byteLength).toBeLessThanOrEqual(16 * 1024);
+}
+
+function jsonByteLength(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }

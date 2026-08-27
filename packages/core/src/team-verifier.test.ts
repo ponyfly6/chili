@@ -437,6 +437,31 @@ test("verifier sweep runs completed tasks with bounded parallelism", async () =>
   }
 });
 
+test("normalizes hostile verifier sweep failures before returning them", async () => {
+  const context = await createDirectVerifierContext("chili-team-verifier-hostile-error-");
+  const originalUpdateTask = context.teams.updateTask.bind(context.teams);
+  let injected = false;
+
+  try {
+    context.teams.updateTask = async (input) => {
+      if (!injected && input.taskId === context.taskId) {
+        injected = true;
+        throw hostileSuccessfulOutputError("verifier update failed");
+      }
+      return originalUpdateTask(input);
+    };
+    const verifier = context.createVerifier();
+
+    const result = await verifier.verifyCompletedTasks({ teamId: context.teamId });
+
+    expect(result.errors).toHaveLength(1);
+    expectBoundedSanitizedDiagnostic(result.errors[0]?.error);
+    expect(utf8Bytes(JSON.stringify(result))).toBeLessThan(64 * 1024);
+  } finally {
+    await context.close();
+  }
+});
+
 test("verifier sweep skips a task already claimed by another verifier", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-verifier-claim-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -1040,6 +1065,31 @@ function testSessionResolver(cwd: string) {
 function createSequentialId(): (prefix: string) => string {
   let next = 0;
   return (prefix: string) => `${prefix}_${++next}`;
+}
+
+const HOSTILE_SUCCESS_OUTPUT_SECRET = "sk-team-success-output-secret-123456789";
+
+function hostileSuccessfulOutputError(label: string): Error {
+  return new Error([
+    `${label}: password=${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    `Authorization: Bearer ${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    `http://127.0.0.1:4567/callback?token=${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    "\u0000".repeat(5 * 1024 * 1024),
+  ].join("\n"));
+}
+
+function expectBoundedSanitizedDiagnostic(value: string | undefined): void {
+  expect(value).toBeDefined();
+  if (value === undefined) return;
+  expect(value).toContain("[REDACTED]");
+  expect(value).not.toContain(HOSTILE_SUCCESS_OUTPUT_SECRET);
+  expect(value).not.toContain("127.0.0.1");
+  expect(value).not.toContain("\u0000");
+  expect(utf8Bytes(value)).toBeLessThanOrEqual(16 * 1024);
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }
 
 function delay(ms: number): Promise<void> {

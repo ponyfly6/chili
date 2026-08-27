@@ -103,6 +103,42 @@ export class FakeModelRouter implements ModelRouter {
       return;
     }
 
+    if (text.includes("desktop input fixture")) {
+      yield {
+        type: "tool_call",
+        name: "request_user_input",
+        input: {
+          questions: [
+            {
+              id: "desktop_fixture",
+              header: "Desktop QA",
+              question: "Choose a response for the desktop input fixture.",
+              options: [
+                { label: "Continue", description: "Resolve the fixture with the primary choice." },
+                { label: "Alternate", description: "Resolve the fixture with the alternate choice." },
+              ],
+            },
+          ],
+        },
+      };
+      yield { type: "finish", reason: "tool_use" };
+      return;
+    }
+
+    if (text.includes("desktop approval fixture")) {
+      yield {
+        type: "tool_call",
+        name: "bash",
+        input: {
+          command: "/usr/bin/true",
+          sandbox_permissions: "require_escalated",
+          justification: "Allow the harmless desktop approval fixture to run once.",
+        },
+      };
+      yield { type: "finish", reason: "tool_use" };
+      return;
+    }
+
     if (text.includes("list tasks through tool")) {
       yield { type: "tool_call", name: "task_list", input: { all: true, limit: 20 } };
       yield { type: "finish", reason: "tool_use" };

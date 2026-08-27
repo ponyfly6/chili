@@ -6,9 +6,10 @@ import type {
   SnapshotId,
   TimestampMs,
 } from "@chili/protocol";
+import { PERSISTED_ERROR_LIMITS } from "@chili/protocol";
 import type { EventQuery, EventStore, SessionRow } from "@chili/store";
 import type { SnapshotProvider, SnapshotRevertOptions } from "@chili/tools";
-import { SnapshotRecoveryService } from "./recovery.js";
+import { SNAPSHOT_REVERT_EVENT_LIMITS, SnapshotRecoveryService } from "./recovery.js";
 
 const sessionId = "session_recovery" as SessionId;
 const otherSessionId = "session_recovery_other" as SessionId;
@@ -121,10 +122,134 @@ test("finds snapshot ownership beyond the first bounded event page", async () =>
   });
 });
 
+test("preserves an ordinary provider failure message while recording a failed revert", async () => {
+  const fixture = recoveryFixture({
+    sessions: [sessionRow(sessionId, "/workspace")],
+    events: [snapshotCreatedEvent(sessionId, snapshotId, "event_snapshot_created")],
+    revert: async () => { throw new Error("tracked file could not be restored"); },
+  });
+
+  await expect(fixture.service.revert({ sessionId, snapshotId }))
+    .rejects.toThrow("tracked file could not be restored");
+  expect(fixture.appended).toEqual([expect.objectContaining({
+    type: "snapshot.reverted",
+    sessionId,
+    payload: {
+      snapshotId,
+      status: "failed",
+      paths: [],
+      error: "tracked file could not be restored",
+    },
+  })]);
+});
+
+test("bounds hostile snapshot paths by item count, item bytes, and aggregate event bytes", async () => {
+  const worstEscapedPath = `src/${"\u0000\u001f\"\\😀".repeat(700_000)}`;
+  expect(Buffer.byteLength(worstEscapedPath, "utf8")).toBeGreaterThan(5 * 1024 * 1024);
+  const rawPaths = [
+    worstEscapedPath,
+    "src/control\u0000newline\nfile.ts",
+    ...Array.from({ length: 1_000 }, (_, index) => `src/generated/${index}.ts`),
+  ];
+  const fixture = recoveryFixture({
+    sessions: [sessionRow(sessionId, "/workspace")],
+    events: [snapshotCreatedEvent(sessionId, snapshotId, "event_snapshot_created")],
+    revert: async (requestedSnapshotId) => ({
+      snapshotId: requestedSnapshotId,
+      paths: rawPaths,
+      restored: [],
+      removed: [],
+    }),
+  });
+
+  const result = await fixture.service.revert({ sessionId, snapshotId });
+  expect(result.paths).toBe(rawPaths);
+
+  const event = fixture.appended.find((candidate): candidate is Extract<ChiliEvent, { type: "snapshot.reverted" }> => (
+    candidate.type === "snapshot.reverted"
+  ));
+  expect(event?.payload.status).toBe("completed");
+  const paths = event?.payload.paths ?? [];
+  expect(paths.length).toBeGreaterThan(0);
+  expect(paths.length).toBeLessThanOrEqual(SNAPSHOT_REVERT_EVENT_LIMITS.paths);
+  expect(paths.some((path) => /[\u0000-\u001f\u007f]/u.test(path))).toBe(false);
+  for (const path of paths) {
+    expect(Buffer.byteLength(JSON.stringify(path), "utf8"))
+      .toBeLessThanOrEqual(SNAPSHOT_REVERT_EVENT_LIMITS.pathJsonBytes);
+  }
+  expect(Buffer.byteLength(JSON.stringify(paths), "utf8"))
+    .toBeLessThanOrEqual(SNAPSHOT_REVERT_EVENT_LIMITS.pathsJsonBytes);
+  expect(Buffer.byteLength(JSON.stringify(event), "utf8"))
+    .toBeLessThanOrEqual(SNAPSHOT_REVERT_EVENT_LIMITS.pathsJsonBytes + 2_048);
+});
+
+test("redacts and byte-bounds hostile snapshot provider errors before persistence and rejection", async () => {
+  const bearer = "snapshot-bearer-secret-123456";
+  const clientSecret = "snapshot-client-secret-123456";
+  const password = "snapshot-password-secret-123456";
+  const loopbackUrl = `http://127.0.0.1:43123/revert?token=${bearer}`;
+  const rawMessage = [
+    `Authorization: Bearer ${bearer}`,
+    `client_secret=${clientSecret}`,
+    `password=${password}`,
+    `endpoint ${loopbackUrl}`,
+    "\u0000\u001f\"\\😀".repeat(700_000),
+  ].join("\n");
+  expect(Buffer.byteLength(rawMessage, "utf8")).toBeGreaterThan(5 * 1024 * 1024);
+  const sourceError = Object.assign(new Error(rawMessage), {
+    name: "SnapshotProviderError",
+    code: "E_SNAPSHOT_REVERT",
+  });
+  const fixture = recoveryFixture({
+    sessions: [sessionRow(sessionId, "/workspace")],
+    events: [snapshotCreatedEvent(sessionId, snapshotId, "event_snapshot_created")],
+    revert: async () => { throw sourceError; },
+  });
+
+  let rejection: unknown;
+  try {
+    await fixture.service.revert({ sessionId, snapshotId });
+  } catch (error) {
+    rejection = error;
+  }
+
+  expect(rejection).toBeInstanceOf(Error);
+  expect(rejection).not.toBe(sourceError);
+  const persistedError = rejection as Error & {
+    code?: string;
+    persistedErrorDetails?: { originalMessageBytes?: number; truncated?: true };
+  };
+  const event = fixture.appended.find((candidate): candidate is Extract<ChiliEvent, { type: "snapshot.reverted" }> => (
+    candidate.type === "snapshot.reverted"
+  ));
+  expect(event?.payload.status).toBe("failed");
+  expect(event?.payload.paths).toEqual([]);
+  const message = event?.payload.error ?? "";
+  expect(persistedError.message).toBe(message);
+  expect(persistedError.name).toBe("SnapshotProviderError");
+  expect(persistedError.code).toBe("E_SNAPSHOT_REVERT");
+  expect(persistedError.persistedErrorDetails).toMatchObject({
+    truncated: true,
+    originalMessageBytes: Buffer.byteLength(rawMessage, "utf8"),
+  });
+  expect(message).toContain("Authorization: [REDACTED]");
+  expect(message).toContain("client_secret=[REDACTED]");
+  expect(message).toContain("password=[REDACTED]");
+  expect(message).toContain("[loopback URL redacted]");
+  for (const secret of [bearer, clientSecret, password, loopbackUrl]) {
+    expect(message).not.toContain(secret);
+    expect(JSON.stringify(event)).not.toContain(secret);
+  }
+  expect(Buffer.byteLength(message, "utf8")).toBeLessThanOrEqual(PERSISTED_ERROR_LIMITS.messageBytes);
+  expect(Buffer.byteLength(JSON.stringify(event), "utf8"))
+    .toBeLessThanOrEqual((PERSISTED_ERROR_LIMITS.messageBytes * 6) + 2_048);
+});
+
 function recoveryFixture(input: {
   sessions: SessionRow[];
   sessionReads?: SessionRow[][];
   events: ChiliEvent[];
+  revert?: SnapshotProvider["revert"];
 }): {
   service: SnapshotRecoveryService;
   appended: ChiliEvent[];
@@ -179,6 +304,7 @@ function recoveryFixture(input: {
         snapshotId: requestedSnapshotId,
         ...(options ? { options } : {}),
       });
+      if (input.revert) return input.revert(requestedSnapshotId, options);
       return {
         snapshotId: requestedSnapshotId,
         paths: ["src/file.ts"],
