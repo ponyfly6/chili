@@ -1112,21 +1112,19 @@ export function useChatRuntime(input: UseChatRuntimeInput): ChatRuntimeState {
   }, [abortPendingRequests, activeSessionId, chatView.cwd, chatView.sessionId, client, invalidateSelectedSession, options.baseUrl, refreshDelegationConfigForSession, running, selectActiveSession, teamRuntime.hydrateEvents, withAbort]);
 
   const renameSession = useCallback(async (title: string): Promise<RuntimeSessionSummary | undefined> => {
-    const sessionId = activeSessionId ?? chatView.sessionId;
-    if (!sessionId) {
-      setChatFeedback({ status: "error", message: "Start a session before renaming it." });
-      return undefined;
-    }
     setChatFeedback({ status: "pending", message: "renaming saved chat" });
     try {
-      const renamed = await withAbort((signal) => client.renameSession({ sessionId, title, signal }));
+      const renamed = await withAbort(async (signal) => {
+        const session = await ensureSession(signal);
+        return client.renameSession({ ...session, title, signal });
+      });
       setChatFeedback({ status: "success", message: `renamed to ${renamed.title ?? title}` });
       return renamed;
     } catch (error) {
       if (!isAbortError(error)) setChatFeedback({ status: "error", message: runtimeErrorMessage(error, options.baseUrl) });
       return undefined;
     }
-  }, [activeSessionId, chatView.sessionId, client, options.baseUrl, withAbort]);
+  }, [client, ensureSession, options.baseUrl, withAbort]);
 
   const approveApproval = useCallback(async (approvalId: ApprovalId, approveOptions: ChatApproveOptions = {}) => {
     await resolveApproval("approve", approvalId, client, withAbort, setChatFeedback, approveOptions);

@@ -16,7 +16,7 @@ const context = {
   mcpServers: [],
 } as unknown as TuiCommandContext;
 
-test("TUI bindings execute only canonical auth and session paths", async () => {
+test("TUI bindings execute auth and session paths", async () => {
   const registry = createTuiCommandRegistry();
 
   expect(resolveCommand(registry, context, "/login").status).toBe("unknown");
@@ -38,6 +38,21 @@ test("TUI bindings execute only canonical auth and session paths", async () => {
     type: "confirm",
     title: "Start a new session?",
     result: { type: "new_session" },
+  });
+
+  const rename = resolveCommand(registry, context, "/rename");
+  expect(rename.status).toBe("matched");
+  if (rename.status !== "matched" || !rename.command.run) return;
+  expect(await rename.command.run(context, rename.args)).toEqual({
+    type: "open_rename_prompt",
+  });
+
+  const renameWithTitle = resolveCommand(registry, context, "/rename  Release   planning ");
+  expect(renameWithTitle.status).toBe("matched");
+  if (renameWithTitle.status !== "matched" || !renameWithTitle.command.run) return;
+  expect(await renameWithTitle.command.run(context, renameWithTitle.args)).toEqual({
+    type: "rename_session",
+    title: "Release planning",
   });
 });
 

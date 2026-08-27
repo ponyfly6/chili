@@ -3417,28 +3417,18 @@ test("/session resume opens a searchable project-scoped picker and switches sess
   }
 });
 
-test("/session rename edits and saves the current chat title", async () => {
+test("/rename edits and saves the current chat title", async () => {
   const renamed: string[] = [];
   const sessionId = "session_rename" as SessionId;
   const app = await mountShell(teamLiveFixture(), {
     runtime: {
-      activeSessionId: sessionId,
       chatView: {
-        sessionId,
         status: "idle",
         items: [],
         pendingApprovals: [],
         activeTools: [],
         generatedAt: "1970-01-01T00:00:00.000Z",
       },
-      listSessions: async () => [{
-        id: sessionId,
-        cwd: "/repo/chili",
-        title: "Old",
-        status: "active",
-        createdAt: 1,
-        updatedAt: 1,
-      }],
       renameSession: async (title) => {
         renamed.push(title);
         return { id: sessionId, cwd: "/repo/chili", title, status: "active", createdAt: 1, updatedAt: 2 };
@@ -3447,14 +3437,13 @@ test("/session rename edits and saves the current chat title", async () => {
   });
 
   try {
-    await typeText(app, "/session rename");
+    await typeText(app, "/rename");
     await press(app, () => app.mockInput.pressEnter());
     await Bun.sleep(40);
     await app.renderOnce();
     expect(app.captureCharFrame()).toContain("Rename chat");
-    expect(app.captureCharFrame()).toContain("> Old");
+    expect(app.captureCharFrame()).toContain("> Type a name");
 
-    await backspace(app, 3);
     await typeText(app, "Investigation");
     await press(app, () => app.mockInput.pressEnter());
     expect(renamed).toEqual(["Investigation"]);

@@ -706,27 +706,14 @@ export function ChatShellSurface(props: {
     await resumeChatSession(match);
   }, [appendLocalItem, currentSessionUiEpoch, enterSessionLayout, isSessionUiEpochCurrent, props.runtime, resumeChatSession]);
   const openRenamePrompt = useCallback(() => {
-    const sessionId = props.runtime.activeSessionId ?? props.runtime.chatView.sessionId;
-    if (!sessionId) {
-      appendLocalItem("error", "Start a chat before renaming it.");
-      return;
-    }
     closeCommandMenu();
     setModelPicker(undefined);
     setReasoningPicker(undefined);
     setPermissionsPicker(undefined);
     setThemePicker(undefined);
     setResumePicker(undefined);
-    setRenamePrompt({ value: "", loading: true, submitting: false });
-    void props.runtime.listSessions()
-      .then((sessions) => {
-        const title = sessions.find((session) => session.id === sessionId)?.title ?? "";
-        setRenamePrompt((current) => current ? { ...current, value: title, loading: false } : current);
-      })
-      .catch(() => {
-        setRenamePrompt((current) => current ? { ...current, loading: false } : current);
-      });
-  }, [appendLocalItem, closeCommandMenu, props.runtime]);
+    setRenamePrompt({ value: "", submitting: false });
+  }, [closeCommandMenu]);
   const renameChatSession = useCallback(async (title: string) => {
     const normalized = title.trim().replace(/\s+/g, " ");
     if (!normalized) {
@@ -1513,7 +1500,7 @@ export function ChatShellSurface(props: {
         setRenamePrompt(undefined);
         return;
       }
-      if (renamePrompt.loading || renamePrompt.submitting) return;
+      if (renamePrompt.submitting) return;
       if (isEnter(key)) {
         void renameChatSession(renamePrompt.value);
         return;
@@ -2421,7 +2408,6 @@ interface ResumePickerModel {
 
 interface RenamePromptNavigation {
   value: string;
-  loading: boolean;
   submitting: boolean;
 }
 
@@ -2637,11 +2623,9 @@ function ResumePicker(props: { model: ResumePickerModel; theme: TuiTheme }) {
 }
 
 function RenamePrompt(props: { model: RenamePromptNavigation; theme: TuiTheme }) {
-  const status = props.model.loading
-    ? "Loading current name..."
-    : props.model.submitting
-      ? "Saving..."
-      : props.model.value || "Type a name";
+  const status = props.model.submitting
+    ? "Saving..."
+    : props.model.value || "Type a name";
   return (
     <box width="100%" flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.focus} paddingX={1}>
       <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{"Rename chat"}</text>

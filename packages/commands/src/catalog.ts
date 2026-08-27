@@ -17,6 +17,7 @@ export const BUILTIN_COMMAND_IDS = [
   "thinking",
   "thinking.effort",
   "thinking.traces",
+  "rename",
   "session",
   "session.new",
   "session.list",
@@ -133,6 +134,10 @@ const BUILTIN_COMMAND_SPECS: readonly BuiltinCommandSpec[] = [
       selectionMode: "complete",
     }),
   ]),
+  leaf("rename", "rename", "Rename session", "Rename the current session", "session", {
+    argumentMode: "optional",
+    argumentHint: "[title]",
+  }),
   parent("session", "session", "Session", "Manage chat sessions", "session", [
     leaf("session.new", "new", "New session", "Start a fresh chat session", "session", { concurrency: "deny" }),
     leaf("session.list", "list", "List sessions", "List saved sessions", "session"),

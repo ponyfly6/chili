@@ -541,6 +541,57 @@ test("all late MCP operations return undefined and cannot refresh the next sessi
   }
 });
 
+test("renaming an empty chat creates its session before saving the title", async () => {
+  const createdSessionId = "session_created_for_rename" as SessionId;
+  const calls: string[] = [];
+  const client = chatRuntimeClient([], {
+    createSession: async (request: { cwd?: string }) => {
+      calls.push(`create:${request.cwd ?? ""}`);
+      return { sessionId: createdSessionId };
+    },
+    renameSession: async (request: { sessionId: SessionId; title: string }) => {
+      calls.push(`rename:${request.sessionId}:${request.title}`);
+      return {
+        ...sessionSummary(request.sessionId),
+        title: request.title,
+      };
+    },
+  });
+  const options: TeamLiveTuiOptions = {
+    baseUrl: "http://chili.test",
+    cwd: "/workspace",
+    runLoop: false,
+    once: false,
+  };
+  let runtime: ChatRuntimeState | undefined;
+  let app!: Awaited<ReturnType<typeof testRender>>;
+  await act(async () => {
+    app = await testRender(createElement(ChatRuntimeProbe, {
+      client,
+      options,
+      onRuntime: (value: ChatRuntimeState) => { runtime = value; },
+    }), { width: 100, height: 4, exitOnCtrlC: false });
+  });
+
+  try {
+    await waitForRuntime(app, () => runtime !== undefined && runtime.activeSessionId === undefined);
+    let renamed: RuntimeSessionSummary | undefined;
+    await act(async () => {
+      renamed = await runtime!.renameSession("Empty chat title");
+      await app.renderOnce();
+    });
+
+    expect(calls).toEqual([
+      "create:/workspace",
+      `rename:${createdSessionId}:Empty chat title`,
+    ]);
+    expect(renamed?.title).toBe("Empty chat title");
+    expect(runtime?.activeSessionId).toBe(createdSessionId);
+  } finally {
+    act(() => app.renderer.destroy());
+  }
+});
+
 test("a failed command-catalog load for the resumed session cannot retain a late catalog from the previous session", async () => {
   const sessionA = "session_command_catalog_a" as SessionId;
   const sessionB = "session_command_catalog_b" as SessionId;

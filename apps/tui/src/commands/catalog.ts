@@ -29,6 +29,11 @@ export function createTuiCommandRegistry(runtimeCatalog?: RuntimeCommandCatalog)
     status: { run: () => ({ type: "open_view", view: "status" }) },
     theme: { run: () => ({ type: "open_theme_picker" }) },
     permissions: { run: () => ({ type: "open_permissions_picker" }) },
+    rename: {
+      run: (_context, input) => input.raw.trim()
+        ? { type: "rename_session", title: input.raw.trim().replace(/\s+/g, " ") }
+        : { type: "open_rename_prompt" },
+    },
     model: { run: () => ({ type: "open_model_picker" }) },
     "model.select": { complete: modelCompletions, run: modelResult },
     "model.service": {
