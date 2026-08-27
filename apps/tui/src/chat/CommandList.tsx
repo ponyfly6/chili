@@ -11,9 +11,10 @@ export function CommandList(props: {
   emptyText?: string | undefined;
 }) {
   const maxItems = Math.max(1, props.maxItems ?? DEFAULT_COMMAND_LIST_MAX_ITEMS);
-  const visible = visibleItems(props.items, props.selectedIndex, maxItems);
+  const height = commandListHeight(props.items, maxItems);
+  const visible = visibleItemsWithinHeight(props.items, props.selectedIndex, maxItems, height);
   return (
-    <box width="100%" flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.default} paddingX={1}>
+    <box width="100%" height={height} flexDirection="column" border borderStyle="single" borderColor={props.theme.colors.border.default} paddingX={1}>
       <text fg={props.theme.colors.text.primary} wrapMode="none" truncate>{props.title}</text>
       {props.items.length === 0 ? (
         <text fg={props.theme.colors.menu.muted} wrapMode="none" truncate>{`  ${props.emptyText ?? "no commands"}`}</text>
@@ -34,6 +35,7 @@ export function CommandList(props: {
           </box>
         ))
       )}
+      <box flexGrow={1} />
       <text fg={props.theme.colors.menu.muted} wrapMode="none" truncate>{" ↑↓ move · Tab/→ expand · Enter run · Esc close"}</text>
     </box>
   );
@@ -44,12 +46,36 @@ export const DEFAULT_COMMAND_LIST_MAX_ITEMS = 5;
 export function commandListHeight(
   items: readonly TuiCommandSuggestion[],
   maxItems = DEFAULT_COMMAND_LIST_MAX_ITEMS,
-  selectedIndex = 0,
 ): number {
-  const visible = visibleItems(items, selectedIndex, Math.max(1, maxItems)).map(({ item }) => item);
+  // The first window establishes the viewport height. Selection changes must
+  // scroll within that viewport instead of moving the composer and footer.
+  const visible = visibleItems(items, 0, Math.max(1, maxItems)).map(({ item }) => item);
   const itemRows = Math.max(visible.length, 1);
-  const groupRows = new Set(visible.map((item) => item.group)).size;
+  const groupRows = visibleGroupRows(visible);
   return itemRows + groupRows + 4;
+}
+
+function visibleItemsWithinHeight(
+  items: readonly TuiCommandSuggestion[],
+  selectedIndex: number,
+  maxItems: number,
+  height: number,
+): Array<{ item: TuiCommandSuggestion; index: number }> {
+  const contentRows = Math.max(1, height - 4);
+  // Group labels consume rows too. Windows that cross more groups therefore
+  // show fewer commands while keeping both the selection and frame stable.
+  for (let itemLimit = Math.min(maxItems, Math.max(items.length, 1)); itemLimit >= 1; itemLimit -= 1) {
+    const visible = visibleItems(items, selectedIndex, itemLimit);
+    const rows = Math.max(visible.length, 1) + visibleGroupRows(visible.map(({ item }) => item));
+    if (rows <= contentRows) return visible;
+  }
+  return visibleItems(items, selectedIndex, 1);
+}
+
+function visibleGroupRows(items: readonly TuiCommandSuggestion[]): number {
+  return items.reduce((rows, item, index) => (
+    index === 0 || items[index - 1]?.group !== item.group ? rows + 1 : rows
+  ), 0);
 }
 
 function visibleItems<T>(items: readonly T[], selectedIndex: number, maxItems: number): Array<{ item: T; index: number }> {

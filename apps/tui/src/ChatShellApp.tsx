@@ -59,6 +59,7 @@ import { BrandMark } from "./chat/BrandMark.js";
 import { charDisplayWidth } from "./chat/markdown.js";
 import { zedPathWithPosition, type FileLinkTarget } from "./chat/file-links.js";
 import { MessageList } from "./chat/MessageList.js";
+import { commandListHeight } from "./chat/CommandList.js";
 import { inlineAgentBatchesForSession } from "./chat/inline-agent-batches.js";
 import type { InlineAgentBatchDisplay } from "./chat/AgentBatchCells.js";
 import { TranscriptLine } from "./chat/lines.js";
@@ -2059,6 +2060,7 @@ function HomeScreen(props: {
     selectorHeight,
     feedback: Boolean(feedback),
     menuOpen: props.paletteOpen || props.completionOpen || props.completions.length > 0,
+    menuItems: props.paletteOpen ? props.paletteItems : props.completions,
   });
   return (
     <box width="100%" height="100%" flexDirection="column">
@@ -2189,6 +2191,7 @@ function SessionScreen(props: {
     selectorHeight,
     feedback: Boolean(feedback),
     menuOpen: props.paletteOpen || props.completionOpen || props.completions.length > 0,
+    menuItems: props.paletteOpen ? props.paletteItems : props.completions,
   });
   const promptHeight = promptComposerHeight({
     completions: props.completions,
@@ -2447,6 +2450,7 @@ function promptMenuItemLimit(input: {
   selectorHeight: number;
   feedback: boolean;
   menuOpen: boolean;
+  menuItems: readonly TuiCommandSuggestion[];
 }): number {
   if (!input.menuOpen) return PROMPT_MENU_MAX_ITEMS;
   const reserved = input.footerHeight
@@ -2456,7 +2460,11 @@ function promptMenuItemLimit(input: {
     + PROMPT_INPUT_HEIGHT
     + (input.feedback ? 1 : 0)
     + 1;
-  return Math.max(1, Math.min(PROMPT_MENU_MAX_ITEMS, input.height - reserved - 3));
+  const availableHeight = input.height - reserved;
+  for (let maxItems = PROMPT_MENU_MAX_ITEMS; maxItems >= 1; maxItems -= 1) {
+    if (commandListHeight(input.menuItems, maxItems) <= availableHeight) return maxItems;
+  }
+  return 1;
 }
 
 function ThemePicker(props: { model: ThemePickerModel; theme: TuiTheme }) {

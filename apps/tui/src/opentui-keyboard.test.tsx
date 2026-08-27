@@ -8,6 +8,7 @@ import { createRuntimeView, type ChatTranscriptItem, type HttpRuntimeClient, typ
 import type { ApprovalId, ChiliEvent, MessageId, PartId, RuntimeCommandCatalog, RuntimeModelDescriptor, SessionId, TaskId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import type { ClipboardAccess } from "./clipboard.js";
 import { CONVERSATION_INTERRUPTED_NOTICE, CTRL_C_EXIT_CONFIRM_MS, ChatShellApp, ChatShellSurface, isWithinCtrlCExitWindow, type ChatShellExitInfo } from "./ChatShellApp.js";
+import { PROMPT_PLACEHOLDER } from "./chat/PromptComposer.js";
 import { TeamLiveSurface } from "./TeamLiveApp.js";
 import type { ChatApproveOptions, ChatRuntimeState } from "./useChatRuntime.js";
 import type { ModelCandidate, ModelSelection, ReasoningLevel } from "./model-state.js";
@@ -1883,6 +1884,68 @@ test("command palette selection uses Up and Down without switching prompt histor
     await press(app, () => app.mockInput.pressArrow("down"));
     expect(app.captureCharFrame()).toContain("> /status — Show session and team status");
     expect(app.captureCharFrame()).not.toContain("palette history");
+  } finally {
+    app.renderer.destroy();
+  }
+});
+
+test("command palette keeps a fixed frame while selection crosses every command group", async () => {
+  const app = await mountShell(teamLiveFixture(), {
+    height: 18,
+    runtime: {
+      submitPrompt: async () => true,
+      chatView: {
+        status: "idle",
+        items: [{
+          id: "msg_palette_fixed_frame" as MessageId,
+          kind: "message",
+          role: "assistant",
+          createdAt: 1,
+          parts: [{ type: "text", id: "part_palette_fixed_frame" as PartId, text: "Existing conversation" }],
+        }],
+        pendingApprovals: [],
+        activeTools: [],
+        generatedAt: "1970-01-01T00:00:00.000Z",
+      },
+    },
+  });
+
+  try {
+    await press(app, () => app.mockInput.pressKey("p", { ctrl: true }));
+    const initialFrame = app.captureCharFrame();
+    const initialPaletteRow = frameRowContaining(initialFrame, "Command Palette");
+    const initialPromptRow = frameRowContaining(initialFrame, PROMPT_PLACEHOLDER);
+
+    expect(initialPaletteRow).toBeGreaterThanOrEqual(0);
+    expect(initialPromptRow).toBeGreaterThanOrEqual(0);
+    expect(initialFrame).toContain("> /help — Browse commands and keyboard shortcuts");
+
+    let wrappedToFirstCommand = false;
+    const visitedCommands = new Set<string>();
+    for (let index = 0; index < 64; index += 1) {
+      await press(app, () => app.mockInput.pressArrow("down"));
+      const frame = app.captureCharFrame();
+      expect(frameRowContaining(frame, "Command Palette")).toBe(initialPaletteRow);
+      expect(frameRowContaining(frame, PROMPT_PLACEHOLDER)).toBe(initialPromptRow);
+      const selectedCommand = /(?:^|\n)[^\n]*> (\/\S+)/.exec(frame)?.[1];
+      expect(selectedCommand).toBeDefined();
+      if (selectedCommand) visitedCommands.add(selectedCommand);
+      if (frame.includes("> /help — Browse commands and keyboard shortcuts")) {
+        wrappedToFirstCommand = true;
+        break;
+      }
+    }
+
+    expect(wrappedToFirstCommand).toBe(true);
+    expect([...visitedCommands]).toEqual(expect.arrayContaining([
+      "/goal",
+      "/team",
+      "/auth",
+      "/skills",
+      "/mcp",
+      "/commands",
+      "/app",
+    ]));
   } finally {
     app.renderer.destroy();
   }
@@ -4939,6 +5002,10 @@ async function typeText(app: TestRenderHarness, text: string): Promise<void> {
   });
   await Bun.sleep(60);
   await app.renderOnce();
+}
+
+function frameRowContaining(frame: string, text: string): number {
+  return frame.split("\n").findIndex((line) => line.includes(text));
 }
 
 async function selectPaletteCommand(app: TestRenderHarness, command: string): Promise<void> {
