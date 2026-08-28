@@ -40,7 +40,15 @@ import {
 } from "./interaction-model.js";
 import { IndependentRefreshScheduler } from "./refresh-scheduler.js";
 import { buildUserInputAnswers } from "./user-input-model.js";
-import { appendRuntimeEvent, presentSession, runtimeEventRelated, visibleToolLiveOutput } from "./view-model.js";
+import {
+  appendRuntimeEvent,
+  desktopTimelineItems,
+  presentSession,
+  runtimeEventRelated,
+  visibleToolLiveOutput,
+  type DesktopTimelineItem,
+  type DesktopWorkItem,
+} from "./view-model.js";
 
 type DesktopProjection = CoordinatedProjection<DesktopState, RuntimeSessionSummary, RuntimeSnapshot>;
 const MAX_OUTER_RESYNC_RETRIES = 4;
@@ -64,6 +72,9 @@ export function App({ transport }: { transport: ControlTransport }) {
   const [diffScope, setDiffScope] = useState<DiffScope>("turn");
   const [diffText, setDiffText] = useState("Select a session to inspect changes.");
   const [diffLoading, setDiffLoading] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [inspectorTab, setInspectorTab] = useState<"activity" | "changes">("activity");
   const [resyncRetryAvailable, setResyncRetryAvailable] = useState(false);
   const selectedRef = useRef<string | undefined>(undefined);
   const projectionRef = useRef(projection);
@@ -80,6 +91,7 @@ export function App({ transport }: { transport: ControlTransport }) {
   const workspaceRef = useRef<string | undefined>(undefined);
   const sidecarPhaseRef = useRef<DesktopState["sidecar"]["phase"]>("idle");
   const timelineRef = useRef<HTMLDivElement | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const followedSessionRef = useRef<string | undefined>(undefined);
   const followTimelineRef = useRef(true);
 
@@ -158,6 +170,10 @@ export function App({ transport }: { transport: ControlTransport }) {
     () => snapshot && snapshot.sessionId === selectedId ? presentSession(snapshot) : undefined,
     [selectedId, snapshot],
   );
+  const timelineItems = useMemo(
+    () => presentation ? desktopTimelineItems(presentation.chat, presentation.runtime) : [],
+    [presentation],
+  );
   const sessionBusy = presentation?.chat.status === "running"
     || presentation?.chat.status === "waiting_for_approval"
     || presentation?.chat.status === "cancelling";
@@ -167,6 +183,13 @@ export function App({ transport }: { transport: ControlTransport }) {
   const composerEditable = canEditComposer({ selectedId, healthy, resyncing, loadingSession, working });
   const workspaceSwitchEnabled = canSwitchWorkspace({ working, loadingSession, resyncing, resyncRetryAvailable });
   const sidecarGuidance = sidecarRecoveryGuidance(desktop.sidecar);
+  const selectedSession = sessions.find((session) => session.id === selectedId);
+  const selectedTitle = selectedSession?.title || selectedSession?.preview || "Development session";
+  const projectLabel = workspaceLabel(desktop.workspace);
+
+  useEffect(() => {
+    if (!composer && composerRef.current) composerRef.current.style.height = "";
+  }, [composer]);
 
   useLayoutEffect(() => {
     const timeline = timelineRef.current;
@@ -537,6 +560,16 @@ export function App({ transport }: { transport: ControlTransport }) {
     await refreshSessions(created.sessionId);
   });
 
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent): void => {
+      if (!event.metaKey || event.altKey || event.ctrlKey || event.shiftKey || event.key.toLowerCase() !== "n") return;
+      event.preventDefault();
+      if (healthy && !actionsDisabled) void createSession();
+    };
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, [actionsDisabled, createSession, healthy]);
+
   const submit = async (mode: "queue" | "steer") => {
     const text = composer.trim();
     if (!selectedId || !text || !composerEditable || actionInFlightRef.current) return;
@@ -579,14 +612,44 @@ export function App({ transport }: { transport: ControlTransport }) {
   return (
     <div className="app-shell">
       <header className="titlebar">
-        <div className="brand">
-          <span className="brand-mark" aria-hidden="true">C</span>
-          <span>Chili Control</span>
+        <div className="titlebar-leading">
+          <button
+            className="chrome-button"
+            type="button"
+            aria-label={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
+            aria-pressed={sidebarOpen}
+            onClick={() => setSidebarOpen((current) => !current)}
+          >
+            <Icon name="sidebar" />
+          </button>
+          <div className="brand" aria-label="Chili">
+            <ChiliMark />
+            <span>Chili</span>
+          </div>
+          <span className="title-divider" aria-hidden="true" />
+          <div className="title-context">
+            <strong>{projectLabel}</strong>
+            <span>/</span>
+            <span>{selectedId ? selectedTitle : "New task"}</span>
+          </div>
         </div>
-        <div className={`runtime-pill phase-${desktop.sidecar.phase}`}>
-          <span className="status-dot" aria-hidden="true" />
-          {desktop.sidecar.phase}
-          {desktop.sidecar.attempt > 0 ? ` · retry ${desktop.sidecar.attempt}` : ""}
+        <div className="titlebar-actions">
+          <div className={`runtime-pill phase-${desktop.sidecar.phase}`} title="Local runtime status">
+            <span className="status-dot" aria-hidden="true" />
+            <span>Local</span>
+            <strong>{desktop.sidecar.phase}</strong>
+            {desktop.sidecar.attempt > 0 ? <em>retry {desktop.sidecar.attempt}</em> : null}
+          </div>
+          <button
+            className={`chrome-button workbench-toggle ${inspectorOpen ? "active" : ""}`}
+            type="button"
+            aria-label={inspectorOpen ? "Hide workbench" : "Show workbench"}
+            aria-pressed={inspectorOpen}
+            onClick={() => setInspectorOpen((current) => !current)}
+          >
+            <Icon name="activity" />
+            <span>Work</span>
+          </button>
         </div>
       </header>
 
@@ -618,54 +681,70 @@ export function App({ transport }: { transport: ControlTransport }) {
         ) : null}
       </div>
 
-      <main className="workspace-grid">
-        <aside className="sidebar panel">
-          <section className="workspace-picker">
-            <p className="eyebrow">Workspace</p>
-            <p className="workspace-path" title={desktop.workspace}>{desktop.workspace ?? "No project selected"}</p>
-            <button className="secondary full" disabled={!workspaceSwitchEnabled} onClick={() => void chooseWorkspace()}>
-              {desktop.workspace ? "Switch project…" : "Choose project…"}
+      <main className={`workspace-grid ${sidebarOpen ? "" : "sidebar-collapsed"} ${inspectorOpen ? "" : "inspector-collapsed"}`}>
+        <aside className="sidebar panel" aria-hidden={!sidebarOpen}>
+          <div className="sidebar-actions">
+            <button className="new-task-button" disabled={!healthy || actionsDisabled} onClick={() => void createSession()}>
+              <span><Icon name="plus" />New task</span>
+              <kbd>⌘ N</kbd>
             </button>
-          </section>
-
+          </div>
           <section className="session-section">
             <div className="section-heading">
-              <div><p className="eyebrow">Sessions</p><span>{sessions.length} active</span></div>
-              <button className="icon-button" title="New session" aria-label="New session" disabled={!healthy || actionsDisabled} onClick={() => void createSession()}>+</button>
+              <p className="eyebrow">Recent tasks</p>
+              <span>{sessions.length}</span>
             </div>
             <div className="session-list">
               {sessions.map((session) => (
                 <button
                   key={session.id}
                   className={`session-row ${selectedId === session.id ? "selected" : ""}`}
-                  disabled={!canOpenSession({ healthy, resyncing })}
+                  disabled={actionsDisabled || !canOpenSession({ healthy, resyncing })}
                   onClick={() => void openSession(session.id)}
                 >
-                  <span className="session-title">{session.title || session.preview || "Untitled session"}</span>
-                  <span className="session-meta">
-                    {shortId(session.id)}
-                    {(desktop.queuedBySession[session.id] ?? 0) > 0 ? ` · ${desktop.queuedBySession[session.id]} queued` : ""}
+                  <span className="session-glyph" aria-hidden="true"><Icon name="message" /></span>
+                  <span className="session-copy">
+                    <span className="session-title">{session.title || session.preview || "Untitled task"}</span>
+                    <span className="session-meta">
+                      {formatRelativeTime(session.updatedAt)}
+                      {(desktop.queuedBySession[session.id] ?? 0) > 0 ? ` · ${desktop.queuedBySession[session.id]} queued` : ""}
+                    </span>
                   </span>
+                  {selectedId === session.id ? <span className="session-active-mark" aria-hidden="true" /> : null}
                 </button>
               ))}
-              {healthy && sessions.length === 0 ? <p className="empty-copy">Create a session to start a local task.</p> : null}
-              {!healthy ? <p className="empty-copy">Choose a project and wait for the local runtime.</p> : null}
+              {healthy && sessions.length === 0 ? <p className="empty-copy sidebar-empty">Your recent work will live here.</p> : null}
+              {!healthy ? <p className="empty-copy sidebar-empty">Choose a project and let the local runtime warm up.</p> : null}
             </div>
           </section>
+          <footer className="workspace-picker">
+            <button className="workspace-card" disabled={!workspaceSwitchEnabled} onClick={() => void chooseWorkspace()}>
+              <span className="workspace-icon" aria-hidden="true"><Icon name="folder" /></span>
+              <span className="workspace-copy">
+                <strong>{projectLabel}</strong>
+                <span title={desktop.workspace}>{desktop.workspace ?? "Choose a local project"}</span>
+              </span>
+              <Icon name="chevron" />
+            </button>
+            <p><span className={`mini-status phase-${desktop.sidecar.phase}`} /> Runs on this Mac</p>
+          </footer>
         </aside>
 
         <section className="conversation panel">
           <div className="conversation-heading">
             <div>
-              <p className="eyebrow">Timeline</p>
-              <h1>{selectedId ? sessions.find((session) => session.id === selectedId)?.title || "Development session" : "Ready when you are"}</h1>
+              <h1>{selectedId ? selectedTitle : "A calmer place to ship code"}</h1>
+              <p>{selectedId ? `${projectLabel} · ${shortId(selectedId)}` : "Local-first · permission-aware · yours"}</p>
             </div>
-            {presentation ? <span className={`session-status status-${presentation.chat.status}`}>{presentation.chat.status.replaceAll("_", " ")}</span> : null}
+            {presentation ? (
+              <span className={`session-status status-${presentation.chat.status}`}>
+                <span aria-hidden="true" />{presentation.chat.status.replaceAll("_", " ")}
+              </span>
+            ) : null}
           </div>
 
           <div
             className="timeline"
-            aria-live="polite"
             ref={timelineRef}
             onScroll={(event) => {
               const timeline = event.currentTarget;
@@ -677,13 +756,32 @@ export function App({ transport }: { transport: ControlTransport }) {
             }}
           >
             {loadingSession ? <p className="empty-copy centered">Restoring timeline…</p> : null}
-            {!loadingSession && presentation?.chat.items.map((item) => <TimelineItem key={`${item.kind}:${item.id}`} item={item} />)}
-            {!loadingSession && selectedId && presentation?.chat.items.length === 0 ? <p className="empty-copy centered">Send a message to begin this session.</p> : null}
+            {!loadingSession && timelineItems.map((item) => <TimelineItem key={`${item.kind}:${item.id}`} item={item} />)}
+            {!loadingSession && selectedId && timelineItems.length === 0 ? (
+              <div className="task-empty-state">
+                <ChiliMark />
+                <h2>What should we build?</h2>
+                <p>Describe the outcome. Chili will inspect the repo, work through the task, and keep the evidence here.</p>
+              </div>
+            ) : null}
             {!selectedId ? (
               <div className="welcome-card">
-                <span className="welcome-mark">⌘</span>
-                <h2>Local runtime, desktop control.</h2>
-                <p>Choose a workspace, create a session, and steer Chili while it works. {RENDERER_CREDENTIAL_BOUNDARY_COPY}</p>
+                <div className="welcome-mark"><ChiliMark /></div>
+                <p className="eyebrow">Chili desktop</p>
+                <h2>Turn a repository into finished work.</h2>
+                <p>Start with the result you want. Chili reads the project, edits with visible permissions, and keeps agents, tasks, and changes in one place.</p>
+                <div className="welcome-actions">
+                  {healthy ? (
+                    <button className="primary" disabled={actionsDisabled} onClick={() => void createSession()}>
+                      <Icon name="plus" />Start a task
+                    </button>
+                  ) : (
+                    <button className="primary" disabled={!workspaceSwitchEnabled} onClick={() => void chooseWorkspace()}>
+                      <Icon name="folder" />Choose a project
+                    </button>
+                  )}
+                  <span>{RENDERER_CREDENTIAL_BOUNDARY_COPY}</span>
+                </div>
               </div>
             ) : null}
           </div>
@@ -712,105 +810,394 @@ export function App({ transport }: { transport: ControlTransport }) {
             </div>
           ) : null}
 
-          <div className="composer">
-            <textarea
-              value={composer}
-              onChange={(event) => setComposer(event.target.value)}
-              onKeyDown={(event) => {
-                if (composerEditable && (event.metaKey || event.ctrlKey) && event.key === "Enter") void submit("queue");
-              }}
-              placeholder={selectedId ? "Message Chili…  ⌘↵ to send" : "Create or select a session first"}
-              disabled={!composerEditable}
-              rows={3}
-            />
-            <div className="composer-actions">
-              <span>{desktop.queuedBySession[selectedId ?? ""] ?? 0} queued</span>
-              <div>
-                <button className="danger" disabled={!selectedId || !sessionBusy || runtimeActionsDisabled} onClick={() => void stop()}>Stop</button>
-                <button className="secondary" disabled={!composer.trim() || !selectedId || runtimeActionsDisabled} onClick={() => void submit("steer")}>Steer</button>
-                <button className="primary" disabled={!composer.trim() || !selectedId || runtimeActionsDisabled} onClick={() => void submit("queue")}>{sessionBusy ? "Queue" : "Send"}</button>
+          <div className="composer-wrap">
+            <div className="composer">
+              <textarea
+                ref={composerRef}
+                value={composer}
+                onChange={(event) => {
+                  setComposer(event.target.value);
+                  event.target.style.height = "auto";
+                  event.target.style.height = `${Math.min(event.target.scrollHeight, 190)}px`;
+                }}
+                onKeyDown={(event) => {
+                  if (composerEditable && (event.metaKey || event.ctrlKey) && event.key === "Enter") void submit("queue");
+                }}
+                placeholder={selectedId ? "Ask Chili to change, investigate, or ship something…" : "Create or select a task first"}
+                disabled={!composerEditable}
+                rows={2}
+              />
+              <div className="composer-actions">
+                <div className="composer-context">
+                  <span className={`composer-local phase-${desktop.sidecar.phase}`}><span />Local</span>
+                  {(desktop.queuedBySession[selectedId ?? ""] ?? 0) > 0 ? <span>{desktop.queuedBySession[selectedId ?? ""]} queued</span> : null}
+                  <span className="shortcut-hint">⌘ ↵ send</span>
+                </div>
+                <div className="composer-buttons">
+                  {sessionBusy ? (
+                    <button className="composer-stop" title="Stop current turn" aria-label="Stop current turn" disabled={!selectedId || runtimeActionsDisabled} onClick={() => void stop()}>
+                      <Icon name="stop" />
+                    </button>
+                  ) : null}
+                  {sessionBusy ? (
+                    <button className="steer-button" disabled={!composer.trim() || !selectedId || runtimeActionsDisabled} onClick={() => void submit("steer")}>
+                      <Icon name="steer" />Steer
+                    </button>
+                  ) : null}
+                  <button className="send-button" title={sessionBusy ? "Queue message" : "Send message"} aria-label={sessionBusy ? "Queue message" : "Send message"} disabled={!composer.trim() || !selectedId || runtimeActionsDisabled} onClick={() => void submit("queue")}>
+                    <Icon name={sessionBusy ? "queue" : "send"} />
+                  </button>
+                </div>
               </div>
             </div>
           </div>
         </section>
 
-        <aside className="inspector panel">
-          {snapshot?.truncated ? (
-            <p className="empty-copy">{snapshot.warning ?? "This large session snapshot was truncated for desktop safety."}</p>
-          ) : null}
-          <section className="inspector-section">
-            <div className="section-heading compact"><p className="eyebrow">Agents</p><span>{snapshot?.agentTree.agents.length ?? 0}</span></div>
-            <div className="agent-tree">
-              {snapshot?.agentTree.nodes.flatMap((node) => renderAgentNode(node))}
-              {snapshot && snapshot.agentTree.nodes.length === 0 ? <p className="empty-copy">No delegated agents.</p> : null}
-            </div>
-          </section>
+        <aside className="inspector panel" aria-hidden={!inspectorOpen}>
+          <div className="inspector-heading">
+            <div><p className="eyebrow">Workbench</p><strong>Live work</strong></div>
+            <button className="icon-button" type="button" aria-label="Close workbench" onClick={() => setInspectorOpen(false)}><Icon name="close" /></button>
+          </div>
+          <div className="inspector-tabs" role="tablist" aria-label="Workbench views">
+            <button role="tab" aria-selected={inspectorTab === "activity"} className={inspectorTab === "activity" ? "active" : ""} onClick={() => setInspectorTab("activity")}>
+              Activity <span>{(snapshot?.agentTree.agents.length ?? 0) + (snapshot?.tasks.length ?? 0)}</span>
+            </button>
+            <button role="tab" aria-selected={inspectorTab === "changes"} className={inspectorTab === "changes" ? "active" : ""} onClick={() => setInspectorTab("changes")}>
+              Changes
+            </button>
+          </div>
 
-          <section className="inspector-section task-section">
-            <div className="section-heading compact"><p className="eyebrow">Tasks</p><span>{snapshot?.tasks.length ?? 0}</span></div>
-            <div className="task-list">
-              {snapshot?.tasks.map((task) => (
-                <div className="task-row" key={task.id}>
-                  <span className={`task-state task-${task.status}`} />
-                  <div><strong>{task.taskName}</strong><span>{task.status}{task.summary ? ` · ${task.summary}` : ""}</span></div>
+          {inspectorTab === "activity" ? (
+            <div className="inspector-scroll">
+              {snapshot?.truncated ? <p className="inspector-warning">{snapshot.warning ?? "This large session was trimmed for desktop safety."}</p> : null}
+              <section className="root-agent-card">
+                <span className="root-agent-mark"><ChiliMark /></span>
+                <div><strong>Chili</strong><span>{presentation?.chat.status.replaceAll("_", " ") ?? (healthy ? "ready" : "offline")}</span></div>
+                <span className={`agent-signal ${sessionBusy ? "working" : ""}`} aria-hidden="true" />
+              </section>
+              <section className="inspector-section">
+                <div className="section-heading compact"><p className="eyebrow">Delegated agents</p><span>{snapshot?.agentTree.agents.length ?? 0}</span></div>
+                <div className="agent-tree">
+                  {snapshot?.agentTree.nodes.flatMap((node) => renderAgentNode(node))}
+                  {!snapshot || snapshot.agentTree.nodes.length === 0 ? <p className="empty-copy">No agents delegated yet.</p> : null}
                 </div>
-              ))}
-              {snapshot && snapshot.tasks.length === 0 ? <p className="empty-copy">No tasks recorded.</p> : null}
-            </div>
-          </section>
+              </section>
 
-          <section className="inspector-section diff-section">
-            <div className="section-heading compact">
-              <p className="eyebrow">Changes</p>
-              <div className="segmented">
-                <button className={diffScope === "turn" ? "active" : ""} onClick={() => setDiffScope("turn")}>Turn</button>
-                <button className={diffScope === "workspace" ? "active" : ""} onClick={() => setDiffScope("workspace")}>Workspace</button>
-              </div>
+              <section className="inspector-section task-section">
+                <div className="section-heading compact"><p className="eyebrow">Task plan</p><span>{snapshot?.tasks.length ?? 0}</span></div>
+                <div className="task-list">
+                  {snapshot?.tasks.map((task) => (
+                    <div className="task-row" key={task.id}>
+                      <span className={`task-state task-${task.status}`} />
+                      <div><strong>{task.taskName}</strong><span>{task.status}{task.summary ? ` · ${task.summary}` : ""}</span></div>
+                    </div>
+                  ))}
+                  {!snapshot || snapshot.tasks.length === 0 ? <p className="empty-copy">The plan will appear as Chili breaks down the work.</p> : null}
+                </div>
+              </section>
             </div>
-            <pre className="diff-view">{diffLoading ? "Loading changes…" : diffText}</pre>
-          </section>
+          ) : (
+            <section className="diff-section">
+              <div className="diff-toolbar">
+                <div>
+                  <strong>Repository changes</strong>
+                  <span>{selectedId ? "Review what this task changed" : "Select a task to inspect changes"}</span>
+                </div>
+                <div className="segmented">
+                  <button disabled={runtimeActionsDisabled || !selectedId} className={diffScope === "turn" ? "active" : ""} onClick={() => setDiffScope("turn")}>Turn</button>
+                  <button disabled={runtimeActionsDisabled || !selectedId} className={diffScope === "workspace" ? "active" : ""} onClick={() => setDiffScope("workspace")}>All</button>
+                </div>
+              </div>
+              <pre className="diff-view">{diffLoading ? "Loading changes…" : diffText}</pre>
+            </section>
+          )}
         </aside>
       </main>
     </div>
   );
 }
 
-function TimelineItem({ item }: { item: ChatTranscriptItem }) {
-  if (item.kind === "message") {
-    return (
-      <article className={`timeline-item message message-${item.role}`}>
-        <header><strong>{item.role === "assistant" ? "Chili" : item.role === "user" ? "You" : item.role}</strong><time>{formatTime(item.createdAt)}</time></header>
-        <div className="message-body">{item.parts.map((part) => <MessagePart key={part.id} part={part} />)}</div>
-      </article>
-    );
-  }
-  if (item.kind === "tool") {
-    const liveOutput = visibleToolLiveOutput(item.output, item.liveOutput);
-    return (
-      <article className="timeline-item tool-card">
-        <header><strong>{item.inputSummary.title || item.toolName}</strong><span className={`tool-status tool-${item.displayStatus}`}>{item.displayStatus.replaceAll("_", " ")}</span></header>
-        {item.inputSummary.detail ? <p>{item.inputSummary.detail}</p> : null}
-        {liveOutput ? <pre className="tool-live-output" aria-live="polite">{liveOutput}</pre> : null}
-        {item.output ? <pre>{item.output}</pre> : null}
-        {item.error ? <pre className="tool-error">{item.error}</pre> : null}
-      </article>
-    );
-  }
+function TimelineItem({ item }: { item: DesktopTimelineItem }) {
+  if (item.kind === "work") return <WorkSummary item={item} />;
   return (
-    <article className="timeline-item approval-history">
-      <header><strong>Approval · {item.permission}</strong><span>{item.status}</span></header>
-      <p>{item.patterns.join(", ") || "No pattern details"}</p>
+    <article className={`timeline-item message message-${item.role}`}>
+      <div className="message-content">
+        <div className="message-body">{item.parts.map((part) => <MessagePart key={part.id} part={part} />)}</div>
+      </div>
     </article>
   );
 }
 
-function MessagePart({ part }: { part: ChatMessagePart }) {
-  if (part.type === "text") return <p>{part.text}</p>;
-  if (part.type === "reasoning") return <details><summary>Reasoning</summary><p>{part.text}</p></details>;
-  if (part.type === "summary") return <p className="summary-part">{part.text}</p>;
+function WorkSummary({ item }: { item: DesktopWorkItem }) {
+  const [open, setOpen] = useState(item.active);
+  const wasActive = useRef(item.active);
+
+  useEffect(() => {
+    if (item.active) setOpen(true);
+    else if (wasActive.current) setOpen(false);
+    wasActive.current = item.active;
+  }, [item.active]);
+
+  const elapsed = Math.max(0, item.updatedAt - item.startedAt);
+  const label = item.active
+    ? "Working"
+    : elapsed >= 1_000
+      ? `Worked for ${formatWorkDuration(elapsed)}`
+      : "Worked";
+
+  return (
+    <details
+      className={`timeline-item work-summary ${item.active ? "active" : ""} ${item.failureCount > 0 ? "has-failure" : ""}`}
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary>
+        <span className="work-indicator" aria-hidden="true" />
+        <span aria-live={item.active ? "polite" : undefined}>{label}</span>
+        {item.failureCount > 0 ? <span className="work-failure">{item.failureCount} issue{item.failureCount === 1 ? "" : "s"}</span> : null}
+      </summary>
+      <div className="work-details">
+        {item.items.map((detail, index) => (
+          <WorkDetail key={`${detail.kind}:${detail.id}:${index}`} item={detail} />
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function WorkDetail({ item }: { item: ChatTranscriptItem }) {
+  if (item.kind === "message") {
+    return (
+      <div className="work-note">
+        {item.parts.map((part) => <MessagePart key={part.id} part={part} compact />)}
+      </div>
+    );
+  }
+
+  if (item.kind === "tool") {
+    const liveOutput = visibleToolLiveOutput(item.output, item.liveOutput);
+    const hasOutput = Boolean(liveOutput || item.output || item.error);
+    const showStatus = item.displayStatus !== "succeeded";
+    return (
+      <div className={`work-tool-row tool-${item.displayStatus}`}>
+        <span className="work-tool-dot" aria-hidden="true" />
+        <div className="work-tool-copy">
+          <strong>{humanizeToolTitle(item.inputSummary.title || item.toolName)}</strong>
+          {item.inputSummary.detail ? <span title={item.inputSummary.detail}>{item.inputSummary.detail}</span> : null}
+        </div>
+        {showStatus ? <span className="work-tool-status">{humanizeStatus(item.displayStatus)}</span> : null}
+        {hasOutput ? (
+          <details className="tool-details">
+            <summary>{item.error ? "View error" : liveOutput ? "Live output" : "View result"}</summary>
+            {liveOutput ? <pre className="tool-live-output">{liveOutput}</pre> : null}
+            {item.output ? <pre>{item.output}</pre> : null}
+            {item.error ? <pre className="tool-error">{item.error}</pre> : null}
+          </details>
+        ) : null}
+      </div>
+    );
+  }
+
+  return (
+    <div className={`work-tool-row work-approval-row approval-${item.status}`}>
+      <span className="work-tool-dot" aria-hidden="true" />
+      <div className="work-tool-copy">
+        <strong>{item.status === "pending" ? "Requested approval" : "Approval"}</strong>
+        <span>{item.patterns.join(", ") || item.permission}</span>
+      </div>
+      {item.status === "pending" ? <span className="work-tool-status">Waiting</span> : null}
+      {item.status === "resolved" && item.decision === "deny" ? <span className="work-tool-status">Denied</span> : null}
+    </div>
+  );
+}
+
+export function MessagePart({ part, compact = false }: { part: ChatMessagePart; compact?: boolean }) {
+  if (part.type === "text") return <MarkdownText text={part.text} compact={compact} />;
+  if (part.type === "reasoning") return <details><summary>Reasoning</summary><MarkdownText text={part.text} compact /></details>;
+  if (part.type === "summary") return <div className="summary-part"><MarkdownText text={part.text} compact /></div>;
   if (part.type === "image") return <p className="attachment">Image · {part.filename ?? part.mimeType}</p>;
-  if (part.type === "tool_call") return <p className="inline-tool">{part.toolName} · {part.displayStatus ?? part.status}</p>;
-  return <pre className={part.error ? "tool-error" : ""}>{part.error ?? part.output}</pre>;
+  if (part.type === "tool_call") {
+    const status = part.displayStatus ?? part.status;
+    return <p className="inline-tool">{humanizeToolTitle(part.toolName)}{status === "succeeded" || status === "completed" ? "" : ` · ${humanizeStatus(status)}`}</p>;
+  }
+  const result = part.error ?? part.output;
+  if (!result.trim()) return null;
+  return (
+    <details className="tool-details inline-tool-result">
+      <summary>{part.error ? "Tool error" : "Tool result"}</summary>
+      <pre className={part.error ? "tool-error" : ""}>{result}</pre>
+    </details>
+  );
+}
+
+export function MarkdownText({ text, compact = false }: { text: string; compact?: boolean }) {
+  const lines = text.replaceAll("\r\n", "\n").split("\n");
+  const blocks: ReactNode[] = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index] ?? "";
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const fence = line.match(/^\s*```([^`]*)$/);
+    if (fence) {
+      const language = fence[1]?.trim();
+      const body: string[] = [];
+      index += 1;
+      while (index < lines.length && !/^\s*```\s*$/.test(lines[index] ?? "")) {
+        body.push(lines[index] ?? "");
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      blocks.push(
+        <div className="markdown-code" key={`code:${index}`}>
+          {language ? <span>{language}</span> : null}
+          <pre><code>{body.join("\n")}</code></pre>
+        </div>,
+      );
+      continue;
+    }
+
+    const heading = line.match(/^\s*(#{1,6})\s+(.+)$/);
+    if (heading) {
+      const level = heading[1]?.length ?? 3;
+      const content = inlineMarkdown(heading[2] ?? "", `heading:${index}`);
+      blocks.push(level === 1
+        ? <h2 key={`heading:${index}`}>{content}</h2>
+        : level === 2
+          ? <h3 key={`heading:${index}`}>{content}</h3>
+          : <h4 key={`heading:${index}`}>{content}</h4>);
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*[-*_](?:\s*[-*_]){2,}\s*$/.test(line)) {
+      blocks.push(<hr key={`rule:${index}`} />);
+      index += 1;
+      continue;
+    }
+
+    if (isMarkdownTable(lines, index)) {
+      const headers = tableCells(line);
+      index += 2;
+      const rows: string[][] = [];
+      while (index < lines.length && (lines[index] ?? "").includes("|") && (lines[index] ?? "").trim()) {
+        rows.push(tableCells(lines[index] ?? ""));
+        index += 1;
+      }
+      blocks.push(
+        <div className="markdown-table-wrap" key={`table:${index}`}>
+          <table>
+            <thead><tr>{headers.map((cell, cellIndex) => <th key={cellIndex}>{inlineMarkdown(cell, `th:${index}:${cellIndex}`)}</th>)}</tr></thead>
+            <tbody>{rows.map((row, rowIndex) => <tr key={rowIndex}>{headers.map((_, cellIndex) => <td key={cellIndex}>{inlineMarkdown(row[cellIndex] ?? "", `td:${index}:${rowIndex}:${cellIndex}`)}</td>)}</tr>)}</tbody>
+          </table>
+        </div>,
+      );
+      continue;
+    }
+
+    const unordered = line.match(/^\s*[-*+]\s+(.+)$/);
+    if (unordered) {
+      const items: string[] = [];
+      while (index < lines.length) {
+        const item = (lines[index] ?? "").match(/^\s*[-*+]\s+(.+)$/);
+        if (!item) break;
+        items.push(item[1] ?? "");
+        index += 1;
+      }
+      blocks.push(<ul key={`list:${index}`}>{items.map((item, itemIndex) => <li key={itemIndex}>{inlineMarkdown(item, `li:${index}:${itemIndex}`)}</li>)}</ul>);
+      continue;
+    }
+
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (ordered) {
+      const items: string[] = [];
+      while (index < lines.length) {
+        const item = (lines[index] ?? "").match(/^\s*\d+[.)]\s+(.+)$/);
+        if (!item) break;
+        items.push(item[1] ?? "");
+        index += 1;
+      }
+      blocks.push(<ol key={`list:${index}`}>{items.map((item, itemIndex) => <li key={itemIndex}>{inlineMarkdown(item, `li:${index}:${itemIndex}`)}</li>)}</ol>);
+      continue;
+    }
+
+    if (/^\s*>\s?/.test(line)) {
+      const quote: string[] = [];
+      while (index < lines.length && /^\s*>\s?/.test(lines[index] ?? "")) {
+        quote.push((lines[index] ?? "").replace(/^\s*>\s?/, ""));
+        index += 1;
+      }
+      blocks.push(<blockquote key={`quote:${index}`}>{inlineMarkdownLines(quote, `quote:${index}`)}</blockquote>);
+      continue;
+    }
+
+    const paragraph: string[] = [line];
+    index += 1;
+    while (index < lines.length && (lines[index] ?? "").trim() && !isMarkdownBlockStart(lines, index)) {
+      paragraph.push(lines[index] ?? "");
+      index += 1;
+    }
+    blocks.push(<p key={`paragraph:${index}`}>{inlineMarkdownLines(paragraph, `paragraph:${index}`)}</p>);
+  }
+
+  return <div className={compact ? "markdown markdown-compact" : "markdown"}>{blocks}</div>;
+}
+
+function isMarkdownBlockStart(lines: readonly string[], index: number): boolean {
+  const line = lines[index] ?? "";
+  return /^\s*```/.test(line)
+    || /^\s*#{1,6}\s+/.test(line)
+    || /^\s*[-*+]\s+/.test(line)
+    || /^\s*\d+[.)]\s+/.test(line)
+    || /^\s*>\s?/.test(line)
+    || /^\s*[-*_](?:\s*[-*_]){2,}\s*$/.test(line)
+    || isMarkdownTable(lines, index);
+}
+
+function isMarkdownTable(lines: readonly string[], index: number): boolean {
+  const header = lines[index] ?? "";
+  const divider = lines[index + 1] ?? "";
+  return header.includes("|") && /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(divider);
+}
+
+function tableCells(line: string): string[] {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+}
+
+function inlineMarkdownLines(lines: readonly string[], keyPrefix: string): ReactNode[] {
+  return lines.flatMap((line, index) => [
+    ...(index > 0 ? [<br key={`${keyPrefix}:br:${index}`} />] : []),
+    ...inlineMarkdown(line, `${keyPrefix}:${index}`),
+  ]);
+}
+
+function inlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
+  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))/g;
+  const nodes: ReactNode[] = [];
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text))) {
+    if (match.index > cursor) nodes.push(text.slice(cursor, match.index));
+    const token = match[0];
+    const key = `${keyPrefix}:${match.index}`;
+    if (token.startsWith("`")) {
+      nodes.push(<code key={key}>{token.slice(1, -1)}</code>);
+    } else if (token.startsWith("**")) {
+      nodes.push(<strong key={key}>{token.slice(2, -2)}</strong>);
+    } else {
+      const link = token.match(/^\[([^\]]+)\]\((https?:\/\/[^)]+)\)$/);
+      nodes.push(link
+        ? <a key={key} href={link[2]} target="_blank" rel="noreferrer">{link[1]}</a>
+        : token);
+    }
+    cursor = match.index + token.length;
+  }
+  if (cursor < text.length) nodes.push(text.slice(cursor));
+  return nodes;
 }
 
 function ApprovalCard({
@@ -901,6 +1288,41 @@ function UserInputCard({
   );
 }
 
+type IconName = "activity" | "chevron" | "close" | "folder" | "message" | "plus" | "queue"
+  | "send" | "shield" | "sidebar" | "steer" | "stop" | "terminal";
+
+function ChiliMark() {
+  return (
+    <svg className="chili-mark" viewBox="0 0 32 32" aria-hidden="true">
+      <path className="chili-stem" d="M20.4 9.2c.1-2.6 1.7-4.6 4-5.1 1-.2 1.7.9.9 1.7-1.5 1.5-1.8 3.2-.9 5-1.5.1-2.8-.5-4-1.6Z" />
+      <path className="chili-body" d="M21.2 8c4.1 1.2 6 5.1 4.4 9.5-2.3 6.5-9.3 10.9-18.3 10.2-1.7-.1-2.1-1.5-.6-2.4 5.2-3 6.6-8 8.4-11.9 1.5-3.4 3.5-5.3 6.1-5.4Z" />
+      <path className="chili-shade" d="M24.5 14.1c-.5 3-2.7 6-5.9 8.2-2.9 2.1-6.7 3.4-10.8 3.6 7.7.5 13.7-3.1 16.2-8.4.6-1.1.8-2.3.5-3.4Z" />
+      <path className="chili-leaf" d="M17.9 9.1c1.9 1.7 4.3 2.1 6.8 1.2-.9 2-3 3.2-5.3 2.8-1-.2-1.8-.7-2.4-1.3.3-1.1.6-2 .9-2.7Z" />
+    </svg>
+  );
+}
+
+function Icon({ name }: { name: IconName }) {
+  const path = (() => {
+    switch (name) {
+      case "sidebar": return <><rect x="3" y="3" width="18" height="18" rx="3" /><path d="M9 3v18" /></>;
+      case "activity": return <><path d="M4 12h3l2-5 4 10 2-5h5" /><path d="M4 4v16h16" /></>;
+      case "plus": return <path d="M12 5v14M5 12h14" />;
+      case "message": return <path d="M5 5h14v10H9l-4 4V5Z" />;
+      case "folder": return <path d="M3.5 7.5h7l2-2h8v13h-17v-11Z" />;
+      case "chevron": return <path d="m9 6 6 6-6 6" />;
+      case "close": return <path d="m7 7 10 10M17 7 7 17" />;
+      case "stop": return <rect x="7" y="7" width="10" height="10" rx="2" />;
+      case "steer": return <path d="M5 18c0-4 2-6 6-6h8M15 8l4 4-4 4M5 6v4" />;
+      case "queue": return <><path d="M5 7h14M5 12h9M5 17h6" /><path d="m16 15 3 3-3 3" /></>;
+      case "send": return <path d="m5 12 14-7-4 14-3-6-7-1Zm7 1 7-8" />;
+      case "terminal": return <><path d="m5 7 4 4-4 4M11 17h7" /><rect x="3" y="4" width="18" height="16" rx="3" /></>;
+      case "shield": return <path d="M12 3 5 6v5c0 4.8 2.6 8 7 10 4.4-2 7-5.2 7-10V6l-7-3Zm-3 9 2 2 4-5" />;
+    }
+  })();
+  return <svg className="icon" viewBox="0 0 24 24" aria-hidden="true">{path}</svg>;
+}
+
 function renderAgentNode(node: RuntimeAgentTreeNode, depth = 0): ReactNode[] {
   return [
     <div className="agent-row" key={node.path}>
@@ -916,8 +1338,47 @@ function shortId(value: string): string {
   return value.length <= 12 ? value : value.slice(-10);
 }
 
-function formatTime(value: number): string {
-  return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(new Date(value));
+function workspaceLabel(value: string | undefined): string {
+  if (!value) return "No project";
+  return value.split(/[\\/]/).filter(Boolean).at(-1) ?? value;
+}
+
+function formatRelativeTime(value: number): string {
+  const elapsed = Math.max(0, Date.now() - value);
+  if (elapsed < 60_000) return "now";
+  if (elapsed < 3_600_000) return `${Math.floor(elapsed / 60_000)}m`;
+  if (elapsed < 86_400_000) return `${Math.floor(elapsed / 3_600_000)}h`;
+  if (elapsed < 604_800_000) return `${Math.floor(elapsed / 86_400_000)}d`;
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(new Date(value));
+}
+
+function formatWorkDuration(value: number): string {
+  const seconds = Math.max(1, Math.round(value / 1_000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes < 60) return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+}
+
+function humanizeToolTitle(value: string): string {
+  const normalized = value.trim().toLowerCase().replaceAll("-", "_");
+  if (normalized === "read" || normalized === "read_file") return "Read";
+  if (normalized === "write" || normalized === "write_file") return "Wrote file";
+  if (normalized === "edit" || normalized === "replace") return "Edited file";
+  if (normalized === "apply_patch") return "Edited files";
+  if (normalized === "bash" || normalized === "run_shell_command" || normalized === "exec_command") return "Ran command";
+  if (normalized === "grep" || normalized === "glob" || normalized === "search") return "Searched";
+  if (normalized === "web_search" || normalized === "search_query") return "Searched the web";
+  const readable = value.trim().replace(/^mcp__[^_]+__/, "").replaceAll(/[_./:-]+/g, " ").replaceAll(/\s+/g, " ");
+  return readable ? `${readable[0]?.toUpperCase() ?? ""}${readable.slice(1)}` : "Used tool";
+}
+
+function humanizeStatus(value: string): string {
+  const readable = value.replaceAll("_", " ");
+  return `${readable[0]?.toUpperCase() ?? ""}${readable.slice(1)}`;
 }
 
 function refreshesDiff(event: ChiliEvent): boolean {
