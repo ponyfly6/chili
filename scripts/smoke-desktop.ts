@@ -109,6 +109,7 @@ const canaryId = randomBytes(16).toString("hex");
 const secretCanary = `chili-desktop-secret-canary-${canaryId}`;
 const inheritedTokenCanary = `chili-desktop-inherited-token-canary-${canaryId}`;
 const pathCanary = join(temporaryRoot, `path-canary-${canaryId}`);
+const providerLoadApiKey = `desktop-provider-load-${canaryId}`;
 const artifactSensitiveNeedles = uniqueNeedles([
   { label: "secret canary", value: secretCanary },
   { label: "inherited desktop token canary", value: inheritedTokenCanary },
@@ -142,6 +143,9 @@ const hostVisibleCredentialNeedles = uniqueNeedles([
 let packagedSidecar: string | undefined;
 let successMessage: string | undefined;
 let smokeFailure: unknown;
+let providerLoadServer: ReturnType<typeof Bun.serve> | undefined;
+let providerLoadRequests = 0;
+let providerLoadFailure: unknown;
 const activeDetachedGroups = new Map<number, SpawnedProcess>();
 const detachedGroupCleanup = new Map<number, Promise<void>>();
 const activeDirectProcesses = new Map<number, SpawnedProcess>();
@@ -180,6 +184,7 @@ try {
   await assertOutputOverflowCleanupFixture();
   await assertProcessGroupCleanupFixture();
   await assertSidecarContainmentGraceFixture();
+  providerLoadServer = startProviderLoadServer();
 
   // A clean output directory makes it impossible to accidentally accept a
   // stale mac-* package from another architecture or an earlier source tree.
@@ -223,11 +228,21 @@ try {
   let blockedGitPid: number | undefined;
   for (let launch = 1; launch <= 2; launch += 1) {
     if (launch === 2) await enableBlockedGitFixture();
-    const result = await runPackagedLaunch(executable, launch);
+    const result = await runPackagedLaunch(
+      executable,
+      launch,
+      launch === 1 ? new URL("chat/completions", providerLoadServer.url).href : undefined,
+    );
     const { sidecarPid, shutdownExitMs } = result;
     sidecarPids.push(sidecarPid);
     shutdownExitTimes.push(shutdownExitMs);
     if (result.blockedGitPid !== undefined) blockedGitPid = result.blockedGitPid;
+    if (launch === 1) {
+      if (providerLoadFailure) throw providerLoadFailure;
+      if (providerLoadRequests !== 1) {
+        throw new Error(`Packaged real-provider smoke made ${providerLoadRequests} loopback requests; expected one`);
+      }
+    }
     if (await processStillExists(sidecarPid, 5_000)) {
       throw new Error(`Launch ${launch} sidecar process ${sidecarPid} survived Electron app exit`);
     }
@@ -243,7 +258,7 @@ try {
   successMessage = `desktop smoke passed: fresh ${expectedMachOSlice} ad-hoc package, strict fuses, `
       + `minimal integrity-verified ASAR, renderer leak audit, `
       + `hardened signatures with an entitlement-free sidecar, host credential audit, `
-      + `two clean launches (sidecars ${sidecarPids.join(", ")}; `
+      + `offline packaged real-provider load, two clean launches (sidecars ${sidecarPids.join(", ")}; `
       + `shutdown exits ${shutdownExitTimes.join("ms, ")}ms; blocked Git group ${blockedGitPid}), `
       + `and parent hard-crash containment `
       + `(sidecar ${hardCrashFixture.sidecarPid}, tool group ${hardCrashFixture.toolProcessGroupPid}, `
@@ -269,7 +284,11 @@ if (smokeFailure || cleanupFailures.length > 0) {
 }
 process.stdout.write(successMessage ?? "desktop smoke passed\n");
 
-async function runPackagedLaunch(executable: string, launch: number): Promise<PackagedLaunchResult> {
+async function runPackagedLaunch(
+  executable: string,
+  launch: number,
+  providerBaseUrl?: string,
+): Promise<PackagedLaunchResult> {
   const sidecar = packagedSidecar;
   if (!sidecar) throw new Error("Packaged launch started before the sidecar path was resolved");
   let shutdownStartedAt: number | undefined;
@@ -283,10 +302,15 @@ async function runPackagedLaunch(executable: string, launch: number): Promise<Pa
     env: {
       ...smokeCanaryEnvironment(),
       CHILI_DESKTOP_SMOKE: "1",
-      CHILI_DESKTOP_MODEL: "fake",
+      CHILI_DESKTOP_MODEL: providerBaseUrl ? "deepseek" : "fake",
       CHILI_DESKTOP_WORKSPACE: workspace,
       CHILI_DESKTOP_USER_DATA: userData,
       CHILI_DESKTOP_DISABLE_DEVTOOLS: "1",
+      ...(providerBaseUrl ? {
+        DEEPSEEK_API_KEY: providerLoadApiKey,
+        DEEPSEEK_BASE_URL: providerBaseUrl,
+        DEEPSEEK_MODEL: "deepseek-v4-pro",
+      } : {}),
       ...(launch === 2 ? { CHILI_DESKTOP_SMOKE_BLOCKED_GIT: "1" } : {}),
       // A packaged app must ignore the dev-server escape hatch even when its
       // launch environment is hostile or inherited from a developer shell.
@@ -479,6 +503,42 @@ async function runPackagedLaunch(executable: string, launch: number): Promise<Pa
     if (completed) activeDetachedGroups.delete(child.pid);
     else await terminateTrackedProcessGroup(child.pid, child);
   }
+}
+
+function startProviderLoadServer(): ReturnType<typeof Bun.serve> {
+  return Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      try {
+        const url = new URL(request.url);
+        if (request.method !== "POST" || url.pathname !== "/chat/completions") {
+          throw new Error(`Packaged real-provider smoke received ${request.method} ${url.pathname}`);
+        }
+        if (request.headers.get("authorization") !== `Bearer ${providerLoadApiKey}`) {
+          throw new Error("Packaged real-provider smoke received the wrong authorization header");
+        }
+        const body = await request.json() as Record<string, unknown>;
+        if (body.model !== "deepseek-v4-pro" || body.stream !== true) {
+          throw new Error(`Packaged real-provider smoke received an invalid request: ${JSON.stringify(body)}`);
+        }
+        providerLoadRequests += 1;
+        return Response.json({
+          id: "chatcmpl_desktop_provider_load",
+          model: "deepseek-v4-pro",
+          choices: [{
+            index: 0,
+            finish_reason: "stop",
+            message: { content: "offline packaged provider loaded" },
+          }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
+      } catch (error) {
+        providerLoadFailure = error;
+        return Response.json({ error: { message: safeErrorMessage(error) } }, { status: 500 });
+      }
+    },
+  });
 }
 
 async function initializeSmokeGitWorkspace(): Promise<void> {
@@ -1928,6 +1988,12 @@ async function performSmokeResourceCleanup(): Promise<unknown[]> {
   const failures = [...registeredCleanup, ...ownedCleanup]
     .filter((result): result is PromiseRejectedResult => result.status === "rejected")
     .map((result) => result.reason as unknown);
+  try {
+    providerLoadServer?.stop(true);
+    providerLoadServer = undefined;
+  } catch (error) {
+    failures.push(error);
+  }
   const resourceResults = await Promise.allSettled([
     rm(temporaryRoot, { recursive: true, force: true }),
   ]);
