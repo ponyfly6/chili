@@ -2,6 +2,7 @@ import { access, mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
+import { normalizePersistedError, PERSISTED_ERROR_LIMITS } from "@chili/protocol";
 import {
   AgentTaskControlService,
   LocalSubagentConcurrencyLimiter,
@@ -30,6 +31,7 @@ import type {
   TeamTaskRow,
 } from "@chili/store";
 import { ObservableEventStore, SqliteEventStore, UnknownEventCursorError } from "@chili/store";
+import type { RuntimeSessionEventWindow } from "@chili/sdk";
 import type {
   AgentPath,
   AgentRunId,
@@ -40,6 +42,7 @@ import type {
   EventEnvelope,
   Message,
   ModelSelection,
+  PendingUserInputRequest,
   ReasoningLevel,
   RuntimeModelConfig,
   RuntimeDelegationConfig,
@@ -56,7 +59,10 @@ import type {
   SessionGoal,
   SessionGoalStatus,
   TimestampMs,
+  ToolCallId,
   TurnId,
+  UserInputAnswers,
+  UserInputId,
 } from "@chili/protocol";
 import { projectRuntimeAgents, type RuntimeAgentsSnapshot } from "./agent-projection.js";
 import type {
@@ -73,6 +79,84 @@ import type {
 import type { PromptCommandControl, PromptCommandRunResult } from "./commands.js";
 import { PromptCommandNotFoundError, PromptCommandUsageError } from "./commands.js";
 import { createRuntimeHttpHandler } from "./runtime-http.js";
+
+test("keeps runtime HTTP routes unauthenticated when no auth token is configured", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
+
+  const healthResponse = await handler(new Request("http://chili.test/health"));
+  const sessionsResponse = await handler(new Request("http://chili.test/sessions"));
+
+  expect(healthResponse.status).toBe(200);
+  expect(await healthResponse.json()).toEqual({ ok: true });
+  expect(sessionsResponse.status).toBe(200);
+});
+
+test("accepts the configured bearer token for the health route", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const handler = createRuntimeHttpHandler({
+    service: new FakeRuntimeService(store),
+    store,
+    authToken: "runtime-secret-token",
+  });
+
+  const response = await handler(new Request("http://chili.test/health", {
+    headers: { authorization: "Bearer runtime-secret-token" },
+  }));
+
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ ok: true });
+});
+
+test("rejects missing, incorrect, and malformed bearer credentials without leaking the token", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const handler = createRuntimeHttpHandler({
+    service: new FakeRuntimeService(store),
+    store,
+    authToken: "runtime-secret-token",
+  });
+
+  for (const authorization of [undefined, "Bearer wrong", "Basic runtime-secret-token", "Bearer"]) {
+    const response = await handler(new Request("http://chili.test/health", {
+      ...(authorization ? { headers: { authorization } } : {}),
+    }));
+    const responseText = await response.text();
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get("www-authenticate")).toBe("Bearer");
+    expect(responseText).not.toContain("runtime-secret-token");
+    expect(JSON.parse(responseText)).toEqual({ error: { message: "Unauthorized" } });
+  }
+});
+
+test("protects non-health runtime HTTP routes with the configured bearer token", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const handler = createRuntimeHttpHandler({
+    service: new FakeRuntimeService(store),
+    store,
+    authToken: "runtime-secret-token",
+  });
+
+  const unauthorizedResponse = await handler(new Request("http://chili.test/sessions"));
+  const authorizedResponse = await handler(new Request("http://chili.test/sessions", {
+    headers: { authorization: "Bearer runtime-secret-token" },
+  }));
+
+  expect(unauthorizedResponse.status).toBe(401);
+  expect(authorizedResponse.status).toBe(200);
+});
+
+test("rejects an empty runtime HTTP auth token configuration", () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+
+  for (const authToken of ["", "   "]) {
+    expect(() => createRuntimeHttpHandler({
+      service: new FakeRuntimeService(store),
+      store,
+      authToken,
+    })).toThrow("authToken must be a non-empty string when provided");
+  }
+});
 
 test("serves sessions and event backlog over the runtime HTTP handler", async () => {
   const baseStore = new MemoryEventStore();
@@ -111,6 +195,392 @@ test("serves sessions and event backlog over the runtime HTTP handler", async ()
   expect(new TextDecoder().decode(chunk.value)).toContain("session.created");
 });
 
+test("SSE serializes a normalized 5 MiB escape-heavy error within a deterministic byte ceiling", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
+  const bearerToken = "sse-secret-token._~+/==";
+  const loopbackUrl = "http://localhost:47833/private/sse?token=sse-url-secret";
+  const boundarySecrets = [
+    "SSE_TAB_LABEL_SECRET",
+    "SSE_LF_LABEL_SECRET",
+    "SSE_ANSI_LABEL_SECRET",
+    "秘密SSE令牌",
+    "alpha beta SSE_TAIL_SECRET",
+  ];
+  const taxonomySecrets = [
+    "secret=SSE_BARE_SECRET",
+    "private_key=SSE_PRIVATE_KEY",
+    "signing_key=SSE_SIGNING_KEY",
+    "webhook_secret=SSE_WEBHOOK_SECRET",
+    "AWS_SECRET_ACCESS_KEY=SSE_AWS_SECRET",
+    "session=SSE_SESSION_SECRET",
+    "id_token=SSE_ID_SECRET",
+  ];
+  const hugeMessage = [
+    `SSE failed with Bearer ${bearerToken} at ${loopbackUrl}`,
+    ...taxonomySecrets,
+    `pass\tword=${boundarySecrets[0]}`,
+    `pass\nword=${boundarySecrets[1]}`,
+    `pass\u001b[31mword=${boundarySecrets[2]}\u001b[0m`,
+    `bEaReR ${boundarySecrets[3]}`,
+    `password=${boundarySecrets[4]}`,
+    "Bearer x",
+  ].join("\n") + "\n"
+    + "\u0000".repeat(5 * 1024 * 1024);
+  const source = Object.assign(new Error(hugeMessage), {
+    name: "EscapedRemoteError",
+    code: "E_ESCAPED_REMOTE",
+    cause: { secret: "SSE_CAUSE_SECRET_MUST_NOT_LEAK" },
+  });
+  const normalized = normalizePersistedError(source);
+  const event: ChiliEvent = {
+    id: "event_sse_bounded_error",
+    type: "tool.call_finished",
+    time: 1 as TimestampMs,
+    sessionId: "session_sse_bounded_error" as SessionId,
+    payload: {
+      callId: "toolcall_sse_bounded_error" as ToolCallId,
+      status: "failed",
+      error: normalized.message,
+      errorDetails: normalized.persistedErrorDetails,
+      synthetic: true,
+    },
+  };
+  await baseStore.append(event);
+
+  const response = await handler(new Request(
+    "http://chili.test/events?sessionId=session_sse_bounded_error",
+  ));
+  expect(response.status).toBe(200);
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("expected event stream body");
+  try {
+    const chunk = (await reader.read()).value;
+    if (!chunk) throw new Error("expected bounded SSE event");
+    const frame = new TextDecoder().decode(chunk);
+    expect(Buffer.byteLength(normalized.message, "utf8")).toBeLessThanOrEqual(PERSISTED_ERROR_LIMITS.messageBytes);
+    expect(Buffer.byteLength(frame, "utf8")).toBeLessThanOrEqual(110_000);
+    expect(frame).toContain("event_sse_bounded_error");
+    expect(frame).toContain("error message truncated from");
+    expect(frame).not.toContain("SSE_CAUSE_SECRET_MUST_NOT_LEAK");
+    expect(frame).not.toContain("cause");
+    expect(frame).toContain("Bearer [REDACTED]");
+    expect(frame).toContain("bEaReR [REDACTED]");
+    expect(frame).toContain("[loopback URL redacted]");
+    expect(frame).not.toContain("[31m");
+    expect(frame).not.toContain("[0m");
+    expect(frame).not.toContain(bearerToken);
+    expect(frame).not.toContain(loopbackUrl);
+    for (const secret of taxonomySecrets) expect(frame).not.toContain(secret.split("=")[1]!);
+    for (const secret of boundarySecrets) expect(frame).not.toContain(secret);
+  } finally {
+    await reader.cancel();
+  }
+});
+
+test("emits a bounded resync cursor for a legacy event above the 4 MB transport cap", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const sessionId = "session_sse_oversized" as SessionId;
+  baseStore.items.push({
+    id: "event_sse_oversized",
+    type: "session.status_changed",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, status: "failed", reason: "x".repeat(4_100_000) },
+  } as ChiliEvent);
+  baseStore.items.push({
+    id: "event_sse_after_oversized",
+    type: "session.renamed",
+    time: 2 as TimestampMs,
+    sessionId,
+    payload: { sessionId, title: "after poison" },
+  } as ChiliEvent);
+  const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
+  const response = await handler(new Request(`http://chili.test/events?sessionId=${sessionId}`));
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("expected event stream body");
+  const chunk = await reader.read();
+  const controlFrame = new TextDecoder().decode(chunk.value);
+  expect(chunk.done).toBe(false);
+  expect(Buffer.byteLength(controlFrame, "utf8")).toBeLessThanOrEqual(4_096);
+  expect(controlFrame).toContain("event: chili.resync");
+  expect(controlFrame).toContain('"afterEventId":"event_sse_oversized"');
+  expect(controlFrame).not.toContain('"reason":"x');
+  const resumed = await collectEventStreamText(
+    handler,
+    `http://chili.test/events?sessionId=${sessionId}&afterEventId=event_sse_oversized`,
+  );
+  expect(resumed).toContain("event_sse_after_oversized");
+  expect(resumed).not.toContain("event_sse_oversized");
+});
+
+test("streams and resumes a worst legal tool result that remains replayable beside a near-limit approval window", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const sessionId = "session_sse_legal_tool_result" as SessionId;
+  const messageId = "message_sse_legal_tool_result";
+  const sessionCreated: ChiliEvent = {
+    id: "event_sse_legal_session_created",
+    type: "session.created",
+    time: 0 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd: "/repo" },
+  };
+  const created: ChiliEvent = {
+    id: "event_sse_legal_message_created",
+    type: "message.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { messageId: messageId as never, role: "assistant" },
+  };
+  const escapedArtifactId = "\\\"".repeat(256);
+  const partAdded: ChiliEvent = {
+    id: "event_sse_legal_tool_result",
+    type: "message.part_added",
+    time: 2 as TimestampMs,
+    sessionId,
+    payload: {
+      messageId: messageId as never,
+      part: {
+        id: "part_sse_legal_tool_result" as never,
+        messageId: messageId as never,
+        sessionId,
+        type: "tool_result",
+        callId: "toolcall_sse_legal_tool_result" as ToolCallId,
+        output: "\\".repeat(256_000),
+        content: [{ type: "text", text: "\u0000".repeat(200_000) }],
+        artifactIds: Array.from({ length: 60 }, () => escapedArtifactId as never),
+        executionContext: {
+          sandbox: "macos-seatbelt",
+          executionMode: "sandboxed",
+          exitCode: 0,
+          timedOut: false,
+          aborted: false,
+          signal: null,
+        },
+      },
+    },
+  };
+  const partEventBytes = Buffer.byteLength(JSON.stringify(partAdded), "utf8");
+  expect(partEventBytes).toBeGreaterThan(1_700_000);
+  expect(partEventBytes).toBeLessThan(2_000_000);
+  await store.appendMany([sessionCreated, created, partAdded]);
+
+  const approvalRow = (index: number, metadataChars: number): ApprovalRow => ({
+    id: `approval_sse_legal_${String(index).padStart(4, "0")}`,
+    sessionId,
+    callId: `toolcall_approval_${index}` as ToolCallId,
+    permission: "P".repeat(512),
+    patterns: ["X".repeat(2_000)],
+    maxApprovalScope: "persistent",
+    metadata: { note: "M".repeat(metadataChars) },
+    status: "pending",
+    createdAt: index + 1,
+  });
+  let approvalBytes = 2;
+  for (let index = 0; index < 2_000; index += 1) {
+    const row = approvalRow(index, 15_000);
+    const extraBytes = Buffer.byteLength(JSON.stringify(row), "utf8")
+      + (baseStore.approvalRows.length > 0 ? 1 : 0);
+    if (approvalBytes + extraBytes > 998_000) break;
+    baseStore.approvalRows.push(row);
+    approvalBytes += extraBytes;
+  }
+  expect(approvalBytes).toBeGreaterThan(980_000);
+
+  const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
+  const initialController = new AbortController();
+  const initial = await handler(new Request(`http://chili.test/events?sessionId=${sessionId}`, {
+    signal: initialController.signal,
+  }));
+  const initialReader = initial.body?.getReader();
+  if (!initialReader) throw new Error("expected event stream body");
+  let partFrame = "";
+  for (let read = 0; read < 4 && !partFrame.includes(partAdded.id); read += 1) {
+    const chunk = await initialReader.read();
+    if (chunk.done) break;
+    partFrame += new TextDecoder().decode(chunk.value);
+  }
+  expect(partFrame).toContain(`id: ${partAdded.id}`);
+  expect(Buffer.byteLength(partFrame, "utf8")).toBeLessThanOrEqual(4_000_000);
+  initialController.abort();
+  await initialReader.cancel();
+
+  const replay = await handler(new Request(
+    `http://chili.test/sessions/${sessionId}/events?window=replayable`,
+  ));
+  const replayText = await replay.text();
+  const replayWindow = JSON.parse(replayText) as RuntimeSessionEventWindow;
+  expect(Buffer.byteLength(replayText, "utf8")).toBeLessThanOrEqual(4_000_000);
+  expect(replayWindow.events.map((event) => event.id)).toEqual(expect.arrayContaining([
+    created.id,
+    partAdded.id,
+  ]));
+  expect(Buffer.byteLength(JSON.stringify(replayWindow.pendingApprovals), "utf8")).toBeGreaterThan(970_000);
+
+  const resumeController = new AbortController();
+  const resumed = await handler(new Request(
+    `http://chili.test/events?sessionId=${sessionId}&afterEventId=${partAdded.id}`,
+    { signal: resumeController.signal },
+  ));
+  const resumedReader = resumed.body?.getReader();
+  if (!resumedReader) throw new Error("expected resumed event stream body");
+  await store.append({
+    id: "event_sse_legal_after_cursor",
+    type: "session.renamed",
+    time: 3 as TimestampMs,
+    sessionId,
+    payload: { sessionId, title: "cursor advanced" },
+  });
+  const resumedChunk = await resumedReader.read();
+  expect(new TextDecoder().decode(resumedChunk.value)).toContain("event_sse_legal_after_cursor");
+  resumeController.abort();
+  await resumedReader.cancel();
+});
+
+test("bounds and redacts hostile HTTP errors and successful finish diagnostics", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const session = await service.createSession({ sessionId: "session_http_hostile" as SessionId, cwd: "/repo" });
+  const rawSecret = "HTTP_SECRET_MUST_NOT_LEAK";
+  const hostile = `password=${rawSecret} http://localhost:43123/private?token=${rawSecret}\n${"\u0000".repeat(5 * 1024 * 1024)}`;
+  service.submitPrompt = async () => {
+    const error = new Error(hostile);
+    error.name = "RuntimeBusyError";
+    throw error;
+  };
+  const handler = createRuntimeHttpHandler({ service, store });
+  const failed = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/prompt`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "fail safely" }),
+  }));
+  const failedBody = await failed.text();
+  expect(failed.status).toBe(409);
+  expect(Buffer.byteLength(failedBody, "utf8")).toBeLessThan(20_000);
+  expect(failedBody).toContain("error message truncated from");
+  expect(failedBody).toContain("[REDACTED]");
+  expect(failedBody).not.toContain(rawSecret);
+  expect(failedBody).not.toContain("localhost:43123");
+
+  service.submitPrompt = async () => ({
+    status: "completed",
+    turns: [],
+    finishReason: hostile,
+  });
+  const completed = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/prompt`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "finish safely" }),
+  }));
+  const completedBody = await completed.text();
+  expect(completed.status).toBe(200);
+  expect(Buffer.byteLength(completedBody, "utf8")).toBeLessThan(20_000);
+  expect(completedBody).toContain("error message truncated from");
+  expect(completedBody).not.toContain(rawSecret);
+  expect(completedBody).not.toContain("localhost:43123");
+});
+
+test("applies the central credential taxonomy idempotently to Error and HttpError responses", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const session = await service.createSession({ sessionId: "session_http_taxonomy" as SessionId, cwd: "/repo" });
+  const handler = createRuntimeHttpHandler({ service, store });
+  const labels = [
+    "secret",
+    "private_key",
+    "signing_key",
+    "webhook_secret",
+    "AWS_SECRET_ACCESS_KEY",
+    "session",
+    "id_token",
+  ];
+  for (const [index, label] of labels.entries()) {
+    const rawSecret = `短密钥_${index}_MUST_NOT_LEAK`;
+    service.submitPrompt = async () => {
+      const error = new Error(`${label}=${rawSecret}`);
+      error.name = "RuntimeBusyError";
+      throw error;
+    };
+    const first = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "normalize taxonomy" }),
+    }));
+    const firstBody = await first.json() as { error: { message: string } };
+    expect(first.status).toBe(409);
+    expect(firstBody.error.message).toContain("[REDACTED]");
+    expect(firstBody.error.message).not.toContain(rawSecret);
+    const normalizedAgain = normalizePersistedError(new Error(firstBody.error.message)).message;
+    expect(normalizedAgain).toBe(firstBody.error.message);
+  }
+
+  service.submitPrompt = async () => {
+    throw { status: 429, message: "webhook_secret=HTTP_ERROR_BYPASS_SECRET" };
+  };
+  const explicit = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/prompt`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "normalize explicit error" }),
+  }));
+  const explicitBody = await explicit.text();
+  expect(explicit.status).toBe(429);
+  expect(explicitBody).toContain("[REDACTED]");
+  expect(explicitBody).not.toContain("HTTP_ERROR_BYPASS_SECRET");
+
+  service.submitPrompt = async () => {
+    const error = new Error("会话暂不可用");
+    error.name = "RuntimeBusyError";
+    throw error;
+  };
+  const unicode = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/prompt`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "preserve unicode" }),
+  }));
+  expect(await unicode.json()).toEqual({ error: { message: "会话暂不可用" } });
+});
+
+test("normalizes hostile service, goal, task, and recovery errors at the HTTP boundary", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const sessionId = "session_http_error_boundaries" as SessionId;
+  await service.createSession({ sessionId, cwd: "/repo" });
+  const secret = "BOUNDARY_SECRET_MUST_NOT_LEAK";
+  const hostileError = (name: string): Error => {
+    const error = new Error(`authorization: Bearer ${secret}\n${"\u0000".repeat(5 * 1024 * 1024)}`);
+    error.name = name;
+    return error;
+  };
+  service.getGoal = async () => { throw hostileError("GoalNotFoundError"); };
+  const tasks = {
+    getTask: async () => { throw hostileError("AgentTaskNotFoundError"); },
+    reconcileStaleTasks: async () => { throw hostileError("AgentTaskControlServiceClosedError"); },
+  } as unknown as RuntimeTaskControlService;
+  const handler = createRuntimeHttpHandler({ service, store, tasks });
+  const requests = [
+    handler(new Request(`http://chili.test/sessions/${sessionId}/goal`)),
+    handler(new Request("http://chili.test/tasks/task_hostile")),
+    handler(new Request("http://chili.test/tasks/reconcile_stale", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    })),
+  ];
+  for (const response of await Promise.all(requests)) {
+    const body = await response.text();
+    expect(Buffer.byteLength(body, "utf8")).toBeLessThan(20_000);
+    expect(body).toContain("[REDACTED]");
+    expect(body).toContain("error message truncated from");
+    expect(body).not.toContain(secret);
+  }
+});
+
 test("returns 409 when an explicit session id is created more than once", async () => {
   const baseStore = new MemoryEventStore();
   const store = new ObservableEventStore(baseStore);
@@ -137,6 +607,28 @@ test("returns 409 when an explicit session id is created more than once", async 
   expect((await store.sessions()).find((session) => session.id === sessionId)?.cwd).toBe(
     "/authoritative/repo",
   );
+});
+
+test("returns 503 when runtime admission closes during an HTTP mutation", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const service = new FakeRuntimeService(store);
+  service.createSession = async () => {
+    const error = new Error("Runtime service is closing or closed");
+    error.name = "RuntimeServiceClosedError";
+    throw error;
+  };
+  const handler = createRuntimeHttpHandler({ service, store });
+
+  const response = await handler(new Request("http://chili.test/sessions", {
+    method: "POST",
+    body: JSON.stringify({ cwd: "/repo" }),
+    headers: { "content-type": "application/json" },
+  }));
+
+  expect(response.status).toBe(503);
+  expect(await response.json()).toEqual({
+    error: { message: "Runtime service is closing or closed" },
+  });
 });
 
 test("returns 409 when session creation ownership is lost before the entity exists", async () => {
@@ -246,6 +738,278 @@ test("loads resumable session events and renames a saved session", async () => {
   });
 });
 
+test("serves a full-envelope bounded replayable event window and clamps its event limit", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const sessionId = "session_replayable_budget" as SessionId;
+  await baseStore.append({
+    id: "event_replayable_session",
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd: "/repo" },
+  });
+  await baseStore.appendMany(Array.from({ length: 6_000 }, (_, index): ChiliEvent => ({
+    id: `event_replayable_${index}`,
+    type: "session.renamed",
+    time: (2 + index) as TimestampMs,
+    sessionId,
+    payload: { sessionId, title: `title-${index}-${"界".repeat(8)}` },
+  })));
+  const maxBytes = 100_000;
+  const handler = createRuntimeHttpHandler({
+    service: new FakeRuntimeService(store),
+    store,
+    maxSessionEventWindowBytes: maxBytes,
+  });
+
+  const response = await handler(new Request(
+    `http://chili.test/sessions/${sessionId}/events?window=replayable&limit=999999`,
+  ));
+  const body = await response.text();
+  const window = JSON.parse(body) as RuntimeSessionEventWindow;
+  expect(response.status).toBe(200);
+  expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(maxBytes);
+  expect(window.events.length).toBeLessThanOrEqual(5_000);
+  expect(window.bytes).toBe(new TextEncoder().encode(JSON.stringify(window.events)).byteLength);
+  expect(window.truncated).toBe(true);
+});
+
+test("replayable windows preserve durable rollback order and same-time causal anchors", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const sessionId = "session_replayable_order" as SessionId;
+  await baseStore.appendMany([
+    {
+      id: "event_order_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_time_a",
+      type: "session.renamed",
+      time: 100 as TimestampMs,
+      sessionId,
+      payload: { sessionId, title: "A" },
+    },
+    {
+      id: "event_time_b",
+      type: "session.renamed",
+      time: 1 as TimestampMs,
+      sessionId,
+      payload: { sessionId, title: "B" },
+    },
+    {
+      id: "z-created",
+      type: "message.created",
+      time: 200 as TimestampMs,
+      sessionId,
+      payload: { messageId: "message_same_time", role: "assistant" },
+    },
+    {
+      id: "a-part",
+      type: "message.part_added",
+      time: 200 as TimestampMs,
+      sessionId,
+      payload: {
+        messageId: "message_same_time",
+        part: {
+          id: "part_same_time",
+          messageId: "message_same_time",
+          sessionId,
+          type: "text",
+          text: "visible",
+        },
+      },
+    },
+  ] as ChiliEvent[]);
+  const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
+  const response = await handler(new Request(
+    `http://chili.test/sessions/${sessionId}/events?window=replayable`,
+  ));
+  const window = await response.json() as RuntimeSessionEventWindow;
+  const ids = window.events.map((event) => event.id);
+  expect(ids.indexOf("event_time_a")).toBeLessThan(ids.indexOf("event_time_b"));
+  expect(ids.indexOf("z-created")).toBeLessThan(ids.indexOf("a-part"));
+});
+
+test("authoritative pending approvals survive when their event anchors predate scan limits", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const sessionId = "session_replayable_approval" as SessionId;
+  await baseStore.appendMany([
+    {
+      id: "event_approval_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_approval_tool",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      payload: { turnId: "turn_approval", callId: "call_approval", toolName: "bash", input: {} },
+    },
+    {
+      id: "event_approval_request",
+      type: "approval.requested",
+      time: 3 as TimestampMs,
+      sessionId,
+      payload: {
+        approvalId: "approval_authoritative",
+        callId: "call_approval",
+        permission: "tool.bash",
+        patterns: ["bun test"],
+      },
+    },
+    ...Array.from({ length: 40 }, (_, index): ChiliEvent => ({
+      id: `event_approval_flood_${index}`,
+      type: "session.renamed",
+      time: (4 + index) as TimestampMs,
+      sessionId,
+      payload: { sessionId, title: `flood-${index}` },
+    })),
+  ] as ChiliEvent[]);
+  baseStore.approvalRows.push(
+    {
+      id: "__proto__",
+      sessionId,
+      callId: "call_invalid",
+      permission: "tool.bash",
+      patterns: ["unsafe"],
+      status: "pending",
+      createdAt: 2,
+    },
+    {
+      id: "approval_authoritative",
+      sessionId,
+      callId: "call_approval",
+      permission: "tool.bash",
+      patterns: ["bun test"],
+      maxApprovalScope: "session",
+      status: "pending",
+      createdAt: 3,
+    },
+  );
+  const handler = createRuntimeHttpHandler({
+    service: new FakeRuntimeService(store),
+    store,
+    maxSessionEventScanPages: 1,
+    maxSessionEventScanEvents: 1,
+  });
+  const response = await handler(new Request(
+    `http://chili.test/sessions/${sessionId}/events?window=replayable&limit=4`,
+  ));
+  const window = await response.json() as RuntimeSessionEventWindow;
+  expect(window.pendingApprovals).toEqual([expect.objectContaining({
+    id: "approval_authoritative",
+    callId: "call_approval",
+  })]);
+  expect(window.events.some((event) => event.type === "approval.requested")).toBe(false);
+  expect(window.truncated).toBe(true);
+  expect(window.warning).toContain("anchors could not be recovered");
+  expect(window.warning).toContain("pending approvals exceeded");
+});
+
+test("replayable windows pin an active tool with its recovered start across an unrelated flood", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const sessionId = "session_replayable_active_tool" as SessionId;
+  await baseStore.appendMany([
+    {
+      id: "event_active_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_active_tool_start",
+      type: "tool.call_started",
+      time: 2 as TimestampMs,
+      sessionId,
+      payload: { turnId: "turn_active", callId: "call_active", toolName: "bash", input: {} },
+    },
+    ...Array.from({ length: 100 }, (_, index): ChiliEvent => ({
+      id: `event_active_flood_${index}`,
+      type: "session.renamed",
+      time: (3 + index) as TimestampMs,
+      sessionId,
+      payload: { sessionId, title: `child-flood-${index}` },
+    })),
+    {
+      id: "event_active_tool_tail",
+      type: "tool.output_delta",
+      time: 104 as TimestampMs,
+      sessionId,
+      payload: { callId: "call_active", stream: "stdout", delta: "still running", sequence: 1 },
+    },
+  ] as ChiliEvent[]);
+  const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
+  const response = await handler(new Request(
+    `http://chili.test/sessions/${sessionId}/events?window=replayable&limit=10`,
+  ));
+  const window = await response.json() as RuntimeSessionEventWindow;
+  expect(window.events.map((event) => event.id)).toEqual(expect.arrayContaining([
+    "event_active_tool_start",
+    "event_active_tool_tail",
+  ]));
+  expect(window.pinnedEventIds).toContain("event_active_tool_tail");
+});
+
+test("coalesces 100 identical replay scans and bounds admission for 100 distinct windows", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const stats = { active: 0, peak: 0, calls: 0 };
+  const originalEvents = baseStore.events.bind(baseStore);
+  baseStore.events = async (query: EventQuery = {}): Promise<EventEnvelope[]> => {
+    stats.active += 1;
+    stats.peak = Math.max(stats.peak, stats.active);
+    stats.calls += 1;
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 2));
+    try {
+      return await originalEvents(query);
+    } finally {
+      stats.active -= 1;
+    }
+  };
+  for (let index = 0; index < 100; index += 1) {
+    const sessionId = `session_admission_${index}` as SessionId;
+    await baseStore.append({
+      id: `event_admission_${index}`,
+      type: "session.created",
+      time: (index + 1) as TimestampMs,
+      sessionId,
+      payload: { sessionId, cwd: "/repo" },
+    });
+  }
+  const handler = createRuntimeHttpHandler({
+    service: new FakeRuntimeService(store),
+    store,
+    maxSessionEventWindowConcurrency: 2,
+  });
+
+  const distinct = await Promise.all(Array.from({ length: 100 }, (_, index) => handler(new Request(
+    `http://chili.test/sessions/session_admission_${index}/events?window=replayable`,
+  ))));
+  expect(distinct.some((response) => response.status === 503)).toBe(true);
+  expect(distinct.some((response) => response.status === 200)).toBe(true);
+  expect(stats.peak).toBeLessThanOrEqual(2);
+
+  stats.calls = 0;
+  stats.peak = 0;
+  const coalesced = await Promise.all(Array.from({ length: 100 }, () => handler(new Request(
+    "http://chili.test/sessions/session_admission_0/events?window=replayable",
+  ))));
+  expect(coalesced.every((response) => response.status === 200)).toBe(true);
+  expect(stats.calls).toBeLessThanOrEqual(3);
+  expect(stats.peak).toBe(1);
+});
+
 test("event backlog stays bounded and oversized resume cursors require a tail resync", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-runtime-tail-backlog-"));
   const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -338,6 +1102,176 @@ test("event backlog stays bounded and oversized resume cursors require a tail re
     baseStore.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("SSE de-duplicates a committed backlog event whose observable emit arrives late", async () => {
+  const store = new DelayedEmitEventStore();
+  const sessionId = "session_sse_commit_emit_race" as SessionId;
+  const event: ChiliEvent = {
+    id: "event_sse_commit_emit_race",
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd: "/repo" },
+  };
+  store.items.push(event);
+  const handler = createRuntimeHttpHandler({ service: new FakeRuntimeService(store), store });
+  const controller = new AbortController();
+  const response = await handler(new Request(
+    `http://chili.test/events?sessionId=${sessionId}`,
+    { signal: controller.signal },
+  ));
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("expected event stream body");
+
+  const backlog = await reader.read();
+  expect(new TextDecoder().decode(backlog.value).match(/event_sse_commit_emit_race/g)).toHaveLength(2);
+  // One occurrence is the SSE id field and one is the JSON envelope. A second
+  // chunk would prove the delayed observable broadcast duplicated the event.
+  store.emit(event);
+  const nextRead = reader.read();
+  const next = await Promise.race([
+    nextRead.then(() => "chunk" as const),
+    new Promise<"none">((resolvePromise) => setTimeout(() => resolvePromise("none"), 20)),
+  ]);
+  expect(next).toBe("none");
+
+  controller.abort();
+  await nextRead;
+  reader.releaseLock();
+});
+
+test("SSE keeps backlog identity after many live events and drops an extremely late emit", async () => {
+  const store = new DelayedEmitEventStore();
+  const sessionId = "session_sse_lifetime_dedupe" as SessionId;
+  const committed: ChiliEvent = {
+    id: "event_sse_lifetime_committed",
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd: "/repo" },
+  };
+  store.items.push(committed);
+  const handler = createRuntimeHttpHandler({
+    service: new FakeRuntimeService(store),
+    store,
+    maxBacklogEvents: 1,
+  });
+  const controller = new AbortController();
+  const response = await handler(new Request(
+    `http://chili.test/events?sessionId=${sessionId}`,
+    { signal: controller.signal },
+  ));
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("expected event stream body");
+  await reader.read();
+
+  for (let index = 0; index < 300; index += 1) {
+    const event: ChiliEvent = {
+      id: `event_sse_live_${index}`,
+      type: "session.status_changed",
+      time: (index + 2) as TimestampMs,
+      sessionId,
+      payload: { sessionId, status: "running" },
+    };
+    store.items.push(event);
+    store.emit(event);
+  }
+  for (let index = 0; index < 300; index += 1) await reader.read();
+
+  store.emit(committed);
+  const nextRead = reader.read();
+  const next = await Promise.race([
+    nextRead.then(() => "chunk" as const),
+    new Promise<"none">((resolvePromise) => setTimeout(() => resolvePromise("none"), 20)),
+  ]);
+  expect(next).toBe("none");
+
+  controller.abort();
+  await nextRead;
+  reader.releaseLock();
+});
+
+test("SSE rotates at a durable cursor and resumes without loss or late-emit duplicates", async () => {
+  const store = new DelayedEmitEventStore();
+  const sessionId = "session_sse_rotation" as SessionId;
+  const events = Array.from({ length: 4 }, (_, index): ChiliEvent => ({
+    id: `event_sse_rotation_${index + 1}`,
+    type: "session.status_changed",
+    time: (index + 1) as TimestampMs,
+    sessionId,
+    payload: { sessionId, status: index % 2 === 0 ? "running" : "idle" },
+  }));
+  store.items.push(events[0]!);
+  const handler = createRuntimeHttpHandler({
+    service: new FakeRuntimeService(store),
+    store,
+    maxEventStreamDurableEvents: 2,
+    maxEventStreamAgeMs: 60_000,
+  });
+
+  const firstResponse = await handler(new Request(`http://chili.test/events?sessionId=${sessionId}`));
+  const firstReader = firstResponse.body?.getReader();
+  if (!firstReader) throw new Error("expected first event stream body");
+  const firstChunks = [new TextDecoder().decode((await firstReader.read()).value)];
+  store.items.push(events[1]!);
+  store.emit(events[1]!);
+  firstChunks.push(new TextDecoder().decode((await firstReader.read()).value));
+  expect((await firstReader.read()).done).toBe(true);
+  firstReader.releaseLock();
+  expect(sseIds(firstChunks.join(""))).toEqual([
+    "event_sse_rotation_1",
+    "event_sse_rotation_2",
+  ]);
+
+  const secondResponse = await handler(new Request(
+    `http://chili.test/events?sessionId=${sessionId}&afterEventId=event_sse_rotation_2`,
+  ));
+  const secondReader = secondResponse.body?.getReader();
+  if (!secondReader) throw new Error("expected resumed event stream body");
+  // This arbitrarily late notification predates the durable cursor. It must
+  // only trigger a store pump, never be sent directly on the new connection.
+  store.emit(events[0]!);
+  store.items.push(events[2]!);
+  store.emit(events[2]!);
+  const secondChunks = [new TextDecoder().decode((await secondReader.read()).value)];
+  store.items.push(events[3]!);
+  store.emit(events[3]!);
+  secondChunks.push(new TextDecoder().decode((await secondReader.read()).value));
+  expect((await secondReader.read()).done).toBe(true);
+  secondReader.releaseLock();
+  expect(sseIds(secondChunks.join(""))).toEqual([
+    "event_sse_rotation_3",
+    "event_sse_rotation_4",
+  ]);
+});
+
+test("SSE age rotation closes a stream only after it has a durable cursor", async () => {
+  const store = new DelayedEmitEventStore();
+  const sessionId = "session_sse_age_rotation" as SessionId;
+  store.items.push({
+    id: "event_sse_age_rotation",
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd: "/repo" },
+  });
+  const handler = createRuntimeHttpHandler({
+    service: new FakeRuntimeService(store),
+    store,
+    maxEventStreamDurableEvents: 100,
+    maxEventStreamAgeMs: 10,
+  });
+  const response = await handler(new Request(`http://chili.test/events?sessionId=${sessionId}`));
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("expected age-limited event stream body");
+  expect(new TextDecoder().decode((await reader.read()).value)).toContain("event_sse_age_rotation");
+  const completion = await Promise.race([
+    reader.read().then((chunk) => chunk.done),
+    new Promise<false>((resolvePromise) => setTimeout(() => resolvePromise(false), 250)),
+  ]);
+  expect(completion).toBe(true);
+  reader.releaseLock();
 });
 
 test("rejects unknown SSE cursors but keeps a known tip cursor live without transient ids", async () => {
@@ -729,6 +1663,7 @@ test("serves task control routes", async () => {
     staleAfterMs: 0,
     modes: ["background"],
     limit: 25,
+    requireLeaseEvidence: true,
   });
 });
 
@@ -1351,6 +2286,77 @@ test("serves team control routes", async () => {
   }
 });
 
+test("normalizes hostile local subagent task errors at the HTTP boundary", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-http-hostile-subagent-error-"));
+  const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const teams = new TeamControlService({
+    store,
+    createId: createSequentialId(),
+    now: () => 20 as TimestampMs,
+  });
+  const teamDispatcher = new FakeTeamDispatcherService();
+  try {
+    const ownerSession = await service.createSession({
+      sessionId: "session_http_hostile_subagent_error" as SessionId,
+      cwd: "/repo",
+    });
+    const team = await teams.createTeam({
+      sessionId: ownerSession.sessionId,
+      name: "hostile-subagent-error",
+      leadPath: "/root" as AgentPath,
+    });
+    const hostileMessage = "secret=LOCAL_SUBAGENT_SECRET\n" + "\u0000".repeat(5 * 1024 * 1024);
+    const hostileError = Object.create(null) as Error;
+    Object.defineProperties(hostileError, {
+      message: { enumerable: true, get: () => hostileMessage },
+      name: { enumerable: true, get: () => "RemoteSubagentError" },
+      stack: { enumerable: true, get: () => { throw new Error("stack accessor must not run"); } },
+    });
+    const normalized = normalizePersistedError(hostileError);
+    teamDispatcher.nextDispatchResult = {
+      status: "failed",
+      teamTask: teamTaskRow({
+        teamId: team.id,
+        taskId: "task_http_hostile_subagent_error" as TaskId,
+        status: "failed",
+      }),
+      agentTask: {
+        ...localSubagentTaskRow({ status: "failed" }),
+        error: hostileError,
+      },
+    };
+    const handler = createRuntimeHttpHandler({ service, store, teams, teamDispatcher });
+
+    const response = await handler(new Request(
+      `http://chili.test/teams/${team.id}/tasks/task_http_hostile_subagent_error/dispatch`,
+      {
+        method: "POST",
+        body: JSON.stringify({ sessionId: ownerSession.sessionId }),
+        headers: { "content-type": "application/json" },
+      },
+    ));
+    const responseText = await response.text();
+    const body = JSON.parse(responseText) as {
+      agentTask: { error: string };
+      agent_task: { error: string };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.agentTask.error).toBe(normalized.message);
+    expect(body.agent_task.error).toBe(normalized.message);
+    expect(Buffer.byteLength(body.agentTask.error, "utf8")).toBeLessThanOrEqual(PERSISTED_ERROR_LIMITS.messageBytes);
+    expect(Buffer.byteLength(responseText, "utf8")).toBeLessThanOrEqual(40_000);
+    expect(responseText).toContain("[REDACTED]");
+    expect(responseText).toContain("error message truncated from");
+    expect(responseText).not.toContain("LOCAL_SUBAGENT_SECRET");
+  } finally {
+    baseStore.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("team HTTP CRUD mutations acquire the owner session operation and stay side-effect free when busy", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-http-team-operation-fence-"));
   const baseStore = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -1674,6 +2680,131 @@ test("resolves approvals through the runtime HTTP handler", async () => {
   expect(await response.json()).toEqual({ resolved: true });
   expect(approvals.resolved).toBe(true);
   expect(calls).toEqual([{ approvalId: "approval_http", decision: "allow_session", feedback: "" }]);
+});
+
+test("lists and resolves pending user input through the runtime HTTP handler", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const pending: PendingUserInputRequest[] = [
+    {
+      id: "userinput_http" as UserInputId,
+      sessionId: "session_http" as SessionId,
+      callId: "toolcall_http" as ToolCallId,
+      createdAt: 123,
+      questions: [{
+        id: "theme",
+        header: "Theme",
+        question: "Which theme should Chili use?",
+        options: [
+          { label: "Light", description: "Use a light theme." },
+          { label: "Dark", description: "Use a dark theme." },
+        ],
+      }],
+    },
+  ];
+  const listInputs: unknown[] = [];
+  const resolveInputs: unknown[] = [];
+  const userInputs = {
+    list(input: { sessionId?: SessionId } = {}) {
+      listInputs.push(input);
+      return pending.filter((request) => !input.sessionId || request.sessionId === input.sessionId);
+    },
+    resolve(input: { inputId: UserInputId; answers: UserInputAnswers }) {
+      resolveInputs.push(input);
+      const index = pending.findIndex((request) => request.id === input.inputId);
+      if (index < 0) return false;
+      pending.splice(index, 1);
+      return true;
+    },
+  };
+  const handler = createRuntimeHttpHandler({ service, store, userInputs });
+
+  const listResponse = await handler(new Request("http://chili.test/user-inputs?sessionId=session_http"));
+  expect(listResponse.status).toBe(200);
+  expect(await listResponse.json()).toEqual([expect.objectContaining({
+    id: "userinput_http",
+    sessionId: "session_http",
+    callId: "toolcall_http",
+    createdAt: 123,
+  })]);
+
+  const resolveResponse = await handler(new Request("http://chili.test/user-inputs/userinput_http/resolve", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ answers: { theme: ["Dark"] } }),
+  }));
+  expect(resolveResponse.status).toBe(200);
+  expect(await resolveResponse.json()).toEqual({ resolved: true });
+  expect(listInputs).toEqual([{ sessionId: "session_http" }, {}]);
+  expect(resolveInputs).toEqual([{ inputId: "userinput_http", answers: { theme: ["Dark"] } }]);
+
+  const repeatedResponse = await handler(new Request("http://chili.test/user-inputs/userinput_http/resolve", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ answers: { theme: ["Dark"] } }),
+  }));
+  expect(repeatedResponse.status).toBe(404);
+});
+
+test("validates user input HTTP filters and answer bodies before resolving", async () => {
+  const baseStore = new MemoryEventStore();
+  const store = new ObservableEventStore(baseStore);
+  const service = new FakeRuntimeService(store);
+  const request: PendingUserInputRequest = {
+    id: "userinput_validation" as UserInputId,
+    sessionId: "session_validation" as SessionId,
+    callId: "toolcall_validation" as ToolCallId,
+    createdAt: 123,
+    questions: [{
+      id: "theme",
+      header: "Theme",
+      question: "Which theme should Chili use?",
+      options: [
+        { label: "Light", description: "Use a light theme." },
+        { label: "Dark", description: "Use a dark theme." },
+      ],
+    }],
+  };
+  const resolveInputs: unknown[] = [];
+  const handler = createRuntimeHttpHandler({
+    service,
+    store,
+    userInputs: {
+      list: () => [request],
+      resolve(input) {
+        resolveInputs.push(input);
+        return false;
+      },
+    },
+  });
+
+  const badRequests = [
+    { answers: {} },
+    { answers: { unknown: ["Dark"] } },
+    { answers: { theme: ["Light", "Dark"] } },
+    { answers: { theme: ["Dark"] }, unexpected: true },
+  ];
+  for (const body of badRequests) {
+    const response = await handler(new Request("http://chili.test/user-inputs/userinput_validation/resolve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }));
+    expect(response.status).toBe(400);
+  }
+  expect(resolveInputs).toEqual([]);
+
+  const conflict = await handler(new Request("http://chili.test/user-inputs/userinput_validation/resolve", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ answers: { theme: ["Dark"] } }),
+  }));
+  expect(conflict.status).toBe(409);
+  expect(resolveInputs).toHaveLength(1);
+
+  const unknownFilter = await handler(new Request("http://chili.test/user-inputs?unexpected=true"));
+  expect(unknownFilter.status).toBe(400);
 });
 
 test("approval resolvers without scope introspection can only resolve one-shot decisions", async () => {
@@ -3550,6 +4681,13 @@ async function collectEventStreamText(
   return chunks.join("") + decoder.decode();
 }
 
+function sseIds(text: string): string[] {
+  return text
+    .split("\n")
+    .filter((line) => line.startsWith("id: "))
+    .map((line) => line.slice("id: ".length));
+}
+
 function permissionConfig(profile: RuntimePermissionProfileId): RuntimePermissionConfig {
   return {
     profile,
@@ -3676,6 +4814,7 @@ function abortError(message: string): Error {
 class MemoryEventStore implements EventStore {
   readonly items: ChiliEvent[] = [];
   readonly sessionRows = new Map<string, SessionRow>();
+  readonly approvalRows: ApprovalRow[] = [];
 
   async append(event: ChiliEvent): Promise<void> {
     this.items.push(event);
@@ -3716,6 +4855,11 @@ class MemoryEventStore implements EventStore {
       if (cursorIndex < 0) throw new UnknownEventCursorError(query.afterEventId);
       events = events.slice(cursorIndex + 1);
     }
+    if (query.beforeEventId) {
+      const cursorIndex = events.findIndex((event) => event.id === query.beforeEventId);
+      if (cursorIndex < 0) throw new UnknownEventCursorError(query.beforeEventId);
+      events = events.slice(0, cursorIndex);
+    }
     const limit = query.limit ?? events.length;
     return query.tail && !query.afterEventId ? events.slice(-limit) : events.slice(0, limit);
   }
@@ -3728,8 +4872,11 @@ class MemoryEventStore implements EventStore {
     return [];
   }
 
-  async pendingApprovals(): Promise<ApprovalRow[]> {
-    return [];
+  async pendingApprovals(sessionId?: SessionId, limit?: number): Promise<ApprovalRow[]> {
+    const rows = sessionId
+      ? this.approvalRows.filter((approval) => approval.sessionId === sessionId)
+      : this.approvalRows;
+    return rows.slice(0, limit ?? rows.length);
   }
 }
 
@@ -3741,5 +4888,18 @@ class CountingEventStore extends MemoryEventStore implements EventPublisher {
     return () => {
       this.listenerCount--;
     };
+  }
+}
+
+class DelayedEmitEventStore extends MemoryEventStore implements EventPublisher {
+  private readonly listeners = new Set<(event: ChiliEvent) => void>();
+
+  subscribe(listener: (event: ChiliEvent) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  emit(event: ChiliEvent): void {
+    for (const listener of this.listeners) listener(event);
   }
 }

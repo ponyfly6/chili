@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
-import { assertWritablePathInsideWorkspace, resolveWorkspacePath } from "../workspace-path.js";
+import { assertDirectWritablePathInsideWorkspace, resolveWorkspacePath } from "../workspace-path.js";
 
 export interface WriteFileInput {
   filePath: string;
@@ -64,12 +64,14 @@ export function createWriteFileTool(): ChiliToolDefinition<WriteFileInput> {
     async execute(input, context) {
       const workspace = context.cwd;
       const target = resolveWorkspacePath(workspace, input.filePath);
-      await assertWritablePathInsideWorkspace(workspace, target, input.filePath);
+      await assertDirectWritablePathInsideWorkspace(workspace, target, input.filePath);
       const existing = await readTextIfExists(target.absolutePath);
       if (existing !== undefined) {
         await context.fileReads?.assertFresh(workspace, target.absolutePath);
       }
 
+      // Re-resolve metadata aliases and link count after reads, immediately before mutation.
+      await assertDirectWritablePathInsideWorkspace(workspace, target, input.filePath);
       await mkdir(dirname(target.absolutePath), { recursive: true });
       await writeFile(target.absolutePath, input.content, "utf8");
       await context.fileReads?.recordTextRead(workspace, target.absolutePath, input.content);

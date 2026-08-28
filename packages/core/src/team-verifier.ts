@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AgentPath, AgentRunId, SessionId, TaskId, TeamId, TimestampMs } from "@chili/protocol";
-import { timestampNow } from "@chili/protocol";
+import { normalizePersistedError, timestampNow } from "@chili/protocol";
 import type { TeamMemberRow, TeamRow, TeamTaskRow } from "@chili/store";
 import { runProcess } from "@chili/tools";
 import {
@@ -564,7 +564,7 @@ export class TeamTaskVerificationService {
       return parts.length > 0 ? truncateDiff(concatenatePatchParts(parts)) : "(no diff)";
     } catch (error) {
       if (isSignalAbort(error, input.signal)) throw error;
-      return `(git diff unavailable: ${toError(error).message})`;
+      return normalizePersistedError(`git diff unavailable: ${toError(error).message}`).message;
     }
   }
 
@@ -860,7 +860,7 @@ function truncateDiff(value: string): string {
 }
 
 function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
+  return normalizePersistedError(error);
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

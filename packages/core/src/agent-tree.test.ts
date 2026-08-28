@@ -519,10 +519,10 @@ test("claims mailbox before delivery so concurrent consumers only deliver once",
   }
 });
 
-test("keeps mailbox queued when delivery fails", async () => {
+test("keeps mailbox queued with a bounded diagnostic when delivery fails", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-agent-tree-delivery-failure-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
-  const runtime = new FakeMailboxRuntime(new Error("child session is busy"));
+  const runtime = new FakeMailboxRuntime(hostileAgentTreeError("child session is busy"));
   const childSessionId = "session_child" as SessionId;
   const childPath = "/root/task_child" as AgentPath;
 
@@ -558,9 +558,11 @@ test("keeps mailbox queued when delivery fails", async () => {
     expect((await store.events({ type: "agent.message_claimed", limit: 10 })).map((event) => event.id)).toEqual([
       "event_1",
     ]);
-    expect((await store.events({ type: "agent.message_requeued", limit: 10 })).map((event) => event.id)).toEqual([
-      "event_2",
-    ]);
+    const requeuedEvents = await store.events({ type: "agent.message_requeued", limit: 10 });
+    expect(requeuedEvents.map((event) => event.id)).toEqual(["event_2"]);
+    const requeued = requeuedEvents[0] as Extract<ChiliEvent, { type: "agent.message_requeued" }>;
+    expectAgentTreeSafeDiagnostic(requeued.payload.error);
+    expect(jsonByteLength(requeued)).toBeLessThanOrEqual(128 * 1024);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -705,6 +707,72 @@ test("sends idempotent agent messages and keeps consumed messages terminal", asy
       messageId: "agent_message_wake_terminal",
       delivery: "triggerTurn",
     })).rejects.toBeInstanceOf(AgentMessageRecipientTerminalError);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("normalizes nested mailbox metadata diagnostics without redacting ordinary feedback", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-agent-message-metadata-bounds-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const parentSessionId = "session_metadata_bounds" as SessionId;
+  const taskId = "task_metadata_bounds" as TaskId;
+  const childPath = "/root/metadata_bounds" as AgentPath;
+  const ordinaryFeedback = `User feedback keeps ${AGENT_TREE_HOSTILE_SECRET}`;
+  const metadata: Record<string, unknown> = {
+    feedback: ordinaryFeedback,
+    diagnostics: { feedback: hostileAgentTreeError("diagnostic feedback") },
+    nested: { failureReason: hostileAgentTreeError("nested failure") },
+    "failure reason": hostileAgentTreeError("spaced failure key"),
+    oversized: "\u0000\"\\\n".repeat(Math.ceil((5 * 1024 * 1024) / 4)),
+  };
+  Object.defineProperty(metadata, "__proto__", {
+    configurable: true,
+    enumerable: true,
+    value: { error: hostileAgentTreeError("prototype key failure") },
+  });
+  metadata.circular = metadata;
+
+  try {
+    await seedMessageTask(store, {
+      taskId,
+      path: childPath,
+      taskName: "metadata_bounds",
+      parentSessionId,
+      status: "running",
+    });
+    const service = new AgentTreeControlService({ store, now: () => 10 as TimestampMs });
+    await service.sendMessage({
+      messageId: "agent_message_metadata_bounds",
+      from: "/root" as AgentPath,
+      to: childPath,
+      content: "Keep ordinary content",
+      sessionId: parentSessionId,
+      metadata,
+    });
+
+    const queued = (await store.events({ type: "agent.message_queued", limit: 10 })).at(-1) as
+      | Extract<ChiliEvent, { type: "agent.message_queued" }>
+      | undefined;
+    expect(queued).toBeDefined();
+    const message = queued!.payload.message;
+    if (!message || !("content" in message)) throw new Error("expected text mailbox message");
+    const persistedMetadata = message.metadata;
+    expect(persistedMetadata?.feedback).toBe(ordinaryFeedback);
+    expectAgentTreeSafeDiagnostic(
+      ((persistedMetadata?.diagnostics as Record<string, unknown> | undefined)?.feedback as string | undefined),
+    );
+    expectAgentTreeSafeDiagnostic(
+      ((persistedMetadata?.nested as Record<string, unknown> | undefined)?.failureReason as string | undefined),
+    );
+    expectAgentTreeSafeDiagnostic(persistedMetadata?.["failure reason"] as string | undefined);
+    expect(Object.prototype.hasOwnProperty.call(persistedMetadata, "__proto__")).toBe(true);
+    expectAgentTreeSafeDiagnostic(
+      ((persistedMetadata?.["__proto__"] as Record<string, unknown> | undefined)?.error as string | undefined),
+    );
+    expect(jsonByteLength(persistedMetadata)).toBeLessThanOrEqual(256 * 1024);
+    expect(jsonByteLength(queued)).toBeLessThanOrEqual(320 * 1024);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -938,6 +1006,31 @@ function agentSpawned(
 function createSequentialId(): (prefix: string) => string {
   let index = 0;
   return (prefix) => `${prefix}_${++index}`;
+}
+
+const AGENT_TREE_HOSTILE_SECRET = "sk-agent-tree-secret-123456789";
+
+function hostileAgentTreeError(label: string): Error {
+  const error = new Error(
+    `${label}\nAuthorization: Bearer ${AGENT_TREE_HOSTILE_SECRET}\n`
+      + `http://127.0.0.1:4555/private?token=${AGENT_TREE_HOSTILE_SECRET}\n`
+      + "\u0000\"\\\n".repeat(Math.ceil((5 * 1024 * 1024) / 4)),
+  ) as Error & { code?: string };
+  error.name = "MailboxDeliveryFailure";
+  error.code = "TOKEN_INVALIDATED";
+  return error;
+}
+
+function expectAgentTreeSafeDiagnostic(value: string | undefined): void {
+  expect(value).toBeDefined();
+  expect(value).toContain("[REDACTED]");
+  expect(value).not.toContain(AGENT_TREE_HOSTILE_SECRET);
+  expect(value).not.toContain("127.0.0.1");
+  expect(new TextEncoder().encode(value ?? "").byteLength).toBeLessThanOrEqual(16 * 1024);
+}
+
+function jsonByteLength(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
 class FakeMailboxRuntime {

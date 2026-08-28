@@ -566,6 +566,41 @@ test("parses Anthropic SSE text and tool deltas", async () => {
   });
 });
 
+test("normalizes hostile Anthropic stream tool call ids consistently", async () => {
+  const model = new AnthropicCompatibleModel({
+    provider: "minimax",
+    model: "test-model",
+    apiKey: "test-key",
+    baseUrl: "https://api.test",
+    backpressureCoordinator: new ProviderBackpressureCoordinator(),
+    fetch: sseFetch([
+      event("message_start", {
+        type: "message_start",
+        message: { id: "msg_hostile_id", model: "test-model", usage: { input_tokens: 1, output_tokens: 0 } },
+      }),
+      event("content_block_start", {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "__proto__", name: "lookup", input: {} },
+      }),
+      event("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: "{\"query\":\"chili\"}" },
+      }),
+      event("content_block_stop", { type: "content_block_stop", index: 0 }),
+      event("message_stop", { type: "message_stop" }),
+    ]),
+  });
+
+  const events = (await collect(model.stream({ messages: [], tools: [], system: [] })))
+    .filter((streamEvent) => streamEvent.type.startsWith("tool_call_"));
+  const ids = events.flatMap((streamEvent) => "toolCallId" in streamEvent ? [streamEvent.toolCallId] : []);
+  expect(ids).toHaveLength(3);
+  expect(new Set(ids).size).toBe(1);
+  expect(ids[0]).toMatch(/^toolcall_invalid_[a-f0-9]{16}$/u);
+});
+
 test("marks invalid Anthropic streaming tool arguments", async () => {
   const model = new AnthropicCompatibleModel({
     provider: "minimax",

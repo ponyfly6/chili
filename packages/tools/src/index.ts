@@ -29,3 +29,4 @@ export * from "./agent-message.js";
 export * from "./team.js";
 export * from "./tool-policy.js";
 export * from "./types.js";
+export * from "./user-input.js";

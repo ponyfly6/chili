@@ -71,6 +71,9 @@ export interface ChiliRuntimeView {
   modelMetadataByTurn: Record<string, RuntimeModelMetadataView>;
   goalsBySession: Record<string, RuntimeSessionGoalView>;
   partIndex: Record<string, RuntimePartIndexEntry>;
+  /** Stable durable/projection order for transcript rows across clock rollback. */
+  transcriptOrder: Record<string, number>;
+  nextTranscriptOrder: number;
   lastEventId?: string;
 }
 
@@ -1001,34 +1004,40 @@ export interface ChatApprovalRow {
 export function createRuntimeView(): ChiliRuntimeView {
   return {
     sessionIds: [],
-    sessions: {},
-    turnStatuses: {},
-    turnStartedAt: {},
-    messages: {},
-    toolCalls: {},
-    approvals: {},
+    sessions: nullPrototypeRecord(),
+    turnStatuses: nullPrototypeRecord(),
+    turnStartedAt: nullPrototypeRecord(),
+    messages: nullPrototypeRecord(),
+    toolCalls: nullPrototypeRecord(),
+    approvals: nullPrototypeRecord(),
     agentRunIds: [],
-    agents: {},
-    agentRunIdsByPath: {},
+    agents: nullPrototypeRecord(),
+    agentRunIdsByPath: nullPrototypeRecord(),
     mailboxMessageIds: [],
-    mailboxMessages: {},
+    mailboxMessages: nullPrototypeRecord(),
     taskIds: [],
-    tasks: {},
-    teamIdByDelegatedTaskId: {},
+    tasks: nullPrototypeRecord(),
+    teamIdByDelegatedTaskId: nullPrototypeRecord(),
     teamIds: [],
-    teams: {},
+    teams: nullPrototypeRecord(),
     teamMemberIds: [],
-    teamMembers: {},
+    teamMembers: nullPrototypeRecord(),
     teamMessageIds: [],
-    teamMessages: {},
+    teamMessages: nullPrototypeRecord(),
     teamRunIds: [],
-    teamRuns: {},
-    teamRunIdsByTeam: {},
+    teamRuns: nullPrototypeRecord(),
+    teamRunIdsByTeam: nullPrototypeRecord(),
     modelMetadataTurnIds: [],
-    modelMetadataByTurn: {},
-    goalsBySession: {},
-    partIndex: {},
+    modelMetadataByTurn: nullPrototypeRecord(),
+    goalsBySession: nullPrototypeRecord(),
+    partIndex: nullPrototypeRecord(),
+    transcriptOrder: nullPrototypeRecord(),
+    nextTranscriptOrder: 0,
   };
+}
+
+function nullPrototypeRecord<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
 }
 
 export function reduceRuntimeEvents(
@@ -1042,6 +1051,7 @@ export function reduceRuntimeEvents(
 }
 
 export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvelope): ChiliRuntimeView {
+  normalizeRuntimeViewIndexes(view);
   if (!isTransientEvent(inputEvent)) view.lastEventId = inputEvent.id;
   applyTeamProjectionEvent(view, inputEvent);
   applySubagentProjectionEvent(view, inputEvent);
@@ -1177,6 +1187,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
         };
         assignOptional(message, "turnId", event.payload.turnId);
         view.messages[message.id] = message;
+        assignTranscriptOrder(view, "message", message.id);
         session.messageIds.push(message.id);
       }
       session.updatedAt = event.time;
@@ -1227,6 +1238,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       assignOptional(toolCall, "sessionId", event.sessionId);
       assignOptional(toolCall, "turnId", event.payload.turnId);
       view.toolCalls[toolCall.id] = toolCall;
+      assignTranscriptOrder(view, "tool", toolCall.id);
       linkToolCallToSession(view, toolCall, event.time);
       setToolPartStatus(view, event.payload.callId, "running");
       break;
@@ -1301,6 +1313,7 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
       assignOptional(approval, "maxApprovalScope", event.payload.maxApprovalScope);
       assignOptional(approval, "metadata", event.payload.metadata);
       view.approvals[approval.id] = approval;
+      assignTranscriptOrder(view, "approval", approval.id);
       linkApprovalToSession(view, approval, event.time, event.id);
       break;
     }
@@ -1334,6 +1347,41 @@ export function applyRuntimeEvent(view: ChiliRuntimeView, inputEvent: EventEnvel
   }
 
   return view;
+}
+
+function normalizeRuntimeViewIndexes(view: ChiliRuntimeView): void {
+  view.sessions = nullPrototypeIndex(view.sessions);
+  view.turnStatuses = nullPrototypeIndex(view.turnStatuses);
+  view.turnStartedAt = nullPrototypeIndex(view.turnStartedAt);
+  view.messages = nullPrototypeIndex(view.messages);
+  view.toolCalls = nullPrototypeIndex(view.toolCalls);
+  view.approvals = nullPrototypeIndex(view.approvals);
+  view.agents = nullPrototypeIndex(view.agents);
+  view.agentRunIdsByPath = nullPrototypeIndex(view.agentRunIdsByPath);
+  view.mailboxMessages = nullPrototypeIndex(view.mailboxMessages);
+  view.tasks = nullPrototypeIndex(view.tasks);
+  view.teamIdByDelegatedTaskId = nullPrototypeIndex(view.teamIdByDelegatedTaskId);
+  view.teams = nullPrototypeIndex(view.teams);
+  view.teamMembers = nullPrototypeIndex(view.teamMembers);
+  view.teamMessages = nullPrototypeIndex(view.teamMessages);
+  view.teamRuns = nullPrototypeIndex(view.teamRuns);
+  view.teamRunIdsByTeam = nullPrototypeIndex(view.teamRunIdsByTeam);
+  view.modelMetadataByTurn = nullPrototypeIndex(view.modelMetadataByTurn);
+  view.goalsBySession = nullPrototypeIndex(view.goalsBySession);
+  view.partIndex = nullPrototypeIndex(view.partIndex);
+  view.transcriptOrder = nullPrototypeIndex(view.transcriptOrder ?? {});
+  if (!Number.isSafeInteger(view.nextTranscriptOrder) || view.nextTranscriptOrder < 0) {
+    let nextOrder = 0;
+    for (const order of Object.values(view.transcriptOrder)) {
+      if (Number.isSafeInteger(order) && order >= nextOrder) nextOrder = order + 1;
+    }
+    view.nextTranscriptOrder = nextOrder;
+  }
+}
+
+function nullPrototypeIndex<T>(index: Record<string, T>): Record<string, T> {
+  if (Object.getPrototypeOf(index) === null) return index;
+  return Object.assign(nullPrototypeRecord<T>(), index);
 }
 
 export function sessionMessages(view: ChiliRuntimeView, sessionId: SessionId): RuntimeMessageView[] {
@@ -1499,7 +1547,10 @@ export function chatSessionView(view: ChiliRuntimeView, input: ChatSessionInput 
   const usageSummary = modelUsageSummary(modelMetadata);
   const goal = sessionId ? view.goalsBySession[sessionId] : undefined;
   const items = [...messages, ...tools, ...approvals]
-    .sort((left, right) => chatItemTime(left) - chatItemTime(right))
+    .sort((left, right) => (
+      chatTranscriptOrder(view, left) - chatTranscriptOrder(view, right)
+      || chatItemTime(left) - chatItemTime(right)
+    ))
     .slice(-limit);
   const pendingApprovalRows = approvals.filter((approval) => approval.status === "pending");
   const effectiveStatus = session?.status === "running"
@@ -4602,6 +4653,7 @@ function upsertToolCall(view: ChiliRuntimeView, callId: ToolCallId, time: number
     updatedAt: time,
   };
   view.toolCalls[callId] = toolCall;
+  assignTranscriptOrder(view, "tool", callId);
   return toolCall;
 }
 
@@ -4611,9 +4663,33 @@ function appendToolOutputDelta(toolCall: RuntimeToolCallView, delta: RuntimeTool
   if (!delta.delta) return;
   const liveOutput = toolCall.liveOutput ? [...toolCall.liveOutput, delta] : [delta];
   if (liveOutput.length > MAX_TOOL_OUTPUT_DELTAS) {
-    liveOutput.splice(0, liveOutput.length - MAX_TOOL_OUTPUT_DELTAS);
+    const dropped = liveOutput.splice(0, liveOutput.length - MAX_TOOL_OUTPUT_DELTAS);
+    const first = liveOutput[0];
+    if (first && (dropped.length > 0 || dropped.some((entry) => entry.truncated === true))) {
+      liveOutput[0] = { ...first, truncated: true };
+    }
   }
   toolCall.liveOutput = liveOutput;
+}
+
+function assignTranscriptOrder(
+  view: ChiliRuntimeView,
+  kind: "message" | "tool" | "approval",
+  id: string,
+): void {
+  const key = transcriptOrderKey(kind, id);
+  if (view.transcriptOrder[key] !== undefined) return;
+  view.transcriptOrder[key] = view.nextTranscriptOrder;
+  view.nextTranscriptOrder += 1;
+}
+
+function chatTranscriptOrder(view: ChiliRuntimeView, item: ChatTranscriptItem): number {
+  const kind = item.kind === "message" ? "message" : item.kind === "tool" ? "tool" : "approval";
+  return view.transcriptOrder[transcriptOrderKey(kind, String(item.id))] ?? Number.MAX_SAFE_INTEGER;
+}
+
+function transcriptOrderKey(kind: "message" | "tool" | "approval", id: string): string {
+  return `${kind}\u0000${id}`;
 }
 
 function touchSession(view: ChiliRuntimeView, sessionId: SessionId, time: number): void {

@@ -1,0 +1,27 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "allowJs": false,
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "emitDeclarationOnly": false,
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "types": [
+      "node",
+      "bun",
+      "electron",
+      "vite/client"
+    ]
+  },
+  "include": [
+    "electron-builder.config.ts",
+    "electron.vite.config.ts",
+    "scripts/**/*.ts",
+    "src/**/*.ts",
+    "src/**/*.tsx"
+  ]
+}

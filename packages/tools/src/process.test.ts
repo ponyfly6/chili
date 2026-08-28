@@ -2,7 +2,46 @@ import { expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runProcess } from "./process.js";
+import { observeRunProcessLifecycle, runProcess, type RunProcessLifecycleEvent } from "./process.js";
+
+test("runProcess reports its detached process group lifecycle", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-process-lifecycle-"));
+  const events: RunProcessLifecycleEvent[] = [];
+  const unsubscribe = observeRunProcessLifecycle((event) => events.push(event));
+  try {
+    expect((await runProcess("bash", ["-lc", "exit 0"], { cwd: workspace })).exitCode).toBe(0);
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({ type: "started", pid: expect.any(Number) });
+    const startedPid = events[0]?.pid;
+    if (!startedPid) throw new Error("runProcess did not report its started PID");
+    expect(events[1]).toEqual({ type: "finished", pid: startedPid });
+  } finally {
+    unsubscribe();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("runProcess does not allow a background process to escape its detached group", async () => {
+  if (process.platform === "win32") return;
+  const workspace = await mkdtemp(join(tmpdir(), "chili-process-background-"));
+  const marker = join(workspace, "escaped.txt");
+  const events: RunProcessLifecycleEvent[] = [];
+  const unsubscribe = observeRunProcessLifecycle((event) => events.push(event));
+  try {
+    const result = await runProcess(
+      "bash",
+      ["-lc", `(sleep 0.4; printf escaped > ${shellQuote(marker)}) >/dev/null 2>&1 &`],
+      { cwd: workspace, killGraceMs: 80 },
+    );
+    expect(result.exitCode).toBe(0);
+    expect(events.map((event) => event.type)).toEqual(["started", "finished"]);
+    await sleep(600);
+    await expect(readFile(marker, "utf8")).rejects.toThrow();
+  } finally {
+    unsubscribe();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
 
 test("runProcess reports output truncation with byte metadata", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-process-output-"));

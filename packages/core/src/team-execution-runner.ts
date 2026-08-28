@@ -11,7 +11,7 @@ import type {
   TeamTaskStatus,
   TimestampMs,
 } from "@chili/protocol";
-import { timestampNow } from "@chili/protocol";
+import { normalizePersistedError, timestampNow } from "@chili/protocol";
 import type {
   EventAppendOptions,
   TeamMemberRow,
@@ -598,7 +598,7 @@ export class TeamExecutionRunner {
       summary.errors.push({
         teamId: error.teamId,
         taskId: error.taskId,
-        error: error.error,
+        error: normalizePersistedError(error.error).message,
       });
     }
   }
@@ -666,7 +666,7 @@ export class TeamExecutionRunner {
       summary.errors.push({
         teamId: error.teamId,
         taskId: error.taskId,
-        error: error.error,
+        error: normalizePersistedError(error.error).message,
       });
     }
   }
@@ -710,7 +710,7 @@ export class TeamExecutionRunner {
       summary.errors.push({
         teamId: error.teamId,
         taskId: error.taskId,
-        error: error.error,
+        error: normalizePersistedError(error.error).message,
       });
     }
   }
@@ -1358,7 +1358,7 @@ function finalTaskSummary(task: TeamTaskRow, agentTaskId: TaskId | undefined): T
   };
   if (task.ownerPath) summary.ownerPath = task.ownerPath;
   if (task.summary) summary.summary = task.summary;
-  if (task.error) summary.error = task.error;
+  if (task.error) summary.error = normalizePersistedError(task.error).message;
   const resolvedAgentTaskId = agentTaskId ?? dispatchAgentTaskId(task.metadata);
   if (resolvedAgentTaskId) summary.agentTaskId = resolvedAgentTaskId;
   return summary;
@@ -1384,8 +1384,10 @@ function mergeSummary(result: TeamMergeTaskResult): TeamExecutionMergeTask {
   };
   if (result.teamTask.ownerPath) item.ownerPath = result.teamTask.ownerPath;
   if (result.diffSummary) item.diffSummary = result.diffSummary;
-  if (result.error) item.error = result.error;
-  if (result.conflicts) item.conflicts = result.conflicts;
+  if (result.error) item.error = normalizePersistedError(result.error).message;
+  if (result.conflicts) {
+    item.conflicts = result.conflicts.map((conflict) => normalizePersistedError(conflict).message);
+  }
   return item;
 }
 
@@ -1396,7 +1398,7 @@ function mergeSkippedSummary(result: TeamMergeTaskSkipped): TeamExecutionMergeSk
     reason: result.reason,
   };
   if (result.teamTask.ownerPath) item.ownerPath = result.teamTask.ownerPath;
-  if (result.error) item.error = result.error;
+  if (result.error) item.error = normalizePersistedError(result.error).message;
   return item;
 }
 
@@ -1541,7 +1543,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
+  return normalizePersistedError(error);
 }
 
 function isAbortError(error: unknown): boolean {

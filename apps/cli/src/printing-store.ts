@@ -37,6 +37,8 @@ import type {
   SessionGoalQuery,
   SessionGoalRow,
   SessionRow,
+  StaleTurnRecoveryInput,
+  StaleTurnRecoveryStore,
   SubagentProjectionStore,
   TeamMemberQuery,
   TeamMemberRow,
@@ -64,6 +66,7 @@ export class PrintingEventStore
   implements
     EventStore,
     EventCommitAwareStore,
+    StaleTurnRecoveryStore,
     GoalProjectionStore,
     SubagentProjectionStore,
     AgentTaskLeaseStore,
@@ -109,6 +112,14 @@ export class PrintingEventStore
       : (await this.inner.appendMany(events, options), events);
     for (const event of committed) this.printer.event(event);
     return committed;
+  }
+
+  async reconcileStaleTurns(input: StaleTurnRecoveryInput): Promise<ChiliEvent[]> {
+    const recovery = this.inner as EventStore & Partial<StaleTurnRecoveryStore>;
+    if (!recovery.reconcileStaleTurns) return [];
+    const events = await recovery.reconcileStaleTurns(input);
+    for (const event of events) this.printer.event(event);
+    return events;
   }
 
   events(query?: EventQuery): Promise<EventEnvelope[]> {

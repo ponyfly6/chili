@@ -3,6 +3,16 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { expect, test } from "bun:test";
 import type {
+  McpClient,
+  McpDiagnostic,
+  McpInitializeResult,
+  McpPrompt,
+  McpResource,
+  McpServerConfig,
+  McpServerState,
+  McpTool,
+} from "@chili/mcp";
+import type {
   ChiliEvent,
   RuntimeCommandCatalog,
   RuntimeCommandNode,
@@ -11,6 +21,7 @@ import type {
   RuntimeMcpToolsResponse,
   SessionId,
   TimestampMs,
+  ToolCallId,
   TurnId,
 } from "@chili/protocol";
 import { createToolSearchTool, InMemoryToolRegistry, ToolExecutor } from "@chili/tools";
@@ -325,6 +336,7 @@ test("MCP prompt conflicts are diagnosed and rejected from catalog execution", a
   const chiliHome = join(root, "home");
   await mkdir(cwd, { recursive: true });
   await mkdir(chiliHome, { recursive: true });
+  await writeMcpConfig(join(chiliHome, "mcp.json"), "docs");
 
   const baseMcp = commandNode({
     id: "prompt.project.mcp",
@@ -349,7 +361,7 @@ test("MCP prompt conflicts are diagnosed and rejected from catalog execution", a
     throw new Error("base command not found");
   }));
   let rendered = false;
-  await stubMcpPrompts(runtime, cwd, [{
+  await stubMcpPrompts(runtime, undefined, [{
     server: { name: "docs" },
     prompt: { name: "review" },
   }], async () => {
@@ -384,13 +396,14 @@ test("duplicate MCP prompt paths retain command diagnostics", async () => {
   const chiliHome = join(root, "home");
   await mkdir(cwd, { recursive: true });
   await mkdir(chiliHome, { recursive: true });
+  await writeMcpConfig(join(chiliHome, "mcp.json"), "docs");
   const runtime = await createCliMcpRuntime({
     cwd,
     chiliHome,
     registries: [new InMemoryToolRegistry()],
     connectMode: "manual",
   }, fakePromptCommands());
-  await stubMcpPrompts(runtime, cwd, [
+  await stubMcpPrompts(runtime, undefined, [
     { server: { name: "docs" }, prompt: { name: "Review Doc" } },
     { server: { name: "docs" }, prompt: { name: "review-doc" } },
   ]);
@@ -641,6 +654,563 @@ test("MCP prompt catalogs and execution never cross workspace scopes", async () 
   }
 });
 
+test("MCP state errors are normalized before status descriptors and durable events", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-mcp-error-boundary-"));
+  const cwd = join(root, "repo");
+  const chiliHome = join(root, "home");
+  const events: ChiliEvent[] = [];
+  await Promise.all([mkdir(cwd, { recursive: true }), mkdir(chiliHome, { recursive: true })]);
+  await writeMcpConfig(join(chiliHome, "mcp.json"), "docs");
+  const runtime = await createCliMcpRuntime({
+    cwd,
+    chiliHome,
+    registries: [new InMemoryToolRegistry()],
+    connectMode: "manual",
+    events: { publish: async (event) => { events.push(event); } },
+  }, fakePromptCommands());
+
+  try {
+    const internal = mcpRuntimeInternals(runtime);
+    const state = internal.userScope?.manager.listStates()[0];
+    if (!state || !internal.userScope) throw new Error("test MCP state was not initialized");
+    const secret = "sk-mcpBoundarySecret123456789";
+    const loopback = "http://127.0.0.1:43123/private?access_token=mcpLoopbackSecret";
+    const hostile = `Bearer ${secret} ${loopback} ${"\u0000\"\\\n".repeat(1_310_720)}`;
+    state.status = "failed";
+    state.error = Object.assign(new Error(hostile), {
+      name: "RemoteMcpError",
+      code: "TOKEN_INVALIDATED",
+    });
+    state.server.raw.description = "A normal, useful MCP server description.";
+
+    const status = await scopedMcpControl(runtime).status?.();
+    const descriptorJson = JSON.stringify(status);
+    expect(status?.servers[0]).toMatchObject({
+      name: "docs",
+      status: "error",
+      description: "A normal, useful MCP server description.",
+    });
+    expect(descriptorJson).not.toContain(secret);
+    expect(descriptorJson).not.toContain("127.0.0.1");
+    expect(descriptorJson).not.toContain("mcpLoopbackSecret");
+    expect(descriptorJson).toContain("REDACTED");
+    expect(descriptorJson).toContain("truncated from");
+    expect(testJsonBytes(status)).toBeLessThanOrEqual(300 * 1024);
+
+    events.length = 0;
+    internal.publishStatusSnapshot(internal.userScope);
+    const statusEvent = events.find((event) => event.type === "mcp.server_status_changed");
+    expect(statusEvent?.type).toBe("mcp.server_status_changed");
+    const eventJson = JSON.stringify(statusEvent);
+    expect(eventJson).not.toContain(secret);
+    expect(eventJson).not.toContain("127.0.0.1");
+    expect(eventJson).not.toContain("mcpLoopbackSecret");
+    expect(eventJson).toContain("truncated from");
+    expect(testJsonBytes(statusEvent)).toBeLessThanOrEqual(80 * 1024);
+  } finally {
+    await runtime.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("MCP diagnostics and reload errors share the persistence-safe normalizer", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-mcp-diagnostic-boundary-"));
+  const cwd = join(root, "repo");
+  const chiliHome = join(root, "home");
+  const events: ChiliEvent[] = [];
+  await Promise.all([mkdir(cwd, { recursive: true }), mkdir(chiliHome, { recursive: true })]);
+  const runtime = await createCliMcpRuntime({
+    cwd,
+    chiliHome,
+    registries: [new InMemoryToolRegistry()],
+    connectMode: "manual",
+    events: { publish: async (event) => { events.push(event); } },
+  }, fakePromptCommands());
+
+  try {
+    const internal = mcpRuntimeInternals(runtime);
+    const scope = internal.userScope;
+    if (!scope) throw new Error("test MCP scope was not initialized");
+    const secret = "sk-mcpDiagnosticSecret123456789";
+    const loopback = "http://localhost:44111/callback?token=mcpDiagnosticToken";
+    const hostile = `Authorization: Basic ${secret} ${loopback} ${"\u0000\"\\\n".repeat(1_310_720)}`;
+
+    events.length = 0;
+    internal.publishDiagnostic({
+      severity: "error",
+      code: "connect_failed",
+      message: hostile,
+      path: "servers.docs",
+      source: "user",
+    });
+    internal.publishDiagnostic({
+      severity: "warning",
+      code: "normal_warning",
+      message: "A normal diagnostic remains useful.",
+      path: "servers.docs",
+      source: "user",
+    });
+    const diagnosticEvents = events.filter((event) => event.type === "mcp.diagnostic");
+    expect(diagnosticEvents).toHaveLength(2);
+    const hostileJson = JSON.stringify(diagnosticEvents[0]);
+    expect(hostileJson).not.toContain(secret);
+    expect(hostileJson).not.toContain("localhost:44111");
+    expect(hostileJson).not.toContain("mcpDiagnosticToken");
+    expect(hostileJson).toContain("REDACTED");
+    expect(hostileJson).toContain("truncated from");
+    expect(testJsonBytes(diagnosticEvents[0])).toBeLessThanOrEqual(20 * 1024);
+    expect(diagnosticEvents[1]).toMatchObject({
+      payload: { message: "A normal diagnostic remains useful." },
+    });
+
+    scope.loadErrors = [{ server: "docs", message: hostile }];
+    internal.reloadUserScope = async () => {};
+    internal.invalidateProjectScopes = async () => {};
+    const reloaded = await runtime.control.reload?.();
+    const reloadJson = JSON.stringify(reloaded);
+    expect(reloadJson).not.toContain(secret);
+    expect(reloadJson).not.toContain("localhost:44111");
+    expect(reloadJson).not.toContain("mcpDiagnosticToken");
+    expect(reloadJson).toContain("truncated from");
+    expect(testJsonBytes(reloaded)).toBeLessThanOrEqual(300 * 1024);
+  } finally {
+    await runtime.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("MCP tool, prompt, and resource descriptors are recursively bounded and redacted", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-mcp-descriptor-boundary-"));
+  const cwd = join(root, "repo");
+  const chiliHome = join(root, "home");
+  const events: ChiliEvent[] = [];
+  await Promise.all([mkdir(cwd, { recursive: true }), mkdir(chiliHome, { recursive: true })]);
+  await writeMcpConfig(join(chiliHome, "mcp.json"), "docs");
+  const runtime = await createCliMcpRuntime({
+    cwd,
+    chiliHome,
+    registries: [new InMemoryToolRegistry()],
+    connectMode: "manual",
+    events: { publish: async (event) => { events.push(event); } },
+  }, fakePromptCommands());
+
+  try {
+    const internal = mcpRuntimeInternals(runtime);
+    const state = internal.userScope?.manager.listStates()[0];
+    if (!state) throw new Error("test MCP state was not initialized");
+    const secret = "sk-mcpDescriptorSecret123456789";
+    const loopback = "http://[::1]:45111/private?api_key=mcpDescriptorToken";
+    const worstEscaped = "\u0000\"\\\n".repeat(1_310_720);
+    state.tools = [
+      {
+        name: "normal_tool",
+        description: "A normal tool description stays intact.",
+        inputSchema: { type: "object", properties: { query: { type: "string" } } },
+      },
+      {
+        name: "hostile_tool",
+        description: `Bearer ${secret} ${loopback}`,
+        inputSchema: {
+          type: "object",
+          secret: `api_key=${secret}`,
+          endpoint: loopback,
+          nested: nestedDescriptor(12),
+          escaped: worstEscaped,
+        },
+        annotations: { note: `access_token=${secret}`, callback: loopback },
+      },
+    ];
+    state.prompts = [{
+      name: "review",
+      description: `Review safely. Bearer ${secret} ${loopback}`,
+      arguments: [{ name: "target", description: `Target ${secret}`, required: true }],
+    }];
+    state.resources = [{
+      uri: "https://docs.example.test/guide",
+      name: "Guide",
+      description: `Guide endpoint ${loopback} token=${secret}`,
+      mimeType: "text/plain",
+    }];
+
+    const tools = await scopedMcpControl(runtime).tools?.("docs");
+    const toolsJson = JSON.stringify(tools);
+    expect(tools?.tools[0]?.description).toBe("A normal tool description stays intact.");
+    expect(toolsJson).not.toContain(secret);
+    expect(toolsJson).not.toContain("::1");
+    expect(toolsJson).not.toContain("mcpDescriptorToken");
+    expect(toolsJson).toContain("REDACTED");
+    expect(toolsJson).toContain("omitted");
+    expect(toolsJson).toContain("depth limit exceeded");
+    expect(testJsonBytes(tools)).toBeLessThanOrEqual(300 * 1024);
+
+    const resources = await runtime.resources.listResources({}, mcpResourceContext(cwd));
+    const resourcesJson = JSON.stringify(resources);
+    expect(resources[0]).toMatchObject({ uri: "https://docs.example.test/guide", name: "Guide" });
+    expect(resourcesJson).not.toContain(secret);
+    expect(resourcesJson).not.toContain("::1");
+
+    events.length = 0;
+    internal.publishToolsChanged(state.server, state.tools);
+    internal.publishPromptsChanged(state.server, state.prompts);
+    internal.publishResourcesChanged(state.server, state.resources);
+    const descriptorsJson = JSON.stringify(events);
+    expect(descriptorsJson).not.toContain(secret);
+    expect(descriptorsJson).not.toContain("::1");
+    expect(descriptorsJson).not.toContain("mcpDescriptorToken");
+    expect(descriptorsJson).toContain("A normal tool description stays intact.");
+    for (const event of events) expect(testJsonBytes(event)).toBeLessThanOrEqual(300 * 1024);
+  } finally {
+    await runtime.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("MCP descriptor catalogs fail closed for responses and mark truncated events", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-mcp-catalog-limits-"));
+  const cwd = join(root, "repo");
+  const chiliHome = join(root, "home");
+  const events: ChiliEvent[] = [];
+  await Promise.all([mkdir(cwd, { recursive: true }), mkdir(chiliHome, { recursive: true })]);
+  await writeMcpConfig(join(chiliHome, "mcp.json"), "docs");
+  const runtime = await createCliMcpRuntime({
+    cwd,
+    chiliHome,
+    registries: [new InMemoryToolRegistry()],
+    connectMode: "manual",
+    events: { publish: async (event) => { events.push(event); } },
+  }, fakePromptCommands());
+
+  try {
+    const internal = mcpRuntimeInternals(runtime);
+    const state = internal.userScope?.manager.listStates()[0];
+    if (!state) throw new Error("test MCP state was not initialized");
+    state.tools = Array.from({ length: 129 }, (_, index) => ({
+      name: `tool_${index}`,
+      description: `Tool ${index}`,
+    }));
+    await expect(scopedMcpControl(runtime).tools?.("docs"))
+      .rejects.toThrow("MCP tool descriptor exceeds the safe catalog limit.");
+
+    events.length = 0;
+    internal.publishToolsChanged(state.server, state.tools);
+    const countEvent = events.find((event) => event.type === "mcp.tools_changed");
+    expect(countEvent?.type).toBe("mcp.tools_changed");
+    if (countEvent?.type === "mcp.tools_changed") {
+      expect(countEvent.payload.toolCount).toBe(129);
+      expect(countEvent.payload.tools).toHaveLength(128);
+    }
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "mcp.diagnostic",
+      payload: expect.objectContaining({ code: "descriptor_catalog_truncated" }),
+    }));
+
+    state.tools = [{
+      name: "oversized_item",
+      description: "\t\"\\\n".repeat(2_048),
+      inputSchema: wideStructuredDescriptor(),
+      annotations: wideStructuredDescriptor(),
+    }];
+    await expect(scopedMcpControl(runtime).tools?.("docs"))
+      .rejects.toThrow("MCP tool descriptor exceeds the safe catalog limit.");
+    events.length = 0;
+    internal.publishToolsChanged(state.server, state.tools);
+    const itemEvent = events.find((event) => event.type === "mcp.tools_changed");
+    expect(itemEvent?.type).toBe("mcp.tools_changed");
+    if (itemEvent?.type === "mcp.tools_changed") {
+      expect(itemEvent.payload.toolCount).toBe(1);
+      expect(itemEvent.payload.tools).toHaveLength(0);
+    }
+
+    const escapedDescription = "\t\"\\\n".repeat(2_048);
+    state.tools = Array.from({ length: 20 }, (_, index) => ({
+      name: `wide_tool_${index}`,
+      description: escapedDescription,
+    }));
+    await expect(scopedMcpControl(runtime).tools?.("docs"))
+      .rejects.toThrow("MCP tool descriptor exceeds the safe catalog limit.");
+    events.length = 0;
+    internal.publishToolsChanged(state.server, state.tools);
+    const aggregateEvent = events.find((event) => event.type === "mcp.tools_changed");
+    expect(aggregateEvent?.type).toBe("mcp.tools_changed");
+    if (aggregateEvent?.type === "mcp.tools_changed") {
+      expect(aggregateEvent.payload.toolCount).toBe(20);
+      expect(aggregateEvent.payload.tools.length).toBeLessThan(20);
+      expect(testJsonBytes(aggregateEvent)).toBeLessThanOrEqual(300 * 1024);
+    }
+  } finally {
+    await runtime.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("MCP close is reentrant, observes disconnect rejection, and rejects every post-close surface", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-mcp-close-reentrant-"));
+  const cwd = join(root, "repo");
+  const chiliHome = join(root, "home");
+  const disconnect = deferred<void>();
+  let disconnectCalls = 0;
+  let closeFromDisconnect: Promise<void> | undefined;
+  await Promise.all([mkdir(cwd, { recursive: true }), mkdir(chiliHome, { recursive: true })]);
+  await writeEnabledMcpConfig(join(chiliHome, "mcp.json"), "docs");
+  let runtime!: CliMcpRuntime;
+  runtime = await createCliMcpRuntime({
+    cwd,
+    chiliHome,
+    registries: [new InMemoryToolRegistry()],
+    createClient: (server) => fakeMcpClient(server, {
+      close: () => {
+        disconnectCalls += 1;
+        closeFromDisconnect = runtime.close();
+        return disconnect.promise;
+      },
+    }),
+  }, fakePromptCommands());
+
+  try {
+    const first = runtime.close();
+    const second = runtime.close();
+    expect(second).toBe(first);
+    expect(closeFromDisconnect).toBe(first);
+    expect(disconnectCalls).toBe(1);
+
+    disconnect.reject(new Error("controlled disconnect rejection"));
+    const results = await Promise.allSettled([first, second]);
+    expect(results).toEqual([
+      expect.objectContaining({ status: "rejected" }),
+      expect.objectContaining({ status: "rejected" }),
+    ]);
+    expect(runtime.close()).toBe(first);
+    expect(disconnectCalls).toBe(1);
+
+    const context = mcpResourceContext(cwd);
+    const closedOperations: Array<() => Promise<unknown>> = [
+      () => runtime.control.list(),
+      () => runtime.control.status?.() ?? Promise.resolve(),
+      () => runtime.control.get?.("docs") ?? Promise.resolve(),
+      () => runtime.control.reload?.() ?? Promise.resolve(),
+      () => runtime.control.add?.({ name: "late", url: "https://late.example.test" }) ?? Promise.resolve(),
+      () => runtime.control.remove?.("docs") ?? Promise.resolve(),
+      () => runtime.control.tools?.("docs") ?? Promise.resolve(),
+      () => runtime.control.auth?.("docs") ?? Promise.resolve(),
+      () => runtime.control.logout?.("docs") ?? Promise.resolve(),
+      () => Promise.resolve(runtime.resources.listResources({}, context)),
+      () => Promise.resolve(runtime.resources.readResource({ serverName: "docs", uri: "docs://late" }, context)),
+      () => Promise.resolve(runtime.prompts.renderPrompt({
+        serverName: "docs",
+        promptName: "late",
+        arguments: {},
+      }, { cwd })),
+      () => runtime.commands.list({ cwd }),
+      () => runtime.commands.reload({ cwd }),
+      () => runtime.commands.run({ commandId: "late", cwd }),
+    ];
+    for (const operation of closedOperations) {
+      await expect(Promise.resolve().then(operation)).rejects.toMatchObject({
+        name: "CliMcpRuntimeClosedError",
+      });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("MCP close shares an admitted reload disconnect and prevents a replacement scope", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-mcp-reload-close-race-"));
+  const cwd = join(root, "repo");
+  const chiliHome = join(root, "home");
+  const disconnect = deferred<void>();
+  let clientCount = 0;
+  let disconnectCalls = 0;
+  await Promise.all([mkdir(cwd, { recursive: true }), mkdir(chiliHome, { recursive: true })]);
+  await writeEnabledMcpConfig(join(chiliHome, "mcp.json"), "docs");
+  const runtime = await createCliMcpRuntime({
+    cwd,
+    chiliHome,
+    registries: [new InMemoryToolRegistry()],
+    createClient: (server) => {
+      clientCount += 1;
+      return fakeMcpClient(server, {
+        close: () => {
+          disconnectCalls += 1;
+          return disconnect.promise;
+        },
+      });
+    },
+  }, fakePromptCommands());
+
+  try {
+    const reload = runtime.control.reload?.();
+    if (!reload) throw new Error("MCP reload is unavailable");
+    await waitForTestCondition(() => disconnectCalls === 1);
+    const firstClose = runtime.close();
+    const secondClose = runtime.close();
+    expect(secondClose).toBe(firstClose);
+    expect(disconnectCalls).toBe(1);
+
+    disconnect.resolve();
+    const [reloadResult, closeResult] = await Promise.allSettled([reload, firstClose]);
+    expect(reloadResult).toMatchObject({
+      status: "rejected",
+      reason: { name: "CliMcpRuntimeClosedError" },
+    });
+    expect(closeResult).toEqual({ status: "fulfilled", value: undefined });
+    expect(clientCount).toBe(1);
+    expect(disconnectCalls).toBe(1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("MCP close does not await a stuck background connect and contains its late completion", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-mcp-late-connect-"));
+  const cwd = join(root, "repo");
+  const chiliHome = join(root, "home");
+  const initialize = deferred<McpInitializeResult>();
+  let disconnectCalls = 0;
+  await Promise.all([mkdir(cwd, { recursive: true }), mkdir(chiliHome, { recursive: true })]);
+  await writeEnabledMcpConfig(join(chiliHome, "mcp.json"), "docs");
+  const runtime = await createCliMcpRuntime({
+    cwd,
+    chiliHome,
+    registries: [new InMemoryToolRegistry()],
+    connectMode: "background",
+    createClient: (server) => fakeMcpClient(server, {
+      initialize: () => initialize.promise,
+      close: async () => {
+        disconnectCalls += 1;
+      },
+    }),
+  }, fakePromptCommands());
+  const state = mcpRuntimeInternals(runtime).userScope?.manager.listStates()[0];
+  if (!state) throw new Error("test MCP state was not initialized");
+
+  try {
+    expect(state.status).toBe("connecting");
+    await runtime.close();
+    expect(disconnectCalls).toBe(1);
+    expect(state.status).toBe("disconnected");
+
+    initialize.resolve({});
+    await initialize.promise;
+    for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    expect(state.status).toBe("disconnected");
+    expect(disconnectCalls).toBe(1);
+    await expect(runtime.control.list()).rejects.toMatchObject({ name: "CliMcpRuntimeClosedError" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("MCP close does not await an admitted eager reconnect and rejects its late scope", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-mcp-late-eager-connect-"));
+  const cwd = join(root, "repo");
+  const chiliHome = join(root, "home");
+  const initialize = deferred<McpInitializeResult>();
+  let initializeCalls = 0;
+  let disconnectCalls = 0;
+  await Promise.all([mkdir(cwd, { recursive: true }), mkdir(chiliHome, { recursive: true })]);
+  const runtime = await createCliMcpRuntime({
+    cwd,
+    chiliHome,
+    registries: [new InMemoryToolRegistry()],
+    connectMode: "eager",
+    createClient: (server) => fakeMcpClient(server, {
+      initialize: () => {
+        initializeCalls += 1;
+        return initialize.promise;
+      },
+      close: async () => {
+        disconnectCalls += 1;
+      },
+    }),
+  }, fakePromptCommands());
+
+  let add: Promise<unknown> | undefined;
+  try {
+    add = runtime.control.add?.({
+      name: "late",
+      transport: "http",
+      url: "https://late.example.test",
+      enabled: true,
+    });
+    if (!add) throw new Error("MCP add is unavailable");
+    await waitForTestCondition(() => initializeCalls === 1);
+    const connectingScope = [...mcpRuntimeInternals(runtime).liveScopes]
+      .find((scope) => scope.manager.listStates().some((state) => state.server.name === "late"));
+    const state = connectingScope?.manager.listStates()[0];
+    if (!state) throw new Error("test MCP reconnect scope was not initialized");
+    expect(state.status).toBe("connecting");
+
+    await runtime.close();
+    expect(disconnectCalls).toBe(1);
+    expect(state.status).toBe("disconnected");
+
+    initialize.resolve({});
+    const addResult = await Promise.allSettled([add]);
+    expect(addResult).toMatchObject([{
+      status: "rejected",
+      reason: { name: "CliMcpRuntimeClosedError" },
+    }]);
+    expect(state.status).toBe("disconnected");
+    expect(disconnectCalls).toBe(1);
+  } finally {
+    initialize.resolve({});
+    await Promise.allSettled([
+      ...(add ? [add] : []),
+      runtime.close(),
+    ]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("MCP close drains accepted event publications and drops callbacks after admission closes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-mcp-event-drain-"));
+  const cwd = join(root, "repo");
+  const chiliHome = join(root, "home");
+  const publication = deferred<void>();
+  let publicationCalls = 0;
+  await Promise.all([mkdir(cwd, { recursive: true }), mkdir(chiliHome, { recursive: true })]);
+  await writeMcpConfig(join(chiliHome, "mcp.json"), "docs");
+  const runtime = await createCliMcpRuntime({
+    cwd,
+    chiliHome,
+    registries: [new InMemoryToolRegistry()],
+    connectMode: "manual",
+    events: {
+      publish: async () => {
+        publicationCalls += 1;
+        return publication.promise;
+      },
+    },
+  }, fakePromptCommands());
+
+  try {
+    expect(publicationCalls).toBeGreaterThan(0);
+    let closeSettled = false;
+    const close = runtime.close().then(() => {
+      closeSettled = true;
+    });
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+
+    publication.resolve();
+    await close;
+    expect(closeSettled).toBe(true);
+    const callsAtClose = publicationCalls;
+    mcpRuntimeInternals(runtime).publishDiagnostic({
+      severity: "warning",
+      code: "late_callback",
+      message: "must be dropped",
+      path: "servers.docs",
+      source: "user",
+    });
+    await Promise.resolve();
+    expect(publicationCalls).toBe(callsAtClose);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 function fakePromptCommands(
   catalog: RuntimeCommandCatalog = { roots: [], diagnostics: [] },
   run: PromptCommandControl["run"] = async () => {
@@ -656,6 +1226,54 @@ function fakePromptCommands(
     },
     run,
   };
+}
+
+interface McpRuntimeTestScope {
+  manager: { listStates(): McpServerState[] };
+  loadErrors: Array<{ server?: string; message: string }>;
+}
+
+interface McpRuntimeTestInternals {
+  userScope?: McpRuntimeTestScope;
+  liveScopes: Set<McpRuntimeTestScope>;
+  publishStatusSnapshot(scope: McpRuntimeTestScope): void;
+  publishDiagnostic(diagnostic: McpDiagnostic): void;
+  publishToolsChanged(server: McpServerConfig, tools: readonly McpTool[]): void;
+  publishPromptsChanged(server: McpServerConfig, prompts: readonly McpPrompt[]): void;
+  publishResourcesChanged(server: McpServerConfig, resources: readonly McpResource[]): void;
+  reloadUserScope(): Promise<void>;
+  invalidateProjectScopes(): Promise<void>;
+}
+
+function mcpRuntimeInternals(runtime: CliMcpRuntime): McpRuntimeTestInternals {
+  return runtime as unknown as McpRuntimeTestInternals;
+}
+
+function mcpResourceContext(cwd: string) {
+  return {
+    sessionId: "session_mcp_descriptors" as SessionId,
+    turnId: "turn_mcp_descriptors" as TurnId,
+    callId: "tool_call_mcp_descriptors" as ToolCallId,
+    cwd,
+    signal: new AbortController().signal,
+  };
+}
+
+function nestedDescriptor(depth: number): unknown {
+  let value: unknown = { leaf: "kept" };
+  for (let index = 0; index < depth; index += 1) value = { child: value };
+  return value;
+}
+
+function wideStructuredDescriptor(): Record<string, string> {
+  return Object.fromEntries(Array.from({ length: 32 }, (_, index) => [
+    `field_${index}`,
+    "\t\"\\\n".repeat(512),
+  ]));
+}
+
+function testJsonBytes(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
 async function stubMcpPrompts(
@@ -674,12 +1292,20 @@ async function stubMcpPrompts(
     ? implementation.userScope?.manager
     : (await implementation.projectScope(cwd)).manager;
   if (!manager) throw new Error("MCP manager scope was not initialized");
-  manager.listPrompts = () => prompts;
+  const entries = prompts as ReadonlyArray<{ server: { name: string }; prompt: unknown }>;
+  for (const state of manager.listStates()) {
+    state.prompts = entries
+      .filter((entry) => entry.server.name === state.server.name)
+      .map((entry) => entry.prompt);
+  }
   manager.getPrompt = getPrompt;
 }
 
 interface StubMcpManager {
-  listPrompts(): readonly unknown[];
+  listStates(): Array<{
+    server: { name: string };
+    prompts: unknown[];
+  }>;
   getPrompt(serverName: string, promptName: string, args: Record<string, string>): Promise<unknown>;
 }
 
@@ -720,6 +1346,18 @@ async function writeMcpConfig(path: string, serverName: string): Promise<void> {
   return writeMcpConfigs(path, [serverName]);
 }
 
+async function writeEnabledMcpConfig(path: string, serverName: string): Promise<void> {
+  await writeFile(path, JSON.stringify({
+    mcpServers: {
+      [serverName]: {
+        type: "http",
+        url: `https://${serverName.replaceAll("_", "-")}.example.test`,
+        enabled: true,
+      },
+    },
+  }), "utf8");
+}
+
 async function writeMcpConfigs(path: string, serverNames: readonly string[]): Promise<void> {
   await writeFile(path, JSON.stringify({
     mcpServers: Object.fromEntries(serverNames.map((serverName) => [serverName, {
@@ -728,6 +1366,65 @@ async function writeMcpConfigs(path: string, serverNames: readonly string[]): Pr
       enabled: false,
     }])),
   }), "utf8");
+}
+
+function fakeMcpClient(
+  server: McpServerConfig,
+  overrides: Partial<Pick<McpClient, "initialize" | "close">> = {},
+): McpClient {
+  return {
+    server,
+    initialize: overrides.initialize ?? (async () => ({})),
+    async listTools() {
+      return { tools: [] };
+    },
+    async callTool() {
+      return { content: [] };
+    },
+    async listPrompts() {
+      return { prompts: [] };
+    },
+    async listResources() {
+      return { resources: [] };
+    },
+    async readResource(uri) {
+      return { contents: [{ uri, text: "" }] };
+    },
+    async getPrompt() {
+      return { messages: [] };
+    },
+    close: overrides.close ?? (async () => {}),
+  };
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value?: T | PromiseLike<T>): void;
+  reject(reason?: unknown): void;
+} {
+  let resolvePromise!: (value: T | PromiseLike<T>) => void;
+  let rejectPromise!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return {
+    promise,
+    resolve(value) {
+      resolvePromise(value as T | PromiseLike<T>);
+    },
+    reject(reason) {
+      rejectPromise(reason);
+    },
+  };
+}
+
+async function waitForTestCondition(condition: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 1_000; attempt += 1) {
+    if (condition()) return;
+    await Bun.sleep(1);
+  }
+  throw new Error("test condition did not become true");
 }
 
 function toolRegistryContext(cwd: string): { sessionId: SessionId; turnId: TurnId; cwd: string } {
@@ -750,6 +1447,11 @@ interface ScopedMcpControl {
   list(input?: { cwd?: string }): Promise<RuntimeMcpListResponse>;
   status?(input?: { cwd?: string }): Promise<RuntimeMcpStatusResponse>;
   tools?(server: string, input?: { cwd?: string }): Promise<RuntimeMcpToolsResponse>;
+  reload?(input?: { cwd?: string }): Promise<{
+    reloaded: boolean;
+    servers: RuntimeMcpListResponse["servers"];
+    errors: Array<{ server?: string; message: string }>;
+  }>;
 }
 
 function scopedMcpControl(runtime: CliMcpRuntime): ScopedMcpControl {

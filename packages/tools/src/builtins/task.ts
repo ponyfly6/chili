@@ -1,4 +1,5 @@
 import type { ToolResult } from "@chili/protocol";
+import { normalizePersistedError } from "@chili/protocol";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
 import type {
   CompleteTaskStatus,
@@ -1131,7 +1132,7 @@ function taskRecordOutput(task: SubagentTaskRecord): Record<string, unknown> {
     child_session_id: task.childSessionId,
     childSessionId: task.childSessionId,
     summary: task.summary,
-    error: task.error,
+    error: task.error === undefined ? undefined : normalizePersistedError(task.error).message,
     created_at: task.createdAt,
     createdAt: task.createdAt,
     updated_at: task.updatedAt,
@@ -1348,7 +1349,7 @@ async function runTaskBatch(
         failures.push({
           batchIndex: index,
           description: task.description,
-          error: preview(errorMessage(error)),
+          error: preview(normalizePersistedError(error).message),
         });
       }
     }
@@ -1402,11 +1403,6 @@ function batchNextAction(
   }
   if (completionPolicy === "supervised") return "Report every spawn failure and integrate the available evidence; no supervised task handle was created to wait on.";
   return "This batch is intentionally detached and will not wake the parent; do not promise its results in the current response.";
-}
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return String(error);
 }
 
 function isBackgroundTaskInput(input: unknown): boolean {

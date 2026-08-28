@@ -1,5 +1,5 @@
 import type { ChiliEvent, EventEnvelope, SessionId, SnapshotId, TimestampMs } from "@chili/protocol";
-import { timestampNow } from "@chili/protocol";
+import { boundPersistedJsonValue, normalizePersistedError, timestampNow } from "@chili/protocol";
 import type { EventStore, SessionRow } from "@chili/store";
 import type { SnapshotProvider, SnapshotRevertResult } from "@chili/tools";
 
@@ -14,6 +14,12 @@ export interface RevertSnapshotInput {
   sessionId: SessionId;
   snapshotId: SnapshotId;
 }
+
+export const SNAPSHOT_REVERT_EVENT_LIMITS = {
+  paths: 128,
+  pathJsonBytes: 16 * 1024,
+  pathsJsonBytes: 128 * 1024,
+} as const;
 
 export class SnapshotRecoveryService {
   constructor(private readonly options: SnapshotRecoveryServiceOptions) {}
@@ -33,11 +39,11 @@ export class SnapshotRecoveryService {
       await this.append(input, "snapshot.reverted", {
         snapshotId: input.snapshotId,
         status: "completed",
-        paths: result.paths,
+        paths: boundedSnapshotPaths(result.paths),
       });
       return result;
     } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
+      const err = normalizePersistedError(error);
       await this.append(input, "snapshot.reverted", {
         snapshotId: input.snapshotId,
         status: "failed",
@@ -117,4 +123,42 @@ function isSnapshotCreatedPayload(payload: unknown): payload is { snapshotId: Sn
     && payload !== null
     && "snapshotId" in payload
     && typeof payload.snapshotId === "string";
+}
+
+function boundedSnapshotPaths(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const candidates: string[] = [];
+  let rawLength: unknown;
+  try {
+    rawLength = Reflect.get(value, "length");
+  } catch {
+    return [];
+  }
+  const length = typeof rawLength === "number"
+    && Number.isSafeInteger(rawLength)
+    && rawLength >= 0
+    ? rawLength
+    : 0;
+  for (let index = 0; index < Math.min(length, SNAPSHOT_REVERT_EVENT_LIMITS.paths); index += 1) {
+    let path: unknown;
+    try {
+      path = Reflect.get(value, String(index));
+    } catch {
+      continue;
+    }
+    if (typeof path === "string") candidates.push(path);
+  }
+  const bounded = boundPersistedJsonValue(candidates, {
+    maxBytes: SNAPSHOT_REVERT_EVENT_LIMITS.pathsJsonBytes,
+    maxStringBytes: SNAPSHOT_REVERT_EVENT_LIMITS.pathJsonBytes - 2,
+    maxItems: SNAPSHOT_REVERT_EVENT_LIMITS.paths,
+    maxDepth: 2,
+    maxNodes: SNAPSHOT_REVERT_EVENT_LIMITS.paths + 1,
+    label: "snapshot paths",
+  });
+  if (!Array.isArray(bounded)) return [];
+  return bounded
+    .filter((path): path is string => typeof path === "string")
+    .slice(0, SNAPSHOT_REVERT_EVENT_LIMITS.paths)
+    .map((path) => path.replace(/[\u0000-\u001f\u007f]/gu, "\ufffd"));
 }

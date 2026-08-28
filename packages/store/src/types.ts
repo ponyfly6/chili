@@ -31,6 +31,8 @@ export interface EventQuery {
   sessionId?: SessionId;
   type?: string;
   afterEventId?: string;
+  /** Read events strictly before this durable cursor. */
+  beforeEventId?: string;
   limit?: number;
   tail?: boolean;
 }
@@ -251,6 +253,8 @@ export interface AgentTaskCloseCasInput {
   expectedLeaseExpiresAt?: number | null;
   /** Require the observed lease to still be absent or expired at commit time. */
   requireExpiredLease?: boolean;
+  /** Require a non-empty owner and finite expiry to prove a durable lease existed. */
+  requireLeaseEvidence?: boolean;
   /** Require the task to remain no newer than the stale-scan cutoff. */
   updatedBeforeOrAt?: number;
   summary?: string;
@@ -566,7 +570,7 @@ export interface EventStore {
   events(query?: EventQuery): Promise<EventEnvelope[]>;
   sessions(): Promise<SessionRow[]>;
   messages(sessionId: SessionId): Promise<Message[]>;
-  pendingApprovals(sessionId?: SessionId): Promise<ApprovalRow[]>;
+  pendingApprovals(sessionId?: SessionId, limit?: number): Promise<ApprovalRow[]>;
 }
 
 /** Optional append receipts used by wrappers to suppress idempotent no-ops. */
@@ -576,6 +580,19 @@ export interface EventCommitAwareStore {
     events: readonly ChiliEvent[],
     options?: EventAppendOptions,
   ): Promise<readonly ChiliEvent[]>;
+}
+
+export interface StaleTurnRecoveryInput {
+  staleBefore: number;
+  createId: (prefix: string) => string;
+  now?: number;
+  status?: "failed" | "cancelled";
+  reason?: string;
+}
+
+/** Optional atomic recovery capability for stores with durable turn state. */
+export interface StaleTurnRecoveryStore {
+  reconcileStaleTurns(input: StaleTurnRecoveryInput): Promise<ChiliEvent[]>;
 }
 
 export interface GoalProjectionStore {

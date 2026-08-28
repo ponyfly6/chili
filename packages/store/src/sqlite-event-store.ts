@@ -33,7 +33,13 @@ import type {
   ToolEvent,
   TurnId,
 } from "@chili/protocol";
-import { isTransientEvent } from "@chili/protocol";
+import {
+  boundPersistedJsonValue,
+  isTransientEvent,
+  normalizePersistedError,
+  PERSISTED_JSON_LIMITS,
+  TEAM_TASK_RUNTIME_METADATA_KEYS,
+} from "@chili/protocol";
 import { decodeJson, encodeJson } from "./json.js";
 import { AGENT_TASKS_CHILD_SESSION_UNIQUE_INDEX, SQLITE_SCHEMA } from "./schema.js";
 import type {
@@ -71,6 +77,8 @@ import type {
   SessionRow,
   SessionCreationClaimFence,
   SessionRunClaimFence,
+  StaleTurnRecoveryInput,
+  StaleTurnRecoveryStore,
   SubagentProjectionStore,
   TeamMemberQuery,
   TeamMemberRow,
@@ -98,6 +106,9 @@ import type {
   SessionGoalQuery,
   SessionGoalRow,
 } from "./types.js";
+
+const AGENT_TEAM_CAS_TEXT_JSON_BYTES = 64 * 1024;
+const AGENT_TEAM_CAS_METADATA_JSON_BYTES = 256 * 1024;
 
 interface StoredEventRow {
   seq: number;
@@ -414,6 +425,7 @@ export class SqliteEventStore
   implements
     EventStore,
     EventCommitAwareStore,
+    StaleTurnRecoveryStore,
     GoalProjectionStore,
     SubagentProjectionStore,
     AgentTaskLeaseStore,
@@ -711,6 +723,9 @@ export class SqliteEventStore
   }
 
   async events(query: EventQuery = {}): Promise<EventEnvelope[]> {
+    if (query.afterEventId && query.beforeEventId) {
+      throw new TypeError("Event queries cannot combine afterEventId and beforeEventId");
+    }
     const clauses: string[] = [];
     const params: Record<string, unknown> = {};
 
@@ -737,6 +752,22 @@ export class SqliteEventStore
       if (!cursor) throw new UnknownEventCursorError(query.afterEventId);
       clauses.push("seq > (select seq from events where id = $afterEventId)");
       params.afterEventId = query.afterEventId;
+    }
+    if (query.beforeEventId) {
+      const cursorClauses = ["id = $beforeEventId"];
+      const cursorParams: Record<string, unknown> = { beforeEventId: query.beforeEventId };
+      if (query.sessionId) {
+        cursorClauses.push("session_id = $sessionId");
+        cursorParams.sessionId = query.sessionId;
+      }
+      const cursor = this.db
+        .query<{ found: number }, any>(
+          `select 1 as found from events where ${cursorClauses.join(" and ")} limit 1`,
+        )
+        .get(cursorParams);
+      if (!cursor) throw new UnknownEventCursorError(query.beforeEventId);
+      clauses.push("seq < (select seq from events where id = $beforeEventId)");
+      params.beforeEventId = query.beforeEventId;
     }
 
     const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
@@ -866,13 +897,14 @@ export class SqliteEventStore
     });
   }
 
-  async pendingApprovals(sessionId?: ApprovalRow["sessionId"]): Promise<ApprovalRow[]> {
+  async pendingApprovals(sessionId?: ApprovalRow["sessionId"], limit?: number): Promise<ApprovalRow[]> {
+    const boundedLimit = limit === undefined ? undefined : Math.max(1, Math.min(10_000, Math.trunc(limit)));
+    const limitSql = boundedLimit === undefined ? "" : " limit ?";
     const sql = sessionId
-      ? `select * from approvals where status = 'pending' and session_id = ? order by created_at asc`
-      : `select * from approvals where status = 'pending' order by created_at asc`;
-    const rows = sessionId
-      ? this.db.query<Record<string, unknown>, [string]>(sql).all(sessionId)
-      : this.db.query<Record<string, unknown>, []>(sql).all();
+      ? `select * from approvals where status = 'pending' and session_id = ? order by created_at asc${limitSql}`
+      : `select * from approvals where status = 'pending' order by created_at asc${limitSql}`;
+    const params = [sessionId, boundedLimit].filter((value) => value !== undefined);
+    const rows = this.db.query<Record<string, unknown>, any>(sql).all(...params);
 
     return rows.map((row) => approvalFromRow(row));
   }
@@ -1256,6 +1288,12 @@ export class SqliteEventStore
   }
 
   async claimTeamTask(input: TeamTaskClaimInput): Promise<TeamTaskMutationResult> {
+    const admittedInput: TeamTaskClaimInput = {
+      ...input,
+      ...(input.metadata
+        ? { metadata: boundedCasMetadata(input.metadata, "team task claim metadata") }
+        : {}),
+    };
     const run = this.db.transaction((item: TeamTaskClaimInput) => {
       const current = this.teamTaskState(item.teamId, item.taskId);
       if (!current) return { applied: false, reason: "not_found" as const, events: [] as ChiliEvent[] };
@@ -1300,7 +1338,7 @@ export class SqliteEventStore
       this.writeTransactionEvents([event], item.runClaim);
       return { applied: true, events: [event] };
     });
-    const result = this.runWithWriteRetry(() => run(input));
+    const result = this.runWithWriteRetry(() => run(admittedInput));
 
     await this.writeMirrors(result.events);
     const task = (await this.teamTasks({ teamId: input.teamId, taskId: input.taskId, limit: 1 }))[0];
@@ -1420,6 +1458,14 @@ export class SqliteEventStore
   }
 
   async claimTeamTaskVerification(input: TeamTaskVerificationClaimInput): Promise<TeamTaskVerificationClaimResult> {
+    const admittedInput: TeamTaskVerificationClaimInput = {
+      ...input,
+      metadata: boundedCasMetadata(
+        input.metadata,
+        "team task verification metadata",
+        ["verification"],
+      ),
+    };
     const run = this.db.transaction((item: TeamTaskVerificationClaimInput) => {
       const current = this.teamTaskState(item.teamId, item.taskId);
       if (!current) return { applied: false, reason: "not_found" as const, events: [] as ChiliEvent[] };
@@ -1430,7 +1476,11 @@ export class SqliteEventStore
         return { applied: false, reason: "verification_pending" as const, events: [] as ChiliEvent[] };
       }
 
-      const metadata = verificationClaimMetadata(current.metadata_json, item.metadata);
+      const metadata = boundedCasMetadata(
+        verificationClaimMetadata(current.metadata_json, item.metadata),
+        "team task verification metadata",
+        ["verification", ...TEAM_TASK_RUNTIME_METADATA_KEYS],
+      );
       const event = this.teamTaskVerificationClaimedEvent(item, current, metadata);
       const cas = this.db
         .query(
@@ -1464,7 +1514,7 @@ export class SqliteEventStore
       this.writeTransactionEvents([event], item.runClaim);
       return { applied: true, events: [event] };
     });
-    const result = this.runWithWriteRetry(() => run(input));
+    const result = this.runWithWriteRetry(() => run(admittedInput));
 
     await this.writeMirrors(result.events);
     const task = (await this.teamTasks({ teamId: input.teamId, taskId: input.taskId, limit: 1 }))[0];
@@ -1472,6 +1522,16 @@ export class SqliteEventStore
   }
 
   async syncTeamTaskFromAgentCas(input: TeamTaskAgentSyncInput): Promise<TeamTaskAgentSyncResult> {
+    const admittedInput: TeamTaskAgentSyncInput = {
+      ...input,
+      metadata: boundedCasMetadata(input.metadata, "team task sync metadata"),
+      ...(input.summary !== undefined
+        ? { summary: boundedCasText(input.summary, "team task summary") }
+        : {}),
+      ...(input.error !== undefined
+        ? { error: normalizePersistedError(input.error).message }
+        : {}),
+    };
     const run = this.db.transaction((item: TeamTaskAgentSyncInput) => {
       const current = this.teamTaskState(item.teamId, item.taskId);
       if (!current) return { applied: false, reason: "not_found" as const, events: [] as ChiliEvent[] };
@@ -1594,7 +1654,7 @@ export class SqliteEventStore
       this.writeTransactionEvents(events, item.runClaim);
       return { applied: true, events };
     });
-    const result = this.runWithWriteRetry(() => run(input));
+    const result = this.runWithWriteRetry(() => run(admittedInput));
 
     await this.writeMirrors(result.events);
     const task = (await this.teamTasks({ teamId: input.teamId, taskId: input.taskId, limit: 1 }))[0];
@@ -1649,6 +1709,12 @@ export class SqliteEventStore
   }
 
   async requeueAgentMailboxMessage(input: AgentMailboxRequeueInput): Promise<AgentMailboxMutationResult> {
+    const admittedInput: AgentMailboxRequeueInput = {
+      ...input,
+      ...(input.error !== undefined
+        ? { error: normalizePersistedError(input.error).message }
+        : {}),
+    };
     const run = this.db.transaction((item: AgentMailboxRequeueInput) => {
       const current = this.agentMailboxState(item.messageId);
       if (!current || current.status !== "delivering") return { applied: false, events: [] as ChiliEvent[] };
@@ -1667,7 +1733,7 @@ export class SqliteEventStore
       this.writeTransactionEvents([event]);
       return { applied: true, events: [event] };
     });
-    const result = this.runWithWriteRetry(() => run(input));
+    const result = this.runWithWriteRetry(() => run(admittedInput));
 
     await this.writeMirrors(result.events);
     const message = await this.agentMailboxMessage(input.messageId);
@@ -1675,6 +1741,10 @@ export class SqliteEventStore
   }
 
   async discardAgentMailboxMessage(input: AgentMailboxDiscardInput): Promise<AgentMailboxMutationResult> {
+    const admittedInput: AgentMailboxDiscardInput = {
+      ...input,
+      reason: normalizePersistedError(input.reason).message,
+    };
     const run = this.db.transaction((item: AgentMailboxDiscardInput) => {
       const current = this.agentMailboxState(item.messageId);
       if (!current || current.status === "consumed" || current.status === "discarded") {
@@ -1696,7 +1766,7 @@ export class SqliteEventStore
       this.writeTransactionEvents([event]);
       return { applied: true, events: [event] };
     });
-    const result = this.runWithWriteRetry(() => run(input));
+    const result = this.runWithWriteRetry(() => run(admittedInput));
 
     await this.writeMirrors(result.events);
     const message = await this.agentMailboxMessage(input.messageId);
@@ -1797,6 +1867,12 @@ export class SqliteEventStore
   }
 
   async beginAgentTaskRunCas(input: AgentTaskBeginRunCasInput): Promise<AgentTaskBeginRunResult> {
+    const admittedInput: AgentTaskBeginRunCasInput = {
+      ...input,
+      ...(input.message
+        ? { message: boundedCasMailboxPayload(input.message) }
+        : {}),
+    };
     const run = this.db.transaction((item: AgentTaskBeginRunCasInput) => {
       const current = this.agentTaskState(item.taskId);
       if (!current) return { applied: false, events: [] as ChiliEvent[] };
@@ -1999,7 +2075,7 @@ export class SqliteEventStore
       }
       return { applied: true, events };
     });
-    const result = this.runWithWriteRetry(() => run(input));
+    const result = this.runWithWriteRetry(() => run(admittedInput));
 
     await this.writeMirrors(result.events);
     const task = await this.agentTask(input.taskId);
@@ -2007,6 +2083,7 @@ export class SqliteEventStore
   }
 
   async completeAgentTaskCas(input: AgentTaskCompleteCasInput): Promise<AgentTaskFinalizationResult> {
+    const admittedInput = admittedAgentTaskCompleteInput(input);
     const run = this.db.transaction((item: AgentTaskCompleteCasInput) => {
       const current = this.agentTaskState(item.taskId);
       if (!current || isFinalTaskStatus(current.status)) return { applied: false, events: [] as ChiliEvent[] };
@@ -2079,7 +2156,7 @@ export class SqliteEventStore
       this.writeTransactionEvents(events, item.runClaim);
       return { applied: true, events };
     });
-    const result = this.runWithWriteRetry(() => run(input));
+    const result = this.runWithWriteRetry(() => run(admittedInput));
 
     await this.writeMirrors(result.events);
     const task = await this.agentTask(input.taskId);
@@ -2087,6 +2164,18 @@ export class SqliteEventStore
   }
 
   async closeAgentTaskCas(input: AgentTaskCloseCasInput): Promise<AgentTaskFinalizationResult> {
+    const admittedInput: AgentTaskCloseCasInput = {
+      ...input,
+      ...(input.summary !== undefined
+        ? { summary: boundedCasText(input.summary, "agent task summary") }
+        : {}),
+      ...(input.error !== undefined
+        ? { error: normalizePersistedError(input.error).message }
+        : {}),
+      ...(input.mailboxError !== undefined
+        ? { mailboxError: normalizePersistedError(input.mailboxError).message }
+        : {}),
+    };
     const run = this.db.transaction((item: AgentTaskCloseCasInput) => {
       const current = this.agentTaskState(item.taskId);
       if (!current) return { applied: false, events: [] as ChiliEvent[] };
@@ -2120,6 +2209,11 @@ export class SqliteEventStore
              and lease_owner is $expectedLeaseOwner
              and ($requireActiveLease = 0 or lease_expires_at > $now)
              and ($checkLeaseExpiresAt = 0 or lease_expires_at is $expectedLeaseExpiresAt)
+             and ($requireLeaseEvidence = 0 or (
+               lease_owner is not null
+               and length(lease_owner) > 0
+               and lease_expires_at is not null
+             ))
              and ($requireExpiredLease = 0 or lease_expires_at is null or lease_expires_at <= $now)
              and ($updatedBeforeOrAt is null or updated_at <= $updatedBeforeOrAt)`,
         )
@@ -2131,6 +2225,7 @@ export class SqliteEventStore
           requireActiveLease: item.requireActiveLease ? 1 : 0,
           checkLeaseExpiresAt: item.expectedLeaseExpiresAt !== undefined ? 1 : 0,
           expectedLeaseExpiresAt: item.expectedLeaseExpiresAt ?? null,
+          requireLeaseEvidence: item.requireLeaseEvidence ? 1 : 0,
           requireExpiredLease: item.requireExpiredLease ? 1 : 0,
           updatedBeforeOrAt: item.updatedBeforeOrAt ?? null,
           now,
@@ -2200,7 +2295,7 @@ export class SqliteEventStore
       this.writeTransactionEvents(events, item.runClaim);
       return { applied: true, events };
     });
-    const result = this.runWithWriteRetry(() => run(input));
+    const result = this.runWithWriteRetry(() => run(admittedInput));
 
     await this.writeMirrors(result.events);
     const task = await this.agentTask(input.taskId);
@@ -2484,13 +2579,7 @@ export class SqliteEventStore
     }
   }
 
-  async reconcileStaleTurns(input: {
-    staleBefore: number;
-    createId: (prefix: string) => string;
-    now?: number;
-    status?: "failed" | "cancelled";
-    reason?: string;
-  }): Promise<ChiliEvent[]> {
+  async reconcileStaleTurns(input: StaleTurnRecoveryInput): Promise<ChiliEvent[]> {
     const status = input.status ?? "failed";
     const reason = input.reason ?? "stale_turn_recovered";
     const now = (input.now ?? Date.now()) as TimestampMs;
@@ -2567,6 +2656,13 @@ export class SqliteEventStore
                   from session_run_claims run
                  where run.session_id = session.id
                    and run.lease_expires_at > $now
+              )
+              and not exists (
+                select 1
+                  from agent_tasks task
+                 where task.child_session_id = session.id
+                   and task.status in ('pending', 'running')
+                   and task.lease_expires_at > $now
               )
             order by coalesce(turn.seq, runtime.seq) asc`,
         )
@@ -5548,6 +5644,185 @@ function verificationClaimMetadata(metadataJson: string | null, claimMetadata: R
     ...current,
     verification: claimMetadata.verification,
   };
+}
+
+function admittedAgentTaskCompleteInput(input: AgentTaskCompleteCasInput): AgentTaskCompleteCasInput {
+  return {
+    ...input,
+    ...(input.summary !== undefined
+      ? { summary: boundedCasText(input.summary, "agent task summary") }
+      : {}),
+    ...(input.error !== undefined
+      ? { error: normalizePersistedError(input.error).message }
+      : {}),
+  };
+}
+
+function boundedCasText(value: string, label: string): string {
+  const bounded = boundPersistedJsonValue(value, {
+    maxBytes: AGENT_TEAM_CAS_TEXT_JSON_BYTES,
+    maxStringBytes: AGENT_TEAM_CAS_TEXT_JSON_BYTES - 2,
+    maxItems: 1,
+    maxDepth: 1,
+    maxNodes: 1,
+    label,
+  });
+  return typeof bounded === "string" ? bounded : "";
+}
+
+function boundedCasMetadata(
+  value: Record<string, unknown>,
+  label: string,
+  priorityKeys: readonly string[] = TEAM_TASK_RUNTIME_METADATA_KEYS,
+): Record<string, unknown> {
+  const prioritized = Object.create(null) as Record<string, unknown>;
+  for (const key of priorityKeys) {
+    if (safeMetadataHasOwn(value, key)) prioritized[key] = safeMetadataGet(value, key);
+  }
+  try {
+    for (const key in value) {
+      if (Object.keys(prioritized).length >= PERSISTED_JSON_LIMITS.items) break;
+      if (!safeMetadataHasOwn(value, key) || Object.prototype.hasOwnProperty.call(prioritized, key)) continue;
+      prioritized[key] = safeMetadataGet(value, key);
+    }
+  } catch {
+    prioritized.__omitted__ = "additional CAS metadata keys could not be enumerated";
+  }
+  const bounded = boundPersistedJsonValue(normalizeCasMetadataDiagnostics(prioritized, value), {
+    maxBytes: AGENT_TEAM_CAS_METADATA_JSON_BYTES,
+    maxStringBytes: PERSISTED_JSON_LIMITS.stringBytes,
+    maxItems: PERSISTED_JSON_LIMITS.items,
+    maxDepth: PERSISTED_JSON_LIMITS.depth,
+    maxNodes: PERSISTED_JSON_LIMITS.nodes,
+    label,
+  });
+  return bounded && typeof bounded === "object" && !Array.isArray(bounded)
+    ? bounded as Record<string, unknown>
+    : {};
+}
+
+function normalizeCasMetadataDiagnostics(
+  value: Record<string, unknown>,
+  originalRoot?: object,
+): Record<string, unknown> {
+  const seen = new WeakSet<object>();
+  if (originalRoot && originalRoot !== value) seen.add(originalRoot);
+  const normalized = normalizeCasMetadataValue(value, [], {
+    nodes: 0,
+    seen,
+  });
+  return normalized && typeof normalized === "object" && !Array.isArray(normalized)
+    ? normalized as Record<string, unknown>
+    : {};
+}
+
+function normalizeCasMetadataValue(
+  value: unknown,
+  path: readonly string[],
+  state: { nodes: number; seen: WeakSet<object> },
+): unknown {
+  state.nodes += 1;
+  if (state.nodes > PERSISTED_JSON_LIMITS.nodes) return "[omitted: CAS metadata node limit exceeded]";
+  if (value === null || typeof value !== "object") return value;
+  if (path.length >= PERSISTED_JSON_LIMITS.depth) return "[omitted: CAS metadata depth limit exceeded]";
+  if (state.seen.has(value)) return "[omitted: circular CAS metadata]";
+  state.seen.add(value);
+
+  if (Array.isArray(value)) {
+    const result: unknown[] = [];
+    const length = safeMetadataArrayLength(value);
+    for (let index = 0; index < Math.min(length, PERSISTED_JSON_LIMITS.items); index += 1) {
+      result.push(normalizeCasMetadataValue(safeMetadataGet(value, String(index)), path, state));
+    }
+    if (length > result.length) result.push(`[${length - result.length} CAS metadata items omitted]`);
+    state.seen.delete(value);
+    return result;
+  }
+
+  const result = Object.create(null) as Record<string, unknown>;
+  let entries = 0;
+  try {
+    for (const key in value) {
+      if (entries >= PERSISTED_JSON_LIMITS.items) {
+        result.__omitted__ = "additional CAS metadata keys omitted";
+        break;
+      }
+      if (!safeMetadataHasOwn(value, key)) continue;
+      entries += 1;
+      const item = safeMetadataGet(value, key);
+      const normalizedKey = normalizedMetadataKey(key);
+      result[key] = isDiagnosticMetadataField(normalizedKey, path)
+        ? normalizePersistedError(item).message
+        : normalizeCasMetadataValue(item, [...path, normalizedKey], state);
+    }
+  } catch {
+    result.__omitted__ = "additional CAS metadata keys could not be enumerated";
+  }
+  state.seen.delete(value);
+  return result;
+}
+
+function isDiagnosticMetadataField(key: string, path: readonly string[]): boolean {
+  if (key === "error" || key === "reason" || key === "failurereason") return true;
+  if (key !== "feedback") return false;
+  return path.some((segment) =>
+    segment === "diagnostic"
+      || segment === "diagnostics"
+      || segment === "failure"
+      || segment === "failures"
+      || segment === "error"
+      || segment === "errors"
+      || segment === "preflight"
+      || segment === "verification"
+  );
+}
+
+function normalizedMetadataKey(value: string): string {
+  return value.replace(/[_ -]/gu, "").toLowerCase();
+}
+
+function safeMetadataGet(value: object, key: string): unknown {
+  try {
+    return Reflect.get(value, key);
+  } catch {
+    return `[omitted: ${key} metadata getter threw]`;
+  }
+}
+
+function safeMetadataHasOwn(value: object, key: string): boolean {
+  try {
+    return Object.prototype.hasOwnProperty.call(value, key);
+  } catch {
+    return false;
+  }
+}
+
+function safeMetadataArrayLength(value: unknown[]): number {
+  const length = safeMetadataGet(value, "length");
+  return typeof length === "number" && Number.isSafeInteger(length) && length >= 0 ? length : 0;
+}
+
+function boundedCasMailboxPayload(value: AgentMailboxPayload): AgentMailboxPayload {
+  if ("content" in value) {
+    return {
+      ...value,
+      content: boundedCasText(value.content, "agent mailbox content"),
+      ...(value.metadata
+        ? { metadata: boundedCasMetadata(value.metadata, "agent mailbox metadata") }
+        : {}),
+    };
+  }
+  const bounded = boundPersistedJsonValue(value, {
+    maxBytes: AGENT_TEAM_CAS_METADATA_JSON_BYTES,
+    maxStringBytes: AGENT_TEAM_CAS_TEXT_JSON_BYTES,
+    maxItems: PERSISTED_JSON_LIMITS.items,
+    maxDepth: PERSISTED_JSON_LIMITS.depth,
+    maxNodes: PERSISTED_JSON_LIMITS.nodes,
+    label: "agent mailbox message",
+  });
+  return bounded && typeof bounded === "object" && !Array.isArray(bounded)
+    ? bounded as unknown as AgentMailboxPayload
+    : { role: "user", content: "[agent mailbox message omitted]" };
 }
 
 function isSqliteBusyError(error: unknown): boolean {

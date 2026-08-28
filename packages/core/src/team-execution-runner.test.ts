@@ -155,6 +155,45 @@ test("runs team tasks through dependencies until the board is drained", async ()
   }
 });
 
+test("normalizes hostile reconcile failures before returning a successful run summary", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-hostile-error-"));
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const sessionId = "session_team_runner_hostile_error" as SessionId;
+
+  try {
+    await persistRootSession(store, sessionId, dir);
+    const teams = new TeamControlService({ store });
+    const team = await teams.createTeam({
+      sessionId,
+      name: "hostile-error",
+      leadPath: "/root" as AgentPath,
+    });
+    const dispatcher = {
+      async reconcileTasks() {
+        throw hostileSuccessfulOutputError("runner reconcile failed");
+      },
+      async dispatchTask() {
+        throw new Error("unexpected dispatch");
+      },
+    } as unknown as TeamTaskDispatchService;
+    const execution = new TeamExecutionRunner({
+      teams,
+      dispatcher,
+      cwd: dir,
+      resolveSession: persistedRootSessionResolver(store),
+    });
+
+    const summary = await execution.run({ teamId: team.id, sessionId, once: true });
+
+    expect(summary.errors).toHaveLength(1);
+    expectBoundedSanitizedDiagnostic(summary.errors[0]?.error);
+    expect(utf8Bytes(JSON.stringify(summary))).toBeLessThan(64 * 1024);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("runs one cycle and reports still-running background tasks", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-once-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -2070,4 +2109,29 @@ async function waitForAgentTaskTerminal(store: SqliteEventStore, taskId: TaskId)
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const HOSTILE_SUCCESS_OUTPUT_SECRET = "sk-team-success-output-secret-123456789";
+
+function hostileSuccessfulOutputError(label: string): Error {
+  return new Error([
+    `${label}: password=${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    `Authorization: Bearer ${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    `http://127.0.0.1:4567/callback?token=${HOSTILE_SUCCESS_OUTPUT_SECRET}`,
+    "\u0000".repeat(5 * 1024 * 1024),
+  ].join("\n"));
+}
+
+function expectBoundedSanitizedDiagnostic(value: string | undefined): void {
+  expect(value).toBeDefined();
+  if (value === undefined) return;
+  expect(value).toContain("[REDACTED]");
+  expect(value).not.toContain(HOSTILE_SUCCESS_OUTPUT_SECRET);
+  expect(value).not.toContain("127.0.0.1");
+  expect(value).not.toContain("\u0000");
+  expect(utf8Bytes(value)).toBeLessThanOrEqual(16 * 1024);
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }

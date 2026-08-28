@@ -10,7 +10,12 @@ import type {
   TaskId,
   TimestampMs,
 } from "@chili/protocol";
-import { ROOT_AGENT_PATH, timestampNow } from "@chili/protocol";
+import {
+  boundPersistedJsonValue,
+  normalizePersistedError,
+  ROOT_AGENT_PATH,
+  timestampNow,
+} from "@chili/protocol";
 import type {
   AgentTaskCapabilityStore,
   AgentTaskFinalizationStore,
@@ -34,6 +39,7 @@ export type AgentTaskFinalStatus = Exclude<AgentTaskStatus, "pending" | "running
 
 const DEFAULT_AGENT_TASK_BATCH_WAIT_TIMEOUT_MS = 600_000;
 const TASK_FOLLOWUP_LEASE_OWNER_PREFIX = "task-followup:";
+const AGENT_TASK_TEXT_JSON_BYTES = 64 * 1024;
 
 export interface AgentTaskPromptRuntime {
   submitPrompt(input: SubmitPromptInput): Promise<SubmitPromptResult>;
@@ -110,6 +116,8 @@ export interface AgentTaskReconcileStaleInput {
   staleAfterMs?: number;
   modes?: AgentTaskMode[];
   liveTaskIds?: Iterable<TaskId | string>;
+  /** Only close tasks carrying an observed lease whose exact expiry has passed. */
+  requireLeaseEvidence?: boolean;
   limit?: number;
   summary?: string;
   error?: string;
@@ -138,6 +146,13 @@ export class AgentTaskWaitTimeoutError extends Error {
   constructor(readonly taskId: TaskId, readonly timeoutMs: number) {
     super(`Timed out waiting for agent task ${taskId} after ${timeoutMs}ms`);
     this.name = "AgentTaskWaitTimeoutError";
+  }
+}
+
+export class AgentTaskControlServiceClosedError extends Error {
+  constructor() {
+    super("Agent task control service is closing or closed");
+    this.name = "AgentTaskControlServiceClosedError";
   }
 }
 
@@ -179,6 +194,7 @@ interface TaskFinalizationOutcome {
 
 interface TaskCloseFenceOptions {
   requireExpiredLease?: boolean;
+  requireLeaseEvidence?: boolean;
   expectedLeaseExpiresAt?: number | null;
   updatedBeforeOrAt?: number;
   mailboxMessageId?: string;
@@ -189,6 +205,10 @@ interface TaskCloseFenceOptions {
 export class AgentTaskControlService {
   private readonly activeRuns = new Map<string, ActiveTaskRun>();
   private readonly pendingRuns = new Map<string, AbortController>();
+  private readonly followupOperations = new Set<Promise<void>>();
+  private readonly shutdownController = new AbortController();
+  private acceptingFollowups = true;
+  private shutdownPromise?: Promise<void>;
 
   constructor(private readonly options: AgentTaskControlServiceOptions) {}
 
@@ -200,12 +220,65 @@ export class AgentTaskControlService {
     return this.requireTask(taskId);
   }
 
-  async followupTask(input: AgentTaskFollowupInput): Promise<AgentTaskFollowupResult> {
+  followupTask(input: AgentTaskFollowupInput): Promise<AgentTaskFollowupResult> {
+    if (!this.acceptingFollowups) {
+      return Promise.reject(new AgentTaskControlServiceClosedError());
+    }
+    return this.trackFollowupOperation(this.runFollowupTask(input));
+  }
+
+  shutdown(reason = "runtime_closed"): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+
+    let resolveShutdown!: () => void;
+    let rejectShutdown!: (error: unknown) => void;
+    const shutdownPromise = new Promise<void>((resolve, reject) => {
+      resolveShutdown = resolve;
+      rejectShutdown = reject;
+    });
+    // A linked prompt signal can synchronously reenter this method from an
+    // abort listener. Publish the single drain promise before any notification.
+    this.shutdownPromise = shutdownPromise;
+
+    this.acceptingFollowups = false;
+    const error = abortError(reason);
+    this.shutdownController.abort(error);
+    for (const controller of this.pendingRuns.values()) {
+      if (!controller.signal.aborted) controller.abort(error);
+    }
+    for (const run of this.activeRuns.values()) {
+      if (!run.controller.signal.aborted) run.controller.abort(error);
+    }
+    void (async () => {
+      while (this.followupOperations.size > 0) {
+        await Promise.allSettled([...this.followupOperations]);
+      }
+    })().then(resolveShutdown, rejectShutdown);
+    return shutdownPromise;
+  }
+
+  private trackFollowupOperation<T>(operation: Promise<T>): Promise<T> {
+    let observed: Promise<void>;
+    observed = operation.then(
+      () => undefined,
+      () => undefined,
+    ).finally(() => {
+      this.followupOperations.delete(observed);
+    });
+    this.followupOperations.add(observed);
+    return operation;
+  }
+
+  private async runFollowupTask(input: AgentTaskFollowupInput): Promise<AgentTaskFollowupResult> {
+    input = {
+      ...input,
+      text: boundedPersistedText(input.text, "agent task follow-up"),
+    };
     if (this.pendingRuns.has(input.taskId) || this.activeRuns.has(input.taskId)) {
       throw new AgentTaskNotRunnableError(input.taskId, `Agent task already has a pending or active turn: ${input.taskId}`);
     }
 
-    const controller = linkedAbortController(input.signal);
+    const controller = linkedAbortController(input.signal, this.shutdownController.signal);
     let releasePermit: (() => void) | undefined;
     this.pendingRuns.set(input.taskId, controller);
     try {
@@ -258,7 +331,9 @@ export class AgentTaskControlService {
         }
         this.startFollowupLeaseHeartbeat(activeRun);
         if (controller.signal.aborted) throw abortError("Task follow-up aborted");
-        const result = await this.options.runtime.submitPrompt(this.submitPromptInput(task, input, controller.signal));
+        const result = normalizePromptResult(
+          await this.options.runtime.submitPrompt(this.submitPromptInput(task, input, controller.signal)),
+        );
         await this.quiesceFollowupLease(activeRun);
         if (activeRun.leaseLost) throw abortError("Task follow-up lease lost");
         if (await this.shouldCompleteRun(task.id, runId, activeRun)) {
@@ -319,7 +394,7 @@ export class AgentTaskControlService {
         if (!input.sourceMailboxMessageId && activeRun.ownershipLostBeforeSubmit) {
           await this.consumeTaskFollowup(task, messageId).catch(() => undefined);
         }
-        throw error;
+        throw toError(error);
       } finally {
         this.stopFollowupLeaseHeartbeat(activeRun);
         this.activeRuns.delete(task.id);
@@ -341,10 +416,11 @@ export class AgentTaskControlService {
       throw new AgentTaskNotRunnableError(input.taskId as TaskId, `Active follow-up run already completed: ${input.taskId}`);
     }
 
+    const summary = boundedPersistedText(input.summary, "agent task summary");
     let status = input.status ?? "completed";
     let error: string | undefined;
     if (status === "completed") {
-      const assessment = assessSubagentCompletion(input.summary);
+      const assessment = assessSubagentCompletion(summary);
       if (assessment.status === "incomplete") {
         status = "incomplete";
         error = completionAssessmentError(assessment);
@@ -356,7 +432,7 @@ export class AgentTaskControlService {
       status,
       activeRun.runId,
       activeRun.generation,
-      input.summary,
+      summary,
       error,
       activeRun.messageId,
     );
@@ -368,7 +444,7 @@ export class AgentTaskControlService {
     activeRun.controller.abort();
     return {
       taskId: input.taskId,
-      summary: input.summary,
+      summary,
       status,
     };
   }
@@ -458,39 +534,51 @@ export class AgentTaskControlService {
       throw new RangeError("Task reconciliation limit must be a positive integer");
     }
     const staleAfterMs = input.staleAfterMs ?? 30_000;
+    if (!Number.isFinite(staleAfterMs) || staleAfterMs < 0) {
+      throw new RangeError("Task reconciliation staleAfterMs must be a non-negative finite number");
+    }
     const now = Number(this.now());
     const cutoff = now - staleAfterMs;
     const liveTaskIds = new Set([...(input.liveTaskIds ?? [])].map(String));
     const modes = input.modes ?? ["background"];
-    let queryLimit = Math.min(limit, 500);
-    let scanned = 0;
-    let candidates: AgentTaskRow[] = [];
+    const scannedTaskIds = new Set<TaskId>();
+    const candidates: AgentTaskRow[] = [];
 
-    // `agentTasks` is ordered and limited before the policy filters below. Grow
-    // the prefix until we find the requested number of actually stale tasks or
-    // exhaust the running projection; otherwise a fixed prefix of live or
-    // non-background tasks can starve every stale task behind it forever.
-    while (true) {
-      const page = await this.options.store.agentTasks({
-        status: "running",
-        limit: queryLimit,
-        ...(input.parentSessionId ? { parentSessionId: input.parentSessionId } : {}),
-      });
-      candidates = [];
-      scanned = 0;
-      for (const task of page) {
-        scanned += 1;
-        if (liveTaskIds.has(task.id)) continue;
-        if (modes.length > 0 && (!task.mode || !modes.includes(task.mode))) continue;
-        if (task.leaseOwner && task.leaseExpiresAt && task.leaseExpiresAt > now) continue;
-        if (task.updatedAt > cutoff) continue;
-        candidates.push(task);
-        if (candidates.length >= limit) break;
+    // Grow the ordered running prefix because the store applies its limit
+    // before the live/mode/lease policy filters below. Pending tasks and the
+    // spawned-before-lease window have no durable ownership evidence, so an
+    // automatic cross-process scanner must never infer that they are dead.
+    for (const status of ["running"] as const) {
+      let queryLimit = Math.min(limit, 500);
+      while (candidates.length < limit) {
+        const page = await this.options.store.agentTasks({
+          status,
+          limit: queryLimit,
+          ...(input.parentSessionId ? { parentSessionId: input.parentSessionId } : {}),
+        });
+        const before = candidates.length;
+        for (const task of page) {
+          scannedTaskIds.add(task.id);
+          if (liveTaskIds.has(task.id)) continue;
+          if (modes.length > 0 && (!task.mode || !modes.includes(task.mode))) continue;
+          if (input.requireLeaseEvidence && (
+            typeof task.leaseOwner !== "string"
+            || task.leaseOwner.length === 0
+            || task.leaseExpiresAt === undefined
+            || !Number.isFinite(task.leaseExpiresAt)
+          )) continue;
+          if (task.leaseOwner && task.leaseExpiresAt && task.leaseExpiresAt > now) continue;
+          if (task.updatedAt > cutoff) continue;
+          if (!candidates.some((candidate) => candidate.id === task.id)) candidates.push(task);
+          if (candidates.length >= limit) break;
+        }
+        if (candidates.length >= limit || page.length < queryLimit) break;
+        const nextLimit = Math.min(2_147_483_647, queryLimit * 2);
+        if (nextLimit === queryLimit || (candidates.length === before && queryLimit === page.length && queryLimit >= 2_147_483_647)) {
+          break;
+        }
+        queryLimit = nextLimit;
       }
-      if (candidates.length >= limit || page.length < queryLimit) break;
-      const nextLimit = Math.min(2_147_483_647, queryLimit * 2);
-      if (nextLimit === queryLimit) break;
-      queryLimit = nextLimit;
     }
     const closed: AgentTaskRow[] = [];
 
@@ -502,6 +590,8 @@ export class AgentTaskControlService {
         input.error ?? "stale_background_worker",
         {
           requireExpiredLease: true,
+          ...(input.requireLeaseEvidence ? { requireLeaseEvidence: true } : {}),
+          ...(task.leaseExpiresAt !== undefined ? { expectedLeaseExpiresAt: task.leaseExpiresAt } : {}),
           updatedBeforeOrAt: cutoff,
         },
       );
@@ -509,7 +599,7 @@ export class AgentTaskControlService {
     }
 
     return {
-      scanned,
+      scanned: scannedTaskIds.size,
       closed,
     };
   }
@@ -727,17 +817,18 @@ export class AgentTaskControlService {
       }
       return this.completeTaskFinal(task, "completed", runId, generation, assessment.summary, undefined, messageId);
     }
+    const failure = promptResultFailure(result);
     if (mailboxOwned) {
       const outcome = await this.closeTaskFinal(
         task,
         status,
         undefined,
-        result.error?.message ?? result.finishReason,
+        failure,
         {
           mailboxMessageId: messageId,
           mailboxDisposition: "requeue",
-          ...((result.error?.message ?? result.finishReason)
-            ? { mailboxError: result.error?.message ?? result.finishReason }
+          ...(failure
+            ? { mailboxError: failure }
             : {}),
         },
       );
@@ -749,7 +840,7 @@ export class AgentTaskControlService {
       runId,
       generation,
       undefined,
-      result.error?.message ?? result.finishReason,
+      failure,
       messageId,
     );
   }
@@ -810,6 +901,10 @@ export class AgentTaskControlService {
     summary?: string,
     error?: string,
   ): Promise<void> {
+    summary = summary === undefined
+      ? undefined
+      : boundedPersistedText(summary, "agent task summary");
+    error = error === undefined ? undefined : normalizePersistedError(error).message;
     await this.append(task, "agent.task_completed", {
       taskId: task.id,
       path: task.path,
@@ -830,6 +925,10 @@ export class AgentTaskControlService {
     error?: string,
     mailboxMessageId?: string,
   ): Promise<boolean> {
+    summary = summary === undefined
+      ? undefined
+      : boundedPersistedText(summary, "agent task summary");
+    error = error === undefined ? undefined : normalizePersistedError(error).message;
     const store = this.finalizationStore();
     if (store) {
       const input: Parameters<AgentTaskFinalizationStore["completeAgentTaskCas"]>[0] = {
@@ -897,6 +996,16 @@ export class AgentTaskControlService {
     error?: string,
     fence: TaskCloseFenceOptions = {},
   ): Promise<TaskFinalizationOutcome> {
+    summary = summary === undefined
+      ? undefined
+      : boundedPersistedText(summary, "agent task summary");
+    error = error === undefined ? undefined : normalizePersistedError(error).message;
+    if (fence.mailboxError !== undefined) {
+      fence = {
+        ...fence,
+        mailboxError: normalizePersistedError(fence.mailboxError).message,
+      };
+    }
     const store = this.finalizationStore();
     if (store) {
       const input: Parameters<AgentTaskFinalizationStore["closeAgentTaskCas"]>[0] = {
@@ -911,6 +1020,7 @@ export class AgentTaskControlService {
       if (error) input.error = error;
       if (task.currentRunId) input.agentEventId = this.id("event");
       if (fence.requireExpiredLease) input.requireExpiredLease = true;
+      if (fence.requireLeaseEvidence) input.requireLeaseEvidence = true;
       if (fence.expectedLeaseExpiresAt !== undefined) {
         input.expectedLeaseExpiresAt = fence.expectedLeaseExpiresAt;
       }
@@ -1106,6 +1216,10 @@ export class AgentTaskControlService {
     error?: string,
   ): Promise<void> {
     if (!runId) return;
+    summary = summary === undefined
+      ? undefined
+      : boundedPersistedText(summary, "agent task summary");
+    error = error === undefined ? undefined : normalizePersistedError(error).message;
     await this.append(task, "agent.completed", {
       runId,
       taskId: task.id,
@@ -1128,7 +1242,8 @@ export class AgentTaskControlService {
     if (!assistantMessageId) return undefined;
     const messages = await this.options.store.messages(sessionId);
     const message = messages.find((candidate) => candidate.id === assistantMessageId && candidate.role === "assistant");
-    return message ? textFromMessage(message) : undefined;
+    const text = message ? textFromMessage(message) : undefined;
+    return text === undefined ? undefined : boundedPersistedText(text, "agent task summary");
   }
 
   private async append<TType extends ChiliEvent["type"], TPayload>(
@@ -1257,14 +1372,16 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function linkedAbortController(signal: AbortSignal | undefined): AbortController {
+function linkedAbortController(...signals: Array<AbortSignal | undefined>): AbortController {
   const controller = new AbortController();
-  if (!signal) return controller;
-  if (signal.aborted) {
-    controller.abort();
-    return controller;
+  for (const signal of signals) {
+    if (!signal) continue;
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+      break;
+    }
+    signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true });
   }
-  signal.addEventListener("abort", () => controller.abort(), { once: true });
   return controller;
 }
 
@@ -1275,9 +1392,45 @@ function abortError(message: string): Error {
 }
 
 function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
+  return normalizePersistedError(error);
 }
 
 function isAbortError(error: Error): boolean {
-  return error.name === "AbortError" || error.message.toLowerCase().includes("aborted");
+  const persisted = normalizePersistedError(error);
+  return persisted.name === "AbortError" || persisted.message.toLowerCase().includes("aborted");
+}
+
+function normalizePromptResult(result: SubmitPromptResult): SubmitPromptResult {
+  const turns = result.turns.map((turn) =>
+    turn.status === "completed" || turn.error === undefined
+      ? turn
+      : { ...turn, error: normalizePersistedError(turn.error) },
+  );
+  if (result.status === "completed") return { ...result, turns };
+  return {
+    ...result,
+    turns,
+    ...(result.error ? { error: normalizePersistedError(result.error) } : {}),
+    ...(result.finishReason
+      ? { finishReason: normalizePersistedError(result.finishReason).message }
+      : {}),
+  };
+}
+
+function promptResultFailure(result: SubmitPromptResult): string | undefined {
+  if (result.status === "completed") return undefined;
+  const value = result.error ?? result.finishReason;
+  return value === undefined ? undefined : normalizePersistedError(value).message;
+}
+
+function boundedPersistedText(value: string, label: string): string {
+  const bounded = boundPersistedJsonValue(value, {
+    maxBytes: AGENT_TASK_TEXT_JSON_BYTES,
+    maxStringBytes: AGENT_TASK_TEXT_JSON_BYTES - 2,
+    maxItems: 1,
+    maxDepth: 1,
+    maxNodes: 1,
+    label,
+  });
+  return typeof bounded === "string" ? bounded : "";
 }

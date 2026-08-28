@@ -1,6 +1,5 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
@@ -34,17 +33,40 @@ import type {
   McpServerCapabilities,
   McpUnsubscribe,
 } from "./client.js";
+import {
+  createBoundedMcpFetch,
+  type McpHttpIngressLimitError,
+  type McpHttpIngressLimits,
+} from "./http-ingress.js";
+import {
+  BoundedStdioClientTransport,
+  type McpStdioFrameTooLargeError,
+} from "./stdio-client-transport.js";
 
 export interface SdkMcpClientOptions {
   clientInfo?: McpClientInfo;
   capabilities?: McpClientCapabilities;
+  fetch?: typeof fetch;
+  ingressLimits?: Partial<McpHttpIngressLimits>;
+}
+
+export interface SdkMcpTransportOptions {
+  fetch?: typeof fetch;
+  ingressLimits?: Partial<McpHttpIngressLimits>;
+  onIngressLimit?: (error: McpHttpIngressLimitError) => void;
+  onStdioIngressLimit?: (error: McpStdioFrameTooLargeError) => void;
 }
 
 type ListChangedKind = "tools" | "prompts" | "resources";
+type McpFatalIngressError = McpHttpIngressLimitError | McpStdioFrameTooLargeError;
 
 export class SdkMcpClient implements McpClient {
   private readonly client: Client;
   private readonly changedHandlers = new Map<ListChangedKind, Set<() => void>>();
+  private readonly fetchImplementation: typeof fetch;
+  private readonly ingressLimits: Partial<McpHttpIngressLimits> | undefined;
+  private activeTransport: Transport | undefined;
+  private fatalIngressError: McpFatalIngressError | undefined;
   private connected = false;
 
   constructor(
@@ -59,56 +81,84 @@ export class SdkMcpClient implements McpClient {
         resources: { onChanged: () => this.emitChanged("resources") },
       },
     });
+    this.fetchImplementation = options.fetch ?? fetch;
+    this.ingressLimits = options.ingressLimits;
+    this.client.onclose = () => {
+      this.connected = false;
+      this.activeTransport = undefined;
+    };
   }
 
   async initialize(options: McpInitializeOptions = {}): Promise<McpInitializeResult> {
-    if (!this.connected) {
-      const transport = createSdkMcpTransport(this.server);
-      await this.client.connect(transport as Transport, requestOptions(options));
-      this.connected = true;
-    }
-    const result: McpInitializeResult = {};
-    if (options.protocolVersion !== undefined) result.protocolVersion = options.protocolVersion;
-    const capabilities = fromSdkServerCapabilities(this.client.getServerCapabilities());
-    if (capabilities !== undefined) result.capabilities = capabilities;
-    const serverInfo = fromImplementation(this.client.getServerVersion());
-    if (serverInfo !== undefined) result.serverInfo = serverInfo;
-    const instructions = this.client.getInstructions();
-    if (instructions !== undefined) result.instructions = instructions;
-    return result;
+    return this.withIngressError(async () => {
+      if (!this.connected) {
+        this.fatalIngressError = undefined;
+        let transport: Transport;
+        transport = createSdkMcpTransport(this.server, {
+          fetch: this.fetchImplementation,
+          ...(this.ingressLimits ? { ingressLimits: this.ingressLimits } : {}),
+          onIngressLimit: (error) => this.handleFatalIngress(error, transport),
+          onStdioIngressLimit: (error) => this.handleFatalIngress(error, transport),
+        });
+        this.activeTransport = transport;
+        await this.client.connect(transport, requestOptions(options));
+        this.connected = true;
+      }
+      const result: McpInitializeResult = {};
+      if (options.protocolVersion !== undefined) result.protocolVersion = options.protocolVersion;
+      const capabilities = fromSdkServerCapabilities(this.client.getServerCapabilities());
+      if (capabilities !== undefined) result.capabilities = capabilities;
+      const serverInfo = fromImplementation(this.client.getServerVersion());
+      if (serverInfo !== undefined) result.serverInfo = serverInfo;
+      const instructions = this.client.getInstructions();
+      if (instructions !== undefined) result.instructions = instructions;
+      return result;
+    });
   }
 
   async listTools(options: McpCursorOptions = {}): Promise<McpListToolsResult> {
-    return this.client.listTools(cursorParams(options), requestOptions(options)) as Promise<ListToolsResult & McpListToolsResult>;
+    return this.withIngressError(
+      () => this.client.listTools(cursorParams(options), requestOptions(options)) as Promise<ListToolsResult & McpListToolsResult>,
+    );
   }
 
   async callTool(name: string, arguments_: unknown, options: McpCallOptions = {}): Promise<McpCallToolResult> {
-    const result = await this.client.callTool({
-      name,
-      arguments: callArguments(arguments_),
-      ...(options.progressToken === undefined ? {} : { _meta: { progressToken: options.progressToken } }),
-    }, undefined, requestOptions(options));
-    return result as CallToolResult & McpCallToolResult;
+    return this.withIngressError(async () => {
+      const result = await this.client.callTool({
+        name,
+        arguments: callArguments(arguments_),
+        ...(options.progressToken === undefined ? {} : { _meta: { progressToken: options.progressToken } }),
+      }, undefined, requestOptions(options));
+      return result as CallToolResult & McpCallToolResult;
+    });
   }
 
   async listPrompts(options: McpCursorOptions = {}): Promise<McpListPromptsResult> {
-    return this.client.listPrompts(cursorParams(options), requestOptions(options)) as Promise<ListPromptsResult & McpListPromptsResult>;
+    return this.withIngressError(
+      () => this.client.listPrompts(cursorParams(options), requestOptions(options)) as Promise<ListPromptsResult & McpListPromptsResult>,
+    );
   }
 
   async listResources(options: McpCursorOptions = {}): Promise<McpListResourcesResult> {
-    return this.client.listResources(cursorParams(options), requestOptions(options)) as Promise<ListResourcesResult & McpListResourcesResult>;
+    return this.withIngressError(
+      () => this.client.listResources(cursorParams(options), requestOptions(options)) as Promise<ListResourcesResult & McpListResourcesResult>,
+    );
   }
 
   async readResource(uri: string, options: McpRequestOptions = {}): Promise<McpReadResourceResult> {
-    return this.client.readResource({ uri }, requestOptions(options)) as Promise<ReadResourceResult & McpReadResourceResult>;
+    return this.withIngressError(
+      () => this.client.readResource({ uri }, requestOptions(options)) as Promise<ReadResourceResult & McpReadResourceResult>,
+    );
   }
 
   async getPrompt(name: string, arguments_?: Record<string, string>, options: McpRequestOptions = {}): Promise<McpGetPromptResult> {
-    const result = await this.client.getPrompt({
-      name,
-      ...(arguments_ ? { arguments: arguments_ } : {}),
-    }, requestOptions(options));
-    return result as GetPromptResult & McpGetPromptResult;
+    return this.withIngressError(async () => {
+      const result = await this.client.getPrompt({
+        name,
+        ...(arguments_ ? { arguments: arguments_ } : {}),
+      }, requestOptions(options));
+      return result as GetPromptResult & McpGetPromptResult;
+    });
   }
 
   onToolsChanged(handler: () => void): McpUnsubscribe {
@@ -138,15 +188,34 @@ export class SdkMcpClient implements McpClient {
   private emitChanged(kind: ListChangedKind): void {
     for (const handler of this.changedHandlers.get(kind) ?? []) handler();
   }
+
+  private async withIngressError<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      throw this.fatalIngressError ?? error;
+    }
+  }
+
+  private handleFatalIngress(error: McpFatalIngressError, transport: Transport): void {
+    if (transport !== this.activeTransport) {
+      void transport.close().catch(() => undefined);
+      return;
+    }
+    if (this.fatalIngressError) return;
+    this.fatalIngressError = error;
+    this.connected = false;
+    void transport.close().catch(() => undefined);
+  }
 }
 
 export function createSdkMcpClient(server: McpServerConfig, options: SdkMcpClientOptions = {}): SdkMcpClient {
   return new SdkMcpClient(server, options);
 }
 
-export function createSdkMcpTransport(server: McpServerConfig): Transport {
+export function createSdkMcpTransport(server: McpServerConfig, options: SdkMcpTransportOptions = {}): Transport {
   if (server.type === "stdio") {
-    return new StdioClientTransport({
+    return new BoundedStdioClientTransport({
       command: server.command,
       args: server.args,
       // MCP stdio uses stdout for protocol messages; server diagnostics commonly go to stderr.
@@ -155,17 +224,27 @@ export function createSdkMcpTransport(server: McpServerConfig): Transport {
       stderr: "ignore",
       ...(server.env ? { env: server.env } : {}),
       ...(server.cwd ? { cwd: server.cwd } : {}),
+    }, {
+      ...(options.onStdioIngressLimit ? { onFatalError: options.onStdioIngressLimit } : {}),
     }) as unknown as Transport;
   }
 
+  const boundedFetch = createBoundedMcpFetch(options.fetch ?? fetch, {
+    ...(options.ingressLimits ? { limits: options.ingressLimits } : {}),
+    ...(options.onIngressLimit ? { onLimit: options.onIngressLimit } : {}),
+  });
+
   if (server.type === "http") {
     return new StreamableHTTPClientTransport(new URL(server.url), {
+      fetch: boundedFetch,
       requestInit: { headers: server.headers },
     }) as unknown as Transport;
   }
 
+  const sseFetch = fetchWithHeaders(server.headers, boundedFetch);
   return new SSEClientTransport(new URL(server.url), {
-    eventSourceInit: { fetch: fetchWithHeaders(server.headers) },
+    fetch: sseFetch,
+    eventSourceInit: { fetch: sseFetch },
     requestInit: { headers: server.headers },
   }) as unknown as Transport;
 }
@@ -200,11 +279,11 @@ function fromSdkServerCapabilities(capabilities: ServerCapabilities | undefined)
   return capabilities ? capabilities as McpServerCapabilities : undefined;
 }
 
-function fetchWithHeaders(headers: Record<string, string>): typeof fetch {
+function fetchWithHeaders(headers: Record<string, string>, baseFetch: typeof fetch): typeof fetch {
   return ((input, init) => {
     const mergedHeaders = new Headers(init?.headers);
     for (const [key, value] of Object.entries(headers)) mergedHeaders.set(key, value);
-    return fetch(input, { ...init, headers: mergedHeaders });
+    return baseFetch(input, { ...init, headers: mergedHeaders });
   }) as typeof fetch;
 }
 

@@ -2270,7 +2270,7 @@ test("terminal synchronization loses atomically when a follow-up run reopens the
   }
 });
 
-test("marks a team task failed when the dispatched subagent fails", async () => {
+test("marks a team task failed with bounded diagnostics when the dispatched subagent is hostile", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-team-dispatch-failed-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
   const ids = createSequentialId();
@@ -2278,7 +2278,7 @@ test("marks a team task failed when the dispatched subagent fails", async () => 
   const leadPath = "/root" as AgentPath;
   const workerPath = "/root/worker" as AgentPath;
   const sessionId = "session_team_failed" as SessionId;
-  const runner = new FakeLocalSubagentRunner({ status: "failed", error: new Error("model failed") });
+  const runner = new FakeLocalSubagentRunner({ status: "failed", error: hostileDispatcherError() });
 
   try {
     const teams = new TeamControlService({ store, createId: ids, now });
@@ -2308,7 +2308,6 @@ test("marks a team task failed when the dispatched subagent fails", async () => 
     expect(result.status).toBe("failed");
     expect(result.teamTask).toMatchObject({
       status: "failed",
-      error: "model failed",
       completedAt: 300,
       metadata: {
         chiliTeamDispatch: {
@@ -2317,6 +2316,19 @@ test("marks a team task failed when the dispatched subagent fails", async () => 
         },
       },
     });
+    expectDispatcherSafeDiagnostic(result.teamTask.error);
+    expectDispatcherSafeDiagnostic(
+      result.agentTask?.error instanceof Error ? result.agentTask.error.message : result.agentTask?.error,
+    );
+    const terminalEvents = ((await store.events({ type: "team.task_updated" })) as ChiliEvent[]).filter(
+      (event): event is Extract<ChiliEvent, { type: "team.task_updated" }> =>
+        event.type === "team.task_updated"
+          && event.payload.taskId === task.id
+          && event.payload.status === "failed",
+    );
+    expect(terminalEvents).toHaveLength(1);
+    expectDispatcherSafeDiagnostic(terminalEvents[0]?.payload.error);
+    expect(jsonByteLength(terminalEvents[0])).toBeLessThanOrEqual(400 * 1024);
     expect(await store.teamMembers({ teamId: team.id, path: workerPath })).toMatchObject([{ status: "idle" }]);
   } finally {
     store.close();
@@ -2500,4 +2512,29 @@ async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs 
 function createSequentialId(): (prefix: string) => string {
   let next = 0;
   return (prefix: string) => `${prefix}_${++next}`;
+}
+
+const DISPATCHER_HOSTILE_SECRET = "sk-dispatcher-secret-123456789";
+
+function hostileDispatcherError(): Error {
+  const error = new Error(
+    `model failed\nAuthorization: Bearer ${DISPATCHER_HOSTILE_SECRET}\n`
+      + `http://localhost:4999/private?token=${DISPATCHER_HOSTILE_SECRET}\n`
+      + "\u0000\"\\\n".repeat(Math.ceil((5 * 1024 * 1024) / 4)),
+  ) as Error & { code?: string };
+  error.name = "DispatcherProviderFailure";
+  error.code = "TOKEN_INVALIDATED";
+  return error;
+}
+
+function expectDispatcherSafeDiagnostic(value: string | undefined): void {
+  expect(value).toBeDefined();
+  expect(value).toContain("[REDACTED]");
+  expect(value).not.toContain(DISPATCHER_HOSTILE_SECRET);
+  expect(value).not.toContain("localhost:4999");
+  expect(new TextEncoder().encode(value ?? "").byteLength).toBeLessThanOrEqual(16 * 1024);
+}
+
+function jsonByteLength(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }

@@ -134,6 +134,52 @@ test("does not retry provider errors explicitly marked non-retryable", async () 
   expect(store.items.some((event) => event.type === "turn.retry_scheduled")).toBe(false);
 });
 
+test("preserves bounded nested retry classification and Retry-After after discarding cause", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  let modelCalls = 0;
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      modelCalls += 1;
+      if (modelCalls === 1) {
+        const cause = Object.assign(new Error("socket reset"), { code: "ECONNRESET", retryAfterMs: 1 });
+        throw Object.assign(new Error("wrapped provider failure"), { cause });
+      }
+      yield { type: "text_delta", text: "recovered" };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const runtime = testRuntime(store, registry, model, { maxAttempts: 2, initialDelayMs: 0 });
+
+  const result = await runtime.runTurn({ sessionId: "session_nested_retry" as SessionId, cwd: "/repo" });
+  expect(result.status).toBe("completed");
+  expect(modelCalls).toBe(2);
+  expect(store.items).toContainEqual(expect.objectContaining({
+    type: "turn.retry_scheduled",
+    payload: expect.objectContaining({ delayMs: 1 }),
+  }));
+});
+
+test("preserves a nested explicit non-retryable veto after discarding cause", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  let modelCalls = 0;
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      modelCalls += 1;
+      throw Object.assign(new Error("socket connection was closed unexpectedly"), {
+        cause: Object.assign(new Error("quota exhausted"), { retryable: false }),
+      });
+    },
+  };
+  const runtime = testRuntime(store, registry, model);
+
+  const result = await runtime.runTurn({ sessionId: "session_nested_retry_veto" as SessionId, cwd: "/repo" });
+  expect(result.status).toBe("failed");
+  expect(modelCalls).toBe(1);
+  expect(store.items.some((event) => event.type === "turn.retry_scheduled")).toBe(false);
+});
+
 test("consumes rich model streams and executes tool calls after the stream finishes", async () => {
   const store = new MemoryEventStore();
   const registry = new InMemoryToolRegistry();
@@ -248,6 +294,196 @@ test("consumes rich model streams and executes tool calls after the stream finis
   expect(liveToolUpdateIndex).toBeLessThan(toolCallPartIndex);
   expect(toolCallPartIndex).toBeGreaterThan(-1);
   expect(toolStartedIndex).toBeGreaterThan(toolCallPartIndex);
+});
+
+test("bounds partial and final tool inputs only at persistence and desktop boundaries", async () => {
+  const hugeInput = "\u0000".repeat(4 * 1024 * 1024);
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  let executedInputBytes = 0;
+  registry.register({
+    name: "large_input",
+    description: "Receives a large provider input.",
+    risk: "read",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async (input: { payload?: string }) => {
+      executedInputBytes = Buffer.byteLength(input.payload ?? "", "utf8");
+      return { title: "large input", output: "ok" };
+    },
+  });
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "tool_call_start", toolCallId: "tool_large_input", name: "large_input" };
+      yield {
+        type: "tool_call_delta",
+        toolCallId: "tool_large_input",
+        name: "large_input",
+        delta: "partial",
+        partialInput: { payload: hugeInput },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCallId: "tool_large_input",
+        name: "large_input",
+        input: { payload: hugeInput },
+      };
+      yield { type: "finish", reason: "tool_use" };
+    },
+  };
+
+  const result = await testRuntime(store, registry, model).runTurn({
+    sessionId: "session_large_tool_input" as SessionId,
+    cwd: "/repo",
+  });
+  expect(result.status).toBe("completed");
+  expect(executedInputBytes).toBe(4 * 1024 * 1024);
+  const inputEvents = store.items.filter((event) =>
+    (event.type === "tool.call_updated" || event.type === "tool.call_started")
+      && event.payload.callId === "tool_large_input"
+  );
+  const toolCallPartEvents = store.items.filter((event) =>
+    event.type === "message.part_added" && event.payload.part.type === "tool_call"
+  );
+  expect(inputEvents.length).toBeGreaterThanOrEqual(3);
+  expect(toolCallPartEvents).toHaveLength(1);
+  const contractsModulePath = "../../../apps/desktop/src/shared/contracts.ts";
+  const { parseDesktopEvent } = await import(contractsModulePath) as {
+    parseDesktopEvent(value: unknown): unknown;
+  };
+  for (const event of [...inputEvents, ...toolCallPartEvents]) {
+    expect(Buffer.byteLength(JSON.stringify(event), "utf8")).toBeLessThan(520_000);
+    expect(() => parseDesktopEvent({ type: "runtime.event", event })).not.toThrow();
+  }
+});
+
+test("keeps one desktop-safe call id across provider stream, message parts, and executor events", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  registry.register({
+    name: "stable_call_id",
+    description: "Return a small result.",
+    risk: "read",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => ({ title: "stable", output: "ok" }),
+  });
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "tool_call_start", toolCallId: "__proto__", name: "stable_call_id", index: 7 };
+      yield {
+        type: "tool_call_delta",
+        toolCallId: "__proto__",
+        name: "stable_call_id",
+        delta: "{}",
+        partialInput: {},
+        index: 7,
+      };
+      yield { type: "tool_call_end", toolCallId: "__proto__", name: "stable_call_id", input: {}, index: 7 };
+      yield { type: "finish", reason: "tool_use" };
+    },
+  };
+
+  const result = await testRuntime(store, registry, model).runTurn({
+    sessionId: "session_hostile_provider_call_id" as SessionId,
+    cwd: "/repo",
+  });
+  expect(result.status).toBe("completed");
+
+  const callEvents = store.items.filter((event): event is Extract<ChiliEvent, {
+    type: "tool.call_started" | "tool.call_updated" | "tool.call_finished" | "message.part_added";
+  }> =>
+    event.type === "tool.call_started"
+      || event.type === "tool.call_updated"
+      || event.type === "tool.call_finished"
+      || (event.type === "message.part_added"
+        && (event.payload.part.type === "tool_call" || event.payload.part.type === "tool_result"))
+  );
+  const ids = callEvents.map((event) => event.type === "message.part_added"
+    ? (event.payload.part as Extract<MessagePart, { type: "tool_call" | "tool_result" }>).callId
+    : event.payload.callId);
+  expect(ids.length).toBeGreaterThanOrEqual(6);
+  expect(new Set(ids).size).toBe(1);
+  expect(ids[0]).toMatch(/^toolcall_invalid_[a-f0-9]{16}$/u);
+
+  const contractsModulePath = "../../../apps/desktop/src/shared/contracts.ts";
+  const { parseDesktopEvent } = await import(contractsModulePath) as {
+    parseDesktopEvent(value: unknown): unknown;
+  };
+  for (const event of callEvents) {
+    expect(() => parseDesktopEvent({ type: "runtime.event", event })).not.toThrow();
+  }
+});
+
+test("RuntimeService shutdown fences a signal-ignoring model EOF before tool execution and completion", async () => {
+  const store = new MemoryEventStore();
+  const registry = new InMemoryToolRegistry();
+  const sessionId = "session_shutdown_model_eof" as SessionId;
+  store.addSession(sessionId);
+  let executions = 0;
+  registry.register({
+    name: "must_not_run_after_shutdown",
+    description: "Must remain fenced after shutdown.",
+    risk: "read",
+    inputSchema: { type: "object" },
+    approval: () => false,
+    execute: async () => {
+      executions += 1;
+      return { title: "unexpected", output: "unexpected" };
+    },
+  });
+  let reachedEofGateResolve: (() => void) | undefined;
+  const reachedEofGate = new Promise<void>((resolve) => { reachedEofGateResolve = resolve; });
+  let releaseEofResolve: (() => void) | undefined;
+  const releaseEof = new Promise<void>((resolve) => { releaseEofResolve = resolve; });
+  const model: ModelRouter = {
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "text_delta", text: "queued" };
+      yield { type: "tool_call", name: "must_not_run_after_shutdown", input: {} };
+      reachedEofGateResolve?.();
+      await releaseEof;
+      return;
+    },
+  };
+  const createId = createSequentialId();
+  const runtime = new SingleAgentRuntime({
+    store,
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({
+      registry,
+      events: { publish: (event) => store.append(event) },
+      approvals: { decide: async () => ({ action: "allow_once" }) },
+      createId,
+      now: () => 1 as TimestampMs,
+    }),
+    createId,
+    now: () => 1 as TimestampMs,
+  });
+  const service = new RuntimeService({
+    runtime,
+    store,
+    cwd: "/repo",
+    maxTurns: 1,
+    createId,
+    now: () => 1 as TimestampMs,
+  });
+
+  const prompt = service.submitPrompt({ sessionId, text: "start" });
+  await reachedEofGate;
+  const shutdown = service.shutdown("test_shutdown_model_eof");
+  releaseEofResolve?.();
+  const result = await prompt;
+  await shutdown;
+
+  expect(result.status).toBe("cancelled");
+  expect(executions).toBe(0);
+  expect(store.items.some(
+    (event) => event.type === "turn.completed" && event.payload.status === "completed",
+  )).toBe(false);
+  expect(store.items.some(
+    (event) => event.type === "turn.completed" && event.payload.status === "cancelled",
+  )).toBe(true);
 });
 
 test("copies only allowlisted tool metadata into model-visible execution context", async () => {
@@ -1235,7 +1471,12 @@ class ThrowingStatusStore extends MemoryEventStore {
   }
 }
 
-function testRuntime(store: MemoryEventStore, registry: InMemoryToolRegistry, model: ModelRouter): SingleAgentRuntime {
+function testRuntime(
+  store: MemoryEventStore,
+  registry: InMemoryToolRegistry,
+  model: ModelRouter,
+  retryPolicy?: ConstructorParameters<typeof SingleAgentRuntime>[0]["retryPolicy"],
+): SingleAgentRuntime {
   return new SingleAgentRuntime({
     store,
     model,
@@ -1245,6 +1486,7 @@ function testRuntime(store: MemoryEventStore, registry: InMemoryToolRegistry, mo
       events: { publish: (event) => store.append(event) },
       approvals: { decide: async () => ({ action: "allow_once" }) },
     }),
+    ...(retryPolicy ? { retryPolicy } : {}),
     createId: createSequentialId(),
     now: () => 1 as TimestampMs,
   });

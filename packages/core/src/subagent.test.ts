@@ -117,6 +117,131 @@ test("spawns a local subagent and records lifecycle events", async () => {
   });
 });
 
+test("shutdown publishes one promise before a runner abort listener reenters", async () => {
+  const store = new MemoryEventStore();
+  const runnerStarted = deferred<void>();
+  let manager!: LocalSubagentManager;
+  let reentrantShutdown: Promise<void> | undefined;
+  let abortCallbacks = 0;
+  let runnerCleanups = 0;
+
+  manager = new LocalSubagentManager({
+    store,
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+    runner: {
+      async run(input) {
+        const signal = input.signal;
+        if (!signal) throw new Error("Expected a shutdown-linked runner signal");
+        runnerStarted.resolve(undefined);
+        try {
+          await new Promise<void>((_resolve, reject) => {
+            const onAbort = (): void => {
+              abortCallbacks++;
+              reentrantShutdown = manager.shutdown();
+              reject(abortTestError());
+            };
+            if (signal.aborted) onAbort();
+            else signal.addEventListener("abort", onAbort, { once: true });
+          });
+          throw new Error("Runner unexpectedly settled without aborting");
+        } finally {
+          runnerCleanups++;
+        }
+      },
+    },
+  });
+
+  await manager.spawnTask({
+    parentSessionId: "session_shutdown_reentry" as SessionId,
+    cwd: "/repo",
+    taskName: "shutdown reentry",
+    prompt: "Wait for shutdown",
+    mode: "background",
+  });
+  await runnerStarted.promise;
+
+  const shutdown = manager.shutdown();
+  expect(reentrantShutdown).toBe(shutdown);
+  expect(manager.shutdown()).toBe(shutdown);
+  await shutdown;
+
+  expect(abortCallbacks).toBe(1);
+  expect(runnerCleanups).toBe(1);
+  expect(store.items.filter((event) => event.type === "agent.task_completed")).toHaveLength(1);
+  expect(store.items.filter((event) => event.type === "agent.completed")).toHaveLength(1);
+});
+
+test("redacts and bounds hostile subagent failures before publishing completion events", async () => {
+  const store = new MemoryEventStore();
+  const manager = new LocalSubagentManager({
+    store,
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+    runner: {
+      async run() {
+        return { status: "failed", error: hostilePersistenceError("subagent provider failed") };
+      },
+    },
+  });
+
+  const result = await manager.spawnTask({
+    parentSessionId: "session_hostile_failure" as SessionId,
+    cwd: "/repo",
+    taskName: "hostile failure",
+    prompt: "Fail safely",
+  });
+
+  expect(result.status).toBe("failed");
+  expectPersistenceSafeDiagnostic(result.error?.message);
+  expect((result.error as Error & { code?: string }).code).toBe("TOKEN_INVALIDATED");
+  const completionEvents = store.items.filter(
+    (event) => event.type === "agent.task_completed" || event.type === "agent.completed",
+  );
+  expect(completionEvents).toHaveLength(2);
+  for (const event of completionEvents) {
+    expectPersistenceSafeDiagnostic(event.payload.error);
+    expect(jsonByteLength(event)).toBeLessThanOrEqual(128 * 1024);
+  }
+});
+
+test("bounds hostile subagent summaries without redacting ordinary authored content", async () => {
+  const store = new MemoryEventStore();
+  const summaryPrefix =
+    `Ordinary summary keeps ${HOSTILE_PERSISTENCE_SECRET} and `
+    + `http://127.0.0.1:4317/result?token=${HOSTILE_PERSISTENCE_SECRET}.\n`;
+  const manager = new LocalSubagentManager({
+    store,
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+    runner: {
+      async run() {
+        return { status: "completed", summary: `${summaryPrefix}${hostileWorstEscapedText()}` };
+      },
+    },
+  });
+
+  const result = await manager.spawnTask({
+    parentSessionId: "session_hostile_summary" as SessionId,
+    cwd: "/repo",
+    taskName: "hostile summary",
+    prompt: "Complete safely",
+  });
+
+  expect(result.status).toBe("completed");
+  expect(result.summary?.startsWith(summaryPrefix)).toBe(true);
+  expect(result.summary).not.toContain("[REDACTED]");
+  const completionEvents = store.items.filter(
+    (event) => event.type === "agent.task_completed" || event.type === "agent.completed",
+  );
+  expect(completionEvents).toHaveLength(2);
+  for (const event of completionEvents) {
+    expect(event.payload.summary?.startsWith(summaryPrefix)).toBe(true);
+    expect(event.payload.summary).not.toContain("[REDACTED]");
+    expect(jsonByteLength(event)).toBeLessThanOrEqual(80 * 1024);
+  }
+});
+
 test("falls back to paired appends when an observable inner store has no CAS capability", async () => {
   const inner = new MemoryEventStore();
   const store = new ObservableEventStore(inner);
@@ -1931,6 +2056,35 @@ function abortTestError(): Error {
 function createSequentialId(): (prefix: string) => string {
   let index = 0;
   return (prefix) => `${prefix}_${++index}`;
+}
+
+const HOSTILE_PERSISTENCE_SECRET = "sk-agent-persistence-secret-123456789";
+
+function hostilePersistenceError(label: string): Error {
+  const error = new Error(
+    `${label}\nAuthorization: Bearer ${HOSTILE_PERSISTENCE_SECRET}\n`
+      + `http://127.0.0.1:4317/internal?token=${HOSTILE_PERSISTENCE_SECRET}\n`
+      + hostileWorstEscapedText(),
+  ) as Error & { code?: string };
+  error.name = "ProviderFailure";
+  error.code = "TOKEN_INVALIDATED";
+  return error;
+}
+
+function hostileWorstEscapedText(): string {
+  return "\u0000\"\\\n".repeat(Math.ceil((5 * 1024 * 1024) / 4));
+}
+
+function expectPersistenceSafeDiagnostic(value: string | undefined): void {
+  expect(value).toBeDefined();
+  expect(value).toContain("[REDACTED]");
+  expect(value).not.toContain(HOSTILE_PERSISTENCE_SECRET);
+  expect(value).not.toContain("127.0.0.1");
+  expect(new TextEncoder().encode(value ?? "").byteLength).toBeLessThanOrEqual(16 * 1024);
+}
+
+function jsonByteLength(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
 function deferred<T>(): {

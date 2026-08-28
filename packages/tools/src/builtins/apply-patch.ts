@@ -2,8 +2,8 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ChiliToolDefinition, ChiliToolExecutionContext, ValidationResult } from "../types.js";
 import {
+  assertDirectWritablePathInsideWorkspace,
   assertExistingPathInsideWorkspace,
-  assertWritablePathInsideWorkspace,
   isSafeRelativePath,
   resolveWorkspacePath,
   type WorkspacePath,
@@ -130,11 +130,11 @@ export function createApplyPatchTool(): ChiliToolDefinition<ApplyPatchInput> {
         await assertPatchWorkspacePath(workspace, target, operation);
         await assertPatchReadState(workspace, target, operation, context.fileReads);
         if (operation.type === "create") {
-          applied.push(await createFile(target, operation));
+          applied.push(await createFile(workspace, target, operation));
         } else if (operation.type === "replace") {
-          applied.push(await replaceText(target, operation));
+          applied.push(await replaceText(workspace, target, operation));
         } else if (operation.type === "delete") {
-          applied.push(await deleteFile(target, operation));
+          applied.push(await deleteFile(workspace, target, operation));
         } else {
           applied.push(await applyRawUpdate(workspace, target, operation));
         }
@@ -167,14 +167,15 @@ async function assertPatchWorkspacePath(
   operation: ApplyPatchOperation,
 ): Promise<void> {
   if (operation.type === "create") {
-    await assertWritablePathInsideWorkspace(workspace, target, operation.path);
+    await assertDirectWritablePathInsideWorkspace(workspace, target, operation.path);
     return;
   }
 
   await assertExistingPathInsideWorkspace(workspace, target, operation.path);
+  await assertDirectWritablePathInsideWorkspace(workspace, target, operation.path);
   if (operation.type === "raw_update" && operation.movePath) {
     const outputPath = resolveWorkspacePath(workspace, operation.movePath);
-    await assertWritablePathInsideWorkspace(workspace, outputPath, operation.movePath);
+    await assertDirectWritablePathInsideWorkspace(workspace, outputPath, operation.movePath);
   }
 }
 
@@ -337,12 +338,17 @@ function isPatchBoundary(line: string | undefined): boolean {
   );
 }
 
-async function createFile(target: WorkspacePath, operation: CreateFileOperation): Promise<AppliedOperation> {
+async function createFile(
+  workspace: string,
+  target: WorkspacePath,
+  operation: CreateFileOperation,
+): Promise<AppliedOperation> {
   const existing = await readTextIfExists(target.absolutePath);
   if (existing !== undefined && !operation.overwrite) {
     throw new Error(`Refusing to overwrite existing file: ${target.relativePath}`);
   }
 
+  await assertDirectWritablePathInsideWorkspace(workspace, target, operation.path);
   await mkdir(dirname(target.absolutePath), { recursive: true });
   await writeFile(target.absolutePath, operation.content, "utf8");
 
@@ -413,7 +419,12 @@ async function updatePatchReadState(
   }
 }
 
-async function deleteFile(target: WorkspacePath, operation: DeleteFileOperation): Promise<AppliedOperation> {
+async function deleteFile(
+  workspace: string,
+  target: WorkspacePath,
+  operation: DeleteFileOperation,
+): Promise<AppliedOperation> {
+  await assertDirectWritablePathInsideWorkspace(workspace, target, operation.path);
   await rm(target.absolutePath);
   return {
     type: operation.type,
@@ -423,7 +434,11 @@ async function deleteFile(target: WorkspacePath, operation: DeleteFileOperation)
   };
 }
 
-async function replaceText(target: WorkspacePath, operation: ReplaceTextOperation): Promise<AppliedOperation> {
+async function replaceText(
+  workspace: string,
+  target: WorkspacePath,
+  operation: ReplaceTextOperation,
+): Promise<AppliedOperation> {
   const current = await readFile(target.absolutePath, "utf8");
   const occurrences = countOccurrences(current, operation.oldText);
   if (occurrences === 0) {
@@ -437,6 +452,7 @@ async function replaceText(target: WorkspacePath, operation: ReplaceTextOperatio
     ? current.split(operation.oldText).join(operation.newText)
     : current.replace(operation.oldText, operation.newText);
 
+  await assertDirectWritablePathInsideWorkspace(workspace, target, operation.path);
   await writeFile(target.absolutePath, next, "utf8");
 
   return {
@@ -456,6 +472,7 @@ async function applyRawUpdate(workspace: string, target: WorkspacePath, operatio
     next = applyRawChunk(next, chunk, target.relativePath);
   }
 
+  await assertPatchWorkspacePath(workspace, target, operation);
   const outputPath = operation.movePath ? resolveWorkspacePath(workspace, operation.movePath) : target;
   await mkdir(dirname(outputPath.absolutePath), { recursive: true });
   await writeFile(outputPath.absolutePath, convertToLineEnding(next, lineEnding), "utf8");

@@ -8,7 +8,14 @@ import type {
   TimestampMs,
   ToolCallId,
 } from "@chili/protocol";
-import { joinAgentPath, ROOT_AGENT_PATH, timestampNow } from "@chili/protocol";
+import {
+  boundPersistedJsonValue,
+  joinAgentPath,
+  normalizePersistedError,
+  PERSISTED_JSON_LIMITS,
+  ROOT_AGENT_PATH,
+  timestampNow,
+} from "@chili/protocol";
 import type {
   AgentTaskCapabilityStore,
   AgentTaskFinalizationStore,
@@ -55,6 +62,8 @@ import {
 
 const FINAL_RESPONSE_AFTER_MAX_TURNS_SYSTEM =
   "The automatic tool-use continuation limit has been reached. Do not call tools. Use the information already available in the conversation to give the best final answer now, and briefly state anything that remains uncertain.";
+const AGENT_EVENT_TEXT_JSON_BYTES = 64 * 1024;
+const AGENT_EVENT_METADATA_JSON_BYTES = 256 * 1024;
 
 export {
   DEFAULT_LOCAL_SUBAGENT_MAX_ACTIVE_RUNS,
@@ -175,6 +184,7 @@ interface LocalSubagentTaskState {
   externallyClosed?: boolean;
   finalizationCommitted?: boolean;
   leaseLost?: boolean;
+  beginRun?: Promise<boolean>;
 }
 
 interface RetainedBatchLimiter {
@@ -204,6 +214,13 @@ export interface AgentRunnerSubagentRunnerOptions {
   promptFragments?: RuntimePromptFragmentsProvider;
 }
 
+export class LocalSubagentManagerClosedError extends Error {
+  constructor() {
+    super("Local subagent manager is closing or closed");
+    this.name = "LocalSubagentManagerClosedError";
+  }
+}
+
 export class LocalSubagentManager implements SubagentController {
   private readonly tasks = new Map<string, LocalSubagentTaskState>();
   private readonly reservedSpawns = new Map<string, {
@@ -211,8 +228,12 @@ export class LocalSubagentManager implements SubagentController {
     promise: Promise<LocalSubagentTaskResult>;
   }>();
   private readonly backgroundTasks = new Set<Promise<void>>();
+  private readonly taskOperations = new Set<Promise<void>>();
   private readonly batchLimiters = new Map<string, BatchLimiterEntry>();
   private readonly runLimiter: LocalSubagentRunLimiter;
+  private readonly shutdownController = new AbortController();
+  private acceptingTasks = true;
+  private shutdownPromise?: Promise<void>;
   private activeRuns = 0;
   private queuedRuns = 0;
   private peakActiveRuns = 0;
@@ -250,16 +271,17 @@ export class LocalSubagentManager implements SubagentController {
     if (!(await this.ensureTaskLease(state))) {
       throw new Error(`Local subagent task lease lost: ${input.taskId}`);
     }
+    const summary = boundedPersistedText(input.summary, "subagent summary");
     let completionStatus = input.status ?? "completed";
     if (completionStatus === "completed") {
-      const assessment = assessSubagentCompletion(input.summary);
+      const assessment = assessSubagentCompletion(summary);
       if (assessment.status === "incomplete") {
         completionStatus = "incomplete";
         state.task.error = completionIssueError(assessment);
       }
     }
     state.task.status = completionStatus;
-    state.task.summary = input.summary;
+    state.task.summary = summary;
     this.stopLeaseHeartbeat(state);
     if (!(await this.completeTaskFinal(state))) {
       state.externallyClosed = true;
@@ -269,13 +291,47 @@ export class LocalSubagentManager implements SubagentController {
     state.controller.abort();
     return {
       taskId: input.taskId,
-      summary: input.summary,
+      summary,
       status: completionStatus,
     };
   }
 
   async waitForBackgroundTasks(): Promise<void> {
     await Promise.allSettled([...this.backgroundTasks]);
+  }
+
+  shutdown(reason = "runtime_closed"): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+
+    let resolveShutdown!: () => void;
+    let rejectShutdown!: (error: unknown) => void;
+    const shutdownPromise = new Promise<void>((resolve, reject) => {
+      resolveShutdown = resolve;
+      rejectShutdown = reject;
+    });
+    // Abort listeners run synchronously and may reenter shutdown. Publish the
+    // one host-level promise before closing admission or notifying any runner.
+    this.shutdownPromise = shutdownPromise;
+
+    // Close admission and abort pre-registration work synchronously. A spawn
+    // that already passed the public gate is tracked in taskOperations and is
+    // linked to this controller before its first await.
+    this.acceptingTasks = false;
+    this.shutdownController.abort(abortError(reason));
+    void (async () => {
+      while (true) {
+        const activeTaskIds = [...this.tasks.values()]
+          .filter((state) => !isFinalLocalSubagentStatus(state.task.status))
+          .map((state) => state.task.taskId);
+        await Promise.allSettled(activeTaskIds.map((taskId) => this.interruptTask(taskId)));
+
+        const operations = [...this.taskOperations];
+        const background = [...this.backgroundTasks];
+        if (operations.length === 0 && background.length === 0) break;
+        await Promise.allSettled([...operations, ...background]);
+      }
+    })().then(resolveShutdown, rejectShutdown);
+    return shutdownPromise;
   }
 
   runStats(): LocalSubagentManagerRunStats {
@@ -287,6 +343,15 @@ export class LocalSubagentManager implements SubagentController {
       peakActiveRuns: this.peakActiveRuns,
       backgroundTasks: this.backgroundTasks.size,
     };
+  }
+
+  liveTaskIds(): TaskId[] {
+    const ids = new Set<TaskId>();
+    for (const state of this.tasks.values()) {
+      if (!isFinalLocalSubagentStatus(state.task.status)) ids.add(state.task.taskId);
+    }
+    for (const taskId of this.reservedSpawns.keys()) ids.add(taskId as TaskId);
+    return [...ids];
   }
 
   async interruptTask(taskId: TaskId | string, fence?: LocalSubagentInterruptFence): Promise<boolean> {
@@ -302,6 +367,14 @@ export class LocalSubagentManager implements SubagentController {
     state.task.status = "cancelled";
     this.stopLeaseHeartbeat(state);
     state.controller.abort();
+    if (state.beginRun) {
+      try {
+        await state.beginRun;
+      } catch {
+        // The normal runner path owns reporting begin failures. Waiting here is
+        // only a fence so closure observes any CAS that may already have committed.
+      }
+    }
     const finalization = this.beginExternalFinalization(state, "cancelled");
     await finalization;
     await this.releaseTaskLease(state);
@@ -309,8 +382,10 @@ export class LocalSubagentManager implements SubagentController {
   }
 
   private spawnLocalTask(input: LocalSubagentTaskInput): Promise<LocalSubagentTaskResult> {
+    if (!this.acceptingTasks) return Promise.reject(new LocalSubagentManagerClosedError());
+    input = boundedLocalSubagentTaskInput(input);
     validateReservedTaskIdentity(input);
-    if (!input.taskId) return this.spawnLocalTaskOnce(input);
+    if (!input.taskId) return this.trackTaskOperation(this.spawnLocalTaskOnce(input));
 
     const fingerprint = reservedTaskFingerprint(input);
     const active = this.tasks.get(input.taskId);
@@ -332,7 +407,7 @@ export class LocalSubagentManager implements SubagentController {
       return existing.promise;
     }
 
-    const promise = this.spawnLocalTaskOnce(input);
+    const promise = this.trackTaskOperation(this.spawnLocalTaskOnce(input));
     this.reservedSpawns.set(input.taskId, { fingerprint, promise });
     void promise.finally(() => {
       const current = this.reservedSpawns.get(input.taskId as TaskId);
@@ -341,11 +416,25 @@ export class LocalSubagentManager implements SubagentController {
     return promise;
   }
 
+  private trackTaskOperation<T>(operation: Promise<T>): Promise<T> {
+    let observed: Promise<void>;
+    observed = operation.then(
+      () => undefined,
+      () => undefined,
+    ).finally(() => {
+      this.taskOperations.delete(observed);
+    });
+    this.taskOperations.add(observed);
+    return operation;
+  }
+
   private async spawnLocalTaskOnce(input: LocalSubagentTaskInput): Promise<LocalSubagentTaskResult> {
+    const controller = linkedAbortController(input.signal, this.shutdownController.signal);
     await this.options.assertDelegationEnabled?.({
       sessionId: input.parentSessionId,
       action: "task.spawn",
     });
+    throwIfAborted(controller.signal);
     const taskId = input.taskId ?? this.id<TaskId>("task");
     const runId = input.runId ?? this.id<AgentRunId>("agent");
     const parentPath = input.parentPath ?? ROOT_AGENT_PATH;
@@ -353,8 +442,12 @@ export class LocalSubagentManager implements SubagentController {
     const childSessionId = input.childSessionId ?? this.id<SessionId>("session");
     const mode = input.mode ?? "one_shot";
     let generation = 1;
-    const controller = linkedAbortController(input.signal);
     const batchLimiter = this.retainBatchLimiter(input);
+    const assertSpawnActive = (): void => {
+      if (!controller.signal.aborted) return;
+      this.releaseBatchLimiter(batchLimiter);
+      throwIfAborted(controller.signal);
+    };
     const workerPolicy = input.workerPolicy
       ? completeWorkerToolPolicy(input.workerPolicy, childSessionId)
       : undefined;
@@ -371,6 +464,7 @@ export class LocalSubagentManager implements SubagentController {
     assignSchedulingMetadata(task, input);
 
     const existingTask = input.taskId ? await this.projectedTask(input.taskId) : undefined;
+    assertSpawnActive();
     if (existingTask) {
       task = localTaskResultFromProjection(existingTask, input, {
         taskId,
@@ -427,6 +521,7 @@ export class LocalSubagentManager implements SubagentController {
     }
 
     if (!existingTask) {
+      assertSpawnActive();
       try {
         await this.append(
           eventContext(input.parentSessionId),
@@ -459,7 +554,6 @@ export class LocalSubagentManager implements SubagentController {
         `Reserved local subagent task requires atomic run-claim capability: ${taskId}`,
       );
     }
-
     const runInput: LocalSubagentRunInput = {
       taskId,
       runId,
@@ -493,7 +587,7 @@ export class LocalSubagentManager implements SubagentController {
         try {
           await this.completeFromRunner(state);
         } catch (error: unknown) {
-          this.options.onBackgroundError?.(error, task);
+          this.options.onBackgroundError?.(toError(error), task);
         } finally {
           this.releaseBatchLimiter(state.batchLimiter);
           this.backgroundTasks.delete(promise);
@@ -547,13 +641,17 @@ export class LocalSubagentManager implements SubagentController {
       this.peakActiveRuns = Math.max(this.peakActiveRuns, this.activeRuns);
       task.status = "running";
       try {
-        if (!(await this.beginTaskRun(state))) return task;
+        const beginRun = this.beginTaskRun(state);
+        state.beginRun = beginRun;
+        if (!(await beginRun)) return task;
       } catch (error) {
         if (!state.externallyClosed) {
           task.status = "pending";
           state.spawned = false;
         }
         throw error;
+      } finally {
+        delete state.beginRun;
       }
 
       await this.options.assertDelegationEnabled?.({
@@ -586,8 +684,8 @@ export class LocalSubagentManager implements SubagentController {
         return task;
       }
       task.status = result.status;
-      if (result.summary) task.summary = result.summary;
-      if (result.error) task.error = result.error;
+      if (result.summary) task.summary = boundedPersistedText(result.summary, "subagent summary");
+      if (result.error) task.error = toError(result.error);
       this.stopLeaseHeartbeat(state);
       if (!(await this.completeTaskFinal(state))) state.externallyClosed = true;
       return task;
@@ -747,7 +845,7 @@ export class LocalSubagentManager implements SubagentController {
     if (state.externalFinalization) return state.externalFinalization;
     state.externallyClosed = true;
     state.task.status = status;
-    if (error) state.task.error = error;
+    if (error) state.task.error = toError(error);
     this.stopLeaseHeartbeat(state);
     state.externalFinalization = this.finalizeExternalClosure(state);
     return state.externalFinalization;
@@ -989,9 +1087,11 @@ export class LocalSubagentManager implements SubagentController {
 
   private hydrateAuthoritativeTask(state: LocalSubagentTaskState, authoritative: AgentTaskRow): void {
     state.task.status = authoritative.status;
-    if (authoritative.summary !== undefined) state.task.summary = authoritative.summary;
+    if (authoritative.summary !== undefined) {
+      state.task.summary = boundedPersistedText(authoritative.summary, "subagent summary");
+    }
     else delete state.task.summary;
-    if (authoritative.error !== undefined) state.task.error = new Error(authoritative.error);
+    if (authoritative.error !== undefined) state.task.error = normalizePersistedError(authoritative.error);
     else delete state.task.error;
   }
 
@@ -1013,8 +1113,8 @@ export class LocalSubagentManager implements SubagentController {
         runId: input.runId,
         status: task.status,
         generation: input.generation,
-        ...(task.summary ? { summary: task.summary } : {}),
-        ...(task.error ? { error: task.error.message } : {}),
+        ...(task.summary ? { summary: boundedPersistedText(task.summary, "subagent summary") } : {}),
+        ...(task.error ? { error: normalizePersistedError(task.error).message } : {}),
       },
     };
     const events: ChiliEvent[] = [taskEvent];
@@ -1030,8 +1130,8 @@ export class LocalSubagentManager implements SubagentController {
           taskId: input.taskId,
           status: task.status,
           generation: input.generation,
-          ...(task.summary ? { summary: task.summary } : {}),
-          ...(task.error ? { error: task.error.message } : {}),
+          ...(task.summary ? { summary: boundedPersistedText(task.summary, "subagent summary") } : {}),
+          ...(task.error ? { error: normalizePersistedError(task.error).message } : {}),
         },
       };
       events.push(agentEvent);
@@ -1069,36 +1169,42 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
   constructor(private readonly options: AgentRunnerSubagentRunnerOptions) {}
 
   async run(input: LocalSubagentRunInput): Promise<LocalSubagentRunResult> {
+    throwIfRunAborted(input);
     await this.options.runner.createSession({
       sessionId: input.childSessionId,
       cwd: input.cwd,
     });
+    throwIfRunAborted(input);
     await this.options.runner.appendUserMessage({
       sessionId: input.childSessionId,
       text: input.prompt,
     });
+    throwIfRunAborted(input);
 
     const maxTurns = this.options.maxTurns ?? 128;
     const prompt = await this.resolvePromptAssembly(input);
+    throwIfRunAborted(input);
     let repairAttempted = false;
     let extraRepairTurn = false;
     for (let index = 0; index < maxTurns || extraRepairTurn; index++) {
       extraRepairTurn = false;
       const runInput = runTurnInputFromPrompt(input, prompt);
       if (input.signal) runInput.signal = input.signal;
+      throwIfRunAborted(input);
       const result = await this.options.runner.runTurn(runInput);
+      throwIfRunAborted(input);
 
       if (result.status !== "completed") {
-        return {
-          status: result.status,
-          error: result.error,
-        };
+        return result.error === undefined
+          ? { status: result.status }
+          : { status: result.status, error: normalizePersistedError(result.error) };
       }
 
       if (!isToolUseFinishReason(result.finishReason)) {
         const assessment = await this.assessLatestCompletion(input.childSessionId);
+        throwIfRunAborted(input);
         if (assessment.status === "completed") {
-          return { status: "completed", summary: assessment.summary };
+          return { status: "completed", summary: boundedPersistedText(assessment.summary, "subagent summary") };
         }
         if (repairAttempted) return incompleteRunResult(assessment);
 
@@ -1107,10 +1213,12 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
           sessionId: input.childSessionId,
           text: subagentCompletionRepairPrompt(assessment),
         });
+        throwIfRunAborted(input);
         if (index + 1 >= maxTurns) extraRepairTurn = true;
       }
     }
 
+    throwIfRunAborted(input);
     const finalPrompt = this.withFinalResponsePrompt(prompt);
     const finalInput: RunTurnInput = {
       sessionId: input.childSessionId,
@@ -1122,17 +1230,19 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
     if (finalPrompt.contextualUser.length > 0) finalInput.contextualUser = finalPrompt.contextualUser;
     finalInput.promptDebug = finalPrompt.debug;
     if (input.signal) finalInput.signal = input.signal;
+    throwIfRunAborted(input);
     const finalResult = await this.options.runner.runTurn(finalInput);
+    throwIfRunAborted(input);
     if (finalResult.status !== "completed") {
-      return {
-        status: finalResult.status,
-        error: finalResult.error,
-      };
+      return finalResult.error === undefined
+        ? { status: finalResult.status }
+        : { status: finalResult.status, error: normalizePersistedError(finalResult.error) };
     }
     if (!isToolUseFinishReason(finalResult.finishReason)) {
       const assessment = await this.assessLatestCompletion(input.childSessionId);
+      throwIfRunAborted(input);
       return assessment.status === "completed"
-        ? { status: "completed", summary: assessment.summary }
+        ? { status: "completed", summary: boundedPersistedText(assessment.summary, "subagent summary") }
         : incompleteRunResult(assessment);
     }
 
@@ -1143,10 +1253,12 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
   }
 
   private async resolvePromptAssembly(input: LocalSubagentRunInput): Promise<PromptAssembly> {
+    throwIfRunAborted(input);
     const fragments = await this.options.promptFragments?.({
       sessionId: input.childSessionId,
       cwd: input.cwd,
     });
+    throwIfRunAborted(input);
     return new PromptAssembler()
       .addMany(fragments)
       .addMany(subagentRunPromptFragments(input))
@@ -1273,8 +1385,8 @@ function localTaskResultFromProjection(
     status: projected.status,
   };
   if (expected.workerPolicy) result.workerPolicy = expected.workerPolicy;
-  if (projected.summary) result.summary = projected.summary;
-  if (projected.error) result.error = new Error(projected.error);
+  if (projected.summary) result.summary = boundedPersistedText(projected.summary, "subagent summary");
+  if (projected.error) result.error = normalizePersistedError(projected.error);
   assignSchedulingMetadata(result, projected);
   return result;
 }
@@ -1345,13 +1457,23 @@ function subagentRunPromptFragments(input: LocalSubagentRunInput): PromptFragmen
 }
 
 function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
+  return normalizePersistedError(error);
 }
 
-function abortError(): Error {
-  const error = new Error("Local subagent run aborted");
+function abortError(message = "Local subagent run aborted"): Error {
+  const error = new Error(message);
   error.name = "AbortError";
   return error;
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  if (signal.reason !== undefined) throw normalizePersistedError(signal.reason);
+  throw abortError();
+}
+
+function throwIfRunAborted(input: LocalSubagentRunInput): void {
+  if (input.signal) throwIfAborted(input.signal);
 }
 
 function assertPositiveInteger(value: number, name: string): void {
@@ -1377,9 +1499,11 @@ function incompleteRunResult(
 ): LocalSubagentRunResult {
   const result: LocalSubagentRunResult = {
     status: "incomplete",
-    error: completionIssueError(assessment),
+    error: normalizePersistedError(completionIssueError(assessment)),
   };
-  if (assessment.summary) result.summary = assessment.summary;
+  if (assessment.summary) {
+    result.summary = boundedPersistedText(assessment.summary, "subagent summary");
+  }
   return result;
 }
 
@@ -1397,6 +1521,51 @@ function isToolUseFinishReason(reason: string | undefined): boolean {
   return reason === "tool_use" || reason === "tool_calls" || reason === "function_call";
 }
 
+function boundedLocalSubagentTaskInput(input: LocalSubagentTaskInput): LocalSubagentTaskInput {
+  const bounded: LocalSubagentTaskInput = {
+    ...input,
+    cwd: boundedPersistedText(input.cwd, "subagent cwd"),
+    taskName: boundedPersistedText(input.taskName, "subagent task name"),
+    prompt: boundedPersistedText(input.prompt, "subagent prompt"),
+  };
+  if (input.workerPolicy) {
+    bounded.workerPolicy = boundedPersistedRecord(
+      input.workerPolicy,
+      "subagent worker policy",
+    ) as WorkerToolPolicyTemplate;
+  }
+  if (input.batchId !== undefined) {
+    bounded.batchId = boundedPersistedText(input.batchId, "subagent batch id");
+  }
+  return bounded;
+}
+
+function boundedPersistedText(value: string, label: string): string {
+  const bounded = boundPersistedJsonValue(value, {
+    maxBytes: AGENT_EVENT_TEXT_JSON_BYTES,
+    maxStringBytes: AGENT_EVENT_TEXT_JSON_BYTES - 2,
+    maxItems: 1,
+    maxDepth: 1,
+    maxNodes: 1,
+    label,
+  });
+  return typeof bounded === "string" ? bounded : "";
+}
+
+function boundedPersistedRecord(value: Record<string, unknown>, label: string): Record<string, unknown> {
+  const bounded = boundPersistedJsonValue(value, {
+    maxBytes: AGENT_EVENT_METADATA_JSON_BYTES,
+    maxStringBytes: PERSISTED_JSON_LIMITS.stringBytes,
+    maxItems: PERSISTED_JSON_LIMITS.items,
+    maxDepth: PERSISTED_JSON_LIMITS.depth,
+    maxNodes: PERSISTED_JSON_LIMITS.nodes,
+    label,
+  });
+  return bounded && typeof bounded === "object" && !Array.isArray(bounded)
+    ? bounded as Record<string, unknown>
+    : {};
+}
+
 function leaseOwner(runId: AgentRunId): string {
   return `local:${runId}`;
 }
@@ -1410,14 +1579,16 @@ function eventContext(sessionId: SessionId): { sessionId: SessionId } {
   return { sessionId };
 }
 
-function linkedAbortController(signal: AbortSignal | undefined): AbortController {
+function linkedAbortController(...signals: Array<AbortSignal | undefined>): AbortController {
   const controller = new AbortController();
-  if (!signal) return controller;
-  if (signal.aborted) {
-    controller.abort();
-    return controller;
+  for (const signal of signals) {
+    if (!signal) continue;
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+      break;
+    }
+    signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true });
   }
-  signal.addEventListener("abort", () => controller.abort(), { once: true });
   return controller;
 }
 

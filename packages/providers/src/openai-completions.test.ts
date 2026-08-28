@@ -925,6 +925,42 @@ test("parses OpenAI-compatible SSE text, reasoning, tool deltas, and usage", asy
   });
 });
 
+test("normalizes hostile OpenAI stream tool call ids consistently", async () => {
+  const model = new OpenAICompletionsModel({
+    provider: "openai",
+    model: "gpt-test",
+    apiKey: "test-key",
+    baseUrl: "https://api.test",
+    fetch: sseFetch([
+      data({
+        id: "chatcmpl_hostile_id",
+        model: "gpt-test",
+        choices: [{
+          index: 0,
+          delta: { tool_calls: [{ index: 0, id: "__proto__", function: { name: "lookup", arguments: "{\"query\"" } }] },
+        }],
+      }),
+      data({
+        id: "chatcmpl_hostile_id",
+        model: "gpt-test",
+        choices: [{
+          index: 0,
+          delta: { tool_calls: [{ index: 0, function: { arguments: ":\"chili\"}" } }] },
+          finish_reason: "tool_calls",
+        }],
+      }),
+      "data: [DONE]\n\n",
+    ]),
+  });
+
+  const events = (await collect(model.stream({ messages: [], tools: [], system: [] })))
+    .filter((event) => event.type.startsWith("tool_call_"));
+  const ids = events.flatMap((event) => "toolCallId" in event ? [event.toolCallId] : []);
+  expect(ids).toHaveLength(4);
+  expect(new Set(ids).size).toBe(1);
+  expect(ids[0]).toMatch(/^toolcall_invalid_[a-f0-9]{16}$/u);
+});
+
 test("marks invalid OpenAI-compatible streaming tool arguments", async () => {
   const model = new OpenAICompletionsModel({
     provider: "openai",

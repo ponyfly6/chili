@@ -1,4 +1,11 @@
-import { DELEGATION_POLICIES, isTransientEvent, RUNTIME_PERMISSION_PROFILE_IDS } from "@chili/protocol";
+import {
+  DELEGATION_POLICIES,
+  isTransientEvent,
+  normalizePersistedError,
+  parseUserInputAnswers,
+  RUNTIME_PERMISSION_PROFILE_IDS,
+} from "@chili/protocol";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import {
@@ -47,6 +54,9 @@ import type {
   TeamMessageDelivery,
   SessionGoal,
   SessionGoalStatus,
+  PendingUserInputRequest,
+  UserInputAnswers,
+  UserInputId,
 } from "@chili/protocol";
 import type {
   AgentTreeSnapshot,
@@ -83,6 +93,17 @@ import type {
 } from "@chili/core";
 import { UnknownEventCursorError } from "@chili/store";
 import type { EventPublisher, EventStore } from "@chili/store";
+import {
+  jsonEventArrayUtf8Bytes,
+  ReplayableRuntimeEventWindowAccumulator,
+  runtimeEventDependencyKey,
+  runtimeEventJsonUtf8Bytes,
+  runtimeEventProvides,
+  runtimeEventRequires,
+  type RuntimePendingApprovalRequest,
+  type RuntimePendingApprovalWindow,
+  type RuntimeSessionEventWindow,
+} from "@chili/sdk";
 import type { PromptCommandControl, PromptCommandRunResult } from "./commands.js";
 import { PromptCommandNotFoundError, PromptCommandUsageError } from "./commands.js";
 import type {
@@ -194,6 +215,7 @@ export interface RuntimeMcpControlService {
 export interface RuntimeHttpHandlerOptions {
   service: RuntimeHttpService;
   store: EventStore & EventPublisher;
+  authToken?: string;
   tasks?: RuntimeTaskControlService;
   agents?: RuntimeAgentTreeService;
   teams?: RuntimeTeamService;
@@ -201,10 +223,19 @@ export interface RuntimeHttpHandlerOptions {
   teamMerger?: RuntimeTeamMergeService;
   teamRunner?: RuntimeTeamExecutionRunnerService;
   approvals?: ApprovalResolver;
+  userInputs?: UserInputController;
   permissions?: PermissionProfileControl;
   commands?: PromptCommandControl;
   mcp?: RuntimeMcpControlService;
   maxBacklogEvents?: number;
+  maxEventStreamDurableEvents?: number;
+  maxEventStreamAgeMs?: number;
+  maxSessionEventWindowBytes?: number;
+  maxSessionEventScanPages?: number;
+  maxSessionEventScanEvents?: number;
+  maxSessionEventScanBytes?: number;
+  maxSessionEventScanMs?: number;
+  maxSessionEventWindowConcurrency?: number;
   onBackgroundError?: (error: unknown) => void;
 }
 
@@ -215,6 +246,14 @@ export interface ApprovalResolver {
     feedback?: string;
   }): boolean | Promise<boolean>;
   maxApprovalScope?(approvalId: import("@chili/protocol").ApprovalId): import("@chili/protocol").ApprovalScope | undefined | Promise<import("@chili/protocol").ApprovalScope | undefined>;
+}
+
+export interface UserInputController {
+  list(input?: { sessionId?: SessionId }): readonly PendingUserInputRequest[] | Promise<readonly PendingUserInputRequest[]>;
+  resolve(input: {
+    inputId: UserInputId;
+    answers: UserInputAnswers;
+  }): boolean | Promise<boolean>;
 }
 
 export interface PermissionProfileControl {
@@ -230,13 +269,34 @@ export interface StartRuntimeHttpServerOptions extends RuntimeHttpHandlerOptions
 
 export interface RuntimeHttpServer {
   url: string;
-  close(): void;
+  close(): Promise<void>;
 }
 
 export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (request: Request) => Promise<Response> {
   const maxBacklogEvents = options.maxBacklogEvents ?? 5000;
+  const maxEventStreamDurableEvents = positiveIntegerOrDefault(
+    options.maxEventStreamDurableEvents,
+    4096,
+  );
+  const maxEventStreamAgeMs = positiveIntegerOrDefault(options.maxEventStreamAgeMs, 5 * 60_000);
+  const sessionEventWindowLimits: SessionEventWindowLimits = {
+    maxBytes: positiveIntegerOrDefault(options.maxSessionEventWindowBytes, 4_000_000),
+    maxScanPages: positiveIntegerOrDefault(options.maxSessionEventScanPages, 512),
+    maxScanEvents: positiveIntegerOrDefault(options.maxSessionEventScanEvents, 4_096),
+    maxScanBytes: positiveIntegerOrDefault(options.maxSessionEventScanBytes, 4_000_000),
+    maxScanMs: positiveIntegerOrDefault(options.maxSessionEventScanMs, 250),
+  };
+  const sessionEventWindowAdmission = new AsyncAdmissionGate(
+    positiveIntegerOrDefault(options.maxSessionEventWindowConcurrency, 4),
+  );
+  const inFlightSessionEventWindows = new Map<string, Promise<RuntimeSessionEventWindow>>();
+  const authTokenDigest = configuredAuthTokenDigest(options.authToken);
 
   return async function runtimeHttpHandler(request: Request): Promise<Response> {
+    if (authTokenDigest && !hasValidBearerToken(request, authTokenDigest)) {
+      return unauthorized();
+    }
+
     const url = new URL(request.url);
     const route = routeRequest(request.method, url.pathname);
 
@@ -620,16 +680,36 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "sessionEvents") {
         await requireSession(options.store, route.sessionId);
+        rejectUnknownQueryParameters(url, ["limit", "window"]);
         const requestedLimit = Number(url.searchParams.get("limit") ?? "5000");
         const limit = Number.isFinite(requestedLimit)
           ? Math.max(1, Math.min(5_000, Math.trunc(requestedLimit)))
           : 5_000;
-        const [created, tail] = await Promise.all([
-          options.store.events({ sessionId: route.sessionId, type: "session.created", limit: 1 }),
-          options.store.events({ sessionId: route.sessionId, limit, tail: true }),
-        ]);
-        const seen = new Set(created.map((event) => event.id));
-        return json([...created, ...tail.filter((event) => !seen.has(event.id))]);
+        const windowKey = `${route.sessionId}\u0000${limit}`;
+        let windowPromise = inFlightSessionEventWindows.get(windowKey);
+        if (!windowPromise) {
+          windowPromise = sessionEventWindowAdmission.run(async () => replayableSessionEventWindow({
+            store: options.store,
+            sessionId: route.sessionId,
+            limit,
+            limits: sessionEventWindowLimits,
+            pendingInputs: options.userInputs
+              ? await options.userInputs.list({ sessionId: route.sessionId })
+              : [],
+          }));
+          inFlightSessionEventWindows.set(windowKey, windowPromise);
+          void windowPromise.finally(() => {
+            if (inFlightSessionEventWindows.get(windowKey) === windowPromise) {
+              inFlightSessionEventWindows.delete(windowKey);
+            }
+          }).catch(() => undefined);
+        }
+        const window = await windowPromise;
+        if (url.searchParams.get("window") === "replayable") return json(window);
+        return json(window.events, 200, {
+          "x-chili-event-window-truncated": String(window.truncated),
+          "x-chili-event-window-bytes": String(window.bytes),
+        });
       }
 
       if (route.name === "renameSession") {
@@ -816,6 +896,43 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         return new Response(null, { status: 204 });
       }
 
+      if (route.name === "listUserInputs") {
+        if (!options.userInputs) return jsonError(501, "No user input controller is configured");
+        rejectUnknownQueryParameters(url, ["sessionId"]);
+        const sessionId = asSessionId(url.searchParams.get("sessionId"));
+        return json(await options.userInputs.list(sessionId ? { sessionId } : {}));
+      }
+
+      if (route.name === "listPendingApprovals") {
+        rejectUnknownQueryParameters(url, ["sessionId", "window"]);
+        const sessionId = asSessionId(url.searchParams.get("sessionId"));
+        const window = await boundedPendingApprovalWindow(options.store, sessionId);
+        if (url.searchParams.get("window") === "bounded") return json(window);
+        return json(window.approvals, 200, {
+          "x-chili-approval-window-truncated": String(window.truncated),
+          "x-chili-approval-window-bytes": String(window.bytes),
+        });
+      }
+
+      if (route.name === "resolveUserInput") {
+        if (!options.userInputs) return jsonError(501, "No user input controller is configured");
+        const inputId = requestUserInputId(route.inputId);
+        const answers = parseResolveUserInputBody(await readJson<unknown>(request));
+        const pending = (await options.userInputs.list()).find((candidate) => candidate.id === inputId);
+        if (!pending) return jsonError(404, `User input request not found: ${inputId}`);
+        let validatedAnswers: UserInputAnswers;
+        try {
+          validatedAnswers = parseUserInputAnswers(answers, pending.questions);
+        } catch (error) {
+          throw badRequest(error instanceof Error ? error.message : String(error));
+        }
+        const resolved = await options.userInputs.resolve({ inputId, answers: validatedAnswers });
+        if (!resolved) {
+          return jsonError(409, "User input request is no longer pending. It may have been handled already or orphaned by a server restart.");
+        }
+        return json({ resolved: true });
+      }
+
       if (route.name === "resolveApproval") {
         if (!options.approvals) return jsonError(501, "No approval resolver is configured");
         const resolveInput = parseResolveApprovalBody(route.approvalId, await readJson<unknown>(request));
@@ -842,6 +959,8 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
           store: options.store,
           request,
           maxBacklogEvents,
+          maxDurableEvents: maxEventStreamDurableEvents,
+          maxAgeMs: maxEventStreamAgeMs,
         };
         const sessionId = asSessionId(url.searchParams.get("sessionId"));
         const afterEventId = url.searchParams.get("afterEventId");
@@ -868,7 +987,9 @@ export function startRuntimeHttpServer(options: StartRuntimeHttpServerOptions): 
 
   return {
     url: server.url.href,
-    close: () => server.stop(true),
+    close: async () => {
+      await server.stop(true);
+    },
   };
 }
 
@@ -935,6 +1056,9 @@ type Route =
   | { name: "commandAsync"; sessionId: SessionId }
   | { name: "interrupt"; sessionId: SessionId }
   | { name: "archive"; sessionId: SessionId }
+  | { name: "listUserInputs" }
+  | { name: "listPendingApprovals" }
+  | { name: "resolveUserInput"; inputId: string }
   | { name: "resolveApproval"; approvalId: import("@chili/protocol").ApprovalId }
   | { name: "notFound" };
 
@@ -993,6 +1117,10 @@ interface GoalBody {
 
 interface PermissionsBody {
   profile?: unknown;
+}
+
+interface ResolveUserInputBody {
+  answers?: unknown;
 }
 
 interface McpAddBody {
@@ -1140,12 +1268,43 @@ interface InterruptBody {
   reason?: string;
 }
 
+interface SessionEventWindowLimits {
+  maxBytes: number;
+  maxScanPages: number;
+  maxScanEvents: number;
+  maxScanBytes: number;
+  maxScanMs: number;
+}
+
+interface SessionEventWindowBuildInput {
+  store: EventStore & EventPublisher;
+  sessionId: SessionId;
+  limit: number;
+  limits: SessionEventWindowLimits;
+  pendingInputs: readonly PendingUserInputRequest[];
+}
+
+interface SessionEventHistoryScanState {
+  pages: number;
+  events: number;
+  bytes: number;
+  startedAt: number;
+  boundary?: "pages" | "events" | "bytes" | "time" | "candidate_bytes";
+}
+
+interface ScannedDependencyEvent {
+  event: ChiliEvent;
+  discoveryOrder: number;
+}
+
 interface EventStreamOptions {
   store: EventStore & EventPublisher;
   request: Request;
   sessionId?: SessionId;
   afterEventId?: string;
   maxBacklogEvents: number;
+  maxDurableEvents: number;
+  maxAgeMs: number;
 }
 
 interface HttpError {
@@ -1165,6 +1324,8 @@ function routeRequest(method: string, pathname: string): Route {
   if (method === "POST" && path === "/teams") return { name: "createTeam" };
   if (method === "POST" && path === "/teams/reconcile_dispatches") return { name: "teamReconcileDispatches" };
   if (method === "GET" && path === "/sessions") return { name: "listSessions" };
+  if (method === "GET" && path === "/user-inputs") return { name: "listUserInputs" };
+  if (method === "GET" && path === "/approvals") return { name: "listPendingApprovals" };
   if (method === "GET" && path === "/models") return { name: "models" };
   if (method === "GET" && path === "/commands") return { name: "commands" };
   if (method === "POST" && path === "/commands/reload") return { name: "commandsReload" };
@@ -1199,6 +1360,11 @@ function routeRequest(method: string, pathname: string): Route {
       name: "resolveApproval",
       approvalId: decodeURIComponent(approvalRoute[1] ?? "") as import("@chili/protocol").ApprovalId,
     };
+  }
+
+  const userInputRoute = /^\/user-inputs\/([^/]+)\/resolve$/.exec(path);
+  if (method === "POST" && userInputRoute) {
+    return { name: "resolveUserInput", inputId: decodeURIComponent(userInputRoute[1] ?? "") };
   }
 
   const teamRoute = /^\/teams\/([^/]+)(?:\/([^/]+)(?:\/([^/]+)(?:\/([^/]+))?)?)?$/.exec(path);
@@ -1494,6 +1660,19 @@ function parseResolveApprovalBody(approvalId: import("@chili/protocol").Approval
   return input;
 }
 
+function parseResolveUserInputBody(body: unknown): UserInputAnswers {
+  if (!isRecord(body) || Array.isArray(body)) throw badRequest("JSON object body is required");
+  const typed = body as ResolveUserInputBody & Record<string, unknown>;
+  const unknownKeys = Object.keys(typed).filter((key) => key !== "answers");
+  if (unknownKeys.length > 0) throw badRequest(`Unexpected field: ${unknownKeys[0]}`);
+  if (typed.answers === undefined) throw badRequest("answers is required");
+  try {
+    return parseUserInputAnswers(typed.answers);
+  } catch (error) {
+    throw badRequest(error instanceof Error ? error.message : String(error));
+  }
+}
+
 function isApprovalDecisionAction(value: unknown): value is ApprovalDecisionAction {
   return value === "allow_once" || value === "allow_session" || value === "allow_always" || value === "deny";
 }
@@ -1542,16 +1721,483 @@ async function readAllProjectionEvents(
   }
 }
 
+// Persisted events are capped at 512k; seven rows keep a scan page below the
+// default 4MB response window before any dependency candidates are retained.
+const SESSION_EVENT_WINDOW_PAGE_SIZE = 7;
+const SESSION_EVENT_WINDOW_METADATA_RESERVE = 16_384;
+const SESSION_EVENT_WINDOW_PIN_LIMIT = 256;
+const SESSION_EVENT_WINDOW_ROW_LIMIT = 2_000;
+const PENDING_APPROVAL_WINDOW_BYTES = 1_000_000;
+const PENDING_APPROVAL_ROW_BYTES = 64_000;
+
+class AsyncAdmissionGate {
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(private readonly concurrency: number) {}
+
+  async run<T>(operation: () => Promise<T>): Promise<T> {
+    let inheritedSlot = false;
+    if (this.active >= this.concurrency) {
+      if (this.waiters.length >= this.concurrency * 8) {
+        const error = new Error("Session event window capacity is exhausted");
+        error.name = "RuntimeEventWindowCapacityError";
+        throw error;
+      }
+      await new Promise<void>((resolvePromise) => this.waiters.push(resolvePromise));
+      inheritedSlot = true;
+    }
+    if (!inheritedSlot) this.active += 1;
+    try {
+      return await operation();
+    } finally {
+      const next = this.waiters.shift();
+      if (next) next();
+      else this.active -= 1;
+    }
+  }
+}
+
+async function boundedPendingApprovalWindow(
+  store: EventStore,
+  sessionId?: SessionId,
+  maxBytes = PENDING_APPROVAL_WINDOW_BYTES,
+): Promise<RuntimePendingApprovalWindow> {
+  const rows = await store.pendingApprovals(sessionId, SESSION_EVENT_WINDOW_ROW_LIMIT + 1);
+  const approvals: RuntimePendingApprovalRequest[] = [];
+  let bytes = 2;
+  let truncated = rows.length > SESSION_EVENT_WINDOW_ROW_LIMIT;
+  for (const row of rows.slice(0, SESSION_EVENT_WINDOW_ROW_LIMIT)) {
+    const safe = safePendingApproval(row, sessionId);
+    if (!safe) {
+      truncated = true;
+      continue;
+    }
+    const approval = safe.approval;
+    truncated ||= safe.sanitized;
+    const rowBytes = utf8Bytes(JSON.stringify(approval));
+    const extra = rowBytes + (approvals.length > 0 ? 1 : 0);
+    if (rowBytes > PENDING_APPROVAL_ROW_BYTES || bytes + extra > maxBytes) {
+      truncated = true;
+      break;
+    }
+    approvals.push(approval);
+    bytes += extra;
+  }
+  return {
+    approvals,
+    truncated,
+    bytes,
+    ...(truncated ? { warning: "Pending approvals exceeded their validated count or UTF-8 byte budget." } : {}),
+  };
+}
+
+function safePendingApproval(
+  value: unknown,
+  requestedSessionId?: SessionId,
+): { approval: RuntimePendingApprovalRequest; sanitized: boolean } | undefined {
+  if (!isRecord(value)) return undefined;
+  const id = boundedIdentifierText(value.id, 256);
+  const permission = boundedPlainText(value.permission, 512);
+  const sessionId = value.sessionId === undefined ? undefined : boundedIdentifierText(value.sessionId, 256);
+  const callId = value.callId === undefined ? undefined : boundedIdentifierText(value.callId, 256);
+  if (!id || !permission || (requestedSessionId && sessionId !== requestedSessionId)) return undefined;
+  let sanitized = (value.sessionId !== undefined && !sessionId) || (value.callId !== undefined && !callId);
+  if (!Array.isArray(value.patterns) || value.patterns.length > 64) return undefined;
+  const patterns = value.patterns.map((pattern) => boundedPlainText(pattern, 2_000));
+  if (patterns.some((pattern) => pattern === undefined)) return undefined;
+  if (typeof value.createdAt !== "number" || !Number.isFinite(value.createdAt)) return undefined;
+  const approval: RuntimePendingApprovalRequest = {
+    id,
+    permission,
+    patterns: patterns as string[],
+    createdAt: value.createdAt,
+  };
+  if (sessionId) approval.sessionId = sessionId as SessionId;
+  if (callId) approval.callId = callId;
+  if (value.maxApprovalScope === "once" || value.maxApprovalScope === "session" || value.maxApprovalScope === "persistent") {
+    approval.maxApprovalScope = value.maxApprovalScope;
+  } else if (value.maxApprovalScope !== undefined) {
+    sanitized = true;
+  }
+  if (isRecord(value.metadata)) {
+    try {
+      if (utf8Bytes(JSON.stringify(value.metadata)) <= 16_000) approval.metadata = value.metadata;
+      else sanitized = true;
+    } catch {
+      sanitized = true;
+    }
+  } else if (value.metadata !== undefined) {
+    sanitized = true;
+  }
+  return { approval, sanitized };
+}
+
+function boundedPlainText(value: unknown, maxChars: number): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= maxChars ? value : undefined;
+}
+
+function boundedIdentifierText(value: unknown, maxChars: number): string | undefined {
+  const text = boundedPlainText(value, maxChars);
+  if (!text || /[\u0000-\u001f\u007f]/u.test(text)) return undefined;
+  if (text === "__proto__" || text === "prototype" || text === "constructor") return undefined;
+  return text;
+}
+
+async function replayableSessionEventWindow(
+  input: SessionEventWindowBuildInput,
+): Promise<RuntimeSessionEventWindow> {
+  const warnings = new Set<string>();
+  const tail = await boundedSessionEventTail(input);
+  if (tail.truncated) warnings.add("durable event tail exceeded its count or byte budget");
+
+  const pendingApprovalWindow = await boundedPendingApprovalWindow(
+    input.store,
+    input.sessionId,
+    Math.max(2, Math.min(PENDING_APPROVAL_WINDOW_BYTES, Math.floor(input.limits.maxBytes / 2))),
+  );
+  if (pendingApprovalWindow.truncated) warnings.add("pending approvals exceeded their validated snapshot budget");
+  if (input.pendingInputs.length > SESSION_EVENT_WINDOW_ROW_LIMIT) {
+    warnings.add(`pending inputs exceeded the ${SESSION_EVENT_WINDOW_ROW_LIMIT}-row event-window seed limit`);
+  }
+
+  const authoritativePins = new Set<string>();
+  const authoritativeDependencyKeys = new Set<string>();
+  for (const approval of pendingApprovalWindow.approvals) {
+    authoritativeDependencyKeys.add(runtimeEventDependencyKey({ kind: "approval", key: approval.id }));
+    if (approval.callId) {
+      authoritativeDependencyKeys.add(runtimeEventDependencyKey({ kind: "tool", key: approval.callId }));
+    }
+  }
+  for (const pending of input.pendingInputs.slice(0, SESSION_EVENT_WINDOW_ROW_LIMIT)) {
+    if (
+      pending.sessionId !== input.sessionId
+      || typeof pending.id !== "string"
+      || pending.id.length === 0
+      || typeof pending.callId !== "string"
+      || pending.callId.length === 0
+    ) {
+      warnings.add("invalid pending input rows were omitted from the event-window seed");
+      continue;
+    }
+    authoritativeDependencyKeys.add(runtimeEventDependencyKey({ kind: "user_input", key: pending.id }));
+    authoritativeDependencyKeys.add(runtimeEventDependencyKey({ kind: "tool", key: pending.callId }));
+  }
+
+  const candidates = new Map<string, ScannedDependencyEvent>();
+  let discoveryOrder = 0;
+  let recoveredOrder = -1_000_000_000;
+  let candidateBytes = 2;
+  const addCandidate = (event: ChiliEvent, explicitOrder?: number): boolean => {
+    if (candidates.has(event.id)) return true;
+    const bytes = runtimeEventJsonUtf8Bytes(event) + (candidates.size > 0 ? 1 : 0);
+    if (candidateBytes + bytes > input.limits.maxBytes * 2) return false;
+    candidates.set(event.id, { event, discoveryOrder: explicitOrder ?? discoveryOrder });
+    if (explicitOrder === undefined) discoveryOrder += 1;
+    candidateBytes += bytes;
+    return true;
+  };
+
+  const created = await input.store.events({
+    sessionId: input.sessionId,
+    type: "session.created",
+    limit: 1,
+  }) as ChiliEvent[];
+  for (const event of created) {
+    if (!addCandidate(event, -2_000_000_000)) warnings.add("session event dependency candidates exceeded their byte budget");
+  }
+  for (const event of tail.events) {
+    if (!addCandidate(event)) {
+      warnings.add("session event dependency candidates exceeded their byte budget");
+      break;
+    }
+  }
+
+  const scanState: SessionEventHistoryScanState = {
+    pages: 0,
+    events: 0,
+    bytes: 0,
+    startedAt: Date.now(),
+  };
+  while (true) {
+    const providers = providerKeys(candidates.values());
+    const unresolved = new Set(authoritativeDependencyKeys);
+    for (const candidate of candidates.values()) {
+      for (const required of runtimeEventRequires(candidate.event)) {
+        unresolved.add(runtimeEventDependencyKey(required));
+      }
+    }
+    for (const key of providers) unresolved.delete(key);
+    if (unresolved.size === 0) break;
+
+    const found = await scanSessionDependencyProviders(input, unresolved, scanState);
+    if (found.length === 0) break;
+    let added = false;
+    for (const row of found) {
+      if (!addCandidate(row.event, recoveredOrder)) {
+        scanState.boundary = "candidate_bytes";
+        break;
+      }
+      recoveredOrder += 1;
+      added = true;
+      for (const provided of runtimeEventProvides(row.event)) {
+        if (authoritativeDependencyKeys.has(runtimeEventDependencyKey(provided))) {
+          authoritativePins.add(row.event.id);
+        }
+      }
+    }
+    if (!added || scanState.boundary) break;
+  }
+
+  const providers = providerKeys(candidates.values());
+  const unresolved = new Set(authoritativeDependencyKeys);
+  for (const candidate of candidates.values()) {
+    for (const required of runtimeEventRequires(candidate.event)) {
+      unresolved.add(runtimeEventDependencyKey(required));
+    }
+  }
+  for (const key of providers) unresolved.delete(key);
+  if (unresolved.size > 0) warnings.add(`${unresolved.size} event dependency anchors could not be recovered`);
+  if (scanState.boundary) warnings.add(`event dependency scan reached its ${scanState.boundary.replace("_", " ")} limit`);
+
+  const ordered = dependencyOrderedCandidates(candidates);
+  const eventBudget = Math.max(
+    2,
+    input.limits.maxBytes - pendingApprovalWindow.bytes - SESSION_EVENT_WINDOW_METADATA_RESERVE,
+  );
+  const accumulator = new ReplayableRuntimeEventWindowAccumulator({
+    maxEvents: input.limit,
+    maxBytes: eventBudget,
+    maxSources: 1,
+  });
+  let retained = accumulator.addSource(ordered, {
+    sourceOrder: 0,
+    pinnedEventIds: authoritativePins,
+  });
+  if (retained.missingDependencies.length > 0) {
+    warnings.add(`${retained.missingDependencies.length} event groups were dropped without their anchors`);
+  }
+  if (retained.truncated) warnings.add("session event window exceeded its replay budget");
+
+  let pins = retained.pinnedEventIds.slice(0, SESSION_EVENT_WINDOW_PIN_LIMIT);
+  if (pins.length < retained.pinnedEventIds.length) warnings.add("active event pins exceeded their metadata limit");
+  let warning = boundedSessionWindowWarning(warnings);
+  let window: RuntimeSessionEventWindow = {
+    events: retained.events,
+    pendingApprovals: pendingApprovalWindow.approvals,
+    truncated: tail.truncated || retained.truncated || warnings.size > 0,
+    bytes: retained.bytes,
+    pinnedEventIds: pins,
+    ...(warning ? { warning } : {}),
+  };
+
+  for (let attempt = 0; attempt < 3 && utf8Bytes(JSON.stringify(window)) > input.limits.maxBytes; attempt += 1) {
+    const overflow = utf8Bytes(JSON.stringify(window)) - input.limits.maxBytes;
+    const nextBudget = Math.max(2, eventBudget - overflow - 256 * (attempt + 1));
+    retained = new ReplayableRuntimeEventWindowAccumulator({
+      maxEvents: input.limit,
+      maxBytes: nextBudget,
+      maxSources: 1,
+    }).addSource(ordered, { sourceOrder: 0, pinnedEventIds: authoritativePins });
+    warnings.add("session event response envelope exceeded its byte budget");
+    pins = retained.pinnedEventIds.slice(0, SESSION_EVENT_WINDOW_PIN_LIMIT);
+    warning = boundedSessionWindowWarning(warnings);
+    window = {
+      events: retained.events,
+      pendingApprovals: pendingApprovalWindow.approvals,
+      truncated: true,
+      bytes: retained.bytes,
+      pinnedEventIds: pins,
+      ...(warning ? { warning } : {}),
+    };
+  }
+  if (utf8Bytes(JSON.stringify(window)) > input.limits.maxBytes) {
+    return {
+      events: [],
+      pendingApprovals: pendingApprovalWindow.approvals,
+      truncated: true,
+      bytes: 2,
+      pinnedEventIds: [],
+      warning: "Session event response metadata exceeded its byte budget; reload after reducing active controls.",
+    };
+  }
+  return window;
+}
+
+async function boundedSessionEventTail(
+  input: SessionEventWindowBuildInput,
+): Promise<{ events: ChiliEvent[]; truncated: boolean }> {
+  const chunks: ChiliEvent[][] = [];
+  let count = 0;
+  let bytes = 2;
+  let beforeEventId: string | undefined;
+  let truncated = false;
+
+  while (count < input.limit + 1) {
+    const requested = Math.min(SESSION_EVENT_WINDOW_PAGE_SIZE, input.limit + 1 - count);
+    const batch = await input.store.events({
+      sessionId: input.sessionId,
+      limit: requested,
+      tail: true,
+      ...(beforeEventId ? { beforeEventId } : {}),
+    }) as ChiliEvent[];
+    if (batch.length === 0) break;
+    if (beforeEventId && batch.at(-1)?.id === beforeEventId) {
+      truncated = true;
+      break;
+    }
+    const accepted: ChiliEvent[] = [];
+    for (let index = batch.length - 1; index >= 0; index -= 1) {
+      const event = batch[index];
+      if (!event) continue;
+      const eventBytes = runtimeEventJsonUtf8Bytes(event) + (count > 0 ? 1 : 0);
+      if (bytes + eventBytes > input.limits.maxBytes || count >= input.limit + 1) {
+        truncated = true;
+        break;
+      }
+      accepted.unshift(event);
+      bytes += eventBytes;
+      count += 1;
+    }
+    if (accepted.length > 0) chunks.unshift(accepted);
+    if (accepted.length < batch.length || batch.length < requested) break;
+    const nextCursor = batch[0]?.id;
+    if (!nextCursor || nextCursor === beforeEventId) break;
+    beforeEventId = nextCursor;
+  }
+  const events = chunks.flat();
+  if (events.length > input.limit) {
+    events.splice(0, events.length - input.limit);
+    truncated = true;
+  }
+  return { events, truncated };
+}
+
+async function scanSessionDependencyProviders(
+  input: SessionEventWindowBuildInput,
+  targets: ReadonlySet<string>,
+  state: SessionEventHistoryScanState,
+): Promise<ScannedDependencyEvent[]> {
+  const found = new Map<string, ScannedDependencyEvent>();
+  let afterEventId: string | undefined;
+  let discoveryOrder = 0;
+
+  while (found.size < targets.size) {
+    if (state.pages >= input.limits.maxScanPages) {
+      state.boundary = "pages";
+      break;
+    }
+    if (state.events >= input.limits.maxScanEvents) {
+      state.boundary = "events";
+      break;
+    }
+    if (Date.now() - state.startedAt >= input.limits.maxScanMs) {
+      state.boundary = "time";
+      break;
+    }
+    const requested = Math.min(
+      SESSION_EVENT_WINDOW_PAGE_SIZE,
+      input.limits.maxScanEvents - state.events,
+    );
+    const batch = await input.store.events({
+      sessionId: input.sessionId,
+      ...(afterEventId ? { afterEventId } : {}),
+      limit: requested,
+    }) as ChiliEvent[];
+    state.pages += 1;
+    if (batch.length === 0) break;
+    for (const event of batch) {
+      const eventBytes = runtimeEventJsonUtf8Bytes(event);
+      if (state.bytes + eventBytes > input.limits.maxScanBytes) {
+        state.boundary = "bytes";
+        break;
+      }
+      state.events += 1;
+      state.bytes += eventBytes;
+      for (const provided of runtimeEventProvides(event)) {
+        const key = runtimeEventDependencyKey(provided);
+        if (targets.has(key) && !found.has(key)) {
+          found.set(key, { event, discoveryOrder });
+        }
+      }
+      discoveryOrder += 1;
+    }
+    if (state.boundary || batch.length < requested) break;
+    const nextCursor = batch.at(-1)?.id;
+    if (!nextCursor || nextCursor === afterEventId) break;
+    afterEventId = nextCursor;
+  }
+  return [...new Map([...found.values()].map((row) => [row.event.id, row])).values()];
+}
+
+function providerKeys(candidates: Iterable<ScannedDependencyEvent>): Set<string> {
+  const providers = new Set<string>();
+  for (const candidate of candidates) {
+    for (const provided of runtimeEventProvides(candidate.event)) {
+      providers.add(runtimeEventDependencyKey(provided));
+    }
+  }
+  return providers;
+}
+
+function dependencyOrderedCandidates(candidates: ReadonlyMap<string, ScannedDependencyEvent>): ChiliEvent[] {
+  const providerByKey = new Map<string, ChiliEvent>();
+  for (const candidate of candidates.values()) {
+    for (const provided of runtimeEventProvides(candidate.event)) {
+      if (!providerByKey.has(runtimeEventDependencyKey(provided))) {
+        providerByKey.set(runtimeEventDependencyKey(provided), candidate.event);
+      }
+    }
+  }
+  const base = [...candidates.values()].sort((left, right) => left.discoveryOrder - right.discoveryOrder);
+  const emitted = new Set<string>();
+  const visiting = new Set<string>();
+  const ordered: ChiliEvent[] = [];
+  const emit = (event: ChiliEvent): void => {
+    if (emitted.has(event.id) || visiting.has(event.id)) return;
+    visiting.add(event.id);
+    for (const required of runtimeEventRequires(event)) {
+      const provider = providerByKey.get(runtimeEventDependencyKey(required));
+      if (provider) emit(provider);
+    }
+    visiting.delete(event.id);
+    emitted.add(event.id);
+    ordered.push(event);
+  };
+  for (const candidate of base) emit(candidate.event);
+  return ordered;
+}
+
+function boundedSessionWindowWarning(warnings: ReadonlySet<string>): string | undefined {
+  if (warnings.size === 0) return undefined;
+  const text = `Session event window truncated: ${[...warnings].join("; ")}.`;
+  return text.length <= 2_000 ? text : `${text.slice(0, 1_997)}...`;
+}
+
 async function eventStream(options: EventStreamOptions): Promise<Response> {
   const encoder = new TextEncoder();
   const pending: ChiliEvent[] = [];
   const maxBacklogEvents = Math.max(1, Math.trunc(options.maxBacklogEvents));
+  const maxDurableEvents = Math.max(1, Math.trunc(options.maxDurableEvents));
+  const maxAgeMs = Math.max(1, Math.trunc(options.maxAgeMs));
+  // This set is bounded by rotating the connection after maxDurableEvents. A
+  // resumed connection never trusts live durable notification order: it pumps
+  // committed events after its durable cursor, so an arbitrarily late emit from
+  // an older connection cannot move the stream backwards or duplicate an event.
+  const seenDurableEventIds = new Set<string>();
   let backlogDone = false;
   let closed = false;
+  let durableEventsSent = 0;
+  let durableCursor = options.afterEventId;
+  let durablePumpRunning = false;
+  let durablePumpRequested = false;
+  let rotationDue = false;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let rotationTimer: ReturnType<typeof setTimeout> | undefined;
   let unsubscribe: (() => void) | undefined;
   let closeController: (() => void) | undefined;
-  let sendLive: ((event: ChiliEvent) => void) | undefined;
+  let sendEvent: ((event: ChiliEvent) => void) | undefined;
+  let requestDurablePump: (() => void) | undefined;
 
   const cleanup = (): void => {
     if (closed) return;
@@ -1560,6 +2206,8 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
     unsubscribe = undefined;
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = undefined;
+    if (rotationTimer) clearTimeout(rotationTimer);
+    rotationTimer = undefined;
     closeController?.();
   };
 
@@ -1577,7 +2225,8 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
   unsubscribe = options.store.subscribe((event) => {
     if (!matchesEvent(event, options)) return;
     if (backlogDone) {
-      sendLive?.(event);
+      if (isTransientEvent(event)) sendEvent?.(event);
+      else requestDurablePump?.();
     } else {
       pending.push(event);
     }
@@ -1616,19 +2265,85 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
     throw error;
   }
 
-  const backlogIds = new Set(backlog.map((event) => event.id));
-
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const send = (event: ChiliEvent): void => {
         if (closed || !matchesEvent(event, options)) return;
+        const durable = !isTransientEvent(event);
+        if (durable && seenDurableEventIds.has(event.id)) return;
         try {
-          controller.enqueue(encoder.encode(formatSse(event)));
-        } catch {
+          controller.enqueue(formatSse(event));
+          if (durable) {
+            seenDurableEventIds.add(event.id);
+            durableCursor = event.id;
+            durableEventsSent += 1;
+            if (durableEventsSent >= maxDurableEvents || rotationDue) cleanup();
+          }
+        } catch (error) {
+          // Legacy/corrupt stores may predate today's producer limits. Advance
+          // only through the exact persisted poison row, tell the SDK to force
+          // an authoritative snapshot, then rotate. No synthetic ChiliEvent is
+          // allowed into the projection and reconnect cannot loop forever.
+          if (durable && isRuntimeEventTransportLimitError(error)) {
+            try {
+              controller.enqueue(formatSseResync(event));
+              seenDurableEventIds.add(event.id);
+              durableCursor = event.id;
+              durableEventsSent += 1;
+            } catch {
+              // An invalid legacy cursor that cannot fit the bounded control
+              // frame still closes safely without allocating another payload.
+            }
+          }
           cleanup();
         }
       };
-      sendLive = send;
+      sendEvent = send;
+
+      const pumpDurableEvents = async (): Promise<void> => {
+        while (!closed) {
+          const remaining = maxDurableEvents - durableEventsSent;
+          if (remaining <= 0) return;
+          const limit = Math.min(maxBacklogEvents, remaining);
+          const cursorBeforeQuery = durableCursor;
+          const batch = await options.store.events(query({
+            ...(cursorBeforeQuery ? { afterEventId: cursorBeforeQuery } : {}),
+            limit,
+            tail: false,
+          })) as ChiliEvent[];
+          if (closed || batch.length === 0) return;
+
+          let advanced = false;
+          for (const event of batch) {
+            if (isTransientEvent(event)) continue;
+            send(event);
+            advanced = true;
+            if (closed) return;
+          }
+          if (!advanced || batch.length < limit) return;
+        }
+      };
+
+      requestDurablePump = (): void => {
+        durablePumpRequested = true;
+        if (durablePumpRunning || closed) return;
+        durablePumpRunning = true;
+        void (async () => {
+          try {
+            while (durablePumpRequested && !closed) {
+              durablePumpRequested = false;
+              await pumpDurableEvents();
+            }
+          } catch {
+            // Closing normally lets the client reconnect with the last durable
+            // cursor. A rejected cursor then receives the regular 409 resync.
+            cleanup();
+          } finally {
+            durablePumpRunning = false;
+            if (durablePumpRequested && !closed) requestDurablePump?.();
+          }
+        })();
+      };
 
       closeController = (): void => {
         try {
@@ -1650,13 +2365,27 @@ async function eventStream(options: EventStreamOptions): Promise<Response> {
           cleanup();
         }
       }, 5_000);
-      for (const event of backlog) send(event);
+      rotationTimer = setTimeout(() => {
+        rotationDue = true;
+        // Once a durable cursor exists, closing is a safe replay boundary. If
+        // the stream has only transient data, wait for its next durable event.
+        if (durableCursor) cleanup();
+      }, maxAgeMs);
+      rotationTimer.unref?.();
+
+      for (const event of backlog) {
+        send(event);
+        if (closed) return;
+      }
+      let pendingDurable = false;
       for (const event of pending) {
-        if (!backlogIds.has(event.id)) send(event);
+        if (isTransientEvent(event)) send(event);
+        else pendingDurable = true;
+        if (closed) return;
       }
       pending.length = 0;
       backlogDone = true;
-      backlogIds.clear();
+      if (pendingDurable) requestDurablePump();
     },
     cancel() {
       cleanup();
@@ -1678,21 +2407,53 @@ function matchesEvent(event: ChiliEvent, options: EventStreamOptions): boolean {
   return true;
 }
 
-function formatSse(event: ChiliEvent): string {
-  return [
-    ...(!isTransientEvent(event) ? [`id: ${event.id}`] : []),
-    "event: chili.event",
-    `data: ${JSON.stringify(event)}`,
-    "",
-    "",
-  ].join("\n");
+const MAX_SSE_FRAME_BYTES = 4_000_000;
+const MAX_SSE_RESYNC_FRAME_BYTES = 4_096;
+
+function formatSse(event: ChiliEvent): Uint8Array {
+  const payload = JSON.stringify(event);
+  const payloadBytes = Buffer.byteLength(payload, "utf8");
+  const prefix = `${!isTransientEvent(event) ? `id: ${event.id}\n` : ""}event: chili.event\ndata: `;
+  const suffix = "\n\n";
+  const prefixBytes = Buffer.byteLength(prefix, "utf8");
+  const frameBytes = prefixBytes + payloadBytes + Buffer.byteLength(suffix, "utf8");
+  if (frameBytes > MAX_SSE_FRAME_BYTES) {
+    const error = new Error(`Runtime event ${event.id} exceeds the ${MAX_SSE_FRAME_BYTES}-byte SSE frame boundary`);
+    error.name = "RuntimeEventTransportLimitError";
+    throw error;
+  }
+  const frame = Buffer.allocUnsafe(frameBytes);
+  let offset = frame.write(prefix, 0, "utf8");
+  offset += frame.write(payload, offset, "utf8");
+  frame.write(suffix, offset, "utf8");
+  return frame;
+}
+
+function formatSseResync(event: ChiliEvent): Uint8Array {
+  const payload = JSON.stringify({
+    reason: "event_transport_limit",
+    afterEventId: event.id,
+    message: `Runtime event ${event.id} exceeded the ${MAX_SSE_FRAME_BYTES}-byte transport boundary. An authoritative resync is required.`,
+  });
+  const frame = `event: chili.resync\ndata: ${payload}\n\n`;
+  const bytes = Buffer.byteLength(frame, "utf8");
+  if (bytes > MAX_SSE_RESYNC_FRAME_BYTES) {
+    const error = new Error("Runtime event resync control frame exceeds its byte boundary");
+    error.name = "RuntimeEventTransportLimitError";
+    throw error;
+  }
+  return Buffer.from(frame, "utf8");
+}
+
+function isRuntimeEventTransportLimitError(error: unknown): boolean {
+  return error instanceof Error && error.name === "RuntimeEventTransportLimitError";
 }
 
 function serializeSubmitPromptResult(result: SubmitPromptResult): RuntimePromptResult {
   const turns = result.turns.map(serializeTurnResult);
   if (result.status === "completed") {
     const completed: Extract<RuntimePromptResult, { status: "completed" }> = { status: "completed", turns };
-    if (result.finishReason) completed.finishReason = result.finishReason;
+    if (result.finishReason) completed.finishReason = normalizeDiagnosticText(result.finishReason);
     return completed;
   }
 
@@ -1701,7 +2462,7 @@ function serializeSubmitPromptResult(result: SubmitPromptResult): RuntimePromptR
     turns,
   };
   if (result.error) failed.error = serializeError(result.error);
-  if (result.finishReason) failed.finishReason = result.finishReason;
+  if (result.finishReason) failed.finishReason = normalizeDiagnosticText(result.finishReason);
   return failed;
 }
 
@@ -1719,7 +2480,7 @@ function serializeTurnResult(result: SubmitPromptResult["turns"][number]): Runti
       turnId: result.turnId,
       assistantMessageId: result.assistantMessageId,
     };
-    if (result.finishReason) completed.finishReason = result.finishReason;
+    if (result.finishReason) completed.finishReason = normalizeDiagnosticText(result.finishReason);
     return completed;
   }
 
@@ -1733,10 +2494,15 @@ function serializeTurnResult(result: SubmitPromptResult["turns"][number]): Runti
 }
 
 function serializeError(error: Error): { name: string; message: string } {
+  const normalized = normalizePersistedError(error);
   return {
-    name: error.name || "Error",
-    message: error.message,
+    name: normalized.name,
+    message: normalized.message,
   };
+}
+
+function normalizeDiagnosticText(value: string): string {
+  return normalizePersistedError(new Error(value)).message;
 }
 
 async function requireSession(store: EventStore, sessionId: SessionId): Promise<Awaited<ReturnType<EventStore["sessions"]>>[number]> {
@@ -1793,6 +2559,15 @@ function requestSessionId(value: unknown, field = "sessionId"): SessionId {
   return sessionId as SessionId;
 }
 
+function requestUserInputId(value: unknown): UserInputId {
+  if (typeof value !== "string") throw badRequest("inputId must be a string");
+  const inputId = value.trim();
+  if (!inputId) throw badRequest("inputId must not be empty");
+  if (inputId.length > 512) throw badRequest("inputId must not exceed 512 characters");
+  if (/[\u0000-\u001f\u007f]/u.test(inputId)) throw badRequest("inputId must be valid text");
+  return inputId as UserInputId;
+}
+
 async function canonicalWorkspacePath(value: string): Promise<string> {
   const absolute = resolve(value);
   const missingSegments: string[] = [];
@@ -1827,15 +2602,57 @@ async function readJson<T>(request: Request): Promise<T> {
   }
 }
 
-function json(value: unknown, status = 200): Response {
+function json(value: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(value), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8" },
+    headers: { "content-type": "application/json; charset=utf-8", ...headers },
   });
 }
 
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
 function jsonError(status: number, message: string): Response {
-  return json({ error: { message } }, status);
+  return json({ error: { message: normalizeDiagnosticText(message) } }, status);
+}
+
+function unauthorized(): Response {
+  return new Response(JSON.stringify({ error: { message: "Unauthorized" } }), {
+    status: 401,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "www-authenticate": "Bearer",
+    },
+  });
+}
+
+function positiveIntegerOrDefault(value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isFinite(value) || value < 1) {
+    throw new Error("Event stream limits must be positive finite numbers");
+  }
+  return Math.trunc(value);
+}
+
+function configuredAuthTokenDigest(authToken: unknown): Uint8Array | undefined {
+  if (authToken === undefined) return undefined;
+  if (typeof authToken !== "string" || authToken.trim().length === 0) {
+    throw new TypeError("authToken must be a non-empty string when provided");
+  }
+  return tokenDigest(authToken);
+}
+
+function hasValidBearerToken(request: Request, expectedDigest: Uint8Array): boolean {
+  const authorization = request.headers.get("authorization");
+  const match = authorization ? /^Bearer +(\S+)$/i.exec(authorization) : null;
+  const candidateDigest = tokenDigest(match?.[1] ?? "");
+  const tokensMatch = timingSafeEqual(expectedDigest, candidateDigest);
+  return match !== null && tokensMatch;
+}
+
+function tokenDigest(token: string): Uint8Array {
+  return createHash("sha256").update(token, "utf8").digest();
 }
 
 function badRequest(message: string): HttpError {
@@ -1847,8 +2664,23 @@ function notFound(message: string): HttpError {
 }
 
 function toHttpError(error: unknown): HttpError {
-  if (isHttpError(error)) return error;
-  const err = error instanceof Error ? error : new Error(String(error));
+  if (isHttpError(error)) {
+    return { status: error.status, message: normalizeDiagnosticText(error.message) };
+  }
+  const rawError = error instanceof Error ? error : new Error(String(error));
+  const normalized = normalizePersistedError(rawError);
+  const err = {
+    name: normalized.name,
+    message: normalized.message,
+  };
+  if (
+    err.name === "RuntimeServiceClosedError"
+    || err.name === "AgentTaskControlServiceClosedError"
+    || err.name === "LocalSubagentManagerClosedError"
+    || err.name === "RuntimeEventWindowCapacityError"
+  ) {
+    return { status: 503, message: err.message };
+  }
   if (err.name === "AgentTaskNotFoundError") {
     return { status: 404, message: err.message };
   }
@@ -1919,7 +2751,7 @@ function toHttpError(error: unknown): HttpError {
   ) {
     return { status: 409, message: err.message };
   }
-  if (err instanceof RuntimeSessionNotFoundError || err.name === "RuntimeSessionNotFoundError") {
+  if (rawError instanceof RuntimeSessionNotFoundError || err.name === "RuntimeSessionNotFoundError") {
     return { status: 404, message: err.message };
   }
   if (err.name === "GoalAlreadyExistsError") {
@@ -1928,10 +2760,10 @@ function toHttpError(error: unknown): HttpError {
   if (err.name === "GoalNotFoundError") {
     return { status: 404, message: err.message };
   }
-  if (err instanceof PromptCommandNotFoundError) {
+  if (rawError instanceof PromptCommandNotFoundError) {
     return { status: 404, message: err.message };
   }
-  if (err instanceof PromptCommandUsageError) {
+  if (rawError instanceof PromptCommandUsageError) {
     return { status: 400, message: err.message };
   }
   return { status: 500, message: err.message };
@@ -2546,7 +3378,7 @@ function serializeTeamTaskDispatchResult(result: TeamTaskDispatchResult): Record
 function serializeLocalSubagentTask(task: NonNullable<TeamTaskDispatchResult["agentTask"]>): Record<string, unknown> {
   return {
     ...task,
-    error: task.error ? task.error.message : undefined,
+    error: task.error ? normalizePersistedError(task.error).message : undefined,
   };
 }
 
@@ -2557,7 +3389,9 @@ function closeStatus(value: unknown): AgentTaskFinalStatus {
 }
 
 function reconcileStaleInput(body: TaskReconcileStaleBody): AgentTaskReconcileStaleInput {
-  const input: AgentTaskReconcileStaleInput = {};
+  // HTTP is a cross-process boundary. Never expose the single-process unsafe
+  // mode that can close a task before its durable worker lease is committed.
+  const input: AgentTaskReconcileStaleInput = { requireLeaseEvidence: true };
   if (body.parentSessionId !== undefined) {
     input.parentSessionId = requestSessionId(body.parentSessionId);
   }

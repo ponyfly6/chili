@@ -7,6 +7,7 @@ import type {
   AgentTaskStatus,
   Message,
   MessageImageContent,
+  PendingUserInputRequest as ProtocolPendingUserInputRequest,
   ApprovalId,
   ApprovalDecisionAction,
   ApprovalScope,
@@ -47,6 +48,9 @@ import type {
   TeamTaskStatus,
   SessionGoal,
   SessionGoalStatus,
+  UserInputAnswers as ProtocolUserInputAnswers,
+  UserInputId,
+  UserInputQuestion as ProtocolUserInputQuestion,
 } from "@chili/protocol";
 import type { RuntimeAgentsSnapshot } from "./projection.js";
 
@@ -84,9 +88,16 @@ export interface RuntimeClient {
   resolveApproval(input: ResolveApprovalRequest): Promise<RuntimeApprovalResolveResult>;
   approveApproval(input: ApproveApprovalRequest): Promise<RuntimeApprovalResolveResult>;
   rejectApproval(input: RejectApprovalRequest): Promise<RuntimeApprovalResolveResult>;
+  listPendingApprovals?(input?: ListPendingApprovalsRequest): Promise<RuntimePendingApprovalRequest[]>;
+  pendingApprovalWindow?(input?: ListPendingApprovalsRequest): Promise<RuntimePendingApprovalWindow>;
+  listUserInputs(input?: ListUserInputsRequest): Promise<RuntimeUserInputRequest[]>;
+  pendingUserInputs(input?: ListUserInputsRequest): Promise<RuntimeUserInputRequest[]>;
+  resolveUserInput(input: ResolveUserInputRequest): Promise<RuntimeUserInputResolveResult>;
   archiveSession(sessionId: SessionId): Promise<void>;
   listSessions(): Promise<RuntimeSessionSummary[]>;
   sessionEvents(input: SessionEventsRequest): Promise<ChiliEvent[]>;
+  /** Dependency-complete bounded replay window with explicit truncation metadata. */
+  sessionEventWindow?(input: SessionEventsRequest): Promise<RuntimeSessionEventWindow>;
   renameSession(input: RenameSessionRequest): Promise<RuntimeSessionSummary>;
   listAgents(input?: ListAgentsRequest): Promise<RuntimeAgentsSnapshot>;
   agentTree(input?: AgentTreeRequest): Promise<RuntimeAgentTreeSnapshot>;
@@ -295,6 +306,25 @@ export interface ResolveApprovalRequest {
   signal?: AbortSignal;
 }
 
+export type RuntimeUserInputQuestion = ProtocolUserInputQuestion;
+export type RuntimeUserInputAnswers = ProtocolUserInputAnswers;
+export type RuntimeUserInputRequest = ProtocolPendingUserInputRequest;
+
+export interface ListUserInputsRequest {
+  sessionId?: SessionId;
+  signal?: AbortSignal;
+}
+
+export interface ResolveUserInputRequest {
+  inputId: UserInputId;
+  answers: RuntimeUserInputAnswers;
+  signal?: AbortSignal;
+}
+
+export interface RuntimeUserInputResolveResult {
+  resolved: boolean;
+}
+
 export type ApprovalGrantScope = ApprovalScope;
 
 export interface ApproveApprovalRequest {
@@ -325,6 +355,41 @@ export interface SessionEventsRequest {
   sessionId: SessionId;
   limit?: number;
   signal?: AbortSignal;
+}
+
+export interface ListPendingApprovalsRequest {
+  sessionId?: SessionId;
+  signal?: AbortSignal;
+}
+
+export interface RuntimePendingApprovalRequest {
+  id: string;
+  sessionId?: SessionId;
+  callId?: string;
+  permission: string;
+  patterns: string[];
+  maxApprovalScope?: ApprovalScope;
+  metadata?: Record<string, unknown>;
+  createdAt: number;
+}
+
+export interface RuntimePendingApprovalWindow {
+  approvals: RuntimePendingApprovalRequest[];
+  truncated: boolean;
+  /** Exact UTF-8 bytes of JSON.stringify(approvals). */
+  bytes: number;
+  warning?: string;
+}
+
+export interface RuntimeSessionEventWindow {
+  events: ChiliEvent[];
+  /** Authoritative replacement set; never infer pending state from omitted history. */
+  pendingApprovals: RuntimePendingApprovalRequest[];
+  truncated: boolean;
+  /** Exact UTF-8 bytes of JSON.stringify(events). */
+  bytes: number;
+  pinnedEventIds: string[];
+  warning?: string;
 }
 
 export interface RenameSessionRequest {
@@ -942,6 +1007,22 @@ export function isEventCursorResyncRequiredError(error: unknown): error is Event
   return error instanceof EventCursorResyncRequiredError;
 }
 
+export class EventTransportResyncRequiredError extends Error {
+  readonly code = "EVENT_TRANSPORT_RESYNC_REQUIRED";
+
+  constructor(
+    message: string,
+    readonly resumeAfterEventId: string,
+  ) {
+    super(message);
+    this.name = "EventTransportResyncRequiredError";
+  }
+}
+
+export function isEventTransportResyncRequiredError(error: unknown): error is EventTransportResyncRequiredError {
+  return error instanceof EventTransportResyncRequiredError;
+}
+
 export interface HttpRuntimeClientOptions {
   baseUrl: string;
   fetch?: typeof fetch;
@@ -1129,6 +1210,33 @@ export class HttpRuntimeClient implements RuntimeClient {
     return this.resolveApproval(request);
   }
 
+  listPendingApprovals(input: ListPendingApprovalsRequest = {}): Promise<RuntimePendingApprovalRequest[]> {
+    const params = new URLSearchParams();
+    if (input.sessionId) params.set("sessionId", input.sessionId);
+    const query = params.toString();
+    return this.get(`approvals${query ? `?${query}` : ""}`, input.signal);
+  }
+
+  pendingApprovalWindow(input: ListPendingApprovalsRequest = {}): Promise<RuntimePendingApprovalWindow> {
+    const params = new URLSearchParams({ window: "bounded" });
+    if (input.sessionId) params.set("sessionId", input.sessionId);
+    return this.get(`approvals?${params.toString()}`, input.signal);
+  }
+
+  listUserInputs(input: ListUserInputsRequest = {}): Promise<RuntimeUserInputRequest[]> {
+    return this.get(sessionScopedRequestPath("user-inputs", input.sessionId), input.signal);
+  }
+
+  pendingUserInputs(input: ListUserInputsRequest = {}): Promise<RuntimeUserInputRequest[]> {
+    return this.listUserInputs(input);
+  }
+
+  resolveUserInput(input: ResolveUserInputRequest): Promise<RuntimeUserInputResolveResult> {
+    return this.post(`user-inputs/${encodeURIComponent(input.inputId)}/resolve`, {
+      answers: input.answers,
+    }, input.signal);
+  }
+
   async archiveSession(sessionId: SessionId): Promise<void> {
     await this.post(`sessions/${encodeURIComponent(sessionId)}/archive`, {});
   }
@@ -1142,6 +1250,15 @@ export class HttpRuntimeClient implements RuntimeClient {
     if (input.limit !== undefined) params.set("limit", String(input.limit));
     const query = params.toString();
     return this.get(`sessions/${encodeURIComponent(input.sessionId)}/events${query ? `?${query}` : ""}`, input.signal);
+  }
+
+  sessionEventWindow(input: SessionEventsRequest): Promise<RuntimeSessionEventWindow> {
+    const params = new URLSearchParams({ window: "replayable" });
+    if (input.limit !== undefined) params.set("limit", String(input.limit));
+    return this.get(
+      `sessions/${encodeURIComponent(input.sessionId)}/events?${params.toString()}`,
+      input.signal,
+    );
   }
 
   renameSession(input: RenameSessionRequest): Promise<RuntimeSessionSummary> {
@@ -1342,8 +1459,11 @@ export class HttpRuntimeClient implements RuntimeClient {
           if (boundary < 0) break;
           const frame = buffer.slice(0, boundary);
           buffer = buffer.slice(boundary + 2);
-          const event = parseSseFrame(frame);
-          if (event) yield event;
+          const parsed = parseSseFrame(frame);
+          if (parsed?.kind === "resync") {
+            throw new EventTransportResyncRequiredError(parsed.message, parsed.afterEventId);
+          }
+          if (parsed) yield parsed.event;
         }
       }
     } finally {
@@ -1417,13 +1537,36 @@ function approvalDecisionForApproveRequest(input: ApproveApprovalRequest): Appro
   throw new Error("approval scope must be one of once, session, persistent");
 }
 
-function parseSseFrame(frame: string): ChiliEvent | undefined {
+type ParsedSseFrame =
+  | { kind: "event"; event: ChiliEvent }
+  | { kind: "resync"; afterEventId: string; message: string };
+
+function parseSseFrame(frame: string): ParsedSseFrame | undefined {
   const data: string[] = [];
+  let eventName = "message";
   for (const line of frame.split("\n")) {
+    if (line.startsWith("event:")) eventName = line.slice("event:".length).trim();
     if (line.startsWith("data:")) data.push(line.slice("data:".length).trimStart());
   }
   if (data.length === 0) return undefined;
-  return JSON.parse(data.join("\n")) as ChiliEvent;
+  const value = JSON.parse(data.join("\n")) as unknown;
+  if (eventName === "chili.resync") {
+    if (!value || typeof value !== "object") throw new TypeError("Invalid event resync control frame");
+    const record = value as Record<string, unknown>;
+    const afterEventId = requireSseControlText(record.afterEventId, "afterEventId", 512);
+    const message = requireSseControlText(record.message, "message", 2_000);
+    if (record.reason !== "event_transport_limit") throw new TypeError("Invalid event resync reason");
+    return { kind: "resync", afterEventId, message };
+  }
+  return { kind: "event", event: value as ChiliEvent };
+}
+
+function requireSseControlText(value: unknown, field: string, maxLength: number): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > maxLength
+    || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new TypeError(`Invalid event resync ${field}`);
+  }
+  return value;
 }
 
 async function responseError(response: Response): Promise<Error> {

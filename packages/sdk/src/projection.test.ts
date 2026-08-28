@@ -29,6 +29,152 @@ import {
 } from "./client.js";
 import { applyRuntimeEvent, chatAgentBatches, chatSessionView, createRuntimeView, pendingApprovals, reduceRuntimeEvents, runtimeAgentsSnapshot, runtimeDelegationStatus, sessionMessages, teamLiveCockpit, teamLiveView, type ChatTranscriptItem } from "./projection.js";
 
+test("stores external identifiers in null-prototype indexes", () => {
+  const view = createRuntimeView();
+  const indexes = [
+    view.sessions,
+    view.turnStatuses,
+    view.turnStartedAt,
+    view.messages,
+    view.toolCalls,
+    view.approvals,
+    view.agents,
+    view.agentRunIdsByPath,
+    view.mailboxMessages,
+    view.tasks,
+    view.teamIdByDelegatedTaskId,
+    view.teams,
+    view.teamMembers,
+    view.teamMessages,
+    view.teamRuns,
+    view.teamRunIdsByTeam,
+    view.modelMetadataByTurn,
+    view.goalsBySession,
+    view.partIndex,
+    view.transcriptOrder,
+  ];
+  for (const index of indexes) expect(Object.getPrototypeOf(index)).toBeNull();
+
+  const safeSessionId = "session_prototype_index_test" as SessionId;
+  applyRuntimeEvent(view, {
+    id: "event_prototype_index_safe_session",
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId: safeSessionId,
+    payload: { sessionId: safeSessionId, cwd: "/safe" },
+  });
+
+  for (const [offset, identifier] of ["__proto__", "constructor", "prototype"].entries()) {
+    const time = (offset * 10 + 2) as TimestampMs;
+    const sessionId = identifier as SessionId;
+    const messageId = identifier as MessageId;
+    const callId = identifier as ToolCallId;
+    const approvalId = identifier as ApprovalId;
+    const taskId = identifier as TaskId;
+    const teamId = identifier as TeamId;
+
+    applyRuntimeEvent(view, {
+      id: `event_prototype_index_session_${offset}`,
+      type: "session.created",
+      time,
+      sessionId,
+      payload: { sessionId, cwd: `/session-${offset}` },
+    });
+    applyRuntimeEvent(view, {
+      id: `event_prototype_index_message_${offset}`,
+      type: "message.created",
+      time,
+      sessionId: safeSessionId,
+      payload: { messageId, role: "assistant" },
+    });
+    applyRuntimeEvent(view, {
+      id: `event_prototype_index_tool_${offset}`,
+      type: "tool.call_started",
+      time,
+      sessionId: safeSessionId,
+      payload: { turnId: `turn_prototype_index_${offset}` as TurnId, callId, toolName: "read", input: {} },
+    });
+    applyRuntimeEvent(view, {
+      id: `event_prototype_index_approval_${offset}`,
+      type: "approval.requested",
+      time,
+      sessionId: safeSessionId,
+      payload: { approvalId, callId, permission: "read", patterns: [] },
+    });
+    applyRuntimeEvent(view, {
+      id: `event_prototype_index_team_${offset}`,
+      type: "team.created",
+      time,
+      sessionId: safeSessionId,
+      payload: { teamId, name: `team-${offset}`, leadPath: "/root" as AgentPath },
+    });
+    applyRuntimeEvent(view, {
+      id: `event_prototype_index_task_${offset}`,
+      type: "team.task_created",
+      time,
+      sessionId: safeSessionId,
+      payload: { teamId, taskId, title: `task-${offset}` },
+    });
+
+    expect(Object.hasOwn(view.sessions, identifier)).toBe(true);
+    expect(Object.hasOwn(view.messages, identifier)).toBe(true);
+    expect(Object.hasOwn(view.toolCalls, identifier)).toBe(true);
+    expect(Object.hasOwn(view.approvals, identifier)).toBe(true);
+    expect(Object.hasOwn(view.tasks, identifier)).toBe(true);
+    expect(Object.hasOwn(view.teams, identifier)).toBe(true);
+    expect(view.sessions[identifier]?.id).toBe(sessionId);
+    expect(view.messages[identifier]?.id).toBe(messageId);
+    expect(view.toolCalls[identifier]?.id).toBe(callId);
+    expect(view.approvals[identifier]?.id).toBe(approvalId);
+    expect(view.tasks[identifier]?.id).toBe(taskId);
+    expect(view.teams[identifier]?.id).toBe(teamId);
+  }
+
+  expect((Object.prototype as { cwd?: unknown }).cwd).toBeUndefined();
+  expect((Object as unknown as { cwd?: unknown }).cwd).toBeUndefined();
+});
+
+test("repairs JSON-roundtripped indexes before applying unsafe identifiers", () => {
+  const roundtripped = JSON.parse(JSON.stringify(createRuntimeView())) as ReturnType<typeof createRuntimeView>;
+  expect(Object.getPrototypeOf(roundtripped.sessions)).toBe(Object.prototype);
+
+  const sessionId = "__proto__" as SessionId;
+  applyRuntimeEvent(roundtripped, {
+    id: "event_roundtrip_prototype_session",
+    type: "session.created",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: { sessionId, cwd: "/roundtrip-safe" },
+  });
+
+  for (const index of [
+    roundtripped.sessions,
+    roundtripped.turnStatuses,
+    roundtripped.turnStartedAt,
+    roundtripped.messages,
+    roundtripped.toolCalls,
+    roundtripped.approvals,
+    roundtripped.agents,
+    roundtripped.agentRunIdsByPath,
+    roundtripped.mailboxMessages,
+    roundtripped.tasks,
+    roundtripped.teamIdByDelegatedTaskId,
+    roundtripped.teams,
+    roundtripped.teamMembers,
+    roundtripped.teamMessages,
+    roundtripped.teamRuns,
+    roundtripped.teamRunIdsByTeam,
+    roundtripped.modelMetadataByTurn,
+    roundtripped.goalsBySession,
+    roundtripped.partIndex,
+  ]) {
+    expect(Object.getPrototypeOf(index)).toBeNull();
+  }
+  expect(Object.hasOwn(roundtripped.sessions, "__proto__")).toBe(true);
+  expect(roundtripped.sessions["__proto__"]?.cwd).toBe("/roundtrip-safe");
+  expect((Object.prototype as { cwd?: unknown }).cwd).toBeUndefined();
+});
+
 test("projects the selected failed session status reason", () => {
   const sessionId = "session_status_reason" as SessionId;
   const otherSessionId = "session_status_reason_other" as SessionId;
@@ -1458,6 +1604,105 @@ test("projects chat session transcript rows from message, tool, and approval eve
   expect(resolved.pendingApprovals).toHaveLength(0);
   expect(resolvedApproval).toMatchObject({ kind: "approval", id: approvalId, status: "resolved", decision: "allow_once" });
   expect(completedTool).toMatchObject({ kind: "tool", id: callId, status: "completed", displayStatus: "succeeded", output: "ok" });
+});
+
+test("preserves durable transcript order when event timestamps roll backwards", () => {
+  const sessionId = "session_chat_rollback" as SessionId;
+  const userMessageId = "message_chat_rollback_user" as MessageId;
+  const assistantMessageId = "message_chat_rollback_assistant" as MessageId;
+  const view = reduceRuntimeEvents([
+    {
+      id: "event_chat_rollback_session",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      payload: { sessionId, cwd: "/repo" },
+    },
+    {
+      id: "event_chat_rollback_user",
+      type: "message.created",
+      time: 100 as TimestampMs,
+      sessionId,
+      payload: { messageId: userMessageId, role: "user" },
+    },
+    {
+      id: "event_chat_rollback_user_part",
+      type: "message.part_added",
+      time: 101 as TimestampMs,
+      sessionId,
+      payload: {
+        messageId: userMessageId,
+        part: {
+          id: "part_chat_rollback_user" as PartId,
+          messageId: userMessageId,
+          sessionId,
+          type: "text",
+          text: "first",
+        },
+      },
+    },
+    {
+      id: "event_chat_rollback_assistant",
+      type: "message.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      payload: { messageId: assistantMessageId, role: "assistant" },
+    },
+    {
+      id: "event_chat_rollback_assistant_part",
+      type: "message.part_added",
+      time: 2 as TimestampMs,
+      sessionId,
+      payload: {
+        messageId: assistantMessageId,
+        part: {
+          id: "part_chat_rollback_assistant" as PartId,
+          messageId: assistantMessageId,
+          sessionId,
+          type: "text",
+          text: "second",
+        },
+      },
+    },
+  ] as ChiliEvent[]);
+
+  expect(chatSessionView(view, { sessionId }).items
+    .filter((item) => item.kind === "message")
+    .map((item) => String(item.id))).toEqual([
+    String(userMessageId),
+    String(assistantMessageId),
+  ]);
+});
+
+test("marks the retained tool-output head when the 80-delta projection drops older output", () => {
+  const sessionId = "session_tool_output_limit" as SessionId;
+  const callId = "toolcall_output_limit" as ToolCallId;
+  const view = createRuntimeView();
+  applyRuntimeEvent(view, {
+    id: "event_tool_output_limit_started",
+    type: "tool.call_started",
+    time: 1 as TimestampMs,
+    sessionId,
+    payload: {
+      turnId: "turn_tool_output_limit" as TurnId,
+      callId,
+      toolName: "bash",
+      input: {},
+    },
+  });
+  for (let index = 0; index < 81; index += 1) {
+    applyRuntimeEvent(view, {
+      id: `event_tool_output_limit_${index}`,
+      type: "tool.output_delta",
+      time: (2 + index) as TimestampMs,
+      sessionId,
+      payload: { callId, stream: "stdout", delta: `${index}|`, sequence: index },
+    });
+  }
+
+  expect(view.toolCalls[callId]?.liveOutput).toHaveLength(80);
+  expect(view.toolCalls[callId]?.liveOutput?.[0]).toMatchObject({ delta: "1|", truncated: true });
+  expect(view.toolCalls[callId]?.liveOutput?.at(-1)).toMatchObject({ delta: "80|" });
 });
 
 test("projects latest model metadata and stable usage summaries for chat sessions", () => {

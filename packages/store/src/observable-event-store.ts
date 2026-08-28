@@ -35,6 +35,8 @@ import type {
   EventStore,
   GoalProjectionStore,
   SessionRow,
+  StaleTurnRecoveryInput,
+  StaleTurnRecoveryStore,
   SubagentProjectionStore,
   TeamMemberQuery,
   TeamMemberRow,
@@ -76,6 +78,7 @@ export class ObservableEventStore
     EventStore,
     EventCommitAwareStore,
     EventPublisher,
+    StaleTurnRecoveryStore,
     GoalProjectionStore,
     SubagentProjectionStore,
     AgentTaskLeaseStore,
@@ -129,6 +132,16 @@ export class ObservableEventStore
     return committed;
   }
 
+  async reconcileStaleTurns(input: StaleTurnRecoveryInput): Promise<ChiliEvent[]> {
+    const recovery = this.inner as EventStore & Partial<StaleTurnRecoveryStore>;
+    if (!recovery.reconcileStaleTurns) return [];
+    const events = await recovery.reconcileStaleTurns(input);
+    // The inner store has already committed these events atomically. Emit them
+    // directly so live SSE subscribers observe recovery without re-appending.
+    for (const event of events) this.emit(event);
+    return events;
+  }
+
   events(query?: EventQuery): Promise<EventEnvelope[]> {
     return this.inner.events(query);
   }
@@ -141,8 +154,8 @@ export class ObservableEventStore
     return this.inner.messages(sessionId);
   }
 
-  pendingApprovals(sessionId?: SessionId): Promise<ApprovalRow[]> {
-    return this.inner.pendingApprovals(sessionId);
+  pendingApprovals(sessionId?: SessionId, limit?: number): Promise<ApprovalRow[]> {
+    return this.inner.pendingApprovals(sessionId, limit);
   }
 
   sessionGoal(sessionId: SessionId): Promise<SessionGoalRow | undefined> {

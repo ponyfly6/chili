@@ -8,7 +8,12 @@ import type {
   TimestampMs,
   ToolCallId,
 } from "@chili/protocol";
-import { joinAgentPath, timestampNow } from "@chili/protocol";
+import {
+  boundPersistedJsonValue,
+  joinAgentPath,
+  normalizePersistedError,
+  timestampNow,
+} from "@chili/protocol";
 import type {
   AgentTaskCapabilityStore,
   AgentTaskFinalizationStore,
@@ -44,6 +49,7 @@ import {
 const DISPATCH_METADATA_KEY = "chiliTeamDispatch";
 const INCOMPLETE_AGENT_RESULT_ERROR =
   "subagent_incomplete: child result did not satisfy the completion contract; inspect the summary and retry or follow up";
+const TEAM_DISPATCH_TEXT_JSON_BYTES = 64 * 1024;
 
 export interface TeamTaskDispatchServiceOptions {
   teams: TeamControlService;
@@ -482,9 +488,9 @@ export class TeamTaskDispatchService {
       ownerPath: input.ownerPath,
       mode: input.mode,
       dispatchedAt: Number(this.now()),
-      taskCwd: input.taskCwd,
-      taskName: input.task.title,
-      prompt: input.prompt,
+      taskCwd: boundedDispatchText(input.taskCwd, "team dispatch cwd"),
+      taskName: boundedDispatchText(input.task.title, "team dispatch task name"),
+      prompt: boundedDispatchText(input.prompt, "team dispatch prompt"),
       workerPolicy: input.workerPolicy,
     };
     if (input.worktreeRequired) intent.worktreeRequired = true;
@@ -1454,8 +1460,8 @@ function localTaskResultFromDispatchIntent(
   if (task.expectedBatchSize !== undefined) result.expectedBatchSize = task.expectedBatchSize;
   if (task.maxConcurrency !== undefined) result.maxConcurrency = task.maxConcurrency;
   if (task.completionPolicy !== undefined) result.completionPolicy = task.completionPolicy;
-  if (task.summary) result.summary = task.summary;
-  if (task.error) result.error = new Error(task.error);
+  if (task.summary) result.summary = boundedDispatchText(task.summary, "team dispatch summary");
+  if (task.error) result.error = normalizePersistedError(task.error);
   return result;
 }
 
@@ -1496,7 +1502,19 @@ function pruneUndefined<T>(value: T): T {
 }
 
 function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
+  return normalizePersistedError(error);
+}
+
+function boundedDispatchText(value: string, label: string): string {
+  const bounded = boundPersistedJsonValue(value, {
+    maxBytes: TEAM_DISPATCH_TEXT_JSON_BYTES,
+    maxStringBytes: TEAM_DISPATCH_TEXT_JSON_BYTES - 2,
+    maxItems: 1,
+    maxDepth: 1,
+    maxNodes: 1,
+    label,
+  });
+  return typeof bounded === "string" ? bounded : "";
 }
 
 function combineAbortSignals(operationSignal: AbortSignal, inputSignal: AbortSignal | undefined): AbortSignal {

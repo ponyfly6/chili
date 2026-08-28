@@ -6,6 +6,7 @@ import type {
   ModelStreamInput,
 } from "@chili/core";
 import type { ModelSelection, RuntimeModelDescriptor, ServiceTier } from "@chili/protocol";
+import * as providersModule from "@chili/providers";
 import {
   assertCodexApiModel,
   assertOpenAICodexModel,
@@ -116,7 +117,7 @@ type ProviderModelStreamEvent =
   | { type: "tool_call_delta"; [key: string]: unknown }
   | { type: "tool_call_end"; name: string; input: unknown; [key: string]: unknown };
 
-const PROVIDERS_PACKAGE_NAME = "@chili/providers";
+const STATIC_PROVIDERS_MODULE = providersModule as unknown as Record<string, unknown>;
 const DEFAULT_DEEPSEEK_MAX_TOKENS = 128 * 1024;
 const DEFAULT_KIMI_MAX_TOKENS = 128 * 1024;
 const DEFAULT_ZAI_MAX_TOKENS = 128 * 1024;
@@ -160,24 +161,6 @@ export function resolveCliRuntimeModelSelection(selection: CliModelSelection): M
   const model = providerOptions.model;
   if (!model) return undefined;
   return { provider: resolved.provider, model };
-}
-
-async function loadProvidersModule(
-  providerName: "minimax" | "deepseek" | "kimi" | "zai" | "xai" | "codex" | "codex-api",
-): Promise<Record<string, unknown>> {
-  try {
-    return (await import(PROVIDERS_PACKAGE_NAME)) as Record<string, unknown>;
-  } catch (error) {
-    throw new Error(
-      [
-        `Unable to load @chili/providers for --model ${providerName}.`,
-        "or --model fake for local smoke tests until the providers package is merged.",
-      ]
-        .filter(Boolean)
-        .join(" "),
-      { cause: error },
-    );
-  }
 }
 
 function resolveMiniMaxFactory(providers: Record<string, unknown>): ProviderRouterFactory {
@@ -693,13 +676,13 @@ function stringProperty(record: Record<string, unknown>, key: string): string | 
 }
 
 async function loadFactoryForProvider(provider: CliProviderName): Promise<ProviderRouterFactory> {
-  if (provider === "deepseek") return resolveDeepSeekFactory(await loadProvidersModule("deepseek"));
-  if (provider === "kimi") return resolveKimiFactory(await loadProvidersModule("kimi"));
-  if (provider === "zai") return resolveZaiFactory(await loadProvidersModule("zai"));
-  if (provider === "xai") return resolveXaiFactory(await loadProvidersModule("xai"));
-  if (provider === "openai-codex") return resolveOpenAICodexFactory(await loadProvidersModule("codex"));
-  if (provider === "codex-api") return resolveCodexApiFactory(await loadProvidersModule("codex-api"));
-  return resolveMiniMaxFactory(await loadProvidersModule("minimax"));
+  if (provider === "deepseek") return resolveDeepSeekFactory(STATIC_PROVIDERS_MODULE);
+  if (provider === "kimi") return resolveKimiFactory(STATIC_PROVIDERS_MODULE);
+  if (provider === "zai") return resolveZaiFactory(STATIC_PROVIDERS_MODULE);
+  if (provider === "xai") return resolveXaiFactory(STATIC_PROVIDERS_MODULE);
+  if (provider === "openai-codex") return resolveOpenAICodexFactory(STATIC_PROVIDERS_MODULE);
+  if (provider === "codex-api") return resolveCodexApiFactory(STATIC_PROVIDERS_MODULE);
+  return resolveMiniMaxFactory(STATIC_PROVIDERS_MODULE);
 }
 
 function readMiniMaxOptionsFromEnv(input: CliModelOptions): ProviderRouterOptions {

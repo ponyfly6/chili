@@ -73,6 +73,34 @@ test("blank approval pattern entries fail before creating approval events", asyn
   expect(events.map((event) => event.type)).not.toContain("approval.resolved");
 });
 
+test("fails closed on oversized approval permissions and patterns without malformed events", async () => {
+  const huge = "\u0000".repeat(4 * 1024 * 1024);
+  const cases = [
+    { permission: huge, patterns: ["safe"] },
+    { permission: "safe.permission", patterns: [huge] },
+    { permission: "safe.permission", patterns: Array.from({ length: 65 }, (_, index) => `pattern-${index}`) },
+  ];
+  const contractsModulePath = "../../../apps/desktop/src/shared/contracts.ts";
+  const { parseDesktopEvent } = await import(contractsModulePath) as {
+    parseDesktopEvent(value: unknown): unknown;
+  };
+  for (const [index, spec] of cases.entries()) {
+    const events: ChiliEvent[] = [];
+    const executor = createExecutor({
+      events,
+      tool: fakeTool(spec),
+      broker: { decide: async () => ({ action: "allow_once" }) },
+    });
+    const result = await executor.execute(toolInput("fake", `toolcall_invalid_spec_${index}` as ToolCallId));
+    expect(result.status).toBe("failed");
+    expect(events.some((event) => event.type === "approval.requested")).toBe(false);
+    for (const event of events) {
+      expect(Buffer.byteLength(JSON.stringify(event), "utf8")).toBeLessThan(520_000);
+      expect(() => parseDesktopEvent({ type: "runtime.event", event })).not.toThrow();
+    }
+  }
+});
+
 test("unknown approval decision actions fail closed", async () => {
   const events: ChiliEvent[] = [];
   const executor = createExecutor({
@@ -238,6 +266,129 @@ test("policy ask preflight creates an approval request", async () => {
     preflightDecision: { action: "ask", source: "policy_rule" },
     patternDecisions: [{ action: "ask", source: "policy_rule" }],
   });
+});
+
+test("bounds static, dynamic, and preflight approval metadata before desktop IPC", async () => {
+  const hugeMetadata = "\u0000".repeat(5 * 1024 * 1024);
+  const events: ChiliEvent[] = [];
+  const tool: ChiliToolDefinition = {
+    name: "approval_metadata",
+    description: "Exercises every approval metadata source.",
+    risk: "read",
+    inputSchema: { type: "object" },
+    approval: () => ({
+      permission: "static.approval",
+      patterns: ["static-pattern"],
+      metadata: { staticPayload: hugeMetadata, useful: "static-kept" },
+    }),
+    execute: async (_input, context) => {
+      await context.requestApproval({
+        permission: "dynamic.approval",
+        patterns: ["dynamic-pattern"],
+        metadata: { dynamicPayload: hugeMetadata, useful: "dynamic-kept" },
+      });
+      return { title: "approval metadata", output: "ok" };
+    },
+  };
+  const executor = createExecutor({
+    events,
+    tool,
+    broker: {
+      preflight: async () => ({
+        action: "ask",
+        source: "metadata-test",
+        reason: "bounded preflight metadata",
+        metadata: {
+          patternDecisions: [{ payload: hugeMetadata }],
+          risks: [{ payload: hugeMetadata }],
+        },
+      }),
+      decide: async () => ({ action: "allow_once" }),
+    },
+  });
+
+  const result = await executor.execute(toolInput("approval_metadata"));
+  expect(result.status).toBe("completed");
+  const requested = events.filter(
+    (event): event is Extract<ChiliEvent, { type: "approval.requested" }> => event.type === "approval.requested",
+  );
+  expect(requested).toHaveLength(2);
+  const contractsModulePath = "../../../apps/desktop/src/shared/contracts.ts";
+  const { parseDesktopEvent } = await import(contractsModulePath) as {
+    parseDesktopEvent(value: unknown): unknown;
+  };
+  for (const event of requested) {
+    expect(Buffer.byteLength(JSON.stringify(event.payload.metadata), "utf8")).toBeLessThanOrEqual(512_000);
+    expect(Buffer.byteLength(JSON.stringify(event), "utf8")).toBeLessThan(520_000);
+    expect(() => parseDesktopEvent({ type: "runtime.event", event })).not.toThrow();
+  }
+});
+
+test("redacts nested preflight diagnostics while preserving ordinary approval patterns", async () => {
+  const worstEscapedReason = `password=abc\n${"\u0000".repeat(5 * 1024 * 1024)}`;
+  const events: ChiliEvent[] = [];
+  const tool = fakeTool({ permission: "write", patterns: ["token=x"] });
+  const executor = createExecutor({
+    events,
+    tool,
+    broker: {
+      preflight: async () => ({
+        action: "ask",
+        source: "hostile-preflight",
+        reason: worstEscapedReason,
+        feedback: "Bearer TOP_LEVEL_FEEDBACK_SECRET",
+        metadata: {
+          ordinary: "keep this non-diagnostic policy description",
+          patternDecisions: [{
+            pattern: "token=x",
+            reason: "client_secret=NESTED_REASON_SECRET",
+            feedback: "password=NESTED_FEEDBACK_SECRET",
+          }],
+          risks: [{
+            error: "token=NESTED_ERROR_SECRET",
+            failureReason: "Authorization Basic NESTED_FAILURE_SECRET",
+          }],
+        },
+      }),
+      decide: async () => ({ action: "allow_once" }),
+    },
+  });
+
+  const result = await executor.execute(toolInput("fake"));
+  expect(result.status).toBe("completed");
+  const requested = events.find(
+    (event): event is Extract<ChiliEvent, { type: "approval.requested" }> =>
+      event.type === "approval.requested",
+  );
+  expect(requested).toBeDefined();
+  expect(requested?.payload.patterns).toEqual(["token=x"]);
+  expect(requested?.payload.metadata).toMatchObject({
+    patternDecisions: [{ pattern: "token=x" }],
+    preflightDecision: {
+      metadata: { ordinary: "keep this non-diagnostic policy description" },
+    },
+  });
+  const serialized = JSON.stringify(requested);
+  for (const secret of [
+    "password=abc",
+    "TOP_LEVEL_FEEDBACK_SECRET",
+    "NESTED_REASON_SECRET",
+    "NESTED_FEEDBACK_SECRET",
+    "NESTED_ERROR_SECRET",
+    "NESTED_FAILURE_SECRET",
+  ]) {
+    expect(serialized).not.toContain(secret);
+  }
+  expect(serialized).toContain("[REDACTED]");
+  expect(Buffer.byteLength(JSON.stringify(requested?.payload.metadata), "utf8"))
+    .toBeLessThanOrEqual(512_000);
+  expect(Buffer.byteLength(serialized, "utf8")).toBeLessThan(600_000);
+
+  const contractsModulePath = "../../../apps/desktop/src/shared/contracts.ts";
+  const { parseDesktopEvent } = await import(contractsModulePath) as {
+    parseDesktopEvent(value: unknown): unknown;
+  };
+  expect(() => parseDesktopEvent({ type: "runtime.event", event: requested })).not.toThrow();
 });
 
 test("policy deny preflight fails without creating approval events", async () => {
