@@ -1,0 +1,300 @@
+{
+  "meta": {
+    "name": "Chili Local Workbench",
+    "description": "A calm, warm-graphite desktop workbench for a local coding agent, with pepper-red heat signals and a dedicated multi-agent activity surface.",
+    "source_references": [
+      "Chili desktop renderer before 2026-08-28 redesign",
+      "OpenCode packages/app/src (local reference)",
+      "OpenCode packages/ui/src/v2 (local reference)",
+      "ChatGPT desktop interaction patterns: quiet conversation canvas, lightweight user bubbles, anchored composer"
+    ],
+    "created_at": "2026-08-28"
+  },
+  "design_system": {
+    "color": {
+      "palette_type": "analogous warm-neutral with semantic contrast",
+      "primary": { "hex": "#FF4B2B", "role": "primary actions, running heat, focus and selected-task accents" },
+      "secondary": { "hex": "#79BE66", "role": "healthy local runtime and successful work" },
+      "accent": { "hex": "#D89480", "role": "quiet links, inline code and secondary warm emphasis" },
+      "neutral": {
+        "scale": {
+          "0": "#0C0C0B",
+          "1": "#10100F",
+          "2": "#151514",
+          "3": "#1B1A18",
+          "4": "#211F1D",
+          "5": "#625E58",
+          "6": "#88837B",
+          "7": "#B8B3AA",
+          "8": "#F3F0E9"
+        },
+        "usage": "Deep canvas at 0-1, panels at 2-4, metadata at 5-6, body and headings at 7-8."
+      },
+      "semantic": {
+        "success": "#79BE66",
+        "warning": "#DFAE57",
+        "error": "#EE7767",
+        "info": "#74A7D8"
+      },
+      "surface": {
+        "background": "#0C0C0B",
+        "card": "#151514",
+        "elevated": "#211F1D"
+      },
+      "contrast_strategy": "High-contrast reading surface with quiet alpha hairlines; saturated color is reserved for state and action."
+    },
+    "typography": {
+      "type_scale": {
+        "display": { "size": "34px", "weight": "650", "line_height": "1.12", "tracking": "-0.045em" },
+        "heading_1": { "size": "24px", "weight": "650", "line_height": "1.2", "tracking": "-0.035em" },
+        "heading_2": { "size": "19px", "weight": "650", "line_height": "1.3", "tracking": "-0.018em" },
+        "heading_3": { "size": "16px", "weight": "650", "line_height": "1.3", "tracking": "-0.018em" },
+        "body": { "size": "14px", "weight": "400", "line_height": "1.68", "tracking": "0" },
+        "body_small": { "size": "12px", "weight": "400", "line_height": "1.55", "tracking": "0" },
+        "caption": { "size": "10px", "weight": "500", "line_height": "1.45", "tracking": "0.02em" },
+        "overline": { "size": "10px", "weight": "650", "line_height": "1.2", "tracking": "0.08em" }
+      },
+      "font_families": {
+        "heading": "-apple-system, BlinkMacSystemFont, SF Pro Display, Segoe UI, sans-serif",
+        "body": "-apple-system, BlinkMacSystemFont, SF Pro Text, Segoe UI, sans-serif",
+        "mono": "SFMono-Regular, Menlo, ui-monospace, monospace"
+      },
+      "font_style_notes": "Native humanist sans for a Mac-like reading feel; monospaced type is limited to code, paths, diffs and shortcuts."
+    },
+    "spacing": {
+      "base_unit": "4px",
+      "scale": ["4px", "8px", "12px", "16px", "20px", "24px", "32px", "40px"],
+      "content_density": "comfortable-compact",
+      "section_rhythm": "8px panel gutters, 20px timeline rhythm, 24-32px content breathing room and compact 40-52px navigation rows."
+    },
+    "layout": {
+      "grid_system": "Three-surface workbench with independently collapsible 260px task rail, fluid conversation and 316px activity inspector.",
+      "max_content_width": "800px conversation reading column",
+      "columns": "260px / minmax(460px, 1fr) / 316px",
+      "gutter": "8px",
+      "breakpoints": ["1260px compact rails", "1080px inspector overlay", "820px sidebar overlay"],
+      "alignment_tendency": "strict workbench grid with centered reading content"
+    },
+    "shape": {
+      "border_radius": { "small": "7px", "medium": "10px", "large": "13px", "pill": "999px" },
+      "border_usage": "0.5-1px alpha hairlines on primary surfaces and inputs; content remains mostly borderless.",
+      "divider_style": "low-contrast warm-white alpha lines"
+    },
+    "elevation": {
+      "shadow_style": "soft layered ambient shadows",
+      "levels": {
+        "low": "0 0 0 0.5px rgb(255 255 255 / 3%)",
+        "medium": "0 12px 34px rgb(0 0 0 / 18%)",
+        "high": "0 18px 52px rgb(0 0 0 / 38%), 0 0 0 0.5px rgb(255 255 255 / 8%)"
+      },
+      "depth_cues": "deep canvas, raised panels, alpha borders, restrained blur and localized warm glows"
+    },
+    "iconography": {
+      "style": "minimal rounded outline with a filled custom pepper mark",
+      "stroke_weight": "1.65px",
+      "size_scale": ["14px", "16px", "24px", "28px", "46px"],
+      "preferred_set": "custom inline SVG icons and the Chili pepper brand mark"
+    },
+    "motion": {
+      "easing": "cubic-bezier(0.22, 1, 0.36, 1)",
+      "duration_scale": { "micro": "120ms", "normal": "150ms", "macro": "240ms" },
+      "entrance_pattern": "opacity and panel-width reveal",
+      "exit_pattern": "short fade followed by visibility collapse",
+      "philosophy": "minimal functional motion with reduced-motion fallback"
+    },
+    "components": {
+      "button_style": "Quiet neutral controls; pepper-red circular send and branded primary CTA; minimum 30-38px targets.",
+      "input_style": "18px floating composer with warm raised surface, alpha border and restrained focus glow.",
+      "card_style": "Cards only for meaningful surfaces, requests and root activity; assistant content stays document-like.",
+      "navigation_pattern": "Collapsible recent-task rail with a persistent local-workspace footer.",
+      "modal_style": "Raised warm-graphite surface with high shadow and semantic border.",
+      "list_style": "52px task rows with quiet icons, relative time and a pepper heat dot for the selection.",
+      "component_notes": "The Workbench is Chili-specific: activity and repository changes share an on-demand right surface. Conversation hierarchy is always user bubble → one Worked/Working disclosure → final answer. Successful tools never appear as first-class transcript cards; tool output and diagnostic detail remain collapsed until the user explicitly opens them."
+    }
+  },
+  "design_style": {
+    "aesthetic": {
+      "mood": ["calm", "focused", "warm", "precise", "trustworthy"],
+      "visual_metaphor": "a quiet local workshop with visible heat where work is active",
+      "era_influence": "contemporary native desktop productivity software",
+      "genre": "local-first AI coding workbench",
+      "personality_traits": ["capable", "unflustered", "transparent", "slightly spirited"],
+      "adjectives": ["graphite", "warm", "restrained", "agentic", "readable"]
+    },
+    "visual_language": {
+      "complexity": "moderate",
+      "ornamentation": "subtle brand and status accents",
+      "whitespace_usage": "generous in the conversation, compact in navigation and telemetry",
+      "visual_weight_distribution": "conversation-dominant with quiet supporting rails",
+      "focal_strategy": "composer and current assistant response first; activity color appears only where state changes",
+      "contrast_level": "high for content, restrained for chrome",
+      "texture_usage": "soft radial warmth, alpha hairlines and nearly flat graphite surfaces"
+    },
+    "composition": {
+      "hierarchy_method": "spatial isolation, typographic hierarchy and semantic heat color",
+      "balance_type": "asymmetric workbench anchored by a fluid center",
+      "flow_direction": "left task selection to center collaboration to right evidence",
+      "grouping_strategy": "panel-level grouping with mostly borderless content inside",
+      "negative_space_role": "protects reading focus and separates assistant reasoning from operational telemetry"
+    },
+    "imagery": {
+      "photo_treatment": "not used in core product UI",
+      "illustration_style": "single custom pepper mark with bold simple geometry",
+      "graphic_elements": "pepper heat dots, warm radial glows and semantic status rings",
+      "pattern_usage": "none beyond subtle gradients",
+      "image_shape": "rounded attachment tiles when image rendering becomes available"
+    },
+    "interaction_feel": {
+      "feedback_style": "immediate color and surface feedback with explicit status copy",
+      "hover_behavior": "small warm surface lift without scale theatrics",
+      "transition_personality": "smooth glide",
+      "loading_style": "semantic pulsing state dots and stable layout",
+      "microinteraction_density": "low to moderate"
+    },
+    "brand_voice_in_ui": {
+      "tone": "direct, calm and collaborative",
+      "formality": "professional but human",
+      "cta_style": "direct imperative",
+      "empty_state_approach": "outcome-oriented invitation with a clear next action",
+      "error_tone": "specific, recoverable and non-alarmist"
+    }
+  },
+  "visual_effects": {
+    "overview": {
+      "effect_intensity": "subtle-accent",
+      "performance_tier": "lightweight",
+      "fallback_strategy": "reduce to static CSS and disable transitions",
+      "primary_technology": "CSS only"
+    },
+    "background_effects": {
+      "type": "mesh-gradient",
+      "description": "Static localized warm radial gradients over a deep graphite canvas.",
+      "technology": "CSS radial-gradient",
+      "params": {
+        "color_palette": ["#0C0C0B", "rgba(255,75,43,0.08)"],
+        "speed": "static",
+        "density": "one to two focal gradients per surface",
+        "opacity": "0.02-0.11",
+        "blend_mode": "normal"
+      }
+    },
+    "particle_systems": {
+      "enabled": false,
+      "type": "none",
+      "description": "No particles; operational focus takes priority.",
+      "technology": "none",
+      "params": {
+        "count": 0,
+        "shape": "none",
+        "size_range": "0px",
+        "movement_pattern": "none",
+        "color_behavior": "none",
+        "interaction": "none",
+        "spawn_area": "none"
+      }
+    },
+    "3d_elements": {
+      "enabled": false,
+      "type": "none",
+      "description": "No 3D elements.",
+      "technology": "none",
+      "params": {
+        "renderer": "none",
+        "lighting": "none",
+        "camera": "none",
+        "materials": "none",
+        "geometry": "none",
+        "post_processing": [],
+        "interaction_model": "none"
+      }
+    },
+    "shader_effects": {
+      "enabled": false,
+      "type": "none",
+      "description": "No shader effects.",
+      "technology": "none",
+      "params": {
+        "uniforms": {},
+        "vertex_manipulation": "none",
+        "fragment_output": "none",
+        "noise_type": "none",
+        "distortion": "none"
+      }
+    },
+    "scroll_effects": {
+      "parallax": { "enabled": false, "layers": 0, "depth_range": "0", "speed_curve": "none" },
+      "scroll_triggered_animations": { "enabled": false, "trigger_points": [], "animation_type": "none", "scrub_behavior": "none" },
+      "scroll_morphing": { "enabled": false, "description": "No scroll morphing." }
+    },
+    "text_effects": {
+      "type": "none",
+      "description": "Typography remains stable for long-session readability.",
+      "technology": "CSS",
+      "params": {
+        "split_strategy": "none",
+        "animation_per_unit": "none",
+        "stagger": "0ms",
+        "effect_style": "none"
+      }
+    },
+    "cursor_effects": {
+      "enabled": false,
+      "type": "none",
+      "description": "Use the native desktop cursor.",
+      "params": {
+        "shape": "native",
+        "size": "native",
+        "blend_mode": "normal",
+        "trail": "none",
+        "interaction_zone": "none"
+      }
+    },
+    "image_effects": {
+      "type": "none",
+      "description": "Attachments use static rounded presentation.",
+      "technology": "CSS",
+      "params": {
+        "filter_pipeline": "none",
+        "hover_transform": "none",
+        "reveal_animation": "none",
+        "distortion_type": "none"
+      }
+    },
+    "glassmorphism_neumorphism": {
+      "enabled": true,
+      "style": "frosted-layers",
+      "params": {
+        "blur_radius": "20px titlebar only",
+        "transparency": "0.88",
+        "border_treatment": "1px warm-white alpha hairline",
+        "shadow_type": "soft layered ambient",
+        "light_source_angle": "top"
+      }
+    },
+    "canvas_drawings": {
+      "enabled": false,
+      "type": "none",
+      "description": "No canvas rendering.",
+      "technology": "none",
+      "params": {
+        "draw_method": "none",
+        "animation_loop": "none",
+        "color_scheme": "none",
+        "responsiveness": "none",
+        "interaction": "none"
+      }
+    },
+    "svg_animations": {
+      "enabled": false,
+      "type": "none",
+      "description": "The pepper logo is a static inline SVG.",
+      "params": {
+        "animation_method": "none",
+        "path_morphing": "none",
+        "stroke_animation": "none",
+        "filter_effects": "static drop-shadow only"
+      }
+    },
+    "composite_notes": "Warm radial CSS gradients, a frosted titlebar, alpha hairlines and small semantic pulse dots provide depth without Canvas, WebGL or distracting ambient animation. All motion is disabled by prefers-reduced-motion."
+  }
+}
