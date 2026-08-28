@@ -1,20 +1,40 @@
-import type { ChiliDesktopApi, DesktopRequest } from "../shared/contracts.js";
+import type {
+  ChiliDesktopApi,
+  DesktopRequest,
+  DesktopResponse,
+  DesktopState,
+} from "../shared/contracts.js";
 import type { ControlTransport } from "./transport.js";
 
 export function createElectronTransport(api: ChiliDesktopApi): ControlTransport {
   const invoke = <Request extends DesktopRequest>(request: Request) => api.invoke(request);
+  const pendingWorkspaceSelections = new Set<Promise<DesktopState>>();
+  const selectWorkspace = (): Promise<DesktopState> => {
+    const selection = invoke({ type: "workspace.select" });
+    pendingWorkspaceSelections.add(selection);
+    void selection.finally(() => pendingWorkspaceSelections.delete(selection)).catch(() => undefined);
+    return selection;
+  };
+  const invokeAfterWorkspaceSelection = async <Request extends DesktopRequest>(
+    request: Request,
+  ): Promise<DesktopResponse<Request>> => {
+    while (pendingWorkspaceSelections.size > 0) {
+      await Promise.allSettled([...pendingWorkspaceSelections]);
+    }
+    return invoke(request);
+  };
   return {
     state: () => invoke({ type: "app.state" }),
-    selectWorkspace: () => invoke({ type: "workspace.select" }),
-    listSessions: () => invoke({ type: "sessions.list" }),
+    selectWorkspace,
+    listSessions: () => invokeAfterWorkspaceSelection({ type: "sessions.list" }),
     createSession: () => invoke({ type: "sessions.create" }),
-    snapshot: (sessionId) => invoke({ type: "session.snapshot", sessionId }),
+    snapshot: (sessionId) => invokeAfterWorkspaceSelection({ type: "session.snapshot", sessionId }),
     send: (sessionId, text, mode) => invoke({ type: "session.send", sessionId, text, mode }),
     stop: (sessionId) => invoke({ type: "session.stop", sessionId }),
     resolveApproval: (approvalId, decision) => invoke({ type: "approval.resolve", approvalId, decision }),
     resolveUserInput: (inputId, answers) => invoke({ type: "user-input.resolve", inputId, answers }),
     completeResync: (barrierId) => invoke({ type: "events.resync.complete", barrierId }),
-    diff: (scope, sessionId, turnId) => invoke({
+    diff: (scope, sessionId, turnId) => invokeAfterWorkspaceSelection({
       type: "diff.get",
       scope,
       sessionId,
