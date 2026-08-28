@@ -159,6 +159,7 @@
         "@chili/commands": "workspace:*",
         "@chili/core": "workspace:*",
         "@chili/protocol": "workspace:*",
+        "@chili/sdk": "workspace:*",
         "@chili/store": "workspace:*",
       },
     },
