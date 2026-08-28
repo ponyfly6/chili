@@ -12,6 +12,7 @@ import { BootstrapLifecycleGuard } from "./bootstrap-lifecycle.js";
 import { DesktopControlService } from "./control-service.js";
 import { DeferredElectronQuit } from "./deferred-electron-quit.js";
 import { registerDesktopIpc, type DesktopIpcController } from "./ipc.js";
+import { shouldUseMockKeychain } from "./keychain-policy.js";
 import { DesktopNotificationGate } from "./notifications.js";
 import { processGroupExists } from "./process-groups.js";
 import { SidecarManager } from "./sidecar-manager.js";
@@ -26,9 +27,14 @@ import {
 const repositoryRoot = resolve(import.meta.dirname, "../../../..");
 const isolatedUserData = process.env.CHILI_DESKTOP_USER_DATA?.trim();
 if (isolatedUserData && isAbsolute(isolatedUserData)) app.setPath("userData", isolatedUserData);
-// Repeated ad-hoc package signatures otherwise trigger a hidden macOS Keychain
-// ACL dialog. Production builds keep the system Keychain and never set this.
-if (process.env.CHILI_DESKTOP_SMOKE === "1") app.commandLine.appendSwitch("use-mock-keychain");
+// Every local package is re-signed ad-hoc, so macOS sees each rebuild as a new
+// Keychain ACL principal. The renderer stores no secrets in Chromium storage;
+// stable signed release builds continue to use the system Keychain.
+if (shouldUseMockKeychain({
+  platform: process.platform,
+  localAdHocBuild: __CHILI_DESKTOP_LOCAL_AD_HOC_BUILD__,
+  smokeMode: process.env.CHILI_DESKTOP_SMOKE === "1",
+})) app.commandLine.appendSwitch("use-mock-keychain");
 
 let mainWindow: BrowserWindow | undefined;
 let sidecar: SidecarManager | undefined;

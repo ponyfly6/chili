@@ -2,9 +2,15 @@ import { resolve } from "node:path";
 import react from "@vitejs/plugin-react";
 import { defineConfig, externalizeDepsPlugin } from "electron-vite";
 
+const desktopSigningIdentity = process.env.CHILI_DESKTOP_SIGN_IDENTITY?.trim() || "-";
+const localAdHocBuild = desktopSigningIdentity === "-";
+
 export default defineConfig({
   main: {
     plugins: [externalizeDepsPlugin({ exclude: ["@chili/protocol", "@chili/sdk"] })],
+    define: {
+      __CHILI_DESKTOP_LOCAL_AD_HOC_BUILD__: JSON.stringify(localAdHocBuild),
+    },
     build: {
       rollupOptions: {
         input: resolve(import.meta.dirname, "src/main/index.ts"),

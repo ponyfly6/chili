@@ -8,9 +8,12 @@ const repositoryRoot = resolve(packageRoot, "../..");
 describe("local macOS package security", () => {
   test("keeps local packaging ad-hoc and disables notarization discovery", async () => {
     const source = await readFile(resolve(packageRoot, "electron-builder.config.ts"), "utf8");
+    const viteConfig = await readFile(resolve(packageRoot, "electron.vite.config.ts"), "utf8");
     expect(source).toContain('const signingIdentity = process.env.CHILI_DESKTOP_SIGN_IDENTITY?.trim() || "-"');
     expect(source).toContain('if (signingIdentity !== "-")');
     expect(source).toContain("notarize: false");
+    expect(viteConfig).toContain('const localAdHocBuild = desktopSigningIdentity === "-"');
+    expect(viteConfig).toContain("__CHILI_DESKTOP_LOCAL_AD_HOC_BUILD__");
   });
 
   test("narrows only the Bun sidecar entitlements and preserves the Electron seal", async () => {

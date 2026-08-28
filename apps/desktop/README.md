@@ -35,7 +35,7 @@ bun run smoke:desktop
 bun run desktop:package
 ```
 
-本轮最终验收与 `smoke:desktop` 产物固定使用完整 ad-hoc 签名，避免 fuses 修改后产生无效 bundle 签名。它是本地 MVP 验证物，**不可直接作为正式分发包**；当前配置明确拒绝 non-ad-hoc identity，未来独立的发布 pipeline 才会支持 Developer ID 签名与 notarization。正式 DMG/ZIP 发布与升级链路也明确不在本轮范围内。自动 smoke 只在 `CHILI_DESKTOP_SMOKE=1` 时使用 Chromium mock Keychain，避免每次 ad-hoc 重签触发 macOS Keychain ACL 对话；普通本地运行仍使用系统 Keychain。
+本轮最终验收与 `smoke:desktop` 产物固定使用完整 ad-hoc 签名，避免 fuses 修改后产生无效 bundle 签名。它是本地 MVP 验证物，**不可直接作为正式分发包**；当前配置明确拒绝 non-ad-hoc identity，未来独立的发布 pipeline 才会支持 Developer ID 签名与 notarization。正式 DMG/ZIP 发布与升级链路也明确不在本轮范围内。开发运行与本地 ad-hoc 包使用 Chromium mock Keychain，避免每次重签后触发 macOS Keychain ACL 对话；Chili 不在 Chromium storage 中保存 provider 密钥。未来使用稳定身份签名的发布包仍应使用系统 Keychain。
 
 ## 产品表面
 

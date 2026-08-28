@@ -29,7 +29,9 @@ describe("production Electron security boundary", () => {
     const load = source.indexOf("loadDesktopWindow(mainWindow)");
     expect(register).toBeGreaterThan(0);
     expect(load).toBeGreaterThan(register);
-    expect(source).toContain('if (process.env.CHILI_DESKTOP_SMOKE === "1") app.commandLine.appendSwitch("use-mock-keychain")');
+    expect(source).toContain("shouldUseMockKeychain({");
+    expect(source).toContain("__CHILI_DESKTOP_LOCAL_AD_HOC_BUILD__");
+    expect(source).toContain('app.commandLine.appendSwitch("use-mock-keychain")');
   });
 
   test("completes a deferred native quit after successful containment", async () => {
