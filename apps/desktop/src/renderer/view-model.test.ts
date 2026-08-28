@@ -1,16 +1,348 @@
 import { expect, test } from "bun:test";
 import type { ChiliEvent } from "@chili/protocol";
 import type { RuntimeSnapshot, UserInputRequest } from "../shared/contracts.js";
-import type { RuntimePendingApprovalRequest } from "@chili/sdk";
+import type { ChatSessionView, ChiliRuntimeView, RuntimePendingApprovalRequest } from "@chili/sdk";
 import {
   appendRuntimeEvent,
   boundedToolLiveOutput,
+  compactDesktopTranscript,
+  desktopTimelineItems,
   presentSession,
   runtimeEventRelated,
   runtimeEventRetentionDiagnostics,
   runtimeEventSerializedBytes,
   visibleToolLiveOutput,
 } from "./view-model.js";
+
+test("keeps user and final answers prominent while folding intermediate work into one row", () => {
+  const timeline = desktopTimelineItems(chatWithItems([
+    {
+      id: "message_user" as never,
+      kind: "message",
+      role: "user",
+      createdAt: 100,
+      parts: [{ type: "text", id: "part_user" as never, text: "Inspect this." }],
+    },
+    {
+      id: "message_commentary" as never,
+      kind: "message",
+      role: "assistant",
+      createdAt: 110,
+      parts: [{
+        type: "text",
+        id: "part_commentary" as never,
+        text: "Checking the relevant files.",
+        phase: "commentary",
+      }],
+    },
+    {
+      id: "call_read" as never,
+      kind: "tool",
+      toolName: "read",
+      status: "completed",
+      displayStatus: "succeeded",
+      waitingForApproval: false,
+      updatedAt: 140,
+      inputSummary: { title: "read", detail: "README.md" },
+      output: "contents",
+    },
+    {
+      id: "message_answer" as never,
+      kind: "message",
+      role: "assistant",
+      createdAt: 160,
+      parts: [{
+        type: "text",
+        id: "part_answer" as never,
+        text: "Here is the result.",
+        phase: "final_answer",
+      }],
+    },
+  ]));
+
+  expect(timeline.map((item) => item.kind)).toEqual(["message", "work", "message"]);
+  expect(timeline[1]).toMatchObject({
+    kind: "work",
+    active: false,
+    toolCount: 1,
+    failureCount: 0,
+    startedAt: 100,
+    updatedAt: 160,
+  });
+  expect(timeline[2]).toMatchObject({
+    kind: "message",
+    parts: [{ type: "text", text: "Here is the result.", phase: "final_answer" }],
+  });
+});
+
+test("places turn work before a final answer even when its tool row was projected later", () => {
+  const chat = chatWithItems([
+    {
+      id: "message_turn_user" as never,
+      kind: "message",
+      role: "user",
+      createdAt: 1,
+      parts: [{ type: "text", id: "part_turn_user" as never, text: "Inspect this." }],
+    },
+    {
+      id: "message_turn_assistant" as never,
+      kind: "message",
+      role: "assistant",
+      createdAt: 3,
+      completedAt: 50,
+      parts: [
+        { type: "text", id: "part_turn_commentary" as never, text: "Reading it.", phase: "commentary" },
+        { type: "reasoning", id: "part_turn_reasoning" as never, text: "Need the relevant section." },
+        {
+          type: "tool_call",
+          id: "part_turn_call" as never,
+          callId: "call_turn_read" as never,
+          toolName: "read",
+          status: "completed",
+          displayStatus: "succeeded",
+        },
+        {
+          type: "tool_result",
+          id: "part_turn_result" as never,
+          callId: "call_turn_read" as never,
+          output: "large contents",
+        },
+        { type: "text", id: "part_turn_final" as never, text: "The answer.", phase: "final_answer" },
+      ],
+    },
+    {
+      id: "call_turn_read" as never,
+      kind: "tool",
+      toolName: "read",
+      status: "completed",
+      displayStatus: "succeeded",
+      waitingForApproval: false,
+      updatedAt: 40,
+      inputSummary: { title: "read", detail: "README.md" },
+      output: "large contents",
+    },
+  ]);
+  const runtime = {
+    messages: {
+      message_turn_user: { turnId: "turn_1" },
+      message_turn_assistant: { turnId: "turn_1", completedAt: 50 },
+    },
+    toolCalls: { call_turn_read: { turnId: "turn_1" } },
+    turnStatuses: { turn_1: "completed" },
+    turnStartedAt: { turn_1: 2 },
+  } as unknown as Pick<ChiliRuntimeView, "messages" | "toolCalls" | "turnStatuses" | "turnStartedAt">;
+
+  const timeline = desktopTimelineItems(chat, runtime);
+
+  expect(timeline.map((item) => item.kind)).toEqual(["message", "work", "message"]);
+  expect(timeline[1]).toMatchObject({
+    id: "work:turn_1",
+    kind: "work",
+    active: false,
+    startedAt: 2,
+    updatedAt: 50,
+    items: [
+      { kind: "message", parts: [{ type: "text", phase: "commentary" }, { type: "reasoning" }] },
+      { kind: "tool", id: "call_turn_read", output: "large contents" },
+    ],
+  });
+  expect(timeline[2]).toMatchObject({
+    kind: "message",
+    parts: [{ type: "text", phase: "final_answer", text: "The answer." }],
+  });
+});
+
+test("keeps the work row identity stable as a turn changes from working to worked", () => {
+  const runningChat = chatWithItems([{
+    id: "call_stable" as never,
+    kind: "tool",
+    toolName: "bash",
+    status: "running",
+    displayStatus: "running",
+    waitingForApproval: false,
+    updatedAt: 10,
+    inputSummary: { title: "bash", detail: "bun test" },
+  }], "running");
+  const runningRuntime = {
+    messages: {},
+    toolCalls: { call_stable: { turnId: "turn_stable" } },
+    turnStatuses: { turn_stable: "running" },
+    turnStartedAt: { turn_stable: 5 },
+  } as unknown as Pick<ChiliRuntimeView, "messages" | "toolCalls" | "turnStatuses" | "turnStartedAt">;
+  const completedChat = chatWithItems([{
+    ...(runningChat.items[0] as Extract<ChatSessionView["items"][number], { kind: "tool" }>),
+    status: "completed",
+    displayStatus: "succeeded",
+    updatedAt: 20,
+  }]);
+  const completedRuntime = {
+    ...runningRuntime,
+    turnStatuses: { turn_stable: "completed" },
+  } as unknown as Pick<ChiliRuntimeView, "messages" | "toolCalls" | "turnStatuses" | "turnStartedAt">;
+
+  expect(desktopTimelineItems(runningChat, runningRuntime)[0]).toMatchObject({ id: "work:turn_stable", active: true });
+  expect(desktopTimelineItems(completedChat, completedRuntime)[0]).toMatchObject({ id: "work:turn_stable", active: false });
+});
+
+test("keeps unphased legacy assistant text as a direct answer", () => {
+  const timeline = desktopTimelineItems(chatWithItems([{
+    id: "message_legacy_answer" as never,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [{ type: "text", id: "part_legacy_answer" as never, text: "Legacy answer." }],
+  }]));
+
+  expect(timeline).toEqual([expect.objectContaining({
+    kind: "message",
+    parts: [expect.objectContaining({ text: "Legacy answer." })],
+  })]);
+});
+
+test("splits commentary and final answer parts from the same assistant message", () => {
+  const timeline = desktopTimelineItems(chatWithItems([{
+    id: "message_mixed_phases" as never,
+    kind: "message",
+    role: "assistant",
+    createdAt: 200,
+    parts: [
+      {
+        type: "text",
+        id: "part_commentary" as never,
+        text: "I found the issue.",
+        phase: "commentary",
+      },
+      {
+        type: "text",
+        id: "part_final" as never,
+        text: "The fix is ready.",
+        phase: "final_answer",
+      },
+    ],
+  }]));
+
+  expect(timeline).toHaveLength(2);
+  expect(timeline[0]).toMatchObject({
+    kind: "work",
+    items: [{ parts: [{ text: "I found the issue.", phase: "commentary" }] }],
+  });
+  expect(timeline[1]).toMatchObject({
+    kind: "message",
+    parts: [{ text: "The fix is ready.", phase: "final_answer" }],
+  });
+});
+
+test("marks the trailing work disclosure active while the session is running", () => {
+  const timeline = desktopTimelineItems(chatWithItems([{
+    id: "call_running" as never,
+    kind: "tool",
+    toolName: "bash",
+    status: "running",
+    displayStatus: "running",
+    waitingForApproval: false,
+    updatedAt: 300,
+    inputSummary: { title: "bash", detail: "bun test" },
+  }], "running"));
+
+  expect(timeline).toHaveLength(1);
+  expect(timeline[0]).toMatchObject({
+    kind: "work",
+    active: true,
+    toolCount: 1,
+    failureCount: 0,
+  });
+});
+
+test("counts failed tools inside the collapsed work disclosure", () => {
+  const timeline = desktopTimelineItems(chatWithItems([{
+    id: "call_failed" as never,
+    kind: "tool",
+    toolName: "bash",
+    status: "failed",
+    displayStatus: "failed",
+    waitingForApproval: false,
+    updatedAt: 400,
+    inputSummary: { title: "bash", detail: "bun test" },
+    error: "tests failed",
+  }]));
+
+  expect(timeline).toHaveLength(1);
+  expect(timeline[0]).toMatchObject({
+    kind: "work",
+    active: false,
+    toolCount: 1,
+    failureCount: 1,
+  });
+});
+
+test("shows linked tool calls once and keeps raw results behind the compact tool row", () => {
+  const chat = chatWithItems([
+    {
+      id: "message_tools" as never,
+      kind: "message",
+      role: "assistant",
+      createdAt: 1,
+      parts: [
+        {
+          type: "tool_call",
+          id: "part_call" as never,
+          callId: "call_read" as never,
+          toolName: "read",
+          status: "completed",
+          displayStatus: "succeeded",
+        },
+        {
+          type: "tool_result",
+          id: "part_result" as never,
+          callId: "call_read" as never,
+          output: "<large raw file contents>",
+        },
+      ],
+    },
+    {
+      id: "call_read" as never,
+      kind: "tool",
+      toolName: "read",
+      status: "completed",
+      displayStatus: "succeeded",
+      waitingForApproval: false,
+      updatedAt: 2,
+      inputSummary: { title: "read", detail: "README.md" },
+      output: "<large raw file contents>",
+    },
+  ]);
+
+  const compact = compactDesktopTranscript(chat);
+  expect(compact.items).toHaveLength(1);
+  expect(compact.items[0]).toMatchObject({ kind: "tool", id: "call_read" });
+  expect(chat.items).toHaveLength(2);
+});
+
+test("keeps assistant text and orphaned tool results as fallback content", () => {
+  const compact = compactDesktopTranscript(chatWithItems([{
+    id: "message_mixed" as never,
+    kind: "message",
+    role: "assistant",
+    createdAt: 1,
+    parts: [
+      { type: "text", id: "part_text" as never, text: "Done." },
+      {
+        type: "tool_result",
+        id: "part_orphan" as never,
+        callId: "call_missing" as never,
+        output: "fallback result",
+      },
+    ],
+  }]));
+
+  expect(compact.items[0]).toMatchObject({
+    kind: "message",
+    parts: [
+      { type: "text", text: "Done." },
+      { type: "tool_result", output: "fallback result" },
+    ],
+  });
+});
 
 test("uses authoritative restored approvals even when their event anchors are unavailable", () => {
   const snapshot = baseSnapshot([
@@ -396,6 +728,19 @@ function baseSnapshot(
     tasks: [],
     pendingApprovals,
     pendingInputs,
+  };
+}
+
+function chatWithItems(
+  items: ChatSessionView["items"],
+  status: ChatSessionView["status"] = "idle",
+): ChatSessionView {
+  return {
+    status,
+    items,
+    pendingApprovals: [],
+    activeTools: [],
+    generatedAt: new Date(0).toISOString(),
   };
 }
 
