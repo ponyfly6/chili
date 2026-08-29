@@ -1,5 +1,15 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import type { ChiliEvent } from "@chili/protocol";
+import { createPortal } from "react-dom";
+import type {
+  ChiliEvent,
+  DelegationPolicy,
+  ReasoningLevel,
+  RuntimeModelDescriptor,
+  RuntimePermissionConfig,
+  RuntimePermissionProfileId,
+  SessionGoal,
+  SessionGoalStatus,
+} from "@chili/protocol";
 import type {
   ChatMessagePart,
   ChatTranscriptItem,
@@ -8,7 +18,9 @@ import type {
   RuntimeSessionSummary,
 } from "@chili/sdk";
 import type {
+  DesktopCreateSessionResult,
   DesktopEvent,
+  DesktopSessionConfig,
   DesktopState,
   DiffScope,
   RuntimeSnapshot,
@@ -25,6 +37,7 @@ import {
   type SequencedProjectionFrame,
 } from "./resync-coordinator.js";
 import { createLatestRequestGate } from "./latest-request.js";
+import { isMenuNavigationKey, menuNavigationTarget, trappedTabTarget } from "./keyboard-navigation.js";
 import {
   canEditComposer,
   canOpenSession,
@@ -49,10 +62,41 @@ import {
   type DesktopTimelineItem,
   type DesktopWorkItem,
 } from "./view-model.js";
+import {
+  availableReasoningLevels,
+  availableServiceTiers,
+  canExposeTaskActions,
+  canReloadSessionMcp,
+  canResumeTask,
+  createNewTaskDraft,
+  filterSessions,
+  goalResumeBudgetMinimum,
+  goalProgress,
+  hydrateNewTaskChoices,
+  isServiceTierSelectionValid,
+  modelFromKey,
+  modelKey,
+  newTaskSubmission,
+  preferredServiceTier,
+  reconcileNewTaskModel,
+  serviceTierMutationValue,
+  validateNewTaskDraft,
+  type NewTaskDraft,
+  type ServiceTierSelection,
+  type SessionListStatus,
+} from "./task-console-model.js";
 
 type DesktopProjection = CoordinatedProjection<DesktopState, RuntimeSessionSummary, RuntimeSnapshot>;
 const MAX_OUTER_RESYNC_RETRIES = 4;
 const OUTER_RESYNC_RETRY_DELAY_MS = 500;
+
+interface SessionSettingsValues {
+  modelKey: string;
+  reasoningLevel: ReasoningLevel;
+  serviceTier: ServiceTierSelection;
+  permissionProfile: RuntimePermissionProfileId;
+  delegationPolicy: DelegationPolicy;
+}
 
 export function App({ transport }: { transport: ControlTransport }) {
   const [projection, setProjection] = useState<DesktopProjection>({
@@ -72,14 +116,34 @@ export function App({ transport }: { transport: ControlTransport }) {
   const [diffScope, setDiffScope] = useState<DiffScope>("turn");
   const [diffText, setDiffText] = useState("Select a session to inspect changes.");
   const [diffLoading, setDiffLoading] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 640);
+  const [inspectorOpen, setInspectorOpen] = useState(() => window.innerWidth > 1080);
   const [inspectorTab, setInspectorTab] = useState<"activity" | "changes">("activity");
   const [resyncRetryAvailable, setResyncRetryAvailable] = useState(false);
+  const [sessionQuery, setSessionQuery] = useState("");
+  const [sessionListStatus, setSessionListStatus] = useState<SessionListStatus>("active");
+  const [taskMenuId, setTaskMenuId] = useState<string>();
+  const [newTaskOpen, setNewTaskOpen] = useState(false);
+  const [newTaskChoicesLoading, setNewTaskChoicesLoading] = useState(false);
+  const [newTaskChoicesReady, setNewTaskChoicesReady] = useState(false);
+  const [newTaskDraft, setNewTaskDraft] = useState<NewTaskDraft>(() => createNewTaskDraft());
+  const [models, setModels] = useState<RuntimeModelDescriptor[]>([]);
+  const [newTaskPermissionConfig, setNewTaskPermissionConfig] = useState<RuntimePermissionConfig>();
+  const [sessionConfig, setSessionConfig] = useState<DesktopSessionConfig>();
+  const [configLoading, setConfigLoading] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<RuntimeSessionSummary>();
+  const [archiveTarget, setArchiveTarget] = useState<RuntimeSessionSummary>();
+  const [goalSetupOpen, setGoalSetupOpen] = useState(false);
+  const [goalBudgetOpen, setGoalBudgetOpen] = useState(false);
+  const taskMenuButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+  const taskMenuRef = useRef<HTMLDivElement | null>(null);
+  const dialogReturnFocusRef = useRef<HTMLElement | null>(null);
   const selectedRef = useRef<string | undefined>(undefined);
   const projectionRef = useRef(projection);
   const projectionRefreshes = useMemo(() => new IndependentRefreshScheduler(), []);
   const diffRefreshTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const configRefreshTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const resyncRetryTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const resyncRetryAttempts = useRef(0);
   const manualResyncRetry = useRef<() => void>(() => undefined);
@@ -88,6 +152,8 @@ export function App({ transport }: { transport: ControlTransport }) {
   );
   const actionInFlightRef = useRef(false);
   const diffRequestGate = useRef(createLatestRequestGate());
+  const configRequestGate = useRef(createLatestRequestGate());
+  const newTaskChoicesGate = useRef(createLatestRequestGate());
   const workspaceRef = useRef<string | undefined>(undefined);
   const sidecarPhaseRef = useRef<DesktopState["sidecar"]["phase"]>("idle");
   const timelineRef = useRef<HTMLDivElement | null>(null);
@@ -177,19 +243,102 @@ export function App({ transport }: { transport: ControlTransport }) {
   const sessionBusy = presentation?.chat.status === "running"
     || presentation?.chat.status === "waiting_for_approval"
     || presentation?.chat.status === "cancelling";
+  const selectedSession = sessions.find((session) => session.id === selectedId);
+  const selectedArchived = selectedSession?.status === "archived";
   const healthy = desktop.sidecar.phase === "healthy";
   const actionsDisabled = working || resyncing || loadingSession;
   const runtimeActionsDisabled = actionsDisabled || !healthy;
-  const composerEditable = canEditComposer({ selectedId, healthy, resyncing, loadingSession, working });
+  const composerEditable = !selectedArchived
+    && canEditComposer({ selectedId, healthy, resyncing, loadingSession, working });
   const workspaceSwitchEnabled = canSwitchWorkspace({ working, loadingSession, resyncing, resyncRetryAvailable });
   const sidecarGuidance = sidecarRecoveryGuidance(desktop.sidecar);
-  const selectedSession = sessions.find((session) => session.id === selectedId);
   const selectedTitle = selectedSession?.title || selectedSession?.preview || "Development session";
   const projectLabel = workspaceLabel(desktop.workspace);
+  const visibleSessions = useMemo(
+    () => filterSessions(sessions, sessionQuery, sessionListStatus),
+    [sessionListStatus, sessionQuery, sessions],
+  );
+  const selectedModel = sessionConfig?.model.modelSelection;
+  const selectedGoal = sessionConfig?.goal ?? undefined;
+  const canResumeSession = canResumeTask(presentation?.chat.status, selectedGoal?.status, Boolean(selectedArchived));
+  const mcpReloadEnabled = canReloadSessionMcp(selectedId, Boolean(selectedArchived), runtimeActionsDisabled);
 
   useEffect(() => {
     if (!composer && composerRef.current) composerRef.current.style.height = "";
   }, [composer]);
+
+  useEffect(() => {
+    let previousWidth = window.innerWidth;
+    const handleResize = (): void => {
+      const width = window.innerWidth;
+      if (previousWidth > 1080 && width <= 1080) setInspectorOpen(false);
+      if (previousWidth > 640 && width <= 640) setSidebarOpen(false);
+      previousWidth = width;
+    };
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  useEffect(() => {
+    if (!taskMenuId) return;
+    const menu = taskMenuRef.current;
+    const trigger = taskMenuButtonRefs.current.get(taskMenuId);
+    if (!menu || !trigger) {
+      setTaskMenuId(undefined);
+      return;
+    }
+    const focusFrame = window.requestAnimationFrame(() => menuItems(menu)[0]?.focus());
+    const closeAndRestore = (): void => {
+      setTaskMenuId(undefined);
+      window.requestAnimationFrame(() => {
+        if (canRestoreFocus(trigger)) trigger.focus();
+      });
+    };
+    const handlePointerDown = (event: PointerEvent): void => {
+      if (!(event.target instanceof Node) || menu.contains(event.target) || trigger.contains(event.target)) return;
+      setTaskMenuId(undefined);
+    };
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeAndRestore();
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [taskMenuId]);
+
+  const reloadSessionConfig = useCallback(async (sessionId = selectedRef.current) => {
+    if (!sessionId || sidecarPhaseRef.current !== "healthy") return;
+    const isCurrent = configRequestGate.current.begin();
+    setConfigLoading(true);
+    try {
+      const next = await transport.sessionConfig(sessionId);
+      if (isCurrent() && selectedRef.current === sessionId) {
+        setSessionConfig(next);
+        setModels(next.model.models);
+      }
+    } catch (cause) {
+      if (isCurrent()) setError(messageFor(cause));
+    } finally {
+      if (isCurrent()) setConfigLoading(false);
+    }
+  }, [transport]);
+
+  useEffect(() => {
+    if (!selectedId || !healthy || resyncing) {
+      configRequestGate.current.invalidate();
+      setSessionConfig(undefined);
+      setConfigLoading(false);
+      return;
+    }
+    void reloadSessionConfig(selectedId);
+    return () => configRequestGate.current.invalidate();
+  }, [healthy, reloadSessionConfig, resyncing, selectedId]);
 
   useLayoutEffect(() => {
     const timeline = timelineRef.current;
@@ -241,8 +390,7 @@ export function App({ transport }: { transport: ControlTransport }) {
     let token;
     try {
       token = coordinator.beginRequest("sessions");
-      const next = (await transport.listSessions())
-        .filter((session) => session.status === "active")
+      const next = (await transport.listSessions({ status: "all" }))
         .sort((left, right) => right.updatedAt - left.updatedAt);
       coordinator.acceptResponse(token);
       setSessions(next);
@@ -251,7 +399,7 @@ export function App({ transport }: { transport: ControlTransport }) {
         ? preferredId
         : current && next.some((session) => session.id === current)
           ? current
-          : next[0]?.id;
+          : next.find((session) => session.status === "active")?.id ?? next[0]?.id;
       if (!target) {
         setComposer("");
         selectedRef.current = undefined;
@@ -451,6 +599,10 @@ export function App({ transport }: { transport: ControlTransport }) {
         if (diffRefreshTimer.current) clearTimeout(diffRefreshTimer.current);
         diffRefreshTimer.current = setTimeout(() => setDiffRevision((current) => current + 1), 100);
       }
+      if (refreshesSessionConfig(event.event)) {
+        if (configRefreshTimer.current) clearTimeout(configRefreshTimer.current);
+        configRefreshTimer.current = setTimeout(() => void reloadSessionConfig(), 120);
+      }
       if (event.event.type.startsWith("session.")) {
         projectionRefreshes.sessions(() => void refreshSessions());
       } else if (event.event.type.startsWith("agent.") || event.event.type.startsWith("task.")
@@ -488,11 +640,13 @@ export function App({ transport }: { transport: ControlTransport }) {
       projectionRefreshes.cancel();
       if (diffRefreshTimer.current) clearTimeout(diffRefreshTimer.current);
       diffRefreshTimer.current = undefined;
+      if (configRefreshTimer.current) clearTimeout(configRefreshTimer.current);
+      configRefreshTimer.current = undefined;
       clearResyncRetryTimer();
       diffRequestGate.current.invalidate();
       coordinator.cancel();
     };
-  }, [coordinator, projectionRefreshes, refreshSessions, reloadSelected, setDesktop, setSnapshot, transport]);
+  }, [coordinator, projectionRefreshes, refreshSessions, reloadSelected, reloadSessionConfig, setDesktop, setSnapshot, transport]);
 
   useEffect(() => {
     const isCurrent = diffRequestGate.current.begin();
@@ -555,20 +709,165 @@ export function App({ transport }: { transport: ControlTransport }) {
     if (state.sidecar.phase === "healthy") await refreshSessions();
   });
 
-  const createSession = async () => runAction(async () => {
-    const created = await transport.createSession();
-    await refreshSessions(created.sessionId);
-  });
+  const openNewTask = useCallback(() => {
+    setTaskMenuId(undefined);
+    setNewTaskDraft(() => {
+      const draft = createNewTaskDraft(models);
+      const permission = sessionConfig?.permission.profile;
+      return permission ? { ...draft, permissionProfile: permission } : draft;
+    });
+    setNewTaskOpen(true);
+    setNewTaskPermissionConfig(sessionConfig?.permission);
+    setNewTaskChoicesLoading(true);
+    setNewTaskChoicesReady(false);
+    const choicesCurrent = newTaskChoicesGate.current.begin();
+    void Promise.all([
+      models.length > 0 ? Promise.resolve(models) : transport.listModels(),
+      sessionConfig?.permission ? Promise.resolve(sessionConfig.permission) : transport.permissionConfig(),
+    ]).then(([catalog, permission]) => {
+      if (!choicesCurrent()) return;
+      setModels(catalog);
+      setNewTaskPermissionConfig(permission);
+      setNewTaskDraft((current) => hydrateNewTaskChoices(current, catalog, permission.profile));
+      setNewTaskChoicesReady(true);
+    }).catch((cause) => {
+      if (choicesCurrent()) setError(`Unable to load runtime choices: ${messageFor(cause)}`);
+    }).finally(() => {
+      if (choicesCurrent()) setNewTaskChoicesLoading(false);
+    });
+  }, [models, sessionConfig?.permission, transport]);
+
+  const closeNewTask = useCallback(() => {
+    if (actionInFlightRef.current) return;
+    newTaskChoicesGate.current.invalidate();
+    setNewTaskChoicesLoading(false);
+    setNewTaskOpen(false);
+  }, []);
+
+  const createSession = async () => {
+    if (newTaskChoicesLoading || !newTaskChoicesReady) return;
+    const validation = validateNewTaskDraft(newTaskDraft, models);
+    if (!validation.valid) return;
+    await runAction(async () => {
+      const created = await transport.createSession(newTaskSubmission(newTaskDraft, models));
+      newTaskChoicesGate.current.invalidate();
+      setNewTaskOpen(false);
+      setSessionListStatus("active");
+      await refreshSessions(created.sessionId);
+      if (created.failure) throw new Error(createFailureMessage(created));
+    });
+  };
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent): void => {
       if (!event.metaKey || event.altKey || event.ctrlKey || event.shiftKey || event.key.toLowerCase() !== "n") return;
       event.preventDefault();
-      if (healthy && !actionsDisabled) void createSession();
+      if (document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+      if (healthy && !actionsDisabled) openNewTask();
     };
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  }, [actionsDisabled, createSession, healthy]);
+  }, [actionsDisabled, healthy, openNewTask]);
+
+  const renameSession = async (session: RuntimeSessionSummary, title: string) => {
+    const normalized = title.trim();
+    if (!normalized) return;
+    await runAction(async () => {
+      await transport.renameSession(String(session.id), normalized);
+      setRenameTarget(undefined);
+      await refreshSessions(String(session.id));
+    });
+  };
+
+  const archiveSession = async (session: RuntimeSessionSummary) => {
+    await runAction(async () => {
+      await transport.archiveSession(String(session.id));
+      setArchiveTarget(undefined);
+      setSessionListStatus("archived");
+      await refreshSessions(String(session.id));
+    });
+  };
+
+  const resumeSession = async () => {
+    if (!selectedId || selectedArchived) return;
+    await runAction(async () => {
+      const next = await transport.resumeSession(selectedId);
+      setSnapshot(next);
+      await reloadSessionConfig(selectedId);
+      requestAnimationFrame(() => composerRef.current?.focus());
+    });
+  };
+
+  const saveSessionSettings = async (values: SessionSettingsValues) => {
+    if (!selectedId || !sessionConfig || selectedArchived) return;
+    await runAction(async () => {
+      const model = modelFromKey(models.length > 0 ? models : sessionConfig.model.models, values.modelKey);
+      if (!model || model.available === false) throw new TypeError("Choose an available model.");
+      if (!isServiceTierSelectionValid(model, values.serviceTier)) {
+        throw new TypeError("Choose a service tier supported by this model.");
+      }
+      if (model && modelKey(model) !== (sessionConfig.model.modelSelection ? modelKey(sessionConfig.model.modelSelection) : "")) {
+        await transport.setModel(selectedId, { provider: model.provider, model: model.model });
+      }
+      if (values.reasoningLevel !== sessionConfig.model.reasoningLevel) {
+        await transport.setReasoning(selectedId, values.reasoningLevel);
+      }
+      const serviceTierMutation = serviceTierMutationValue(values.serviceTier, sessionConfig.model.serviceTier);
+      if (serviceTierMutation) {
+        await transport.setServiceTier(selectedId, serviceTierMutation);
+      }
+      if (values.permissionProfile !== sessionConfig.permission.profile) {
+        await transport.setPermission(values.permissionProfile);
+      }
+      if (values.delegationPolicy !== sessionConfig.delegation.policy) {
+        await transport.setDelegation(selectedId, values.delegationPolicy);
+      }
+      setSettingsOpen(false);
+      await reloadSessionConfig(selectedId);
+    });
+  };
+
+  const changeGoalStatus = async (status: SessionGoalStatus) => {
+    if (!selectedId || selectedArchived) return;
+    await runAction(async () => {
+      await transport.updateGoal(selectedId, { status });
+      await reloadSessionConfig(selectedId);
+    });
+  };
+
+  const resumeBudgetLimitedGoal = async (tokenBudget: number) => {
+    if (!selectedId || !selectedGoal || selectedGoal.status !== "budgetLimited" || selectedArchived) return;
+    await runAction(async () => {
+      await transport.updateGoal(selectedId, { tokenBudget, status: "active" });
+      setGoalBudgetOpen(false);
+      await reloadSessionConfig(selectedId);
+    });
+  };
+
+  const addGoal = async (objective: string, tokenBudget?: number) => {
+    if (!selectedId || selectedArchived) return;
+    await runAction(async () => {
+      await transport.setGoal(selectedId, objective, tokenBudget);
+      setGoalSetupOpen(false);
+      await reloadSessionConfig(selectedId);
+    });
+  };
+
+  const clearGoal = async () => {
+    if (!selectedId || selectedArchived) return;
+    await runAction(async () => {
+      await transport.clearGoal(selectedId);
+      await reloadSessionConfig(selectedId);
+    });
+  };
+
+  const reloadMcp = async () => {
+    if (!selectedId || selectedArchived) return;
+    await runAction(async () => {
+      await transport.reloadMcp(selectedId);
+      await reloadSessionConfig(selectedId);
+    });
+  };
 
   const submit = async (mode: "queue" | "steer") => {
     const text = composer.trim();
@@ -616,6 +915,7 @@ export function App({ transport }: { transport: ControlTransport }) {
           <button
             className="chrome-button"
             type="button"
+            data-dialog-fallback-focus="true"
             aria-label={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
             aria-pressed={sidebarOpen}
             onClick={() => setSidebarOpen((current) => !current)}
@@ -684,36 +984,123 @@ export function App({ transport }: { transport: ControlTransport }) {
       <main className={`workspace-grid ${sidebarOpen ? "" : "sidebar-collapsed"} ${inspectorOpen ? "" : "inspector-collapsed"}`}>
         <aside className="sidebar panel" aria-hidden={!sidebarOpen}>
           <div className="sidebar-actions">
-            <button className="new-task-button" disabled={!healthy || actionsDisabled} onClick={() => void createSession()}>
+            <button className="new-task-button" aria-label="New task" disabled={!healthy || actionsDisabled} onClick={openNewTask}>
               <span><Icon name="plus" />New task</span>
-              <kbd>⌘ N</kbd>
+              <kbd aria-hidden="true">⌘ N</kbd>
             </button>
+            <label className="session-search">
+              <span className="sr-only">Search tasks</span>
+              <Icon name="search" />
+              <input
+                type="search"
+                aria-label="Search tasks"
+                value={sessionQuery}
+                onChange={(event) => { setTaskMenuId(undefined); setSessionQuery(event.target.value); }}
+                placeholder="Search tasks"
+              />
+            </label>
+            <div className="session-filters" role="tablist" aria-label="Task status">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={sessionListStatus === "active"}
+                className={sessionListStatus === "active" ? "active" : ""}
+                onClick={() => { setTaskMenuId(undefined); setSessionListStatus("active"); }}
+              >
+                Active tasks <span>{sessions.filter((session) => session.status === "active").length}</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={sessionListStatus === "archived"}
+                className={sessionListStatus === "archived" ? "active" : ""}
+                onClick={() => { setTaskMenuId(undefined); setSessionListStatus("archived"); }}
+              >
+                Archived tasks <span>{sessions.filter((session) => session.status === "archived").length}</span>
+              </button>
+            </div>
           </div>
           <section className="session-section">
             <div className="section-heading">
-              <p className="eyebrow">Recent tasks</p>
-              <span>{sessions.length}</span>
+              <p className="eyebrow">{sessionListStatus === "active" ? "Recent tasks" : "Archived tasks"}</p>
+              <span>{visibleSessions.length}</span>
             </div>
             <div className="session-list">
-              {sessions.map((session) => (
-                <button
-                  key={session.id}
-                  className={`session-row ${selectedId === session.id ? "selected" : ""}`}
-                  disabled={actionsDisabled || !canOpenSession({ healthy, resyncing })}
-                  onClick={() => void openSession(session.id)}
-                >
-                  <span className="session-glyph" aria-hidden="true"><Icon name="message" /></span>
-                  <span className="session-copy">
-                    <span className="session-title">{session.title || session.preview || "Untitled task"}</span>
-                    <span className="session-meta">
-                      {formatRelativeTime(session.updatedAt)}
-                      {(desktop.queuedBySession[session.id] ?? 0) > 0 ? ` · ${desktop.queuedBySession[session.id]} queued` : ""}
+              {visibleSessions.map((session) => (
+                <div className={`session-entry ${taskMenuId === session.id ? "menu-open" : ""}`} key={session.id}>
+                  <button
+                    className={`session-row ${selectedId === session.id ? "selected" : ""}`}
+                    disabled={actionsDisabled || !canOpenSession({ healthy, resyncing })}
+                    onClick={() => {
+                      setTaskMenuId(undefined);
+                      void openSession(session.id);
+                      if (window.innerWidth <= 640) setSidebarOpen(false);
+                    }}
+                  >
+                    <span className="session-glyph" aria-hidden="true"><Icon name={session.status === "archived" ? "archive" : "message"} /></span>
+                    <span className="session-copy">
+                      <span className="session-title">{session.title || session.preview || "Untitled task"}</span>
+                      <span className="session-meta">
+                        {formatRelativeTime(session.updatedAt)}
+                        {(desktop.queuedBySession[session.id] ?? 0) > 0 ? ` · ${desktop.queuedBySession[session.id]} queued` : ""}
+                      </span>
                     </span>
-                  </span>
-                  {selectedId === session.id ? <span className="session-active-mark" aria-hidden="true" /> : null}
-                </button>
+                    {selectedId === session.id ? <span className="session-active-mark" aria-hidden="true" /> : null}
+                  </button>
+                  {canExposeTaskActions(session.status) ? (
+                    <>
+                      <button
+                        ref={(node) => {
+                          const id = String(session.id);
+                          if (node) taskMenuButtonRefs.current.set(id, node);
+                          else taskMenuButtonRefs.current.delete(id);
+                        }}
+                        className="session-menu-button"
+                        type="button"
+                        aria-label={`Task actions for ${session.title || session.preview || "Untitled task"}`}
+                        aria-haspopup="menu"
+                        aria-expanded={taskMenuId === session.id}
+                        disabled={actionsDisabled}
+                        onClick={() => setTaskMenuId((current) => current === String(session.id) ? undefined : String(session.id))}
+                      >
+                        <Icon name="more" />
+                      </button>
+                      {taskMenuId === session.id ? (
+                        <div
+                          ref={taskMenuRef}
+                          className="session-menu"
+                          role="menu"
+                          aria-label={`Task actions for ${session.title || session.preview || "Untitled task"}`}
+                          onKeyDown={(event) => {
+                            if (!isMenuNavigationKey(event.key)) return;
+                            const items = menuItems(event.currentTarget);
+                            const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
+                            const nextIndex = menuNavigationTarget(event.key, currentIndex, items.length);
+                            if (nextIndex === undefined) return;
+                            event.preventDefault();
+                            items[nextIndex]?.focus();
+                          }}
+                        >
+                          <button role="menuitem" onClick={() => {
+                            dialogReturnFocusRef.current = taskMenuButtonRefs.current.get(String(session.id)) ?? null;
+                            setRenameTarget(session);
+                            setTaskMenuId(undefined);
+                          }}>Rename task</button>
+                          <button className="danger-menu-item" role="menuitem" onClick={() => {
+                            dialogReturnFocusRef.current = taskMenuButtonRefs.current.get(String(session.id)) ?? null;
+                            setArchiveTarget(session);
+                            setTaskMenuId(undefined);
+                          }}>Archive task</button>
+                        </div>
+                      ) : null}
+                    </>
+                  ) : null}
+                </div>
               ))}
               {healthy && sessions.length === 0 ? <p className="empty-copy sidebar-empty">Your recent work will live here.</p> : null}
+              {healthy && sessions.length > 0 && visibleSessions.length === 0 ? (
+                <p className="empty-copy sidebar-empty">No {sessionListStatus} tasks match this search.</p>
+              ) : null}
               {!healthy ? <p className="empty-copy sidebar-empty">Choose a project and let the local runtime warm up.</p> : null}
             </div>
           </section>
@@ -732,16 +1119,53 @@ export function App({ transport }: { transport: ControlTransport }) {
 
         <section className="conversation panel">
           <div className="conversation-heading">
-            <div>
+            <div className="conversation-title">
               <h1>{selectedId ? selectedTitle : "A calmer place to ship code"}</h1>
-              <p>{selectedId ? `${projectLabel} · ${shortId(selectedId)}` : "Local-first · permission-aware · yours"}</p>
+              <p>{selectedId ? `${projectLabel} · ${shortId(selectedId)}${selectedArchived ? " · archived" : ""}` : "Local-first · permission-aware · yours"}</p>
+              {selectedId && sessionConfig ? (
+                <div className="session-config-strip" aria-label="Task runtime configuration">
+                  <span title={selectedModel ? `${selectedModel.provider}/${selectedModel.model}` : "Runtime default model"}>
+                    {selectedModel?.model ?? "Default model"}
+                  </span>
+                  <span>{sessionConfig.model.reasoningLevel ?? "default"} reasoning</span>
+                  <span>{sessionConfig.model.serviceTier ?? "provider default"} tier</span>
+                  <span>{sessionConfig.permission.profile} permissions</span>
+                  <span>{sessionConfig.delegation.policy} delegation</span>
+                  {selectedGoal ? <span className={`goal-chip goal-${selectedGoal.status}`}>Goal {goalStatusLabel(selectedGoal.status)}</span> : null}
+                </div>
+              ) : selectedId && configLoading ? <p className="config-loading">Loading runtime configuration…</p> : null}
             </div>
-            {presentation ? (
-              <span className={`session-status status-${presentation.chat.status}`}>
-                <span aria-hidden="true" />{presentation.chat.status.replaceAll("_", " ")}
-              </span>
-            ) : null}
+            <div className="conversation-heading-actions">
+              {canResumeSession ? (
+                <button className="secondary compact-action" disabled={runtimeActionsDisabled} onClick={() => void resumeSession()}>
+                  <Icon name="resume" />Resume task
+                </button>
+              ) : null}
+              {selectedId && !selectedArchived ? (
+                <button
+                  className="icon-button session-settings-button"
+                  type="button"
+                  aria-label="Task runtime settings"
+                  disabled={runtimeActionsDisabled || !sessionConfig}
+                  onClick={() => setSettingsOpen(true)}
+                >
+                  <Icon name="settings" />
+                </button>
+              ) : null}
+              {presentation ? (
+                <span className={`session-status status-${presentation.chat.status}`}>
+                  <span aria-hidden="true" />{presentation.chat.status.replaceAll("_", " ")}
+                </span>
+              ) : null}
+            </div>
           </div>
+
+          {selectedArchived ? (
+            <div className="read-only-banner" role="status">
+              <Icon name="archive" />
+              <span>This task is archived and read-only. Archived tasks cannot be restored in this milestone.</span>
+            </div>
+          ) : null}
 
           <div
             className="timeline"
@@ -772,7 +1196,7 @@ export function App({ transport }: { transport: ControlTransport }) {
                 <p>Start with the result you want. Chili reads the project, edits with visible permissions, and keeps agents, tasks, and changes in one place.</p>
                 <div className="welcome-actions">
                   {healthy ? (
-                    <button className="primary" disabled={actionsDisabled} onClick={() => void createSession()}>
+                    <button className="primary" disabled={actionsDisabled} onClick={openNewTask}>
                       <Icon name="plus" />Start a task
                     </button>
                   ) : (
@@ -814,6 +1238,7 @@ export function App({ transport }: { transport: ControlTransport }) {
             <div className="composer">
               <textarea
                 ref={composerRef}
+                aria-label="Message composer"
                 value={composer}
                 onChange={(event) => {
                   setComposer(event.target.value);
@@ -823,19 +1248,32 @@ export function App({ transport }: { transport: ControlTransport }) {
                 onKeyDown={(event) => {
                   if (composerEditable && (event.metaKey || event.ctrlKey) && event.key === "Enter") void submit("queue");
                 }}
-                placeholder={selectedId ? "Ask Chili to change, investigate, or ship something…" : "Create or select a task first"}
+                placeholder={selectedArchived
+                  ? "Archived tasks are read-only"
+                  : selectedId
+                    ? canResumeSession
+                      ? "Resume with a follow-up…"
+                      : "Ask Chili to change, investigate, or ship something…"
+                    : "Create or select a task first"}
                 disabled={!composerEditable}
                 rows={2}
               />
               <div className="composer-actions">
                 <div className="composer-context">
                   <span className={`composer-local phase-${desktop.sidecar.phase}`}><span />Local</span>
+                  {selectedGoal ? <span className={`composer-goal goal-${selectedGoal.status}`}>Goal · {goalStatusLabel(selectedGoal.status)}</span> : null}
                   {(desktop.queuedBySession[selectedId ?? ""] ?? 0) > 0 ? <span>{desktop.queuedBySession[selectedId ?? ""]} queued</span> : null}
                   <span className="shortcut-hint">⌘ ↵ send</span>
                 </div>
                 <div className="composer-buttons">
                   {sessionBusy ? (
-                    <button className="composer-stop" title="Stop current turn" aria-label="Stop current turn" disabled={!selectedId || runtimeActionsDisabled} onClick={() => void stop()}>
+                    <button
+                      className="composer-stop"
+                      title={selectedGoal?.status === "active" ? "Stop current turn and pause Goal" : "Stop current turn"}
+                      aria-label={selectedGoal?.status === "active" ? "Stop current turn and pause Goal" : "Stop current turn"}
+                      disabled={!selectedId || runtimeActionsDisabled}
+                      onClick={() => void stop()}
+                    >
                       <Icon name="stop" />
                     </button>
                   ) : null}
@@ -875,6 +1313,65 @@ export function App({ transport }: { transport: ControlTransport }) {
                 <div><strong>Chili</strong><span>{presentation?.chat.status.replaceAll("_", " ") ?? (healthy ? "ready" : "offline")}</span></div>
                 <span className={`agent-signal ${sessionBusy ? "working" : ""}`} aria-hidden="true" />
               </section>
+              <section className="inspector-section goal-section">
+                <div className="section-heading compact"><p className="eyebrow">Goal</p>{selectedGoal ? <span className={`goal-status goal-${selectedGoal.status}`}>{goalStatusLabel(selectedGoal.status)}</span> : null}</div>
+                {selectedGoal ? (
+                  <GoalCard
+                    goal={selectedGoal}
+                    disabled={runtimeActionsDisabled || selectedArchived}
+                    busy={Boolean(sessionBusy)}
+                    onStatus={(status) => void changeGoalStatus(status)}
+                    onRaiseBudget={() => setGoalBudgetOpen(true)}
+                    onClear={() => void clearGoal()}
+                  />
+                ) : (
+                  <div className="compact-empty-action">
+                    <p className="empty-copy">No autonomous Goal is attached to this task.</p>
+                    {selectedId && !selectedArchived ? (
+                      <button className="secondary" disabled={runtimeActionsDisabled} onClick={() => setGoalSetupOpen(true)}>Add Goal</button>
+                    ) : null}
+                  </div>
+                )}
+              </section>
+
+              <section className="inspector-section runtime-config-section">
+                <div className="section-heading compact"><p className="eyebrow">Runtime</p>{!selectedArchived && sessionConfig ? <button className="text-button" onClick={() => setSettingsOpen(true)}>Change</button> : null}</div>
+                {sessionConfig ? (
+                  <dl className="config-list">
+                    <div><dt>Model</dt><dd>{selectedModel?.model ?? "Runtime default"}</dd></div>
+                    <div><dt>Reasoning</dt><dd>{sessionConfig.model.reasoningLevel ?? "default"}</dd></div>
+                    <div><dt>Service tier</dt><dd>{sessionConfig.model.serviceTier ?? "Provider default"}</dd></div>
+                    <div><dt>Permission</dt><dd>{sessionConfig.permission.profile} <em>global</em></dd></div>
+                    <div><dt>Delegation</dt><dd>{sessionConfig.delegation.policy}</dd></div>
+                  </dl>
+                ) : <p className="empty-copy">{selectedId ? "Loading runtime settings…" : "Select a task to inspect its runtime."}</p>}
+              </section>
+
+              <section className="inspector-section mcp-section">
+                <div className="section-heading compact">
+                  <p className="eyebrow">MCP connections</p>
+                  <button className="text-button" disabled={!mcpReloadEnabled} onClick={() => void reloadMcp()}>Reload</button>
+                </div>
+                {sessionConfig ? (
+                  <>
+                    <p className="mcp-summary">
+                      <strong>{sessionConfig.mcp.summary.running}/{sessionConfig.mcp.summary.total}</strong> running
+                      {sessionConfig.mcp.summary.errored > 0 ? <span>{sessionConfig.mcp.summary.errored} errors</span> : null}
+                      {sessionConfig.mcp.summary.authRequired > 0 ? <span>{sessionConfig.mcp.summary.authRequired} need auth</span> : null}
+                    </p>
+                    <div className="mcp-server-list">
+                      {sessionConfig.mcp.servers.map((server) => (
+                        <div className="mcp-server" key={server.name} title={server.error}>
+                          <span className={`mcp-dot mcp-${server.status}`} aria-hidden="true" />
+                          <strong>{server.name}</strong>
+                          <span>{server.status.replaceAll("_", " ")}</span>
+                        </div>
+                      ))}
+                      {sessionConfig.mcp.servers.length === 0 ? <p className="empty-copy">No MCP servers configured.</p> : null}
+                    </div>
+                  </>
+                ) : <p className="empty-copy">MCP status follows the selected task.</p>}
+              </section>
               <section className="inspector-section">
                 <div className="section-heading compact"><p className="eyebrow">Delegated agents</p><span>{snapshot?.agentTree.agents.length ?? 0}</span></div>
                 <div className="agent-tree">
@@ -913,8 +1410,547 @@ export function App({ transport }: { transport: ControlTransport }) {
           )}
         </aside>
       </main>
+
+      {newTaskOpen ? (
+        <NewTaskDialog
+          draft={newTaskDraft}
+          models={models}
+          permissionConfig={newTaskPermissionConfig}
+          disabled={working}
+          choicesLoading={newTaskChoicesLoading}
+          choicesReady={newTaskChoicesReady}
+          onChange={setNewTaskDraft}
+          onClose={closeNewTask}
+          onSubmit={() => void createSession()}
+        />
+      ) : null}
+
+      {renameTarget ? (
+        <RenameTaskDialog
+          session={renameTarget}
+          disabled={working}
+          returnFocus={dialogReturnFocusRef.current}
+          onClose={() => !working && setRenameTarget(undefined)}
+          onSubmit={(title) => void renameSession(renameTarget, title)}
+        />
+      ) : null}
+
+      {archiveTarget ? (
+        <ArchiveTaskDialog
+          session={archiveTarget}
+          disabled={working}
+          archiveDisabled={String(archiveTarget.id) === selectedId && Boolean(sessionBusy)}
+          returnFocus={dialogReturnFocusRef.current}
+          onClose={() => !working && setArchiveTarget(undefined)}
+          onArchive={() => void archiveSession(archiveTarget)}
+        />
+      ) : null}
+
+      {settingsOpen && sessionConfig ? (
+        <SessionSettingsDialog
+          config={sessionConfig}
+          models={models}
+          disabled={working}
+          onClose={() => !working && setSettingsOpen(false)}
+          onSubmit={(values) => void saveSessionSettings(values)}
+        />
+      ) : null}
+
+      {goalSetupOpen ? (
+        <GoalSetupDialog
+          defaultObjective={composer.trim()}
+          disabled={working}
+          onClose={() => !working && setGoalSetupOpen(false)}
+          onSubmit={(objective, tokenBudget) => void addGoal(objective, tokenBudget)}
+        />
+      ) : null}
+
+      {goalBudgetOpen && selectedGoal?.status === "budgetLimited" ? (
+        <GoalBudgetDialog
+          goal={selectedGoal}
+          disabled={working}
+          onClose={() => !working && setGoalBudgetOpen(false)}
+          onSubmit={(tokenBudget) => void resumeBudgetLimitedGoal(tokenBudget)}
+        />
+      ) : null}
     </div>
   );
+}
+
+function NewTaskDialog({
+  draft,
+  models,
+  permissionConfig,
+  disabled,
+  choicesLoading,
+  choicesReady,
+  onChange,
+  onClose,
+  onSubmit,
+}: {
+  draft: NewTaskDraft;
+  models: readonly RuntimeModelDescriptor[];
+  permissionConfig: RuntimePermissionConfig | undefined;
+  disabled: boolean;
+  choicesLoading: boolean;
+  choicesReady: boolean;
+  onChange: (draft: NewTaskDraft) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  useDialogEscape(onClose, disabled);
+  const validation = validateNewTaskDraft(draft, models);
+  const reasoningLevels = availableReasoningLevels(models, draft.modelKey);
+  const serviceTiers = availableServiceTiers(models, draft.modelKey);
+  return (
+    <ModalFrame labelId="new-task-title" className="new-task-dialog" onClose={onClose} closeDisabled={disabled}>
+      <form onSubmit={(event) => { event.preventDefault(); if (validation.valid && !disabled) onSubmit(); }}>
+        <header className="modal-heading">
+          <div><p className="eyebrow">New task</p><h2 id="new-task-title">Create a new task</h2><p>Configure the runtime and launch work without opening a terminal.</p></div>
+          <button className="icon-button" type="button" aria-label="Close new task" disabled={disabled} onClick={onClose}><Icon name="close" /></button>
+        </header>
+        <div className="setup-flow" aria-label="Task setup steps">
+          <span><b>1</b> Outcome</span><span><b>2</b> Runtime</span><span><b>3</b> Goal</span>
+        </div>
+        <div className="modal-scroll">
+          <section className="form-section">
+            <div className="form-section-heading"><span>1</span><div><h3>Outcome</h3><p>Lead with the result Chili should own.</p></div></div>
+            <label className="field-label">
+              <span>Task title <em>optional</em></span>
+              <input
+                autoFocus
+                data-modal-initial-focus="true"
+                aria-label="Task title"
+                value={draft.title}
+                maxLength={240}
+                disabled={disabled}
+                onChange={(event) => onChange({ ...draft, title: event.target.value })}
+                placeholder="e.g. Harden the desktop control plane"
+              />
+            </label>
+            <label className="field-label">
+              <span>What should Chili accomplish?</span>
+              <textarea
+                aria-label="What should Chili accomplish?"
+                aria-invalid={Boolean(validation.errors.prompt)}
+                aria-describedby={validation.errors.prompt ? "new-task-prompt-error" : "new-task-prompt-help"}
+                value={draft.prompt}
+                disabled={disabled}
+                onChange={(event) => onChange({ ...draft, prompt: event.target.value })}
+                placeholder="Describe a verifiable outcome, constraints, and what done means…"
+                rows={5}
+              />
+              <small id="new-task-prompt-help">This becomes the first turn, or the autonomous Goal objective when Goal mode is on.</small>
+              {validation.errors.prompt ? <small className="field-error" id="new-task-prompt-error">{validation.errors.prompt}</small> : null}
+            </label>
+          </section>
+
+          <section className="form-section">
+            <div className="form-section-heading"><span>2</span><div><h3>Runtime</h3><p>Choose how this task thinks, acts, and delegates.</p></div></div>
+            <div className="form-grid">
+              <label className="field-label field-wide">
+                <span>Model</span>
+                <select
+                  aria-label="Model"
+                  value={draft.modelKey}
+                  disabled={disabled || choicesLoading || models.length === 0}
+                  onChange={(event) => onChange(reconcileNewTaskModel(draft, models, event.target.value))}
+                >
+                  {models.length === 0 ? <option value="">Runtime default</option> : null}
+                  {models.length > 0 && !models.some((model) => model.available !== false) ? <option value="">No available models</option> : null}
+                  {models.map((model) => (
+                    <option key={modelKey(model)} value={modelKey(model)} disabled={model.available === false}>
+                      {model.displayName ?? model.model} · {model.providerDisplayName ?? model.provider}{model.available === false ? " (unavailable)" : ""}
+                    </option>
+                  ))}
+                </select>
+                {validation.errors.model ? <small className="field-error">{validation.errors.model}</small> : null}
+              </label>
+              <label className="field-label">
+                <span>Reasoning</span>
+                <select aria-label="Reasoning" value={draft.reasoningLevel} disabled={disabled || choicesLoading} onChange={(event) => onChange({ ...draft, reasoningLevel: event.target.value as ReasoningLevel })}>
+                  {reasoningLevels.map((level) => <option value={level} key={level}>{reasoningLabel(level)}</option>)}
+                </select>
+              </label>
+              <label className="field-label">
+                <span>Service tier</span>
+                <select aria-label="Service tier" value={draft.serviceTier} disabled={disabled || choicesLoading || serviceTiers.length === 0} onChange={(event) => onChange({ ...draft, serviceTier: event.target.value as ServiceTierSelection })}>
+                  {serviceTiers.length === 0 ? <option value="">Provider default</option> : null}
+                  {serviceTiers.map((tier) => <option value={tier} key={tier}>{humanizeStatus(tier)}</option>)}
+                </select>
+                {serviceTiers.length === 0 ? <small>This provider does not expose a configurable service tier.</small> : null}
+                {validation.errors.serviceTier ? <small className="field-error">{validation.errors.serviceTier}</small> : null}
+              </label>
+              <label className="field-label">
+                <span>Runtime permission profile</span>
+                <select aria-label="Permission profile" value={draft.permissionProfile} disabled={disabled || choicesLoading} onChange={(event) => onChange({ ...draft, permissionProfile: event.target.value as RuntimePermissionProfileId })}>
+                  {!permissionConfig ? <option value={draft.permissionProfile}>Loading runtime permission…</option> : null}
+                  {(permissionConfig?.profiles ?? []).map((profile) => (
+                    <option key={profile.id} value={profile.id} disabled={Boolean(profile.disabledReason)}>{profile.label} · {profile.description}</option>
+                  ))}
+                </select>
+                <small className="scope-warning"><Icon name="shield" />Applies to every task until the local runtime restarts; restart returns to Default.</small>
+              </label>
+              <label className="field-label">
+                <span>Delegation</span>
+                <select aria-label="Delegation" value={draft.delegationPolicy} disabled={disabled || choicesLoading} onChange={(event) => onChange({ ...draft, delegationPolicy: event.target.value as DelegationPolicy })}>
+                  <option value="proactive">Proactive · delegate freely</option>
+                  <option value="explicit">Explicit · only when asked</option>
+                  <option value="off">Off · root agent only</option>
+                </select>
+              </label>
+            </div>
+          </section>
+
+          <section className={`form-section goal-setup-section ${draft.goalEnabled ? "enabled" : ""}`}>
+            <div className="form-section-heading"><span>3</span><div><h3>Overnight Goal</h3><p>Keep pursuing the outcome across turns until complete, paused, or budget-limited.</p></div></div>
+            <label className="goal-toggle">
+              <input
+                type="checkbox"
+                aria-label="Run as an overnight Goal"
+                checked={draft.goalEnabled}
+                disabled={disabled}
+                onChange={(event) => onChange({ ...draft, goalEnabled: event.target.checked })}
+              />
+              <span><strong>Run as an overnight Goal</strong><small>Starts autonomous continuation immediately after setup.</small></span>
+            </label>
+            {draft.goalEnabled ? (
+              <label className="field-label goal-budget-field">
+                <span>Token budget <em>optional</em></span>
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  min="1"
+                  step="1"
+                  aria-label="Token budget"
+                  aria-invalid={Boolean(validation.errors.tokenBudget)}
+                  value={draft.tokenBudget}
+                  disabled={disabled}
+                  onChange={(event) => onChange({ ...draft, tokenBudget: event.target.value })}
+                  placeholder="Default · 50,000"
+                />
+                <small>Leave blank to use the runtime default (50,000 tokens).</small>
+                {validation.errors.tokenBudget ? <small className="field-error">{validation.errors.tokenBudget}</small> : null}
+              </label>
+            ) : null}
+          </section>
+        </div>
+        <footer className="modal-actions">
+          <span>{choicesLoading ? "Loading model and runtime permission choices…" : !choicesReady ? "Runtime choices could not be loaded. Close and try again." : draft.goalEnabled ? "Chili will continue autonomously." : "One task starts with one turn."}</span>
+          <div><button className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="primary create-run-button" type="submit" disabled={disabled || choicesLoading || !choicesReady || !validation.valid}>{draft.goalEnabled ? "Create & start Goal" : "Create & run"}</button></div>
+        </footer>
+      </form>
+    </ModalFrame>
+  );
+}
+
+function RenameTaskDialog({
+  session,
+  disabled,
+  returnFocus,
+  onClose,
+  onSubmit,
+}: {
+  session: RuntimeSessionSummary;
+  disabled: boolean;
+  returnFocus: HTMLElement | null;
+  onClose: () => void;
+  onSubmit: (title: string) => void;
+}) {
+  const [title, setTitle] = useState(session.title ?? session.preview ?? "");
+  useDialogEscape(onClose, disabled);
+  return (
+    <ModalFrame labelId="rename-task-title" className="compact-dialog" onClose={onClose} closeDisabled={disabled} returnFocus={returnFocus}>
+      <form onSubmit={(event) => { event.preventDefault(); if (title.trim() && !disabled) onSubmit(title); }}>
+        <header className="modal-heading"><div><p className="eyebrow">Task</p><h2 id="rename-task-title">Rename task</h2><p>Use a name that makes this work easy to find later.</p></div></header>
+        <div className="compact-dialog-body"><label className="field-label"><span>Task title</span><input autoFocus data-modal-initial-focus="true" aria-label="New task title" value={title} maxLength={240} disabled={disabled} onChange={(event) => setTitle(event.target.value)} /></label></div>
+        <footer className="modal-actions"><span /><div><button className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="primary" type="submit" disabled={disabled || !title.trim()}>Save name</button></div></footer>
+      </form>
+    </ModalFrame>
+  );
+}
+
+function ArchiveTaskDialog({
+  session,
+  disabled,
+  archiveDisabled,
+  returnFocus,
+  onClose,
+  onArchive,
+}: {
+  session: RuntimeSessionSummary;
+  disabled: boolean;
+  archiveDisabled: boolean;
+  returnFocus: HTMLElement | null;
+  onClose: () => void;
+  onArchive: () => void;
+}) {
+  useDialogEscape(onClose, disabled);
+  return (
+    <ModalFrame labelId="archive-task-title" className="compact-dialog" onClose={onClose} closeDisabled={disabled} returnFocus={returnFocus}>
+      <div>
+        <header className="modal-heading"><div><p className="eyebrow">Archive</p><h2 id="archive-task-title">Archive task?</h2><p>{session.title || session.preview || "Untitled task"}</p></div></header>
+        <div className="compact-dialog-body archive-warning"><Icon name="archive" /><p>This removes the task from Active tasks. Archived tasks remain inspectable but are read-only and cannot be restored in this milestone.</p>{archiveDisabled ? <small>Stop the running task before archiving it.</small> : null}</div>
+        <footer className="modal-actions"><span /><div><button autoFocus data-modal-initial-focus="true" className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="danger" type="button" disabled={disabled || archiveDisabled} onClick={onArchive}>Archive task</button></div></footer>
+      </div>
+    </ModalFrame>
+  );
+}
+
+function SessionSettingsDialog({
+  config,
+  models,
+  disabled,
+  onClose,
+  onSubmit,
+}: {
+  config: DesktopSessionConfig;
+  models: readonly RuntimeModelDescriptor[];
+  disabled: boolean;
+  onClose: () => void;
+  onSubmit: (values: SessionSettingsValues) => void;
+}) {
+  const catalog = models.length > 0 ? models : config.model.models;
+  const initialModelKey = config.model.modelSelection ? modelKey(config.model.modelSelection) : (catalog[0] ? modelKey(catalog[0]) : "");
+  const initialModel = modelFromKey(catalog, initialModelKey);
+  const [values, setValues] = useState<SessionSettingsValues>({
+    modelKey: initialModelKey,
+    reasoningLevel: config.model.reasoningLevel ?? availableReasoningLevels(catalog, initialModelKey).at(-1) ?? "off",
+    serviceTier: preferredServiceTier(initialModel, config.model.serviceTier ?? ""),
+    permissionProfile: config.permission.profile,
+    delegationPolicy: config.delegation.policy,
+  });
+  useDialogEscape(onClose, disabled);
+  const reasoningLevels = availableReasoningLevels(catalog, values.modelKey);
+  const serviceTiers = availableServiceTiers(catalog, values.modelKey);
+  const selectedSettingsModel = modelFromKey(catalog, values.modelKey);
+  const settingsValid = Boolean(
+    selectedSettingsModel
+    && selectedSettingsModel.available !== false
+    && isServiceTierSelectionValid(selectedSettingsModel, values.serviceTier),
+  );
+  return (
+    <ModalFrame labelId="session-settings-title" className="settings-dialog" onClose={onClose} closeDisabled={disabled}>
+      <form onSubmit={(event) => { event.preventDefault(); if (!disabled) onSubmit(values); }}>
+        <header className="modal-heading"><div><p className="eyebrow">Runtime</p><h2 id="session-settings-title">Task runtime settings</h2><p>Changes apply to the next turn. Permission profile is shared by the runtime.</p></div><button className="icon-button" type="button" aria-label="Close task runtime settings" disabled={disabled} onClick={onClose}><Icon name="close" /></button></header>
+        <div className="modal-scroll settings-grid">
+          <label className="field-label field-wide"><span>Model</span><select autoFocus data-modal-initial-focus="true" aria-label="Task model" value={values.modelKey} disabled={disabled} onChange={(event) => {
+            const nextKey = event.target.value;
+            const nextReasoning = availableReasoningLevels(catalog, nextKey);
+            const nextModel = modelFromKey(catalog, nextKey);
+            setValues((current) => ({ ...current, modelKey: nextKey, reasoningLevel: nextReasoning.includes(current.reasoningLevel) ? current.reasoningLevel : nextReasoning.at(-1) ?? "off", serviceTier: preferredServiceTier(nextModel, current.serviceTier) }));
+          }}>{catalog.map((model) => <option key={modelKey(model)} value={modelKey(model)} disabled={model.available === false}>{model.displayName ?? model.model} · {model.providerDisplayName ?? model.provider}</option>)}</select></label>
+          <label className="field-label"><span>Reasoning</span><select aria-label="Task reasoning" value={values.reasoningLevel} disabled={disabled} onChange={(event) => setValues({ ...values, reasoningLevel: event.target.value as ReasoningLevel })}>{reasoningLevels.map((level) => <option key={level} value={level}>{reasoningLabel(level)}</option>)}</select></label>
+          <label className="field-label"><span>Service tier</span><select aria-label="Task service tier" value={values.serviceTier} disabled={disabled || serviceTiers.length === 0} onChange={(event) => setValues({ ...values, serviceTier: event.target.value as ServiceTierSelection })}>{serviceTiers.length === 0 ? <option value="">Provider default</option> : null}{serviceTiers.map((tier) => <option key={tier} value={tier}>{humanizeStatus(tier)}</option>)}</select>{serviceTiers.length === 0 ? <small>This provider does not expose a configurable service tier.</small> : null}</label>
+          <label className="field-label"><span>Runtime permission profile</span><select aria-label="Task permission profile" value={values.permissionProfile} disabled={disabled} onChange={(event) => setValues({ ...values, permissionProfile: event.target.value as RuntimePermissionProfileId })}>{config.permission.profiles.map((profile) => <option key={profile.id} value={profile.id} disabled={Boolean(profile.disabledReason)}>{profile.label}</option>)}</select><small className="scope-warning"><Icon name="shield" />Applies to every task until restart; restart returns to Default.</small></label>
+          <label className="field-label"><span>Delegation</span><select aria-label="Task delegation" value={values.delegationPolicy} disabled={disabled} onChange={(event) => setValues({ ...values, delegationPolicy: event.target.value as DelegationPolicy })}><option value="proactive">Proactive</option><option value="explicit">Explicit only</option><option value="off">Off</option></select></label>
+        </div>
+        <footer className="modal-actions"><span>{settingsValid ? "Settings are validated before crossing the renderer boundary." : "Choose an available model before saving."}</span><div><button className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="primary" type="submit" disabled={disabled || !settingsValid}>Save settings</button></div></footer>
+      </form>
+    </ModalFrame>
+  );
+}
+
+function GoalSetupDialog({
+  defaultObjective,
+  disabled,
+  onClose,
+  onSubmit,
+}: {
+  defaultObjective: string;
+  disabled: boolean;
+  onClose: () => void;
+  onSubmit: (objective: string, tokenBudget?: number) => void;
+}) {
+  const [objective, setObjective] = useState(defaultObjective);
+  const [budget, setBudget] = useState("");
+  useDialogEscape(onClose, disabled);
+  const budgetValid = !budget || (/^\d+$/.test(budget) && Number(budget) > 0 && Number.isSafeInteger(Number(budget)));
+  return (
+    <ModalFrame labelId="add-goal-title" className="compact-dialog goal-dialog" onClose={onClose} closeDisabled={disabled}>
+      <form onSubmit={(event) => { event.preventDefault(); if (objective.trim() && budgetValid && !disabled) onSubmit(objective.trim(), budget ? Number(budget) : undefined); }}>
+        <header className="modal-heading"><div><p className="eyebrow">Autonomous work</p><h2 id="add-goal-title">Add Goal</h2><p>The Goal starts immediately and continues across turns.</p></div></header>
+        <div className="compact-dialog-body"><label className="field-label"><span>Goal objective</span><textarea autoFocus data-modal-initial-focus="true" aria-label="Goal objective" rows={4} value={objective} disabled={disabled} onChange={(event) => setObjective(event.target.value)} /></label><label className="field-label"><span>Token budget <em>optional</em></span><input type="number" min="1" step="1" aria-label="Goal token budget" aria-invalid={!budgetValid} value={budget} disabled={disabled} onChange={(event) => setBudget(event.target.value)} placeholder="Default · 50,000" />{!budgetValid ? <small className="field-error">Token budget must be a positive whole number.</small> : <small>Leave blank to use the runtime default (50,000 tokens).</small>}</label></div>
+        <footer className="modal-actions"><span>Monitor or pause it from the Workbench.</span><div><button className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="primary" type="submit" disabled={disabled || !objective.trim() || !budgetValid}>Start Goal</button></div></footer>
+      </form>
+    </ModalFrame>
+  );
+}
+
+function GoalBudgetDialog({
+  goal,
+  disabled,
+  onClose,
+  onSubmit,
+}: {
+  goal: SessionGoal;
+  disabled: boolean;
+  onClose: () => void;
+  onSubmit: (tokenBudget: number) => void;
+}) {
+  const minimum = goalResumeBudgetMinimum(goal);
+  const [budget, setBudget] = useState(String(Math.max(minimum, Math.ceil(minimum * 1.25))));
+  const parsed = Number(budget);
+  const valid = /^\d+$/.test(budget) && Number.isSafeInteger(parsed) && parsed >= minimum;
+  useDialogEscape(onClose, disabled);
+  return (
+    <ModalFrame labelId="raise-goal-budget-title" className="compact-dialog goal-dialog" onClose={onClose} closeDisabled={disabled}>
+      <form onSubmit={(event) => { event.preventDefault(); if (valid && !disabled) onSubmit(parsed); }}>
+        <header className="modal-heading"><div><p className="eyebrow">Budget limited</p><h2 id="raise-goal-budget-title">Raise budget to resume</h2><p>This Goal used {formatTokenCount(goal.tokensUsed)} tokens. Its budget must increase before it can continue.</p></div></header>
+        <div className="compact-dialog-body"><label className="field-label"><span>New token budget</span><input autoFocus data-modal-initial-focus="true" type="number" min={minimum} step="1" aria-label="New Goal token budget" aria-invalid={!valid} value={budget} disabled={disabled} onChange={(event) => setBudget(event.target.value)} />{valid ? <small>Minimum {formatTokenCount(minimum)} tokens.</small> : <small className="field-error">Enter at least {formatTokenCount(minimum)} tokens.</small>}</label></div>
+        <footer className="modal-actions"><span>The Goal resumes only after the new budget is accepted.</span><div><button className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="primary" type="submit" disabled={disabled || !valid}>Update & resume Goal</button></div></footer>
+      </form>
+    </ModalFrame>
+  );
+}
+
+function ModalFrame({
+  labelId,
+  className,
+  onClose,
+  closeDisabled,
+  returnFocus,
+  children,
+}: {
+  labelId: string;
+  className: string;
+  onClose: () => void;
+  closeDisabled: boolean;
+  returnFocus?: HTMLElement | null;
+  children: ReactNode;
+}) {
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(
+    returnFocus ?? (typeof document !== "undefined" && document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null),
+  );
+
+  useLayoutEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const focusables = modalFocusables(dialog);
+    const initialFocus = dialog.querySelector<HTMLElement>("[data-modal-initial-focus]") ?? focusables[0] ?? dialog;
+    if (!dialog.contains(document.activeElement)) initialFocus.focus();
+
+    const appShell = document.querySelector<HTMLElement>(".app-shell");
+    const previousInert = appShell?.inert ?? false;
+    const previousAriaHidden = appShell ? appShell.getAttribute("aria-hidden") : null;
+    if (appShell) {
+      appShell.inert = true;
+      appShell.setAttribute("aria-hidden", "true");
+    }
+
+    return () => {
+      if (appShell) {
+        appShell.inert = previousInert;
+        if (previousAriaHidden === null) appShell.removeAttribute("aria-hidden");
+        else appShell.setAttribute("aria-hidden", previousAriaHidden);
+      }
+      const preferred = returnFocusRef.current;
+      window.requestAnimationFrame(() => {
+        if (preferred && canRestoreFocus(preferred)) {
+          preferred.focus();
+          return;
+        }
+        document.querySelector<HTMLElement>("[data-dialog-fallback-focus]")?.focus();
+      });
+    };
+  }, []);
+
+  const modal = (
+    <div className="modal-layer" role="presentation" onMouseDown={(event) => { if (!closeDisabled && event.target === event.currentTarget) onClose(); }}>
+      <section
+        ref={dialogRef}
+        className={`modal-card ${className}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={labelId}
+        tabIndex={-1}
+        onKeyDown={(event) => {
+          if (event.key !== "Tab") return;
+          const dialog = event.currentTarget;
+          const focusables = modalFocusables(dialog);
+          const currentIndex = focusables.indexOf(document.activeElement as HTMLElement);
+          const targetIndex = trappedTabTarget(currentIndex, focusables.length, event.shiftKey);
+          if (targetIndex === undefined) return;
+          event.preventDefault();
+          (focusables[targetIndex] ?? dialog).focus();
+        }}
+      >{children}</section>
+    </div>
+  );
+  return createPortal(modal, document.body);
+}
+
+const MODAL_FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled]):not([type='hidden'])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "summary",
+  "[tabindex]:not([tabindex='-1'])",
+].join(",");
+
+function modalFocusables(container: HTMLElement): HTMLElement[] {
+  return Array.from(container.querySelectorAll<HTMLElement>(MODAL_FOCUSABLE_SELECTOR))
+    .filter((element) => canRestoreFocus(element));
+}
+
+function menuItems(menu: HTMLElement): HTMLButtonElement[] {
+  return Array.from(menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not([disabled])'));
+}
+
+function canRestoreFocus(element: HTMLElement): boolean {
+  if (!element.isConnected || element.matches(":disabled") || element.closest("[inert]")) return false;
+  const style = window.getComputedStyle(element);
+  return style.display !== "none" && style.visibility !== "hidden";
+}
+
+function GoalCard({
+  goal,
+  disabled,
+  busy,
+  onStatus,
+  onRaiseBudget,
+  onClear,
+}: {
+  goal: SessionGoal;
+  disabled: boolean;
+  busy: boolean;
+  onStatus: (status: SessionGoalStatus) => void;
+  onRaiseBudget: () => void;
+  onClear: () => void;
+}) {
+  const progress = goalProgress(goal.tokensUsed, goal.tokenBudget);
+  return (
+    <div className="goal-card">
+      <p>{goal.objective}</p>
+      <div className="goal-metrics"><span>{formatTokenCount(goal.tokensUsed)} tokens</span><span>{formatGoalTime(goal.timeUsedSeconds)}</span></div>
+      {progress !== undefined ? (
+        <div className="goal-progress-row"><div className="goal-progress" role="progressbar" aria-label="Goal token budget used" aria-valuemin={0} aria-valuemax={goal.tokenBudget} aria-valuenow={goal.tokensUsed}><span style={{ width: `${progress * 100}%` }} /></div><small>{Math.round(progress * 100)}%</small></div>
+      ) : <small className="goal-unlimited">Runtime default budget · 50,000 tokens</small>}
+      <div className="goal-actions">
+        {goal.status === "active" ? <button className="secondary" disabled={disabled} onClick={() => onStatus("paused")}><Icon name="pause" />Pause Goal</button> : null}
+        {goal.status === "paused" ? <button className="primary" disabled={disabled || busy} onClick={() => onStatus("active")}><Icon name="resume" />Resume Goal</button> : null}
+        {goal.status === "budgetLimited" ? <button className="primary" disabled={disabled || busy} onClick={onRaiseBudget}><Icon name="budget" />Raise budget to resume</button> : null}
+        <button className="text-button danger-text" disabled={disabled || busy} onClick={onClear}>Clear Goal</button>
+      </div>
+    </div>
+  );
+}
+
+function useDialogEscape(close: () => void, disabled: boolean): void {
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (event.key !== "Escape" || disabled) return;
+      event.preventDefault();
+      close();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [close, disabled]);
 }
 
 function TimelineItem({ item }: { item: DesktopTimelineItem }) {
@@ -1271,6 +2307,7 @@ function UserInputCard({
             })}
           </div>
           <input
+            aria-label={`Custom answer for ${question.header}`}
             value={custom[question.id] ?? ""}
             onChange={(event) => {
               const value = event.target.value;
@@ -1288,8 +2325,9 @@ function UserInputCard({
   );
 }
 
-type IconName = "activity" | "chevron" | "close" | "folder" | "message" | "plus" | "queue"
-  | "send" | "shield" | "sidebar" | "steer" | "stop" | "terminal";
+type IconName = "activity" | "archive" | "budget" | "chevron" | "close" | "folder" | "message" | "more"
+  | "pause" | "plus" | "queue" | "resume" | "search" | "send" | "settings" | "shield" | "sidebar"
+  | "steer" | "stop" | "terminal";
 
 function ChiliMark() {
   return (
@@ -1307,12 +2345,19 @@ function Icon({ name }: { name: IconName }) {
     switch (name) {
       case "sidebar": return <><rect x="3" y="3" width="18" height="18" rx="3" /><path d="M9 3v18" /></>;
       case "activity": return <><path d="M4 12h3l2-5 4 10 2-5h5" /><path d="M4 4v16h16" /></>;
+      case "archive": return <><path d="M4 7h16v13H4V7Zm-1-3h18v4H3V4Z" /><path d="M9 12h6" /></>;
+      case "budget": return <><circle cx="12" cy="12" r="8" /><path d="M12 7v10M9 9.5c0-1.2 1.2-2 3-2s3 .8 3 2-1.2 2-3 2-3 .8-3 2 1.2 2 3 2 3-.8 3-2" /></>;
       case "plus": return <path d="M12 5v14M5 12h14" />;
       case "message": return <path d="M5 5h14v10H9l-4 4V5Z" />;
+      case "more": return <><circle cx="6" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="18" cy="12" r="1" fill="currentColor" stroke="none" /></>;
       case "folder": return <path d="M3.5 7.5h7l2-2h8v13h-17v-11Z" />;
       case "chevron": return <path d="m9 6 6 6-6 6" />;
       case "close": return <path d="m7 7 10 10M17 7 7 17" />;
       case "stop": return <rect x="7" y="7" width="10" height="10" rx="2" />;
+      case "pause": return <><path d="M9 7v10M15 7v10" /></>;
+      case "resume": return <><path d="M7 5v14l11-7-11-7Z" /></>;
+      case "search": return <><circle cx="10.5" cy="10.5" r="6" /><path d="m15 15 4 4" /></>;
+      case "settings": return <><circle cx="12" cy="12" r="3" /><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6 7 7M17 17l1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4" /></>;
       case "steer": return <path d="M5 18c0-4 2-6 6-6h8M15 8l4 4-4 4M5 6v4" />;
       case "queue": return <><path d="M5 7h14M5 12h9M5 17h6" /><path d="m16 15 3 3-3 3" /></>;
       case "send": return <path d="m5 12 14-7-4 14-3-6-7-1Zm7 1 7-8" />;
@@ -1363,6 +2408,41 @@ function formatWorkDuration(value: number): string {
   return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
 }
 
+function formatGoalTime(seconds: number): string {
+  if (seconds < 60) return `${Math.max(0, Math.round(seconds))}s active`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m active`;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  return `${hours}h${remainder ? ` ${remainder}m` : ""} active`;
+}
+
+function formatTokenCount(value: number): string {
+  return new Intl.NumberFormat(undefined, { notation: value >= 10_000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(value);
+}
+
+function goalStatusLabel(status: SessionGoalStatus): string {
+  return status === "budgetLimited" ? "budget limited" : status;
+}
+
+function reasoningLabel(level: ReasoningLevel): string {
+  return level === "off" ? "Off" : `${humanizeStatus(level)}${level === "high" ? " · recommended" : ""}`;
+}
+
+function createFailureMessage(result: DesktopCreateSessionResult): string {
+  const failure = result.failure;
+  if (!failure) return "Task setup did not complete.";
+  if (result.startState === "unknown") {
+    return `Task creation reached ${failure.stage.replaceAll("_", " ")}, but Chili could not confirm whether launch committed: ${failure.message}. Inspect the retained task before retrying to avoid a duplicate start.`;
+  }
+  const recovery = failure.permissionRestored
+    ? " The runtime permission profile was restored."
+    : result.startState === "not_started"
+      ? " The task was retained but did not start."
+      : " The created task was kept so you can recover it.";
+  return `Task setup stopped at ${failure.stage.replaceAll("_", " ")}: ${failure.message}.${recovery}`;
+}
+
 function humanizeToolTitle(value: string): string {
   const normalized = value.trim().toLowerCase().replaceAll("-", "_");
   if (normalized === "read" || normalized === "read_file") return "Read";
@@ -1388,6 +2468,16 @@ function refreshesDiff(event: ChiliEvent): boolean {
     || event.type === "turn.compaction_completed"
     || event.type === "turn.compaction_failed"
     || event.type === "session.status_changed";
+}
+
+function refreshesSessionConfig(event: ChiliEvent): boolean {
+  return event.type === "session.model_changed"
+    || event.type === "session.reasoning_changed"
+    || event.type === "session.service_tier_changed"
+    || event.type === "session.delegation_changed"
+    || event.type === "goal.updated"
+    || event.type === "goal.cleared"
+    || event.type.startsWith("mcp.");
 }
 
 function applyDesktopFrames(

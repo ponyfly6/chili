@@ -93,7 +93,7 @@ export function createDesktopWindow(): BrowserWindow {
   const window = new BrowserWindow({
     width: 1480,
     height: 940,
-    minWidth: 960,
+    minWidth: 390,
     minHeight: 620,
     show: false,
     backgroundColor: "#0d1010",

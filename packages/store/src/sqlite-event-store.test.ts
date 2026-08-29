@@ -24,8 +24,10 @@ import {
   SessionCwdConflictError,
   SessionRunClaimConflictError,
   SqliteEventStore,
+  SqliteJournalModeError,
   TeamTaskAlreadyExistsError,
 } from "./sqlite-event-store.js";
+import { sqliteJournalPolicy } from "./sqlite-journal-policy.js";
 
 test("round-trips assistant text phase without transforming the event payload", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-assistant-phase-"));
@@ -60,15 +62,21 @@ test("round-trips assistant text phase without transforming the event payload", 
   }
 });
 
-test("configures SQLite for bounded WAL maintenance", async () => {
+test("configures SQLite for safe bounded journal maintenance", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-wal-pragmas-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
 
   try {
     const db = sqliteDatabase(store);
-    expect(pragmaString(db, "journal_mode")).toBe("wal");
+    const sqliteVersion = String(db.query<{ version: string }, []>(
+      "select sqlite_version() as version",
+    ).get()?.version);
+    const journalPolicy = sqliteJournalPolicy(sqliteVersion);
+    expect(pragmaString(db, "journal_mode")).toBe(journalPolicy.journalMode);
     expect(pragmaNumber(db, "synchronous")).toBe(2);
-    expect(pragmaNumber(db, "wal_autocheckpoint")).toBe(256);
+    if (journalPolicy.journalMode === "wal") {
+      expect(pragmaNumber(db, "wal_autocheckpoint")).toBe(256);
+    }
     expect(pragmaNumber(db, "journal_size_limit")).toBe(16 * 1024 * 1024);
     expect(db.query<{ name: string }, []>(
       "select name from sqlite_master where type = 'index' and name = 'events_session_type_seq_idx'",
@@ -99,7 +107,7 @@ test("configures SQLite for bounded WAL maintenance", async () => {
   }
 });
 
-test("close checkpoints and truncates the WAL file", async () => {
+test("close checkpoints WAL stores and leaves rollback stores without a WAL", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-wal-close-"));
   const dbPath = join(dir, "events.sqlite");
   const store = new SqliteEventStore(dbPath);
@@ -111,11 +119,38 @@ test("close checkpoints and truncates the WAL file", async () => {
       index as TimestampMs,
     ));
     await store.appendMany(events);
-    expect(await fileSize(`${dbPath}-wal`)).toBeGreaterThan(0);
+    if (pragmaString(sqliteDatabase(store), "journal_mode") === "wal") {
+      expect(await fileSize(`${dbPath}-wal`)).toBeGreaterThan(0);
+    } else {
+      expect(await fileSize(`${dbPath}-wal`)).toBe(0);
+    }
     store.close();
     expect(await fileSize(`${dbPath}-wal`)).toBe(0);
   } finally {
     store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("affected SQLite fails closed when an active WAL peer prevents rollback fallback", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-store-wal-fail-closed-"));
+  const dbPath = join(dir, "events.sqlite");
+  const walPeer = new Database(dbPath, { create: true, strict: true });
+  const sqliteVersion = String(walPeer.query<{ version: string }, []>(
+    "select sqlite_version() as version",
+  ).get()?.version);
+
+  try {
+    if (sqliteJournalPolicy(sqliteVersion).walResetSafe) return;
+    walPeer.exec("pragma journal_mode = WAL");
+    walPeer.exec("create table peer_lock (value text)");
+
+    expect(() => new SqliteEventStore(dbPath, { busyTimeoutMs: 5 })).toThrow(
+      SqliteJournalModeError,
+    );
+    expect(pragmaString(walPeer, "journal_mode")).toBe("wal");
+  } finally {
+    walPeer.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

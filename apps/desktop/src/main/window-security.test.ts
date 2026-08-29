@@ -19,6 +19,8 @@ describe("production Electron security boundary", () => {
     expect(source).toContain("devTools: !app.isPackaged");
     expect(source).toContain("return app.isPackaged ? undefined : process.env.ELECTRON_RENDERER_URL");
     expect(source).toContain("trustedWebContents.has(webContents.id)");
+    expect(source).toContain("minWidth: 390");
+    expect(source).toContain("minHeight: 620");
     expect(security).toContain("connect-src 'none'");
     expect(source).not.toContain("Access-Control-Allow-Origin");
   });

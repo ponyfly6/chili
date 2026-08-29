@@ -22,6 +22,75 @@ describe("desktop IPC contracts", () => {
     })).toEqual({ type: "session.send", sessionId: "session_1", text: "continue", mode: "steer" });
   });
 
+  test("validates the complete New Task and Goal control surface", () => {
+    expect(parseDesktopRequest({
+      type: "sessions.create",
+      title: "Overnight",
+      prompt: "finish the release",
+      modelSelection: { provider: "openai", model: "gpt-5" },
+      reasoningLevel: "high",
+      serviceTier: "fast",
+      permissionProfile: "auto-review",
+      delegationPolicy: "proactive",
+      goal: { objective: "finish the release", tokenBudget: 20_000 },
+    })).toMatchObject({
+      type: "sessions.create",
+      goal: { objective: "finish the release", tokenBudget: 20_000 },
+    });
+    expect(() => parseDesktopRequest({
+      type: "sessions.create",
+      prompt: "one objective",
+      goal: { objective: "different objective" },
+    })).toThrow("Goal objective must match");
+    expect(() => parseDesktopRequest({
+      type: "sessions.create",
+      prompt: "work",
+      permissionProfile: "unrestricted",
+    })).toThrow("unsupported value");
+    expect(parseDesktopRequest({
+      type: "session.goal.update",
+      sessionId: "session_1",
+      status: "active",
+      tokenBudget: 40_000,
+    })).toMatchObject({ status: "active", tokenBudget: 40_000 });
+    expect(() => parseDesktopRequest({
+      type: "session.goal.update",
+      sessionId: "session_1",
+    })).toThrow("must change");
+  });
+
+  test("validates aggregate desktop session configuration", () => {
+    const request = parseDesktopRequest({ type: "session.config.get", sessionId: "session_1" });
+    expect(parseDesktopResponse(request, {
+      model: {
+        sessionId: "session_1",
+        availableReasoningLevels: ["low", "high"],
+        models: [{ provider: "openai", model: "gpt-5", available: true }],
+        modelSelection: { provider: "openai", model: "gpt-5" },
+        reasoningLevel: "high",
+        serviceTier: "fast",
+      },
+      permission: {
+        profile: "default",
+        profiles: [
+          { id: "default", label: "Default", description: "Review writes", current: true },
+          { id: "auto-review", label: "Auto review", description: "Review risky actions", current: false },
+        ],
+      },
+      delegation: { sessionId: "session_1", policy: "proactive", source: "session" },
+      goal: null,
+      mcp: {
+        servers: [{ name: "github", status: "running", enabled: true, toolCount: 4 }],
+        summary: { total: 1, running: 1, disabled: 0, authRequired: 0, errored: 0 },
+      },
+    })).toMatchObject({
+      model: { sessionId: "session_1", reasoningLevel: "high" },
+      delegation: { policy: "proactive" },
+      goal: null,
+      mcp: { summary: { running: 1 } },
+    });
+  });
+
   test("rejects unknown operations, fields, and invalid answers", () => {
     expect(() => parseDesktopRequest({ type: "shell.exec", command: "rm" })).toThrow();
     expect(() => parseDesktopRequest({ type: "app.state", token: "secret" })).toThrow("Unexpected request field");
@@ -365,8 +434,18 @@ describe("desktop IPC contracts", () => {
 
   test("validates responses at both ends of the IPC bridge", () => {
     const request = parseDesktopRequest({ type: "sessions.create" });
-    expect(parseDesktopResponse(request, { sessionId: "session_1" })).toEqual({ sessionId: "session_1" });
-    expect(() => parseDesktopResponse(request, { sessionId: "" })).toThrow("must not be empty");
+    expect(parseDesktopResponse(request, {
+      sessionId: "session_1",
+      status: "created",
+      startState: "not_started",
+      started: false,
+    })).toEqual({ sessionId: "session_1", status: "created", startState: "not_started", started: false });
+    expect(() => parseDesktopResponse(request, {
+      sessionId: "",
+      status: "created",
+      startState: "not_started",
+      started: false,
+    })).toThrow("must not be empty");
     expect(() => parseDesktopResponse(
       { type: "session.send", sessionId: "session_1", text: "hi", mode: "queue" },
       { status: "unknown" },

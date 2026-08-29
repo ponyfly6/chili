@@ -2100,6 +2100,189 @@ test("prompt, standalone goal, and compaction expose their held claim to nested 
   expect(nestedSessions).toEqual([promptSessionId, goalSessionId, compactSessionId]);
 });
 
+test("immediate Goal resume waits for the interrupted run to settle and starts exactly once", async () => {
+  const store = new MemoryEventStore();
+  const sessionId = "session_goal_pause_immediate_resume" as SessionId;
+  store.addSession(sessionId);
+  const runner = new FakeAgentRunner();
+  const firstTurnStarted = deferred<void>();
+  const releaseFirstTurn = deferred<void>();
+  const resumedTurnStarted = deferred<void>();
+  let service: RuntimeService;
+  runner.onRunTurn = async () => {
+    const turnNumber = runner.turnInputs.length;
+    if (turnNumber === 1) {
+      firstTurnStarted.resolve();
+      await releaseFirstTurn.promise;
+      runner.runTurnResult = {
+        status: "completed",
+        turnId: "turn_goal_before_pause" as TurnId,
+        assistantMessageId: "message_goal_before_pause" as MessageId,
+        finishReason: "stop",
+      };
+      return;
+    }
+    if (turnNumber === 2) {
+      resumedTurnStarted.resolve();
+      await service.updateGoal({ sessionId, status: "complete" });
+      runner.runTurnResult = {
+        status: "completed",
+        turnId: "turn_goal_after_resume" as TurnId,
+        assistantMessageId: "message_goal_after_resume" as MessageId,
+        finishReason: "stop",
+      };
+      return;
+    }
+    throw new Error(`Unexpected Goal turn: ${turnNumber}`);
+  };
+  service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  await service.setGoal({ sessionId, objective: "resume after pause" });
+  await firstTurnStarted.promise;
+  await service.updateGoal({ sessionId, status: "paused" });
+  await service.updateGoal({ sessionId, status: "active" });
+  await service.updateGoal({ sessionId, status: "active" });
+
+  expect(runner.turnInputs).toHaveLength(1);
+  releaseFirstTurn.resolve();
+  await resumedTurnStarted.promise;
+  while (service.isRunning(sessionId)) await Promise.resolve();
+  await Promise.resolve();
+
+  expect(runner.turnInputs).toHaveLength(2);
+  expect(await service.getGoal({ sessionId })).toMatchObject({ status: "complete" });
+  expect(statuses(store)).toEqual(["running", "cancelled", "running", "idle"]);
+});
+
+test("raising a budget-limited Goal during wrap-up defers one continuation until wrap-up settles", async () => {
+  const store = new MemoryEventStore();
+  const sessionId = "session_goal_budget_resume_during_wrapup" as SessionId;
+  store.addSession(sessionId);
+  const runner = new FakeAgentRunner();
+  const wrapUpStarted = deferred<void>();
+  const releaseWrapUp = deferred<void>();
+  const resumedTurnStarted = deferred<void>();
+  let service: RuntimeService;
+  runner.onRunTurn = async () => {
+    const turnNumber = runner.turnInputs.length;
+    if (turnNumber === 1) {
+      runner.runTurnResult = {
+        status: "completed",
+        turnId: "turn_goal_budget_limit" as TurnId,
+        assistantMessageId: "message_goal_budget_limit" as MessageId,
+        finishReason: "stop",
+        usage: { totalTokens: 1 },
+      };
+      return;
+    }
+    if (turnNumber === 2) {
+      wrapUpStarted.resolve();
+      await releaseWrapUp.promise;
+      runner.runTurnResult = {
+        status: "completed",
+        turnId: "turn_goal_budget_wrapup" as TurnId,
+        assistantMessageId: "message_goal_budget_wrapup" as MessageId,
+        finishReason: "stop",
+        usage: { totalTokens: 1 },
+      };
+      return;
+    }
+    if (turnNumber === 3) {
+      resumedTurnStarted.resolve();
+      await service.updateGoal({ sessionId, status: "complete" });
+      runner.runTurnResult = {
+        status: "completed",
+        turnId: "turn_goal_after_budget_resume" as TurnId,
+        assistantMessageId: "message_goal_after_budget_resume" as MessageId,
+        finishReason: "stop",
+        usage: { totalTokens: 0 },
+      };
+      return;
+    }
+    throw new Error(`Unexpected Goal turn: ${turnNumber}`);
+  };
+  service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  await service.setGoal({ sessionId, objective: "resume after budget wrap-up", tokenBudget: 1 });
+  await wrapUpStarted.promise;
+  expect(await service.getGoal({ sessionId })).toMatchObject({
+    status: "budgetLimited",
+    tokenBudget: 1,
+    tokensUsed: 1,
+  });
+
+  await service.updateGoal({ sessionId, tokenBudget: 100, status: "active" });
+  expect(runner.turnInputs).toHaveLength(2);
+  releaseWrapUp.resolve();
+  await resumedTurnStarted.promise;
+  while (service.isRunning(sessionId)) await Promise.resolve();
+  await Promise.resolve();
+
+  expect(runner.turnInputs).toHaveLength(3);
+  expect(await service.getGoal({ sessionId })).toMatchObject({
+    status: "complete",
+    tokenBudget: 100,
+    tokensUsed: 2,
+  });
+  expect(statuses(store)).toEqual(["running", "idle", "running", "idle"]);
+});
+
+test("an owning prompt acknowledges the active Goal it continues without bypassing the turn fence", async () => {
+  const store = new MemoryEventStore();
+  const sessionId = "session_prompt_acknowledges_deferred_goal" as SessionId;
+  store.addSession(sessionId);
+  const runner = new FakeAgentRunner();
+  const promptTurnStarted = deferred<void>();
+  const releasePromptTurn = deferred<void>();
+  runner.onRunTurn = async () => {
+    const turnNumber = runner.turnInputs.length;
+    if (turnNumber === 1) {
+      promptTurnStarted.resolve();
+      await releasePromptTurn.promise;
+    }
+    runner.runTurnResult = {
+      status: "completed",
+      turnId: `turn_prompt_goal_ack_${turnNumber}` as TurnId,
+      assistantMessageId: `message_prompt_goal_ack_${turnNumber}` as MessageId,
+      finishReason: "stop",
+    };
+  };
+  const service = new RuntimeService({
+    runtime: runner,
+    store,
+    cwd: "/repo",
+    maxGoalTurns: 1,
+    createId: createSequentialId(),
+    now: () => 1 as TimestampMs,
+  });
+
+  const prompt = service.submitPrompt({ sessionId, text: "start ordinary work" });
+  await promptTurnStarted.promise;
+  await service.setGoal({ sessionId, objective: "continue inside the owning prompt" });
+  releasePromptTurn.resolve();
+
+  await expect(prompt).resolves.toMatchObject({ status: "max_turns" });
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(service.isRunning(sessionId)).toBe(false);
+  expect(runner.turnInputs).toHaveLength(2);
+  expect(await service.getGoal({ sessionId })).toMatchObject({ status: "active" });
+  expect(statuses(store)).toEqual(["running", "running", "failed"]);
+});
+
 test("withSessionOperation aborts and fails closed when its durable lease is lost", async () => {
   const store = new LeaseControlledEventStore();
   const sessionId = "session_operation_lease_lost" as SessionId;

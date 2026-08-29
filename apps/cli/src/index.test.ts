@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "@chili/core";
 import type { SessionId } from "@chili/protocol";
@@ -388,6 +389,96 @@ test("real idle REPL exits after one SIGTERM and preserves the signal exit code"
   }
 }, 10_000);
 
+test("real CLI serve fails closed before a non-loopback unauthenticated bind", async () => {
+  const root = await mkdtemp(join(tmpdir(), "chili-cli-serve-auth-"));
+  const repo = join(root, "repo");
+  const chiliHome = join(root, "home");
+  const databasePath = join(repo, ".chili", "chili.sqlite");
+  const secretCanary = `CLI_BIND_SECRET_MUST_NOT_LEAK_${root}`;
+  const port = await availableIpv4Port();
+  let child: ReturnType<typeof Bun.spawn> | undefined;
+  try {
+    await mkdir(repo, { recursive: true });
+    const spawned = Bun.spawn({
+      cmd: [
+        process.execPath,
+        fileURLToPath(new URL("./index.ts", import.meta.url)),
+        "serve",
+        "--model",
+        "fake",
+        "--yes",
+        "--no-mcp",
+        "--cwd",
+        repo,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        String(port),
+      ],
+      cwd: repo,
+      env: {
+        ...process.env,
+        CHILI_HOME: chiliHome,
+        CHILI_TEST_SECRET_CANARY: secretCanary,
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      detached: true,
+    });
+    child = spawned;
+    const stdout = new Response(spawned.stdout).text();
+    const stderr = new Response(spawned.stderr).text();
+
+    const exitCode = await withTimeout(spawned.exited, 5_000);
+    const [output, errorOutput] = await withTimeout(Promise.all([stdout, stderr]), 1_000);
+
+    expect(exitCode).toBe(1);
+    expect(output).not.toContain("[server]");
+    expect(output).not.toContain("Press Ctrl+C to stop.");
+    expect(errorOutput).toContain(
+      'Refusing to bind runtime HTTP server to non-loopback host "0.0.0.0" '
+      + "without an authToken of at least 32 UTF-8 bytes",
+    );
+    expect(Buffer.byteLength(errorOutput, "utf8")).toBeLessThanOrEqual(4_096);
+    expect(`${output}\n${errorOutput}`).not.toContain(secretCanary);
+    expect(processExists(spawned.pid)).toBe(false);
+    if (process.platform !== "win32") expect(processGroupExists(spawned.pid)).toBe(false);
+
+    const database = new Database(databasePath, { create: false, strict: true });
+    try {
+      database.exec("pragma busy_timeout = 0");
+      database.exec("begin exclusive");
+      try {
+        expect(database.query<{ integrity_check: string }, []>("pragma integrity_check").get()?.integrity_check).toBe("ok");
+      } finally {
+        database.exec("rollback");
+      }
+    } finally {
+      database.close();
+    }
+
+    const rebound = Bun.serve({
+      hostname: "0.0.0.0",
+      port,
+      fetch: () => new Response("ok"),
+    });
+    try {
+      expect(rebound.port).toBe(port);
+    } finally {
+      await rebound.stop(true);
+    }
+  } finally {
+    if (child && child.pid > 1 && process.platform !== "win32" && processGroupExists(child.pid)) {
+      process.kill(-child.pid, "SIGKILL");
+    } else if (child?.exitCode === null) {
+      child.kill("SIGKILL");
+    }
+    if (child?.exitCode === null) await child.exited;
+    await rm(root, { recursive: true, force: true });
+  }
+}, 10_000);
+
 test("one serve shutdown signal aborts an in-flight synchronous prompt and drains exactly once", async () => {
   const root = await mkdtemp(join(tmpdir(), "chili-cli-serve-shutdown-"));
   const repo = join(root, "repo");
@@ -721,4 +812,44 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   return Promise.race([promise, timeout]).finally(() => {
     if (timer) clearTimeout(timer);
   });
+}
+
+async function availableIpv4Port(): Promise<number> {
+  const server = Bun.serve({
+    hostname: "0.0.0.0",
+    port: 0,
+    fetch: () => new Response("port probe"),
+  });
+  try {
+    if (server.port === undefined) {
+      throw new Error("Bun did not allocate an IPv4 probe port");
+    }
+    return server.port;
+  } finally {
+    await server.stop(true);
+  }
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (isNoSuchProcess(error)) return false;
+    throw error;
+  }
+}
+
+function processGroupExists(leaderPid: number): boolean {
+  try {
+    process.kill(-leaderPid, 0);
+    return true;
+  } catch (error) {
+    if (isNoSuchProcess(error)) return false;
+    throw error;
+  }
+}
+
+function isNoSuchProcess(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH";
 }

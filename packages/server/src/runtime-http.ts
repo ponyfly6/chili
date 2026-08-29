@@ -2,8 +2,17 @@ import {
   DELEGATION_POLICIES,
   isTransientEvent,
   normalizePersistedError,
+  parseRuntimeArray,
+  parseRuntimeBoolean,
+  parseRuntimeModelSelection,
+  parseRuntimeRecord,
+  parseRuntimeString,
+  parseRuntimeStringArray,
+  parseRuntimeStringRecord,
   parseUserInputAnswers,
+  rejectRuntimeUnknownFields,
   RUNTIME_PERMISSION_PROFILE_IDS,
+  RuntimeValidationError,
 } from "@chili/protocol";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { realpath } from "node:fs/promises";
@@ -265,12 +274,15 @@ export interface StartRuntimeHttpServerOptions extends RuntimeHttpHandlerOptions
   hostname?: string;
   port?: number;
   idleTimeout?: number;
+  tls?: Bun.TLSOptions | Bun.TLSOptions[];
 }
 
 export interface RuntimeHttpServer {
   url: string;
   close(): Promise<void>;
 }
+
+export const RUNTIME_HTTP_MINIMUM_REMOTE_AUTH_TOKEN_BYTES = 32;
 
 export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (request: Request) => Promise<Response> {
   const maxBacklogEvents = options.maxBacklogEvents ?? 5000;
@@ -295,6 +307,9 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
   return async function runtimeHttpHandler(request: Request): Promise<Response> {
     if (authTokenDigest && !hasValidBearerToken(request, authTokenDigest)) {
       return unauthorized();
+    }
+    if (isUnsafeHttpMethod(request.method) && request.headers.has("origin")) {
+      return jsonError(403, "Browser-originated runtime mutations are disabled");
     }
 
     const url = new URL(request.url);
@@ -321,7 +336,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "setPermissions") {
         if (!options.permissions) return jsonError(501, "No permission profile controller is configured");
-        const body = await readJson<PermissionsBody>(request);
+        const body = await readJson<PermissionsBody>(request, ["profile"]);
         if (!isRuntimePermissionProfileId(body.profile)) throw badRequest("profile must be default, auto-review, or full-access");
         return json(await options.permissions.set(body.profile));
       }
@@ -361,7 +376,9 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "mcpAdd") {
         const mcp = requireMcpControl(options);
         if (!mcp.add) return jsonError(501, "No MCP add controller is configured");
-        const body = await readJson<McpAddBody>(request);
+        const body = await readJson<McpAddBody>(request, [
+          "name", "transport", "command", "args", "env", "cwd", "url", "headers", "description", "enabled",
+        ]);
         const input = mcpAddInput(body);
         if (mcpAddCreatesStdioServer(input)) {
           return jsonError(403, "Adding stdio MCP servers over HTTP is disabled because it can execute local commands.");
@@ -392,7 +409,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "mcpAuth") {
         const mcp = requireMcpControl(options);
         if (!mcp.auth) return jsonError(501, "No MCP auth controller is configured");
-        return json(await mcp.auth(route.server, mcpAuthInput(await readJson<McpAuthBody>(request))));
+        return json(await mcp.auth(route.server, mcpAuthInput(await readJson<McpAuthBody>(request, ["callbackUrl", "scopes"]))));
       }
 
       if (route.name === "mcpLogout") {
@@ -408,7 +425,9 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "tasksReconcileStale") {
         const tasks = requireTaskControl(options);
-        const body = await readJson<TaskReconcileStaleBody>(request);
+        const body = await readJson<TaskReconcileStaleBody>(request, [
+          "parentSessionId", "staleAfterMs", "modes", "limit", "summary", "error",
+        ]);
         return json(await tasks.reconcileStaleTasks(reconcileStaleInput(body)));
       }
 
@@ -419,36 +438,35 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "taskFollowup") {
         const tasks = requireTaskControl(options);
-        const body = await readJson<TaskFollowupBody>(request);
+        const body = await readJson<TaskFollowupBody>(request, ["text", "maxTurns", "system"]);
         rejectLegacySystemField(body);
-        if (!body.text) throw badRequest("text is required");
         const input: AgentTaskFollowupInput = {
           taskId: route.taskId,
-          text: body.text,
+          text: stringField(body.text, "text"),
           signal: request.signal,
         };
-        if (body.maxTurns !== undefined) input.maxTurns = body.maxTurns;
+        if (body.maxTurns !== undefined) input.maxTurns = positiveInteger(body.maxTurns, "maxTurns");
         return json(serializeTaskFollowupResult(await tasks.followupTask(input)));
       }
 
       if (route.name === "taskWait") {
         const tasks = requireTaskControl(options);
-        const body = await readJson<TaskWaitBody>(request);
+        const body = await readJson<TaskWaitBody>(request, ["timeoutMs"]);
         const input: AgentTaskWaitInput = { taskId: route.taskId, signal: request.signal };
-        if (body.timeoutMs !== undefined) input.timeoutMs = body.timeoutMs;
+        if (body.timeoutMs !== undefined) input.timeoutMs = nonNegativeInteger(body.timeoutMs, "timeoutMs");
         return json(await tasks.waitForTask(input));
       }
 
       if (route.name === "taskClose") {
         const tasks = requireTaskControl(options);
-        const body = await readJson<TaskCloseBody>(request);
+        const body = await readJson<TaskCloseBody>(request, ["status", "summary", "error", "interrupt"]);
         const input: AgentTaskCloseInput = {
           taskId: route.taskId,
           status: closeStatus(body.status),
         };
-        if (body.summary) input.summary = body.summary;
-        if (body.error) input.error = body.error;
-        if (body.interrupt !== undefined) input.interrupt = body.interrupt;
+        if (body.summary !== undefined) input.summary = stringField(body.summary, "summary");
+        if (body.error !== undefined) input.error = stringField(body.error, "error");
+        if (body.interrupt !== undefined) input.interrupt = parseRuntimeBoolean(body.interrupt, "body.interrupt");
         return json(await tasks.closeTask(input));
       }
 
@@ -484,7 +502,9 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "createTeam") {
         const teams = requireTeams(options);
-        const body = await readJson<TeamCreateBody>(request);
+        const body = await readJson<TeamCreateBody>(request, [
+          "teamId", "sessionId", "name", "leadPath", "description", "leadName", "leadRole", "leadStatus", "leadWriteScope",
+        ]);
         if (!body.name) throw badRequest("name is required");
         if (!body.leadPath) throw badRequest("leadPath is required");
         const input = teamCreateInput(body);
@@ -500,7 +520,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "teamReconcileDispatches") {
         const dispatcher = requireTeamDispatcher(options);
-        const body = await readJson<TeamTaskReconcileBody>(request);
+        const body = await readJson<TeamTaskReconcileBody>(request, ["teamId", "sessionId", "limit"]);
         const input = teamTaskReconcileInput(route.teamId, body);
         await assertHttpTeamReconcileAuthority(options, input);
         return json(await dispatcher.reconcileTasks(input));
@@ -508,7 +528,9 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "teamRunLoop") {
         const runner = requireTeamRunner(options);
-        const body = await readJson<TeamRunLoopBody>(request);
+        const body = await readJson<TeamRunLoopBody>(request, [
+          "teamId", "sessionId", "cwd", "mode", "once", "maxCycles", "timeoutMs", "pollIntervalMs",
+        ]);
         const input = teamRunLoopInput(route.teamId, body);
         const team = await requireHttpTeam(options, route.teamId);
         if (team.status !== "active") {
@@ -529,7 +551,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "teamMerge") {
         const merger = requireTeamMerger(options);
-        const body = await readJson<TeamMergeBody>(request);
+        const body = await readJson<TeamMergeBody>(request, ["teamId", "sessionId", "taskId", "cwd"]);
         const input = teamMergeInput(route.teamId, body);
         const authority = await resolveHttpTeamAuthority(options, route.teamId, input.sessionId, input.cwd);
         input.sessionId = authority.sessionId;
@@ -550,7 +572,9 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "teamAddMember") {
         const teams = requireTeams(options);
-        const body = await readJson<TeamMemberBody>(request);
+        const body = await readJson<TeamMemberBody>(request, [
+          "teamId", "sessionId", "path", "name", "role", "status", "childSessionId", "model", "toolScope", "writeScope",
+        ]);
         if (!body.path) throw badRequest("path is required");
         if (!body.name) throw badRequest("name is required");
         if (!body.role) throw badRequest("role is required");
@@ -568,7 +592,9 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "teamCreateTask") {
         const teams = requireTeams(options);
-        const body = await readJson<TeamTaskCreateBody>(request);
+        const body = await readJson<TeamTaskCreateBody>(request, [
+          "teamId", "sessionId", "taskId", "title", "description", "createdBy", "ownerPath", "dependsOn", "status", "metadata",
+        ]);
         if (!body.title) throw badRequest("title is required");
         const input = teamTaskCreateInput(route.teamId, body);
         return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
@@ -579,7 +605,9 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "teamAssignTask") {
         const teams = requireTeams(options);
-        const body = await readJson<TeamTaskAssignBody>(request);
+        const body = await readJson<TeamTaskAssignBody>(request, [
+          "teamId", "taskId", "sessionId", "ownerPath", "assignedBy", "message", "messageDelivery", "messageSummary",
+        ]);
         if (!body.ownerPath) throw badRequest("ownerPath is required");
         const input = teamTaskAssignInput(route.teamId, route.taskId, body);
         return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
@@ -590,7 +618,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "teamClaimTask") {
         const teams = requireTeams(options);
-        const body = await readJson<TeamTaskClaimBody>(request);
+        const body = await readJson<TeamTaskClaimBody>(request, ["teamId", "taskId", "sessionId", "ownerPath", "claimedBy"]);
         if (!body.ownerPath) throw badRequest("ownerPath is required");
         const input = teamTaskClaimInput(route.teamId, route.taskId, body);
         return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
@@ -601,7 +629,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "teamDispatchTask") {
         const dispatcher = requireTeamDispatcher(options);
-        const body = await readJson<TeamTaskDispatchBody>(request);
+        const body = await readJson<TeamTaskDispatchBody>(request, ["teamId", "taskId", "sessionId", "ownerPath", "cwd", "mode", "prompt"]);
         const input = teamTaskDispatchInput(route.teamId, route.taskId, body);
         const authority = await resolveHttpTeamAuthority(options, route.teamId, input.sessionId, input.cwd);
         input.sessionId = authority.sessionId;
@@ -614,7 +642,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "teamSyncTask") {
         const dispatcher = requireTeamDispatcher(options);
-        const body = await readJson<TeamContextBody>(request);
+        const body = await readJson<TeamContextBody>(request, ["teamId", "taskId", "sessionId"]);
         const input = teamTaskSyncInput(route.teamId, route.taskId, body);
         const authority = await resolveHttpTeamAuthority(options, route.teamId, input.sessionId, undefined);
         input.sessionId = authority.sessionId;
@@ -623,7 +651,9 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "teamUpdateTask") {
         const teams = requireTeams(options);
-        const body = await readJson<TeamTaskUpdateBody>(request);
+        const body = await readJson<TeamTaskUpdateBody>(request, [
+          "teamId", "taskId", "sessionId", "status", "ownerPath", "title", "description", "dependsOn", "summary", "error", "metadata",
+        ]);
         const input = teamTaskUpdateInput(route.teamId, route.taskId, body);
         return json(await withHttpTeamOwnerMutation(options, route.teamId, input.sessionId, async (authority) => {
           input.sessionId = authority.sessionId;
@@ -638,7 +668,9 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "teamSendMessage") {
         const teams = requireTeams(options);
-        const body = await readJson<TeamMessageBody>(request);
+        const body = await readJson<TeamMessageBody>(request, [
+          "teamId", "sessionId", "messageId", "from", "to", "content", "kind", "delivery", "taskId", "summary", "metadata",
+        ]);
         if (!body.from) throw badRequest("from is required");
         if (!body.to) throw badRequest("to is required");
         if (!body.content) throw badRequest("content is required");
@@ -667,7 +699,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       }
 
       if (route.name === "createSession") {
-        const body = await readJson<CreateSessionBody>(request);
+        const body = await readJson<CreateSessionBody>(request, ["sessionId", "cwd"]);
         const input: { sessionId?: SessionId; cwd?: string } = {};
         if (body.sessionId !== undefined) input.sessionId = requestSessionId(body.sessionId);
         if (body.cwd !== undefined) input.cwd = await requestWorkspaceCwd(body.cwd);
@@ -716,9 +748,8 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         await requireSession(options.store, route.sessionId);
         await options.service.assertSessionTurnAllowed(route.sessionId);
         if (!options.service.renameSession) return jsonError(501, "Session rename is not available from this runtime");
-        const body = await readJson<RenameSessionBody>(request);
-        const title = body.title?.trim().replace(/\s+/g, " ") ?? "";
-        if (!title) throw badRequest("title is required");
+        const body = await readJson<RenameSessionBody>(request, ["title"]);
+        const title = stringField(body.title, "title").replace(/\s+/g, " ");
         if (title.length > 120) throw badRequest("title must be 120 characters or fewer");
         await options.service.renameSession(route.sessionId, title);
         const renamed = (await options.store.sessions()).find((session) => session.id === route.sessionId);
@@ -734,7 +765,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "setModel") {
         await requireSession(options.store, route.sessionId);
         await options.service.assertSessionTurnAllowed(route.sessionId);
-        const body = await readJson<ModelBody>(request);
+        const body = await readJson<ModelBody>(request, ["modelSelection"]);
         if (!isModelSelection(body.modelSelection)) throw badRequest("modelSelection with provider and model is required");
         return json(await requireModelControl(options).setModel({
           sessionId: route.sessionId,
@@ -745,7 +776,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "setReasoning") {
         await requireSession(options.store, route.sessionId);
         await options.service.assertSessionTurnAllowed(route.sessionId);
-        const body = await readJson<ReasoningBody>(request);
+        const body = await readJson<ReasoningBody>(request, ["reasoningLevel"]);
         if (!isReasoningLevel(body.reasoningLevel)) {
           throw badRequest("reasoningLevel must be off, minimal, low, medium, high, xhigh, max, or ultra");
         }
@@ -758,7 +789,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "setServiceTier") {
         await requireSession(options.store, route.sessionId);
         await options.service.assertSessionTurnAllowed(route.sessionId);
-        const body = await readJson<ServiceTierBody>(request);
+        const body = await readJson<ServiceTierBody>(request, ["serviceTier"]);
         if (!isServiceTier(body.serviceTier)) {
           throw badRequest("serviceTier must be standard or fast");
         }
@@ -776,7 +807,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "setDelegationPolicy") {
         await requireSession(options.store, route.sessionId);
         await options.service.assertSessionTurnAllowed(route.sessionId);
-        const body = await readJson<DelegationBody>(request);
+        const body = await readJson<DelegationBody>(request, ["policy"]);
         if (!isDelegationPolicy(body.policy)) {
           throw badRequest("policy must be off, explicit, or proactive");
         }
@@ -795,14 +826,14 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
           return goal ? json(goal) : new Response(null, { status: 204 });
         }
         if (request.method === "POST") {
-          const body = await readJson<GoalBody>(request);
+          const body = await readJson<GoalBody>(request, ["objective", "tokenBudget", "replace"]);
           const input = goalSetInput(route.sessionId, body);
           await options.service.assertSessionTurnAllowed(route.sessionId);
           await requireSession(options.store, route.sessionId);
           return json(await goals.setGoal(input), 201);
         }
         if (request.method === "PATCH") {
-          const body = await readJson<GoalBody>(request);
+          const body = await readJson<GoalBody>(request, ["status", "objective", "tokenBudget"]);
           const input = goalUpdateInput(route.sessionId, body);
           await options.service.assertSessionTurnAllowed(route.sessionId);
           await requireSession(options.store, route.sessionId);
@@ -817,7 +848,9 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       }
 
       if (route.name === "prompt" || route.name === "promptAsync") {
-        const body = await readJson<PromptBody>(request);
+        const body = await readJson<PromptBody>(request, [
+          "text", "displayText", "images", "skillMentions", "cwd", "maxTurns", "modelSelection", "reasoningLevel", "serviceTier", "system",
+        ]);
         rejectLegacySystemField(body);
         const promptImages = parsePromptImages(body.images);
         if (!body.text && promptImages.length === 0) throw badRequest("text is required");
@@ -841,7 +874,9 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       }
 
       if (route.name === "command" || route.name === "commandAsync") {
-        const body = await readJson<CommandPromptBody>(request);
+        const body = await readJson<CommandPromptBody>(request, [
+          "commandId", "name", "args", "cwd", "modelSelection", "reasoningLevel", "serviceTier",
+        ]);
         await options.service.assertSessionTurnAllowed(route.sessionId);
         const session = await requireSession(options.store, route.sessionId);
         if (typeof body.commandId !== "string" || body.commandId.trim().length === 0) {
@@ -882,9 +917,10 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       }
 
       if (route.name === "interrupt") {
-        const body = await readJson<InterruptBody>(request);
+        const body = await readJson<InterruptBody>(request, ["reason"]);
+        const reason = body.reason === undefined ? undefined : stringField(body.reason, "reason");
         const result: RuntimeInterruptResult = {
-          interrupted: await options.service.interrupt(route.sessionId, body.reason),
+          interrupted: await options.service.interrupt(route.sessionId, reason),
         };
         return json(result);
       }
@@ -977,11 +1013,17 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
   };
 }
 
+function isUnsafeHttpMethod(method: string): boolean {
+  return method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
+}
+
 export function startRuntimeHttpServer(options: StartRuntimeHttpServerOptions): RuntimeHttpServer {
+  assertRuntimeHttpServerAuthentication(options.hostname, options.authToken, options.tls);
   const server = Bun.serve({
     hostname: options.hostname ?? "127.0.0.1",
     port: options.port ?? 0,
     idleTimeout: options.idleTimeout ?? 255,
+    ...(options.tls !== undefined ? { tls: options.tls } : {}),
     fetch: createRuntimeHttpHandler(options),
   });
 
@@ -991,6 +1033,48 @@ export function startRuntimeHttpServer(options: StartRuntimeHttpServerOptions): 
       await server.stop(true);
     },
   };
+}
+
+/**
+ * Remote binds expose task execution and filesystem-affecting controls. Keep
+ * loopback development compatible, but require a high-entropy bearer secret
+ * and an explicit certificate/private-key pair before Bun opens any other
+ * interface.
+ */
+export function assertRuntimeHttpServerAuthentication(
+  hostname: string | undefined,
+  authToken: string | undefined,
+  tls?: Bun.TLSOptions | Bun.TLSOptions[],
+): void {
+  const effectiveHostname = hostname === undefined ? "127.0.0.1" : hostname;
+  if (isLoopbackBindHostname(effectiveHostname)) return;
+  const tokenBytes = typeof authToken === "string"
+    ? new TextEncoder().encode(authToken).byteLength
+    : 0;
+  if (tokenBytes < RUNTIME_HTTP_MINIMUM_REMOTE_AUTH_TOKEN_BYTES) {
+    throw new Error(
+      `Refusing to bind runtime HTTP server to non-loopback host ${JSON.stringify(diagnosticHostname(effectiveHostname))} without an authToken of at least ${RUNTIME_HTTP_MINIMUM_REMOTE_AUTH_TOKEN_BYTES} UTF-8 bytes`,
+    );
+  }
+  if (!hasExplicitTlsCredentials(tls)) {
+    throw new Error(
+      `Refusing to bind runtime HTTP server to non-loopback host ${JSON.stringify(diagnosticHostname(effectiveHostname))} without explicit TLS cert and key`,
+    );
+  }
+}
+
+export function isLoopbackBindHostname(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase();
+  if (!normalized) return false;
+  const unbracketed = normalized.startsWith("[") && normalized.endsWith("]")
+    ? normalized.slice(1, -1)
+    : normalized;
+  if (unbracketed === "localhost" || unbracketed.endsWith(".localhost")) return true;
+  if (unbracketed === "::1") return true;
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(unbracketed);
+  if (!ipv4) return false;
+  const octets = ipv4.slice(1).map(Number);
+  return octets.every((octet) => octet >= 0 && octet <= 255) && octets[0] === 127;
 }
 
 type Route =
@@ -1063,33 +1147,33 @@ type Route =
   | { name: "notFound" };
 
 interface CreateSessionBody {
-  sessionId?: SessionId;
+  sessionId?: unknown;
   cwd?: unknown;
 }
 
 interface RenameSessionBody {
-  title?: string;
+  title?: unknown;
 }
 
 interface PromptBody {
-  text?: string;
-  displayText?: string;
+  text?: unknown;
+  displayText?: unknown;
   images?: unknown;
   skillMentions?: unknown;
   cwd?: unknown;
-  maxTurns?: number;
-  modelSelection?: ModelSelection;
-  reasoningLevel?: ReasoningLevel;
-  serviceTier?: ServiceTier;
+  maxTurns?: unknown;
+  modelSelection?: unknown;
+  reasoningLevel?: unknown;
+  serviceTier?: unknown;
 }
 
 interface CommandPromptBody {
   commandId?: unknown;
   args?: unknown;
   cwd?: unknown;
-  modelSelection?: ModelSelection;
-  reasoningLevel?: ReasoningLevel;
-  serviceTier?: ServiceTier;
+  modelSelection?: unknown;
+  reasoningLevel?: unknown;
+  serviceTier?: unknown;
 }
 
 interface ModelBody {
@@ -1142,130 +1226,131 @@ interface McpAuthBody {
 }
 
 interface TaskFollowupBody {
-  text?: string;
-  maxTurns?: number;
+  text?: unknown;
+  maxTurns?: unknown;
 }
 
 interface TaskWaitBody {
-  timeoutMs?: number;
+  timeoutMs?: unknown;
 }
 
 interface TaskCloseBody {
   status?: unknown;
-  summary?: string;
-  error?: string;
-  interrupt?: boolean;
+  summary?: unknown;
+  error?: unknown;
+  interrupt?: unknown;
 }
 
 interface TaskReconcileStaleBody {
   parentSessionId?: unknown;
-  staleAfterMs?: number;
+  staleAfterMs?: unknown;
   modes?: unknown;
-  limit?: number;
-  summary?: string;
-  error?: string;
+  limit?: unknown;
+  summary?: unknown;
+  error?: unknown;
 }
 
 interface TeamContextBody {
-  sessionId?: SessionId;
+  sessionId?: unknown;
+  teamId?: unknown;
+  taskId?: unknown;
 }
 
 interface TeamCreateBody extends TeamContextBody {
-  teamId?: TeamId;
-  name?: string;
-  leadPath?: AgentPath;
-  description?: string;
-  leadName?: string;
-  leadRole?: string;
+  name?: unknown;
+  leadPath?: unknown;
+  description?: unknown;
+  leadName?: unknown;
+  leadRole?: unknown;
   leadStatus?: unknown;
-  leadWriteScope?: string[];
+  leadWriteScope?: unknown;
 }
 
 interface TeamMemberBody extends TeamContextBody {
-  path?: AgentPath;
-  name?: string;
-  role?: string;
+  path?: unknown;
+  name?: unknown;
+  role?: unknown;
   status?: unknown;
-  childSessionId?: SessionId;
-  model?: string;
-  toolScope?: string[];
-  writeScope?: string[];
+  childSessionId?: unknown;
+  model?: unknown;
+  toolScope?: unknown;
+  writeScope?: unknown;
 }
 
 interface TeamTaskCreateBody extends TeamContextBody {
-  taskId?: TaskId;
-  title?: string;
-  description?: string;
-  createdBy?: AgentPath;
-  ownerPath?: AgentPath;
-  dependsOn?: TaskId[];
+  taskId?: unknown;
+  title?: unknown;
+  description?: unknown;
+  createdBy?: unknown;
+  ownerPath?: unknown;
+  dependsOn?: unknown;
   status?: unknown;
-  metadata?: Record<string, unknown>;
+  metadata?: unknown;
 }
 
 interface TeamTaskAssignBody extends TeamContextBody {
-  ownerPath?: AgentPath;
-  assignedBy?: AgentPath;
-  message?: string;
+  ownerPath?: unknown;
+  assignedBy?: unknown;
+  message?: unknown;
   messageDelivery?: unknown;
-  messageSummary?: string;
+  messageSummary?: unknown;
 }
 
 interface TeamTaskClaimBody extends TeamContextBody {
-  ownerPath?: AgentPath;
-  claimedBy?: AgentPath;
+  ownerPath?: unknown;
+  claimedBy?: unknown;
 }
 
 interface TeamTaskDispatchBody extends TeamContextBody {
-  ownerPath?: AgentPath;
-  cwd?: string;
-  mode?: string;
-  prompt?: string;
+  ownerPath?: unknown;
+  cwd?: unknown;
+  mode?: unknown;
+  prompt?: unknown;
 }
 
 interface TeamTaskReconcileBody extends TeamContextBody {
-  limit?: number;
+  limit?: unknown;
 }
 
 interface TeamRunLoopBody extends TeamContextBody {
   cwd?: unknown;
-  mode?: string;
-  once?: boolean;
-  maxCycles?: number;
-  timeoutMs?: number;
-  pollIntervalMs?: number;
+  mode?: unknown;
+  once?: unknown;
+  maxCycles?: unknown;
+  timeoutMs?: unknown;
+  pollIntervalMs?: unknown;
 }
 
 interface TeamMergeBody extends TeamContextBody {
-  taskId?: TaskId;
+  taskId?: unknown;
   cwd?: unknown;
 }
 
 interface TeamTaskUpdateBody extends TeamContextBody {
   status?: unknown;
-  ownerPath?: AgentPath;
-  title?: string;
-  description?: string;
-  dependsOn?: TaskId[];
-  summary?: string;
-  error?: string;
-  metadata?: Record<string, unknown>;
+  ownerPath?: unknown;
+  title?: unknown;
+  description?: unknown;
+  dependsOn?: unknown;
+  summary?: unknown;
+  error?: unknown;
+  metadata?: unknown;
 }
 
 interface TeamMessageBody extends TeamContextBody {
-  messageId?: string;
-  from?: string;
-  to?: string | "*";
-  content?: string;
+  messageId?: unknown;
+  from?: unknown;
+  to?: unknown;
+  content?: unknown;
   kind?: unknown;
   delivery?: unknown;
-  taskId?: TaskId;
-  summary?: string;
-  metadata?: Record<string, unknown>;
+  taskId?: unknown;
+  summary?: unknown;
+  metadata?: unknown;
 }
 
 interface InterruptBody {
-  reason?: string;
+  reason?: unknown;
 }
 
 interface SessionEventWindowLimits {
@@ -1458,18 +1543,32 @@ function routeRequest(method: string, pathname: string): Route {
 function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody, parsedImages?: readonly MessageImageContent[]): SubmitPromptInput {
   const input: SubmitPromptInput = {
     sessionId,
-    text: body.text ?? "",
+    text: body.text === undefined
+      ? ""
+      : parseRuntimeString(body.text, "body.text", { allowEmpty: true }),
   };
-  if (body.displayText) input.displayText = body.displayText;
+  if (body.displayText !== undefined) {
+    input.displayText = parseRuntimeString(body.displayText, "body.displayText", { allowEmpty: true });
+  }
   const images = parsedImages ?? parsePromptImages(body.images);
   if (images.length > 0) input.images = images;
   if (typeof body.cwd === "string" && body.cwd.trim().length > 0) input.cwd = body.cwd;
   const skillMentions = parseSkillMentions(body.skillMentions);
   if (skillMentions.length > 0) input.skillMentions = skillMentions;
-  if (body.maxTurns !== undefined) input.maxTurns = body.maxTurns;
-  if (isModelSelection(body.modelSelection)) input.modelSelection = body.modelSelection;
-  if (isReasoningLevel(body.reasoningLevel)) input.reasoningLevel = body.reasoningLevel;
-  if (isServiceTier(body.serviceTier)) input.serviceTier = body.serviceTier;
+  if (body.maxTurns !== undefined) input.maxTurns = positiveInteger(body.maxTurns, "maxTurns");
+  if (body.modelSelection !== undefined) {
+    input.modelSelection = parseRuntimeModelSelection(body.modelSelection, "body.modelSelection");
+  }
+  if (body.reasoningLevel !== undefined) {
+    if (!isReasoningLevel(body.reasoningLevel)) {
+      throw badRequest("reasoningLevel must be off, minimal, low, medium, high, xhigh, max, or ultra");
+    }
+    input.reasoningLevel = body.reasoningLevel;
+  }
+  if (body.serviceTier !== undefined) {
+    if (!isServiceTier(body.serviceTier)) throw badRequest("serviceTier must be standard or fast");
+    input.serviceTier = body.serviceTier;
+  }
   return input;
 }
 
@@ -1511,7 +1610,7 @@ function goalSetInput(sessionId: SessionId, body: GoalBody): {
   };
   const tokenBudget = optionalPositiveInteger(body.tokenBudget, "tokenBudget");
   if (tokenBudget !== undefined) input.tokenBudget = tokenBudget;
-  if (body.replace !== undefined) input.replace = Boolean(body.replace);
+  if (body.replace !== undefined) input.replace = parseRuntimeBoolean(body.replace, "body.replace");
   return input;
 }
 
@@ -1553,32 +1652,35 @@ function optionalGoalStatus(value: unknown): SessionGoalStatus | undefined {
 
 function optionalPositiveInteger(value: unknown, field: string): number | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
-    throw badRequest(`${field} must be a positive integer`);
+  return positiveInteger(value, field);
+}
+
+function positiveInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw badRequest(`${field} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function nonNegativeInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw badRequest(`${field} must be a non-negative safe integer`);
   }
   return value;
 }
 
 function stringField(value: unknown, field: string): string {
-  if (typeof value !== "string" || value.trim().length === 0) throw badRequest(`${field} must be a non-empty string`);
-  return value.trim();
+  const text = parseRuntimeString(value, `body.${field}`);
+  if (text.trim().length === 0) throw badRequest(`${field} must be a non-empty string`);
+  return text.trim();
 }
 
 function stringArrayField(value: unknown, field: string): string[] {
-  if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) {
-    throw badRequest(`${field} must be an array of strings`);
-  }
-  return value;
+  return parseRuntimeStringArray(value, `body.${field}`);
 }
 
 function stringRecordField(value: unknown, field: string): Record<string, string> {
-  if (!isRecord(value) || Array.isArray(value)) throw badRequest(`${field} must be an object of strings`);
-  const result: Record<string, string> = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (typeof item !== "string") throw badRequest(`${field}.${key} must be a string`);
-    result[key] = item;
-  }
-  return result;
+  return parseRuntimeStringRecord(value, `body.${field}`);
 }
 
 function parseSkillMentions(value: unknown): RuntimeSkillMention[] {
@@ -2551,12 +2653,26 @@ async function requestWorkspaceCwd(value: unknown): Promise<string> {
 }
 
 function requestSessionId(value: unknown, field = "sessionId"): SessionId {
+  return requestIdentifier<SessionId>(value, field);
+}
+
+function requestIdentifier<T extends string = string>(value: unknown, field = "id"): T {
   if (typeof value !== "string") throw badRequest(`${field} must be a string when provided`);
-  const sessionId = value.trim();
-  if (!sessionId) throw badRequest(`${field} must not be empty`);
-  if (sessionId.length > 512) throw badRequest(`${field} must not exceed 512 characters`);
-  if (/[\u0000-\u001f\u007f]/u.test(sessionId)) throw badRequest(`${field} must be valid text`);
-  return sessionId as SessionId;
+  const identifier = value.trim();
+  if (!identifier) throw badRequest(`${field} must not be empty`);
+  if (identifier.length > 512) throw badRequest(`${field} must not exceed 512 characters`);
+  if (/[\u0000-\u001f\u007f]/u.test(identifier)) throw badRequest(`${field} must be valid text`);
+  return identifier as T;
+}
+
+function requestAgentPath(value: unknown, field: string): AgentPath {
+  const path = requestIdentifier<string>(value, field);
+  if (!path.startsWith("/")) throw badRequest(`${field} must be an absolute agent path`);
+  return path as AgentPath;
+}
+
+function requestIdentifierArray<T extends string>(value: unknown, field: string): T[] {
+  return parseRuntimeArray(value, (item, itemPath) => requestIdentifier<T>(item, itemPath), `body.${field}`);
 }
 
 function requestUserInputId(value: unknown): UserInputId {
@@ -2593,13 +2709,46 @@ function isMissingPathError(error: unknown): boolean {
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
-async function readJson<T>(request: Request): Promise<T> {
-  if (request.headers.get("content-length") === "0") return {} as T;
-  try {
-    return (await request.json()) as T;
-  } catch {
-    return {} as T;
+const MAX_RUNTIME_HTTP_JSON_BODY_BYTES = 32_000_000;
+
+async function readJson<T>(request: Request, allowedFields?: readonly string[]): Promise<T> {
+  const contentType = request.headers.get("content-type");
+  if (contentType !== null && !isJsonMediaType(contentType)) {
+    throw { status: 415, message: "content-type must be application/json" } satisfies HttpError;
   }
+  const declaredLength = request.headers.get("content-length");
+  if (declaredLength === "0") return {} as T;
+  if (declaredLength !== null) {
+    const bytes = Number(declaredLength);
+    if (!Number.isSafeInteger(bytes) || bytes < 0) throw badRequest("content-length must be a non-negative integer");
+    if (bytes > MAX_RUNTIME_HTTP_JSON_BODY_BYTES) {
+      throw { status: 413, message: `JSON body must not exceed ${MAX_RUNTIME_HTTP_JSON_BODY_BYTES} bytes` } satisfies HttpError;
+    }
+  }
+  let text: string;
+  try {
+    text = await request.text();
+  } catch {
+    throw badRequest("JSON body could not be read");
+  }
+  if (utf8Bytes(text) > MAX_RUNTIME_HTTP_JSON_BODY_BYTES) {
+    throw { status: 413, message: `JSON body must not exceed ${MAX_RUNTIME_HTTP_JSON_BODY_BYTES} bytes` } satisfies HttpError;
+  }
+  if (text.trim().length === 0) return {} as T;
+  let value: unknown;
+  try {
+    value = JSON.parse(text) as unknown;
+  } catch {
+    throw badRequest("JSON body must contain valid JSON");
+  }
+  const record = parseRuntimeRecord(value, "body");
+  if (allowedFields) rejectRuntimeUnknownFields(record, allowedFields, "body");
+  return record as T;
+}
+
+function isJsonMediaType(value: string): boolean {
+  const mediaType = value.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  return mediaType === "application/json" || mediaType.endsWith("+json");
 }
 
 function json(value: unknown, status = 200, headers: Record<string, string> = {}): Response {
@@ -2637,7 +2786,7 @@ function positiveIntegerOrDefault(value: number | undefined, fallback: number): 
 
 function configuredAuthTokenDigest(authToken: unknown): Uint8Array | undefined {
   if (authToken === undefined) return undefined;
-  if (typeof authToken !== "string" || authToken.trim().length === 0) {
+  if (typeof authToken !== "string" || authToken.length === 0 || /[\s\u0000-\u001f\u007f]/u.test(authToken)) {
     throw new TypeError("authToken must be a non-empty string when provided");
   }
   return tokenDigest(authToken);
@@ -2664,6 +2813,9 @@ function notFound(message: string): HttpError {
 }
 
 function toHttpError(error: unknown): HttpError {
+  if (error instanceof RuntimeValidationError) {
+    return { status: 400, message: error.message };
+  }
   if (isHttpError(error)) {
     return { status: error.status, message: normalizeDiagnosticText(error.message) };
   }
@@ -2767,6 +2919,41 @@ function toHttpError(error: unknown): HttpError {
     return { status: 400, message: err.message };
   }
   return { status: 500, message: err.message };
+}
+
+function diagnosticHostname(hostname: string): string {
+  if (hostname.length > 200) return "<unsafe-hostname>";
+  if (/^[A-Za-z0-9_*.-]+$/u.test(hostname)) return hostname;
+  if (/^\[[0-9A-Fa-f:.]+(?:%[A-Za-z0-9_.-]+)?\]$/u.test(hostname)) return hostname;
+  if (/^[0-9A-Fa-f:.]+(?:%[A-Za-z0-9_.-]+)?$/u.test(hostname) && hostname.includes(":")) {
+    return hostname;
+  }
+  return "<unsafe-hostname>";
+}
+
+function hasExplicitTlsCredentials(tls: Bun.TLSOptions | Bun.TLSOptions[] | undefined): boolean {
+  if (tls === undefined) return false;
+  const configurations = Array.isArray(tls) ? tls : [tls];
+  return configurations.length > 0 && configurations.every((configuration) => (
+    isRecord(configuration) &&
+    hasNonEmptyTlsMaterial(configuration.cert) &&
+    hasNonEmptyTlsMaterial(configuration.key)
+  ));
+}
+
+function hasNonEmptyTlsMaterial(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.length > 0 && value.every((entry) => !Array.isArray(entry) && hasNonEmptyTlsMaterialEntry(entry));
+  }
+  return hasNonEmptyTlsMaterialEntry(value);
+}
+
+function hasNonEmptyTlsMaterialEntry(value: unknown): boolean {
+  if (typeof value === "string") return value.trim().length > 0;
+  if (ArrayBuffer.isView(value)) return value.byteLength > 0;
+  if (value instanceof ArrayBuffer) return value.byteLength > 0;
+  if (value instanceof Blob) return value.size > 0;
+  return false;
 }
 
 function isHttpError(error: unknown): error is HttpError {
@@ -3005,6 +3192,8 @@ async function assertHttpTeamReconcileAuthority(
 function teamContext(body: TeamContextBody): TeamEventContextInput {
   const input: TeamEventContextInput = {};
   if (body.sessionId !== undefined) input.sessionId = requestSessionId(body.sessionId);
+  if (body.teamId !== undefined) requestIdentifier<TeamId>(body.teamId, "teamId");
+  if (body.taskId !== undefined) requestIdentifier<TaskId>(body.taskId, "taskId");
   return input;
 }
 
@@ -3051,16 +3240,16 @@ function mcpTransport(value: unknown): RuntimeMcpTransport | undefined {
 function teamCreateInput(body: TeamCreateBody): CreateTeamInput {
   const input: CreateTeamInput = {
     ...teamContext(body),
-    name: body.name ?? "",
-    leadPath: body.leadPath as AgentPath,
+    name: stringField(body.name, "name"),
+    leadPath: requestAgentPath(body.leadPath, "leadPath"),
   };
-  if (body.teamId) input.teamId = body.teamId;
-  if (body.description) input.description = body.description;
-  if (body.leadName) input.leadName = body.leadName;
-  if (body.leadRole) input.leadRole = body.leadRole;
+  if (body.teamId !== undefined) input.teamId = requestIdentifier<TeamId>(body.teamId, "teamId");
+  if (body.description !== undefined) input.description = stringField(body.description, "description");
+  if (body.leadName !== undefined) input.leadName = stringField(body.leadName, "leadName");
+  if (body.leadRole !== undefined) input.leadRole = stringField(body.leadRole, "leadRole");
   const leadStatus = teamMemberStatus(body.leadStatus);
   if (leadStatus) input.leadStatus = leadStatus;
-  if (body.leadWriteScope) input.leadWriteScope = body.leadWriteScope;
+  if (body.leadWriteScope !== undefined) input.leadWriteScope = stringArrayField(body.leadWriteScope, "leadWriteScope");
   return input;
 }
 
@@ -3068,16 +3257,16 @@ function teamMemberInput(teamId: TeamId, body: TeamMemberBody): AddTeamMemberInp
   const input: AddTeamMemberInput = {
     ...teamContext(body),
     teamId,
-    path: body.path as AgentPath,
-    name: body.name ?? "",
-    role: body.role ?? "",
+    path: requestAgentPath(body.path, "path"),
+    name: stringField(body.name, "name"),
+    role: stringField(body.role, "role"),
   };
   const status = teamMemberStatus(body.status);
   if (status) input.status = status;
-  if (body.childSessionId) input.childSessionId = body.childSessionId;
-  if (body.model) input.model = body.model;
-  if (body.toolScope) input.toolScope = body.toolScope;
-  if (body.writeScope) input.writeScope = body.writeScope;
+  if (body.childSessionId !== undefined) input.childSessionId = requestSessionId(body.childSessionId, "childSessionId");
+  if (body.model !== undefined) input.model = stringField(body.model, "model");
+  if (body.toolScope !== undefined) input.toolScope = stringArrayField(body.toolScope, "toolScope");
+  if (body.writeScope !== undefined) input.writeScope = stringArrayField(body.writeScope, "writeScope");
   return input;
 }
 
@@ -3085,16 +3274,16 @@ function teamTaskCreateInput(teamId: TeamId, body: TeamTaskCreateBody): CreateTe
   const input: CreateTeamTaskInput = {
     ...teamContext(body),
     teamId,
-    title: body.title ?? "",
+    title: stringField(body.title, "title"),
   };
-  if (body.taskId) input.taskId = body.taskId;
-  if (body.description) input.description = body.description;
-  if (body.createdBy) input.createdBy = body.createdBy;
-  if (body.ownerPath) input.ownerPath = body.ownerPath;
-  if (body.dependsOn) input.dependsOn = body.dependsOn;
+  if (body.taskId !== undefined) input.taskId = requestIdentifier<TaskId>(body.taskId, "taskId");
+  if (body.description !== undefined) input.description = stringField(body.description, "description");
+  if (body.createdBy !== undefined) input.createdBy = requestAgentPath(body.createdBy, "createdBy");
+  if (body.ownerPath !== undefined) input.ownerPath = requestAgentPath(body.ownerPath, "ownerPath");
+  if (body.dependsOn !== undefined) input.dependsOn = requestIdentifierArray<TaskId>(body.dependsOn, "dependsOn");
   const status = teamTaskStatus(body.status);
   if (status) input.status = status;
-  if (body.metadata) input.metadata = body.metadata;
+  if (body.metadata !== undefined) input.metadata = parseRuntimeRecord(body.metadata, "body.metadata");
   return input;
 }
 
@@ -3103,13 +3292,13 @@ function teamTaskAssignInput(teamId: TeamId, taskId: TaskId, body: TeamTaskAssig
     ...teamContext(body),
     teamId,
     taskId,
-    ownerPath: body.ownerPath as AgentPath,
+    ownerPath: requestAgentPath(body.ownerPath, "ownerPath"),
   };
-  if (body.assignedBy) input.assignedBy = body.assignedBy;
-  if (body.message) input.message = body.message;
+  if (body.assignedBy !== undefined) input.assignedBy = requestAgentPath(body.assignedBy, "assignedBy");
+  if (body.message !== undefined) input.message = stringField(body.message, "message");
   const delivery = teamMessageDelivery(body.messageDelivery);
   if (delivery) input.messageDelivery = delivery;
-  if (body.messageSummary) input.messageSummary = body.messageSummary;
+  if (body.messageSummary !== undefined) input.messageSummary = stringField(body.messageSummary, "messageSummary");
   return input;
 }
 
@@ -3118,9 +3307,9 @@ function teamTaskClaimInput(teamId: TeamId, taskId: TaskId, body: TeamTaskClaimB
     ...teamContext(body),
     teamId,
     taskId,
-    ownerPath: body.ownerPath as AgentPath,
+    ownerPath: requestAgentPath(body.ownerPath, "ownerPath"),
   };
-  if (body.claimedBy) input.claimedBy = body.claimedBy;
+  if (body.claimedBy !== undefined) input.claimedBy = requestAgentPath(body.claimedBy, "claimedBy");
   return input;
 }
 
@@ -3130,13 +3319,13 @@ function teamTaskDispatchInput(teamId: TeamId, taskId: TaskId, body: TeamTaskDis
     teamId,
     taskId,
   };
-  if (body.ownerPath) input.ownerPath = body.ownerPath;
+  if (body.ownerPath !== undefined) input.ownerPath = requestAgentPath(body.ownerPath, "ownerPath");
   if (body.cwd !== undefined) {
     const cwd = stringField(body.cwd, "cwd");
     if (cwd.includes("\0")) throw badRequest("cwd must be a valid filesystem path");
     input.cwd = cwd;
   }
-  if (body.prompt) input.prompt = body.prompt;
+  if (body.prompt !== undefined) input.prompt = stringField(body.prompt, "prompt");
   const mode = localSubagentMode(body.mode);
   if (mode) input.mode = mode;
   return input;
@@ -3155,10 +3344,7 @@ function teamTaskReconcileInput(teamId: TeamId | undefined, body: TeamTaskReconc
     ...teamContext(body),
   };
   if (teamId) input.teamId = teamId;
-  if (body.limit !== undefined) {
-    if (!Number.isInteger(body.limit) || body.limit <= 0) throw badRequest("limit must be a positive integer");
-    input.limit = body.limit;
-  }
+  if (body.limit !== undefined) input.limit = positiveInteger(body.limit, "limit");
   return input;
 }
 
@@ -3170,19 +3356,10 @@ function teamRunLoopInput(teamId: TeamId, body: TeamRunLoopBody): TeamExecutionR
   if (body.cwd !== undefined) input.cwd = teamRequestCwd(body.cwd);
   const mode = localSubagentMode(body.mode);
   if (mode) input.mode = mode;
-  if (body.once !== undefined) input.once = body.once;
-  if (body.maxCycles !== undefined) {
-    if (!Number.isInteger(body.maxCycles) || body.maxCycles <= 0) throw badRequest("maxCycles must be a positive integer");
-    input.maxCycles = body.maxCycles;
-  }
-  if (body.timeoutMs !== undefined) {
-    if (!Number.isInteger(body.timeoutMs) || body.timeoutMs <= 0) throw badRequest("timeoutMs must be a positive integer");
-    input.timeoutMs = body.timeoutMs;
-  }
-  if (body.pollIntervalMs !== undefined) {
-    if (!Number.isInteger(body.pollIntervalMs) || body.pollIntervalMs < 0) throw badRequest("pollIntervalMs must be a non-negative integer");
-    input.pollIntervalMs = body.pollIntervalMs;
-  }
+  if (body.once !== undefined) input.once = parseRuntimeBoolean(body.once, "body.once");
+  if (body.maxCycles !== undefined) input.maxCycles = positiveInteger(body.maxCycles, "maxCycles");
+  if (body.timeoutMs !== undefined) input.timeoutMs = positiveInteger(body.timeoutMs, "timeoutMs");
+  if (body.pollIntervalMs !== undefined) input.pollIntervalMs = nonNegativeInteger(body.pollIntervalMs, "pollIntervalMs");
   return input;
 }
 
@@ -3191,7 +3368,7 @@ function teamMergeInput(teamId: TeamId, body: TeamMergeBody): TeamMergeInput {
     ...teamContext(body),
     teamId,
   };
-  if (body.taskId) input.taskId = body.taskId;
+  if (body.taskId !== undefined) input.taskId = requestIdentifier<TaskId>(body.taskId, "taskId");
   if (body.cwd !== undefined) input.cwd = teamRequestCwd(body.cwd);
   return input;
 }
@@ -3210,23 +3387,20 @@ function teamTaskUpdateInput(teamId: TeamId, taskId: TaskId, body: TeamTaskUpdat
   };
   const status = teamTaskStatus(body.status);
   if (status) input.status = status;
-  if (body.ownerPath) input.ownerPath = body.ownerPath;
-  if (body.title) input.title = body.title;
-  if (body.description) input.description = body.description;
-  if (body.dependsOn) input.dependsOn = body.dependsOn;
-  if (body.summary) input.summary = body.summary;
-  if (body.error) input.error = body.error;
-  if (body.metadata) input.metadata = body.metadata;
+  if (body.ownerPath !== undefined) input.ownerPath = requestAgentPath(body.ownerPath, "ownerPath");
+  if (body.title !== undefined) input.title = stringField(body.title, "title");
+  if (body.description !== undefined) input.description = stringField(body.description, "description");
+  if (body.dependsOn !== undefined) input.dependsOn = requestIdentifierArray<TaskId>(body.dependsOn, "dependsOn");
+  if (body.summary !== undefined) input.summary = stringField(body.summary, "summary");
+  if (body.error !== undefined) input.error = stringField(body.error, "error");
+  if (body.metadata !== undefined) input.metadata = parseRuntimeRecord(body.metadata, "body.metadata");
   return input;
 }
 
 function teamMessageInput(teamId: TeamId, body: TeamMessageBody): SendTeamMessageInput {
-  const from = body.from?.trim();
-  const to = body.to?.trim();
-  const content = body.content?.trim();
-  if (!from) throw badRequest("from must be a non-empty member path or member name");
-  if (!to) throw badRequest("to must be a non-empty member path, member name, or *");
-  if (!content) throw badRequest("content must be a non-empty string");
+  const from = stringField(body.from, "from");
+  const to = stringField(body.to, "to");
+  const content = stringField(body.content, "content");
   const input: SendTeamMessageInput = {
     ...teamContext(body),
     teamId,
@@ -3234,14 +3408,14 @@ function teamMessageInput(teamId: TeamId, body: TeamMessageBody): SendTeamMessag
     to: to as SendTeamMessageInput["to"],
     content,
   };
-  if (body.messageId) input.messageId = body.messageId;
+  if (body.messageId !== undefined) input.messageId = requestIdentifier(body.messageId, "messageId");
   const kind = teamMessageKind(body.kind);
   if (kind) input.kind = kind;
   const delivery = teamMessageDelivery(body.delivery);
   if (delivery) input.delivery = delivery;
-  if (body.taskId) input.taskId = body.taskId;
-  if (body.summary) input.summary = body.summary;
-  if (body.metadata) input.metadata = body.metadata;
+  if (body.taskId !== undefined) input.taskId = requestIdentifier<TaskId>(body.taskId, "taskId");
+  if (body.summary !== undefined) input.summary = stringField(body.summary, "summary");
+  if (body.metadata !== undefined) input.metadata = parseRuntimeRecord(body.metadata, "body.metadata");
   return input;
 }
 
@@ -3396,19 +3570,11 @@ function reconcileStaleInput(body: TaskReconcileStaleBody): AgentTaskReconcileSt
     input.parentSessionId = requestSessionId(body.parentSessionId);
   }
   if (body.staleAfterMs !== undefined) {
-    if (!Number.isInteger(body.staleAfterMs) || body.staleAfterMs < 0) {
-      throw badRequest("staleAfterMs must be a non-negative integer");
-    }
-    input.staleAfterMs = body.staleAfterMs;
+    input.staleAfterMs = nonNegativeInteger(body.staleAfterMs, "staleAfterMs");
   }
-  if (body.limit !== undefined) {
-    if (!Number.isInteger(body.limit) || body.limit <= 0) {
-      throw badRequest("limit must be a positive integer");
-    }
-    input.limit = body.limit;
-  }
-  if (body.summary) input.summary = body.summary;
-  if (body.error) input.error = body.error;
+  if (body.limit !== undefined) input.limit = positiveInteger(body.limit, "limit");
+  if (body.summary !== undefined) input.summary = stringField(body.summary, "summary");
+  if (body.error !== undefined) input.error = stringField(body.error, "error");
   if (body.modes !== undefined) {
     if (!Array.isArray(body.modes)) throw badRequest("modes must be an array");
     input.modes = body.modes.map((mode) => {

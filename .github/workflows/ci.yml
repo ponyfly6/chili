@@ -96,9 +96,9 @@ jobs:
         run: bun test packages/tools/src/macos-seatbelt.test.ts apps/cli/src/bash-runner.test.ts
 
   macos-desktop:
-    name: macOS Desktop Package
+    name: macOS Desktop E2E and Package
     runs-on: macos-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -124,6 +124,9 @@ jobs:
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
+
+      - name: Real Electron click-flow E2E
+        run: bun run test:e2e:desktop
 
       - name: Build and smoke packaged desktop
         run: bun run smoke:desktop

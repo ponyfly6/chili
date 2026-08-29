@@ -4,6 +4,7 @@ export * from "./message.js";
 export * from "./tool.js";
 export * from "./goal.js";
 export * from "./runtime.js";
+export * from "./runtime-validation.js";
 export * from "./mcp.js";
 export * from "./persisted-error.js";
 export * from "./persisted-json.js";

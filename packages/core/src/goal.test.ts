@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { ChiliEvent, EventEnvelope, SessionId, TimestampMs } from "@chili/protocol";
+import type { ChiliEvent, EventEnvelope, ModelUsage, SessionId, TimestampMs, TurnId } from "@chili/protocol";
 import type { EventQuery, EventStore } from "@chili/store";
 import { GoalService, goalTokenDelta } from "./goal.js";
 
@@ -19,6 +19,148 @@ test("goal token accounting includes cache usage when totals are unavailable", (
     cacheReadInputTokens: 11,
     cacheCreationInputTokens: 3,
   })).toBe(19);
+});
+
+test("goal token accounting treats a reported zero total as authoritative", () => {
+  expect(goalTokenDelta({
+    inputTokens: 4,
+    outputTokens: 1,
+    totalTokens: 0,
+  })).toBe(0);
+});
+
+test("goal token accounting rejects non-safe provider usage and cumulative deltas", () => {
+  for (const field of [
+    "inputTokens",
+    "outputTokens",
+    "cacheReadInputTokens",
+    "cacheCreationInputTokens",
+    "totalTokens",
+  ] as const) {
+    for (const value of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => goalTokenDelta({ [field]: value } as ModelUsage)).toThrow("non-negative safe integer");
+    }
+  }
+
+  expect(goalTokenDelta({ totalTokens: Number.MAX_SAFE_INTEGER })).toBe(Number.MAX_SAFE_INTEGER);
+  expect(() => goalTokenDelta({
+    inputTokens: Number.MAX_SAFE_INTEGER,
+    outputTokens: 1,
+  })).toThrow("Goal token usage delta must be a non-negative safe integer");
+});
+
+test("goal inputs trim objectives and require positive safe-integer token budgets", async () => {
+  const store = new MemoryEventStore();
+  const service = new GoalService({ store, createId: sequentialId() });
+  const sessionId = "session_goal_validation" as SessionId;
+
+  await expect(service.setGoal({ sessionId, objective: "   " })).rejects.toThrow("Goal objective is required");
+  for (const tokenBudget of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+    await expect(service.setGoal({ sessionId, objective: "ship", tokenBudget })).rejects.toThrow(
+      "Goal token budget must be a positive safe integer",
+    );
+  }
+
+  const goal = await service.setGoal({ sessionId, objective: "  ship safely  ", tokenBudget: 10 });
+  expect(goal.objective).toBe("ship safely");
+  for (const tokenBudget of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+    await expect(service.updateGoal({ sessionId, tokenBudget })).rejects.toThrow(
+      "Goal token budget must be a positive safe integer",
+    );
+  }
+  await expect(service.updateGoal({ sessionId, objective: "\t\n" })).rejects.toThrow("Goal objective is required");
+
+  const boundaryStore = new MemoryEventStore();
+  const boundary = await new GoalService({ store: boundaryStore }).setGoal({
+    sessionId: "session_goal_max_safe_budget" as SessionId,
+    objective: "keep precise",
+    tokenBudget: Number.MAX_SAFE_INTEGER,
+  });
+  expect(boundary.tokenBudget).toBe(Number.MAX_SAFE_INTEGER);
+});
+
+test("goal default token budget must be a positive safe integer", async () => {
+  for (const defaultTokenBudget of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+    const service = new GoalService({
+      store: new MemoryEventStore(),
+      defaultTokenBudget,
+    });
+    await expect(service.setGoal({
+      sessionId: "session_goal_invalid_default" as SessionId,
+      objective: "ship",
+    })).rejects.toThrow("Default goal token budget must be a positive safe integer");
+  }
+});
+
+test("goal accounting requires finite non-negative time and cumulative values", async () => {
+  const store = new MemoryEventStore();
+  const service = new GoalService({ store, createId: sequentialId() });
+  const sessionId = "session_goal_accounting_validation" as SessionId;
+  const turnId = "turn_goal_accounting_validation" as TurnId;
+  await service.setGoal({ sessionId, objective: "account safely" });
+
+  for (const timeSeconds of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    await expect(service.accountUsage({ sessionId, turnId, timeSeconds })).rejects.toThrow(
+      "Goal usage timeSeconds must be a finite non-negative number",
+    );
+  }
+  await expect(service.accountUsage({
+    sessionId,
+    turnId,
+    usage: { inputTokens: -1 },
+    timeSeconds: 0,
+  })).rejects.toThrow("Goal usage inputTokens must be a non-negative safe integer");
+
+  await service.updateGoal({ sessionId, status: "complete" });
+  await service.accountUsage({
+    sessionId,
+    turnId,
+    usage: { totalTokens: Number.MAX_SAFE_INTEGER },
+    timeSeconds: Number.MAX_VALUE,
+  });
+  await expect(service.accountUsage({
+    sessionId,
+    turnId,
+    usage: { totalTokens: 1 },
+    timeSeconds: 0,
+  })).rejects.toThrow("Goal tokensUsed must be a non-negative safe integer");
+  await expect(service.accountUsage({
+    sessionId,
+    turnId,
+    usage: { totalTokens: 0 },
+    timeSeconds: Number.MAX_VALUE,
+  })).rejects.toThrow("Goal timeUsedSeconds must be a finite non-negative number");
+});
+
+test("budget-limited goals require additional budget before reactivation", async () => {
+  const store = new MemoryEventStore();
+  const service = new GoalService({ store, createId: sequentialId() });
+  const sessionId = "session_goal_budget_reactivation" as SessionId;
+  await service.setGoal({ sessionId, objective: "finish within budget", tokenBudget: 10 });
+  const limited = await service.accountUsage({
+    sessionId,
+    turnId: "turn_goal_budget_reactivation" as TurnId,
+    usage: { totalTokens: 10 },
+    timeSeconds: 1,
+  });
+  expect(limited.goal?.status).toBe("budgetLimited");
+
+  const eventCount = store.items.length;
+  await expect(service.updateGoal({ sessionId, status: "active" })).rejects.toThrow(
+    "Goal token budget must exceed tokens used (10)",
+  );
+  await expect(service.updateGoal({ sessionId, status: "active", tokenBudget: 10 })).rejects.toThrow(
+    "Goal token budget must exceed tokens used (10)",
+  );
+  await expect(service.setGoal({
+    sessionId,
+    objective: "replace without more budget",
+    replace: true,
+  })).rejects.toThrow("Goal token budget must exceed tokens used (10)");
+  expect(store.items).toHaveLength(eventCount);
+
+  const resumed = await service.updateGoal({ sessionId, status: "active", tokenBudget: 11 });
+  expect(resumed).toMatchObject({ status: "active", tokenBudget: 11, tokensUsed: 10, lastReason: "resume" });
 });
 
 test("goal state is isolated by session", async () => {

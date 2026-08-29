@@ -214,6 +214,14 @@ interface RuntimeRunState {
   settle(): void;
 }
 
+interface DeferredGoalContinuationState {
+  input: { sessionId: SessionId; cwd?: string };
+  requestVersion: number;
+  attemptedVersion: number;
+  handledVersion: number;
+  promise: Promise<void>;
+}
+
 interface RuntimeSessionOperationContext {
   sessionId: SessionId;
   controller: AbortController;
@@ -353,6 +361,7 @@ export class RuntimeServiceClosedError extends Error {
 
 export class RuntimeService {
   private readonly running = new Map<SessionId, RuntimeRunState>();
+  private readonly deferredGoalContinuations = new Map<SessionId, DeferredGoalContinuationState>();
   private readonly sessionOperationStorage = new AsyncLocalStorage<RuntimeSessionOperationContext>();
   private readonly creatingSessions = new Set<SessionId>();
   private readonly creationSettlements = new Set<Promise<void>>();
@@ -1243,9 +1252,21 @@ export class RuntimeService {
         return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
       }
 
-    const goal = await this.goals.getGoal({ sessionId: args.input.sessionId });
+      const deferred = this.deferredGoalContinuations.get(args.input.sessionId);
+      const deferredRequestVersion = deferred?.requestVersion;
+      const goal = await this.goals.getGoal({ sessionId: args.input.sessionId });
       if (args.controller.signal.aborted) {
         return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
+      }
+      if (
+        goal?.status === "active"
+        && deferred
+        && deferredRequestVersion !== undefined
+        && this.deferredGoalContinuations.get(args.input.sessionId) === deferred
+      ) {
+        // The owning run has observed every active request committed before
+        // this Goal read. Do not add another top-level run after it settles.
+        deferred.handledVersion = Math.max(deferred.handledVersion, deferredRequestVersion);
       }
       const continueAfterToolUse = lastCompleted?.status === "completed" && isToolUseFinishReason(lastCompleted.finishReason);
       if ((!goal || goal.status !== "active") && !continueAfterToolUse) {
@@ -1366,7 +1387,86 @@ export class RuntimeService {
   }
 
   private submitGoalContinuationAsync(input: { sessionId: SessionId; cwd?: string }): void {
-    if (this.running.has(input.sessionId)) return;
+    const pending = this.deferredGoalContinuations.get(input.sessionId);
+    if (pending) {
+      pending.requestVersion += 1;
+      if (input.cwd !== undefined) pending.input.cwd = input.cwd;
+      return;
+    }
+    if (this.running.has(input.sessionId)) {
+      this.deferGoalContinuation(input);
+      return;
+    }
+    this.startGoalContinuationAsync(input);
+  }
+
+  private deferGoalContinuation(input: { sessionId: SessionId; cwd?: string }): void {
+    if (this.deferredGoalContinuations.has(input.sessionId)) return;
+    const state: DeferredGoalContinuationState = {
+      input: { ...input },
+      requestVersion: 1,
+      attemptedVersion: 0,
+      handledVersion: 0,
+      promise: Promise.resolve(),
+    };
+    state.promise = this.runDeferredGoalContinuation(state)
+      .catch(() => {
+        // Deferred continuation is best effort, like the immediate background
+        // path. A later explicit active update can make a fresh request.
+        state.handledVersion = Math.max(state.handledVersion, state.attemptedVersion);
+      })
+      .finally(() => {
+        if (this.deferredGoalContinuations.get(input.sessionId) === state) {
+          this.deferredGoalContinuations.delete(input.sessionId);
+        }
+        if (this.lifecycle === "open" && state.requestVersion > state.handledVersion) {
+          this.submitGoalContinuationAsync(state.input);
+        }
+      });
+    this.deferredGoalContinuations.set(input.sessionId, state);
+  }
+
+  private async runDeferredGoalContinuation(state: DeferredGoalContinuationState): Promise<void> {
+    const { input } = state;
+    while (this.lifecycle === "open") {
+      if (state.handledVersion >= state.requestVersion) return;
+      const requestVersion = state.requestVersion;
+      state.attemptedVersion = requestVersion;
+      const owningRun = this.running.get(input.sessionId);
+      if (owningRun) {
+        await owningRun.settlement;
+        continue;
+      }
+
+      await this.assertSessionTurnAllowed(input.sessionId);
+      const goal = await this.goals.getGoal({ sessionId: input.sessionId });
+      if (state.handledVersion >= state.requestVersion) return;
+      if (state.requestVersion !== requestVersion) continue;
+      if (this.lifecycle !== "open" || goal?.status !== "active") {
+        state.handledVersion = requestVersion;
+        return;
+      }
+
+      // A replacement run can be admitted while the durable Goal/session state
+      // is being read. Follow that exact run to settlement instead of racing it.
+      if (this.running.has(input.sessionId)) continue;
+      if (this.startGoalContinuationAsync(input)) {
+        state.handledVersion = requestVersion;
+        return;
+      }
+
+      // A local replacement can win between the last check and admission when
+      // the backing store provides a durable run fence. Wait for it; an opaque
+      // peer-owned claim has no process-local settlement to follow safely.
+      if (!this.running.has(input.sessionId)) {
+        state.handledVersion = requestVersion;
+        return;
+      }
+    }
+  }
+
+  private startGoalContinuationAsync(input: { sessionId: SessionId; cwd?: string }): boolean {
+    if (this.running.has(input.sessionId)) return false;
     const continuationInput: SubmitPromptInput = {
       sessionId: input.sessionId,
       text: "",
@@ -1377,7 +1477,7 @@ export class RuntimeService {
       controller = this.createRunController(continuationInput, "goal");
     } catch (error) {
       const err = toError(error);
-      if (isRuntimeSessionBoundaryError(err) || err instanceof RuntimeBusyError) return;
+      if (isRuntimeSessionBoundaryError(err) || err instanceof RuntimeBusyError) return false;
       throw error;
     }
     queueMicrotask(() => {
@@ -1402,6 +1502,7 @@ export class RuntimeService {
         // because a peer may have acquired the session in the meantime.
       });
     });
+    return true;
   }
 
   private async runStandaloneGoalContinuation(input: SubmitPromptInput, controller: AbortController): Promise<void> {

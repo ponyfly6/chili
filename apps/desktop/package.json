@@ -11,6 +11,8 @@
     "build:sidecar": "bun run scripts/build-sidecar.ts",
     "build": "bun run build:sidecar && electron-vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck:e2e": "tsc --noEmit -p e2e/tsconfig.json",
+    "test:e2e": "bun run typecheck:e2e && bun run e2e/electron.e2e.ts",
     "package:dir": "bun run build && electron-builder --dir --mac --config electron-builder.config.ts",
     "package:mac": "bun run build && electron-builder --mac dmg zip --config electron-builder.config.ts"
   },
@@ -25,12 +27,13 @@
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "4.7.0",
-    "electron": "42.3.3",
+    "electron": "42.10.1",
     "electron-builder": "26.15.2",
     "electron-vite": "5.0.0",
-    "react": "19.2.6",
-    "react-dom": "19.2.6",
+    "playwright-core": "1.62.1",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
     "typescript": "^5.8.3",
-    "vite": "7.1.4"
+    "vite": "7.3.6"
   }
 }

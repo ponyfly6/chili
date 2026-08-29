@@ -78,6 +78,57 @@ test("a failed workspace selection releases deferred projection reads", async ()
   expect(calls).toEqual(["workspace.select", "sessions.list"]);
 });
 
+test("maps daily-driver task controls to explicit validated IPC requests", async () => {
+  const calls: DesktopRequest[] = [];
+  const api = {
+    invoke: async <Request extends DesktopRequest>(request: Request): Promise<DesktopResponse<Request>> => {
+      calls.push(request);
+      return undefined as unknown as DesktopResponse<Request>;
+    },
+    subscribe: () => () => undefined,
+  } satisfies ChiliDesktopApi;
+  const transport = createElectronTransport(api);
+
+  await transport.listSessions({ query: "overnight", status: "archived" });
+  await transport.createSession({
+    title: "Nightly console",
+    prompt: "Finish the console",
+    modelSelection: { provider: "openai-codex", model: "gpt-5.6-sol" },
+    reasoningLevel: "high",
+    serviceTier: "fast",
+    permissionProfile: "auto-review",
+    delegationPolicy: "proactive",
+    goal: { objective: "Finish the console", tokenBudget: 75_000 },
+  });
+  await transport.resumeSession("session_goal");
+  await transport.renameSession("session_goal", "Renamed");
+  await transport.archiveSession("session_goal");
+  await transport.setGoal("session_goal", "Keep going", 50_000);
+  await transport.updateGoal("session_goal", { tokenBudget: 80_000, status: "active" });
+  await transport.reloadMcp("session_goal");
+
+  expect(calls).toEqual([
+    { type: "sessions.list", query: "overnight", status: "archived" },
+    {
+      type: "sessions.create",
+      title: "Nightly console",
+      prompt: "Finish the console",
+      modelSelection: { provider: "openai-codex", model: "gpt-5.6-sol" },
+      reasoningLevel: "high",
+      serviceTier: "fast",
+      permissionProfile: "auto-review",
+      delegationPolicy: "proactive",
+      goal: { objective: "Finish the console", tokenBudget: 75_000 },
+    },
+    { type: "session.resume", sessionId: "session_goal" },
+    { type: "session.rename", sessionId: "session_goal", title: "Renamed" },
+    { type: "session.archive", sessionId: "session_goal" },
+    { type: "session.goal.set", sessionId: "session_goal", objective: "Keep going", tokenBudget: 50_000 },
+    { type: "session.goal.update", sessionId: "session_goal", tokenBudget: 80_000, status: "active" },
+    { type: "mcp.reload", sessionId: "session_goal" },
+  ]);
+});
+
 function responseFor(request: DesktopRequest, state: DesktopState): unknown {
   if (request.type === "app.state") return state;
   if (request.type === "sessions.list") return [];

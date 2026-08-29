@@ -433,6 +433,7 @@ describe("desktop prompt controls", () => {
         interrupts.push(input.reason ?? "");
         return { interrupted: true };
       },
+      getGoal: async () => undefined,
     } as unknown as RuntimeClient;
     const sidecar = {
       state: () => ({ sidecar: { phase: "healthy" as const, attempt: 0 }, queuedBySession: {} }),
@@ -568,6 +569,409 @@ describe("desktop prompt controls", () => {
     } finally {
       process.off("unhandledRejection", onUnhandled);
     }
+  });
+});
+
+describe("desktop task and Goal controls", () => {
+  test("configures a Goal task in safe order and starts only through setGoal", async () => {
+    const order: string[] = [];
+    let permission: "default" | "full-access" = "default";
+    let promptSubmissions = 0;
+    const client = {
+      createSession: async () => {
+        order.push("create");
+        return { sessionId: "session_goal" };
+      },
+      renameSession: async () => {
+        order.push("rename");
+        return sessionSummary("session_goal");
+      },
+      setModel: async () => {
+        order.push("model");
+        return {};
+      },
+      setReasoning: async () => {
+        order.push("reasoning");
+        return {};
+      },
+      setServiceTier: async () => {
+        order.push("service_tier");
+        return {};
+      },
+      setDelegationPolicy: async () => {
+        order.push("delegation");
+        return {};
+      },
+      getPermissionConfig: async () => {
+        order.push(`permission:get:${permission}`);
+        return permissionConfig(permission);
+      },
+      setPermissionProfile: async ({ profile }: { profile: "default" | "full-access" }) => {
+        permission = profile;
+        order.push(`permission:set:${profile}`);
+        return permissionConfig(permission);
+      },
+      setGoal: async () => {
+        order.push("goal");
+        return goalRecord("session_goal", "active");
+      },
+      submitPromptAsync: async () => {
+        promptSubmissions += 1;
+        return { status: "accepted", sessionId: "session_goal" };
+      },
+    } as unknown as RuntimeClient;
+
+    const result = await serviceFor(client).invoke({
+      type: "sessions.create",
+      title: "Overnight Goal",
+      prompt: "finish the release",
+      modelSelection: { provider: "openai", model: "gpt-5" },
+      reasoningLevel: "high",
+      serviceTier: "fast",
+      permissionProfile: "full-access",
+      delegationPolicy: "proactive",
+      goal: { objective: "finish the release", tokenBudget: 20_000 },
+    });
+
+    expect(result).toMatchObject({ sessionId: "session_goal", status: "started", started: true });
+    expect(order).toEqual([
+      "create",
+      "rename",
+      "model",
+      "reasoning",
+      "service_tier",
+      "delegation",
+      "permission:get:default",
+      "permission:set:full-access",
+      "goal",
+    ]);
+    expect(promptSubmissions).toBe(0);
+  });
+
+  test("serializes global permission rollback before a later desktop permission write", async () => {
+    const permissionGate = deferred<void>();
+    const order: string[] = [];
+    let permission: "default" | "full-access" | "auto-review" = "default";
+    let archived = 0;
+    const client = {
+      createSession: async () => ({ sessionId: "session_partial" }),
+      getPermissionConfig: async () => {
+        order.push(`get:${permission}`);
+        return permissionConfig(permission);
+      },
+      setPermissionProfile: async ({ profile }: { profile: typeof permission }) => {
+        permission = profile;
+        order.push(`set:${profile}`);
+        if (profile === "full-access") {
+          await permissionGate.promise;
+          throw new Error("permission response failed");
+        }
+        return permissionConfig(permission);
+      },
+      submitPromptAsync: async () => {
+        order.push("prompt:start");
+        return { status: "accepted", sessionId: "session_partial" };
+      },
+      archiveSession: async () => {
+        archived += 1;
+      },
+    } as unknown as RuntimeClient;
+    const service = serviceFor(client);
+
+    const creating = service.invoke({
+      type: "sessions.create",
+      prompt: "ordinary task",
+      permissionProfile: "full-access",
+    });
+    await waitUntil(() => order.includes("set:full-access"));
+    const laterWrite = service.invoke({ type: "permissions.set", profile: "auto-review" });
+    permissionGate.resolve(undefined);
+
+    expect(await creating).toMatchObject({
+      sessionId: "session_partial",
+      status: "partial",
+      startState: "not_started",
+      started: false,
+      failure: { stage: "permission", permissionRestored: true },
+    });
+    expect((await laterWrite).profile).toBe("auto-review");
+    expect(order).toEqual([
+      "get:default",
+      "set:full-access",
+      "get:full-access",
+      "set:default",
+      "set:auto-review",
+    ]);
+    expect(String(permission)).toBe("auto-review");
+    expect(archived).toBe(0);
+  });
+
+  test("does not roll back global permission after an uncertain launch commit", async () => {
+    let permission: "default" | "full-access" = "default";
+    const order: string[] = [];
+    const client = {
+      createSession: async () => ({ sessionId: "session_uncertain" }),
+      getPermissionConfig: async () => {
+        order.push(`get:${permission}`);
+        return permissionConfig(permission);
+      },
+      setPermissionProfile: async ({ profile }: { profile: typeof permission }) => {
+        permission = profile;
+        order.push(`set:${profile}`);
+        return permissionConfig(permission);
+      },
+      submitPromptAsync: async () => {
+        order.push("prompt:dispatch");
+        throw new Error("launch acknowledgement lost");
+      },
+    } as unknown as RuntimeClient;
+
+    const result = await serviceFor(client).invoke({
+      type: "sessions.create",
+      prompt: "ordinary task",
+      permissionProfile: "full-access",
+    });
+    expect(result).toMatchObject({
+      status: "partial",
+      startState: "unknown",
+      started: false,
+      failure: { stage: "prompt", launchMayHaveCommitted: true },
+    });
+    expect(order).toEqual(["get:default", "set:full-access", "prompt:dispatch"]);
+    expect(String(permission)).toBe("full-access");
+  });
+
+  test("pauses an idle active Goal before making its task read-only", async () => {
+    const order: string[] = [];
+    const client = {
+      sessionEvents: async () => [],
+      getGoal: async () => {
+        order.push("goal:active");
+        return goalRecord("session_archive", "active");
+      },
+      updateGoal: async ({ status }: { status?: string }) => {
+        order.push(`goal:${status}`);
+        return goalRecord("session_archive", "paused");
+      },
+      archiveSession: async () => {
+        order.push("archive");
+      },
+    } as unknown as RuntimeClient;
+
+    expect(await serviceFor(client).invoke({ type: "session.archive", sessionId: "session_archive" }))
+      .toEqual({ archived: true });
+    expect(order).toEqual(["goal:active", "goal:paused", "archive"]);
+  });
+
+  test("keeps the busy-run archive guard ahead of Goal mutation", async () => {
+    let goalReads = 0;
+    let goalUpdates = 0;
+    let archives = 0;
+    const client = {
+      sessionEvents: async () => [{
+        id: "event_archive_running",
+        type: "session.status_changed",
+        time: 1,
+        sessionId: "session_archive",
+        payload: { sessionId: "session_archive", status: "running" },
+      }],
+      getGoal: async () => {
+        goalReads += 1;
+        return goalRecord("session_archive", "active");
+      },
+      updateGoal: async () => {
+        goalUpdates += 1;
+        return goalRecord("session_archive", "paused");
+      },
+      archiveSession: async () => {
+        archives += 1;
+      },
+    } as unknown as RuntimeClient;
+
+    await expect(serviceFor(client).invoke({ type: "session.archive", sessionId: "session_archive" }))
+      .rejects.toThrow("Stop the current run before archiving");
+    expect({ goalReads, goalUpdates, archives }).toEqual({ goalReads: 0, goalUpdates: 0, archives: 0 });
+  });
+
+  test("archives paused, completed, and budget-limited Goals without rewriting them", async () => {
+    for (const status of ["paused", "complete", "budgetLimited"] as const) {
+      let goalUpdates = 0;
+      let archives = 0;
+      const client = {
+        sessionEvents: async () => [],
+        getGoal: async () => goalRecord(`session_${status}`, status),
+        updateGoal: async () => {
+          goalUpdates += 1;
+          return goalRecord(`session_${status}`, status);
+        },
+        archiveSession: async () => {
+          archives += 1;
+        },
+      } as unknown as RuntimeClient;
+
+      expect(await serviceFor(client).invoke({ type: "session.archive", sessionId: `session_${status}` }))
+        .toEqual({ archived: true });
+      expect({ status, goalUpdates, archives }).toEqual({ status, goalUpdates: 0, archives: 1 });
+    }
+  });
+
+  test("resumes a paused Goal, rejects archived and budget-limited Goals", async () => {
+    const updates: Array<{ status?: string; tokenBudget?: number }> = [];
+    let goalStatus: "paused" | "budgetLimited" = "paused";
+    let lifecycle: "active" | "archived" = "active";
+    const client = {
+      listSessions: async () => [sessionSummary("session_resume", lifecycle)],
+      getGoal: async () => goalRecord("session_resume", goalStatus),
+      updateGoal: async (input: { status?: string; tokenBudget?: number }) => {
+        updates.push(input);
+        return goalRecord("session_resume", "active");
+      },
+      ...snapshotClientMethods(),
+    } as unknown as RuntimeClient;
+    const service = serviceFor(client);
+
+    expect((await service.invoke({ type: "session.resume", sessionId: "session_resume" })).sessionId)
+      .toBe("session_resume");
+    expect(updates).toHaveLength(1);
+    expect(updates[0]?.status).toBe("active");
+
+    goalStatus = "budgetLimited";
+    await expect(service.invoke({ type: "session.resume", sessionId: "session_resume" }))
+      .rejects.toThrow("Increase the Goal token budget");
+    expect(updates).toHaveLength(1);
+
+    lifecycle = "archived";
+    await expect(service.invoke({ type: "session.resume", sessionId: "session_resume" }))
+      .rejects.toThrow("Archived tasks cannot be resumed");
+    expect(updates).toHaveLength(1);
+  });
+
+  test("forwards a higher Goal budget with active status for explicit recovery", async () => {
+    let received: { status?: string; tokenBudget?: number } | undefined;
+    const client = {
+      sessionEvents: async () => [],
+      updateGoal: async (input: { status?: string; tokenBudget?: number }) => {
+        received = input;
+        return { ...goalRecord("session_budget", "active"), tokenBudget: input.tokenBudget };
+      },
+    } as unknown as RuntimeClient;
+
+    const result = await serviceFor(client).invoke({
+      type: "session.goal.update",
+      sessionId: "session_budget",
+      status: "active",
+      tokenBudget: 40_000,
+    });
+    expect(received).toMatchObject({ status: "active", tokenBudget: 40_000 });
+    expect(result).toMatchObject({ status: "active", tokenBudget: 40_000 });
+  });
+
+  test("does not claim an active Goal resume while a prior run is still draining", async () => {
+    let updates = 0;
+    const client = {
+      sessionEvents: async () => [{
+        id: "event_cancelling",
+        type: "session.status_changed",
+        time: 1,
+        sessionId: "session_budget",
+        payload: { sessionId: "session_budget", status: "cancelling" },
+      }],
+      updateGoal: async () => {
+        updates += 1;
+        return goalRecord("session_budget", "active");
+      },
+    } as unknown as RuntimeClient;
+
+    await expect(serviceFor(client).invoke({
+      type: "session.goal.update",
+      sessionId: "session_budget",
+      status: "active",
+      tokenBudget: 40_000,
+    })).rejects.toThrow("Wait for the current run to stop");
+    expect(updates).toBe(0);
+  });
+
+  test("steers an active Goal and resumes it only after the queued prompt drains", async () => {
+    const order: string[] = [];
+    let goalStatus: "active" | "paused" = "active";
+    let submissions = 0;
+    let resumptions = 0;
+    const client = {
+      sessionEvents: async () => [{
+        id: "event_running_goal",
+        type: "session.status_changed",
+        time: 1,
+        sessionId: "session_goal",
+        payload: { sessionId: "session_goal", status: "running" },
+      }],
+      getGoal: async () => {
+        order.push(`goal:${goalStatus}`);
+        return goalRecord("session_goal", goalStatus);
+      },
+      interruptSession: async () => {
+        order.push("interrupt");
+        goalStatus = "paused";
+        return { interrupted: true };
+      },
+      submitPromptAsync: async () => {
+        order.push("submit:steer");
+        submissions += 1;
+        return { status: "accepted", sessionId: "session_goal" };
+      },
+      updateGoal: async ({ status }: { status?: "active" | "paused" }) => {
+        order.push(`update:${status}`);
+        if (status === "active") {
+          goalStatus = "active";
+          resumptions += 1;
+        }
+        return goalRecord("session_goal", goalStatus);
+      },
+    } as unknown as RuntimeClient;
+    const service = serviceFor(client);
+
+    expect(await service.invoke({
+      type: "session.send",
+      sessionId: "session_goal",
+      text: "change direction",
+      mode: "steer",
+    })).toEqual({ status: "queued", position: 1 });
+    expect(order).toEqual(["goal:active", "interrupt"]);
+
+    service.observeEvent({
+      id: "event_original_stopped",
+      type: "session.status_changed",
+      time: 2,
+      sessionId: "session_goal",
+      payload: { sessionId: "session_goal", status: "cancelled" },
+    } as never, 1);
+    await waitUntil(() => submissions === 1);
+    expect(resumptions).toBe(0);
+
+    service.observeEvent({
+      id: "event_steer_finished",
+      type: "session.status_changed",
+      time: 3,
+      sessionId: "session_goal",
+      payload: { sessionId: "session_goal", status: "idle" },
+    } as never, 1);
+    await waitUntil(() => resumptions === 1);
+    expect(order).toEqual([
+      "goal:active",
+      "interrupt",
+      "submit:steer",
+      "goal:paused",
+      "update:active",
+    ]);
+
+    service.observeEvent({
+      id: "event_extra_idle",
+      type: "session.status_changed",
+      time: 4,
+      sessionId: "session_goal",
+      payload: { sessionId: "session_goal", status: "idle" },
+    } as never, 1);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(resumptions).toBe(1);
   });
 });
 
@@ -1189,6 +1593,57 @@ function serviceFor(client: RuntimeClient, onError: (error: Error) => void = () 
     emitQueue: () => undefined,
     onError,
   });
+}
+
+function sessionSummary(id: string, status: "active" | "archived" = "active") {
+  return {
+    id,
+    cwd: "/repo",
+    source: "interactive",
+    status,
+    createdAt: 1,
+    updatedAt: 1,
+  } as never;
+}
+
+function permissionConfig(profile: "default" | "auto-review" | "full-access") {
+  return {
+    profile,
+    profiles: ["default", "auto-review", "full-access"].map((id) => ({
+      id,
+      label: id,
+      description: id,
+      current: id === profile,
+    })),
+  } as never;
+}
+
+function goalRecord(sessionId: string, status: "active" | "paused" | "budgetLimited" | "complete") {
+  return {
+    sessionId,
+    objective: "finish the release",
+    status,
+    tokensUsed: 0,
+    timeUsedSeconds: 0,
+    createdAt: 1,
+    updatedAt: 1,
+  };
+}
+
+function snapshotClientMethods() {
+  return {
+    sessionEvents: async () => [],
+    sessionEventWindow: async () => ({
+      events: [],
+      pendingApprovals: [],
+      truncated: false,
+      bytes: 2,
+      pinnedEventIds: [],
+    }),
+    agentTree: async () => ({ nodes: [], agents: [], tasks: [], mailbox: [] }),
+    listTasks: async () => [],
+    listUserInputs: async () => [],
+  };
 }
 
 function taskRecord(id: string, path: string, parentSessionId: string, childSessionId: string) {

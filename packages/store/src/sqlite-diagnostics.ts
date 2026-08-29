@@ -2,6 +2,7 @@ import { readdir, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
 import { SQLITE_JOURNAL_SIZE_LIMIT_BYTES, SQLITE_WAL_AUTO_CHECKPOINT_PAGES } from "./sqlite-event-store.js";
+import { sqliteJournalPolicy, type SqliteJournalMode } from "./sqlite-journal-policy.js";
 
 export interface SqliteEventStoreDiagnostics {
   path: string;
@@ -14,6 +15,12 @@ export interface SqliteEventStoreDiagnostics {
   configuredWal: {
     autoCheckpointPages: number;
     journalSizeLimitBytes: number;
+  };
+  sqliteJournal?: {
+    sqliteVersion: string;
+    walResetSafe: boolean;
+    selectedMode: SqliteJournalMode;
+    actualMode: string;
   };
   pragmas: {
     journalMode: string;
@@ -110,6 +117,11 @@ const TOP_ROWS_LIMIT = 10;
 export async function inspectSqliteEventStore(path: string): Promise<SqliteEventStoreDiagnostics> {
   const db = new Database(path, { readonly: true, strict: true });
   try {
+    const sqliteVersion = db
+      .query<{ version: string }, []>("select sqlite_version() as version")
+      .get()?.version ?? "unknown";
+    const journalPolicy = sqliteJournalPolicy(sqliteVersion);
+    const actualJournalMode = pragmaString(db, "journal_mode");
     return {
       path,
       files: {
@@ -122,8 +134,14 @@ export async function inspectSqliteEventStore(path: string): Promise<SqliteEvent
         autoCheckpointPages: SQLITE_WAL_AUTO_CHECKPOINT_PAGES,
         journalSizeLimitBytes: SQLITE_JOURNAL_SIZE_LIMIT_BYTES,
       },
+      sqliteJournal: {
+        sqliteVersion,
+        walResetSafe: journalPolicy.walResetSafe,
+        selectedMode: journalPolicy.journalMode,
+        actualMode: actualJournalMode,
+      },
       pragmas: {
-        journalMode: pragmaString(db, "journal_mode"),
+        journalMode: actualJournalMode,
         pageSize: pragmaNumber(db, "page_size"),
         pageCount: pragmaNumber(db, "page_count"),
         freelistCount: pragmaNumber(db, "freelist_count"),

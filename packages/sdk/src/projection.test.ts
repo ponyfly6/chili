@@ -5568,7 +5568,7 @@ test("client sends model control requests and prompt overrides", async () => {
     model: "gpt-5.5",
     connectionLabel: "Third-party API",
     authSource: "environment",
-    endpoint: "https://gateway.example",
+    endpoint: "https://gateway.example/",
   }]);
   expect(commands.roots[0]?.children[0]?.id).toBe("session.rename");
   expect(reloadedCommands).toEqual(commands);

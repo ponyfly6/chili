@@ -42,6 +42,10 @@ import {
 } from "@chili/protocol";
 import { decodeJson, encodeJson } from "./json.js";
 import { AGENT_TASKS_CHILD_SESSION_UNIQUE_INDEX, SQLITE_SCHEMA } from "./schema.js";
+import {
+  sqliteJournalPolicy,
+  type SqliteJournalMode,
+} from "./sqlite-journal-policy.js";
 import type {
   AgentMailboxQuery,
   AgentMailboxRow,
@@ -328,6 +332,23 @@ interface TeamMessageDeliveryProjectionRow {
 export const SQLITE_WAL_AUTO_CHECKPOINT_PAGES = 256;
 export const SQLITE_JOURNAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024;
 
+export class SqliteJournalModeError extends Error {
+  override readonly name = "SqliteJournalModeError";
+
+  constructor(
+    readonly sqliteVersion: string,
+    readonly requestedMode: SqliteJournalMode,
+    readonly actualMode: string,
+    cause?: unknown,
+  ) {
+    super(
+      `SQLite ${sqliteVersion} requires journal_mode=${requestedMode.toUpperCase()} for Chili, `
+      + `but the database remained in journal_mode=${actualMode.toUpperCase()}`,
+      cause === undefined ? undefined : { cause },
+    );
+  }
+}
+
 export class UnknownEventCursorError extends Error {
   override readonly name = "UnknownEventCursorError";
 
@@ -442,16 +463,23 @@ export class SqliteEventStore
   private readonly legacySessionIds = new Map<string, SessionId>();
   private readonly ownedCreationClaims = new Map<SessionId, string>();
   private readonly ownedRunClaims = new Map<SessionId, string>();
+  private readonly journalMode: string;
   private closed = false;
 
   constructor(path = ".chili/chili.sqlite", private readonly options: SqliteEventStoreOptions = {}) {
     this.db = new Database(path, { create: true, strict: true });
     try {
-      this.db.exec("pragma journal_mode = WAL");
-      this.db.exec("pragma synchronous = FULL");
-      this.db.exec(`pragma wal_autocheckpoint = ${SQLITE_WAL_AUTO_CHECKPOINT_PAGES}`);
-      this.db.exec(`pragma journal_size_limit = ${SQLITE_JOURNAL_SIZE_LIMIT_BYTES}`);
       this.db.exec(`pragma busy_timeout = ${Math.max(0, Math.trunc(options.busyTimeoutMs ?? 10_000))}`);
+      const sqliteVersion = this.db
+        .query<{ version: string }, []>("select sqlite_version() as version")
+        .get()?.version ?? "unknown";
+      const policy = sqliteJournalPolicy(sqliteVersion);
+      this.journalMode = configureSqliteJournalMode(this.db, policy.journalMode, sqliteVersion);
+      this.db.exec("pragma synchronous = FULL");
+      if (this.journalMode === "wal") {
+        this.db.exec(`pragma wal_autocheckpoint = ${SQLITE_WAL_AUTO_CHECKPOINT_PAGES}`);
+      }
+      this.db.exec(`pragma journal_size_limit = ${SQLITE_JOURNAL_SIZE_LIMIT_BYTES}`);
       this.db.exec("pragma foreign_keys = ON");
       const [eventTableStatement, ...remainingStatements] = SQLITE_SCHEMA;
       if (eventTableStatement) {
@@ -495,7 +523,7 @@ export class SqliteEventStore
   close(): void {
     if (this.closed) return;
     try {
-      this.db.exec("pragma wal_checkpoint(TRUNCATE)");
+      if (this.journalMode === "wal") this.db.exec("pragma wal_checkpoint(TRUNCATE)");
     } finally {
       this.closed = true;
       this.db.close();
@@ -5829,6 +5857,28 @@ function isSqliteBusyError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const message = error.message.toLowerCase();
   return message.includes("database is locked") || message.includes("database busy") || message.includes("sqlite_busy");
+}
+
+function configureSqliteJournalMode(
+  db: Database,
+  requestedMode: SqliteJournalMode,
+  sqliteVersion: string,
+): string {
+  let actualMode = "unknown";
+  try {
+    const row = db
+      .query<Record<string, unknown>, []>(`pragma journal_mode = ${requestedMode.toUpperCase()}`)
+      .get();
+    actualMode = String(row ? Object.values(row)[0] : "unknown").toLowerCase();
+  } catch (error) {
+    throw new SqliteJournalModeError(sqliteVersion, requestedMode, actualMode, error);
+  }
+  // SQLite in-memory databases report MEMORY and cannot be shared across
+  // processes, so they do not meet the WAL-reset bug's preconditions.
+  if (actualMode !== requestedMode && actualMode !== "memory") {
+    throw new SqliteJournalModeError(sqliteVersion, requestedMode, actualMode);
+  }
+  return actualMode;
 }
 
 function sleepSync(ms: number): void {

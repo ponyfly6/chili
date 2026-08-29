@@ -23,6 +23,12 @@ test("formatStoreDoctorText surfaces file and largest-payload diagnostics", () =
       autoCheckpointPages: 256,
       journalSizeLimitBytes: 16 * 1024 * 1024,
     },
+    sqliteJournal: {
+      sqliteVersion: "3.51.0",
+      walResetSafe: false,
+      selectedMode: "delete",
+      actualMode: "delete",
+    },
     pragmas: {
       journalMode: "wal",
       pageSize: 4_096,
@@ -74,6 +80,7 @@ test("formatStoreDoctorText surfaces file and largest-payload diagnostics", () =
   expect(output).toContain("wal=2.0 KiB");
   expect(output).toContain("toolcall_big.txt\t48.0 KiB");
   expect(output).toContain("autocheckpoint_pages=256");
+  expect(output).toContain("sqlite_policy version=3.51.0 wal_reset_safe=false selected=delete actual=delete");
   expect(output).toContain("message.part_delta\t30\t8.0 KiB");
   expect(output).toContain("event_big\ttool.call_finished\tsession_hot\t4.0 KiB");
   expect(output).toContain("read\t3\t16.0 KiB");

@@ -11,6 +11,11 @@ export function formatStoreDoctorText(report: SqliteEventStoreDiagnostics): stri
       formatBytes(row.bytes),
     ])),
     `sqlite journal=${report.pragmas.journalMode} page_size=${report.pragmas.pageSize} page_count=${report.pragmas.pageCount} freelist=${report.pragmas.freelistCount}`,
+    ...(report.sqliteJournal
+      ? [
+          `sqlite_policy version=${report.sqliteJournal.sqliteVersion} wal_reset_safe=${report.sqliteJournal.walResetSafe} selected=${report.sqliteJournal.selectedMode} actual=${report.sqliteJournal.actualMode}`,
+        ]
+      : []),
     `configured_wal autocheckpoint_pages=${report.configuredWal.autoCheckpointPages} journal_size_limit=${formatBytes(report.configuredWal.journalSizeLimitBytes)}`,
     `events rows=${report.events.rows} payload=${formatBytes(report.events.totalPayloadBytes)}`,
     ...tableLines("events by type", ["type", "rows", "payload"], report.events.byType.map((row) => [

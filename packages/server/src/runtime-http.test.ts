@@ -78,7 +78,171 @@ import type {
 } from "./runtime-http.js";
 import type { PromptCommandControl, PromptCommandRunResult } from "./commands.js";
 import { PromptCommandNotFoundError, PromptCommandUsageError } from "./commands.js";
-import { createRuntimeHttpHandler } from "./runtime-http.js";
+import {
+  assertRuntimeHttpServerAuthentication,
+  createRuntimeHttpHandler,
+  isLoopbackBindHostname,
+  startRuntimeHttpServer,
+} from "./runtime-http.js";
+
+test("classifies only explicit loopback bind hosts as local", () => {
+  for (const hostname of ["127.0.0.1", "127.255.12.9", "localhost", "api.localhost", "::1", "[::1]"]) {
+    expect(isLoopbackBindHostname(hostname)).toBe(true);
+  }
+  for (const hostname of ["", "0.0.0.0", "::", "[::]", "192.168.1.20", "example.test", "127.0.0.1.example.test", "2130706433"]) {
+    expect(isLoopbackBindHostname(hostname)).toBe(false);
+  }
+});
+
+test("requires at least 32 UTF-8 token bytes before any non-loopback bind", () => {
+  const tls = { cert: "test certificate", key: "test private key" } satisfies Bun.TLSOptions;
+  for (const hostname of ["0.0.0.0", "::", "192.168.1.20", "example.test", ""]) {
+    expect(() => assertRuntimeHttpServerAuthentication(hostname, "x".repeat(31))).toThrow(
+      "without an authToken of at least 32 UTF-8 bytes",
+    );
+    expect(() => assertRuntimeHttpServerAuthentication(hostname, "é".repeat(15))).toThrow(
+      "without an authToken of at least 32 UTF-8 bytes",
+    );
+    expect(() => assertRuntimeHttpServerAuthentication(hostname, "x".repeat(32), tls)).not.toThrow();
+    expect(() => assertRuntimeHttpServerAuthentication(hostname, "é".repeat(16), tls)).not.toThrow();
+  }
+  expect(() => assertRuntimeHttpServerAuthentication(undefined, undefined)).not.toThrow();
+});
+
+test("requires explicit nonempty TLS cert and key for authenticated non-loopback binds", () => {
+  const token = "x".repeat(32);
+  const invalidTlsOptions: unknown[] = [
+    undefined,
+    {},
+    { cert: "certificate" },
+    { key: "private key" },
+    { cert: "", key: "private key" },
+    { cert: "certificate", key: " \t\n" },
+    { cert: [], key: "private key" },
+    { cert: "certificate", key: [] },
+    { cert: [["certificate"]], key: "private key" },
+    { cert: new Uint8Array(), key: new Uint8Array([1]) },
+    [],
+    [
+      { cert: "certificate", key: "private key" },
+      { cert: "", key: "private key" },
+    ],
+  ];
+
+  for (const tls of invalidTlsOptions) {
+    expect(() => assertRuntimeHttpServerAuthentication(
+      "0.0.0.0",
+      token,
+      tls as Bun.TLSOptions | Bun.TLSOptions[] | undefined,
+    )).toThrow('non-loopback host "0.0.0.0" without explicit TLS cert and key');
+  }
+
+  const validTlsOptions: Array<Bun.TLSOptions | Bun.TLSOptions[]> = [
+    { cert: "certificate", key: "private key" },
+    { cert: ["certificate", new Uint8Array([1])], key: [new Uint8Array([1])] },
+    [
+      { cert: "first certificate", key: "first private key" },
+      { cert: new Uint8Array([1]), key: new Uint8Array([2]) },
+    ],
+  ];
+  for (const tls of validTlsOptions) {
+    expect(() => assertRuntimeHttpServerAuthentication("0.0.0.0", token, tls)).not.toThrow();
+  }
+
+  for (const hostname of ["127.0.0.1", "localhost", "::1"]) {
+    expect(() => assertRuntimeHttpServerAuthentication(hostname, undefined, undefined)).not.toThrow();
+  }
+});
+
+test("keeps safe bind hosts in diagnostics but never reflects hostile host input", () => {
+  for (const hostname of ["0.0.0.0", "192.168.1.20", "example.test", "::", "[::]"]) {
+    expect(() => assertRuntimeHttpServerAuthentication(hostname, undefined)).toThrow(
+      `non-loopback host ${JSON.stringify(hostname)}`,
+    );
+  }
+
+  const hostileHostnames = [
+    "operator:hostname-secret@example.test",
+    "https://operator:hostname-secret@example.test",
+    "0.0.0.0\nhostname-secret",
+    "example.test/path?token=hostname-secret",
+    `example.test-${"hostname-secret".repeat(30)}`,
+  ];
+  for (const hostname of hostileHostnames) {
+    let message = "";
+    try {
+      assertRuntimeHttpServerAuthentication(hostname, undefined);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain('non-loopback host "<unsafe-hostname>"');
+    expect(message).not.toContain("hostname-secret");
+    expect(message).not.toContain("\n");
+  }
+});
+
+test("passes validated TLS configuration through to Bun.serve", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const tls: Bun.TLSOptions[] = [
+    { cert: "first certificate", key: "first private key" },
+    { cert: "second certificate", key: "second private key" },
+  ];
+  const mutableBun = Bun as unknown as { serve: typeof Bun.serve };
+  const originalServe = mutableBun.serve;
+  let capturedOptions: unknown;
+  let stopped = false;
+  mutableBun.serve = ((options: unknown) => {
+    capturedOptions = options;
+    return {
+      url: new URL("https://0.0.0.0:4443/"),
+      stop(closeActiveConnections?: boolean) {
+        expect(closeActiveConnections).toBe(true);
+        stopped = true;
+      },
+    } as unknown as ReturnType<typeof Bun.serve>;
+  }) as typeof Bun.serve;
+
+  try {
+    const server = startRuntimeHttpServer({
+      service: new FakeRuntimeService(store),
+      store,
+      hostname: "0.0.0.0",
+      authToken: "x".repeat(32),
+      tls,
+    });
+    expect((capturedOptions as { tls?: unknown }).tls).toBe(tls);
+    expect(server.url).toBe("https://0.0.0.0:4443/");
+    await server.close();
+    expect(stopped).toBe(true);
+  } finally {
+    mutableBun.serve = originalServe;
+  }
+});
+
+test("start rejects an unauthenticated wildcard before opening a Bun server", () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  expect(() => startRuntimeHttpServer({
+    service: new FakeRuntimeService(store),
+    store,
+    hostname: "0.0.0.0",
+  })).toThrow('Refusing to bind runtime HTTP server to non-loopback host "0.0.0.0"');
+});
+
+test("rejects every browser-originated mutation, including routes without bodies", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const service = new FakeRuntimeService(store);
+  const handler = createRuntimeHttpHandler({ service, store });
+  const session = await service.createSession({ cwd: "/repo" });
+
+  const response = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/archive`, {
+    method: "POST",
+    headers: { origin: "https://evil.example" },
+  }));
+
+  expect(response.status).toBe(403);
+  expect(await response.json()).toEqual({ error: { message: "Browser-originated runtime mutations are disabled" } });
+  expect((await store.sessions()).find((candidate) => candidate.id === session.sessionId)?.status).toBe("active");
+});
 
 test("keeps runtime HTTP routes unauthenticated when no auth token is configured", async () => {
   const store = new ObservableEventStore(new MemoryEventStore());
@@ -149,7 +313,7 @@ test("protects non-health runtime HTTP routes with the configured bearer token",
 test("rejects an empty runtime HTTP auth token configuration", () => {
   const store = new ObservableEventStore(new MemoryEventStore());
 
-  for (const authToken of ["", "   "]) {
+  for (const authToken of ["", "   ", "token\u0000with-control", "token\u007fwith-delete"]) {
     expect(() => createRuntimeHttpHandler({
       service: new FakeRuntimeService(store),
       store,

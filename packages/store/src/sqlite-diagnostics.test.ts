@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { ChiliEvent, MessageId, SessionId, TimestampMs, ToolCallId, TurnId } from "@chili/protocol";
 import { inspectSqliteEventStore } from "./sqlite-diagnostics.js";
 import { SqliteEventStore } from "./sqlite-event-store.js";
+import { sqliteJournalPolicy } from "./sqlite-journal-policy.js";
 
 test("inspectSqliteEventStore reports files and the largest storage rows", async () => {
   const dir = await mkdtemp(join(tmpdir(), "chili-store-doctor-"));
@@ -66,7 +67,16 @@ test("inspectSqliteEventStore reports files and the largest storage rows", async
       autoCheckpointPages: 256,
       journalSizeLimitBytes: 16 * 1024 * 1024,
     });
-    expect(report.pragmas.journalMode).toBe("wal");
+    const sqliteJournal = report.sqliteJournal;
+    if (!sqliteJournal) throw new Error("Missing SQLite journal diagnostics");
+    const journalPolicy = sqliteJournalPolicy(sqliteJournal.sqliteVersion);
+    expect(sqliteJournal).toEqual({
+      sqliteVersion: sqliteJournal.sqliteVersion,
+      walResetSafe: journalPolicy.walResetSafe,
+      selectedMode: journalPolicy.journalMode,
+      actualMode: journalPolicy.journalMode,
+    });
+    expect(report.pragmas.journalMode).toBe(journalPolicy.journalMode);
     expect(report.pragmas.pageSize).toBeGreaterThan(0);
     expect(report.events.rows).toBe(5);
     expect(report.events.totalPayloadBytes).toBeGreaterThan(4_000);

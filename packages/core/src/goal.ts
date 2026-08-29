@@ -79,17 +79,22 @@ export class GoalService {
   }
 
   async setGoal(input: SetGoalInput): Promise<SessionGoal> {
-    const objective = input.objective.trim();
-    if (!objective) throw new Error("Goal objective is required.");
+    const objective = normalizeObjective(input.objective);
     const existing = await this.getGoal({ sessionId: input.sessionId });
     if (existing && !input.replace) throw new GoalAlreadyExistsError(input.sessionId);
+    const tokenBudget = input.tokenBudget !== undefined
+      ? positiveInteger(input.tokenBudget, "Goal token budget")
+      : existing?.tokenBudget !== undefined
+        ? positiveInteger(existing.tokenBudget, "Existing goal token budget")
+        : this.defaultTokenBudget();
+    if (input.replace && existing) assertBudgetAllowsReactivation(existing, tokenBudget);
 
     const now = this.now();
     const goal: SessionGoal = {
       sessionId: input.sessionId,
       objective,
       status: "active",
-      tokenBudget: input.tokenBudget ?? existing?.tokenBudget ?? this.defaultTokenBudget(),
+      tokenBudget,
       tokensUsed: input.replace && existing ? existing.tokensUsed : 0,
       timeUsedSeconds: input.replace && existing ? existing.timeUsedSeconds : 0,
       createdAt: input.replace && existing ? existing.createdAt : now,
@@ -103,6 +108,10 @@ export class GoalService {
   async updateGoal(input: UpdateGoalInput): Promise<SessionGoal> {
     const existing = await this.getGoal({ sessionId: input.sessionId });
     if (!existing) throw new GoalNotFoundError(input.sessionId);
+    const tokenBudget = input.tokenBudget === undefined
+      ? existing.tokenBudget
+      : positiveInteger(input.tokenBudget, "Goal token budget");
+    if (input.status === "active") assertBudgetAllowsReactivation(existing, tokenBudget);
     const now = this.now();
     const reason = input.reason ?? reasonForStatus(input.status) ?? "external";
     const goal: SessionGoal = {
@@ -112,11 +121,9 @@ export class GoalService {
       lastReason: reason,
     };
     if (input.objective !== undefined) {
-      const objective = input.objective.trim();
-      if (!objective) throw new Error("Goal objective is required.");
-      goal.objective = objective;
+      goal.objective = normalizeObjective(input.objective);
     }
-    if (input.tokenBudget !== undefined) goal.tokenBudget = input.tokenBudget;
+    if (input.tokenBudget !== undefined && tokenBudget !== undefined) goal.tokenBudget = tokenBudget;
     if (input.status) {
       goal.status = input.status;
       if (input.status === "complete") {
@@ -152,7 +159,7 @@ export class GoalService {
     if (!existing || (existing.status !== "active" && existing.status !== "complete")) return { budgetLimited: false };
 
     const tokenDelta = goalTokenDelta(input.usage);
-    const timeSeconds = finitePositive(input.timeSeconds) ?? 0;
+    const timeSeconds = finiteNonNegative(input.timeSeconds, "Goal usage timeSeconds");
     if (tokenDelta <= 0 && timeSeconds <= 0) {
       return { goal: cloneGoal(existing), budgetLimited: false };
     }
@@ -170,14 +177,21 @@ export class GoalService {
     }
     if (input.usage?.totalTokens !== undefined) usageDelta.totalTokens = input.usage.totalTokens;
 
-    const tokensUsed = existing.tokensUsed + tokenDelta;
+    const tokensUsed = safeNonNegativeInteger(
+      safeNonNegativeInteger(existing.tokensUsed, "Goal tokensUsed") + tokenDelta,
+      "Goal tokensUsed",
+    );
+    const timeUsedSeconds = finiteNonNegative(
+      finiteNonNegative(existing.timeUsedSeconds, "Goal timeUsedSeconds") + timeSeconds,
+      "Goal timeUsedSeconds",
+    );
     const budgetLimited = existing.status === "active" && existing.tokenBudget !== undefined && tokensUsed >= existing.tokenBudget;
     const goal: SessionGoal = {
       ...existing,
       sessionId: input.sessionId,
       status: budgetLimited ? "budgetLimited" : existing.status,
       tokensUsed,
-      timeUsedSeconds: existing.timeUsedSeconds + timeSeconds,
+      timeUsedSeconds,
       updatedAt: this.now(),
       lastReason: budgetLimited ? "budget_limited" : "usage",
     };
@@ -234,7 +248,10 @@ export class GoalService {
   }
 
   private defaultTokenBudget(): number {
-    return Math.max(1, Math.trunc(this.options.defaultTokenBudget ?? DEFAULT_GOAL_TOKEN_BUDGET));
+    return positiveInteger(
+      this.options.defaultTokenBudget ?? DEFAULT_GOAL_TOKEN_BUDGET,
+      "Default goal token budget",
+    );
   }
 
   private id(prefix: string): string {
@@ -248,13 +265,22 @@ export class GoalService {
 
 export function goalTokenDelta(usage: ModelUsage | undefined): number {
   if (!usage) return 0;
-  const totalTokens = finitePositive(usage.totalTokens);
+  const inputTokens = optionalSafeNonNegativeInteger(usage.inputTokens, "Goal usage inputTokens") ?? 0;
+  const outputTokens = optionalSafeNonNegativeInteger(usage.outputTokens, "Goal usage outputTokens") ?? 0;
+  const cacheReadInputTokens = optionalSafeNonNegativeInteger(
+    usage.cacheReadInputTokens,
+    "Goal usage cacheReadInputTokens",
+  ) ?? 0;
+  const cacheCreationInputTokens = optionalSafeNonNegativeInteger(
+    usage.cacheCreationInputTokens,
+    "Goal usage cacheCreationInputTokens",
+  ) ?? 0;
+  const totalTokens = optionalSafeNonNegativeInteger(usage.totalTokens, "Goal usage totalTokens");
   if (totalTokens !== undefined) return totalTokens;
-  const inputTokens = finitePositive(usage.inputTokens) ?? 0;
-  const cacheReadInputTokens = finitePositive(usage.cacheReadInputTokens) ?? 0;
-  const cacheCreationInputTokens = finitePositive(usage.cacheCreationInputTokens) ?? 0;
-  const outputTokens = finitePositive(usage.outputTokens) ?? 0;
-  return inputTokens + cacheReadInputTokens + cacheCreationInputTokens + outputTokens;
+  return safeNonNegativeInteger(
+    inputTokens + cacheReadInputTokens + cacheCreationInputTokens + outputTokens,
+    "Goal token usage delta",
+  );
 }
 
 export function cloneGoal(goal: SessionGoal): SessionGoal {
@@ -281,9 +307,43 @@ function reasonForStatus(status: SessionGoalStatus | undefined): SessionGoalUpda
   return undefined;
 }
 
-function finitePositive(value: number | undefined): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+function normalizeObjective(value: string): string {
+  const objective = typeof value === "string" ? value.trim() : "";
+  if (!objective) throw new Error("Goal objective is required.");
+  return objective;
+}
+
+function positiveInteger(value: number, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${field} must be a positive safe integer.`);
+  }
   return value;
+}
+
+function optionalSafeNonNegativeInteger(value: number | undefined, field: string): number | undefined {
+  if (value === undefined) return undefined;
+  return safeNonNegativeInteger(value, field);
+}
+
+function safeNonNegativeInteger(value: number, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${field} must be a non-negative safe integer.`);
+  }
+  return value;
+}
+
+function finiteNonNegative(value: number, field: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error(`${field} must be a finite non-negative number.`);
+  }
+  return value;
+}
+
+function assertBudgetAllowsReactivation(goal: SessionGoal, tokenBudget: number | undefined): void {
+  if (goal.status !== "budgetLimited" || tokenBudget === undefined || tokenBudget > goal.tokensUsed) return;
+  throw new Error(
+    `Goal token budget must exceed tokens used (${goal.tokensUsed}) before a budget-limited goal can resume.`,
+  );
 }
 
 function defaultCreateId(prefix: string): string {

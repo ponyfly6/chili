@@ -1,4 +1,26 @@
-import type { ChiliEvent } from "@chili/protocol";
+import {
+  parseRuntimeDelegationConfig as parseProtocolDelegationConfig,
+  parseRuntimeMcpReloadResponse as parseProtocolMcpReloadResponse,
+  parseRuntimeMcpStatusResponse as parseProtocolMcpStatusResponse,
+  parseRuntimeModelConfig as parseProtocolModelConfig,
+  parseRuntimeModelDescriptor as parseProtocolModelDescriptor,
+  parseRuntimePermissionConfig as parseProtocolPermissionConfig,
+  parseRuntimeSessionGoal as parseProtocolSessionGoal,
+  type ChiliEvent,
+  type DelegationPolicy,
+  type ModelSelection,
+  type ReasoningLevel,
+  type RuntimeDelegationConfig,
+  type RuntimeMcpReloadResponse,
+  type RuntimeMcpStatusResponse,
+  type RuntimeModelConfig,
+  type RuntimeModelDescriptor,
+  type RuntimePermissionConfig,
+  type RuntimePermissionProfileId,
+  type ServiceTier,
+  type SessionGoal,
+  type SessionGoalStatus,
+} from "@chili/protocol";
 import type {
   RuntimeAgentTreeSnapshot,
   RuntimeAgentTaskRecord,
@@ -18,6 +40,16 @@ const MAX_PENDING_APPROVAL_ROW_BYTES = 64_000;
 export type SidecarPhase = "idle" | "starting" | "healthy" | "recovering" | "stopping" | "error";
 export type SendMode = "queue" | "steer";
 export type DiffScope = "turn" | "workspace";
+export type SessionListStatus = "active" | "archived" | "all";
+export type DesktopCreateSessionStage =
+  | "rename"
+  | "model"
+  | "reasoning"
+  | "service_tier"
+  | "delegation"
+  | "permission"
+  | "prompt"
+  | "goal";
 export type DesktopResyncReason =
   | "renderer_ready"
   | "source_cursor"
@@ -77,12 +109,90 @@ export interface UserInputRequest {
   createdAt: number;
 }
 
+export interface DesktopCreateGoalOptions {
+  objective: string;
+  tokenBudget?: number;
+}
+
+/**
+ * All values needed to create and launch a top-level desktop task. Permission
+ * profiles are runtime-global; the renderer must label them accordingly.
+ */
+export interface DesktopCreateSessionOptions {
+  title?: string;
+  prompt?: string;
+  modelSelection?: ModelSelection;
+  reasoningLevel?: ReasoningLevel;
+  serviceTier?: ServiceTier;
+  permissionProfile?: RuntimePermissionProfileId;
+  delegationPolicy?: DelegationPolicy;
+  goal?: DesktopCreateGoalOptions;
+}
+
+export interface DesktopCreateSessionFailure {
+  stage: DesktopCreateSessionStage;
+  message: string;
+  /** True when a pre-start global permission mutation was restored. */
+  permissionRestored?: boolean;
+  /** The final launch request may have committed before its response failed. */
+  launchMayHaveCommitted?: boolean;
+}
+
+export interface DesktopCreateSessionResult {
+  sessionId: string;
+  status: "created" | "started" | "partial";
+  startState: "not_started" | "started" | "unknown";
+  /** Compatibility convenience: true only when startState is started. */
+  started: boolean;
+  goal?: SessionGoal;
+  /** A created session is deliberately retained so the user can recover it. */
+  failure?: DesktopCreateSessionFailure;
+}
+
+export interface DesktopSessionConfig {
+  model: RuntimeModelConfig;
+  permission: RuntimePermissionConfig;
+  delegation: RuntimeDelegationConfig;
+  goal: SessionGoal | null;
+  mcp: RuntimeMcpStatusResponse;
+}
+
 export type DesktopRequest =
   | { type: "app.state" }
   | { type: "workspace.select" }
-  | { type: "sessions.list" }
-  | { type: "sessions.create" }
+  | { type: "sessions.list"; query?: string; status?: SessionListStatus }
+  | ({ type: "sessions.create" } & DesktopCreateSessionOptions)
+  | { type: "models.list"; provider?: string }
   | { type: "session.snapshot"; sessionId: string }
+  | { type: "session.resume"; sessionId: string }
+  | { type: "session.rename"; sessionId: string; title: string }
+  | { type: "session.archive"; sessionId: string }
+  | { type: "session.config.get"; sessionId: string }
+  | { type: "session.model.set"; sessionId: string; modelSelection: ModelSelection }
+  | { type: "session.reasoning.set"; sessionId: string; reasoningLevel: ReasoningLevel }
+  | { type: "session.service-tier.set"; sessionId: string; serviceTier: ServiceTier }
+  | { type: "permissions.get" }
+  | { type: "permissions.set"; profile: RuntimePermissionProfileId }
+  | { type: "session.delegation.get"; sessionId: string }
+  | { type: "session.delegation.set"; sessionId: string; policy: DelegationPolicy }
+  | { type: "session.goal.get"; sessionId: string }
+  | {
+      type: "session.goal.set";
+      sessionId: string;
+      objective: string;
+      tokenBudget?: number;
+      replace?: boolean;
+    }
+  | {
+      type: "session.goal.update";
+      sessionId: string;
+      status?: SessionGoalStatus;
+      objective?: string;
+      tokenBudget?: number;
+    }
+  | { type: "session.goal.clear"; sessionId: string }
+  | { type: "mcp.status"; sessionId?: string }
+  | { type: "mcp.reload"; sessionId?: string }
   | { type: "session.send"; sessionId: string; text: string; mode: SendMode }
   | { type: "session.stop"; sessionId: string }
   | {
@@ -99,8 +209,26 @@ export interface DesktopResponseMap {
   "app.state": DesktopState;
   "workspace.select": DesktopState;
   "sessions.list": RuntimeSessionSummary[];
-  "sessions.create": { sessionId: string };
+  "sessions.create": DesktopCreateSessionResult;
+  "models.list": RuntimeModelDescriptor[];
   "session.snapshot": RuntimeSnapshot;
+  "session.resume": RuntimeSnapshot;
+  "session.rename": RuntimeSessionSummary;
+  "session.archive": { archived: boolean };
+  "session.config.get": DesktopSessionConfig;
+  "session.model.set": RuntimeModelConfig;
+  "session.reasoning.set": RuntimeModelConfig;
+  "session.service-tier.set": RuntimeModelConfig;
+  "permissions.get": RuntimePermissionConfig;
+  "permissions.set": RuntimePermissionConfig;
+  "session.delegation.get": RuntimeDelegationConfig;
+  "session.delegation.set": RuntimeDelegationConfig;
+  "session.goal.get": { goal: SessionGoal | null };
+  "session.goal.set": SessionGoal;
+  "session.goal.update": SessionGoal;
+  "session.goal.clear": { cleared: boolean; previousGoal?: SessionGoal };
+  "mcp.status": RuntimeMcpStatusResponse;
+  "mcp.reload": RuntimeMcpReloadResponse;
   "session.send": { status: "accepted" | "queued"; position?: number };
   "session.stop": { interrupted: boolean };
   "approval.resolve": { resolved: boolean };
@@ -145,11 +273,102 @@ export function parseDesktopRequest(value: unknown): DesktopRequest {
   const type = requireString(record.type, "type", 80);
   assertOnlyKeys(record, requestKeys(type));
 
-  if (type === "app.state" || type === "workspace.select" || type === "sessions.list" || type === "sessions.create") {
+  if (type === "app.state" || type === "workspace.select" || type === "permissions.get") {
     return { type };
   }
-  if (type === "session.snapshot" || type === "session.stop") {
+  if (type === "sessions.list") {
+    const request: Extract<DesktopRequest, { type: "sessions.list" }> = { type };
+    if (record.query !== undefined) request.query = requireString(record.query, "query", 500, true).trim();
+    if (record.status !== undefined) {
+      request.status = requireEnum(record.status, ["active", "archived", "all"], "status") as SessionListStatus;
+    }
+    return request;
+  }
+  if (type === "sessions.create") return parseCreateSessionRequest(record);
+  if (type === "models.list") {
+    const request: Extract<DesktopRequest, { type: "models.list" }> = { type };
+    if (record.provider !== undefined) request.provider = requireString(record.provider, "provider", 200);
+    return request;
+  }
+  if (
+    type === "session.snapshot"
+    || type === "session.resume"
+    || type === "session.stop"
+    || type === "session.config.get"
+    || type === "session.delegation.get"
+    || type === "session.goal.get"
+    || type === "session.goal.clear"
+  ) {
     return { type, sessionId: requireIdentifier(record.sessionId, "sessionId") };
+  }
+  if (type === "session.rename") {
+    return {
+      type,
+      sessionId: requireIdentifier(record.sessionId, "sessionId"),
+      title: requireString(record.title, "title", 2_000),
+    };
+  }
+  if (type === "session.archive") {
+    return { type, sessionId: requireIdentifier(record.sessionId, "sessionId") };
+  }
+  if (type === "session.model.set") {
+    return {
+      type,
+      sessionId: requireIdentifier(record.sessionId, "sessionId"),
+      modelSelection: parseModelSelection(record.modelSelection, "modelSelection"),
+    };
+  }
+  if (type === "session.reasoning.set") {
+    return {
+      type,
+      sessionId: requireIdentifier(record.sessionId, "sessionId"),
+      reasoningLevel: requireReasoningLevel(record.reasoningLevel, "reasoningLevel"),
+    };
+  }
+  if (type === "session.service-tier.set") {
+    return {
+      type,
+      sessionId: requireIdentifier(record.sessionId, "sessionId"),
+      serviceTier: requireServiceTier(record.serviceTier, "serviceTier"),
+    };
+  }
+  if (type === "permissions.set") {
+    return { type, profile: requirePermissionProfile(record.profile, "profile") };
+  }
+  if (type === "session.delegation.set") {
+    return {
+      type,
+      sessionId: requireIdentifier(record.sessionId, "sessionId"),
+      policy: requireDelegationPolicy(record.policy, "policy"),
+    };
+  }
+  if (type === "session.goal.set") {
+    const request: Extract<DesktopRequest, { type: "session.goal.set" }> = {
+      type,
+      sessionId: requireIdentifier(record.sessionId, "sessionId"),
+      objective: requireString(record.objective, "objective", 200_000),
+    };
+    if (record.tokenBudget !== undefined) request.tokenBudget = requireTokenBudget(record.tokenBudget, "tokenBudget");
+    if (record.replace !== undefined) request.replace = requireBoolean(record.replace, "replace");
+    return request;
+  }
+  if (type === "session.goal.update") {
+    const request: Extract<DesktopRequest, { type: "session.goal.update" }> = {
+      type,
+      sessionId: requireIdentifier(record.sessionId, "sessionId"),
+    };
+    if (record.status !== undefined) request.status = requireGoalStatus(record.status, "status");
+    if (record.objective !== undefined) request.objective = requireString(record.objective, "objective", 200_000);
+    if (record.tokenBudget !== undefined) request.tokenBudget = requireTokenBudget(record.tokenBudget, "tokenBudget");
+    if (request.status === undefined && request.objective === undefined && request.tokenBudget === undefined) {
+      throw new TypeError("Goal update must change status, objective, or tokenBudget");
+    }
+    return request;
+  }
+  if (type === "mcp.status" || type === "mcp.reload") {
+    const request: Extract<DesktopRequest, { type: typeof type }> = { type };
+    if (record.sessionId !== undefined) request.sessionId = requireIdentifier(record.sessionId, "sessionId");
+    return request;
   }
   if (type === "session.send") {
     const mode = record.mode;
@@ -210,6 +429,81 @@ export function parseDesktopRequest(value: unknown): DesktopRequest {
     return request;
   }
   throw new TypeError(`Unsupported desktop request: ${type}`);
+}
+
+function parseCreateSessionRequest(
+  record: Record<string, unknown>,
+): Extract<DesktopRequest, { type: "sessions.create" }> {
+  const request: Extract<DesktopRequest, { type: "sessions.create" }> = { type: "sessions.create" };
+  if (record.title !== undefined) request.title = requireString(record.title, "title", 2_000);
+  if (record.prompt !== undefined) request.prompt = requireString(record.prompt, "prompt", 200_000);
+  if (record.modelSelection !== undefined) {
+    request.modelSelection = parseModelSelection(record.modelSelection, "modelSelection");
+  }
+  if (record.reasoningLevel !== undefined) {
+    request.reasoningLevel = requireReasoningLevel(record.reasoningLevel, "reasoningLevel");
+  }
+  if (record.serviceTier !== undefined) request.serviceTier = requireServiceTier(record.serviceTier, "serviceTier");
+  if (record.permissionProfile !== undefined) {
+    request.permissionProfile = requirePermissionProfile(record.permissionProfile, "permissionProfile");
+  }
+  if (record.delegationPolicy !== undefined) {
+    request.delegationPolicy = requireDelegationPolicy(record.delegationPolicy, "delegationPolicy");
+  }
+  if (record.goal !== undefined) {
+    const goal = requireRecord(record.goal, "goal");
+    assertOnlyKeys(goal, ["objective", "tokenBudget"]);
+    request.goal = { objective: requireString(goal.objective, "goal.objective", 200_000) };
+    if (goal.tokenBudget !== undefined) {
+      request.goal.tokenBudget = requireTokenBudget(goal.tokenBudget, "goal.tokenBudget");
+    }
+    if (request.prompt === undefined) {
+      throw new TypeError("A Goal task requires the task objective in prompt");
+    }
+    if (request.prompt.trim() !== request.goal.objective.trim()) {
+      throw new TypeError("Goal objective must match the task prompt");
+    }
+  }
+  return request;
+}
+
+function parseModelSelection(value: unknown, field: string): ModelSelection {
+  const selection = requireRecord(value, field);
+  assertOnlyKeys(selection, ["provider", "model"]);
+  return {
+    provider: requireString(selection.provider, `${field}.provider`, 200),
+    model: requireString(selection.model, `${field}.model`, 500),
+  };
+}
+
+function requireReasoningLevel(value: unknown, field: string): ReasoningLevel {
+  return requireEnum(
+    value,
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+    field,
+  ) as ReasoningLevel;
+}
+
+function requireServiceTier(value: unknown, field: string): ServiceTier {
+  return requireEnum(value, ["standard", "fast"], field) as ServiceTier;
+}
+
+function requireDelegationPolicy(value: unknown, field: string): DelegationPolicy {
+  return requireEnum(value, ["off", "explicit", "proactive"], field) as DelegationPolicy;
+}
+
+function requirePermissionProfile(value: unknown, field: string): RuntimePermissionProfileId {
+  return requireEnum(value, ["default", "auto-review", "full-access"], field) as RuntimePermissionProfileId;
+}
+
+function requireGoalStatus(value: unknown, field: string): SessionGoalStatus {
+  return requireEnum(value, ["active", "paused", "budgetLimited", "complete"], field) as SessionGoalStatus;
+}
+
+function requireTokenBudget(value: unknown, field: string): number {
+  const budget = requirePositiveInteger(value, field);
+  if (budget > 1_000_000_000_000) throw new TypeError(`${field} exceeds the supported limit`);
+  return budget;
 }
 
 export function parseDesktopEvent(value: unknown): DesktopEvent {
@@ -283,10 +577,48 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
     if (!Array.isArray(value) || value.length > 10_000) throw new TypeError("Invalid session list");
     response = value.map((item) => parseSessionSummary(item));
   } else if (request.type === "sessions.create") {
-    const record = requireRecord(value, "create session response");
-    response = { sessionId: requireIdentifier(record.sessionId, "sessionId") };
-  } else if (request.type === "session.snapshot") {
+    response = parseCreateSessionResult(value);
+  } else if (request.type === "models.list") {
+    if (!Array.isArray(value) || value.length > 1_000) throw new TypeError("Invalid model list");
+    response = value.map((item, index) => parseRuntimeModelDescriptor(item, `models[${index}]`));
+  } else if (request.type === "session.snapshot" || request.type === "session.resume") {
     response = parseRuntimeSnapshot(value);
+  } else if (request.type === "session.rename") {
+    response = parseSessionSummary(value);
+  } else if (request.type === "session.archive") {
+    const record = requireRecord(value, "archive response");
+    assertOnlyKeys(record, ["archived"]);
+    response = { archived: requireBoolean(record.archived, "archived") };
+  } else if (request.type === "session.config.get") {
+    response = parseDesktopSessionConfig(value);
+  } else if (
+    request.type === "session.model.set"
+    || request.type === "session.reasoning.set"
+    || request.type === "session.service-tier.set"
+  ) {
+    response = parseRuntimeModelConfig(value, "model config");
+  } else if (request.type === "permissions.get" || request.type === "permissions.set") {
+    response = parseRuntimePermissionConfig(value, "permission config");
+  } else if (request.type === "session.delegation.get" || request.type === "session.delegation.set") {
+    response = parseRuntimeDelegationConfig(value, "delegation config");
+  } else if (request.type === "session.goal.get") {
+    const record = requireRecord(value, "goal response");
+    assertOnlyKeys(record, ["goal"]);
+    response = { goal: record.goal === null ? null : parseSessionGoal(record.goal, "goal") };
+  } else if (request.type === "session.goal.set" || request.type === "session.goal.update") {
+    response = parseSessionGoal(value, "goal");
+  } else if (request.type === "session.goal.clear") {
+    const record = requireRecord(value, "clear goal response");
+    assertOnlyKeys(record, ["cleared", "previousGoal"]);
+    const result: DesktopResponseMap["session.goal.clear"] = {
+      cleared: requireBoolean(record.cleared, "cleared"),
+    };
+    if (record.previousGoal !== undefined) result.previousGoal = parseSessionGoal(record.previousGoal, "previousGoal");
+    response = result;
+  } else if (request.type === "mcp.status") {
+    response = parseRuntimeMcpStatus(value, "MCP status");
+  } else if (request.type === "mcp.reload") {
+    response = parseRuntimeMcpReload(value, "MCP reload");
   } else if (request.type === "session.send") {
     const record = requireRecord(value, "send response");
     if (record.status !== "accepted" && record.status !== "queued") throw new TypeError("Invalid send status");
@@ -312,7 +644,59 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
   } else {
     throw new TypeError("Unsupported desktop response");
   }
+  assertDesktopResponseScope(request, response);
   return response as DesktopResponse<Request>;
+}
+
+function assertDesktopResponseScope(request: DesktopRequest, response: unknown): void {
+  if (request.type === "session.snapshot" || request.type === "session.resume") {
+    requireMatchingSessionId(request.sessionId, (response as RuntimeSnapshot).sessionId, "snapshot.sessionId");
+    return;
+  }
+  if (request.type === "session.rename") {
+    requireMatchingSessionId(request.sessionId, String((response as RuntimeSessionSummary).id), "session.id");
+    return;
+  }
+  if (request.type === "session.config.get") {
+    const config = response as DesktopSessionConfig;
+    requireMatchingSessionId(request.sessionId, String(config.model.sessionId), "model.sessionId");
+    requireMatchingSessionId(request.sessionId, String(config.delegation.sessionId), "delegation.sessionId");
+    if (config.goal) requireMatchingSessionId(request.sessionId, String(config.goal.sessionId), "goal.sessionId");
+    return;
+  }
+  if (
+    request.type === "session.model.set"
+    || request.type === "session.reasoning.set"
+    || request.type === "session.service-tier.set"
+  ) {
+    requireMatchingSessionId(request.sessionId, String((response as RuntimeModelConfig).sessionId), "model.sessionId");
+    return;
+  }
+  if (request.type === "session.delegation.get" || request.type === "session.delegation.set") {
+    requireMatchingSessionId(
+      request.sessionId,
+      String((response as RuntimeDelegationConfig).sessionId),
+      "delegation.sessionId",
+    );
+    return;
+  }
+  if (request.type === "session.goal.get") {
+    const goal = (response as DesktopResponseMap["session.goal.get"]).goal;
+    if (goal) requireMatchingSessionId(request.sessionId, String(goal.sessionId), "goal.sessionId");
+    return;
+  }
+  if (request.type === "session.goal.set" || request.type === "session.goal.update") {
+    requireMatchingSessionId(request.sessionId, String((response as SessionGoal).sessionId), "goal.sessionId");
+    return;
+  }
+  if (request.type === "session.goal.clear") {
+    const previous = (response as DesktopResponseMap["session.goal.clear"]).previousGoal;
+    if (previous) requireMatchingSessionId(request.sessionId, String(previous.sessionId), "previousGoal.sessionId");
+  }
+}
+
+function requireMatchingSessionId(expected: string, actual: string, field: string): void {
+  if (expected !== actual) throw new TypeError(`${field} does not match the requested session`);
 }
 
 export function parseDesktopState(value: unknown): DesktopState {
@@ -468,6 +852,143 @@ function parseSessionSummary(value: unknown): RuntimeSessionSummary {
   return summary;
 }
 
+function parseCreateSessionResult(value: unknown): DesktopCreateSessionResult {
+  const record = requireRecord(value, "create session response");
+  assertOnlyKeys(record, ["sessionId", "status", "startState", "started", "goal", "failure"]);
+  const status = requireEnum(record.status, ["created", "started", "partial"], "status") as DesktopCreateSessionResult["status"];
+  const startState = requireEnum(
+    record.startState,
+    ["not_started", "started", "unknown"],
+    "startState",
+  ) as DesktopCreateSessionResult["startState"];
+  const started = requireBoolean(record.started, "started");
+  if (started !== (startState === "started")) {
+    throw new TypeError("Create session started is inconsistent with startState");
+  }
+  if (
+    (status === "created" && startState !== "not_started")
+    || (status === "started" && startState !== "started")
+    || (status === "partial" && startState === "started")
+  ) {
+    throw new TypeError("Create session status is inconsistent with started");
+  }
+  const result: DesktopCreateSessionResult = {
+    sessionId: requireIdentifier(record.sessionId, "sessionId"),
+    status,
+    startState,
+    started,
+  };
+  if (record.goal !== undefined) {
+    result.goal = parseSessionGoal(record.goal, "goal");
+    if (String(result.goal.sessionId) !== result.sessionId) throw new TypeError("Created Goal belongs to another session");
+  }
+  if (record.failure !== undefined) {
+    const failure = requireRecord(record.failure, "failure");
+    assertOnlyKeys(failure, ["stage", "message", "permissionRestored", "launchMayHaveCommitted"]);
+    result.failure = {
+      stage: requireEnum(
+        failure.stage,
+        ["rename", "model", "reasoning", "service_tier", "delegation", "permission", "prompt", "goal"],
+        "failure.stage",
+      ) as DesktopCreateSessionStage,
+      message: requireString(failure.message, "failure.message", 8_000),
+    };
+    if (failure.permissionRestored !== undefined) {
+      result.failure.permissionRestored = requireBoolean(failure.permissionRestored, "failure.permissionRestored");
+    }
+    if (failure.launchMayHaveCommitted !== undefined) {
+      result.failure.launchMayHaveCommitted = requireBoolean(
+        failure.launchMayHaveCommitted,
+        "failure.launchMayHaveCommitted",
+      );
+    }
+  }
+  if (status === "partial" && !result.failure) throw new TypeError("Partial create response requires failure details");
+  if (status !== "partial" && result.failure) throw new TypeError("Only a partial create response can contain failure details");
+  if (startState === "unknown" && result.failure?.launchMayHaveCommitted !== true) {
+    throw new TypeError("Unknown launch state must identify a possibly committed launch");
+  }
+  if (startState !== "unknown" && result.failure?.launchMayHaveCommitted === true) {
+    throw new TypeError("Possibly committed launch requires unknown startState");
+  }
+  return result;
+}
+
+function parseDesktopSessionConfig(value: unknown): DesktopSessionConfig {
+  const record = requireRecord(value, "session config");
+  assertOnlyKeys(record, ["model", "permission", "delegation", "goal", "mcp"]);
+  return {
+    model: parseRuntimeModelConfig(record.model, "session config.model"),
+    permission: parseRuntimePermissionConfig(record.permission, "session config.permission"),
+    delegation: parseRuntimeDelegationConfig(record.delegation, "session config.delegation"),
+    goal: record.goal === null ? null : parseSessionGoal(record.goal, "session config.goal"),
+    mcp: parseRuntimeMcpStatus(record.mcp, "session config.mcp"),
+  };
+}
+
+function parseRuntimeModelConfig(value: unknown, field: string): RuntimeModelConfig {
+  const record = requireRecord(value, field);
+  if (!Array.isArray(record.models) || record.models.length > 1_000) {
+    throw new TypeError(`${field}.models must be an array of at most 1000 models`);
+  }
+  const parsed = parseProtocolModelConfig(value, field);
+  requireIdentifier(parsed.sessionId, `${field}.sessionId`);
+  return parsed;
+}
+
+function parseRuntimeModelDescriptor(value: unknown, field: string): RuntimeModelDescriptor {
+  return parseProtocolModelDescriptor(value, field);
+}
+
+function parseRuntimePermissionConfig(value: unknown, field: string): RuntimePermissionConfig {
+  const record = requireRecord(value, field);
+  if (!Array.isArray(record.profiles) || record.profiles.length === 0 || record.profiles.length > 16) {
+    throw new TypeError(`${field}.profiles must contain between 1 and 16 profiles`);
+  }
+  const parsed = parseProtocolPermissionConfig(value, field);
+  const current = parsed.profiles.filter((candidate) => candidate.current);
+  if (current.length !== 1 || current[0]?.id !== parsed.profile) {
+    throw new TypeError(`${field} has inconsistent current profile metadata`);
+  }
+  return parsed;
+}
+
+function parseRuntimeDelegationConfig(value: unknown, field: string): RuntimeDelegationConfig {
+  const parsed = parseProtocolDelegationConfig(value, field);
+  requireIdentifier(parsed.sessionId, `${field}.sessionId`);
+  return parsed;
+}
+
+function parseSessionGoal(value: unknown, field: string): SessionGoal {
+  const parsed = parseProtocolSessionGoal(value, field);
+  requireIdentifier(parsed.sessionId, `${field}.sessionId`);
+  return parsed;
+}
+
+function parseRuntimeMcpStatus(value: unknown, field: string): RuntimeMcpStatusResponse {
+  const record = requireRecord(value, field);
+  if (!Array.isArray(record.servers) || record.servers.length > 1_000) {
+    throw new TypeError(`${field}.servers must be an array of at most 1000 servers`);
+  }
+  const parsed = parseProtocolMcpStatusResponse(value, field);
+  if (
+    parsed.summary.running + parsed.summary.disabled + parsed.summary.authRequired + parsed.summary.errored
+    > parsed.summary.total
+  ) throw new TypeError(`${field}.summary counts exceed total`);
+  return parsed;
+}
+
+function parseRuntimeMcpReload(value: unknown, field: string): RuntimeMcpReloadResponse {
+  const record = requireRecord(value, field);
+  if (!Array.isArray(record.servers) || record.servers.length > 1_000) {
+    throw new TypeError(`${field}.servers must be an array of at most 1000 servers`);
+  }
+  if (!Array.isArray(record.errors) || record.errors.length > 1_000) {
+    throw new TypeError(`${field}.errors must be an array of at most 1000 errors`);
+  }
+  return parseProtocolMcpReloadResponse(value, field);
+}
+
 function parseTaskRecord(value: unknown): RuntimeAgentTaskRecord {
   const task = requireRecord(value, "task");
   requireIdentifier(task.id, "task.id");
@@ -520,8 +1041,41 @@ function parseUserInputQuestion(value: unknown): UserInputQuestion {
 }
 
 function requestKeys(type: string): readonly string[] {
-  if (type === "app.state" || type === "workspace.select" || type === "sessions.list" || type === "sessions.create") return ["type"];
-  if (type === "session.snapshot" || type === "session.stop") return ["type", "sessionId"];
+  if (type === "app.state" || type === "workspace.select" || type === "permissions.get") return ["type"];
+  if (type === "sessions.list") return ["type", "query", "status"];
+  if (type === "sessions.create") {
+    return [
+      "type",
+      "title",
+      "prompt",
+      "modelSelection",
+      "reasoningLevel",
+      "serviceTier",
+      "permissionProfile",
+      "delegationPolicy",
+      "goal",
+    ];
+  }
+  if (type === "models.list") return ["type", "provider"];
+  if (
+    type === "session.snapshot"
+    || type === "session.resume"
+    || type === "session.stop"
+    || type === "session.archive"
+    || type === "session.config.get"
+    || type === "session.delegation.get"
+    || type === "session.goal.get"
+    || type === "session.goal.clear"
+  ) return ["type", "sessionId"];
+  if (type === "session.rename") return ["type", "sessionId", "title"];
+  if (type === "session.model.set") return ["type", "sessionId", "modelSelection"];
+  if (type === "session.reasoning.set") return ["type", "sessionId", "reasoningLevel"];
+  if (type === "session.service-tier.set") return ["type", "sessionId", "serviceTier"];
+  if (type === "permissions.set") return ["type", "profile"];
+  if (type === "session.delegation.set") return ["type", "sessionId", "policy"];
+  if (type === "session.goal.set") return ["type", "sessionId", "objective", "tokenBudget", "replace"];
+  if (type === "session.goal.update") return ["type", "sessionId", "status", "objective", "tokenBudget"];
+  if (type === "mcp.status" || type === "mcp.reload") return ["type", "sessionId"];
   if (type === "session.send") return ["type", "sessionId", "text", "mode"];
   if (type === "approval.resolve") return ["type", "approvalId", "decision", "feedback"];
   if (type === "user-input.resolve") return ["type", "inputId", "answers"];

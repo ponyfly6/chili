@@ -9,7 +9,16 @@ import type {
   RuntimeClient,
   RuntimePendingApprovalRequest,
 } from "@chili/sdk";
-import type { DesktopRequest, DesktopResponse, DesktopState, SendMode } from "../shared/contracts.js";
+import type {
+  DesktopCreateSessionResult,
+  DesktopCreateSessionStage,
+  DesktopRequest,
+  DesktopResponse,
+  DesktopSessionConfig,
+  DesktopState,
+  SendMode,
+} from "../shared/contracts.js";
+import { safeDesktopErrorMessage } from "../shared/safe-error.js";
 import { DetachedProcessGroupRegistry } from "./detached-process-group-registry.js";
 import { desktopDiff } from "./git-diff.js";
 import type { SidecarManager } from "./sidecar-manager.js";
@@ -32,6 +41,11 @@ interface ClientLease {
   controlEpoch: number;
   sidecarGeneration: number;
   signal: AbortSignal;
+}
+
+interface GoalResumeMarker {
+  controlEpoch: number;
+  sidecarGeneration: number;
 }
 
 export interface DesktopControlServiceOptions {
@@ -62,6 +76,7 @@ export class DesktopControlService {
   private readonly sessionActors = new Map<string, Promise<void>>();
   private workspaceActor: Promise<void> = Promise.resolve();
   private readonly observedEventIds = new Map<string, Set<string>>();
+  private readonly resumeGoalsAfterDrain = new Map<string, GoalResumeMarker>();
   private controlEpoch = 0;
   private controlEpochController = new AbortController();
   private switchingWorkspace = false;
@@ -99,6 +114,7 @@ export class DesktopControlService {
   beginShutdown(): void {
     if (this.closing) return;
     this.closing = true;
+    this.resumeGoalsAfterDrain.clear();
     this.controlEpochController.abort(new Error("Desktop is closing"));
     this.mainProcessContainment = this.mainProcessGroups.close();
     void this.mainProcessContainment.catch(() => undefined);
@@ -185,13 +201,25 @@ export class DesktopControlService {
     this.busySessions.clear();
     this.flushingSessions.clear();
     this.observedEventIds.clear();
+    this.resumeGoalsAfterDrain.clear();
+  }
+
+  private clearSessionQueue(sessionId: string): void {
+    const queue = this.queues.get(sessionId);
+    if (queue) {
+      for (const prompt of queue) this.releaseQueuedPrompt(sessionId, prompt);
+    }
+    this.queues.delete(sessionId);
+    this.queuedBytesBySession.delete(sessionId);
+    this.resumeGoalsAfterDrain.delete(sessionId);
+    this.updateQueueCount(sessionId, 0);
   }
 
   private closingResponse(request: DesktopRequest): unknown {
     if (!this.closing) return undefined;
     if (request.type === "app.state") return this.options.sidecar.state();
     if (request.type === "sessions.list") return [];
-    if (request.type === "session.snapshot") {
+    if (request.type === "session.snapshot" || request.type === "session.resume") {
       return {
         sessionId: request.sessionId,
         events: [],
@@ -226,17 +254,242 @@ export class DesktopControlService {
       const lease = this.captureClientLease();
       const sessions = await lease.client.listSessions();
       this.assertClientLease(lease);
-      return sessions.filter((session) => session.source !== "subagent");
+      const query = request.query?.trim().toLowerCase();
+      return sessions.filter((session) => {
+        if (session.source === "subagent") return false;
+        if (request.status && request.status !== "all" && session.status !== request.status) return false;
+        if (!query) return true;
+        return [String(session.id), session.title, session.preview, session.cwd]
+          .some((candidate) => candidate?.toLowerCase().includes(query));
+      });
     }
     if (request.type === "sessions.create") {
+      return this.withWorkspaceActor(() => this.createConfiguredSession(request));
+    }
+    if (request.type === "models.list") {
       const lease = this.captureClientLease();
-      const cwd = this.requireWorkspace();
-      const created = await lease.client.createSession({ cwd, signal: lease.signal });
+      const models = await lease.client.listModels(request.provider ? { provider: request.provider } : {});
       this.assertClientLease(lease);
-      return created;
+      return models;
     }
     if (request.type === "session.snapshot") {
       return this.sessionSnapshot(request.sessionId as SessionId, this.captureClientLease());
+    }
+    if (request.type === "session.resume") {
+      const lease = this.captureClientLease();
+      return this.withSessionActor(request.sessionId, async () => {
+        const sessions = await lease.client.listSessions();
+        this.assertClientLease(lease);
+        const session = sessions.find((candidate) => String(candidate.id) === request.sessionId);
+        if (!session) throw new Error(`Saved task not found: ${request.sessionId}`);
+        if (session.source === "subagent") throw new Error("Subagent tasks cannot be resumed directly");
+        if (session.status !== "active") throw new Error("Archived tasks cannot be resumed");
+        const sessionId = request.sessionId as SessionId;
+        const goal = await lease.client.getGoal({ sessionId, signal: lease.signal });
+        this.assertClientLease(lease);
+        if (goal?.status === "budgetLimited") {
+          throw new Error("Increase the Goal token budget before resuming this task");
+        }
+        if (goal?.status === "active" || goal?.status === "paused") {
+          if (await this.isBusy(request.sessionId, lease)) {
+            throw new Error("Wait for the current run to stop before resuming this Goal");
+          }
+          await lease.client.updateGoal({ sessionId, status: "active", signal: lease.signal });
+          this.assertClientLease(lease);
+          this.markOptimisticBusy(request.sessionId, lease);
+        }
+        return this.sessionSnapshot(sessionId, lease);
+      });
+    }
+    if (request.type === "session.rename") {
+      const lease = this.captureClientLease();
+      return this.withSessionActor(request.sessionId, async () => {
+        const renamed = await lease.client.renameSession({
+          sessionId: request.sessionId as SessionId,
+          title: request.title,
+          signal: lease.signal,
+        });
+        this.assertClientLease(lease);
+        return renamed;
+      });
+    }
+    if (request.type === "session.archive") {
+      const lease = this.captureClientLease();
+      return this.withSessionActor(request.sessionId, async () => {
+        if (await this.isBusy(request.sessionId, lease)) {
+          throw new Error("Stop the current run before archiving this task");
+        }
+        const sessionId = request.sessionId as SessionId;
+        const goal = await lease.client.getGoal({ sessionId, signal: lease.signal });
+        this.assertClientLease(lease);
+        if (goal?.status === "active") {
+          await lease.client.updateGoal({ sessionId, status: "paused", signal: lease.signal });
+          this.assertClientLease(lease);
+        }
+        await lease.client.archiveSession(sessionId);
+        this.assertClientLease(lease);
+        this.clearSessionQueue(request.sessionId);
+        this.busySessions.delete(request.sessionId);
+        return { archived: true };
+      });
+    }
+    if (request.type === "session.config.get") {
+      const lease = this.captureClientLease();
+      const sessionId = request.sessionId as SessionId;
+      const [model, permission, delegation, goal, mcp] = await Promise.all([
+        lease.client.getModelConfig({ sessionId, signal: lease.signal }),
+        lease.client.getPermissionConfig({ signal: lease.signal }),
+        lease.client.getDelegationConfig({ sessionId, signal: lease.signal }),
+        lease.client.getGoal({ sessionId, signal: lease.signal }),
+        lease.client.mcpStatus({ sessionId, signal: lease.signal }),
+      ]);
+      this.assertClientLease(lease);
+      return { model, permission, delegation, goal: goal ?? null, mcp } satisfies DesktopSessionConfig;
+    }
+    if (request.type === "session.model.set") {
+      const lease = this.captureClientLease();
+      return this.withSessionActor(request.sessionId, async () => {
+        const config = await lease.client.setModel({
+          sessionId: request.sessionId as SessionId,
+          modelSelection: request.modelSelection,
+          signal: lease.signal,
+        });
+        this.assertClientLease(lease);
+        return config;
+      });
+    }
+    if (request.type === "session.reasoning.set") {
+      const lease = this.captureClientLease();
+      return this.withSessionActor(request.sessionId, async () => {
+        const config = await lease.client.setReasoning({
+          sessionId: request.sessionId as SessionId,
+          reasoningLevel: request.reasoningLevel,
+          signal: lease.signal,
+        });
+        this.assertClientLease(lease);
+        return config;
+      });
+    }
+    if (request.type === "session.service-tier.set") {
+      const lease = this.captureClientLease();
+      return this.withSessionActor(request.sessionId, async () => {
+        const config = await lease.client.setServiceTier({
+          sessionId: request.sessionId as SessionId,
+          serviceTier: request.serviceTier,
+          signal: lease.signal,
+        });
+        this.assertClientLease(lease);
+        return config;
+      });
+    }
+    if (request.type === "permissions.get") {
+      const lease = this.captureClientLease();
+      const config = await lease.client.getPermissionConfig({ signal: lease.signal });
+      this.assertClientLease(lease);
+      return config;
+    }
+    if (request.type === "permissions.set") {
+      return this.withWorkspaceActor(async () => {
+        const lease = this.captureClientLease();
+        const config = await lease.client.setPermissionProfile({ profile: request.profile, signal: lease.signal });
+        this.assertClientLease(lease);
+        return config;
+      });
+    }
+    if (request.type === "session.delegation.get") {
+      const lease = this.captureClientLease();
+      const config = await lease.client.getDelegationConfig({
+        sessionId: request.sessionId as SessionId,
+        signal: lease.signal,
+      });
+      this.assertClientLease(lease);
+      return config;
+    }
+    if (request.type === "session.delegation.set") {
+      const lease = this.captureClientLease();
+      return this.withSessionActor(request.sessionId, async () => {
+        const config = await lease.client.setDelegationPolicy({
+          sessionId: request.sessionId as SessionId,
+          policy: request.policy,
+          signal: lease.signal,
+        });
+        this.assertClientLease(lease);
+        return config;
+      });
+    }
+    if (request.type === "session.goal.get") {
+      const lease = this.captureClientLease();
+      const goal = await lease.client.getGoal({ sessionId: request.sessionId as SessionId, signal: lease.signal });
+      this.assertClientLease(lease);
+      return { goal: goal ?? null };
+    }
+    if (request.type === "session.goal.set") {
+      const lease = this.captureClientLease();
+      return this.withSessionActor(request.sessionId, async () => {
+        this.resumeGoalsAfterDrain.delete(request.sessionId);
+        const goal = await lease.client.setGoal({
+          sessionId: request.sessionId as SessionId,
+          objective: request.objective,
+          ...(request.tokenBudget !== undefined ? { tokenBudget: request.tokenBudget } : {}),
+          ...(request.replace !== undefined ? { replace: request.replace } : {}),
+          signal: lease.signal,
+        });
+        this.assertClientLease(lease);
+        return goal;
+      });
+    }
+    if (request.type === "session.goal.update") {
+      const lease = this.captureClientLease();
+      return this.withSessionActor(request.sessionId, async () => {
+        if (request.status === "active" && await this.isBusy(request.sessionId, lease)) {
+          throw new Error("Wait for the current run to stop before resuming this Goal");
+        }
+        if (request.status !== undefined && request.status !== "active") {
+          this.resumeGoalsAfterDrain.delete(request.sessionId);
+        }
+        const goal = await lease.client.updateGoal({
+          sessionId: request.sessionId as SessionId,
+          ...(request.status !== undefined ? { status: request.status } : {}),
+          ...(request.objective !== undefined ? { objective: request.objective } : {}),
+          ...(request.tokenBudget !== undefined ? { tokenBudget: request.tokenBudget } : {}),
+          signal: lease.signal,
+        });
+        this.assertClientLease(lease);
+        return goal;
+      });
+    }
+    if (request.type === "session.goal.clear") {
+      const lease = this.captureClientLease();
+      return this.withSessionActor(request.sessionId, async () => {
+        this.resumeGoalsAfterDrain.delete(request.sessionId);
+        const result = await lease.client.clearGoal({
+          sessionId: request.sessionId as SessionId,
+          signal: lease.signal,
+        });
+        this.assertClientLease(lease);
+        return result;
+      });
+    }
+    if (request.type === "mcp.status") {
+      const lease = this.captureClientLease();
+      const status = await lease.client.mcpStatus({
+        ...(request.sessionId !== undefined ? { sessionId: request.sessionId as SessionId } : {}),
+        signal: lease.signal,
+      });
+      this.assertClientLease(lease);
+      return status;
+    }
+    if (request.type === "mcp.reload") {
+      const run = async () => {
+        const lease = this.captureClientLease();
+        const result = await lease.client.reloadMcp({
+          ...(request.sessionId !== undefined ? { sessionId: request.sessionId as SessionId } : {}),
+          signal: lease.signal,
+        });
+        this.assertClientLease(lease);
+        return result;
+      };
+      return request.sessionId ? this.withSessionActor(request.sessionId, run) : this.withWorkspaceActor(run);
     }
     if (request.type === "session.send") {
       const lease = this.captureClientLease();
@@ -250,6 +503,7 @@ export class DesktopControlService {
       const lease = this.captureClientLease();
       return this.withSessionActor(request.sessionId, async () => {
         this.assertClientLease(lease);
+        this.resumeGoalsAfterDrain.delete(request.sessionId);
         const previous = this.busySessions.get(request.sessionId);
         if (!previous) {
           this.busySessions.set(request.sessionId, {
@@ -313,6 +567,145 @@ export class DesktopControlService {
       return result;
     }
     throw new Error("Unsupported desktop request");
+  }
+
+  private async createConfiguredSession(
+    request: Extract<DesktopRequest, { type: "sessions.create" }>,
+  ): Promise<DesktopCreateSessionResult> {
+    if (request.goal && (
+      request.prompt === undefined
+      || request.prompt.trim() !== request.goal.objective.trim()
+    )) {
+      throw new TypeError("Goal objective must match the task prompt");
+    }
+    const lease = this.captureClientLease();
+    const cwd = this.requireWorkspace();
+    const created = await lease.client.createSession({ cwd, signal: lease.signal });
+    this.assertClientLease(lease);
+    const sessionId = created.sessionId;
+    let stage: DesktopCreateSessionStage = "rename";
+    let previousPermission: Awaited<ReturnType<RuntimeClient["getPermissionConfig"]>> | undefined;
+    let permissionMutationAttempted = false;
+
+    const partial = async (
+      error: unknown,
+      launchMayHaveCommitted = false,
+    ): Promise<DesktopCreateSessionResult> => {
+      const permissionRestored = launchMayHaveCommitted
+        ? undefined
+        : await this.restoreCreatePermission({
+            lease,
+            ...(previousPermission ? { previous: previousPermission } : {}),
+            ...(request.permissionProfile ? { requested: request.permissionProfile } : {}),
+            mutationAttempted: permissionMutationAttempted,
+          });
+      return {
+        sessionId: String(sessionId),
+        status: "partial",
+        startState: launchMayHaveCommitted ? "unknown" : "not_started",
+        started: false,
+        failure: {
+          stage,
+          message: safeDesktopErrorMessage(error),
+          ...(permissionRestored !== undefined ? { permissionRestored } : {}),
+          ...(launchMayHaveCommitted ? { launchMayHaveCommitted: true } : {}),
+        },
+      };
+    };
+
+    try {
+      if (request.title !== undefined) {
+        stage = "rename";
+        await lease.client.renameSession({ sessionId, title: request.title, signal: lease.signal });
+        this.assertClientLease(lease);
+      }
+      if (request.modelSelection !== undefined) {
+        stage = "model";
+        await lease.client.setModel({ sessionId, modelSelection: request.modelSelection, signal: lease.signal });
+        this.assertClientLease(lease);
+      }
+      if (request.reasoningLevel !== undefined) {
+        stage = "reasoning";
+        await lease.client.setReasoning({ sessionId, reasoningLevel: request.reasoningLevel, signal: lease.signal });
+        this.assertClientLease(lease);
+      }
+      if (request.serviceTier !== undefined) {
+        stage = "service_tier";
+        await lease.client.setServiceTier({ sessionId, serviceTier: request.serviceTier, signal: lease.signal });
+        this.assertClientLease(lease);
+      }
+      if (request.delegationPolicy !== undefined) {
+        stage = "delegation";
+        await lease.client.setDelegationPolicy({ sessionId, policy: request.delegationPolicy, signal: lease.signal });
+        this.assertClientLease(lease);
+      }
+      if (request.permissionProfile !== undefined) {
+        stage = "permission";
+        previousPermission = await lease.client.getPermissionConfig({ signal: lease.signal });
+        this.assertClientLease(lease);
+        if (previousPermission.profile !== request.permissionProfile) {
+          permissionMutationAttempted = true;
+          await lease.client.setPermissionProfile({ profile: request.permissionProfile, signal: lease.signal });
+          this.assertClientLease(lease);
+        }
+      }
+    } catch (error) {
+      return partial(error);
+    }
+
+    if (request.goal) {
+      stage = "goal";
+      try {
+        const goal = await lease.client.setGoal({
+          sessionId,
+          objective: request.goal.objective,
+          ...(request.goal.tokenBudget !== undefined ? { tokenBudget: request.goal.tokenBudget } : {}),
+          signal: lease.signal,
+        });
+        this.assertClientLease(lease);
+        this.markOptimisticBusy(String(sessionId), lease);
+        return { sessionId: String(sessionId), status: "started", startState: "started", started: true, goal };
+      } catch (error) {
+        return partial(error, true);
+      }
+    }
+
+    if (request.prompt !== undefined) {
+      stage = "prompt";
+      try {
+        await lease.client.submitPromptAsync({ sessionId, text: request.prompt, signal: lease.signal });
+        this.assertClientLease(lease);
+        this.markOptimisticBusy(String(sessionId), lease);
+        return { sessionId: String(sessionId), status: "started", startState: "started", started: true };
+      } catch (error) {
+        return partial(error, true);
+      }
+    }
+
+    return { sessionId: String(sessionId), status: "created", startState: "not_started", started: false };
+  }
+
+  private async restoreCreatePermission(input: {
+    lease: ClientLease;
+    previous?: Awaited<ReturnType<RuntimeClient["getPermissionConfig"]>>;
+    requested?: Extract<DesktopRequest, { type: "permissions.set" }>["profile"];
+    mutationAttempted: boolean;
+  }): Promise<boolean | undefined> {
+    if (!input.mutationAttempted || !input.previous || !input.requested) return undefined;
+    try {
+      const current = await input.lease.client.getPermissionConfig({ signal: input.lease.signal });
+      this.assertClientLease(input.lease);
+      if (current.profile !== input.requested) return false;
+      await input.lease.client.setPermissionProfile({
+        profile: input.previous.profile,
+        signal: input.lease.signal,
+      });
+      this.assertClientLease(input.lease);
+      return true;
+    } catch (rollbackError) {
+      this.options.onError(new Error(`Failed to restore the runtime permission profile: ${safeDesktopErrorMessage(rollbackError)}`));
+      return false;
+    }
   }
 
   private async selectWorkspace(): Promise<DesktopState> {
@@ -506,8 +899,14 @@ export class DesktopControlService {
   ): Promise<{ status: "accepted" | "queued"; position?: number }> {
     this.assertClientLease(lease);
     const busy = await this.isBusy(sessionId, lease);
+    let resumeGoalAfterDrain = false;
+    if (mode === "steer") {
+      const goal = await lease.client.getGoal({ sessionId: sessionId as SessionId, signal: lease.signal });
+      this.assertClientLease(lease);
+      resumeGoalAfterDrain = goal?.status === "active";
+    }
     let queue = this.queues.get(sessionId) ?? [];
-    if (!busy && queue.length === 0) {
+    if (!busy && !resumeGoalAfterDrain && queue.length === 0) {
       this.markOptimisticBusy(sessionId, lease);
       try {
         this.assertClientLease(lease);
@@ -525,6 +924,12 @@ export class DesktopControlService {
     queue = this.queues.get(sessionId) ?? [];
     this.updateQueueCount(sessionId, queue.length);
     if (mode === "steer") {
+      if (resumeGoalAfterDrain) {
+        this.resumeGoalsAfterDrain.set(sessionId, {
+          controlEpoch: lease.controlEpoch,
+          sidecarGeneration: lease.sidecarGeneration,
+        });
+      }
       try {
         this.assertClientLease(lease);
         const result = await lease.client.interruptSession({
@@ -534,10 +939,19 @@ export class DesktopControlService {
         });
         this.assertClientLease(lease);
         if (!result.interrupted) {
+          if (resumeGoalAfterDrain) {
+            await lease.client.updateGoal({
+              sessionId: sessionId as SessionId,
+              status: "paused",
+              signal: lease.signal,
+            });
+            this.assertClientLease(lease);
+          }
           this.busySessions.delete(sessionId);
           this.scheduleFlush(sessionId);
         }
       } catch (error) {
+        if (resumeGoalAfterDrain) this.resumeGoalsAfterDrain.delete(sessionId);
         if (!this.isClientLeaseCurrent(lease)) throw error;
         const queuedIndex = queue.indexOf(prompt);
         if (queuedIndex >= 0) {
@@ -616,6 +1030,7 @@ export class DesktopControlService {
     if (!queue || !next) {
       this.queues.delete(sessionId);
       this.updateQueueCount(sessionId, 0);
+      await this.resumeGoalAfterQueueDrain(sessionId, lease);
       return;
     }
     this.releaseQueuedPrompt(sessionId, next);
@@ -639,6 +1054,37 @@ export class DesktopControlService {
       }
     } finally {
       if (this.flushingSessions.get(sessionId) === lease) this.flushingSessions.delete(sessionId);
+    }
+  }
+
+  private async resumeGoalAfterQueueDrain(sessionId: string, lease: ClientLease): Promise<void> {
+    const marker = this.resumeGoalsAfterDrain.get(sessionId);
+    if (
+      !marker
+      || marker.controlEpoch !== lease.controlEpoch
+      || marker.sidecarGeneration !== lease.sidecarGeneration
+    ) return;
+    this.resumeGoalsAfterDrain.delete(sessionId);
+    try {
+      this.assertClientLease(lease);
+      const goal = await lease.client.getGoal({ sessionId: sessionId as SessionId, signal: lease.signal });
+      this.assertClientLease(lease);
+      if (goal?.status !== "paused") return;
+      await lease.client.updateGoal({
+        sessionId: sessionId as SessionId,
+        status: "active",
+        signal: lease.signal,
+      });
+      this.assertClientLease(lease);
+      this.markOptimisticBusy(sessionId, lease);
+    } catch (error) {
+      if (this.isClientLeaseCurrent(lease)) {
+        this.resumeGoalsAfterDrain.set(sessionId, marker);
+        // Keep an empty queue key so a later healthy sidecar state retries the
+        // deferred Goal resume without resubmitting the steer prompt.
+        this.queues.set(sessionId, []);
+        this.options.onError(error instanceof Error ? error : new Error(String(error)));
+      }
     }
   }
 
