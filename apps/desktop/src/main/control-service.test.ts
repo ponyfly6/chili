@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { SESSION_TITLE_MAX_CHARS } from "@chili/protocol";
 import { reduceRuntimeEvents, type RuntimeClient } from "@chili/sdk";
 import { DesktopControlService } from "./control-service.js";
 
@@ -573,6 +574,113 @@ describe("desktop prompt controls", () => {
 });
 
 describe("desktop task and Goal controls", () => {
+  test("preserves archived task session scope when aggregating readable configuration", async () => {
+    const mcpScopes: Array<string | undefined> = [];
+    const client = {
+      getModelConfig: async () => ({
+        sessionId: "session_archived",
+        availableReasoningLevels: ["low", "high"],
+        models: [{ provider: "openai", model: "gpt-5", available: true }],
+        modelSelection: { provider: "openai", model: "gpt-5" },
+        reasoningLevel: "high",
+        serviceTier: "fast",
+      }),
+      getPermissionConfig: async () => permissionConfig("default"),
+      getDelegationConfig: async () => ({
+        sessionId: "session_archived",
+        policy: "proactive",
+        source: "session",
+      }),
+      getGoal: async () => goalRecord("session_archived", "paused"),
+      mcpStatus: async (input: { sessionId?: string } = {}) => {
+        mcpScopes.push(input.sessionId);
+        return {
+          servers: [{ name: "github", status: "running", enabled: true, toolCount: 4 }],
+          summary: { total: 1, running: 1, disabled: 0, authRequired: 0, errored: 0 },
+        };
+      },
+    } as unknown as RuntimeClient;
+
+    const config = await serviceFor(client).invoke({
+      type: "session.config.get",
+      sessionId: "session_archived",
+    });
+
+    expect(config).toMatchObject({
+      model: { sessionId: "session_archived", reasoningLevel: "high" },
+      permission: { profile: "default" },
+      delegation: { sessionId: "session_archived", policy: "proactive" },
+      goal: { sessionId: "session_archived", status: "paused" },
+      mcp: { summary: { running: 1 } },
+    });
+    expect(mcpScopes).toEqual(["session_archived"]);
+  });
+
+  test("rejects an over-limit New Task title before allocating a partial session", async () => {
+    const maximumTitleChars = SESSION_TITLE_MAX_CHARS;
+    let creations = 0;
+    let renames = 0;
+    const client = {
+      createSession: async () => {
+        creations += 1;
+        return { sessionId: "session_partial_title" };
+      },
+      renameSession: async () => {
+        renames += 1;
+        throw new Error("Session title must be 120 characters or fewer.");
+      },
+    } as unknown as RuntimeClient;
+
+    const outcome = await serviceFor(client).invoke({
+      type: "sessions.create",
+      title: "x".repeat(maximumTitleChars + 1),
+    }).then(
+      (value) => ({ kind: "resolved" as const, value }),
+      (error: unknown) => ({
+        kind: "rejected" as const,
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    );
+
+    expect({ outcome, creations, renames }).toEqual({
+      outcome: {
+        kind: "rejected",
+        message: `Session title must be ${maximumTitleChars} characters or fewer.`,
+      },
+      creations: 0,
+      renames: 0,
+    });
+  });
+
+  test("normalizes a valid New Task title before the post-create rename", async () => {
+    const order: string[] = [];
+    const renamedTitles: string[] = [];
+    const client = {
+      createSession: async () => {
+        order.push("create");
+        return { sessionId: "session_normalized_title" };
+      },
+      renameSession: async ({ title }: { title: string }) => {
+        order.push("rename");
+        renamedTitles.push(title);
+        return sessionSummary("session_normalized_title");
+      },
+    } as unknown as RuntimeClient;
+
+    const result = await serviceFor(client).invoke({
+      type: "sessions.create",
+      title: "  Overnight   Goal\nconsole  ",
+    });
+
+    expect(result).toMatchObject({
+      sessionId: "session_normalized_title",
+      status: "created",
+      startState: "not_started",
+    });
+    expect(order).toEqual(["create", "rename"]);
+    expect(renamedTitles).toEqual(["Overnight Goal console"]);
+  });
+
   test("configures a Goal task in safe order and starts only through setGoal", async () => {
     const order: string[] = [];
     let permission: "default" | "full-access" = "default";

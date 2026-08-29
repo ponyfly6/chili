@@ -24,6 +24,7 @@ try {
     env: {
       ...stringEnvironment(),
       CHILI_E2E_REPOSITORY_ROOT: repositoryRoot,
+      CHILI_E2E_BUN_PATH: process.execPath,
     },
     stdin: "inherit",
     stdout: "inherit",

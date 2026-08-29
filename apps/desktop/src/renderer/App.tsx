@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { SESSION_TITLE_MAX_CHARS } from "@chili/protocol";
 import type {
   ChiliEvent,
   DelegationPolicy,
@@ -39,6 +40,10 @@ import {
 import { createLatestRequestGate } from "./latest-request.js";
 import { isMenuNavigationKey, menuNavigationTarget, trappedTabTarget } from "./keyboard-navigation.js";
 import {
+  sessionConfigAfterSelectionChange,
+  sessionConfigResponseForSelection,
+} from "./session-config-state.js";
+import {
   canEditComposer,
   canOpenSession,
   canSwitchWorkspace,
@@ -68,21 +73,25 @@ import {
   canExposeTaskActions,
   canReloadSessionMcp,
   canResumeTask,
+  canSelectProviderDefault,
   createNewTaskDraft,
+  createSessionModelSettingsDraft,
   filterSessions,
   goalResumeBudgetMinimum,
   goalProgress,
   hydrateNewTaskChoices,
-  isServiceTierSelectionValid,
   modelFromKey,
   modelKey,
   newTaskSubmission,
-  preferredServiceTier,
   reconcileNewTaskModel,
-  serviceTierMutationValue,
+  reconcileSessionModelSettingsModel,
+  sessionModelSettingsMutations,
   validateNewTaskDraft,
+  validateSessionModelSettingsDraft,
   type NewTaskDraft,
+  type ReasoningSelection,
   type ServiceTierSelection,
+  type SessionModelSettingsDraft,
   type SessionListStatus,
 } from "./task-console-model.js";
 
@@ -90,10 +99,7 @@ type DesktopProjection = CoordinatedProjection<DesktopState, RuntimeSessionSumma
 const MAX_OUTER_RESYNC_RETRIES = 4;
 const OUTER_RESYNC_RETRY_DELAY_MS = 500;
 
-interface SessionSettingsValues {
-  modelKey: string;
-  reasoningLevel: ReasoningLevel;
-  serviceTier: ServiceTierSelection;
+interface SessionSettingsValues extends SessionModelSettingsDraft {
   permissionProfile: RuntimePermissionProfileId;
   delegationPolicy: DelegationPolicy;
 }
@@ -129,7 +135,7 @@ export function App({ transport }: { transport: ControlTransport }) {
   const [newTaskDraft, setNewTaskDraft] = useState<NewTaskDraft>(() => createNewTaskDraft());
   const [models, setModels] = useState<RuntimeModelDescriptor[]>([]);
   const [newTaskPermissionConfig, setNewTaskPermissionConfig] = useState<RuntimePermissionConfig>();
-  const [sessionConfig, setSessionConfig] = useState<DesktopSessionConfig>();
+  const [sessionConfigState, setSessionConfig] = useState<DesktopSessionConfig>();
   const [configLoading, setConfigLoading] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<RuntimeSessionSummary>();
@@ -166,6 +172,9 @@ export function App({ transport }: { transport: ControlTransport }) {
   const selectedId = projection.selectedId;
   const snapshot = projection.snapshot;
   const diffRevision = projection.diffRevision;
+  const sessionConfig = sessionConfigState
+    ? sessionConfigResponseForSelection(selectedId, sessionConfigState)
+    : undefined;
   selectedRef.current = selectedId;
   projectionRef.current = projection;
   const setDesktop = useCallback((next: DesktopState | ((current: DesktopState) => DesktopState)) => {
@@ -178,6 +187,9 @@ export function App({ transport }: { transport: ControlTransport }) {
     setProjection((current) => ({ ...current, sessions: sessionsNext }));
   }, []);
   const setSelectedId = useCallback((selectedNext: string | undefined) => {
+    const selectedPrevious = selectedRef.current;
+    selectedRef.current = selectedNext;
+    setSessionConfig((current) => sessionConfigAfterSelectionChange(selectedPrevious, selectedNext, current));
     setProjection((current) => {
       const { selectedId: _selectedId, ...withoutSelection } = current;
       return selectedNext ? { ...withoutSelection, selectedId: selectedNext } : withoutSelection;
@@ -221,7 +233,13 @@ export function App({ transport }: { transport: ControlTransport }) {
       )) setComposer("");
       workspaceRef.current = published.state.workspace;
       sidecarPhaseRef.current = published.state.sidecar.phase;
+      const previousSelectedId = selectedRef.current;
       selectedRef.current = published.selectedId;
+      setSessionConfig((current) => sessionConfigAfterSelectionChange(
+        previousSelectedId,
+        published.selectedId,
+        current,
+      ));
       projectionRef.current = published;
       setProjection(published);
       setLoadingSession(false);
@@ -319,8 +337,11 @@ export function App({ transport }: { transport: ControlTransport }) {
     try {
       const next = await transport.sessionConfig(sessionId);
       if (isCurrent() && selectedRef.current === sessionId) {
-        setSessionConfig(next);
-        setModels(next.model.models);
+        const accepted = sessionConfigResponseForSelection(selectedRef.current, next);
+        if (accepted) {
+          setSessionConfig(accepted);
+          setModels(accepted.model.models);
+        }
       }
     } catch (cause) {
       if (isCurrent()) setError(messageFor(cause));
@@ -362,7 +383,6 @@ export function App({ transport }: { transport: ControlTransport }) {
       { workspace: workspaceRef.current, sessionId: selectedRef.current },
       { workspace: workspaceRef.current, sessionId },
     )) setComposer("");
-    selectedRef.current = sessionId;
     setSelectedId(sessionId);
     if (!options.background) {
       setSnapshot(undefined);
@@ -402,7 +422,6 @@ export function App({ transport }: { transport: ControlTransport }) {
           : next.find((session) => session.status === "active")?.id ?? next[0]?.id;
       if (!target) {
         setComposer("");
-        selectedRef.current = undefined;
         setSelectedId(undefined);
         setSnapshot(undefined);
       } else if (target !== current || preferredId) {
@@ -554,7 +573,13 @@ export function App({ transport }: { transport: ControlTransport }) {
           workspaceRef.current = event.state.workspace;
           coordinator.invalidateRequests("sessions", "snapshot", "diff");
           diffRequestGate.current.invalidate();
+          const previousSelectedId = selectedRef.current;
           selectedRef.current = undefined;
+          setSessionConfig((current) => sessionConfigAfterSelectionChange(
+            previousSelectedId,
+            undefined,
+            current,
+          ));
           setProjection((current) => ({
             epoch: current.epoch,
             diffRevision: current.diffRevision + 1,
@@ -693,7 +718,13 @@ export function App({ transport }: { transport: ControlTransport }) {
     sidecarPhaseRef.current = state.sidecar.phase;
     if (workspaceChanged) {
       setComposer("");
+      const previousSelectedId = selectedRef.current;
       selectedRef.current = undefined;
+      setSessionConfig((current) => sessionConfigAfterSelectionChange(
+        previousSelectedId,
+        undefined,
+        current,
+      ));
       setProjection((current) => ({
         epoch: current.epoch,
         diffRevision: current.diffRevision + 1,
@@ -791,7 +822,10 @@ export function App({ transport }: { transport: ControlTransport }) {
   const resumeSession = async () => {
     if (!selectedId || selectedArchived) return;
     await runAction(async () => {
-      const next = await transport.resumeSession(selectedId);
+      const next = await coordinator.refreshSessionSnapshot(
+        selectedId,
+        () => transport.resumeSession(selectedId),
+      );
       setSnapshot(next);
       await reloadSessionConfig(selectedId);
       requestAnimationFrame(() => composerRef.current?.focus());
@@ -801,20 +835,21 @@ export function App({ transport }: { transport: ControlTransport }) {
   const saveSessionSettings = async (values: SessionSettingsValues) => {
     if (!selectedId || !sessionConfig || selectedArchived) return;
     await runAction(async () => {
-      const model = modelFromKey(models.length > 0 ? models : sessionConfig.model.models, values.modelKey);
-      if (!model || model.available === false) throw new TypeError("Choose an available model.");
-      if (!isServiceTierSelectionValid(model, values.serviceTier)) {
-        throw new TypeError("Choose a service tier supported by this model.");
+      const catalog = models.length > 0 ? models : sessionConfig.model.models;
+      const validation = validateSessionModelSettingsDraft(values, catalog, sessionConfig.model);
+      if (!validation.valid) {
+        throw new TypeError(Object.values(validation.errors)[0] ?? "Invalid task runtime settings.");
       }
-      if (model && modelKey(model) !== (sessionConfig.model.modelSelection ? modelKey(sessionConfig.model.modelSelection) : "")) {
+      const model = modelFromKey(catalog, values.modelKey)!;
+      if (modelKey(model) !== (sessionConfig.model.modelSelection ? modelKey(sessionConfig.model.modelSelection) : "")) {
         await transport.setModel(selectedId, { provider: model.provider, model: model.model });
       }
-      if (values.reasoningLevel !== sessionConfig.model.reasoningLevel) {
-        await transport.setReasoning(selectedId, values.reasoningLevel);
+      const mutations = sessionModelSettingsMutations(values, sessionConfig.model);
+      if (mutations.reasoningLevel) {
+        await transport.setReasoning(selectedId, mutations.reasoningLevel);
       }
-      const serviceTierMutation = serviceTierMutationValue(values.serviceTier, sessionConfig.model.serviceTier);
-      if (serviceTierMutation) {
-        await transport.setServiceTier(selectedId, serviceTierMutation);
+      if (mutations.serviceTier) {
+        await transport.setServiceTier(selectedId, mutations.serviceTier);
       }
       if (values.permissionProfile !== sessionConfig.permission.profile) {
         await transport.setPermission(values.permissionProfile);
@@ -1522,7 +1557,7 @@ function NewTaskDialog({
                 data-modal-initial-focus="true"
                 aria-label="Task title"
                 value={draft.title}
-                maxLength={240}
+                maxLength={SESSION_TITLE_MAX_CHARS}
                 disabled={disabled}
                 onChange={(event) => onChange({ ...draft, title: event.target.value })}
                 placeholder="e.g. Harden the desktop control plane"
@@ -1568,9 +1603,12 @@ function NewTaskDialog({
               </label>
               <label className="field-label">
                 <span>Reasoning</span>
-                <select aria-label="Reasoning" value={draft.reasoningLevel} disabled={disabled || choicesLoading} onChange={(event) => onChange({ ...draft, reasoningLevel: event.target.value as ReasoningLevel })}>
+                <select aria-label="Reasoning" value={draft.reasoningLevel} disabled={disabled || choicesLoading || reasoningLevels.length === 0} onChange={(event) => onChange({ ...draft, reasoningLevel: event.target.value as ReasoningSelection })}>
+                  {reasoningLevels.length === 0 ? <option value="">Provider default</option> : null}
                   {reasoningLevels.map((level) => <option value={level} key={level}>{reasoningLabel(level)}</option>)}
                 </select>
+                {reasoningLevels.length === 0 ? <small>This provider does not expose configurable reasoning.</small> : null}
+                {validation.errors.reasoningLevel ? <small className="field-error">{validation.errors.reasoningLevel}</small> : null}
               </label>
               <label className="field-label">
                 <span>Service tier</span>
@@ -1663,7 +1701,7 @@ function RenameTaskDialog({
     <ModalFrame labelId="rename-task-title" className="compact-dialog" onClose={onClose} closeDisabled={disabled} returnFocus={returnFocus}>
       <form onSubmit={(event) => { event.preventDefault(); if (title.trim() && !disabled) onSubmit(title); }}>
         <header className="modal-heading"><div><p className="eyebrow">Task</p><h2 id="rename-task-title">Rename task</h2><p>Use a name that makes this work easy to find later.</p></div></header>
-        <div className="compact-dialog-body"><label className="field-label"><span>Task title</span><input autoFocus data-modal-initial-focus="true" aria-label="New task title" value={title} maxLength={240} disabled={disabled} onChange={(event) => setTitle(event.target.value)} /></label></div>
+        <div className="compact-dialog-body"><label className="field-label"><span>Task title</span><input autoFocus data-modal-initial-focus="true" aria-label="New task title" value={title} maxLength={SESSION_TITLE_MAX_CHARS} disabled={disabled} onChange={(event) => setTitle(event.target.value)} /></label></div>
         <footer className="modal-actions"><span /><div><button className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="primary" type="submit" disabled={disabled || !title.trim()}>Save name</button></div></footer>
       </form>
     </ModalFrame>
@@ -1711,37 +1749,33 @@ function SessionSettingsDialog({
   onSubmit: (values: SessionSettingsValues) => void;
 }) {
   const catalog = models.length > 0 ? models : config.model.models;
-  const initialModelKey = config.model.modelSelection ? modelKey(config.model.modelSelection) : (catalog[0] ? modelKey(catalog[0]) : "");
-  const initialModel = modelFromKey(catalog, initialModelKey);
+  const initialModelSettings = createSessionModelSettingsDraft(catalog, config.model);
   const [values, setValues] = useState<SessionSettingsValues>({
-    modelKey: initialModelKey,
-    reasoningLevel: config.model.reasoningLevel ?? availableReasoningLevels(catalog, initialModelKey).at(-1) ?? "off",
-    serviceTier: preferredServiceTier(initialModel, config.model.serviceTier ?? ""),
+    ...initialModelSettings,
     permissionProfile: config.permission.profile,
     delegationPolicy: config.delegation.policy,
   });
   useDialogEscape(onClose, disabled);
   const reasoningLevels = availableReasoningLevels(catalog, values.modelKey);
   const serviceTiers = availableServiceTiers(catalog, values.modelKey);
-  const selectedSettingsModel = modelFromKey(catalog, values.modelKey);
-  const settingsValid = Boolean(
-    selectedSettingsModel
-    && selectedSettingsModel.available !== false
-    && isServiceTierSelectionValid(selectedSettingsModel, values.serviceTier),
-  );
+  const reasoningProviderDefaultSelectable = canSelectProviderDefault(config.model.reasoningLevel);
+  const serviceTierProviderDefaultSelectable = canSelectProviderDefault(config.model.serviceTier);
+  const settingsValidation = validateSessionModelSettingsDraft(values, catalog, config.model);
+  const settingsValid = settingsValidation.valid;
   return (
     <ModalFrame labelId="session-settings-title" className="settings-dialog" onClose={onClose} closeDisabled={disabled}>
-      <form onSubmit={(event) => { event.preventDefault(); if (!disabled) onSubmit(values); }}>
+      <form onSubmit={(event) => { event.preventDefault(); if (!disabled && settingsValid) onSubmit(values); }}>
         <header className="modal-heading"><div><p className="eyebrow">Runtime</p><h2 id="session-settings-title">Task runtime settings</h2><p>Changes apply to the next turn. Permission profile is shared by the runtime.</p></div><button className="icon-button" type="button" aria-label="Close task runtime settings" disabled={disabled} onClick={onClose}><Icon name="close" /></button></header>
         <div className="modal-scroll settings-grid">
           <label className="field-label field-wide"><span>Model</span><select autoFocus data-modal-initial-focus="true" aria-label="Task model" value={values.modelKey} disabled={disabled} onChange={(event) => {
             const nextKey = event.target.value;
-            const nextReasoning = availableReasoningLevels(catalog, nextKey);
-            const nextModel = modelFromKey(catalog, nextKey);
-            setValues((current) => ({ ...current, modelKey: nextKey, reasoningLevel: nextReasoning.includes(current.reasoningLevel) ? current.reasoningLevel : nextReasoning.at(-1) ?? "off", serviceTier: preferredServiceTier(nextModel, current.serviceTier) }));
+            setValues((current) => ({
+              ...current,
+              ...reconcileSessionModelSettingsModel(current, catalog, nextKey),
+            }));
           }}>{catalog.map((model) => <option key={modelKey(model)} value={modelKey(model)} disabled={model.available === false}>{model.displayName ?? model.model} · {model.providerDisplayName ?? model.provider}</option>)}</select></label>
-          <label className="field-label"><span>Reasoning</span><select aria-label="Task reasoning" value={values.reasoningLevel} disabled={disabled} onChange={(event) => setValues({ ...values, reasoningLevel: event.target.value as ReasoningLevel })}>{reasoningLevels.map((level) => <option key={level} value={level}>{reasoningLabel(level)}</option>)}</select></label>
-          <label className="field-label"><span>Service tier</span><select aria-label="Task service tier" value={values.serviceTier} disabled={disabled || serviceTiers.length === 0} onChange={(event) => setValues({ ...values, serviceTier: event.target.value as ServiceTierSelection })}>{serviceTiers.length === 0 ? <option value="">Provider default</option> : null}{serviceTiers.map((tier) => <option key={tier} value={tier}>{humanizeStatus(tier)}</option>)}</select>{serviceTiers.length === 0 ? <small>This provider does not expose a configurable service tier.</small> : null}</label>
+          <label className="field-label"><span>Reasoning</span><select aria-label="Task reasoning" value={values.reasoningLevel} disabled={disabled || reasoningLevels.length === 0} onChange={(event) => setValues({ ...values, reasoningLevel: event.target.value as ReasoningSelection })}><option value="" disabled={!reasoningProviderDefaultSelectable}>Provider default</option>{reasoningLevels.map((level) => <option key={level} value={level}>{reasoningLabel(level)}</option>)}</select>{reasoningLevels.length === 0 ? <small>This provider does not expose configurable reasoning.</small> : null}{settingsValidation.errors.reasoningLevel ? <small className="field-error">{settingsValidation.errors.reasoningLevel}</small> : null}</label>
+          <label className="field-label"><span>Service tier</span><select aria-label="Task service tier" value={values.serviceTier} disabled={disabled || serviceTiers.length === 0} onChange={(event) => setValues({ ...values, serviceTier: event.target.value as ServiceTierSelection })}><option value="" disabled={!serviceTierProviderDefaultSelectable}>Provider default</option>{serviceTiers.map((tier) => <option key={tier} value={tier}>{humanizeStatus(tier)}</option>)}</select>{serviceTiers.length === 0 ? <small>This provider does not expose a configurable service tier.</small> : null}{settingsValidation.errors.serviceTier ? <small className="field-error">{settingsValidation.errors.serviceTier}</small> : null}</label>
           <label className="field-label"><span>Runtime permission profile</span><select aria-label="Task permission profile" value={values.permissionProfile} disabled={disabled} onChange={(event) => setValues({ ...values, permissionProfile: event.target.value as RuntimePermissionProfileId })}>{config.permission.profiles.map((profile) => <option key={profile.id} value={profile.id} disabled={Boolean(profile.disabledReason)}>{profile.label}</option>)}</select><small className="scope-warning"><Icon name="shield" />Applies to every task until restart; restart returns to Default.</small></label>
           <label className="field-label"><span>Delegation</span><select aria-label="Task delegation" value={values.delegationPolicy} disabled={disabled} onChange={(event) => setValues({ ...values, delegationPolicy: event.target.value as DelegationPolicy })}><option value="proactive">Proactive</option><option value="explicit">Explicit only</option><option value="off">Off</option></select></label>
         </div>

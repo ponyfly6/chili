@@ -111,6 +111,9 @@ test("root RuntimeService rejects direct subagent turns while an explicit child 
   const root = new RuntimeService({ runtime: rootRunner, store, cwd: "/repo" });
   const input = { sessionId, text: "bypass child policy" };
 
+  await expect(root.assertSessionReadAllowed(sessionId)).rejects.toBeInstanceOf(
+    RuntimeSubagentSessionAccessError,
+  );
   await expect(root.submitPrompt(input)).rejects.toMatchObject({
     name: "RuntimeSubagentSessionAccessError",
     message: expect.stringContaining("Use task_followup for the owning task"),
@@ -162,6 +165,7 @@ test("root RuntimeService rejects direct subagent turns while an explicit child 
     cwd: "/repo",
     allowSubagentSessions: true,
   });
+  await expect(child.assertSessionReadAllowed(sessionId)).resolves.toBeUndefined();
   await expect(child.submitPrompt({ ...input, text: "authorized child continuation" })).resolves.toMatchObject({
     status: "completed",
   });
@@ -171,6 +175,24 @@ test("root RuntimeService rejects direct subagent turns while an explicit child 
   });
   expect(childRunner.userMessages).toHaveLength(1);
   expect(childRunner.turnInputs).toHaveLength(1);
+});
+
+test("RuntimeService allows archived root reads without reopening turn admission", async () => {
+  const sessionId = "session_archived_root_read" as SessionId;
+  const store = new SessionSourceEventStore({
+    id: sessionId,
+    cwd: "/repo",
+    source: "interactive",
+    status: "archived",
+    createdAt: 1,
+    updatedAt: 2,
+  });
+  const service = new RuntimeService({ runtime: new FakeAgentRunner(), store, cwd: "/repo" });
+
+  await expect(service.assertSessionReadAllowed(sessionId)).resolves.toBeUndefined();
+  await expect(service.assertSessionTurnAllowed(sessionId)).rejects.toBeInstanceOf(
+    RuntimeSessionInactiveError,
+  );
 });
 
 test("RuntimeService rejects duplicate explicit session ids before creating or changing cwd", async () => {

@@ -1852,9 +1852,11 @@ function parseAgentMailboxArray(value: unknown, path = "response"): RuntimeAgent
 function parseTeamRecord(value: unknown, path = "team"): RuntimeTeamRecord {
   const record = parseRuntimeRecord(value, path);
   parseRuntimeIdentifier(record.id, `${path}.id`);
+  optionalIdentifier(record.sessionId, `${path}.sessionId`);
   parseRuntimeString(record.name, `${path}.name`);
   parseAgentPath(record.leadPath, `${path}.leadPath`);
   parseRuntimeEnum(record.status, ["active", "archived"] as const, `${path}.status`);
+  optionalString(record.description, `${path}.description`);
   parseRuntimeNonNegativeInteger(record.createdAt, `${path}.createdAt`);
   parseRuntimeNonNegativeInteger(record.updatedAt, `${path}.updatedAt`);
   return record as unknown as RuntimeTeamRecord;
@@ -1871,8 +1873,14 @@ function parseTeamMemberRecord(value: unknown, path = "member"): RuntimeTeamMemb
   parseRuntimeString(record.name, `${path}.name`);
   parseRuntimeString(record.role, `${path}.role`);
   parseRuntimeEnum(record.status, ["idle", "running", "waiting", "blocked", "closed"] as const, `${path}.status`);
+  optionalIdentifier(record.childSessionId, `${path}.childSessionId`);
+  optionalString(record.model, `${path}.model`);
+  if (record.toolScope !== undefined) parseRuntimeStringArray(record.toolScope, `${path}.toolScope`);
+  if (record.writeScope !== undefined) parseRuntimeStringArray(record.writeScope, `${path}.writeScope`);
+  optionalIdentifier(record.currentTaskId, `${path}.currentTaskId`);
   parseRuntimeNonNegativeInteger(record.createdAt, `${path}.createdAt`);
   parseRuntimeNonNegativeInteger(record.updatedAt, `${path}.updatedAt`);
+  optionalNonNegativeInteger(record.closedAt, `${path}.closedAt`);
   return record as unknown as RuntimeTeamMemberRecord;
 }
 
@@ -1884,11 +1892,19 @@ function parseTeamTaskRecord(value: unknown, path = "task"): RuntimeTeamTaskReco
   const record = parseRuntimeRecord(value, path);
   parseRuntimeIdentifier(record.id, `${path}.id`);
   parseRuntimeIdentifier(record.teamId, `${path}.teamId`);
+  optionalIdentifier(record.sessionId, `${path}.sessionId`);
   parseRuntimeString(record.title, `${path}.title`);
+  optionalString(record.description, `${path}.description`);
   parseRuntimeEnum(record.status, ["pending", "in_progress", "blocked", "completed", "failed", "cancelled"] as const, `${path}.status`);
+  if (record.ownerPath !== undefined) parseAgentPath(record.ownerPath, `${path}.ownerPath`);
+  if (record.createdBy !== undefined) parseAgentPath(record.createdBy, `${path}.createdBy`);
   parseRuntimeArray(record.dependsOn, (item, itemPath) => parseRuntimeIdentifier(item, itemPath), `${path}.dependsOn`);
+  optionalString(record.summary, `${path}.summary`);
+  optionalString(record.error, `${path}.error`);
+  if (record.metadata !== undefined) parseRuntimeRecord(record.metadata, `${path}.metadata`);
   parseRuntimeNonNegativeInteger(record.createdAt, `${path}.createdAt`);
   parseRuntimeNonNegativeInteger(record.updatedAt, `${path}.updatedAt`);
+  optionalNonNegativeInteger(record.completedAt, `${path}.completedAt`);
   return record as unknown as RuntimeTeamTaskRecord;
 }
 
@@ -1904,6 +1920,22 @@ function parseTeamMessageRecord(value: unknown, path = "message"): RuntimeTeamMe
   if (record.toPath !== "*") parseAgentPath(record.toPath, `${path}.toPath`);
   parseRuntimeString(record.content, `${path}.content`);
   parseRuntimeEnum(record.kind, ["text", "task_assignment", "system"] as const, `${path}.kind`);
+  if (record.delivery !== undefined) {
+    parseRuntimeEnum(record.delivery, ["queueOnly", "triggerTurn"] as const, `${path}.delivery`);
+  }
+  if (record.deliveryStatus !== undefined) {
+    parseRuntimeEnum(
+      record.deliveryStatus,
+      ["queued", "delivering", "delivered", "failed"] as const,
+      `${path}.deliveryStatus`,
+    );
+  }
+  optionalString(record.deliveryError, `${path}.deliveryError`);
+  optionalNonNegativeInteger(record.deliveryUpdatedAt, `${path}.deliveryUpdatedAt`);
+  optionalNonNegativeInteger(record.deliveredAt, `${path}.deliveredAt`);
+  optionalIdentifier(record.taskId, `${path}.taskId`);
+  optionalString(record.summary, `${path}.summary`);
+  if (record.metadata !== undefined) parseRuntimeRecord(record.metadata, `${path}.metadata`);
   parseRuntimeNonNegativeInteger(record.createdAt, `${path}.createdAt`);
   return record as unknown as RuntimeTeamMessageRecord;
 }
@@ -1915,18 +1947,109 @@ function parseTeamMessageArray(value: unknown, path = "response"): RuntimeTeamMe
 function parseTeamSnapshot(value: unknown, path = "response"): RuntimeTeamSnapshot {
   const record = parseRuntimeRecord(value, path);
   parseTeamRecord(record.team, `${path}.team`);
-  parseRuntimeArray(record.members, parseTeamMemberRecord, `${path}.members`);
-  parseRuntimeArray(record.tasks, parseTeamTaskRecord, `${path}.tasks`);
-  parseRuntimeArray(record.messages, parseTeamMessageRecord, `${path}.messages`);
-  parseRuntimeArray(record.messageDeliveries, (item, itemPath) => {
-    const delivery = parseRuntimeRecord(item, itemPath);
-    parseRuntimeIdentifier(delivery.mailboxMessageId, `${itemPath}.mailboxMessageId`);
-    parseRuntimeEnum(delivery.status, ["queued", "delivering", "delivered", "failed"] as const, `${itemPath}.status`);
-    return delivery;
-  }, `${path}.messageDeliveries`);
-  parseRuntimeRecord(record.stats, `${path}.stats`);
+  parseRuntimeArray(record.members, parseTeamSnapshotMember, `${path}.members`);
+  parseRuntimeArray(record.tasks, parseTeamSnapshotTask, `${path}.tasks`);
+  parseRuntimeArray(record.messages, parseTeamSnapshotMessage, `${path}.messages`);
+  parseRuntimeArray(record.messageDeliveries, parseTeamMessageDeliveryRecord, `${path}.messageDeliveries`);
+  parseTeamSnapshotStats(record.stats, `${path}.stats`);
   parseRuntimeNonNegativeInteger(record.generatedAt, `${path}.generatedAt`);
   return record as unknown as RuntimeTeamSnapshot;
+}
+
+function parseTeamSnapshotMember(value: unknown, path: string): RuntimeTeamSnapshotMember {
+  const record = parseRuntimeRecord(value, path);
+  parseTeamMemberRecord(record, path);
+  parseRuntimeArray(
+    record.taskIds,
+    (item, itemPath) => parseRuntimeIdentifier(item, itemPath),
+    `${path}.taskIds`,
+  );
+  parseRuntimeArray(
+    record.deliveryIds,
+    (item, itemPath) => parseRuntimeIdentifier(item, itemPath),
+    `${path}.deliveryIds`,
+  );
+  if (record.currentTask !== undefined) parseTeamTaskRecord(record.currentTask, `${path}.currentTask`);
+  return record as unknown as RuntimeTeamSnapshotMember;
+}
+
+function parseTeamSnapshotTask(value: unknown, path: string): RuntimeTeamSnapshotTask {
+  const record = parseRuntimeRecord(value, path);
+  parseTeamTaskRecord(record, path);
+  for (const field of ["blockedBy", "blocks", "messageIds"] as const) {
+    parseRuntimeArray(
+      record[field],
+      (item, itemPath) => parseRuntimeIdentifier(item, itemPath),
+      `${path}.${field}`,
+    );
+  }
+  parseRuntimeBoolean(record.ready, `${path}.ready`);
+  if (record.owner !== undefined) parseTeamMemberRecord(record.owner, `${path}.owner`);
+  return record as unknown as RuntimeTeamSnapshotTask;
+}
+
+function parseTeamSnapshotMessage(value: unknown, path: string): RuntimeTeamSnapshotMessage {
+  const record = parseRuntimeRecord(value, path);
+  parseTeamMessageRecord(record, path);
+  parseRuntimeArray(record.deliveries, parseTeamMessageDeliveryRecord, `${path}.deliveries`);
+  return record as unknown as RuntimeTeamSnapshotMessage;
+}
+
+function parseTeamMessageDeliveryRecord(value: unknown, path: string): RuntimeTeamMessageDeliveryRecord {
+  const record = parseRuntimeRecord(value, path);
+  parseRuntimeIdentifier(record.mailboxMessageId, `${path}.mailboxMessageId`);
+  parseRuntimeIdentifier(record.teamId, `${path}.teamId`);
+  parseRuntimeIdentifier(record.teamMessageId, `${path}.teamMessageId`);
+  parseAgentPath(record.path, `${path}.path`);
+  parseRuntimeEnum(record.status, ["queued", "delivering", "delivered", "failed"] as const, `${path}.status`);
+  parseRuntimeBoolean(record.triggerTurn, `${path}.triggerTurn`);
+  optionalIdentifier(record.childSessionId, `${path}.childSessionId`);
+  optionalString(record.error, `${path}.error`);
+  parseRuntimeNonNegativeInteger(record.queuedAt, `${path}.queuedAt`);
+  parseRuntimeNonNegativeInteger(record.updatedAt, `${path}.updatedAt`);
+  optionalNonNegativeInteger(record.deliveredAt, `${path}.deliveredAt`);
+  return record as unknown as RuntimeTeamMessageDeliveryRecord;
+}
+
+function parseTeamSnapshotStats(value: unknown, path: string): RuntimeTeamSnapshotStats {
+  const record = parseRuntimeRecord(value, path);
+  for (const field of ["memberCount", "taskCount", "messageCount", "deliveryCount"] as const) {
+    parseRuntimeNonNegativeInteger(record[field], `${path}.${field}`);
+  }
+
+  const membersByStatus = parseRuntimeRecord(record.membersByStatus, `${path}.membersByStatus`);
+  for (const status of ["idle", "running", "waiting", "blocked", "closed"] as const) {
+    parseRuntimeNonNegativeInteger(membersByStatus[status], `${path}.membersByStatus.${status}`);
+  }
+  parseNonNegativeCountRecord(membersByStatus, `${path}.membersByStatus`);
+
+  const tasksByStatus = parseRuntimeRecord(record.tasksByStatus, `${path}.tasksByStatus`);
+  for (const status of ["pending", "in_progress", "blocked", "completed", "failed", "cancelled"] as const) {
+    parseRuntimeNonNegativeInteger(tasksByStatus[status], `${path}.tasksByStatus.${status}`);
+  }
+  parseNonNegativeCountRecord(tasksByStatus, `${path}.tasksByStatus`);
+
+  parseNonNegativeCountRecord(record.messagesByDeliveryStatus, `${path}.messagesByDeliveryStatus`);
+  parseNonNegativeCountRecord(record.deliveriesByStatus, `${path}.deliveriesByStatus`);
+  parseRuntimeArray(
+    record.readyTaskIds,
+    (item, itemPath) => parseRuntimeIdentifier(item, itemPath),
+    `${path}.readyTaskIds`,
+  );
+  parseRuntimeArray(
+    record.blockedTaskIds,
+    (item, itemPath) => parseRuntimeIdentifier(item, itemPath),
+    `${path}.blockedTaskIds`,
+  );
+  return record as unknown as RuntimeTeamSnapshotStats;
+}
+
+function parseNonNegativeCountRecord(value: unknown, path: string): Record<string, unknown> {
+  const record = parseRuntimeRecord(value, path);
+  for (const [index, count] of Object.values(record).entries()) {
+    parseRuntimeNonNegativeInteger(count, `${path}[${index}]`);
+  }
+  return record;
 }
 
 function parseTeamTaskClaimResult(value: unknown, path = "response"): RuntimeTeamTaskClaimResult {

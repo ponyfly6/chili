@@ -1146,7 +1146,7 @@ function validateMessagePart(value: unknown, path: string): void {
     case "reasoning":
       parseRuntimeString(part.text, `${path}.text`, { allowEmpty: true });
       optionalEventBoolean(part.redacted, `${path}.redacted`);
-      if (part.modelOutput !== undefined) parseRuntimeRecord(part.modelOutput, `${path}.modelOutput`);
+      if (part.modelOutput !== undefined) validatePersistedModelOutput(part.modelOutput, `${path}.modelOutput`);
       return;
     case "tool_call":
       parseRuntimeIdentifier(part.callId, `${path}.callId`);
@@ -1158,7 +1158,18 @@ function validateMessagePart(value: unknown, path: string): void {
       parseRuntimeIdentifier(part.callId, `${path}.callId`);
       parseRuntimeString(part.output, `${path}.output`, { allowEmpty: true });
       optionalEventString(part.error, `${path}.error`);
+      if (part.content !== undefined) validateToolResultContent(part.content, `${path}.content`);
+      if (part.executionContext !== undefined) {
+        validateToolResultExecutionContext(part.executionContext, `${path}.executionContext`);
+      }
       optionalEventBoolean(part.synthetic, `${path}.synthetic`);
+      if (part.artifactIds !== undefined) {
+        parseRuntimeArray(
+          part.artifactIds,
+          (item, itemPath) => parseRuntimeIdentifier(item, itemPath),
+          `${path}.artifactIds`,
+        );
+      }
       return;
     case "patch":
       parseRuntimeStringArray(part.files, `${path}.files`);
@@ -1180,6 +1191,50 @@ function validateMessagePart(value: unknown, path: string): void {
     case "agent_handoff":
       parseRuntimeIdentifier(part.agentPath, `${path}.agentPath`);
       parseRuntimeString(part.summary, `${path}.summary`);
+  }
+}
+
+function validatePersistedModelOutput(value: unknown, path: string): void {
+  const output = parseRuntimeRecord(value, path);
+  parseRuntimeString(output.apiFamily, `${path}.apiFamily`);
+  if (output.outputIndex !== undefined) {
+    parseRuntimeNonNegativeInteger(output.outputIndex, `${path}.outputIndex`);
+  }
+  parseRuntimeRecord(output.item, `${path}.item`);
+}
+
+function validateToolResultContent(value: unknown, path: string): void {
+  parseRuntimeArray(value, (item, itemPath) => {
+    const content = parseRuntimeRecord(item, itemPath);
+    const type = parseRuntimeEnum(content.type, ["text", "image"] as const, `${itemPath}.type`);
+    if (type === "text") {
+      parseRuntimeString(content.text, `${itemPath}.text`, { allowEmpty: true });
+    } else {
+      parseRuntimeString(content.data, `${itemPath}.data`, {
+        allowEmpty: true,
+        maxChars: MAX_IMAGE_DATA_CHARS,
+      });
+      parseRuntimeString(content.mimeType, `${itemPath}.mimeType`);
+    }
+    return content;
+  }, path);
+}
+
+function validateToolResultExecutionContext(value: unknown, path: string): void {
+  const context = parseRuntimeRecord(value, path);
+  if (context.sandbox !== undefined) {
+    parseRuntimeEnum(context.sandbox, ["macos-seatbelt", "none"] as const, `${path}.sandbox`);
+  }
+  if (context.executionMode !== undefined) {
+    parseRuntimeEnum(context.executionMode, ["sandboxed", "unsandboxed"] as const, `${path}.executionMode`);
+  }
+  if (context.exitCode !== undefined && context.exitCode !== null) {
+    parseRuntimeNonNegativeInteger(context.exitCode, `${path}.exitCode`);
+  }
+  optionalEventBoolean(context.timedOut, `${path}.timedOut`);
+  optionalEventBoolean(context.aborted, `${path}.aborted`);
+  if (context.signal !== undefined && context.signal !== null) {
+    parseRuntimeString(context.signal, `${path}.signal`, { allowEmpty: true });
   }
 }
 

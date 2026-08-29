@@ -1,18 +1,31 @@
 import { describe, expect, test } from "bun:test";
-import { normalizePersistedError } from "@chili/protocol";
+import { normalizePersistedError, SESSION_TITLE_MAX_CHARS } from "@chili/protocol";
 import { presentSession } from "../renderer/view-model.js";
 import {
+  DESKTOP_INVOKE_CLOSING_RESPONSE,
   desktopJsonUtf8Bytes,
   parseDesktopEvent,
   parseDesktopEventAck,
   parseDesktopEventEnvelope,
   parseDesktopEventReady,
+  parseDesktopInvokeResponse,
   parseDesktopRequest,
   parseDesktopResponse,
   parseDesktopState,
 } from "./contracts.js";
 
 describe("desktop IPC contracts", () => {
+  test("turns the resolved shutdown sentinel into a renderer-local rejection", () => {
+    expect(() => parseDesktopInvokeResponse(
+      { type: "app.state" },
+      DESKTOP_INVOKE_CLOSING_RESPONSE,
+    )).toThrow("Desktop is closing");
+    expect(() => parseDesktopInvokeResponse(
+      { type: "app.state" },
+      { ...DESKTOP_INVOKE_CLOSING_RESPONSE, unexpected: true },
+    )).toThrow("Unexpected request field: unexpected");
+  });
+
   test("accepts a typed session send request", () => {
     expect(parseDesktopRequest({
       type: "session.send",
@@ -57,6 +70,50 @@ describe("desktop IPC contracts", () => {
       type: "session.goal.update",
       sessionId: "session_1",
     })).toThrow("must change");
+  });
+
+  test("exports one shared canonical session title limit", () => {
+    expect(SESSION_TITLE_MAX_CHARS).toBe(120);
+  });
+
+  test("enforces the runtime's canonical 120-character session title limit", () => {
+    const maximumTitle = "x".repeat(SESSION_TITLE_MAX_CHARS);
+    const overLimitTitle = `${maximumTitle}x`;
+
+    expect(parseDesktopRequest({
+      type: "sessions.create",
+      title: maximumTitle,
+    })).toMatchObject({ title: maximumTitle });
+    expect(parseDesktopRequest({
+      type: "session.rename",
+      sessionId: "session_1",
+      title: maximumTitle,
+    })).toMatchObject({ title: maximumTitle });
+    expect(() => parseDesktopRequest({
+      type: "sessions.create",
+      title: overLimitTitle,
+    })).toThrow("120");
+    expect(() => parseDesktopRequest({
+      type: "session.rename",
+      sessionId: "session_1",
+      title: overLimitTitle,
+    })).toThrow("120");
+  });
+
+  test("normalizes session title whitespace at the Desktop request boundary", () => {
+    expect(parseDesktopRequest({
+      type: "sessions.create",
+      title: "  Overnight   Goal\nconsole  ",
+    })).toMatchObject({ title: "Overnight Goal console" });
+    expect(parseDesktopRequest({
+      type: "session.rename",
+      sessionId: "session_1",
+      title: "  Overnight   Goal\nconsole  ",
+    })).toMatchObject({ title: "Overnight Goal console" });
+    expect(() => parseDesktopRequest({
+      type: "sessions.create",
+      title: " \n\t ",
+    })).toThrow("empty");
   });
 
   test("validates aggregate desktop session configuration", () => {

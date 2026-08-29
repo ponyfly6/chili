@@ -15,7 +15,11 @@ import {
   type DesktopResyncReason,
 } from "../shared/contracts.js";
 import { DesktopIpcAdmission } from "./ipc-admission.js";
-import { createDesktopRequestDispatcher, type DesktopRequestHandler } from "./ipc-dispatcher.js";
+import {
+  createDesktopInvokeShutdownGate,
+  createDesktopRequestDispatcher,
+  type DesktopRequestHandler,
+} from "./ipc-dispatcher.js";
 import { DesktopEventOutbox } from "./ipc-outbox.js";
 import { requireTrustedDesktopIpcSender } from "./ipc-security.js";
 import { safeDesktopErrorMessage } from "../shared/safe-error.js";
@@ -23,6 +27,7 @@ import { safeDesktopErrorMessage } from "../shared/safe-error.js";
 export interface DesktopIpcController {
   publish(event: DesktopEvent): void;
   requestResync(reason: DesktopResyncReason): void;
+  beginShutdown(): void;
   dispose(): void;
 }
 
@@ -42,14 +47,17 @@ export function registerDesktopIpc(
     onError: (error) => console.error("Desktop event delivery error", safeDesktopErrorMessage(error)),
   });
   const dispatchRequest = createDesktopRequestDispatcher(handler, outbox, admission);
+  const shutdownGate = createDesktopInvokeShutdownGate();
+  let disposed = false;
   ipcMain.removeHandler(DESKTOP_INVOKE_CHANNEL);
   ipcMain.removeHandler(DESKTOP_EVENT_READY_CHANNEL);
   ipcMain.handle(DESKTOP_INVOKE_CHANNEL, async (event, value: unknown) => {
     requireTrustedSender(event, window);
-    return dispatchRequest(value);
+    return shutdownGate.invoke(() => dispatchRequest(value));
   });
   ipcMain.handle(DESKTOP_EVENT_READY_CHANNEL, (event) => {
     requireTrustedSender(event, window);
+    if (shutdownGate.isShuttingDown()) return { version: 1, streamId: "stream_shutdown" };
     return outbox.rendererReady();
   });
   const acknowledge = (event: IpcMainEvent, value: unknown): void => {
@@ -62,13 +70,23 @@ export function registerDesktopIpc(
   };
   ipcMain.on(DESKTOP_EVENT_ACK_CHANNEL, acknowledge);
 
-  let disposed = false;
   return {
-    publish: (event) => outbox.publish(event),
-    requestResync: (reason) => outbox.requestResync(reason),
+    publish: (event) => {
+      if (!shutdownGate.isShuttingDown()) outbox.publish(event);
+    },
+    requestResync: (reason) => {
+      if (!shutdownGate.isShuttingDown()) outbox.requestResync(reason);
+    },
+    beginShutdown: () => {
+      if (shutdownGate.isShuttingDown()) return;
+      shutdownGate.beginShutdown();
+      ipcMain.removeListener(DESKTOP_EVENT_ACK_CHANNEL, acknowledge);
+      outbox.dispose();
+    },
     dispose: () => {
       if (disposed) return;
       disposed = true;
+      shutdownGate.beginShutdown();
       ipcMain.removeHandler(DESKTOP_INVOKE_CHANNEL);
       ipcMain.removeHandler(DESKTOP_EVENT_READY_CHANNEL);
       ipcMain.removeListener(DESKTOP_EVENT_ACK_CHANNEL, acknowledge);

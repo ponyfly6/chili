@@ -121,3 +121,112 @@ test("event validation accepts multiline text and rejects nested projection pois
     payload: { serverName: "github", operation: "connect", status: 7 },
   })).toThrow("event.payload.status");
 });
+
+test("message part events reject malformed nested reasoning and tool result fields", () => {
+  const eventWithPart = (part: Record<string, unknown>) => ({
+    id: "event_message_part",
+    type: "message.part_added",
+    time: 1,
+    payload: {
+      messageId: "message_1",
+      part: {
+        id: "part_1",
+        messageId: "message_1",
+        sessionId: "session_1",
+        ...part,
+      },
+    },
+  });
+
+  for (const [part, expectedPath] of [
+    [
+      { type: "reasoning", text: "", modelOutput: { apiFamily: 7, item: {} } },
+      "event.payload.part.modelOutput.apiFamily",
+    ],
+    [
+      { type: "reasoning", text: "", modelOutput: { apiFamily: "responses", outputIndex: -1, item: {} } },
+      "event.payload.part.modelOutput.outputIndex",
+    ],
+    [
+      { type: "reasoning", text: "", modelOutput: { apiFamily: "responses", outputIndex: 0.5, item: {} } },
+      "event.payload.part.modelOutput.outputIndex",
+    ],
+    [
+      {
+        type: "reasoning",
+        text: "",
+        modelOutput: { apiFamily: "responses", outputIndex: Number.MAX_SAFE_INTEGER + 1, item: {} },
+      },
+      "event.payload.part.modelOutput.outputIndex",
+    ],
+    [
+      { type: "reasoning", text: "", modelOutput: { apiFamily: "responses", item: [] } },
+      "event.payload.part.modelOutput.item",
+    ],
+    [
+      { type: "tool_result", callId: "call_1", output: "ok", content: "not-an-array" },
+      "event.payload.part.content",
+    ],
+    [
+      { type: "tool_result", callId: "call_1", output: "ok", content: [{ type: "text", text: 7 }] },
+      "event.payload.part.content[0].text",
+    ],
+    [
+      { type: "tool_result", callId: "call_1", output: "ok", executionContext: { timedOut: "yes" } },
+      "event.payload.part.executionContext.timedOut",
+    ],
+    [
+      { type: "tool_result", callId: "call_1", output: "ok", executionContext: { sandbox: "container" } },
+      "event.payload.part.executionContext.sandbox",
+    ],
+    [
+      { type: "tool_result", callId: "call_1", output: "ok", executionContext: { exitCode: 0.5 } },
+      "event.payload.part.executionContext.exitCode",
+    ],
+    [
+      {
+        type: "tool_result",
+        callId: "call_1",
+        output: "ok",
+        executionContext: { exitCode: Number.MAX_SAFE_INTEGER + 1 },
+      },
+      "event.payload.part.executionContext.exitCode",
+    ],
+    [
+      { type: "tool_result", callId: "call_1", output: "ok", artifactIds: [7] },
+      "event.payload.part.artifactIds[0]",
+    ],
+  ] as const) {
+    expect(() => parseChiliEvent(eventWithPart(part))).toThrow(expectedPath);
+  }
+
+  expect(parseChiliEvent(eventWithPart({
+    type: "reasoning",
+    text: "",
+    modelOutput: { apiFamily: "responses", outputIndex: 0, item: { type: "reasoning" } },
+  })).type).toBe("message.part_added");
+  expect(parseChiliEvent(eventWithPart({
+    type: "tool_result",
+    callId: "call_1",
+    output: "ok",
+    content: [
+      { type: "text", text: "" },
+      { type: "image", data: "", mimeType: "image/png" },
+    ],
+    executionContext: {
+      sandbox: "macos-seatbelt",
+      executionMode: "sandboxed",
+      exitCode: 0,
+      timedOut: false,
+      aborted: false,
+      signal: null,
+    },
+    artifactIds: ["artifact_1"],
+  })).type).toBe("message.part_added");
+  expect(parseChiliEvent(eventWithPart({
+    type: "tool_result",
+    callId: "call_2",
+    output: "",
+    executionContext: { exitCode: null },
+  })).type).toBe("message.part_added");
+});

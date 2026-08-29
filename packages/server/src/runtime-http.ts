@@ -2,6 +2,7 @@ import {
   DELEGATION_POLICIES,
   isTransientEvent,
   normalizePersistedError,
+  normalizeSessionTitle,
   parseRuntimeArray,
   parseRuntimeBoolean,
   parseRuntimeModelSelection,
@@ -152,6 +153,7 @@ export interface RuntimeHttpService {
   setGoal?(input: { sessionId: SessionId; objective: string; tokenBudget?: number; replace?: boolean }): Promise<SessionGoal>;
   updateGoal?(input: { sessionId: SessionId; status?: SessionGoalStatus; objective?: string; tokenBudget?: number }): Promise<SessionGoal>;
   clearGoal?(input: { sessionId: SessionId }): Promise<{ cleared: boolean; previousGoal?: SessionGoal }>;
+  assertSessionReadAllowed(sessionId: SessionId): Promise<void>;
   assertSessionTurnAllowed(sessionId: SessionId): Promise<void>;
   submitPrompt(input: SubmitPromptInput): Promise<SubmitPromptResult>;
   submitPromptAsync(input: SubmitPromptInput, onError?: RuntimeBackgroundErrorHandler): void;
@@ -370,7 +372,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       if (route.name === "mcpReload") {
         const mcp = requireMcpControl(options);
         if (!mcp.reload) return jsonError(501, "No MCP reload controller is configured");
-        return json(await mcp.reload(await mcpScopeFromRequest(options, url)));
+        return json(await withMcpMutationScope(options, url, (scope) => mcp.reload!(scope)));
       }
 
       if (route.name === "mcpAdd") {
@@ -749,8 +751,13 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         await options.service.assertSessionTurnAllowed(route.sessionId);
         if (!options.service.renameSession) return jsonError(501, "Session rename is not available from this runtime");
         const body = await readJson<RenameSessionBody>(request, ["title"]);
-        const title = stringField(body.title, "title").replace(/\s+/g, " ");
-        if (title.length > 120) throw badRequest("title must be 120 characters or fewer");
+        let title: string;
+        try {
+          title = normalizeSessionTitle(parseRuntimeString(body.title, "body.title", { allowEmpty: true }));
+        } catch (error) {
+          if (error instanceof TypeError) throw badRequest(error.message);
+          throw error;
+        }
         await options.service.renameSession(route.sessionId, title);
         const renamed = (await options.store.sessions()).find((session) => session.id === route.sessionId);
         if (!renamed) throw notFound(`Session not found: ${route.sessionId}`);
@@ -1019,12 +1026,23 @@ function isUnsafeHttpMethod(method: string): boolean {
 
 export function startRuntimeHttpServer(options: StartRuntimeHttpServerOptions): RuntimeHttpServer {
   assertRuntimeHttpServerAuthentication(options.hostname, options.authToken, options.tls);
+  const handler = createRuntimeHttpHandler(options);
+  const protectLoopbackHost = isLoopbackBindHostname(options.hostname ?? "127.0.0.1");
   const server = Bun.serve({
     hostname: options.hostname ?? "127.0.0.1",
     port: options.port ?? 0,
     idleTimeout: options.idleTimeout ?? 255,
     ...(options.tls !== undefined ? { tls: options.tls } : {}),
-    fetch: createRuntimeHttpHandler(options),
+    fetch(request, listener) {
+      if (protectLoopbackHost && (listener.port === undefined || !isTrustedLoopbackHostAuthority(
+        request.headers.get("host"),
+        listener.port,
+        options.tls !== undefined,
+      ))) {
+        return jsonError(421, "Misdirected request");
+      }
+      return handler(request);
+    },
   });
 
   return {
@@ -1075,6 +1093,82 @@ export function isLoopbackBindHostname(hostname: string): boolean {
   if (!ipv4) return false;
   const octets = ipv4.slice(1).map(Number);
   return octets.every((octet) => octet >= 0 && octet <= 255) && octets[0] === 127;
+}
+
+function isTrustedLoopbackHostAuthority(
+  authority: string | null,
+  listenerPort: number,
+  tls: boolean,
+): boolean {
+  if (!authority || authority.length > 512 || /[\u0000-\u0020\u007f]/u.test(authority)) return false;
+
+  let hostname: string;
+  let port: string | undefined;
+  if (authority.startsWith("[")) {
+    const match = /^\[([0-9A-Fa-f:]+)\](?::([0-9]+))?$/u.exec(authority);
+    if (!match || !isIpv6LoopbackLiteral(match[1] ?? "")) return false;
+    hostname = match[1] ?? "";
+    port = match[2];
+  } else {
+    const match = /^([^:]+)(?::([0-9]+))?$/u.exec(authority);
+    if (!match) return false;
+    hostname = match[1] ?? "";
+    port = match[2];
+    if (!isCanonicalIpv4Loopback(hostname) && !isLocalhostDnsName(hostname)) return false;
+  }
+
+  if (!hostname) return false;
+  if (port === undefined) return listenerPort === (tls ? 443 : 80);
+  if (!/^[1-9][0-9]{0,4}$/u.test(port)) return false;
+  const numericPort = Number(port);
+  return numericPort <= 65_535 && numericPort === listenerPort;
+}
+
+function isCanonicalIpv4Loopback(hostname: string): boolean {
+  const octets = hostname.split(".");
+  if (octets.length !== 4) return false;
+  const values: number[] = [];
+  for (const octet of octets) {
+    if (!/^(?:0|[1-9][0-9]{0,2})$/u.test(octet)) return false;
+    const value = Number(octet);
+    if (value > 255) return false;
+    values.push(value);
+  }
+  return values[0] === 127;
+}
+
+function isLocalhostDnsName(hostname: string): boolean {
+  const normalized = hostname.toLowerCase();
+  if (normalized.length > 253 || (normalized !== "localhost" && !normalized.endsWith(".localhost"))) return false;
+  return normalized.split(".").every((label) => (
+    label.length > 0 && label.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u.test(label)
+  ));
+}
+
+function isIpv6LoopbackLiteral(hostname: string): boolean {
+  const halves = hostname.split("::");
+  if (halves.length > 2) return false;
+  const left = ipv6Hextets(halves[0] ?? "");
+  const right = halves.length === 2 ? ipv6Hextets(halves[1] ?? "") : [];
+  if (!left || !right) return false;
+
+  let hextets: number[];
+  if (halves.length === 1) {
+    if (left.length !== 8) return false;
+    hextets = left;
+  } else {
+    const omitted = 8 - left.length - right.length;
+    if (omitted < 1) return false;
+    hextets = [...left, ...Array.from({ length: omitted }, () => 0), ...right];
+  }
+  return hextets.length === 8 && hextets.slice(0, 7).every((value) => value === 0) && hextets[7] === 1;
+}
+
+function ipv6Hextets(value: string): number[] | undefined {
+  if (!value) return [];
+  const parts = value.split(":");
+  if (parts.some((part) => !/^[0-9A-Fa-f]{1,4}$/u.test(part))) return undefined;
+  return parts.map((part) => Number.parseInt(part, 16));
 }
 
 type Route =
@@ -2624,9 +2718,27 @@ async function mcpScopeFromRequest(
   const sessionId = asSessionId(url.searchParams.get("sessionId"));
   if (!sessionId) return {};
 
-  await options.service.assertSessionTurnAllowed(sessionId);
+  await options.service.assertSessionReadAllowed(sessionId);
   const session = await requireSession(options.store, sessionId);
   return { cwd: await authoritativeRequestCwd(session.cwd, undefined) };
+}
+
+async function withMcpMutationScope<T>(
+  options: RuntimeHttpHandlerOptions,
+  url: URL,
+  mutate: (scope: RuntimeMcpScopeInput) => Promise<T>,
+): Promise<T> {
+  rejectUnknownQueryParameters(url, ["sessionId"]);
+  const sessionId = asSessionId(url.searchParams.get("sessionId"));
+  if (!sessionId) return mutate({});
+
+  return options.service.withSessionOperation(sessionId, async (operation) => {
+    await options.service.assertSessionTurnAllowed(sessionId);
+    const session = await requireSession(options.store, sessionId);
+    const scope = { cwd: await authoritativeRequestCwd(session.cwd, undefined) };
+    operation.assertCurrent();
+    return mutate(scope);
+  });
 }
 
 async function authoritativeRequestCwd(sessionCwd: string, requestedCwd: unknown): Promise<string> {

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { PERSISTED_ERROR_LIMITS } from "@chili/protocol";
+import { PERSISTED_ERROR_LIMITS, SESSION_TITLE_MAX_CHARS } from "@chili/protocol";
 import type {
   ChiliEvent,
   EventEnvelope,
@@ -597,6 +597,22 @@ test("RuntimeService shutdown waits for an admitted non-run mutation", async () 
   }));
   await expect(service.renameSession(sessionId, "too late"))
     .rejects.toBeInstanceOf(RuntimeServiceClosedError);
+});
+
+test("RuntimeService applies the canonical session title normalization and limit", async () => {
+  const sessionId = "session_canonical_title" as SessionId;
+  const { service, store } = runtimeFixture(new ImmediateAbortRunner(), sessionId);
+
+  await service.renameSession(sessionId, "  Overnight   Goal\nconsole  ");
+  await expect(service.renameSession(sessionId, "x".repeat(SESSION_TITLE_MAX_CHARS + 1)))
+    .rejects.toThrow(`${SESSION_TITLE_MAX_CHARS} characters or fewer`);
+
+  expect(store.items.filter((event) => event.type === "session.renamed")).toEqual([
+    expect.objectContaining({
+      sessionId,
+      payload: { sessionId, title: "Overnight Goal console" },
+    }),
+  ]);
 });
 
 test("RuntimeService interrupt still aborts and settles when cancelling metadata fails", async () => {

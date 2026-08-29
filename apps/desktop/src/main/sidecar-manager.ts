@@ -656,6 +656,9 @@ function authenticatedFetch(token: string): typeof fetch {
 function cleanChildEnvironment(extra: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, ...extra };
   delete env.CHILI_DESKTOP_TOKEN;
+  delete env.CHILI_DESKTOP_SMOKE_RENDERER_NEEDLES;
+  delete env.CHILI_DESKTOP_SMOKE_SECRET_CANARY;
+  delete env.CHILI_DESKTOP_SMOKE_PATH_CANARY;
   delete env.ELECTRON_RUN_AS_NODE;
   delete env.NODE_OPTIONS;
   if (process.platform === "linux") delete env.LD_PRELOAD;

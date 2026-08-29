@@ -6,7 +6,7 @@ import {
   isEventCursorResyncRequiredError,
   isEventTransportResyncRequiredError,
 } from "./client.js";
-import type { SessionId, UserInputId } from "@chili/protocol";
+import type { SessionId, TeamId, UserInputId } from "@chili/protocol";
 
 test("streamEvents exposes a cursor resync signal for rejected resume cursors", async () => {
   const client = new HttpRuntimeClient({
@@ -489,6 +489,402 @@ test("rejects malformed JSON response shapes and unexpected no-content responses
   });
   await expect(empty.listSessions()).rejects.toThrow("unexpectedly had no content");
   expect(await empty.getGoal({ sessionId: "session_1" as SessionId })).toBeUndefined();
+});
+
+test("rejects poisoned optional team record fields through shared list parsers", async () => {
+  const teamId = "team_optional_validation" as TeamId;
+  const team = {
+    id: teamId,
+    name: "Optional validation",
+    leadPath: "/root",
+    status: "active",
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  const member = {
+    teamId,
+    path: "/root/reviewer",
+    name: "reviewer",
+    role: "reviewer",
+    status: "idle",
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  const task = {
+    id: "task_optional_validation",
+    teamId,
+    title: "Optional validation",
+    status: "pending",
+    dependsOn: [],
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  const message = {
+    id: "message_optional_validation",
+    teamId,
+    fromPath: "/root",
+    toPath: "/root/reviewer",
+    content: "review",
+    kind: "task_assignment",
+    createdAt: 1,
+  };
+  const cases: Array<{
+    base: Record<string, unknown>;
+    parse(client: HttpRuntimeClient): Promise<unknown>;
+    poisoned: Array<{ field: string; value: unknown; path: string }>;
+  }> = [
+    {
+      base: team,
+      parse: (client) => client.listTeams(),
+      poisoned: [
+        { field: "sessionId", value: 7, path: "response[0].sessionId" },
+        { field: "description", value: 7, path: "response[0].description" },
+      ],
+    },
+    {
+      base: member,
+      parse: (client) => client.listTeamMembers(teamId),
+      poisoned: [
+        { field: "childSessionId", value: 7, path: "response[0].childSessionId" },
+        { field: "model", value: 7, path: "response[0].model" },
+        { field: "toolScope", value: [7], path: "response[0].toolScope[0]" },
+        { field: "writeScope", value: "poison", path: "response[0].writeScope" },
+        { field: "currentTaskId", value: 7, path: "response[0].currentTaskId" },
+        { field: "closedAt", value: -1, path: "response[0].closedAt" },
+      ],
+    },
+    {
+      base: task,
+      parse: (client) => client.listTeamTasks(teamId),
+      poisoned: [
+        { field: "sessionId", value: 7, path: "response[0].sessionId" },
+        { field: "description", value: 7, path: "response[0].description" },
+        { field: "ownerPath", value: "reviewer", path: "response[0].ownerPath" },
+        { field: "createdBy", value: 7, path: "response[0].createdBy" },
+        { field: "summary", value: 7, path: "response[0].summary" },
+        { field: "error", value: 7, path: "response[0].error" },
+        { field: "metadata", value: [], path: "response[0].metadata" },
+        { field: "completedAt", value: -1, path: "response[0].completedAt" },
+      ],
+    },
+    {
+      base: message,
+      parse: (client) => client.listTeamMessages(teamId),
+      poisoned: [
+        { field: "delivery", value: "immediate", path: "response[0].delivery" },
+        { field: "deliveryStatus", value: "consumed", path: "response[0].deliveryStatus" },
+        { field: "deliveryError", value: 7, path: "response[0].deliveryError" },
+        { field: "deliveryUpdatedAt", value: -1, path: "response[0].deliveryUpdatedAt" },
+        { field: "deliveredAt", value: 0.5, path: "response[0].deliveredAt" },
+        { field: "taskId", value: 7, path: "response[0].taskId" },
+        { field: "summary", value: 7, path: "response[0].summary" },
+        { field: "metadata", value: [], path: "response[0].metadata" },
+      ],
+    },
+  ];
+
+  for (const recordCase of cases) {
+    for (const poison of recordCase.poisoned) {
+      const client = new HttpRuntimeClient({
+        baseUrl: "http://chili.test",
+        fetch: (async () => Response.json([{
+          ...recordCase.base,
+          [poison.field]: poison.value,
+        }])) as unknown as typeof fetch,
+      });
+      await expect(recordCase.parse(client)).rejects.toThrow(poison.path);
+    }
+  }
+
+  const accepted: Array<{
+    record: Record<string, unknown>;
+    parse(client: HttpRuntimeClient): Promise<unknown>;
+  }> = [
+    {
+      record: { ...team, sessionId: "session_optional_validation", description: "" },
+      parse: (client) => client.listTeams(),
+    },
+    {
+      record: {
+        ...member,
+        childSessionId: "session_optional_validation",
+        model: "provider/model",
+        toolScope: ["read"],
+        writeScope: ["src/**"],
+        currentTaskId: task.id,
+        closedAt: 2,
+      },
+      parse: (client) => client.listTeamMembers(teamId),
+    },
+    {
+      record: {
+        ...task,
+        sessionId: "session_optional_validation",
+        description: "",
+        ownerPath: member.path,
+        createdBy: "/root",
+        summary: "",
+        error: "",
+        metadata: { opaque: [7, null, { nested: true }] },
+        completedAt: 2,
+      },
+      parse: (client) => client.listTeamTasks(teamId),
+    },
+    {
+      record: {
+        ...message,
+        delivery: "triggerTurn",
+        deliveryStatus: "delivered",
+        deliveryError: "",
+        deliveryUpdatedAt: 2,
+        deliveredAt: 3,
+        taskId: task.id,
+        summary: "",
+        metadata: { opaque: [7, null, { nested: true }] },
+      },
+      parse: (client) => client.listTeamMessages(teamId),
+    },
+  ];
+  for (const acceptedCase of accepted) {
+    const client = new HttpRuntimeClient({
+      baseUrl: "http://chili.test",
+      fetch: (async () => Response.json([acceptedCase.record])) as unknown as typeof fetch,
+    });
+    expect(await acceptedCase.parse(client)).toEqual([acceptedCase.record]);
+  }
+});
+
+test("rejects poisoned team snapshot stats fields", async () => {
+  const teamId = "team_stats_validation" as TeamId;
+  const validStats = {
+    memberCount: 0,
+    taskCount: 0,
+    messageCount: 0,
+    deliveryCount: 0,
+    membersByStatus: { idle: 0, running: 0, waiting: 0, blocked: 0, closed: 0 },
+    tasksByStatus: { pending: 0, in_progress: 0, blocked: 0, completed: 0, failed: 0, cancelled: 0 },
+    messagesByDeliveryStatus: {},
+    deliveriesByStatus: {},
+    readyTaskIds: [],
+    blockedTaskIds: [],
+  };
+  const snapshot = {
+    team: {
+      id: teamId,
+      name: "Stats validation",
+      leadPath: "/root",
+      status: "active",
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    members: [],
+    tasks: [],
+    messages: [],
+    messageDeliveries: [],
+    stats: validStats,
+    generatedAt: 1,
+  };
+  const poisoned: Array<{ stats: unknown; path: string }> = [
+    { stats: { ...validStats, memberCount: -1 }, path: "response.stats.memberCount" },
+    { stats: { ...validStats, taskCount: 0.5 }, path: "response.stats.taskCount" },
+    { stats: { ...validStats, messageCount: "0" }, path: "response.stats.messageCount" },
+    { stats: { ...validStats, deliveryCount: null }, path: "response.stats.deliveryCount" },
+    {
+      stats: { ...validStats, membersByStatus: { ...validStats.membersByStatus, idle: "0" } },
+      path: "response.stats.membersByStatus.idle",
+    },
+    {
+      stats: { ...validStats, tasksByStatus: { ...validStats.tasksByStatus, cancelled: -1 } },
+      path: "response.stats.tasksByStatus.cancelled",
+    },
+    {
+      stats: { ...validStats, messagesByDeliveryStatus: { queued: "1" } },
+      path: "response.stats.messagesByDeliveryStatus[0]",
+    },
+    {
+      stats: { ...validStats, deliveriesByStatus: { queued: 1.5 } },
+      path: "response.stats.deliveriesByStatus[0]",
+    },
+    { stats: { ...validStats, readyTaskIds: [7] }, path: "response.stats.readyTaskIds[0]" },
+    { stats: { ...validStats, blockedTaskIds: [""] }, path: "response.stats.blockedTaskIds[0]" },
+  ];
+
+  for (const poison of poisoned) {
+    const client = new HttpRuntimeClient({
+      baseUrl: "http://chili.test",
+      fetch: (async () => Response.json({ ...snapshot, stats: poison.stats })) as unknown as typeof fetch,
+    });
+    await expect(client.teamSnapshot(teamId)).rejects.toThrow(poison.path);
+  }
+});
+
+test("rejects poisoned team snapshot extension fields", async () => {
+  const teamId = "team_snapshot_validation" as TeamId;
+  const task = {
+    id: "task_snapshot_validation",
+    teamId,
+    title: "Snapshot task",
+    status: "pending",
+    dependsOn: [],
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  const member = {
+    teamId,
+    path: "/root/reviewer",
+    name: "reviewer",
+    role: "reviewer",
+    status: "idle",
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  const delivery = {
+    mailboxMessageId: "mailbox_snapshot_validation",
+    teamId,
+    teamMessageId: "message_snapshot_validation",
+    path: "/root/reviewer",
+    status: "queued",
+    triggerTurn: true,
+    childSessionId: "session_snapshot_validation",
+    error: "retrying",
+    queuedAt: 1,
+    updatedAt: 2,
+    deliveredAt: 3,
+  };
+  const message = {
+    id: "message_snapshot_validation",
+    teamId,
+    fromPath: "/root",
+    toPath: "/root/reviewer",
+    content: "review",
+    kind: "task_assignment",
+    createdAt: 1,
+  };
+  const snapshot = {
+    team: {
+      id: teamId,
+      name: "Snapshot validation",
+      leadPath: "/root",
+      status: "active",
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    members: [{
+      ...member,
+      taskIds: [task.id],
+      deliveryIds: [delivery.mailboxMessageId],
+      currentTask: task,
+    }],
+    tasks: [{
+      ...task,
+      blockedBy: [],
+      blocks: [],
+      ready: true,
+      messageIds: [message.id],
+      owner: member,
+      dispatch: { opaque: true },
+    }],
+    messages: [{ ...message, deliveries: [delivery] }],
+    messageDeliveries: [delivery],
+    stats: {
+      memberCount: 1,
+      taskCount: 1,
+      messageCount: 1,
+      deliveryCount: 1,
+      membersByStatus: { idle: 1, running: 0, waiting: 0, blocked: 0, closed: 0 },
+      tasksByStatus: { pending: 1, in_progress: 0, blocked: 0, completed: 0, failed: 0, cancelled: 0 },
+      messagesByDeliveryStatus: { none: 1 },
+      deliveriesByStatus: { queued: 1 },
+      readyTaskIds: [task.id],
+      blockedTaskIds: [],
+    },
+    generatedAt: 3,
+  };
+  const poisoned: Array<{ snapshot: unknown; path: string }> = [
+    {
+      snapshot: { ...snapshot, members: [{ ...snapshot.members[0], taskIds: "poison" }] },
+      path: "response.members[0].taskIds",
+    },
+    {
+      snapshot: { ...snapshot, members: [{ ...snapshot.members[0], deliveryIds: [7] }] },
+      path: "response.members[0].deliveryIds[0]",
+    },
+    {
+      snapshot: { ...snapshot, members: [{ ...snapshot.members[0], currentTask: { ...task, title: 7 } }] },
+      path: "response.members[0].currentTask.title",
+    },
+    {
+      snapshot: { ...snapshot, tasks: [{ ...snapshot.tasks[0], blockedBy: "poison" }] },
+      path: "response.tasks[0].blockedBy",
+    },
+    {
+      snapshot: { ...snapshot, tasks: [{ ...snapshot.tasks[0], blocks: [7] }] },
+      path: "response.tasks[0].blocks[0]",
+    },
+    {
+      snapshot: { ...snapshot, tasks: [{ ...snapshot.tasks[0], ready: "yes" }] },
+      path: "response.tasks[0].ready",
+    },
+    {
+      snapshot: { ...snapshot, tasks: [{ ...snapshot.tasks[0], messageIds: [null] }] },
+      path: "response.tasks[0].messageIds[0]",
+    },
+    {
+      snapshot: { ...snapshot, tasks: [{ ...snapshot.tasks[0], owner: { ...member, name: 7 } }] },
+      path: "response.tasks[0].owner.name",
+    },
+    {
+      snapshot: { ...snapshot, messages: [{ ...snapshot.messages[0], deliveries: "poison" }] },
+      path: "response.messages[0].deliveries",
+    },
+    {
+      snapshot: {
+        ...snapshot,
+        messages: [{ ...snapshot.messages[0], deliveries: [{ ...delivery, triggerTurn: "true" }] }],
+      },
+      path: "response.messages[0].deliveries[0].triggerTurn",
+    },
+    {
+      snapshot: { ...snapshot, messageDeliveries: [{ ...delivery, teamId: 7 }] },
+      path: "response.messageDeliveries[0].teamId",
+    },
+    {
+      snapshot: { ...snapshot, messageDeliveries: [{ ...delivery, teamMessageId: 7 }] },
+      path: "response.messageDeliveries[0].teamMessageId",
+    },
+    {
+      snapshot: { ...snapshot, messageDeliveries: [{ ...delivery, path: "reviewer" }] },
+      path: "response.messageDeliveries[0].path",
+    },
+    {
+      snapshot: { ...snapshot, messageDeliveries: [{ ...delivery, childSessionId: 7 }] },
+      path: "response.messageDeliveries[0].childSessionId",
+    },
+    {
+      snapshot: { ...snapshot, messageDeliveries: [{ ...delivery, error: 7 }] },
+      path: "response.messageDeliveries[0].error",
+    },
+    {
+      snapshot: { ...snapshot, messageDeliveries: [{ ...delivery, queuedAt: -1 }] },
+      path: "response.messageDeliveries[0].queuedAt",
+    },
+    {
+      snapshot: { ...snapshot, messageDeliveries: [{ ...delivery, updatedAt: 0.5 }] },
+      path: "response.messageDeliveries[0].updatedAt",
+    },
+    {
+      snapshot: { ...snapshot, messageDeliveries: [{ ...delivery, deliveredAt: "3" }] },
+      path: "response.messageDeliveries[0].deliveredAt",
+    },
+  ];
+
+  for (const poison of poisoned) {
+    const client = new HttpRuntimeClient({
+      baseUrl: "http://chili.test",
+      fetch: (async () => Response.json(poison.snapshot)) as unknown as typeof fetch,
+    });
+    await expect(client.teamSnapshot(teamId)).rejects.toThrow(poison.path);
+  }
 });
 
 test("rejects malformed and nested-invalid SSE without reflecting hostile JSON", async () => {

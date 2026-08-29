@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -34,6 +35,52 @@ describe("desktop sidecar security boundary", () => {
     expect(manager).toContain('stdio: ["pipe", "pipe", "pipe", "pipe"]');
     expect(sidecar).not.toContain('requireEnvironment("CHILI_DESKTOP_TOKEN")');
     expect(sidecar).toContain("SIDECAR_CREDENTIAL_FD");
+  });
+
+  test("strips main-only smoke canaries from the sidecar environment", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "chili-sidecar-main-only-env-"));
+    const environmentKeys = [
+      "CHILI_DESKTOP_SMOKE_RENDERER_NEEDLES",
+      "CHILI_DESKTOP_SMOKE_SECRET_CANARY",
+      "CHILI_DESKTOP_SMOKE_PATH_CANARY",
+      "CHILI_DESKTOP_SMOKE",
+      "CHILI_HOME",
+    ] as const;
+    const previousEnvironment = new Map(
+      environmentKeys.map((key) => [key, process.env[key]] as const),
+    );
+    let capturedEnvironment: NodeJS.ProcessEnv | undefined;
+    const manager = new SidecarManager({
+      repositoryRoot: resolve(import.meta.dirname, "../../../.."),
+      spawnSidecar: ({ env }) => {
+        capturedEnvironment = env;
+        throw new Error("environment fixture captured");
+      },
+    });
+
+    try {
+      process.env.CHILI_DESKTOP_SMOKE_RENDERER_NEEDLES = '[{"label":"token","value":"secret"}]';
+      process.env.CHILI_DESKTOP_SMOKE_SECRET_CANARY = "main-only-secret";
+      process.env.CHILI_DESKTOP_SMOKE_PATH_CANARY = "/main-only/path";
+      process.env.CHILI_DESKTOP_SMOKE = "1";
+      process.env.CHILI_HOME = workspace;
+
+      await expect(manager.switchWorkspace(workspace)).rejects.toThrow("environment fixture captured");
+      expect(capturedEnvironment).toMatchObject({
+        CHILI_DESKTOP_SMOKE: "1",
+        CHILI_HOME: workspace,
+      });
+      expect(capturedEnvironment?.CHILI_DESKTOP_SMOKE_RENDERER_NEEDLES).toBeUndefined();
+      expect(capturedEnvironment?.CHILI_DESKTOP_SMOKE_SECRET_CANARY).toBeUndefined();
+      expect(capturedEnvironment?.CHILI_DESKTOP_SMOKE_PATH_CANARY).toBeUndefined();
+    } finally {
+      await manager.stop().catch(() => undefined);
+      for (const [key, value] of previousEnvironment) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await rm(workspace, { recursive: true, force: true });
+    }
   });
 
   test("contains a child when the private credential pipe is unavailable", async () => {
@@ -368,6 +415,7 @@ describe("desktop sidecar security boundary", () => {
         throw new Error(`${String(error)}\n${logs.join("\n")}`);
       });
       expect(healthyCount).toBe(1);
+      await waitUntil(() => existsSync(firstSidecarPidPath), 1_000);
       const firstSidecarPid = Number(await readFile(firstSidecarPidPath, "utf8"));
       const firstToolPid = Number(await readFile(firstToolPidPath, "utf8"));
 
@@ -645,7 +693,7 @@ process.stdin.on("data", (chunk) => {
 });
 process.stdin.resume();
 `, "utf8");
-    let childPid = 0;
+    const childPids: number[] = [];
     const manager = new SidecarManager({
       repositoryRoot: resolve(import.meta.dirname, "../../../.."),
       spawnSidecar: ({ env }) => {
@@ -655,25 +703,45 @@ process.stdin.resume();
           detached: true,
           stdio: ["pipe", "pipe", "pipe", "pipe"],
         });
-        childPid = child.pid ?? 0;
+        if (!child.pid) throw new Error("Graceful ownership fixture did not receive a PID");
+        childPids.push(child.pid);
         return child;
       },
       healthCheck: async () => undefined,
     });
     try {
-      await manager.switchWorkspace(workspace);
+      let initialLaunchError: unknown;
+      try {
+        await manager.switchWorkspace(workspace);
+      } catch (error) {
+        initialLaunchError = error;
+      }
+      if (initialLaunchError !== undefined) {
+        expect(initialLaunchError).toBeInstanceOf(Error);
+        expect((initialLaunchError as Error).message).toBe("Sidecar credential delivery failed");
+        expect(manager.state().sidecar.phase).toBe("recovering");
+        expect(manager.state().sidecar.attempt).toBe(1);
+      }
+      await waitUntil(() => manager.state().sidecar.phase === "healthy", 4_000);
+      const launchAttempt = manager.state().sidecar.attempt;
+      expect(childPids.length).toBe(launchAttempt + 1);
+      expect(childPids.length).toBeLessThanOrEqual(4);
+
       await manager.stop();
       expect(await readFile(markerPath, "utf8")).toBe("false");
-      expect(processGroupExists(childPid)).toBe(false);
+      expect(childPids.length).toBeGreaterThan(0);
+      for (const childPid of childPids) expect(processGroupExists(childPid)).toBe(false);
       expect(manager.state().sidecar.phase).toBe("idle");
     } finally {
       await manager.stop().catch(() => undefined);
-      if (childPid > 0 && processGroupExists(childPid)) {
-        await terminateProcessGroup(childPid, { termGraceMs: 50, killGraceMs: 500 }).catch(() => undefined);
+      for (const childPid of childPids) {
+        if (childPid > 0 && processGroupExists(childPid)) {
+          await terminateProcessGroup(childPid, { termGraceMs: 50, killGraceMs: 500 }).catch(() => undefined);
+        }
       }
       await rm(workspace, { recursive: true, force: true });
     }
-  });
+  }, 8_000);
 
   test("reconnects a clean event-stream EOF from the last durable cursor", async () => {
     const requests: StreamEventsRequest[] = [];

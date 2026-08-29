@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { REASONING_LEVELS } from "@chili/protocol";
 import type { RuntimeModelDescriptor, SessionId } from "@chili/protocol";
 import type { RuntimeSessionSummary } from "@chili/sdk";
 import {
@@ -7,7 +8,9 @@ import {
   canExposeTaskActions,
   canReloadSessionMcp,
   canResumeTask,
+  canSelectProviderDefault,
   createNewTaskDraft,
+  createSessionModelSettingsDraft,
   filterSessions,
   goalResumeBudgetMinimum,
   goalProgress,
@@ -17,8 +20,12 @@ import {
   newTaskSubmission,
   preferredServiceTier,
   reconcileNewTaskModel,
+  reconcileSessionModelSettingsModel,
+  sessionModelSettingsMutations,
   serviceTierMutationValue,
   validateNewTaskDraft,
+  validateSessionModelSettingsDraft,
+  type NewTaskDraft,
 } from "./task-console-model.js";
 
 const models: RuntimeModelDescriptor[] = [
@@ -44,6 +51,39 @@ const tierlessModel: RuntimeModelDescriptor = {
   displayName: "DeepSeek V4 Pro",
   default: true,
   reasoningLevels: ["low", "high"],
+};
+
+const noReasoningModel: RuntimeModelDescriptor = {
+  provider: "local",
+  model: "no-reasoning",
+  reasoningLevels: [],
+  serviceTiers: ["standard"],
+};
+
+const missingReasoningMetadataModel: RuntimeModelDescriptor = {
+  provider: "local",
+  model: "implicit-reasoning-defaults",
+  serviceTiers: ["standard"],
+};
+
+const reasoningCapabilityDisabledModel: RuntimeModelDescriptor = {
+  provider: "local",
+  model: "reasoning-capability-disabled",
+  capabilities: { reasoning: false },
+  serviceTiers: ["standard"],
+};
+
+const offOnlyReasoningModel: RuntimeModelDescriptor = {
+  provider: "local",
+  model: "off-only-reasoning",
+  reasoningLevels: ["off"],
+  serviceTiers: ["standard"],
+};
+
+const providerDefaultOnlyModel: RuntimeModelDescriptor = {
+  provider: "local",
+  model: "provider-default-only",
+  reasoningLevels: [],
 };
 
 describe("new task setup", () => {
@@ -95,6 +135,177 @@ describe("new task setup", () => {
     expect(validateNewTaskDraft(stale, [...models, tierlessModel]).errors.serviceTier)
       .toBe("This model uses its provider-default service tier.");
     expect(() => newTaskSubmission(stale, [...models, tierlessModel])).toThrow();
+  });
+
+  test("preserves undefined reasoning and service tier in the Session Settings draft", () => {
+    expect(createSessionModelSettingsDraft(models, {
+      modelSelection: { provider: models[0]!.provider, model: models[0]!.model },
+    })).toEqual({
+      modelKey: modelKey(models[0]!),
+      reasoningLevel: "",
+      serviceTier: "",
+    });
+    expect(createSessionModelSettingsDraft(models, {
+      modelSelection: { provider: models[0]!.provider, model: models[0]!.model },
+      reasoningLevel: "off",
+      serviceTier: "standard",
+    })).toEqual({
+      modelKey: modelKey(models[0]!),
+      reasoningLevel: "off",
+      serviceTier: "standard",
+    });
+  });
+
+  test("accepts provider-default Settings values for a tier-capable model", () => {
+    expect(validateSessionModelSettingsDraft({
+      modelKey: modelKey(models[0]!),
+      reasoningLevel: "",
+      serviceTier: "",
+    }, models, {})).toEqual({ valid: true, errors: {} });
+  });
+
+  test("rejects blank Settings after an explicit A to provider-default B to A round trip", () => {
+    const catalog = [...models, providerDefaultOnlyModel];
+    const current = {
+      modelSelection: { provider: models[0]!.provider, model: models[0]!.model },
+      reasoningLevel: "high" as const,
+      serviceTier: "fast" as const,
+    };
+    const initial = createSessionModelSettingsDraft(catalog, current);
+    const onProviderDefaultModel = reconcileSessionModelSettingsModel(
+      initial,
+      catalog,
+      modelKey(providerDefaultOnlyModel),
+    );
+    expect(onProviderDefaultModel).toMatchObject({ reasoningLevel: "", serviceTier: "" });
+    expect(validateSessionModelSettingsDraft(onProviderDefaultModel, catalog, current))
+      .toEqual({ valid: true, errors: {} });
+
+    const backOnExplicitModel = reconcileSessionModelSettingsModel(
+      onProviderDefaultModel,
+      catalog,
+      modelKey(models[0]!),
+    );
+    const validation = validateSessionModelSettingsDraft(backOnExplicitModel, catalog, current);
+    expect(validation.valid).toBe(false);
+    expect(validation.errors.reasoningLevel).toBeDefined();
+    expect(validation.errors.serviceTier).toBeDefined();
+  });
+
+  test("distinguishes missing reasoning metadata, explicit empty capability, and explicit off", () => {
+    expect(availableReasoningLevels(
+      [missingReasoningMetadataModel],
+      modelKey(missingReasoningMetadataModel),
+    )).toEqual(REASONING_LEVELS);
+    expect(availableReasoningLevels([noReasoningModel], modelKey(noReasoningModel))).toEqual([]);
+    expect(availableReasoningLevels(
+      [reasoningCapabilityDisabledModel],
+      modelKey(reasoningCapabilityDisabledModel),
+    )).toEqual([]);
+    expect(availableReasoningLevels(
+      [offOnlyReasoningModel],
+      modelKey(offOnlyReasoningModel),
+    )).toEqual(["off"]);
+  });
+
+  test("clears stale reasoning when switching to an explicitly non-configurable model", () => {
+    const draft = { ...createNewTaskDraft(models), reasoningLevel: "high" as const };
+    const switched = reconcileNewTaskModel(
+      draft,
+      [...models, noReasoningModel],
+      modelKey(noReasoningModel),
+    );
+    expect(switched.reasoningLevel).toBe("");
+  });
+
+  test("validates stale reasoning for an explicitly non-configurable model", () => {
+    const stale = {
+      ...createNewTaskDraft([noReasoningModel]),
+      prompt: "Run without configurable reasoning",
+      reasoningLevel: "high" as const,
+    };
+    const validation = validateNewTaskDraft(stale, [noReasoningModel]);
+    expect((validation.errors as Record<string, string | undefined>).reasoningLevel)
+      .toBe("This model uses provider-default reasoning.");
+  });
+
+  test("rejects a stale reasoning submission for an explicitly non-configurable model", () => {
+    const stale = {
+      ...createNewTaskDraft([noReasoningModel]),
+      prompt: "Run without configurable reasoning",
+      reasoningLevel: "high" as const,
+    };
+    expect(() => newTaskSubmission(stale, [noReasoningModel])).toThrow();
+  });
+
+  test("omits provider-default reasoning from the submission", () => {
+    const providerDefault: NewTaskDraft = {
+      ...createNewTaskDraft([noReasoningModel]),
+      prompt: "Use provider-default reasoning",
+      reasoningLevel: "",
+    };
+    expect(newTaskSubmission(providerDefault, [noReasoningModel])).toEqual({
+      prompt: "Use provider-default reasoning",
+      modelSelection: { provider: "local", model: "no-reasoning" },
+      serviceTier: "standard",
+      permissionProfile: "default",
+      delegationPolicy: "proactive",
+    });
+  });
+
+  test("preserves explicit off reasoning through reconciliation and submission", () => {
+    const explicitOff = reconcileNewTaskModel(
+      { ...createNewTaskDraft(models), prompt: "Keep off explicit", reasoningLevel: "high" },
+      [...models, offOnlyReasoningModel],
+      modelKey(offOnlyReasoningModel),
+    );
+    expect(explicitOff.reasoningLevel).toBe("off");
+    expect(newTaskSubmission(explicitOff, [...models, offOnlyReasoningModel]).reasoningLevel).toBe("off");
+  });
+
+  test("emits no Settings mutations for unchanged provider defaults but preserves explicit values", () => {
+    expect(sessionModelSettingsMutations(
+      { reasoningLevel: "", serviceTier: "" },
+      {},
+    )).toEqual({});
+    expect(sessionModelSettingsMutations(
+      { reasoningLevel: "off", serviceTier: "standard" },
+      {},
+    )).toEqual({ reasoningLevel: "off", serviceTier: "standard" });
+    expect(sessionModelSettingsMutations(
+      { reasoningLevel: "off", serviceTier: "standard" },
+      { reasoningLevel: "off", serviceTier: "standard" },
+    )).toEqual({});
+    expect(sessionModelSettingsMutations(
+      { reasoningLevel: "", serviceTier: "" },
+      { reasoningLevel: "high", serviceTier: "fast" },
+    )).toEqual({});
+  });
+
+  test("offers Provider default only when Settings opened with an undefined value", () => {
+    expect(canSelectProviderDefault(undefined)).toBe(true);
+    expect(canSelectProviderDefault("high")).toBe(false);
+    expect(canSelectProviderDefault("fast")).toBe(false);
+  });
+
+  test("clears and rejects stale Settings reasoning for a model with no configurable reasoning", () => {
+    const switched = reconcileSessionModelSettingsModel({
+      modelKey: modelKey(models[0]!),
+      reasoningLevel: "high",
+      serviceTier: "standard",
+    }, [...models, noReasoningModel], modelKey(noReasoningModel));
+    expect(switched).toEqual({
+      modelKey: modelKey(noReasoningModel),
+      reasoningLevel: "",
+      serviceTier: "standard",
+    });
+    expect(validateSessionModelSettingsDraft({
+      ...switched,
+      reasoningLevel: "high",
+    }, [...models, noReasoningModel])).toEqual({
+      valid: false,
+      errors: { reasoningLevel: "This model uses provider-default reasoning." },
+    });
   });
 
   test("hydrates async runtime choices without erasing outcome or Goal edits", () => {

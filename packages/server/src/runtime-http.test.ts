@@ -31,7 +31,7 @@ import type {
   TeamTaskRow,
 } from "@chili/store";
 import { ObservableEventStore, SqliteEventStore, UnknownEventCursorError } from "@chili/store";
-import type { RuntimeSessionEventWindow } from "@chili/sdk";
+import { HttpRuntimeClient, type RuntimeSessionEventWindow } from "@chili/sdk";
 import type {
   AgentPath,
   AgentRunId,
@@ -212,10 +212,222 @@ test("passes validated TLS configuration through to Bun.serve", async () => {
     });
     expect((capturedOptions as { tls?: unknown }).tls).toBe(tls);
     expect(server.url).toBe("https://0.0.0.0:4443/");
+    const transportFetch = (capturedOptions as {
+      fetch: (request: Request, listener: { port: number }) => Response | Promise<Response>;
+    }).fetch;
+    const publicHostResponse = await transportFetch(new Request("https://control.private.example:4443/health", {
+      headers: {
+        authorization: `Bearer ${"x".repeat(32)}`,
+        host: "control.private.example:4443",
+      },
+    }), { port: 4443 });
+    expect(publicHostResponse.status).toBe(200);
+    expect(await publicHostResponse.json()).toEqual({ ok: true });
     await server.close();
     expect(stopped).toBe(true);
   } finally {
     mutableBun.serve = originalServe;
+  }
+});
+
+test("loopback server accepts explicit loopback Host authorities on its listener port", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const server = startRuntimeHttpServer({
+    service: new FakeRuntimeService(store),
+    store,
+    hostname: "127.0.0.1",
+  });
+
+  try {
+    const port = new URL(server.url).port;
+    expect(port).not.toBe("");
+    const trustedHosts = [
+      `127.0.0.1:${port}`,
+      `127.255.12.9:${port}`,
+      `localhost:${port}`,
+      `LOCALHOST:${port}`,
+      `api.localhost:${port}`,
+      `[::1]:${port}`,
+      `[0:0:0:0:0:0:0:1]:${port}`,
+    ];
+
+    const observed: Array<{ host: string; status: number }> = [];
+    for (const host of trustedHosts) {
+      const response = await fetch(new URL("health", server.url), { headers: { host } });
+      observed.push({ host, status: response.status });
+      expect(await response.json()).toEqual({ ok: true });
+    }
+    expect(observed).toEqual(trustedHosts.map((host) => ({ host, status: 200 })));
+  } finally {
+    await server.close();
+  }
+});
+
+test("loopback server rejects DNS rebinding and deceptive numeric Host authorities", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const server = startRuntimeHttpServer({
+    service: new FakeRuntimeService(store),
+    store,
+    hostname: "127.0.0.1",
+  });
+
+  try {
+    const port = new URL(server.url).port;
+    const hostileHosts = [
+      `HOST_REBIND_CANARY.example:${port}`,
+      `127.0.0.1.HOST_REBIND_CANARY.example:${port}`,
+      `192.168.1.20:${port}`,
+      `0.0.0.0:${port}`,
+      `[::]:${port}`,
+      `2130706433:${port}`,
+      `0x7f000001:${port}`,
+      `0177.0.0.1:${port}`,
+      `127.1:${port}`,
+      `127.000.000.001:${port}`,
+      `127.0.0.01:${port}`,
+      `127.0.0.1.:${port}`,
+      `[::ffff:127.0.0.1]:${port}`,
+    ];
+
+    const observed: Array<{ body: unknown; host: string; status: number; text: string }> = [];
+    for (const host of hostileHosts) {
+      const response = await fetch(new URL("health", server.url), { headers: { host } });
+      const text = await response.text();
+      observed.push({
+        body: JSON.parse(text) as unknown,
+        host,
+        status: response.status,
+        text,
+      });
+    }
+
+    expect(observed.map(({ body, host, status }) => ({ body, host, status }))).toEqual(
+      hostileHosts.map((host) => ({
+        body: { error: { message: "Misdirected request" } },
+        host,
+        status: 421,
+      })),
+    );
+    for (const result of observed) expect(result.text).not.toContain("HOST_REBIND_CANARY");
+  } finally {
+    await server.close();
+  }
+});
+
+test("loopback server rejects an untrusted Host before reading session state", async () => {
+  const innerStore = new MemoryEventStore();
+  const originalSessions = innerStore.sessions.bind(innerStore);
+  let sessionsCalls = 0;
+  innerStore.sessions = async () => {
+    sessionsCalls += 1;
+    return originalSessions();
+  };
+  const store = new ObservableEventStore(innerStore);
+  const server = startRuntimeHttpServer({
+    service: new FakeRuntimeService(store),
+    store,
+    hostname: "127.0.0.1",
+  });
+
+  try {
+    const port = new URL(server.url).port;
+    const response = await fetch(new URL("sessions", server.url), {
+      headers: { host: `HOST_STATE_CANARY.example:${port}` },
+    });
+    const text = await response.text();
+
+    expect(response.status).toBe(421);
+    expect(JSON.parse(text)).toEqual({ error: { message: "Misdirected request" } });
+    expect(text).not.toContain("HOST_STATE_CANARY");
+    expect(sessionsCalls).toBe(0);
+  } finally {
+    await server.close();
+  }
+});
+
+test("loopback server rejects an untrusted Host before an unsafe mutation", async () => {
+  const innerStore = new MemoryEventStore();
+  const store = new ObservableEventStore(innerStore);
+  const service = new FakeRuntimeService(store);
+  const session = await service.createSession({ sessionId: "session_host_mutation" as SessionId, cwd: "/repo" });
+  const originalArchiveSession = service.archiveSession.bind(service);
+  let archiveCalls = 0;
+  service.archiveSession = async (sessionId) => {
+    archiveCalls += 1;
+    await originalArchiveSession(sessionId);
+  };
+  const server = startRuntimeHttpServer({ service, store, hostname: "127.0.0.1" });
+
+  try {
+    const port = new URL(server.url).port;
+    const response = await fetch(new URL(`sessions/${session.sessionId}/archive`, server.url), {
+      method: "POST",
+      headers: { host: `HOST_MUTATION_CANARY.example:${port}` },
+    });
+    const text = await response.text();
+    const persisted = (await store.sessions()).find((candidate) => candidate.id === session.sessionId);
+
+    expect({
+      archiveCalls,
+      body: text.length > 0 ? JSON.parse(text) as unknown : undefined,
+      sessionStatus: persisted?.status,
+      status: response.status,
+    }).toEqual({
+      archiveCalls: 0,
+      body: { error: { message: "Misdirected request" } },
+      sessionStatus: "active",
+      status: 421,
+    });
+    expect(text).not.toContain("HOST_MUTATION_CANARY");
+  } finally {
+    await server.close();
+  }
+});
+
+test("loopback server rejects omitted, mismatched, and malformed Host ports", async () => {
+  const store = new ObservableEventStore(new MemoryEventStore());
+  const server = startRuntimeHttpServer({
+    service: new FakeRuntimeService(store),
+    store,
+    hostname: "127.0.0.1",
+  });
+
+  try {
+    const port = Number(new URL(server.url).port);
+    expect(port).toBeGreaterThan(0);
+    const mismatchedHosts = [
+      "127.0.0.1",
+      `127.0.0.1:${port + 1}`,
+      "[::1]",
+      `[::1]:${port + 1}`,
+      `localhost:${port}:80`,
+      `::1:${port}`,
+      "localhost:http",
+      `localhost:+${port}`,
+      `user:HOST_PORT_CANARY@localhost:${port}`,
+      `localhost:${port}/HOST_PORT_CANARY`,
+      `localhost:${port}?host=HOST_PORT_CANARY`,
+      `localhost:${port}#HOST_PORT_CANARY`,
+      `localhost:${port}, HOST_PORT_CANARY.example:${port}`,
+    ];
+
+    const observed: Array<{ body: unknown; host: string; status: number }> = [];
+    for (const host of mismatchedHosts) {
+      const response = await fetch(new URL("health", server.url), { headers: { host } });
+      observed.push({
+        body: await response.json() as unknown,
+        host,
+        status: response.status,
+      });
+    }
+
+    expect(observed).toEqual(mismatchedHosts.map((host) => ({
+      body: { error: { message: "Misdirected request" } },
+      host,
+      status: 421,
+    })));
+  } finally {
+    await server.close();
   }
 });
 
@@ -893,13 +1105,40 @@ test("loads resumable session events and renames a saved session", async () => {
   const renameResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/rename`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ title: "  Saved   investigation  " }),
+    body: JSON.stringify({ title: "  Saved  \n investigation  " }),
   }));
   expect(renameResponse.status).toBe(200);
   expect(await renameResponse.json()).toMatchObject({
     id: session.sessionId,
     title: "Saved investigation",
   });
+
+  const maximumTitle = "x".repeat(120);
+  const maximumResponse = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/rename`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ title: maximumTitle }),
+  }));
+  expect(maximumResponse.status).toBe(200);
+  expect(await maximumResponse.json()).toMatchObject({ title: maximumTitle });
+
+  const tooLong = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/rename`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ title: "x".repeat(121) }),
+  }));
+  expect(tooLong.status).toBe(400);
+  expect(await tooLong.json()).toEqual({
+    error: { message: "Session title must be 120 characters or fewer." },
+  });
+
+  const empty = await handler(new Request(`http://chili.test/sessions/${session.sessionId}/rename`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ title: " \n\t " }),
+  }));
+  expect(empty.status).toBe(400);
+  expect(await empty.json()).toEqual({ error: { message: "Session title cannot be empty." } });
 });
 
 test("serves a full-envelope bounded replayable event window and clamps its event limit", async () => {
@@ -3550,6 +3789,7 @@ test("scopes MCP catalog views to the persisted canonical session workspace", as
       { operation: "tools", cwd: canonicalWorkspace },
       { operation: "reload", cwd: canonicalWorkspace },
     ]);
+    expect(service.sessionOperationIds).toEqual([sessionId]);
 
     const callCount = mcp.scopeInputs.length;
     const missing = await handler(new Request("http://chili.test/mcp/status?sessionId=session_missing"));
@@ -3559,6 +3799,125 @@ test("scopes MCP catalog views to the persisted canonical session workspace", as
     const unsupported = await handler(new Request(`http://chili.test/mcp?${query}&cwd=${encodeURIComponent(workspace)}`));
     expect(unsupported.status).toBe(400);
     expect(mcp.scopeInputs).toHaveLength(callCount);
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("keeps archived MCP reads project-scoped while reload remains active-only", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "chili-mcp-http-archived-scope-"));
+  const workspace = join(tempRoot, "workspace");
+  const workspaceAlias = join(tempRoot, "workspace-alias");
+  await mkdir(workspace);
+  await symlink(workspace, workspaceAlias);
+
+  try {
+    const baseStore = new MemoryEventStore();
+    const store = new ObservableEventStore(baseStore);
+    const service = new FakeRuntimeService(store);
+    const mcp = new FakeMcpControlService();
+    const handler = createRuntimeHttpHandler({ service, store, mcp });
+    const client = new HttpRuntimeClient({
+      baseUrl: "http://chili.test/",
+      fetch: ((input, init) => handler(new Request(input, init))) as typeof fetch,
+    });
+    const sessionId = "session_mcp_archived_scope" as SessionId;
+    await store.append({
+      id: "event_session_mcp_archived_scope_created",
+      type: "session.created",
+      time: 1 as TimestampMs,
+      sessionId,
+      payload: { sessionId, cwd: workspaceAlias },
+    });
+    await store.append({
+      id: "event_session_mcp_archived_scope_archived",
+      type: "session.archived",
+      time: 2 as TimestampMs,
+      sessionId,
+      payload: { sessionId },
+    });
+
+    const reloadResponse = await handler(new Request(`http://chili.test/mcp/reload?sessionId=${sessionId}`, {
+      method: "POST",
+    }));
+    expect(reloadResponse.status).toBe(409);
+    expect(await reloadResponse.json()).toEqual({
+      error: { message: `Session is not active: ${sessionId} (archived)` },
+    });
+    expect(mcp.scopeInputs).toEqual([]);
+
+    expect(await client.listMcpServers({ sessionId })).toMatchObject({
+      servers: [{ name: "github", status: "running" }],
+    });
+    expect(await client.mcpStatus({ sessionId })).toMatchObject({
+      summary: { total: 1, running: 1 },
+    });
+    expect(await client.mcpServer({ server: "github", sessionId })).toMatchObject({
+      name: "github",
+      status: "running",
+    });
+    expect(await client.listMcpTools({ server: "github", sessionId })).toEqual({
+      server: "github",
+      tools: [{ name: "search_issues", description: "Search issues" }],
+    });
+
+    const canonicalWorkspace = await realpath(workspace);
+    expect(mcp.scopeInputs).toEqual([
+      { operation: "list", cwd: canonicalWorkspace },
+      { operation: "list", cwd: canonicalWorkspace },
+      { operation: "list", cwd: canonicalWorkspace },
+      { operation: "tools", cwd: canonicalWorkspace },
+    ]);
+
+    const activeChildId = "session_mcp_active_child" as SessionId;
+    const archivedChildId = "session_mcp_archived_child" as SessionId;
+    for (const childId of [activeChildId, archivedChildId]) {
+      await store.append({
+        id: `event_${childId}_created`,
+        type: "session.created",
+        time: 3 as TimestampMs,
+        sessionId: childId,
+        payload: { sessionId: childId, cwd: workspaceAlias },
+      });
+      service.blockedSubagentSessions.add(childId);
+    }
+    await store.append({
+      id: "event_session_mcp_archived_child_archived",
+      type: "session.archived",
+      time: 4 as TimestampMs,
+      sessionId: archivedChildId,
+      payload: { sessionId: archivedChildId },
+    });
+
+    for (const childId of [activeChildId, archivedChildId]) {
+      const childQuery = `sessionId=${childId}`;
+      for (const path of [
+        `/mcp?${childQuery}`,
+        `/mcp/status?${childQuery}`,
+        `/mcp/github?${childQuery}`,
+        `/mcp/github/tools?${childQuery}`,
+      ]) {
+        const response = await handler(new Request(`http://chili.test${path}`));
+        expect(response.status).toBe(409);
+        expect(await response.json()).toEqual({
+          error: {
+            message: expect.stringContaining(`Session ${childId} belongs to a subagent`),
+          },
+        });
+      }
+      const reload = await handler(new Request(
+        `http://chili.test/mcp/reload?${childQuery}`,
+        { method: "POST" },
+      ));
+      expect(reload.status).toBe(409);
+      expect(await reload.json()).toEqual({
+        error: {
+          message: expect.stringContaining(`Session ${childId} belongs to a subagent`),
+        },
+      });
+    }
+    expect(mcp.scopeInputs).toHaveLength(4);
+    expect(service.sessionOperationIds).toEqual([sessionId, activeChildId, archivedChildId]);
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
@@ -4119,12 +4478,16 @@ class FakeRuntimeService implements RuntimeHttpService {
   }
 
   async assertSessionTurnAllowed(sessionId: SessionId): Promise<void> {
-    if (this.blockedSubagentSessions.has(sessionId)) {
-      throw new RuntimeSubagentSessionAccessError(sessionId);
-    }
+    await this.assertSessionReadAllowed(sessionId);
     const session = (await this.store.sessions()).find((candidate) => candidate.id === sessionId);
     if (session && session.status !== "active") {
       throw new RuntimeSessionInactiveError(sessionId, session.status);
+    }
+  }
+
+  async assertSessionReadAllowed(sessionId: SessionId): Promise<void> {
+    if (this.blockedSubagentSessions.has(sessionId)) {
+      throw new RuntimeSubagentSessionAccessError(sessionId);
     }
   }
 

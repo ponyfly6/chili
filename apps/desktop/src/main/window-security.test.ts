@@ -56,6 +56,30 @@ describe("production Electron security boundary", () => {
     expect(source).not.toContain("__CHILI_REPOSITORY_ROOT__");
   });
 
+  test("quiesces renderer IPC before closing the desktop control plane", async () => {
+    const source = await readFile(resolve(import.meta.dirname, "index.ts"), "utf8");
+    const shutdown = source.slice(
+      source.indexOf("function beginShutdown"),
+      source.indexOf("function finishShutdown"),
+    );
+    const quiesceIpc = shutdown.indexOf("desktopIpc?.beginShutdown()");
+    const closeControlPlane = shutdown.indexOf("controlService?.beginShutdown()");
+    expect(quiesceIpc).toBeGreaterThan(0);
+    expect(closeControlPlane).toBeGreaterThan(quiesceIpc);
+    expect(shutdown).not.toContain("desktopIpc?.dispose()");
+    expect(shutdown).not.toContain("mainWindow?.destroy()");
+
+    const ipc = await readFile(resolve(import.meta.dirname, "ipc.ts"), "utf8");
+    expect(ipc).toContain("shutdownGate.invoke(() => dispatchRequest(value))");
+    expect(ipc).toContain('return { version: 1, streamId: "stream_shutdown" }');
+    const ipcBeginShutdown = ipc.slice(
+      ipc.indexOf("beginShutdown: () =>"),
+      ipc.indexOf("dispose: () =>"),
+    );
+    expect(ipcBeginShutdown).not.toContain("removeHandler(DESKTOP_INVOKE_CHANNEL)");
+    expect(ipcBeginShutdown).not.toContain("removeHandler(DESKTOP_EVENT_READY_CHANNEL)");
+  });
+
   test("validates the sender frame and runtime request and response", async () => {
     const source = await readFile(resolve(import.meta.dirname, "ipc.ts"), "utf8");
     const dispatcher = await readFile(resolve(import.meta.dirname, "ipc-dispatcher.ts"), "utf8");

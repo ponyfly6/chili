@@ -131,6 +131,7 @@ const commandOutputSensitiveNeedles = uniqueNeedles([
 ]);
 const rendererSensitiveNeedles = uniqueNeedles([
   { label: "secret canary", value: secretCanary },
+  { label: "inherited desktop token canary", value: inheritedTokenCanary },
   ...pathNeedles("path canary", pathCanary),
   ...pathNeedles("isolated Chili home", isolatedChiliHome),
   ...pathNeedles("source worktree", repositoryRoot),

@@ -3,6 +3,7 @@ import { useAppContext, useKeyboard, useRenderer, useTerminalDimensions } from "
 import type { KeyEvent, MouseEvent, ScrollBoxRenderable, Selection } from "@opentui/core";
 import { collectCommandNodes, completeCommandsSync, resolveCommand, type ResolveCommandResult } from "@chili/commands";
 import { runtimeDelegationStatus, type ChatSessionView, type ChatTranscriptItem, type HttpRuntimeClient, type RuntimeSessionSummary, type TeamLiveAction, type TeamLiveView } from "@chili/sdk";
+import { normalizeSessionTitle, SESSION_TITLE_MAX_CHARS } from "@chili/protocol";
 import type {
   ApprovalId,
   DelegationPolicy,
@@ -716,13 +717,11 @@ export function ChatShellSurface(props: {
     setRenamePrompt({ value: "", submitting: false });
   }, [closeCommandMenu]);
   const renameChatSession = useCallback(async (title: string) => {
-    const normalized = title.trim().replace(/\s+/g, " ");
-    if (!normalized) {
-      appendLocalItem("error", "Session title cannot be empty.");
-      return;
-    }
-    if (normalized.length > 120) {
-      appendLocalItem("error", "Session title must be 120 characters or fewer.");
+    let normalized: string;
+    try {
+      normalized = normalizeSessionTitle(title);
+    } catch (error) {
+      appendLocalItem("error", error instanceof Error ? error.message : "Invalid session title.");
       return;
     }
     setRenamePrompt((current) => current ? { ...current, submitting: true } : current);
@@ -1513,13 +1512,13 @@ export function ChatShellSurface(props: {
       if (isPasteShortcut(key)) {
         void clipboard.readText().then((value) => {
           const pasted = cleanClipboardText(value ?? "")?.replace(/\s+/g, " ") ?? "";
-          if (pasted) setRenamePrompt((current) => current ? { ...current, value: `${current.value}${pasted}`.slice(0, 120) } : current);
+          if (pasted) setRenamePrompt((current) => current ? { ...current, value: `${current.value}${pasted}`.slice(0, SESSION_TITLE_MAX_CHARS) } : current);
         });
         return;
       }
       const printable = printableKey(key);
       if (printable) {
-        setRenamePrompt((current) => current ? { ...current, value: `${current.value}${printable}`.slice(0, 120) } : current);
+        setRenamePrompt((current) => current ? { ...current, value: `${current.value}${printable}`.slice(0, SESSION_TITLE_MAX_CHARS) } : current);
       }
       return;
     }

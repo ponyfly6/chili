@@ -6,7 +6,7 @@ import {
   DESKTOP_INVOKE_CHANNEL,
   parseDesktopEventReady,
   parseDesktopRequest,
-  parseDesktopResponse,
+  parseDesktopInvokeResponse,
   type ChiliDesktopApi,
   type DesktopEventEnvelope,
   type DesktopRequest,
@@ -37,7 +37,7 @@ const api: ChiliDesktopApi = Object.freeze({
   async invoke<Request extends DesktopRequest>(value: Request): Promise<DesktopResponse<Request>> {
     const request = parseDesktopRequest(value) as Request;
     const response: unknown = await ipcRenderer.invoke(DESKTOP_INVOKE_CHANNEL, request);
-    return parseDesktopResponse(request, response);
+    return parseDesktopInvokeResponse(request, response);
   },
   subscribe(listener: Parameters<ChiliDesktopApi["subscribe"]>[0]) {
     if (typeof listener !== "function") throw new TypeError("Desktop event listener must be a function");

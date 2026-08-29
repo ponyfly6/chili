@@ -1,4 +1,4 @@
-import type { ChiliEvent, SessionId } from "@chili/protocol";
+import { normalizeSessionTitle, type ChiliEvent, type SessionId } from "@chili/protocol";
 import { reduceRuntimeEvents, ReplayableRuntimeEventWindowAccumulator } from "@chili/sdk";
 import type {
   RuntimeAgentMailboxRecord,
@@ -306,7 +306,7 @@ export class DesktopControlService {
       return this.withSessionActor(request.sessionId, async () => {
         const renamed = await lease.client.renameSession({
           sessionId: request.sessionId as SessionId,
-          title: request.title,
+          title: normalizeSessionTitle(request.title),
           signal: lease.signal,
         });
         this.assertClientLease(lease);
@@ -578,6 +578,9 @@ export class DesktopControlService {
     )) {
       throw new TypeError("Goal objective must match the task prompt");
     }
+    const normalizedTitle = request.title === undefined
+      ? undefined
+      : normalizeSessionTitle(request.title);
     const lease = this.captureClientLease();
     const cwd = this.requireWorkspace();
     const created = await lease.client.createSession({ cwd, signal: lease.signal });
@@ -614,9 +617,9 @@ export class DesktopControlService {
     };
 
     try {
-      if (request.title !== undefined) {
+      if (normalizedTitle !== undefined) {
         stage = "rename";
-        await lease.client.renameSession({ sessionId, title: request.title, signal: lease.signal });
+        await lease.client.renameSession({ sessionId, title: normalizedTitle, signal: lease.signal });
         this.assertClientLease(lease);
       }
       if (request.modelSelection !== undefined) {

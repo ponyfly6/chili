@@ -1,8 +1,39 @@
 import { expect, test } from "bun:test";
 import { HttpRuntimeClient } from "@chili/sdk";
 import { DesktopControlService } from "./control-service.js";
-import { createDesktopRequestDispatcher } from "./ipc-dispatcher.js";
+import { DESKTOP_INVOKE_CLOSING_RESPONSE } from "../shared/contracts.js";
+import {
+  createDesktopInvokeShutdownGate,
+  createDesktopRequestDispatcher,
+} from "./ipc-dispatcher.js";
 import { MAX_DESKTOP_ERROR_MESSAGE_BYTES } from "../shared/safe-error.js";
+
+test("shutdown resolves pending and later invokes without rejecting the main IPC handler", async () => {
+  const gate = createDesktopInvokeShutdownGate();
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const pending = gate.invoke(async () => {
+    entered.resolve();
+    await release.promise;
+    throw new Error("Desktop is closing");
+  });
+  await entered.promise;
+
+  gate.beginShutdown();
+  release.resolve();
+  await expect(pending).resolves.toBe(DESKTOP_INVOKE_CLOSING_RESPONSE);
+
+  let laterDispatches = 0;
+  await expect(gate.invoke(() => {
+    laterDispatches += 1;
+    return Promise.resolve("unexpected");
+  })).resolves.toBe(DESKTOP_INVOKE_CLOSING_RESPONSE);
+  expect(laterDispatches).toBe(0);
+
+  const activeGate = createDesktopInvokeShutdownGate();
+  await expect(activeGate.invoke(() => Promise.reject(new Error("real failure"))))
+    .rejects.toThrow("real failure");
+});
 
 test("renderer invoke rejections redact labeled secrets and loopback URLs", async () => {
   const password = "abc";

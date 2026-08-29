@@ -1,6 +1,19 @@
 import type { ApprovalId, MessageId, SessionId, TurnId } from "./ids.js";
 import type { ApprovalDecisionAction } from "./tool.js";
 
+export const SESSION_TITLE_MAX_CHARS = 120;
+
+/** Normalize and validate a user-visible session title at every runtime boundary. */
+export function normalizeSessionTitle(title: string): string {
+  if (typeof title !== "string") throw new TypeError("Session title must be a string.");
+  const normalized = title.trim().replace(/\s+/gu, " ");
+  if (!normalized) throw new TypeError("Session title cannot be empty.");
+  if (normalized.length > SESSION_TITLE_MAX_CHARS) {
+    throw new TypeError(`Session title must be ${SESSION_TITLE_MAX_CHARS} characters or fewer.`);
+  }
+  return normalized;
+}
+
 export type RuntimeSessionStatus =
   | "idle"
   | "running"

@@ -1,4 +1,5 @@
 import {
+  DESKTOP_INVOKE_CLOSING_RESPONSE,
   parseDesktopRequest,
   parseDesktopResponse,
   type DesktopRequest,
@@ -13,6 +14,33 @@ export interface DesktopRequestHandler {
 
 export interface DesktopResyncCompleter {
   completeResync(barrierId: string): { status: "completed" | "retry" };
+}
+
+export interface DesktopInvokeShutdownGate {
+  beginShutdown(): void;
+  isShuttingDown(): boolean;
+  invoke<T>(operation: () => Promise<T> | T): Promise<T | typeof DESKTOP_INVOKE_CLOSING_RESPONSE>;
+}
+
+export function createDesktopInvokeShutdownGate(): DesktopInvokeShutdownGate {
+  let shuttingDown = false;
+  return {
+    beginShutdown() {
+      shuttingDown = true;
+    },
+    isShuttingDown() {
+      return shuttingDown;
+    },
+    async invoke<T>(operation: () => Promise<T> | T) {
+      if (shuttingDown) return DESKTOP_INVOKE_CLOSING_RESPONSE;
+      try {
+        return await operation();
+      } catch (error) {
+        if (shuttingDown) return DESKTOP_INVOKE_CLOSING_RESPONSE;
+        throw error;
+      }
+    },
+  };
 }
 
 export function createDesktopRequestDispatcher(

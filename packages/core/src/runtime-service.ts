@@ -24,6 +24,7 @@ import type {
 } from "@chili/protocol";
 import {
   DELEGATION_POLICIES,
+  normalizeSessionTitle,
   normalizePersistedError,
   REASONING_LEVELS,
   SERVICE_TIERS,
@@ -551,20 +552,28 @@ export class RuntimeService {
     });
   }
 
+  async assertSessionReadAllowed(sessionId: SessionId): Promise<void> {
+    await this.assertSessionAccessAllowed(sessionId, false);
+  }
+
   async assertSessionTurnAllowed(sessionId: SessionId): Promise<void> {
+    await this.assertSessionAccessAllowed(sessionId, true);
+  }
+
+  private async assertSessionAccessAllowed(sessionId: SessionId, requireActive: boolean): Promise<void> {
     const sessions = await this.options.store.sessions();
     const session = sessions.find((candidate) => candidate.id === sessionId);
-    if (session && session.status !== "active") {
-      throw new RuntimeSessionInactiveError(sessionId, session.status);
-    }
     if (this.options.allowSubagentSessions) {
       if (!session) throw new RuntimeSessionNotFoundError(sessionId);
-      return;
+    } else {
+      if (session?.source === "subagent" || await this.isSubagentSessionOwned(sessionId)) {
+        throw new RuntimeSubagentSessionAccessError(sessionId);
+      }
+      if (!session) throw new RuntimeSessionNotFoundError(sessionId);
     }
-    if (session?.source === "subagent" || await this.isSubagentSessionOwned(sessionId)) {
-      throw new RuntimeSubagentSessionAccessError(sessionId);
+    if (requireActive && session.status !== "active") {
+      throw new RuntimeSessionInactiveError(sessionId, session.status);
     }
-    if (!session) throw new RuntimeSessionNotFoundError(sessionId);
   }
 
   withSessionOperation<T>(
@@ -2177,9 +2186,7 @@ export class RuntimeService {
   async renameSession(sessionId: SessionId, title: string): Promise<void> {
     return this.withMutationAdmission(async () => {
       await this.assertSessionTurnAllowed(sessionId);
-      const normalized = title.trim().replace(/\s+/g, " ");
-      if (!normalized) throw new Error("Session title cannot be empty.");
-      if (normalized.length > 120) throw new Error("Session title must be 120 characters or fewer.");
+      const normalized = normalizeSessionTitle(title);
       await this.append({ sessionId }, "session.renamed", { sessionId, title: normalized });
     });
   }

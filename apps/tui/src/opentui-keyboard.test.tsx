@@ -3507,9 +3507,9 @@ test("/rename edits and saves the current chat title", async () => {
     expect(app.captureCharFrame()).toContain("Rename chat");
     expect(app.captureCharFrame()).toContain("> Type a name");
 
-    await typeText(app, "Investigation");
+    await typeText(app, "  Investigation   notes  ");
     await press(app, () => app.mockInput.pressEnter());
-    expect(renamed).toEqual(["Investigation"]);
+    expect(renamed).toEqual(["Investigation notes"]);
   } finally {
     app.renderer.destroy();
   }

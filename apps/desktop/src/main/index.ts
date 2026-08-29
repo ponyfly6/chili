@@ -15,6 +15,10 @@ import { registerDesktopIpc, type DesktopIpcController } from "./ipc.js";
 import { shouldUseMockKeychain } from "./keychain-policy.js";
 import { DesktopNotificationGate } from "./notifications.js";
 import { processGroupExists } from "./process-groups.js";
+import {
+  containsRendererCredentialMaterial,
+  RENDERER_CREDENTIAL_PATTERN_SOURCE,
+} from "./renderer-leak-audit.js";
 import { SidecarManager } from "./sidecar-manager.js";
 import { armShutdownDeadlines, retryShutdownContainment } from "./shutdown-containment.js";
 import {
@@ -239,6 +243,10 @@ function requestQuit(code: number): void {
 function beginShutdown(): void {
   if (!bootstrapLifecycle.beginShutdown()) return;
   const controlService = control;
+  // Resolve late renderer invokes with a typed shutdown sentinel before
+  // aborting the control plane. Throwing or removing the handler makes
+  // Electron log the expected close race as a main-process error.
+  desktopIpc?.beginShutdown();
   controlService?.beginShutdown();
   smokeStage("shutdown-started");
   const manager = sidecar;
@@ -367,7 +375,7 @@ async function runSmokeScenario(): Promise<void> {
     let checkedBytes = 0;
     let envelopeCount = 0;
     let credentialChecks = 0;
-    const credentialPattern = /https?:\\/\\/(?:127\\.0\\.0\\.1|localhost)|bearer|token/iu;
+    const credentialPattern = new RegExp(${JSON.stringify(RENDERER_CREDENTIAL_PATTERN_SOURCE)}, "iu");
     const serializeBounded = (label, value) => {
       const serialized = JSON.stringify(value);
       if (serialized === undefined) throw new Error("Renderer leak audit could not serialize " + label);
@@ -464,7 +472,7 @@ async function runSmokeScenario(): Promise<void> {
     };
   })()`, true);
   const serialized = JSON.stringify(result);
-  if (/https?:\/\/(?:127\.0\.0\.1|localhost)|bearer|token/iu.test(serialized)) {
+  if (containsRendererCredentialMaterial(serialized)) {
     throw new Error("A sidecar credential or endpoint crossed into the renderer");
   }
   const record = result as Record<string, unknown>;

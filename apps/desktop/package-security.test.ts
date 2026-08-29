@@ -45,6 +45,9 @@ describe("local macOS package security", () => {
 
   test("gates signature profiles and host-visible credentials in the final smoke", async () => {
     const source = await readFile(resolve(repositoryRoot, "scripts/smoke-desktop.ts"), "utf8");
+    const rendererNeedlesStart = source.indexOf("const rendererSensitiveNeedles = uniqueNeedles([");
+    const hostNeedlesStart = source.indexOf("const hostVisibleCredentialNeedles", rendererNeedlesStart);
+    const rendererNeedles = source.slice(rendererNeedlesStart, hostNeedlesStart);
     expect(source).toContain("assertCodesigned(application, packagedSidecar)");
     expect(source).toContain("ELECTRON_HARDENED_RUNTIME_ENTITLEMENTS");
     expect(source).toContain('assertHardenedAdHocSignature(sidecar, "Bun sidecar", [])');
@@ -53,6 +56,9 @@ describe("local macOS package security", () => {
     expect(source).toContain('{ label: "desktop token environment variable", value: "CHILI_DESKTOP_TOKEN=" }');
     expect(source).toContain("CHILI_DESKTOP_TOKEN: inheritedTokenCanary");
     expect(source).toContain("CHILI_HOME: isolatedChiliHome");
+    expect(rendererNeedles).toContain(
+      '{ label: "inherited desktop token canary", value: inheritedTokenCanary }',
+    );
   });
 
   test("keeps the packaged sidecar credential on private fd 3", async () => {

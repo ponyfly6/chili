@@ -1,4 +1,5 @@
 import {
+  normalizeSessionTitle,
   parseRuntimeDelegationConfig as parseProtocolDelegationConfig,
   parseRuntimeMcpReloadResponse as parseProtocolMcpReloadResponse,
   parseRuntimeMcpStatusResponse as parseProtocolMcpStatusResponse,
@@ -32,6 +33,9 @@ export const DESKTOP_INVOKE_CHANNEL = "chili:desktop:invoke";
 export const DESKTOP_EVENT_CHANNEL = "chili:desktop:event";
 export const DESKTOP_EVENT_READY_CHANNEL = "chili:desktop:event-ready";
 export const DESKTOP_EVENT_ACK_CHANNEL = "chili:desktop:event-ack";
+export const DESKTOP_INVOKE_CLOSING_RESPONSE = Object.freeze({
+  __chiliDesktopInvoke: "closing" as const,
+});
 
 const MAX_DESKTOP_JSON_BYTES = 12_000_000;
 const MAX_PENDING_APPROVAL_BYTES = 1_000_000;
@@ -305,7 +309,7 @@ export function parseDesktopRequest(value: unknown): DesktopRequest {
     return {
       type,
       sessionId: requireIdentifier(record.sessionId, "sessionId"),
-      title: requireString(record.title, "title", 2_000),
+      title: normalizeSessionTitle(requireString(record.title, "title", 2_000)),
     };
   }
   if (type === "session.archive") {
@@ -435,7 +439,9 @@ function parseCreateSessionRequest(
   record: Record<string, unknown>,
 ): Extract<DesktopRequest, { type: "sessions.create" }> {
   const request: Extract<DesktopRequest, { type: "sessions.create" }> = { type: "sessions.create" };
-  if (record.title !== undefined) request.title = requireString(record.title, "title", 2_000);
+  if (record.title !== undefined) {
+    request.title = normalizeSessionTitle(requireString(record.title, "title", 2_000));
+  }
   if (record.prompt !== undefined) request.prompt = requireString(record.prompt, "prompt", 200_000);
   if (record.modelSelection !== undefined) {
     request.modelSelection = parseModelSelection(record.modelSelection, "modelSelection");
@@ -646,6 +652,22 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
   }
   assertDesktopResponseScope(request, response);
   return response as DesktopResponse<Request>;
+}
+
+export function parseDesktopInvokeResponse<Request extends DesktopRequest>(
+  request: Request,
+  value: unknown,
+): DesktopResponse<Request> {
+  if (typeof value === "object" && value !== null && !Array.isArray(value)
+    && "__chiliDesktopInvoke" in value) {
+    const record = value as Record<string, unknown>;
+    assertOnlyKeys(record, ["__chiliDesktopInvoke"]);
+    if (record.__chiliDesktopInvoke !== "closing") {
+      throw new TypeError("Invalid desktop invoke lifecycle response");
+    }
+    throw new Error("Desktop is closing");
+  }
+  return parseDesktopResponse(request, value);
 }
 
 function assertDesktopResponseScope(request: DesktopRequest, response: unknown): void {
