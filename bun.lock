@@ -146,6 +146,10 @@
         "@chili/protocol": "workspace:*",
       },
     },
+    "packages/remote-control": {
+      "name": "@chili/remote-control",
+      "version": "0.0.0",
+    },
     "packages/sdk": {
       "name": "@chili/sdk",
       "version": "0.0.0",
@@ -255,6 +259,8 @@
     "@chili/protocol": ["@chili/protocol@workspace:packages/protocol"],
 
     "@chili/providers": ["@chili/providers@workspace:packages/providers"],
+
+    "@chili/remote-control": ["@chili/remote-control@workspace:packages/remote-control"],
 
     "@chili/sdk": ["@chili/sdk@workspace:packages/sdk"],
 
