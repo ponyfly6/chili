@@ -1,16 +1,39 @@
-# Chili Remote Control Foundation Phase 0
+# Chili Remote Control
 
-This package is an executable, host-neutral security foundation for a single
-vertical slice:
+The private mobile Alpha adds a production browser entrypoint and a private
+HTTPS host while preserving the Phase 0 protocol:
+
+```text
+apps/control-web (browser WebCrypto + HTTPS)
+  -> PrivateControlHttpsHost -> HostBridge
+  -> DesktopRemoteControlAdapter -> the window's DesktopControlService
+  -> real sidecar/runtime
+```
+
+`@chili/remote-control/browser` has no Node runtime imports. The root entrypoint
+contains the Node HTTPS host. Desktop remote control is off by default; its local
+panel issues a two-minute one-use code and requires confirmation before granting
+read/send/stop capabilities. Credentials and replay state are memory-only and
+expire together on disable, workspace switch or restart. Reads run concurrently
+with at most eight in flight, preserving capacity for Stop. Authenticated ACKs
+commit sequence; lost results and ambiguous mutation failures stay unknown,
+never permission to submit a new duplicate command.
+
+The desktop adapter projects root-task text into a separate 48 KiB JSON budget.
+It does not expose arbitrary paths, child task contents, raw desktop snapshots,
+permissions, approvals or credentials. Only the model may be a fixture in the
+Alpha acceptance chain. See the [setup and phone acceptance guide](../../docs/private-mobile-alpha-acceptance.md).
+
+The original Phase 0 executable demo remains available for protocol exploration:
+
 
 ```text
 fake mobile client -> in-memory relay -> host bridge
                    -> mocked host-neutral control service
 ```
 
-It is intentionally isolated from Electron, the renderer, runtime HTTP, and the
-current desktop control service. It does not contain a public relay, PWA, native
-mobile client, or production persistence.
+The demo below is not Alpha acceptance evidence. This package contains no public
+relay, native mobile client, account system or persistent credentials.
 
 ## Run it
 
@@ -72,7 +95,7 @@ The complete threat model and accepted Phase 0 residual risks are documented in
 
 There are no wildcard scopes or implicit capability inheritance.
 
-## Minimal desktop integration after the desktop fixes merge
+## Historical Phase 0 integration checklist (implemented by Alpha)
 
 1. Add `@chili/remote-control` as an `apps/desktop` workspace dependency and a
    TypeScript project reference only when the desktop integration branch is

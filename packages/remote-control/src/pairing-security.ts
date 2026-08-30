@@ -17,9 +17,8 @@ import {
   type RemoteControlCapability,
   type RemoteControlRelayDirection,
 } from "./protocol.js";
+import { pairingProofBytes, relayAadBytes, relayKeyDerivationBytes } from "./security-transcripts.js";
 
-const PAIRING_PROOF_DOMAIN = "chili.remote-control.pairing-proof.v1";
-const RELAY_AEAD_DOMAIN = "chili.remote-control.relay-aead.v1";
 const DEVICE_ID_PREFIX = "device_";
 const ROUTE_ID_PREFIX = "route_";
 const MESSAGE_ID_PREFIX = "message_";
@@ -899,18 +898,7 @@ function verifyPairingProof(challenge: PairingChallenge, encodedSignature: strin
 }
 
 function pairingProofTranscript(challenge: PairingChallenge): Buffer {
-  return Buffer.from(JSON.stringify({
-    domain: PAIRING_PROOF_DOMAIN,
-    version: challenge.version,
-    hostId: challenge.hostId,
-    deviceId: challenge.deviceId,
-    publicKey: challenge.publicKey,
-    routeId: challenge.routeId,
-    nonce: challenge.nonce,
-    capabilities: [...challenge.capabilities],
-    issuedAt: challenge.issuedAt,
-    expiresAt: challenge.expiresAt,
-  }), "utf8");
+  return Buffer.from(pairingProofBytes(challenge));
 }
 
 function canonicalPublicKey(encoded: string): { encoded: string; bytes: Buffer } {
@@ -1065,16 +1053,7 @@ function relayAad(
     "version" | "routeId" | "direction" | "messageId" | "byteLength" | "createdAt"
   >,
 ): Buffer {
-  return Buffer.from(JSON.stringify({
-    domain: RELAY_AEAD_DOMAIN,
-    hostId: channel.hostId,
-    version: envelope.version,
-    routeId: envelope.routeId,
-    direction: envelope.direction,
-    messageId: envelope.messageId,
-    byteLength: envelope.byteLength,
-    createdAt: envelope.createdAt,
-  }), "utf8");
+  return Buffer.from(relayAadBytes(channel, envelope));
 }
 
 function decodeChannelRootKey(channel: RelayChannelKey): Buffer {
@@ -1093,8 +1072,7 @@ function deriveDirectionalChannelKey(
 ): Buffer {
   assertRelayDirection(direction);
   const rootKey = decodeChannelRootKey(channel);
-  const salt = Buffer.from(`${RELAY_AEAD_DOMAIN}\u0000${channel.routeId}`, "utf8");
-  const info = Buffer.from(`${channel.hostId}\u0000${direction}`, "utf8");
+  const { salt, info } = relayKeyDerivationBytes(channel, direction);
   return Buffer.from(hkdfSync("sha256", rootKey, salt, info, AES_KEY_BYTES));
 }
 
