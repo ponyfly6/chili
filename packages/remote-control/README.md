@@ -95,28 +95,21 @@ The complete threat model and accepted Phase 0 residual risks are documented in
 
 There are no wildcard scopes or implicit capability inheritance.
 
-## Historical Phase 0 integration checklist (implemented by Alpha)
+## Production integration and lifetime
 
-1. Add `@chili/remote-control` as an `apps/desktop` workspace dependency and a
-   TypeScript project reference only when the desktop integration branch is
-   ready. Phase 0 deliberately does not modify those existing manifests now.
-2. Add one main-process adapter implementing `RemoteControlService`. Map the
-   four validated host-neutral requests to the same-shaped subset of
-   `DesktopControlService.invoke`; keep authentication, authorization, replay,
-   limits, and redaction in `HostBridge` rather than duplicating them in the
-   adapter.
-3. Before exposing real session data, define a bounded remote-safe projection.
-   In particular, do not pass raw snapshots, provider credentials, workspace
-   paths, approval bodies, tool output, or unbounded errors through the adapter.
-4. Construct the pairing authority and bridge in the desktop main-process
-   lifecycle after `DesktopControlService` is ready. Disconnect the bridge
-   before desktop shutdown. Do not route remote control through `App.tsx` or the
-   renderer.
-5. Keep the in-memory relay and fake client for deterministic integration tests.
-   A later real relay must preserve the same opaque-envelope API, dual queue
-   quotas, connection bounds, declared immutable route limits, and secret-free
-   diagnostics before it can replace the Phase 0 relay.
+`DesktopRemoteControlManager` constructs the HTTPS host and a fresh workspace-bound
+adapter on each local enable. The adapter calls the window's existing service;
+it owns no separate runtime client or prompt queue. Per-device cancellation
+prevents revoked requests that are still awaiting membership/actor admission
+from executing, while disabling remote control revokes the entire adapter scope.
 
-Those steps are intentionally narrow: one adapter, one lifecycle owner, and one
-workspace dependency. Electron IPC, renderer UI, public networking, device UX,
-and Electron E2E remain separate follow-up phases.
+Accepted remote queue items carry their origin into the desktop queue. If the
+runtime may have accepted an item before its response fails, that item is not
+automatically requeued. A sticky `deliveryUnknown` snapshot flag tells the phone
+to inspect the task before issuing another command. This complements the
+HostBridge sequence high-water mark and browser `outcome_unknown` state.
+
+The in-memory relay, fake client and mock service remain protocol test/demo
+fixtures only. They are not used by the private HTTPS/desktop/browser acceptance
+chain. Public relay, account, multi-host and persistent authorization support
+remain outside this Alpha.
