@@ -30,7 +30,9 @@ bun run smoke:desktop
 
 `test:e2e:desktop` 仅支持 macOS；它会先构建真实 Electron 应用和 sidecar，再点击完成 New Task/Goal、审批、输入、Steer、Stop、恢复、rename/search/archive，并检查原生 1440/820/390 宽度。已经构建时可用 `CHILI_DESKTOP_E2E_SKIP_BUILD=1 bun run test:e2e:desktop` 跳过重复构建。
 
-`smoke:desktop` 会删除旧 release 输出并重新生成当前主机架构的 macOS `.app`，核验签名、完整 Electron 42 fuse wire、最小 ASAR 与其 header integrity，再实际启动应用内的 `Contents/Resources/chili-sidecar`。它会用同一个隔离 user-data 连续启动两次，通过 preload 创建 session、发送 fake-model 消息并等待 SSE assistant/idle 事件，并走原生 `app.quit()` 路径；两个正常启动都拒绝 forced stage、stderr、源码路径或秘密 canary 泄漏。blocked-Git fixture 通过仓库本地 `include.path` FIFO 阻塞 Git，并验证退出会中止 diff、清理登记的 Git process group。另有独立 fixture 会对 Electron 父进程发送 `SIGKILL`，验证 hard-crash containment。每个场景结束后都会检查 sidecar、登记的 Git/tool process group、继承子进程和 Electron helper 全部消失。
+`smoke:desktop` 在每轮 `mkdtemp` 目录中独立构建 sidecar、桌面与手机页面，以及当前主机架构的 macOS `.app`，不读写共享 `apps/desktop/release`、`out` 或 `resources` 构建产物。它核验签名、完整 Electron 42 fuse wire、最小 ASAR 与其 header integrity，再实际启动应用内的 `Contents/Resources/chili-sidecar`。它会用同一个隔离 user-data 连续启动两次，通过 preload 创建 session、发送 fake-model 消息并等待 SSE assistant/idle 事件，并走原生 `app.quit()` 路径；两个正常启动都拒绝 forced stage、stderr、源码路径或秘密 canary 泄漏。blocked-Git fixture 通过仓库本地 `include.path` FIFO 阻塞 Git，并验证退出会中止 diff、清理登记的 Git process group。另有独立 fixture 会对 Electron 父进程发送 `SIGKILL`，验证 hard-crash containment。每个场景结束后都会检查 sidecar、登记的 Git/tool process group、继承子进程和 Electron helper 全部消失。
+
+smoke 进程审计以本轮 `spawn` 返回的 PID、直接父进程和启动时间开始登记，再通过已观测父子链与进程组连续性追踪后代；每次发信号前重新核验。可执行文件和 user-data 路径只分类已经登记的进程，不会认领其它 Chili 实例。成功、失败和 `SIGINT`/`SIGTERM` 都清理本轮临时目录。`bun test scripts/desktop-smoke-isolation.test.ts` 用真实子进程验证同可执行文件哨兵不受影响、共享 release 的内容/权限/文件修改时间不变、父进程退出后独立子进程组可清理，以及并发两轮互不干扰。
 
 本地检查用 DMG/ZIP：
 

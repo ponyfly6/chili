@@ -1,11 +1,15 @@
-import { chmod, mkdir } from "node:fs/promises";
+import { chmod, copyFile, mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 
 const packageRoot = resolve(import.meta.dirname, "..");
-const output = resolve(packageRoot, "resources/chili-sidecar");
+const buildRoot = process.env.CHILI_DESKTOP_BUILD_ROOT || packageRoot;
+const output = resolve(buildRoot, "resources/chili-sidecar");
 const target = compileTarget(process.platform, process.arch);
 
-await mkdir(resolve(packageRoot, "resources"), { recursive: true });
+await mkdir(resolve(buildRoot, "resources"), { recursive: true });
+if (buildRoot !== packageRoot) {
+  await copyFile(resolve(packageRoot, "package.json"), resolve(buildRoot, "package.json"));
+}
 
 const child = Bun.spawn({
   cmd: [

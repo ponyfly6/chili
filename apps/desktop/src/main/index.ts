@@ -161,6 +161,13 @@ async function bootstrap(): Promise<void> {
     }
   }
 
+  if (process.env.CHILI_DESKTOP_SMOKE === "1" && process.env.CHILI_DESKTOP_PARENT_LOSS_FIXTURE_PATH) {
+    // The outer smoke owns this fixture's SIGKILL. Do not race it with the
+    // normal renderer smoke scenario's app.quit() and graceful sidecar stop.
+    smokeStage("parent-loss-ready");
+    return;
+  }
+
   if (process.env.CHILI_DESKTOP_SMOKE === "1") {
     try {
       if (!bootstrapLifecycle.canContinue()) return;
