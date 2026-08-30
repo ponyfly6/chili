@@ -8,6 +8,37 @@ import {
 } from "./client.js";
 import type { SessionId, TeamId, UserInputId } from "@chili/protocol";
 
+test("listSessions aborts a stalled real HTTP read", async () => {
+  let received = false;
+  let release!: () => void;
+  const response = new Promise<Response>((resolveResponse) => {
+    release = () => resolveResponse(Response.json([]));
+  });
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: () => {
+      received = true;
+      return response;
+    },
+  });
+  const controller = new AbortController();
+  try {
+    const client = new HttpRuntimeClient({ baseUrl: `http://127.0.0.1:${server.port}` });
+    const reading = client.listSessions({ signal: controller.signal });
+    for (let attempt = 0; attempt < 100 && !received; attempt += 1) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 1));
+    }
+    expect(received).toBe(true);
+    controller.abort();
+    await expect(reading).rejects.toThrow();
+  } finally {
+    controller.abort();
+    release();
+    await server.stop(true);
+  }
+});
+
 test("streamEvents exposes a cursor resync signal for rejected resume cursors", async () => {
   const client = new HttpRuntimeClient({
     baseUrl: "http://chili.test",

@@ -23,6 +23,12 @@ import {
 import { DesktopEventOutbox } from "./ipc-outbox.js";
 import { requireTrustedDesktopIpcSender } from "./ipc-security.js";
 import { safeDesktopErrorMessage } from "../shared/safe-error.js";
+import {
+  REMOTE_DESKTOP_CHANNEL,
+  parseRemoteDesktopRequest,
+  parseRemoteDesktopState,
+  type ChiliRemoteDesktopApi,
+} from "../shared/remote-control-contracts.js";
 
 export interface DesktopIpcController {
   publish(event: DesktopEvent): void;
@@ -35,6 +41,7 @@ export interface DesktopIpcController {
 export function registerDesktopIpc(
   window: BrowserWindow,
   handler: DesktopRequestHandler,
+  remote?: ChiliRemoteDesktopApi,
 ): DesktopIpcController {
   const admission = new DesktopIpcAdmission();
   const outbox = new DesktopEventOutbox({
@@ -51,6 +58,23 @@ export function registerDesktopIpc(
   let disposed = false;
   ipcMain.removeHandler(DESKTOP_INVOKE_CHANNEL);
   ipcMain.removeHandler(DESKTOP_EVENT_READY_CHANNEL);
+  ipcMain.removeHandler(REMOTE_DESKTOP_CHANNEL);
+  let pendingRemoteRequests = 0;
+  ipcMain.handle(REMOTE_DESKTOP_CHANNEL, async (event, value: unknown) => {
+    requireTrustedSender(event, window);
+    const request = parseRemoteDesktopRequest(value);
+    if (!remote || shutdownGate.isShuttingDown()) throw new Error("Desktop remote control is unavailable");
+    // Keep the disable path available even while a setup/read is pending.
+    if (request.type !== "disable" && pendingRemoteRequests >= 8) throw new Error("Too many remote management requests");
+    pendingRemoteRequests += 1;
+    try {
+      return parseRemoteDesktopState(await remote.invoke(request));
+    } catch (error) {
+      throw new Error(safeDesktopErrorMessage(error));
+    } finally {
+      pendingRemoteRequests -= 1;
+    }
+  });
   ipcMain.handle(DESKTOP_INVOKE_CHANNEL, async (event, value: unknown) => {
     requireTrustedSender(event, window);
     return shutdownGate.invoke(() => dispatchRequest(value));
@@ -89,6 +113,7 @@ export function registerDesktopIpc(
       shutdownGate.beginShutdown();
       ipcMain.removeHandler(DESKTOP_INVOKE_CHANNEL);
       ipcMain.removeHandler(DESKTOP_EVENT_READY_CHANNEL);
+      ipcMain.removeHandler(REMOTE_DESKTOP_CHANNEL);
       ipcMain.removeListener(DESKTOP_EVENT_ACK_CHANNEL, acknowledge);
       outbox.dispose();
     },

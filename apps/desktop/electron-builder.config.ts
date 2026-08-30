@@ -38,6 +38,11 @@ const config: Configuration = {
   extraResources: [{
     from: resolve(buildRoot, "resources/chili-sidecar"),
     to: "chili-sidecar",
+  }, {
+    from: process.env.CHILI_DESKTOP_BUILD_ROOT
+      ? resolve(buildRoot, "resources/control-web")
+      : resolve(packageRoot, "../control-web/dist"),
+    to: "control-web",
   }],
   asar: true,
   npmRebuild: false,

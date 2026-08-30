@@ -8,7 +8,7 @@ const isolatedBuildRoot = process.env.CHILI_DESKTOP_BUILD_ROOT;
 
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin({ exclude: ["@chili/protocol", "@chili/sdk"] })],
+    plugins: [externalizeDepsPlugin({ exclude: ["@chili/protocol", "@chili/sdk", "@chili/remote-control"] })],
     define: {
       __CHILI_DESKTOP_LOCAL_AD_HOC_BUILD__: JSON.stringify(localAdHocBuild),
     },
@@ -20,7 +20,7 @@ export default defineConfig({
     },
   },
   preload: {
-    plugins: [externalizeDepsPlugin({ exclude: ["@chili/protocol", "@chili/sdk"] })],
+    plugins: [externalizeDepsPlugin({ exclude: ["@chili/protocol", "@chili/sdk", "@chili/remote-control"] })],
     build: {
       ...(isolatedBuildRoot ? { outDir: resolve(isolatedBuildRoot, "out/preload") } : {}),
       rollupOptions: {

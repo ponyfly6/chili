@@ -93,3 +93,9 @@ MCP 面板读取当前 session scope 的 server 状态与汇总，并提供 relo
 运行状态只持久化工作区路径。provider key、OAuth token、sidecar token 和 endpoint 都不会写入 desktop state。
 
 更完整的模块与 transport 设计见 [../../docs/desktop-architecture.md](../../docs/desktop-architecture.md)。
+
+## 私网手机控制 Alpha
+
+通过标题栏 **Phone · Off** 开启配有可信 TLS 的私网端点，生成短期一次性配对码并在本地确认设备。手机只控制当前工作区的既有顶层任务（列表、有限消息、Queue / Steer / Stop），与桌面窗口共享同一个 `DesktopControlService`。远控默认关闭；关闭、切换工作区或重启会使旧授权失效。手机刷新需重新配对，审批与提问只能回桌面处理。
+
+启动环境、证书与私网准备、3–5 分钟真机清单及测试边界见 [手机 Alpha 验收指南](../../docs/private-mobile-alpha-acceptance.md)。远程真实浏览器门禁：`bun run test:e2e:remote`。它不会修改系统信任、VPN 或防火墙；窄屏浏览器测试不等于 iPhone/Android 真机验收。

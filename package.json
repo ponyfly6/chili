@@ -34,7 +34,9 @@
     "smoke:p3-team-model": "bun run scripts/smoke-p3-team-model.ts",
     "smoke:p3-team-parallel": "bun run scripts/smoke-p3-team-parallel.ts",
     "test:index": "bun run scripts/test-index.ts",
-    "typecheck": "tsc -b && bun run --cwd apps/desktop typecheck"
+    "typecheck": "tsc -b && bun run --cwd apps/desktop typecheck && bun run --cwd apps/control-web typecheck",
+    "control-web:build": "bun run --cwd apps/control-web build",
+    "control-web:typecheck": "bun run --cwd apps/control-web typecheck"
   },
   "devDependencies": {
     "@types/react": "19.2.14",

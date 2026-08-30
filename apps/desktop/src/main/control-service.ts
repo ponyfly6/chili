@@ -1,4 +1,5 @@
 import { normalizeSessionTitle, type ChiliEvent, type SessionId } from "@chili/protocol";
+import { resolve } from "node:path";
 import { reduceRuntimeEvents, ReplayableRuntimeEventWindowAccumulator } from "@chili/sdk";
 import type {
   RuntimeAgentMailboxRecord,
@@ -8,6 +9,7 @@ import type {
   RuntimeAgentTreeSnapshot,
   RuntimeClient,
   RuntimePendingApprovalRequest,
+  RuntimeSessionSummary,
 } from "@chili/sdk";
 import type {
   DesktopCreateSessionResult,
@@ -27,6 +29,7 @@ interface QueuedPrompt {
   text: string;
   mode: SendMode;
   bytes: number;
+  origin: "local" | "remote";
 }
 
 interface BusySessionState {
@@ -41,6 +44,7 @@ interface ClientLease {
   controlEpoch: number;
   sidecarGeneration: number;
   signal: AbortSignal;
+  readTimeoutMs: number;
 }
 
 interface GoalResumeMarker {
@@ -55,7 +59,32 @@ export interface DesktopControlServiceOptions {
   emitQueue(sessionId: string, count: number): void;
   onError(error: Error): void;
   processGroups?: DetachedProcessGroupRegistry;
+  /** Test/embedding override may shorten, but never extend, the five-second read bound. */
+  controlReadTimeoutMs?: number;
 }
+
+/** Main-process-only scope; its client lease is deliberately not exposed. */
+export interface DesktopRemoteControlScope {
+  readonly workspace: string;
+  readonly signal: AbortSignal;
+}
+
+export type DesktopRemoteControlRequest = Extract<DesktopRequest, {
+  type: "sessions.list" | "session.snapshot" | "session.send" | "session.stop";
+}>;
+
+/** Internal input to the separate remote whitelist projector, never a wire response. */
+export interface DesktopRemoteRootSnapshot {
+  session: RuntimeSessionSummary;
+  events: ChiliEvent[];
+  queuedCount: number;
+  deliveryUnknown: boolean;
+  needsDesktop: { approval: boolean; input: boolean };
+  truncated: boolean;
+}
+
+export type DesktopRemoteControlResponse<Request extends DesktopRemoteControlRequest> =
+  Request extends { type: "session.snapshot" } ? DesktopRemoteRootSnapshot : DesktopResponse<Request>;
 
 const MAX_PENDING_SENDS_PER_SESSION = 8;
 const MAX_PENDING_SENDS_GLOBAL = 64;
@@ -77,6 +106,7 @@ export class DesktopControlService {
   private workspaceActor: Promise<void> = Promise.resolve();
   private readonly observedEventIds = new Map<string, Set<string>>();
   private readonly resumeGoalsAfterDrain = new Map<string, GoalResumeMarker>();
+  private readonly remoteDeliveryUnknown = new Set<string>();
   private controlEpoch = 0;
   private controlEpochController = new AbortController();
   private switchingWorkspace = false;
@@ -90,9 +120,18 @@ export class DesktopControlService {
   private readonly pendingStopsBySession = new Map<string, number>();
   private readonly mainProcessGroups: DetachedProcessGroupRegistry;
   private mainProcessContainment: Promise<void> | undefined;
+  private readonly controlReadTimeoutMs: number;
+  private readonly remoteScopes = new WeakMap<DesktopRemoteControlScope, {
+    lease: ClientLease;
+    controller: AbortController;
+  }>();
 
   constructor(private readonly options: DesktopControlServiceOptions) {
     this.mainProcessGroups = options.processGroups ?? new DetachedProcessGroupRegistry();
+    this.controlReadTimeoutMs = options.controlReadTimeoutMs ?? 5_000;
+    if (!Number.isSafeInteger(this.controlReadTimeoutMs) || this.controlReadTimeoutMs < 1 || this.controlReadTimeoutMs > 5_000) {
+      throw new TypeError("Control read timeout must be between 1 and 5000 milliseconds");
+    }
   }
 
   async invoke<Request extends DesktopRequest>(request: Request): Promise<DesktopResponse<Request>> {
@@ -111,10 +150,124 @@ export class DesktopControlService {
     }
   }
 
+  captureRemoteControlScope(): DesktopRemoteControlScope {
+    if (this.switchingWorkspace || this.workspaceSelectionsPending > 0) {
+      throw new Error("Workspace selection is in progress");
+    }
+    const lease = this.captureClientLease();
+    this.assertClientLease(lease);
+    const controller = new AbortController();
+    const signal = AbortSignal.any([lease.signal, controller.signal]);
+    const scope = Object.freeze({ workspace: this.requireWorkspace(), signal });
+    this.remoteScopes.set(scope, { lease: { ...lease, signal }, controller });
+    return scope;
+  }
+
+  assertRemoteControlScope(scope: DesktopRemoteControlScope): void {
+    const lease = this.remoteScopes.get(scope)?.lease;
+    if (!lease || this.workspaceSelectionsPending > 0 || this.requireWorkspace() !== scope.workspace) {
+      throw new Error("Remote control workspace is no longer available; pair again on desktop");
+    }
+    this.assertClientLease(lease);
+  }
+
+  revokeRemoteControlScope(scope: DesktopRemoteControlScope): void {
+    this.remoteScopes.get(scope)?.controller.abort(new Error("Remote control was disabled"));
+    this.remoteScopes.delete(scope);
+  }
+
+  /**
+   * Every remote operation resolves membership using the original workspace lease.
+   * Sends and stops still use the local window's service actors and prompt queue.
+   * Snapshot reads never enter those actors or fetch subagent session contents.
+   */
+  async invokeRemoteControl<Request extends DesktopRemoteControlRequest>(
+    request: Request,
+    scope: DesktopRemoteControlScope,
+    signal?: AbortSignal,
+  ): Promise<DesktopRemoteControlResponse<Request>> {
+    this.assertRemoteControlScope(scope);
+    const scopedLease = this.remoteScopes.get(scope)!.lease;
+    const lease = signal ? { ...scopedLease, signal: AbortSignal.any([scopedLease.signal, signal]) } : scopedLease;
+    this.assertClientLease(lease);
+    const sessions = (await boundedControlRead(lease, (signal) => lease.client.listSessions({ signal }))).filter((session) =>
+      session.source !== "subagent" && resolve(session.cwd) === resolve(scope.workspace));
+    this.assertRemoteControlScope(scope);
+    this.assertClientLease(lease);
+    if (request.type === "sessions.list") {
+      const query = request.query?.trim().toLowerCase();
+      return sessions.filter((session) => {
+        if (request.status && request.status !== "all" && request.status !== session.status) return false;
+        return !query || [String(session.id), session.title]
+          .some((value) => value?.toLowerCase().includes(query));
+      }) as DesktopRemoteControlResponse<Request>;
+    }
+    const session = sessions.find((candidate) => String(candidate.id) === request.sessionId);
+    if (!session) throw new Error("Task is not available for remote control in this workspace");
+    if (request.type === "session.snapshot") {
+      const result = await this.remoteRootSnapshot(session, lease);
+      this.assertRemoteControlScope(scope);
+      this.assertClientLease(lease);
+      return result as DesktopRemoteControlResponse<Request>;
+    }
+    if (request.type !== "session.send" && request.type !== "session.stop") {
+      throw new Error("Operation is not available for remote control");
+    }
+    if (session.status !== "active") throw new Error("Archived tasks cannot be controlled remotely");
+    this.assertRemoteControlScope(scope);
+    const result = request.type === "session.send"
+      ? await this.withSessionActor(request.sessionId, () => {
+          this.assertRemoteControlScope(scope);
+          return this.send(request.sessionId, request.text, request.mode, lease, "remote");
+        }, "send")
+      : await this.withSessionActor(request.sessionId, () => {
+          this.assertRemoteControlScope(scope);
+          return this.stop(request.sessionId, lease);
+        }, "stop");
+    this.assertRemoteControlScope(scope);
+    this.assertClientLease(lease);
+    return result as DesktopRemoteControlResponse<Request>;
+  }
+
+  private async remoteRootSnapshot(
+    session: RuntimeSessionSummary,
+    lease: ClientLease,
+  ): Promise<DesktopRemoteRootSnapshot> {
+    const sessionId = session.id;
+    const [eventWindow, inputs] = await boundedControlRead(lease, (signal) => Promise.all([
+      (async () => {
+        if (lease.client.sessionEventWindow) {
+          return lease.client.sessionEventWindow({ sessionId, limit: 5_000, signal });
+        }
+        if (!lease.client.listPendingApprovals) throw new Error("Runtime does not support safe remote snapshots");
+        const [events, approvals] = await Promise.all([
+          lease.client.sessionEvents({ sessionId, limit: 5_000, signal }),
+          lease.client.listPendingApprovals({ sessionId, signal }),
+        ]);
+        return { events, pendingApprovals: approvals, truncated: false, approvalsTruncated: false };
+      })(),
+      lease.client.listUserInputs({ sessionId, signal }),
+    ]));
+    this.assertClientLease(lease);
+    return {
+      session,
+      events: eventWindow.events,
+      queuedCount: this.queues.get(String(sessionId))?.length ?? 0,
+      deliveryUnknown: this.remoteDeliveryUnknown.has(String(sessionId)),
+      needsDesktop: {
+        approval: eventWindow.pendingApprovals.length > 0
+          || ("approvalsTruncated" in eventWindow && eventWindow.approvalsTruncated === true),
+        input: inputs.length > 0,
+      },
+      truncated: eventWindow.truncated,
+    };
+  }
+
   beginShutdown(): void {
     if (this.closing) return;
     this.closing = true;
     this.resumeGoalsAfterDrain.clear();
+    this.remoteDeliveryUnknown.clear();
     this.controlEpochController.abort(new Error("Desktop is closing"));
     this.mainProcessContainment = this.mainProcessGroups.close();
     void this.mainProcessContainment.catch(() => undefined);
@@ -202,6 +355,7 @@ export class DesktopControlService {
     this.flushingSessions.clear();
     this.observedEventIds.clear();
     this.resumeGoalsAfterDrain.clear();
+    this.remoteDeliveryUnknown.clear();
   }
 
   private clearSessionQueue(sessionId: string): void {
@@ -501,35 +655,7 @@ export class DesktopControlService {
     }
     if (request.type === "session.stop") {
       const lease = this.captureClientLease();
-      return this.withSessionActor(request.sessionId, async () => {
-        this.assertClientLease(lease);
-        this.resumeGoalsAfterDrain.delete(request.sessionId);
-        const previous = this.busySessions.get(request.sessionId);
-        if (!previous) {
-          this.busySessions.set(request.sessionId, {
-            controlEpoch: lease.controlEpoch,
-            sidecarGeneration: lease.sidecarGeneration,
-            awaitingTurnStart: false,
-            baselineEventIds: new Set(this.observedEventIds.get(request.sessionId)),
-          });
-        }
-        try {
-          const result = await lease.client.interruptSession({
-            sessionId: request.sessionId as SessionId,
-            reason: "desktop_stop",
-            signal: lease.signal,
-          });
-          this.assertClientLease(lease);
-          if (!result.interrupted) {
-            this.busySessions.delete(request.sessionId);
-            this.scheduleFlush(request.sessionId);
-          }
-          return result;
-        } catch (error) {
-          if (!previous) this.deleteBusyIfOwned(request.sessionId, lease);
-          throw error;
-        }
-      }, "stop");
+      return this.withSessionActor(request.sessionId, () => this.stop(request.sessionId, lease), "stop");
     }
     if (request.type === "approval.resolve") {
       const lease = this.captureClientLease();
@@ -894,20 +1020,58 @@ export class DesktopControlService {
     };
   }
 
+  private async stop(sessionId: string, lease: ClientLease): Promise<{ interrupted: boolean }> {
+    this.assertClientLease(lease);
+    this.resumeGoalsAfterDrain.delete(sessionId);
+    const previous = this.busySessions.get(sessionId);
+    if (!previous) {
+      this.busySessions.set(sessionId, {
+        controlEpoch: lease.controlEpoch,
+        sidecarGeneration: lease.sidecarGeneration,
+        awaitingTurnStart: false,
+        baselineEventIds: new Set(this.observedEventIds.get(sessionId)),
+      });
+    }
+    try {
+      const result = await lease.client.interruptSession({
+        sessionId: sessionId as SessionId,
+        reason: "desktop_stop",
+        signal: lease.signal,
+      });
+      this.assertClientLease(lease);
+      if (!result.interrupted) {
+        this.busySessions.delete(sessionId);
+        this.scheduleFlush(sessionId);
+      }
+      return result;
+    } catch (error) {
+      if (!previous) this.deleteBusyIfOwned(sessionId, lease);
+      throw error;
+    }
+  }
+
   private async send(
     sessionId: string,
     text: string,
     mode: SendMode,
     lease: ClientLease,
+    origin: QueuedPrompt["origin"] = "local",
   ): Promise<{ status: "accepted" | "queued"; position?: number }> {
     this.assertClientLease(lease);
-    const busy = await this.isBusy(sessionId, lease);
-    let resumeGoalAfterDrain = false;
-    if (mode === "steer") {
-      const goal = await lease.client.getGoal({ sessionId: sessionId as SessionId, signal: lease.signal });
-      this.assertClientLease(lease);
-      resumeGoalAfterDrain = goal?.status === "active";
-    }
+    // One deadline covers all preflight reads, so two slow reads cannot each
+    // consume a full deadline ahead of Stop. Mutations use the original lease.
+    const { busy, resumeGoalAfterDrain } = await boundedControlRead(lease, async (signal) => {
+      const readLease = { ...lease, signal };
+      const busy = await this.isBusy(sessionId, readLease);
+      // Even the optimistic in-memory busy fast path yields at this await.
+      this.assertClientLease(readLease);
+      const goal = mode === "steer"
+        ? await lease.client.getGoal({ sessionId: sessionId as SessionId, signal })
+        : undefined;
+      this.assertClientLease(readLease);
+      return { busy, resumeGoalAfterDrain: goal?.status === "active" };
+    });
+    this.assertClientLease(lease);
     let queue = this.queues.get(sessionId) ?? [];
     if (!busy && !resumeGoalAfterDrain && queue.length === 0) {
       this.markOptimisticBusy(sessionId, lease);
@@ -922,7 +1086,7 @@ export class DesktopControlService {
       }
     }
 
-    const prompt: QueuedPrompt = { text, mode, bytes: Buffer.byteLength(text, "utf8") };
+    const prompt: QueuedPrompt = { text, mode, bytes: Buffer.byteLength(text, "utf8"), origin };
     this.enqueuePrompt(sessionId, prompt, mode === "steer");
     queue = this.queues.get(sessionId) ?? [];
     this.updateQueueCount(sessionId, queue.length);
@@ -977,11 +1141,11 @@ export class DesktopControlService {
       && known.controlEpoch === lease.controlEpoch
       && known.sidecarGeneration === lease.sidecarGeneration
     ) return true;
-    const events = await lease.client.sessionEvents({
+    const events = await boundedControlRead(lease, (signal) => lease.client.sessionEvents({
       sessionId: sessionId as SessionId,
       limit: 5_000,
-      signal: lease.signal,
-    });
+      signal,
+    }));
     this.assertClientLease(lease);
     for (const event of events) this.recordObservedEvent(sessionId, event.id);
     const session = reduceRuntimeEvents(events).sessions[sessionId];
@@ -1048,12 +1212,25 @@ export class DesktopControlService {
       });
       this.assertClientLease(lease);
     } catch (error) {
+      if (next.origin === "remote" && !this.closing && !this.switchingWorkspace && lease.controlEpoch === this.controlEpoch) {
+        this.remoteDeliveryUnknown.add(sessionId);
+      }
       if (this.isClientLeaseCurrent(lease)) {
-        this.deleteBusyIfOwned(sessionId, lease);
-        queue.unshift(next);
-        this.accountQueuedPrompt(sessionId, next);
+        if (next.origin === "remote") {
+          // The runtime may have committed the prompt before its HTTP response
+          // was lost. Never convert that uncertainty into a second execution.
+          if (queue.length === 0) this.queues.delete(sessionId);
+          // Keep optimistic busy until a runtime event or explicit Stop settles
+          // the original run, so remaining queued prompts do not race it.
+        } else {
+          this.deleteBusyIfOwned(sessionId, lease);
+          queue.unshift(next);
+          this.accountQueuedPrompt(sessionId, next);
+        }
         this.updateQueueCount(sessionId, queue.length);
-        this.options.onError(error instanceof Error ? error : new Error(String(error)));
+        this.options.onError(next.origin === "remote"
+          ? new Error("Remote queued message result is unknown; it may have started. Check the task before sending it again.")
+          : error instanceof Error ? error : new Error(String(error)));
       }
     } finally {
       if (this.flushingSessions.get(sessionId) === lease) this.flushingSessions.delete(sessionId);
@@ -1070,7 +1247,7 @@ export class DesktopControlService {
     this.resumeGoalsAfterDrain.delete(sessionId);
     try {
       this.assertClientLease(lease);
-      const goal = await lease.client.getGoal({ sessionId: sessionId as SessionId, signal: lease.signal });
+      const goal = await boundedControlRead(lease, (signal) => lease.client.getGoal({ sessionId: sessionId as SessionId, signal }));
       this.assertClientLease(lease);
       if (goal?.status !== "paused") return;
       await lease.client.updateGoal({
@@ -1184,6 +1361,7 @@ export class DesktopControlService {
       sidecarGeneration: context.generation,
       controlEpoch: this.controlEpoch,
       signal: this.controlEpochController.signal,
+      readTimeoutMs: this.controlReadTimeoutMs,
     };
   }
 
@@ -1272,6 +1450,48 @@ export class DesktopControlService {
 }
 
 const MAX_DESCENDANT_SESSIONS = 512;
+
+/** Slow reads release the actor and cancel HTTP without timing out any mutation. */
+function boundedControlRead<Value>(lease: ClientLease, read: (signal: AbortSignal) => Promise<Value>): Promise<Value> {
+  const unavailable = (): Error => new Error(
+    lease.signal.reason instanceof Error && lease.signal.reason.message === "Workspace changed"
+      ? "Workspace changed while the request was in progress"
+      : "Desktop control is no longer available",
+  );
+  if (lease.signal.aborted) return Promise.reject(unavailable());
+  const deadline = new AbortController();
+  const signal = AbortSignal.any([lease.signal, deadline.signal]);
+  return new Promise((resolveRead, rejectRead) => {
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+    };
+    const abort = (): void => {
+      finish();
+      rejectRead(deadline.signal.aborted
+        ? new Error("Control read timed out; retry or return to desktop")
+        : unavailable());
+    };
+    const timer = setTimeout(() => {
+      deadline.abort();
+    }, lease.readTimeoutMs);
+    signal.addEventListener("abort", abort, { once: true });
+    Promise.resolve().then(() => {
+      if (signal.aborted) throw unavailable();
+      return read(signal);
+    }).then((value) => {
+      finish();
+      resolveRead(value);
+    }, (error: unknown) => {
+      finish();
+      // Promise.all may reject while sibling HTTP reads remain pending. Cancel
+      // them after removing our own listener, preserving the original failure.
+      deadline.abort();
+      rejectRead(error);
+    });
+  });
+}
+
 const SNAPSHOT_FETCH_CONCURRENCY = 6;
 const SNAPSHOT_SESSION_BATCH = 6;
 const SNAPSHOT_EVENT_LIMIT = 20_000;

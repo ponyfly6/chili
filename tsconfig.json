@@ -39,6 +39,9 @@
     },
     {
       "path": "./apps/tui"
+    },
+    {
+      "path": "./packages/remote-control"
     }
   ]
 }

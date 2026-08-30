@@ -13,6 +13,12 @@ import {
   type DesktopResponse,
 } from "../shared/contracts.js";
 import { DesktopEventReadyLifecycle, DesktopEventStreamReceiver } from "./event-stream-receiver.js";
+import {
+  REMOTE_DESKTOP_CHANNEL,
+  parseRemoteDesktopRequest,
+  parseRemoteDesktopState,
+  type ChiliRemoteDesktopApi,
+} from "../shared/remote-control-contracts.js";
 
 const listeners = new Set<(event: DesktopEventEnvelope) => void>();
 const receiver = new DesktopEventStreamReceiver({
@@ -55,3 +61,10 @@ const api: ChiliDesktopApi = Object.freeze({
 });
 
 contextBridge.exposeInMainWorld("chiliDesktop", api);
+const remoteApi: ChiliRemoteDesktopApi = Object.freeze({
+  async invoke(value: Parameters<ChiliRemoteDesktopApi["invoke"]>[0]) {
+    const request = parseRemoteDesktopRequest(value);
+    return parseRemoteDesktopState(await ipcRenderer.invoke(REMOTE_DESKTOP_CHANNEL, request));
+  },
+});
+contextBridge.exposeInMainWorld("chiliRemote", remoteApi);

@@ -27,7 +27,7 @@ describe("production Electron security boundary", () => {
 
   test("registers IPC before loading the first renderer document", async () => {
     const source = await readFile(resolve(import.meta.dirname, "index.ts"), "utf8");
-    const register = source.indexOf("registerDesktopIpc(mainWindow, control)");
+    const register = source.indexOf("registerDesktopIpc(mainWindow,");
     const load = source.indexOf("loadDesktopWindow(mainWindow)");
     expect(register).toBeGreaterThan(0);
     expect(load).toBeGreaterThan(register);
