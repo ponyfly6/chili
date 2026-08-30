@@ -49,6 +49,8 @@ pairing and channel secret before output.
 - The fake client permits only one not-yet-admitted request. Retryable
   rejections retain that exact sequence, resync only updates local state, and
   each explicit reconnect sends at most one fresh-envelope retry or probe.
+  A prior relay `queued` receipt is not host admission evidence and cannot
+  suppress that retry, even if the original ciphertext may still be queued.
 - Protocol frames, relay messages, connection maps, pending pairing records,
   credential/channel records, bridge work, tracked client requests, and relay
   queues all have finite count or byte ceilings. Relay queues have both

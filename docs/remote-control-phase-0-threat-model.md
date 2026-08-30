@@ -319,11 +319,14 @@ This state is independent of the relay connection object:
 - an ACK is evidence of host admission, not merely relay delivery and not by
   itself evidence of a successful service outcome.
 
-The client may resend an unacknowledged request after reconnect. If the host had
-already accepted it, replay protection rejects the duplicate without invoking
-the service twice. An authenticated resync proves admission and the host's
-expected sequence, but cannot reconstruct a lost result or prove the service
-outcome. The fake client records a bounded `outcome_unknown`, stops retrying that
+Each explicit client reconnect may resend the earliest unsettled request once,
+using a fresh envelope and the original request/sequence. A historical relay
+`queued` receipt cannot suppress this retry: the relay may have drained the
+ciphertext before the bridge disconnected without admitting it. If the original
+is still queued or the host already accepted it, sequence replay protection
+prevents a second service invocation. An authenticated resync proves admission
+and the host's expected sequence, but cannot reconstruct a lost result or prove
+the service outcome. The fake client records a bounded `outcome_unknown`, stops retrying that
 request, and requires its caller to explicitly fetch fresh remote-safe state; it
 does not fetch a snapshot automatically. Stale ACK or resync frames are
 themselves authenticated and cannot move a client across credential, device,
@@ -496,6 +499,12 @@ implement every desirable hardening case. Current coverage is:
   `outcome_unknown` when ACK arrives but a result is lost. Exact service-call
   counts prove that none of those recovery paths executes an admitted request
   twice.
+- `queued-reconnect.integration.test.ts` uses the real relay, bridge, and client
+  to interrupt a queued request after synchronous relay drain but before host
+  admission. Both endpoint recovery orders complete the original sequence and
+  permit the next request. Repeated explicit client reconnects while the original
+  remains queued each add only one fresh envelope, and all copies together
+  invoke the side-effecting operation exactly once.
 - Relay integration additionally covers message size, per-route and global
   message/byte queues, reconnect replacement, and secret-canary-free aggregate
   diagnostics.

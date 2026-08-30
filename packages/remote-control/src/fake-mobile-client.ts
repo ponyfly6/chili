@@ -118,8 +118,6 @@ interface TrackedRequest {
   frame: RemoteControlRequestFrame;
   admitted: boolean;
   terminal: boolean;
-  retryOnReconnect: boolean;
-  relayStatus?: RelaySendResult["status"];
 }
 
 const DEFAULT_MAX_TRACKED_REQUESTS = REMOTE_CONTROL_LIMITS.maxQueueMessages;
@@ -254,8 +252,11 @@ export class FakeMobileClient {
       },
     });
 
-    // A queued relay delivery may have ACKed requests synchronously during
-    // connect. An admitted request still awaiting a terminal result is
+    // Queued host replies may settle requests synchronously during connect.
+    // A prior "queued" send result is not admission evidence: the relay may
+    // have drained the envelope just before the host disconnected. Retry the
+    // earliest remaining request with a fresh envelope and its original frame.
+    // An admitted request still awaiting a terminal result is
     // retransmitted as a resync probe: the host high-water mark rejects
     // re-execution and returns authenticated resync, allowing the client to
     // surface an explicit outcome_unknown if the result was lost.
@@ -265,15 +266,6 @@ export class FakeMobileClient {
       }
       if (request.terminal) {
         continue;
-      }
-      if (
-        !request.admitted
-        && !request.retryOnReconnect
-        && request.relayStatus === "queued"
-      ) {
-        // The relay still owns the lowest unadmitted sequence. Never skip it
-        // to transmit a higher historical request.
-        break;
       }
       this.#tryTransmit(request);
       // One explicit reconnect performs at most one retry/probe. In
@@ -346,7 +338,6 @@ export class FakeMobileClient {
       frame: parsed,
       admitted: false,
       terminal: false,
-      retryOnReconnect: false,
     };
     this.#tracked.set(sequence, tracked);
     this.#nextSequence += 1;
@@ -483,7 +474,6 @@ export class FakeMobileClient {
       throw new FakeMobileClientError("ACK_STALE_OR_FUTURE");
     }
     request.admitted = true;
-    request.retryOnReconnect = false;
     this.#acknowledgedSequence = acknowledgedSequence;
   }
 
@@ -534,10 +524,8 @@ export class FakeMobileClient {
       throw new FakeMobileClientError("ERROR_STALE_OR_FUTURE");
     }
     if (retryable) {
-      // Retain the exact request and sequence. Clearing the transport status
-      // ensures a disconnect/reconnect re-encrypts it with a fresh message id.
-      request.retryOnReconnect = true;
-      delete request.relayStatus;
+      // Retain the exact request and sequence for one fresh-envelope retry
+      // on an explicit reconnect. Never retransmit on the inbound stack.
       return;
     }
 
@@ -602,17 +590,8 @@ export class FakeMobileClient {
     }
     this.#acknowledgedSequence = acknowledgedSequence;
 
-    for (let sequence = expectedSequence; sequence < this.#nextSequence; sequence += 1) {
-      const request = this.#tracked.get(sequence);
-      if (request === undefined) {
-        // The validation pass above makes this unreachable unless internal
-        // state was mutated reentrantly by an observer.
-        throw new FakeMobileClientError("RESYNC_HISTORY_MISSING");
-      }
-      request.admitted = false;
-      request.retryOnReconnect = true;
-      delete request.relayStatus;
-    }
+    // Unadmitted requests remain tracked for the next explicit reconnect;
+    // an inbound resync never recursively sends another envelope.
   }
 
   #hasAdmissionPending(): boolean {
@@ -655,14 +634,7 @@ export class FakeMobileClient {
     if (connection === undefined || !connection.connected) {
       return { status: "queued" };
     }
-    request.retryOnReconnect = false;
-    const result = connection.send(envelope);
-    // A synchronous authenticated retryable error can request another retry
-    // while connection.send is still on the stack. Do not overwrite it.
-    if (!request.retryOnReconnect) {
-      request.relayStatus = result.status;
-    }
-    return result;
+    return connection.send(envelope);
   }
 
   #tryTransmit(request: TrackedRequest): void {
