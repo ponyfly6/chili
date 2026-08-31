@@ -45,6 +45,8 @@ interface ClientLease {
   sidecarGeneration: number;
   signal: AbortSignal;
   readTimeoutMs: number;
+  /** Read-only budget shared by remote membership and send preflight; never aborts a write. */
+  readDeadlineAt?: number;
 }
 
 interface GoalResumeMarker {
@@ -72,6 +74,8 @@ export interface DesktopRemoteControlScope {
 export type DesktopRemoteControlRequest = Extract<DesktopRequest, {
   type: "sessions.list" | "session.snapshot" | "session.send" | "session.stop";
 }>;
+
+type DesktopRemoteMutationRequest = Extract<DesktopRemoteControlRequest, { type: "session.send" | "session.stop" }>;
 
 /** Internal input to the separate remote whitelist projector, never a wire response. */
 export interface DesktopRemoteRootSnapshot {
@@ -190,10 +194,10 @@ export class DesktopControlService {
     const scopedLease = this.remoteScopes.get(scope)!.lease;
     const lease = signal ? { ...scopedLease, signal: AbortSignal.any([scopedLease.signal, signal]) } : scopedLease;
     this.assertClientLease(lease);
-    const sessions = (await boundedControlRead(lease, (signal) => lease.client.listSessions({ signal }))).filter((session) =>
-      session.source !== "subagent" && resolve(session.cwd) === resolve(scope.workspace));
-    this.assertRemoteControlScope(scope);
-    this.assertClientLease(lease);
+    if (request.type === "session.send" || request.type === "session.stop") {
+      return await this.invokeRemoteMutation(request, scope, lease) as DesktopRemoteControlResponse<Request>;
+    }
+    const sessions = await this.readRemoteSessions(scope, lease);
     if (request.type === "sessions.list") {
       const query = request.query?.trim().toLowerCase();
       return sessions.filter((session) => {
@@ -210,23 +214,49 @@ export class DesktopControlService {
       this.assertClientLease(lease);
       return result as DesktopRemoteControlResponse<Request>;
     }
-    if (request.type !== "session.send" && request.type !== "session.stop") {
-      throw new Error("Operation is not available for remote control");
-    }
-    if (session.status !== "active") throw new Error("Archived tasks cannot be controlled remotely");
-    this.assertRemoteControlScope(scope);
-    const result = request.type === "session.send"
-      ? await this.withSessionActor(request.sessionId, () => {
-          this.assertRemoteControlScope(scope);
-          return this.send(request.sessionId, request.text, request.mode, lease, "remote");
-        }, "send")
-      : await this.withSessionActor(request.sessionId, () => {
-          this.assertRemoteControlScope(scope);
-          return this.stop(request.sessionId, lease);
-        }, "stop");
+    throw new Error("Operation is not available for remote control");
+  }
+
+  private async readRemoteSessions(scope: DesktopRemoteControlScope, lease: ClientLease): Promise<RuntimeSessionSummary[]> {
+    const sessions = await boundedControlRead(lease, (signal) => lease.client.listSessions({ signal }));
     this.assertRemoteControlScope(scope);
     this.assertClientLease(lease);
-    return result as DesktopRemoteControlResponse<Request>;
+    return sessions.filter((session) => session.source !== "subagent" && resolve(session.cwd) === resolve(scope.workspace));
+  }
+
+  private async invokeRemoteMutation(
+    request: DesktopRemoteMutationRequest,
+    scope: DesktopRemoteControlScope,
+    lease: ClientLease,
+  ): Promise<DesktopResponse<DesktopRemoteMutationRequest>> {
+    // Reserve capacity and actor order before the first await. Membership reads
+    // may finish out of order; local and remote writes must not do so.
+    const releaseAdmission = this.admitSessionOperation(request.sessionId, request.type === "session.send" ? "send" : "stop");
+    try {
+      const readLease = { ...lease, readDeadlineAt: performance.now() + lease.readTimeoutMs };
+      const membership = this.readRemoteSessions(scope, readLease);
+      // This read can reject while an earlier real write still owns the actor.
+      // Observe it immediately, but propagate its error when this slot runs.
+      void membership.catch(() => undefined);
+      const result = await this.withSessionActor(request.sessionId, async () => {
+        const sessions = await membership;
+        this.assertRemoteControlScope(scope);
+        this.assertClientLease(lease);
+        const session = sessions.find((candidate) => String(candidate.id) === request.sessionId);
+        if (!session) throw new Error("Task is not available for remote control in this workspace");
+        if (session.status !== "active") throw new Error("Archived tasks cannot be controlled remotely");
+        // send's remaining preflight uses the same read budget. Neither this
+        // budget nor waiting for an earlier write expires an authorized Stop.
+        return request.type === "session.send"
+          ? this.send(request.sessionId, request.text, request.mode, readLease, "remote")
+          : this.stop(request.sessionId, lease);
+      });
+      this.assertRemoteControlScope(scope);
+      this.assertClientLease(lease);
+      return result;
+    } finally {
+      releaseAdmission?.();
+    }
   }
 
   private async remoteRootSnapshot(
@@ -1459,6 +1489,11 @@ function boundedControlRead<Value>(lease: ClientLease, read: (signal: AbortSigna
       : "Desktop control is no longer available",
   );
   if (lease.signal.aborted) return Promise.reject(unavailable());
+  const timedOut = (): Error => new Error("Control read timed out; retry or return to desktop");
+  const remainingMs = lease.readDeadlineAt === undefined
+    ? lease.readTimeoutMs
+    : Math.min(lease.readTimeoutMs, lease.readDeadlineAt - performance.now());
+  if (remainingMs <= 0) return Promise.reject(timedOut());
   const deadline = new AbortController();
   const signal = AbortSignal.any([lease.signal, deadline.signal]);
   return new Promise((resolveRead, rejectRead) => {
@@ -1469,12 +1504,12 @@ function boundedControlRead<Value>(lease: ClientLease, read: (signal: AbortSigna
     const abort = (): void => {
       finish();
       rejectRead(deadline.signal.aborted
-        ? new Error("Control read timed out; retry or return to desktop")
+        ? timedOut()
         : unavailable());
     };
     const timer = setTimeout(() => {
       deadline.abort();
-    }, lease.readTimeoutMs);
+    }, remainingMs);
     signal.addEventListener("abort", abort, { once: true });
     Promise.resolve().then(() => {
       if (signal.aborted) throw unavailable();

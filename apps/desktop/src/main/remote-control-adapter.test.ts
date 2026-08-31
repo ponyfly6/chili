@@ -17,6 +17,168 @@ import {
 } from "./remote-control-adapter.js";
 
 describe("real desktop remote adapter boundary", () => {
+  for (const mode of ["queue", "steer"] as const) {
+    test.each(["remote", "local"] as const)(`a slow ${mode} membership check preserves send before %s Stop`, async (stopOrigin) => {
+      const fixture = orderedMembershipHarness();
+      const sending = invoke(fixture.adapter, {
+        operation: "session.send", payload: { sessionId: "root", text: "older send", mode },
+      });
+      await until(() => fixture.membershipReads() === 1);
+      const stopping = stopOrigin === "remote"
+        ? invoke(fixture.adapter, { operation: "session.stop", payload: { sessionId: "root" } })
+        : fixture.service.invoke({ type: "session.stop", sessionId: "root" });
+      // The later request's membership is ready, but the older request is not.
+      await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+      fixture.membership.resolve([summary("root")]);
+      expect(await sending).toEqual({ status: "accepted" });
+      expect(await stopping).toEqual({ interrupted: false });
+      expect(fixture.order).toEqual(["submit:older send", "desktop_stop"]);
+      fixture.adapter.revoke();
+    });
+
+    test.each(["remote", "local"] as const)(`a slow Stop membership check preserves Stop before a new %s ${mode}`, async (sendOrigin) => {
+      const fixture = orderedMembershipHarness();
+      const stopping = invoke(fixture.adapter, { operation: "session.stop", payload: { sessionId: "root" } });
+      await until(() => fixture.membershipReads() === 1);
+      const sending = sendOrigin === "remote"
+        ? invoke(fixture.adapter, { operation: "session.send", payload: { sessionId: "root", text: "new send", mode } })
+        : fixture.service.invoke({ type: "session.send", sessionId: "root", text: "new send", mode });
+      await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+      fixture.membership.resolve([summary("root")]);
+      expect(await stopping).toEqual({ interrupted: false });
+      expect(await sending).toEqual({ status: "accepted" });
+      expect(fixture.order).toEqual(["desktop_stop", "submit:new send"]);
+      fixture.adapter.revoke();
+    });
+  }
+
+  test("pending remote preflights share one admission deadline instead of multiplying Stop latency", async () => {
+    const events = deferred<ChiliEvent[]>();
+    const readSignals: AbortSignal[] = [];
+    const fixture = harness({ sessionEvents: async ({ signal }) => {
+      readSignals.push(signal!);
+      return events.promise;
+    } }, 60);
+    const startedAt = performance.now();
+    const sends = Array.from({ length: 8 }, (_, index) => invoke(fixture.adapter, {
+      operation: "session.send", payload: { sessionId: "root", text: `expired ${index}`, mode: "queue" },
+    }).then(() => null, (error: unknown) => error));
+    await until(() => readSignals.length > 0);
+    const stopping = invoke(fixture.adapter, { operation: "session.stop", payload: { sessionId: "root" } });
+    expect(await stopping).toEqual({ interrupted: true });
+    expect(performance.now() - startedAt).toBeLessThan(250);
+    for (const result of await Promise.all(sends)) {
+      expect(result).toBeInstanceOf(Error);
+      expect((result as Error).message).toContain("read timed out");
+    }
+    // A later actor cannot start a fresh full budget after the first expires.
+    // Sub-millisecond admission gaps can allow an additional very short read.
+    expect(readSignals.every((signal) => signal.aborted)).toBe(true);
+    events.resolve([]);
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+    expect(fixture.submitted).toEqual([]);
+    expect(fixture.queuedCounts).toEqual([]);
+    fixture.adapter.revoke();
+  });
+
+  test("a send read deadline neither aborts an earlier real write nor discards an authorized Stop", async () => {
+    const submission = deferred<{ status: "accepted"; sessionId: SessionId }>();
+    const order: string[] = [];
+    let writeSignal: AbortSignal | undefined;
+    let membershipReads = 0;
+    const fixture = harness({
+      listSessions: async () => { membershipReads += 1; return [summary("root")]; },
+      submitPromptAsync: async ({ text, signal }) => {
+        order.push(`submit:${text}`);
+        writeSignal = signal;
+        return submission.promise;
+      },
+      interruptSession: async () => { order.push("stop"); return { interrupted: true }; },
+    }, 20);
+    const first = fixture.service.invoke({ type: "session.send", sessionId: "root", text: "real write", mode: "queue" });
+    await until(() => writeSignal !== undefined);
+    const later = invoke(fixture.adapter, {
+      operation: "session.send", payload: { sessionId: "root", text: "expired preflight", mode: "queue" },
+    }).then(() => null, (error: unknown) => error);
+    const stopping = invoke(fixture.adapter, { operation: "session.stop", payload: { sessionId: "root" } });
+    await until(() => membershipReads === 2);
+    // Let only the read budget expire while a real mutation response is held.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 40));
+    expect(writeSignal?.aborted).toBe(false);
+    expect(order).toEqual(["submit:real write"]);
+    submission.resolve({ status: "accepted", sessionId: "root" as SessionId });
+    expect(await first).toEqual({ status: "accepted" });
+    const expired = await later;
+    expect(expired).toBeInstanceOf(Error);
+    expect((expired as Error).message).toContain("read timed out");
+    expect(await stopping).toEqual({ interrupted: true });
+    expect(order).toEqual(["submit:real write", "stop"]);
+    expect(writeSignal?.aborted).toBe(false);
+    fixture.adapter.revoke();
+  });
+
+  test("reserves remote write quotas before membership IO and releases each slot after completion", async () => {
+    const membership = deferred<RuntimeSessionSummary[]>();
+    let membershipReads = 0;
+    const fixture = harness({ listSessions: async () => { membershipReads += 1; return membership.promise; } });
+    const sending = Array.from({ length: 8 }, (_, index) => invoke(fixture.adapter, {
+      operation: "session.send", payload: { sessionId: "root", text: `item ${index}`, mode: "queue" },
+    }));
+    await until(() => membershipReads === 8);
+    await expect(invoke(fixture.adapter, {
+      operation: "session.send", payload: { sessionId: "root", text: "overflow", mode: "queue" },
+    })).rejects.toThrow("Too many pending desktop send operations");
+    expect(membershipReads).toBe(8);
+    const stopping = invoke(fixture.adapter, { operation: "session.stop", payload: { sessionId: "root" } });
+    await until(() => membershipReads === 9);
+    membership.resolve([summary("root")]);
+    expect((await Promise.all(sending)).map((result) => (result as { status: string }).status))
+      .toEqual(["accepted", "queued", "queued", "queued", "queued", "queued", "queued", "queued"]);
+    expect(await stopping).toEqual({ interrupted: true });
+    expect(await invoke(fixture.adapter, {
+      operation: "session.send", payload: { sessionId: "root", text: "capacity restored", mode: "queue" },
+    })).toMatchObject({ status: "queued" });
+    expect(membershipReads).toBe(10);
+    fixture.adapter.revoke();
+  });
+
+  test.each(["child", "foreign", "archived", "missing"] as const)("a denied %s Stop cannot mutate or cancel a later desktop send", async (kind) => {
+    const membership = deferred<RuntimeSessionSummary[]>();
+    const fixture = harness({ listSessions: () => membership.promise });
+    const stopping = invoke(fixture.adapter, { operation: "session.stop", payload: { sessionId: "root" } })
+      .then(() => null, (error: unknown) => error);
+    const sending = fixture.service.invoke({ type: "session.send", sessionId: "root", text: "allowed local", mode: "queue" });
+    membership.resolve(kind === "missing" ? [] : [{ ...summary("root"),
+      ...(kind === "child" ? { source: "subagent" as const } : {}),
+      ...(kind === "foreign" ? { cwd: "/other" } : {}),
+      ...(kind === "archived" ? { status: "archived" as const } : {}),
+    }]);
+    expect(await stopping).toBeInstanceOf(Error);
+    expect(await sending).toEqual({ status: "accepted" });
+    expect(fixture.submitted).toEqual(["allowed local"]);
+    expect(fixture.interrupts).toEqual([]);
+    fixture.adapter.revoke();
+  });
+
+  test("device scopes share the task actor without blocking a different task", async () => {
+    const fixture = orderedMembershipHarness();
+    const otherDevice = new DesktopRemoteControlAdapter({ controlService: fixture.service });
+    const sending = invoke(fixture.adapter, {
+      operation: "session.send", payload: { sessionId: "root", text: "first device", mode: "queue" },
+    });
+    await until(() => fixture.membershipReads() === 1);
+    const stopping = invoke(otherDevice, { operation: "session.stop", payload: { sessionId: "root" } });
+    expect(await fixture.service.invoke({ type: "session.send", sessionId: "other-task", text: "independent", mode: "queue" }))
+      .toEqual({ status: "accepted" });
+    expect(fixture.order).toEqual(["submit:independent"]);
+    fixture.membership.resolve([summary("root")]);
+    expect(await sending).toEqual({ status: "accepted" });
+    expect(await stopping).toEqual({ interrupted: false });
+    expect(fixture.order).toEqual(["submit:independent", "submit:first device", "desktop_stop"]);
+    otherDevice.revoke();
+    fixture.adapter.revoke();
+  });
+
   test("lists only existing root tasks in the enabled workspace and never searches hidden paths", async () => {
     const legacy = summary("legacy");
     delete legacy.source;
@@ -479,6 +641,27 @@ function context(operation: RemoteControlServiceRequest["operation"]): RemoteCon
 
 function invoke(adapter: DesktopRemoteControlAdapter, request: RemoteControlServiceRequest) {
   return adapter.invoke(request, context(request.operation));
+}
+
+function orderedMembershipHarness() {
+  const membership = deferred<RuntimeSessionSummary[]>();
+  let reads = 0;
+  const order: string[] = [];
+  const fixture = harness({
+    listSessions: async () => {
+      reads += 1;
+      return reads === 1 ? membership.promise : [summary("root")];
+    },
+    submitPromptAsync: async ({ text }) => {
+      order.push(`submit:${text}`);
+      return { status: "accepted", sessionId: "root" as SessionId };
+    },
+    interruptSession: async ({ reason }) => {
+      order.push(reason ?? "interrupt");
+      return { interrupted: false };
+    },
+  });
+  return { ...fixture, membership, membershipReads: () => reads, order };
 }
 
 function harness(overrides: Partial<RuntimeClient> = {}, controlReadTimeoutMs = 5_000) {
