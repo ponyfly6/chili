@@ -103,11 +103,26 @@ it owns no separate runtime client or prompt queue. Per-device cancellation
 prevents revoked requests that are still awaiting membership/actor admission
 from executing, while disabling remote control revokes the entire adapter scope.
 
+Remote Send and Stop reserve the shared task actor before awaiting membership.
+Membership reads start concurrently, but cannot reorder remote or local writes.
+Membership and later Send preflight share a five-second read budget starting at
+admission; queued preflights cannot each add another full timeout ahead of Stop.
+That deadline does not abort a real write or discard a Stop whose membership
+check already succeeded. List and snapshot reads remain outside the task actor.
+
 Accepted remote queue items carry their origin into the desktop queue. If the
 runtime may have accepted an item before its response fails, that item is not
 automatically requeued. A sticky `deliveryUnknown` snapshot flag tells the phone
 to inspect the task before issuing another command. This complements the
 HostBridge sequence high-water mark and browser `outcome_unknown` state.
+
+The phone keeps each unknown command outcome separately from connection and
+ordinary success notices. Reconnect or a later successful read/write cannot
+resolve that warning; an explicit user confirmation clears only its own command.
+Revocation or disposal also preserves uncertainty for transmitted mutations whose
+results have not arrived. An authenticated, correlated `admitted:false` rejection
+still proves non-execution for that exact attempt; unsent requests and reads keep
+their ordinary errors.
 
 The in-memory relay, fake client and mock service remain protocol test/demo
 fixtures only. They are not used by the private HTTPS/desktop/browser acceptance

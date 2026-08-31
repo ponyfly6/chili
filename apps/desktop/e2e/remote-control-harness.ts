@@ -185,7 +185,8 @@ try {
   evidence.reconnect = true;
   await mobile.getByTestId("disconnect").click();
   await desktopPage.getByTestId("remote-open").click();
-  evidence.wireLoss = await proveWireLoss(browser, desktopPage, remoteOrigin);
+  evidence.unknownOutcomeUi = await proveStickyUnknownOutcomeUi(browser, desktopPage, remoteOrigin);
+  evidence.wireLoss = await proveWireLoss(browser, desktopPage, remoteOrigin, desktop);
   await mobile.reload();
   await mobile.getByTestId("pairing-code").waitFor();
   assert.match(await mobile.locator("body").innerText(), /refresh|刷新|重新配对/iu);
@@ -340,13 +341,13 @@ async function createDesktopTask(page: Page, title: string, text: string): Promi
   await page.getByRole("heading", { name: title, exact: true }).waitFor();
 }
 
-async function pairThroughUi(local: Page, phone: Page): Promise<void> {
+async function pairThroughUi(local: Page, phone: Page, label = "Firefox real browser E2E"): Promise<void> {
   await local.getByTestId("remote-pairing-create").click();
   const code = local.getByTestId("remote-code");
   await code.waitFor();
   await phone.getByTestId("pairing-code").fill((await code.innerText()).trim());
   const deviceName = phone.getByTestId("device-label");
-  if (await deviceName.count()) await deviceName.fill("Firefox real browser E2E");
+  if (await deviceName.count()) await deviceName.fill(label);
   await phone.getByTestId("pair-submit").click();
   await local.getByTestId("remote-pending-confirm").first().waitFor();
   assert.equal(await phone.getByTestId("task-list").count(), 0, "Unconfirmed phone must not receive task list");
@@ -370,9 +371,203 @@ async function assertNarrowLayout(page: Page): Promise<void> {
 interface BrowserFaultWindow extends Window {
   remoteFaultClient: import("../../../packages/remote-control/src/browser-client.js").BrowserControlClient;
   remoteFaultPending: Promise<{ ok: boolean; code?: string; result?: unknown }>;
+  remoteOrderingFirst: Promise<{ ok: boolean; code?: string; result?: unknown }>;
+  remoteOrderingSecond: Promise<{ ok: boolean; code?: string; result?: unknown }>;
 }
 
-async function proveWireLoss(context: BrowserContext, local: Page, origin: string): Promise<unknown[]> {
+interface DesktopOrderingWindow extends Window {
+  chiliDesktop: import("../src/shared/contracts.js").ChiliDesktopApi;
+  remoteOrderingLocalStop: Promise<{ ok: boolean; code?: string; result?: unknown }>;
+}
+
+interface MainMembershipProbe {
+  originalFetch: typeof globalThis.fetch;
+  armed: boolean;
+  inFlightReads: number;
+  completedReads: number;
+  held: boolean;
+  release?: () => void;
+  operations: string[];
+}
+
+type ProbedMainGlobal = typeof globalThis & { __chiliMembershipProbe?: MainMembershipProbe };
+
+/**
+ * Exercise the shipped React App, not a protocol-only client fixture. Only real
+ * encrypted terminal responses are discarded, after normal HTTPS validation.
+ */
+async function proveStickyUnknownOutcomeUi(context: BrowserContext, local: Page, origin: string): Promise<unknown> {
+  process.stdout.write("[remote-e2e] Production phone UI preserves unknown outcomes through reconnect and successful operations\n");
+  const page = await context.newPage();
+  const label = "Unknown outcome UI E2E";
+  const title = "Phone Alpha real runtime";
+  const lostSend = "page Queue result lost; inspect before retry";
+  const successfulSend = "page success must not clear prior unknown";
+  const concurrentSend = "[slow] page concurrent Queue and Stop results lost";
+  const revokedSend = "page Queue result lost before desktop revokes device";
+  const droppedSendTexts = new Set([lostSend, concurrentSend, revokedSend]);
+  let pairing: PairingGrant | undefined;
+  let dropStopResults = false;
+  let completedSnapshotReads = 0;
+  const targetIds = new Set<string>();
+  const observedRequests = new Map<string, { operation: string; text?: string; sequence: number; transmissions: number }>();
+  const droppedResults: Array<{ operation: string; requestId: string }> = [];
+  page.setDefaultTimeout(30_000);
+  page.on("pageerror", (error) => browserErrors.push(error.message));
+  await page.route("**/api/pairing/poll", async (route) => {
+    const response = await route.fetch();
+    const body = await response.json() as { status: string; grant?: PairingGrant };
+    if (body.status === "approved" && body.grant) pairing = body.grant;
+    await route.fulfill({ response });
+  });
+  await page.route("**/api/control/send", async (route) => {
+    assert.ok(pairing, "UI pairing must finish before encrypted control requests");
+    const body = route.request().postDataJSON() as { envelope: unknown };
+    const frame = openRelayEnvelope<RemoteControlFrame>(pairing.channel, decodeWireEnvelope(body.envelope));
+    if (frame.type === "request") {
+      const previous = observedRequests.get(frame.requestId);
+      observedRequests.set(frame.requestId, {
+        operation: frame.operation,
+        sequence: frame.sequence,
+        ...(frame.operation === "session.send" ? { text: frame.payload.text } : {}),
+        transmissions: (previous?.transmissions ?? 0) + 1,
+      });
+      if ((frame.operation === "session.send" && droppedSendTexts.has(frame.payload.text))
+        || (frame.operation === "session.stop" && dropStopResults)) targetIds.add(frame.requestId);
+    }
+    await route.continue();
+  });
+  await page.route("**/api/control/poll", async (route) => {
+    const response = await route.fetch();
+    const body = await response.json() as { envelopes?: unknown[] };
+    if (!pairing || !Array.isArray(body.envelopes)) { await route.fulfill({ response }); return; }
+    const envelopes = body.envelopes.filter((wire) => {
+      const frame = openRelayEnvelope<RemoteControlFrame>(pairing!.channel, decodeWireEnvelope(wire));
+      if (frame.type !== "result") return true;
+      const request = observedRequests.get(frame.requestId);
+      if (targetIds.has(frame.requestId)) {
+        droppedResults.push({ operation: request?.operation ?? "unknown", requestId: frame.requestId });
+        return false;
+      }
+      if (request?.operation === "session.snapshot") completedSnapshotReads += 1;
+      return true;
+    });
+    await route.fulfill({ response, json: { ...body, envelopes } });
+  });
+  const unknown = page.getByTestId("outcome-unknown");
+  const unknownItems = unknown.locator('[data-testid^="unknown-outcome-"]');
+  const confirmations = unknown.getByRole("button", { name: /已核对，清除此提醒/u });
+  const assertOneWarning = async (message: string): Promise<void> => {
+    await unknown.waitFor({ state: "visible" });
+    assert.equal(await unknownItems.count(), 1, message);
+    const content = await unknown.innerText();
+    assert.match(content, /结果未知/u, message);
+    assert.ok(content.includes("Queue") && content.includes(title) && content.includes(lostSend), message);
+  };
+  try {
+    await page.goto(origin);
+    await pairThroughUi(local, page, label);
+    await page.getByTestId("task-list").getByText(title, { exact: true }).click();
+    await page.getByTestId("message-input").fill(lostSend);
+    await page.getByTestId("queue-send").click();
+    await waitUntil("production UI send reached real runtime exactly once", () => fixture.requests.filter((request) => request.text === lostSend).length === 1);
+    await waitUntil("real production UI send result discarded", () => droppedResults.length === 1);
+    // Use the production timeout. No test-only client or shortened timer stands
+    // in for App.tsx's catch/state/notification behavior.
+    await assertOneWarning("The timed-out Queue must create a persistent, identified warning");
+    assert.equal(await page.getByTestId("message-input").inputValue(), "", "An unknown command must not leave a draft ready for accidental resend");
+    await page.getByTestId("reconnect").click();
+    await waitUntil("production UI reconnect succeeds", async () => /已安全连接/u.test(await page.getByTestId("connection-status").innerText()));
+    await page.getByTestId("notice").getByText(/连接已恢复/u).waitFor();
+    await assertOneWarning("Successful reconnect must not replace an unknown-command warning");
+    const readsBeforeRefresh = completedSnapshotReads;
+    await page.getByRole("button", { name: "刷新任务", exact: true }).click();
+    await waitUntil("explicit refresh reads the real task again", () => completedSnapshotReads > readsBeforeRefresh);
+    await waitUntil("recovered snapshot displays executed but unacknowledged text", async () => (await page.getByTestId("transcript").innerText()).includes(lostSend));
+    await assertOneWarning("A successful snapshot cannot infer an unknown command's terminal result");
+    await page.getByTestId("message-input").fill(successfulSend);
+    await page.getByTestId("queue-send").click();
+    await waitUntil("another production UI command succeeds", () => fixture.requests.filter((request) => request.text === successfulSend).length === 1);
+    await page.getByTestId("notice").getByText(/Queue.*接受|Queue.*入队/u).waitFor();
+    await assertOneWarning("A different successful Queue must not clear the prior unknown outcome");
+    await page.getByTestId("stop-task").click();
+    await page.getByTestId("notice").getByText(/Stop.*已/u).waitFor();
+    await assertOneWarning("A successful Stop notification must not clear the prior unknown outcome");
+    await page.screenshot({ path: join(artifacts, "mobile-unknown-after-success.png"), fullPage: true });
+    await confirmations.click();
+    await unknown.waitFor({ state: "detached" });
+
+    process.stdout.write("[remote-e2e] Production UI retains concurrent Queue/Stop unknown outcomes independently\n");
+    dropStopResults = true;
+    await page.getByTestId("message-input").fill(concurrentSend);
+    await page.getByTestId("queue-send").click();
+    await waitUntil("concurrent lost-result Queue starts real runtime", () => fixture.requests.some((request) => request.text === concurrentSend));
+    await page.getByTestId("stop-task").click();
+    await waitUntil("concurrent lost-result Stop aborts real runtime", () => fixture.requests.some((request) => request.text === concurrentSend && request.aborted));
+    await waitUntil("both concurrent terminal results discarded", () => droppedResults.length === 3);
+    await waitUntil("production UI records both unknown commands", async () => await unknownItems.count() === 2);
+    assert.match(await unknown.innerText(), /Queue/u);
+    assert.match(await unknown.innerText(), /Stop/u);
+    await page.getByTestId("reconnect").click();
+    await waitUntil("concurrent-unknown UI reconnect succeeds", async () => /已安全连接/u.test(await page.getByTestId("connection-status").innerText()));
+    await page.getByTestId("notice").getByText(/连接已恢复/u).waitFor();
+    assert.equal(await unknownItems.count(), 2, "Resync must preserve both unresolved UI command records");
+    await page.screenshot({ path: join(artifacts, "mobile-unknown-concurrent.png"), fullPage: true });
+    await confirmations.first().click();
+    await waitUntil("one explicit confirmation clears only its own warning", async () => await unknownItems.count() === 1);
+    await confirmations.click();
+    await unknown.waitFor({ state: "detached" });
+    assert.equal(fixture.requests.filter((request) => request.text === lostSend).length, 1);
+    assert.equal(fixture.requests.filter((request) => request.text === concurrentSend).length, 1);
+    process.stdout.write("[remote-e2e] Production UI retains admitted command uncertainty after desktop revocation\n");
+    const revocationStarted = Date.now();
+    await page.getByTestId("message-input").fill(revokedSend);
+    await page.getByTestId("queue-send").click();
+    await waitUntil("revoke-target send reaches real runtime and loses only its result", () =>
+      fixture.requests.filter((request) => request.text === revokedSend).length === 1 && droppedResults.length === 4);
+    // A later admitted real App read proves the browser consumed this send's
+    // encrypted ACK, rather than merely proving that the server generated it.
+    await waitUntil("a later real request proves the lost-result send ACK was consumed", () => {
+      const lost = [...observedRequests.values()].find((request) => request.text === revokedSend);
+      return lost !== undefined && [...observedRequests.values()].some((request) => request.sequence > lost.sequence);
+    }, 10_000);
+    const millisecondsBeforeRevocation = Date.now() - revocationStarted;
+    assert.ok(millisecondsBeforeRevocation < 12_000, "Revoke must occur before the production 15s result timeout");
+    await local.locator(".remote-panel-device").filter({ hasText: label }).getByTestId("remote-revoke").click();
+    await page.getByTestId("pairing-code").waitFor();
+    await unknown.waitFor();
+    assert.equal(await unknownItems.count(), 1, "Revocation must preserve the admitted command's unknown result");
+    const revokedWarning = await unknown.innerText();
+    assert.ok(revokedWarning.includes(revokedSend) && revokedWarning.includes(title) && revokedWarning.includes("Queue"));
+    await page.screenshot({ path: join(artifacts, "mobile-unknown-after-revoke.png"), fullPage: true });
+    await confirmations.click();
+    await unknown.waitFor({ state: "detached" });
+    return {
+      productionReactPage: true,
+      realTerminalResultsDiscarded: droppedResults.map((entry) => entry.operation),
+      warningSurvivesSuccessfulReconnect: true,
+      warningSurvivesSnapshotRead: true,
+      warningSurvivesSuccessfulQueueAndStop: true,
+      concurrentUnknownRecordsPreserved: 2,
+      eachConfirmationClearsOnlyItsOwnRecord: true,
+      admittedOutcomeSurvivesRevocationBeforeTimeout: true,
+      millisecondsBeforeRevocation,
+      executedSendCounts: { lostSend: 1, concurrentSend: 1, revokedSend: 1 },
+    };
+  } catch (error) {
+    await Promise.allSettled([
+      page.screenshot({ path: join(artifacts, "mobile-unknown-failure.png"), fullPage: true }),
+      page.content().then((html) => writeFile(join(artifacts, "mobile-unknown-failure.html"), html)),
+    ]);
+    throw error;
+  } finally {
+    await page.close();
+    const row = local.locator(".remote-panel-device").filter({ hasText: label });
+    if (await row.count()) await row.getByTestId("remote-revoke").click();
+  }
+}
+
+async function proveWireLoss(context: BrowserContext, local: Page, origin: string, application: ElectronApplication): Promise<unknown[]> {
   const page = await context.newPage();
   let pairing: PairingGrant | undefined;
   let mode: "none" | "ack" | "result" | "both" = "none";
@@ -381,6 +576,7 @@ async function proveWireLoss(context: BrowserContext, local: Page, origin: strin
   let targetSnapshot = false;
   const dropped: { type: string; requestId: string }[] = [];
   const requests: RemoteControlRequestFrame[] = [];
+  const acknowledged = new Set<string>();
   const results: unknown[] = [];
   // This observer decrypts real authenticated frames only to choose which real
   // response to discard. No plaintext or credential goes into artifacts.
@@ -404,11 +600,12 @@ async function proveWireLoss(context: BrowserContext, local: Page, origin: strin
   await page.route("**/api/control/poll", async (route) => {
     const response = await route.fetch();
     const body = await response.json() as { envelopes?: unknown[] };
-    if (!pairing || !Array.isArray(body.envelopes) || mode === "none") {
+    if (!pairing || !Array.isArray(body.envelopes)) {
       await route.fulfill({ response }); return;
     }
     const envelopes = body.envelopes.filter((wire) => {
       const frame = openRelayEnvelope<RemoteControlFrame>(pairing!.channel, decodeWireEnvelope(wire));
+      if (frame.type === "ack") acknowledged.add(frame.requestId);
       const shouldDrop = frame.type !== "resync" && frame.type !== "request" && frame.requestId === targetId
         && (mode === "both" || frame.type === mode);
       if (shouldDrop && "requestId" in frame) dropped.push({ type: frame.type, requestId: frame.requestId });
@@ -435,6 +632,7 @@ async function proveWireLoss(context: BrowserContext, local: Page, origin: strin
     for (const forbidden of ["cwd", "apiKey", "permissions", "configuration", "rawEvents", "sidecar"]) {
       assert.ok(!Object.keys(snapshot as Record<string, unknown>).includes(forbidden));
     }
+    results.push(...await proveMutationMembershipOrdering(application, local, page, sessionId, requests, acknowledged));
     const slowReadStopText = "[slow] unresolved snapshot Stop";
     await page.evaluate(async ({ id, text }) => (window as unknown as BrowserFaultWindow).remoteFaultClient.request("session.send", { sessionId: id, text, mode: "queue" }), { id: sessionId, text: slowReadStopText });
     await waitUntil("runtime started for unresolved snapshot Stop", () => fixture.requests.some((request) => request.text === slowReadStopText));
@@ -509,6 +707,172 @@ async function proveWireLoss(context: BrowserContext, local: Page, origin: strin
     // Remove the fault page's authority locally without affecting the main UI device.
     const row = local.locator(".remote-panel-device").filter({ hasText: "Wire loss browser E2E" });
     if (await row.count()) await row.getByTestId("remote-revoke").click();
+  }
+  return results;
+}
+
+async function proveMutationMembershipOrdering(
+  application: ElectronApplication,
+  local: Page,
+  phone: Page,
+  sessionId: string,
+  requests: readonly RemoteControlRequestFrame[],
+  acknowledged: ReadonlySet<string>,
+): Promise<unknown[]> {
+  process.stdout.write("[remote-e2e] Real runtime membership response delay preserves remote and local mutation ordering\n");
+  const debuggerSession = await application.context().newCDPSession(local);
+  let rendererPaused = false;
+  const results: unknown[] = [];
+  await debuggerSession.send("Debugger.enable");
+  const pauseRenderer = async (): Promise<void> => {
+    if (rendererPaused) return;
+    const paused = new Promise<void>((resolve) => debuggerSession.once("Debugger.paused", () => resolve()));
+    await debuggerSession.send("Debugger.pause");
+    await paused;
+    rendererPaused = true;
+  };
+  const resumeRenderer = async (): Promise<void> => {
+    if (!rendererPaused) return;
+    await debuggerSession.send("Debugger.resume");
+    rendererPaused = false;
+  };
+  const probe = async () => application.evaluate(() => {
+    const state = (globalThis as ProbedMainGlobal).__chiliMembershipProbe;
+    if (!state) throw new Error("Missing runtime response-delay probe");
+    return { held: state.held, inFlightReads: state.inFlightReads, completedReads: state.completedReads, operations: [...state.operations] };
+  });
+  const arm = async (): Promise<void> => {
+    await pauseRenderer();
+    await waitUntil("desktop background membership reads settle before injection", async () => (await probe()).inFlightReads === 0);
+    await application.evaluate(() => {
+      const state = (globalThis as ProbedMainGlobal).__chiliMembershipProbe!;
+      state.completedReads = 0;
+      state.operations = [];
+      state.held = false;
+      state.armed = true;
+    });
+  };
+  const release = async (): Promise<void> => application.evaluate(() => {
+    (globalThis as ProbedMainGlobal).__chiliMembershipProbe?.release?.();
+  });
+  const start = async (which: "first" | "second", operation: "session.send" | "session.stop", text = ""): Promise<void> => {
+    await phone.evaluate(({ which, operation, id, text }) => {
+      const target = window as unknown as BrowserFaultWindow;
+      const result = (operation === "session.send"
+        ? target.remoteFaultClient.request("session.send", { sessionId: id, text, mode: "queue" })
+        : target.remoteFaultClient.request("session.stop", { sessionId: id }))
+        .then((result) => ({ ok: true, result }), (error: unknown) => ({ ok: false,
+          code: error instanceof Error && "code" in error ? String(error.code) : "unknown" }));
+      if (which === "first") target.remoteOrderingFirst = result;
+      else target.remoteOrderingSecond = result;
+    }, { which, operation, id: sessionId, text });
+  };
+  await application.evaluate((_electron, id) => {
+    const target = globalThis as ProbedMainGlobal;
+    if (target.__chiliMembershipProbe) throw new Error("Runtime response-delay probe already installed");
+    const state: MainMembershipProbe = { originalFetch: globalThis.fetch, armed: false, inFlightReads: 0,
+      completedReads: 0, held: false, operations: [] };
+    target.__chiliMembershipProbe = state;
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+      const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
+      const membershipRead = loopback && method === "GET" && url.pathname === "/sessions";
+      const operation = loopback && method === "POST" && url.pathname.startsWith(`/sessions/${encodeURIComponent(id)}/`)
+        ? url.pathname.slice(url.pathname.lastIndexOf("/") + 1) : undefined;
+      if (operation === "prompt_async" || operation === "interrupt") state.operations.push(operation);
+      const shouldDelay = membershipRead && state.armed;
+      if (shouldDelay) state.armed = false;
+      if (membershipRead) state.inFlightReads += 1;
+      try {
+        // The real authenticated HTTP request completes. Never inspect or
+        // change its headers, body, status, Response or credentials.
+        const response = await state.originalFetch(input, init);
+        if (membershipRead) state.completedReads += 1;
+        if (shouldDelay) {
+          state.held = true;
+          await new Promise<void>((resolve) => { state.release = resolve; });
+        }
+        return response;
+      } finally { if (membershipRead) state.inFlightReads -= 1; }
+    }) as typeof fetch;
+  }, sessionId);
+  try {
+    for (const direction of ["send_then_stop", "stop_then_send"] as const) {
+      await arm();
+      const text = `[slow] membership ordering ${direction}`;
+      const startIndex = requests.length;
+      await start("first", direction === "send_then_stop" ? "session.send" : "session.stop", text);
+      await waitUntil("first real membership Response is held", async () => (await probe()).held);
+      await start("second", direction === "send_then_stop" ? "session.stop" : "session.send", text);
+      await waitUntil("second mutation receives real encrypted admission ACK", () => {
+        const second = requests.slice(startIndex).filter((frame) => frame.operation === "session.send" || frame.operation === "session.stop")[1];
+        return second !== undefined && acknowledged.has(second.requestId);
+      });
+      // Parallel membership implementations finish read two here; a correct
+      // serial implementation may defer it. Either way the first stays held
+      // long enough to expose the former actor-enrollment race.
+      const deadline = Date.now() + 400;
+      while (Date.now() < deadline && (await probe()).completedReads < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const beforeRelease = await probe();
+      await release();
+      const receipts = await phone.evaluate(async () => {
+        const target = window as unknown as BrowserFaultWindow;
+        return Promise.all([target.remoteOrderingFirst, target.remoteOrderingSecond]);
+      });
+      assert.ok(receipts.every((result) => result.ok), `${direction} receipts: ${JSON.stringify(receipts)}`);
+      const expected = direction === "send_then_stop" ? ["prompt_async", "interrupt"] : ["interrupt", "prompt_async"];
+      assert.deepEqual((await probe()).operations, expected, "Membership latency must not reorder actual runtime HTTP mutations");
+      if (direction === "stop_then_send") {
+        await waitUntil("new Send after old Stop remains running", () => fixture.requests.some((request) => request.text === text));
+        assert.equal(fixture.requests.find((request) => request.text === text)?.aborted, false, "Delayed old Stop killed a newer Send");
+      }
+      const snapshot = await phone.evaluate(async (id) => (window as unknown as BrowserFaultWindow).remoteFaultClient.request("session.snapshot", { sessionId: id }), sessionId);
+      assert.ok(snapshot && typeof snapshot === "object");
+      assert.deepEqual((await probe()).operations, expected, "No delayed first submit may appear after Stop completed");
+      results.push({ membershipOrdering: direction, instrumentation: "Electron renderer paused; first real authenticated GET /sessions Response delivered late, unchanged",
+        secondReadCompletedWhileFirstHeld: beforeRelease.completedReads >= 2, runtimeRequestOrder: expected });
+      await phone.evaluate(async (id) => (window as unknown as BrowserFaultWindow).remoteFaultClient.request("session.stop", { sessionId: id }), sessionId);
+    }
+
+    const crossSurfaceSend = "[slow] remote Send before local IPC Stop";
+    await arm();
+    await start("first", "session.send", crossSurfaceSend);
+    await waitUntil("remote Send membership Response held before local Stop", async () => (await probe()).held);
+    await resumeRenderer();
+    // The idle UI intentionally has no Stop button. Invoke its real preload API
+    // instead: this still crosses trusted Electron IPC into the same service.
+    // Do not seed a busy holder here: Stop-current-turn intentionally drains
+    // already accepted queued messages, which is a separate existing behavior.
+    await local.evaluate((id) => {
+      const target = window as unknown as DesktopOrderingWindow;
+      target.remoteOrderingLocalStop = target.chiliDesktop.invoke({ type: "session.stop", sessionId: id })
+        .then((result) => ({ ok: true, result }), (error: unknown) => ({ ok: false,
+          code: error instanceof Error ? error.message : "unknown" }));
+    }, sessionId);
+    await pauseRenderer();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    await release();
+    const receipt = await phone.evaluate(async () => (window as unknown as BrowserFaultWindow).remoteOrderingFirst);
+    assert.equal(receipt.ok, true);
+    await resumeRenderer();
+    const localReceipt = await local.evaluate(async () => (window as unknown as DesktopOrderingWindow).remoteOrderingLocalStop);
+    assert.equal(localReceipt.ok, true);
+    await phone.evaluate(async (id) => (window as unknown as BrowserFaultWindow).remoteFaultClient.request("session.snapshot", { sessionId: id }), sessionId);
+    assert.deepEqual((await probe()).operations, ["prompt_async", "interrupt"], "A delayed remote first submit must not start after the later local IPC Stop");
+    results.push({ membershipOrdering: "remote_send_then_local_stop", instrumentation: "one unchanged real runtime membership Response delayed; real desktop preload invoke/IPC, not an idle UI button",
+      runtimeRequestOrder: ["prompt_async", "interrupt"] });
+  } finally {
+    await application.evaluate(() => {
+      const target = globalThis as ProbedMainGlobal;
+      const state = target.__chiliMembershipProbe;
+      if (state) { state.release?.(); globalThis.fetch = state.originalFetch; delete target.__chiliMembershipProbe; }
+    });
+    await resumeRenderer();
+    await debuggerSession.send("Debugger.disable");
+    await debuggerSession.detach();
   }
   return results;
 }
