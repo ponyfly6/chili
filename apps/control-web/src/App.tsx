@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { BrowserControlClient } from "@chili/remote-control/browser";
+import { INITIAL_CONTROL_FEEDBACK, promptPreview, reduceControlFeedback, type OrdinaryNotice, type UnknownMutationOutcome } from "./control-feedback.js";
+import { OutcomeWarnings } from "./OutcomeWarnings.js";
 import {
   MAX_PROMPT_BYTES,
   canSendPrompt,
@@ -19,7 +21,6 @@ import {
 
 type ConnectionState = "unpaired" | "connected" | "disconnected" | "reconnecting" | "expired" | "closed";
 type PairingStatus = "creating_identity" | "waiting_for_desktop" | "approved";
-type Notice = { kind: "error" | "success" | "unknown"; text: string };
 
 const LIST_POLL_MS = 5_000;
 const SNAPSHOT_POLL_MS = 2_500;
@@ -31,7 +32,9 @@ export function App() {
   const [pairingStatus, setPairingStatus] = useState<PairingStatus | null>(null);
   const [pairingCode, setPairingCode] = useState("");
   const [deviceLabel, setDeviceLabel] = useState("我的手机");
-  const [notice, setNotice] = useState<Notice | null>(null);
+  const [feedback, dispatchFeedback] = useReducer(reduceControlFeedback, INITIAL_CONTROL_FEEDBACK);
+  const notice = feedback.notice;
+  const setNotice = useCallback((value: OrdinaryNotice | null) => dispatchFeedback({ type: "notice", notice: value }), []);
   const [tasks, setTasks] = useState<RemoteTask[]>([]);
   const [tasksTruncated, setTasksTruncated] = useState(false);
   const [listLoaded, setListLoaded] = useState(false);
@@ -50,12 +53,23 @@ export function App() {
   const stopPending = useRef(false);
   const listReadPending = useRef(false);
   const snapshotReadPending = useRef(false);
+  const mutationCounter = useRef(0);
   const activeClientRef = useRef(client);
   activeClientRef.current = client;
   const selectedIdRef = useRef(selectedId);
   selectedIdRef.current = selectedId;
 
   useEffect(() => () => pairAttempt.current?.abort(), []);
+
+  useEffect(() => {
+    if (feedback.unknownOutcomes.length === 0) return;
+    const warnBeforeLeaving = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeLeaving);
+    return () => window.removeEventListener("beforeunload", warnBeforeLeaving);
+  }, [feedback.unknownOutcomes.length]);
 
   useEffect(() => {
     if (!client) return;
@@ -72,7 +86,7 @@ export function App() {
       }
     });
     return () => { unsubscribe(); client.dispose(); };
-  }, [client]);
+  }, [client, setNotice]);
 
   const connected = connection === "connected";
 
@@ -184,9 +198,9 @@ export function App() {
     try {
       await client.reconnect();
       setReadRevision((value) => value + 1);
-      setNotice({ kind: "success", text: "连接已恢复并同步请求序号。已发送的请求不会自动重发。" });
+      setNotice({ kind: "success", text: "连接已恢复并同步请求序号。重连不会把旧请求作为新指令再次执行。" });
     } catch (error) {
-      setNotice({ kind: errorCode(error) === "outcome_unknown" ? "unknown" : "error", text: errorMessage(error) });
+      setNotice({ kind: "error", text: errorMessage(error) });
     }
   };
 
@@ -202,7 +216,7 @@ export function App() {
     setListError(null);
     setMobilePanel("list");
     setNotice({ kind: "success", text: "本页的授权已清除。如需再次连接，请回桌面生成新的配对码。设备也可在桌面撤销。" });
-  }, [client]);
+  }, [client, setNotice]);
 
   const send = async (mode: "queue" | "steer") => {
     if (!client || !connected || !selectedId || !canSendPrompt(draft) || sendPending.current) return;
@@ -211,20 +225,31 @@ export function App() {
     setNotice(null);
     const sessionId = selectedId;
     const text = draft;
+    const outcome: UnknownMutationOutcome = {
+      id: String(++mutationCounter.current),
+      sessionId,
+      sessionTitle: (snapshot?.session.id === sessionId ? snapshot.session.title : tasks.find((task) => task.id === sessionId)?.title) ?? "未命名任务",
+      command: mode === "queue" ? "Queue" : "Steer",
+      startedAt: Date.now(),
+      promptPreview: promptPreview(text),
+    };
     try {
       const result = await client.request("session.send", { sessionId, text, mode });
-      if (activeClientRef.current !== client || selectedIdRef.current !== sessionId) return;
       const queued = readSendReceipt(result) === "queued";
+      if (activeClientRef.current !== client || selectedIdRef.current !== sessionId) return;
       setDraft((current) => current === text ? "" : current);
       setNotice({ kind: "success", text: queued ? "Queue 已入队，等待任务处理。" : `${mode === "queue" ? "Queue" : "Steer"} 请求已由桌面接受。` });
       setReadRevision((value) => value + 1);
     } catch (error) {
-      if (activeClientRef.current !== client || selectedIdRef.current !== sessionId) return;
       const unknown = errorCode(error) === "outcome_unknown";
+      // Preserve an old task's outcome even after selection/connection changes.
+      // Ordinary connection and action notices cannot replace this record.
+      if (unknown) dispatchFeedback({ type: "mutation_unknown", outcome });
+      if (activeClientRef.current !== client || selectedIdRef.current !== sessionId) return;
       // An uncertain request is never presented as a safe retry. Remove its
       // unchanged draft so a second tap cannot accidentally enqueue it again.
       if (unknown) setDraft((current) => current === text ? "" : current);
-      setNotice({ kind: unknown ? "unknown" : "error", text: errorMessage(error) });
+      if (!unknown) setNotice({ kind: "error", text: errorMessage(error) });
     } finally {
       sendPending.current = false;
       setSending(null);
@@ -237,15 +262,24 @@ export function App() {
     setStopping(true);
     setNotice(null);
     const sessionId = selectedId;
+    const outcome: UnknownMutationOutcome = {
+      id: String(++mutationCounter.current),
+      sessionId,
+      sessionTitle: (snapshot?.session.id === sessionId ? snapshot.session.title : tasks.find((task) => task.id === sessionId)?.title) ?? "未命名任务",
+      command: "Stop",
+      startedAt: Date.now(),
+    };
     try {
       const result = await client.request("session.stop", { sessionId });
-      if (activeClientRef.current !== client || selectedIdRef.current !== sessionId) return;
       const interrupted = readStopReceipt(result);
+      if (activeClientRef.current !== client || selectedIdRef.current !== sessionId) return;
       setNotice({ kind: "success", text: interrupted ? "Stop 已由桌面接受，正在停止任务。" : "Stop 已处理，当前没有运行中的任务。" });
       setReadRevision((value) => value + 1);
     } catch (error) {
+      const unknown = errorCode(error) === "outcome_unknown";
+      if (unknown) dispatchFeedback({ type: "mutation_unknown", outcome });
       if (activeClientRef.current !== client || selectedIdRef.current !== sessionId) return;
-      setNotice({ kind: errorCode(error) === "outcome_unknown" ? "unknown" : "error", text: errorMessage(error) });
+      if (!unknown) setNotice({ kind: "error", text: errorMessage(error) });
     } finally {
       stopPending.current = false;
       setStopping(false);
@@ -283,11 +317,13 @@ export function App() {
         </section>
 
         {notice && (
-          <div className={`notice notice-${notice.kind}`} role={notice.kind === "success" ? "status" : "alert"} data-testid={notice.kind === "unknown" ? "outcome-unknown" : "notice"}>
+          <div className={`notice notice-${notice.kind}`} role={notice.kind === "success" ? "status" : "alert"} data-testid="notice">
             <span>{notice.text}</span>
             <button type="button" aria-label="关闭提示" onClick={() => setNotice(null)}>×</button>
           </div>
         )}
+
+        <OutcomeWarnings outcomes={feedback.unknownOutcomes} onConfirm={(id) => dispatchFeedback({ type: "confirm_unknown", id })} />
 
         {!client ? (
           <section className="pairing-layout">

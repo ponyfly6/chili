@@ -23,6 +23,15 @@ polling. Read requests do not own the send/stop locks. Approval and input prompt
 only show a request to return to the desktop, with no remote approval controls.
 An unknown send outcome clears that submitted draft and tells the user to inspect
 the task before issuing another command; there is no automatic mutation retry.
+Unknown Queue, Steer and Stop outcomes are retained separately from connection
+and ordinary action notices, with the original task, a page-local command number,
+submission time and bounded prompt summary. Reconnecting, reading, selecting a
+different task, clearing authorization or a later successful operation cannot
+remove them. Only the explicit “已核对，清除此提醒” action clears the matching
+warning, so concurrent Send and Stop uncertainties cannot overwrite one another.
+These warnings also live only in page memory; the page warns before navigation
+while unresolved outcomes remain. Closing or refreshing still discards all page
+state, so the warning explains that task records must be checked first.
 
 Run `bun run --cwd apps/control-web typecheck` and
 `bun run --cwd apps/control-web test` for this app's focused checks. Actual

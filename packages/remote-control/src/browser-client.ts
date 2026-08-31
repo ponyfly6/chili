@@ -344,6 +344,10 @@ export class BrowserControlClient {
       this.#setState("disconnected");
       this.#synchronized?.reject(new BrowserControlClientError(frame.error.code));
     } else {
+      // This authenticated, correlated admitted:false response proves that
+      // this exact attempt did not execute. Settle it before terminating the
+      // stream; older transmitted mutations may still have unknown outcomes.
+      this.#settle(pending, new BrowserControlClientError(frame.error.code));
       this.#setState("expired");
       this.#failPending(frame.error.code);
     }
@@ -379,7 +383,14 @@ export class BrowserControlClient {
   }
 
   #failPending(code: string): void {
-    for (const pending of this.#pending.values()) this.#settle(pending, new BrowserControlClientError(code));
+    // Entries enter #pending only when dispatching their encrypted HTTP send.
+    // Losing the page or authorization cannot retract an already issued
+    // mutation, even if its ACK was lost. Requests still waiting for admission
+    // live outside this map and retain their ordinary never-sent rejection.
+    for (const pending of this.#pending.values()) {
+      const mutating = pending.frame.operation === "session.send" || pending.frame.operation === "session.stop";
+      this.#settle(pending, new BrowserControlClientError(mutating ? "outcome_unknown" : code));
+    }
     this.#synchronized?.reject(new BrowserControlClientError(code));
   }
 

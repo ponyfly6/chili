@@ -23,7 +23,14 @@ beforeAll(() => {
 });
 afterAll(() => { if (tlsDirectory) rmSync(tlsDirectory, { recursive: true, force: true }); });
 
-for (const scenario of ["normal", "lost_ack", "lost_result", "lost_ack_and_result", "before_admission", "parallel_results", "slow_http_ack", "unadmitted_behind_read", "side_effect_then_error", "late_unrelated_result", "reconnect_auth_before_ack", "reconnect_poll_auth_before_send"] as const) {
+for (const scenario of [
+  "normal", "lost_ack", "lost_result", "lost_ack_and_result", "before_admission", "parallel_results",
+  "slow_http_ack", "unadmitted_behind_read", "side_effect_then_error", "late_unrelated_result",
+  "reconnect_auth_before_ack", "reconnect_poll_auth_before_send",
+  "held_send_dispose", "held_stop_dispose", "held_read_dispose",
+  "held_send_revoke", "held_stop_revoke", "held_read_revoke",
+  "unsent_behind_pending_dispose", "definite_unadmitted", "definite_refusal_after_pending",
+] as const) {
   test(`production fetch/WebCrypto client over trusted isolated HTTPS: ${scenario}`, async () => {
     const identity = generateDeviceIdentity();
     const authority = new InMemoryPairingAuthority({ hostId: "browser_client_test", allowedCapabilities: ["sessions.read", "sessions.send", "sessions.stop"] });
@@ -52,8 +59,8 @@ for (const scenario of ["normal", "lost_ack", "lost_result", "lost_ack_and_resul
           send(envelope: OpaqueRelayEnvelope) {
             const frame = authority.openRelayEnvelope<RemoteControlFrame>(envelope);
             const first = "sequence" in frame && frame.sequence === 1;
-            if (first && frame.type === "ack" && ["lost_ack", "lost_ack_and_result"].includes(scenario)) return;
-            if (first && frame.type === "result" && ["lost_result", "lost_ack_and_result", "unadmitted_behind_read"].includes(scenario)) return;
+            if (first && frame.type === "ack" && ["lost_ack", "lost_ack_and_result", "unsent_behind_pending_dispose"].includes(scenario)) return;
+            if (first && frame.type === "result" && (scenario.startsWith("held_") || ["lost_result", "lost_ack_and_result", "unadmitted_behind_read", "unsent_behind_pending_dispose", "definite_refusal_after_pending"].includes(scenario))) return;
             outgoing.push(encodeWireEnvelope(envelope));
           },
         };
@@ -61,7 +68,7 @@ for (const scenario of ["normal", "lost_ack", "lost_result", "lost_ack_and_resul
     };
     bridge.connect(relay);
     let discardedBeforeAdmission = false;
-    let rejectPollAuthentication = false;
+    let pollAuthenticationError: string | undefined;
     const server = createServer({ cert: readFileSync(tlsCert), key: readFileSync(tlsKey) }, async (request, response) => {
       try {
         if (request.headers.authorization !== `Bearer ${pairing.credential}`) throw new Error("Authentication required");
@@ -81,20 +88,25 @@ for (const scenario of ["normal", "lost_ack", "lost_result", "lost_ack_and_resul
               return;
             }
             if (scenario === "reconnect_poll_auth_before_send") {
-              rejectPollAuthentication = true;
+              pollAuthenticationError = "authentication_failed";
               await Bun.sleep(100);
             }
             response.writeHead(401).end(JSON.stringify({ error: { code: "authentication_failed" } }));
             return;
           }
+          if (scenario === "definite_unadmitted" || (scenario === "definite_refusal_after_pending" && frame.sequence === 2)) authority.revokeCredential(pairing.credential);
           if ((scenario === "before_admission" || (["unadmitted_behind_read", "late_unrelated_result"].includes(scenario) && frame.sequence === 2)) && !discardedBeforeAdmission) discardedBeforeAdmission = true;
           else if (scenario === "late_unrelated_result" && frame.sequence === 2) setTimeout(() => { void bridge.receive(envelope); }, 350);
           else void bridge.receive(envelope);
           if (scenario === "slow_http_ack" && frame.sequence === 1) await Bun.sleep(500);
           response.writeHead(202).end(JSON.stringify({ accepted: true }));
         } else if (request.url === "/api/control/poll") {
-          if (rejectPollAuthentication) response.writeHead(401).end(JSON.stringify({ error: { code: "authentication_failed" } }));
+          if (pollAuthenticationError) response.writeHead(401).end(JSON.stringify({ error: { code: pollAuthenticationError } }));
           else response.end(JSON.stringify({ envelopes: outgoing.splice(0) }));
+        } else if (request.url === "/test/revoke") {
+          authority.revokeCredential(pairing.credential);
+          pollAuthenticationError = "credential_revoked";
+          response.end(JSON.stringify({ revoked: true }));
         } else response.writeHead(404).end("{}");
       } catch { response.writeHead(400).end(JSON.stringify({ error: { code: "invalid_request" } })); }
     });
@@ -110,8 +122,12 @@ for (const scenario of ["normal", "lost_ack", "lost_result", "lost_ack_and_resul
       expect(stderr.trim()).toBe("");
       expect(exitCode).toBe(0);
       expect(JSON.parse(stdout)).toMatchObject({ ok: true, unhandledRejections: 0 });
-      if (["reconnect_auth_before_ack", "reconnect_poll_auth_before_send"].includes(scenario)) expect(calls).toHaveLength(0);
+      if (["reconnect_auth_before_ack", "reconnect_poll_auth_before_send", "definite_unadmitted"].includes(scenario)) expect(calls).toHaveLength(0);
+      else if (scenario.startsWith("held_stop_")) expect(calls.filter((operation) => operation === "session.stop")).toHaveLength(1);
+      else if (scenario.startsWith("held_read_")) expect(calls.filter((operation) => operation === "session.snapshot")).toHaveLength(1);
       else if (!["parallel_results", "slow_http_ack"].includes(scenario)) expect(calls.filter((operation) => operation === "session.send")).toHaveLength(1);
+      if (scenario === "unsent_behind_pending_dispose" || scenario === "definite_unadmitted") expect(received.map((request) => request.sequence)).toEqual([1]);
+      if (scenario === "definite_refusal_after_pending") expect(received.map((request) => request.sequence)).toEqual([1, 2]);
       if (["lost_result", "lost_ack_and_result", "before_admission"].includes(scenario)) {
         const attempts = received.filter((request) => request.sequence === 1);
         expect(attempts).toHaveLength(2);

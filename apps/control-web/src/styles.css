@@ -47,6 +47,17 @@ strong { font-weight: 600; }
 .notice-success { border-color: #d0dec4; background: #eff4e9; color: #425a35; }
 .notice-error { border-color: #e8c8b9; background: #fff2eb; color: #8d4d32; }
 .notice-unknown { border-color: #e3cb92; background: #fff8df; color: #715215; }
+.outcome-warnings { margin: 0 0 18px; padding: 14px; border: 1px solid #d8bd78; background: #fff8e2; border-radius: 8px; color: #705314; overflow-wrap: anywhere; }
+.outcome-explanation, .outcome-lifetime { font-size: 12px; margin: 0; }
+.outcome-warning { padding: 14px 0; border-bottom: 1px solid #e7d8af; }
+.outcome-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; }
+.outcome-heading strong { font-size: 13px; }
+.outcome-heading > span { font-size: 10px; color: #887343; }
+.outcome-task { margin: 8px 0; font-size: 12px; }
+.outcome-task span { display: block; color: #8b794f; font-size: 10px; }
+.outcome-preview { font-size: 12px; margin: 8px 0 12px; white-space: pre-wrap; }
+.outcome-warning button { min-height: 44px; border-color: #d8bd78; color: #705314; font-size: 12px; }
+.outcome-lifetime { padding-top: 12px; font-size: 10px; color: #8b794f; }
 .pairing-layout { display: grid; grid-template-columns: 1fr 400px; gap: 60px; align-items: center; padding: 60px 15px 70px 0; }
 .eyebrow { color: #808971; font-size: 10px; letter-spacing: 1.7px; font-weight: 650; }
 .pairing-intro h1 { font-size: clamp(32px, 4vw, 49px); line-height: 1.28; letter-spacing: -1.8px; font-weight: 550; margin: 24px 0; }
