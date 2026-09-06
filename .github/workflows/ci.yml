@@ -125,8 +125,22 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Install remote browser test dependencies
+        run: |
+          brew install nss
+          echo "$(brew --prefix nss)/bin" >> "$GITHUB_PATH"
+          bun apps/desktop/node_modules/playwright-core/cli.js install firefox
+
+      - name: Desktop smoke process and artifact isolation
+        run: bun test scripts/desktop-smoke-isolation.test.ts
+
       - name: Real Electron click-flow E2E
         run: bun run test:e2e:desktop
+
+      - name: Trusted HTTPS remote browser E2E
+        env:
+          CHILI_REMOTE_E2E_SKIP_BUILD: "1"
+        run: bun run test:e2e:remote
 
       - name: Build and smoke packaged desktop
         run: bun run smoke:desktop
