@@ -5,9 +5,11 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { flipFuses, FuseV1Options, FuseVersion } from "@electron/fuses";
 import type { Configuration } from "electron-builder";
+import { desktopBuildMetadata } from "./scripts/build-metadata.js";
 
 const packageRoot = import.meta.dirname;
 const buildRoot = process.env.CHILI_DESKTOP_BUILD_ROOT || packageRoot;
+const previewBuild = desktopBuildMetadata(process.env, resolve(packageRoot, "../..")).channel === "preview";
 const execFileAsync = promisify(execFile);
 const signingIdentity = process.env.CHILI_DESKTOP_SIGN_IDENTITY?.trim() || "-";
 if (signingIdentity !== "-") {
@@ -17,8 +19,8 @@ if (signingIdentity !== "-") {
 }
 
 const config: Configuration = {
-  appId: "dev.chili.control",
-  productName: "Chili",
+  appId: previewBuild ? "dev.chili.control.preview" : "dev.chili.control",
+  productName: previewBuild ? "Chili Preview" : "Chili",
   copyright: "Copyright © 2026 Chili contributors",
   directories: {
     app: buildRoot,
@@ -61,7 +63,7 @@ const config: Configuration = {
   },
   dmg: {
     sign: false,
-    title: "Chili ${version}",
+    title: previewBuild ? "Chili Preview ${version}" : "Chili ${version}",
   },
   artifactName: "${productName}-${version}-${os}-${arch}.${ext}",
   afterPack: async (context) => {

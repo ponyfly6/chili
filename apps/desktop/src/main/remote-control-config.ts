@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import type { PrivateControlTlsMaterial } from "@chili/remote-control";
 
 export interface DesktopRemoteHttpsConfig {
   bindAddress: string;
@@ -6,6 +7,8 @@ export interface DesktopRemoteHttpsConfig {
   publicOrigin: string;
   tlsCertPath: string;
   tlsKeyPath: string;
+  /** Main-only, one-use material prepared for the listener; never persisted or projected. */
+  tlsMaterial?: PrivateControlTlsMaterial;
   webRoot: string;
 }
 

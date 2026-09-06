@@ -6,11 +6,14 @@
 
 ## 启动与网络准备
 
-1. 在本 worktree 安装依赖并构建：`bun install --frozen-lockfile`、`bun run typecheck`、`bun run desktop:build`。
+1. 打开本地 `Chili Preview.app`，或从源码安装并构建：`bun install --frozen-lockfile`、`bun run typecheck`、`bun run desktop:build`。生成可保留的 Preview 见 [桌面打包说明](../apps/desktop/README.md#本地-preview)。
 2. 电脑和手机接入同一可信局域网或已由用户配置好的私网 VPN。选定电脑的私网地址和端口，例如 `192.168.1.20:4743`。不要使用公网监听地址、路由器端口转发或公网代理。确认现有网络策略允许手机访问该地址；程序不会更改 VPN 或防火墙。
 3. 自行准备匹配**实际访问主机名或 IP 的 SAN**、有效期内、手机浏览器正常信任的 TLS 证书及其私钥。可以使用已有企业/私网 PKI，或人工建立仅供测试的本地 CA。私钥只放在电脑上，限制文件权限，不要发送给手机或提交 Git。
 4. 若采用本地 CA，需要用户自行把 **CA 公钥证书**安装为手机信任源。iPhone 通常还需在“设置 → 通用 → 关于本机 → 证书信任设置”开启该 CA 的完全信任；Android 的证书安装入口由厂商和工作资料配置决定。仅安装服务器证书、点击证书警告继续或关闭校验不等同于可信 HTTPS。验收结束按需要人工移除测试 CA。程序和 E2E 都不会修改系统信任库。
-5. 从准备好环境变量的终端启动桌面；启动后远控仍然默认关闭：
+5. 打开桌面或 `Chili Preview.app`，在 **Phone · Off** 面板选择本机私网 IP 与端口，点击 **Choose TLS files and save**，依次用原生对话框选定证书和对应私钥。程序检查 SAN、有效期、密钥匹配和本机地址，再以 0600 权限保存文件引用；保存后远控仍关闭。手机浏览器信任须另外完成，保存成功不代表手机已信任。
+6. 点击 **Turn on phone control**，按面板显示的准确 HTTPS URL 打开手机页面，再创建配对码并本地确认设备。保持桌面和目标工作区打开；关闭桌面不是后台托管方式。重启会保留配置但仍默认关闭，旧授权失效。更换网络/证书时先关闭远控；取消任一文件对话框保留旧配置。
+
+已有环境启动方式仍兼容；完整环境组优先于保存值，Phone 面板显示只读的 Launch settings。部分环境组会报错，须补全或移除，不能混用保存的证书/端口。需要私网 DNS 主机名时使用此方式，DNS 必须全部解析到私网地址，证书必须有相应 DNS SAN：
 
 ```sh
 CHILI_REMOTE_BIND_ADDRESS=192.168.1.20 \
@@ -66,6 +69,10 @@ openssl x509 -req -sha256 -days 7 -in "$CHILI_TEST_TLS/server.csr" \
 **当前真机状态：尚未执行 iPhone 或 Android 真机验收。** 浏览器窄屏截图、viewport 模拟和 Playwright 的浏览器自动化都不是手机真机测试，不应据此填写真机通过。
 
 ## 自动化证据与边界
+
+当前自动化从没有 `CHILI_REMOTE_*` HTTPS 启动环境的桌面开始，通过真实 Phone 表单与 IPC 保存配置。测试仅为原生文件对话框提供本轮证书/私钥选择结果，覆盖先取消证书、成功保存仍关闭、替换时取消私钥保留原字节、0600 权限，以及重启/工作区切换保留配置但失去授权。另以真实 Electron 1440/820/390 窗口检查面板溢出、Tab 焦点圈定、Escape 关闭与焦点恢复。`2026-09-06T16-10-31-669Z` 这一轮在 `192.168.1.2` 私网接口完成全链路，`completed: true`、`physicalDeviceTested: false`。
+
+原生配置与 Preview 集成的全量单元测试为 **2663 pass / 0 fail / 17174 assertions / 214 files**；typecheck、既有桌面 E2E **4/4**、上述真实远程 E2E、smoke:all **10/10** 与 high audit 均通过。新增主进程回归还验证了配置失效后的 Enable 重试、关闭期间迟到的原生选择不落盘、无效启动地址不回显任意文本，以及启用使用同一份经过校验的 TLS 内容。启动时只加载文件引用，DNS/TLS 验证留在保存与启用时；读取/验证后文件替换或删除不会改变本次 HTTPS 的证书。
 
 远程浏览器入口：`bun run test:e2e:remote`。测试为 Node 执行的 Playwright harness，使用真实 Electron 窗口、独立工作区/用户数据目录、真实本地 HTTP 模型 fixture 和 HTTPS socket。优先使用本机已有的 RFC1918/CGNAT 网卡地址；本轮使用 `192.168.1.6`，浏览器和 Host 在同一台电脑。无合适网卡时退到 loopback 并在证据中明确记录，不能写成跨设备 LAN 验收。运行前需要桌面声明的 Playwright 浏览器与 `openssl`、NSS `certutil`：
 

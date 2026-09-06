@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { RemoteControlPanel } from "./RemoteControlPanel.js";
+import { getDesktopBuildInfo } from "../shared/build-info.js";
 import { SESSION_TITLE_MAX_CHARS } from "@chili/protocol";
 import type {
   ChiliEvent,
@@ -106,6 +107,7 @@ interface SessionSettingsValues extends SessionModelSettingsDraft {
 }
 
 export function App({ transport }: { transport: ControlTransport }) {
+  const buildInfo = getDesktopBuildInfo();
   const [projection, setProjection] = useState<DesktopProjection>({
     epoch: 0,
     diffRevision: 0,
@@ -961,6 +963,7 @@ export function App({ transport }: { transport: ControlTransport }) {
           <div className="brand" aria-label="Chili">
             <ChiliMark />
             <span>Chili</span>
+            {buildInfo.channel === "preview" ? <small className="desktop-build-label" data-testid="desktop-build-label" title={buildInfo.label}>{buildInfo.label}</small> : null}
           </div>
           <span className="title-divider" aria-hidden="true" />
           <div className="title-context">

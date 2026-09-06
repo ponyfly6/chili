@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { decodeWireEnvelope, encodeWireEnvelope } from "./http-wire.js";
-import { PrivateControlHttpsHost, isPrivateControlAddress } from "./https-host.js";
+import { PrivateControlHttpsHost, disposePrivateControlTlsMaterial, isPrivateControlAddress } from "./https-host.js";
 import type { RemoteControlService } from "./host-bridge.js";
 import {
   createPairingProof, generateDeviceIdentity, openRelayEnvelope, sealRelayEnvelope,
@@ -47,6 +47,13 @@ async function enable(value: PrivateControlHttpsHost): Promise<string> {
     tlsCertPath: certPath, tlsKeyPath: keyPath, webRoot: directory,
   });
   return state.origin!;
+}
+async function tlsMaterial() {
+  return { certificate: Buffer.from(certificate), privateKey: await readFile(keyPath) };
+}
+function expectDisposed(material: { certificate: Buffer; privateKey: Buffer }): void {
+  expect(material.certificate).toEqual(Buffer.alloc(material.certificate.length));
+  expect(material.privateKey).toEqual(Buffer.alloc(material.privateKey.length));
 }
 interface HttpResult { status: number; body: unknown; text: string; headers: Record<string, string | string[] | undefined> }
 function http(origin: string, path: string, body?: unknown, options: {
@@ -152,6 +159,78 @@ test("starts disabled; real TLS requires explicit client trust and enforces Host
   expect((await http(origin, "/secret.json")).status).toBe(404);
   expect((await http(origin, "/key.pem")).status).toBe(404);
   expect((await http(origin, "/api/control/poll")).status).toBe(405);
+});
+
+test("validated TLS material serves trusted HTTPS without reopening certificate paths and is disposed", async () => {
+  const value = host();
+  const material = await tlsMaterial();
+  const state = await value.enable({
+    bindAddress: "127.0.0.1", port: 0, publicOrigin: "https://127.0.0.1:0",
+    tlsCertPath: join(directory, "missing-certificate.pem"), tlsKeyPath: join(directory, "missing-key.pem"),
+    tlsMaterial: material, webRoot: directory,
+  });
+  expectDisposed(material);
+  const page = await http(state.origin!, "/");
+  expect(page.status).toBe(200);
+  expect(page.text).toContain("Private control");
+});
+
+test("invalid listener configuration disposes supplied TLS material and leaves the host disabled", async () => {
+  const value = host();
+  const material = await tlsMaterial();
+  await expect(value.enable({
+    bindAddress: "0.0.0.0", port: 0, publicOrigin: "https://127.0.0.1:0",
+    tlsCertPath: certPath, tlsKeyPath: keyPath, tlsMaterial: material, webRoot: directory,
+  })).rejects.toThrow("wildcard/public listeners");
+  expectDisposed(material);
+  expect(value.snapshot()).toEqual({ enabled: false, starting: false, pendingPairings: [], devices: [] });
+});
+
+test("invalid supplied TLS material fails closed without falling back to valid certificate paths", async () => {
+  const value = host();
+  const material = { certificate: Buffer.from(certificate), privateKey: Buffer.from("invalid private key") };
+  await expect(value.enable({
+    bindAddress: "127.0.0.1", port: 0, publicOrigin: "https://127.0.0.1:0",
+    tlsCertPath: certPath, tlsKeyPath: keyPath, tlsMaterial: material, webRoot: directory,
+  })).rejects.toThrow("Cannot start HTTPS");
+  expectDisposed(material);
+  expect(value.snapshot()).toEqual({ enabled: false, starting: false, pendingPairings: [], devices: [] });
+});
+
+test("disable during material-based HTTPS setup disposes material and cannot leave a listener enabled", async () => {
+  const value = host();
+  const material = await tlsMaterial();
+  const opening = value.enable({
+    bindAddress: "127.0.0.1", port: 0, publicOrigin: "https://127.0.0.1:0",
+    tlsCertPath: certPath, tlsKeyPath: keyPath, tlsMaterial: material, webRoot: directory,
+  });
+  const rejected = opening.catch((error: unknown) => error);
+  await value.disable();
+  expect(await rejected).toMatchObject({ code: "remote_disabled" });
+  expectDisposed(material);
+  expect(value.snapshot()).toEqual({ enabled: false, starting: false, pendingPairings: [], devices: [] });
+});
+
+test("an already enabled host disposes rejected replacement material while keeping its listener usable", async () => {
+  const value = host();
+  const origin = await enable(value);
+  const material = await tlsMaterial();
+  await expect(value.enable({
+    bindAddress: "127.0.0.1", port: 0, publicOrigin: "https://127.0.0.1:0",
+    tlsCertPath: certPath, tlsKeyPath: keyPath, tlsMaterial: material, webRoot: directory,
+  })).rejects.toThrow("already enabled");
+  expectDisposed(material);
+  expect(value.snapshot().origin).toBe(origin);
+  expect((await http(origin, "/")).status).toBe(200);
+});
+
+test("TLS material can be explicitly disposed repeatedly or omitted", async () => {
+  const material = await tlsMaterial();
+  disposePrivateControlTlsMaterial(material);
+  expectDisposed(material);
+  expect(() => disposePrivateControlTlsMaterial(material)).not.toThrow();
+  expectDisposed(material);
+  expect(() => disposePrivateControlTlsMaterial()).not.toThrow();
 });
 
 test("one-use short pairing code and key proof cannot bypass local confirmation", async () => {
