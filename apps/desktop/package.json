@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build:sidecar": "bun run scripts/build-sidecar.ts",
-    "build": "bun run build:sidecar && electron-vite build",
+    "build": "bun run --cwd ../control-web build && bun run build:sidecar && electron-vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "typecheck:e2e": "tsc --noEmit -p e2e/tsconfig.json",
     "test:e2e": "bun run typecheck:e2e && bun run e2e/electron.e2e.ts",
@@ -34,6 +34,7 @@
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "typescript": "^5.8.3",
-    "vite": "7.3.6"
+    "vite": "7.3.6",
+    "@chili/remote-control": "workspace:*"
   }
 }

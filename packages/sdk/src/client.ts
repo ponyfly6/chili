@@ -129,7 +129,7 @@ export interface RuntimeClient {
   pendingUserInputs(input?: ListUserInputsRequest): Promise<RuntimeUserInputRequest[]>;
   resolveUserInput(input: ResolveUserInputRequest): Promise<RuntimeUserInputResolveResult>;
   archiveSession(sessionId: SessionId): Promise<void>;
-  listSessions(): Promise<RuntimeSessionSummary[]>;
+  listSessions(input?: { signal?: AbortSignal }): Promise<RuntimeSessionSummary[]>;
   sessionEvents(input: SessionEventsRequest): Promise<ChiliEvent[]>;
   /** Dependency-complete bounded replay window with explicit truncation metadata. */
   sessionEventWindow?(input: SessionEventsRequest): Promise<RuntimeSessionEventWindow>;
@@ -1304,8 +1304,8 @@ export class HttpRuntimeClient implements RuntimeClient {
     await this.post(`sessions/${encodeURIComponent(sessionId)}/archive`, {}, undefined, undefined, true);
   }
 
-  listSessions(): Promise<RuntimeSessionSummary[]> {
-    return this.get("sessions", undefined, parseRuntimeSessionSummaryArray);
+  listSessions(input: { signal?: AbortSignal } = {}): Promise<RuntimeSessionSummary[]> {
+    return this.get("sessions", input.signal, parseRuntimeSessionSummaryArray);
   }
 
   sessionEvents(input: SessionEventsRequest): Promise<ChiliEvent[]> {

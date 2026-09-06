@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { RemoteControlPanel } from "./RemoteControlPanel.js";
 import { SESSION_TITLE_MAX_CHARS } from "@chili/protocol";
 import type {
   ChiliEvent,
@@ -969,6 +970,7 @@ export function App({ transport }: { transport: ControlTransport }) {
           </div>
         </div>
         <div className="titlebar-actions">
+          <RemoteControlPanel />
           <div className={`runtime-pill phase-${desktop.sidecar.phase}`} title="Local runtime status">
             <span className="status-dot" aria-hidden="true" />
             <span>Local</span>

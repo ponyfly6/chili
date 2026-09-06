@@ -10,6 +10,7 @@ import {
 import { safeDesktopErrorMessage as safeLogMessage } from "../shared/safe-error.js";
 import { BootstrapLifecycleGuard } from "./bootstrap-lifecycle.js";
 import { DesktopControlService } from "./control-service.js";
+import { DesktopRemoteControlManager } from "./remote-control-manager.js";
 import { DeferredElectronQuit } from "./deferred-electron-quit.js";
 import { registerDesktopIpc, type DesktopIpcController } from "./ipc.js";
 import { shouldUseMockKeychain } from "./keychain-policy.js";
@@ -43,6 +44,7 @@ if (shouldUseMockKeychain({
 let mainWindow: BrowserWindow | undefined;
 let sidecar: SidecarManager | undefined;
 let control: DesktopControlService | undefined;
+let remoteControl: DesktopRemoteControlManager | undefined;
 let desktopIpc: DesktopIpcController | undefined;
 const bootstrapLifecycle = new BootstrapLifecycleGuard();
 const deferredElectronQuit = new DeferredElectronQuit(exitDesktopProcess);
@@ -91,6 +93,7 @@ async function bootstrap(): Promise<void> {
     onState: (state, generation) => {
       notificationGate.observeSidecarState(state.sidecar.phase, generation);
       control?.observeState(state, generation);
+      remoteControl?.observeSidecar(state, generation);
       desktopIpc?.publish({ type: "state.changed", state });
     },
     onEvent: (event, generation) => {
@@ -120,6 +123,13 @@ async function bootstrap(): Promise<void> {
     emitQueue: (sessionId, count) => desktopIpc?.publish({ type: "queue.changed", sessionId, count }),
     onError: (error) => console.error("Desktop control error", safeLogMessage(error)),
   });
+  remoteControl = new DesktopRemoteControlManager({
+    controlService: control,
+    environment: process.env,
+    defaultWebRoot: app.isPackaged
+      ? resolve(process.resourcesPath, "control-web")
+      : resolve(repositoryRoot, "apps/control-web/dist"),
+  });
 
   if (!bootstrapLifecycle.canContinue()) return;
   const createdWindow = createDesktopWindow();
@@ -128,7 +138,16 @@ async function bootstrap(): Promise<void> {
     return;
   }
   mainWindow = createdWindow;
-  desktopIpc = registerDesktopIpc(mainWindow, control);
+  const desktopControl = control;
+  const desktopRemote = remoteControl;
+  desktopIpc = registerDesktopIpc(mainWindow, {
+    async invoke(request) {
+      // Invalidate phone authority before the workspace picker or switch can
+      // await anything. The local renderer and adapter share desktopControl.
+      if (request.type === "workspace.select") await desktopRemote.disable();
+      return desktopControl.invoke(request);
+    },
+  }, desktopRemote);
   createdWindow.once("closed", () => {
     desktopIpc?.dispose();
     desktopIpc = undefined;
@@ -159,6 +178,13 @@ async function bootstrap(): Promise<void> {
       if (!bootstrapLifecycle.canContinue()) return;
       console.error("Failed to start workspace sidecar", safeLogMessage(error));
     }
+  }
+
+  if (process.env.CHILI_DESKTOP_SMOKE === "1" && process.env.CHILI_DESKTOP_PARENT_LOSS_FIXTURE_PATH) {
+    // The outer smoke owns this fixture's SIGKILL. Do not race it with the
+    // normal renderer smoke scenario's app.quit() and graceful sidecar stop.
+    smokeStage("parent-loss-ready");
+    return;
   }
 
   if (process.env.CHILI_DESKTOP_SMOKE === "1") {
@@ -247,6 +273,7 @@ function beginShutdown(): void {
   // aborting the control plane. Throwing or removing the handler makes
   // Electron log the expected close race as a main-process error.
   desktopIpc?.beginShutdown();
+  const remoteShutdown = remoteControl?.disable() ?? Promise.resolve();
   controlService?.beginShutdown();
   smokeStage("shutdown-started");
   const manager = sidecar;
@@ -289,6 +316,7 @@ function beginShutdown(): void {
       stopAttempts += 1;
       try {
         await Promise.all([
+          remoteShutdown,
           manager?.stop() ?? Promise.resolve(),
           controlService?.containMainProcesses() ?? Promise.resolve(),
         ]);

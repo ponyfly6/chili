@@ -1,16 +1,39 @@
-# Chili Remote Control Foundation Phase 0
+# Chili Remote Control
 
-This package is an executable, host-neutral security foundation for a single
-vertical slice:
+The private mobile Alpha adds a production browser entrypoint and a private
+HTTPS host while preserving the Phase 0 protocol:
+
+```text
+apps/control-web (browser WebCrypto + HTTPS)
+  -> PrivateControlHttpsHost -> HostBridge
+  -> DesktopRemoteControlAdapter -> the window's DesktopControlService
+  -> real sidecar/runtime
+```
+
+`@chili/remote-control/browser` has no Node runtime imports. The root entrypoint
+contains the Node HTTPS host. Desktop remote control is off by default; its local
+panel issues a two-minute one-use code and requires confirmation before granting
+read/send/stop capabilities. Credentials and replay state are memory-only and
+expire together on disable, workspace switch or restart. Reads run concurrently
+with at most eight in flight, preserving capacity for Stop. Authenticated ACKs
+commit sequence; lost results and ambiguous mutation failures stay unknown,
+never permission to submit a new duplicate command.
+
+The desktop adapter projects root-task text into a separate 48 KiB JSON budget.
+It does not expose arbitrary paths, child task contents, raw desktop snapshots,
+permissions, approvals or credentials. Only the model may be a fixture in the
+Alpha acceptance chain. See the [setup and phone acceptance guide](../../docs/private-mobile-alpha-acceptance.md).
+
+The original Phase 0 executable demo remains available for protocol exploration:
+
 
 ```text
 fake mobile client -> in-memory relay -> host bridge
                    -> mocked host-neutral control service
 ```
 
-It is intentionally isolated from Electron, the renderer, runtime HTTP, and the
-current desktop control service. It does not contain a public relay, PWA, native
-mobile client, or production persistence.
+The demo below is not Alpha acceptance evidence. This package contains no public
+relay, native mobile client, account system or persistent credentials.
 
 ## Run it
 
@@ -72,28 +95,36 @@ The complete threat model and accepted Phase 0 residual risks are documented in
 
 There are no wildcard scopes or implicit capability inheritance.
 
-## Minimal desktop integration after the desktop fixes merge
+## Production integration and lifetime
 
-1. Add `@chili/remote-control` as an `apps/desktop` workspace dependency and a
-   TypeScript project reference only when the desktop integration branch is
-   ready. Phase 0 deliberately does not modify those existing manifests now.
-2. Add one main-process adapter implementing `RemoteControlService`. Map the
-   four validated host-neutral requests to the same-shaped subset of
-   `DesktopControlService.invoke`; keep authentication, authorization, replay,
-   limits, and redaction in `HostBridge` rather than duplicating them in the
-   adapter.
-3. Before exposing real session data, define a bounded remote-safe projection.
-   In particular, do not pass raw snapshots, provider credentials, workspace
-   paths, approval bodies, tool output, or unbounded errors through the adapter.
-4. Construct the pairing authority and bridge in the desktop main-process
-   lifecycle after `DesktopControlService` is ready. Disconnect the bridge
-   before desktop shutdown. Do not route remote control through `App.tsx` or the
-   renderer.
-5. Keep the in-memory relay and fake client for deterministic integration tests.
-   A later real relay must preserve the same opaque-envelope API, dual queue
-   quotas, connection bounds, declared immutable route limits, and secret-free
-   diagnostics before it can replace the Phase 0 relay.
+`DesktopRemoteControlManager` constructs the HTTPS host and a fresh workspace-bound
+adapter on each local enable. The adapter calls the window's existing service;
+it owns no separate runtime client or prompt queue. Per-device cancellation
+prevents revoked requests that are still awaiting membership/actor admission
+from executing, while disabling remote control revokes the entire adapter scope.
 
-Those steps are intentionally narrow: one adapter, one lifecycle owner, and one
-workspace dependency. Electron IPC, renderer UI, public networking, device UX,
-and Electron E2E remain separate follow-up phases.
+Remote Send and Stop reserve the shared task actor before awaiting membership.
+Membership reads start concurrently, but cannot reorder remote or local writes.
+Membership and later Send preflight share a five-second read budget starting at
+admission; queued preflights cannot each add another full timeout ahead of Stop.
+That deadline does not abort a real write or discard a Stop whose membership
+check already succeeded. List and snapshot reads remain outside the task actor.
+
+Accepted remote queue items carry their origin into the desktop queue. If the
+runtime may have accepted an item before its response fails, that item is not
+automatically requeued. A sticky `deliveryUnknown` snapshot flag tells the phone
+to inspect the task before issuing another command. This complements the
+HostBridge sequence high-water mark and browser `outcome_unknown` state.
+
+The phone keeps each unknown command outcome separately from connection and
+ordinary success notices. Reconnect or a later successful read/write cannot
+resolve that warning; an explicit user confirmation clears only its own command.
+Revocation or disposal also preserves uncertainty for transmitted mutations whose
+results have not arrived. An authenticated, correlated `admitted:false` rejection
+still proves non-execution for that exact attempt; unsent requests and reads keep
+their ordinary errors.
+
+The in-memory relay, fake client and mock service remain protocol test/demo
+fixtures only. They are not used by the private HTTPS/desktop/browser acceptance
+chain. Public relay, account, multi-host and persistent authorization support
+remain outside this Alpha.

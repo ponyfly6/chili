@@ -42,6 +42,8 @@ export interface RemoteControlInvocationContext {
   /** Stable per request and suitable for a future host adapter's deduplication key. */
   readonly idempotencyKey: string;
   readonly capability: RemoteControlCapability;
+  /** Abort queued work on this device route before a host side effect begins. */
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -182,6 +184,10 @@ interface SessionHighWaterMark {
 
 type FrameSendResult = "sent" | "unavailable" | "encoding_failed";
 
+// Reads have their own execution ceiling so stalled snapshots cannot occupy
+// the entire global admission budget and starve cancellation.
+const MAX_PENDING_READ_EXECUTIONS = 8;
+
 const DEFAULT_HOST_BRIDGE_LIMITS: HostBridgeLimits = Object.freeze({
   maxMessageBytes: REMOTE_CONTROL_LIMITS.maxCiphertextBytes,
   maxPendingMessages: REMOTE_CONTROL_LIMITS.maxQueueMessages,
@@ -215,9 +221,12 @@ export class HostBridge {
   #relay: HostBridgeRelay | undefined;
   #connection: HostBridgeRelayConnection | undefined;
   #connectionEpoch = 0;
+  #connectionController: AbortController | undefined;
   #pendingMessages = 0;
   #pendingBytes = 0;
+  #pendingReadExecutions = 0;
   #processingTail: Promise<void> = Promise.resolve();
+  readonly #executions = new Set<Promise<HostBridgeReceiveResult>>();
 
   constructor(options: HostBridgeOptions) {
     this.hostId = parseRemoteControlHostId(options.hostId);
@@ -248,6 +257,8 @@ export class HostBridge {
       this.#pendingBytes,
     );
 
+    this.#connectionController?.abort(new Error("Remote connection was replaced"));
+    this.#connectionController = new AbortController();
     const epoch = this.#connectionEpoch + 1;
     this.#connectionEpoch = epoch;
     this.#seenEnvelopeIds.clear();
@@ -281,6 +292,7 @@ export class HostBridge {
     if (connection.routeId !== this.routeId || connection.connected !== true) {
       connection.disconnect();
       this.#connectionEpoch += 1;
+      this.#connectionController.abort(new Error("Remote connection failed"));
       throw new Error("Host relay connection did not bind the configured route");
     }
 
@@ -294,6 +306,7 @@ export class HostBridge {
     const connection = this.#connection;
     this.#connection = undefined;
     this.#connectionEpoch += 1;
+    this.#connectionController?.abort(new Error("Remote device route was disconnected"));
     this.#seenEnvelopeIds.clear();
     this.#seenEnvelopeOrder.length = 0;
     connection?.disconnect();
@@ -325,6 +338,7 @@ export class HostBridge {
     while (true) {
       const tail = this.#processingTail;
       await tail;
+      await Promise.all(this.#executions);
       if (tail === this.#processingTail && this.#pendingMessages === 0) return;
     }
   }
@@ -367,19 +381,46 @@ export class HostBridge {
 
     this.#pendingMessages += 1;
     this.#pendingBytes += envelope.byteLength;
+    // Serialize authenticated admission, not runtime reads. A slow snapshot
+    // must not hold Stop behind its result. Pending byte/count limits continue
+    // to include the entire execution, including responses still being sealed.
+    let releaseAdmission!: () => void;
+    const admitted = new Promise<void>((resolve) => { releaseAdmission = resolve; });
     const processing = this.#processingTail
-      .then(() => this.#processEnvelope(envelope, epoch))
+      .then(() => this.#processEnvelope(envelope, epoch, releaseAdmission))
       .catch(() => rejected("internal_error"));
-    this.#processingTail = processing.then(() => undefined);
-    return processing.finally(() => {
+    this.#processingTail = admitted;
+    const settled = processing.finally(() => {
+      releaseAdmission();
       this.#pendingMessages -= 1;
       this.#pendingBytes -= envelope.byteLength;
+      this.#executions.delete(settled);
     });
+    this.#executions.add(settled);
+    return settled;
   }
 
   async #processEnvelope(
     envelope: OpaqueRelayEnvelope,
     epoch: number,
+    releaseAdmission: () => void,
+  ): Promise<HostBridgeReceiveResult> {
+    let holdsReadSlot = false;
+    try {
+      return await this.#decodeAndAdmitEnvelope(envelope, epoch, releaseAdmission, () => {
+        holdsReadSlot = true;
+        this.#pendingReadExecutions += 1;
+      });
+    } finally {
+      if (holdsReadSlot) this.#pendingReadExecutions -= 1;
+    }
+  }
+
+  async #decodeAndAdmitEnvelope(
+    envelope: OpaqueRelayEnvelope,
+    epoch: number,
+    releaseAdmission: () => void,
+    acquireReadSlot: () => void,
   ): Promise<HostBridgeReceiveResult> {
     if (!this.#isCurrentConnection(epoch)) return rejected("unavailable");
 
@@ -466,6 +507,13 @@ export class HostBridge {
       return this.#rejectFrame(frame, "limit_exceeded", true);
     }
 
+    const isRead = frame.operation === "sessions.list" || frame.operation === "session.snapshot";
+    if (isRead && this.#pendingReadExecutions >= MAX_PENDING_READ_EXECUTIONS) {
+      // The authenticated frame has not consumed a sequence. The client must
+      // retain it for explicit recovery, rather than skip ahead or duplicate it.
+      return this.#rejectFrame(frame, "limit_exceeded", true);
+    }
+
     // Atomic admission boundary: never roll this back, even if invoke/send fails.
     this.#sessionHighWater.set(streamKey, {
       sessionId: frame.sessionId,
@@ -473,6 +521,7 @@ export class HostBridge {
       lastRequestId: frame.requestId,
       expiresAt: authorization.expiresAt,
     });
+    if (isRead) acquireReadSlot();
 
     const acknowledgementSent = await this.#sendFrame({
       version: REMOTE_CONTROL_PROTOCOL_VERSION,
@@ -486,7 +535,17 @@ export class HostBridge {
 
     let result: RemoteControlJsonValue;
     try {
-      result = await this.#controlService.invoke(
+      // ACK encoding is asynchronous. Revocation/disconnect during it must
+      // prevent an admitted but not yet started operation from executing.
+      if (!this.#isCurrentConnection(epoch)) throw new Error("Connection expired");
+      this.#credentials.authenticate({
+        credential: frame.credential,
+        hostId: this.hostId,
+        deviceId: frame.deviceId,
+        routeId: envelope.routeId,
+        capability: requiredCapability,
+      });
+      const execution = this.#controlService.invoke(
         serviceRequest(frame),
         Object.freeze({
           hostId: this.hostId,
@@ -501,9 +560,15 @@ export class HostBridge {
             envelope.routeId,
           ),
           capability: requiredCapability,
+          signal: this.#connectionController!.signal,
         }),
       );
+      // invoke starts synchronously in sequence order; the desktop service
+      // owns mutation ordering. Other requests need not await this result.
+      releaseAdmission();
+      result = await execution;
     } catch {
+      releaseAdmission();
       const responseSent = await this.#sendErrorFrame(
         frame,
         "request_failed",

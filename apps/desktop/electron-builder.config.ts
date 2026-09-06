@@ -7,6 +7,7 @@ import { flipFuses, FuseV1Options, FuseVersion } from "@electron/fuses";
 import type { Configuration } from "electron-builder";
 
 const packageRoot = import.meta.dirname;
+const buildRoot = process.env.CHILI_DESKTOP_BUILD_ROOT || packageRoot;
 const execFileAsync = promisify(execFile);
 const signingIdentity = process.env.CHILI_DESKTOP_SIGN_IDENTITY?.trim() || "-";
 if (signingIdentity !== "-") {
@@ -20,7 +21,8 @@ const config: Configuration = {
   productName: "Chili",
   copyright: "Copyright © 2026 Chili contributors",
   directories: {
-    output: "release",
+    app: buildRoot,
+    output: process.env.CHILI_DESKTOP_PACKAGE_OUTPUT_DIR || "release",
     buildResources: resolve(packageRoot, "../../assets/brand"),
   },
   files: [
@@ -34,8 +36,13 @@ const config: Configuration = {
     "!**/*.test.*",
   ],
   extraResources: [{
-    from: "resources/chili-sidecar",
+    from: resolve(buildRoot, "resources/chili-sidecar"),
     to: "chili-sidecar",
+  }, {
+    from: process.env.CHILI_DESKTOP_BUILD_ROOT
+      ? resolve(buildRoot, "resources/control-web")
+      : resolve(packageRoot, "../control-web/dist"),
+    to: "control-web",
   }],
   asar: true,
   npmRebuild: false,

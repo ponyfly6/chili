@@ -80,6 +80,10 @@ bun run smoke:desktop
 
 桌面端支持选择工作区、创建/恢复 session、实时 timeline、Queue/Steer/Stop、agent tree、tasks、审批、用户输入和 turn/workspace diff。详细运行说明与安全边界见 [apps/desktop/README.md](apps/desktop/README.md)，架构说明见 [docs/desktop-architecture.md](docs/desktop-architecture.md)。
 
+私网手机 Alpha 使用独立的 `apps/control-web` 页面，通过受信任的私网 HTTPS、HostBridge 和桌面窗口共用的 `DesktopControlService` 操作真实 sidecar/runtime。远控默认关闭；在桌面开启后，手机使用短期一次性配对码申请授权，再由桌面本地确认。手机仅能查看当前工作区已有的顶层任务及有限消息，并执行 Queue、Steer、Stop；任务创建、工作区选择、审批、用户输入答复和权限设置仍在桌面完成。关闭远控、撤销设备、切换工作区或重启桌面会使对应授权失效。
+
+网络与证书配置、浏览器自动化入口和五分钟手机检查清单见 [私网手机 Alpha 验收指南](docs/private-mobile-alpha-acceptance.md)。当前已有真实浏览器到桌面/runtime 的自动化验证，**iPhone / Android 真机验收尚未执行**。此 Alpha 不包含公网 relay、账号、原生手机 App 或后台 daemon。
+
 运行时会话现在只使用 `session-id` 标识；旧的 `--thread` 参数不再支持。`--resume` 只接受已存在且活跃的交互式 session，子代理 session 请通过 `task_followup` 继续。多代理任务仍以 `task-id` 作为用户可见标识，每个子代理对应唯一的 child session，后续消息会复用同一个 `task-id` 和 child session。邮箱工具输出中的接收方字段已从 `child_session_id` / `childSessionId` 更名为 `recipient_session_id` / `recipientSessionId`。
 
 身份职责保持正交：`SessionId` 标识可恢复的对话上下文，`TaskId` 标识逻辑代理任务，`AgentRunId` 标识该任务的一次执行尝试，`TurnId` 只标识一次模型轮次。Follow-up 会复用 `TaskId + SessionId`，同时创建新的 `AgentRunId` 并递增 generation。
@@ -262,6 +266,8 @@ bun run scripts/probe-minimax.ts --mock
 ```
 
 `bun run smoke:all` 是跨平台 CLI/runtime 的完整 fake-model smoke 入口，不需要 API key 或网络访问。Electron 的 macOS 打包与实机生命周期门禁独立运行 `bun run smoke:desktop`；发布或修改桌面代码时两者都必须通过。
+
+`smoke:desktop` 在每轮独立临时目录中构建并清理桌面、sidecar 与手机页面，不覆盖共享 release，也只清理本轮启动的进程及其后代。隔离回归入口为 `bun test scripts/desktop-smoke-isolation.test.ts`。远程浏览器全链路使用 `bun run test:e2e:remote`，所需 Firefox、NSS `certutil` 与证书验证说明见上述 Alpha 验收指南。
 
 局部开发验证可单独运行 `smoke`、`smoke:cli`、`smoke:p0p1`、`smoke:p2`、`smoke:p2-control`、`smoke:p3`、`smoke:p3-background`、`smoke:p3-team-model`、`smoke:p3-team-parallel` 或 `smoke:p3-multi-agent-lifecycle`。`smoke:p0` 是 `smoke` 的别名。`bun run smoke` 会在系统临时目录创建 fixture workspace，覆盖 CLI fake model 基础工具循环、`--resume`、runtime `read`/`glob`/`grep`/`edit`/`apply_patch`/`bash` 工具面，以及最小 context compaction 路径。通过的 fixture 会清理；失败的 fixture 会保留并打印路径。需要保留全部 fixture 时可设置 `CHILI_SMOKE_KEEP_WORKSPACE=1`。
 

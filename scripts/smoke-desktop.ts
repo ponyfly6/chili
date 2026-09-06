@@ -9,6 +9,7 @@ import {
   readdir,
   readFile,
   readlink,
+  realpath,
   rm,
   stat,
   writeFile,
@@ -16,6 +17,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { DesktopSmokeOwnership } from "./desktop-smoke-ownership.js";
 
 const FUSE_SENTINEL = Buffer.from("dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX", "utf8");
 const FUSE_DISABLED = "0".charCodeAt(0);
@@ -97,8 +99,13 @@ if (process.arch !== "arm64" && process.arch !== "x64") {
 const repositoryRoot = resolve(import.meta.dirname, "..");
 const expectedReleaseDirectory = process.arch === "arm64" ? "mac-arm64" : "mac";
 const expectedMachOSlice = process.arch === "arm64" ? "arm64" : "x86_64";
-const temporaryRoot = await mkdtemp(join(tmpdir(), "chili-desktop-smoke-"));
-const releaseRoot = resolve(repositoryRoot, "apps/desktop/release");
+// Electron resolves macOS /var to /private/var in resourcesPath. Keep the
+// isolated paths canonical so owned sidecars are classified consistently.
+const temporaryRoot = await realpath(await mkdtemp(join(tmpdir(), "chili-desktop-smoke-")));
+const releaseRoot = join(temporaryRoot, "release");
+const buildRoot = join(temporaryRoot, "build");
+const processOwnership = new DesktopSmokeOwnership();
+const isolationFixture = process.argv.find((argument) => argument.startsWith("--isolation-fixture="))?.split("=")[1];
 const workspace = join(temporaryRoot, "workspace");
 const userData = join(temporaryRoot, "user-data");
 const hardCrashUserData = join(temporaryRoot, "hard-crash-user-data");
@@ -175,95 +182,104 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
 }
 
 try {
-  await mkdir(workspace, { recursive: true });
-  await mkdir(userData, { recursive: true });
-  await mkdir(hardCrashUserData, { recursive: true });
-  await mkdir(isolatedChiliHome, { recursive: true });
-  await mkdir(pathCanary, { recursive: true });
-  await writeFile(join(workspace, "README.md"), "# Chili desktop smoke workspace\n", "utf8");
-  await initializeSmokeGitWorkspace();
-  await assertOutputOverflowCleanupFixture();
-  await assertProcessGroupCleanupFixture();
-  await assertSidecarContainmentGraceFixture();
-  providerLoadServer = startProviderLoadServer();
+  if (isolationFixture) {
+    await runIsolationFixture(isolationFixture);
+    successMessage = "desktop smoke isolation fixture passed\n";
+  } else {
+    await mkdir(workspace, { recursive: true });
+    await mkdir(userData, { recursive: true });
+    await mkdir(hardCrashUserData, { recursive: true });
+    await mkdir(isolatedChiliHome, { recursive: true });
+    await mkdir(pathCanary, { recursive: true });
+    await writeFile(join(workspace, "README.md"), "# Chili desktop smoke workspace\n", "utf8");
+    await initializeSmokeGitWorkspace();
+    await assertOutputOverflowCleanupFixture();
+    await assertProcessGroupCleanupFixture();
+    await assertSidecarContainmentGraceFixture();
+    providerLoadServer = startProviderLoadServer();
 
-  // A clean output directory makes it impossible to accidentally accept a
-  // stale mac-* package from another architecture or an earlier source tree.
-  await rm(releaseRoot, { recursive: true, force: true });
-  const buildStartedAt = Date.now();
-  await runChecked(
-    ["bun", "run", "desktop:package:dir"],
-    repositoryRoot,
-    300_000,
-    smokeCanaryEnvironment(),
-  );
-
-  const application = await findSinglePackagedApplication(releaseRoot);
-  const applicationName = basename(application, ".app");
-  const executable = join(application, "Contents", "MacOS", applicationName);
-  const resources = join(application, "Contents", "Resources");
-  const asar = join(resources, "app.asar");
-  packagedSidecar = join(resources, "chili-sidecar");
-  const electronFramework = join(
-    application,
-    "Contents",
-    "Frameworks",
-    "Electron Framework.framework",
-    "Electron Framework",
-  );
-
-  await assertFresh("application bundle", application, buildStartedAt);
-  await assertFresh("ASAR archive", asar, buildStartedAt);
-  await assertFresh("sidecar executable", packagedSidecar, buildStartedAt);
-  await assertExecutable(executable);
-  await assertExecutable(packagedSidecar);
-  await assertMachOSlices(executable, packagedSidecar);
-  await assertCodesigned(application, packagedSidecar);
-  await assertAsarContents(asar);
-  await assertAsarIntegrity(application, asar);
-  await assertFuseWire(electronFramework);
-  await assertNoEmbeddedText(application, artifactSensitiveNeedles);
-
-  const sidecarPids: number[] = [];
-  const shutdownExitTimes: number[] = [];
-  let blockedGitPid: number | undefined;
-  for (let launch = 1; launch <= 2; launch += 1) {
-    if (launch === 2) await enableBlockedGitFixture();
-    const result = await runPackagedLaunch(
-      executable,
-      launch,
-      launch === 1 ? new URL("chat/completions", providerLoadServer.url).href : undefined,
+    // Both intermediate build products and the final package belong to this
+    // mkdtemp run. Never delete, overwrite, or launch the shared release tree.
+    const buildStartedAt = Date.now();
+    await runChecked(
+      ["bun", "run", "desktop:package:dir"],
+      repositoryRoot,
+      300_000,
+      {
+        ...smokeCanaryEnvironment(),
+        CHILI_DESKTOP_BUILD_ROOT: buildRoot,
+        CHILI_DESKTOP_PACKAGE_OUTPUT_DIR: releaseRoot,
+      },
     );
-    const { sidecarPid, shutdownExitMs } = result;
-    sidecarPids.push(sidecarPid);
-    shutdownExitTimes.push(shutdownExitMs);
-    if (result.blockedGitPid !== undefined) blockedGitPid = result.blockedGitPid;
-    if (launch === 1) {
-      if (providerLoadFailure) throw providerLoadFailure;
-      if (providerLoadRequests !== 1) {
-        throw new Error(`Packaged real-provider smoke made ${providerLoadRequests} loopback requests; expected one`);
+
+    const application = await findSinglePackagedApplication(releaseRoot);
+    const applicationName = basename(application, ".app");
+    const executable = join(application, "Contents", "MacOS", applicationName);
+    const resources = join(application, "Contents", "Resources");
+    const asar = join(resources, "app.asar");
+    packagedSidecar = join(resources, "chili-sidecar");
+    const electronFramework = join(
+      application,
+      "Contents",
+      "Frameworks",
+      "Electron Framework.framework",
+      "Electron Framework",
+    );
+
+    await assertFresh("application bundle", application, buildStartedAt);
+    await assertFresh("ASAR archive", asar, buildStartedAt);
+    await assertFresh("sidecar executable", packagedSidecar, buildStartedAt);
+    await assertFresh("mobile control page", join(resources, "control-web/index.html"), buildStartedAt);
+    await assertExecutable(executable);
+    await assertExecutable(packagedSidecar);
+    await assertMachOSlices(executable, packagedSidecar);
+    await assertCodesigned(application, packagedSidecar);
+    await assertAsarContents(asar);
+    await assertAsarIntegrity(application, asar);
+    await assertFuseWire(electronFramework);
+    await assertNoEmbeddedText(application, artifactSensitiveNeedles);
+
+    const sidecarPids: number[] = [];
+    const shutdownExitTimes: number[] = [];
+    let blockedGitPid: number | undefined;
+    for (let launch = 1; launch <= 2; launch += 1) {
+      if (launch === 2) await enableBlockedGitFixture();
+      const result = await runPackagedLaunch(
+        executable,
+        launch,
+        launch === 1 ? new URL("chat/completions", providerLoadServer.url).href : undefined,
+      );
+      const { sidecarPid, shutdownExitMs } = result;
+      sidecarPids.push(sidecarPid);
+      shutdownExitTimes.push(shutdownExitMs);
+      if (result.blockedGitPid !== undefined) blockedGitPid = result.blockedGitPid;
+      if (launch === 1) {
+        if (providerLoadFailure) throw providerLoadFailure;
+        if (providerLoadRequests !== 1) {
+          throw new Error(`Packaged real-provider smoke made ${providerLoadRequests} loopback requests; expected one`);
+        }
+      }
+      if (await processStillExists(sidecarPid, 5_000)) {
+        throw new Error(`Launch ${launch} sidecar process ${sidecarPid} survived Electron app exit`);
+      }
+      const survivors = await waitForNoPackagedProcesses(userData, packagedSidecar, 5_000);
+      if (survivors.length > 0) {
+        throw new Error(`Launch ${launch} left packaged processes alive:\n${survivors.join("\n")}`);
       }
     }
-    if (await processStillExists(sidecarPid, 5_000)) {
-      throw new Error(`Launch ${launch} sidecar process ${sidecarPid} survived Electron app exit`);
-    }
-    const survivors = await waitForNoPackagedProcesses(userData, packagedSidecar, 5_000);
-    if (survivors.length > 0) {
-      throw new Error(`Launch ${launch} left packaged processes alive:\n${survivors.join("\n")}`);
-    }
+    await disableBlockedGitFixture();
+
+    const hardCrashFixture = await runParentHardCrashLaunch(executable);
+
+    successMessage = `desktop smoke passed: fresh ${expectedMachOSlice} ad-hoc package, strict fuses, `
+        + `minimal integrity-verified ASAR, renderer leak audit, `
+        + `hardened signatures with an entitlement-free sidecar, host credential audit, `
+        + `offline packaged real-provider load, two clean launches (sidecars ${sidecarPids.join(", ")}; `
+        + `shutdown exits ${shutdownExitTimes.join("ms, ")}ms; blocked Git group ${blockedGitPid}), `
+        + `and parent hard-crash containment `
+        + `(sidecar ${hardCrashFixture.sidecarPid}, tool group ${hardCrashFixture.toolProcessGroupPid}, `
+        + `inherited ${hardCrashFixture.inheritedPid})\n`;
   }
-  await disableBlockedGitFixture();
-
-  const hardCrashFixture = await runParentHardCrashLaunch(executable);
-
-  successMessage = `desktop smoke passed: fresh ${expectedMachOSlice} ad-hoc package, strict fuses, `
-      + `minimal integrity-verified ASAR, renderer leak audit, `
-      + `hardened signatures with an entitlement-free sidecar, host credential audit, `
-      + `offline packaged real-provider load, two clean launches (sidecars ${sidecarPids.join(", ")}; `
-      + `shutdown exits ${shutdownExitTimes.join("ms, ")}ms; blocked Git group ${blockedGitPid}), `
-      + `and parent hard-crash containment `
-      + `(sidecar ${hardCrashFixture.sidecarPid}, tool group ${hardCrashFixture.toolProcessGroupPid}, `
-      + `inherited ${hardCrashFixture.inheritedPid})\n`;
 } catch (error) {
   smokeFailure = error;
 }
@@ -284,6 +300,42 @@ if (smokeFailure || cleanupFailures.length > 0) {
   );
 }
 process.stdout.write(successMessage ?? "desktop smoke passed\n");
+
+// This explicitly requested regression fixture runs the same termination and
+// failure cleanup as a package launch, without building Electron. Its process
+// uses the same executable as the independent sentinel in the test runner.
+async function runIsolationFixture(mode: string): Promise<void> {
+  if (!["success", "failure", "hold"].includes(mode)) throw new Error("Unknown smoke isolation fixture");
+  await mkdir(releaseRoot, { recursive: true });
+  await mkdir(buildRoot, { recursive: true });
+  await writeFile(join(releaseRoot, "owned-artifact"), "this run only\n");
+  await writeFile(join(buildRoot, "owned-build-artifact"), "this run only\n");
+  packagedSidecar = process.execPath;
+  const child = Bun.spawn({
+    cmd: [process.execPath, "-e", `
+      const tool = Bun.spawn({ cmd: ["/bin/sleep", "60"], detached: true, stdout: "ignore", stderr: "ignore" });
+      process.stdout.write(String(tool.pid) + "\\n");
+      setInterval(() => {}, 1000);
+    `],
+    detached: true,
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  trackDetachedProcess(child);
+  const reader = child.stdout.getReader();
+  const chunk = await settleWithin(reader.read(), 5_000);
+  reader.releaseLock();
+  if (!chunk.settled || chunk.value.done) throw new Error("Isolation fixture descendant did not start");
+  const descendantPid = Number(new TextDecoder().decode(chunk.value.value).trim());
+  if (!Number.isSafeInteger(descendantPid) || !processOwnership.scan().some((row) => row.pid === descendantPid)) {
+    throw new Error("Isolation fixture descendant was not owned");
+  }
+  const found = await packagedProcesses(userData, packagedSidecar);
+  if (!found.some((entry) => entry.pid === child.pid)) throw new Error("Isolation fixture child was not owned");
+  process.stdout.write(`CHILI_DESKTOP_ISOLATION_READY ${JSON.stringify({ temporaryRoot, releaseRoot, buildRoot, childPid: child.pid, descendantPid })}\n`);
+  if (mode === "failure") throw new Error("Intentional smoke isolation fixture failure");
+  if (mode === "hold") await new Promise<never>(() => undefined);
+}
 
 async function runPackagedLaunch(
   executable: string,
@@ -624,6 +676,9 @@ async function waitForBlockedGitProcess(
             + `${candidate.pid}/${candidate.processGroupPid}/${candidate.executable}`,
         );
       }
+      if (!processOwnership.scan().some((row) => row.pid === candidate.pid)) {
+        throw new Error(`Blocked Git PID ${candidate.pid} has no current-run launch ancestry`);
+      }
       observedBlockedGitProcessGroups.add(candidate.processGroupPid);
       return candidate.pid;
     }
@@ -685,10 +740,16 @@ async function runParentHardCrashLaunch(executable: string): Promise<ParentLossF
   let failure: unknown;
   try {
     fixture = await waitForParentLossFixture(parentLossFixturePath, 30_000);
+    const owned = new Set(processOwnership.scan().map((row) => row.pid));
+    if (Object.values(fixture).some((pid) => !owned.has(pid))) {
+      throw new Error("Parent-loss fixture contains a PID without current-run launch ancestry");
+    }
     assertParentLossFixtureAlive(fixture);
-    process.kill(child.pid, "SIGKILL");
+    signalPid(child.pid, "SIGKILL");
     const parentExitCode = await waitForExit(child, 5_000, child.pid);
-    if (parentExitCode === 124) throw new Error("Electron parent survived SIGKILL");
+    if (parentExitCode !== 137 || child.signalCode !== "SIGKILL") {
+      throw new Error(`Parent hard-crash fixture did not exit from SIGKILL (exit ${parentExitCode}, signal ${child.signalCode})`);
+    }
     await waitForParentLossCleanup(fixture, 10_000);
     const survivors = await waitForNoPackagedProcesses(hardCrashUserData, sidecar, 5_000);
     if (survivors.length > 0) {
@@ -1389,6 +1450,7 @@ function trackDetachedProcess(child: SpawnedProcess): void {
     throw new Error(`Detached process group ${child.pid} was registered twice`);
   }
   activeDetachedGroups.set(child.pid, child);
+  processOwnership.registerSpawn(child.pid);
 }
 
 function markContainmentAware(processGroupPid: number, prepareForParentLoss: () => void): void {
@@ -1422,6 +1484,7 @@ function trackDirectProcess(child: SpawnedProcess): void {
     throw new Error(`Direct child process ${child.pid} was registered twice`);
   }
   activeDirectProcesses.set(child.pid, child);
+  processOwnership.registerSpawn(child.pid);
 }
 
 function terminateTrackedProcessGroup(processGroupPid: number, child?: SpawnedProcess): Promise<void> {
@@ -1723,11 +1786,7 @@ async function terminateProcessGroup(processGroupPid: number, child?: SpawnedPro
 }
 
 function signalProcessGroup(processGroupPid: number, signal: NodeJS.Signals): void {
-  try {
-    process.kill(-processGroupPid, signal);
-  } catch (error) {
-    if (!isNoSuchProcess(error)) throw error;
-  }
+  processOwnership.signalGroup(processGroupPid, signal);
 }
 
 async function waitForProcessGroupExit(processGroupPid: number, timeoutMs: number): Promise<boolean> {
@@ -1848,51 +1907,23 @@ async function assertNoHostVisibleSidecarCredential(
 async function packagedProcesses(
   isolatedUserData: string,
   sidecar?: string,
-  allowDuringCleanup = false,
 ): Promise<PackagedProcess[]> {
-  const { stdout } = await runCapture(
-    ["/bin/ps", "-axo", "pid=,pgid=,command="],
-    repositoryRoot,
-    5_000,
-    allowDuringCleanup,
-  );
-  const rows: Array<{ pid: number; processGroupPid: number; command: string; line: string }> = [];
-  for (const line of stdout.split(/\r?\n/u)) {
-    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/u);
-    if (!match) continue;
-    rows.push({
-      pid: Number.parseInt(match[1]!, 10),
-      processGroupPid: Number.parseInt(match[2]!, 10),
-      command: match[3]!,
-      line,
-    });
-  }
-  const smokeProcessGroupPid = rows.find((row) => row.pid === process.pid)?.processGroupPid;
-  if (!smokeProcessGroupPid) throw new Error("Unable to resolve the desktop smoke process group");
-  const matches: PackagedProcess[] = [];
-  for (const row of rows) {
-    const command = row.command;
-    const isOwnedHelper = command.includes(isolatedUserData);
-    const isOwnedSidecar = Boolean(
-      sidecar && (command === sidecar || command.startsWith(`${sidecar} `)),
-    );
-    if (!isOwnedHelper && !isOwnedSidecar) continue;
-    if (row.pid !== process.pid) {
-      matches.push({
-        pid: row.pid,
-        processGroupPid: row.processGroupPid,
-        processGroupIsSafe: row.processGroupPid > 1 && row.processGroupPid !== smokeProcessGroupPid,
-        isSidecar: isOwnedSidecar,
-        command,
-        line: row.line,
-      });
-    }
-  }
-  return matches;
+  assertNotTerminating();
+  // Paths only distinguish known-owned processes for the credential audit;
+  // they can never grant ownership to another Chili launch.
+  return ownedProcesses(sidecar).filter((entry) => entry.isSidecar || entry.command.includes(isolatedUserData));
 }
 
-async function terminateOwnedProcesses(isolatedUserData: string, sidecar?: string): Promise<void> {
-  const initial = await packagedProcesses(isolatedUserData, sidecar, true);
+function ownedProcesses(sidecar?: string): PackagedProcess[] {
+  return processOwnership.scan().map((row) => ({
+    ...row,
+    processGroupIsSafe: processOwnership.isOwnedGroup(row.processGroupPid),
+    isSidecar: Boolean(sidecar && (row.command === sidecar || row.command.startsWith(`${sidecar} `))),
+  }));
+}
+
+async function terminateOwnedProcesses(sidecar?: string): Promise<void> {
+  const initial = ownedProcesses(sidecar);
   const initialResults = await terminateDiscoveredProcesses(initial);
   const failures = initialResults
     .filter((result): result is PromiseRejectedResult => result.status === "rejected")
@@ -1901,12 +1932,12 @@ async function terminateOwnedProcesses(isolatedUserData: string, sidecar?: strin
   // Always perform a second independent discovery pass. It catches children
   // that appeared while the first set was terminating, and a failed probe is
   // surfaced only after the temporary-root cleanup has still been attempted.
-  const remaining = await packagedProcesses(isolatedUserData, sidecar, true);
+  const remaining = ownedProcesses(sidecar);
   const remainingResults = await terminateDiscoveredProcesses(remaining);
   failures.push(...remainingResults
     .filter((result): result is PromiseRejectedResult => result.status === "rejected")
     .map((result) => result.reason as unknown));
-  if (failures.length > 0) throw new AggregateError(failures, `Failed to terminate owned processes for ${isolatedUserData}`);
+  if (failures.length > 0) throw new AggregateError(failures, "Failed to terminate processes owned by this smoke run");
 }
 
 async function terminateDiscoveredProcesses(processes: readonly PackagedProcess[]): Promise<PromiseSettledResult<void>[]> {
@@ -1961,11 +1992,7 @@ async function terminatePid(pid: number): Promise<void> {
 }
 
 function signalPid(pid: number, signal: NodeJS.Signals): void {
-  try {
-    process.kill(pid, signal);
-  } catch (error) {
-    if (!isNoSuchProcess(error)) throw error;
-  }
+  processOwnership.signalPid(pid, signal);
 }
 
 function cleanupSmokeResources(): Promise<unknown[]> {
@@ -1974,6 +2001,14 @@ function cleanupSmokeResources(): Promise<unknown[]> {
 }
 
 async function performSmokeResourceCleanup(): Promise<unknown[]> {
+  // Discover descendants while their launched parents still exist. Captured
+  // launch identities let us safely recognize detached sidecars after reparenting.
+  const discoveryFailures: unknown[] = [];
+  try {
+    processOwnership.scan();
+  } catch (error) {
+    discoveryFailures.push(error);
+  }
   // Close/kill every known Electron/build group first. Only then discover the
   // sidecar, so its stdin has reached EOF and its parent-loss watchdog gets the
   // full containment grace before any fallback signal targets its own group.
@@ -1983,12 +2018,12 @@ async function performSmokeResourceCleanup(): Promise<unknown[]> {
     ...[...observedBlockedGitProcessGroups].map((pid) => terminateProcessGroup(pid)),
   ]);
   const ownedCleanup = await Promise.allSettled([
-    terminateOwnedProcesses(userData, packagedSidecar),
-    terminateOwnedProcesses(hardCrashUserData, packagedSidecar),
+    terminateOwnedProcesses(packagedSidecar),
   ]);
   const failures = [...registeredCleanup, ...ownedCleanup]
     .filter((result): result is PromiseRejectedResult => result.status === "rejected")
     .map((result) => result.reason as unknown);
+  failures.push(...discoveryFailures);
   try {
     providerLoadServer?.stop(true);
     providerLoadServer = undefined;

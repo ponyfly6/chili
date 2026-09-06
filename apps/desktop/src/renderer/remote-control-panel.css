@@ -1,0 +1,10 @@
+.remote-panel-anchor { position: relative; -webkit-app-region: no-drag; }
+.remote-panel { position: fixed; top: 60px; right: 18px; z-index: 100; width: min(420px, calc(100vw - 32px)); max-height: calc(100vh - 90px); overflow: auto; padding: 20px; border: 1px solid var(--line, #444); border-radius: 14px; background: var(--canvas-deep, #161615); color: var(--text, #eee); box-shadow: 0 12px 50px #0008; font-size: 13px; line-height: 1.55; -webkit-app-region: no-drag; }
+.remote-panel p { margin: 12px 0; }
+.remote-panel button { min-height: 36px; margin: 4px 6px 4px 0; padding: 6px 12px; border: 1px solid var(--line, #444); border-radius: 8px; background: var(--surface, #262624); color: inherit; cursor: pointer; }
+.remote-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.remote-panel-heading button { padding: 0 10px; }
+.remote-panel-origin, .remote-panel-device code { overflow-wrap: anywhere; }
+.remote-panel-device { margin-top: 12px; padding-top: 12px; border-top: 1px solid #8884; }
+.remote-panel-device code { display: block; font-size: 11px; }
+.remote-panel-error { color: #b42318; }

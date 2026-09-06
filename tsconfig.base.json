@@ -51,6 +51,12 @@
       ],
       "@chili/tools": [
         "packages/tools/src/index.ts"
+      ],
+      "@chili/remote-control": [
+        "packages/remote-control/src/index.ts"
+      ],
+      "@chili/remote-control/browser": [
+        "packages/remote-control/src/browser.ts"
       ]
     },
     "skipLibCheck": true,
