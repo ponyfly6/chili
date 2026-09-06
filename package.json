@@ -17,6 +17,7 @@
     "desktop:build": "bun run --cwd apps/desktop build",
     "desktop:package": "bun run --cwd apps/desktop package:mac",
     "desktop:package:dir": "bun run --cwd apps/desktop package:dir",
+    "desktop:preview": "bun run scripts/desktop-preview.ts",
     "test:e2e:desktop": "bun run --cwd apps/desktop test:e2e",
     "smoke:desktop": "bun run scripts/smoke-desktop.ts",
     "tui": "bun run apps/tui/src/index.tsx",

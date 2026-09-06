@@ -27,6 +27,7 @@ const API_BODY_BYTES = 100_000;
 const PAIRING_BODY_BYTES = 4_096;
 const MAX_POLL_BYTES = REMOTE_CONTROL_LIMITS.maxQueueBytes;
 const REQUEST_TIMEOUT_MS = 5_000;
+const MAX_TLS_MATERIAL_BYTES = 256 * 1024;
 const CONTROL_PREFIX = "/api/control/";
 const MIME_TYPES: Readonly<Record<string, string>> = Object.freeze({
   ".html": "text/html; charset=utf-8",
@@ -39,6 +40,18 @@ const MIME_TYPES: Readonly<Record<string, string>> = Object.freeze({
   ".woff2": "font/woff2",
 });
 
+/** Main-process TLS input. enable consumes and clears both buffers; never send over IPC. */
+export interface PrivateControlTlsMaterial {
+  readonly certificate: Buffer;
+  readonly privateKey: Buffer;
+}
+
+/** Also release a prepared input when its caller cancels before invoking enable. */
+export function disposePrivateControlTlsMaterial(material?: PrivateControlTlsMaterial): void {
+  material?.certificate.fill(0);
+  material?.privateKey.fill(0);
+}
+
 export interface PrivateControlHttpsConfig {
   /** Literal loopback, RFC1918, link-local, ULA or CGNAT address; never 0.0.0.0/::. */
   readonly bindAddress: string;
@@ -48,6 +61,8 @@ export interface PrivateControlHttpsConfig {
   readonly publicOrigin: string;
   readonly tlsCertPath: string;
   readonly tlsKeyPath: string;
+  /** Already validated bytes take precedence over paths and are consumed exactly once. */
+  readonly tlsMaterial?: PrivateControlTlsMaterial;
   /** Only built, allowlisted static assets are loaded. No filesystem path is accepted remotely. */
   readonly webRoot: string;
 }
@@ -168,19 +183,33 @@ export class PrivateControlHttpsHost {
   }
 
   async enable(config: PrivateControlHttpsConfig): Promise<PrivateControlHttpsSnapshot> {
-    if (this.#state || this.#starting || this.#opening) fail("already_enabled", "Remote control is already enabled or starting.");
+    if (this.#state || this.#starting || this.#opening) {
+      disposePrivateControlTlsMaterial(config.tlsMaterial);
+      fail("already_enabled", "Remote control is already enabled or starting.");
+    }
     let finishOpening!: () => void;
     const opening = new Promise<void>((finish) => { finishOpening = finish; });
     this.#opening = opening;
     this.#starting = true;
     const generation = ++this.#generation;
-    this.#notify();
     let server: Server | undefined;
+    let cert = config.tlsMaterial?.certificate;
+    let key = config.tlsMaterial?.privateKey;
     try {
+      this.#notify();
       const origin = await validateConfig(config);
-      const [cert, key, assets] = await Promise.all([
-        readFile(config.tlsCertPath), readFile(config.tlsKeyPath), loadAssets(config.webRoot),
-      ]);
+      if (config.tlsMaterial) {
+        if (!Buffer.isBuffer(cert) || !Buffer.isBuffer(key) || cert.length === 0 || key.length === 0
+          || cert.length > MAX_TLS_MATERIAL_BYTES || key.length > MAX_TLS_MATERIAL_BYTES) {
+          fail("invalid_tls_material", "The prepared HTTPS certificate and private key are invalid.");
+        }
+      } else {
+        // Preserve direct path callers; desktop setup supplies its bounded, validated bytes.
+        // Assign reads separately so a later read failure still clears material already read.
+        cert = await readFile(config.tlsCertPath);
+        key = await readFile(config.tlsKeyPath);
+      }
+      const assets = await loadAssets(config.webRoot);
       if (generation !== this.#generation) fail("remote_disabled", "Remote control was disabled.", 410);
       server = createServer({ cert, key, minVersion: "TLSv1.2", maxHeaderSize: 8_192 });
       server.requestTimeout = REQUEST_TIMEOUT_MS;
@@ -231,6 +260,8 @@ export class PrivateControlHttpsHost {
       if (error instanceof PrivateControlHttpsError) throw error;
       throw new PrivateControlHttpsError("setup_failed", "Cannot start HTTPS. Check the private address, TLS certificate/key, port and control-web build.");
     } finally {
+      cert?.fill(0);
+      key?.fill(0);
       finishOpening();
       if (this.#opening === opening) this.#opening = undefined;
     }

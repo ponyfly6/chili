@@ -42,6 +42,20 @@ bun run desktop:package
 
 本轮最终验收与 `smoke:desktop` 产物固定使用完整 ad-hoc 签名，避免 fuses 修改后产生无效 bundle 签名。它是本地 MVP 验证物，**不可直接作为正式分发包**；当前配置明确拒绝 non-ad-hoc identity，未来独立的发布 pipeline 才会支持 Developer ID 签名与 notarization。正式 DMG/ZIP 发布与升级链路也明确不在本轮范围内。开发运行与本地 ad-hoc 包使用 Chromium mock Keychain，避免每次重签后触发 macOS Keychain ACL 对话；Chili 不在 Chromium storage 中保存 provider 密钥。未来使用稳定身份签名的发布包仍应使用系统 Keychain。
 
+## 本地 Preview
+
+在已提交的干净 checkout 执行：
+
+```bash
+bun run desktop:preview
+```
+
+默认在 `~/Downloads/Chili Previews/` 创建唯一版本目录，保留 `release/mac-arm64/Chili Preview.app`（Intel Mac 为 `release/mac/`）与 `build-manifest.json`。也可用 `bun run desktop:preview --output /absolute/parent-directory` 选择仓库外的父目录。清单记录完整 Git revision、构建时间、架构、相对应用位置及 executable/ASAR/sidecar 的 SHA-256。构建前后检查 Git revision 与源码状态；构建失败只清理本轮独有目录，成功不自动启动。
+
+Preview 的应用标识为 `dev.chili.control.preview`，默认桌面配置目录为 `~/Library/Application Support/Chili Preview`，在获取单实例锁之前与普通 Chili 分开。窗口品牌区域显示 `Preview · <12 位 Git revision>`，用来确认打开的是哪次构建。它不会复制旧版的工作区选择与远控配置；首次打开需选择工作区。原有项目数据仍在所选工作区，provider 配置仍遵循 Chili runtime 的配置规则，Preview 并非独立复制的项目/runtime 数据库。需要隔离测试时选择专用工作区并设置专用 `CHILI_HOME`。
+
+Preview 使用本地 ad-hoc 签名，不是已公证的正式发布包。打包器不会覆盖共享 `apps/desktop/release`、替换旧应用、修改系统信任或发布产物。
+
 ## 产品表面
 
 - 选择或切换本地工作区。
@@ -90,7 +104,7 @@ MCP 面板读取当前 session scope 的 server 状态与汇总，并提供 relo
 - 锁屏可见的 approval 与 user-input 原生通知只显示固定泛化文案，不包含问题、路径、命令 pattern、token 或其他运行时详情。
 - Electron fuses 禁止 RunAsNode、Node options、CLI inspect 和 file-protocol extra privileges，只允许从带完整性校验的 ASAR 加载应用。
 
-运行状态只持久化工作区路径。provider key、OAuth token、sidecar token 和 endpoint 都不会写入 desktop state。
+`desktop-state.json` 只持久化工作区路径。单独的 `remote-control-settings.json` 以 0600 权限保存本机绑定地址、端口及用户通过原生对话框选择的 TLS 文件引用；不复制证书或私钥内容。provider key、OAuth token、sidecar token、手机授权及启用状态均不写入这两个文件。
 
 更完整的模块与 transport 设计见 [../../docs/desktop-architecture.md](../../docs/desktop-architecture.md)。
 
@@ -98,4 +112,6 @@ MCP 面板读取当前 session scope 的 server 状态与汇总，并提供 relo
 
 通过标题栏 **Phone · Off** 开启配有可信 TLS 的私网端点，生成短期一次性配对码并在本地确认设备。手机只控制当前工作区的既有顶层任务（列表、有限消息、Queue / Steer / Stop），与桌面窗口共享同一个 `DesktopControlService`。远控默认关闭；关闭、切换工作区或重启会使旧授权失效。手机刷新需重新配对，审批与提问只能回桌面处理。
 
-启动环境、证书与私网准备、3–5 分钟真机清单及测试边界见 [手机 Alpha 验收指南](../../docs/private-mobile-alpha-acceptance.md)。远程真实浏览器门禁：`bun run test:e2e:remote`。它不会修改系统信任、VPN 或防火墙；窄屏浏览器测试不等于 iPhone/Android 真机验收。
+Phone 面板可选择本机私网地址与端口，依次在原生文件对话框选择证书和私钥并保存。保存不会开启监听；每次开启都重新检查地址仍可用、证书 SAN/有效期及密钥匹配。证书路径和 PEM 留在主进程，不跨越 renderer IPC。修改配置前须关闭远控；取消文件选择保留旧配置。完整的既有 `CHILI_REMOTE_*` 启动环境仍优先且在面板只读，部分环境配置会报错，不与保存值混用。
+
+证书与私网准备、环境启动兼容方式、3–5 分钟真机清单及测试边界见 [手机 Alpha 验收指南](../../docs/private-mobile-alpha-acceptance.md)。远程真实浏览器门禁：`bun run test:e2e:remote`。它不会修改系统信任、VPN 或防火墙；窄屏浏览器测试不等于 iPhone/Android 真机验收。

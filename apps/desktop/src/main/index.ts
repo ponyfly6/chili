@@ -8,9 +8,11 @@ import {
   Notification,
 } from "electron";
 import { safeDesktopErrorMessage as safeLogMessage } from "../shared/safe-error.js";
+import { getDesktopBuildInfo } from "../shared/build-info.js";
 import { BootstrapLifecycleGuard } from "./bootstrap-lifecycle.js";
 import { DesktopControlService } from "./control-service.js";
 import { DesktopRemoteControlManager } from "./remote-control-manager.js";
+import { DesktopRemoteSettings } from "./remote-control-settings.js";
 import { DeferredElectronQuit } from "./deferred-electron-quit.js";
 import { registerDesktopIpc, type DesktopIpcController } from "./ipc.js";
 import { shouldUseMockKeychain } from "./keychain-policy.js";
@@ -32,6 +34,10 @@ import {
 const repositoryRoot = resolve(import.meta.dirname, "../../../..");
 const isolatedUserData = process.env.CHILI_DESKTOP_USER_DATA?.trim();
 if (isolatedUserData && isAbsolute(isolatedUserData)) app.setPath("userData", isolatedUserData);
+else if (getDesktopBuildInfo().channel === "preview") {
+  // Preview must never hand a new launch to an older Chili instance's lock.
+  app.setPath("userData", resolve(app.getPath("appData"), "Chili Preview"));
+}
 // Every local package is re-signed ad-hoc, so macOS sees each rebuild as a new
 // Keychain ACL principal. The renderer stores no secrets in Chromium storage;
 // stable signed release builds continue to use the system Keychain.
@@ -123,12 +129,19 @@ async function bootstrap(): Promise<void> {
     emitQueue: (sessionId, count) => desktopIpc?.publish({ type: "queue.changed", sessionId, count }),
     onError: (error) => console.error("Desktop control error", safeLogMessage(error)),
   });
-  remoteControl = new DesktopRemoteControlManager({
-    controlService: control,
+  const remoteSettings = new DesktopRemoteSettings({
+    settingsPath: resolve(app.getPath("userData"), "remote-control-settings.json"),
     environment: process.env,
     defaultWebRoot: app.isPackaged
       ? resolve(process.resourcesPath, "control-web")
       : resolve(repositoryRoot, "apps/control-web/dist"),
+    chooseTlsFiles,
+  });
+  await remoteSettings.initialize();
+  if (!bootstrapLifecycle.canContinue()) return;
+  remoteControl = new DesktopRemoteControlManager({
+    controlService: control,
+    settings: remoteSettings,
   });
 
   if (!bootstrapLifecycle.canContinue()) return;
@@ -203,6 +216,23 @@ async function bootstrap(): Promise<void> {
       requestQuit(1);
     }
   }
+}
+
+/** The renderer requests a selection, never supplies a filesystem path. */
+async function chooseTlsFiles(): Promise<{ certificatePath: string; privateKeyPath: string } | undefined> {
+  async function choose(title: string): Promise<string | undefined> {
+    if (!mainWindow || mainWindow.isDestroyed() || !bootstrapLifecycle.canContinue()) return undefined;
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title,
+      properties: ["openFile"],
+      filters: [{ name: "TLS PEM files", extensions: ["pem", "crt", "cer", "key"] }, { name: "All files", extensions: ["*"] }],
+    });
+    return result.canceled ? undefined : result.filePaths[0];
+  }
+  const certificatePath = await choose("Choose the HTTPS certificate for your phone connection");
+  if (!certificatePath) return undefined;
+  const privateKeyPath = await choose("Choose the matching private key — it stays on this computer");
+  return privateKeyPath ? { certificatePath, privateKeyPath } : undefined;
 }
 
 async function selectWorkspace(): Promise<string | undefined> {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { createHash, X509Certificate } from "node:crypto";
 import { createServer } from "node:https";
 import { createServer as createPortProbe } from "node:net";
@@ -9,6 +9,7 @@ import { FIXTURE_KEY, runCommand, startModelFixture, trustTestAuthorityInProfile
 import { openRelayEnvelope, type PairingGrant } from "../../../packages/remote-control/src/pairing-security.js";
 import { decodeWireEnvelope } from "../../../packages/remote-control/src/http-wire.js";
 import type { RemoteControlFrame, RemoteControlRequestFrame } from "../../../packages/remote-control/src/protocol.js";
+import type { ChiliRemoteDesktopApi, RemoteDesktopState } from "../src/shared/remote-control-contracts.js";
 
 const temporaryRoot = process.env.CHILI_REMOTE_E2E_ROOT;
 assert.ok(temporaryRoot && isAbsolute(temporaryRoot));
@@ -116,11 +117,13 @@ try {
       ELECTRON_RENDERER_URL: `${fixture.origin}/renderer/index.html`, CHILI_DESKTOP_WORKSPACE: workspace,
       CHILI_DESKTOP_USER_DATA: userData, CHILI_DESKTOP_DISABLE_DEVTOOLS: "1", CHILI_DESKTOP_MODEL: "deepseek",
       CHILI_HOME: isolatedHome, DEEPSEEK_API_KEY: FIXTURE_KEY, DEEPSEEK_BASE_URL: fixture.origin,
-      DEEPSEEK_MODEL: "deepseek-v4-pro", CHILI_REMOTE_BIND_ADDRESS: remoteBindAddress, CHILI_REMOTE_PORT: String(remotePort),
-      CHILI_REMOTE_ORIGIN: remoteOrigin, CHILI_REMOTE_TLS_CERT: certificate.certificate, CHILI_REMOTE_TLS_KEY: certificate.key,
-      CHILI_REMOTE_WEB_ROOT: join(repositoryRoot, "apps/control-web/dist"),
+      DEEPSEEK_MODEL: "deepseek-v4-pro",
     } };
   desktop = await electron.launch(launchOptions);
+  assert.deepEqual(await desktop.evaluate(() => [
+    "CHILI_REMOTE_BIND_ADDRESS", "CHILI_REMOTE_PORT", "CHILI_REMOTE_ORIGIN",
+    "CHILI_REMOTE_TLS_CERT", "CHILI_REMOTE_TLS_KEY", "CHILI_REMOTE_WEB_ROOT",
+  ].filter((name) => process.env[name] !== undefined)), [], "Native setup must run without HTTPS launch configuration");
   desktop.process().stdout?.on("data", (chunk: Buffer) => { desktopStdout = (desktopStdout + chunk.toString("utf8")).slice(-2_000_000); });
   desktop.process().stderr?.on("data", (chunk: Buffer) => { desktopStderr = (desktopStderr + chunk.toString("utf8")).slice(-2_000_000); });
   desktopPage = await desktop.firstWindow();
@@ -133,6 +136,21 @@ try {
   await waitUntil("initial streamed model request", () => fixture.requests.some((request) => request.text === "[slow] initial desktop task"));
   await desktopPage.getByTestId("remote-open").click();
   assert.equal(await desktopPage.getByTestId("remote-status").count(), 0, "Remote must start disabled");
+  process.stdout.write("[remote-e2e] Saving private HTTPS through the native desktop setup and testing picker cancellation\n");
+  const savedSetup = await configureThroughUi(desktop, desktopPage, userData);
+  evidence.nativeSetupModal = await assertNativeSetupModal(desktop, desktopPage);
+  evidence.nativeSetup = {
+    launchHttpsEnvironmentFields: 0,
+    realDesktopFormAndIpc: true,
+    chooserAutomation: "only native certificate/private-key dialog selection results; production settings validation and persistence",
+    certificatePickerCancellationLeavesSetupAbsent: true,
+    keyPickerCancellationPreservesPreviousSetup: true,
+    saveLeavesRemoteOff: true,
+    settingsFileMode: "0600",
+    persistedFields: ["version", "bindAddress", "port", "tlsCertPath", "tlsKeyPath"],
+    authorizationAndEnabledStatePersisted: false,
+    rendererContainsNoTlsPathsOrContents: true,
+  };
   await desktopPage.getByTestId("remote-enable").click();
   await desktopPage.getByTestId("remote-status").waitFor();
   evidence.remoteDefaultOff = true;
@@ -227,6 +245,17 @@ try {
   await waitUntil("restarted real sidecar healthy", async () => /healthy/iu.test(await desktopPage!.locator('[title="Local runtime status"]').innerText()));
   await desktopPage.getByTestId("remote-open").click();
   assert.equal(await desktopPage.getByTestId("remote-status").count(), 0, "Desktop restart must leave remote disabled");
+  await desktopPage.getByTestId("remote-setup-replace-tls").waitFor();
+  assert.equal(await desktopPage.getByTestId("remote-setup-address").inputValue(), remoteBindAddress);
+  assert.equal(await desktopPage.getByTestId("remote-setup-port").inputValue(), String(remotePort));
+  const restoredSetup = await readDesktopRemoteState(desktopPage);
+  assert.equal(restoredSetup.setup?.source, "saved", "Restart must restore native setup without launch configuration");
+  assert.equal(restoredSetup.enabled, false);
+  assert.deepEqual(restoredSetup.devices, [], "Restart cannot restore paired device authority");
+  assert.equal(restoredSetup.pairing, undefined, "Restart cannot restore a pairing code");
+  assert.equal(await assertPersistedSetup(userData), savedSetup, "Pairing and restart must not write authority into setup");
+  await assertNoTlsMaterialInRenderer(desktopPage, restoredSetup);
+  evidence.desktopRestartPreservesNativeSetupWithoutAuthorization = true;
   await desktopPage.getByTestId("remote-enable").click();
   await desktopPage.getByTestId("remote-status").waitFor();
   await mobile.getByTestId("reconnect").click();
@@ -255,6 +284,7 @@ try {
   await desktopPage.getByTestId("remote-open").click();
   await desktopPage.getByTestId("remote-enable").waitFor();
   assert.equal(await desktopPage.getByTestId("remote-status").count(), 0);
+  assert.equal(await assertPersistedSetup(userData), savedSetup, "Workspace persistence must not replace phone setup");
   await waitUntil("workspace selection disconnects prior phone grant", async () => !/已安全连接/u.test(await mobile!.getByTestId("connection-status").innerText()));
   await desktopPage.getByTestId("remote-enable").click();
   await desktopPage.getByTestId("remote-status").waitFor();
@@ -322,6 +352,205 @@ async function reservePort(bindAddress: string): Promise<number> {
   assert.ok(value && typeof value !== "string");
   await new Promise<void>((resolve, reject) => probe.close((error) => error ? reject(error) : resolve()));
   return value.port;
+}
+
+interface DesktopSetupWindow extends Window { chiliRemote: ChiliRemoteDesktopApi }
+interface NativeDialogProbe {
+  original: Electron.Dialog["showOpenDialog"];
+  titles: string[];
+  unexpected: boolean;
+}
+interface NativeDialogGlobal { __chiliNativeTlsDialogProbe?: NativeDialogProbe }
+
+async function readDesktopRemoteState(page: Page): Promise<RemoteDesktopState> {
+  return page.evaluate(() => (window as unknown as DesktopSetupWindow).chiliRemote.invoke({ type: "status" }));
+}
+
+/** Replace only native chooser results; the form, IPC, manager, TLS reads and save are real. */
+async function chooseTlsThroughUi(application: ElectronApplication, page: Page, button: string, selections: Array<string | null>): Promise<void> {
+  await application.evaluate(({ dialog }, paths) => {
+    const target = globalThis as NativeDialogGlobal;
+    if (target.__chiliNativeTlsDialogProbe) throw new Error("A native TLS picker probe is already installed");
+    const probe: NativeDialogProbe = { original: dialog.showOpenDialog, titles: [], unexpected: false };
+    target.__chiliNativeTlsDialogProbe = probe;
+    dialog.showOpenDialog = async (...args: unknown[]) => {
+      const options = args.at(-1) as Electron.OpenDialogOptions | undefined;
+      const index = probe.titles.length;
+      probe.titles.push(options?.title ?? "");
+      if (index >= paths.length || options?.properties?.length !== 1 || options.properties[0] !== "openFile") {
+        probe.unexpected = true;
+        throw new Error("Unexpected native dialog during phone setup");
+      }
+      const path = paths[index];
+      return path ? { canceled: false, filePaths: [path] } : { canceled: true, filePaths: [] };
+    };
+  }, selections);
+  let probeResult: { titles: string[]; unexpected: boolean } | undefined;
+  try {
+    await page.getByTestId(button).click();
+    await waitUntil("native TLS file selection completes", async () => application.evaluate((_electron, count) => {
+      const probe = (globalThis as NativeDialogGlobal).__chiliNativeTlsDialogProbe;
+      return Boolean(probe && (probe.unexpected || probe.titles.length >= count));
+    }, selections.length));
+    await waitUntil("native setup releases its main-process operation", async () => (await readDesktopRemoteState(page)).setup?.busy === false);
+    await waitUntil("native setup operation settles in the real UI", async () => page.getByTestId("remote-setup-save").isEnabled());
+  } finally {
+    probeResult = await application.evaluate(({ dialog }) => {
+      const target = globalThis as NativeDialogGlobal;
+      const probe = target.__chiliNativeTlsDialogProbe;
+      if (!probe) return undefined;
+      dialog.showOpenDialog = probe.original;
+      delete target.__chiliNativeTlsDialogProbe;
+      return { titles: probe.titles, unexpected: probe.unexpected };
+    });
+  }
+  assert.ok(probeResult);
+  assert.equal(probeResult.unexpected, false, "Setup must invoke only its two native file pickers");
+  assert.equal(probeResult.titles.length, selections.length);
+  assert.match(probeResult.titles[0] ?? "", /certificate/iu);
+  if (selections.length === 2) assert.match(probeResult.titles[1] ?? "", /private key/iu);
+}
+
+async function configureThroughUi(application: ElectronApplication, page: Page, profileDirectory: string): Promise<string> {
+  await page.getByTestId("remote-setup-address").selectOption(remoteBindAddress);
+  await page.getByTestId("remote-setup-port").fill(String(remotePort));
+  const initial = await readDesktopRemoteState(page);
+  assert.equal(initial.setup?.source, "none", "Setup must start without HTTPS environment configuration");
+  assert.equal(initial.setup.hasTlsFiles, false);
+  assert.equal(initial.enabled, false);
+  assert.equal(await page.getByTestId("remote-enable").isDisabled(), true);
+
+  await chooseTlsThroughUi(application, page, "remote-setup-save", [null]);
+  const cancelled = await readDesktopRemoteState(page);
+  assert.equal(cancelled.setup?.source, "none");
+  assert.equal(cancelled.setup.hasTlsFiles, false);
+  assert.equal(cancelled.setup.error, undefined, "Cancelling a native picker is not a configuration error");
+  assert.equal(await page.getByTestId("remote-enable").isDisabled(), true);
+  assert.equal(await page.getByTestId("remote-setup-clear").count(), 0);
+  await assert.rejects(stat(join(profileDirectory, "remote-control-settings.json")), { code: "ENOENT" });
+
+  await chooseTlsThroughUi(application, page, "remote-setup-save", [certificate.certificate, certificate.key]);
+  await page.getByTestId("remote-setup-replace-tls").waitFor();
+  await waitUntil("native setup makes Enable available", async () => page.getByTestId("remote-enable").isEnabled());
+  const configured = await readDesktopRemoteState(page);
+  assert.equal(configured.setup?.source, "saved");
+  assert.equal(configured.setup.bindAddress, remoteBindAddress);
+  assert.equal(configured.setup.port, remotePort);
+  assert.equal(configured.enabled, false, "Saving native setup must not start HTTPS");
+  assert.equal(await page.getByTestId("remote-status").count(), 0);
+  await assertNoTlsMaterialInRenderer(page, configured);
+  const saved = await assertPersistedSetup(profileDirectory);
+
+  // Select a certificate but cancel the private key: neither files nor the new
+  // draft port may partially replace the already working saved configuration.
+  const cancelledPort = remotePort === 65_535 ? remotePort - 1 : remotePort + 1;
+  await page.getByTestId("remote-setup-port").fill(String(cancelledPort));
+  await chooseTlsThroughUi(application, page, "remote-setup-replace-tls", [certificate.certificate, null]);
+  assert.equal(await assertPersistedSetup(profileDirectory), saved);
+  const retained = await readDesktopRemoteState(page);
+  assert.equal(retained.setup?.port, remotePort);
+  assert.equal(retained.setup.error, undefined);
+  assert.equal(retained.enabled, false);
+  assert.equal(await page.getByTestId("remote-setup-port").inputValue(), String(cancelledPort), "Cancellation retains the unsaved form draft");
+  await page.getByTestId("remote-setup-discard").click();
+  await waitUntil("discarded setup edits restore Enable", async () => page.getByTestId("remote-enable").isEnabled());
+  assert.equal(await page.getByTestId("remote-setup-port").inputValue(), String(remotePort));
+  return saved;
+}
+
+async function assertNativeSetupModal(application: ElectronApplication, page: Page): Promise<unknown[]> {
+  const originalSize = await application.evaluate(({ BrowserWindow }) => {
+    const window = BrowserWindow.getAllWindows()[0];
+    if (!window) throw new Error("Desktop window is unavailable");
+    return window.getContentSize();
+  });
+  const results: unknown[] = [];
+  const dialog = page.getByRole("dialog", { name: "Phone control", exact: true });
+  const close = page.getByRole("button", { name: "Close phone control", exact: true });
+  const focusableSelector = "button:not(:disabled), input:not(:disabled), select:not(:disabled), summary, a[href], [tabindex='0']";
+  try {
+    for (const width of [1440, 820, 390]) {
+      const actualSize = await application.evaluate(({ BrowserWindow }, size) => {
+        const window = BrowserWindow.getAllWindows()[0];
+        if (!window) throw new Error("Desktop window is unavailable");
+        window.setContentSize(size.width, size.height, false);
+        return window.getContentSize();
+      }, { width, height: 820 });
+      assert.deepEqual(actualSize, [width, 820]);
+      await page.waitForFunction((expected) => innerWidth === expected && innerHeight === 820, width);
+      const metrics = await dialog.evaluate((element) => {
+        const bounds = element.getBoundingClientRect();
+        const scroller = element.querySelector<HTMLElement>(".remote-panel-scroll");
+        if (!scroller) throw new Error("Phone dialog scroll container is unavailable");
+        return {
+          width: innerWidth, height: innerHeight,
+          documentWidth: document.documentElement.scrollWidth, bodyWidth: document.body.scrollWidth,
+          left: bounds.left, right: bounds.right, top: bounds.top, bottom: bounds.bottom,
+          scrollWidth: scroller.scrollWidth, clientWidth: scroller.clientWidth,
+          backgroundInert: document.querySelector<HTMLElement>(".app-shell")?.inert,
+        };
+      });
+      assert.ok(metrics.documentWidth <= width + 1 && metrics.bodyWidth <= width + 1, `Desktop horizontal overflow: ${JSON.stringify(metrics)}`);
+      assert.ok(metrics.left >= 0 && metrics.right <= width + 1 && metrics.top >= 0 && metrics.bottom <= 821, `Phone dialog exceeds its native window: ${JSON.stringify(metrics)}`);
+      assert.ok(metrics.scrollWidth <= metrics.clientWidth + 1, `Phone dialog horizontal overflow: ${JSON.stringify(metrics)}`);
+      assert.equal(metrics.backgroundInert, true);
+      await page.screenshot({ path: join(artifacts, `desktop-phone-setup-${width}.png`) });
+
+      await close.focus();
+      const focusableCount = await dialog.evaluate((element, selector) => Array.from(element.querySelectorAll<HTMLElement>(selector)).filter((node) => node.getClientRects().length > 0).length, focusableSelector);
+      assert.ok(focusableCount > 2);
+      await page.keyboard.press("Shift+Tab");
+      assert.equal(await dialog.evaluate((element, selector) => {
+        const controls = Array.from(element.querySelectorAll<HTMLElement>(selector)).filter((node) => node.getClientRects().length > 0);
+        return document.activeElement === controls.at(-1);
+      }, focusableSelector), true, "Shift+Tab wraps from the first control to the last");
+      await page.keyboard.press("Tab");
+      assert.equal(await close.evaluate((element) => element === document.activeElement), true, "Tab wraps back to the first control");
+      for (let index = 0; index < focusableCount + 1; index += 1) {
+        await page.keyboard.press("Tab");
+        assert.equal(await dialog.evaluate((element) => element.contains(document.activeElement)), true, "Tab focus stays inside Phone control");
+      }
+      await page.keyboard.press("Escape");
+      await dialog.waitFor({ state: "hidden" });
+      assert.equal(await page.getByTestId("remote-open").evaluate((element) => element === document.activeElement), true, "Escape returns keyboard focus to the Phone trigger");
+      assert.equal(await page.locator(".app-shell").evaluate((element) => (element as HTMLElement).inert), false);
+      await page.getByTestId("remote-open").click();
+      await dialog.waitFor();
+      assert.equal(await close.evaluate((element) => element === document.activeElement), true, "Opening Phone control focuses its close button");
+      results.push({ ...metrics, keyboardTrap: true, escapeCloses: true, triggerFocusRestored: true, screenshot: `desktop-phone-setup-${width}.png` });
+    }
+  } finally {
+    await application.evaluate(({ BrowserWindow }, size) => {
+      const window = BrowserWindow.getAllWindows()[0];
+      if (!window) throw new Error("Desktop window is unavailable");
+      window.setContentSize(size[0]!, size[1]!, false);
+    }, originalSize);
+    await page.waitForFunction((size) => innerWidth === size[0] && innerHeight === size[1], originalSize);
+  }
+  await waitUntil("Phone setup remains ready after native-window checks", async () => page.getByTestId("remote-enable").isEnabled());
+  return results;
+}
+
+async function assertPersistedSetup(profileDirectory: string): Promise<string> {
+  const path = join(profileDirectory, "remote-control-settings.json");
+  const text = await readFile(path, "utf8");
+  const saved = JSON.parse(text) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(saved).sort(), ["version", "bindAddress", "port", "tlsCertPath", "tlsKeyPath"].sort(), "Only native connection settings may persist");
+  assert.equal(saved.version, 1);
+  assert.equal(saved.bindAddress, remoteBindAddress);
+  assert.equal(saved.port, remotePort);
+  assert.equal(saved.tlsCertPath === certificate.certificate, true, "Only the native certificate selection may persist");
+  assert.equal(saved.tlsKeyPath === certificate.key, true, "Only the native private key selection may persist");
+  assert.equal(text.includes("-----BEGIN"), false, "PEM contents must not enter setup persistence");
+  assert.equal((await stat(path)).mode & 0o777, 0o600, "Saved setup must be private to its owner");
+  return text;
+}
+
+async function assertNoTlsMaterialInRenderer(page: Page, state: RemoteDesktopState): Promise<void> {
+  const exposed = `${JSON.stringify(state)}\n${await page.content()}`;
+  for (const value of [certificate.certificate, certificate.key, "tlsCertPath", "tlsKeyPath", "-----BEGIN PRIVATE KEY-----", "-----BEGIN CERTIFICATE-----"]) {
+    assert.equal(exposed.includes(value), false, "TLS paths and contents must remain outside renderer state and markup");
+  }
 }
 
 async function createDesktopTask(page: Page, title: string, text: string): Promise<void> {

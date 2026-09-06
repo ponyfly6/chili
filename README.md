@@ -78,11 +78,13 @@ bun run desktop:package:dir
 bun run smoke:desktop
 ```
 
+需要保留一个可与旧版同时运行的本地试用包时，在已提交、干净的 checkout 执行 `bun run desktop:preview`。它在 `~/Downloads/Chili Previews/` 新建带 Git 版本的独立目录，保留 `Chili Preview.app` 与校验清单。Preview 使用独立桌面配置目录，窗口显示构建版本；此命令不会自动启动应用。详情见 [Preview 打包说明](apps/desktop/README.md#本地-preview)。
+
 桌面端支持选择工作区、创建/恢复 session、实时 timeline、Queue/Steer/Stop、agent tree、tasks、审批、用户输入和 turn/workspace diff。详细运行说明与安全边界见 [apps/desktop/README.md](apps/desktop/README.md)，架构说明见 [docs/desktop-architecture.md](docs/desktop-architecture.md)。
 
 私网手机 Alpha 使用独立的 `apps/control-web` 页面，通过受信任的私网 HTTPS、HostBridge 和桌面窗口共用的 `DesktopControlService` 操作真实 sidecar/runtime。远控默认关闭；在桌面开启后，手机使用短期一次性配对码申请授权，再由桌面本地确认。手机仅能查看当前工作区已有的顶层任务及有限消息，并执行 Queue、Steer、Stop；任务创建、工作区选择、审批、用户输入答复和权限设置仍在桌面完成。关闭远控、撤销设备、切换工作区或重启桌面会使对应授权失效。
 
-网络与证书配置、浏览器自动化入口和五分钟手机检查清单见 [私网手机 Alpha 验收指南](docs/private-mobile-alpha-acceptance.md)。当前已有真实浏览器到桌面/runtime 的自动化验证，**iPhone / Android 真机验收尚未执行**。此 Alpha 不包含公网 relay、账号、原生手机 App 或后台 daemon。
+在桌面 Phone 面板选择本机私网地址和端口，再通过原生对话框选择证书及私钥；保存后单独开启，无需启动环境变量。配置会保留，启用状态与手机授权不会保留。网络与证书配置、浏览器自动化入口和五分钟手机检查清单见 [私网手机 Alpha 验收指南](docs/private-mobile-alpha-acceptance.md)。当前已有真实浏览器到桌面/runtime 的自动化验证，**iPhone / Android 真机验收尚未执行**。此 Alpha 不包含公网 relay、账号、原生手机 App 或后台 daemon。
 
 运行时会话现在只使用 `session-id` 标识；旧的 `--thread` 参数不再支持。`--resume` 只接受已存在且活跃的交互式 session，子代理 session 请通过 `task_followup` 继续。多代理任务仍以 `task-id` 作为用户可见标识，每个子代理对应唯一的 child session，后续消息会复用同一个 `task-id` 和 child session。邮箱工具输出中的接收方字段已从 `child_session_id` / `childSessionId` 更名为 `recipient_session_id` / `recipientSessionId`。
 
