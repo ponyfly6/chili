@@ -580,7 +580,7 @@ function storeEvent(value: DesktopEvent, streamId: string): StoredEvent {
 
 function eventCoalesceKey(event: DesktopEvent): string | undefined {
   if (event.type === "state.changed") return "state";
-  if (event.type === "queue.changed") return `queue:${event.sessionId}`;
+  if (event.type === "queue.changed") return `queue:${event.projectId ?? ""}:${event.sessionId}`;
   return undefined;
 }
 

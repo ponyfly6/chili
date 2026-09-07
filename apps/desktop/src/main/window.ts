@@ -5,6 +5,7 @@ import {
   app,
   BrowserWindow,
   net,
+  nativeTheme,
   protocol,
   session,
   shell,
@@ -96,7 +97,7 @@ export function createDesktopWindow(): BrowserWindow {
     minWidth: 390,
     minHeight: 620,
     show: false,
-    backgroundColor: "#0d1010",
+    backgroundColor: nativeTheme.shouldUseDarkColors ? "#0c0c0b" : "#f1eee8",
     title: "Chili",
     ...(process.platform === "darwin" ? { titleBarStyle: "hiddenInset" as const } : {}),
     webPreferences: {

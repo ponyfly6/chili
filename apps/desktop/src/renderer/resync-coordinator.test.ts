@@ -43,6 +43,27 @@ type Frame =
 type Projection = CoordinatedProjection<State, Session, Snapshot>;
 
 describe("resync coordinator", () => {
+  test("binds hydration reads and remembered selection to the state returned for that recovery", async () => {
+    const calls: string[] = [];
+    const published: Projection[] = [];
+    const coordinator = createCoordinator({
+      loadState: async () => state("/project-b"),
+      listSessions: async (owner) => {
+        calls.push(`list:${owner.workspace}`);
+        return [session("newest-b"), session("remembered-b")];
+      },
+      preferredSessionId: (owner) => owner.workspace === "/project-b" ? "remembered-b" : undefined,
+      loadSnapshot: async (sessionId, owner) => {
+        calls.push(`snapshot:${owner?.workspace}:${sessionId}`);
+        return { sessionId, events: [] };
+      },
+      publish: (value) => published.push(value),
+    });
+    await coordinator.barrier({ sequence: 1, preferredSessionId: "old-project-a-selection" });
+    expect(calls).toEqual(["list:/project-b", "snapshot:/project-b:remembered-b"]);
+    expect(published[0]?.selectedId).toBe("remembered-b");
+  });
+
   test("hydrates state, sessions, and snapshot in order, then replays live events atomically", async () => {
     const snapshot = deferred<Snapshot>();
     const calls: string[] = [];

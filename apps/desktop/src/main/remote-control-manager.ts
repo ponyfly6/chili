@@ -25,7 +25,7 @@ export class DesktopRemoteControlManager implements ChiliRemoteDesktopApi {
   private closing: Promise<void> = Promise.resolve();
 
   constructor(private readonly options: {
-    controlService: DesktopControlService;
+    controlService: DesktopControlService | (() => DesktopControlService);
     settings: DesktopRemoteSettingsAccess;
   }) {}
 
@@ -101,7 +101,7 @@ export class DesktopRemoteControlManager implements ChiliRemoteDesktopApi {
       configuration = await this.options.settings.configuration();
       if (epoch !== this.transition) return;
       if (!configuration) throw new Error("Set up the connection and select TLS files before enabling phone access");
-      adapter = new DesktopRemoteControlAdapter({ controlService: this.options.controlService });
+      adapter = new DesktopRemoteControlAdapter({ controlService: typeof this.options.controlService === "function" ? this.options.controlService() : this.options.controlService });
       host = new PrivateControlHttpsHost({ controlService: adapter });
       this.adapter = adapter;
       this.host = host;

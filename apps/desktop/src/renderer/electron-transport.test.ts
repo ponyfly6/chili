@@ -7,6 +7,19 @@ import type {
 } from "../shared/contracts.js";
 import { createElectronTransport } from "./electron-transport.js";
 
+test("binds every task operation to its project even after another transport activates a project", async () => {
+  const calls: DesktopRequest[] = [];
+  const api = { invoke: async (request: DesktopRequest) => { calls.push(request); return {}; }, subscribe: () => () => undefined } as ChiliDesktopApi;
+  const host = createElectronTransport(api);
+  const a = host.forProject!("project-a");
+  const b = host.forProject!("project-b");
+  await a.send("same-id", "A", "queue");
+  await b.activateProject!("project-b");
+  await a.setReasoning("same-id", "high");
+  await b.stop("same-id");
+  expect(calls.map((request) => request.projectId)).toEqual(["project-a", "project-b", "project-a", "project-b"]);
+});
+
 test("projection reads wait until workspace selection fully settles", async () => {
   const selection = deferred<DesktopState>();
   const calls: DesktopRequest[] = [];

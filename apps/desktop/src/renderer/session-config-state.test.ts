@@ -70,7 +70,7 @@ test("wires App selection changes and async config acceptance through the sessio
     source.indexOf("const reloadSessionConfig = useCallback"),
     source.indexOf("useEffect(() =>", source.indexOf("const reloadSessionConfig = useCallback")),
   );
-  const response = reload.indexOf("await transport.sessionConfig(sessionId)");
+  const response = reload.indexOf("await projectTransport().sessionConfig(sessionId)");
   const selectedGuard = reload.indexOf("selectedRef.current === sessionId");
   const aggregateGuard = reload.indexOf("sessionConfigResponseForSelection(selectedRef.current, next)");
   const configUpdate = reload.indexOf("setSessionConfig(accepted)");

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import type { ChiliDesktopApi } from "../src/shared/contracts.js";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
@@ -8,6 +9,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { Readable } from "node:stream";
+import { assertDesktopAppearance, assertDesktopAppearanceRestored } from "./appearance.js";
 import {
   _electron as electron,
   type ElectronApplication,
@@ -27,6 +29,10 @@ const SLOW_TITLE = "Steer and stop E2E";
 const SLOW_STEER_PROMPT = "electron slow steer fixture";
 const STEER_REPLACEMENT = "electron steer replacement";
 const RECOVERY_PROMPT = "electron recovery follow-up";
+const PROJECT_B_TITLE = "Independent project B task";
+const PROJECT_B_PROMPT = "work in the second project independently";
+const PROJECT_A_DRAFT = "unsent draft in project A";
+const PROJECT_B_DRAFT = "unsent draft in project B";
 const CLOSE_ABORT_CANARY = process.env.CHILI_E2E_CLOSE_ABORT_CANARY === "1";
 const ENVIRONMENT_CANARY = process.env.CHILI_E2E_ENV_CANARY_ONLY === "1";
 const STDERR_CANARY = process.env.CHILI_E2E_STDERR_CANARY_ONLY === "1";
@@ -167,11 +173,13 @@ try {
     currentLaunch = await launchDesktop("goal-create", "fake");
     await createGoalThroughUi(currentLaunch.page);
     await assertGoalSurface(currentLaunch.page);
+    await assertDesktopAppearance(currentLaunch.page, artifacts);
     await closeDesktop(currentLaunch);
     currentLaunch = undefined;
 
     logStep("launch 2/4: recover the Goal and exercise approval, input, rename, search, and archive");
     currentLaunch = await launchDesktop("goal-recovery", "fake");
+    await assertDesktopAppearanceRestored(currentLaunch.page);
     await assertRecoveredGoalAndControls(currentLaunch.page);
     await createApprovalTaskThroughUi(currentLaunch.page);
     await resolveApprovalThroughUi(currentLaunch.page);
@@ -183,6 +191,7 @@ try {
     logStep("launch 3/4: persist an in-flight streamed Goal for explicit recovery");
     currentLaunch = await launchDesktop("stream-controls", "deepseek");
     await createSlowProviderTaskThroughUi(currentLaunch.page);
+    await assertMultipleProjects(currentLaunch);
     await closeDesktop(currentLaunch);
     currentLaunch = undefined;
     await waitForProviderAbort(SLOW_STEER_PROMPT, 1);
@@ -196,6 +205,7 @@ try {
     await stopSlowTurnThroughUi(currentLaunch.page);
     await clearSlowGoalThroughUi(currentLaunch.page);
     await sendRecoveryFollowUpThroughUi(currentLaunch.page);
+    await assertProjectsRestored(currentLaunch.page);
     await assertNativeResponsiveWidths(currentLaunch);
     await closeDesktop(currentLaunch);
     currentLaunch = undefined;
@@ -232,7 +242,7 @@ try {
 
 process.stdout.write(
   "electron desktop E2E passed: click-driven Goal create/recovery, approval, input, steer, stop, "
-  + "rename/search/archive, and native 1440/820/390 layout\n",
+  + "rename/search/archive, background projects and isolated drafts, theme switching/system tracking/restart persistence, and native 1440/820/390 layout\n",
 );
 
 interface DesktopLaunch {
@@ -773,6 +783,14 @@ async function assertNativeResponsiveWidths(launch: DesktopLaunch): Promise<void
     assert.equal(metrics.innerWidth, width, `renderer width at ${width}px`);
     assert.ok(metrics.documentWidth <= width + 1, `document overflow at ${width}px: ${metrics.documentWidth}`);
     assert.ok(metrics.bodyWidth <= width + 1, `body overflow at ${width}px: ${metrics.bodyWidth}`);
+    await launch.page.getByRole("button", { name: "Appearance settings", exact: true }).click();
+    const appearance = launch.page.getByRole("dialog", { name: "Appearance", exact: true });
+    await assertWithinViewport(appearance, width, `appearance dialog at ${width}px`);
+    for (const name of [/System/, /Dark/, /Light/]) {
+      await assertWithinViewport(appearance.getByRole("radio", { name }), width, `theme choice at ${width}px`);
+    }
+    await launch.page.screenshot({ path: join(artifacts, `appearance-${width}.png`) });
+    await appearance.getByRole("button", { name: "Done", exact: true }).click();
     await assertWithinViewport(
       launch.page.locator(".titlebar-leading").getByRole("button", { name: /(?:Hide|Show) sidebar/iu }),
       width,
@@ -801,6 +819,71 @@ async function assertNativeResponsiveWidths(launch: DesktopLaunch): Promise<void
       `New task at ${width}px`,
     );
   }
+}
+
+async function assertMultipleProjects(launch: DesktopLaunch): Promise<void> {
+  const page = launch.page;
+  const slow = provider.requests.find((request) => request.text.includes(SLOW_STEER_PROMPT));
+  assert.ok(slow && !slow.aborted, "Project A should still be streaming");
+  await activeComposer(page).fill("Queued message for project A");
+  await page.getByRole("button", { name: "Queue message", exact: true }).click();
+  await waitUntil("project A queued message", async () => await page.evaluate(async () => {
+    const state = await (window as unknown as { chiliDesktop: ChiliDesktopApi }).chiliDesktop.invoke({ type: "app.state" });
+    return Object.values(state.queuedBySession).reduce((sum, count) => sum + count, 0) === 1;
+  }));
+  await activeComposer(page).fill(PROJECT_A_DRAFT);
+  const otherWorkspace = join(temporaryRoot, "project-b");
+  await mkdir(otherWorkspace, { recursive: true });
+  await runChecked(["/usr/bin/git", "init", "--quiet", otherWorkspace], repositoryRoot, 10_000);
+  // Exercise the Add project UI while replacing only the native OS picker.
+  await launch.app.evaluate(({ dialog }, path) => {
+    dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [path] });
+  }, otherWorkspace);
+  await page.getByRole("button", { name: "Add project", exact: true }).click();
+  await waitUntil("project B to become active", async () => (
+    await page.getByRole("button", { name: "Open project project-b", exact: true }).getAttribute("aria-current") === "true"
+  ));
+  assert.equal(await page.evaluate(async () => {
+    const state = await (window as unknown as { chiliDesktop: ChiliDesktopApi }).chiliDesktop.invoke({ type: "app.state" });
+    return Object.values(state.queuedBySession).reduce((sum, count) => sum + count, 0);
+  }), 0, "Project B must not display project A's queue");
+  const dialog = await openNewTaskDialog(page);
+  await dialog.getByLabel("Task title", { exact: true }).fill(PROJECT_B_TITLE);
+  await dialog.getByLabel("What should Chili accomplish?", { exact: true }).fill(PROJECT_B_PROMPT);
+  await chooseOption(dialog.getByLabel("Model", { exact: true }), /^DeepSeek V4 Pro\b/iu);
+  await dialog.getByRole("button", { name: "Create & run", exact: true }).click();
+  await dialog.waitFor({ state: "hidden" });
+  await waitForTaskTitle(page, PROJECT_B_TITLE);
+  await expectVisible(page.locator(".timeline").getByText(`Fixture response: ${PROJECT_B_PROMPT}`, { exact: true }));
+  assert.equal(slow.aborted, false, "Switching projects must not stop project A's provider stream");
+  assert.equal(await page.locator(".timeline").getByText(`Fixture stream opened: ${SLOW_STEER_PROMPT}`, { exact: true }).count(), 0);
+  await activeComposer(page).fill(PROJECT_B_DRAFT);
+  await page.getByRole("button", { name: "Open project workspace", exact: true }).click();
+  await waitForTaskTitle(page, SLOW_TITLE);
+  await waitUntil("project A draft restoration", async () => await activeComposer(page).inputValue() === PROJECT_A_DRAFT);
+  assert.equal(await page.evaluate(async () => {
+    const state = await (window as unknown as { chiliDesktop: ChiliDesktopApi }).chiliDesktop.invoke({ type: "app.state" });
+    return Object.values(state.queuedBySession).reduce((sum, count) => sum + count, 0);
+  }), 1, "Project A's queue must survive switching projects");
+  await expectVisible(page.locator(".timeline").getByText(`Fixture stream opened: ${SLOW_STEER_PROMPT}`, { exact: true }));
+  assert.equal(slow.aborted, false);
+  assert.equal(await page.locator(".timeline").getByText(`Fixture response: ${PROJECT_B_PROMPT}`, { exact: true }).count(), 0);
+  await page.getByRole("button", { name: `Open ${PROJECT_B_TITLE} in project-b`, exact: true }).click();
+  await waitForTaskTitle(page, PROJECT_B_TITLE);
+  await waitUntil("project B draft restoration", async () => await activeComposer(page).inputValue() === PROJECT_B_DRAFT);
+  await page.screenshot({ path: join(artifacts, "multiple-projects.png") });
+  await page.getByRole("button", { name: "Open project workspace", exact: true }).click();
+  await waitForTaskTitle(page, SLOW_TITLE);
+  assert.equal(slow.aborted, false);
+  await activeComposer(page).fill("");
+}
+
+async function assertProjectsRestored(page: Page): Promise<void> {
+  await page.getByRole("button", { name: "Open project project-b", exact: true }).click();
+  await waitForTaskTitle(page, PROJECT_B_TITLE);
+  await expectVisible(page.locator(".timeline").getByText(`Fixture response: ${PROJECT_B_PROMPT}`, { exact: true }));
+  await page.getByRole("button", { name: "Open project workspace", exact: true }).click();
+  await waitForTaskTitle(page, SLOW_TITLE);
 }
 
 async function assertTaskConfigurationControls(dialog: Locator): Promise<void> {

@@ -23,6 +23,8 @@ import type {
  * this interface without changing React components or importing Electron.
  */
 export interface ControlTransport {
+  forProject?(projectId: string): ControlTransport;
+  activateProject?(projectId: string): Promise<DesktopState>;
   state(): Promise<DesktopState>;
   selectWorkspace(): Promise<DesktopState>;
   listSessions(options?: { query?: string; status?: SessionListStatus }): Promise<RuntimeSessionSummary[]>;
