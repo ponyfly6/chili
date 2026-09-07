@@ -3111,6 +3111,8 @@ button.danger:hover:not(:disabled) {
 
   .inspector {
     position: absolute;
+    /* Overlay dimensions use the workspace, not the collapsed inspector track. */
+    grid-area: auto;
     z-index: 5;
     top: 8px;
     right: 8px;
@@ -3169,6 +3171,8 @@ button.danger:hover:not(:disabled) {
 
   .sidebar {
     position: absolute;
+    /* Leave the zero-width grid track when this panel becomes an overlay. */
+    grid-area: auto;
     z-index: 6;
     top: 8px;
     bottom: 8px;
