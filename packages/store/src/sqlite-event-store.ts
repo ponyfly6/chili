@@ -967,8 +967,26 @@ export class SqliteEventStore
         )
         .all(sessionId)
         .map((event) => this.eventFromRow(event) as Extract<ChiliEvent, { type: "goal.updated" }>);
+      let goal = row ? sessionGoalFromRow(row) : undefined;
+      if (!goal && updatedEvents.length > 0) {
+        // Match GoalService's event replay when a derived projection is absent.
+        // A clear also removes this row, so inspect the last committed Goal
+        // event before recovering an update; never resurrect a cleared ledger.
+        const latest = this.db
+          .query<{ type: string }, [string]>(
+            `select type from events
+             where session_id = ? and type in ('goal.updated', 'goal.cleared')
+             order by seq desc limit 1`,
+          )
+          .get(sessionId);
+        const update = updatedEvents.at(-1);
+        if (latest?.type === "goal.updated" && update) {
+          const lastReason = update.payload.reason ?? update.payload.goal.lastReason;
+          goal = { ...update.payload.goal, sessionId, ...(lastReason ? { lastReason } : {}) };
+        }
+      }
       const snapshot: GoalMutationSnapshot = {
-        ...(row ? { goal: sessionGoalFromRow(row) } : {}),
+        ...(goal ? { goal } : {}),
         updatedEvents,
       };
       const decision = decide(snapshot);
