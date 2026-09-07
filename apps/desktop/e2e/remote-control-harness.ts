@@ -10,6 +10,7 @@ import { openRelayEnvelope, type PairingGrant } from "../../../packages/remote-c
 import { decodeWireEnvelope } from "../../../packages/remote-control/src/http-wire.js";
 import type { RemoteControlFrame, RemoteControlRequestFrame } from "../../../packages/remote-control/src/protocol.js";
 import type { ChiliRemoteDesktopApi, RemoteDesktopState } from "../src/shared/remote-control-contracts.js";
+import { proveRemoteProjectIsolation } from "./remote-control-projects.js";
 
 const temporaryRoot = process.env.CHILI_REMOTE_E2E_ROOT;
 assert.ok(temporaryRoot && isAbsolute(temporaryRoot));
@@ -262,43 +263,11 @@ try {
   await mobile.getByTestId("pairing-code").waitFor();
   assert.equal(await mobile.getByTestId("task-list").count(), 0);
   evidence.desktopRestartRevokesOldGrant = true;
-  process.stdout.write("[remote-e2e] Workspace change revokes phone before starting the next real sidecar\n");
-  await pairThroughUi(desktopPage, mobile);
-  const workspaceTwo = join(temporaryRoot, "workspace-two");
-  await mkdir(workspaceTwo, { recursive: true });
-  await runCommand("/usr/bin/git", ["init", "--quiet", workspaceTwo]);
-  // Only native chooser input is automated. The visible workspace button still
-  // invokes production IPC, DesktopControlService, shutdown, and new sidecar.
-  await desktop.evaluate(({ dialog }, selectedWorkspace) => {
-    const original = dialog.showOpenDialog;
-    dialog.showOpenDialog = async () => {
-      dialog.showOpenDialog = original;
-      return { canceled: false, filePaths: [selectedWorkspace] };
-    };
-  }, workspaceTwo);
-  await desktopPage.getByRole("button", { name: "Close phone control", exact: true }).click();
-  await desktopPage.locator(".workspace-card").click();
-  await waitUntil("real workspace switch and new sidecar health", async () =>
-    (await desktopPage!.locator(".workspace-copy strong").innerText()) === "workspace-two"
-      && /healthy/iu.test(await desktopPage!.locator('[title="Local runtime status"]').innerText()));
-  await desktopPage.getByTestId("remote-open").click();
-  await desktopPage.getByTestId("remote-enable").waitFor();
-  assert.equal(await desktopPage.getByTestId("remote-status").count(), 0);
-  assert.equal(await assertPersistedSetup(userData), savedSetup, "Workspace persistence must not replace phone setup");
-  await waitUntil("workspace selection disconnects prior phone grant", async () => !/已安全连接/u.test(await mobile!.getByTestId("connection-status").innerText()));
-  await desktopPage.getByTestId("remote-enable").click();
-  await desktopPage.getByTestId("remote-status").waitFor();
-  await mobile.getByTestId("reconnect").click();
-  await mobile.getByTestId("pairing-code").waitFor();
-  await pairThroughUi(desktopPage, mobile);
-  await mobile.getByText("暂时没有可访问的任务", { exact: true }).waitFor();
-  assert.equal(await mobile.getByText("Phone Alpha real runtime", { exact: true }).count(), 0);
-  await desktopPage.getByTestId("remote-disable").click();
-  evidence.workspaceChangeRevokesOldGrant = true;
-  evidence.newWorkspaceListDoesNotLeakOldTasks = true;
-  evidence.workspaceChooserAutomation = "only native dialog selection result; real visible workspace button, IPC, control service and sidecar switch";
-  await desktopPage.getByTestId("remote-enable").waitFor();
-  assert.equal(await desktopPage.getByTestId("remote-status").count(), 0);
+  evidence.multiProject = await proveRemoteProjectIsolation({
+    application: desktop, desktop: desktopPage, phone: mobile, workspace, temporaryRoot, artifacts,
+    requests: fixture.requests, savedSetup, readSavedSetup: () => assertPersistedSetup(userData),
+    createTask: createDesktopTask, pair: pairThroughUi,
+  });
   await desktopPage.screenshot({ path: join(artifacts, "desktop-after-revoke.png"), fullPage: true });
   await mobile.screenshot({ path: join(artifacts, "mobile-revoked.png"), fullPage: true });
   assert.deepEqual(errors, [], "Desktop renderer errors");

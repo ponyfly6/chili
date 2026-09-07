@@ -1,8 +1,8 @@
 # Chili 私网手机控制既有任务 Alpha 验收
 
-此 Alpha 的链路为浏览器页面 → 私网 HTTPS → `PrivateControlHttpsHost` → `HostBridge` → 桌面窗口使用的同一个 `DesktopControlService` → 真实 sidecar/runtime。只有测试模型使用本机 fixture；没有用 fake mobile、mock adapter 或 mock control service 替代链路。
+此 Alpha 的链路为浏览器页面 → 私网 HTTPS → `PrivateControlHttpsHost` → `HostBridge` → 桌面当前项目使用的同一个 `DesktopControlService` → 真实 sidecar/runtime。只有测试模型使用本机 fixture；没有用 fake mobile、mock adapter 或 mock control service 替代链路。
 
-它只允许当前工作区已有的顶层任务列表、有限快照、Queue、Steer、Stop。任务创建、工作区选择、子智能体内部任务、审批/提问答复、权限和凭据修改均留在桌面。不包含公网 relay、账号、后台 daemon、原生 App 或离线缓存。
+它只允许桌面当前项目已有的顶层任务列表、有限快照、Queue、Steer、Stop。多个项目可以各自保持运行，但每次手机配对只绑定当前项目。切换项目会关闭远控并使旧授权失效；切回原项目也必须重新开启和配对。任务创建、工作区选择、子智能体内部任务、审批/提问答复、权限和凭据修改均留在桌面。不包含公网 relay、账号、后台 daemon、原生 App 或离线缓存。
 
 ## 启动与网络准备
 
@@ -63,7 +63,7 @@ openssl x509 -req -sha256 -days 7 -in "$CHILI_TEST_TLS/server.csr" \
 - **0:45–1:30，配对。** 手机输入短期配对码和设备名称；提交后应等待桌面本地确认，不能直接操作任务。桌面对照设备信息确认后，手机应显示当前工作区的已有任务。验证没有任意路径、创建任务、权限设置、凭据或子智能体内部任务入口。
 - **1:30–2:30，查看与发送。** 打开已有任务，确认有限消息和任务状态。在运行任务发送一条 Queue，确认它排队且不抢占当前执行；发送一条 Steer，确认运行任务转向新输入。同时用桌面发送/查看同一任务，检查两端状态一致且消息没有重复。遇到审批或提问时，手机只提示回桌面处理。
 - **2:30–3:15，Stop 与网络恢复。** 在运行任务点击 Stop，确认任务停止且界面有反馈。关闭手机网络片刻再恢复，点击重连；不能把“结果未知”当成发送失败重新创建一条同样请求。重连成功不能盖掉已有未知提醒；核对任务后才能逐条点击“已核对，清除此提醒”。确认既有消息未因重连重复执行。刷新页面后本轮授权不恢复，应明确提示重新配对。
-- **3:15–4:15，撤销与失效。** 重新配对后在桌面撤销该设备，手机后续请求必须失败。再次配对并关闭远控，手机失效；重新开启不应让旧授权复活。切换工作区或重启桌面后也必须重新开启/配对。
+- **3:15–4:15，撤销与失效。** 重新配对后在桌面撤销该设备，手机后续请求必须失败。再次配对并关闭远控，手机失效；重新开启不应让旧授权复活。切换到另一个项目后确认原项目任务仍在后台运行，手机旧授权失效；在新项目重新开启并配对后，只能看到该项目的任务。切回原项目或重启桌面后也必须重新开启/配对。
 - **4:15–5:00，窄屏检查。** 手机纵屏下列表、消息输入、Queue/Steer/Stop 和错误提示可见可点；页面无横向溢出。记下手机型号、系统版本、浏览器版本、网络类型、证书来源和发现的问题。
 
 **当前真机状态：尚未执行 iPhone 或 Android 真机验收。** 浏览器窄屏截图、viewport 模拟和 Playwright 的浏览器自动化都不是手机真机测试，不应据此填写真机通过。
@@ -83,7 +83,7 @@ bun node_modules/playwright-core/cli.js install firefox
 
 测试临时生成 CA 与服务器证书，仅通过 `certutil -d sql:<temporary-profile>` 导入本轮 Firefox profile。没有 `ignoreHTTPSErrors:true`、全局证书错误忽略参数或系统 Keychain 操作。独立未信任浏览器必须拒绝同一服务器，然后受信任 profile 才能正常打开页面。页面还证明 `isSecureContext` 和 WebCrypto Ed25519 签名/验签可用。故障注入器的网络转取也使用正常 TLS 校验，只对本轮 Node 进程通过 `NODE_EXTRA_CA_CERTS` 信任同一临时 CA。
 
-主流程通过真实页面按钮完成配对、本地确认、列表、快照、Queue、Steer、Stop、重连、刷新重新配对和撤销。另一真实浏览器页面载入同一个生产 `BrowserControlClient`，只在真实 HTTPS 响应到达后选择丢弃加密 ACK、加密结果或两者；Host、adapter、service 和 runtime 均未替换。测试核对重发保持原 request ID/sequence，队列只有一项，真实 runtime 只执行一次；丢结果后仍然报告 `outcome_unknown`。另有未收到快照结果时的并发 Stop，以及真实桌面重启后的旧授权失效。工作区切换测试仅为系统选目录对话框提供本轮临时目录；点击桌面按钮后的 IPC、service、旧 sidecar 停止、新 sidecar 启动都是真实实现。
+主流程通过真实页面按钮完成配对、本地确认、列表、快照、Queue、Steer、Stop、重连、刷新重新配对和撤销。另一真实浏览器页面载入同一个生产 `BrowserControlClient`，只在真实 HTTPS 响应到达后选择丢弃加密 ACK、加密结果或两者；Host、adapter、service 和 runtime 均未替换。测试核对重发保持原 request ID/sequence，队列只有一项，真实 runtime 只执行一次；丢结果后仍然报告 `outcome_unknown`。另有未收到快照结果时的并发 Stop，以及真实桌面重启后的旧授权失效。项目切换测试仅为系统选目录对话框提供本轮临时目录；Add project / Open project 按钮后的 IPC、项目选择、远控撤销与每项目独立 sidecar 都使用真实实现。A、B 同时执行时，切换只改变活动项目及手机授权范围，原项目的 provider 请求保持运行。
 
 每次运行输出独立证据目录 `apps/desktop/out/remote-control-e2e/<UTC timestamp>/`，包含 HTTPS 校验证据、执行结果、浏览器和桌面截图及 trace；失败也保留现场。临时 profile、工作区与 PKI 在系统临时目录中。原始 trace 可能包含已经撤销的测试授权，因此仅供本地排错，不作为公开附件发布。模型 fixture 的输出只用于可重复验收，不代表真实模型质量。
 
@@ -131,3 +131,13 @@ bun node_modules/playwright-core/cli.js install firefox
 修正后的 typecheck、完整串行测试 **2562 pass / 0 fail / 16462 assertions / 209 files**、smoke:all **10/10**、隔离 smoke:desktop、既有 Electron E2E **4/4**、high audit 均通过。只读安全复查发现的授权终止 P2 已修复并复查通过。四个原有 Chili 进程仍保持原 PID 与启动时间。新门禁日志及修复前失败的回归证据保留在 `apps/desktop/out/alpha-review-verification/`。
 
 本次仍未执行 iPhone/Android 真机验收；新证据是同机私网接口上的真实浏览器自动化。
+
+## 2026-09-07 多项目手机授权回归
+
+远控 E2E 已改用真实 **Add project / Open project** 按钮，并增加 `apps/desktop/e2e/remote-control-projects.ts`。A、B 两个项目各自运行持续的模型响应：A 配对后添加 B，A 继续运行且旧手机授权失效；B 重新开启并配对后只显示 B 的任务；切回 A 时两边仍运行，必须重新配对，原来的 A 授权也不会恢复。
+
+测试保留真实浏览器收到的旧授权，仅在本轮内存中使用。它通过生产浏览器加密函数生成新的有效 Queue、Steer、Stop 请求，经正常校验的 HTTPS 分别指向 A、B 任务。在“旧 A 授权访问当前 B”“旧 B 授权访问当前 A”“返回 A 后重用原 A 授权”三个阶段，合计 **18 个请求全部返回 HTTP 401 / `authentication_failed`**，没有请求到达模型执行。此项为真实浏览器发起的协议负向测试；正常配对、项目选择、列表、快照与操作仍通过产品页面完成。
+
+新配对的 A 手机成功停止 A，后台 B 的响应未中断。先前由 B 手机接受的 Queue 随项目切换保留，在 B 的桌面 Stop 后恰好执行一次。每次切换均核对保存的 HTTPS 配置字节不变。完整既有远控流程也继续通过，包括原生 TLS 配置、撤销、重启、丢 ACK/结果、未知结果提示和跨端顺序。
+
+本轮在独立 `codex/parallel-20260907-remote` worktree 完成完整构建与 `bun run test:e2e:remote`，证据目录为该 worktree 下的 `apps/desktop/out/remote-control-e2e/2026-09-07T03-20-03-991Z/`。Firefox **153.0**，使用电脑已有的 `192.168.77.52` 私网接口；`completed: true`、`physicalDeviceTested: false`。E2E 类型检查通过。该结果对应测试启动时构建的多项目/主题快照；并行任务后续同步的生产修复和最终集成仍需独立构建验收，不能用本记录替代全量门禁。未执行 iPhone 或 Android 真机验收。
