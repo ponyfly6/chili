@@ -54,6 +54,7 @@ export interface UpdateGoalInput {
   status?: SessionGoalStatus;
   objective?: string;
   tokenBudget?: number;
+  /** set/replace/clear/usage are reserved for their owning operations. */
   reason?: SessionGoalUpdateReason;
 }
 
@@ -145,6 +146,9 @@ export class GoalService {
   }
 
   private async updateGoalUnlocked(input: UpdateGoalInput): Promise<SessionGoal> {
+    if (input.reason === "set" || input.reason === "replace" || input.reason === "clear" || input.reason === "usage") {
+      throw new Error(`Goal update reason '${input.reason}' is reserved for its owning operation.`);
+    }
     const existing = await this.getGoal({ sessionId: input.sessionId });
     if (!existing) throw new GoalNotFoundError(input.sessionId);
     const tokenBudget = input.tokenBudget === undefined
@@ -197,17 +201,28 @@ export class GoalService {
     return { cleared: true, previousGoal: cloneGoal(previousGoal) };
   }
 
-  captureUsage(input: { sessionId: SessionId; includeBudgetLimited?: boolean }): Promise<GoalUsageScope> {
+  captureUsage(input: {
+    sessionId: SessionId;
+    includeBudgetLimited?: boolean;
+    /** Tool continuations and final replies stay with the preceding ledger. */
+    continuationOf?: GoalUsageScope;
+  }): Promise<GoalUsageScope> {
     return this.withMutation(input.sessionId, async () => {
       const goal = await this.getGoal(input);
       const history = await this.usageHistory(input.sessionId);
       const lastGoalEventId = history.events.at(-1)?.id;
+      const continuation = input.continuationOf;
+      if (continuation && (!goal || !scopeOwnsGoal(continuation, input.sessionId, history))) {
+        // Keep a cleared/replaced identity: turning it into an unowned scope
+        // would incorrectly let the next create_goal adopt this old work.
+        return { ...continuation, accountStopped: false };
+      }
       return {
         sessionId: input.sessionId,
         goalEventId: goal ? history.goalEventId ?? null : null,
         ...(lastGoalEventId ? { lastGoalEventId } : {}),
         accountStopped: goal?.status === "active" || goal?.status === "complete"
-          || (goal?.status === "budgetLimited" && input.includeBudgetLimited === true),
+          || (goal?.status === "budgetLimited" && (input.includeBudgetLimited === true || continuation !== undefined)),
       };
     });
   }

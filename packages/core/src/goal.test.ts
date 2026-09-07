@@ -495,6 +495,38 @@ test("budget wrap-up usage is counted while keeping the goal budget-limited", as
   expect(await service.getGoal({ sessionId })).toMatchObject({ status: "complete" });
 });
 
+test("ordinary updates cannot impersonate lifecycle events or reset turn receipts", async () => {
+  const store = new MemoryEventStore();
+  const service = new GoalService({ store, createId: sequentialId() });
+  const sessionId = "session_goal_reserved_reasons" as SessionId;
+  await service.setGoal({ sessionId, objective: "original objective" });
+  const input = { sessionId, turnId: "turn_reserved_reason" as TurnId, usage: { totalTokens: 7 }, timeSeconds: 1 };
+  await service.accountUsage(input);
+  const scope = await service.captureUsage({ sessionId });
+  const eventCount = store.items.length;
+  for (const reason of ["set", "replace", "clear", "usage"] as const) {
+    await expect(service.updateGoal({ sessionId, objective: "spoofed objective", reason })).rejects.toThrow("reserved");
+  }
+  expect(store.items).toHaveLength(eventCount);
+  await service.updateGoal({ sessionId, objective: "updated objective", reason: "external" });
+  await service.accountUsage(input);
+  await service.accountUsage({ ...input, scope, turnId: "turn_reserved_reason_late" as TurnId });
+  expect(await service.getGoal({ sessionId })).toMatchObject({ objective: "updated objective", tokensUsed: 14 });
+});
+
+test("capturing a continuation while its goal is cleared cannot turn it into unowned work", async () => {
+  const store = new MemoryEventStore();
+  const service = new GoalService({ store, createId: sequentialId() });
+  const sessionId = "session_goal_cleared_continuation" as SessionId;
+  await service.setGoal({ sessionId, objective: "original goal" });
+  const original = await service.captureUsage({ sessionId });
+  await service.clearGoal({ sessionId });
+  const scope = await service.captureUsage({ sessionId, continuationOf: original });
+  await service.setGoal({ sessionId, objective: "replacement goal" });
+  await service.accountUsage({ sessionId, scope, turnId: "turn_cleared_continuation" as TurnId, usage: { totalTokens: 9 }, timeSeconds: 1 });
+  expect(await service.getGoal({ sessionId })).toMatchObject({ objective: "replacement goal", tokensUsed: 0 });
+});
+
 class MemoryEventStore implements EventStore {
   readonly items: ChiliEvent[] = [];
 

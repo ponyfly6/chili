@@ -990,6 +990,7 @@ export class RuntimeService {
       const unreadableSupervisedCallIds = new Set<string>();
       let supervisedAllConfirmationRequired = false;
       let supervisedWorkflowActive = false;
+      let previousGoalUsageScope: GoalUsageScope | undefined;
 
       for (let index = 0; index < maxTurns; index++) {
         if (controller.signal.aborted) {
@@ -1018,15 +1019,19 @@ export class RuntimeService {
           modelState: promptModelState,
           ...(index === 0 ? { turnId: promptTurnId } : {}),
         });
-        const goalUsageScope = await this.goals.captureUsage(promptInput);
+        const goalUsageScope = await this.goals.captureUsage({
+          sessionId: promptInput.sessionId,
+          ...(previousGoalUsageScope ? { continuationOf: previousGoalUsageScope } : {}),
+        });
         if (controller.signal.aborted) {
           return await this.cancelledPrompt(promptInput, turns, "Prompt aborted", promptTurnId);
         }
         const startedAt = this.now();
         const result = normalizeRunTurnResult(await this.options.runtime.runTurn(runInput));
         turns.push(result);
-        await this.publishTurnProgress(promptInput, result);
         await this.accountGoalTurn(promptInput, result, startedAt, goalUsageScope);
+        previousGoalUsageScope = goalUsageScope;
+        await this.publishTurnProgress(promptInput, result);
 
         if (result.status !== "completed") {
           return this.terminalRunFailure(promptInput, turns, result);
@@ -1172,15 +1177,18 @@ export class RuntimeService {
         modelState: promptModelState,
         toolMode: "disabled",
       });
-      const finalGoalUsageScope = await this.goals.captureUsage(promptInput);
+      const finalGoalUsageScope = await this.goals.captureUsage({
+        sessionId: promptInput.sessionId,
+        ...(previousGoalUsageScope ? { continuationOf: previousGoalUsageScope } : {}),
+      });
       if (controller.signal.aborted) {
         return await this.cancelledPrompt(promptInput, turns, "Prompt aborted", promptTurnId);
       }
       const finalStartedAt = this.now();
       const finalResult = normalizeRunTurnResult(await this.options.runtime.runTurn(finalRunInput));
       turns.push(finalResult);
-      await this.publishTurnProgress(promptInput, finalResult);
       await this.accountGoalTurn(promptInput, finalResult, finalStartedAt, finalGoalUsageScope);
+      await this.publishTurnProgress(promptInput, finalResult);
 
       if (finalResult.status !== "completed") {
         return this.terminalRunFailure(promptInput, turns, finalResult);
@@ -1265,6 +1273,7 @@ export class RuntimeService {
     const maxGoalTurns = this.options.maxGoalTurns ?? DEFAULT_MAX_GOAL_TURNS;
     let ranContinuation = false;
     let lastCompleted = args.turns.at(-1);
+    let previousGoalUsageScope: GoalUsageScope | undefined;
 
     for (let index = 0; index < maxGoalTurns; index++) {
       if (args.controller.signal.aborted) {
@@ -1323,7 +1332,14 @@ export class RuntimeService {
         signal: args.controller.signal,
         modelState: args.modelState,
       });
-      const goalUsageScope = await this.goals.captureUsage(args.input);
+      const goalUsageScope = await this.goals.captureUsage({
+        sessionId: args.input.sessionId,
+        // An active goal gets its own goal-specific prompt above. A terminal
+        // goal only finishes the preceding tool turn and retains its ledger.
+        ...(goal?.status !== "active" && previousGoalUsageScope
+          ? { continuationOf: previousGoalUsageScope }
+          : {}),
+      });
       if (args.controller.signal.aborted) {
         return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
       }
@@ -1332,8 +1348,9 @@ export class RuntimeService {
       ranContinuation = true;
       lastCompleted = result;
       args.turns.push(result);
-      await this.publishTurnProgress(args.input, result);
       const accounting = await this.accountGoalTurn(args.input, result, startedAt, goalUsageScope);
+      previousGoalUsageScope = goalUsageScope;
+      await this.publishTurnProgress(args.input, result);
 
       if (result.status !== "completed") {
         return this.terminalRunFailure(args.input, args.turns, result);
@@ -1344,7 +1361,7 @@ export class RuntimeService {
       }
 
       if (accounting?.budgetLimited) {
-        return await this.runGoalBudgetWrapUp(args, result);
+        return await this.runGoalBudgetWrapUp(args, result, goalUsageScope);
       }
     }
 
@@ -1369,6 +1386,7 @@ export class RuntimeService {
       modelState: RuntimeSessionModelState;
     },
     previous: Extract<RunTurnResult, { status: "completed" }>,
+    previousGoalUsageScope: GoalUsageScope,
   ): Promise<SubmitPromptResult> {
     if (args.controller.signal.aborted) {
       return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
@@ -1397,15 +1415,19 @@ export class RuntimeService {
       modelState: args.modelState,
       toolMode: "disabled",
     });
-    const goalUsageScope = await this.goals.captureUsage({ ...args.input, includeBudgetLimited: true });
+    const goalUsageScope = await this.goals.captureUsage({
+      sessionId: args.input.sessionId,
+      includeBudgetLimited: true,
+      continuationOf: previousGoalUsageScope,
+    });
     if (args.controller.signal.aborted) {
       return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
     }
     const startedAt = this.now();
     const result = normalizeRunTurnResult(await this.options.runtime.runTurn(runInput));
     args.turns.push(result);
-    await this.publishTurnProgress(args.input, result);
     await this.accountGoalTurn(args.input, result, startedAt, goalUsageScope);
+    await this.publishTurnProgress(args.input, result);
 
     if (result.status !== "completed") {
       return this.terminalRunFailure(args.input, args.turns, result);

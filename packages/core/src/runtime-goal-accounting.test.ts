@@ -143,6 +143,129 @@ test("a delayed interrupt status cannot pause a replacement goal created after t
   }
 });
 
+for (const status of ["failed", "cancelled"] as const) {
+  test(`returned ${status} usage is accounted even if terminal status acknowledgement is lost`, async () => {
+    const fixture = await createFixture();
+    const { service, goals, store, runner, sessionId } = fixture;
+    runner.results.push({ status, turnId: "turn_billable_terminal" as TurnId, error: new Error("billable terminal result"), usage: { totalTokens: 12 } });
+    const append = store.append.bind(store);
+    let fail = true;
+    store.append = async (event, options) => {
+      await append(event, options);
+      if (fail && event.type === "session.status_changed" && event.payload.status === status) {
+        fail = false;
+        throw new Error("terminal status acknowledgement lost");
+      }
+    };
+    try {
+      await goals.setGoal({ sessionId, objective: "account returned usage" });
+      await service.submitPrompt({ sessionId, text: "work" });
+      expect(fail).toBe(false);
+      expect(await service.getGoal({ sessionId })).toMatchObject({ tokensUsed: 12 });
+    } finally {
+      await fixture.close();
+    }
+  });
+}
+
+for (const maxTurns of [1, 2]) {
+  test(`tool continuation and forced final response retain their goal ledger after the budget is exhausted (${maxTurns} tool turns)`, async () => {
+    const fixture = await createFixture();
+    const { service, goals, runner, sessionId } = fixture;
+    runner.results.push(...Array.from({ length: maxTurns + 1 }, (_, index): RunTurnResult => ({
+      status: "completed",
+      turnId: `turn_budget_final_${index}` as TurnId,
+      assistantMessageId: `message_budget_final_${index}` as MessageId,
+      finishReason: index < maxTurns ? "tool_use" : "stop",
+      usage: { totalTokens: 12 },
+    })));
+    try {
+      await goals.setGoal({ sessionId, objective: "finish within the budget", tokenBudget: 10 });
+      expect(await service.submitPrompt({ sessionId, text: "work", maxTurns })).toMatchObject({ status: "completed" });
+      expect(runner.calls).toBe(maxTurns + 1);
+      expect(await service.getGoal({ sessionId })).toMatchObject({ status: "budgetLimited", tokensUsed: (maxTurns + 1) * 12 });
+    } finally {
+      await fixture.close();
+    }
+  });
+}
+
+test("a new prompt started with an exhausted goal cannot acquire its ledger through a tool continuation", async () => {
+  const fixture = await createFixture();
+  const { service, goals, runner, sessionId } = fixture;
+  runner.results.push(...["tool_use", "tool_use", "stop"].map((finishReason, index): RunTurnResult => ({
+    status: "completed",
+    turnId: `turn_unrelated_${index}` as TurnId,
+    assistantMessageId: `message_unrelated_${index}` as MessageId,
+    finishReason,
+    usage: { totalTokens: 12 },
+  })));
+  try {
+    await goals.setGoal({ sessionId, objective: "already exhausted", tokenBudget: 1 });
+    await goals.accountUsage({ sessionId, turnId: "turn_exhausted" as TurnId, usage: { totalTokens: 1 }, timeSeconds: 1 });
+    await service.submitPrompt({ sessionId, text: "unrelated work", maxTurns: 2 });
+    expect(runner.calls).toBe(3);
+    expect(await service.getGoal({ sessionId })).toMatchObject({ status: "budgetLimited", tokensUsed: 1 });
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("a forced final response keeps the old ledger while a new goal continuation can adopt the replacement", async () => {
+  const fixture = await createFixture();
+  const { service, goals, runner, sessionId } = fixture;
+  runner.results.push(...["tool_use", "stop", "stop"].map((finishReason, index): RunTurnResult => ({
+    status: "completed",
+    turnId: `turn_replacement_final_${index}` as TurnId,
+    assistantMessageId: `message_replacement_final_${index}` as MessageId,
+    finishReason,
+    usage: { totalTokens: 12 },
+  })));
+  runner.onRun = async () => {
+    if (runner.calls === 1) {
+      await goals.clearGoal({ sessionId });
+      await goals.setGoal({ sessionId, objective: "replacement goal" });
+    } else if (runner.calls === 3) {
+      await service.updateGoal({ sessionId, status: "complete" });
+    }
+  };
+  try {
+    await goals.setGoal({ sessionId, objective: "original goal" });
+    await service.submitPrompt({ sessionId, text: "old work", maxTurns: 1 });
+    expect(runner.calls).toBe(3);
+    expect(await service.getGoal({ sessionId })).toMatchObject({ objective: "replacement goal", status: "complete", tokensUsed: 12 });
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("goal finalizing cannot charge a different completed goal created inside the preceding tool turn", async () => {
+  const fixture = await createFixture();
+  const { service, goals, runner, sessionId } = fixture;
+  runner.results.push(...["stop", "tool_use", "stop"].map((finishReason, index): RunTurnResult => ({
+    status: "completed",
+    turnId: `turn_completed_replacement_${index}` as TurnId,
+    assistantMessageId: `message_completed_replacement_${index}` as MessageId,
+    finishReason,
+    usage: { totalTokens: index === 0 ? 0 : 12 },
+  })));
+  runner.onRun = async () => {
+    if (runner.calls === 2) {
+      await goals.clearGoal({ sessionId });
+      await goals.setGoal({ sessionId, objective: "already completed replacement" });
+      await goals.updateGoal({ sessionId, status: "complete" });
+    }
+  };
+  try {
+    await goals.setGoal({ sessionId, objective: "original goal" });
+    await service.submitPrompt({ sessionId, text: "old work" });
+    expect(runner.calls).toBe(3);
+    expect(await service.getGoal({ sessionId })).toMatchObject({ objective: "already completed replacement", status: "complete", tokensUsed: 0 });
+  } finally {
+    await fixture.close();
+  }
+});
+
 async function createFixture() {
   const dir = await mkdtemp(join(tmpdir(), "chili-goal-accounting-"));
   const store = new SqliteEventStore(join(dir, "events.sqlite"));
@@ -169,6 +292,7 @@ async function createFixture() {
 
 class AccountingRunner implements AgentRunner {
   calls = 0;
+  readonly results: RunTurnResult[] = [];
   onRun?: () => Promise<void>;
 
   constructor(private readonly store: SqliteEventStore) {}
@@ -192,6 +316,8 @@ class AccountingRunner implements AgentRunner {
   async runTurn(input: RunTurnInput): Promise<RunTurnResult> {
     this.calls += 1;
     await this.onRun?.();
+    const result = this.results.shift();
+    if (result) return result;
     const turnId = input.turnId ?? `turn_${this.calls}` as TurnId;
     if (input.signal?.aborted) {
       return { status: "cancelled", turnId, error: new Error("cancelled"), usage: { totalTokens: 12 } };
