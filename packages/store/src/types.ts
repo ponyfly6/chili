@@ -186,6 +186,22 @@ export interface AgentTaskLeaseClaimInput {
   generation?: number;
 }
 
+export interface AgentTaskAdmissionInput {
+  event: Extract<ChiliEvent, { type: "agent.task_created" }>;
+  /** Unique admission:v1: token reserved before publishing the pending task. */
+  owner: string;
+  ttlMs: number;
+  now?: number;
+  runClaim?: SessionRunClaimFence;
+}
+
+export interface AgentTaskAdmissionResult {
+  applied: boolean;
+  /** Authoritative state when returned; mirrors may delay the response. */
+  task?: AgentTaskRow;
+  events: ChiliEvent[];
+}
+
 export interface AgentTaskLeaseRenewInput {
   taskId: TaskId;
   owner: string;
@@ -294,6 +310,8 @@ export interface AgentTaskBeginRunCasInput {
    * runId matches the stored reservation.
    */
   reservedInitial?: boolean;
+  /** Start a pending generation-0 admission while retaining its active owner token. */
+  admittedInitial?: boolean;
   sourceMailboxMessageId?: string;
   messageEventId?: string;
   messageClaimEventId?: string;
@@ -646,6 +664,11 @@ export interface AgentTaskLeaseStore {
   releaseAgentTaskLease(input: AgentTaskLeaseReleaseInput): Promise<boolean>;
 }
 
+/** Atomically publishes a new ordinary task together with its initial ownership lease. */
+export interface AgentTaskAdmissionStore {
+  admitAgentTask(input: AgentTaskAdmissionInput): Promise<AgentTaskAdmissionResult>;
+}
+
 export interface AgentTaskFinalizationStore {
   completeAgentTaskCas(input: AgentTaskCompleteCasInput): Promise<AgentTaskFinalizationResult>;
   closeAgentTaskCas(input: AgentTaskCloseCasInput): Promise<AgentTaskFinalizationResult>;
@@ -655,7 +678,7 @@ export interface AgentTaskRunClaimStore {
   beginAgentTaskRunCas(input: AgentTaskBeginRunCasInput): Promise<AgentTaskBeginRunResult>;
 }
 
-export type AgentTaskStoreCapability = "lease" | "run-claim" | "finalization";
+export type AgentTaskStoreCapability = "admission" | "lease" | "run-claim" | "finalization";
 
 /**
  * Wrappers that always expose forwarding methods use this hook to report

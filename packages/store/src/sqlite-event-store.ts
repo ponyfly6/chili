@@ -56,6 +56,9 @@ import type {
   AgentMailboxMutationResult,
   AgentMailboxRequeueInput,
   AgentTaskCloseCasInput,
+  AgentTaskAdmissionInput,
+  AgentTaskAdmissionResult,
+  AgentTaskAdmissionStore,
   AgentTaskBeginRunCasInput,
   AgentTaskBeginRunResult,
   AgentTaskCompleteCasInput,
@@ -455,6 +458,7 @@ export class SqliteEventStore
     GoalProjectionStore,
     GoalMutationStore,
     SubagentProjectionStore,
+    AgentTaskAdmissionStore,
     AgentTaskLeaseStore,
     AgentTaskRunClaimStore,
     AgentTaskFinalizationStore,
@@ -1856,6 +1860,53 @@ export class SqliteEventStore
     return { ...result, ...(message ? { message } : {}) };
   }
 
+  async admitAgentTask(input: AgentTaskAdmissionInput): Promise<AgentTaskAdmissionResult> {
+    if (!isAgentTaskAdmissionOwner(input.owner)) {
+      throw new Error("agent task admission requires a non-empty admission:v1: owner token");
+    }
+    const run = this.db.transaction((item: AgentTaskAdmissionInput) => {
+      const now = item.now ?? Date.now();
+      assertAgentTaskAdmissionLeaseWindow(now, item.ttlMs);
+      const event = item.event;
+      if (
+        event.type !== "agent.task_created"
+        || event.payload.dispatchId !== undefined
+        || event.payload.reservedRunId !== undefined
+        || isTeamTaskWorkerPolicyJson(event.payload.workerPolicy ? encodeJson(event.payload.workerPolicy) : null)
+      ) {
+        throw new Error("agent task admission requires an ordinary task without a dispatch or run reservation");
+      }
+      // Duplicate admission never upgrades an unowned task or replaces another
+      // creator's token, even when the original lease has already expired.
+      if (this.agentTaskProjectionState(event.payload.taskId)) {
+        return { applied: false, events: [] as ChiliEvent[] };
+      }
+      const events = this.writeTransactionEvents([event], item.runClaim);
+      const lease = this.db.query(
+        `update agent_tasks
+         set lease_owner = $owner,
+             lease_expires_at = $expiresAt,
+             lease_heartbeat_at = $now,
+             updated_at = $now
+         where id = $taskId
+           and status = 'pending'
+           and generation = 0
+           and current_run_id is null
+           and dispatch_id is null
+           and reserved_run_id is null
+           and lease_owner is null`,
+      ).run({ taskId: event.payload.taskId, owner: item.owner, expiresAt: now + item.ttlMs, now });
+      if (events.length !== 1 || lease.changes !== 1) {
+        throw new Error("agent task admission lost its initial ownership lease");
+      }
+      return { applied: true, events };
+    });
+    const result = this.runWithWriteRetry(() => run(input));
+    await this.writeMirrors(result.events);
+    const task = await this.agentTask(input.event.payload.taskId);
+    return { ...result, ...(task ? { task } : {}) };
+  }
+
   async claimAgentTaskLease(input: AgentTaskLeaseClaimInput): Promise<AgentTaskLeaseResult> {
     const run = this.db.transaction((item: AgentTaskLeaseClaimInput) => {
       const now = item.now ?? Date.now();
@@ -1902,29 +1953,40 @@ export class SqliteEventStore
   }
 
   async renewAgentTaskLease(input: AgentTaskLeaseRenewInput): Promise<AgentTaskLeaseResult> {
-    const now = input.now ?? Date.now();
-    const expiresAt = now + input.ttlMs;
-    const result = this.db
-      .query(
+    const run = this.db.transaction((item: AgentTaskLeaseRenewInput) => {
+      const now = item.now ?? Date.now();
+      const current = this.agentTaskState(item.taskId);
+      const admittedPending = current?.status === "pending"
+        && current.generation === 0
+        && current.current_run_id === null
+        && current.dispatch_id === null
+        && current.reserved_run_id === null
+        && !isTeamTaskWorkerPolicyJson(current.worker_policy_json)
+        && isAgentTaskAdmissionOwner(item.owner);
+      if (admittedPending) assertAgentTaskAdmissionLeaseWindow(now, item.ttlMs);
+      const result = this.db.query(
         `update agent_tasks
          set lease_expires_at = $expiresAt,
              lease_heartbeat_at = $now,
              updated_at = $now
          where id = $taskId
-           and status = 'running'
+           and (status = 'running' or (status = 'pending' and $admittedPending = 1))
            and lease_owner = $owner
            and generation = $generation
            and lease_expires_at > $now`,
-      )
-      .run({
-        taskId: input.taskId,
-        owner: input.owner,
-        generation: input.generation,
+      ).run({
+        taskId: item.taskId,
+        owner: item.owner,
+        generation: item.generation,
+        admittedPending: admittedPending ? 1 : 0,
         now,
-        expiresAt,
+        expiresAt: now + item.ttlMs,
       });
-    const task = await this.agentTask(input.taskId);
-    return result.changes > 0 && task ? { acquired: true, task } : { acquired: false, ...(task ? { task } : {}) };
+      const row = this.agentTaskProjectionState(item.taskId);
+      const task = row ? agentTaskFromRow(row) : undefined;
+      return result.changes > 0 && task ? { acquired: true, task } : { acquired: false, ...(task ? { task } : {}) };
+    });
+    return this.runWithWriteRetry(() => run(input));
   }
 
   async releaseAgentTaskLease(input: AgentTaskLeaseReleaseInput): Promise<boolean> {
@@ -1960,7 +2022,34 @@ export class SqliteEventStore
       const current = this.agentTaskState(item.taskId);
       if (!current) return { applied: false, events: [] as ChiliEvent[] };
       const reservedInitial = item.reservedInitial === true;
-      if (reservedInitial) {
+      const admittedInitial = item.admittedInitial === true;
+      const now = item.time ?? Date.now();
+      if (admittedInitial && reservedInitial) {
+        throw new Error("agent task run cannot combine admission and reserved initial ownership");
+      }
+      if (admittedInitial) {
+        assertAgentTaskAdmissionLeaseWindow(now, item.leaseTtlMs);
+        if (
+          current.status !== "pending"
+          || current.generation !== 0
+          || current.current_run_id !== null
+          || current.dispatch_id !== null
+          || current.reserved_run_id !== null
+          || isTeamTaskWorkerPolicyJson(current.worker_policy_json)
+          || !isAgentTaskAdmissionOwner(item.expectedLeaseOwner)
+          || current.lease_owner !== item.expectedLeaseOwner
+          || current.lease_expires_at === null
+          || current.lease_expires_at <= now
+          || item.expectedGeneration !== 0
+          || item.expectedRunId !== null
+          || item.leaseOwner !== item.expectedLeaseOwner
+        ) {
+          return { applied: false, events: [] as ChiliEvent[] };
+        }
+        if (item.sourceMailboxMessageId || item.messageEventId || item.messageClaimEventId || item.message) {
+          throw new Error("admitted initial agent task run cannot include a follow-up message");
+        }
+      } else if (reservedInitial) {
         if (
           current.status !== "pending"
           || current.generation !== 0
@@ -2030,7 +2119,20 @@ export class SqliteEventStore
         }
       }
 
-      const cas = reservedInitial
+      const cas = admittedInitial
+        ? this.db.query(
+            `update agent_tasks
+             set updated_at = updated_at
+             where id = $taskId
+               and status = 'pending'
+               and generation = 0
+               and current_run_id is null
+               and dispatch_id is null
+               and reserved_run_id is null
+               and lease_owner = $expectedLeaseOwner
+               and lease_expires_at > $now`,
+          ).run({ taskId: item.taskId, expectedLeaseOwner: item.expectedLeaseOwner, now })
+        : reservedInitial
         ? this.db
             .query(
               `update agent_tasks
@@ -2062,7 +2164,6 @@ export class SqliteEventStore
             });
       if (cas.changes === 0) return { applied: false, events: [] as ChiliEvent[] };
 
-      const now = item.time ?? Date.now();
       const sessionId = item.sessionId ?? current.parent_session_id ?? current.child_session_id;
       const events: ChiliEvent[] = [];
       if (item.messageEventId && item.message && item.from) {
@@ -5679,6 +5780,18 @@ function canonicalDispatchIdentity(value: Record<string, unknown>): string {
   delete identity.agentStatus;
   delete identity.syncedAt;
   return JSON.stringify(sortJsonValue(identity));
+}
+
+function isAgentTaskAdmissionOwner(value: unknown): value is string {
+  const prefix = "admission:v1:";
+  return typeof value === "string" && value.startsWith(prefix) && value.slice(prefix.length).trim().length > 0;
+}
+
+function assertAgentTaskAdmissionLeaseWindow(now: number, ttlMs: number): void {
+  if (!Number.isFinite(now) || !Number.isFinite(ttlMs) || ttlMs <= 0
+    || !Number.isFinite(now + ttlMs) || now + ttlMs <= now) {
+    throw new Error("agent task admission requires a finite time and positive lease duration");
+  }
 }
 
 function isTeamTaskWorkerPolicyJson(value: string | null): boolean {

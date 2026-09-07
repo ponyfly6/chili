@@ -544,11 +544,11 @@ export class AgentTaskControlService {
     const scannedTaskIds = new Set<TaskId>();
     const candidates: AgentTaskRow[] = [];
 
-    // Grow the ordered running prefix because the store applies its limit
-    // before the live/mode/lease policy filters below. Pending tasks and the
-    // spawned-before-lease window have no durable ownership evidence, so an
-    // automatic cross-process scanner must never infer that they are dead.
-    for (const status of ["running"] as const) {
+    // Scan admitted pending work first so a prefix of live running workers
+    // cannot starve its recovery. Legacy pending rows and team intents carry
+    // no admission ownership; their age never grants a scanner authority.
+    // Grow each ordered prefix because the store limits before policy filters.
+    for (const status of ["pending", "running"] as const) {
       let queryLimit = Math.min(limit, 500);
       while (candidates.length < limit) {
         const page = await this.options.store.agentTasks({
@@ -559,6 +559,7 @@ export class AgentTaskControlService {
         const before = candidates.length;
         for (const task of page) {
           scannedTaskIds.add(task.id);
+          if (status === "pending" && !hasTaskAdmissionLease(task)) continue;
           if (liveTaskIds.has(task.id)) continue;
           if (modes.length > 0 && (!task.mode || !modes.includes(task.mode))) continue;
           if (input.requireLeaseEvidence && (
@@ -590,7 +591,7 @@ export class AgentTaskControlService {
         input.error ?? "stale_background_worker",
         {
           requireExpiredLease: true,
-          ...(input.requireLeaseEvidence ? { requireLeaseEvidence: true } : {}),
+          ...(input.requireLeaseEvidence || task.status === "pending" ? { requireLeaseEvidence: true } : {}),
           ...(task.leaseExpiresAt !== undefined ? { expectedLeaseExpiresAt: task.leaseExpiresAt } : {}),
           updatedBeforeOrAt: cutoff,
         },
@@ -1433,4 +1434,13 @@ function boundedPersistedText(value: string, label: string): string {
     label,
   });
   return typeof bounded === "string" ? bounded : "";
+}
+
+function hasTaskAdmissionLease(task: AgentTaskRow): boolean {
+  return task.status === "pending" && task.generation === 0
+    && task.currentRunId === undefined && task.dispatchId === undefined && task.reservedRunId === undefined
+    && !isTeamTaskWorkerPolicy(task.workerPolicy)
+    && typeof task.leaseOwner === "string" && task.leaseOwner.startsWith("admission:v1:")
+    && task.leaseOwner.length > "admission:v1:".length
+    && task.leaseExpiresAt !== undefined && Number.isFinite(task.leaseExpiresAt);
 }

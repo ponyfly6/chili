@@ -17,6 +17,7 @@ import {
   timestampNow,
 } from "@chili/protocol";
 import type {
+  AgentTaskAdmissionStore,
   AgentTaskCapabilityStore,
   AgentTaskFinalizationStore,
   AgentTaskLeaseStore,
@@ -177,6 +178,8 @@ interface LocalSubagentTaskState {
   controller: AbortController;
   reservationFingerprint?: string;
   reservedInitial?: boolean;
+  admittedInitial?: boolean;
+  admission?: Promise<void>;
   lease?: LocalSubagentTaskLease;
   batchLimiter?: RetainedBatchLimiter;
   spawned?: boolean;
@@ -365,8 +368,11 @@ export class LocalSubagentManager implements SubagentController {
     if (isFinalLocalSubagentStatus(state.task.status)) return false;
     state.externallyClosed = true;
     state.task.status = "cancelled";
-    this.stopLeaseHeartbeat(state);
+    // Keep ownership alive until pending durable operations have drained.
     state.controller.abort();
+    if (state.admission) {
+      try { await state.admission; } catch { /* The admitting caller reports its error. */ }
+    }
     if (state.beginRun) {
       try {
         await state.beginRun;
@@ -377,7 +383,8 @@ export class LocalSubagentManager implements SubagentController {
     }
     const finalization = this.beginExternalFinalization(state, "cancelled");
     await finalization;
-    await this.releaseTaskLease(state);
+    // A rejected/expired closure must retain its durable recovery evidence.
+    if (state.finalizationCommitted) await this.releaseTaskLease(state);
     return true;
   }
 
@@ -520,40 +527,6 @@ export class LocalSubagentManager implements SubagentController {
       generation = Math.max(existingTask.generation + 1, 1);
     }
 
-    if (!existingTask) {
-      assertSpawnActive();
-      try {
-        await this.append(
-          eventContext(input.parentSessionId),
-          "agent.task_created",
-          {
-            taskId,
-            ...(input.dispatchId ? { dispatchId: input.dispatchId } : {}),
-            ...(input.runId ? { reservedRunId: input.runId } : {}),
-            path,
-            parentPath,
-            parentSessionId: input.parentSessionId,
-            childSessionId,
-            taskName: input.taskName,
-            cwd: input.cwd,
-            prompt: input.prompt,
-            ...(mode ? { mode } : {}),
-            ...(workerPolicy ? { workerPolicy } : {}),
-            ...schedulingEventPayload(input),
-          },
-          input.runClaim ? { runClaim: input.runClaim } : undefined,
-        );
-      } catch (error) {
-        this.releaseBatchLimiter(batchLimiter);
-        throw error;
-      }
-    }
-    if (input.dispatchId && !this.runClaimStore()) {
-      this.releaseBatchLimiter(batchLimiter);
-      throw new Error(
-        `Reserved local subagent task requires atomic run-claim capability: ${taskId}`,
-      );
-    }
     const runInput: LocalSubagentRunInput = {
       taskId,
       runId,
@@ -579,6 +552,81 @@ export class LocalSubagentManager implements SubagentController {
       ...(input.dispatchId ? { reservedInitial: true } : {}),
     };
     if (batchLimiter) state.batchLimiter = batchLimiter;
+
+    if (!existingTask) {
+      assertSpawnActive();
+      try {
+        const event: Extract<ChiliEvent, { type: "agent.task_created" }> = {
+          id: this.id("event"),
+          type: "agent.task_created",
+          time: this.now(),
+          sessionId: input.parentSessionId,
+          payload: {
+            taskId,
+            ...(input.dispatchId ? { dispatchId: input.dispatchId } : {}),
+            ...(input.runId ? { reservedRunId: input.runId } : {}),
+            path,
+            parentPath,
+            parentSessionId: input.parentSessionId,
+            childSessionId,
+            taskName: input.taskName,
+            cwd: input.cwd,
+            prompt: input.prompt,
+            ...(mode ? { mode } : {}),
+            ...(workerPolicy ? { workerPolicy: { ...workerPolicy } } : {}),
+            ...schedulingEventPayload(input),
+          },
+        };
+        const teamWorker = typeof workerPolicy?.teamId === "string" && workerPolicy.teamId.length > 0
+          && typeof workerPolicy.taskId === "string" && workerPolicy.taskId.length > 0;
+        const admissionStore = !input.dispatchId && !teamWorker ? this.admissionStore() : undefined;
+        if (admissionStore) {
+          const ttlMs = this.options.leaseTtlMs ?? 30_000;
+          const admittedAt = Number(this.now());
+          state.admittedInitial = true;
+          state.lease = {
+            owner: `admission:v1:${crypto.randomUUID()}`,
+            generation: 0,
+            expiresAt: admittedAt + ttlMs,
+            ttlMs,
+            heartbeatIntervalMs: this.leaseHeartbeatIntervalMs(ttlMs),
+          };
+          this.tasks.set(taskId, state);
+          // The SQL transaction commits before its transcript mirror settles.
+          // Own and renew the pending reservation throughout that await too.
+          this.startLeaseHeartbeat(state);
+          const admission = (async () => {
+            const result = await admissionStore.admitAgentTask({
+              event,
+              owner: state.lease!.owner,
+              ttlMs,
+              now: admittedAt,
+              ...(input.runClaim ? { runClaim: input.runClaim } : {}),
+            });
+            if (!result.applied) throw new Error(`Local subagent admission conflicts with an existing task: ${taskId}`);
+          })();
+          state.admission = admission;
+          try { await admission; } finally { delete state.admission; }
+        } else {
+          await this.options.store.append(event, input.runClaim ? { runClaim: input.runClaim } : undefined);
+        }
+      } catch (error) {
+        if (state.admittedInitial) {
+          await this.beginExternalFinalization(state, "failed", toError(error)).catch((failure) => {
+            this.options.onBackgroundError?.(failure, task);
+          });
+          if (this.tasks.get(taskId) === state) this.tasks.delete(taskId);
+        }
+        this.releaseBatchLimiter(batchLimiter);
+        throw error;
+      }
+    }
+    if (input.dispatchId && !this.runClaimStore()) {
+      this.releaseBatchLimiter(batchLimiter);
+      throw new Error(
+        `Reserved local subagent task requires atomic run-claim capability: ${taskId}`,
+      );
+    }
     this.tasks.set(taskId, state);
 
     if (mode === "background") {
@@ -645,10 +693,13 @@ export class LocalSubagentManager implements SubagentController {
         state.beginRun = beginRun;
         if (!(await beginRun)) return task;
       } catch (error) {
-        if (!state.externallyClosed) {
-          task.status = "pending";
-          state.spawned = false;
+        // A failed acknowledgement can follow a committed initial CAS. Read
+        // only our exact token/run before deciding how to settle that work.
+        if (state.admittedInitial) {
+          const current = await this.projectedTask(input.taskId);
+          if (current) this.adoptAdmittedRun(state, current);
         }
+        if (!state.externallyClosed && !state.spawned) task.status = "pending";
         throw error;
       } finally {
         delete state.beginRun;
@@ -669,6 +720,11 @@ export class LocalSubagentManager implements SubagentController {
         return task;
       }
 
+      if (state.externallyClosed) {
+        await state.externalFinalization;
+        return task;
+      }
+      if (input.signal?.aborted) throw abortError();
       const result = await this.options.runner.run(input);
       if (state.externallyClosed) {
         await state.externalFinalization;
@@ -726,26 +782,26 @@ export class LocalSubagentManager implements SubagentController {
 
   private async beginTaskRun(state: LocalSubagentTaskState): Promise<boolean> {
     const input = state.runInput;
-    const atomicStore = state.reservedInitial ? this.runClaimStore() : undefined;
-    if (state.reservedInitial && !atomicStore) {
+    const atomicStore = state.reservedInitial || state.admittedInitial ? this.runClaimStore() : undefined;
+    if ((state.reservedInitial || state.admittedInitial) && !atomicStore) {
       throw new Error(
         `Reserved local subagent task requires atomic run-claim capability: ${input.taskId}`,
       );
     }
     if (atomicStore) {
       const ttlMs = this.options.leaseTtlMs ?? 30_000;
-      const owner = leaseOwner(input.runId);
+      const owner = state.admittedInitial ? state.lease!.owner : leaseOwner(input.runId);
       const result = await atomicStore.beginAgentTaskRunCas({
         taskId: input.taskId,
         expectedGeneration: 0,
         expectedRunId: null,
-        expectedLeaseOwner: null,
+        expectedLeaseOwner: state.admittedInitial ? owner : null,
         runId: input.runId,
         generation: 1,
         leaseOwner: owner,
         leaseTtlMs: ttlMs,
         spawnEventId: this.id("event"),
-        reservedInitial: true,
+        ...(state.admittedInitial ? { admittedInitial: true } : { reservedInitial: true }),
         sessionId: input.parentSessionId,
         time: this.now(),
       });
@@ -759,15 +815,26 @@ export class LocalSubagentManager implements SubagentController {
       if (!task || task.leaseExpiresAt === undefined) {
         throw new Error(`Reserved local subagent task began without a durable lease: ${input.taskId}`);
       }
+      if (state.admittedInitial && !this.adoptAdmittedRun(state, task)) {
+        this.hydrateAuthoritativeTask(state, task);
+        state.externallyClosed = true;
+        if (this.tasks.get(input.taskId) === state) this.tasks.delete(input.taskId);
+        return false;
+      }
       input.generation = task.generation;
       state.spawned = true;
-      state.lease = {
-        owner,
-        generation: task.generation,
-        expiresAt: task.leaseExpiresAt,
-        ttlMs,
-        heartbeatIntervalMs: this.leaseHeartbeatIntervalMs(ttlMs),
-      };
+      if (state.lease) {
+        state.lease.generation = task.generation;
+        state.lease.expiresAt = task.leaseExpiresAt;
+      } else {
+        state.lease = {
+          owner,
+          generation: task.generation,
+          expiresAt: task.leaseExpiresAt,
+          ttlMs,
+          heartbeatIntervalMs: this.leaseHeartbeatIntervalMs(ttlMs),
+        };
+      }
       this.startLeaseHeartbeat(state);
       return true;
     }
@@ -852,6 +919,15 @@ export class LocalSubagentManager implements SubagentController {
   }
 
   private async finalizeExternalClosure(state: LocalSubagentTaskState): Promise<void> {
+    // Optional capability wrappers may delay before the durable commit. A
+    // cancelled local placeholder cannot settle until that admission (or its
+    // initial run transition) has either committed or rejected.
+    if (state.admission) {
+      try { await state.admission; } catch { /* The admitting caller reports its error. */ }
+    }
+    if (state.beginRun) {
+      try { await state.beginRun; } catch { /* The runner path reports its error. */ }
+    }
     const { task, runInput: input } = state;
     if (!isFinalLocalSubagentStatus(task.status)) return;
     const store = this.finalizationStore();
@@ -934,8 +1010,8 @@ export class LocalSubagentManager implements SubagentController {
     if (!lease || lease.stopped || !store) return;
 
     const result = await this.renewTaskLeaseOnce(state, store, lease);
-    if (result.acquired) {
-      if (result.task?.leaseExpiresAt !== undefined) lease.expiresAt = result.task.leaseExpiresAt;
+    if (this.hasCurrentLeaseReceipt(lease, result)) {
+      lease.expiresAt = result.task!.leaseExpiresAt!;
       return;
     }
     this.cancelForLeaseLoss(state);
@@ -945,18 +1021,29 @@ export class LocalSubagentManager implements SubagentController {
     const lease = state.lease;
     const store = this.leaseStore();
     if (!lease || !store) return true;
-    if (lease.stopped) return true;
+    if (lease.stopped) return false;
 
     let result: Awaited<ReturnType<AgentTaskLeaseStore["renewAgentTaskLease"]>>;
     try {
-      result = await this.renewTaskLeaseOnce(state, store, lease);
+      // A heartbeat may have committed before the ownership check was
+      // requested. Drain it, then issue a fresh CAS for this runner boundary.
+      if (lease.renewal) await lease.renewal;
+      if (lease.stopped || state.externallyClosed || state.controller.signal.aborted) return false;
+      result = await store.renewAgentTaskLease({
+        taskId: state.runInput.taskId,
+        owner: lease.owner,
+        generation: lease.generation,
+        ttlMs: lease.ttlMs,
+        now: Number(this.now()),
+      });
     } catch (error) {
       this.cancelForLeaseLoss(state, error);
       return false;
     }
-    if (result.acquired) {
-      if (result.task?.leaseExpiresAt !== undefined) lease.expiresAt = result.task.leaseExpiresAt;
-      return true;
+    if (this.hasCurrentLeaseReceipt(lease, result) && result.task!.status === "running"
+      && result.task!.currentRunId === state.runInput.runId) {
+      lease.expiresAt = result.task!.leaseExpiresAt!;
+      return !state.externallyClosed && !state.controller.signal.aborted;
     }
     this.cancelForLeaseLoss(state);
     return false;
@@ -968,19 +1055,60 @@ export class LocalSubagentManager implements SubagentController {
     lease: LocalSubagentTaskLease,
   ): Promise<Awaited<ReturnType<AgentTaskLeaseStore["renewAgentTaskLease"]>>> {
     if (lease.renewal) return lease.renewal;
-    const renewal = store.renewAgentTaskLease({
-      taskId: state.runInput.taskId,
-      owner: lease.owner,
-      generation: lease.generation,
-      ttlMs: lease.ttlMs,
-      now: Number(this.now()),
-    });
+    const generation = lease.generation;
+    const renewal = (async () => {
+      let result = await store.renewAgentTaskLease({
+        taskId: state.runInput.taskId,
+        owner: lease.owner,
+        generation,
+        ttlMs: lease.ttlMs,
+        now: Number(this.now()),
+      });
+      const ownInitialTransition = !result.acquired && generation === 0 && result.task
+        && this.adoptAdmittedRun(state, result.task);
+      if (!lease.stopped && (ownInitialTransition || (result.acquired && !this.hasCurrentLeaseReceipt(lease, result)))) {
+        // A delayed receipt may belong to gen0 after gen1 started, or may have
+        // expired while awaiting its acknowledgement. Recheck the current
+        // generation before that receipt can authorize a runner or settlement.
+        result = await store.renewAgentTaskLease({
+          taskId: state.runInput.taskId,
+          owner: lease.owner,
+          generation: lease.generation,
+          ttlMs: lease.ttlMs,
+          now: Number(this.now()),
+        });
+      }
+      return result;
+    })();
     lease.renewal = renewal;
     try {
       return await renewal;
     } finally {
       if (lease.renewal === renewal) delete lease.renewal;
     }
+  }
+
+  private hasCurrentLeaseReceipt(
+    lease: LocalSubagentTaskLease,
+    result: Awaited<ReturnType<AgentTaskLeaseStore["renewAgentTaskLease"]>>,
+  ): boolean {
+    const task = result.task;
+    return result.acquired && task !== undefined
+      && (task.status === "pending" || task.status === "running")
+      && task.leaseOwner === lease.owner && task.generation === lease.generation
+      && task.leaseExpiresAt !== undefined && task.leaseExpiresAt > Number(this.now());
+  }
+
+  private adoptAdmittedRun(state: LocalSubagentTaskState, task: AgentTaskRow): boolean {
+    const lease = state.lease;
+    if (!state.admittedInitial || !lease || task.status !== "running"
+      || task.currentRunId !== state.runInput.runId || task.generation !== 1
+      || task.leaseOwner !== lease.owner || task.leaseExpiresAt === undefined) return false;
+    state.spawned = true;
+    state.runInput.generation = task.generation;
+    lease.generation = task.generation;
+    lease.expiresAt = task.leaseExpiresAt;
+    return true;
   }
 
   private cancelForLeaseLoss(state: LocalSubagentTaskState, error?: unknown): void {
@@ -1051,6 +1179,15 @@ export class LocalSubagentManager implements SubagentController {
       return store as EventStore & AgentTaskLeaseStore;
     }
     return undefined;
+  }
+
+  private admissionStore(): AgentTaskAdmissionStore | undefined {
+    const store = this.options.store as EventStore & Partial<AgentTaskAdmissionStore> & Partial<AgentTaskCapabilityStore>;
+    if (store.supportsAgentTaskCapability?.("admission") === false) return undefined;
+    // Admission requires the full lease lifecycle; embedded legacy stores keep
+    // their original append path rather than receiving an unusable reservation.
+    if (!this.leaseStore() || !this.runClaimStore() || !this.finalizationStore()) return undefined;
+    return store.admitAgentTask ? store as EventStore & AgentTaskAdmissionStore : undefined;
   }
 
   private runClaimStore(): AgentTaskRunClaimStore | undefined {

@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { expect, test } from "bun:test";
 import type { ChiliEvent, SessionId, TaskId, TimestampMs } from "@chili/protocol";
 import type {
+  AgentTaskAdmissionInput,
+  AgentTaskAdmissionResult,
   AgentTaskBeginRunCasInput,
   AgentTaskBeginRunResult,
   EventAppendOptions,
@@ -398,16 +400,14 @@ class TaskCreatedAppendBarrierStore extends SqliteEventStore {
   readonly taskCreatedCommitted = deferred<void>();
   private interceptTaskCreated = true;
 
-  override async append(event: ChiliEvent, options?: EventAppendOptions): Promise<void> {
-    if (event.type !== "agent.task_created" || !this.interceptTaskCreated) {
-      await super.append(event, options);
-      return;
-    }
+  override async admitAgentTask(input: AgentTaskAdmissionInput): Promise<AgentTaskAdmissionResult> {
+    if (!this.interceptTaskCreated) return super.admitAgentTask(input);
     this.interceptTaskCreated = false;
     this.appendEntered.resolve();
     await this.allowAppend.promise;
-    await super.append(event, options);
+    const result = await super.admitAgentTask(input);
     this.taskCreatedCommitted.resolve();
+    return result;
   }
 }
 

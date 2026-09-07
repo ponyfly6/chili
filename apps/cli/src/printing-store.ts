@@ -12,6 +12,9 @@ import type {
   AgentMailboxStoreCapability,
   AgentRunQuery,
   AgentRunRow,
+  AgentTaskAdmissionInput,
+  AgentTaskAdmissionResult,
+  AgentTaskAdmissionStore,
   AgentTaskBeginRunCasInput,
   AgentTaskBeginRunResult,
   AgentTaskCapabilityStore,
@@ -79,6 +82,7 @@ export class PrintingEventStore
     AgentTaskLeaseStore,
     AgentTaskCapabilityStore,
     AgentTaskRunClaimStore,
+    AgentTaskAdmissionStore,
     AgentTaskFinalizationStore,
     AgentMailboxCapabilityStore,
     AgentMailboxDeliveryStore,
@@ -224,6 +228,7 @@ export class PrintingEventStore
     }
     if (capability === "lease") return this.leaseStore() !== undefined;
     if (capability === "run-claim") return this.runClaimStore() !== undefined;
+    if (capability === "admission") return this.admissionStore() !== undefined;
     return this.finalizationStore() !== undefined;
   }
 
@@ -233,6 +238,13 @@ export class PrintingEventStore
       return inner.supportsAgentMailboxCapability(capability);
     }
     return capability === "delivery" && this.mailboxDeliveryStore() !== undefined;
+  }
+
+  async admitAgentTask(input: AgentTaskAdmissionInput): Promise<AgentTaskAdmissionResult> {
+    const result = await (this.admissionStore()?.admitAgentTask(input) ??
+      Promise.resolve({ applied: false, events: [] }));
+    for (const event of result.events) this.printer.event(event);
+    return result;
   }
 
   async beginAgentTaskRunCas(input: AgentTaskBeginRunCasInput): Promise<AgentTaskBeginRunResult> {
@@ -343,6 +355,12 @@ export class PrintingEventStore
       return inner as EventStore & AgentTaskFinalizationStore;
     }
     return undefined;
+  }
+
+  private admissionStore(): AgentTaskAdmissionStore | undefined {
+    const inner = this.inner as EventStore & Partial<AgentTaskAdmissionStore> & Partial<AgentTaskCapabilityStore>;
+    if (inner.supportsAgentTaskCapability?.("admission") === false) return undefined;
+    return inner.admitAgentTask ? inner as EventStore & AgentTaskAdmissionStore : undefined;
   }
 
   private runClaimStore(): AgentTaskRunClaimStore | undefined {

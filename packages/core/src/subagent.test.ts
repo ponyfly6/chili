@@ -453,12 +453,12 @@ test("background subagents run under a durable task lease", async () => {
 
     await manager.waitForBackgroundTasks();
 
-    expect(runGeneration).toBe(2);
-    expect(leaseOwner).toBe("local:agent_2");
+    expect(runGeneration).toBe(1);
+    expect(leaseOwner).toMatch(/^admission:v1:[0-9a-f-]{36}$/);
     expect(await store.agentTask(task.taskId)).toMatchObject({
       id: task.taskId,
       status: "completed",
-      generation: 2,
+      generation: 1,
       summary: "background done",
     });
     expect((await store.agentTask(task.taskId))?.leaseOwner).toBeUndefined();
@@ -505,7 +505,7 @@ test("an initial lease that expires during the post-spawn gate cannot start the 
     expect(result).toMatchObject({ status: "cancelled" });
     expect(await store.agentTask(result.taskId)).toMatchObject({
       status: "cancelled",
-      generation: 3,
+      generation: 2,
       error: expect.stringContaining("lease lost"),
     });
     expect((await store.events({ type: "agent.task_completed", limit: 10 }))).toHaveLength(1);
@@ -558,11 +558,8 @@ test("background subagents abort when an external close invalidates the lease", 
     });
     await startedPromise;
     const leasedTask = await store.agentTask(task.taskId);
-    expect(leasedTask).toMatchObject({
-      status: "running",
-      generation: 2,
-      leaseOwner: "local:agent_2",
-    });
+    expect(leasedTask).toMatchObject({ status: "running", generation: 1 });
+    expect(leasedTask?.leaseOwner).toMatch(/^admission:v1:[0-9a-f-]{36}$/);
 
     if (!leasedTask) throw new Error("Expected a leased task projection");
     const closed = await store.closeAgentTaskCas({
@@ -585,7 +582,7 @@ test("background subagents abort when an external close invalidates the lease", 
     expect(await store.agentTask(task.taskId)).toMatchObject({
       id: task.taskId,
       status: "cancelled",
-      generation: 3,
+      generation: 2,
       summary: "external close",
     });
     expect((await store.events({ type: "agent.task_completed", limit: 10 })).map((event) => event.id)).toEqual([
@@ -639,7 +636,7 @@ test("lease loss detaches the stale runner without closing the takeover generati
     });
     await startedPromise;
     const leasedTask = await store.agentTask(task.taskId);
-    expect(leasedTask).toMatchObject({ status: "running", generation: 2 });
+    expect(leasedTask).toMatchObject({ status: "running", generation: 1 });
     if (!leasedTask) throw new Error("Expected the running task lease projection");
 
     now = 200;
@@ -658,7 +655,7 @@ test("lease loss detaches the stale runner without closing the takeover generati
 
     expect(await store.agentTask(task.taskId)).toMatchObject({
       status: "running",
-      generation: 3,
+      generation: 2,
       currentRunId: task.runId,
       leaseOwner: "external-owner",
     });
@@ -714,8 +711,8 @@ test("an expired lease closes its own generation when no takeover occurred", asy
     await startedPromise;
     expect(await store.agentTask(task.taskId)).toMatchObject({
       status: "running",
-      generation: 2,
-      leaseOwner: "local:agent_2",
+      generation: 1,
+      leaseOwner: expect.stringMatching(/^admission:v1:[0-9a-f-]{36}$/),
       leaseExpiresAt: 150,
     });
 
@@ -725,7 +722,7 @@ test("an expired lease closes its own generation when no takeover occurred", asy
 
     expect(await store.agentTask(task.taskId)).toMatchObject({
       status: "cancelled",
-      generation: 3,
+      generation: 2,
       error: `Local subagent task lease lost: ${task.taskId}`,
     });
     expect(await store.events({ type: "agent.task_completed", limit: 10 })).toHaveLength(1);
@@ -794,7 +791,7 @@ test("background subagents suppress completion when external close wins before h
     expect(await store.agentTask(task.taskId)).toMatchObject({
       id: task.taskId,
       status: "cancelled",
-      generation: 3,
+      generation: 2,
       summary: "external close",
     });
     expect((await store.events({ type: "agent.task_completed", limit: 10 })).map((event) => event.id)).toEqual([
@@ -845,14 +842,14 @@ test("complete_task completes a leased local background task without leaking the
       mode: "background",
     });
 
-    await waitUntil(async () => Boolean((await store.agentTask(task.taskId))?.leaseOwner));
+    await waitUntil(async () => (await store.agentTask(task.taskId))?.status === "running");
     await manager.completeTask({ taskId: task.taskId, summary: "tool summary" });
     await manager.waitForBackgroundTasks();
 
     expect(await store.agentTask(task.taskId)).toMatchObject({
       id: task.taskId,
       status: "completed",
-      generation: 2,
+      generation: 1,
       summary: "tool summary",
     });
     expect((await store.agentTask(task.taskId))?.leaseOwner).toBeUndefined();
@@ -860,7 +857,7 @@ test("complete_task completes a leased local background task without leaking the
       payload: {
         taskId: task.taskId,
         status: "completed",
-        generation: 2,
+        generation: 1,
         summary: "tool summary",
       },
     });
@@ -991,7 +988,7 @@ test("complete_task commits paired terminal projections before an abort-ignoring
     expect(await store.agentTask(first.taskId)).toMatchObject({
       status: "completed",
       summary: "tool result",
-      generation: 2,
+      generation: 1,
     });
     expect(await store.agentRuns({ taskId: first.taskId })).toEqual([
       expect.objectContaining({ id: first.runId, status: "completed" }),
