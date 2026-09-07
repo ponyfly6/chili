@@ -716,6 +716,7 @@ export class LocalSubagentManager implements SubagentController {
       if (input.signal?.aborted) throw abortError();
       if (task.status !== "running") return task;
       if (!(await this.ensureTaskLease(state))) {
+        if (input.signal?.aborted && !state.externallyClosed) throw abortError();
         await state.externalFinalization;
         return task;
       }
@@ -736,6 +737,7 @@ export class LocalSubagentManager implements SubagentController {
         return task;
       }
       if (!(await this.ensureTaskLease(state))) {
+        if (input.signal?.aborted && !state.externallyClosed) throw abortError();
         await state.externalFinalization;
         return task;
       }
@@ -763,7 +765,9 @@ export class LocalSubagentManager implements SubagentController {
         );
         return task;
       }
-      if (!(await this.ensureTaskLease(state))) {
+      // A caller-aborted runner still owns terminal settlement. Cancellation
+      // must prevent provider entry, without bypassing this fresh lease CAS.
+      if (!(await this.ensureTaskLease(state, true))) {
         await state.externalFinalization;
         return task;
       }
@@ -1017,7 +1021,7 @@ export class LocalSubagentManager implements SubagentController {
     this.cancelForLeaseLoss(state);
   }
 
-  private async ensureTaskLease(state: LocalSubagentTaskState): Promise<boolean> {
+  private async ensureTaskLease(state: LocalSubagentTaskState, allowAborted = false): Promise<boolean> {
     const lease = state.lease;
     const store = this.leaseStore();
     if (!lease || !store) return true;
@@ -1028,7 +1032,7 @@ export class LocalSubagentManager implements SubagentController {
       // A heartbeat may have committed before the ownership check was
       // requested. Drain it, then issue a fresh CAS for this runner boundary.
       if (lease.renewal) await lease.renewal;
-      if (lease.stopped || state.externallyClosed || state.controller.signal.aborted) return false;
+      if (lease.stopped || state.externallyClosed || (!allowAborted && state.controller.signal.aborted)) return false;
       result = await store.renewAgentTaskLease({
         taskId: state.runInput.taskId,
         owner: lease.owner,
@@ -1043,7 +1047,7 @@ export class LocalSubagentManager implements SubagentController {
     if (this.hasCurrentLeaseReceipt(lease, result) && result.task!.status === "running"
       && result.task!.currentRunId === state.runInput.runId) {
       lease.expiresAt = result.task!.leaseExpiresAt!;
-      return !state.externallyClosed && !state.controller.signal.aborted;
+      return !state.externallyClosed && (allowAborted || !state.controller.signal.aborted);
     }
     this.cancelForLeaseLoss(state);
     return false;

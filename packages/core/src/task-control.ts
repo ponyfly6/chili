@@ -846,6 +846,16 @@ export class AgentTaskControlService {
     );
   }
 
+  private isCurrentFollowupLeaseReceipt(activeRun: ActiveTaskRun, task: AgentTaskRow | undefined): boolean {
+    // A successful transaction can be acknowledged after its lease expired.
+    // Such a receipt cannot authorize provider entry or keep a turn alive.
+    return task !== undefined && task.status === "running"
+      && task.generation === activeRun.generation
+      && task.currentRunId === activeRun.runId
+      && task.leaseOwner === activeRun.lease?.owner
+      && task.leaseExpiresAt !== undefined && task.leaseExpiresAt > Number(this.now());
+  }
+
   private async shouldCompleteRun(taskId: TaskId, runId: AgentRunId, activeRun: ActiveTaskRun): Promise<boolean> {
     if (activeRun.completed) return false;
     const current = await this.options.store.agentTask(taskId);
@@ -872,21 +882,25 @@ export class AgentTaskControlService {
         activeRun.leaseLost = true;
         return false;
       }
-      if (!result.acquired || !result.task) {
+      if (!result.acquired || !this.isCurrentFollowupLeaseReceipt(activeRun, result.task)) {
         const current = result.task ?? await this.options.store.agentTask(activeRun.task.id);
         if (
           current?.status === "running"
           && current.generation === activeRun.generation
           && current.currentRunId === activeRun.runId
           && current.leaseOwner === lease.owner
-        ) activeRun.leaseLost = true;
+        ) {
+          // Fence closure with the expiry actually observed in this receipt,
+          // including a successful renewal whose acknowledgement arrived late.
+          if (current.leaseExpiresAt !== undefined && Number.isFinite(current.leaseExpiresAt)) {
+            lease.expiresAt = current.leaseExpiresAt;
+          }
+          activeRun.leaseLost = true;
+        }
         return false;
       }
-      if (result.task.leaseExpiresAt !== undefined) lease.expiresAt = result.task.leaseExpiresAt;
-      return result.task.status === "running"
-        && result.task.generation === activeRun.generation
-        && result.task.currentRunId === activeRun.runId
-        && result.task.leaseOwner === lease.owner;
+      lease.expiresAt = result.task!.leaseExpiresAt!;
+      return true;
     }
     const current = await this.options.store.agentTask(activeRun.task.id);
     if (!current || current.status !== "running") return false;
@@ -1175,8 +1189,8 @@ export class AgentTaskControlService {
           ttlMs: lease.ttlMs,
           now: Number(this.now()),
         });
-        if (result.acquired) {
-          if (result.task?.leaseExpiresAt !== undefined) lease.expiresAt = result.task.leaseExpiresAt;
+        if (result.acquired && this.isCurrentFollowupLeaseReceipt(activeRun, result.task)) {
+          lease.expiresAt = result.task!.leaseExpiresAt!;
           return;
         }
       } catch {
@@ -1195,6 +1209,11 @@ export class AgentTaskControlService {
         this.stopFollowupLeaseHeartbeat(activeRun);
         activeRun.controller.abort(abortError("Task follow-up was finalized externally"));
         return;
+      }
+      if (current?.status === "running" && current.generation === activeRun.generation
+        && current.currentRunId === activeRun.runId && current.leaseOwner === lease.owner
+        && current.leaseExpiresAt !== undefined && Number.isFinite(current.leaseExpiresAt)) {
+        lease.expiresAt = current.leaseExpiresAt;
       }
       this.stopFollowupLeaseHeartbeat(activeRun);
       activeRun.leaseLost = true;
