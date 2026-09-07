@@ -263,7 +263,7 @@ try {
 process.stdout.write(
   "electron desktop E2E passed: click-driven Goal create/recovery, approval, input, steer, stop, "
   + "rename/search/archive, delegated task details and Git changes, background projects and isolated drafts, "
-  + "theme switching/system tracking/restart persistence, native 1440/820/390 layout, and live timeline following\n",
+  + "theme switching/system tracking/restart persistence, nine native widths from 390 to 1440, keyboard panel navigation, and live timeline following\n",
 );
 
 interface DesktopLaunch {
@@ -812,6 +812,11 @@ async function assertNativeResponsiveWidths(launch: DesktopLaunch): Promise<void
     assert.ok(metrics.bodyWidth <= width + 1, `body overflow at ${width}px: ${metrics.bodyWidth}`);
     if ([640, 641, 695, 696, 1080, 1081].includes(width)) {
       await assertResponsiveNavigation(launch.page);
+      await launch.page.waitForFunction(() => [".sidebar", ".inspector"].every((selector) => {
+        const panel = document.querySelector(selector);
+        return panel && getComputedStyle(panel).opacity === "0" && getComputedStyle(panel).visibility === "hidden";
+      }));
+      await launch.page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
       await launch.page.screenshot({ path: join(artifacts, `responsive-navigation-${width}.png`) });
     }
     await launch.page.getByRole("button", { name: "Appearance settings", exact: true }).click();
