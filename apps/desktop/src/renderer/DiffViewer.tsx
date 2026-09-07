@@ -30,12 +30,12 @@ function DiffViewerContent({ text, truncated = false, loading = false }: Omit<Di
   const selectedIndex = Math.max(0, document.files.findIndex((file) => file.id === selectedId));
   const selected = document.files[selectedIndex];
   const selectedRawPage = Math.min(rawPage, rawPages.length - 1);
-  const notes = useMemo(() => [
+  const notes = useMemo(() => [...new Set([
     ...document.preamble,
     ...document.files.flatMap((file) => file.lines
       .filter((line) => line.kind === "metadata" && line.text.startsWith("#"))
       .map((line) => line.text)),
-  ].join("\n").trim(), [document]);
+  ])].join("\n").trim(), [document]);
 
   const toggleFile = (id: string) => setCollapsedFiles((previous) => {
     const next = new Set(previous);
@@ -77,12 +77,12 @@ function DiffViewerContent({ text, truncated = false, loading = false }: Omit<Di
             <>
               <div className="diff-review-navigation">
                 <button type="button" className="diff-review-arrow" aria-label="Previous changed file" disabled={selectedIndex === 0} onClick={() => setSelectedId(document.files[selectedIndex - 1]?.id)}>‹</button>
-                <label className="diff-review-file-select" htmlFor={selectId}>
-                  <span className="diff-review-sr-only">Changed file</span>
+                <div className="diff-review-file-select">
+                  <label className="diff-review-sr-only" htmlFor={selectId}>Changed file</label>
                   <select id={selectId} value={selected.id} onChange={(event) => setSelectedId(event.target.value)}>
                     {document.files.map((file, index) => <option key={file.id} value={file.id}>{index + 1}. {file.path} · +{file.added} −{file.removed}</option>)}
                   </select>
-                </label>
+                </div>
                 <button type="button" className="diff-review-arrow" aria-label="Next changed file" disabled={selectedIndex >= document.files.length - 1} onClick={() => setSelectedId(document.files[selectedIndex + 1]?.id)}>›</button>
               </div>
               <FilePatch

@@ -67,7 +67,8 @@ Preview 使用本地 ad-hoc 签名，不是已公证的正式发布包。打包�
 - Stop 当前 session。
 - 汇总 root 与 descendant session 的 pending approvals，并允许 deny、allow once、allow session、always allow。
 - 展示并提交 `request_user_input` 请求。
-- 查看 agent tree、tasks、当前 turn diff 和 workspace diff。
+- **Activity** 展示子代理层级与任务状态；选择节点后可展开任务说明、结果、错误和运行历史。长正文分页读取，执行统计与时间默认折叠。切换项目或任务会重置详情选择。
+- **Changes** 按文件查看当前 turn 或 workspace diff，提供增删统计、双侧行号、文件折叠和 Patch / Raw 切换；长补丁与原始文本分页，截断提示保留。
 - 窗口失焦或后台项目发生审批、输入请求和 turn 完成时发原生通知，点击后切到对应项目并聚焦窗口。
 
 ## New Task 与 Goal
@@ -87,6 +88,12 @@ Permission profile 是当前项目 runtime/sidecar 的**全局内存状态**，�
 - Archive 在当前 Desktop 中是单向操作：没有 unarchive；归档非 busy task 前会把 active Goal 持久化为 paused，busy task 必须先 Stop。archived task 只读，不能 Resume、发送或改配置；其历史与 Goal 记录仍保留用于查看。
 
 MCP 面板读取当前 session scope 的 server 状态与汇总，并提供 reload。Desktop 当前不暴露 add/remove/auth 配置流程；这些仍由现有 CLI/TUI/runtime 配置完成。
+
+## 多项目与面板验收
+
+`bun run test:e2e:desktop` 使用真实 Electron、编译后的 sidecar 与本地 fake model，覆盖主题持久化、多项目切换、Goal 恢复、审批/提问、任务操作，以及实际委派后的 Activity 结果和真实 Git 文件的 Changes 视图。
+
+`bun run smoke:desktop-projects` 是独立的 macOS 多项目进程门禁：三个项目同时运行，反复切换、分别 Stop，并验证正常退出和强制终止 Electron 后的 sidecar、工具及 Git 进程回收。测试只管理本次启动并确认身份的进程，保留无关进程；成功或失败均留下性能与进程证据。CI 已构建当前源码时可设置 `CHILI_DESKTOP_PROJECTS_SKIP_BUILD=1`。
 
 ## 安全约束
 

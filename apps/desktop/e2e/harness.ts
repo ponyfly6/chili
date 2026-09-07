@@ -3,13 +3,14 @@ import type { ChiliDesktopApi } from "../src/shared/contracts.js";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { assertDesktopAppearance, assertDesktopAppearanceRestored } from "./appearance.js";
+import { assertWorkbenchPanels } from "./workbench-panels.js";
 import {
   _electron as electron,
   type ElectronApplication,
@@ -185,6 +186,7 @@ try {
     await resolveApprovalThroughUi(currentLaunch.page);
     await resolveUserInputThroughUi(currentLaunch.page);
     await renameSearchAndArchiveThroughUi(currentLaunch.page);
+    await assertWorkbenchPanels(currentLaunch.page, workspace, artifacts);
     await closeDesktop(currentLaunch);
     currentLaunch = undefined;
 
@@ -229,6 +231,19 @@ try {
     cleanupErrors.push(error);
   }
   if (completed && cleanupErrors.length === 0) {
+    try {
+      const screenshots = (await readdir(artifacts)).filter((name) => name.endsWith(".png"));
+      if (screenshots.length > 0) {
+        const output = join(desktopRoot, "out/electron-e2e", new Date().toISOString().replaceAll(":", "-"));
+        await mkdir(output, { recursive: true });
+        for (const name of screenshots) await copyFile(join(artifacts, name), join(output, name));
+        process.stdout.write(`Electron E2E screenshots: ${output}\n`);
+      }
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (completed && cleanupErrors.length === 0) {
     await rm(temporaryRoot, { recursive: true, force: true }).catch((error) => cleanupErrors.push(error));
   }
   if (failure || cleanupErrors.length > 0) {
@@ -242,7 +257,8 @@ try {
 
 process.stdout.write(
   "electron desktop E2E passed: click-driven Goal create/recovery, approval, input, steer, stop, "
-  + "rename/search/archive, background projects and isolated drafts, theme switching/system tracking/restart persistence, and native 1440/820/390 layout\n",
+  + "rename/search/archive, delegated task details and Git changes, background projects and isolated drafts, "
+  + "theme switching/system tracking/restart persistence, and native 1440/820/390 layout\n",
 );
 
 interface DesktopLaunch {
@@ -320,6 +336,11 @@ async function launchDesktop(
     if (message.type() === "error") mainErrors.push(message.text());
   });
   const page = await app.firstWindow({ timeout: ACTION_TIMEOUT_MS });
+  // Keep this isolated test window from receiving the developer's physical
+  // keyboard input; Playwright still drives renderer focus and keyboard events.
+  await app.evaluate(({ BrowserWindow }) => {
+    for (const window of BrowserWindow.getAllWindows()) window.setFocusable(false);
+  });
   page.setDefaultTimeout(ACTION_TIMEOUT_MS);
   page.on("pageerror", (error) => rendererErrors.push(error.message));
   page.on("console", (message) => {

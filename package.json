@@ -20,6 +20,7 @@
     "desktop:preview": "bun run scripts/desktop-preview.ts",
     "test:e2e:desktop": "bun run --cwd apps/desktop test:e2e",
     "smoke:desktop": "bun run scripts/smoke-desktop.ts",
+    "smoke:desktop-projects": "bun run scripts/smoke-desktop-projects.ts",
     "tui": "bun run apps/tui/src/index.tsx",
     "probe:minimax": "bun run scripts/probe-minimax.ts",
     "smoke": "bun run scripts/smoke.ts",

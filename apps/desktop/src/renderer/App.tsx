@@ -2,6 +2,8 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { createPortal } from "react-dom";
 import { RemoteControlPanel } from "./RemoteControlPanel.js";
 import { ProjectSidebar } from "./ProjectSidebar.js";
+import { AgentDetailsPanel } from "./AgentDetailsPanel.js";
+import { DiffViewer } from "./DiffViewer.js";
 import { eventMatchesProject, ProjectViewMemory } from "./project-view-state.js";
 import { desktopThemeOptions, type DesktopTheme } from "./theme.js";
 import { useDesktopTheme } from "./useDesktopTheme.js";
@@ -20,7 +22,6 @@ import type {
 import type {
   ChatMessagePart,
   ChatTranscriptItem,
-  RuntimeAgentTreeNode,
   RuntimeApprovalView,
   RuntimeSessionSummary,
 } from "@chili/sdk";
@@ -133,7 +134,10 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const [loadingSession, setLoadingSession] = useState(false);
   const [resyncing, setResyncing] = useState(false);
   const [diffScope, setDiffScope] = useState<DiffScope>("turn");
-  const [diffText, setDiffText] = useState("Select a session to inspect changes.");
+  const [diffView, setDiffView] = useState<{ text: string; truncated: boolean; scope?: string }>({
+    text: "Select a session to inspect changes.", truncated: false,
+  });
+  const setDiffText = useCallback((text: string) => setDiffView({ text, truncated: false }), []);
   const [diffLoading, setDiffLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 640);
   const [inspectorOpen, setInspectorOpen] = useState(() => window.innerWidth > 1080);
@@ -722,6 +726,10 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     };
   }, [coordinator, projectionRefreshes, refreshSessions, reloadSelected, reloadSessionConfig, setDesktop, setSnapshot, hostTransport]);
 
+  const diffViewScope = JSON.stringify([desktop.projectId, desktop.workspace, selectedId, diffScope,
+    diffScope === "turn" ? presentation?.latestTurnId : undefined]);
+  const diffBelongsToScope = diffView.scope === undefined || diffView.scope === diffViewScope;
+
   useEffect(() => {
     const isCurrent = diffRequestGate.current.begin();
     if (!selectedId || !healthy || resyncing || loadingSession || snapshot?.sessionId !== selectedId) {
@@ -739,18 +747,20 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     setDiffLoading(true);
     void transport.diff(diffScope, selectedId, presentation?.latestTurnId)
       .then((result) => {
-        if (isCurrent() && requestToken && coordinator.isRequestCurrent(requestToken)) setDiffText(result.text);
+        if (isCurrent() && requestToken && coordinator.isRequestCurrent(requestToken)) {
+          setDiffView({ text: result.text, truncated: result.truncated, scope: diffViewScope });
+        }
       })
       .catch((cause) => {
         if (isCurrent() && requestToken && coordinator.isRequestCurrent(requestToken)) {
-          setDiffText(`Unable to load diff: ${messageFor(cause)}`);
+          setDiffView({ text: `Unable to load diff: ${messageFor(cause)}`, truncated: false, scope: diffViewScope });
         }
       })
       .finally(() => {
         if (isCurrent() && requestToken && coordinator.isRequestCurrent(requestToken)) setDiffLoading(false);
       });
     return () => diffRequestGate.current.invalidate();
-  }, [coordinator, diffRevision, diffScope, healthy, loadingSession, presentation?.latestTurnId, resyncing, selectedId, snapshot?.sessionId, transport]);
+  }, [coordinator, diffRevision, diffScope, diffViewScope, healthy, loadingSession, presentation?.latestTurnId, resyncing, selectedId, snapshot?.sessionId, transport]);
 
   const chooseWorkspace = async (projectId?: string, sessionId?: string) => runAction(async () => {
     requestedProjectSession.current = projectId && sessionId ? { projectId, sessionId } : undefined;
@@ -1477,13 +1487,12 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                   </>
                 ) : <p className="empty-copy">MCP status follows the selected task.</p>}
               </section>
-              <section className="inspector-section">
-                <div className="section-heading compact"><p className="eyebrow">Delegated agents</p><span>{snapshot?.agentTree.agents.length ?? 0}</span></div>
-                <div className="agent-tree">
-                  {snapshot?.agentTree.nodes.flatMap((node) => renderAgentNode(node))}
-                  {!snapshot || snapshot.agentTree.nodes.length === 0 ? <p className="empty-copy">No agents delegated yet.</p> : null}
-                </div>
-              </section>
+              <AgentDetailsPanel
+                projectId={desktop.projectId}
+                sessionId={selectedId}
+                tree={snapshot?.sessionId === selectedId ? snapshot?.agentTree : undefined}
+                tasks={snapshot?.sessionId === selectedId ? snapshot?.tasks ?? [] : []}
+              />
 
               <section className="inspector-section task-section">
                 <div className="section-heading compact"><p className="eyebrow">Task plan</p><span>{snapshot?.tasks.length ?? 0}</span></div>
@@ -1510,7 +1519,12 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                   <button disabled={runtimeActionsDisabled || !selectedId} className={diffScope === "workspace" ? "active" : ""} onClick={() => setDiffScope("workspace")}>All</button>
                 </div>
               </div>
-              <pre className="diff-view">{diffLoading ? "Loading changes…" : diffText}</pre>
+              <DiffViewer
+                text={diffBelongsToScope ? diffView.text : ""}
+                truncated={diffBelongsToScope && diffView.truncated}
+                loading={diffLoading || !diffBelongsToScope}
+                resetKey={diffViewScope}
+              />
             </section>
           )}
         </aside>
@@ -2521,16 +2535,6 @@ function Icon({ name }: { name: IconName }) {
     }
   })();
   return <svg className="icon" viewBox="0 0 24 24" aria-hidden="true">{path}</svg>;
-}
-
-function renderAgentNode(node: RuntimeAgentTreeNode, depth = 0): ReactNode[] {
-  return [
-    <div className="agent-row" key={node.path}>
-      <span className="tree-prefix" aria-hidden="true">{`${"· ".repeat(depth)}${depth ? "↳" : "●"}`}</span>
-      <div><strong>{node.taskName || node.path}</strong><span>{node.status} · {node.path}</span></div>
-    </div>,
-    ...node.children.flatMap((child) => renderAgentNode(child, depth + 1)),
-  ];
 }
 
 function shortId(value: string): string {

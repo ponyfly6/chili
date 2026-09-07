@@ -142,5 +142,10 @@ jobs:
           CHILI_REMOTE_E2E_SKIP_BUILD: "1"
         run: bun run test:e2e:remote
 
+      - name: Multi-project process containment
+        env:
+          CHILI_DESKTOP_PROJECTS_SKIP_BUILD: "1"
+        run: bun run smoke:desktop-projects
+
       - name: Build and smoke packaged desktop
         run: bun run smoke:desktop
