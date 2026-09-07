@@ -180,6 +180,18 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const workspaceRef = useRef<string | undefined>(undefined);
   const sidecarPhaseRef = useRef<DesktopState["sidecar"]["phase"]>("idle");
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
+  const inspectorRef = useRef<HTMLElement>(null);
+  const sidebarToggleRef = useRef<HTMLButtonElement>(null);
+  const inspectorToggleRef = useRef<HTMLButtonElement>(null);
+  const closeSidebar = useCallback(() => {
+    if (sidebarRef.current?.contains(document.activeElement)) sidebarToggleRef.current?.focus({ preventScroll: true });
+    setSidebarOpen(false);
+  }, []);
+  const closeInspector = useCallback(() => {
+    if (inspectorRef.current?.contains(document.activeElement)) inspectorToggleRef.current?.focus({ preventScroll: true });
+    setInspectorOpen(false);
+  }, []);
 
   const desktop = projection.state;
   const sessions = projection.sessions;
@@ -318,13 +330,13 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     let previousWidth = window.innerWidth;
     const handleResize = (): void => {
       const width = window.innerWidth;
-      if (previousWidth > 1080 && width <= 1080) setInspectorOpen(false);
-      if (previousWidth > 640 && width <= 640) setSidebarOpen(false);
+      if (previousWidth > 1080 && width <= 1080) closeInspector();
+      if (previousWidth > 640 && width <= 640) closeSidebar();
       previousWidth = width;
     };
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
-  }, []);
+  }, [closeInspector, closeSidebar]);
 
   useEffect(() => {
     if (!taskMenuId) return;
@@ -1000,6 +1012,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       <header className="titlebar">
         <div className="titlebar-leading">
           <button
+            ref={sidebarToggleRef}
             className="chrome-button"
             type="button"
             data-dialog-fallback-focus="true"
@@ -1040,6 +1053,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
             {desktop.sidecar.attempt > 0 ? <em>retry {desktop.sidecar.attempt}</em> : null}
           </div>
           <button
+            ref={inspectorToggleRef}
             className={`chrome-button workbench-toggle ${inspectorOpen ? "active" : ""}`}
             type="button"
             aria-label={inspectorOpen ? "Hide workbench" : "Show workbench"}
@@ -1081,7 +1095,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       </div>
 
       <main className={`workspace-grid ${sidebarOpen ? "" : "sidebar-collapsed"} ${inspectorOpen ? "" : "inspector-collapsed"}`}>
-        <aside className="sidebar panel" aria-hidden={!sidebarOpen}>
+        <aside ref={sidebarRef} className="sidebar panel" aria-hidden={!sidebarOpen} inert={!sidebarOpen}>
           <div className="sidebar-actions">
             <button className="new-task-button" aria-label="New task" disabled={!healthy || actionsDisabled} onClick={openNewTask}>
               <span><Icon name="plus" />New task</span>
@@ -1135,7 +1149,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                     onClick={() => {
                       setTaskMenuId(undefined);
                       void openSession(session.id);
-                      if (window.innerWidth <= 640) setSidebarOpen(false);
+                      if (window.innerWidth <= 640) closeSidebar();
                     }}
                   >
                     <span className="session-glyph" aria-hidden="true"><Icon name={session.status === "archived" ? "archive" : "message"} /></span>
@@ -1382,10 +1396,10 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           </div>
         </section>
 
-        <aside className="inspector panel" aria-hidden={!inspectorOpen}>
+        <aside ref={inspectorRef} className="inspector panel" aria-hidden={!inspectorOpen} inert={!inspectorOpen}>
           <div className="inspector-heading">
             <div><p className="eyebrow">Workbench</p><strong>Live work</strong></div>
-            <button className="icon-button" type="button" aria-label="Close workbench" onClick={() => setInspectorOpen(false)}><Icon name="close" /></button>
+            <button className="icon-button" type="button" aria-label="Close workbench" onClick={closeInspector}><Icon name="close" /></button>
           </div>
           <div className="inspector-tabs" role="tablist" aria-label="Workbench views">
             <button role="tab" aria-selected={inspectorTab === "activity"} className={inspectorTab === "activity" ? "active" : ""} onClick={() => setInspectorTab("activity")}>

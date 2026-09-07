@@ -3101,12 +3101,12 @@ button.danger:hover:not(:disabled) {
 @media (max-width: 1080px) {
   .workspace-grid,
   .workspace-grid.inspector-collapsed {
-    grid-template-columns: 224px minmax(440px, 1fr) 0;
+    grid-template-columns: 224px minmax(0, 1fr) 0;
   }
 
   .workspace-grid.sidebar-collapsed,
   .workspace-grid.sidebar-collapsed.inspector-collapsed {
-    grid-template-columns: 0 minmax(440px, 1fr) 0;
+    grid-template-columns: 0 minmax(0, 1fr) 0;
   }
 
   .inspector {

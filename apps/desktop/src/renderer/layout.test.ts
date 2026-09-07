@@ -23,7 +23,7 @@ test("defines real desktop, tablet, and narrow-phone layout gates without horizo
 
   expect(rule(styles, ".workspace-grid")).toContain("grid-template-columns: 260px minmax(460px, 1fr) 316px;");
   expect(styles).toContain("@media (max-width: 1080px)");
-  expect(styles).toContain("grid-template-columns: 224px minmax(440px, 1fr) 0;");
+  expect(styles).toContain("grid-template-columns: 224px minmax(0, 1fr) 0;");
   expect(styles).toContain("@media (max-width: 640px)");
   expect(styles).toContain([
     ".workspace-grid,",
