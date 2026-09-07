@@ -1,6 +1,6 @@
 # MCP 2026-07-28 与第三轮可靠性验收
 
-本轮从 `6b49833` 出发，在独立 worktree 中并行处理 MCP、Goal、任务租约和 Desktop。MCP 生产迁移提交为 `95d8c0f`；其他生产修复为 `f040e33`、`a9e8e1d`、`fed11cb`。后续提交只补验收与文档。
+本轮从 `6b49833` 出发，在独立 worktree 中并行处理 MCP、Goal、任务租约和 Desktop。MCP 生产迁移提交为 `95d8c0f`，随后 `ee637fc`、`720bee2` 补充超时取消与迟到启动隔离；其他生产修复为 `f040e33`、`a9e8e1d`、`fed11cb`。最终全部生产实现为 `720bee2`，后续只补文档。
 
 ## 协议依据与落地范围
 
@@ -32,7 +32,7 @@ Goal 使用 10,001 条 receipt 的单机探针：建历史 164.6ms，重开 22.3
 | 检查 | 结果 |
 | --- | --- |
 | `bun run typecheck` | 全工作区通过 |
-| `bun test` 最终重跑 | 2874 通过、0 失败；236 文件、20647 断言，138.48 秒 |
+| `bun test` 最终重跑 | 2881 通过、0 失败；237 文件、20673 断言，137.32 秒 |
 | `bun run smoke:all` | 10/10，包括两组 team smoke |
 | MCP 定向 | 现代 HTTP/生命周期 14 项、stdio 11 项，以及原 HTTP/SSE、接收边界、manager、adapter 回归通过 |
 | Goal / 任务租约 | 各自定向 70 / 102 项通过；组合复核 8 项、67 断言通过 |
@@ -42,6 +42,10 @@ Goal 使用 10,001 条 receipt 的单机探针：建历史 164.6ms，重开 22.3
 
 第一次全仓为 2873 通过、1 条基础提示词测试超时。这条测试无意连接了用户 MCP 配置，单独重跑仍耗时 4.37 秒。修复为该测试使用 manual MCP 连接模式；提示词断言不变，同文件 38 项测试耗时 1.32 秒。随后按上表重跑全仓，未放宽超时。
 
+MCP 超时原先只停止等待，现通过 operation callback 传递 AbortSignal，并清理监听器与定时器。追加修复后的全仓捕捉到迟到 initialize 把已关闭 manager 改回 connected；现每个启动 await 后及失败处理前核对客户端身份。相关 94 项定向、完整 typecheck、10 组 smoke 与上表最终整仓全部通过。真实 HTTP deadline 探针 2/2 通过，客户端 fetch 与服务端 request.signal 都在清理前观察到取消；每项请求只发送一次，迟到启动不会复活。服务端故意继续执行的夹具仍能完成，因此不把取消描述为撤销远端副作用。
+
 原始日志保存在 `.worktrees/soak-20260907-integration/apps/desktop/out/soak-validation/2026-09-07/`。最终原生截图位于该 worktree 的 `apps/desktop/out/electron-e2e/2026-09-07T06-33-15.806Z/`，641px 截图已视觉复核；截图等待隐藏动画结束，避免把过渡帧当作最终效果。远控证据位于 `apps/desktop/out/remote-control-e2e/2026-09-07T06-33-48-972Z/evidence.json`，保持 TLS 校验、未修改系统信任。
 
 本轮仅合并本地 `dev`，不推送远端。使用 fake model 或本地 HTTP/stdio 夹具；远控使用同机私网浏览器，不等同于移动真机验收。
+
+最终预览来自 `720bee27b69c`，完整路径为 `/Users/pony/Downloads/Chili Previews/preview-720bee27b69c-20260907T064512242Z-nZjWgS/release/mac-arm64/Chili Preview.app`，已通过 `codesign --verify --deep --strict`，未启动。后续任务见 [交互输入计划](mcp-interactive-input-plan.md)、[Codex 源码对照](mcp-reference-codex.md) 与 [OpenCode/Gemini CLI 对照](mcp-reference-peers.md)。
