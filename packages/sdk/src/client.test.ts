@@ -7,20 +7,23 @@ import {
   isEventTransportResyncRequiredError,
 } from "./client.js";
 import type { SessionId, TeamId, UserInputId } from "@chili/protocol";
+import type { RuntimeAgentTreeNode, RuntimeAgentTreeSnapshot } from "./client.js";
 
 test("agentTree accepts unnamed grouping and mailbox-only nodes", async () => {
-  const leaf = {
+  const leaf: RuntimeAgentTreeNode = {
     path: "/root/reviewer",
     taskName: "review changes",
     status: "completed",
-    runs: [], tasks: [], mailbox: [], children: [],
+    runIds: [], runs: [], tasks: [], mailbox: [], children: [], createdAt: 1, updatedAt: 1,
   };
-  const snapshot = {
+  const snapshot: RuntimeAgentTreeSnapshot = {
     rootPath: "/root",
     nodes: [{
       path: "/root", taskName: "", status: "empty",
+      runIds: [], createdAt: 1, updatedAt: 1,
       runs: [], tasks: [], mailbox: [], children: [leaf, {
         path: "/root/mailbox", taskName: "", status: "queued",
+        runIds: [], createdAt: 1, updatedAt: 1,
         runs: [], tasks: [], mailbox: [], children: [],
       }],
     }],
