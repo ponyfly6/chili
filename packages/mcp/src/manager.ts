@@ -172,18 +172,23 @@ export class McpClientManager {
 
     state.status = "connecting";
     delete state.error;
+    let client: McpClient | undefined;
     try {
-      const client = this.options.createClient(state.server);
+      client = this.options.createClient(state.server);
       state.client = client;
-      await withTimeout((signal) => client.initialize({ signal }), state.server.startupTimeoutMs);
+      const connectingClient = client;
+      await withTimeout((signal) => connectingClient.initialize({ signal }), state.server.startupTimeoutMs);
+      if (state.client !== client) return;
       this.subscribe(state);
       await withTimeout((signal) => Promise.all([
         this.refreshStateTools(state, signal),
         this.refreshStatePrompts(state, signal),
         this.refreshStateResources(state, signal),
       ]), state.server.startupTimeoutMs);
+      if (state.client !== client) return;
       state.status = "connected";
     } catch (error) {
+      if (client && state.client !== client) return;
       state.status = "failed";
       state.error = toError(error);
       await this.closeFailedStateClient(state);
