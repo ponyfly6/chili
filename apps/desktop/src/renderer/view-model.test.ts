@@ -478,6 +478,88 @@ test("a single oversized live event is dropped rather than retained without a wa
   expect(snapshot.events).toEqual([]);
   expect(snapshot.truncated).toBe(true);
   expect(snapshot.warning).toContain("100-byte");
+  expect(snapshot.warning).not.toContain("causal anchor");
+});
+
+test("streams complete tool input previews before call_started without a truncation warning", () => {
+  const rows = [
+    event("session.created", "root", { sessionId: "root", cwd: "/fixture" }, 1),
+    event("turn.started", "root", { turnId: "turn_preview" }, 2),
+    event("message.created", "root", { messageId: "message_preview", role: "assistant", turnId: "turn_preview" }, 3),
+    event("tool.call_updated", "root", { callId: "call_preview", status: "running", toolName: "bash", input: {} }, 4),
+    event("tool.call_updated", "root", { callId: "call_preview", status: "running", toolName: "bash", input: { command: "pwd" } }, 5),
+    event("message.part_added", "root", { messageId: "message_preview", part: {
+      id: "part_preview", messageId: "message_preview", sessionId: "root", type: "tool_call", callId: "call_preview", toolName: "bash", input: { command: "pwd" }, status: "pending",
+    } }, 6),
+    event("tool.call_started", "root", { callId: "call_preview", turnId: "turn_preview", toolName: "bash", input: { command: "pwd" } }, 7),
+    event("tool.call_updated", "root", { callId: "call_preview", status: "validating" }, 8),
+    event("tool.call_updated", "root", { callId: "call_preview", status: "running" }, 9),
+  ];
+  let snapshot = baseSnapshot([]);
+  for (const [index, row] of rows.entries()) {
+    snapshot = appendRuntimeEvent(snapshot, row);
+    expect(snapshot.events).toHaveLength(index + 1);
+    expect(snapshot.truncated).not.toBe(true);
+    expect(snapshot.warning).toBeUndefined();
+    if (index === 4) expect(presentSession(snapshot).runtime.toolCalls.call_preview).toMatchObject({ input: { command: "pwd" }, toolName: "bash" });
+  }
+  expect(presentSession(snapshot).runtime.toolCalls.call_preview).toMatchObject({ turnId: "turn_preview", status: "running" });
+});
+
+test("unfinished preview cancellation survives bounded retention and snapshot reconnect", () => {
+  const limits = { maxEvents: 6, maxBytes: 1_800 };
+  let snapshot = baseSnapshot([]);
+  for (let index = 1; index <= 250; index += 1) {
+    snapshot = appendRuntimeEvent(snapshot, event("tool.call_updated", "root", {
+      callId: "call_preview", status: "running", toolName: "bash", input: { command: `preview-${index}` },
+    }, index), limits);
+    expect(snapshot.events.length).toBeLessThanOrEqual(limits.maxEvents);
+    expect(new TextEncoder().encode(JSON.stringify(snapshot.events)).byteLength).toBeLessThanOrEqual(limits.maxBytes);
+    expect(presentSession(snapshot).runtime.toolCalls.call_preview?.input).toEqual({ command: `preview-${index}` });
+  }
+  expect(snapshot.warning).toContain("renderer budget");
+  expect(snapshot.warning).not.toContain("causal anchor");
+  // A new authoritative snapshot has no WeakMap state from the live window.
+  snapshot = baseSnapshot(structuredClone(snapshot.events));
+  const cancelled = event("tool.call_finished", "root", { callId: "call_preview", status: "cancelled", error: "provider_cancelled", synthetic: true }, 251);
+  snapshot = appendRuntimeEvent(snapshot, cancelled, limits);
+  snapshot = appendRuntimeEvent(snapshot, cancelled, limits);
+  expect(snapshot.events.filter((row) => row.id === cancelled.id)).toHaveLength(1);
+  expect(snapshot.warning).toBeUndefined();
+  expect(presentSession(snapshot).runtime.toolCalls.call_preview).toMatchObject({ input: { command: "preview-250" }, status: "cancelled" });
+});
+
+test("orphaned tool events stay rejected without falsely reporting a capacity overflow", () => {
+  const orphan = event("tool.call_updated", "root", { callId: "call_orphan", status: "running" }, 1);
+  for (const base of [baseSnapshot([]), baseSnapshot([orphan])]) {
+    const snapshot = appendRuntimeEvent(base, event("tool.output_delta", "root", { callId: "call_orphan", stream: "stdout", delta: "orphan" }, 2));
+    expect(snapshot.events).toEqual([]);
+    expect(snapshot.truncated).toBe(true);
+    expect(snapshot.warning).toContain("causal anchor");
+    expect(snapshot.warning).not.toContain("exceeded");
+  }
+  const started = event("tool.call_started", "root", { callId: "call_orphan", turnId: "turn_late", toolName: "bash", input: {} }, 3);
+  let late = appendRuntimeEvent(baseSnapshot([]), orphan);
+  late = appendRuntimeEvent(late, started);
+  expect(late.events).toEqual([started]);
+  expect(presentSession(late).runtime.toolCalls.call_orphan?.status).toBe("running");
+});
+
+test("a different session's preview does not admit a same-id live tool update", () => {
+  const preview = event("tool.call_updated", "other", { callId: "shared_call", status: "running", toolName: "bash", input: {} }, 1);
+  const orphan = event("tool.call_updated", "root", { callId: "shared_call", status: "waiting_for_approval" }, 2);
+  const snapshot = appendRuntimeEvent(baseSnapshot([preview]), orphan);
+  expect(snapshot.events).toEqual([preview]);
+  expect(snapshot.warning).toContain("causal anchor");
+  expect(snapshot.warning).not.toContain("exceeded");
+});
+
+test("a complete oversized tool preview is rejected by capacity, not by a missing anchor", () => {
+  const preview = event("tool.call_updated", "root", { callId: "call_large", status: "running", toolName: "bash", input: { command: "😀".repeat(2_000) } }, 1);
+  const snapshot = appendRuntimeEvent(baseSnapshot([]), preview, { maxEvents: 20, maxBytes: 1_000 });
+  expect(snapshot.events).toEqual([]);
+  expect(snapshot.warning).toContain("1000-byte");
+  expect(snapshot.warning).not.toContain("causal anchor");
 });
 
 test("tiny live budgets retain message anchors with the newest visible delta", () => {

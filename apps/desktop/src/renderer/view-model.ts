@@ -49,6 +49,7 @@ interface LiveEventWindowState {
   fullProjectionReplays: number;
   incrementalProjectionUpdates: number;
   initializationTruncated: boolean;
+  initializationBudgetTruncated: boolean;
   initializationDependencyTruncated: boolean;
 }
 
@@ -335,6 +336,7 @@ export function appendRuntimeEvent(
   let fullProjectionReplays = state.fullProjectionReplays;
   let incrementalProjectionUpdates = state.incrementalProjectionUpdates;
   let truncated = state.initializationTruncated;
+  let budgetTruncated = state.initializationBudgetTruncated;
   let dependencyTruncated = state.initializationDependencyTruncated;
   let compactedOrReplaced = false;
 
@@ -348,6 +350,7 @@ export function appendRuntimeEvent(
     truncated = true;
   } else if (existing >= 0) {
     const replaced = state.events.map((candidate, index) => index === existing ? event : candidate);
+    budgetTruncated ||= replaced.length > limits.maxEvents || jsonEventArrayUtf8Bytes(replaced) > limits.maxBytes;
     const retained = retainReplayableRuntimeEvents(replaced, limits);
     events = retained.events;
     bytes = retained.bytes;
@@ -374,7 +377,8 @@ export function appendRuntimeEvent(
       fullRetentionPasses += compacted.passes;
       compactedOrReplaced = true;
       truncated = true;
-      dependencyTruncated ||= compacted.dependencyTruncated || !events.some((candidate) => candidate.id === event.id);
+      budgetTruncated = true;
+      dependencyTruncated ||= compacted.dependencyTruncated;
     }
   }
 
@@ -397,15 +401,16 @@ export function appendRuntimeEvent(
     pendingInputs: projectPendingInputs(snapshot.pendingInputs, event),
     ...(omittedMessageParts.length > 0 ? { omittedMessageParts } : {}),
   };
-  if (truncated || projectedApprovals.truncated) {
+  if (truncated) next.truncated = true;
+  if (budgetTruncated || projectedApprovals.truncated) {
     next.truncated = true;
     next.warning = appendWarning(
       snapshot.warning,
-      truncated
+      budgetTruncated
         ? `Live timeline events exceeded the ${limits.maxEvents}-event or ${limits.maxBytes}-byte renderer budget.`
         : "Live pending approvals exceeded the 2000-row or 1000000-byte renderer budget.",
     );
-    if (projectedApprovals.truncated && truncated) {
+    if (projectedApprovals.truncated && budgetTruncated) {
       next.warning = appendWarning(
         next.warning,
         "Live pending approvals exceeded the 2000-row or 1000000-byte renderer budget.",
@@ -416,7 +421,7 @@ export function appendRuntimeEvent(
     next.truncated = true;
     next.warning = appendWarning(
       next.warning,
-      `A live event was omitted because its causal anchor was unavailable within the renderer budget${missing.length > 0 ? ` (${missing.join(", ")})` : ""}.`,
+      `A live event was omitted because its causal anchor was unavailable${missing.length > 0 ? ` (${missing.join(", ")})` : ""}.`,
     );
   }
   let runtime: ChiliRuntimeView;
@@ -446,6 +451,7 @@ export function appendRuntimeEvent(
     fullProjectionReplays,
     incrementalProjectionUpdates,
     initializationTruncated: false,
+    initializationBudgetTruncated: false,
     initializationDependencyTruncated: false,
   });
   return next;
@@ -792,6 +798,7 @@ function liveWindowState(snapshot: RuntimeSnapshot, limits: RuntimeEventLimits):
     fullProjectionReplays: 1,
     incrementalProjectionUpdates: 0,
     initializationTruncated: retained.truncated,
+    initializationBudgetTruncated: overBudget,
     initializationDependencyTruncated: retained.dependencyTruncated,
   };
   liveEventWindowCache.set(snapshot, state);

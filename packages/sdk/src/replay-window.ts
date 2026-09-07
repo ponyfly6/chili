@@ -205,7 +205,9 @@ export function runtimeEventProvides(event: ChiliEvent): RuntimeEventDependencyR
     case "message.part_added":
       return [reference("part", event.payload.part.id)];
     case "tool.call_started":
-      return [reference("tool", event.payload.callId)];
+      return [toolReference(event, event.payload.callId)];
+    case "tool.call_updated":
+      return isToolInputPreview(event) ? [toolReference(event, event.payload.callId)] : [];
     case "approval.requested":
       return [reference("approval", event.payload.approvalId)];
     case "user_input.requested":
@@ -252,15 +254,18 @@ export function runtimeEventRequires(event: ChiliEvent): RuntimeEventDependencyR
         reference("part", event.payload.partId),
       ];
     case "tool.call_updated":
+      // Provider input previews precede execution and already contain the
+      // information needed to project a tool. Status-only updates do not.
+      return isToolInputPreview(event) ? [] : [toolReference(event, event.payload.callId)];
     case "tool.output_delta":
     case "tool.call_finished":
-      return [reference("tool", event.payload.callId)];
+      return [toolReference(event, event.payload.callId)];
     case "approval.requested":
-      return event.payload.callId ? [reference("tool", event.payload.callId)] : [];
+      return event.payload.callId ? [toolReference(event, event.payload.callId)] : [];
     case "approval.resolved":
       return [reference("approval", event.payload.approvalId)];
     case "user_input.requested":
-      return [reference("tool", event.payload.callId)];
+      return [toolReference(event, event.payload.callId)];
     case "user_input.resolved":
     case "user_input.cancelled":
       return [reference("user_input", event.payload.inputId)];
@@ -325,7 +330,13 @@ function retainOrderedRuntimeEvents(
     if (!row) continue;
     for (const provided of runtimeEventProvides(row.event)) {
       const key = runtimeEventDependencyKey(provided);
-      if (!providerByKey.has(key)) providerByKey.set(key, index);
+      const previous = providerByKey.get(key);
+      if (previous === undefined || isToolInputPreview(rows[previous]!.event)) {
+        // A real execution start restores turn identity and wins over its
+        // previews. Before execution, each complete preview replaces earlier
+        // partial inputs, so the newest is enough to anchor cancellation.
+        providerByKey.set(key, index);
+      }
     }
   }
 
@@ -508,7 +519,7 @@ function lifecycleChainKey(event: ChiliEvent): string | undefined {
     case "tool.call_updated":
     case "tool.output_delta":
     case "tool.call_finished":
-      return `tool:${event.payload.callId}`;
+      return runtimeEventDependencyKey(toolReference(event, event.payload.callId));
     case "approval.requested":
     case "approval.resolved":
       return `approval:${event.payload.approvalId}`;
@@ -600,6 +611,20 @@ function jsonOrderedEventArrayUtf8Bytes(rows: readonly OrderedRuntimeEvent[]): n
 
 function reference(kind: RuntimeEventDependencyKind, key: string): RuntimeEventDependencyReference {
   return { kind, key: String(key) };
+}
+
+function isToolInputPreview(event: ChiliEvent): boolean {
+  return event.type === "tool.call_updated"
+    && event.payload.status === "running"
+    && typeof event.payload.toolName === "string"
+    && event.payload.toolName.trim().length > 0
+    && Object.hasOwn(event.payload, "input")
+    && event.payload.input !== undefined;
+}
+
+function toolReference(event: ChiliEvent, callId: string): RuntimeEventDependencyReference {
+  // Provider call IDs can repeat in distinct sessions in a combined snapshot.
+  return reference("tool", JSON.stringify([event.sessionId ?? null, String(callId)]));
 }
 
 function teamMemberKey(teamId: string, path: string): string {
