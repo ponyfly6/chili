@@ -128,6 +128,13 @@ export async function assertTimelineFollowStream(page: Page, fixture: TimelineFo
   await page.getByRole("button", { name: "Show workbench", exact: true }).click();
   await page.getByRole("tab", { name: "Changes", exact: true }).click();
   await page.getByRole("region", { name: "Changes review", exact: true }).waitFor();
+  await page.waitForFunction(() => {
+    const inspector = document.querySelector(".inspector");
+    return inspector !== null && getComputedStyle(inspector).opacity === "1";
+  });
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  }));
   await page.screenshot({ path: join(artifacts, "workbench-overlay-390.png") });
   await page.getByRole("button", { name: "Hide workbench", exact: true }).click();
 }
