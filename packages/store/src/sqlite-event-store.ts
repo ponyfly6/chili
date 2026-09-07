@@ -78,6 +78,11 @@ import type {
   EventQuery,
   EventStore,
   GoalProjectionStore,
+  GoalMutationDecision,
+  GoalMutationEvent,
+  GoalMutationResult,
+  GoalMutationSnapshot,
+  GoalMutationStore,
   SessionRow,
   SessionCreationClaimFence,
   SessionRunClaimFence,
@@ -448,6 +453,7 @@ export class SqliteEventStore
     EventCommitAwareStore,
     StaleTurnRecoveryStore,
     GoalProjectionStore,
+    GoalMutationStore,
     SubagentProjectionStore,
     AgentTaskLeaseStore,
     AgentTaskRunClaimStore,
@@ -935,6 +941,55 @@ export class SqliteEventStore
     const rows = this.db.query<Record<string, unknown>, any>(sql).all(...params);
 
     return rows.map((row) => approvalFromRow(row));
+  }
+
+  async mutateGoal<T>(
+    sessionId: SessionId,
+    decide: (snapshot: GoalMutationSnapshot) => GoalMutationDecision<T>,
+    options?: EventAppendOptions,
+  ): Promise<GoalMutationResult<T>> {
+    const run = this.db.transaction(() => {
+      const row = this.db
+        .query<SessionGoalProjectionRow, [string]>(
+          `select session_id, objective, status, token_budget, tokens_used,
+                  time_used_seconds, created_at, updated_at, completed_at, last_reason
+           from session_goals where session_id = ?`,
+        )
+        .get(sessionId);
+      const updatedEvents = this.db
+        .query<StoredEventRow, [string]>(
+          `select seq, id, type, time, session_id, payload_json from events
+           where session_id = ? and type = 'goal.updated' order by seq asc`,
+        )
+        .all(sessionId)
+        .map((event) => this.eventFromRow(event) as Extract<ChiliEvent, { type: "goal.updated" }>);
+      const snapshot: GoalMutationSnapshot = {
+        ...(row ? { goal: sessionGoalFromRow(row) } : {}),
+        updatedEvents,
+      };
+      const decision = decide(snapshot);
+      if (decision && typeof (decision as { then?: unknown }).then === "function") {
+        // Observe a rejected async function without ever waiting inside SQLite.
+        if (decision instanceof Promise) void decision.catch(() => {});
+        throw new TypeError("Goal mutation decisions must be synchronous; thenables are not supported.");
+      }
+      if (!decision || typeof decision !== "object" || !("value" in decision)) {
+        throw new TypeError("Goal mutation must return a synchronous decision with a value.");
+      }
+      const event = decision.event;
+      if (event && ((event.type !== "goal.updated" && event.type !== "goal.cleared") || event.sessionId !== sessionId)) {
+        throw new Error("Goal mutation may only append a Goal event for its target session.");
+      }
+      const events = event
+        ? this.writeTransactionEvents([event], options?.runClaim, options?.creationClaim) as GoalMutationEvent[]
+        : [];
+      return { value: decision.value, events };
+    });
+    // Acquire the writer reservation before reading, so another connection or
+    // process cannot base its decision on the same stale Goal/receipt snapshot.
+    const result = this.runWithWriteRetry(() => run.immediate());
+    await this.writeMirrors(result.events);
+    return result;
   }
 
   async sessionGoal(sessionId: SessionId): Promise<SessionGoalRow | undefined> {

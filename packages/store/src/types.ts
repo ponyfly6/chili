@@ -595,6 +595,39 @@ export interface StaleTurnRecoveryStore {
   reconcileStaleTurns(input: StaleTurnRecoveryInput): Promise<ChiliEvent[]>;
 }
 
+export type GoalMutationEvent = Extract<ChiliEvent, { type: "goal.updated" | "goal.cleared" }>;
+
+export interface GoalMutationSnapshot {
+  readonly goal?: SessionGoalRow;
+  readonly updatedEvents: readonly Extract<ChiliEvent, { type: "goal.updated" }>[];
+}
+
+export interface GoalMutationDecision<T> {
+  value: T;
+  event?: GoalMutationEvent;
+}
+
+export interface GoalMutationResult<T> {
+  value: T;
+  /** Only events committed by this invocation; empty for an idempotent no-op. */
+  events: readonly GoalMutationEvent[];
+}
+
+/** Optional atomic Goal read/decide/append capability. */
+export interface GoalMutationStore {
+  /** decide must be synchronous, free of I/O, and safe to invoke on retry. */
+  mutateGoal<T>(
+    sessionId: SessionId,
+    decide: (snapshot: GoalMutationSnapshot) => GoalMutationDecision<T>,
+    options?: EventAppendOptions,
+  ): Promise<GoalMutationResult<T>>;
+}
+
+/** Wrappers report whether the complete inner chain supports atomic Goals. */
+export interface GoalMutationCapabilityStore {
+  supportsGoalMutation(): boolean;
+}
+
 export interface GoalProjectionStore {
   sessionGoal(sessionId: SessionId): Promise<SessionGoalRow | undefined>;
   sessionGoals(query?: SessionGoalQuery): Promise<SessionGoalRow[]>;

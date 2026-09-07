@@ -33,6 +33,11 @@ import type {
   EventCommitAwareStore,
   EventQuery,
   EventStore,
+  GoalMutationCapabilityStore,
+  GoalMutationDecision,
+  GoalMutationResult,
+  GoalMutationSnapshot,
+  GoalMutationStore,
   GoalProjectionStore,
   SessionGoalQuery,
   SessionGoalRow,
@@ -67,6 +72,8 @@ export class PrintingEventStore
     EventStore,
     EventCommitAwareStore,
     StaleTurnRecoveryStore,
+    GoalMutationCapabilityStore,
+    GoalMutationStore,
     GoalProjectionStore,
     SubagentProjectionStore,
     AgentTaskLeaseStore,
@@ -144,6 +151,22 @@ export class PrintingEventStore
 
   sessionGoals(query?: SessionGoalQuery): Promise<SessionGoalRow[]> {
     return this.goalProjectionStore()?.sessionGoals(query) ?? Promise.resolve([]);
+  }
+
+  supportsGoalMutation(): boolean {
+    return this.goalMutationStore() !== undefined;
+  }
+
+  async mutateGoal<T>(
+    sessionId: SessionId,
+    decide: (snapshot: GoalMutationSnapshot) => GoalMutationDecision<T>,
+    options?: EventAppendOptions,
+  ): Promise<GoalMutationResult<T>> {
+    const store = this.goalMutationStore();
+    if (!store) throw new Error("Inner event store does not support atomic goal mutations");
+    const result = await store.mutateGoal(sessionId, decide, options);
+    for (const event of result.events) this.printer.event(event);
+    return result;
   }
 
   agentTasks(query?: AgentTaskQuery): Promise<AgentTaskRow[]> {
@@ -296,6 +319,14 @@ export class PrintingEventStore
       return inner as EventStore & GoalProjectionStore;
     }
     return undefined;
+  }
+
+  private goalMutationStore(): GoalMutationStore | undefined {
+    const inner = this.inner as EventStore
+      & Partial<GoalMutationStore>
+      & Partial<GoalMutationCapabilityStore>;
+    if (!inner.mutateGoal || (inner.supportsGoalMutation && !inner.supportsGoalMutation())) return undefined;
+    return inner as EventStore & GoalMutationStore;
   }
 
   private leaseStore(): AgentTaskLeaseStore | undefined {
