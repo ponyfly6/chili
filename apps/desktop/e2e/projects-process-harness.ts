@@ -112,6 +112,11 @@ try {
     let output = "";
     activeApp.process().stderr?.on("data", (chunk: Buffer) => { output = `${output}${chunk}`.slice(-128_000); });
     page = await activeApp.firstWindow();
+    // Keep real user keystrokes out of this fixture while Playwright continues
+    // to drive this launch's renderer through its own automation connection.
+    await activeApp.evaluate(({ BrowserWindow }) => {
+      for (const window of BrowserWindow.getAllWindows()) window.setFocusable(false);
+    });
     page.setDefaultTimeout(30_000);
     await healthy(page);
     await inspect("observe", pid);
