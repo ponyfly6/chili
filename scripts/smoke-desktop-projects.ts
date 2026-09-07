@@ -150,7 +150,9 @@ async function inspect(request: Request): Promise<unknown> {
     const main = rows.find((row) => row.pid === request.electronPid);
     assert.ok(main && main.parentPid === driver?.pid && main.command.includes("Electron.app/Contents/MacOS/Electron"), "Electron PID is not a direct, owned driver launch");
     launches.set(main.pid, main);
-    const sidecars = rows.filter((row) => row.parentPid === main.pid && row.command.includes("apps/desktop/src/sidecar/index.ts"));
+    const sidecars = rows.filter((row) => row.parentPid === main.pid
+      && /apps\/desktop\/src\/sidecar\/(?:index|entry)\.ts(?:\s|$)/u.test(row.command)
+      && !row.command.includes("--chili-git-supervisor-v1"));
     return {
       electronPid: main.pid,
       sidecarPids: sidecars.map((row) => row.pid).sort((a, b) => a - b),
