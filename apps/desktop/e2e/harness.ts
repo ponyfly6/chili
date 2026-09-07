@@ -11,6 +11,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { assertDesktopAppearance, assertDesktopAppearanceRestored } from "./appearance.js";
 import { assertWorkbenchPanels } from "./workbench-panels.js";
+import { assertResponsiveNavigation } from "./responsive-navigation.js";
 import { assertTimelineFollowStream, TIMELINE_FOLLOW_PROMPT, TimelineFollowFixture } from "./timeline-follow-stream.js";
 import { assertTimelineNavigation } from "./timeline-navigation.js";
 import {
@@ -787,7 +788,7 @@ async function assertNativeResponsiveWidths(launch: DesktopLaunch): Promise<void
   const hideWorkbench = launch.page.getByRole("button", { name: "Hide workbench", exact: true });
   if (await isVisible(hideWorkbench, 1_000)) await hideWorkbench.click();
 
-  for (const width of [1440, 820, 390]) {
+  for (const width of [1440, 1081, 1080, 820, 696, 695, 641, 640, 390]) {
     const expected = { width, height: 820 };
     const contentSize = await launch.app.evaluate(({ BrowserWindow }, size) => {
       const window = BrowserWindow.getAllWindows()[0];
@@ -809,6 +810,10 @@ async function assertNativeResponsiveWidths(launch: DesktopLaunch): Promise<void
     assert.equal(metrics.innerWidth, width, `renderer width at ${width}px`);
     assert.ok(metrics.documentWidth <= width + 1, `document overflow at ${width}px: ${metrics.documentWidth}`);
     assert.ok(metrics.bodyWidth <= width + 1, `body overflow at ${width}px: ${metrics.bodyWidth}`);
+    if ([640, 641, 695, 696, 1080, 1081].includes(width)) {
+      await assertResponsiveNavigation(launch.page);
+      await launch.page.screenshot({ path: join(artifacts, `responsive-navigation-${width}.png`) });
+    }
     await launch.page.getByRole("button", { name: "Appearance settings", exact: true }).click();
     const appearance = launch.page.getByRole("dialog", { name: "Appearance", exact: true });
     await assertWithinViewport(appearance, width, `appearance dialog at ${width}px`);
