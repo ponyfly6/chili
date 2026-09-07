@@ -259,6 +259,9 @@ function createStreamableHttpFixture(
     requestHeaders.push(new Headers(init?.headers));
     if (method === "GET") return new Response(null, { status: 405 });
     const request = parseRequest(init?.body);
+    if (request.method === "server/discover" && request.id !== undefined) {
+      return jsonResponse({ jsonrpc: "2.0", id: request.id, error: { code: -32601, message: "Method not found" } });
+    }
     if (request.method === "initialize" && request.id !== undefined) {
       return jsonResponse({
         jsonrpc: "2.0",

@@ -10,9 +10,10 @@
     }
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
     "@chili/protocol": "workspace:*",
     "@chili/tools": "workspace:*",
+    "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/core": "2.0.0",
     "zod": "^3.25.1 || ^4.0.0"
   },
   "scripts": {

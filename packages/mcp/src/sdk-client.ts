@@ -1,8 +1,5 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import { Client, SSEClientTransport, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import type { Transport, RequestOptions } from "@modelcontextprotocol/client";
 import type {
   CallToolResult,
   ClientCapabilities,
@@ -13,7 +10,7 @@ import type {
   ListToolsResult,
   ReadResourceResult,
   ServerCapabilities,
-} from "@modelcontextprotocol/sdk/types.js";
+} from "@modelcontextprotocol/client";
 import type { McpServerConfig } from "./config.js";
 import type {
   McpCallOptions,
@@ -39,7 +36,7 @@ import {
   type McpHttpIngressLimits,
 } from "./http-ingress.js";
 import {
-  BoundedStdioClientTransport,
+  createBoundedStdioClientTransport,
   type McpStdioFrameTooLargeError,
 } from "./stdio-client-transport.js";
 
@@ -61,51 +58,111 @@ type ListChangedKind = "tools" | "prompts" | "resources";
 type McpFatalIngressError = McpHttpIngressLimitError | McpStdioFrameTooLargeError;
 
 export class SdkMcpClient implements McpClient {
-  private readonly client: Client;
+  private client: Client;
   private readonly changedHandlers = new Map<ListChangedKind, Set<() => void>>();
   private readonly fetchImplementation: typeof fetch;
   private readonly ingressLimits: Partial<McpHttpIngressLimits> | undefined;
   private activeTransport: Transport | undefined;
   private fatalIngressError: McpFatalIngressError | undefined;
   private connected = false;
+  private connecting: Promise<McpInitializeResult> | undefined;
+  private connectionAbort: AbortController | undefined;
+  private connectionEpoch = 0;
 
   constructor(
     readonly server: McpServerConfig,
-    options: SdkMcpClientOptions = {},
+    private readonly options: SdkMcpClientOptions = {},
   ) {
-    this.client = new Client(toImplementation(options.clientInfo ?? { name: "chili", version: "0.0.0" }), {
-      capabilities: toSdkClientCapabilities(options.capabilities),
+    this.client = this.createClient();
+    this.fetchImplementation = options.fetch ?? fetch;
+    this.ingressLimits = options.ingressLimits;
+  }
+
+  private createClient(options: McpInitializeOptions = {}): Client {
+    const version = options.protocolVersion;
+    const client = new Client(toImplementation(options.clientInfo ?? this.options.clientInfo ?? { name: "chili", version: "0.0.0" }), {
+      capabilities: toSdkClientCapabilities(options.capabilities ?? this.options.capabilities),
+      versionNegotiation: {
+        mode: this.server.type === "sse" ? "legacy" : version
+          ? version >= "2026-07-28" ? { pin: version } : "legacy"
+          : "auto",
+        probe: { timeoutMs: 2_000, maxRetries: 0 },
+      },
+      ...(version ? { supportedProtocolVersions: [version] } : {}),
+      // Interactive MCP requests need a host approval/input bridge before they
+      // can run. Keep them explicit failures instead of silently retrying tools.
+      inputRequired: { autoFulfill: false },
+      listMaxPages: 64,
       listChanged: {
         tools: { onChanged: () => this.emitChanged("tools") },
         prompts: { onChanged: () => this.emitChanged("prompts") },
         resources: { onChanged: () => this.emitChanged("resources") },
       },
     });
-    this.fetchImplementation = options.fetch ?? fetch;
-    this.ingressLimits = options.ingressLimits;
-    this.client.onclose = () => {
+    client.onclose = () => {
+      if (this.client !== client) return;
       this.connected = false;
       this.activeTransport = undefined;
     };
+    return client;
   }
 
   async initialize(options: McpInitializeOptions = {}): Promise<McpInitializeResult> {
+    options.signal?.throwIfAborted();
+    if (this.connecting) return this.connecting;
+    const operation = this.initializeConnection(options);
+    this.connecting = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this.connecting === operation) this.connecting = undefined;
+    }
+  }
+
+  private async initializeConnection(options: McpInitializeOptions): Promise<McpInitializeResult> {
+    if (!this.connected) this.fatalIngressError = undefined;
     return this.withIngressError(async () => {
       if (!this.connected) {
-        this.fatalIngressError = undefined;
+        const client = this.createClient(options);
+        this.client = client;
+        const epoch = ++this.connectionEpoch;
+        const controller = new AbortController();
+        this.connectionAbort = controller;
+        const onAbort = () => controller.abort(options.signal?.reason);
+        options.signal?.addEventListener("abort", onAbort, { once: true });
+        if (options.signal?.aborted) onAbort();
         let transport: Transport;
         transport = createSdkMcpTransport(this.server, {
-          fetch: this.fetchImplementation,
+          // Auto-discovery precedes the SDK's normal connection ownership.
+          // Bind its HTTP probe to cancellation and explicit close as well.
+          fetch: ((input: RequestInfo | URL, init?: RequestInit) => {
+            controller.signal.throwIfAborted();
+            const requestSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+            const signal = requestSignal ? AbortSignal.any([controller.signal, requestSignal]) : controller.signal;
+            return this.fetchImplementation(input, { ...init, signal });
+          }) as typeof fetch,
           ...(this.ingressLimits ? { ingressLimits: this.ingressLimits } : {}),
           onIngressLimit: (error) => this.handleFatalIngress(error, transport),
           onStdioIngressLimit: (error) => this.handleFatalIngress(error, transport),
         });
         this.activeTransport = transport;
-        await this.client.connect(transport, requestOptions(options));
-        this.connected = true;
+        try {
+          await client.connect(transport, { ...requestOptions(options), signal: controller.signal });
+          controller.signal.throwIfAborted();
+          if (epoch !== this.connectionEpoch) throw new Error("MCP connection closed during initialization");
+          if (this.fatalIngressError) throw this.fatalIngressError;
+          this.connected = true;
+        } catch (error) {
+          controller.abort(error);
+          await Promise.allSettled([client.close(), transport.close()]);
+          throw error;
+        } finally {
+          options.signal?.removeEventListener("abort", onAbort);
+        }
       }
       const result: McpInitializeResult = {};
-      if (options.protocolVersion !== undefined) result.protocolVersion = options.protocolVersion;
+      const protocolVersion = this.client.getNegotiatedProtocolVersion();
+      if (protocolVersion !== undefined) result.protocolVersion = protocolVersion;
       const capabilities = fromSdkServerCapabilities(this.client.getServerCapabilities());
       if (capabilities !== undefined) result.capabilities = capabilities;
       const serverInfo = fromImplementation(this.client.getServerVersion());
@@ -113,7 +170,7 @@ export class SdkMcpClient implements McpClient {
       const instructions = this.client.getInstructions();
       if (instructions !== undefined) result.instructions = instructions;
       return result;
-    });
+    }, false);
   }
 
   async listTools(options: McpCursorOptions = {}): Promise<McpListToolsResult> {
@@ -128,7 +185,7 @@ export class SdkMcpClient implements McpClient {
         name,
         arguments: callArguments(arguments_),
         ...(options.progressToken === undefined ? {} : { _meta: { progressToken: options.progressToken } }),
-      }, undefined, requestOptions(options));
+      }, requestOptions(options));
       return result as CallToolResult & McpCallToolResult;
     });
   }
@@ -174,8 +231,13 @@ export class SdkMcpClient implements McpClient {
   }
 
   async close(): Promise<void> {
+    ++this.connectionEpoch;
+    this.connectionAbort?.abort(new Error("MCP connection closed"));
+    this.connectionAbort = undefined;
     this.connected = false;
-    await this.client.close();
+    const transport = this.activeTransport;
+    this.activeTransport = undefined;
+    await Promise.all([this.client.close(), transport?.close()]);
   }
 
   private addChangedHandler(kind: ListChangedKind, handler: () => void): McpUnsubscribe {
@@ -189,9 +251,13 @@ export class SdkMcpClient implements McpClient {
     for (const handler of this.changedHandlers.get(kind) ?? []) handler();
   }
 
-  private async withIngressError<T>(operation: () => Promise<T>): Promise<T> {
+  private async withIngressError<T>(operation: () => Promise<T>, requireConnection = true): Promise<T> {
+    if (this.fatalIngressError) throw this.fatalIngressError;
+    if (requireConnection && !this.connected) throw new Error("MCP client is not connected");
     try {
-      return await operation();
+      const result = await operation();
+      if (this.fatalIngressError) throw this.fatalIngressError;
+      return result;
     } catch (error) {
       throw this.fatalIngressError ?? error;
     }
@@ -215,7 +281,7 @@ export function createSdkMcpClient(server: McpServerConfig, options: SdkMcpClien
 
 export function createSdkMcpTransport(server: McpServerConfig, options: SdkMcpTransportOptions = {}): Transport {
   if (server.type === "stdio") {
-    return new BoundedStdioClientTransport({
+    return createBoundedStdioClientTransport({
       command: server.command,
       args: server.args,
       // MCP stdio uses stdout for protocol messages; server diagnostics commonly go to stderr.
