@@ -1,7 +1,5 @@
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import type { StdioServerParameters } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { deserializeMessage } from "@modelcontextprotocol/sdk/shared/stdio.js";
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import { StdioClientTransport, type StdioServerParameters } from "@modelcontextprotocol/client/stdio";
+import { deserializeMessage, type JSONRPCMessage } from "@modelcontextprotocol/client";
 import type { ChildProcess } from "node:child_process";
 
 export const DEFAULT_MCP_STDIO_MAX_FRAME_BYTES = 4 * 1024 * 1024;
@@ -114,84 +112,80 @@ export class BoundedStdioReadBuffer {
 }
 
 /**
- * Keeps the SDK's process spawning and stdio compatibility while replacing its
- * unbounded ReadBuffer with a bounded implementation.
+ * Return the SDK's exact transport class so v2 negotiates on a disposable
+ * sibling. A subclass would probe the actual session and exhaust strict legacy
+ * servers that exit on a request before initialize. The sibling inherits the
+ * native maxBufferSize guard; the session retains our per-frame guard.
  */
-export class BoundedStdioClientTransport extends StdioClientTransport {
-  private readonly boundedReadBuffer: BoundedStdioReadBuffer;
-  private closePromise: Promise<void> | undefined;
-  private closeHandler: (() => void) | undefined;
-  private closeHandlerCaptured = false;
-  private closeEmitted = false;
-  private terminalError: McpStdioFrameTooLargeError | undefined;
-  private readonly onFatalError: ((error: McpStdioFrameTooLargeError) => void) | undefined;
+export function createBoundedStdioClientTransport(
+  server: StdioServerParameters,
+  options: BoundedStdioClientTransportOptions = {},
+): StdioClientTransport {
+  const maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MCP_STDIO_MAX_FRAME_BYTES;
+  const transport = new StdioClientTransport({ ...server, maxBufferSize: maxFrameBytes });
+  let closePromise: Promise<void> | undefined;
+  let closeHandler: (() => void) | undefined;
+  let closeHandlerCaptured = false;
+  let closeEmitted = false;
+  let terminalError: McpStdioFrameTooLargeError | undefined;
+  const originalStart = transport.start.bind(transport);
+  const originalClose = transport.close.bind(transport);
+  const boundedReadBuffer = new BoundedStdioReadBuffer(maxFrameBytes, fail);
+  (transport as unknown as { _readBuffer: BoundedStdioReadBuffer })._readBuffer = boundedReadBuffer;
 
-  constructor(
-    server: StdioServerParameters,
-    options: BoundedStdioClientTransportOptions = {},
-  ) {
-    super(server);
-    this.onFatalError = options.onFatalError;
-    this.boundedReadBuffer = new BoundedStdioReadBuffer(
-      options.maxFrameBytes ?? DEFAULT_MCP_STDIO_MAX_FRAME_BYTES,
-      (error) => this.fail(error),
-    );
-    (this as unknown as { _readBuffer: BoundedStdioReadBuffer })._readBuffer = this.boundedReadBuffer;
-  }
-
-  override start(): Promise<void> {
-    this.captureCloseHandler();
-    return super.start();
-  }
-
-  override close(): Promise<void> {
-    if (!this.closePromise) {
-      this.captureCloseHandler();
-      this.closePromise = this.closeTransport();
+  transport.start = () => {
+    captureCloseHandler();
+    return originalStart();
+  };
+  transport.close = () => {
+    if (!closePromise) {
+      captureCloseHandler();
+      closePromise = closeTransport();
     }
-    return this.closePromise;
-  }
+    return closePromise;
+  };
+  return transport;
 
-  private async closeTransport(): Promise<void> {
-    this.boundedReadBuffer.stop();
-    const child = (this as unknown as { _process?: ChildProcess })._process;
+  async function closeTransport(): Promise<void> {
+    boundedReadBuffer.stop();
+    const child = (transport as unknown as { _process?: ChildProcess })._process;
     child?.stdout?.pause();
     child?.stdout?.removeAllListeners("data");
     child?.stdout?.destroy();
 
     try {
-      await super.close();
+      await originalClose();
     } finally {
-      this.emitCloseOnce();
+      emitCloseOnce();
     }
   }
 
-  private fail(error: McpStdioFrameTooLargeError): void {
-    if (this.terminalError) return;
-    this.terminalError = error;
+  function fail(error: McpStdioFrameTooLargeError): void {
+    if (terminalError) return;
+    terminalError = error;
     try {
-      this.onFatalError?.(error);
+      options.onFatalError?.(error);
     } catch {
       // A fatal-state observer must not prevent SDK error delivery or cleanup.
     }
     try {
-      this.onerror?.(error);
+      transport.onerror?.(error);
     } catch {
       // An observer must not prevent terminal transport cleanup.
     }
-    void this.close().catch(() => undefined);
+    void transport.close().catch(() => undefined);
   }
 
-  private captureCloseHandler(): void {
-    if (this.closeHandlerCaptured) return;
-    this.closeHandlerCaptured = true;
-    this.closeHandler = this.onclose;
-    this.onclose = () => this.emitCloseOnce();
+  function captureCloseHandler(): void {
+    if (closeHandlerCaptured) return;
+    closeHandlerCaptured = true;
+    closeHandler = transport.onclose;
+    transport.onclose = emitCloseOnce;
   }
 
-  private emitCloseOnce(): void {
-    if (this.closeEmitted) return;
-    this.closeEmitted = true;
-    this.closeHandler?.();
+  function emitCloseOnce(): void {
+    if (closeEmitted) return;
+    closeEmitted = true;
+    closeHandler?.();
   }
 }

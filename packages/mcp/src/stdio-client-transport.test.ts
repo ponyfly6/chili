@@ -1,12 +1,14 @@
 import { expect, test } from "bun:test";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { serializeMessage } from "@modelcontextprotocol/sdk/shared/stdio.js";
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import { Client, serializeMessage, type JSONRPCMessage } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { McpServerConfig } from "./config.js";
 import { createSdkMcpClient } from "./sdk-client.js";
 import {
-  BoundedStdioClientTransport,
+  createBoundedStdioClientTransport,
   BoundedStdioReadBuffer,
   DEFAULT_MCP_STDIO_MAX_FRAME_BYTES,
   McpStdioFrameTooLargeError,
@@ -77,7 +79,7 @@ test("bounded stdio applies the limit to UTF-8 bytes rather than characters", ()
 test("oversized real stdio child is closed and pending initialization rejects", async () => {
   const maxFrameBytes = 64;
   const fixture = fileURLToPath(new URL("./fixtures/oversized-stdio-server.mjs", import.meta.url));
-  const transport = new BoundedStdioClientTransport({
+  const transport = createBoundedStdioClientTransport({
     command: process.execPath,
     args: [fixture, String(maxFrameBytes + 1), "50"],
     stderr: "ignore",
@@ -136,6 +138,117 @@ test("public stdio client preserves one fatal frame-limit error across calls", a
     expect(await rejectionOf(client.readResource("file:///after-overflow"))).toBe(initializeError);
   } finally {
     await client.close().catch(() => undefined);
+  }
+});
+
+test.each(["legacy", "modern"] as const)("auto negotiation uses a disposable bounded sibling for %s stdio", async (mode) => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-mcp-stdio-negotiation-"));
+  const logPath = join(dir, "requests.jsonl");
+  const fixture = fileURLToPath(new URL("./fixtures/negotiating-stdio-server.mjs", import.meta.url));
+  const server: McpServerConfig = {
+    name: "stdio-negotiation", type: "stdio", command: process.execPath,
+    args: [fixture, mode, logPath], enabled: true, required: false, trust: false, source: "user", raw: {},
+  };
+  const client = createSdkMcpClient(server);
+  try {
+    const initialized = await client.initialize();
+    expect(initialized.protocolVersion).toBe(mode === "modern" ? "2026-07-28" : "2025-11-25");
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual(["echo"]);
+    const requests = (await readFile(logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+      pid: number; method: string; params?: { _meta?: Record<string, unknown> };
+    });
+    const probe = requests.find((request) => request.method === "server/discover");
+    const active = requests.find((request) => request.method === "tools/list");
+    expect(probe).toBeDefined();
+    expect(active).toBeDefined();
+    expect(probe!.pid).not.toBe(active!.pid);
+    expect(processExists(probe!.pid)).toBe(false);
+    if (mode === "legacy") {
+      expect(requests.filter((request) => request.pid === active!.pid).map((request) => request.method))
+        .toEqual(["initialize", "notifications/initialized", "tools/list"]);
+    } else {
+      expect(requests.some((request) => request.method === "initialize")).toBe(false);
+      expect(active!.params?._meta?.["io.modelcontextprotocol/protocolVersion"]).toBe("2026-07-28");
+    }
+    await client.close();
+    await eventually(() => expect(processExists(active!.pid)).toBe(false));
+  } finally {
+    await client.close().catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("bounded transport preserves the SDK base identity used to create probe siblings", async () => {
+  const transport = createBoundedStdioClientTransport({ command: process.execPath, stderr: "ignore" });
+  expect(Object.getPrototypeOf(transport)).toBe(StdioClientTransport.prototype);
+  expect(transport.constructor).toBe(StdioClientTransport);
+  await transport.close();
+});
+
+test("an oversized probe remains bounded and both probe and failed session are reaped", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-mcp-stdio-probe-limit-"));
+  const logPath = join(dir, "requests.jsonl");
+  const fixture = fileURLToPath(new URL("./fixtures/negotiating-stdio-server.mjs", import.meta.url));
+  const errors: Error[] = [];
+  let closeCount = 0;
+  const transport = createBoundedStdioClientTransport({
+    command: process.execPath, args: [fixture, "overflow", logPath], stderr: "ignore",
+  }, { maxFrameBytes: 64, onFatalError: (error) => errors.push(error) });
+  transport.onclose = () => { closeCount += 1; };
+  const client = new Client({ name: "bounded-probe-test", version: "0" }, {
+    versionNegotiation: { mode: "auto", probe: { timeoutMs: 200, maxRetries: 0 } },
+  });
+  try {
+    await expect(client.connect(transport, { timeout: 1_000 })).rejects.toThrow("Connection closed");
+    const requests = (await readFile(logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { pid: number; method: string });
+    expect(requests.map((request) => request.method)).toEqual(["server/discover", "initialize"]);
+    expect(new Set(requests.map((request) => request.pid)).size).toBe(2);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBeInstanceOf(McpStdioFrameTooLargeError);
+    await eventually(() => {
+      expect(closeCount).toBe(1);
+      for (const request of requests) expect(processExists(request.pid)).toBe(false);
+    });
+  } finally {
+    await client.close().catch(() => undefined);
+    await transport.close().catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("closing during discovery reaps the probe without starting a session or emitting close twice", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-mcp-stdio-probe-close-"));
+  const logPath = join(dir, "requests.jsonl");
+  const fixture = fileURLToPath(new URL("./fixtures/negotiating-stdio-server.mjs", import.meta.url));
+  const transport = createBoundedStdioClientTransport({
+    command: process.execPath, args: [fixture, "wait", logPath], stderr: "ignore",
+  });
+  let closeCount = 0;
+  transport.onclose = () => { closeCount += 1; };
+  const client = new Client({ name: "cancel-probe-test", version: "0" }, {
+    versionNegotiation: { mode: "auto", probe: { timeoutMs: 2_000, maxRetries: 0 } },
+  });
+  try {
+    const connecting = rejectionOf(client.connect(transport));
+    let probePid: number | undefined;
+    for (let attempt = 0; attempt < 100 && !probePid; attempt += 1) {
+      const content = await readFile(logPath, "utf8").catch(() => "");
+      if (content.trim()) probePid = (JSON.parse(content.trim()) as { pid: number }).pid;
+      else await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(probePid).toBeDefined();
+    await transport.close();
+    expect(await connecting).toMatchObject({ message: expect.stringContaining("closed during the server/discover probe") });
+    expect(transport.pid).toBeNull();
+    expect((await readFile(logPath, "utf8")).trim().split("\n")).toHaveLength(1);
+    await eventually(() => {
+      expect(closeCount).toBe(1);
+      expect(processExists(probePid!)).toBe(false);
+    });
+  } finally {
+    await client.close().catch(() => undefined);
+    await transport.close().catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
