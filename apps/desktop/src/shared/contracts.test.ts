@@ -15,6 +15,38 @@ import {
 } from "./contracts.js";
 
 describe("desktop IPC contracts", () => {
+  test("validates project-scoped requests and bounded project summaries", () => {
+    const request = { type: "session.stop", projectId: "project-a", sessionId: "session-1" } as const;
+    expect(parseDesktopRequest(request)).toEqual(request);
+    expect(parseDesktopRequest({ type: "workspace.activate", id: "project-b" })).toEqual({ type: "workspace.activate", id: "project-b" });
+    expect(() => parseDesktopRequest({ ...request, projectId: "../outside" })).toThrow();
+    expect(() => parseDesktopRequest({ type: "workspace.activate", id: "project-b", path: "/arbitrary" })).toThrow();
+    const project = { id: "project-a", path: "/a", phase: "healthy" as const, runningCount: 1, attentionCount: 0,
+      tasksLoaded: true, recentTasks: [{ id: "session-1", title: "Task A", status: "active" as const, updatedAt: 1 }] };
+    const state = { projectId: "project-a", workspace: "/a", projects: [project], sidecar: { phase: "healthy" as const, attempt: 0 }, queuedBySession: {} };
+    expect(parseDesktopState(state)).toEqual(state);
+    expect(() => parseDesktopState({ ...state, workspace: "/b" })).toThrow("Active project");
+    expect(() => parseDesktopState({ ...state, projects: [project, project] })).toThrow("Duplicate projects");
+    expect(() => parseDesktopState({ ...state, projects: Array(65).fill(project) })).toThrow("project list");
+    expect(() => parseDesktopState({ ...state, projects: [{ ...project, runningCount: -1 }] })).toThrow();
+    expect(() => parseDesktopState({ ...state, projects: [{ ...project, recentTasks: Array(9).fill(project.recentTasks[0]) }] })).toThrow("project tasks");
+    expect(parseDesktopEvent({ type: "queue.changed", projectId: "project-b", sessionId: "session-1", count: 2 }))
+      .toEqual({ type: "queue.changed", projectId: "project-b", sessionId: "session-1", count: 2 });
+  });
+
+  test("validates appearance preferences and rejects arbitrary settings at the IPC boundary", () => {
+    expect(parseDesktopRequest({ type: "appearance.get" })).toEqual({ type: "appearance.get" });
+    for (const theme of ["system", "dark", "light"] as const) {
+      expect(parseDesktopRequest({ type: "appearance.set", theme })).toEqual({ type: "appearance.set", theme });
+      expect(parseDesktopResponse({ type: "appearance.get" }, { theme })).toEqual({ theme });
+      expect(parseDesktopResponse({ type: "appearance.set", theme }, { theme })).toEqual({ theme });
+    }
+    expect(() => parseDesktopRequest({ type: "appearance.set", theme: "unknown" })).toThrow();
+    expect(() => parseDesktopRequest({ type: "appearance.set", theme: "light", path: "/tmp/settings" })).toThrow();
+    expect(() => parseDesktopResponse({ type: "appearance.get" }, { theme: "unknown" })).toThrow();
+    expect(() => parseDesktopResponse({ type: "appearance.get" }, { theme: "light", path: "/tmp/settings" })).toThrow();
+  });
+
   test("turns the resolved shutdown sentinel into a renderer-local rejection", () => {
     expect(() => parseDesktopInvokeResponse(
       { type: "app.state" },

@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { RemoteControlPanel } from "./RemoteControlPanel.js";
+import { ProjectSidebar } from "./ProjectSidebar.js";
+import { eventMatchesProject, ProjectViewMemory } from "./project-view-state.js";
+import { desktopThemeOptions, type DesktopTheme } from "./theme.js";
+import { useDesktopTheme } from "./useDesktopTheme.js";
 import { getDesktopBuildInfo } from "../shared/build-info.js";
 import { SESSION_TITLE_MAX_CHARS } from "@chili/protocol";
 import type {
@@ -106,8 +110,10 @@ interface SessionSettingsValues extends SessionModelSettingsDraft {
   delegationPolicy: DelegationPolicy;
 }
 
-export function App({ transport }: { transport: ControlTransport }) {
+export function App({ transport: hostTransport }: { transport: ControlTransport }) {
   const buildInfo = getDesktopBuildInfo();
+  const { theme, changeTheme, saveFailed: themeSaveFailed, saving: themeSaving } = useDesktopTheme();
+  const [appearanceOpen, setAppearanceOpen] = useState(false);
   const [projection, setProjection] = useState<DesktopProjection>({
     epoch: 0,
     diffRevision: 0,
@@ -118,6 +124,10 @@ export function App({ transport }: { transport: ControlTransport }) {
     sessions: [],
   });
   const [composer, setComposer] = useState("");
+  const transport = useMemo(() => projection.state.projectId && hostTransport.forProject
+    ? hostTransport.forProject(projection.state.projectId) : hostTransport, [hostTransport, projection.state.projectId]);
+  const projectViews = useRef(new ProjectViewMemory());
+  const requestedProjectSession = useRef<{ projectId: string; sessionId: string } | undefined>(undefined);
   const [error, setError] = useState<string>();
   const [working, setWorking] = useState(false);
   const [loadingSession, setLoadingSession] = useState(false);
@@ -174,6 +184,9 @@ export function App({ transport }: { transport: ControlTransport }) {
   const sessions = projection.sessions;
   const selectedId = projection.selectedId;
   const snapshot = projection.snapshot;
+  useEffect(() => {
+    projectViews.current.remember(desktop.workspace, selectedId, composer);
+  }, [desktop.workspace, selectedId, composer]);
   const diffRevision = projection.diffRevision;
   const sessionConfig = sessionConfigState
     ? sessionConfigResponseForSelection(selectedId, sessionConfigState)
@@ -208,10 +221,18 @@ export function App({ transport }: { transport: ControlTransport }) {
   const setDiffRevision = useCallback((next: (current: number) => number) => {
     setProjection((current) => ({ ...current, diffRevision: next(current.diffRevision) }));
   }, []);
+  const projectTransport = useCallback((state = projectionRef.current.state) => state.projectId && hostTransport.forProject
+    ? hostTransport.forProject(state.projectId) : hostTransport, [hostTransport]);
   const coordinator = useMemo(() => new ResyncCoordinator<DesktopState, RuntimeSessionSummary, RuntimeSnapshot, DesktopEvent>({
-    loadState: () => transport.state(),
-    listSessions: () => transport.listSessions(),
-    loadSnapshot: (sessionId) => transport.snapshot(sessionId),
+    loadState: () => hostTransport.state(),
+    listSessions: (state) => projectTransport(state).listSessions(),
+    loadSnapshot: (sessionId, state) => projectTransport(state).snapshot(sessionId),
+    preferredSessionId: (state) => {
+      const requested = requestedProjectSession.current;
+      return requested?.projectId === state.projectId ? requested?.sessionId
+        : state.workspace === workspaceRef.current ? selectedRef.current ?? projectViews.current.read(state.workspace)?.sessionId
+          : projectViews.current.read(state.workspace)?.sessionId;
+    },
     canListSessions: (state) => Boolean(state.workspace) && state.sidecar.phase === "healthy",
     authorityKey: (state) => state.workspace,
     sessionId: (session) => String(session.id),
@@ -233,12 +254,16 @@ export function App({ transport }: { transport: ControlTransport }) {
       if (draftScopeChanged(
         { workspace: workspaceRef.current, sessionId: selectedRef.current },
         { workspace: published.state.workspace, sessionId: published.selectedId },
-      )) setComposer("");
+      )) {
+        const saved = projectViews.current.read(published.state.workspace);
+        setComposer(saved && saved.sessionId === published.selectedId ? saved.draft : "");
+      }
+      const projectChanged = workspaceRef.current !== published.state.workspace;
       workspaceRef.current = published.state.workspace;
       sidecarPhaseRef.current = published.state.sidecar.phase;
       const previousSelectedId = selectedRef.current;
       selectedRef.current = published.selectedId;
-      setSessionConfig((current) => sessionConfigAfterSelectionChange(
+      setSessionConfig((current) => projectChanged ? undefined : sessionConfigAfterSelectionChange(
         previousSelectedId,
         published.selectedId,
         current,
@@ -249,10 +274,10 @@ export function App({ transport }: { transport: ControlTransport }) {
       setDiffLoading(false);
     },
     complete: async ({ barrierId }) => barrierId
-      ? transport.completeResync(barrierId)
+      ? hostTransport.completeResync(barrierId)
       : { status: "completed" },
     statusChanged: (status) => setResyncing(status.actionsDisabled),
-  }), [transport]);
+  }), [hostTransport, projectTransport]);
   const presentation = useMemo(
     () => snapshot && snapshot.sessionId === selectedId ? presentSession(snapshot) : undefined,
     [selectedId, snapshot],
@@ -336,10 +361,11 @@ export function App({ transport }: { transport: ControlTransport }) {
   const reloadSessionConfig = useCallback(async (sessionId = selectedRef.current) => {
     if (!sessionId || sidecarPhaseRef.current !== "healthy") return;
     const isCurrent = configRequestGate.current.begin();
+    const owner = projectionRef.current.state.projectId;
     setConfigLoading(true);
     try {
-      const next = await transport.sessionConfig(sessionId);
-      if (isCurrent() && selectedRef.current === sessionId) {
+      const next = await projectTransport().sessionConfig(sessionId);
+      if (isCurrent() && selectedRef.current === sessionId && projectionRef.current.state.projectId === owner) {
         const accepted = sessionConfigResponseForSelection(selectedRef.current, next);
         if (accepted) {
           setSessionConfig(accepted);
@@ -351,7 +377,7 @@ export function App({ transport }: { transport: ControlTransport }) {
     } finally {
       if (isCurrent()) setConfigLoading(false);
     }
-  }, [transport]);
+  }, [projectTransport]);
 
   useEffect(() => {
     if (!selectedId || !healthy || resyncing) {
@@ -385,7 +411,10 @@ export function App({ transport }: { transport: ControlTransport }) {
     if (draftScopeChanged(
       { workspace: workspaceRef.current, sessionId: selectedRef.current },
       { workspace: workspaceRef.current, sessionId },
-    )) setComposer("");
+    )) {
+      const saved = projectViews.current.read(workspaceRef.current);
+      setComposer(saved?.sessionId === sessionId ? saved.draft : "");
+    }
     setSelectedId(sessionId);
     if (!options.background) {
       setSnapshot(undefined);
@@ -410,14 +439,19 @@ export function App({ transport }: { transport: ControlTransport }) {
   }, [coordinator, setSelectedId, setSnapshot]);
 
   const refreshSessions = useCallback(async (preferredId?: string) => {
+    if (sidecarPhaseRef.current !== "healthy") return;
     let token;
     try {
       token = coordinator.beginRequest("sessions");
-      const next = (await transport.listSessions({ status: "all" }))
+      const next = (await projectTransport().listSessions({ status: "all" }))
         .sort((left, right) => right.updatedAt - left.updatedAt);
       coordinator.acceptResponse(token);
       setSessions(next);
       const current = selectedRef.current;
+      const requested = requestedProjectSession.current;
+      preferredId ??= requested && requested.projectId === projectionRef.current.state.projectId
+        ? requested.sessionId : !current ? projectViews.current.read(workspaceRef.current)?.sessionId : undefined;
+      if (requested && requested.projectId === projectionRef.current.state.projectId) requestedProjectSession.current = undefined;
       const target = preferredId && next.some((session) => session.id === preferredId)
         ? preferredId
         : current && next.some((session) => session.id === current)
@@ -435,7 +469,7 @@ export function App({ transport }: { transport: ControlTransport }) {
         setError(messageFor(cause));
       }
     }
-  }, [coordinator, openSession, setSelectedId, setSessions, setSnapshot, transport]);
+  }, [coordinator, openSession, setSelectedId, setSessions, setSnapshot, projectTransport]);
 
   const reloadSelected = useCallback(async () => {
     const current = selectedRef.current;
@@ -548,14 +582,18 @@ export function App({ transport }: { transport: ControlTransport }) {
       selectWorkspace,
       resumeBarrier: startResync,
     });
-    const unsubscribe = transport.subscribe((envelope) => {
+    const unsubscribe = hostTransport.subscribe((envelope) => {
+      if (!eventMatchesProject(envelope.event, projectionRef.current.state.projectId)) return;
       coordinator.recordFrame({ sequence: envelope.sequence, frame: envelope.event });
       const event = envelope.event;
       if (event.type === "runtime.resync") {
+        const requested = requestedProjectSession.current;
+        const preferred = (requested?.projectId === projectionRef.current.state.projectId ? requested?.sessionId : undefined)
+          ?? selectedRef.current ?? projectViews.current.read(workspaceRef.current)?.sessionId;
         startResync({
           sequence: envelope.sequence,
           barrierId: event.barrierId,
-          ...(selectedRef.current ? { preferredSessionId: selectedRef.current } : {}),
+          ...(preferred ? { preferredSessionId: preferred } : {}),
         });
         return;
       }
@@ -566,13 +604,22 @@ export function App({ transport }: { transport: ControlTransport }) {
         const workspaceChanged = workspaceRef.current !== event.state.workspace;
         coordinator.invalidateRequests("state");
         if (event.state.sidecar.phase !== "healthy") {
+          projectionRefreshes.cancel();
           coordinator.invalidateRequests("sessions", "snapshot", "diff");
           diffRequestGate.current.invalidate();
           setDiffLoading(false);
           if (selectedRef.current) setDiffText("Runtime unavailable; changes will refresh after recovery.");
         }
         if (workspaceChanged) {
+          projectionRefreshes.cancel();
           setComposer("");
+          setNewTaskOpen(false);
+          setSettingsOpen(false);
+          setRenameTarget(undefined);
+          setArchiveTarget(undefined);
+          setGoalSetupOpen(false);
+          setGoalBudgetOpen(false);
+          setTaskMenuId(undefined);
           workspaceRef.current = event.state.workspace;
           coordinator.invalidateRequests("sessions", "snapshot", "diff");
           diffRequestGate.current.invalidate();
@@ -583,12 +630,10 @@ export function App({ transport }: { transport: ControlTransport }) {
             undefined,
             current,
           ));
-          setProjection((current) => ({
-            epoch: current.epoch,
-            diffRevision: current.diffRevision + 1,
-            state: event.state,
-            sessions: [],
-          }));
+          const next = { epoch: projectionRef.current.epoch, diffRevision: projectionRef.current.diffRevision + 1,
+            state: event.state, sessions: [] };
+          projectionRef.current = next;
+          setProjection(next);
           setLoadingSession(false);
           setDiffLoading(false);
           setDiffText("Select a session to inspect changes.");
@@ -646,11 +691,12 @@ export function App({ transport }: { transport: ControlTransport }) {
       stateToken = undefined;
     }
     if (stateToken) {
-      void transport.state().then((state) => {
+      void hostTransport.state().then((state) => {
         if (disposed || !stateToken) return;
         coordinator.acceptResponse(stateToken);
         workspaceRef.current = state.workspace;
         sidecarPhaseRef.current = state.sidecar.phase;
+        projectionRef.current = { ...projectionRef.current, state };
         setDesktop(state);
         if (state.sidecar.phase === "healthy") void refreshSessions();
       }).catch((cause) => {
@@ -674,7 +720,7 @@ export function App({ transport }: { transport: ControlTransport }) {
       diffRequestGate.current.invalidate();
       coordinator.cancel();
     };
-  }, [coordinator, projectionRefreshes, refreshSessions, reloadSelected, reloadSessionConfig, setDesktop, setSnapshot, transport]);
+  }, [coordinator, projectionRefreshes, refreshSessions, reloadSelected, reloadSessionConfig, setDesktop, setSnapshot, hostTransport]);
 
   useEffect(() => {
     const isCurrent = diffRequestGate.current.begin();
@@ -706,13 +752,18 @@ export function App({ transport }: { transport: ControlTransport }) {
     return () => diffRequestGate.current.invalidate();
   }, [coordinator, diffRevision, diffScope, healthy, loadingSession, presentation?.latestTurnId, resyncing, selectedId, snapshot?.sessionId, transport]);
 
-  const chooseWorkspace = async () => runAction(async () => {
+  const chooseWorkspace = async (projectId?: string, sessionId?: string) => runAction(async () => {
+    requestedProjectSession.current = projectId && sessionId ? { projectId, sessionId } : undefined;
     diffRequestGate.current.invalidate();
     coordinator.invalidateRequests();
     const previousWorkspace = workspaceRef.current;
     let stateToken;
     const state = await selectWorkspaceWithRecoveryEscape.current(async () => {
       stateToken = coordinator.beginRequest("state");
+      if (projectId) {
+        if (!transport.activateProject) throw new Error("Project switching is unavailable");
+        return transport.activateProject(projectId);
+      }
       return transport.selectWorkspace();
     });
     if (!stateToken || !coordinator.isRequestCurrent(stateToken)) return;
@@ -912,7 +963,8 @@ export function App({ transport }: { transport: ControlTransport }) {
     if (!selectedId || !text || !composerEditable || actionInFlightRef.current) return;
     await runAction(async () => {
       await transport.send(selectedId, text, mode);
-      setComposer("");
+      projectViews.current.remember(desktop.workspace, selectedId, "");
+      if (projectionRef.current.state.workspace === desktop.workspace && selectedRef.current === selectedId) setComposer("");
     });
   };
 
@@ -973,6 +1025,16 @@ export function App({ transport }: { transport: ControlTransport }) {
           </div>
         </div>
         <div className="titlebar-actions">
+          <button
+            className="chrome-button"
+            type="button"
+            aria-label="Appearance settings"
+            title="Appearance"
+            aria-haspopup="dialog"
+            onClick={() => setAppearanceOpen(true)}
+          >
+            <Icon name="appearance" />
+          </button>
           <RemoteControlPanel />
           <div className={`runtime-pill phase-${desktop.sidecar.phase}`} title="Local runtime status">
             <span className="status-dot" aria-hidden="true" />
@@ -1060,6 +1122,8 @@ export function App({ transport }: { transport: ControlTransport }) {
               </button>
             </div>
           </div>
+          <ProjectSidebar projects={desktop.projects ?? []} activeId={desktop.projectId} disabled={!workspaceSwitchEnabled}
+            onActivate={(id, sessionId) => void chooseWorkspace(id, sessionId)}>
           <section className="session-section">
             <div className="section-heading">
               <p className="eyebrow">{sessionListStatus === "active" ? "Recent tasks" : "Archived tasks"}</p>
@@ -1144,12 +1208,13 @@ export function App({ transport }: { transport: ControlTransport }) {
               {!healthy ? <p className="empty-copy sidebar-empty">Choose a project and let the local runtime warm up.</p> : null}
             </div>
           </section>
+          </ProjectSidebar>
           <footer className="workspace-picker">
-            <button className="workspace-card" disabled={!workspaceSwitchEnabled} onClick={() => void chooseWorkspace()}>
+            <button className="workspace-card" aria-label="Add project" disabled={!workspaceSwitchEnabled} onClick={() => void chooseWorkspace()}>
               <span className="workspace-icon" aria-hidden="true"><Icon name="folder" /></span>
               <span className="workspace-copy">
-                <strong>{projectLabel}</strong>
-                <span title={desktop.workspace}>{desktop.workspace ?? "Choose a local project"}</span>
+                <strong>Add project</strong>
+                <span>Keep projects running side by side</span>
               </span>
               <Icon name="chevron" />
             </button>
@@ -1486,6 +1551,16 @@ export function App({ transport }: { transport: ControlTransport }) {
         />
       ) : null}
 
+      {appearanceOpen ? (
+        <AppearanceDialog
+          theme={theme}
+          onChange={changeTheme}
+          saveFailed={themeSaveFailed}
+          saving={themeSaving}
+          onClose={() => setAppearanceOpen(false)}
+        />
+      ) : null}
+
       {settingsOpen && sessionConfig ? (
         <SessionSettingsDialog
           config={sessionConfig}
@@ -1514,6 +1589,46 @@ export function App({ transport }: { transport: ControlTransport }) {
         />
       ) : null}
     </div>
+  );
+}
+
+function AppearanceDialog({ theme, onChange, saveFailed, saving, onClose }: {
+  theme: DesktopTheme;
+  onChange: (theme: DesktopTheme) => void;
+  saveFailed: boolean;
+  saving: boolean;
+  onClose: () => void;
+}) {
+  useDialogEscape(onClose, saving);
+  return (
+    <ModalFrame labelId="appearance-title" className="appearance-dialog" onClose={onClose} closeDisabled={saving}>
+      <header className="modal-heading">
+        <div><p className="eyebrow">Personalize</p><h2 id="appearance-title">Appearance</h2><p>Make Chili feel at home.</p></div>
+        <button className="icon-button" type="button" aria-label="Close appearance settings" disabled={saving} onClick={onClose}><Icon name="close" /></button>
+      </header>
+      <div className="modal-scroll">
+        <fieldset className="theme-picker">
+          <legend>Theme</legend>
+          <div className="theme-options">
+            {desktopThemeOptions.map((option) => (
+              <label className="theme-option" key={option.id}>
+                <span className={`theme-preview theme-preview-${option.id}`} aria-hidden="true">
+                  <span className="theme-preview-sidebar"><i /><i /><i /></span>
+                  <span className="theme-preview-content"><i /><i /><i /><b /></span>
+                </span>
+                <span className="theme-option-label">
+                  <input type="radio" name="desktop-theme" value={option.id} checked={theme === option.id} onChange={() => onChange(option.id)} data-modal-initial-focus={theme === option.id ? "true" : undefined} />
+                  <strong>{option.label}</strong>
+                </span>
+                <small>{option.description}</small>
+              </label>
+            ))}
+          </div>
+        </fieldset>
+        {saveFailed ? <p className="field-error" role="alert">Theme applied, but it could not be saved. <button className="text-button" onClick={() => onChange(theme)}>Retry</button></p> : null}
+      </div>
+      <footer className="modal-actions"><span role="status">{saving ? "Saving theme…" : saveFailed ? "This change has not been saved." : "Applies to all tasks. Changes are saved automatically."}</span><button className="primary" type="button" disabled={saving} onClick={onClose}>Done</button></footer>
+    </ModalFrame>
   );
 }
 
@@ -2365,7 +2480,7 @@ function UserInputCard({
 }
 
 type IconName = "activity" | "archive" | "budget" | "chevron" | "close" | "folder" | "message" | "more"
-  | "pause" | "plus" | "queue" | "resume" | "search" | "send" | "settings" | "shield" | "sidebar"
+  | "appearance" | "pause" | "plus" | "queue" | "resume" | "search" | "send" | "settings" | "shield" | "sidebar"
   | "steer" | "stop" | "terminal";
 
 function ChiliMark() {
@@ -2396,6 +2511,7 @@ function Icon({ name }: { name: IconName }) {
       case "pause": return <><path d="M9 7v10M15 7v10" /></>;
       case "resume": return <><path d="M7 5v14l11-7-11-7Z" /></>;
       case "search": return <><circle cx="10.5" cy="10.5" r="6" /><path d="m15 15 4 4" /></>;
+      case "appearance": return <><circle cx="12" cy="12" r="8" /><path d="M12 4a8 8 0 0 1 0 16Z" fill="currentColor" stroke="none" /></>;
       case "settings": return <><circle cx="12" cy="12" r="3" /><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6 7 7M17 17l1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4" /></>;
       case "steer": return <path d="M5 18c0-4 2-6 6-6h8M15 8l4 4-4 4M5 6v4" />;
       case "queue": return <><path d="M5 7h14M5 12h9M5 17h6" /><path d="m16 15 3 3-3 3" /></>;
@@ -2525,6 +2641,7 @@ function applyDesktopFrames(
 ): DesktopProjection {
   return frames.reduce((current, input) => {
     const frame = input.frame;
+    if (!eventMatchesProject(frame, current.state.projectId)) return current;
     if (frame.type === "state.changed") return { ...current, state: frame.state };
     if (frame.type === "queue.changed") {
       return {

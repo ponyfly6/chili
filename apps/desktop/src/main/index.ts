@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import type { ChiliEvent } from "@chili/protocol";
 import {
@@ -6,11 +6,16 @@ import {
   BrowserWindow,
   dialog,
   Notification,
+  nativeTheme,
 } from "electron";
 import { safeDesktopErrorMessage as safeLogMessage } from "../shared/safe-error.js";
 import { getDesktopBuildInfo } from "../shared/build-info.js";
+import { parseDesktopResponse } from "../shared/contracts.js";
 import { BootstrapLifecycleGuard } from "./bootstrap-lifecycle.js";
+import { DesktopAppearanceSettings } from "./appearance-settings.js";
 import { DesktopControlService } from "./control-service.js";
+import { DesktopProjectManager } from "./project-manager.js";
+import { DesktopProjectSettings } from "./project-settings.js";
 import { DesktopRemoteControlManager } from "./remote-control-manager.js";
 import { DesktopRemoteSettings } from "./remote-control-settings.js";
 import { DeferredElectronQuit } from "./deferred-electron-quit.js";
@@ -52,9 +57,9 @@ let sidecar: SidecarManager | undefined;
 let control: DesktopControlService | undefined;
 let remoteControl: DesktopRemoteControlManager | undefined;
 let desktopIpc: DesktopIpcController | undefined;
+let projects: DesktopProjectManager | undefined;
 const bootstrapLifecycle = new BootstrapLifecycleGuard();
 const deferredElectronQuit = new DeferredElectronQuit(exitDesktopProcess);
-const notificationGate = new DesktopNotificationGate();
 let shutdownFinished = false;
 let forcedExitStarted = false;
 let exitCode = 0;
@@ -92,41 +97,18 @@ async function bootstrap(): Promise<void> {
   await installRendererProtocol();
   if (!bootstrapLifecycle.canContinue()) return;
 
-  const createdSidecar = new SidecarManager({
-    repositoryRoot,
-    isPackaged: app.isPackaged,
-    resourcesPath: process.resourcesPath,
-    onState: (state, generation) => {
-      notificationGate.observeSidecarState(state.sidecar.phase, generation);
-      control?.observeState(state, generation);
-      remoteControl?.observeSidecar(state, generation);
-      desktopIpc?.publish({ type: "state.changed", state });
-    },
-    onEvent: (event, generation) => {
-      control?.observeEvent(event, generation);
-      desktopIpc?.publish({ type: "runtime.event", event });
-      maybeNotify(event, generation);
-    },
-    onResync: () => desktopIpc?.requestResync("source_cursor"),
-    onLog: (stream, text) => {
-      const output = stream === "stderr" ? console.error : console.log;
-      output(`[sidecar:${stream}] ${text}`);
-    },
-  });
-  sidecar = createdSidecar;
-  if (!bootstrapLifecycle.canContinue()) {
-    await createdSidecar.stop().catch((error) => {
-      console.error("Failed to stop late Chili sidecar", safeLogMessage(error));
-    });
-    if (sidecar === createdSidecar) sidecar = undefined;
-    return;
-  }
+  const appearanceSettings = new DesktopAppearanceSettings(resolve(app.getPath("userData"), "appearance-settings.json"));
+  nativeTheme.themeSource = await appearanceSettings.initialize();
+  if (!bootstrapLifecycle.canContinue()) return;
 
+  // The empty runtime lets connection setup remain available before a project is opened.
+  const createdSidecar = new SidecarManager({ repositoryRoot, isPackaged: app.isPackaged, resourcesPath: process.resourcesPath });
+  sidecar = createdSidecar;
   control = new DesktopControlService({
     sidecar: createdSidecar,
     selectWorkspace,
-    persistWorkspace,
-    emitQueue: (sessionId, count) => desktopIpc?.publish({ type: "queue.changed", sessionId, count }),
+    persistWorkspace: async () => undefined,
+    emitQueue: () => undefined,
     onError: (error) => console.error("Desktop control error", safeLogMessage(error)),
   });
   const remoteSettings = new DesktopRemoteSettings({
@@ -140,10 +122,53 @@ async function bootstrap(): Promise<void> {
   await remoteSettings.initialize();
   if (!bootstrapLifecycle.canContinue()) return;
   remoteControl = new DesktopRemoteControlManager({
-    controlService: control,
+    controlService: () => control!,
     settings: remoteSettings,
   });
 
+  projects = new DesktopProjectManager({
+    settings: new DesktopProjectSettings(resolve(app.getPath("userData"), "desktop-state.json")),
+    chooseDirectory: selectWorkspace,
+    beforeActivate: () => remoteControl?.disable() ?? Promise.resolve(),
+    activated: (runtime) => {
+      sidecar = runtime.sidecar as SidecarManager;
+      control = runtime.control as DesktopControlService;
+      remoteControl?.observeSidecar(sidecar.state(), sidecar.currentGeneration());
+    },
+    publish: (event) => desktopIpc?.publish(event),
+    resync: () => desktopIpc?.requestResync("source_cursor"),
+    createRuntime: (project) => {
+      const gate = new DesktopNotificationGate();
+      let projectControl: DesktopControlService;
+      const manager = new SidecarManager({
+        repositoryRoot, isPackaged: app.isPackaged, resourcesPath: process.resourcesPath,
+        onState: (state, generation) => {
+          gate.observeSidecarState(state.sidecar.phase, generation);
+          projectControl.observeState(state, generation);
+          if (projects?.activeProjectId() === project.id) remoteControl?.observeSidecar(state, generation);
+          projects?.observeState(project.id);
+        },
+        onEvent: (event, generation) => {
+          projectControl.observeEvent(event, generation);
+          projects?.observeEvent(project.id, event);
+          maybeNotify(event, generation, gate, project.id);
+        },
+        onResync: () => {
+          if (projects?.activeProjectId() === project.id) desktopIpc?.requestResync("source_cursor");
+        },
+        onLog: (stream, text) => (stream === "stderr" ? console.error : console.log)(`[sidecar:${stream}] ${text}`),
+      });
+      projectControl = new DesktopControlService({
+        sidecar: manager,
+        selectWorkspace: async () => undefined,
+        persistWorkspace: async () => undefined,
+        emitQueue: (sessionId, count) => projects?.observeQueue(project.id, sessionId, count),
+        onError: (error) => console.error("Desktop control error", safeLogMessage(error)),
+      });
+      return { sidecar: manager, control: projectControl };
+    },
+  });
+  await projects.initialize();
   if (!bootstrapLifecycle.canContinue()) return;
   const createdWindow = createDesktopWindow();
   if (!bootstrapLifecycle.canContinue()) {
@@ -151,16 +176,26 @@ async function bootstrap(): Promise<void> {
     return;
   }
   mainWindow = createdWindow;
-  const desktopControl = control;
+  const desktopProjects = projects;
   const desktopRemote = remoteControl;
   desktopIpc = registerDesktopIpc(mainWindow, {
     async invoke(request) {
-      // Invalidate phone authority before the workspace picker or switch can
-      // await anything. The local renderer and adapter share desktopControl.
-      if (request.type === "workspace.select") await desktopRemote.disable();
-      return desktopControl.invoke(request);
+      if (request.type === "appearance.get") return parseDesktopResponse(request, { theme: await appearanceSettings.getTheme() });
+      if (request.type === "appearance.set") {
+        const theme = await appearanceSettings.setTheme(request.theme);
+        nativeTheme.themeSource = theme;
+        return parseDesktopResponse(request, { theme });
+      }
+      return desktopProjects.invoke(request);
     },
-  }, desktopRemote);
+  }, {
+    invoke: (request) => {
+      if (desktopProjects.isSelecting() && request.type !== "status" && request.type !== "disable") {
+        return Promise.reject(new Error("Project selection is in progress"));
+      }
+      return desktopRemote.invoke(request);
+    },
+  });
   createdWindow.once("closed", () => {
     desktopIpc?.dispose();
     desktopIpc = undefined;
@@ -170,26 +205,19 @@ async function bootstrap(): Promise<void> {
   if (!bootstrapLifecycle.canContinue()) return;
   smokeStage("window-loaded");
 
-  let initialWorkspace = process.env.CHILI_DESKTOP_WORKSPACE?.trim();
-  if (!initialWorkspace) {
-    initialWorkspace = await readPersistedWorkspace();
-    if (!bootstrapLifecycle.canContinue()) return;
-  }
-  if (initialWorkspace) {
+  const initialWorkspace = process.env.CHILI_DESKTOP_WORKSPACE?.trim();
+  const savedProjectId = desktopProjects.activeProjectId();
+  if (initialWorkspace || savedProjectId) {
     try {
       if (!bootstrapLifecycle.canContinue()) return;
       smokeStage("sidecar-starting");
-      await createdSidecar.switchWorkspace(initialWorkspace);
+      if (initialWorkspace) await desktopProjects.add(initialWorkspace);
+      else if (savedProjectId) await desktopProjects.activate(savedProjectId);
       if (!bootstrapLifecycle.canContinue()) return;
       smokeStage("sidecar-healthy");
-      const selected = createdSidecar.currentWorkspace();
-      if (selected) {
-        await persistWorkspace(selected);
-        if (!bootstrapLifecycle.canContinue()) return;
-      }
     } catch (error) {
       if (!bootstrapLifecycle.canContinue()) return;
-      console.error("Failed to start workspace sidecar", safeLogMessage(error));
+      console.error("Failed to start project runtime", safeLogMessage(error));
     }
   }
 
@@ -248,34 +276,16 @@ async function selectWorkspace(): Promise<string | undefined> {
   return result.canceled ? undefined : result.filePaths[0];
 }
 
-async function persistWorkspace(workspace: string): Promise<void> {
-  const path = desktopStatePath();
-  await mkdir(app.getPath("userData"), { recursive: true });
-  await writeFile(path, `${JSON.stringify({ workspace }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-}
-
-async function readPersistedWorkspace(): Promise<string | undefined> {
-  try {
-    const value: unknown = JSON.parse(await readFile(desktopStatePath(), "utf8"));
-    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-    const workspace = (value as Record<string, unknown>).workspace;
-    return typeof workspace === "string" && isAbsolute(workspace) ? workspace : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function desktopStatePath(): string {
-  return resolve(app.getPath("userData"), "desktop-state.json");
-}
-
-function maybeNotify(event: ChiliEvent, generation: number): void {
+function maybeNotify(event: ChiliEvent, generation: number, gate: DesktopNotificationGate, projectId: string): void {
   const window = mainWindow;
-  if (!window || window.isFocused() || !Notification.isSupported()) return;
-  const content = notificationGate.notificationForEvent(event, generation);
+  if (!window || (window.isFocused() && projects?.activeProjectId() === projectId) || !Notification.isSupported()) return;
+  const content = gate.notificationForEvent(event, generation);
   if (!content) return;
   const notification = new Notification({ ...content, silent: false });
-  notification.on("click", focusMainWindow);
+  notification.on("click", () => {
+    focusMainWindow();
+    void projects?.activate(projectId).catch(() => undefined);
+  });
   notification.show();
 }
 
@@ -305,6 +315,7 @@ function beginShutdown(): void {
   desktopIpc?.beginShutdown();
   const remoteShutdown = remoteControl?.disable() ?? Promise.resolve();
   controlService?.beginShutdown();
+  projects?.beginShutdown();
   smokeStage("shutdown-started");
   const manager = sidecar;
   let stopAttempts = 0;
@@ -347,7 +358,7 @@ function beginShutdown(): void {
       try {
         await Promise.all([
           remoteShutdown,
-          manager?.stop() ?? Promise.resolve(),
+          projects?.stop() ?? manager?.stop() ?? Promise.resolve(),
           controlService?.containMainProcesses() ?? Promise.resolve(),
         ]);
       } catch (error) {
@@ -375,6 +386,7 @@ function finishShutdown(force: boolean): void {
     if (forcedExitStarted) return;
     forcedExitStarted = true;
     try {
+      projects?.forceContainGitProcessGroups();
       control?.forceContainGitProcessGroups();
     } catch (error) {
       console.error("Failed to synchronously signal every Chili Git process group", safeLogMessage(error));

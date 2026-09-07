@@ -1,5 +1,5 @@
 .remote-panel-anchor { position: relative; -webkit-app-region: no-drag; }
-.remote-panel-layer { position: fixed; inset: 0; z-index: 100; background: rgb(4 4 3 / 42%); -webkit-app-region: no-drag; }
+.remote-panel-layer { position: fixed; inset: 0; z-index: 100; background: light-dark(rgb(45 35 23 / 18.9%), rgb(4 4 3 / 42%)); -webkit-app-region: no-drag; }
 .remote-panel { position: absolute; top: 60px; right: 18px; display: flex; flex-direction: column; width: min(460px, calc(100vw - 32px)); max-height: calc(100dvh - 78px); overflow: hidden; border: 1px solid var(--line-strong); border-radius: var(--radius-lg); background: var(--panel); color: var(--text); box-shadow: var(--shadow-float); font-size: 13px; line-height: 1.55; }
 .remote-panel-heading { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 20px 14px; border-bottom: 1px solid var(--line); }
 .remote-panel-heading .eyebrow { margin: 0 0 3px; }
@@ -39,7 +39,7 @@
 .remote-pairing-code { padding: 2px 6px; border-radius: 5px; background: var(--panel-raised); font-family: ui-monospace, monospace; letter-spacing: 0.08em; }
 .remote-panel-device { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
 .remote-panel-device code { display: block; overflow-wrap: anywhere; color: var(--muted); font-size: 11px; }
-.remote-panel .remote-panel-error { padding: 10px 12px; border: 1px solid rgb(238 119 103 / 25%); border-radius: var(--radius-sm); background: rgb(238 119 103 / 6%); color: var(--red); overflow-wrap: anywhere; }
+.remote-panel .remote-panel-error { padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--red) 25%, transparent); border-radius: var(--radius-sm); background: color-mix(in srgb, var(--red) 6%, transparent); color: var(--red); overflow-wrap: anywhere; }
 .remote-panel .remote-panel-footnote { margin: 16px 0 0; padding-top: 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
 .desktop-build-label { flex: none; padding: 2px 5px; border: 1px solid var(--accent-line); border-radius: 4px; color: var(--accent); font-size: 10px; line-height: 1.4; white-space: nowrap; }
 @media (max-width: 520px) {

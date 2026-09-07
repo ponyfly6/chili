@@ -6,8 +6,11 @@ import type {
 } from "../shared/contracts.js";
 import type { ControlTransport } from "./transport.js";
 
-export function createElectronTransport(api: ChiliDesktopApi): ControlTransport {
-  const invoke = <Request extends DesktopRequest>(request: Request) => api.invoke(request);
+export function createElectronTransport(api: ChiliDesktopApi, projectId?: string): ControlTransport {
+  const invoke = <Request extends DesktopRequest>(request: Request) => api.invoke({
+    ...request,
+    ...(projectId ? { projectId } : {}),
+  });
   const pendingWorkspaceSelections = new Set<Promise<DesktopState>>();
   const selectWorkspace = (): Promise<DesktopState> => {
     const selection = invoke({ type: "workspace.select" });
@@ -24,6 +27,13 @@ export function createElectronTransport(api: ChiliDesktopApi): ControlTransport 
     return invoke(request);
   };
   return {
+    forProject: (id) => createElectronTransport(api, id),
+    activateProject: (id) => {
+      const selection = invoke({ type: "workspace.activate", id });
+      pendingWorkspaceSelections.add(selection);
+      void selection.finally(() => pendingWorkspaceSelections.delete(selection)).catch(() => undefined);
+      return selection;
+    },
     state: () => invoke({ type: "app.state" }),
     selectWorkspace,
     listSessions: (options = {}) => invokeAfterWorkspaceSelection({ type: "sessions.list", ...options }),

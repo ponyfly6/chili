@@ -1,3 +1,4 @@
+import type { DesktopTheme } from "./appearance.js";
 import {
   normalizeSessionTitle,
   parseRuntimeDelegationConfig as parseProtocolDelegationConfig,
@@ -62,7 +63,19 @@ export type DesktopResyncReason =
   | "sequence_gap"
   | "delivery_error";
 
+export interface DesktopProject {
+  id: string;
+  path: string;
+  phase: SidecarPhase;
+  runningCount: number;
+  attentionCount: number;
+  tasksLoaded: boolean;
+  recentTasks: Array<{ id: string; title: string; status: "active" | "archived"; updatedAt: number }>;
+}
+
 export interface DesktopState {
+  projectId?: string;
+  projects?: DesktopProject[];
   workspace?: string;
   sidecar: {
     phase: SidecarPhase;
@@ -161,9 +174,12 @@ export interface DesktopSessionConfig {
   mcp: RuntimeMcpStatusResponse;
 }
 
-export type DesktopRequest =
+type DesktopOperation =
+  | { type: "appearance.get" }
+  | { type: "appearance.set"; theme: DesktopTheme }
   | { type: "app.state" }
   | { type: "workspace.select" }
+  | { type: "workspace.activate"; id: string }
   | { type: "sessions.list"; query?: string; status?: SessionListStatus }
   | ({ type: "sessions.create" } & DesktopCreateSessionOptions)
   | { type: "models.list"; provider?: string }
@@ -209,9 +225,15 @@ export type DesktopRequest =
   | { type: "events.resync.complete"; barrierId: string }
   | { type: "diff.get"; scope: DiffScope; sessionId: string; turnId?: string };
 
+/** Every runtime operation can name its owning project independently of the visible project. */
+export type DesktopRequest = DesktopOperation & { projectId?: string };
+
 export interface DesktopResponseMap {
+  "appearance.get": { theme: DesktopTheme };
+  "appearance.set": { theme: DesktopTheme };
   "app.state": DesktopState;
   "workspace.select": DesktopState;
+  "workspace.activate": DesktopState;
   "sessions.list": RuntimeSessionSummary[];
   "sessions.create": DesktopCreateSessionResult;
   "models.list": RuntimeModelDescriptor[];
@@ -245,8 +267,8 @@ export type DesktopResponse<Request extends DesktopRequest> = DesktopResponseMap
 
 export type DesktopEvent =
   | { type: "state.changed"; state: DesktopState }
-  | { type: "runtime.event"; event: ChiliEvent }
-  | { type: "queue.changed"; sessionId: string; count: number }
+  | { type: "runtime.event"; event: ChiliEvent; projectId?: string }
+  | { type: "queue.changed"; sessionId: string; count: number; projectId?: string }
   | { type: "runtime.resync"; barrierId: string; reason: DesktopResyncReason };
 
 export interface DesktopEventEnvelope {
@@ -274,9 +296,21 @@ export interface ChiliDesktopApi {
 
 export function parseDesktopRequest(value: unknown): DesktopRequest {
   const record = requireRecord(value, "Desktop request");
+  const { projectId, ...operation } = record;
+  const request = parseDesktopOperation(operation);
+  return projectId === undefined ? request : { ...request, projectId: requireProjectId(projectId, "projectId") };
+}
+
+function parseDesktopOperation(value: unknown): DesktopOperation {
+  const record = requireRecord(value, "Desktop request");
   const type = requireString(record.type, "type", 80);
   assertOnlyKeys(record, requestKeys(type));
 
+  if (type === "workspace.activate") return { type, id: requireProjectId(record.id, "id") };
+  if (type === "appearance.get") return { type };
+  if (type === "appearance.set") {
+    return { type, theme: requireEnum(record.theme, ["system", "dark", "light"], "theme") as DesktopTheme };
+  }
   if (type === "app.state" || type === "workspace.select" || type === "permissions.get") {
     return { type };
   }
@@ -520,10 +554,11 @@ export function parseDesktopEvent(value: unknown): DesktopEvent {
     return { type: "state.changed", state: parseDesktopState(record.state) };
   }
   if (record.type === "queue.changed") {
-    assertOnlyKeys(record, ["type", "sessionId", "count"]);
+    assertOnlyKeys(record, ["type", "sessionId", "count", "projectId"]);
     const count = record.count;
     if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0) throw new TypeError("Invalid queue count");
-    return { type: "queue.changed", sessionId: requireSafeMapKey(record.sessionId, "sessionId"), count };
+    return { type: "queue.changed", sessionId: requireSafeMapKey(record.sessionId, "sessionId"), count,
+      ...(record.projectId === undefined ? {} : { projectId: requireProjectId(record.projectId, "projectId") }) };
   }
   if (record.type === "runtime.resync") {
     assertOnlyKeys(record, ["type", "barrierId", "reason"]);
@@ -534,8 +569,9 @@ export function parseDesktopEvent(value: unknown): DesktopEvent {
     };
   }
   if (record.type === "runtime.event") {
-    assertOnlyKeys(record, ["type", "event"]);
-    return { type: "runtime.event", event: parseRuntimeEvent(record.event) };
+    assertOnlyKeys(record, ["type", "event", "projectId"]);
+    return { type: "runtime.event", event: parseRuntimeEvent(record.event),
+      ...(record.projectId === undefined ? {} : { projectId: requireProjectId(record.projectId, "projectId") }) };
   }
   throw new TypeError("Unsupported desktop event");
 }
@@ -577,7 +613,11 @@ export function parseDesktopResponse<Request extends DesktopRequest>(
 ): DesktopResponse<Request> {
   assertDesktopJsonValue(value, "Desktop response");
   let response: unknown;
-  if (request.type === "app.state" || request.type === "workspace.select") {
+  if (request.type === "appearance.get" || request.type === "appearance.set") {
+    const record = requireRecord(value, "appearance response");
+    assertOnlyKeys(record, ["theme"]);
+    response = { theme: requireEnum(record.theme, ["system", "dark", "light"], "theme") };
+  } else if (request.type === "app.state" || request.type === "workspace.select" || request.type === "workspace.activate") {
     response = parseDesktopState(value);
   } else if (request.type === "sessions.list") {
     if (!Array.isArray(value) || value.length > 10_000) throw new TypeError("Invalid session list");
@@ -740,6 +780,34 @@ export function parseDesktopState(value: unknown): DesktopState {
   }
   const queuedBySession = Object.fromEntries(queuedEntries) as Record<string, number>;
   const state: DesktopState = { sidecar: { phase, attempt: sidecar.attempt }, queuedBySession };
+  if (record.projectId !== undefined) state.projectId = requireProjectId(record.projectId, "projectId");
+  if (record.projects !== undefined) {
+    if (!Array.isArray(record.projects) || record.projects.length > 64) throw new TypeError("Invalid project list");
+    state.projects = record.projects.map((value) => {
+      const project = requireRecord(value, "project");
+      assertOnlyKeys(project, ["id", "path", "phase", "runningCount", "attentionCount", "tasksLoaded", "recentTasks"]);
+      if (!Array.isArray(project.recentTasks) || project.recentTasks.length > 8) throw new TypeError("Invalid project tasks");
+      return {
+        id: requireProjectId(project.id, "project.id"),
+        path: requireString(project.path, "project.path", 16_384),
+        phase: requireEnum(project.phase, ["idle", "starting", "healthy", "recovering", "stopping", "error"], "project.phase") as SidecarPhase,
+        runningCount: requireNonNegativeInteger(project.runningCount, "project.runningCount"),
+        attentionCount: requireNonNegativeInteger(project.attentionCount, "project.attentionCount"),
+        tasksLoaded: requireBoolean(project.tasksLoaded, "project.tasksLoaded"),
+        recentTasks: project.recentTasks.map((value) => {
+          const task = requireRecord(value, "project task");
+          assertOnlyKeys(task, ["id", "title", "status", "updatedAt"]);
+          return { id: requireIdentifier(task.id, "task.id"), title: requireString(task.title, "task.title", 160),
+            status: requireEnum(task.status, ["active", "archived"], "task.status") as "active" | "archived",
+            updatedAt: requireNonNegativeInteger(task.updatedAt, "task.updatedAt") };
+        }),
+      };
+    });
+    if (new Set(state.projects.map((project) => project.id)).size !== state.projects.length) throw new TypeError("Duplicate projects");
+    if (state.projectId && !state.projects.some((project) => project.id === state.projectId && project.path === record.workspace)) {
+      throw new TypeError("Active project does not match the workspace");
+    }
+  }
   if (record.workspace !== undefined) state.workspace = requireString(record.workspace, "workspace", 16_384);
   if (sidecar.error !== undefined) state.sidecar.error = requireString(sidecar.error, "sidecar.error", 8_000);
   return state;
@@ -1063,6 +1131,9 @@ function parseUserInputQuestion(value: unknown): UserInputQuestion {
 }
 
 function requestKeys(type: string): readonly string[] {
+  if (type === "workspace.activate") return ["type", "id"];
+  if (type === "appearance.get") return ["type"];
+  if (type === "appearance.set") return ["type", "theme"];
   if (type === "app.state" || type === "workspace.select" || type === "permissions.get") return ["type"];
   if (type === "sessions.list") return ["type", "query", "status"];
   if (type === "sessions.create") {
@@ -1137,6 +1208,12 @@ function requireString(value: unknown, field: string, max: number, allowEmpty = 
   if (value.length > max) throw new TypeError(`${field} exceeds ${max} characters`);
   if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) throw new TypeError(`${field} contains control characters`);
   return allowEmpty ? value : text;
+}
+
+function requireProjectId(value: unknown, field: string): string {
+  const id = requireIdentifier(value, field);
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(id)) throw new TypeError(`Invalid ${field}`);
+  return id;
 }
 
 function requireIdentifier(value: unknown, field: string): string {

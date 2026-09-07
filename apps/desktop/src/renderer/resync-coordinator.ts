@@ -59,8 +59,9 @@ export type ResyncCompletion = "completed" | "retry" | { status: "completed" | "
 
 export interface ResyncCoordinatorOptions<State, Session, Snapshot, Frame> {
   loadState(): Promise<State>;
-  listSessions(): Promise<Session[]>;
-  loadSnapshot(sessionId: string): Promise<Snapshot>;
+  listSessions(state: State): Promise<Session[]>;
+  loadSnapshot(sessionId: string, state?: State): Promise<Snapshot>;
+  preferredSessionId?(state: State): string | undefined;
   canListSessions?(state: State): boolean;
   authorityKey(state: State): string | number | undefined;
   sessionId(session: Session): string;
@@ -388,14 +389,14 @@ export class ResyncCoordinator<State, Session, Snapshot, Frame> {
 
     const listedSessions = this.options.canListSessions?.(state) === false
       ? []
-      : await this.options.listSessions();
+      : await this.options.listSessions(state);
     if (!this.isIntentCurrent(intent)) return undefined;
     const sessions = listedSessions.filter((session) => this.options.isSessionActive(session));
-    const selectedId = this.selectSession(sessions, intent.preferredSessionId);
+    const selectedId = this.selectSession(sessions, this.options.preferredSessionId?.(state) ?? intent.preferredSessionId);
 
     let snapshot: Snapshot | undefined;
     if (selectedId) {
-      snapshot = await this.options.loadSnapshot(selectedId);
+      snapshot = await this.options.loadSnapshot(selectedId, state);
       if (!this.isIntentCurrent(intent)) return undefined;
       this.assertSnapshotIdentity(snapshot, selectedId);
     }

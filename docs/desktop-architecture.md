@@ -8,13 +8,14 @@ React renderer
        └─ Electron transport
             └─ frozen preload invoke/subscribe capability
                  └─ validated IPC (main frame + exact origin)
-                      └─ DesktopControlService
-                           └─ authenticated SDK client
-                                └─ 127.0.0.1:dynamic-port Bun sidecar
-                                     └─ existing Chili runtime/store/tools
+                      └─ DesktopProjectManager (saved projects + active selection)
+                           └─ per-project DesktopControlService
+                                └─ authenticated SDK client
+                                     └─ per-project 127.0.0.1:dynamic-port Bun sidecar
+                                          └─ existing Chili runtime/store/tools
 ```
 
-The desktop renderer imports domain types and SDK projection functions, but no Electron, Node, filesystem, process, or sidecar endpoint. `ControlTransport` in `apps/desktop/src/renderer/transport.ts` uses narrow Electron IPC. The private mobile Alpha adds a separate browser page with fewer capabilities, sharing the same window-owned control service:
+The desktop renderer imports domain types and SDK projection functions, but no Electron, Node, filesystem, process, or sidecar endpoint. `ControlTransport` in `apps/desktop/src/renderer/transport.ts` uses narrow Electron IPC. The private mobile Alpha adds a separate browser page with fewer capabilities, sharing the active project’s control service:
 
 ```text
 apps/control-web → private HTTPS → PrivateControlHttpsHost → HostBridge
@@ -29,7 +30,11 @@ Local setup travels through a separate `chiliRemote` preload capability. The ren
 
 ## Processes and lifecycle
 
-Electron main owns one sidecar for the selected workspace. The supervisor:
+Electron main owns a `DesktopProjectManager` registry of up to 64 saved directories, deduplicated by canonical path. Each opened project retains its own sidecar, control service, queues, permission state, and process containment owners. Switching changes the active projection without stopping other projects. Every action transport captures its project ID, while resync list/snapshot reads bind to the project returned by the same state query. Project-tagged events from another project cannot enter the active timeline; background control services continue receiving their events and draining queues.
+
+`desktop-state.json` atomically persists project IDs, paths and active selection with mode 0600 and migrates the old single-workspace value. Startup restores the list and starts only the active project; other projects start on first selection. Selection/draft memory survives switching within the current renderer; draft and queue memory are not persisted across application exits. Remote authorization is disabled before changing projects, and enabling again captures the newly active control service. Shutdown seals and contains every opened project concurrently.
+
+Each project supervisor:
 
 1. Canonicalizes the selected directory.
 2. Generates a new random bearer token.
@@ -54,7 +59,7 @@ Snapshots combine root events with recursively discovered child sessions using s
 
 Queue and Steer live in `DesktopControlService` rather than duplicating the runtime. Queue waits until a session becomes idle. Steer inserts at the head and interrupts the active turn before draining. Per-session and global item/UTF-8 byte budgets bound queued prompts and pending send operations; Stop has separate reserved admission so prompt flooding cannot lock out cancellation. Stop maps directly to the existing runtime interrupt endpoint. Approval decisions and user-input answers use existing deferred queues through authenticated SDK endpoints.
 
-Ordinary renderer invokes share a global count and UTF-8 byte admission budget before sidecar HTTP work begins; Stop uses its own reserved lane. Main-to-renderer events use a private preload READY/ACK protocol with monotonically increasing sequence numbers. Pending, sent-but-unacknowledged, and recovery-held frames share count plus full serialized-envelope byte budgets. State and per-session queue counts may coalesce, transient tool-output deltas may drop, and every durable loss creates one reserved resync barrier. Normal increments remain suppressed until the renderer has reloaded app state, active sessions, and the selected snapshot and has completed the same barrier; frames released synchronously by completion remain buffered and are replayed before actions are enabled. The page sees only `invoke` and `subscribe`, never the ACK capability.
+Ordinary renderer invokes share a global count and UTF-8 byte admission budget before sidecar HTTP work begins; Stop uses its own reserved lane. Main-to-renderer events use a private preload READY/ACK protocol with monotonically increasing sequence numbers. Pending, sent-but-unacknowledged, and recovery-held frames share count plus full serialized-envelope byte budgets. State and per-project/per-session queue counts may coalesce, transient tool-output deltas may drop, and every durable loss creates one reserved resync barrier. Normal increments remain suppressed until the renderer has reloaded app state, active sessions, and the selected snapshot and has completed the same barrier; frames released synchronously by completion remain buffered and are replayed before actions are enabled. The page sees only `invoke` and `subscribe`, never the ACK capability.
 
 Turn changes are reconstructed from the current turn's validated versioned snapshot manifests and current files. Workspace changes use only sanitized Git plumbing (`ls-tree`, `ls-files`, `cat-file`) plus an in-process bounded patch renderer; repository fsmonitor, textconv, clean/process filters and external diff commands are never executed. Every detached Git command is registered immediately in a main-owned process-group registry. Shutdown seals new admission, aborts in-flight diff work, and escalates each registered group from `SIGTERM` to `SIGKILL` until absence is confirmed. Renderer output is capped, request-sequenced, and runtime validated before crossing IPC.
 

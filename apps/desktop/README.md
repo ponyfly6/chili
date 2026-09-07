@@ -28,7 +28,7 @@ bun run desktop:package:dir
 bun run smoke:desktop
 ```
 
-`test:e2e:desktop` 仅支持 macOS；它会先构建真实 Electron 应用和 sidecar，再点击完成 New Task/Goal、审批、输入、Steer、Stop、恢复、rename/search/archive，并检查原生 1440/820/390 宽度。已经构建时可用 `CHILI_DESKTOP_E2E_SKIP_BUILD=1 bun run test:e2e:desktop` 跳过重复构建。
+`test:e2e:desktop` 仅支持 macOS；它会先构建真实 Electron 应用和 sidecar，再点击完成 New Task/Goal、审批、输入、Steer、Stop、恢复、rename/search/archive、多项目后台运行、队列与草稿隔离、重启后项目恢复，并检查原生 1440/820/390 宽度。已经构建时可用 `CHILI_DESKTOP_E2E_SKIP_BUILD=1 bun run test:e2e:desktop` 跳过重复构建。
 
 `smoke:desktop` 在每轮 `mkdtemp` 目录中独立构建 sidecar、桌面与手机页面，以及当前主机架构的 macOS `.app`，不读写共享 `apps/desktop/release`、`out` 或 `resources` 构建产物。它核验签名、完整 Electron 42 fuse wire、最小 ASAR 与其 header integrity，再实际启动应用内的 `Contents/Resources/chili-sidecar`。它会用同一个隔离 user-data 连续启动两次，通过 preload 创建 session、发送 fake-model 消息并等待 SSE assistant/idle 事件，并走原生 `app.quit()` 路径；两个正常启动都拒绝 forced stage、stderr、源码路径或秘密 canary 泄漏。blocked-Git fixture 通过仓库本地 `include.path` FIFO 阻塞 Git，并验证退出会中止 diff、清理登记的 Git process group。另有独立 fixture 会对 Electron 父进程发送 `SIGKILL`，验证 hard-crash containment。每个场景结束后都会检查 sidecar、登记的 Git/tool process group、继承子进程和 Electron helper 全部消失。
 
@@ -58,7 +58,8 @@ Preview 使用本地 ad-hoc 签名，不是已公证的正式发布包。打包�
 
 ## 产品表面
 
-- 选择或切换本地工作区。
+- 标题栏 **Appearance** 提供 System / Dark / Light 主题。默认跟随 macOS 外观并随系统切换即时更新；手动选择立即生效，由主进程保存到当前应用配置目录的 `appearance-settings.json`，跨任务、刷新和重启保留。启动时先恢复原生窗口外观，再渲染界面；主题独立于工作区与 TUI 配置。
+- **Add project** 添加本地目录，侧边栏按项目展示任务及后台运行/待处理数量；点击项目或其任务切换。已打开项目各自保留 runtime，切换不会中断任务、Goal 或消息队列。当前窗口内记住各项目选中的任务与未发送草稿。
 - 搜索 active/archived task，创建、重新载入或继续未归档 task，并对 active task 执行 rename/archive；subagent session 不会作为独立 task 暴露，也不支持 unarchive。
 - 在 inspector 查看或修改 model、model 能力允许的 reasoning/service tier、permission profile、delegation policy 与 Goal，并查看 MCP server 状态或触发 reload；不支持显式 tier 的模型使用 provider default，Desktop 不会提交伪造 tier。
 - 实时查看消息、工具和审批，并在 inspector 中查看 agent/task 状态。
@@ -67,7 +68,7 @@ Preview 使用本地 ad-hoc 签名，不是已公证的正式发布包。打包�
 - 汇总 root 与 descendant session 的 pending approvals，并允许 deny、allow once、allow session、always allow。
 - 展示并提交 `request_user_input` 请求。
 - 查看 agent tree、tasks、当前 turn diff 和 workspace diff。
-- 窗口失焦时对审批、输入请求和 turn 完成发原生通知，点击后恢复并聚焦窗口。
+- 窗口失焦或后台项目发生审批、输入请求和 turn 完成时发原生通知，点击后切到对应项目并聚焦窗口。
 
 ## New Task 与 Goal
 
@@ -75,7 +76,7 @@ New Task 对话框一次配置标题、任务目标、model、模型能力允许
 
 创建结果区分 `not_started`、`started` 和 `unknown`。启动前失败会保留可恢复的 session，并在安全时回滚 permission；最终启动请求若可能已经提交但确认丢失，则返回 `unknown`，不擅自 archive session 或改变一个可能正在运行的 task。
 
-Permission profile 是当前 runtime/sidecar 的**全局内存状态**，不是 session 配置：修改后会影响该 runtime 中所有 task，Desktop 会串行化 New Task 与 permission 写入。它不写入 Desktop 持久化状态，runtime 重启后回到其配置默认值。
+Permission profile 是当前项目 runtime/sidecar 的**全局内存状态**，不是 session 配置：修改后会影响该项目中所有 task，不影响其他项目，Desktop 会串行化 New Task 与 permission 写入。它不写入 Desktop 持久化状态，runtime 重启后回到其配置默认值。
 
 ## Stop、Steer、恢复与 archive
 
@@ -100,11 +101,11 @@ MCP 面板读取当前 session scope 的 server 状态与汇总，并提供 relo
 - 通用 runtime HTTP 在调用 `Bun.serve` 前拒绝不安全的非回环绑定：必须同时提供至少 32 UTF-8 bytes 的 bearer token 与显式非空 TLS cert/key；SDK 也拒绝把 bearer 发往非回环明文 HTTP。当前 CLI 没有远程 token/TLS 配置入口，因此 `serve --host 0.0.0.0` 保持 fail closed，不能直接发布为远程服务。
 - Prompt Queue 有 per-session/global item 与累计 UTF-8 byte 预算；pending send/stop 有独立的 per-session/global 数量上限。普通 IPC admission 以及 main→renderer outbox 各有全局 item/UTF-8 byte 预算，Stop 使用独立保留通道。MCP Streamable HTTP、legacy SSE 和 stdio 都在 JSON parse 前执行 4 MiB 单消息/frame 限制；tool/MCP 错误在持久化、SQLite、SSE 与 IPC 前归一化为最多 16 KiB 的安全正文，不复制 stack、cause 或任意对象图。
 - 第一方 `write`、`edit`、`apply_patch` 拒绝根级 `.git/**`、`.chili/**` 及其 symlink/gitdir target；模型可达 Bash 还由 macOS Seatbelt 的 metadata 与 hard-link 检查保护。内部受信的 `.chili/tool-results` 存储保持独立 capability。
-- Electron 42 的 `before-quit` 由 `DeferredElectronQuit` 同步拦截一次。退出会关闭新控制请求与 Git admission、中止进行中的 diff，并行收口 sidecar 及 main-owned detached Git process group；Git 使用 `SIGTERM`→`SIGKILL`，所有进程组都必须确认消失。sidecar 正常退出由 main 发送显式 ASCII shutdown frame，stdin EOF 永远表示 parent loss；ownership EOF 与 parent PID 检查为 Electron hard-kill 提供双重兜底。完成 containment 后用 `process.reallyExit` 物理退出，缺失时仅对 Electron main 的准确 PID 发送 `SIGKILL`；12 秒 outer watchdog/forced stage 只处理无法有界收口的异常。
+- Electron 42 的 `before-quit` 由 `DeferredElectronQuit` 同步拦截一次。退出会关闭新控制请求与 Git admission、中止进行中的 diff，并行收口所有已打开项目的 sidecar 及各自 main-owned detached Git process group；Git 使用 `SIGTERM`→`SIGKILL`，所有进程组都必须确认消失。sidecar 正常退出由 main 发送显式 ASCII shutdown frame，stdin EOF 永远表示 parent loss；ownership EOF 与 parent PID 检查为 Electron hard-kill 提供双重兜底。完成 containment 后用 `process.reallyExit` 物理退出，缺失时仅对 Electron main 的准确 PID 发送 `SIGKILL`；12 秒 outer watchdog/forced stage 只处理无法有界收口的异常。
 - 锁屏可见的 approval 与 user-input 原生通知只显示固定泛化文案，不包含问题、路径、命令 pattern、token 或其他运行时详情。
 - Electron fuses 禁止 RunAsNode、Node options、CLI inspect 和 file-protocol extra privileges，只允许从带完整性校验的 ASAR 加载应用。
 
-`desktop-state.json` 只持久化工作区路径。单独的 `remote-control-settings.json` 以 0600 权限保存本机绑定地址、端口及用户通过原生对话框选择的 TLS 文件引用；不复制证书或私钥内容。provider key、OAuth token、sidecar token、手机授权及启用状态均不写入这两个文件。
+`desktop-state.json` 以 0600 权限原子保存项目 ID、规范化目录路径及当前项目；旧版单工作区配置自动迁移。重启后恢复项目列表，仅启动当前项目，其他项目在首次点击时启动并加载历史任务。未发送草稿和 Desktop 消息队列只保存在当前进程内，退出后不恢复。`appearance-settings.json` 以 0600 权限保存主题 ID。单独的 `remote-control-settings.json` 以 0600 权限保存本机绑定地址、端口及用户通过原生对话框选择的 TLS 文件引用；不复制证书或私钥内容。provider key、OAuth token、sidecar token、手机授权及启用状态均不写入这些文件。
 
 更完整的模块与 transport 设计见 [../../docs/desktop-architecture.md](../../docs/desktop-architecture.md)。
 

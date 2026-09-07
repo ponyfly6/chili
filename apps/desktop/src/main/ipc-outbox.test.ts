@@ -4,6 +4,23 @@ import { desktopJsonUtf8Bytes, type DesktopEvent, type DesktopEventEnvelope } fr
 import { DesktopEventOutbox, type DesktopEventOutboxOptions } from "./ipc-outbox.js";
 
 describe("desktop main-to-renderer outbox", () => {
+  test("does not coalesce equal session IDs from different project queues", () => {
+    const fixture = createFixture({ maxInFlightItems: 1 });
+    fixture.finishBootstrap();
+    fixture.outbox.publish(runtimeEvent("blocker", "message.created", { messageId: "message_1", role: "user" }));
+    fixture.outbox.publish({ type: "queue.changed", projectId: "project-a", sessionId: "shared", count: 1 });
+    fixture.outbox.publish({ type: "queue.changed", projectId: "project-b", sessionId: "shared", count: 2 });
+    fixture.outbox.publish({ type: "queue.changed", projectId: "project-a", sessionId: "shared", count: 3 });
+    expect(fixture.outbox.diagnostics().pendingItems).toBe(2);
+    fixture.ackLatest();
+    fixture.ackLatest();
+    expect(fixture.sent.slice(1).map((item) => item.event)).toEqual([
+      { type: "queue.changed", projectId: "project-a", sessionId: "shared", count: 3 },
+      { type: "queue.changed", projectId: "project-b", sessionId: "shared", count: 2 },
+    ]);
+    fixture.ackLatest();
+  });
+
   test("commits send state before synchronous bootstrap and normal ACK callbacks", () => {
     const sent: DesktopEventEnvelope[] = [];
     let id = 0;
