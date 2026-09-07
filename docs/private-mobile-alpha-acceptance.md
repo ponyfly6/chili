@@ -141,3 +141,5 @@ bun node_modules/playwright-core/cli.js install firefox
 新配对的 A 手机成功停止 A，后台 B 的响应未中断。先前由 B 手机接受的 Queue 随项目切换保留，在 B 的桌面 Stop 后恰好执行一次。每次切换均核对保存的 HTTPS 配置字节不变。完整既有远控流程也继续通过，包括原生 TLS 配置、撤销、重启、丢 ACK/结果、未知结果提示和跨端顺序。
 
 本轮在独立 `codex/parallel-20260907-remote` worktree 完成完整构建与 `bun run test:e2e:remote`，证据目录为该 worktree 下的 `apps/desktop/out/remote-control-e2e/2026-09-07T03-20-03-991Z/`。Firefox **153.0**，使用电脑已有的 `192.168.77.52` 私网接口；`completed: true`、`physicalDeviceTested: false`。E2E 类型检查通过。该结果对应测试启动时构建的多项目/主题快照；并行任务后续同步的生产修复和最终集成仍需独立构建验收，不能用本记录替代全量门禁。未执行 iPhone 或 Android 真机验收。
+
+最终集成于北京时间 **2026-09-07 11:59:20** 再次完成可信私网 Firefox 验收，代码版本 `5fae9266722904c5ae7b19b974dfda60e36fd2b4`。证据位于集成 worktree 的 `apps/desktop/out/remote-control-e2e/2026-09-07T03-59-20-064Z/evidence.json`：`completed: true`，18/18 旧授权请求返回 `401 authentication_failed`；A/B 后台运行保持、独立 Stop、B 队列只执行一次和重新配对均通过。此次依然为同机私网 Firefox，`physicalDeviceTested: false`，没有修改系统信任。其他最终门禁见 [并行验收记录](parallel-validation-2026-09-07.md)。
