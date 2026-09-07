@@ -76,23 +76,19 @@ function ScopedAgentDetailsPanel({ tree, tasks, sessionId }: AgentDetailsPanelPr
 function AgentDetail({ node, onClose }: { node: AgentDetailsNode; onClose: () => void }) {
   const [taskId, setTaskId] = useState<string>();
   const [taskPage, setTaskPage] = useState(0);
+  const [executionOpen, setExecutionOpen] = useState(false);
   const visibleTasks = agentListPage(node.tasks, taskPage, AGENT_HISTORY_LIMIT);
   const task = visibleTasks.items.find((item) => item.id === taskId) ?? visibleTasks.items[0];
   const run = agentTaskRun(node, task);
   const now = useAgentClock(node.status === "running" || node.status === "pending");
   const titleId = useId();
+  const executionId = useId();
   const queued = node.mailbox.filter((message) => message.status === "queued" || message.status === "delivering").length;
 
   return <section className="agent-details-card" aria-labelledby={titleId}>
     <div className="agent-details-heading"><strong id={titleId}>{node.name}</strong><button type="button" className="agent-details-close" aria-label="Close agent details" onClick={onClose}>×</button></div>
     <p className="agent-details-path">{node.path}</p>
     <span className={`agent-details-status agent-details-${node.status}`}>{agentStatusLabel(node.status)}</span>
-    <dl className="agent-details-facts">
-      <div><dt>Runs</dt><dd>{node.runs.length}</dd></div>
-      <div><dt>Tasks</dt><dd>{node.tasks.length}</dd></div>
-      <div><dt>Nested agents</dt><dd>{node.children.length}</dd></div>
-      <div><dt>Pending messages</dt><dd>{queued}</dd></div>
-    </dl>
     {node.tasks.length > 1 ? <label className="agent-details-task-picker">Task history
       <select value={task?.id ?? ""} onChange={(event) => setTaskId(event.currentTarget.value)}>
         {visibleTasks.items.map((item, index) => <option key={item.id} value={item.id}>{index === 0 && visibleTasks.page === 0 ? "Latest · " : ""}{agentTextPreview(item.taskName, 50)} · {agentStatusLabel(item.status)}</option>)}
@@ -100,19 +96,30 @@ function AgentDetail({ node, onClose }: { node: AgentDetailsNode; onClose: () =>
     </label> : null}
     <AgentPagination label="Task history" page={visibleTasks.page} total={visibleTasks.total} onChange={(page) => { setTaskPage(page); setTaskId(undefined); }} />
     {task ? <div key={`${task.id}:${task.generation}`} className="agent-details-task">
-      <dl className="agent-details-facts agent-details-times">
-        <div><dt>Task status</dt><dd>{agentStatusLabel(task.status)}</dd></div>
-        <div><dt>Generation</dt><dd>{task.generation}</dd></div>
-        <div><dt>Created</dt><dd><AgentTime value={task.createdAt} /></dd></div>
-        <div><dt>Updated</dt><dd><AgentTime value={task.updatedAt} /></dd></div>
-        {task.completedAt !== undefined ? <div><dt>Finished</dt><dd><AgentTime value={task.completedAt} /></dd></div> : null}
-        {run ? <div><dt>Run duration</dt><dd>{run.completedAt !== undefined || run.status === "running" || task.completedAt !== undefined ? agentDuration(run.createdAt, run.completedAt ?? (run.status === "running" ? undefined : task.completedAt), now) : "Unavailable"}{run.status === "running" ? " · running" : ""}</dd></div> : null}
-        {task.mode ? <div><dt>Mode</dt><dd>{task.mode}</dd></div> : null}
-      </dl>
       {task.prompt ? <AgentTextDisclosure label="Task instructions" text={task.prompt} /> : <p className="agent-details-hint">Task instructions are unavailable in this snapshot.</p>}
       {task.summary ? <AgentTextDisclosure label="Result" text={task.summary} previewLimit={240} /> : <p className="agent-details-hint">{task.status === "pending" || task.status === "running" ? "The result will appear when the agent reports back." : "No result was recorded."}</p>}
       {task.error ? <AgentTextDisclosure label="Error" text={task.error} error /> : null}
     </div> : <p className="agent-details-hint">{node.children.length > 0 ? "Expand this agent to inspect delegated tasks." : "No task details were included in this snapshot."}</p>}
+    <div className="agent-details-disclosure">
+      <button type="button" className="agent-details-disclosure-toggle" aria-expanded={executionOpen} aria-controls={executionId} onClick={() => setExecutionOpen(!executionOpen)}><span aria-hidden="true">{executionOpen ? "▾" : "▸"}</span>Execution details</button>
+      {executionOpen ? <div id={executionId}>
+        <dl className="agent-details-facts">
+          <div><dt>Runs</dt><dd>{node.runs.length}</dd></div>
+          <div><dt>Tasks</dt><dd>{node.tasks.length}</dd></div>
+          <div><dt>Nested agents</dt><dd>{node.children.length}</dd></div>
+          <div><dt>Pending messages</dt><dd>{queued}</dd></div>
+        </dl>
+        {task ? <dl className="agent-details-facts agent-details-times">
+          <div><dt>Task status</dt><dd>{agentStatusLabel(task.status)}</dd></div>
+          <div><dt>Generation</dt><dd>{task.generation}</dd></div>
+          <div><dt>Created</dt><dd><AgentTime value={task.createdAt} /></dd></div>
+          <div><dt>Updated</dt><dd><AgentTime value={task.updatedAt} /></dd></div>
+          {task.completedAt !== undefined ? <div><dt>Finished</dt><dd><AgentTime value={task.completedAt} /></dd></div> : null}
+          {run ? <div><dt>Run duration</dt><dd>{run.completedAt !== undefined || run.status === "running" || task.completedAt !== undefined ? agentDuration(run.createdAt, run.completedAt ?? (run.status === "running" ? undefined : task.completedAt), now) : "Unavailable"}{run.status === "running" ? " · running" : ""}</dd></div> : null}
+          {task.mode ? <div><dt>Mode</dt><dd>{task.mode}</dd></div> : null}
+        </dl> : null}
+      </div> : null}
+    </div>
     {node.runs.length > 0 ? <AgentRunHistory node={node} now={now} /> : null}
   </section>;
 }
