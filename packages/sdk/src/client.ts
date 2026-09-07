@@ -1797,7 +1797,8 @@ function parseAgentTreeSnapshot(value: unknown, path = "response"): RuntimeAgent
 function parseAgentTreeNode(value: unknown, path = "node"): RuntimeAgentTreeNode {
   const record = parseRuntimeRecord(value, path);
   parseAgentPath(record.path, `${path}.path`);
-  parseRuntimeString(record.taskName, `${path}.taskName`);
+  // Synthesized ancestors and mailbox-only nodes have no associated task.
+  parseRuntimeString(record.taskName, `${path}.taskName`, { allowEmpty: true });
   parseRuntimeEnum(record.status, [
     "empty",
     "pending",

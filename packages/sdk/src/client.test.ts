@@ -8,6 +8,54 @@ import {
 } from "./client.js";
 import type { SessionId, TeamId, UserInputId } from "@chili/protocol";
 
+test("agentTree accepts unnamed grouping and mailbox-only nodes", async () => {
+  const leaf = {
+    path: "/root/reviewer",
+    taskName: "review changes",
+    status: "completed",
+    runs: [], tasks: [], mailbox: [], children: [],
+  };
+  const snapshot = {
+    rootPath: "/root",
+    nodes: [{
+      path: "/root", taskName: "", status: "empty",
+      runs: [], tasks: [], mailbox: [], children: [leaf, {
+        path: "/root/mailbox", taskName: "", status: "queued",
+        runs: [], tasks: [], mailbox: [], children: [],
+      }],
+    }],
+    agents: [], tasks: [], mailbox: [],
+  };
+  const client = new HttpRuntimeClient({
+    baseUrl: "http://chili.test",
+    fetch: (async () => Response.json(snapshot)) as unknown as typeof fetch,
+  });
+  expect(await client.agentTree()).toEqual(snapshot);
+});
+
+test("agentTree still rejects malformed names and unnamed actual runs", async () => {
+  const node = {
+    path: "/root", taskName: "", status: "empty",
+    runs: [], tasks: [], mailbox: [], children: [],
+  };
+  const read = (value: unknown) => new HttpRuntimeClient({
+    baseUrl: "http://chili.test",
+    fetch: (async () => Response.json(value)) as unknown as typeof fetch,
+  }).agentTree();
+  for (const taskName of [undefined, null, 42]) {
+    await expect(read({
+      nodes: [{ ...node, taskName }], agents: [], tasks: [], mailbox: [],
+    })).rejects.toThrow("taskName");
+  }
+  await expect(read({
+    nodes: [{ ...node, runs: [{
+      id: "run_review", path: "/root/reviewer", taskName: "",
+      status: "running", createdAt: 1,
+    }] }],
+    agents: [], tasks: [], mailbox: [],
+  })).rejects.toThrow("taskName must not be empty");
+});
+
 test("listSessions aborts a stalled real HTTP read", async () => {
   let received = false;
   let release!: () => void;
