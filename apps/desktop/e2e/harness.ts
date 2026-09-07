@@ -11,6 +11,8 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { assertDesktopAppearance, assertDesktopAppearanceRestored } from "./appearance.js";
 import { assertWorkbenchPanels } from "./workbench-panels.js";
+import { assertTimelineFollowStream, TIMELINE_FOLLOW_PROMPT, TimelineFollowFixture } from "./timeline-follow-stream.js";
+import { assertTimelineNavigation } from "./timeline-navigation.js";
 import {
   _electron as electron,
   type ElectronApplication,
@@ -209,6 +211,8 @@ try {
     await sendRecoveryFollowUpThroughUi(currentLaunch.page);
     await assertProjectsRestored(currentLaunch.page);
     await assertNativeResponsiveWidths(currentLaunch);
+    await assertTimelineFollowStream(currentLaunch.page, provider.timeline, artifacts);
+    await assertTimelineNavigation(currentLaunch.page);
     await closeDesktop(currentLaunch);
     currentLaunch = undefined;
 
@@ -258,7 +262,7 @@ try {
 process.stdout.write(
   "electron desktop E2E passed: click-driven Goal create/recovery, approval, input, steer, stop, "
   + "rename/search/archive, delegated task details and Git changes, background projects and isolated drafts, "
-  + "theme switching/system tracking/restart persistence, and native 1440/820/390 layout\n",
+  + "theme switching/system tracking/restart persistence, native 1440/820/390 layout, and live timeline following\n",
 );
 
 interface DesktopLaunch {
@@ -299,6 +303,7 @@ interface FixtureProvider {
   readonly url: URL;
   readonly requests: ProviderRequest[];
   readonly failures: string[];
+  readonly timeline: TimelineFollowFixture;
   stop(closeActiveConnections?: boolean): Promise<void>;
 }
 
@@ -1046,11 +1051,12 @@ async function startFixtureProvider(): Promise<FixtureProvider> {
   const requests: ProviderRequest[] = [];
   const failures: string[] = [];
   let responseId = 0;
+  const timeline = new TimelineFollowFixture();
   const server = createServer((request, response) => {
     void handleFixtureRequest(request, response, requests, () => {
       responseId += 1;
       return responseId;
-    }).catch((error) => {
+    }, timeline).catch((error) => {
       const message = safeError(error);
       failures.push(message);
       if (!response.headersSent) {
@@ -1077,6 +1083,7 @@ async function startFixtureProvider(): Promise<FixtureProvider> {
     url: new URL(`http://127.0.0.1:${address.port}/`),
     requests,
     failures,
+    timeline,
     stop: async (closeActiveConnections = false) => {
       if (closeActiveConnections) server.closeAllConnections();
       await new Promise<void>((resolveClose, rejectClose) => {
@@ -1091,6 +1098,7 @@ async function handleFixtureRequest(
   response: ServerResponse,
   requests: ProviderRequest[],
   nextResponseId: () => number,
+  timeline: TimelineFollowFixture,
 ): Promise<void> {
   const url = new URL(request.url ?? "/", "http://127.0.0.1");
   if (request.method === "GET") {
@@ -1109,6 +1117,10 @@ async function handleFixtureRequest(
   const observed: ProviderRequest = { text, slow, aborted: false };
   requests.push(observed);
   const responseId = nextResponseId();
+  if (text.includes(TIMELINE_FOLLOW_PROMPT)) {
+    timeline.open(request, response, observed, responseId);
+    return;
+  }
   if (slow) {
     writeSlowProviderResponse(request, response, observed, responseId);
     return;
