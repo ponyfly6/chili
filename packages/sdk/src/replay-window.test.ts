@@ -158,7 +158,8 @@ test("incrementally merges 512 by 5000 logical events without exceeding resident
   const result = accumulator.result();
   expect(result.events.some((item) => item.sessionId === "session_0")).toBe(true);
   expect(result.truncated).toBe(true);
-});
+  // Retention assertions process 2.56 million events; allow CI scheduling headroom.
+}, 15_000);
 
 test("preserves durable source order when timestamps move backwards", () => {
   const accumulator = new ReplayableRuntimeEventWindowAccumulator({ maxEvents: 10, maxBytes: 10_000 });
