@@ -2,10 +2,20 @@ import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { access, lstat, open, readlink, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import type { Readable, Writable } from "node:stream";
 import type { ChiliEvent } from "@chili/protocol";
 import type { RuntimeClient } from "@chili/sdk";
 import type { DiffScope } from "../shared/contracts.js";
 import { DetachedProcessGroupRegistry } from "./detached-process-group-registry.js";
+import { gitEnvironment } from "../shared/git-environment.js";
+import type { GitSupervisorLaunch } from "./git-supervisor-launch.js";
+import {
+  encodeGitOwnerFrame,
+  GIT_OWNER_FD,
+  GIT_RESULT_FD,
+  MAX_GIT_SUPERVISOR_FRAME_BYTES,
+  parseGitResultFrame,
+} from "../shared/git-supervisor-protocol.js";
 
 const MAX_DIFF_BYTES = 512 * 1024;
 const MAX_FILE_BYTES = 1024 * 1024;
@@ -100,6 +110,7 @@ interface GitMetadata {
 interface GitCommandContext {
   processGroups: DetachedProcessGroupRegistry;
   signal?: AbortSignal;
+  gitSupervisor?: GitSupervisorLaunch;
 }
 
 class GitCommandError extends Error {
@@ -209,15 +220,20 @@ export async function desktopDiff(input: {
   client: RuntimeClient;
   signal?: AbortSignal;
   processGroups?: DetachedProcessGroupRegistry;
+  gitSupervisor?: GitSupervisorLaunch;
 }): Promise<DiffResult<DiffScope>> {
   const processGroups = input.processGroups ?? new DetachedProcessGroupRegistry();
   const ownsProcessGroups = input.processGroups === undefined;
   try {
     throwIfAborted(input.signal, processGroups.signal);
     if (input.scope === "turn") return await turnDiff(input);
+    if (process.platform !== "win32" && process.versions.electron && !input.gitSupervisor) {
+      throw new Error("Desktop workspace diff requires a Git supervisor");
+    }
     return await workspaceDiff(input.workspace, {
       processGroups,
       ...(input.signal ? { signal: input.signal } : {}),
+      ...(input.gitSupervisor ? { gitSupervisor: input.gitSupervisor } : {}),
     });
   } finally {
     if (ownsProcessGroups) await processGroups.close();
@@ -1394,6 +1410,7 @@ async function runGit(
   const metadata = await resolveGitMetadata(cwd);
   throwIfAborted(context.signal, context.processGroups.signal);
   const executable = await systemGitExecutable();
+  const supervisor = process.platform === "win32" ? undefined : context.gitSupervisor;
   throwIfAborted(context.signal, context.processGroups.signal);
   const commandArgs = [
     "--no-pager",
@@ -1405,11 +1422,15 @@ async function runGit(
     ...args,
   ];
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(executable, commandArgs, {
-      cwd,
+    const child = spawn(supervisor?.executable ?? executable, supervisor ? [...supervisor.args, ...commandArgs] : commandArgs, {
+      // Bun can autoload configuration before the helper entry runs. Never
+      // launch it inside the repository whose Git metadata we are inspecting.
+      cwd: supervisor ? "/" : cwd,
       detached: process.platform !== "win32",
       env: gitEnvironment(),
-      stdio: [input ? "pipe" : "ignore", "pipe", "pipe"],
+      stdio: supervisor
+        ? [input ? "pipe" : "ignore", "pipe", "pipe", "pipe"]
+        : [input ? "pipe" : "ignore", "pipe", "pipe"],
     });
     const leaderPid = child.pid;
     if (!leaderPid) {
@@ -1425,6 +1446,7 @@ async function runGit(
       releaseProcessGroup = context.processGroups.register(leaderPid);
     } catch (error) {
       child.once("error", () => undefined);
+      try { process.kill(process.platform === "win32" ? leaderPid : -leaderPid, "SIGKILL"); } catch { /* Already gone. */ }
       reject(error);
       return;
     }
@@ -1436,6 +1458,10 @@ async function runGit(
     let timedOut = false;
     let aborted: Error | undefined;
     let spawnError: Error | undefined;
+    let supervisorError: Error | undefined;
+    const resultChunks: Buffer[] = [];
+    let resultBytes = 0;
+    let resultDrained = Promise.resolve();
     let containment: Promise<void> | undefined;
     let settled = false;
     const abortSignals = [...new Set([
@@ -1446,6 +1472,36 @@ async function runGit(
       containment ??= context.processGroups.contain(leaderPid);
       return containment;
     };
+    const failSupervisor = (): void => {
+      supervisorError ??= new Error("Git supervisor control channel failed");
+      void startContainment().catch(() => undefined);
+    };
+    if (supervisor) {
+      const owner = child.stdio[GIT_OWNER_FD] as Writable | null | undefined;
+      const result = child.stdio[GIT_RESULT_FD] as Readable | null | undefined;
+      if (!owner || !result) {
+        failSupervisor();
+      } else {
+        // A helper deliberately SIGKILLs its group after writing the result;
+        // the owner's socket may then report ECONNRESET. Write failure is
+        // checked below; an absent or malformed terminal frame still fails.
+        resultDrained = new Promise<void>((resolveDrain) => {
+          result.once("end", resolveDrain);
+          result.once("close", resolveDrain);
+          result.once("error", () => {
+            void startContainment().catch(() => undefined);
+            resolveDrain();
+          });
+        });
+        result.on("data", (chunk: Buffer) => {
+          resultBytes += chunk.length;
+          if (resultBytes > MAX_GIT_SUPERVISOR_FRAME_BYTES) return failSupervisor();
+          resultChunks.push(chunk);
+        });
+        // Keep this pipe open until the helper exits. EOF means this owner died.
+        owner.write(encodeGitOwnerFrame(process.pid, leaderPid), (error) => { if (error) failSupervisor(); });
+      }
+    }
     const onAbort = (): void => {
       aborted ??= abortError(...abortSignals);
       void startContainment().catch(() => undefined);
@@ -1486,7 +1542,17 @@ async function runGit(
       for (const signal of abortSignals) signal.removeEventListener("abort", onAbort);
       void (async () => {
         try {
-          if (containment) await containment;
+          if (supervisor) {
+            // Bun may emit child close before dispatching the extra socket's
+            // final data. Drain that channel explicitly, with a bounded wait.
+            let drainTimer: ReturnType<typeof setTimeout> | undefined;
+            await Promise.race([resultDrained, new Promise<void>((resolveDrain) => {
+              drainTimer = setTimeout(resolveDrain, 250);
+            })]);
+            if (drainTimer) clearTimeout(drainTimer);
+          }
+          if (supervisor) await startContainment();
+          else if (containment) await containment;
           releaseProcessGroup();
           const errorText = Buffer.concat(stderr).toString("utf8");
           if (spawnError) throw spawnError;
@@ -1497,14 +1563,16 @@ async function runGit(
           if (outputExceeded) {
             throw new GitCommandError(`Git ${args[0] ?? "command"} exceeded its output limit`, code, errorText);
           }
-          if (!acceptedExitCodes.includes(code ?? -1)) {
+          if (supervisorError) throw supervisorError;
+          const gitCode = supervisor ? parseGitResultFrame(Buffer.concat(resultChunks)).code : code;
+          if (!acceptedExitCodes.includes(gitCode ?? -1)) {
             throw new GitCommandError(
-              errorText.trim() || `Git ${args[0] ?? "command"} failed with exit code ${code ?? "unknown"}`,
-              code,
+              errorText.trim() || `Git ${args[0] ?? "command"} failed with exit code ${gitCode ?? "unknown"}`,
+              gitCode,
               errorText,
             );
           }
-          resolvePromise({ code, stdout: Buffer.concat(stdout), stderr: errorText });
+          resolvePromise({ code: gitCode, stdout: Buffer.concat(stdout), stderr: errorText });
         } catch (error) {
           releaseProcessGroup();
           reject(error);
@@ -1529,25 +1597,4 @@ function abortError(...signals: AbortSignal[]): Error {
   const error = new Error("Git operation was aborted");
   error.name = "AbortError";
   return error;
-}
-
-function gitEnvironment(): NodeJS.ProcessEnv {
-  const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
-  const env: NodeJS.ProcessEnv = {
-    HOME: process.platform === "win32" ? "C:\\Windows\\Temp" : "/nonexistent",
-    LANG: "C",
-    LC_ALL: "C",
-    PATH: process.platform === "win32" ? "C:\\Windows\\System32;C:\\Windows" : "/usr/bin:/bin",
-    TMPDIR: process.platform === "win32" ? "C:\\Windows\\Temp" : "/tmp",
-    GIT_CONFIG_GLOBAL: nullDevice,
-    GIT_CONFIG_NOSYSTEM: "1",
-    GIT_NO_LAZY_FETCH: "1",
-    GIT_OPTIONAL_LOCKS: "0",
-    GIT_TERMINAL_PROMPT: "0",
-  };
-  if (process.platform === "win32") {
-    if (process.env.SystemRoot) env.SystemRoot = process.env.SystemRoot;
-    if (process.env.WINDIR) env.WINDIR = process.env.WINDIR;
-  }
-  return env;
 }

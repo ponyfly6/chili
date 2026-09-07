@@ -19,7 +19,7 @@ const child = Bun.spawn({
     "--production",
     `--target=${target}`,
     `--outfile=${output}`,
-    resolve(packageRoot, "src/sidecar/index.ts"),
+    resolve(packageRoot, "src/sidecar/entry.ts"),
   ],
   cwd: resolve(packageRoot, "../.."),
   stdout: "inherit",

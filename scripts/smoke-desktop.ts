@@ -18,6 +18,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { DesktopSmokeOwnership } from "./desktop-smoke-ownership.js";
+import { GIT_SUPERVISOR_MODE } from "../apps/desktop/src/shared/git-supervisor-protocol.js";
 
 const FUSE_SENTINEL = Buffer.from("dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX", "utf8");
 const FUSE_DISABLED = "0".charCodeAt(0);
@@ -87,6 +88,7 @@ interface PackagedProcess {
   processGroupPid: number;
   processGroupIsSafe: boolean;
   isSidecar: boolean;
+  isGitSupervisor?: boolean;
   command: string;
   line: string;
 }
@@ -648,18 +650,20 @@ async function waitForBlockedGitProcess(
       continue;
     }
     const { stdout } = await runCapture(
-      ["/bin/ps", "-axo", "pid=,pgid=,comm="],
+      ["/bin/ps", "-axo", "pid=,ppid=,pgid=,comm="],
       repositoryRoot,
       5_000,
     );
-    const candidates = stdout.split(/\r?\n/u).flatMap((line) => {
-      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/u);
+    const processes = stdout.split(/\r?\n/u).flatMap((line) => {
+      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/u);
       if (!match) return [];
       const pid = Number.parseInt(match[1]!, 10);
-      const processGroupPid = Number.parseInt(match[2]!, 10);
-      const executable = match[3]!;
-      return pid === expectedPid ? [{ pid, processGroupPid, executable }] : [];
+      const parentPid = Number.parseInt(match[2]!, 10);
+      const processGroupPid = Number.parseInt(match[3]!, 10);
+      const executable = match[4]!;
+      return [{ pid, parentPid, processGroupPid, executable }];
     });
+    const candidates = processes.filter((row) => row.pid === expectedPid);
     if (candidates.length > 1) throw new Error(`Blocked Git PID ${expectedPid} appeared multiple times in ps`);
     const candidate = candidates[0];
     if (candidate) {
@@ -667,7 +671,7 @@ async function waitForBlockedGitProcess(
         !Number.isSafeInteger(candidate.pid)
         || candidate.pid <= 1
         || candidate.processGroupPid !== candidate.pid
-        || basename(candidate.executable) !== "git"
+        || candidate.executable !== packagedSidecar
         || !isAlive(candidate.pid)
         || !isProcessGroupAlive(candidate.processGroupPid)
       ) {
@@ -676,9 +680,27 @@ async function waitForBlockedGitProcess(
             + `${candidate.pid}/${candidate.processGroupPid}/${candidate.executable}`,
         );
       }
-      if (!processOwnership.scan().some((row) => row.pid === candidate.pid)) {
+      const owned = processOwnership.scan();
+      const supervisor = owned.find((row) => row.pid === candidate.pid);
+      if (!supervisor) {
         throw new Error(`Blocked Git PID ${candidate.pid} has no current-run launch ancestry`);
       }
+      if (!supervisor.command.startsWith(`${packagedSidecar} ${GIT_SUPERVISOR_MODE} `)) {
+        throw new Error("Blocked Git supervisor did not use its private helper mode");
+      }
+      const git = processes.find((row) => row.parentPid === candidate.pid
+        && row.processGroupPid === candidate.pid && basename(row.executable) === "git");
+      if (!git) {
+        await Bun.sleep(25);
+        continue;
+      }
+      if (!owned.some((row) => row.pid === git.pid)) throw new Error("Blocked Git child has no current-run launch ancestry");
+      const hostView = await runCapture(
+        ["/bin/ps", "-Eww", "-p", String(candidate.pid), "-o", "command="],
+        repositoryRoot, 5_000, false, true,
+      );
+      assertTextOmitsSensitiveNeedles("Blocked Git supervisor argv and initial environment",
+        `${hostView.stdout}\n${hostView.stderr}`, hostVisibleCredentialNeedles);
       observedBlockedGitProcessGroups.add(candidate.processGroupPid);
       return candidate.pid;
     }
@@ -1860,12 +1882,12 @@ async function assertNoHostVisibleSidecarCredential(
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     const candidates = (await packagedProcesses(isolatedUserData, sidecar))
-      .filter((entry) => entry.isSidecar);
-    if (candidates.length > 1) {
+      .filter((entry) => entry.isSidecar || entry.isGitSupervisor);
+    const runtimes = candidates.filter((entry) => entry.isSidecar);
+    if (runtimes.length > 1) {
       throw new Error(`Packaged desktop launch ${launch} had multiple sidecar processes during credential audit`);
     }
-    const candidate = candidates[0];
-    if (candidate) {
+    for (const candidate of candidates) {
       const result = await runCapture(
         ["/bin/ps", "-Eww", "-p", String(candidate.pid), "-o", "command="],
         repositoryRoot,
@@ -1877,25 +1899,25 @@ async function assertNoHostVisibleSidecarCredential(
       if (!hostView) {
         throw new Error(`Packaged desktop launch ${launch} sidecar had no host-visible process record`);
       }
-      if (candidate.command !== sidecar) {
+      if (candidate.isSidecar && candidate.command !== sidecar) {
         throw new Error(`Packaged desktop launch ${launch} sidecar had a host-visible argv argument`);
       }
       if (!hostView.includes(sidecar)) {
         throw new Error(`Packaged desktop launch ${launch} environment record did not identify its sidecar`);
       }
       if (
-        !hostView.includes("CHILI_DESKTOP_SMOKE=1")
+        candidate.isSidecar && (!hostView.includes("CHILI_DESKTOP_SMOKE=1")
         || !hostView.includes(`CHILI_HOME=${isolatedChiliHome}`)
-      ) {
+      )) {
         throw new Error(`Packaged desktop launch ${launch} did not expose its non-secret environment fixtures`);
       }
       assertTextOmitsSensitiveNeedles(
-        `Packaged desktop launch ${launch} sidecar argv and initial environment`,
+        `Packaged desktop launch ${launch} ${candidate.isGitSupervisor ? "Git supervisor" : "sidecar"} argv and initial environment`,
         hostView,
         hostVisibleCredentialNeedles,
       );
-      return;
     }
+    if (runtimes.length === 1) return;
     if (parentExited()) {
       throw new Error(`Packaged desktop launch ${launch} exited before its host credential audit`);
     }
@@ -1911,14 +1933,16 @@ async function packagedProcesses(
   assertNotTerminating();
   // Paths only distinguish known-owned processes for the credential audit;
   // they can never grant ownership to another Chili launch.
-  return ownedProcesses(sidecar).filter((entry) => entry.isSidecar || entry.command.includes(isolatedUserData));
+  return ownedProcesses(sidecar).filter((entry) => entry.isSidecar || entry.isGitSupervisor || entry.command.includes(isolatedUserData));
 }
 
 function ownedProcesses(sidecar?: string): PackagedProcess[] {
   return processOwnership.scan().map((row) => ({
     ...row,
     processGroupIsSafe: processOwnership.isOwnedGroup(row.processGroupPid),
-    isSidecar: Boolean(sidecar && (row.command === sidecar || row.command.startsWith(`${sidecar} `))),
+    isSidecar: Boolean(sidecar && (row.command === sidecar || row.command.startsWith(`${sidecar} `))
+      && !row.command.startsWith(`${sidecar} ${GIT_SUPERVISOR_MODE} `)),
+    isGitSupervisor: Boolean(sidecar && row.command.startsWith(`${sidecar} ${GIT_SUPERVISOR_MODE} `)),
   }));
 }
 

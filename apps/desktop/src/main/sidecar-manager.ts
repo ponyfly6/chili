@@ -28,6 +28,7 @@ import {
   type SidecarReadyMessage,
 } from "./sidecar-control-stream.js";
 import { safeDesktopErrorMessage } from "../shared/safe-error.js";
+import { gitSupervisorLaunch, type GitSupervisorLaunch } from "./git-supervisor-launch.js";
 
 const CONTAINMENT_DEADLINE_MS = 9_000;
 const GRACEFUL_EXIT_TIMEOUT_MS = 2_500;
@@ -100,6 +101,10 @@ export class SidecarManager {
   private activeLifecycleCancellation: AbortController | undefined;
 
   constructor(private readonly options: SidecarManagerOptions) {}
+
+  gitSupervisorLaunch(): Promise<GitSupervisorLaunch> {
+    return gitSupervisorLaunch(this.options);
+  }
 
   state(): DesktopState {
     const state: DesktopState = {
@@ -370,7 +375,7 @@ export class SidecarManager {
             : process.env.CHILI_BUN_PATH?.trim() || "bun",
           this.options.isPackaged
             ? []
-            : ["run", resolve(this.options.repositoryRoot, "apps/desktop/src/sidecar/index.ts")],
+            : ["run", resolve(this.options.repositoryRoot, "apps/desktop/src/sidecar/entry.ts")],
           {
             cwd: workspace,
             env,

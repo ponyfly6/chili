@@ -718,6 +718,8 @@ export class DesktopControlService {
         client: lease.client,
         signal: lease.signal,
         processGroups: this.mainProcessGroups,
+        ...(request.scope === "workspace" && process.platform !== "win32"
+          ? { gitSupervisor: await this.options.sidecar.gitSupervisorLaunch() } : {}),
       });
       this.assertClientLease(lease);
       return result;
