@@ -63,7 +63,7 @@ import {
   delegationPolicyPromptFragment,
 } from "./prompt/index.js";
 import { resolveDelegationConfig } from "./delegation.js";
-import { DEFAULT_GOAL_TOKEN_BUDGET, GoalService, type AccountGoalUsageResult } from "./goal.js";
+import { DEFAULT_GOAL_TOKEN_BUDGET, GoalService, type AccountGoalUsageResult, type GoalUsageScope } from "./goal.js";
 import { buildFailureCheckpoint } from "./failure-checkpoint.js";
 import type { AgentRunner, RunTurnInput, RunTurnResult } from "./runner.js";
 import type { CompactContextResult } from "./single-agent-runtime.js";
@@ -846,10 +846,12 @@ export class RuntimeService {
         if (modelState.modelSelection) compactInput.modelSelection = modelState.modelSelection;
         if (modelState.reasoningLevel !== undefined) compactInput.reasoningLevel = modelState.reasoningLevel;
         if (modelState.serviceTier !== undefined) compactInput.serviceTier = modelState.serviceTier;
+        const goalUsageScope = await this.goals.captureUsage(input);
+        if (controller.signal.aborted) throw abortError("Compaction aborted");
         const startedAt = this.now();
         const result = normalizeCompactContextResult(await compactContext(compactInput));
+        await this.accountGoalUsage(input, result.turnId, result.usage, startedAt, goalUsageScope);
         if (controller.signal.aborted) throw abortError("Compaction aborted");
-        await this.accountGoalUsage(input, result.turnId, result.usage, startedAt);
         await this.publishStatus({
           sessionId: input.sessionId,
           status: result.status === "failed" || result.status === "cancelled" ? result.status : "idle",
@@ -1016,11 +1018,15 @@ export class RuntimeService {
           modelState: promptModelState,
           ...(index === 0 ? { turnId: promptTurnId } : {}),
         });
+        const goalUsageScope = await this.goals.captureUsage(promptInput);
+        if (controller.signal.aborted) {
+          return await this.cancelledPrompt(promptInput, turns, "Prompt aborted", promptTurnId);
+        }
         const startedAt = this.now();
         const result = normalizeRunTurnResult(await this.options.runtime.runTurn(runInput));
         turns.push(result);
         await this.publishTurnProgress(promptInput, result);
-        await this.accountGoalTurn(promptInput, result, startedAt);
+        await this.accountGoalTurn(promptInput, result, startedAt, goalUsageScope);
 
         if (result.status !== "completed") {
           return this.terminalRunFailure(promptInput, turns, result);
@@ -1166,11 +1172,15 @@ export class RuntimeService {
         modelState: promptModelState,
         toolMode: "disabled",
       });
+      const finalGoalUsageScope = await this.goals.captureUsage(promptInput);
+      if (controller.signal.aborted) {
+        return await this.cancelledPrompt(promptInput, turns, "Prompt aborted", promptTurnId);
+      }
       const finalStartedAt = this.now();
       const finalResult = normalizeRunTurnResult(await this.options.runtime.runTurn(finalRunInput));
       turns.push(finalResult);
       await this.publishTurnProgress(promptInput, finalResult);
-      await this.accountGoalTurn(promptInput, finalResult, finalStartedAt);
+      await this.accountGoalTurn(promptInput, finalResult, finalStartedAt, finalGoalUsageScope);
 
       if (finalResult.status !== "completed") {
         return this.terminalRunFailure(promptInput, turns, finalResult);
@@ -1313,13 +1323,17 @@ export class RuntimeService {
         signal: args.controller.signal,
         modelState: args.modelState,
       });
+      const goalUsageScope = await this.goals.captureUsage(args.input);
+      if (args.controller.signal.aborted) {
+        return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
+      }
       const startedAt = this.now();
       const result = normalizeRunTurnResult(await this.options.runtime.runTurn(runInput));
       ranContinuation = true;
       lastCompleted = result;
       args.turns.push(result);
       await this.publishTurnProgress(args.input, result);
-      const accounting = await this.accountGoalTurn(args.input, result, startedAt);
+      const accounting = await this.accountGoalTurn(args.input, result, startedAt, goalUsageScope);
 
       if (result.status !== "completed") {
         return this.terminalRunFailure(args.input, args.turns, result);
@@ -1360,7 +1374,7 @@ export class RuntimeService {
       return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
     }
 
-      const goal = await this.goals.getGoal({ sessionId: args.input.sessionId });
+    const goal = await this.goals.getGoal({ sessionId: args.input.sessionId });
     if (args.controller.signal.aborted) {
       return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
     }
@@ -1383,11 +1397,15 @@ export class RuntimeService {
       modelState: args.modelState,
       toolMode: "disabled",
     });
+    const goalUsageScope = await this.goals.captureUsage({ ...args.input, includeBudgetLimited: true });
+    if (args.controller.signal.aborted) {
+      return await this.cancelledPrompt(args.input, args.turns, "Prompt aborted");
+    }
     const startedAt = this.now();
     const result = normalizeRunTurnResult(await this.options.runtime.runTurn(runInput));
     args.turns.push(result);
     await this.publishTurnProgress(args.input, result);
-    await this.accountGoalTurn(args.input, result, startedAt);
+    await this.accountGoalTurn(args.input, result, startedAt, goalUsageScope);
 
     if (result.status !== "completed") {
       return this.terminalRunFailure(args.input, args.turns, result);
@@ -1581,8 +1599,9 @@ export class RuntimeService {
     input: { sessionId: SessionId },
     result: RunTurnResult,
     startedAt: TimestampMs,
+    scope: GoalUsageScope,
   ): Promise<AccountGoalUsageResult | undefined> {
-    return this.accountGoalUsage(input, result.turnId, result.usage, startedAt);
+    return this.accountGoalUsage(input, result.turnId, result.usage, startedAt, scope);
   }
 
   private async accountGoalUsage(
@@ -1590,12 +1609,14 @@ export class RuntimeService {
     turnId: TurnId,
     usage: ModelUsage | undefined,
     startedAt: TimestampMs,
+    scope: GoalUsageScope,
   ): Promise<AccountGoalUsageResult | undefined> {
     const elapsedSeconds = Math.max(0, (Number(this.now()) - Number(startedAt)) / 1000);
     const accountInput: Parameters<GoalService["accountUsage"]>[0] = {
       sessionId: input.sessionId,
       turnId,
       timeSeconds: elapsedSeconds,
+      scope,
     };
     if (usage) accountInput.usage = usage;
     return this.goals.accountUsage(accountInput);
@@ -2477,7 +2498,13 @@ export class RuntimeService {
   ): Promise<void> {
     if (this.running.get(sessionId) !== run) return;
     let cancellingPublication: Promise<void> | undefined;
+    let goalPausePublication: Promise<void> | undefined;
     if (run.interruptMetadataAdmissionOpen) {
+      // Queue the conditional pause before asynchronous status publication. A
+      // later clear/set must not be paused by this older interrupt when the
+      // status write finally finishes.
+      goalPausePublication = this.pauseActiveGoalForInterrupt(sessionId);
+      this.trackInterruptMetadata(run, goalPausePublication);
       cancellingPublication = this.publishStatus({
         sessionId,
         status: "cancelling",
@@ -2500,7 +2527,7 @@ export class RuntimeService {
       }
     }
     try {
-      await this.pauseActiveGoalForInterrupt(sessionId);
+      await goalPausePublication;
     } catch (error) {
       firstError ??= error;
     }
@@ -2536,10 +2563,7 @@ export class RuntimeService {
   }
 
   private async pauseActiveGoalForInterrupt(sessionId: SessionId): Promise<void> {
-    const goal = await this.goals.getGoal({ sessionId });
-    if (goal?.status === "active") {
-      await this.goals.updateGoal({ sessionId, status: "paused", reason: "pause" });
-    }
+    await this.goals.pauseActiveGoal({ sessionId });
   }
 
   private async publishStatus(input: {

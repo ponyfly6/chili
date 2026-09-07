@@ -15,6 +15,25 @@ import type { EventStore, GoalProjectionStore } from "@chili/store";
 
 export const DEFAULT_GOAL_TOKEN_BUDGET = 50_000;
 const GOAL_REPLAY_PAGE_SIZE = 1_000;
+// Services using the same store share short mutation queues. This coordinates
+// in-process writers; it is not a transaction across separate store instances.
+const goalMutationQueues = new WeakMap<EventStore, Map<SessionId, Promise<void>>>();
+
+type GoalUpdatedEvent = Extract<ChiliEvent, { type: "goal.updated" }>;
+
+/** Captures which budget ledger owned a model turn before that turn starts. */
+export interface GoalUsageScope {
+  readonly sessionId: SessionId;
+  readonly goalEventId: string | null;
+  readonly lastGoalEventId?: string;
+  readonly accountStopped: boolean;
+}
+
+interface GoalUsageHistory {
+  events: GoalUpdatedEvent[];
+  goalEventId?: string;
+  accountedTurnIds: Set<TurnId>;
+}
 
 export interface GoalServiceOptions {
   store: EventStore & Partial<GoalProjectionStore>;
@@ -47,6 +66,8 @@ export interface AccountGoalUsageInput {
   turnId: TurnId;
   usage?: ModelUsage;
   timeSeconds: number;
+  /** Required for delayed in-flight accounting after pause/clear/recreation. */
+  scope?: GoalUsageScope;
 }
 
 export interface AccountGoalUsageResult {
@@ -78,7 +99,11 @@ export class GoalService {
     return this.replayGoal(input.sessionId);
   }
 
-  async setGoal(input: SetGoalInput): Promise<SessionGoal> {
+  setGoal(input: SetGoalInput): Promise<SessionGoal> {
+    return this.withMutation(input.sessionId, () => this.setGoalUnlocked(input));
+  }
+
+  private async setGoalUnlocked(input: SetGoalInput): Promise<SessionGoal> {
     const objective = normalizeObjective(input.objective);
     const existing = await this.getGoal({ sessionId: input.sessionId });
     if (existing && !input.replace) throw new GoalAlreadyExistsError(input.sessionId);
@@ -105,7 +130,21 @@ export class GoalService {
     return cloneGoal(goal);
   }
 
-  async updateGoal(input: UpdateGoalInput): Promise<SessionGoal> {
+  updateGoal(input: UpdateGoalInput): Promise<SessionGoal> {
+    return this.withMutation(input.sessionId, () => this.updateGoalUnlocked(input));
+  }
+
+  /** Stop only the current active goal, without racing a completion or clear. */
+  pauseActiveGoal(input: { sessionId: SessionId }): Promise<SessionGoal | undefined> {
+    return this.withMutation(input.sessionId, async () => {
+      const goal = await this.getGoal(input);
+      return goal?.status === "active"
+        ? this.updateGoalUnlocked({ ...input, status: "paused", reason: "pause" })
+        : goal;
+    });
+  }
+
+  private async updateGoalUnlocked(input: UpdateGoalInput): Promise<SessionGoal> {
     const existing = await this.getGoal({ sessionId: input.sessionId });
     if (!existing) throw new GoalNotFoundError(input.sessionId);
     const tokenBudget = input.tokenBudget === undefined
@@ -136,7 +175,11 @@ export class GoalService {
     return cloneGoal(goal);
   }
 
-  async clearGoal(input: ClearGoalInput): Promise<{ cleared: boolean; previousGoal?: SessionGoal }> {
+  clearGoal(input: ClearGoalInput): Promise<{ cleared: boolean; previousGoal?: SessionGoal }> {
+    return this.withMutation(input.sessionId, () => this.clearGoalUnlocked(input));
+  }
+
+  private async clearGoalUnlocked(input: ClearGoalInput): Promise<{ cleared: boolean; previousGoal?: SessionGoal }> {
     const previousGoal = await this.getGoal({ sessionId: input.sessionId });
     if (!previousGoal) return { cleared: false };
     const event: EventEnvelope<"goal.cleared", Extract<ChiliEvent, { type: "goal.cleared" }>["payload"]> = {
@@ -154,9 +197,39 @@ export class GoalService {
     return { cleared: true, previousGoal: cloneGoal(previousGoal) };
   }
 
-  async accountUsage(input: AccountGoalUsageInput): Promise<AccountGoalUsageResult> {
+  captureUsage(input: { sessionId: SessionId; includeBudgetLimited?: boolean }): Promise<GoalUsageScope> {
+    return this.withMutation(input.sessionId, async () => {
+      const goal = await this.getGoal(input);
+      const history = await this.usageHistory(input.sessionId);
+      const lastGoalEventId = history.events.at(-1)?.id;
+      return {
+        sessionId: input.sessionId,
+        goalEventId: goal ? history.goalEventId ?? null : null,
+        ...(lastGoalEventId ? { lastGoalEventId } : {}),
+        accountStopped: goal?.status === "active" || goal?.status === "complete"
+          || (goal?.status === "budgetLimited" && input.includeBudgetLimited === true),
+      };
+    });
+  }
+
+  accountUsage(input: AccountGoalUsageInput): Promise<AccountGoalUsageResult> {
+    return this.withMutation(input.sessionId, () => this.accountUsageUnlocked(input));
+  }
+
+  private async accountUsageUnlocked(input: AccountGoalUsageInput): Promise<AccountGoalUsageResult> {
     const existing = await this.getGoal({ sessionId: input.sessionId });
-    if (!existing || (existing.status !== "active" && existing.status !== "complete")) return { budgetLimited: false };
+    if (!existing) return { budgetLimited: false };
+    const history = await this.usageHistory(input.sessionId);
+    if (input.scope) {
+      if (!scopeOwnsGoal(input.scope, input.sessionId, history)) return { budgetLimited: false };
+    } else if (existing.status !== "active" && existing.status !== "complete") {
+      return { budgetLimited: false };
+    }
+    // runTurn reports final totals, not incremental deltas. The durable event
+    // is the receipt, so retrying a lost append acknowledgement is also safe.
+    if (history.accountedTurnIds.has(input.turnId)) {
+      return { goal: cloneGoal(existing), budgetLimited: existing.status === "budgetLimited" };
+    }
 
     const tokenDelta = goalTokenDelta(input.usage);
     const timeSeconds = finiteNonNegative(input.timeSeconds, "Goal usage timeSeconds");
@@ -197,6 +270,51 @@ export class GoalService {
     };
     await this.appendGoalUpdated(input, goal, budgetLimited ? "budget_limited" : "usage", usageDelta);
     return { goal: cloneGoal(goal), budgetLimited, usageDelta };
+  }
+
+  private async usageHistory(sessionId: SessionId): Promise<GoalUsageHistory> {
+    const history: GoalUsageHistory = { events: [], accountedTurnIds: new Set() };
+    let afterEventId: string | undefined;
+    while (true) {
+      const events = await this.options.store.events({
+        sessionId,
+        type: "goal.updated",
+        ...(afterEventId ? { afterEventId } : {}),
+        limit: GOAL_REPLAY_PAGE_SIZE,
+      }) as GoalUpdatedEvent[];
+      for (const event of events) {
+        history.events.push(event);
+        // replace deliberately retains the budget and its accounting ledger.
+        // A fresh set after clear starts a new ledger, even at the same time.
+        if (!history.goalEventId || event.payload.reason === "set") {
+          history.goalEventId = event.id;
+          history.accountedTurnIds.clear();
+        }
+        const turnId = event.payload.usageDelta?.turnId;
+        if (turnId) history.accountedTurnIds.add(turnId);
+      }
+      if (events.length < GOAL_REPLAY_PAGE_SIZE) break;
+      const nextAfterEventId = events.at(-1)?.id;
+      if (!nextAfterEventId || nextAfterEventId === afterEventId) break;
+      afterEventId = nextAfterEventId;
+    }
+    return history;
+  }
+
+  private withMutation<T>(sessionId: SessionId, operation: () => Promise<T>): Promise<T> {
+    let queues = goalMutationQueues.get(this.options.store);
+    if (!queues) {
+      queues = new Map();
+      goalMutationQueues.set(this.options.store, queues);
+    }
+    const previous = queues.get(sessionId) ?? Promise.resolve();
+    const result = previous.then(operation);
+    const settled = result.then(() => undefined, () => undefined);
+    queues.set(sessionId, settled);
+    void settled.then(() => {
+      if (queues.get(sessionId) === settled) queues.delete(sessionId);
+    });
+    return result;
   }
 
   private async replayGoal(sessionId: SessionId): Promise<SessionGoal | undefined> {
@@ -261,6 +379,22 @@ export class GoalService {
   private now(): TimestampMs {
     return this.options.now ? this.options.now() : timestampNow();
   }
+}
+
+function scopeOwnsGoal(scope: GoalUsageScope, sessionId: SessionId, history: GoalUsageHistory): boolean {
+  if (scope.sessionId !== sessionId || !history.goalEventId) return false;
+  if (scope.goalEventId !== null) {
+    return scope.accountStopped && scope.goalEventId === history.goalEventId;
+  }
+  // create_goal may run inside the first model turn. Charge that turn only if
+  // exactly one new ledger was created since capture; a later clear/recreate
+  // must not attach an old turn to the replacement goal.
+  const previousIndex = scope.lastGoalEventId
+    ? history.events.findIndex((event) => event.id === scope.lastGoalEventId)
+    : -1;
+  if (scope.lastGoalEventId && previousIndex < 0) return false;
+  const created = history.events.slice(previousIndex + 1).filter((event) => event.payload.reason === "set");
+  return created.length === 1 && created[0]?.id === history.goalEventId;
 }
 
 export function goalTokenDelta(usage: ModelUsage | undefined): number {
@@ -340,9 +474,9 @@ function finiteNonNegative(value: number, field: string): number {
 }
 
 function assertBudgetAllowsReactivation(goal: SessionGoal, tokenBudget: number | undefined): void {
-  if (goal.status !== "budgetLimited" || tokenBudget === undefined || tokenBudget > goal.tokensUsed) return;
+  if (tokenBudget === undefined || tokenBudget > goal.tokensUsed) return;
   throw new Error(
-    `Goal token budget must exceed tokens used (${goal.tokensUsed}) before a budget-limited goal can resume.`,
+    `Goal token budget must exceed tokens used (${goal.tokensUsed}) before the goal can resume.`,
   );
 }
 
