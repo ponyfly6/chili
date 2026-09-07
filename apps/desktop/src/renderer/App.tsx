@@ -4,6 +4,7 @@ import { RemoteControlPanel } from "./RemoteControlPanel.js";
 import { ProjectSidebar } from "./ProjectSidebar.js";
 import { AgentDetailsPanel } from "./AgentDetailsPanel.js";
 import { DiffViewer } from "./DiffViewer.js";
+import { TimelineViewport } from "./TimelineViewport.js";
 import { eventMatchesProject, ProjectViewMemory } from "./project-view-state.js";
 import { desktopThemeOptions, type DesktopTheme } from "./theme.js";
 import { useDesktopTheme } from "./useDesktopTheme.js";
@@ -59,7 +60,6 @@ import {
   preferredSessionAfterRecovery,
   RENDERER_CREDENTIAL_BOUNDARY_COPY,
   selectWorkspaceEscapingPausedResync,
-  shouldFollowTimeline,
   sidecarRecoveryGuidance,
   workspaceSelectionChangesScope,
 } from "./interaction-model.js";
@@ -179,10 +179,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const newTaskChoicesGate = useRef(createLatestRequestGate());
   const workspaceRef = useRef<string | undefined>(undefined);
   const sidecarPhaseRef = useRef<DesktopState["sidecar"]["phase"]>("idle");
-  const timelineRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
-  const followedSessionRef = useRef<string | undefined>(undefined);
-  const followTimelineRef = useRef(true);
 
   const desktop = projection.state;
   const sessions = projection.sessions;
@@ -393,16 +390,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     void reloadSessionConfig(selectedId);
     return () => configRequestGate.current.invalidate();
   }, [healthy, reloadSessionConfig, resyncing, selectedId]);
-
-  useLayoutEffect(() => {
-    const timeline = timelineRef.current;
-    if (!timeline) return;
-    if (followedSessionRef.current !== selectedId) {
-      followedSessionRef.current = selectedId;
-      followTimelineRef.current = true;
-    }
-    if (followTimelineRef.current) timeline.scrollTop = timeline.scrollHeight;
-  }, [selectedId, snapshot]);
 
   const openSession = useCallback(async (
     sessionId: string,
@@ -1282,18 +1269,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
             </div>
           ) : null}
 
-          <div
-            className="timeline"
-            ref={timelineRef}
-            onScroll={(event) => {
-              const timeline = event.currentTarget;
-              followTimelineRef.current = shouldFollowTimeline({
-                scrollTop: timeline.scrollTop,
-                scrollHeight: timeline.scrollHeight,
-                clientHeight: timeline.clientHeight,
-              });
-            }}
-          >
+          <TimelineViewport scopeKey={JSON.stringify([desktop.projectId, desktop.workspace, selectedId])}>
             {loadingSession ? <p className="empty-copy centered">Restoring timeline…</p> : null}
             {!loadingSession && timelineItems.map((item) => <TimelineItem key={`${item.kind}:${item.id}`} item={item} />)}
             {!loadingSession && selectedId && timelineItems.length === 0 ? (
@@ -1323,7 +1299,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                 </div>
               </div>
             ) : null}
-          </div>
+          </TimelineViewport>
 
           {presentation && presentation.pendingApprovals.length > 0 ? (
             <div className="blocking-dock">

@@ -1,0 +1,51 @@
+.timeline-viewport {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+}
+
+.timeline-viewport > .timeline {
+  min-width: 0;
+  scroll-behavior: auto;
+}
+
+.timeline-content {
+  display: flex;
+  min-width: 0;
+  flex: 1 0 auto;
+  flex-direction: column;
+  gap: inherit;
+}
+
+.timeline-jump {
+  position: absolute;
+  z-index: 1;
+  right: 18px;
+  bottom: 12px;
+  display: flex;
+  max-width: calc(100% - 36px);
+  min-height: 34px;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-lg);
+  background: var(--panel-raised);
+  box-shadow: var(--shadow-panel);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.timeline-jump:hover {
+  background: var(--panel-hover);
+  color: var(--text);
+}
+
+.timeline-jump:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
