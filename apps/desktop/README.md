@@ -109,6 +109,7 @@ MCP 面板读取当前 session scope 的 server 状态与汇总，并提供 relo
 - Prompt Queue 有 per-session/global item 与累计 UTF-8 byte 预算；pending send/stop 有独立的 per-session/global 数量上限。普通 IPC admission 以及 main→renderer outbox 各有全局 item/UTF-8 byte 预算，Stop 使用独立保留通道。MCP Streamable HTTP、legacy SSE 和 stdio 都在 JSON parse 前执行 4 MiB 单消息/frame 限制；tool/MCP 错误在持久化、SQLite、SSE 与 IPC 前归一化为最多 16 KiB 的安全正文，不复制 stack、cause 或任意对象图。
 - 第一方 `write`、`edit`、`apply_patch` 拒绝根级 `.git/**`、`.chili/**` 及其 symlink/gitdir target；模型可达 Bash 还由 macOS Seatbelt 的 metadata 与 hard-link 检查保护。内部受信的 `.chili/tool-results` 存储保持独立 capability。
 - Electron 42 的 `before-quit` 由 `DeferredElectronQuit` 同步拦截一次。退出会关闭新控制请求与 Git admission、中止进行中的 diff，并行收口所有已打开项目的 sidecar 及各自 main-owned detached Git process group；Git 使用 `SIGTERM`→`SIGKILL`，所有进程组都必须确认消失。sidecar 正常退出由 main 发送显式 ASCII shutdown frame，stdin EOF 永远表示 parent loss；ownership EOF 与 parent PID 检查为 Electron hard-kill 提供双重兜底。完成 containment 后用 `process.reallyExit` 物理退出，缺失时仅对 Electron main 的准确 PID 发送 `SIGKILL`；12 秒 outer watchdog/forced stage 只处理无法有界收口的异常。
+- POSIX 工作区 Git 由独立 supervisor 持有进程组，专用父进程管道关闭时会清理整组，覆盖 Electron 被强制终止的情形。打包态复用 sidecar 的独立 helper 入口，不初始化模型、凭据或 HTTP server；Git 的二进制输入输出与所有权管道分开。
 - 锁屏可见的 approval 与 user-input 原生通知只显示固定泛化文案，不包含问题、路径、命令 pattern、token 或其他运行时详情。
 - Electron fuses 禁止 RunAsNode、Node options、CLI inspect 和 file-protocol extra privileges，只允许从带完整性校验的 ASAR 加载应用。
 
