@@ -128,6 +128,11 @@ try {
   desktop.process().stdout?.on("data", (chunk: Buffer) => { desktopStdout = (desktopStdout + chunk.toString("utf8")).slice(-2_000_000); });
   desktop.process().stderr?.on("data", (chunk: Buffer) => { desktopStderr = (desktopStderr + chunk.toString("utf8")).slice(-2_000_000); });
   desktopPage = await desktop.firstWindow();
+  // Prevent physical keyboard input from entering this isolated test window;
+  // Playwright still controls renderer focus and synthetic keyboard events.
+  await desktop.evaluate(({ BrowserWindow }) => {
+    for (const window of BrowserWindow.getAllWindows()) window.setFocusable(false);
+  });
   desktopPage.setDefaultTimeout(30_000);
   desktopPage.on("pageerror", (error) => errors.push(error.message));
   await desktop.context().tracing.start({ screenshots: true, snapshots: true, sources: true });
@@ -240,6 +245,9 @@ try {
   desktop.process().stdout?.on("data", (chunk: Buffer) => { desktopStdout = (desktopStdout + chunk.toString("utf8")).slice(-2_000_000); });
   desktop.process().stderr?.on("data", (chunk: Buffer) => { desktopStderr = (desktopStderr + chunk.toString("utf8")).slice(-2_000_000); });
   desktopPage = await desktop.firstWindow();
+  await desktop.evaluate(({ BrowserWindow }) => {
+    for (const window of BrowserWindow.getAllWindows()) window.setFocusable(false);
+  });
   desktopPage.setDefaultTimeout(30_000);
   desktopPage.on("pageerror", (error) => errors.push(error.message));
   await desktop.context().tracing.start({ screenshots: true, snapshots: true, sources: true });
