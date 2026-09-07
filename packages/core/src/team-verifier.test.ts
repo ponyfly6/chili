@@ -14,6 +14,7 @@ import {
   createReadFileTool,
   createWriteFileTool,
   filterToolsByPolicy,
+  observeRunProcessLifecycle,
   runProcess,
 } from "@chili/tools";
 import { LocalSubagentManager, type LocalSubagentRunInput, type LocalSubagentRunResult, type LocalSubagentRunner } from "./subagent.js";
@@ -237,6 +238,209 @@ test("failed verifier reopens the task with feedback", async () => {
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  ["failed before a quoted earlier pass", "VERDICT: failed\nMissing coverage. Earlier output:\n```\nVERDICT: passed\n```", "failed"],
+  ["pass only in a quotation", "Earlier output:\nVERDICT: passed", "failed"],
+  ["pass only in a code fence", "```\nVERDICT: passed\n```", "failed"],
+  ["contradictory verdicts", "VERDICT: passed\nVERDICT: failed", "failed"],
+  ["quoted contradictory verdict", "VERDICT: passed\n> VERDICT: failed", "failed"],
+  ["inline quoted contradictory verdict", "VERDICT: passed\nThe old result was **VERDICT: failed**.", "failed"],
+  ["formatted contradictory verdict", "VERDICT: passed\nFinal **VERDICT**: failed. Required coverage is missing.", "failed"],
+  ["ordinary verdict property description", "VERDICT: passed\nValidated the `verdict: string` field in the protocol.", "passed"],
+  ["repeated passing verdict", "VERDICT: passed\nVERDICT: passed", "failed"],
+  ["negated passing prefix", "VERDICT: passed - actually no, tests failed", "failed"],
+  ["verdict split over two lines", "VERDICT:\npassed", "failed"],
+  ["missing verdict", "Tests passed.", "failed"],
+  ["empty summary", "", "failed"],
+  ["one leading verdict with CRLF", "  \r\nVERDICT: PASSED\r\nTests passed.\r\n", "passed"],
+] as const)("verifier requires an unambiguous first-line verdict: %s", async (_name, summary, status) => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-verifier-verdict-"));
+  const context = await createVerifierRegressionContext(dir, { summary, gitDiff: async () => "(no diff)" });
+  try {
+    const result = await context.verify();
+    expect(result.status).toBe(status);
+    const [stored] = await context.teams.tasks(context.teamId);
+    expect(stored?.status).toBe(status === "passed" ? "completed" : "pending");
+    expect(verificationMetadata(stored?.metadata)?.status).toBe(status);
+  } finally {
+    await context.close();
+  }
+});
+
+test("verifier bounds tracked diffs by UTF-8 bytes and cannot accept omitted changes", async () => {
+  const dir = await mkVerifierGitRepo("chili-team-verifier-tracked-budget-");
+  const context = await createVerifierRegressionContext(dir);
+  try {
+    await writeFile(join(dir, "packages/core/src/feature.ts"), `export const changed = true;\n${"// 中文🌶️\n".repeat(30_000)}`);
+    const result = await context.verify();
+    const [stored] = await context.teams.tasks(context.teamId);
+    const diff = verificationMetadata(stored?.metadata)?.gitDiff ?? "";
+    expect(result.status).toBe("failed");
+    expect(result).toMatchObject({ feedback: expect.stringContaining("git diff collection was incomplete") });
+    expect(stored?.status).toBe("pending");
+    expect(Buffer.byteLength(diff, "utf8")).toBeLessThanOrEqual(200_000);
+    expect(diff).toContain("export const changed = true;");
+    expect(diff.slice(0, 300)).toContain("Git diff incomplete: tracked diff truncated at UTF-8 byte limit");
+    expect(diff).not.toContain("�");
+    const snapshot = context.runner.runs[0]?.prompt.split("Git diff at verifier start:\n")[1] ?? "";
+    expect(Buffer.byteLength(snapshot, "utf8")).toBeLessThanOrEqual(200_000);
+    expect(snapshot.startsWith("[Git diff incomplete:")).toBe(true);
+    expect(snapshot.includes("�")).toBe(false);
+  } finally {
+    await context.close();
+  }
+});
+
+test("verifier stops collecting untracked diffs when the aggregate UTF-8 budget is exhausted", async () => {
+  const dir = await mkVerifierGitRepo("chili-team-verifier-untracked-budget-");
+  const context = await createVerifierRegressionContext(dir);
+  let processesStarted = 0;
+  try {
+    await Promise.all(Array.from({ length: 40 }, (_, index) => writeFile(
+      join(dir, `new-${String(index).padStart(3, "0")}.txt`),
+      `${"中文🌶️".repeat(700)}\n`,
+    )));
+    const unsubscribe = observeRunProcessLifecycle((event) => {
+      if (event.type === "started") processesStarted++;
+    });
+    try {
+      expect((await context.verify()).status).toBe("failed");
+    } finally {
+      unsubscribe();
+    }
+    const [stored] = await context.teams.tasks(context.teamId);
+    const diff = verificationMetadata(stored?.metadata)?.gitDiff ?? "";
+    expect(Buffer.byteLength(diff, "utf8")).toBeLessThanOrEqual(200_000);
+    expect(diff.slice(0, 300)).toContain("Git diff incomplete: untracked diff truncated at UTF-8 byte limit");
+    expect(diff).not.toContain("new-039.txt");
+    expect(diff).not.toContain("�");
+    expect(processesStarted).toBeLessThan(30);
+  } finally {
+    await context.close();
+  }
+});
+
+test("verifier bounds the number of untracked file processes even when patches are small", async () => {
+  const dir = await mkVerifierGitRepo("chili-team-verifier-file-budget-");
+  const context = await createVerifierRegressionContext(dir);
+  let processesStarted = 0;
+  try {
+    await Promise.all(Array.from({ length: 150 }, (_, index) => writeFile(
+      join(dir, `new-${String(index).padStart(3, "0")}.txt`),
+      "small change\n",
+    )));
+    const unsubscribe = observeRunProcessLifecycle((event) => {
+      if (event.type === "started") processesStarted++;
+    });
+    try {
+      expect((await context.verify()).status).toBe("failed");
+    } finally {
+      unsubscribe();
+    }
+    const [stored] = await context.teams.tasks(context.teamId);
+    const diff = verificationMetadata(stored?.metadata)?.gitDiff ?? "";
+    expect(diff.slice(0, 300)).toContain("Git diff incomplete: untracked file limit reached (128 files)");
+    expect(diff).toContain("new-127.txt");
+    expect(diff).not.toContain("new-128.txt");
+    expect(processesStarted).toBe(130);
+  } finally {
+    await context.close();
+  }
+}, 15_000);
+
+test("verifier includes untracked paths with spaces and newlines without splitting the filename", async () => {
+  const dir = await mkVerifierGitRepo("chili-team-verifier-untracked-name-");
+  const context = await createVerifierRegressionContext(dir);
+  try {
+    await writeFile(join(dir, "new file\nwith newline.txt"), "new implementation\n");
+    expect((await context.verify()).status).toBe("passed");
+    const [stored] = await context.teams.tasks(context.teamId);
+    expect(verificationMetadata(stored?.metadata)?.gitDiff).toContain("+new implementation");
+  } finally {
+    await context.close();
+  }
+});
+
+test("abort while collecting real git output stops subsequent files and releases the verification claim", async () => {
+  const dir = await mkVerifierGitRepo("chili-team-verifier-git-abort-");
+  const context = await createVerifierRegressionContext(dir);
+  const controller = new AbortController();
+  let processesStarted = 0;
+  try {
+    await Promise.all(Array.from({ length: 10 }, (_, index) => writeFile(join(dir, `new-${index}.txt`), "change\n")));
+    const unsubscribe = observeRunProcessLifecycle((event) => {
+      if (event.type === "started" && ++processesStarted === 3) controller.abort();
+    });
+    try {
+      await expect(context.verify(controller.signal)).rejects.toThrow();
+    } finally {
+      unsubscribe();
+    }
+    expect(processesStarted).toBe(3);
+    expect(context.runner.runs).toEqual([]);
+    const [stored] = await context.teams.tasks(context.teamId);
+    expect(stored?.status).toBe("completed");
+    expect(verificationMetadata(stored?.metadata)).toBeUndefined();
+  } finally {
+    await context.close();
+  }
+});
+
+test("an empty collection error cannot be overridden by a passing verifier", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-verifier-empty-error-"));
+  const context = await createVerifierRegressionContext(dir, { gitDiff: async () => { throw new Error(""); } });
+  try {
+    expect((await context.verify()).status).toBe("failed");
+    const [stored] = await context.teams.tasks(context.teamId);
+    expect(verificationMetadata(stored?.metadata)?.feedback).toContain("unknown git diff collection error");
+    expect(stored?.status).toBe("pending");
+  } finally {
+    await context.close();
+  }
+});
+
+test.each([false, true])("read-only verification can inspect files without a committed Git baseline (repository: %s)", async (initializeGit) => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-verifier-readonly-baseline-"));
+  if (initializeGit) await verifierGit(dir, ["init", "-q"]);
+  const context = await createVerifierRegressionContext(dir, { metadata: { writeScope: [], requiredTools: ["read"] } });
+  try {
+    expect((await context.verify()).status).toBe("passed");
+    const [stored] = await context.teams.tasks(context.teamId);
+    expect(verificationMetadata(stored?.metadata)?.gitDiff).toContain("Inspect the relevant files and task result directly");
+    expect(stored?.status).toBe("completed");
+  } finally {
+    await context.close();
+  }
+});
+
+test.each([
+  { writeScope: ["."] },
+  { writeScope: [], executeScope: ["bun run build"] },
+  { writeScope: [], requiredTools: ["shell"] },
+])("verification of tasks with write or execution capability still requires a Git baseline: %j", async (metadata) => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-verifier-writing-baseline-"));
+  const context = await createVerifierRegressionContext(dir, { metadata });
+  try {
+    expect((await context.verify()).status).toBe("failed");
+    const [stored] = await context.teams.tasks(context.teamId);
+    expect(verificationMetadata(stored?.metadata)?.gitDiff).toContain("Git diff incomplete: git diff failed");
+  } finally {
+    await context.close();
+  }
+});
+
+test("verifier cannot pass when git diff collection fails", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chili-team-verifier-git-error-"));
+  const context = await createVerifierRegressionContext(dir);
+  try {
+    expect((await context.verify()).status).toBe("failed");
+    const [stored] = await context.teams.tasks(context.teamId);
+    expect(verificationMetadata(stored?.metadata)?.gitDiff).toContain("Git diff incomplete: git diff failed");
+  } finally {
+    await context.close();
   }
 });
 
@@ -765,6 +969,58 @@ test("runner does not report drained while a completed task is unverified", asyn
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+async function createVerifierRegressionContext(
+  dir: string,
+  options: {
+    summary?: string;
+    gitDiff?: (input: TeamTaskVerifierGitDiffInput) => Promise<string>;
+    metadata?: Record<string, unknown>;
+  } = {},
+) {
+  // Keep the store outside the inspected directory so it never becomes a worker change.
+  const storeDir = await mkdtemp(join(tmpdir(), "chili-team-verifier-regression-store-"));
+  const store = new SqliteEventStore(join(storeDir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 1100 as TimestampMs;
+  const sessionId = "session_team_verifier_regression" as SessionId;
+  const workerPath = "/root/worker" as AgentPath;
+  const teams = new TeamControlService({ store, createId: ids, now });
+  const runner = new FixedVerifierRunner(options.summary ?? "VERDICT: passed\nLooks good.");
+  const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+  const verifier = new TeamTaskVerificationService({
+    teams,
+    subagents,
+    cwd: dir,
+    now,
+    resolveSession: testSessionResolver(dir),
+    sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
+    ...(options.gitDiff ? { gitDiff: options.gitDiff } : {}),
+  });
+  const team = await teams.createTeam({ sessionId, name: "verifier-regression", leadPath: "/root" as AgentPath });
+  await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+  const task = await teams.createTask({
+    sessionId,
+    teamId: team.id,
+    title: "Verify worker changes",
+    ownerPath: workerPath,
+    metadata: options.metadata ?? { writeScope: ["."] },
+  });
+  await teams.updateTask({ sessionId, teamId: team.id, taskId: task.id, status: "completed", summary: "Done" });
+  return {
+    teams,
+    teamId: team.id,
+    runner,
+    verify(signal?: AbortSignal) {
+      return verifier.verifyTask({ teamId: team.id, taskId: task.id, sessionId, ...(signal ? { signal } : {}) });
+    },
+    async close() {
+      store.close();
+      await rm(storeDir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
 
 interface DirectVerifierContext {
   ownerCwd: string;

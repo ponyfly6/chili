@@ -21,6 +21,8 @@ import type { WorkerToolPolicyTemplate } from "./worker-policy.js";
 
 const VERIFICATION_METADATA_KEY = "verification";
 const DEFAULT_GIT_DIFF_MAX_BYTES = 200_000;
+const DEFAULT_GIT_DIFF_MAX_UNTRACKED_FILES = 128;
+const DEFAULT_GIT_DIFF_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_CONCURRENT_VERIFICATIONS = 2;
 const MAX_CONCURRENT_VERIFICATIONS = 4;
 const VERIFICATION_PENDING_TTL_MS = 15 * 60_000;
@@ -109,6 +111,11 @@ export interface TeamTaskVerifierError {
   teamId: TeamId;
   taskId: TaskId;
   error: string;
+}
+
+interface VerifierGitDiffSnapshot {
+  text: string;
+  incompleteReason?: string;
 }
 
 type AuthorizedTeamTaskVerifierInput = TeamTaskVerifierSweepInput & {
@@ -294,12 +301,12 @@ export class TeamTaskVerificationService {
       gitDiffInput.baseCwd = workspaceCwd;
     }
     if (input.signal) gitDiffInput.signal = input.signal;
-    let gitDiff: string;
+    let gitDiffSnapshot: VerifierGitDiffSnapshot;
     try {
       await this.revalidateAuthority(input, operation);
       operation.assertCurrent();
       throwIfAborted(input.signal);
-      gitDiff = await this.gitDiff(gitDiffInput);
+      gitDiffSnapshot = await this.gitDiff(gitDiffInput);
       operation.assertCurrent();
       throwIfAborted(input.signal);
     } catch (error) {
@@ -310,6 +317,7 @@ export class TeamTaskVerificationService {
       }
       throw error;
     }
+    const gitDiff = gitDiffSnapshot.text;
     const testCommands = verifierTestCommands(task.metadata);
     await this.revalidateAuthority(input, operation);
     operation.assertCurrent();
@@ -361,7 +369,13 @@ export class TeamTaskVerificationService {
     const verifierTask = await this.options.subagents.spawnTask(verifierInput);
     operation.assertCurrent();
     throwIfAborted(input.signal);
-    const verdict = verifierVerdict(verifierTask);
+    const reportedVerdict = verifierVerdict(verifierTask);
+    const verdict = gitDiffSnapshot.incompleteReason !== undefined
+      ? {
+          status: "failed" as const,
+          feedback: `Verification cannot pass because git diff collection was incomplete: ${gitDiffSnapshot.incompleteReason}.\n\n${reportedVerdict.feedback}`,
+        }
+      : reportedVerdict;
     const checkedAt = Number(this.now());
     const feedback = verdict.feedback;
 
@@ -505,17 +519,30 @@ export class TeamTaskVerificationService {
     return team;
   }
 
-  private async gitDiff(input: TeamTaskVerifierGitDiffInput): Promise<string> {
+  private async gitDiff(input: TeamTaskVerifierGitDiffInput): Promise<VerifierGitDiffSnapshot> {
+    const snapshot = new VerifierGitDiffCollector();
+    const deadline = Date.now() + DEFAULT_GIT_DIFF_TIMEOUT_MS;
     try {
-      if (this.options.gitDiff) return await this.options.gitDiff(input);
-      const processInput = {
-        timeoutMs: 15_000,
-        maxOutputBytes: DEFAULT_GIT_DIFF_MAX_BYTES,
+      throwIfAborted(input.signal);
+      if (this.options.gitDiff) {
+        const diff = await this.options.gitDiff(input);
+        throwIfAborted(input.signal);
+        return snapshot.append(diff) ? snapshot.complete() : snapshot.incomplete("UTF-8 byte limit reached");
+      }
+      const runGit = async (cwd: string, args: readonly string[], maxOutputBytes = snapshot.remainingBytes + 4) => {
+        throwIfAborted(input.signal);
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) throw new Error(`collection timed out after ${DEFAULT_GIT_DIFF_TIMEOUT_MS}ms`);
+        const result = await runProcess("git", args, {
+          cwd,
+          timeoutMs: remainingMs,
+          maxOutputBytes,
+          ...(input.signal ? { signal: input.signal } : {}),
+        });
+        throwIfAborted(input.signal);
+        if (result.timedOut) throw new Error(`collection timed out after ${DEFAULT_GIT_DIFF_TIMEOUT_MS}ms`);
+        return result;
       };
-      const runGit = (cwd: string, args: readonly string[]) =>
-        runProcess("git", args, input.signal
-          ? { ...processInput, cwd, signal: input.signal }
-          : { ...processInput, cwd });
       let diffBase = "HEAD";
       if (input.baseRef) {
         const resolved = await runGit(input.baseCwd ?? input.cwd, [
@@ -523,10 +550,9 @@ export class TeamTaskVerificationService {
           "--verify",
           "--end-of-options",
           `${input.baseRef}^{commit}`,
-        ]);
-        if (resolved.timedOut) return `(git diff failed: resolving baseRef ${input.baseRef} timed out after 15000ms)`;
-        if (resolved.exitCode !== 0 || !isFullObjectId(resolved.stdout.trim())) {
-          return `(git diff failed: could not resolve baseRef ${input.baseRef}: ${resolved.stderr || `exit ${resolved.exitCode}`})`;
+        ], 4_096);
+        if (resolved.exitCode !== 0 || resolved.stdoutTruncated || !isFullObjectId(resolved.stdout.trim())) {
+          return snapshot.incomplete(`could not resolve baseRef ${input.baseRef}: ${resolved.stderr || `exit ${resolved.exitCode}`}`);
         }
         diffBase = resolved.stdout.trim();
       }
@@ -539,32 +565,48 @@ export class TeamTaskVerificationService {
         diffBase,
         "--",
       ]);
-      if (tracked.timedOut) return "(git diff failed: timed out after 15000ms)";
-      if (tracked.exitCode !== 0) return `(git diff failed: ${tracked.stderr || `exit ${tracked.exitCode}`})`;
-
-      const parts = tracked.stdout.length > 0 ? [tracked.stdout] : [];
-      const untracked = await runGit(input.cwd, ["ls-files", "--others", "--exclude-standard", "-z"]);
-      if (untracked.timedOut) {
-        parts.push("(git untracked file scan failed: timed out after 15000ms)");
-      } else if (untracked.exitCode !== 0) {
-        parts.push(`(git untracked file scan failed: ${untracked.stderr || `exit ${untracked.exitCode}`})`);
-      } else {
-        for (const path of splitNul(untracked.stdout)) {
-          const fileDiff = await runGit(input.cwd, ["diff", "--no-ext-diff", "--no-color", "--binary", "--no-index", "--", "/dev/null", path]);
-          if (fileDiff.timedOut) {
-            parts.push(`(git diff for untracked file failed: ${path}: timed out after 15000ms)`);
-          } else if (fileDiff.exitCode !== 0 && fileDiff.exitCode !== 1) {
-            parts.push(`(git diff for untracked file failed: ${path}: ${fileDiff.stderr || `exit ${fileDiff.exitCode}`})`);
-          } else if (fileDiff.stdout.length > 0) {
-            parts.push(fileDiff.stdout);
+      if (tracked.exitCode !== 0) {
+        if (!input.baseRef && isReadOnlyVerificationTask(input.task)) {
+          const repository = await runGit(input.cwd, ["rev-parse", "--is-inside-work-tree"], 4_096);
+          const head = repository.exitCode === 0
+            ? await runGit(input.cwd, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], 4_096)
+            : undefined;
+          if (repository.exitCode !== 0 || (head?.exitCode === 1 && !head.stderr)) {
+            return {
+              text: "(Git diff unavailable: this read-only task has no Git worktree or committed HEAD baseline. Inspect the relevant files and task result directly before reporting a verdict.)",
+            };
           }
         }
+        return snapshot.incomplete(`git diff failed: ${tracked.stderr || `exit ${tracked.exitCode}`}`);
       }
+      const trackedFits = snapshot.append(tracked.stdout);
+      if (!trackedFits || tracked.stdoutTruncated) return snapshot.incomplete("tracked diff truncated at UTF-8 byte limit");
 
-      return parts.length > 0 ? truncateDiff(concatenatePatchParts(parts)) : "(no diff)";
+      const untracked = await runGit(input.cwd, ["ls-files", "--others", "--exclude-standard", "-z"], DEFAULT_GIT_DIFF_MAX_BYTES + 4);
+      if (untracked.exitCode !== 0) {
+        return snapshot.incomplete(`untracked file scan failed: ${untracked.stderr || `exit ${untracked.exitCode}`}`);
+      }
+      // A truncated NUL-delimited scan can end in the middle of a filename.
+      if (untracked.stdoutTruncated) return snapshot.incomplete("untracked file list truncated at UTF-8 byte limit");
+      let filesCollected = 0;
+      for (const path of splitNul(untracked.stdout)) {
+        throwIfAborted(input.signal);
+        if (filesCollected >= DEFAULT_GIT_DIFF_MAX_UNTRACKED_FILES) {
+          return snapshot.incomplete(`untracked file limit reached (${DEFAULT_GIT_DIFF_MAX_UNTRACKED_FILES} files)`);
+        }
+        if (snapshot.remainingBytes <= 0) return snapshot.incomplete("UTF-8 byte limit reached before remaining untracked files");
+        const fileDiff = await runGit(input.cwd, ["diff", "--no-ext-diff", "--no-color", "--binary", "--no-index", "--", "/dev/null", path]);
+        filesCollected++;
+        if (fileDiff.exitCode !== 0 && fileDiff.exitCode !== 1) {
+          return snapshot.incomplete(`diff for untracked file failed: ${path}: ${fileDiff.stderr || `exit ${fileDiff.exitCode}`}`);
+        }
+        const fileFits = snapshot.append(fileDiff.stdout);
+        if (!fileFits || fileDiff.stdoutTruncated) return snapshot.incomplete("untracked diff truncated at UTF-8 byte limit");
+      }
+      return snapshot.complete();
     } catch (error) {
       if (isSignalAbort(error, input.signal)) throw error;
-      return normalizePersistedError(`git diff unavailable: ${toError(error).message}`).message;
+      return snapshot.incomplete(toError(error).message);
     }
   }
 
@@ -655,6 +697,8 @@ function verifierPrompt(input: {
     "Use complete_task with a concise summary that starts with exactly one of:",
     "VERDICT: passed",
     "VERDICT: failed",
+    "Put the verdict alone on the first line. Do not include additional verdict lines, even when quoting earlier output.",
+    "If the git diff is marked incomplete, report failed and explain what prevented complete inspection.",
     "",
     "Git diff at verifier start:",
     input.gitDiff,
@@ -684,12 +728,16 @@ function verifierPromptInput(input: {
 
 function verifierVerdict(task: LocalSubagentTaskResult): { status: Exclude<TeamTaskVerifierResultStatus, "skipped">; feedback: string } {
   const feedback = task.error?.message ?? task.summary ?? "";
-  if (task.status !== "completed") {
+  if (task.status !== "completed" || task.error) {
     return { status: "failed", feedback: feedback || `Verifier task ended with status ${task.status}.` };
   }
   const text = feedback.trim();
-  if (/^\s*VERDICT:\s*passed\b/im.test(text)) return { status: "passed", feedback: text };
-  if (/^\s*VERDICT:\s*failed\b/im.test(text)) return { status: "failed", feedback: text };
+  const lines = text.split(/\r?\n/);
+  const firstVerdict = /^VERDICT:[\t ]*(passed|failed)[\t ]*$/i.exec(lines[0] ?? "");
+  const verdictCount = [...text.replace(/[`*_]/g, "").matchAll(/\bVERDICT[\t ]*:[\t ]*(?:passed|failed)\b/gi)].length;
+  if (firstVerdict && verdictCount === 1) {
+    return { status: firstVerdict[1]?.toLowerCase() === "passed" ? "passed" : "failed", feedback: text };
+  }
   return {
     status: "failed",
     feedback: text ? `Verifier did not report a passing verdict.\n\n${text}` : "Verifier did not report a passing verdict.",
@@ -784,6 +832,15 @@ function metadataStringArray(metadata: Record<string, unknown> | undefined, keys
   return undefined;
 }
 
+function isReadOnlyVerificationTask(task: TeamTaskRow): boolean {
+  const writeScope = metadataStringArray(task.metadata, ["writeScope", "write_scope", "writeScopes", "write_scopes"]);
+  const executeScope = metadataStringArray(task.metadata, ["executeScope", "execute_scope", "executionScope", "execution_scope"]);
+  if ((writeScope?.length ?? 0) > 0 || (executeScope?.length ?? 0) > 0) return false;
+  const tools = metadataStringArray(task.metadata, ["requiredTools", "required_tools", "toolScope", "tool_scope"]);
+  const mutatingTools = new Set(["edit", "write", "write_file", "apply_patch", "patch", "bash", "shell", "run_shell_command"]);
+  return !(tools ?? []).some((tool) => mutatingTools.has(tool.trim().toLowerCase()));
+}
+
 function verifierTestCommands(metadata: Record<string, unknown> | undefined): string[] {
   const commands = metadataStringArray(metadata, [
     "suggestedTestCommands",
@@ -840,23 +897,49 @@ function splitNul(value: string): string[] {
   return value.split("\0").filter((item) => item.length > 0);
 }
 
-function concatenatePatchParts(parts: readonly string[]): string {
-  let output = "";
-  for (const part of parts) {
-    if (part.length === 0) continue;
-    if (output.length > 0 && !output.endsWith("\n") && !part.startsWith("\n")) output += "\n";
-    output += part;
+class VerifierGitDiffCollector {
+  private text = "";
+  private bytes = 0;
+
+  get remainingBytes(): number {
+    return DEFAULT_GIT_DIFF_MAX_BYTES - this.bytes;
   }
-  return output;
+
+  append(part: string): boolean {
+    if (!part) return true;
+    const separator = this.text && !this.text.endsWith("\n") && !part.startsWith("\n") ? "\n" : "";
+    const addition = separator + part;
+    const bounded = utf8Prefix(addition, this.remainingBytes);
+    this.text += bounded;
+    this.bytes += Buffer.byteLength(bounded, "utf8");
+    return bounded === addition;
+  }
+
+  complete(): VerifierGitDiffSnapshot {
+    return { text: this.text || "(no diff)" };
+  }
+
+  incomplete(reason: string): VerifierGitDiffSnapshot {
+    const incompleteReason = utf8Prefix(normalizePersistedError(reason).message || "unknown git diff collection error", 1_024);
+    // Persisted metadata may be shortened again, so keep the warning ahead of the patch.
+    const marker = `[Git diff incomplete: ${incompleteReason}. Automatic verification cannot pass with omitted changes.]\n\n`;
+    return {
+      text: marker + utf8Prefix(this.text, DEFAULT_GIT_DIFF_MAX_BYTES - Buffer.byteLength(marker, "utf8")),
+      incompleteReason,
+    };
+  }
+}
+
+function utf8Prefix(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.byteLength <= maxBytes) return value;
+  let end = Math.max(0, maxBytes);
+  while (end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end--;
+  return bytes.subarray(0, end).toString("utf8");
 }
 
 function isFullObjectId(value: string): boolean {
   return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
-}
-
-function truncateDiff(value: string): string {
-  if (value.length <= DEFAULT_GIT_DIFF_MAX_BYTES) return value;
-  return `${value.slice(0, DEFAULT_GIT_DIFF_MAX_BYTES)}\n(diff truncated at ${DEFAULT_GIT_DIFF_MAX_BYTES} characters)`;
 }
 
 function toError(error: unknown): Error {
