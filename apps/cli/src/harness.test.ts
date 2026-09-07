@@ -760,7 +760,11 @@ test("CLI harness promptFragments provider includes chili.base", async () => {
   let harness: CliHarness | undefined;
   try {
     await mkdir(repo, { recursive: true });
-    harness = await createCliHarness({ cwd: repo, model: "fake", quiet: true, yes: true });
+    harness = await createCliHarness({
+      cwd: repo, model: "fake", quiet: true, yes: true,
+      // Base prompt assembly does not need live servers from the user's config.
+      mcpConnectMode: "manual",
+    });
 
     const service = harness.service as unknown as {
       options: {
