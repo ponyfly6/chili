@@ -35,3 +35,5 @@
 ## 已知边界
 
 手机远控此次使用电脑上的私网 Firefox，`physicalDeviceTested: false`，未做 iPhone/Android 真机验收。Goal 串行化覆盖同一个 store 对象内的写入；独立数据库连接/进程之间的原子事务，以及首次持久化前丢失的 usage，仍不在本轮保证范围内。
+
+后续第二轮已补充独立数据库连接/进程之间的 Goal 原子事务和普通子任务 admission 所有权，详见 [第二轮可靠性验收](./reliability-validation-2026-09-07.md)。上述第一轮记录保留为当时的验收范围。
