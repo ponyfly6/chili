@@ -26,6 +26,7 @@ import type {
 import type { LocalSubagentMode, LocalSubagentTaskInput, LocalSubagentTaskResult } from "./subagent.js";
 import type { RuntimeSessionOperation, SessionOperationCoordinator } from "./runtime-service.js";
 import { TeamTaskNotFoundError, type TeamControlService } from "./team.js";
+import { isTeamTaskArtifactDelivered } from "./team-artifact.js";
 import {
   resolveTeamSessionAuthority,
   TeamSessionAuthorityError,
@@ -224,6 +225,13 @@ export class TeamTaskDispatchService {
     const task = await this.requireTeamTask(input.teamId, input.taskId);
     if (isFinalTeamTaskStatus(task.status)) {
       return { status: "skipped", reason: "already_resolved", teamTask: task };
+    }
+    if (task.dependsOn.length > 0) {
+      const dependencies = new Map((await this.options.teams.tasks(task.teamId)).map((item) => [item.id, item]));
+      if (task.dependsOn.some((id) => {
+        const dependency = dependencies.get(id);
+        return !dependency || !isTeamTaskArtifactDelivered(dependency);
+      })) return { status: "skipped", reason: "blocked", teamTask: task };
     }
 
     const ownerPath = input.ownerPath ?? task.ownerPath;

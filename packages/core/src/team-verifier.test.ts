@@ -30,6 +30,8 @@ import { TeamControlService } from "./team.js";
 import {
   TeamTaskVerificationService,
   type TeamTaskVerifierGitDiffInput,
+  isAcceptedTeamTask,
+  isCompletedButUnverifiedTeamTask,
   verificationMetadata,
   verifierWorkerPolicy,
 } from "./team-verifier.js";
@@ -180,6 +182,16 @@ test("verifier includes worker commits by diffing from the persisted worktree ba
     expect(runner.runs[0]?.prompt).toContain("export const committed = 7;");
     const [storedTask] = await teams.tasks(team.id);
     expect(verificationMetadata(storedTask?.metadata)?.gitDiff).toContain("export const committed = 7;");
+    const artifact = verificationMetadata(storedTask?.metadata)?.artifact;
+    expect(artifact).toMatchObject({ version: 1, baseCommit: worktree.baseRef });
+    expect(artifact?.tree).toMatch(/^[0-9a-f]{40,64}$/);
+    expect(artifact?.patchFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    const verifiedContent = await runProcess("git", ["show", `${artifact?.commit}:packages/core/src/feature.ts`], {
+      cwd: worktree.path,
+      timeoutMs: 30_000,
+    });
+    expect(verifiedContent.exitCode).toBe(0);
+    expect(verifiedContent.stdout).toBe("export const committed = 7;\n");
     expect(taskMergeMetadata(storedTask?.metadata)).toMatchObject({
       status: "pending",
       baseRef: worktree.baseRef,
@@ -187,6 +199,116 @@ test("verifier includes worker commits by diffing from the persisted worktree ba
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test.each(["tracked", "untracked"] as const)("verifier rejects %s changes made while the verifier is running", async (kind) => {
+  const context = await createArtifactVerifierContext(`chili-team-verifier-artifact-${kind}-`);
+  const run = context.runner.run.bind(context.runner);
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const committed = 2;\n");
+    context.runner.run = async (input) => {
+      expect(input.prompt).toContain("export const committed = 2;");
+      await writeFile(join(context.worktreePath, kind === "tracked" ? "packages/core/src/feature.ts" : "unchecked.ts"), "export const unchecked = 999;\n");
+      return run(input);
+    };
+
+    const result = await context.verify();
+
+    expect(result.status).toBe("failed");
+    const [task] = await context.teams.tasks(context.teamId);
+    expect(task).toMatchObject({ status: "pending", error: "verification_failed" });
+    expect(verificationMetadata(task?.metadata)?.feedback).toContain("worktree changed during verification");
+    expect(verificationMetadata(task?.metadata)?.artifact).toBeDefined();
+    expect(taskMergeMetadata(task?.metadata)).toBeUndefined();
+  } finally {
+    await context.close();
+  }
+});
+
+test("immutable artifact patches retain the verifier byte limit", async () => {
+  const context = await createArtifactVerifierContext("chili-team-verifier-artifact-limit-");
+  try {
+    await writeFile(join(context.worktreePath, "large.ts"), "x".repeat(210_000));
+
+    const result = await context.verify();
+
+    expect(result.status).toBe("failed");
+    const [task] = await context.teams.tasks(context.teamId);
+    expect(verificationMetadata(task?.metadata)?.feedback).toContain("git diff collection was incomplete");
+    expect(verificationMetadata(task?.metadata)?.artifact).toBeDefined();
+  } finally {
+    await context.close();
+  }
+});
+
+test.each([undefined, { version: 0 }] as const)("legacy applied tasks without a valid artifact are automatically reverified: %j", async (artifact) => {
+  const context = await createArtifactVerifierContext("chili-team-verifier-legacy-applied-");
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const committed = 2;\n");
+    const [original] = await context.teams.tasks(context.teamId);
+    if (!original) throw new Error("Missing legacy task fixture");
+    const legacy = await context.teams.updateTask({
+      teamId: context.teamId,
+      taskId: original.id,
+      metadata: {
+        ...original.metadata,
+        verification: { status: "passed", ...(artifact ? { artifact } : {}) },
+        merge: { status: "applied", createdAt: 1000, mergedAt: 1100 },
+      },
+    });
+    expect(isAcceptedTeamTask(legacy)).toBe(false);
+    expect(isCompletedButUnverifiedTeamTask(legacy)).toBe(true);
+    const claim = context.teams.claimTaskVerification.bind(context.teams);
+    context.teams.claimTaskVerification = async (input) => {
+      const [beforeClaim] = await context.teams.tasks(context.teamId);
+      expect(beforeClaim?.status).toBe("completed");
+      expect(verificationMetadata(beforeClaim?.metadata)?.status).toBe("failed");
+      return claim(input);
+    };
+
+    const result = await context.sweep();
+
+    expect(result.scanned).toBe(1);
+    expect(result.errors).toEqual([]);
+    expect(result.verified).toHaveLength(1);
+    expect(result.verified[0]?.status).toBe("passed");
+    expect(context.runner.runs).toHaveLength(1);
+    const [task] = await context.teams.tasks(context.teamId);
+    expect(task && isAcceptedTeamTask(task)).toBe(true);
+    expect(verificationMetadata(task?.metadata)?.artifact).toBeDefined();
+    expect(taskMergeMetadata(task?.metadata)).toMatchObject({ status: "pending", reason: "legacy_reverification" });
+    expect(taskMergeMetadata(task?.metadata)?.mergedAt).toBeUndefined();
+  } finally {
+    await context.close();
+  }
+});
+
+test.each(["applyStartedAt", "patchFingerprint"] as const)("legacy frozen pending merge with %s remains untouched until merger recovery", async (field) => {
+  const context = await createArtifactVerifierContext("chili-team-verifier-legacy-frozen-");
+  try {
+    const [original] = await context.teams.tasks(context.teamId);
+    if (!original) throw new Error("Missing frozen task fixture");
+    const legacy = await context.teams.updateTask({
+      teamId: context.teamId,
+      taskId: original.id,
+      metadata: {
+        ...original.metadata,
+        verification: { status: "passed", feedback: "Legacy verifier passed" },
+        merge: { status: "pending", createdAt: 1000, diff: "frozen patch", [field]: field === "applyStartedAt" ? 1100 : "frozen-fingerprint" },
+      },
+    });
+
+    const result = await context.sweep();
+    const direct = await context.verify();
+
+    expect(result).toMatchObject({ scanned: 0, verified: [], errors: [] });
+    expect(direct).toMatchObject({ status: "skipped", reason: "merge_pending" });
+    expect(context.runner.runs).toHaveLength(0);
+    const [task] = await context.teams.tasks(context.teamId);
+    expect(task).toEqual(legacy);
+  } finally {
+    await context.close();
   }
 });
 
@@ -599,7 +721,7 @@ test("verifier sweep runs completed tasks with bounded parallelism", async () =>
   const workerB = "/root/b" as AgentPath;
   const workerC = "/root/c" as AgentPath;
   const sessionId = "session_team_verifier_parallel" as SessionId;
-  const runner = new DelayedVerifierRunner();
+  const runner = new BarrierVerifierRunner();
 
   try {
     const teams = new TeamControlService({ store, createId: ids, now });
@@ -624,7 +746,12 @@ test("verifier sweep runs completed tasks with bounded parallelism", async () =>
       await teams.updateTask({ sessionId, teamId: team.id, taskId: task.id, status: "completed", summary: `Done ${task.title}` });
     }
 
-    const result = await verifier.verifyCompletedTasks({ teamId: team.id, sessionId, maxConcurrentVerifications: 2 });
+    const verification = verifier.verifyCompletedTasks({ teamId: team.id, sessionId, maxConcurrentVerifications: 2 });
+    await runner.firstBatchStarted;
+    expect(runner.running).toBe(2);
+    expect(runner.runs).toHaveLength(2);
+    runner.releaseFirstBatch();
+    const result = await verification;
 
     expect(result.maxConcurrentVerifications).toBe(2);
     expect(result.verified).toHaveLength(3);
@@ -636,6 +763,7 @@ test("verifier sweep runs completed tasks with bounded parallelism", async () =>
       "Verify Verify third",
     ]);
   } finally {
+    runner.releaseFirstBatch();
     store.close();
     await rm(dir, { recursive: true, force: true });
   }
@@ -780,6 +908,71 @@ test("direct verifier stops after losing its owner lease", async () => {
     expect(context.runner.runs).toEqual([]);
     const [storedTask] = await context.teams.tasks(context.teamId);
     expect(verificationMetadata(storedTask?.metadata)?.status).toBe("pending");
+  } finally {
+    await context.close();
+  }
+});
+
+test.each(["claim", "subagent"] as const)("cancellation after %s releases the verifier claim for an immediate retry", async (stage) => {
+  const context = await createDirectVerifierContext(`chili-team-verifier-cancel-${stage}-`);
+  const controller = new AbortController();
+  const cancellation = new Error(`Cancelled after ${stage}`);
+  const claim = context.teams.claimTaskVerification.bind(context.teams);
+  const run = context.runner.run.bind(context.runner);
+
+  try {
+    if (stage === "claim") {
+      context.teams.claimTaskVerification = async (input) => {
+        const result = await claim(input);
+        controller.abort(cancellation);
+        return result;
+      };
+    } else {
+      context.runner.run = async (input) => {
+        const result = await run(input);
+        controller.abort(cancellation);
+        return result;
+      };
+    }
+    const verifier = context.createVerifier();
+    await expect(verifier.verifyTask({
+      teamId: context.teamId,
+      taskId: context.taskId,
+      signal: controller.signal,
+    })).rejects.toBe(cancellation);
+
+    const [cancelledTask] = await context.teams.tasks(context.teamId);
+    expect(cancelledTask?.status).toBe("completed");
+    expect(verificationMetadata(cancelledTask?.metadata)).toBeUndefined();
+
+    context.teams.claimTaskVerification = claim;
+    context.runner.run = run;
+    const retry = await verifier.verifyTask({ teamId: context.teamId, taskId: context.taskId });
+    expect(retry.status).toBe("passed");
+  } finally {
+    await context.close();
+  }
+});
+
+test("lease loss after the verifier runs preserves its pending claim", async () => {
+  const context = await createDirectVerifierContext("chili-team-verifier-lost-after-run-");
+  const run = context.runner.run.bind(context.runner);
+
+  try {
+    context.runner.run = async (input) => {
+      const result = await run(input);
+      context.operations.lose(context.ownerSessionId);
+      return result;
+    };
+    await expect(context.createVerifier().verifyTask({
+      teamId: context.teamId,
+      taskId: context.taskId,
+    })).rejects.toBeInstanceOf(RuntimeBusyError);
+
+    const [task] = await context.teams.tasks(context.teamId);
+    expect(task?.status).toBe("completed");
+    expect(verificationMetadata(task?.metadata)?.status).toBe("pending");
+    expect(context.runner.runs).toHaveLength(1);
   } finally {
     await context.close();
   }
@@ -1022,6 +1215,52 @@ async function createVerifierRegressionContext(
   };
 }
 
+async function createArtifactVerifierContext(prefix: string) {
+  const dir = await mkVerifierGitRepo(prefix);
+  const store = new SqliteEventStore(join(dir, "events.sqlite"));
+  const ids = createSequentialId();
+  const now = () => 1250 as TimestampMs;
+  const sessionId = "session_team_verifier_artifact" as SessionId;
+  const workerPath = "/root/worker" as AgentPath;
+  await persistRootSession(store, sessionId, dir);
+  const teams = new TeamControlService({ store, createId: ids, now });
+  const runner = new FixedVerifierRunner("VERDICT: passed\nThe implementation is correct.");
+  const subagents = new LocalSubagentManager({ store, runner, createId: ids, now });
+  const options = {
+    teams,
+    cwd: dir,
+    now,
+    resolveSession: persistedRootSessionResolver(store),
+    sessionOperations: PASSTHROUGH_SESSION_OPERATIONS,
+  };
+  const worktrees = new TeamWorktreeService(options);
+  const verifier = new TeamTaskVerificationService({ ...options, subagents });
+  const team = await teams.createTeam({ sessionId, name: "artifact-verifier", leadPath: "/root" as AgentPath });
+  await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+  const task = await teams.createTask({ sessionId, teamId: team.id, title: "Verify exact changes", ownerPath: workerPath });
+  const worktree = await worktrees.ensureTaskWorktree({ teamId: team.id, taskId: task.id, sessionId, cwd: dir });
+  await teams.updateTask({
+    sessionId,
+    teamId: team.id,
+    taskId: task.id,
+    status: "completed",
+    summary: "Implementation complete",
+    metadata: worktree.task.metadata ?? {},
+  });
+  return {
+    teams,
+    teamId: team.id,
+    runner,
+    worktreePath: worktree.path,
+    verify: () => verifier.verifyTask({ teamId: team.id, taskId: task.id, sessionId, cwd: dir }),
+    sweep: () => verifier.verifyCompletedTasks({ teamId: team.id, sessionId, cwd: dir }),
+    async close() {
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
+
 interface DirectVerifierContext {
   ownerCwd: string;
   defaultCwd: string;
@@ -1227,18 +1466,31 @@ class FixedVerifierRunner implements LocalSubagentRunner {
   }
 }
 
-class DelayedVerifierRunner implements LocalSubagentRunner {
+class BarrierVerifierRunner implements LocalSubagentRunner {
   readonly runs: LocalSubagentRunInput[] = [];
   running = 0;
   maxRunning = 0;
+  private markFirstBatchStarted!: () => void;
+  readonly firstBatchStarted = new Promise<void>((resolve) => {
+    this.markFirstBatchStarted = resolve;
+  });
+  private releaseBatch!: () => void;
+  private readonly firstBatchReleased = new Promise<void>((resolve) => {
+    this.releaseBatch = resolve;
+  });
 
   async run(input: LocalSubagentRunInput): Promise<LocalSubagentRunResult> {
     this.runs.push(input);
     this.running++;
     this.maxRunning = Math.max(this.maxRunning, this.running);
-    await delay(input.taskName.endsWith("first") ? 20 : 1);
+    if (this.runs.length === 2) this.markFirstBatchStarted();
+    await this.firstBatchReleased;
     this.running--;
     return { status: "completed", summary: "VERDICT: passed\nLooks good." };
+  }
+
+  releaseFirstBatch(): void {
+    this.releaseBatch();
   }
 }
 
@@ -1348,9 +1600,6 @@ function utf8Bytes(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 async function actualReadOnly<Input>(
   tool: { isReadOnly?: boolean | ((input: Input) => boolean | Promise<boolean>) },

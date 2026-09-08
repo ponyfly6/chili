@@ -1,9 +1,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import type { AgentPath, SessionId, TimestampMs } from "@chili/protocol";
+import type { AgentPath, AgentRunId, SessionId, TaskId, TimestampMs } from "@chili/protocol";
 import { SqliteEventStore } from "@chili/store";
 import { runProcess } from "@chili/tools";
 import {
@@ -11,10 +11,13 @@ import {
   type RuntimeSessionOperation,
   type SessionOperationCoordinator,
 } from "./runtime-service.js";
+import { TeamTaskVerificationService } from "./team-verifier.js";
+import { TeamTaskDispatchService } from "./team-dispatcher.js";
+import { captureTeamTaskArtifact } from "./team-artifact.js";
 import { TeamMergeService, type TeamMergeGitRunnerResult } from "./team-merge.js";
 import { TeamSessionAuthorityError } from "./team-session-authority.js";
 import { TeamControlService } from "./team.js";
-import { taskMergeMetadata, TeamWorktreeService } from "./team-worktree.js";
+import { taskMergeMetadata, TeamWorktreeService, worktreeMetadata } from "./team-worktree.js";
 
 test("applies a verifier-passed pending worktree merge to the main workspace", async () => {
   const context = await createPendingMergeContext("chili-team-merge-applied-");
@@ -22,6 +25,7 @@ test("applies a verifier-passed pending worktree merge to the main workspace", a
   try {
     await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
 
+    await acceptPendingArtifacts(context);
     const result = await context.merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -98,6 +102,7 @@ test("continues apply and finalization after the request aborts post-marker", as
       },
     });
 
+    await acceptPendingArtifacts(context);
     const result = await merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -123,6 +128,7 @@ test("marks a merge conflicted without changing dirty main workspace files", asy
     await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
     await writeFile(join(context.dir, "packages/core/src/feature.ts"), "export const value = 99;\n");
 
+    await acceptPendingArtifacts(context);
     const result = await context.merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -153,6 +159,7 @@ test("marks a pending merge skipped when the task worktree is missing", async ()
   try {
     await rm(context.worktreePath, { recursive: true, force: true });
 
+    await acceptPendingArtifacts(context);
     const result = await context.merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -184,6 +191,7 @@ test("applies staged and untracked worktree changes in the merge diff", async ()
     await git(context.worktreePath, ["add", "docs/readme.md"]);
     await writeFile(join(context.worktreePath, "packages/core/src/new-feature.ts"), "export const created = true;\n");
 
+    await acceptPendingArtifacts(context);
     const result = await context.merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -210,6 +218,7 @@ test("merges worker commits by diffing the frozen base commit to the current wor
     await git(context.worktreePath, ["add", "packages/core/src/feature.ts"]);
     await git(context.worktreePath, ["commit", "-q", "-m", "worker commit"]);
 
+    await acceptPendingArtifacts(context);
     const result = await context.merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -254,6 +263,7 @@ test("rejects committed main divergence on a touched path before git apply", asy
       },
     });
 
+    await acceptPendingArtifacts(context);
     const result = await merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -302,6 +312,7 @@ test("recovers a durable apply intent after a crash before git apply", async () 
       },
     });
 
+    await acceptPendingArtifacts(context);
     const interrupted = await merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -367,6 +378,7 @@ test("refuses a frozen apply intent after main HEAD advances", async () => {
       },
     });
 
+    await acceptPendingArtifacts(context);
     const interrupted = await merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -428,6 +440,7 @@ test("finalizes exactly once when the owner lease is lost after git apply", asyn
       },
     });
 
+    await acceptPendingArtifacts(context);
     await expect(merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -485,6 +498,7 @@ test("marks a partially applied frozen patch conflicted without rollback", async
       },
     });
 
+    await acceptPendingArtifacts(context);
     const interrupted = await merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -540,6 +554,7 @@ test("does not accept an already-applied patch after touched files receive extra
       },
     });
 
+    await acceptPendingArtifacts(context);
     const interrupted = await merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -640,6 +655,7 @@ test("prechecks pending merge patches concurrently before serial apply", async (
       },
     });
 
+    await acceptPendingArtifacts(context);
     const result = await merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -673,6 +689,7 @@ test("rejects merge session/workspace overrides and resolver failures before any
       sessionOperations: passthroughSessionOperations,
       runGit,
     });
+    await acceptPendingArtifacts(context);
     await expect(merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: sessionB,
@@ -750,6 +767,7 @@ test("rejects absolute, traversal, and symlink worktree path overrides before gi
           return { exitCode: 0, stdout: "", stderr: "" };
         },
       });
+      await acceptPendingArtifacts(context);
       const result = await merger.mergeTeamTasks({
         teamId: context.teamId,
         sessionId: context.sessionId,
@@ -817,6 +835,7 @@ test("reauthorizes every merge-prepare finalization branch before task mutation"
         sessionOperations: passthroughSessionOperations,
       });
 
+      await acceptPendingArtifacts(context);
       const result = await merger.mergeTeamTasks({
         teamId: context.teamId,
         sessionId: context.sessionId,
@@ -864,6 +883,7 @@ test("reauthorizes immediately before the actual git apply", async () => {
       },
     });
 
+    await acceptPendingArtifacts(context);
     const result = await merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -924,6 +944,7 @@ test("holds one session operation across the merge sweep and rejects a concurren
       },
     });
 
+    await acceptPendingArtifacts(context);
     firstMerge = merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -984,6 +1005,7 @@ test("fails closed when the session operation capability is lost immediately bef
       },
     });
 
+    await acceptPendingArtifacts(context);
     await expect(merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -1029,6 +1051,7 @@ test("refuses merge finalization when the session operation capability expires a
       },
     });
 
+    await acceptPendingArtifacts(context);
     await expect(merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -1057,6 +1080,7 @@ test("reuses a nested session operation while preserving the merge capability", 
       sessionOperations,
     });
 
+    await acceptPendingArtifacts(context);
     const result = await sessionOperations.withSessionOperation(
       context.sessionId,
       () => merger.mergeTeamTasks({
@@ -1092,6 +1116,7 @@ test("does not downgrade a merge authority revocation into a per-task error", as
       sessionOperations: passthroughSessionOperations,
     });
 
+    await acceptPendingArtifacts(context);
     await expect(merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -1118,6 +1143,7 @@ test("normalizes hostile merge sweep failures before returning them", async () =
       },
     });
 
+    await acceptPendingArtifacts(context);
     const result = await merger.mergeTeamTasks({
       teamId: context.teamId,
       sessionId: context.sessionId,
@@ -1131,6 +1157,205 @@ test("normalizes hostile merge sweep failures before returning them", async () =
     await context.close();
   }
 });
+
+test("verified A -> B artifacts inherit and merge same-file increments without committing dirty user work", async () => {
+  const context = await createPendingMergeContext("chili-team-artifact-chain-");
+  try {
+    const originalHead = (await runProcess("git", ["rev-parse", "HEAD"], { cwd: context.dir })).stdout;
+    const originalIndex = await readFile(join(context.dir, ".git/index"));
+    await writeFile(join(context.dir, "docs/readme.md"), "user unfinished docs\n");
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    await writeFile(join(context.worktreePath, "packages/core/src/created-by-a.ts"), "export const created = 1;\n");
+    await verifyCurrentTask(context, context.taskId);
+    const firstMerge = await context.merger.mergeTeamTasks({ teamId: context.teamId, sessionId: context.sessionId });
+    expect(firstMerge.applied).toHaveLength(1);
+    const second = await context.teams.createTask({
+      teamId: context.teamId, sessionId: context.sessionId, title: "B consumes A", ownerPath: "/root/worker" as AgentPath,
+      dependsOn: [context.taskId], metadata: { writeScope: ["packages/core"] },
+    });
+    const worktrees = new TeamWorktreeService({
+      teams: context.teams, cwd: context.dir, resolveSession: persistedRootSessionResolver(context.store),
+      sessionOperations: passthroughSessionOperations,
+    });
+    const secondWorktree = await worktrees.ensureTaskWorktree({ teamId: context.teamId, taskId: second.id, sessionId: context.sessionId });
+    expect(await readFile(join(secondWorktree.path, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 2;\n");
+    expect(await readFile(join(secondWorktree.path, "packages/core/src/created-by-a.ts"), "utf8")).toBe("export const created = 1;\n");
+    expect(await readFile(join(secondWorktree.path, "docs/readme.md"), "utf8")).toBe("# docs\n");
+    await writeFile(join(secondWorktree.path, "packages/core/src/feature.ts"), "export const value = 3;\n");
+    await writeFile(join(secondWorktree.path, "packages/core/src/created-by-a.ts"), "export const created = 2;\n");
+    await writeFile(join(secondWorktree.path, "packages/core/src/created-by-b.ts"), "export const successor = true;\n");
+    await verifyCurrentTask(context, second.id);
+    const secondMerge = await context.merger.mergeTeamTasks({ teamId: context.teamId, taskId: second.id, sessionId: context.sessionId });
+    expect(secondMerge.errors).toEqual([]);
+    expect(secondMerge.conflicted).toEqual([]);
+    expect(secondMerge.applied).toHaveLength(1);
+    expect(taskMergeMetadata(secondMerge.applied[0]?.teamTask.metadata)?.diff).toContain("-export const value = 2;");
+    expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 3;\n");
+    expect(await readFile(join(context.dir, "packages/core/src/created-by-a.ts"), "utf8")).toBe("export const created = 2;\n");
+    expect(await readFile(join(context.dir, "packages/core/src/created-by-b.ts"), "utf8")).toBe("export const successor = true;\n");
+    expect(await readFile(join(context.dir, "docs/readme.md"), "utf8")).toBe("user unfinished docs\n");
+    expect((await runProcess("git", ["rev-parse", "HEAD"], { cwd: context.dir })).stdout).toBe(originalHead);
+    expect(await readFile(join(context.dir, ".git/index"))).toEqual(originalIndex);
+  } finally { await context.close(); }
+});
+
+test("changes after verification cannot merge or dispatch dependent tasks", async () => {
+  const context = await createPendingMergeContext("chili-team-artifact-changed-");
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    await verifyCurrentTask(context, context.taskId);
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 999;\n");
+    const result = await context.merger.mergeTeamTasks({ teamId: context.teamId, sessionId: context.sessionId });
+    expect(result.applied).toEqual([]);
+    expect(result.conflicted[0]?.error).toContain("changed after verification");
+    expect(result.conflicted[0]?.teamTask.metadata?.verification).toMatchObject({ status: "failed" });
+    expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 1;\n");
+    const dependent = await context.teams.createTask({
+      teamId: context.teamId, sessionId: context.sessionId, title: "Must not run", ownerPath: "/root/worker" as AgentPath,
+      dependsOn: [context.taskId], metadata: { allowedTools: ["read"] },
+    });
+    const worktrees = new TeamWorktreeService({ teams: context.teams, cwd: context.dir,
+      resolveSession: persistedRootSessionResolver(context.store), sessionOperations: passthroughSessionOperations });
+    await expect(worktrees.ensureTaskWorktree({ teamId: context.teamId, taskId: dependent.id, sessionId: context.sessionId }))
+      .rejects.toThrow("no delivered artifact");
+    const dispatcher = new TeamTaskDispatchService({ teams: context.teams, cwd: context.dir, store: context.store,
+      resolveSession: persistedRootSessionResolver(context.store), sessionOperations: passthroughSessionOperations,
+      subagents: { async spawnTask() { throw new Error("must not spawn dependent"); } },
+    });
+    expect(await dispatcher.dispatchTask({ teamId: context.teamId, taskId: dependent.id, sessionId: context.sessionId }))
+      .toMatchObject({ status: "skipped", reason: "blocked" });
+  } finally { await context.close(); }
+});
+
+test("legacy passed metadata without an artifact requires reverification", async () => {
+  const context = await createPendingMergeContext("chili-team-artifact-legacy-");
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    const result = await context.merger.mergeTeamTasks({ teamId: context.teamId, sessionId: context.sessionId });
+    expect(result.conflicted[0]?.error).toContain("no immutable artifact");
+    expect(result.applied).toEqual([]);
+    await verifyCurrentTask(context, context.taskId);
+    expect((await context.merger.mergeTeamTasks({ teamId: context.teamId, sessionId: context.sessionId })).applied).toHaveLength(1);
+  } finally { await context.close(); }
+});
+
+test("merges a verified mode-only artifact", async () => {
+  const context = await createPendingMergeContext("chili-team-artifact-mode-");
+  try {
+    await chmod(join(context.worktreePath, "packages/core/src/feature.ts"), 0o755);
+    await verifyCurrentTask(context, context.taskId);
+    const result = await context.merger.mergeTeamTasks({ teamId: context.teamId, sessionId: context.sessionId });
+    expect(result.errors).toEqual([]);
+    expect(result.conflicted).toEqual([]);
+    expect(result.applied).toHaveLength(1);
+    expect((await lstat(join(context.dir, "packages/core/src/feature.ts"))).mode & 0o111).toBe(0o111);
+  } finally { await context.close(); }
+});
+
+for (const changedAfterOldMerge of [false, true]) {
+  test(`reverifies legacy applied artifacts and ${changedAfterOldMerge ? "rejects changed results" : "confirms matching results without reapplying"}`, async () => {
+    const context = await createPendingMergeContext("chili-team-artifact-legacy-applied-");
+    try {
+      await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+      await verifyCurrentTask(context, context.taskId);
+      expect((await context.merger.mergeTeamTasks({ teamId: context.teamId, sessionId: context.sessionId })).applied).toHaveLength(1);
+      await removeArtifactIdentity(context);
+      if (changedAfterOldMerge) await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 999;\n");
+      const verification = await createArtifactVerifier(context).verifyCompletedTasks({ teamId: context.teamId, sessionId: context.sessionId });
+      expect(verification.verified.map((item) => item.status)).toEqual(["passed"]);
+      const result = await context.merger.mergeTeamTasks({ teamId: context.teamId, sessionId: context.sessionId });
+      expect(result.errors).toEqual([]);
+      expect(changedAfterOldMerge ? result.conflicted : result.applied).toHaveLength(1);
+      expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 2;\n");
+    } finally { await context.close(); }
+  });
+}
+
+test("recovers a legacy frozen apply before independently reverifying its artifact", async () => {
+  const context = await createPendingMergeContext("chili-team-artifact-legacy-frozen-");
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    await acceptPendingArtifacts(context);
+    const interruptedMerger = new TeamMergeService({ teams: context.teams, cwd: context.dir,
+      resolveSession: persistedRootSessionResolver(context.store), sessionOperations: passthroughSessionOperations,
+      runGit: async (input) => {
+        const result = await runProcess("git", input.args, { cwd: input.cwd, ...(input.signal ? { signal: input.signal } : {}) });
+        if (input.args[0] === "apply" && !input.args.includes("--check")) throw new Error("simulated old-process crash after apply");
+        return result;
+      },
+    });
+    expect((await interruptedMerger.mergeTeamTasks({ teamId: context.teamId, sessionId: context.sessionId })).errors).toHaveLength(1);
+    await removeArtifactIdentity(context);
+    expect((await createArtifactVerifier(context).verifyCompletedTasks({ teamId: context.teamId, sessionId: context.sessionId })).verified).toEqual([]);
+    const recovered = await context.merger.mergeTeamTasks({ teamId: context.teamId, sessionId: context.sessionId });
+    expect(recovered.applied).toHaveLength(1);
+    const verified = await createArtifactVerifier(context).verifyCompletedTasks({ teamId: context.teamId, sessionId: context.sessionId });
+    expect(verified.verified.map((item) => item.status)).toEqual(["passed"]);
+    expect((await context.merger.mergeTeamTasks({ teamId: context.teamId, sessionId: context.sessionId })).applied).toHaveLength(1);
+    expect(await readFile(join(context.dir, "packages/core/src/feature.ts"), "utf8")).toBe("export const value = 2;\n");
+  } finally { await context.close(); }
+});
+
+async function removeArtifactIdentity(context: Awaited<ReturnType<typeof createPendingMergeContext>>): Promise<void> {
+  const task = (await context.teams.tasks(context.teamId)).find((item) => item.id === context.taskId)!;
+  const merge = { ...taskMergeMetadata(task.metadata) };
+  delete merge.artifactCommit;
+  await context.teams.updateTask({ teamId: context.teamId, taskId: context.taskId, sessionId: context.sessionId,
+    metadata: { ...task.metadata, verification: { status: "passed" }, merge } });
+}
+
+test("refuses a preexisting dependent worktree with an obsolete base and preserves its edits", async () => {
+  const context = await createPendingMergeContext("chili-team-artifact-old-dependent-");
+  try {
+    await writeFile(join(context.worktreePath, "packages/core/src/feature.ts"), "export const value = 2;\n");
+    await verifyCurrentTask(context, context.taskId);
+    expect((await context.merger.mergeTeamTasks({ teamId: context.teamId, sessionId: context.sessionId })).applied).toHaveLength(1);
+    const dependent = await context.teams.createTask({ teamId: context.teamId, sessionId: context.sessionId, title: "Old dependent", ownerPath: "/root/worker" as AgentPath });
+    const worktrees = new TeamWorktreeService({ teams: context.teams, cwd: context.dir,
+      resolveSession: persistedRootSessionResolver(context.store), sessionOperations: passthroughSessionOperations });
+    const old = await worktrees.ensureTaskWorktree({ teamId: context.teamId, taskId: dependent.id, sessionId: context.sessionId });
+    await writeFile(join(old.path, "packages/core/src/feature.ts"), "worker unfinished edit\n");
+    await context.teams.updateTask({ teamId: context.teamId, taskId: dependent.id, sessionId: context.sessionId, dependsOn: [context.taskId] });
+    await expect(worktrees.ensureTaskWorktree({ teamId: context.teamId, taskId: dependent.id, sessionId: context.sessionId }))
+      .rejects.toThrow("Existing task worktree does not match");
+    expect(await readFile(join(old.path, "packages/core/src/feature.ts"), "utf8")).toBe("worker unfinished edit\n");
+  } finally { await context.close(); }
+});
+
+test("reuses a worktree whose dependency only delivered a read-only result", async () => {
+  const context = await createPendingMergeContext("chili-team-artifact-read-only-base-");
+  try {
+    const analysis = await context.teams.createTask({ teamId: context.teamId, sessionId: context.sessionId, title: "Analysis", status: "completed" });
+    const dependent = await context.teams.createTask({ teamId: context.teamId, sessionId: context.sessionId, title: "Implementation", ownerPath: "/root/worker" as AgentPath, dependsOn: [analysis.id] });
+    const worktrees = new TeamWorktreeService({ teams: context.teams, cwd: context.dir,
+      resolveSession: persistedRootSessionResolver(context.store), sessionOperations: passthroughSessionOperations });
+    const first = await worktrees.ensureTaskWorktree({ teamId: context.teamId, taskId: dependent.id, sessionId: context.sessionId });
+    const repeated = await worktrees.ensureTaskWorktree({ teamId: context.teamId, taskId: dependent.id, sessionId: context.sessionId });
+    expect(repeated.created).toBe(false);
+    expect(repeated.baseRef).toBe(first.baseRef);
+    expect(repeated.path).toBe(first.path);
+  } finally { await context.close(); }
+});
+
+async function verifyCurrentTask(context: Awaited<ReturnType<typeof createPendingMergeContext>>, taskId: TaskId): Promise<void> {
+  const task = (await context.teams.tasks(context.teamId)).find((item) => item.id === taskId)!;
+  await context.teams.updateTask({ teamId: context.teamId, taskId, sessionId: context.sessionId, status: "completed",
+    metadata: { ...task.metadata, verification: { status: "failed" } } });
+  const verifier = createArtifactVerifier(context);
+  expect((await verifier.verifyTask({ teamId: context.teamId, taskId, sessionId: context.sessionId })).status).toBe("passed");
+}
+
+function createArtifactVerifier(context: Awaited<ReturnType<typeof createPendingMergeContext>>): TeamTaskVerificationService {
+  return new TeamTaskVerificationService({
+    teams: context.teams, cwd: context.dir, resolveSession: persistedRootSessionResolver(context.store),
+    sessionOperations: passthroughSessionOperations,
+    subagents: { async spawnTask() { return {
+      taskId: "verifier" as TaskId, runId: "verify-run" as AgentRunId, path: "/root/worker/verifier" as AgentPath,
+      parentPath: "/root/worker" as AgentPath, childSessionId: "verify-session" as SessionId,
+      status: "completed" as const, summary: "VERDICT: passed\nDeterministic integration fixture inspected the artifact.",
+    }; } },
+  });
+}
 
 async function createPendingMergeContext(prefix: string): Promise<{
   dir: string;
@@ -1209,6 +1434,24 @@ async function createPendingMergeContext(prefix: string): Promise<{
       await rm(dir, { recursive: true, force: true });
     },
   };
+}
+
+// Existing recovery/authority cases start with a deterministic accepted artifact.
+// This is explicit test setup: production merge never manufactures acceptance.
+async function acceptPendingArtifacts(context: Awaited<ReturnType<typeof createPendingMergeContext>>): Promise<void> {
+  for (const task of await context.teams.tasks(context.teamId)) {
+    const merge = taskMergeMetadata(task.metadata);
+    if (merge?.status !== "pending" || !merge.worktreePath || !merge.baseRef) continue;
+    if (merge.worktreePath !== worktreeMetadata(task.metadata)?.path) continue;
+    try {
+      if (!(await lstat(merge.worktreePath)).isDirectory()) continue;
+    } catch { continue; }
+    const { patch, ...artifact } = await captureTeamTaskArtifact({ cwd: merge.worktreePath, baseRef: merge.baseRef });
+    await context.teams.updateTask({
+      teamId: task.teamId, taskId: task.id, sessionId: context.sessionId,
+      metadata: { ...task.metadata, verification: { status: "passed", gitDiff: patch, artifact }, merge: { ...merge, diff: patch } },
+    });
+  }
 }
 
 async function mkGitRepo(prefix: string): Promise<string> {

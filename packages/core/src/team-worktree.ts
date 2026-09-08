@@ -6,6 +6,7 @@ import { timestampNow } from "@chili/protocol";
 import type { TeamRow, TeamTaskRow } from "@chili/store";
 import { runProcess } from "@chili/tools";
 import type { RuntimeSessionOperation, SessionOperationCoordinator } from "./runtime-service.js";
+import { composeTeamTaskDependencyBase } from "./team-artifact.js";
 import { TeamNotFoundError, TeamTaskNotFoundError, type TeamControlService } from "./team.js";
 import {
   canonicalTeamWorkspacePath,
@@ -101,6 +102,7 @@ export interface TeamTaskMergeMetadata {
   reason?: string;
   mainHead?: string;
   worktreeHead?: string;
+  artifactCommit?: string;
 }
 
 export interface TeamTaskWorktreePreflightInput {
@@ -237,7 +239,24 @@ export class TeamWorktreeService {
     });
     operation.assertCurrent();
     throwIfAborted(input.signal);
+    const dependencyBaseRef = task.dependsOn.length === 0
+      ? input.baseRef ?? DEFAULT_BASE_REF
+      : await composeTeamTaskDependencyBase({
+          cwd,
+          baseRef: input.baseRef ?? DEFAULT_BASE_REF,
+          task,
+          tasks: await this.options.teams.tasks(task.teamId),
+          ...(input.signal ? { signal: input.signal } : {}),
+        });
+    const requestedBaseRef = task.dependsOn.length > 0
+      ? await this.resolveCommit(cwd, dependencyBaseRef, input.signal)
+      : dependencyBaseRef;
+    operation.assertCurrent();
+    throwIfAborted(input.signal);
     if (existing?.status === "active") {
+      if (task.dependsOn.length > 0 && existing.baseRef !== requestedBaseRef) {
+        throw new TeamTaskWorktreePathError("Existing task worktree does not match its delivered dependency snapshot; create a replacement task and transfer needed edits from the preserved worktree");
+      }
       return {
         path: existing.path,
         baseRef: existing.baseRef,
@@ -248,7 +267,6 @@ export class TeamWorktreeService {
       };
     }
 
-    const requestedBaseRef = input.baseRef ?? DEFAULT_BASE_REF;
     const path = await assertTeamTaskWorktreePath({ cwd, teamId: input.teamId, taskId: input.taskId });
     await this.revalidateAuthority(input, operation);
     operation.assertCurrent();
@@ -257,6 +275,9 @@ export class TeamWorktreeService {
     let canonicalPath: string;
     let baseRef: string;
     if (recovered) {
+      if (task.dependsOn.length > 0 && recovered.head !== requestedBaseRef) {
+        throw new TeamTaskWorktreePathError("Recovered worktree does not match its delivered dependency snapshot");
+      }
       canonicalPath = recovered.path;
       baseRef = recovered.head;
     } else {

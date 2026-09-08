@@ -19,6 +19,7 @@ import {
   type TeamSessionResolver,
 } from "./team-session-authority.js";
 import { verificationMetadata } from "./team-verifier.js";
+import { captureTeamTaskArtifact, teamPathsChangedFromBase, teamTaskArtifact } from "./team-artifact.js";
 import {
   assertTeamTaskWorktreePath,
   mergeMergeMetadata,
@@ -129,6 +130,7 @@ interface PreparedMergeTask {
   recovering: boolean;
   mainHead?: string;
   worktreeHead?: string;
+  artifactCommit?: string;
 }
 
 interface DurableTeamTaskMergeMetadata extends TeamTaskMergeMetadata {
@@ -179,6 +181,7 @@ interface FinalizeMergeInput {
   worktreeHead?: string;
   baseCommit?: string;
   expectedPatchFingerprint?: string;
+  invalidateVerification?: boolean;
 }
 
 interface AuthorizedTeamMergeState {
@@ -351,6 +354,7 @@ export class TeamMergeService {
         baseCommit: frozenIntent.baseCommit,
         postStateFingerprint: frozenIntent.postStateFingerprint,
         recovering: true,
+        ...(merge.artifactCommit ? { artifactCommit: merge.artifactCommit } : {}),
         ...(merge.mainHead ? { mainHead: merge.mainHead } : {}),
         ...(merge.worktreeHead ? { worktreeHead: merge.worktreeHead } : {}),
       };
@@ -394,6 +398,39 @@ export class TeamMergeService {
 
     const postStateFingerprint = await pathStateFingerprint(confirmedWorktree.path, patch.paths);
 
+    const verifiedArtifact = teamTaskArtifact(task.metadata);
+    const currentArtifact = verifiedArtifact
+      ? await captureTeamTaskArtifact({ cwd: confirmedWorktree.path, baseRef: baseCommit, ...(input.signal ? { signal: input.signal } : {}) })
+      : undefined;
+    if (!verifiedArtifact || currentArtifact?.baseCommit !== verifiedArtifact.baseCommit
+      || currentArtifact.tree !== verifiedArtifact.tree
+      || currentArtifact.patchFingerprint !== verifiedArtifact.patchFingerprint
+      || patchFingerprint(patch.patch) !== verifiedArtifact.patchFingerprint) {
+      const error = verifiedArtifact
+        ? "Task worktree changed after verification; verify the current artifact before merging"
+        : "Passed verification has no immutable artifact; reverify the task before merging";
+      const updated = await this.finalizeMerge(input, {
+        task, merge, status: "conflicted", diff: patch.patch, summary: patch.summary, mergedAt,
+        worktreePath: confirmedWorktree.path, baseCommit, error, conflicts: [error],
+        invalidateVerification: true,
+      }, operation);
+      return { status: "conflicted", teamTask: updated, diffSummary: patch.summary, error, conflicts: [error] };
+    }
+
+    if (merge.reason === "legacy_reverification") {
+      // An old applied merge has now been independently verified against a
+      // precise artifact. Confirm its existing result without applying again.
+      const actual = await pathStateFingerprint(cwd, patch.paths);
+      const matches = actual === postStateFingerprint;
+      const error = matches ? undefined : "Previously applied task differs from the reverified artifact; preserve the workspace and resolve the conflict";
+      const updated = await this.finalizeMerge(input, {
+        task, merge, status: matches ? "applied" : "conflicted", diff: patch.patch,
+        summary: patch.summary, mergedAt, worktreePath: confirmedWorktree.path, baseCommit,
+        ...(error ? { error, conflicts: [error] } : {}),
+      }, operation);
+      return { status: matches ? "applied" : "conflicted", teamTask: updated, diffSummary: patch.summary, ...(error ? { error, conflicts: [error] } : {}) };
+    }
+
     if (patch.patch.trim().length === 0) {
       const updated = await this.finalizeMerge(input, {
         task,
@@ -413,7 +450,7 @@ export class TeamMergeService {
     if (!mainHead) {
       throw new Error(`Task ${task.teamId}/${task.id} could not resolve the main workspace HEAD`);
     }
-    const committedPaths = await this.committedMainPaths(
+    const committedPaths = task.dependsOn.length > 0 ? [] : await this.committedMainPaths(
       cwd,
       baseCommit,
       mainHead,
@@ -440,7 +477,9 @@ export class TeamMergeService {
       return { status: "conflicted", teamTask: updated, diffSummary: patch.summary, error, conflicts };
     }
 
-    const dirtyPaths = await this.dirtyMainPaths(cwd, patch.paths, input.signal);
+    const dirtyPaths = task.dependsOn.length > 0
+      ? await teamPathsChangedFromBase({ cwd, baseRef: baseCommit, paths: patch.paths, ...(input.signal ? { signal: input.signal } : {}) })
+      : await this.dirtyMainPaths(cwd, patch.paths, input.signal);
     if (dirtyPaths.length > 0) {
       const conflicts = dirtyPaths.map((path) => `Main workspace has local changes at ${path}`);
       const updated = await this.finalizeMerge(input, {
@@ -495,6 +534,7 @@ export class TeamMergeService {
       baseCommit,
       postStateFingerprint,
       recovering: false,
+      artifactCommit: verifiedArtifact.commit,
     };
     if (mainHead) prepared.mainHead = mainHead;
     if (worktreeHead) prepared.worktreeHead = worktreeHead;
@@ -538,7 +578,7 @@ export class TeamMergeService {
         }, operation);
         return { status: "conflicted", teamTask: updated, diffSummary: patch.summary, error, conflicts };
       }
-      const committedPaths = await this.committedMainPaths(
+      const committedPaths = task.dependsOn.length > 0 ? [] : await this.committedMainPaths(
         cwd,
         baseCommit,
         mainHead,
@@ -564,7 +604,9 @@ export class TeamMergeService {
         }, operation);
         return { status: "conflicted", teamTask: updated, diffSummary: patch.summary, error, conflicts };
       }
-      const dirtyPaths = await this.dirtyMainPaths(cwd, patch.paths, input.signal);
+      const dirtyPaths = task.dependsOn.length > 0
+        ? await teamPathsChangedFromBase({ cwd, baseRef: baseCommit, paths: patch.paths, ...(input.signal ? { signal: input.signal } : {}) })
+        : await this.dirtyMainPaths(cwd, patch.paths, input.signal);
       if (dirtyPaths.length > 0) {
         const conflicts = dirtyPaths.map((path) => `Main workspace has local changes at ${path}`);
         const updated = await this.finalizeMerge(input, {
@@ -672,7 +714,7 @@ export class TeamMergeService {
       }, operation);
       return { status: "conflicted", teamTask: updated, diffSummary: patch.summary, error, conflicts };
     }
-    const inspection = await this.inspectPatchApplication(cwd, patch.patch, operation.signal);
+    const inspection = await this.inspectPatchApplication(cwd, patch.patch, operation.signal, prepared);
     operation.assertCurrent();
 
     if (inspection.state === "partial") {
@@ -732,7 +774,7 @@ export class TeamMergeService {
         });
         operation.assertCurrent();
         if (applied.exitCode !== 0) {
-          const afterFailure = await this.inspectPatchApplication(cwd, patch.patch, operation.signal);
+          const afterFailure = await this.inspectPatchApplication(cwd, patch.patch, operation.signal, prepared);
           operation.assertCurrent();
           if (afterFailure.state === "partial") {
             const error = applied.stderr || "git apply left the frozen task patch partially applied";
@@ -862,6 +904,9 @@ export class TeamMergeService {
     if (!prepared.mainHead || !prepared.worktreeHead) {
       throw new Error(`Task ${prepared.task.teamId}/${prepared.task.id} cannot freeze merge intent without full repository heads`);
     }
+    if (!prepared.artifactCommit || teamTaskArtifact(current.task.metadata)?.commit !== prepared.artifactCommit) {
+      throw new Error("Verified task artifact changed before merge apply intent");
+    }
 
     const intent: DurableTeamTaskMergeMetadata = {
       status: "pending",
@@ -875,6 +920,7 @@ export class TeamMergeService {
       patchFingerprint: patchFingerprint(prepared.patch.patch),
       applyPaths: [...prepared.patch.paths],
       postStateFingerprint: prepared.postStateFingerprint,
+      artifactCommit: prepared.artifactCommit,
       ...(prepared.mainHead ? { mainHead: prepared.mainHead } : {}),
       ...(prepared.worktreeHead ? { worktreeHead: prepared.worktreeHead } : {}),
     };
@@ -897,11 +943,24 @@ export class TeamMergeService {
     cwd: string,
     patch: string,
     signal: AbortSignal | undefined,
+    prepared: PreparedMergeTask,
   ): Promise<PatchApplicationInspection> {
     const reverse = await this.checkPatch(cwd, patch, signal, true);
     const forward = await this.checkPatch(cwd, patch, signal);
     if (reverse.ok && !forward.ok) return { state: "applied", forward, reverse };
     if (forward.ok && !reverse.ok) return { state: "unapplied", forward, reverse };
+    if (forward.ok && reverse.ok) {
+      // Git's mode-only --check accepts both directions (wrong modes merely
+      // warn). Resolve that ambiguity with the exact frozen file states.
+      if (await pathStateFingerprint(cwd, prepared.patch.paths) === prepared.postStateFingerprint) {
+        return { state: "applied", forward, reverse };
+      }
+      const changed = await teamPathsChangedFromBase({
+        cwd, baseRef: prepared.baseCommit, paths: prepared.patch.paths,
+        ...(signal ? { signal } : {}),
+      });
+      if (changed.length === 0) return { state: "unapplied", forward, reverse };
+    }
     return { state: "partial", forward, reverse };
   }
 
@@ -910,69 +969,25 @@ export class TeamMergeService {
     baseCommit: string,
     signal: AbortSignal | undefined,
   ): Promise<WorktreePatch> {
+    const artifact = await captureTeamTaskArtifact({ cwd, baseRef: baseCommit, ...(signal ? { signal } : {}) });
     const tracked = await this.git({
       cwd,
-      args: ["diff", "--no-ext-diff", "--no-color", "--no-renames", "--binary", baseCommit, "--"],
+      args: ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "--full-index", "--binary", baseCommit, artifact.commit, "--"],
       ...(signal ? { signal } : {}),
       maxOutputBytes: DEFAULT_MERGE_PATCH_MAX_BYTES,
     });
-    ensureGitSuccess(tracked, `git diff ${baseCommit}`);
-    ensureNotTruncated(tracked, `git diff ${baseCommit}`);
-
-    const paths = await this.changedPaths(cwd, baseCommit, signal);
-    const parts = tracked.stdout.length > 0 ? [tracked.stdout] : [];
-    const untracked = await this.untrackedPaths(cwd, signal);
-    for (const path of untracked) {
-      const fileDiff = await this.git({
-        cwd,
-        args: ["diff", "--no-ext-diff", "--no-color", "--binary", "--no-index", "--", "/dev/null", path],
-        ...(signal ? { signal } : {}),
-        maxOutputBytes: DEFAULT_MERGE_PATCH_MAX_BYTES,
-      });
-      if (fileDiff.exitCode !== 0 && fileDiff.exitCode !== 1) {
-        throw new Error(fileDiff.stderr || `git diff --no-index failed for ${path} with exit ${fileDiff.exitCode}`);
-      }
-      ensureNotTruncated(fileDiff, `git diff --no-index ${path}`);
-      if (fileDiff.stdout.length > 0) parts.push(fileDiff.stdout);
-    }
-
-    const patch = concatenatePatchParts(parts);
-    if (Buffer.byteLength(patch, "utf8") > DEFAULT_MERGE_PATCH_MAX_BYTES) {
-      throw new Error(`Task patch output exceeded ${DEFAULT_MERGE_PATCH_MAX_BYTES} bytes`);
-    }
-    return {
-      patch,
-      paths,
-      summary: diffSummary(paths, patch),
-    };
-  }
-
-  private async changedPaths(
-    cwd: string,
-    baseCommit: string,
-    signal: AbortSignal | undefined,
-  ): Promise<string[]> {
-    const tracked = await this.git({
+    ensureGitSuccess(tracked, `git diff ${baseCommit} ${artifact.commit}`);
+    ensureNotTruncated(tracked, `git diff ${baseCommit} ${artifact.commit}`);
+    const names = await this.git({
       cwd,
-      args: ["diff", "--no-renames", "--name-only", "-z", baseCommit, "--"],
+      args: ["diff", "--no-renames", "--name-only", "-z", baseCommit, artifact.commit, "--"],
       ...(signal ? { signal } : {}),
       maxOutputBytes: DEFAULT_MERGE_PATCH_MAX_BYTES,
     });
-    ensureGitSuccess(tracked, `git diff --name-only ${baseCommit}`);
-    ensureNotTruncated(tracked, `git diff --name-only ${baseCommit}`);
-    return uniquePaths([...splitNul(tracked.stdout), ...(await this.untrackedPaths(cwd, signal))]);
-  }
-
-  private async untrackedPaths(cwd: string, signal: AbortSignal | undefined): Promise<string[]> {
-    const result = await this.git({
-      cwd,
-      args: ["ls-files", "--others", "--exclude-standard", "-z"],
-      ...(signal ? { signal } : {}),
-      maxOutputBytes: DEFAULT_MERGE_PATCH_MAX_BYTES,
-    });
-    ensureGitSuccess(result, "git ls-files --others");
-    ensureNotTruncated(result, "git ls-files --others");
-    return splitNul(result.stdout);
+    ensureGitSuccess(names, "git diff artifact paths");
+    ensureNotTruncated(names, "git diff artifact paths");
+    const paths = uniquePaths(splitNul(names.stdout));
+    return { patch: tracked.stdout, paths, summary: diffSummary(paths, tracked.stdout) };
   }
 
   private async committedMainPaths(
@@ -1116,7 +1131,16 @@ export class TeamMergeService {
     if (input.reason) merge.reason = normalizePersistedError(input.reason).message;
     if (input.mainHead) merge.mainHead = input.mainHead;
     if (input.worktreeHead) merge.worktreeHead = input.worktreeHead;
+    const artifactCommit = input.merge.artifactCommit ?? teamTaskArtifact(revalidated.task.metadata)?.commit;
+    if (artifactCommit) merge.artifactCommit = artifactCommit;
     const metadata = mergeMergeMetadata(revalidated.task.metadata, merge);
+    if (input.invalidateVerification) {
+      metadata.verification = {
+        ...verificationMetadata(revalidated.task.metadata),
+        status: "failed",
+        feedback: input.error,
+      };
+    }
     operation.assertCurrent();
     throwIfAborted(authorityInput.signal);
     const updated = await this.options.teams.updateTask({
@@ -1168,6 +1192,9 @@ export class TeamMergeService {
       || merge.status !== "pending"
     ) {
       throw new Error(`Task ${task.teamId}/${task.id} is no longer a verifier-passed pending merge`);
+    }
+    if (merge.artifactCommit && teamTaskArtifact(task.metadata)?.commit !== merge.artifactCommit) {
+      throw new Error(`Task ${task.teamId}/${task.id} verified artifact changed after merge intent`);
     }
     const worktree = await preflightTeamTaskWorktree({
       cwd: authorized.input.cwd,
@@ -1312,16 +1339,6 @@ function samePaths(left: readonly string[], right: readonly string[]): boolean {
 
 function literalPathspec(path: string): string {
   return `:(literal)${path}`;
-}
-
-function concatenatePatchParts(parts: readonly string[]): string {
-  let output = "";
-  for (const part of parts) {
-    if (part.length === 0) continue;
-    if (output.length > 0 && !output.endsWith("\n") && !part.startsWith("\n")) output += "\n";
-    output += part;
-  }
-  return output;
 }
 
 function durableMergeMetadata(

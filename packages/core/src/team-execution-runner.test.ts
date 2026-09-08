@@ -1951,6 +1951,39 @@ class RecordingTeamRunEventStore {
   }
 }
 
+for (const mergeStatus of ["failed", "conflicted"] as const) {
+  test(`does not dispatch dependents of a ${mergeStatus} verified artifact`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "chili-team-runner-undelivered-"));
+    const store = new SqliteEventStore(join(dir, "events.sqlite"));
+    const sessionId = "session_team_undelivered" as SessionId;
+    const now = () => 900 as TimestampMs;
+    try {
+      const teams = new TeamControlService({ store, createId: createSequentialId(), now });
+      const team = await teams.createTeam({ sessionId, name: "undelivered", leadPath: "/root" as AgentPath });
+      const workerPath = "/root/worker" as AgentPath;
+      await teams.addMember({ sessionId, teamId: team.id, path: workerPath, name: "worker", role: "implementer" });
+      const artifact = { version: 1, baseCommit: "a".repeat(40), commit: "b".repeat(40), tree: "c".repeat(40), patchFingerprint: "d".repeat(64) };
+      const prerequisite = await teams.createTask({ sessionId, teamId: team.id, title: "Undelivered prerequisite", ownerPath: workerPath,
+        status: "completed", metadata: {
+          verification: { status: "passed", artifact },
+          merge: { status: mergeStatus, createdAt: 900, artifactCommit: artifact.commit },
+        },
+      });
+      const dependent = await teams.createTask({ sessionId, teamId: team.id, title: "Dependent", ownerPath: workerPath, dependsOn: [prerequisite.id] });
+      const dispatcher = {
+        async reconcileTasks() { return emptyReconcileResult(); },
+        async dispatchTask() { throw new Error("must not dispatch undelivered dependency"); },
+      } as unknown as TeamTaskDispatchService;
+      const execution = new TeamExecutionRunner({ teams, dispatcher, cwd: dir, now, resolveSession: () => ({ cwd: dir }) });
+      const result = await execution.run({ teamId: team.id, sessionId, maxCycles: 2 });
+      expect(result.dispatched).toEqual([]);
+      expect(result.errors).toEqual([]);
+      expect(result.blocked).toContainEqual(expect.objectContaining({ taskId: dependent.id, reason: "dependency_incomplete", blockedBy: [prerequisite.id] }));
+      expect((await teams.tasks(team.id)).find((task) => task.id === dependent.id)?.status).toBe("pending");
+    } finally { store.close(); await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
 class PendingMergeVerifier implements TeamTaskVerifier {
   constructor(
     private readonly teams: TeamControlService,

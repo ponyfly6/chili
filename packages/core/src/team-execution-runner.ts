@@ -20,6 +20,7 @@ import type {
   TeamTaskRow,
 } from "@chili/store";
 import type { LocalSubagentMode } from "./subagent.js";
+import { isTeamTaskArtifactDelivered } from "./team-artifact.js";
 import type {
   TeamTaskDispatchResult,
   TeamTaskDispatchService,
@@ -1311,6 +1312,7 @@ function incompleteDependencies(task: TeamTaskRow, tasks: readonly TeamTaskRow[]
   return task.dependsOn.filter((taskId) => {
     const dependency = byId.get(taskId);
     if (!dependency || dependency.status !== "completed") return true;
+    if (!isTeamTaskArtifactDelivered(dependency)) return true;
     return requireAccepted && !isAcceptedTeamTask(dependency);
   });
 }
