@@ -515,6 +515,7 @@ export class SqliteEventStore
       this.migrateMessageSchema();
       this.migrateGoalSchema();
       this.migrateLegacyThreadSchema();
+      this.migrateMessageCreationSequence();
       this.db.exec(AGENT_TASKS_CHILD_SESSION_UNIQUE_INDEX);
       this.migrateSubagentSchema();
       this.migrateTeamSchema();
@@ -871,7 +872,7 @@ export class SqliteEventStore
                  where m.session_id = s.id
                    and m.role = 'user'
                    and mp.type = 'text'
-                 order by m.created_at desc, mp.ordinal asc
+                 order by m.created_event_seq desc, m.created_at desc, m.id desc, mp.ordinal asc
                  limit 1) as preview
          from sessions s
          order by s.updated_at desc, s.id desc`,
@@ -895,7 +896,7 @@ export class SqliteEventStore
         `select id, session_id, turn_id, role, parent_id, created_at
          from messages
          where session_id = ?
-         order by created_at asc, id asc`,
+         order by created_event_seq asc, created_at asc, id asc`,
       )
       .all(sessionId);
     const pendingDeltas = this.pendingMessagePartDeltas(sessionId);
@@ -2541,8 +2542,8 @@ export class SqliteEventStore
         }
         this.assertAgentTaskReservationAvailable(event.payload);
       }
-      this.insertEvent(event);
-      this.applyProjection(event);
+      const eventSeq = this.insertEvent(event);
+      this.applyProjection(event, eventSeq);
       committed.push(event);
     }
     return committed;
@@ -3133,20 +3134,22 @@ export class SqliteEventStore
     return event;
   }
 
-  private insertEvent(event: ChiliEvent): void {
+  private insertEvent(event: ChiliEvent): number {
+    const seq = this.nextEventSeq();
     this.db
       .query(
         `insert into events (seq, id, type, time, session_id, payload_json)
          values (?, ?, ?, ?, ?, ?)`,
       )
       .run(
-        this.nextEventSeq(),
+        seq,
         event.id,
         event.type,
         event.time,
         event.sessionId ?? null,
         encodeJson(event.payload),
       );
+    return seq;
   }
 
   private backfillScopedEventSessionIds(): void {
@@ -3310,6 +3313,66 @@ export class SqliteEventStore
         this.db.query(`insert into schema_migrations (name) values (?)`).run(deltaCheckpointMigration);
       }
       this.db.exec(`create index if not exists messages_turn_idx on messages(turn_id)`);
+    });
+    migrate();
+  }
+
+  private migrateMessageCreationSequence(): void {
+    const migrate = this.db.transaction(() => {
+      this.addColumnIfMissing("messages", "created_event_seq", "integer");
+      const marker = "message_creation_event_sequence_v1";
+      const alreadyMigrated = this.db
+        .query<{ found: number }, [string]>(
+          `select 1 as found from schema_migrations where name = ? limit 1`,
+        )
+        .get(marker);
+      if (!alreadyMigrated) {
+        // Session identity migration must finish first. Only durable creation
+        // events can establish causal order; timestamps and random IDs cannot.
+        this.db.exec(`
+          update messages
+             set created_event_seq = creation.seq
+            from (
+              select session_id,
+                     json_extract(payload_json, '$.messageId') as message_id,
+                     min(seq) as seq
+                from events
+               where type = 'message.created'
+                 and json_valid(payload_json)
+                 and json_type(payload_json, '$.messageId') = 'text'
+               group by session_id, json_extract(payload_json, '$.messageId')
+            ) as creation
+           where messages.id = creation.message_id
+             and messages.session_id = creation.session_id
+             and messages.created_event_seq is null
+        `);
+        // Incomplete legacy projections retain NULL: they form a stable prefix
+        // in their previous timestamp/ID order, without inventing event history.
+        this.db.query(`insert into schema_migrations (name) values (?)`).run(marker);
+      }
+      this.db.exec(`create index if not exists messages_session_created_seq_idx
+        on messages(session_id, created_event_seq, created_at, id)`);
+      // Older writers insert the event before its projection in the same
+      // transaction but omit created_event_seq. Keep their new messages in
+      // causal order without rebinding existing, unanchored legacy rows.
+      this.db.exec(`
+        create trigger if not exists messages_created_event_seq_compat
+        after insert on messages
+        when new.created_event_seq is null
+        begin
+          update messages
+             set created_event_seq = (
+               select min(seq)
+                 from events
+                where session_id = new.session_id
+                  and type = 'message.created'
+                  and json_valid(payload_json)
+                  and json_type(payload_json, '$.messageId') = 'text'
+                  and json_extract(payload_json, '$.messageId') = new.id
+             )
+           where id = new.id;
+        end
+      `);
     });
     migrate();
   }
@@ -4030,7 +4093,7 @@ export class SqliteEventStore
     return (row?.seq ?? 0) + 1;
   }
 
-  private applyProjection(event: ChiliEvent): void {
+  private applyProjection(event: ChiliEvent, eventSeq: number): void {
     if (event.type === "turn.completed") {
       this.compactTurnMessagePartDeltas(event.payload.turnId);
       return;
@@ -4040,7 +4103,7 @@ export class SqliteEventStore
       return;
     }
     if (event.type.startsWith("message.")) {
-      this.applyMessageEvent(event as MessageEvent);
+      this.applyMessageEvent(event as MessageEvent, eventSeq);
       return;
     }
     if (event.type.startsWith("tool.")) {
@@ -4145,18 +4208,18 @@ export class SqliteEventStore
     }
   }
 
-  private applyMessageEvent(event: MessageEvent): void {
+  private applyMessageEvent(event: MessageEvent, eventSeq: number): void {
     if (event.type === "message.created") {
       if (!event.sessionId) {
         throw new Error("message.created requires event.sessionId");
       }
       this.db
         .query(
-          `insert into messages (id, session_id, turn_id, role, parent_id, created_at)
-           values (?, ?, ?, ?, null, ?)
+          `insert into messages (id, session_id, turn_id, role, parent_id, created_at, created_event_seq)
+           values (?, ?, ?, ?, null, ?, ?)
            on conflict(id) do nothing`,
         )
-        .run(event.payload.messageId, event.sessionId, event.payload.turnId ?? null, event.payload.role, event.time);
+        .run(event.payload.messageId, event.sessionId, event.payload.turnId ?? null, event.payload.role, event.time, eventSeq);
       return;
     }
 

@@ -49,7 +49,8 @@ export const SQLITE_SCHEMA = [
     turn_id text,
     role text not null,
     parent_id text,
-    created_at integer not null
+    created_at integer not null,
+    created_event_seq integer
   )`,
   `create index if not exists messages_session_time_idx on messages(session_id, created_at, id)`,
 
