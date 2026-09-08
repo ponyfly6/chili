@@ -65,7 +65,7 @@ import {
 import { resolveDelegationConfig } from "./delegation.js";
 import { DEFAULT_GOAL_TOKEN_BUDGET, GoalService, type AccountGoalUsageResult, type GoalUsageScope } from "./goal.js";
 import { buildFailureCheckpoint } from "./failure-checkpoint.js";
-import type { AgentRunner, RunTurnInput, RunTurnResult } from "./runner.js";
+import type { AgentRunner, PromptExecutionScope, RunTurnInput, RunTurnResult } from "./runner.js";
 import type { CompactContextResult } from "./single-agent-runtime.js";
 import {
   assessDelegationIntegration,
@@ -934,6 +934,7 @@ export class RuntimeService {
 
   private async runReservedPrompt(input: SubmitPromptInput, controller: AbortController): Promise<SubmitPromptResult> {
     const turns: RunTurnResult[] = [];
+    const promptExecution: PromptExecutionScope = { sessionId: input.sessionId };
     const maxTurns = input.maxTurns ?? this.options.maxTurns ?? DEFAULT_MAX_TURNS;
 
     try {
@@ -1013,6 +1014,7 @@ export class RuntimeService {
         }
         const runInput = this.buildRunTurnInput({
           input: promptInput,
+          promptExecution,
           cwd,
           prompt,
           signal: controller.signal,
@@ -1138,7 +1140,9 @@ export class RuntimeService {
                 : "delegation_integration_incomplete",
             );
           }
-          return await this.completedPromptWithGoalContinuation(promptInput, turns, result, controller, cwd, promptModelState);
+          return await this.completedPromptWithGoalContinuation(
+            promptInput, turns, result, controller, cwd, promptModelState, promptExecution,
+          );
         }
       }
 
@@ -1171,6 +1175,7 @@ export class RuntimeService {
       }
       const finalRunInput = this.buildRunTurnInput({
         input: promptInput,
+        promptExecution,
         cwd,
         prompt: this.withFinalResponsePrompt(prompt),
         signal: controller.signal,
@@ -1213,7 +1218,9 @@ export class RuntimeService {
             );
           }
         }
-        return await this.completedPromptWithGoalContinuation(promptInput, turns, finalResult, controller, cwd, promptModelState);
+        return await this.completedPromptWithGoalContinuation(
+          promptInput, turns, finalResult, controller, cwd, promptModelState, promptExecution,
+        );
       }
 
       await this.publishStatus({
@@ -1251,6 +1258,7 @@ export class RuntimeService {
     controller: AbortController,
     cwd: string,
     modelState: RuntimeSessionModelState,
+    promptExecution: PromptExecutionScope,
   ): Promise<SubmitPromptResult> {
     const continued = await this.runGoalContinuation({
       input,
@@ -1258,6 +1266,7 @@ export class RuntimeService {
       controller,
       cwd,
       modelState,
+      promptExecution,
     });
     if (continued) return continued;
     return this.completedPrompt(input, turns, result);
@@ -1269,6 +1278,7 @@ export class RuntimeService {
     controller: AbortController;
     cwd: string;
     modelState: RuntimeSessionModelState;
+    promptExecution: PromptExecutionScope;
   }): Promise<SubmitPromptResult | undefined> {
     const maxGoalTurns = this.options.maxGoalTurns ?? DEFAULT_MAX_GOAL_TURNS;
     let ranContinuation = false;
@@ -1327,6 +1337,7 @@ export class RuntimeService {
       }
       const runInput = this.buildRunTurnInput({
         input: args.input,
+        promptExecution: args.promptExecution,
         cwd: args.cwd,
         prompt,
         signal: args.controller.signal,
@@ -1384,6 +1395,7 @@ export class RuntimeService {
       controller: AbortController;
       cwd: string;
       modelState: RuntimeSessionModelState;
+      promptExecution: PromptExecutionScope;
     },
     previous: Extract<RunTurnResult, { status: "completed" }>,
     previousGoalUsageScope: GoalUsageScope,
@@ -1409,6 +1421,7 @@ export class RuntimeService {
     }
     const runInput = this.buildRunTurnInput({
       input: args.input,
+      promptExecution: args.promptExecution,
       cwd: args.cwd,
       prompt,
       signal: args.controller.signal,
@@ -1574,6 +1587,7 @@ export class RuntimeService {
     }
     const result = await this.runGoalContinuation({
       input: normalizedInput,
+      promptExecution: { sessionId: input.sessionId },
       turns,
       controller,
       cwd,
@@ -1590,6 +1604,7 @@ export class RuntimeService {
 
   private buildRunTurnInput(input: {
     input: SubmitPromptInput;
+    promptExecution: PromptExecutionScope;
     cwd: string;
     prompt: PromptAssembly;
     signal: AbortSignal;
@@ -1599,6 +1614,7 @@ export class RuntimeService {
   }): RunTurnInput {
     const runInput: RunTurnInput = {
       sessionId: input.input.sessionId,
+      promptExecution: input.promptExecution,
       cwd: input.cwd,
       system: input.prompt.system,
       signal: input.signal,

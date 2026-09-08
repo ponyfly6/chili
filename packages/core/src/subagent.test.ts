@@ -385,6 +385,84 @@ test("marks an invalid max-turn final response incomplete", async () => {
   expect(runner.turnInputs.at(-1)).toMatchObject({ toolMode: "disabled" });
 });
 
+test("child continuations and final response keep one resolved model configuration", async () => {
+  const store = new MemoryEventStore();
+  const runner = new ScriptedChildRunner(store, [
+    { finishReason: "tool_use" },
+    { text: "Verified the repository configuration and recorded the result." },
+  ]);
+  const config: Pick<RunTurnInput, "modelSelection" | "reasoningLevel" | "serviceTier"> = {
+    modelSelection: { provider: "test", model: "selected" },
+    reasoningLevel: "high",
+    serviceTier: "fast",
+  };
+  const runTurn = runner.runTurn.bind(runner);
+  runner.runTurn = async (input) => {
+    const result = await runTurn(input);
+    if (config.modelSelection) config.modelSelection.model = "changed_after_start";
+    config.reasoningLevel = "low";
+    config.serviceTier = "standard";
+    return result;
+  };
+  let resolutions = 0;
+  const subagentRunner = new AgentRunnerSubagentRunner({
+    runner,
+    store,
+    maxTurns: 1,
+    modelConfig(input) {
+      expect(input).toEqual({ sessionId: "session_child" as SessionId, cwd: "/repo" });
+      resolutions++;
+      return config;
+    },
+  });
+
+  expect((await subagentRunner.run(localRunInput())).status).toBe("completed");
+  expect(resolutions).toBe(1);
+  expect(runner.turnInputs).toHaveLength(2);
+  for (const input of runner.turnInputs) {
+    expect(input).toMatchObject({
+      modelSelection: { provider: "test", model: "selected" },
+      reasoningLevel: "high",
+      serviceTier: "fast",
+      promptExecution: { sessionId: "session_child" },
+    });
+  }
+  expect(runner.turnInputs[1]?.toolMode).toBe("disabled");
+  expect(runner.turnInputs[1]?.promptExecution).toBe(runner.turnInputs[0]?.promptExecution);
+});
+
+test("child repair turns share a prompt scope and a later run gets a fresh scope", async () => {
+  const store = new MemoryEventStore();
+  const runner = new ScriptedChildRunner(store, [
+    { text: "I'll inspect the repository next." },
+    { text: "Found the cause in the parser and verified the result." },
+    { text: "Confirmed the result still holds for the second task." },
+  ]);
+  const subagentRunner = new AgentRunnerSubagentRunner({ runner, store, maxTurns: 1 });
+  expect((await subagentRunner.run(localRunInput())).status).toBe("completed");
+  expect((await subagentRunner.run(localRunInput())).status).toBe("completed");
+  expect(runner.turnInputs).toHaveLength(3);
+  expect(runner.turnInputs[0]?.promptExecution).toBeDefined();
+  expect(runner.turnInputs[1]?.promptExecution).toBe(runner.turnInputs[0]?.promptExecution);
+  expect(runner.turnInputs[2]?.promptExecution).not.toBe(runner.turnInputs[0]?.promptExecution);
+});
+
+test("cancellation during child model configuration cannot start a model turn", async () => {
+  const store = new MemoryEventStore();
+  const runner = new FakeChildRunner(store);
+  const controller = new AbortController();
+  const subagentRunner = new AgentRunnerSubagentRunner({
+    runner,
+    store,
+    modelConfig() {
+      controller.abort(abortTestError());
+      return {};
+    },
+  });
+  await expect(subagentRunner.run({ ...localRunInput(), signal: controller.signal })).rejects.toThrow("aborted");
+  expect(runner.turnInputs).toEqual([]);
+});
+
 test("tracks background subagent tasks until they complete", async () => {
   const store = new MemoryEventStore();
   const manager = new LocalSubagentManager({

@@ -482,6 +482,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
       store: eventStore,
       maxTurns: DEV_MAX_TURNS,
       promptFragments: subagentPromptFragments,
+      modelConfig: ({ sessionId }) => childService.getModelConfig(sessionId),
     }),
     createId,
     runLimiter: childRunLimiter,

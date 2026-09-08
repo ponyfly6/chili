@@ -659,8 +659,8 @@ test("does not execute tool calls from output-limited model responses", async ()
     cwd: "/repo",
   });
 
-  expect(result.status).toBe("completed");
-  if (result.status === "completed") expect(result.finishReason).toBe("tool_use");
+  expect(result.status).toBe("failed");
+  if (result.status === "failed") expect(result.error.message).toContain("output token limit");
   expect(executed).toBe(false);
   expect(toolFinishedPayloads(store)).toContainEqual(expect.objectContaining({
     status: "failed",
@@ -942,7 +942,7 @@ test("finishes live streaming tool rows as failed when finish arrives before too
     cwd: "/repo",
   });
 
-  expect(result.status).toBe("completed");
+  expect(result.status).toBe("failed");
   expect(toolCallParts(store)).toEqual([]);
   expect(toolResultParts(store)).toEqual([]);
   expect(toolFinishedPayloads(store)).toEqual([
@@ -950,6 +950,7 @@ test("finishes live streaming tool rows as failed when finish arrives before too
       callId: "tool_unfinished" as ToolCallId,
       status: "failed",
       error: "Tool call stream ended before tool_call_end",
+      errorDetails: expect.objectContaining({ name: "ModelStreamIncompleteError" }),
       synthetic: true,
     },
   ]);
@@ -971,13 +972,14 @@ test("finishes live streaming tool rows as failed when the stream ends before to
     cwd: "/repo",
   });
 
-  expect(result.status).toBe("completed");
+  expect(result.status).toBe("failed");
   expect(toolCallParts(store)).toEqual([]);
   expect(toolFinishedPayloads(store)).toEqual([
     {
       callId: "tool_eof" as ToolCallId,
       status: "failed",
-      error: "Tool call stream ended before tool_call_end",
+      error: "Model stream ended before an explicit finish event",
+      errorDetails: expect.objectContaining({ name: "ModelStreamIncompleteError" }),
       synthetic: true,
     },
   ]);

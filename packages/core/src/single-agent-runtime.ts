@@ -51,7 +51,7 @@ import {
   type RetryPolicy,
 } from "./retry.js";
 import type { ModelRouter, ModelStreamEvent, ModelStreamInput } from "./runtime.js";
-import type { AgentRunner, AppendUserMessageInput, CreateSessionInput, RunTurnInput, RunTurnResult } from "./runner.js";
+import type { AgentRunner, AppendUserMessageInput, CreateSessionInput, PromptExecutionScope, RunTurnInput, RunTurnResult } from "./runner.js";
 
 export type { AppendUserMessageInput, CreateSessionInput, RunTurnInput, RunTurnResult } from "./runner.js";
 
@@ -97,7 +97,7 @@ interface AssistantStreamState {
 }
 
 interface AssistantStreamResult {
-  finishReason?: string;
+  finishReason: string;
   toolCalls: PendingToolCall[];
   usage?: ModelUsage;
 }
@@ -144,6 +144,8 @@ export type CompactContextResult =
     };
 
 export class SingleAgentRuntime implements AgentRunner {
+  private readonly promptGuards = new WeakMap<PromptExecutionScope, DoomLoopGuard>();
+
   constructor(private readonly options: SingleAgentRuntimeOptions) {}
 
   listModels(): Promise<readonly RuntimeModelDescriptor[]> | readonly RuntimeModelDescriptor[] {
@@ -258,9 +260,11 @@ export class SingleAgentRuntime implements AgentRunner {
     let assistantMessageId: MessageId | undefined;
     let contextUsage: ContextUsage | undefined;
     let turnUsage: ModelUsage | undefined;
+    const pendingToolCalls = new Set<PendingToolCall>();
 
     try {
       await this.append(input, "turn.started", { turnId });
+      const guard = this.guardForTurn(input);
 
       const visibleTools = await this.visibleTools(input, turnId);
       const requestLimits = await this.options.model.resolveRequestLimits?.({
@@ -326,7 +330,6 @@ export class SingleAgentRuntime implements AgentRunner {
       if (input.serviceTier !== undefined) modelInput.serviceTier = input.serviceTier;
       if (input.signal) modelInput.signal = input.signal;
 
-      const guard = new DoomLoopGuard(this.options.doomLoopGuard);
       let streamResult: AssistantStreamResult;
       try {
         streamResult = await this.consumeModelStream(input, turnId, assistantMessageId, modelInput, guard);
@@ -368,31 +371,20 @@ export class SingleAgentRuntime implements AgentRunner {
         streamResult = await this.consumeModelStream(input, turnId, assistantMessageId, modelInput, guard);
       }
       turnUsage = addModelUsage(turnUsage, streamResult.usage);
+      for (const toolCall of streamResult.toolCalls) pendingToolCalls.add(toolCall);
       throwIfTurnAborted(input.signal);
-      let finishReason = streamResult.finishReason;
-      if (isOutputLimitFinishReason(streamResult.finishReason) && streamResult.toolCalls.length > 0) {
-        await this.failOutputLimitedToolCalls(
-          input,
-          turnId,
-          assistantMessageId,
-          streamResult.toolCalls,
-          streamResult.finishReason,
-        );
-        finishReason = "tool_use";
-      } else {
-        throwIfTurnAborted(input.signal);
-        await this.executeToolCalls(
-          input,
-          turnId,
-          assistantMessageId,
-          streamResult.toolCalls,
-          new Set(
-            visibleTools
-              .map((tool) => tool.name)
-              .filter((toolName) => !modelInput.tools.some((tool) => tool.name === toolName)),
-          ),
-        );
-      }
+      await this.executeToolCalls(
+        input,
+        turnId,
+        assistantMessageId,
+        streamResult.toolCalls,
+        pendingToolCalls,
+        new Set(
+          visibleTools
+            .map((tool) => tool.name)
+            .filter((toolName) => !modelInput.tools.some((tool) => tool.name === toolName)),
+        ),
+      );
 
       throwIfTurnAborted(input.signal);
       await this.append(input, "turn.completed", {
@@ -407,7 +399,7 @@ export class SingleAgentRuntime implements AgentRunner {
       };
       if (contextUsage) result.contextUsage = contextUsage;
       if (turnUsage) result.usage = turnUsage;
-      if (finishReason) result.finishReason = finishReason;
+      result.finishReason = streamResult.finishReason;
       return result;
     } catch (error) {
       const err = toError(error);
@@ -415,6 +407,12 @@ export class SingleAgentRuntime implements AgentRunner {
       const aborted = input.signal?.aborted === true || isAbortError(err);
       const persistedError = terminalPersistedError(err, aborted);
       const status = aborted ? "cancelled" : "failed";
+      if (assistantMessageId && pendingToolCalls.size > 0) {
+        await this.finishPendingToolCalls(
+          input, turnId, assistantMessageId, [...pendingToolCalls], status, persistedError,
+        );
+        pendingToolCalls.clear();
+      }
       if (status === "failed" && assistantMessageId && !didAssistantMutate(err)) {
         await this.appendModelFailureMessage(input, assistantMessageId, persistedError);
       }
@@ -432,6 +430,21 @@ export class SingleAgentRuntime implements AgentRunner {
       if (turnUsage) result.usage = turnUsage;
       return result;
     }
+  }
+
+  private guardForTurn(input: RunTurnInput): DoomLoopGuard {
+    const scope = input.promptExecution;
+    if (!scope) return new DoomLoopGuard(this.options.doomLoopGuard);
+    if (scope.sessionId !== input.sessionId) {
+      throw new Error("Prompt execution scope belongs to a different session");
+    }
+    let guard = this.promptGuards.get(scope);
+    if (!guard) {
+      guard = new DoomLoopGuard(this.options.doomLoopGuard);
+      this.promptGuards.set(scope, guard);
+    }
+    guard.beginTurn();
+    return guard;
   }
 
   private async appendModelFailureMessage(
@@ -595,10 +608,22 @@ export class SingleAgentRuntime implements AgentRunner {
               await this.appendModelMetadata(input, turnId, event);
             }
             throwIfTurnAborted(input.signal);
-            await this.finishUnfinishedStreamingToolCalls(input, state, "failed", "Tool call stream ended before tool_call_end");
+            if (typeof event.reason !== "string" || !event.reason.trim()) {
+              throw incompleteModelStreamError("Model finish event did not include a finish reason");
+            }
+            const finishReason = normalizePersistedError(event.reason).message.trim();
+            if (isOutputLimitFinishReason(finishReason)) {
+              throw Object.assign(
+                new Error(`Model response hit output token limit (finish reason: ${finishReason}); response is incomplete and tool calls were not executed.`),
+                { name: "ModelOutputLimitError", retryable: false },
+              );
+            }
+            if (state.streamingToolCalls.size > 0) {
+              throw incompleteModelStreamError("Tool call stream ended before tool_call_end");
+            }
             const usage = addModelUsage(previousAttemptUsage, latestUsage);
             return {
-              finishReason: normalizePersistedError(event.reason).message,
+              finishReason,
               toolCalls: state.toolCalls,
               ...(usage ? { usage } : {}),
             };
@@ -617,9 +642,7 @@ export class SingleAgentRuntime implements AgentRunner {
           throw toError(event.error);
         }
         throwIfTurnAborted(input.signal);
-        await this.finishUnfinishedStreamingToolCalls(input, state, "failed", "Tool call stream ended before tool_call_end");
-        const usage = addModelUsage(previousAttemptUsage, latestUsage);
-        return { toolCalls: state.toolCalls, ...(usage ? { usage } : {}) };
+        throw incompleteModelStreamError("Model stream ended before an explicit finish event");
       } catch (error) {
         const err = toError(error);
         const persistedError = normalizePersistedError(err);
@@ -629,9 +652,11 @@ export class SingleAgentRuntime implements AgentRunner {
         );
         if (input.signal?.aborted || isAbortError(err)) {
           await this.finishUnfinishedStreamingToolCalls(input, state, "cancelled", persistedError);
+          await this.finishPendingToolCalls(input, turnId, assistantMessageId, state.toolCalls.splice(0), "cancelled", persistedError);
           throw attachModelUsage(err, previousAttemptUsage);
         }
         await this.finishUnfinishedStreamingToolCalls(input, state, "failed", persistedError);
+        await this.finishPendingToolCalls(input, turnId, assistantMessageId, state.toolCalls.splice(0), "failed", persistedError);
         if (!assistantMutated && attempt < retryPolicy.maxAttempts && retryPolicy.retryable(err)) {
           const delayMs = retryDelay(retryPolicy, attempt, err);
           await this.append(input, "turn.retry_scheduled", {
@@ -945,6 +970,7 @@ export class SingleAgentRuntime implements AgentRunner {
     turnId: TurnId,
     assistantMessageId: MessageId,
     toolCalls: readonly PendingToolCall[],
+    pendingToolCalls: Set<PendingToolCall>,
     envelopeHiddenToolNames: ReadonlySet<string>,
   ): Promise<void> {
     const concurrentLimit = this.options.maxConcurrentToolCalls ?? 10;
@@ -952,17 +978,26 @@ export class SingleAgentRuntime implements AgentRunner {
 
     const flush = async (): Promise<void> => {
       if (batch.length === 0) return;
+      throwIfTurnAborted(input.signal);
       const current = batch;
       batch = [];
-      const results = await Promise.all(
-        current.map((toolCall) => this.runToolCall(input, turnId, assistantMessageId, toolCall)),
+      const results = await Promise.allSettled(
+        current.map((toolCall) => {
+          // ToolExecutor owns terminal events once a call is dispatched.
+          pendingToolCalls.delete(toolCall);
+          return this.runToolCall(input, turnId, assistantMessageId, toolCall);
+        }),
       );
-      let cancelled: Error | undefined;
+      let failure: Error | undefined;
       for (const result of results) {
-        await this.appendPart(input, assistantMessageId, result.part);
-        if (result.cancelledError && !cancelled) cancelled = result.cancelledError;
+        if (result.status === "rejected") {
+          failure ??= toError(result.reason);
+          continue;
+        }
+        await this.appendPart(input, assistantMessageId, result.value.part);
+        failure ??= result.value.cancelledError;
       }
-      if (cancelled) throw cancelled;
+      if (failure) throw failure;
     };
 
     for (const toolCall of toolCalls) {
@@ -976,6 +1011,7 @@ export class SingleAgentRuntime implements AgentRunner {
           toolCall,
           "Tool use is disabled for this turn.",
         );
+        pendingToolCalls.delete(toolCall);
         await this.appendPart(input, assistantMessageId, part);
         continue;
       }
@@ -988,6 +1024,7 @@ export class SingleAgentRuntime implements AgentRunner {
           toolCall,
           "Tool was not advertised to the model because its definition exceeded the context envelope.",
         );
+        pendingToolCalls.delete(toolCall);
         await this.appendPart(input, assistantMessageId, part);
         continue;
       }
@@ -1000,6 +1037,7 @@ export class SingleAgentRuntime implements AgentRunner {
           toolCall,
           toolCall.inputParseError,
         );
+        pendingToolCalls.delete(toolCall);
         await this.appendPart(input, assistantMessageId, part);
         continue;
       }
@@ -1015,6 +1053,8 @@ export class SingleAgentRuntime implements AgentRunner {
       }
 
       await flush();
+      throwIfTurnAborted(input.signal);
+      pendingToolCalls.delete(toolCall);
       const result = await this.runToolCall(input, turnId, assistantMessageId, toolCall);
       await this.appendPart(input, assistantMessageId, result.part);
       if (result.cancelledError) throw result.cancelledError;
@@ -1028,7 +1068,8 @@ export class SingleAgentRuntime implements AgentRunner {
     turnId: TurnId,
     assistantMessageId: MessageId,
     toolCall: PendingToolCall,
-    error: string,
+    error: unknown,
+    status: "failed" | "cancelled" = "failed",
   ): Promise<MessagePart> {
     const persistedError = normalizePersistedError(error);
     await this.append(input, "tool.call_started", {
@@ -1039,7 +1080,7 @@ export class SingleAgentRuntime implements AgentRunner {
     });
     await this.append(input, "tool.call_finished", {
       callId: toolCall.callId,
-      status: "failed",
+      status,
       error: persistedError.message,
       ...persistedErrorDetailsPayload(persistedError),
       synthetic: true,
@@ -1056,15 +1097,14 @@ export class SingleAgentRuntime implements AgentRunner {
     };
   }
 
-  private async failOutputLimitedToolCalls(
+  private async finishPendingToolCalls(
     input: EventContext,
     turnId: TurnId,
     assistantMessageId: MessageId,
     toolCalls: readonly PendingToolCall[],
-    finishReason: string | undefined,
+    status: "failed" | "cancelled",
+    error: unknown,
   ): Promise<void> {
-    const reason = finishReason ?? "unknown";
-    const error = `Model response hit output token limit (finish reason: ${reason}); tool arguments may be truncated. Re-issue the complete tool call.`;
     for (const toolCall of toolCalls) {
       const part = await this.failToolCallWithoutExecution(
         input,
@@ -1072,6 +1112,7 @@ export class SingleAgentRuntime implements AgentRunner {
         assistantMessageId,
         toolCall,
         error,
+        status,
       );
       await this.appendPart(input, assistantMessageId, part);
     }
@@ -1595,6 +1636,10 @@ function isOutputLimitFinishReason(reason: string | undefined): boolean {
   if (!reason) return false;
   const normalized = reason.toLowerCase();
   return normalized === "length" || normalized === "max_tokens" || normalized === "max_output_tokens";
+}
+
+function incompleteModelStreamError(message: string): Error {
+  return Object.assign(new Error(message), { name: "ModelStreamIncompleteError", retryable: false });
 }
 
 function isModelMetadataEvent(

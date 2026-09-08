@@ -42,7 +42,7 @@ import {
   type PromptAssembly,
   type PromptFragment,
 } from "./prompt/index.js";
-import type { AgentRunner, RunTurnInput } from "./runner.js";
+import type { AgentRunner, PromptExecutionScope, RunTurnInput } from "./runner.js";
 import type { RuntimePromptFragmentsProvider } from "./runtime-service.js";
 import {
   assessSubagentCompletion,
@@ -215,6 +215,10 @@ export interface AgentRunnerSubagentRunnerOptions {
   store: EventStore;
   maxTurns?: number;
   promptFragments?: RuntimePromptFragmentsProvider;
+  /** Resolve once per run, using the same session configuration as followups. */
+  modelConfig?: (input: { sessionId: SessionId; cwd: string }) =>
+    | Pick<RunTurnInput, "modelSelection" | "reasoningLevel" | "serviceTier">
+    | Promise<Pick<RunTurnInput, "modelSelection" | "reasoningLevel" | "serviceTier">>;
 }
 
 export class LocalSubagentManagerClosedError extends Error {
@@ -1322,6 +1326,23 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
     });
     throwIfRunAborted(input);
 
+    const resolvedModelConfig = await this.options.modelConfig?.({
+      sessionId: input.childSessionId,
+      cwd: input.cwd,
+    });
+    throwIfRunAborted(input);
+    const modelConfig = {
+      ...(resolvedModelConfig?.modelSelection
+        ? { modelSelection: { ...resolvedModelConfig.modelSelection } }
+        : {}),
+      ...(resolvedModelConfig?.reasoningLevel !== undefined
+        ? { reasoningLevel: resolvedModelConfig.reasoningLevel }
+        : {}),
+      ...(resolvedModelConfig?.serviceTier !== undefined
+        ? { serviceTier: resolvedModelConfig.serviceTier }
+        : {}),
+    };
+    const promptExecution: PromptExecutionScope = { sessionId: input.childSessionId };
     const maxTurns = this.options.maxTurns ?? 128;
     const prompt = await this.resolvePromptAssembly(input);
     throwIfRunAborted(input);
@@ -1330,6 +1351,7 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
     for (let index = 0; index < maxTurns || extraRepairTurn; index++) {
       extraRepairTurn = false;
       const runInput = runTurnInputFromPrompt(input, prompt);
+      Object.assign(runInput, modelConfig, { promptExecution });
       if (input.signal) runInput.signal = input.signal;
       throwIfRunAborted(input);
       const result = await this.options.runner.runTurn(runInput);
@@ -1366,6 +1388,8 @@ export class AgentRunnerSubagentRunner implements LocalSubagentRunner {
       cwd: input.cwd,
       system: finalPrompt.system,
       toolMode: "disabled",
+      ...modelConfig,
+      promptExecution,
     };
     if (finalPrompt.developer.length > 0) finalInput.developer = finalPrompt.developer;
     if (finalPrompt.contextualUser.length > 0) finalInput.contextualUser = finalPrompt.contextualUser;

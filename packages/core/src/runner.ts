@@ -16,8 +16,14 @@ export interface AppendUserMessageInput {
   images?: readonly MessageImageContent[];
 }
 
+/** Reuse this object only across the model turns of one prompt execution. */
+export interface PromptExecutionScope {
+  readonly sessionId: SessionId;
+}
+
 export interface RunTurnInput {
   sessionId: SessionId;
+  promptExecution?: PromptExecutionScope;
   turnId?: TurnId;
   cwd: string;
   system?: string[];
