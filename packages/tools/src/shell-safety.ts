@@ -273,8 +273,12 @@ function shellWords(segment: string): string[] {
 }
 
 function isReadOnlySegment(command: string): boolean {
-  const normalized = stripWrappers(stripEnvAssignments(shellWords(command)));
-  if (normalized.sawSudo) return false;
+  const words = shellWords(command);
+  // Environment assignments and `env` wrappers alter the invocation being
+  // classified, even when the visible executable is normally read-only.
+  if (stripEnvAssignments(words).length !== words.length) return false;
+  const normalized = stripWrappers(words);
+  if (normalized.sawSudo || normalized.sawEnvironment) return false;
 
   const executable = commandName(normalized.words[0] ?? "");
   const args = normalized.words.slice(1);
@@ -470,9 +474,10 @@ function stripEnvAssignments(words: string[]): string[] {
   return words.slice(index);
 }
 
-function stripWrappers(words: string[]): { words: string[]; sawSudo: boolean } {
+function stripWrappers(words: string[]): { words: string[]; sawSudo: boolean; sawEnvironment: boolean } {
   let index = 0;
   let sawSudo = false;
+  let sawEnvironment = false;
   while (index < words.length) {
     const word = commandName(words[index] ?? "");
     if (word === "sudo") {
@@ -485,6 +490,7 @@ function stripWrappers(words: string[]): { words: string[]; sawSudo: boolean } {
       continue;
     }
     if (word === "env") {
+      sawEnvironment = true;
       index++;
       while (index < words.length) {
         const arg = words[index] ?? "";
@@ -506,7 +512,7 @@ function stripWrappers(words: string[]): { words: string[]; sawSudo: boolean } {
     }
     break;
   }
-  return { words: words.slice(index), sawSudo };
+  return { words: words.slice(index), sawSudo, sawEnvironment };
 }
 
 function commandName(word: string): string {

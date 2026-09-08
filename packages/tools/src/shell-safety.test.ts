@@ -26,6 +26,20 @@ test("read-only shell classification keeps safe git branch and status commands",
   expect(isReadOnlyShellCommand("git diff")).toBe(true);
 });
 
+test("read-only shell classification does not discard invocation environment changes", () => {
+  for (const command of [
+    "LC_ALL=C rg needle .",
+    "PATH=./bin ls",
+    "env LC_ALL=C rg needle .",
+    "env -C subdir pwd",
+    "command env HOME=./home git status",
+  ]) {
+    expect(isReadOnlyShellCommand(command)).toBe(false);
+  }
+  expect(isReadOnlyShellCommand("command pwd")).toBe(true);
+  expect(isReadOnlyShellCommand("rg needle . | head -n 10")).toBe(true);
+});
+
 test("dangerous shell classification follows command separators and common wrappers", () => {
   for (const command of [
     "echo first\necho second\nrm -rf /",

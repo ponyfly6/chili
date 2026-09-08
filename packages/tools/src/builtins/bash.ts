@@ -2,6 +2,7 @@ import { normalizePersistedError } from "@chili/protocol";
 import type { ChiliToolDefinition, ValidationResult } from "../types.js";
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import { bashArguments } from "../bash-invocation.js";
 import { runProcess, type RunProcessOptions, type RunProcessResult } from "../process.js";
 import { ProcessOutputAccumulator, type ProcessOutputSnapshot } from "../process-output-accumulator.js";
 import {
@@ -62,7 +63,8 @@ const DEFAULT_BASH_RUNNER: BashRunner = {
     if (request.env) processOptions.env = request.env;
     if (request.onOutput) processOptions.onOutput = request.onOutput;
     if (request.onRawOutput) processOptions.onRawOutput = request.onRawOutput;
-    const result = await runProcess("bash", ["-lc", request.command], processOptions);
+    const executable = process.platform === "win32" ? "bash" : "/bin/bash";
+    const result = await runProcess(executable, bashArguments(request.command), processOptions);
     return { ...result, sandbox: "none" };
   },
 };
@@ -79,12 +81,12 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
     aliases: ["run_shell_command"],
     searchHint: "Run shell commands; read-only commands can be scheduled concurrently.",
     description: allowEscalation
-      ? "Run a non-interactive shell command in the authoritative workspace. Relative cwd values resolve from that workspace root, and absolute cwd values must remain inside it. Commands that require desktop IPC or other access blocked by the default sandbox may request one-time elevated execution with a justification."
-      : "Run a non-interactive shell command in the authoritative workspace. Relative cwd values resolve from that workspace root, and absolute cwd values must remain inside it.",
+      ? "Run a non-interactive Bash command without login or interactive profiles in the authoritative workspace. Relative cwd values resolve from that workspace root, and absolute cwd values must remain inside it. Commands that require desktop IPC or other access blocked by the default sandbox may request one-time elevated execution with a justification."
+      : "Run a non-interactive Bash command without login or interactive profiles in the authoritative workspace. Relative cwd values resolve from that workspace root, and absolute cwd values must remain inside it.",
     risk: "execute",
-    isReadOnly: (input) => isReadOnlyShellCommand(input.command),
-    isConcurrencySafe: (input) => isReadOnlyShellCommand(input.command),
-    isDestructive: (input) => !isReadOnlyShellCommand(input.command),
+    isReadOnly: isReadOnlyBashInput,
+    isConcurrencySafe: isReadOnlyBashInput,
+    isDestructive: (input) => !isReadOnlyBashInput(input),
     interruptBehavior: "cancel",
     maxResultOutputBytes: 64 * 1024,
     inputSchema: {
@@ -108,7 +110,11 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
           type: "string",
           description: "Alias for cwd. Relative paths resolve from the authoritative workspace root; absolute paths must remain inside it.",
         },
-        env: { type: "object", additionalProperties: { type: "string" } },
+        env: {
+          type: "object",
+          additionalProperties: { type: "string" },
+          description: "Environment overrides. Non-empty overrides require execution scope for scoped workers and disable read-only concurrent scheduling.",
+        },
         ...(allowEscalation
           ? {
               sandboxPermissions: {
@@ -215,7 +221,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
         metadata: {
           command: input.command,
           commandPrefix: commandPrefix(input.command),
-          readOnly: isReadOnlyShellCommand(input.command),
+          readOnly: isReadOnlyBashInput(input),
           cwd: input.cwd,
           envKeys: input.env ? Object.keys(input.env).sort() : [],
           sandboxPermissions,
@@ -332,6 +338,12 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       };
     },
   };
+}
+
+function isReadOnlyBashInput(input: BashInput): boolean {
+  // The same command can invoke different executables or startup code under
+  // custom BASH_ENV, PATH, HOME, or other tool-specific environment settings.
+  return Object.keys(input.env ?? {}).length === 0 && isReadOnlyShellCommand(input.command);
 }
 
 function formatTruncatedCommandOutput(

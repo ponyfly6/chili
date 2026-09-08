@@ -3,6 +3,7 @@ import { lstat, mkdtemp, opendir, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { BashRunner } from "./builtins/bash.js";
+import { bashArguments } from "./bash-invocation.js";
 import { runProcess, type RunProcessOptions, type RunProcessResult } from "./process.js";
 
 export const MACOS_SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
@@ -147,7 +148,7 @@ export function createMacOsSeatbeltBashRunner(options: MacOsSeatbeltBashRunnerOp
       try {
         const result = await processRunner(
           MACOS_SANDBOX_EXEC_PATH,
-          ["-p", profile, ...definitions, "--", "/bin/bash", "-lc", request.command],
+          ["-p", profile, ...definitions, "--", "/bin/bash", ...bashArguments(request.command)],
           processOptions,
         );
         return { ...result, sandbox: "macos-seatbelt" };

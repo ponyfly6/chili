@@ -45,7 +45,7 @@ test("macOS Seatbelt runner uses a fixed executable and forwards process control
   });
 
   expect(seen?.command).toBe(MACOS_SANDBOX_EXEC_PATH);
-  expect(seen?.args.slice(-4)).toEqual(["--", "/bin/bash", "-lc", "printf ok"]);
+  expect(seen?.args.slice(-6)).toEqual(["--", "/bin/bash", "--noprofile", "--norc", "-c", "printf ok"]);
   expect(seen?.args).toContain(`-DWORKSPACE_ROOT=${canonicalWorkspace}`);
   const tempDefinition = seen?.args.find((argument) => argument.startsWith("-DTEMP_ROOT="));
   expect(tempDefinition).toBeDefined();
