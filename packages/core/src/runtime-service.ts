@@ -114,6 +114,8 @@ export interface RuntimeServiceOptions {
   /** Internal child runtime only. Root/user-facing services must leave this false. */
   allowSubagentSessions?: boolean;
   onModelChanged?: (input: RuntimeModelChangedInput) => Promise<void> | void;
+  /** Stop host resources owned by this session without changing its conversation. */
+  stopSessionResources?: (sessionId: SessionId, reason: string) => Promise<boolean>;
   createId?: (prefix: string) => string;
   now?: () => TimestampMs;
 }
@@ -211,6 +213,8 @@ interface RuntimeRunState {
   operationContext: RuntimeSessionOperationContext;
   interruptMetadataAdmissionOpen: boolean;
   interruptMetadataSettlements: Set<Promise<void>>;
+  resourceStop?: Promise<boolean>;
+  removeInputAbortListener?: () => void;
   settlement: Promise<void>;
   settle(): void;
 }
@@ -2181,10 +2185,36 @@ export class RuntimeService {
   async interrupt(sessionId: SessionId, reason = "user_interrupt"): Promise<boolean> {
     return this.withMutationAdmission(async () => {
       const run = this.running.get(sessionId);
-      if (!run) return false;
-      await this.interruptRun(sessionId, run, reason);
-      return true;
+      // Steering only replaces the current model turn. Its working services
+      // remain available to the replacement turn.
+      const resourceStop = reason === "desktop_steer"
+        ? Promise.resolve(false)
+        : this.stopSessionResources(sessionId, reason, run);
+      const interruption = run
+        ? this.interruptRun(sessionId, run, reason)
+        : Promise.resolve();
+      const results = await Promise.allSettled([resourceStop, interruption]);
+      const errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+      if (errors.length === 1) throw errors[0];
+      if (errors.length > 1) throw new AggregateError(errors, "Session interrupt encountered multiple errors");
+      // Transports use this boolean to await a running turn's terminal event.
+      // An idle Stop may clean resources without creating such a turn.
+      return run !== undefined;
     });
+  }
+
+  private stopSessionResources(
+    sessionId: SessionId,
+    reason: string,
+    run?: RuntimeRunState,
+  ): Promise<boolean> {
+    if (run?.resourceStop) return run.resourceStop;
+    const stopping = Promise.resolve().then(() => this.options.stopSessionResources?.(sessionId, reason) ?? false);
+    if (run) run.resourceStop = stopping;
+    // External AbortSignal listeners cannot await cleanup. The run and any
+    // explicit interrupt still observe its original outcome before settling.
+    void stopping.catch(() => undefined);
+    return stopping;
   }
 
   shutdown(reason = "runtime_shutdown"): Promise<void> {
@@ -2239,6 +2269,7 @@ export class RuntimeService {
         }
         throw error;
       }
+      await this.stopSessionResources(sessionId, "session_archived");
     });
   }
 
@@ -2317,15 +2348,8 @@ export class RuntimeService {
         () => this.loseSessionOperation(operationContext),
       );
     }
-    if (input.signal) {
-      if (input.signal.aborted) {
-        controller.abort();
-      } else {
-        input.signal.addEventListener("abort", () => controller.abort(), { once: true });
-      }
-    }
     const settlement = createSettlement();
-    this.running.set(input.sessionId, {
+    const run: RuntimeRunState = {
       controller,
       purpose,
       operationContext,
@@ -2335,7 +2359,19 @@ export class RuntimeService {
       settle: settlement.settle,
       ...(durableClaimId ? { durableClaimId } : {}),
       ...(durableClaimHeartbeat ? { durableClaimHeartbeat } : {}),
-    });
+    };
+    this.running.set(input.sessionId, run);
+    if (input.signal) {
+      const signal = input.signal;
+      const abort = (): void => {
+        if (this.running.get(input.sessionId) !== run) return;
+        void this.stopSessionResources(input.sessionId, "prompt_aborted", run);
+        controller.abort();
+      };
+      run.removeInputAbortListener = () => signal.removeEventListener("abort", abort);
+      if (signal.aborted) abort();
+      else signal.addEventListener("abort", abort, { once: true });
+    }
     return controller;
   }
 
@@ -2347,6 +2383,7 @@ export class RuntimeService {
     if (expectedContext && run?.operationContext !== expectedContext) return;
     try {
       if (run) run.operationContext.active = false;
+      run?.removeInputAbortListener?.();
       if (run?.durableClaimHeartbeat) clearInterval(run.durableClaimHeartbeat);
       if (run?.durableClaimId) {
         run.operationContext.atomicStore.releaseSessionRun?.({
@@ -2391,7 +2428,12 @@ export class RuntimeService {
           },
         );
       } finally {
-        this.releaseRunController(sessionId, context);
+        try {
+          const run = this.running.get(sessionId);
+          if (run?.operationContext === context) await run.resourceStop;
+        } finally {
+          this.releaseRunController(sessionId, context);
+        }
       }
     })();
   }

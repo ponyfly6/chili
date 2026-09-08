@@ -5,6 +5,8 @@ import { resolve } from "node:path";
 import { bashArguments } from "../bash-invocation.js";
 import { runProcess, type RunProcessOptions, type RunProcessResult } from "../process.js";
 import { ProcessOutputAccumulator, type ProcessOutputSnapshot } from "../process-output-accumulator.js";
+import type { ManagedProcessManager } from "../managed-process.js";
+import { managedProcessToolResult } from "./process.js";
 import {
   classifyDangerousShellCommand,
   commandPrefix,
@@ -15,6 +17,7 @@ import { assertExistingPathInsideWorkspace, resolveWorkspacePath, type Workspace
 
 export interface BashInput {
   command: string;
+  background?: boolean;
   description?: string;
   timeoutMs?: number;
   maxOutputBytes?: number;
@@ -50,6 +53,7 @@ export interface BashRunner {
 export interface BashToolOptions {
   runner?: BashRunner;
   allowEscalation?: boolean;
+  processes?: ManagedProcessManager;
 }
 
 const DEFAULT_BASH_RUNNER: BashRunner = {
@@ -79,10 +83,15 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
   return {
     name: "bash",
     aliases: ["run_shell_command"],
-    searchHint: "Run shell commands; read-only commands can be scheduled concurrently.",
-    description: allowEscalation
+    searchHint: options.processes
+      ? "Run shell commands or start managed background servers; inspect and stop them with process."
+      : "Run shell commands; read-only commands can be scheduled concurrently.",
+    description: (allowEscalation
       ? "Run a non-interactive Bash command without login or interactive profiles in the authoritative workspace. Relative cwd values resolve from that workspace root, and absolute cwd values must remain inside it. Commands that require desktop IPC or other access blocked by the default sandbox may request one-time elevated execution with a justification."
-      : "Run a non-interactive Bash command without login or interactive profiles in the authoritative workspace. Relative cwd values resolve from that workspace root, and absolute cwd values must remain inside it.",
+      : "Run a non-interactive Bash command without login or interactive profiles in the authoritative workspace. Relative cwd values resolve from that workspace root, and absolute cwd values must remain inside it.")
+      + (options.processes
+        ? " Set background=true for a dev server or long-running command. Run the program in the foreground, without nohup or a trailing &: Chili keeps it running and returns a processId for the process tool. A running handle does not imply the program is ready or successful. Background commands have no default timeout and survive ordinary replies; explicit Stop, archive, or host shutdown stops them. Existing sandbox restrictions still apply."
+        : ""),
     risk: "execute",
     isReadOnly: isReadOnlyBashInput,
     isConcurrencySafe: isReadOnlyBashInput,
@@ -94,6 +103,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       required: ["command"],
       properties: {
         command: { type: "string" },
+        ...(options.processes ? { background: { type: "boolean", description: "Keep this command running across model turns and return a managed processId." } } : {}),
         description: { type: "string" },
         timeoutMs: { type: "number" },
         timeout: { type: "number" },
@@ -133,6 +143,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
     validate(input): ValidationResult<BashInput> {
       if (!isRecord(input)) return { ok: false, message: "expected an object" };
       const command = input.command;
+      const background = input.background;
       const description = input.description;
       const timeoutMs = input.timeoutMs ?? input.timeout;
       const maxOutputBytes = input.maxOutputBytes;
@@ -143,6 +154,12 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
 
       if (typeof command !== "string" || command.trim().length === 0) {
         return { ok: false, message: "command must be a non-empty string" };
+      }
+      if (background !== undefined && typeof background !== "boolean") {
+        return { ok: false, message: "background must be a boolean" };
+      }
+      if (background === true && !options.processes) {
+        return { ok: false, message: "managed background commands are unavailable in this tool registry" };
       }
       if (description !== undefined && typeof description !== "string") {
         return { ok: false, message: "description must be a string" };
@@ -203,6 +220,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
       }
 
       const value: BashInput = { command, sandboxPermissions: sandboxPermissions.value };
+      if (background !== undefined) value.background = background;
       if (description !== undefined) value.description = description;
       if (timeoutMs !== undefined) value.timeoutMs = timeoutMs;
       if (maxOutputBytes !== undefined) value.maxOutputBytes = maxOutputBytes;
@@ -220,6 +238,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
         ...(sandboxPermissions === "require_escalated" ? { maxApprovalScope: "once" as const } : {}),
         metadata: {
           command: input.command,
+          ...(input.background ? { background: true } : {}),
           commandPrefix: commandPrefix(input.command),
           readOnly: isReadOnlyBashInput(input),
           cwd: input.cwd,
@@ -241,6 +260,42 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
           ...(input.justification ? { justification: input.justification } : {}),
         },
       });
+
+      if (input.background) {
+        const processes = options.processes;
+        if (!processes) throw new Error("Managed background commands are unavailable");
+        context.signal.throwIfAborted();
+        const owner = { sessionId: context.sessionId, workspaceRoot: context.cwd };
+        const processId = processes.start({
+          owner,
+          runner,
+          request: {
+            command: input.command,
+            workspaceRoot: resolve(context.cwd),
+            cwd,
+            timeoutMs: input.timeoutMs ?? 0,
+            maxOutputBytes: Math.min(input.maxOutputBytes ?? 64 * 1024, 64 * 1024),
+            sandboxPermissions,
+            ...(input.env ? { env: input.env } : {}),
+          },
+          capture: new ProcessOutputAccumulator({
+            cwd: context.cwd,
+            callId: context.outputArtifactId,
+            maxBytes: 16 * 1024,
+            maxLines: 200,
+            persistOutput: false,
+          }),
+        });
+        try {
+          const snapshot = await processes.read(owner, processId, { waitMs: 250, signal: context.signal });
+          await context.metadata({ metadata: { processId, background: true } });
+          context.signal.throwIfAborted();
+          return managedProcessToolResult(snapshot);
+        } catch (error) {
+          await processes.stop(owner, processId);
+          throw error;
+        }
+      }
 
       const timeoutMs = input.timeoutMs ?? 30_000;
       const maxOutputBytes = input.maxOutputBytes ?? 256_000;
@@ -343,7 +398,7 @@ export function createBashTool(options: BashToolOptions = {}): ChiliToolDefiniti
 function isReadOnlyBashInput(input: BashInput): boolean {
   // The same command can invoke different executables or startup code under
   // custom BASH_ENV, PATH, HOME, or other tool-specific environment settings.
-  return Object.keys(input.env ?? {}).length === 0 && isReadOnlyShellCommand(input.command);
+  return !input.background && Object.keys(input.env ?? {}).length === 0 && isReadOnlyShellCommand(input.command);
 }
 
 function formatTruncatedCommandOutput(

@@ -26,6 +26,7 @@ export interface ProcessOutputAccumulatorOptions {
   callId: ToolCallId;
   maxLines?: number;
   maxBytes?: number;
+  persistOutput?: boolean;
   maxPersistedBytes?: number;
   maxDirectoryBytes?: number;
 }
@@ -73,6 +74,7 @@ export class ProcessOutputAccumulator {
   private renderedEndsWithNewline = true;
   private operationQueue: Promise<void> = Promise.resolve();
   private finished: ProcessOutputSnapshot | undefined;
+  private finishing: Promise<ProcessOutputSnapshot> | undefined;
 
   constructor(private readonly options: ProcessOutputAccumulatorOptions) {
     this.maxLines = normalizeLimit(options.maxLines ?? DEFAULT_MAX_LINES);
@@ -80,14 +82,20 @@ export class ProcessOutputAccumulator {
   }
 
   append(update: RunProcessRawOutputChunk): Promise<void> {
-    if (this.finished) return Promise.reject(new Error("Cannot append after process output capture has finished"));
+    if (this.finishing) return Promise.reject(new Error("Cannot append after process output capture has finished"));
     this.operationQueue = this.operationQueue.then(() => this.appendUpdate(update));
     return this.operationQueue;
   }
 
-  async finish(): Promise<ProcessOutputSnapshot> {
-    if (this.finished) return this.finished;
-    this.operationQueue = this.operationQueue.then(async () => {
+  snapshot(): Promise<ProcessOutputSnapshot> {
+    const snapshot = this.operationQueue.then(() => this.finished ?? this.buildSnapshot());
+    this.operationQueue = snapshot.then(() => undefined);
+    return snapshot;
+  }
+
+  finish(): Promise<ProcessOutputSnapshot> {
+    if (this.finishing) return this.finishing;
+    this.finishing = this.operationQueue.then(async () => {
       for (const stream of ["stdout", "stderr"] as const) {
         const finalText = this.decoders[stream].end();
         if (finalText) await this.processText(stream, finalText);
@@ -102,13 +110,18 @@ export class ProcessOutputAccumulator {
           this.outputFile = undefined;
         }
       }
+      this.finished = this.buildSnapshot();
+      return this.finished;
     });
-    await this.operationQueue;
+    this.operationQueue = this.finishing.then(() => undefined);
+    return this.finishing;
+  }
 
+  private buildSnapshot(): ProcessOutputSnapshot {
     const preview = this.isTruncated() ? this.boundedPreview() : this.pending;
     const linesExceeded = this.totalLines() > this.maxLines;
     const bytesExceeded = this.totalBytes > this.maxBytes;
-    this.finished = {
+    return {
       preview,
       truncated: linesExceeded || bytesExceeded,
       truncatedBy: linesExceeded && bytesExceeded
@@ -132,7 +145,6 @@ export class ProcessOutputAccumulator {
         : {}),
       ...(this.persistenceError ? { persistenceError: this.persistenceError } : {}),
     };
-    return this.finished;
   }
 
   private async appendUpdate(update: RunProcessRawOutputChunk): Promise<void> {
@@ -245,6 +257,10 @@ export class ProcessOutputAccumulator {
 
   private async startPersistence(): Promise<void> {
     this.persistenceAttempted = true;
+    if (this.options.persistOutput === false) {
+      this.pending = "";
+      return;
+    }
     let outputFile: StreamingToolOutputFile | undefined;
     try {
       outputFile = await StreamingToolOutputFile.open(this.options.cwd, this.options.callId, {

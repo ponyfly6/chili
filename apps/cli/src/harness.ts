@@ -36,6 +36,7 @@ import {
   DELEGATION_OFF_DENIED_TOOL_NAMES,
   FileSystemSnapshotProvider,
   InMemoryToolRegistry,
+  ManagedProcessManager,
   PolicyApprovalBroker,
   PolicyApprovalState,
   type AgentMessageRecord,
@@ -48,6 +49,7 @@ import {
   createAgentMessageListTool,
   createAgentMessageSendTool,
   createBashTool,
+  createProcessTool,
   createDelegationSetTool,
   createDelegationStatusTool,
   createMailboxConsumeTool,
@@ -383,6 +385,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
   const bashRunner = options.bashRunner ?? createCliBashRunner({
     permissionProfile: () => permissions.get().profile,
   });
+  const processes = new ManagedProcessManager();
   // A scoped worker may only receive Bash when Chili owns a concrete host
   // sandbox. An injected runner is opaque, and non-macOS platforms currently
   // have no equivalent sandbox implementation, so fail closed by omitting it.
@@ -392,7 +395,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
         permissionProfile: () => permissions.get().profile,
         allowHostSandboxEscape: false,
       });
-  const registry = createToolRegistry(skillRegistryForCwd, bashRunner);
+  const registry = createToolRegistry(skillRegistryForCwd, bashRunner, processes);
   const childRegistry = createChildToolRegistry(skillRegistryForCwd, childBashRunner);
   if (options.userInputQueue) {
     const userInputTool = createRequestUserInputTool(
@@ -548,6 +551,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     ...(options.reasoningLevel !== undefined ? { defaultReasoningLevel: options.reasoningLevel } : {}),
     ...(options.serviceTier !== undefined ? { defaultServiceTier: options.serviceTier } : {}),
     onModelChanged: persistUserModelSelection,
+    stopSessionResources: (sessionId, reason) => processes.stopSession(sessionId, reason),
     ...(options.sessionClaimLeaseMs !== undefined ? { sessionClaimLeaseMs: options.sessionClaimLeaseMs } : {}),
     ...(options.sessionClaimHeartbeatMs !== undefined ? { sessionClaimHeartbeatMs: options.sessionClaimHeartbeatMs } : {}),
   });
@@ -695,6 +699,7 @@ export async function createCliHarness(options: CliHarnessOptions): Promise<CliH
     startDrain(() => childService.shutdown("runtime_closed"));
     startDrain(() => subagents.shutdown("runtime_closed"));
     startDrain(() => tasks.shutdown("runtime_closed"));
+    startDrain(() => processes.close("runtime_closed"));
     startDrain(() => options.approvalQueue?.denyAll("Runtime closed while waiting for approval."));
     startDrain(() => options.userInputQueue?.denyAll("Runtime closed while waiting for user input."));
     startDrain(() => mailboxPump.stop());
@@ -1099,6 +1104,7 @@ function shortHash(value: string): string {
 function createToolRegistry(
   skillRegistryForCwd: (cwd: string) => Promise<SkillRegistry>,
   bashRunner: BashRunner,
+  processes: ManagedProcessManager,
 ): InMemoryToolRegistry {
   const registry = new InMemoryToolRegistry();
   registry.register(createReadFileTool({ defaultMaxBytes: CLI_DEFAULT_READ_MAX_BYTES, maxBytesLimit: CLI_READ_MAX_BYTES_LIMIT }));
@@ -1110,7 +1116,8 @@ function createToolRegistry(
   registry.register(createEditTool());
   registry.register(createWriteFileTool());
   registry.register(createApplyPatchTool());
-  registry.register(createBashTool({ runner: bashRunner }));
+  registry.register(createBashTool({ runner: bashRunner, processes }));
+  registry.register(createProcessTool(processes));
   registerGitTools(registry);
   registry.register(createToolSearchTool(registry));
   return registry;

@@ -1,9 +1,126 @@
 import { expect, test } from "bun:test";
 import type { ToolCallId } from "@chili/protocol";
-import { mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ProcessOutputAccumulator } from "./process-output-accumulator.js";
+
+test("live snapshots preserve incomplete UTF-8 characters for subsequent output", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-output-live-utf8-"));
+  try {
+    const accumulator = new ProcessOutputAccumulator({
+      cwd: workspace,
+      callId: "toolcall_live_utf8" as ToolCallId,
+    });
+    const bytes = Buffer.from("ready 🙂 done\n");
+    await accumulator.append({ stream: "stdout", chunk: bytes.subarray(0, 8) });
+
+    const first = await accumulator.snapshot();
+    const repeated = await accumulator.snapshot();
+
+    expect(first.preview).toBe("ready ");
+    expect(first.totalBytes).toBe(8);
+    expect(repeated).toEqual(first);
+
+    await accumulator.append({ stream: "stdout", chunk: bytes.subarray(8) });
+    const second = await accumulator.snapshot();
+    expect(second.preview).toBe("ready 🙂 done\n");
+    expect(second.preview).not.toContain("�");
+    expect(second.totalBytes).toBe(bytes.byteLength);
+    expect(first.preview).toBe("ready ");
+    expect(await accumulator.finish()).toEqual(second);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("live snapshots leave the output sidecar open for subsequent output", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-output-live-persist-"));
+  try {
+    const accumulator = new ProcessOutputAccumulator({
+      cwd: workspace,
+      callId: "toolcall_live_persist" as ToolCallId,
+      maxLines: 2,
+    });
+    await accumulator.append({ stream: "stdout", chunk: Buffer.from("one\ntwo\nthree\n") });
+    expect((await accumulator.snapshot()).preview).toBe("two\nthree\n");
+
+    await accumulator.append({ stream: "stdout", chunk: Buffer.from("four\n") });
+    expect((await accumulator.snapshot()).preview).toBe("three\nfour\n");
+    const finished = await accumulator.finish();
+    expect(await readFile(join(workspace, finished.outputPath!), "utf8")).toBe("one\ntwo\nthree\nfour\n");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("disabled output persistence keeps only a bounded live tail without creating files", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-output-live-bounded-"));
+  try {
+    const accumulator = new ProcessOutputAccumulator({
+      cwd: workspace,
+      callId: "toolcall_live_bounded" as ToolCallId,
+      maxLines: 2,
+      maxBytes: 16,
+      persistOutput: false,
+    });
+    for (let index = 0; index < 100; index += 1) {
+      await accumulator.append({ stream: "stdout", chunk: Buffer.from(`line ${index}\n`) });
+      const snapshot = await accumulator.snapshot();
+      expect(snapshot.preview).toEndWith(`line ${index}\n`);
+      expect(snapshot.previewLines).toBeLessThanOrEqual(2);
+      expect(snapshot.previewBytes).toBeLessThanOrEqual(16);
+      expect(snapshot.outputPath).toBeUndefined();
+      expect(snapshot.persistedOutput).toBeUndefined();
+    }
+
+    const snapshot = await accumulator.finish();
+    expect(snapshot.preview).toBe("line 98\nline 99\n");
+    expect(snapshot.truncatedBy).toBe("lines_and_bytes");
+    expect(snapshot.totalLines).toBe(100);
+    expect(snapshot.outputPath).toBeUndefined();
+    expect(snapshot.persistedOutput).toBeUndefined();
+    expect(snapshot.persistenceError).toBeUndefined();
+    expect(await readdir(workspace)).toEqual([]);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("snapshots and finish are ordered with queued appends and finish is idempotent", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "chili-output-live-order-"));
+  try {
+    const accumulator = new ProcessOutputAccumulator({
+      cwd: workspace,
+      callId: "toolcall_live_order" as ToolCallId,
+    });
+    const firstAppend = accumulator.append({ stream: "stdout", chunk: Buffer.from("first") });
+    const firstSnapshot = accumulator.snapshot();
+    const secondAppend = accumulator.append({ stream: "stdout", chunk: Buffer.from(" second") });
+    const secondSnapshot = accumulator.snapshot();
+    const incompleteAppend = accumulator.append({ stream: "stdout", chunk: Buffer.from([0xe2]) });
+    const beforeFinish = accumulator.snapshot();
+    const finish = accumulator.finish();
+    const repeatedFinish = accumulator.finish();
+    const afterFinish = accumulator.snapshot();
+
+    await expect(accumulator.append({ stream: "stdout", chunk: Buffer.from("too late") })).rejects.toThrow(
+      "Cannot append after process output capture has finished",
+    );
+    await Promise.all([firstAppend, secondAppend, incompleteAppend]);
+    expect((await firstSnapshot).preview).toBe("first");
+    expect((await secondSnapshot).preview).toBe("first second");
+    expect((await beforeFinish).preview).toBe("first second");
+    const finished = await finish;
+    expect(finished.preview).toBe("first second�");
+    expect(await repeatedFinish).toBe(finished);
+    expect(await afterFinish).toBe(finished);
+    expect(await accumulator.finish()).toBe(finished);
+    expect(await accumulator.snapshot()).toBe(finished);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
 
 test("process output accumulator keeps the final 2000 of 3000 lines and persists all output", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "chili-output-lines-"));
