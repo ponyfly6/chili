@@ -31,6 +31,7 @@ export async function* readSseEvents(
   const { signal, idleTimeoutMs, maxEventBytes, maxBufferBytes } = normalizeOptions(options);
   const reader = body.getReader();
   const decoder = new TextDecoder();
+  const normalizeNewlines = createNewlineNormalizer();
   let buffer = "";
   let reachedEof = false;
   let cancelPromise: Promise<void> | undefined;
@@ -53,9 +54,13 @@ export async function* readSseEvents(
       }
       buffer += normalizeNewlines(decoder.decode(chunk.value, { stream: true }));
       assertSseSize(buffer, maxBufferBytes, "buffer");
-      yield* drainEvents(buffer, maxEventBytes, (next) => {
+      for (const event of drainEvents(buffer, maxEventBytes, (next) => {
         buffer = next;
-      });
+      })) {
+        throwIfStreamAborted(signal);
+        yield event;
+        throwIfStreamAborted(signal);
+      }
     }
 
     if (signal?.aborted) throw abortError();
@@ -72,6 +77,10 @@ export async function* readSseEvents(
     if (!reachedEof) await cancelReader();
     reader.releaseLock();
   }
+}
+
+export function throwIfStreamAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError();
 }
 
 function normalizeOptions(options: AbortSignal | ReadSseEventsOptions | undefined): NormalizedReadSseEventsOptions {
@@ -174,8 +183,15 @@ function parseSseEvent(raw: string): SseEvent {
   return parsed;
 }
 
-function normalizeNewlines(value: string): string {
-  return value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+function createNewlineNormalizer(): (value: string) => string {
+  let previousChunkEndedWithCr = false;
+  return (value) => {
+    // Empty decoded chunks can occur while TextDecoder buffers a UTF-8 character.
+    if (value.length === 0) return "";
+    const text = previousChunkEndedWithCr && value.startsWith("\n") ? value.slice(1) : value;
+    previousChunkEndedWithCr = value.endsWith("\r");
+    return text.replace(/\r\n?/g, "\n");
+  };
 }
 
 function abortError(): Error {

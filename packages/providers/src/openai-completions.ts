@@ -1,8 +1,8 @@
 import { formatToolResultForModel, normalizeToolCallId, type Message, type MessagePart } from "@chili/protocol";
 import { resolveChatCompletionsCompatibility, type ChatCompletionsCompatibility } from "./compat.js";
 import { assertImageInputSupported } from "./image-input.js";
-import { providerHttpError, providerPayloadError } from "./provider-error.js";
-import { readSseEvents } from "./sse.js";
+import { providerHttpError, providerPayloadError, providerStreamProtocolError } from "./provider-error.js";
+import { readSseEvents, throwIfStreamAborted } from "./sse.js";
 import { prependContextualUserMessage, transformModelMessages } from "./transform-messages.js";
 import type {
   ChiliModel,
@@ -209,14 +209,15 @@ export class OpenAICompletionsModel implements ChiliModel {
     let responseId: string | undefined;
     let usage: ModelUsage | undefined;
     let finishReason = "stop";
-    let finished = false;
     let emittedInitialMetadata = false;
     const toolCalls = new Map<number, ToolStreamState>();
+    const unfinishedChoices = new Set<number>();
+    const finishedChoices = new Set<number>();
 
     for await (const event of readSseEvents(body, signal)) {
       if (event.data === "[DONE]") break;
       const payload = parseJson<OpenAIChatCompletionResponse>(event.data, undefined);
-      if (!payload) {
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
         if (event.event === "error") {
           yield errorEvent(providerPayloadError(undefined, {
             provider: this.provider,
@@ -225,7 +226,8 @@ export class OpenAICompletionsModel implements ChiliModel {
           }), responseId, usage);
           return;
         }
-        continue;
+        if (!event.data.trim()) continue;
+        throw providerStreamProtocolError(this.provider, "Model stream contained invalid JSON", response, "invalid_stream");
       }
 
       if (event.event === "error" || payload.error) {
@@ -248,6 +250,10 @@ export class OpenAICompletionsModel implements ChiliModel {
 
       for (const choice of payload.choices ?? []) {
         const index = choice.index ?? 0;
+        if (!finishedChoices.has(index)) unfinishedChoices.add(index);
+        else if (choice.delta?.content || choice.delta?.reasoning_content || choice.delta?.tool_calls?.length) {
+          throw providerStreamProtocolError(this.provider, "Model stream continued a finished choice", response, "invalid_stream");
+        }
         if (choice.delta?.reasoning_content) {
           yield { type: "reasoning_delta", text: choice.delta.reasoning_content, index };
         }
@@ -257,17 +263,26 @@ export class OpenAICompletionsModel implements ChiliModel {
         for (const toolCall of choice.delta?.tool_calls ?? []) {
           yield* applyToolCallDelta(toolCalls, toolCall, index);
         }
-        if (choice.finish_reason) finishReason = choice.finish_reason;
+        if (choice.finish_reason) {
+          finishReason = choice.finish_reason;
+          unfinishedChoices.delete(index);
+          finishedChoices.add(index);
+        }
       }
     }
 
+    throwIfStreamAborted(signal);
+    // Keep reading after finish_reason to collect the optional usage-only tail.
+    // [DONE] or EOF alone does not establish that a choice finished generating.
+    if (finishedChoices.size === 0 || unfinishedChoices.size > 0) {
+      throw providerStreamProtocolError(this.provider, "Model stream ended before finish_reason", response, "incomplete_stream");
+    }
     for (const [index, tool] of toolCalls) {
+      throwIfStreamAborted(signal);
       yield finishToolCallEvent(tool, index);
     }
-    if (!finished) {
-      finished = true;
-      yield finishEvent(finishReason, responseId, usage);
-    }
+    throwIfStreamAborted(signal);
+    yield finishEvent(finishReason, responseId, usage);
   }
 
   private async *streamJsonResponse(text: string, response: Response): AsyncIterable<ModelStreamEvent> {

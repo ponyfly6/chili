@@ -266,6 +266,26 @@ export function providerPayloadError(payload: unknown, options: ProviderPayloadE
   });
 }
 
+/** A transport EOF or malformed frame is not a successful model completion. */
+export function providerStreamProtocolError(
+  provider: string,
+  label: string,
+  response: Response,
+  code: "incomplete_stream" | "invalid_stream",
+): ProviderError {
+  return providerPayloadError(undefined, {
+    provider,
+    label,
+    response,
+    details: {
+      code,
+      type: "stream_protocol_error",
+      retryable: true,
+      opensCircuit: false,
+    },
+  });
+}
+
 export function extractProviderErrorDetails(value: unknown): ProviderErrorDetails | undefined {
   if (!isRecord(value)) return undefined;
   const response = isRecord(value.response) ? value.response : undefined;

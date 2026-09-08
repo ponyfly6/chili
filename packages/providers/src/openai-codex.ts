@@ -28,9 +28,10 @@ import { assertImageInputSupported } from "./image-input.js";
 import {
   providerHttpError,
   providerPayloadError,
+  providerStreamProtocolError,
   type ProviderRequestError,
 } from "./provider-error.js";
-import { readSseEvents } from "./sse.js";
+import { readSseEvents, throwIfStreamAborted } from "./sse.js";
 import { prependContextualUserMessage, transformModelMessages } from "./transform-messages.js";
 import type {
   ChiliModel,
@@ -421,6 +422,7 @@ class CodexResponsesModel implements ChiliModel {
     let responseId: string | undefined;
     let usage: ModelUsage | undefined;
     let finishReason = "stop";
+    let finished = false;
     let sawToolCall = false;
     const toolCalls = new Map<string, ToolStreamState>();
     const messagePhases = new Map<number, AssistantMessagePhase>();
@@ -433,6 +435,10 @@ class CodexResponsesModel implements ChiliModel {
 
       if (event.event === "error" || payload?.type === "error") {
         throw formatCodexStreamError(payload, this.provider, "OpenAI Codex stream error", response);
+      }
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        if (!event.data.trim()) continue;
+        throw providerStreamProtocolError(this.provider, "OpenAI Codex stream contained invalid JSON", response, "invalid_stream");
       }
       if (!payload?.type) continue;
 
@@ -527,6 +533,7 @@ class CodexResponsesModel implements ChiliModel {
           if (payload.item.arguments !== undefined) state.partialJson = payload.item.arguments;
           if (!state.started && state.name) yield startToolEvent(state);
           if (!state.ended) {
+            throwIfStreamAborted(signal);
             state.ended = true;
             yield finishToolEvent(state);
           }
@@ -535,6 +542,19 @@ class CodexResponsesModel implements ChiliModel {
       }
 
       if (payload.type === "response.completed" || payload.type === "response.done" || payload.type === "response.incomplete") {
+        const status = payload.response?.status;
+        if (payload.response?.error || status === "failed" || status === "cancelled") {
+          throw formatCodexStreamError(payload, this.provider, "OpenAI Codex response did not complete successfully", response);
+        }
+        if (
+          (status !== undefined && status !== "completed" && status !== "incomplete")
+          || (payload.type === "response.done" && status === undefined)
+          || (payload.type === "response.completed" && status === "incomplete")
+          || (payload.type === "response.incomplete" && status === "completed")
+        ) {
+          throw providerStreamProtocolError(this.provider, "OpenAI Codex stream has an invalid terminal status", response, "invalid_stream");
+        }
+        finished = true;
         responseId = payload.response?.id ?? responseId;
         usage = toModelUsage(payload.response?.usage) ?? usage;
         finishReason = mapCodexFinishReason(
@@ -546,9 +566,15 @@ class CodexResponsesModel implements ChiliModel {
       }
     }
 
+    throwIfStreamAborted(signal);
+    if (!finished) {
+      throw providerStreamProtocolError(this.provider, "OpenAI Codex stream ended before a terminal response event", response, "incomplete_stream");
+    }
     for (const state of toolCalls.values()) {
+      throwIfStreamAborted(signal);
       if (!state.ended) yield finishToolEvent(state);
     }
+    throwIfStreamAborted(signal);
     yield finishEvent(finishReason, responseId, usage);
   }
 }

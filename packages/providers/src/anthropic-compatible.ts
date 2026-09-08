@@ -22,6 +22,7 @@ import {
 import {
   providerHttpError,
   providerPayloadError,
+  providerStreamProtocolError,
   type ProviderErrorDetails,
 } from "./provider-error.js";
 import { readSseEvents } from "./sse.js";
@@ -232,18 +233,12 @@ export class AnthropicCompatibleModel implements ChiliModel {
     let responseId: string | undefined;
     let usage: ModelUsage | undefined;
     let finishReason = "stop";
-    let finished = false;
     const toolBlocks = new Map<number, ToolBlockState>();
 
     for await (const event of readSseEvents(body, signal)) {
       if (event.data === "[DONE]") break;
-      const fallback: AnthropicSsePayload = {};
-      if (event.event !== undefined) fallback.type = event.event;
       const parsed = parseJson<AnthropicSsePayload>(event.data, undefined);
-      const payload = parsed ?? fallback;
-      if (!payload) continue;
-
-      if (payload.type === "error" || event.event === "error") {
+      if (parsed?.type === "error" || event.event === "error") {
         const details = anthropicErrorDetails(parsed);
         const error = providerPayloadError(parsed, {
           provider: this.provider,
@@ -255,6 +250,13 @@ export class AnthropicCompatibleModel implements ChiliModel {
         yield errorEvent(error, responseId, usage);
         return;
       }
+
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        if (!event.data.trim()) continue;
+        throw providerStreamProtocolError(this.provider, "Model stream contained invalid JSON", response, "invalid_stream");
+      }
+      const payload = parsed;
+      if (payload.type === undefined && event.event !== undefined) payload.type = event.event;
 
       if (payload.type === "message_start") {
         responseId = payload.message?.id;
@@ -336,14 +338,15 @@ export class AnthropicCompatibleModel implements ChiliModel {
       }
 
       if (payload.type === "message_stop") {
-        finished = true;
+        if (toolBlocks.size > 0) {
+          throw providerStreamProtocolError(this.provider, "Model stream stopped before tool content_block_stop", response, "incomplete_stream");
+        }
         yield finishEvent(finishReason, responseId, usage);
+        return;
       }
     }
 
-    if (!finished) {
-      yield finishEvent(finishReason, responseId, usage);
-    }
+    throw providerStreamProtocolError(this.provider, "Model stream ended before message_stop", response, "incomplete_stream");
   }
 
   private async *streamJsonResponse(text: string, response: Response): AsyncIterable<ModelStreamEvent> {
