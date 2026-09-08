@@ -1,5 +1,7 @@
 # Coding reliability foundation
 
+Current product priorities are defined in [product-direction.md](product-direction.md). The coding evaluation baseline below is a completed development tool; further model benchmarking is not on the current work plan.
+
 This change addresses concrete execution and integration failures found during the September 2026 codebase review. It preserves the Bun/TypeScript runtime and existing application boundaries. It does not establish a coding-agent ranking or choose a final Desktop design.
 
 ## Completion is a protocol boundary
