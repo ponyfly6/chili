@@ -25,6 +25,7 @@ import type {
 import type { DelegationPolicy, ModelSelection, ReasoningLevel, ServiceTier, ModelMetadataPayload, RuntimeStatusPayload } from "./runtime.js";
 import type { ApprovalDecisionAction, ApprovalScope, ToolCallStatus, ToolOutputStream } from "./tool.js";
 import type { PersistedErrorDetails } from "./persisted-error.js";
+import type { RuntimeInputQueue } from "./session-input.js";
 
 export interface EventEnvelope<TType extends string = string, TPayload = unknown> {
   id: string;
@@ -55,6 +56,7 @@ export function isTransientEvent(event: Pick<EventEnvelope, "type">): boolean {
 }
 
 export type SessionEvent =
+  | SessionScopedEventEnvelope<"session.input_queue_changed", RuntimeInputQueue>
   | SessionScopedEventEnvelope<"session.created", { sessionId: SessionId; cwd: string }>
   | SessionScopedEventEnvelope<"session.renamed", { sessionId: SessionId; title: string }>
   | SessionScopedEventEnvelope<"session.status_changed", RuntimeStatusPayload>

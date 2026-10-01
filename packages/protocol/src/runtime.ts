@@ -366,6 +366,8 @@ export interface RuntimeSessionRef {
 export interface RuntimePromptAccepted {
   status: "accepted";
   sessionId: SessionId;
+  input?: import("./session-input.js").RuntimeSessionInput;
+  queue?: import("./session-input.js").RuntimeInputQueue;
 }
 
 export interface RuntimeInterruptResult {

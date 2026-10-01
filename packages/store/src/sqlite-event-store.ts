@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { SessionInputRepository, type SessionInputMutation, type SessionInputMutationResult } from "./session-inputs.js";
 import type {
   AgentCompleteTaskPayload,
   AgentCompletedPayload,
@@ -475,6 +476,8 @@ export class SqliteEventStore
   private readonly ownedRunClaims = new Map<SessionId, string>();
   private readonly journalMode: string;
   private closed = false;
+  private readonly inputs: SessionInputRepository;
+  private inputMirrors: Promise<void> = Promise.resolve();
 
   constructor(path = ".chili/chili.sqlite", private readonly options: SqliteEventStoreOptions = {}) {
     this.db = new Database(path, { create: true, strict: true });
@@ -520,6 +523,19 @@ export class SqliteEventStore
       this.migrateSubagentSchema();
       this.migrateTeamSchema();
       this.migrateSessionClaimSchema();
+      this.inputs = new SessionInputRepository(this.db, {
+        commit: (events, fence) => { this.writeTransactionEvents(events, fence); },
+        claim: (input) => this.claimSessionRun(input),
+        forgetClaim: (sessionId, claimId) => {
+          if (this.ownedRunClaims.get(sessionId) === claimId) this.ownedRunClaims.delete(sessionId);
+        },
+        assertSession: (sessionId) => {
+          if (this.subagentSessionReservationExists(sessionId)) throw new SessionReservedForSubagentError(sessionId);
+          const session = this.db.query<{ status: string }, [string]>("select status from sessions where id = ?").get(sessionId);
+          if (!session || session.status !== "active") throw new SessionStateConflictError(sessionId, session?.status);
+        },
+        retry: (operation) => this.runWithWriteRetry(operation),
+      });
       this.loadLegacySessionIdentities();
     } catch (error) {
       try {
@@ -540,6 +556,20 @@ export class SqliteEventStore
       this.db.close();
     }
   }
+
+  sessionInputQueue(sessionId: SessionId) { return this.inputs.queue(sessionId); }
+
+  sessionInput(sessionId: SessionId, submissionId: string) { return this.inputs.get(sessionId, submissionId); }
+
+  mutateSessionInputs(input: SessionInputMutation): SessionInputMutationResult {
+    const result = this.inputs.mutate(input);
+    this.inputMirrors = this.inputMirrors.catch(() => undefined).then(() => this.writeMirrors(result.events));
+    // Mirror failures never change an already committed receipt.
+    void this.inputMirrors.catch(() => undefined);
+    return result;
+  }
+
+  async flushInputMirrors(): Promise<void> { await this.inputMirrors; }
 
   async append(event: ChiliEvent, options?: EventAppendOptions): Promise<void> {
     await this.appendCommitted(event, options);
@@ -674,11 +704,17 @@ export class SqliteEventStore
     allowSubagentSessions: boolean;
     time: number;
     leaseDurationMs: number;
+    respectDispatch?: boolean;
   }): { status: "claimed" | "busy" | "inactive" | "not_found" | "subagent"; sessionStatus?: string } {
     const claim = this.db.transaction(() => {
       // See claimSessionCreation: replacing an owned claim on this connection
       // would erase the identity needed to reject the old operation's appends.
       if (this.ownedRunClaims.has(input.sessionId)) return { status: "busy" as const };
+      if (input.respectDispatch) {
+        const paused = this.db.query<{ paused: number }, [string]>("select paused from session_dispatch where session_id = ?").get(input.sessionId);
+        const queued = this.db.query<{ found: number }, [string]>("select 1 as found from session_inputs where session_id = ? and state != 'settled' limit 1").get(input.sessionId);
+        if (paused?.paused || queued) return { status: "busy" as const };
+      }
       this.db.query(
         `delete from session_creation_claims where session_id = ? and lease_expires_at <= ?`,
       ).run(input.sessionId, input.time);
@@ -703,13 +739,14 @@ export class SqliteEventStore
       if (!input.allowSubagentSessions && subagentOwned) return { status: "subagent" as const };
       const inserted = this.db.query(
         `insert into session_run_claims
-           (session_id, claim_id, claimed_at, heartbeat_at, lease_expires_at)
-         values (?, ?, ?, ?, ?)
+           (session_id, claim_id, claimed_at, heartbeat_at, lease_expires_at, input_version)
+         values (?, ?, ?, ?, ?, 1)
          on conflict(session_id) do update set
            claim_id = excluded.claim_id,
            claimed_at = excluded.claimed_at,
            heartbeat_at = excluded.heartbeat_at,
-           lease_expires_at = excluded.lease_expires_at
+           lease_expires_at = excluded.lease_expires_at,
+           input_version = excluded.input_version
          where session_run_claims.lease_expires_at <= ?`,
       ).run(
         input.sessionId,
@@ -4185,6 +4222,10 @@ export class SqliteEventStore
     }
 
     if (event.type === "session.archived") {
+      if (this.tableExists("session_inputs")) {
+        this.db.query("update session_inputs set state = 'settled', outcome = 'cancelled', revision = revision + 1, updated_at = ? where session_id = ? and state = 'pending'").run(event.time, event.sessionId);
+        this.db.query("update session_dispatch set paused = 1, revision = revision + 1 where session_id = ?").run(event.sessionId);
+      }
       const session = this.db
         .query<{ status: string }, [string]>(`select status from sessions where id = ?`)
         .get(event.sessionId);

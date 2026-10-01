@@ -35,6 +35,7 @@ import {
   type RuntimeSessionRef,
 } from "./runtime.js";
 import type { Message } from "./message.js";
+import type { RuntimeInputQueue, RuntimeSessionInput } from "./session-input.js";
 
 const MAX_VALIDATION_PATH_CHARS = 512;
 const MAX_VALIDATION_EXPECTATION_CHARS = 512;
@@ -345,7 +346,46 @@ export function parseRuntimePromptAccepted(value: unknown, path = "response"): R
   return {
     status: "accepted",
     sessionId: parseRuntimeIdentifier(record.sessionId, `${path}.sessionId`) as RuntimePromptAccepted["sessionId"],
+    ...(record.input !== undefined ? { input: parseRuntimeSessionInput(record.input, `${path}.input`) } : {}),
+    ...(record.queue !== undefined ? { queue: parseRuntimeInputQueue(record.queue, `${path}.queue`) } : {}),
   };
+}
+
+export function parseRuntimeSessionInput(value: unknown, path = "input"): RuntimeSessionInput {
+  const row = parseRuntimeRecord(value, path);
+  const input: RuntimeSessionInput = {
+    inputId: parseRuntimeIdentifier(row.inputId, `${path}.inputId`),
+    submissionId: parseRuntimeIdentifier(row.submissionId, `${path}.submissionId`),
+    sessionId: parseRuntimeIdentifier(row.sessionId, `${path}.sessionId`) as RuntimeSessionInput["sessionId"],
+    mode: parseRuntimeEnum(row.mode, ["start", "queue", "steer"] as const, `${path}.mode`),
+    state: parseRuntimeEnum(row.state, ["pending", "claimed", "settled"] as const, `${path}.state`),
+    revision: parseRuntimeNonNegativeInteger(row.revision, `${path}.revision`),
+    sequence: parseRuntimeNonNegativeInteger(row.sequence, `${path}.sequence`),
+    text: parseRuntimeString(row.text, `${path}.text`, { allowEmpty: true }),
+    acceptedAt: parseRuntimeNonNegativeInteger(row.acceptedAt, `${path}.acceptedAt`),
+    updatedAt: parseRuntimeNonNegativeInteger(row.updatedAt, `${path}.updatedAt`),
+  };
+  assignOptionalString(input, "executionRef", row.executionRef, path);
+  assignOptionalString(input, "messageId", row.messageId, path);
+  assignOptionalString(input, "turnId", row.turnId, path);
+  assignOptionalString(input, "error", row.error, path);
+  if (row.outcome !== undefined) input.outcome = parseRuntimeEnum(row.outcome, ["completed", "failed", "cancelled", "interrupted"] as const, `${path}.outcome`);
+  return input;
+}
+
+export function parseRuntimeInputQueue(value: unknown, path = "queue"): RuntimeInputQueue {
+  const row = parseRuntimeRecord(value, path);
+  const queue: RuntimeInputQueue = {
+    sessionId: parseRuntimeIdentifier(row.sessionId, `${path}.sessionId`) as RuntimeInputQueue["sessionId"],
+    paused: parseRuntimeBoolean(row.paused, `${path}.paused`),
+    revision: parseRuntimeNonNegativeInteger(row.revision, `${path}.revision`),
+    pendingCount: parseRuntimeNonNegativeInteger(row.pendingCount, `${path}.pendingCount`),
+    interruptedCount: parseRuntimeNonNegativeInteger(row.interruptedCount, `${path}.interruptedCount`),
+    items: parseRuntimeArray(row.items, parseRuntimeSessionInput, `${path}.items`),
+  };
+  if (queue.items.some((item) => item.sessionId !== queue.sessionId)) throw new RuntimeValidationError(path, "must contain inputs from the same session");
+  assignOptionalString(queue, "executionRef", row.executionRef, path);
+  return queue;
 }
 
 export function parseRuntimePromptResult(value: unknown, path = "response"): RuntimePromptResult {
@@ -564,6 +604,7 @@ export function parseRuntimeMcpLogoutResponse(value: unknown, path = "response")
 }
 
 const CHILI_EVENT_TYPES = [
+  "session.input_queue_changed",
   "session.created",
   "session.renamed",
   "session.status_changed",
@@ -675,6 +716,10 @@ function validateChiliEventPayload(
   _eventId: string,
 ): void {
   switch (type) {
+    case "session.input_queue_changed":
+      matchingEventSessionId(payload.sessionId, envelopeSessionId, `${path}.sessionId`);
+      parseRuntimeInputQueue(payload, path);
+      return;
     case "session.created":
       matchingEventSessionId(payload.sessionId, envelopeSessionId, `${path}.sessionId`);
       parseRuntimeString(payload.cwd, `${path}.cwd`);

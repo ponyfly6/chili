@@ -176,7 +176,7 @@ test("uses persisted session cwd as the only prompt authority and normalizes new
     expect(mismatched.error?.message).toContain(
       `expected ${persistedCwd}, received /other/workspace`,
     );
-    expect(runner.userMessages).toHaveLength(1);
+    expect((await store.messages(sessionId)).filter((message) => message.role === "user")).toHaveLength(1);
     expect(runner.turnInputs).toHaveLength(1);
   } finally {
     store.close();

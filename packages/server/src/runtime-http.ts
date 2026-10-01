@@ -5,6 +5,7 @@ import {
   normalizeSessionTitle,
   parseRuntimeArray,
   parseRuntimeBoolean,
+  parseRuntimeIdentifier,
   parseRuntimeModelSelection,
   parseRuntimeRecord,
   parseRuntimeString,
@@ -98,7 +99,7 @@ import type {
   TeamSnapshot,
   UpdateTeamTaskInput,
 } from "@chili/core";
-import { UnknownEventCursorError } from "@chili/store";
+import { SessionInputConflictError, UnknownEventCursorError } from "@chili/store";
 import type { EventPublisher, EventStore } from "@chili/store";
 import {
   jsonEventArrayUtf8Bytes,
@@ -151,14 +152,20 @@ export interface RuntimeHttpService {
   getDelegationConfig?(sessionId: SessionId): Promise<RuntimeDelegationConfig>;
   setDelegationPolicy?(input: { sessionId: SessionId; policy: DelegationPolicy }): Promise<RuntimeDelegationConfig>;
   getGoal?(input: { sessionId: SessionId }): Promise<SessionGoal | undefined>;
-  setGoal?(input: { sessionId: SessionId; objective: string; tokenBudget?: number; replace?: boolean }): Promise<SessionGoal>;
-  updateGoal?(input: { sessionId: SessionId; status?: SessionGoalStatus; objective?: string; tokenBudget?: number }): Promise<SessionGoal>;
+  setGoal?(input: { sessionId: SessionId; objective: string; tokenBudget?: number; replace?: boolean; resumeDispatch?: boolean }): Promise<SessionGoal>;
+  updateGoal?(input: { sessionId: SessionId; status?: SessionGoalStatus; objective?: string; tokenBudget?: number; resumeDispatch?: boolean }): Promise<SessionGoal>;
   clearGoal?(input: { sessionId: SessionId }): Promise<{ cleared: boolean; previousGoal?: SessionGoal }>;
   assertSessionReadAllowed(sessionId: SessionId): Promise<void>;
   assertSessionTurnAllowed(sessionId: SessionId): Promise<void>;
   submitPrompt(input: SubmitPromptInput): Promise<SubmitPromptResult>;
-  submitPromptAsync(input: SubmitPromptInput, onError?: RuntimeBackgroundErrorHandler): void;
-  interrupt(sessionId: SessionId, reason?: string): Promise<boolean>;
+  submitPromptAsync(input: SubmitPromptInput, onError?: RuntimeBackgroundErrorHandler): void | RuntimePromptAccepted | Promise<RuntimePromptAccepted>;
+  inputQueue?(sessionId: SessionId): import("@chili/protocol").RuntimeInputQueue;
+  getInput?(sessionId: SessionId, submissionId: string): import("@chili/protocol").RuntimeSessionInput | undefined;
+  retryInput?(input: { sessionId: SessionId; submissionId: string; identity: string; mode: import("@chili/protocol").RuntimeInputMode }): RuntimePromptAccepted | undefined;
+  resumeInputs?(sessionId: SessionId): Promise<import("@chili/protocol").RuntimeInputQueue>;
+  cancelInput?(input: { sessionId: SessionId; inputId: string; expectedRevision: number }): import("@chili/protocol").RuntimeInputQueue;
+  cancelInputsFromSource?(sessionId: SessionId, source: string): void;
+  interrupt(sessionId: SessionId, reason?: string, expectedExecutionRef?: string): Promise<boolean>;
   archiveSession(sessionId: SessionId): Promise<void>;
   renameSession?(sessionId: SessionId, title: string): Promise<void>;
 }
@@ -824,14 +831,14 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
           const input = goalSetInput(route.sessionId, body);
           await options.service.assertSessionTurnAllowed(route.sessionId);
           await requireSession(options.store, route.sessionId);
-          return json(await goals.setGoal(input), 201);
+          return json(await goals.setGoal({ ...input, ...(options.service.inputQueue?.(route.sessionId).paused ? { resumeDispatch: true } : {}) }), 201);
         }
         if (request.method === "PATCH") {
           const body = await readJson<GoalBody>(request, ["status", "objective", "tokenBudget"]);
           const input = goalUpdateInput(route.sessionId, body);
           await options.service.assertSessionTurnAllowed(route.sessionId);
           await requireSession(options.store, route.sessionId);
-          return json(await goals.updateGoal(input));
+          return json(await goals.updateGoal({ ...input, ...(input.status === "active" && options.service.inputQueue?.(route.sessionId).paused ? { resumeDispatch: true } : {}) }));
         }
         if (request.method === "DELETE") {
           rejectUnknownQueryParameters(url, []);
@@ -841,10 +848,38 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
         }
       }
 
+      if (route.name === "inputQueue" || route.name === "resumeInputs" || route.name === "cancelInput" || route.name === "cancelInputSource") {
+        await options.service.assertSessionReadAllowed(route.sessionId);
+        await requireSession(options.store, route.sessionId);
+        if (!options.service.inputQueue) throw badRequest("Durable inputs are unavailable");
+        if (route.name === "inputQueue") {
+          const submissionId = url.searchParams.get("submissionId");
+          if (submissionId) return json({ input: options.service.getInput?.(route.sessionId, submissionId) ?? null });
+          return json(options.service.inputQueue(route.sessionId));
+        }
+        await options.service.assertSessionTurnAllowed(route.sessionId);
+        if (route.name === "resumeInputs") {
+          await readJson(request, []);
+          if (!options.service.resumeInputs) throw badRequest("Durable resume is unavailable");
+          return json(await options.service.resumeInputs(route.sessionId));
+        }
+        if (route.name === "cancelInputSource") {
+          const body = await readJson<{ source?: unknown }>(request, ["source"]);
+          const source = stringField(body.source, "source");
+          options.service.cancelInputsFromSource?.(route.sessionId, source);
+          return json(options.service.inputQueue(route.sessionId));
+        }
+        const body = await readJson<{ inputId?: unknown; expectedRevision?: unknown }>(request, ["inputId", "expectedRevision"]);
+        if (!options.service.cancelInput) throw badRequest("Input cancellation is unavailable");
+        return json(options.service.cancelInput({ sessionId: route.sessionId,
+          inputId: stringField(body.inputId, "inputId"), expectedRevision: positiveInteger(body.expectedRevision, "expectedRevision") }));
+      }
+
       if (route.name === "prompt" || route.name === "promptAsync") {
         const body = await readJson<PromptBody>(request, [
-          "text", "displayText", "images", "skillMentions", "cwd", "maxTurns", "modelSelection", "reasoningLevel", "serviceTier", "system",
+          "text", "displayText", "images", "skillMentions", "cwd", "maxTurns", "modelSelection", "reasoningLevel", "serviceTier", "system", "submissionId", "mode", "expectedExecutionRef", "inputSource",
         ]);
+        if (route.name === "prompt" && body.mode !== undefined && body.mode !== "start") throw badRequest("Use prompt_async to queue or steer input");
         rejectLegacySystemField(body);
         const promptImages = parsePromptImages(body.images);
         if (!body.text && promptImages.length === 0) throw badRequest("text is required");
@@ -859,8 +894,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
           return json(serializeSubmitPromptResult(await options.service.submitPrompt(input)));
         }
 
-        options.service.submitPromptAsync(input, options.onBackgroundError);
-        const accepted: RuntimePromptAccepted = {
+        const accepted = await options.service.submitPromptAsync(input, options.onBackgroundError) ?? {
           status: "accepted",
           sessionId: route.sessionId,
         };
@@ -869,7 +903,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
 
       if (route.name === "command" || route.name === "commandAsync") {
         const body = await readJson<CommandPromptBody>(request, [
-          "commandId", "name", "args", "cwd", "modelSelection", "reasoningLevel", "serviceTier",
+          "commandId", "name", "args", "cwd", "modelSelection", "reasoningLevel", "serviceTier", "submissionId", "mode",
         ]);
         await options.service.assertSessionTurnAllowed(route.sessionId);
         const session = await requireSession(options.store, route.sessionId);
@@ -886,7 +920,16 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
           ...(body.modelSelection !== undefined ? { modelSelection: body.modelSelection } : {}),
           ...(body.reasoningLevel !== undefined ? { reasoningLevel: body.reasoningLevel } : {}),
           ...(body.serviceTier !== undefined ? { serviceTier: body.serviceTier } : {}),
+          ...(body.submissionId !== undefined ? { submissionId: body.submissionId } : {}),
+          ...(body.mode !== undefined ? { mode: body.mode } : {}),
         });
+        if (route.name === "command" && input.mode !== undefined && input.mode !== "start") throw badRequest("Use command_async to queue or steer input");
+        input.requestIdentity = JSON.stringify({ commandId: body.commandId, args: body.args ?? "", ...input });
+        if (input.submissionId && route.name === "commandAsync") {
+          const previous = options.service.retryInput?.({ sessionId: route.sessionId, submissionId: input.submissionId,
+            identity: input.requestIdentity, mode: input.mode ?? "start" });
+          if (previous) return json(previous, 202);
+        }
         const command = await preparePromptCommandSubmission(requireCommandControl(options), {
           commandId: body.commandId.trim(),
           ...(body.args ? { args: body.args } : {}),
@@ -898,8 +941,7 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
           return json(serializeSubmitPromptResult(await options.service.submitPrompt(input)));
         }
 
-        options.service.submitPromptAsync(input, options.onBackgroundError);
-        const accepted: RuntimePromptAccepted = {
+        const accepted = await options.service.submitPromptAsync(input, options.onBackgroundError) ?? {
           status: "accepted",
           sessionId: route.sessionId,
         };
@@ -907,10 +949,11 @@ export function createRuntimeHttpHandler(options: RuntimeHttpHandlerOptions): (r
       }
 
       if (route.name === "interrupt") {
-        const body = await readJson<InterruptBody>(request, ["reason"]);
+        const body = await readJson<InterruptBody & { expectedExecutionRef?: unknown }>(request, ["reason", "expectedExecutionRef"]);
         const reason = body.reason === undefined ? undefined : stringField(body.reason, "reason");
         const result: RuntimeInterruptResult = {
-          interrupted: await options.service.interrupt(route.sessionId, reason),
+          interrupted: await options.service.interrupt(route.sessionId, reason,
+            body.expectedExecutionRef === undefined ? undefined : stringField(body.expectedExecutionRef, "expectedExecutionRef")),
         };
         return json(result);
       }
@@ -1216,6 +1259,7 @@ type Route =
   | { name: "command"; sessionId: SessionId }
   | { name: "commandAsync"; sessionId: SessionId }
   | { name: "interrupt"; sessionId: SessionId }
+  | { name: "inputQueue" | "resumeInputs" | "cancelInput" | "cancelInputSource"; sessionId: SessionId }
   | { name: "archive"; sessionId: SessionId }
   | { name: "listUserInputs" }
   | { name: "listPendingApprovals" }
@@ -1233,6 +1277,10 @@ interface RenameSessionBody {
 }
 
 interface PromptBody {
+  submissionId?: unknown;
+  mode?: unknown;
+  expectedExecutionRef?: unknown;
+  inputSource?: unknown;
   text?: unknown;
   displayText?: unknown;
   images?: unknown;
@@ -1245,6 +1293,8 @@ interface PromptBody {
 }
 
 interface CommandPromptBody {
+  submissionId?: unknown;
+  mode?: unknown;
   commandId?: unknown;
   args?: unknown;
   cwd?: unknown;
@@ -1610,6 +1660,10 @@ function routeRequest(method: string, pathname: string): Route {
   if ((method === "GET" || method === "POST" || method === "PATCH" || method === "DELETE") && action === "goal") return { name: "goal", sessionId };
   if (method === "POST" && action === "prompt") return { name: "prompt", sessionId };
   if (method === "POST" && action === "prompt_async") return { name: "promptAsync", sessionId };
+  if (method === "GET" && action === "input_queue") return { name: "inputQueue", sessionId };
+  if (method === "POST" && action === "resume_inputs") return { name: "resumeInputs", sessionId };
+  if (method === "POST" && action === "cancel_input") return { name: "cancelInput", sessionId };
+  if (method === "POST" && action === "cancel_input_source") return { name: "cancelInputSource", sessionId };
   if (method === "POST" && action === "command") return { name: "command", sessionId };
   if (method === "POST" && action === "command_async") return { name: "commandAsync", sessionId };
   if (method === "POST" && action === "interrupt") return { name: "interrupt", sessionId };
@@ -1624,6 +1678,16 @@ function buildSubmitPromptInput(sessionId: SessionId, body: PromptBody, parsedIm
       ? ""
       : parseRuntimeString(body.text, "body.text", { allowEmpty: true }),
   };
+  if (body.submissionId !== undefined) {
+    input.submissionId = parseRuntimeIdentifier(body.submissionId, "body.submissionId");
+    if (!/^[^\u0000-\u0020\u007f]{1,512}$/u.test(input.submissionId)) throw badRequest("Invalid submissionId");
+  }
+  if (body.expectedExecutionRef !== undefined) input.expectedExecutionRef = parseRuntimeIdentifier(body.expectedExecutionRef, "body.expectedExecutionRef");
+  if (body.inputSource !== undefined) input.inputSource = parseRuntimeIdentifier(body.inputSource, "body.inputSource");
+  if (body.mode !== undefined) {
+    if (body.mode !== "start" && body.mode !== "queue" && body.mode !== "steer") throw badRequest("Invalid input mode");
+    input.mode = body.mode;
+  }
   if (body.displayText !== undefined) {
     input.displayText = parseRuntimeString(body.displayText, "body.displayText", { allowEmpty: true });
   }
@@ -2890,6 +2954,7 @@ function notFound(message: string): HttpError {
 }
 
 function toHttpError(error: unknown): HttpError {
+  if (error instanceof SessionInputConflictError) return { status: 409, message: normalizeDiagnosticText(error.message) };
   if (error instanceof RuntimeValidationError) {
     return { status: 400, message: error.message };
   }
@@ -2967,7 +3032,7 @@ function toHttpError(error: unknown): HttpError {
   if (err.name === "TeamMessageSenderUnauthorizedError") {
     return { status: 403, message: err.message };
   }
-  if (err.name === "RuntimeBusyError") {
+  if (err.name === "RuntimeBusyError" || err.name === "SessionInputConflictError") {
     return { status: 409, message: err.message };
   }
   if (err.name === "RuntimeSubagentSessionAccessError") {

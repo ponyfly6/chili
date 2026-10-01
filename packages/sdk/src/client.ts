@@ -1,5 +1,8 @@
 import type {
   ChiliEvent,
+  RuntimeInputMode,
+  RuntimeInputQueue,
+  RuntimeSessionInput,
   AgentPath,
   AgentRunId,
   AgentMailboxStatus,
@@ -54,6 +57,8 @@ import type {
 } from "@chili/protocol";
 import {
   normalizePersistedError,
+  parseRuntimeInputQueue,
+  parseRuntimeSessionInput,
   parseChiliEvent,
   parseChiliEventArray,
   parsePendingUserInputRequestArray,
@@ -117,6 +122,11 @@ export interface RuntimeClient {
   logoutMcpServer(input: LogoutMcpServerRequest): Promise<RuntimeMcpLogoutResponse>;
   submitPrompt(input: SubmitPromptRequest): Promise<RuntimePromptResult>;
   submitPromptAsync(input: SubmitPromptRequest): Promise<RuntimePromptAccepted>;
+  inputQueue(input: { sessionId: SessionId; signal?: AbortSignal }): Promise<RuntimeInputQueue>;
+  getInput(input: { sessionId: SessionId; submissionId: string; signal?: AbortSignal }): Promise<RuntimeSessionInput | undefined>;
+  resumeInputs(input: { sessionId: SessionId; signal?: AbortSignal }): Promise<RuntimeInputQueue>;
+  cancelInput(input: { sessionId: SessionId; inputId: string; expectedRevision: number; signal?: AbortSignal }): Promise<RuntimeInputQueue>;
+  cancelInputsFromSource(input: { sessionId: SessionId; source: string; signal?: AbortSignal }): Promise<RuntimeInputQueue>;
   submitCommand(input: SubmitCommandRequest): Promise<RuntimePromptResult>;
   submitCommandAsync(input: SubmitCommandRequest): Promise<RuntimePromptAccepted>;
   interruptSession(input: InterruptSessionRequest): Promise<RuntimeInterruptResult>;
@@ -173,6 +183,10 @@ export interface CreateSessionRequest {
 }
 
 export interface SubmitPromptRequest {
+  submissionId?: string;
+  mode?: RuntimeInputMode;
+  expectedExecutionRef?: string;
+  inputSource?: string;
   sessionId: SessionId;
   text: string;
   displayText?: string;
@@ -321,6 +335,8 @@ export interface LogoutMcpServerRequest {
 }
 
 export interface SubmitCommandRequest extends RuntimeCommandInvocation {
+  submissionId?: string;
+  mode?: RuntimeInputMode;
   sessionId: SessionId;
   modelSelection?: ModelSelection;
   reasoningLevel?: ReasoningLevel;
@@ -329,6 +345,7 @@ export interface SubmitCommandRequest extends RuntimeCommandInvocation {
 }
 
 export interface InterruptSessionRequest {
+  expectedExecutionRef?: string;
   sessionId: SessionId;
   reason?: string;
   signal?: AbortSignal;
@@ -1232,6 +1249,29 @@ export class HttpRuntimeClient implements RuntimeClient {
     return this.post(`sessions/${encodeURIComponent(sessionId)}/prompt_async`, body, signal, parseRuntimePromptAccepted);
   }
 
+  inputQueue(input: { sessionId: SessionId; signal?: AbortSignal }): Promise<RuntimeInputQueue> {
+    return this.get(`sessions/${encodeURIComponent(input.sessionId)}/input_queue`, input.signal, parseRuntimeInputQueue);
+  }
+
+  getInput(input: { sessionId: SessionId; submissionId: string; signal?: AbortSignal }): Promise<RuntimeSessionInput | undefined> {
+    return this.get(`sessions/${encodeURIComponent(input.sessionId)}/input_queue?submissionId=${encodeURIComponent(input.submissionId)}`, input.signal, (value) => {
+      const record = parseRuntimeRecord(value);
+      return record.input === null ? undefined : parseRuntimeSessionInput(record.input);
+    });
+  }
+
+  resumeInputs(input: { sessionId: SessionId; signal?: AbortSignal }): Promise<RuntimeInputQueue> {
+    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/resume_inputs`, {}, input.signal, parseRuntimeInputQueue);
+  }
+
+  cancelInput(input: { sessionId: SessionId; inputId: string; expectedRevision: number; signal?: AbortSignal }): Promise<RuntimeInputQueue> {
+    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/cancel_input`, { inputId: input.inputId, expectedRevision: input.expectedRevision }, input.signal, parseRuntimeInputQueue);
+  }
+
+  cancelInputsFromSource(input: { sessionId: SessionId; source: string; signal?: AbortSignal }): Promise<RuntimeInputQueue> {
+    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/cancel_input_source`, { source: input.source }, input.signal, parseRuntimeInputQueue);
+  }
+
   submitCommand(input: SubmitCommandRequest): Promise<RuntimePromptResult> {
     const { sessionId, signal, ...body } = input;
     return this.post(`sessions/${encodeURIComponent(sessionId)}/command`, body, signal, parseRuntimePromptResult);
@@ -1243,7 +1283,7 @@ export class HttpRuntimeClient implements RuntimeClient {
   }
 
   interruptSession(input: InterruptSessionRequest): Promise<RuntimeInterruptResult> {
-    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/interrupt`, { reason: input.reason }, input.signal, parseRuntimeInterruptResult);
+    return this.post(`sessions/${encodeURIComponent(input.sessionId)}/interrupt`, { reason: input.reason, expectedExecutionRef: input.expectedExecutionRef }, input.signal, parseRuntimeInterruptResult);
   }
 
   resolveApproval(input: ResolveApprovalRequest): Promise<RuntimeApprovalResolveResult> {
@@ -2300,22 +2340,27 @@ function requireSseControlText(value: unknown, field: string, maxLength: number)
   return value;
 }
 
+export class RuntimeHttpError extends Error {
+  override readonly name = "RuntimeHttpError";
+  constructor(readonly status: number, message: string) { super(message); }
+}
+
 async function responseError(response: Response, authorization?: string): Promise<Error> {
   const fallback = `Runtime request failed with HTTP ${response.status}`;
   try {
     const text = await readBoundedResponseText(response, MAX_RUNTIME_HTTP_ERROR_RESPONSE_BYTES);
-    if (text === undefined) return new Error(fallback);
+    if (text === undefined) return new RuntimeHttpError(response.status, fallback);
     const body = parseRuntimeRecord(JSON.parse(text) as unknown, "error response");
     const nested = body.error === undefined ? undefined : parseRuntimeRecord(body.error, "error response.error");
     const candidate = nested?.message ?? body.message;
     if (typeof candidate === "string" && candidate.length > 0) {
       const message = boundedRemoteDiagnostic(candidate, MAX_RUNTIME_HTTP_ERROR_MESSAGE_BYTES, authorization);
-      return new Error(message || fallback);
+      return new RuntimeHttpError(response.status, message || fallback);
     }
   } catch {
     // Keep the HTTP status fallback.
   }
-  return new Error(fallback);
+  return new RuntimeHttpError(response.status, fallback);
 }
 
 async function readBoundedResponseText(response: Response, maxBytes: number): Promise<string | undefined> {

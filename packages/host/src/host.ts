@@ -295,6 +295,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
         status: "failed",
         reason: "stale_turn_recovered",
       });
+      await service.recoverInputs();
     };
     const scheduleStaleTurnRecovery = (): void => {
       if (hostClosing || staleTurnRecoveryIntervalMs === false) return;
@@ -734,7 +735,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
         } finally {
           try {
             unsubscribeObserver?.();
-            sqliteStore.close();
+            try { await sqliteStore.flushInputMirrors(); } finally { sqliteStore.close(); }
           } catch (error) {
             errors.push(error);
           }
@@ -786,7 +787,7 @@ export async function createChiliHost(options: ChiliHostOptions): Promise<ChiliH
     }
     unsubscribeObserver?.();
     try {
-      sqliteStore.close();
+      try { await sqliteStore.flushInputMirrors(); } finally { sqliteStore.close(); }
     } catch (closeError) {
       errors.push(closeError);
     }

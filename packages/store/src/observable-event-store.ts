@@ -1,4 +1,5 @@
 import type { ChiliEvent, EventEnvelope, Message, SessionId, TaskId } from "@chili/protocol";
+import type { SessionInputMutation, SessionInputStore } from "./session-inputs.js";
 import type {
   AgentMailboxQuery,
   AgentMailboxRow,
@@ -113,6 +114,26 @@ export class ObservableEventStore
 
   async append(event: ChiliEvent, options?: EventAppendOptions): Promise<void> {
     await this.appendCommitted(event, options);
+  }
+
+  supportsSessionInputs(): boolean {
+    const store = this.inner as EventStore & Partial<SessionInputStore>;
+    return !!store.mutateSessionInputs && store.supportsSessionInputs?.() !== false;
+  }
+
+  private inputStore(): SessionInputStore {
+    if (!this.supportsSessionInputs()) throw new Error("Store does not support durable session inputs");
+    return this.inner as EventStore & SessionInputStore;
+  }
+
+  sessionInputQueue(sessionId: SessionId) { return this.inputStore().sessionInputQueue(sessionId); }
+
+  sessionInput(sessionId: SessionId, submissionId: string) { return this.inputStore().sessionInput(sessionId, submissionId); }
+
+  mutateSessionInputs(input: SessionInputMutation) {
+    const result = this.inputStore().mutateSessionInputs(input);
+    for (const event of result.events) this.emit(event);
+    return result;
   }
 
   async appendCommitted(event: ChiliEvent, options?: EventAppendOptions): Promise<boolean> {
