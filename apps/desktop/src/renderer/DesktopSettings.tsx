@@ -47,8 +47,7 @@ export function DesktopSettings({ page, onPage, project, session, config, models
             </select></label>
             {themeSaveFailed ? <p role="alert" className="field-error">外观已应用，但保存失败。<button className="text-button" onClick={() => onTheme(theme)}>重试</button></p> : null}
           </SettingsSection>
-          <SettingsSection title="查看结果" scope="整个客户端">
-            <label className="settings-row"><span>完成后直接查看成果<small>随时可以回到对话，继续修改。</small></span><input type="checkbox" checked={preferences.autoResult} onChange={(event) => onPreferences({ ...preferences, autoResult: event.target.checked })} /></label>
+          <SettingsSection title="对话" scope="整个客户端">
             <label className="settings-row"><span>默认展开工作过程<small>查看 Chili 做了哪些步骤。</small></span><input type="checkbox" checked={preferences.expandWork} onChange={(event) => onPreferences({ ...preferences, expandWork: event.target.checked })} /></label>
             {preferenceSaveFailed ? <p role="alert" className="field-error">此次偏好未能保存，重启后将恢复上次保存的设置。</p> : null}
           </SettingsSection>

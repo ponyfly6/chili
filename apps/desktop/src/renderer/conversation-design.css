@@ -82,11 +82,6 @@ button { cursor: pointer; }
 .conversation-heading h1 { font-size: 13px; font-weight: 450; letter-spacing: 0; }
 .conversation-title { min-width: 0; }
 .conversation-heading h1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.conversation-viewbar { display: flex; flex: none; justify-content: space-between; align-items: center; margin: 0 28px; padding: 0 0 10px; border-bottom: 1px solid var(--line); }
-.conversation-viewbar > div { display: flex; gap: 4px; }
-.conversation-viewbar button, .result-toolbar button { border-radius: 6px; padding: 6px 12px; background: none; color: var(--muted); font-size: 12px; }
-.conversation-viewbar button[aria-pressed="true"], .result-toolbar button[aria-pressed="true"] { background: var(--panel-hover); color: var(--text); }
-.conversation-viewbar .split-view-button { display: flex; align-items: center; gap: 6px; font-size: 11px; }
 .conversation-body { display: grid; flex: 1; min-height: 0; min-width: 0; grid-template-columns: minmax(0, 1fr); overflow: hidden; }
 .chat-surface { display: flex; min-height: 0; min-width: 0; }
 .timeline-viewport { width: 100%; }
@@ -120,7 +115,6 @@ button { cursor: pointer; }
 .send-button { width: 32px; height: 32px; min-height: 32px; padding: 6px; border: 0; border-radius: 8px; background: var(--strong); color: var(--on-strong); box-shadow: none; }
 .send-button:hover:not(:disabled) { background: var(--strong); opacity: .85; }
 .send-button .icon { width: 17px; height: 17px; }
-.composer-key-hint { text-align: center; margin: 10px 0 0; color: var(--muted); font-size: 10px; }
 .conversation-examples { display: flex; justify-content: center; flex-wrap: wrap; gap: 14px; margin-top: 18px; }
 .conversation-examples button { display: flex; align-items: center; gap: 8px; padding: 5px 2px; font-size: 12px; color: var(--muted); background: none; }
 .conversation-examples button:hover { color: var(--text); }
@@ -129,24 +123,6 @@ button { cursor: pointer; }
 .composer-command-menu button { display: flex; justify-content: space-between; align-items: center; width: 100%; gap: 16px; padding: 9px 10px; background: none; border-radius: 6px; font-size: 12px; text-align: left; }
 .composer-command-menu small { color: var(--muted); font-size: 11px; }
 .composer-command-menu button[aria-selected="true"], .composer-command-menu button:hover { background: var(--panel-hover); }
-.result-surface { display: flex; flex-direction: column; min-width: 0; min-height: 0; padding: 24px 28px 0; overflow: auto; }
-.result-summary { display: flex; align-items: center; gap: 8px; flex: none; margin-bottom: 15px; color: var(--text-secondary); font-size: 12px; }
-.result-summary .chili-mark { width: 22px; height: 22px; filter: none; }
-.result-paper { display: flex; flex-direction: column; min-height: 0; flex: 1 0 220px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-raised); box-shadow: var(--shadow-panel); overflow: hidden; }
-.result-toolbar { display: flex; flex: none; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 9px 14px; border-bottom: 1px solid var(--line); }
-.result-toolbar select { max-width: 170px; font: inherit; font-size: 11px; color: var(--muted); background: transparent; border: 0; }
-.result-document { flex: 1; min-height: 0; overflow: auto; padding: 28px clamp(20px, 5vw, 66px); }
-.result-document .markdown { max-width: 780px; margin-inline: auto; }
-.result-changes-note { margin: 10px 16px; font-size: 11px; color: var(--muted); }
-.result-paper .diff-review { min-height: 0; flex: 1; overflow: auto; }
-.result-caption { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex: none; padding-top: 13px; color: var(--muted); font-size: 11px; }
-.result-caption button { display: flex; gap: 6px; align-items: center; white-space: nowrap; font-size: 11px; color: var(--muted); background: none; }
-.view-split .conversation-body { grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); }
-.view-split .chat-surface { border-right: 1px solid var(--line); }
-.view-split .timeline { padding: 24px; }
-.view-split .result-surface { padding: 24px 20px 0; }
-.view-split .result-document { padding: 22px; }
-.view-split .result-caption > span { display: none; }
 .inspector { border-left: 1px solid var(--line); background: var(--panel); }
 .inspector-heading { background: transparent; }
 .primary { color: var(--on-strong); background: var(--strong); border: 1px solid transparent; box-shadow: none; }
@@ -191,25 +167,16 @@ button { cursor: pointer; }
 @media (max-width: 1080px) {
   .workspace-grid, .workspace-grid.inspector-collapsed { grid-template-columns: 208px minmax(0, 1fr) 0; }
   .workspace-grid.sidebar-collapsed, .workspace-grid.sidebar-collapsed.inspector-collapsed { grid-template-columns: 0 minmax(0, 1fr) 0; }
-  .view-split .conversation-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(120px, .75fr) minmax(180px, 1fr); }
-  .view-split .chat-surface { border-right: 0; border-bottom: 1px solid var(--line); }
-  .view-split .result-paper { flex-basis: 100px; }
-  .view-split .result-summary, .view-split .result-caption { display: none; }
 }
 @media (max-width: 640px) {
   .workspace-grid, .workspace-grid.inspector-collapsed, .workspace-grid.sidebar-collapsed, .workspace-grid.sidebar-collapsed.inspector-collapsed { grid-template-columns: 0 minmax(0, 1fr) 0; }
   .sidebar { top: 0; bottom: 0; left: 0; width: min(286px, calc(100% - 28px)); border: 1px solid var(--line); border-radius: 0 12px 12px 0; }
   .sidebar .brand span { display: inline; }
   .conversation-heading { min-height: 44px; padding-inline: 18px; }
-  .conversation-viewbar { margin-inline: 18px; }
   .timeline { padding: 22px 20px; }
   .composer-wrap { width: calc(100% - 32px); }
   .conversation-examples { gap: 10px; }
   .conversation-examples button { font-size: 11px; }
-  .result-surface { padding: 18px 16px 0; }
-  .result-caption > span { display: none; }
-  .result-summary { font-size: 11px; }
-  .result-document { padding: 20px; }
   .desktop-settings-dialog { width: calc(100vw - 24px); height: calc(100dvh - 40px); max-height: calc(100dvh - 40px); grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
   .settings-nav { flex-direction: row; overflow: auto; gap: 5px; padding: 12px; }
   .settings-nav h2, .settings-directory, .settings-nav > button > span { display: none; }

@@ -11,25 +11,29 @@ test("reading preferences survive restart with ordered atomic saves and private 
   try {
     const settings = new DesktopReadingSettings(path);
     await settings.initialize();
-    expect(await settings.get()).toEqual({ autoResult: true, expandWork: false });
-    await Promise.all([settings.set({ autoResult: true, expandWork: true }), settings.set({ autoResult: false, expandWork: true })]);
+    expect(await settings.get()).toEqual({ expandWork: false });
+    await Promise.all([settings.set({ expandWork: false }), settings.set({ expandWork: true })]);
     const restored = new DesktopReadingSettings(path);
     await restored.initialize();
-    expect(await restored.get()).toEqual({ autoResult: false, expandWork: true });
+    expect(await restored.get()).toEqual({ expandWork: true });
     expect(JSON.parse(await readFile(path, "utf8"))).toEqual(await restored.get());
     expect((await stat(path)).mode & 0o777).toBe(0o600);
+    await writeFile(path, JSON.stringify({ autoResult: true, expandWork: true }));
+    await restored.initialize();
+    expect(await restored.get()).toEqual({ expandWork: true });
     await writeFile(path, "corrupted");
     await restored.initialize();
-    expect(await restored.get()).toEqual({ autoResult: true, expandWork: false });
+    expect(await restored.get()).toEqual({ expandWork: false });
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 test("reading preferences reject non-boolean or extra renderer fields at both IPC boundaries", () => {
-  const request = { type: "reading.set", autoResult: false, expandWork: true } as const;
+  const request = { type: "reading.set", expandWork: true } as const;
   expect(parseDesktopRequest(request)).toEqual(request);
-  expect(parseDesktopResponse(request, { autoResult: false, expandWork: true })).toEqual({ autoResult: false, expandWork: true });
-  for (const invalid of [{ ...request, autoResult: "false" }, { ...request, path: "/tmp/file" }, { type: "reading.set" }]) {
+  expect(parseDesktopResponse(request, { expandWork: true })).toEqual({ expandWork: true });
+  for (const invalid of [{ ...request, expandWork: "false" }, { ...request, autoResult: true }, { ...request, path: "/tmp/file" }, { type: "reading.set" }]) {
     expect(() => parseDesktopRequest(invalid)).toThrow();
   }
-  expect(() => parseDesktopResponse({ type: "reading.get" }, { autoResult: true })).toThrow();
+  expect(() => parseDesktopResponse({ type: "reading.get" }, {})).toThrow();
+  expect(() => parseDesktopResponse({ type: "reading.get" }, { autoResult: true, expandWork: true })).toThrow();
 });

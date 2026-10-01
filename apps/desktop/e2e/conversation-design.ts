@@ -34,16 +34,20 @@ export async function assertConversationDesign(page: Page, artifacts: string): P
   await composer.press("Shift+Enter");
   assert.equal(await composer.inputValue(), "hello conversation redesign\n", "Shift+Enter inserts a newline without sending");
   await composer.press("Enter");
-  const result = page.getByRole("region", { name: "成果", exact: true });
-  await result.waitFor();
+  await page.getByText("Echo: hello conversation redesign", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Send message", exact: true }).waitFor();
   await page.getByRole("heading", { name: "hello conversation redesign", exact: true }).waitFor();
   assert.equal(await page.locator(".timeline .message-user").count(), 1, "The first prompt is submitted once");
-  await page.screenshot({ path: join(artifacts, "conversation-result.png") });
-  await page.getByRole("button", { name: "并排查看", exact: true }).click();
-  await page.locator(".timeline .message-user").waitFor();
-  await result.waitFor();
-  await page.screenshot({ path: join(artifacts, "conversation-split.png") });
-  await page.getByRole("button", { name: "对话", exact: true }).click();
+  assert.equal(await page.getByText("Echo: hello conversation redesign", { exact: true }).count(), 1, "Replies appear only once in the conversation");
+  await composer.fill("continue this conversation");
+  await composer.press("Enter");
+  await page.getByText("Echo: continue this conversation", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Send message", exact: true }).waitFor();
+  assert.equal(await page.locator(".timeline .message-user").count(), 2, "Follow-up messages stay in the same conversation");
+  assert.equal(await page.locator(".timeline .message-assistant").count(), 2);
+  assert.equal(await page.getByRole("region", { name: "成果", exact: true }).count(), 0);
+  assert.equal(await page.getByRole("button", { name: /^(成果|并排查看)$/ }).count(), 0);
+  await page.screenshot({ path: join(artifacts, "conversation-chat.png") });
   await composer.fill("保留这条未发送的想法");
   await page.getByRole("button", { name: "更多命令", exact: true }).click();
   await page.getByRole("option", { name: "/settings 打开设置", exact: true }).click();
@@ -53,7 +57,7 @@ export async function assertConversationDesign(page: Page, artifacts: string): P
     await settings.getByRole("button", { name, exact: true }).click();
     await settings.getByRole("heading", { name, exact: true }).waitFor();
   }
-  await settings.getByRole("checkbox", { name: /完成后直接查看成果/ }).uncheck();
+  assert.equal(await settings.getByRole("checkbox", { name: /完成后直接查看成果/ }).count(), 0);
   await settings.getByRole("checkbox", { name: /默认展开工作过程/ }).check();
   await settings.getByRole("button", { name: "模型与账号", exact: true }).click();
   await settings.getByLabel("Task model", { exact: true }).waitFor();

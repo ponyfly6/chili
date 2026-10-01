@@ -1,7 +1,3 @@
-import type { DesktopTimelineItem } from "./view-model.js";
-import type { ChiliRuntimeView } from "@chili/sdk";
-
-export type ConversationView = "chat" | "result" | "split";
 export type SettingsPage = "general" | "models" | "permissions" | "tools" | "memory" | "phone";
 
 export const settingsPages: readonly { id: SettingsPage; label: string; description: string }[] = [
@@ -31,27 +27,6 @@ export function matchingDesktopCommands(text: string): readonly DesktopCommand[]
   if (!/^\/[^\s]*$/.test(text)) return [];
   const query = text.slice(1).toLowerCase();
   return desktopCommands.filter((command) => command.id.startsWith(query));
-}
-
-/** Only completed answer text is a result; tool output and reasoning stay in the conversation. */
-export function completedResults(items: readonly DesktopTimelineItem[], runtime?: Pick<ChiliRuntimeView, "messages" | "turnStatuses">) {
-  const answers = new Map<string, { id: string; text: string }>();
-  for (const item of items) {
-    if (item.kind !== "message" || item.role !== "assistant") continue;
-    const message = runtime?.messages[String(item.id)];
-    const turnId = message?.turnId;
-    // Some providers only complete the turn, without emitting message.completed.
-    const complete = turnId ? runtime?.turnStatuses[String(turnId)] === "completed" : item.completedAt !== undefined;
-    if (!complete) continue;
-    const callsTools = (message?.parts ?? item.parts).some((part) => part.type === "tool_call");
-    const text = item.parts.filter((part) => part.type === "text" && part.phase !== "commentary"
-      && (!callsTools || part.phase === "final_answer"))
-      .map((part) => part.type === "text" ? part.text : "").join("\n\n").trim();
-    // Tool-using providers may emit several unphased messages in one turn.
-    // Keep its final answer, rather than presenting its earlier plan as a result.
-    if (text) answers.set(String(turnId ?? item.id), { id: String(item.id), text });
-  }
-  return [...answers.values()];
 }
 
 export function conversationTitle(prompt: string): string {

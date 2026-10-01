@@ -2,8 +2,8 @@ import { useReadingPreferences } from "./useReadingPreferences.js";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { DesktopSettings, type SessionSettingsValues } from "./DesktopSettings.js";
-import { completedResults, conversationTitle, matchingDesktopCommands,
-  type ConversationView, type DesktopCommand, type SettingsPage } from "./conversation-design.js";
+import { conversationTitle, matchingDesktopCommands,
+  type DesktopCommand, type SettingsPage } from "./conversation-design.js";
 import { ProjectSidebar } from "./ProjectSidebar.js";
 import { AgentDetailsPanel } from "./AgentDetailsPanel.js";
 import { DiffViewer } from "./DiffViewer.js";
@@ -107,11 +107,10 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const buildInfo = getDesktopBuildInfo();
   const { theme, changeTheme, saveFailed: themeSaveFailed, saving: themeSaving } = useDesktopTheme();
   const [settingsPage, setSettingsPage] = useState<SettingsPage>("general");
-  const [view, setView] = useState<ConversationView>("chat");
   const [commandsOpen, setCommandsOpen] = useState(false);
   const [commandIndex, setCommandIndex] = useState(0);
   const [searchOpen, setSearchOpen] = useState(false);
-  const { preferences, ready: preferencesReady, saving: preferencesSaving, saveFailed: preferenceSaveFailed, savePreferences } = useReadingPreferences();
+  const { preferences, saving: preferencesSaving, saveFailed: preferenceSaveFailed, savePreferences } = useReadingPreferences();
   const [projection, setProjection] = useState<DesktopProjection>({
     epoch: 0,
     diffRevision: 0,
@@ -318,24 +317,11 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const selectedGoal = sessionConfig?.goal ?? undefined;
   const canResumeSession = canResumeTask(presentation?.chat.status, selectedGoal?.status, Boolean(selectedArchived), snapshot?.inputQueue?.paused);
   const mcpReloadEnabled = canReloadSessionMcp(selectedId, Boolean(selectedArchived), runtimeActionsDisabled);
-  const results = useMemo(() => completedResults(timelineItems, presentation?.runtime), [timelineItems, presentation?.runtime]);
-  const latestResult = results.at(-1);
   const emptyConversation = !loadingSession && timelineItems.length === 0;
   const commands = commandsOpen ? matchingDesktopCommands(composer.startsWith("/") ? composer : "/") : [];
-  const resultScope = JSON.stringify([desktop.projectId, selectedId]);
-  const observedResult = useRef({ scope: resultScope, id: latestResult?.id, busy: Boolean(sessionBusy) });
   useEffect(() => {
-    if (!preferencesReady) return;
-    const previous = observedResult.current;
-    if (previous.scope !== resultScope) {
-      setView(preferences.autoResult && latestResult && !sessionBusy ? "result" : "chat");
-      setCommandsOpen(false);
-    } else if (preferences.autoResult && latestResult && !sessionBusy
-      && (latestResult.id !== previous.id || previous.busy)) {
-      setView("result");
-    }
-    observedResult.current = { scope: resultScope, id: latestResult?.id, busy: Boolean(sessionBusy) };
-  }, [resultScope, latestResult?.id, sessionBusy, preferences.autoResult, preferencesReady]);
+    setCommandsOpen(false);
+  }, [desktop.projectId, selectedId]);
 
   const openSettings = (page: SettingsPage = "general") => {
     setSettingsPage(page);
@@ -890,7 +876,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       setTaskMenuId(undefined);
       await refreshSessions(created.sessionId);
       setComposer("");
-      setView("chat");
       if (window.innerWidth <= 640) closeSidebar();
       requestAnimationFrame(() => composerRef.current?.focus());
       if (created.failure) throw new Error(createFailureMessage(created));
@@ -1283,7 +1268,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           </footer>
         </aside>
 
-        <section className={`conversation panel ${emptyConversation ? "is-empty" : ""} view-${view}`}>
+        <section className={`conversation panel ${emptyConversation ? "is-empty" : ""}`}>
           <div className="conversation-heading">
             <div className="conversation-title"><h1>{selectedId ? selectedTitle : "新会话"}</h1></div>
             <div className="conversation-heading-actions">
@@ -1292,13 +1277,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
               {selectedId && !selectedArchived ? <button className="icon-button" aria-label="Task runtime settings" title="会话设置" disabled={runtimeActionsDisabled || !sessionConfig} onClick={() => openSettings("models")}><Icon name="more" /></button> : null}
             </div>
           </div>
-          {latestResult ? <div className="conversation-viewbar">
-            <div role="group" aria-label="查看方式">
-              <button aria-pressed={view === "result"} onClick={() => setView("result")}>成果</button>
-              <button aria-pressed={view === "chat"} onClick={() => setView("chat")}>对话</button>
-            </div>
-            <button className="split-view-button" aria-pressed={view === "split"} onClick={() => setView(view === "split" ? "result" : "split")}><Icon name="sidebar" />并排查看</button>
-          </div> : null}
           {selectedArchived ? (
             <div className="read-only-banner" role="status">
               <Icon name="archive" />
@@ -1307,7 +1285,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           ) : null}
 
           <div className="conversation-body">
-          <div className="chat-surface" hidden={Boolean(latestResult) && view === "result"}>
+          <div className="chat-surface">
           <TimelineViewport scopeKey={JSON.stringify([desktop.projectId, desktop.workspace, selectedId])}>
             {loadingSession ? <p className="empty-copy centered">正在恢复会话…</p> : null}
             {!loadingSession && timelineItems.map((item) => <TimelineItem key={`${item.kind}:${item.id}`} item={item} expandWork={preferences.expandWork} />)}
@@ -1318,10 +1296,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
             </div> : null}
           </TimelineViewport>
           </div>
-          {latestResult && view !== "chat" ? <ResultSurface key={resultScope} results={results} busy={Boolean(sessionBusy)}
-            diffText={diffBelongsToScope ? diffView.text : ""} diffLoading={diffLoading || !diffBelongsToScope} diffTruncated={diffView.truncated}
-            diffScope={diffScope} onViewChanges={() => setDiffScope("workspace")}
-            onViewChat={() => setView("chat")} /> : null}
           </div>
 
           {presentation && presentation.pendingApprovals.length > 0 ? (
@@ -1377,7 +1351,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                     else if (composerEditable) void submit("queue");
                   }
                 }}
-                placeholder={selectedArchived ? "已归档的会话仅供查看" : sessionBusy ? "补充想法，或告诉 Chili 调整方向…" : latestResult ? "说说你还想改哪里…" : "说说你想做什么…"}
+                placeholder={selectedArchived ? "已归档的会话仅供查看" : sessionBusy ? "补充想法，或告诉 Chili 调整方向…" : "说说你想做什么…"}
                 aria-expanded={commandsOpen && commands.length > 0}
                 aria-controls={commandsOpen && commands.length > 0 ? "composer-commands" : undefined}
                 aria-activedescendant={commandsOpen && commands.length > 0 ? `command-${commands[commandIndex % commands.length]!.id}` : undefined}
@@ -1417,7 +1391,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
               ["做一个网站", "帮我做一个简洁自然的网站，先了解这个目录，再和我确认具体内容。"],
               ["整理文件", "查看这个目录，给我一个整理文件的建议，先不要移动或删除文件。"],
               ["修改已有作品", "看看这个目录里的作品，告诉我有哪些值得改进的地方。"],
-            ].map(([label, prompt]) => <button key={label} disabled={!composerEditable} onClick={() => { setComposer(prompt!); composerRef.current?.focus(); }}>{label}<span aria-hidden="true">↗</span></button>)}</div> : <p className="composer-key-hint">Enter 发送 · Shift + Enter 换行</p>}
+            ].map(([label, prompt]) => <button key={label} disabled={!composerEditable} onClick={() => { setComposer(prompt!); composerRef.current?.focus(); }}>{label}<span aria-hidden="true">↗</span></button>)}</div> : null}
           </div>
         </section>
 
@@ -1585,7 +1559,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           models={models} disabled={runtimeActionsDisabled || Boolean(selectedArchived)} busy={working} error={error} theme={theme} onTheme={changeTheme}
           themeSaveFailed={themeSaveFailed} themeSaving={themeSaving || preferencesSaving} preferences={preferences} onPreferences={savePreferences} preferenceSaveFailed={preferenceSaveFailed}
           onSave={(values, section) => void saveSessionSettings(values, section)} onReloadMcp={() => void reloadMcp()}
-          onPrompt={(text) => { setSettingsOpen(false); setComposer(text); setView("chat"); requestAnimationFrame(() => composerRef.current?.focus()); }}
+          onPrompt={(text) => { setSettingsOpen(false); setComposer(text); requestAnimationFrame(() => composerRef.current?.focus()); }}
           onNewSession={() => { setSettingsOpen(false); openNewTask(); }} onClose={() => setSettingsOpen(false)} />
       </ModalFrame> : null}
 
@@ -1608,27 +1582,6 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       ) : null}
     </div>
   );
-}
-
-function ResultSurface({ results, busy, diffText, diffLoading, diffTruncated, diffScope, onViewChanges, onViewChat }: {
-  results: readonly { id: string; text: string }[]; busy: boolean; diffText: string; diffLoading: boolean; diffTruncated: boolean; onViewChat: () => void;
-  diffScope: DiffScope; onViewChanges: () => void;
-}) {
-  const [selected, setSelected] = useState<string>();
-  const [changes, setChanges] = useState(false);
-  const current = results.find((result) => result.id === selected) ?? results.at(-1)!;
-  return <section className="result-surface" aria-label="成果">
-    <div className="result-summary"><ChiliMark /><span>{busy ? "Chili 正在继续处理，你可以先查看已有成果。" : "已整理好。看看成果，继续说说想改哪里。"}</span></div>
-    <div className={`result-paper ${changes ? "show-changes" : ""}`}>
-      <header className="result-toolbar"><div role="group" aria-label="成果内容"><button aria-pressed={!changes} onClick={() => setChanges(false)}>回复</button><button aria-pressed={changes} onClick={() => { onViewChanges(); setChanges(true); }}>文件修改</button></div>
-        <select aria-label="查看历史回复" value={current.id} onChange={(event) => setSelected(event.target.value)}>
-          {results.map((result, index) => <option key={result.id} value={result.id}>第 {index + 1} 次回复{index === results.length - 1 ? " · 最新" : ""}</option>)}
-        </select></header>
-      {changes ? <><p className="result-changes-note">{diffScope === "workspace" ? "当前目录尚未提交的改动，可能包含其他会话或手动修改。" : "工作过程面板已切换为当前步骤的改动。"} 与所选历史回复无关。</p><DiffViewer text={diffText} truncated={diffTruncated} loading={diffLoading} /></>
-        : <div className="result-document"><MarkdownText text={current.text} /></div>}
-    </div>
-    <footer className="result-caption"><span>{changes ? "查看具体文件，继续描述你希望调整的地方。" : "成果来自当前会话的实际回复。"}</span><button onClick={onViewChat}><Icon name="message" />查看对话</button></footer>
-  </section>;
 }
 
 function NewTaskDialog({

@@ -3,7 +3,6 @@ import { defaultReadingPreferences, type ReadingPreferences } from "../shared/re
 
 export function useReadingPreferences() {
   const [preferences, setPreferences] = useState({ ...defaultReadingPreferences });
-  const [ready, setReady] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveFailed, setSaveFailed] = useState(false);
   const revision = useRef(0);
@@ -12,7 +11,7 @@ export function useReadingPreferences() {
     const initialRevision = revision.current;
     void window.chiliDesktop.invoke({ type: "reading.get" }).then((next) => {
       if (active && revision.current === initialRevision) setPreferences(next);
-    }).catch(() => { if (active) setSaveFailed(true); }).finally(() => { if (active) setReady(true); });
+    }).catch(() => { if (active) setSaveFailed(true); });
     return () => { active = false; };
   }, []);
   const savePreferences = async (next: ReadingPreferences) => {
@@ -24,5 +23,5 @@ export function useReadingPreferences() {
     catch { if (revision.current === request) setSaveFailed(true); }
     finally { if (revision.current === request) setSaving(false); }
   };
-  return { preferences, ready, saving, saveFailed, savePreferences };
+  return { preferences, saving, saveFailed, savePreferences };
 }

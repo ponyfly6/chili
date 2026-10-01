@@ -184,7 +184,7 @@ async function bootstrap(): Promise<void> {
   desktopIpc = registerDesktopIpc(mainWindow, {
     async invoke(request) {
       if (request.type === "reading.get") return parseDesktopResponse(request, await readingSettings.get());
-      if (request.type === "reading.set") return parseDesktopResponse(request, await readingSettings.set({ autoResult: request.autoResult, expandWork: request.expandWork }));
+      if (request.type === "reading.set") return parseDesktopResponse(request, await readingSettings.set({ expandWork: request.expandWork }));
       if (request.type === "appearance.get") return parseDesktopResponse(request, { theme: await appearanceSettings.getTheme() });
       if (request.type === "appearance.set") {
         const theme = await appearanceSettings.setTheme(request.theme);
