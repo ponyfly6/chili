@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import react from "@vitejs/plugin-react";
 import { defineConfig, externalizeDepsPlugin } from "electron-vite";
+import type { Plugin } from "vite";
 import { desktopBuildMetadata } from "./scripts/build-metadata.js";
 
 const desktopSigningIdentity = process.env.CHILI_DESKTOP_SIGN_IDENTITY?.trim() || "-";
@@ -41,7 +42,7 @@ export default defineConfig({
   renderer: {
     define: buildInfoDefine,
     root: resolve(import.meta.dirname, "src/renderer"),
-    plugins: [react()],
+    plugins: [react(), externalReactPreamble()],
     build: {
       ...(isolatedBuildRoot ? { outDir: resolve(isolatedBuildRoot, "out/renderer") } : {}),
       rollupOptions: {
@@ -50,3 +51,29 @@ export default defineConfig({
     },
   },
 });
+
+/** Keep Fast Refresh compatible with the desktop's no-inline-script policy. */
+function externalReactPreamble(): Plugin {
+  let base = "/";
+  const path = () => `${base}@chili/react-preamble.js`;
+  const source = () => react.preambleCode.replace("__BASE__", base);
+  return {
+    name: "chili:external-react-preamble",
+    apply: "serve",
+    configResolved(config) { base = config.base; },
+    configureServer(server) {
+      server.middlewares.use((request, response, next) => {
+        if (request.url?.split("?")[0] !== path()) return next();
+        response.setHeader("Content-Type", "text/javascript; charset=utf-8");
+        response.end(source());
+      });
+    },
+    transformIndexHtml: {
+      order: "post",
+      handler(html) {
+        return html.replace(`<script type="module">${source()}</script>`,
+          `<script type="module" src="${path()}"></script>`);
+      },
+    },
+  };
+}
