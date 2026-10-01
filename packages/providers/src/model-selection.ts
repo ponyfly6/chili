@@ -2,7 +2,9 @@ import type { ModelDescriptor, ModelSelection, ReasoningLevel, ThinkingLevel } f
 import { REASONING_LEVELS } from "./types.js";
 import {
   CODEX_API_PROVIDER_ID,
-  OPENAI_CODEX_DEFAULT_MODEL,
+  canonicalizeOpenAICodexModel,
+  findKnownModel,
+  isOpenAICodexModel,
   OPENAI_CODEX_PROVIDER_ID,
 } from "./models.js";
 
@@ -155,12 +157,16 @@ function canonicalizeOfficialModelAlias(pattern: string, defaultProvider: string
       ? defaultProvider
       : undefined);
   if (!provider) return pattern;
-  return `${provider}/${OPENAI_CODEX_DEFAULT_MODEL}${suffix}`;
+  return `${provider}/${canonicalizeOpenAICodexModel("gpt-5.6")}${suffix}`;
 }
 
 export function getModelSelectionAvailableReasoningLevels(model: ModelDescriptor | undefined): readonly ReasoningLevel[] {
   if (model && model.capabilities?.reasoning === false) return [];
   if (model?.reasoningLevels !== undefined) return model.reasoningLevels;
+  if (model && isOpenAICodexModel(model.model)) {
+    const known = findKnownModel(OPENAI_CODEX_PROVIDER_ID, canonicalizeOpenAICodexModel(model.model));
+    if (known?.reasoningLevels) return known.reasoningLevels;
+  }
   if (supportsUltraReasoning(model)) return REASONING_LEVELS;
   if (supportsMaxReasoning(model)) return REASONING_LEVELS_THROUGH_MAX;
   return supportsXHighReasoning(model) ? REASONING_LEVELS_THROUGH_XHIGH : REASONING_LEVELS_THROUGH_HIGH;
@@ -191,6 +197,7 @@ export function supportsXHighReasoning(model: ModelDescriptor | string | undefin
   const id = modelId.toLowerCase();
   return (
     id.includes("gpt-5.6") ||
+    /^gpt-6(?:\.1)?-/.test(id) ||
     id.includes("grok-4.6") ||
     id.includes("opus-4-6") ||
     id.includes("opus-4.6") ||
@@ -204,6 +211,7 @@ export function supportsMaxReasoning(model: ModelDescriptor | string | undefined
   if (!modelId) return false;
   const id = modelId.toLowerCase();
   return id.includes("gpt-5.6")
+    || /^gpt-6(?:\.1)?-/.test(id)
     || id.includes("deepseek-v4-")
     || id.includes("kimi-k3")
     || id.includes("glm-5.3");
@@ -213,7 +221,7 @@ export function supportsUltraReasoning(model: ModelDescriptor | string | undefin
   const modelId = typeof model === "string" ? model : model?.model;
   if (!modelId) return false;
   const id = modelId.toLowerCase();
-  return id.includes("gpt-5.6") && !id.includes("gpt-5.6-luna");
+  return (id.includes("gpt-5.6") || /^gpt-6(?:\.1)?-/.test(id)) && !id.endsWith("-luna");
 }
 
 export function formatModelSelection(selection: Pick<ModelSelection, "provider" | "model" | "reasoning">): string {

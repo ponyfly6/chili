@@ -21,9 +21,13 @@ export const XAI_GROK_46_MODEL = "grok-4.6";
 export const XAI_OPENAI_BASE_URL = "https://api.x.ai/v1";
 export const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
 export const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
-export const OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.6-sol";
+export const OPENAI_CODEX_DEFAULT_MODEL = "gpt-6.1-sol";
 export const OPENAI_CODEX_MODELS = [
   OPENAI_CODEX_DEFAULT_MODEL,
+  "gpt-6-astra",
+  "gpt-6-luna",
+  "gpt-6-sol",
+  "gpt-5.6-sol",
   "gpt-5.6-terra",
   "gpt-5.6-luna",
 ] as const;
@@ -69,15 +73,19 @@ export function assertCodexApiModel(model: string): asserts model is CodexApiMod
 
 export function canonicalizeOpenAICodexModel(model: string): OpenAICodexCanonicalModel {
   assertOpenAICodexModel(model);
-  return model === "gpt-5.6" ? OPENAI_CODEX_DEFAULT_MODEL : model;
+  return model === "gpt-5.6" ? "gpt-5.6-sol" : model;
 }
 
 export function canonicalizeCodexApiModel(model: string): CodexApiCanonicalModel {
   assertCodexApiModel(model);
-  return model === "gpt-5.6" ? CODEX_API_DEFAULT_MODEL : model;
+  return model === "gpt-5.6" ? "gpt-5.6-sol" : model;
 }
 
 const OPENAI_CODEX_MODEL_COSTS = {
+  "gpt-6.1-sol": { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
+  "gpt-6-astra": { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
+  "gpt-6-luna": { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
+  "gpt-6-sol": { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
   "gpt-5.6-sol": { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
   "gpt-5.6-terra": { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 2.5 },
   "gpt-5.6-luna": { input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 },
@@ -422,9 +430,11 @@ function codexModelDescriptor(
   model: (typeof OPENAI_CODEX_MODELS)[number],
   baseUrl?: string,
 ): ModelDescriptor {
-  const reasoningLevels = model === "gpt-5.6-luna"
-    ? ["off", "low", "medium", "high", "xhigh", "max"] as const
-    : ["off", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
+  const reasoningLevels = model === "gpt-6.1-sol" || model === "gpt-6-astra"
+    ? ["low", "medium", "high", "xhigh", "max", "ultra"] as const
+    : model.endsWith("-luna")
+      ? ["off", "low", "medium", "high", "xhigh", "max"] as const
+      : ["off", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
   return {
     provider,
     model,

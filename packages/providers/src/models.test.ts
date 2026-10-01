@@ -258,8 +258,12 @@ test("catalog lookups deep-clone nested compatibility maps", () => {
   expect(fresh?.compatibility?.chatCompletions?.reasoningEffortMap?.high).toBe("high");
 });
 
-test("ChatGPT and Codex API catalogs contain only the three canonical GPT-5.6 models", () => {
+test("ChatGPT and Codex API catalogs offer GPT-6 models and retain GPT-5.6 selections", () => {
   const expectedModels: Array<(typeof OPENAI_CODEX_MODELS)[number]> = [
+    "gpt-6.1-sol",
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -272,17 +276,32 @@ test("ChatGPT and Codex API catalogs contain only the three canonical GPT-5.6 mo
   expect(findDefaultKnownModel(OPENAI_CODEX_PROVIDER_ID)).toMatchObject({
     provider: OPENAI_CODEX_PROVIDER_ID,
     model: OPENAI_CODEX_DEFAULT_MODEL,
-    displayName: "GPT-5.6 Sol",
+    displayName: "GPT-6.1 Sol",
     apiFamily: "openai-responses",
     baseUrl: OPENAI_CODEX_BASE_URL,
     default: true,
     inputCapabilities: ["text", "image"],
     contextWindowTokens: 1_050_000,
     maxOutputTokens: 128_000,
-    reasoningLevels: ["off", "low", "medium", "high", "xhigh", "max", "ultra"],
+    reasoningLevels: ["low", "medium", "high", "xhigh", "max", "ultra"],
     serviceTiers: ["standard", "fast"],
-    cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
+    cost: { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
     capabilities: FULL_CAPABILITIES,
+  });
+  expect(findKnownModel(OPENAI_CODEX_PROVIDER_ID, "gpt-6-astra")).toMatchObject({
+    displayName: "GPT-6 Astra",
+    reasoningLevels: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
+  });
+  expect(findKnownModel(OPENAI_CODEX_PROVIDER_ID, "gpt-6-luna")).toMatchObject({
+    displayName: "GPT-6 Luna",
+    reasoningLevels: ["off", "low", "medium", "high", "xhigh", "max"],
+    cost: { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
+  });
+  expect(findKnownModel(OPENAI_CODEX_PROVIDER_ID, "gpt-6-sol")).toMatchObject({
+    displayName: "GPT-6 Sol",
+    reasoningLevels: ["off", "low", "medium", "high", "xhigh", "max", "ultra"],
+    cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
   });
   expect(findKnownModel(OPENAI_CODEX_PROVIDER_ID, "gpt-5.6-terra")).toMatchObject({
     displayName: "GPT-5.6 Terra",
@@ -310,8 +329,8 @@ test("ChatGPT and Codex API catalogs contain only the three canonical GPT-5.6 mo
 test("gpt-5.6 is accepted only as an alias and canonicalizes to GPT-5.6 Sol", () => {
   expect(isOpenAICodexModel("gpt-5.6")).toBe(true);
   expect(isCodexApiModel("gpt-5.6")).toBe(true);
-  expect(canonicalizeOpenAICodexModel("gpt-5.6")).toBe(OPENAI_CODEX_DEFAULT_MODEL);
-  expect(canonicalizeCodexApiModel("gpt-5.6")).toBe(CODEX_API_DEFAULT_MODEL);
+  expect(canonicalizeOpenAICodexModel("gpt-5.6")).toBe("gpt-5.6-sol");
+  expect(canonicalizeCodexApiModel("gpt-5.6")).toBe("gpt-5.6-sol");
   expect(findKnownModel(OPENAI_CODEX_PROVIDER_ID, "gpt-5.6")).toBeUndefined();
   expect(findKnownModel(CODEX_API_PROVIDER_ID, "gpt-5.6")).toBeUndefined();
 

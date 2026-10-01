@@ -201,17 +201,19 @@ Codex 有两条独立的连接，通过 provider 明确区分：
 ChatGPT 订阅里的 Codex 可以通过 TUI 斜杠命令登录：
 
 ```bash
-bun run chili -- serve --provider openai-codex --model gpt-5.6-sol
+bun run chili -- serve --provider openai-codex --model gpt-6.1-sol
 bun run tui
 ```
 
-在 TUI 里执行 `/auth login`，浏览器完成 ChatGPT 登录后，Chili 会把 OAuth 凭据保存到 `~/.chili/auth.json`。这个文件包含 access/refresh token，应按密码处理。`openai-codex` 的默认模型为 `gpt-5.6-sol`：
+在 TUI 里执行 `/auth login`，浏览器完成 ChatGPT 登录后，Chili 会把 OAuth 凭据保存到 `~/.chili/auth.json`。这个文件包含 access/refresh token，应按密码处理。`openai-codex` 的默认模型为 `gpt-6.1-sol`：
 
 ```bash
-bun run chili -- --model openai-codex/gpt-5.6-sol "总结这个仓库"
+bun run chili -- --model openai-codex/gpt-6.1-sol "总结这个仓库"
 ```
 
-GPT 目录只保留 5.6 系列：`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`；官方 alias `gpt-5.6` 会规范化为 `gpt-5.6-sol`。三者均为 1,050,000 context、128,000 最大输出。`off` 会发送 `reasoning.effort=none`，并支持 GPT-5.6 的 `pro` mode 与 persisted-reasoning context 参数。
+ChatGPT 与 Codex API 的默认模型为 `gpt-6.1-sol`，目录还提供 `gpt-6-astra`、`gpt-6-luna`、`gpt-6-sol`，并保留 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`。官方 alias `gpt-5.6` 仍规范化为 `gpt-5.6-sol`，不会随默认模型改变。以上模型均为 1,050,000 context、128,000 最大输出。
+
+GPT-6.1 Sol 和 GPT-6 Astra 的推理档位从 `low` 开始，旧配置中的 `off` / `minimal` 会转换为 `low`；GPT-6 Sol 和 GPT-6 Luna 支持 `off`（发送 `reasoning.effort=none`）。Luna 最高支持 `max`，其余型号保留 Chili 的 `ultra` 选项（请求转换为 `max`）。GPT-6 开启推理时不发送 `temperature`。实际模型访问权限取决于 ChatGPT 账号或 API 服务商。型号与参数核对于 2026-10-01，参见 [OpenAI 模型说明](https://learn.chatgpt.com/docs/models)和 [GPT-6 接入指南](https://developers.openai.com/api/docs/guides/latest-model)。
 
 也可以用 `/auth` 查看 OAuth 状态，或用 `/logout` 删除本地 ChatGPT Codex 凭据。`openai-codex` 是 OAuth-only provider，不从 API key 或自定义 base URL 取凭据。
 
@@ -222,13 +224,13 @@ GPT 目录只保留 5.6 系列：`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna
 ```bash
 CODEX_API_KEY=...
 CODEX_API_BASE_URL=https://gateway.example/v1
-CODEX_API_MODEL=gpt-5.6-sol
+CODEX_API_MODEL=gpt-6.1-sol
 ```
 
 选择该 provider 时，Chili 才会使用这组 API 配置：
 
 ```bash
-bun run chili -- --model codex-api/gpt-5.6-sol "总结这个仓库"
+bun run chili -- --model codex-api/gpt-6.1-sol "总结这个仓库"
 ```
 
 为了平滑迁移，以下旧变量仍作为 `codex-api` 的兼容别名：
@@ -248,8 +250,8 @@ OPENAI_CODEX_MODEL        -> CODEX_API_MODEL
 在 TUI 中可以显式切换两个 provider：
 
 ```text
-/model openai-codex/gpt-5.6-sol
-/model codex-api/gpt-5.6-sol
+/model openai-codex/gpt-6.1-sol
+/model codex-api/gpt-6.1-sol
 /status
 ```
 

@@ -82,12 +82,20 @@ test("built-in picker exposes only current model generations", () => {
     .map(({ model }) => model);
 
   expect(openAIModels).toEqual([
-    "gpt-5.6-sol",
+    "gpt-6.1-sol",
     "gpt-5.6-luna",
-    "gpt-5.6-terra",
     "gpt-5.6-sol",
-    "gpt-5.6-luna",
     "gpt-5.6-terra",
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
+    "gpt-6.1-sol",
+    "gpt-5.6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
   ]);
   expect(models).toContain("minimax/MiniMax-M3");
   expect(models).toContain("kimi/kimi-k3");

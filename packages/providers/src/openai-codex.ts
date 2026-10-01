@@ -872,11 +872,14 @@ function buildCodexResponsesRequestBody(
   const instructions = instructionText(messages, input.system ?? [], input.developer ?? []);
   if (instructions) body.instructions = instructions;
   if (includeMaxOutputTokens && options.maxTokens !== undefined) body.max_output_tokens = options.maxTokens;
-  if (options.temperature !== undefined) body.temperature = options.temperature;
   if (options.sessionId) body.prompt_cache_key = options.sessionId;
   const serviceTier = openAICodexWireServiceTier(options.serviceTier);
   if (serviceTier) body.service_tier = serviceTier;
   const effort = resolveOpenAICodexReasoningEffort(model, options.reasoningEffort);
+  // GPT-6 sampling controls are only accepted with reasoning explicitly disabled.
+  if (options.temperature !== undefined && (!model.startsWith("gpt-6") || effort === "none")) {
+    body.temperature = options.temperature;
+  }
   if (
     effort !== undefined
     || options.reasoningMode !== undefined
@@ -1336,7 +1339,7 @@ export function clampOpenAICodexReasoningEffort(
   effort: ReasoningLevel,
 ): OpenAICodexReasoningEffort {
   const canonicalModel = model === "gpt-5.6" ? canonicalizeOpenAICodexModel(model) : model;
-  const clamped = clampModelReasoningLevel(canonicalModel, effort);
+  const clamped = clampModelReasoningLevel(canonicalModel, effort === "minimal" ? "low" : effort);
   if (clamped === "off") return "none";
   if (clamped === "minimal") return "low";
   if (clamped === "ultra") return "max";

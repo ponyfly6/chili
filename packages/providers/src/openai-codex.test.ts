@@ -29,6 +29,46 @@ import type { ModelStreamEvent, ModelTool } from "./types.js";
 const sessionId = "session_codex" as SessionId;
 const createdAt = 1 as TimestampMs;
 
+test("new Codex sessions default to GPT-6.1 Sol in both authentication modes", () => {
+  expect(createOpenAICodexModel().model).toBe("gpt-6.1-sol");
+  expect(createCodexApiModel({
+    env: {},
+    apiKey: "api-key",
+    baseUrl: "https://gateway.test/v1",
+  }).model).toBe("gpt-6.1-sol");
+});
+
+test("GPT-6 requests respect each model's reasoning and sampling limits", () => {
+  for (const model of ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]) {
+    const requiresReasoning = model === "gpt-6.1-sol" || model === "gpt-6-astra";
+    const offBody = buildOpenAICodexResponsesRequestBody({ messages: [] }, {
+      model,
+      reasoningEffort: "off",
+      temperature: 0.7,
+    });
+    expect(offBody).toMatchObject({
+      model,
+      reasoning: { effort: requiresReasoning ? "low" : "none" },
+    });
+    if (requiresReasoning) expect(offBody).not.toHaveProperty("temperature");
+    else expect(offBody.temperature).toBe(0.7);
+
+    expect(clampOpenAICodexReasoningEffort(model, "minimal")).toBe("low");
+    expect(clampOpenAICodexReasoningEffort(model, "xhigh")).toBe("xhigh");
+    expect(clampOpenAICodexReasoningEffort(model, "ultra")).toBe("max");
+    const defaultBody = buildOpenAICodexResponsesRequestBody({ messages: [] }, { model, temperature: 0.7 });
+    expect(defaultBody).not.toHaveProperty("temperature");
+    expect(defaultBody).not.toHaveProperty("reasoning");
+    const highBody = buildOpenAICodexResponsesRequestBody({ messages: [] }, {
+      model,
+      reasoningEffort: "high",
+      temperature: 0.7,
+    });
+    expect(highBody).toMatchObject({ reasoning: { effort: "high" } });
+    expect(highBody).not.toHaveProperty("temperature");
+  }
+});
+
 test("accepts only cataloged OpenAI Codex models", () => {
   for (const model of OPENAI_CODEX_MODELS) {
     expect(() => createOpenAICodexModel({ model })).not.toThrow();

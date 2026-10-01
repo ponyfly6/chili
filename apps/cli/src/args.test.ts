@@ -232,7 +232,7 @@ test("usage documents team run loop fan-out flag", () => {
   expect(usage()).toContain("--max-concurrent-dispatches <n>");
   expect(usage()).toContain("--max-concurrent-verifications <n>");
   expect(usage()).toContain("openai-codex | codex-api");
-  expect(usage()).toContain("codex-api/gpt-5.6-sol");
+  expect(usage()).toContain("codex-api/gpt-6.1-sol");
   expect(usage()).toContain("xai | grok");
   expect(usage()).toContain("xai/grok-4.6");
 });

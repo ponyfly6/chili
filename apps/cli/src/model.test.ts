@@ -341,7 +341,7 @@ test("CLI runtime model selection resolves explicit provider aliases to concrete
   });
   expect(resolveCliRuntimeModelSelection({ model: "codex" })).toEqual({
     provider: "openai-codex",
-    model: "gpt-5.6-sol",
+    model: "gpt-6.1-sol",
   });
   expect(resolveCliRuntimeModelSelection({ model: "codex-api" })).toEqual({
     provider: "codex-api",
@@ -373,7 +373,7 @@ test("CLI runtime model selection rejects pre-5.6 Codex models", () => {
   process.env.OPENAI_CODEX_MODEL = "gpt-5.3-codex";
   expect(resolveCliRuntimeModelSelection({ model: "codex" })).toEqual({
     provider: "openai-codex",
-    model: "gpt-5.6-sol",
+    model: "gpt-6.1-sol",
   });
   expect(() => resolveCliRuntimeModelSelection({ model: "codex-api" })).toThrow(
     'Unsupported Codex API model "gpt-5.3-codex"',
@@ -397,7 +397,7 @@ test("CLI ChatGPT Codex ignores API env and uses OAuth endpoint and headers", as
     body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     return new Response(
       streamText([
-        data({ type: "response.created", response: { id: "resp_cli", model: "gpt-5.6-sol" } }),
+        data({ type: "response.created", response: { id: "resp_cli", model: "gpt-6.1-sol" } }),
         data({
           type: "response.output_item.done",
           output_index: 0,
@@ -413,7 +413,7 @@ test("CLI ChatGPT Codex ignores API env and uses OAuth endpoint and headers", as
           type: "response.completed",
           response: {
             id: "resp_cli",
-            model: "gpt-5.6-sol",
+            model: "gpt-6.1-sol",
             status: "completed",
             usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3 },
           },
@@ -436,7 +436,7 @@ test("CLI ChatGPT Codex ignores API env and uses OAuth endpoint and headers", as
   expect(headers.get("openai-beta")).toBe("responses=experimental");
   expect(headers.get("session_id")).toBe("session_cli_model");
   expect(body).toMatchObject({
-    model: "gpt-5.6-sol",
+    model: "gpt-6.1-sol",
     prompt_cache_key: "session_cli_model",
   });
   expect(body).not.toHaveProperty("max_output_tokens");
@@ -444,7 +444,7 @@ test("CLI ChatGPT Codex ignores API env and uses OAuth endpoint and headers", as
   expect(events).toContainEqual(expect.objectContaining({
     type: "metadata",
     provider: "openai-codex",
-    model: "gpt-5.6-sol",
+    model: "gpt-6.1-sol",
     contextWindowTokens: 1050000,
     maxOutputTokens: 128000,
   }));
@@ -737,7 +737,7 @@ test("CLI Codex API never falls back to stored ChatGPT OAuth", async () => {
   expect(fetchCalled).toBe(false);
 });
 
-test("CLI model catalog exposes only GPT-5.6 models for both Codex providers", async () => {
+test("CLI model catalog exposes GPT-6 and retained GPT-5.6 models for both Codex providers", async () => {
   process.env.CODEX_API_KEY = "secret-key";
   process.env.CODEX_API_BASE_URL = "https://user:password@gateway.example:8443/v1?api_key=hidden#fragment";
   process.env.CODEX_API_MODEL = "gpt-5.6-sol";
@@ -748,11 +748,19 @@ test("CLI model catalog exposes only GPT-5.6 models for both Codex providers", a
   const api = models.find((model) => model.provider === "codex-api" && model.model === "gpt-5.6-sol");
 
   expect(models.filter((model) => model.provider === "openai-codex").map((model) => model.model)).toEqual([
+    "gpt-6.1-sol",
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
   ]);
   expect(models.filter((model) => model.provider === "codex-api").map((model) => model.model)).toEqual([
+    "gpt-6.1-sol",
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",

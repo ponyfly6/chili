@@ -27,7 +27,7 @@ import {
 import type { ModelDescriptor } from "./types.js";
 
 test("parses current provider/model patterns and optional reasoning suffixes", () => {
-  expect(parseModelSelectionPattern("openai-codex/gpt-5.6-sol:ultra")).toEqual({
+  expect(parseModelSelectionPattern("openai-codex/gpt-6.1-sol:ultra")).toEqual({
     provider: OPENAI_CODEX_PROVIDER_ID,
     model: OPENAI_CODEX_DEFAULT_MODEL,
     reasoning: "ultra",
@@ -56,6 +56,10 @@ test("parses current provider/model patterns and optional reasoning suffixes", (
 
 test("reasoning capability inference recognizes only the current advanced families", () => {
   expect(supportsXHighReasoning(OPENAI_CODEX_DEFAULT_MODEL)).toBe(true);
+  expect(supportsMaxReasoning("gpt-6.1-sol")).toBe(true);
+  expect(supportsUltraReasoning("gpt-6-astra")).toBe(true);
+  expect(supportsUltraReasoning("gpt-6-sol")).toBe(true);
+  expect(supportsUltraReasoning("gpt-6-luna")).toBe(false);
   expect(supportsXHighReasoning(XAI_GROK_46_MODEL)).toBe(true);
   expect(supportsMaxReasoning(DEEPSEEK_V4_PRO_MODEL)).toBe(true);
   expect(supportsMaxReasoning(KIMI_K3_MODEL)).toBe(true);
@@ -101,7 +105,6 @@ test("catalog descriptors define the exact selectable reasoning levels", () => {
     "xhigh",
   ]);
   expect(getModelSelectionAvailableReasoningLevels(model(OPENAI_CODEX_PROVIDER_ID, OPENAI_CODEX_DEFAULT_MODEL))).toEqual([
-    "off",
     "low",
     "medium",
     "high",
@@ -137,7 +140,7 @@ test("resolves current catalog models and clamps reasoning to each model contrac
   expect(resolveModelSelectionPattern("xai/grok-4.6:max", models)).toMatchObject({
     selection: { provider: XAI_PROVIDER_ID, model: XAI_GROK_46_MODEL, reasoning: "xhigh", thinking: "xhigh" },
   });
-  expect(resolveModelSelectionPattern("openai-codex/gpt-5.6-sol:ultra", models)).toMatchObject({
+  expect(resolveModelSelectionPattern("openai-codex/gpt-6.1-sol:ultra", models)).toMatchObject({
     selection: {
       provider: OPENAI_CODEX_PROVIDER_ID,
       model: OPENAI_CODEX_DEFAULT_MODEL,
@@ -145,6 +148,24 @@ test("resolves current catalog models and clamps reasoning to each model contrac
       thinking: "ultra",
     },
   });
+});
+
+test("GPT-6 selection clamps unsupported reasoning in both Codex providers", () => {
+  const models = listKnownModels();
+  for (const provider of [OPENAI_CODEX_PROVIDER_ID, CODEX_API_PROVIDER_ID]) {
+    for (const model of ["gpt-6.1-sol", "gpt-6-astra"]) {
+      expect(resolveModelSelectionPattern(`${provider}/${model}:off`, models)).toMatchObject({
+        selection: { provider, model, reasoning: "low", thinking: "low" },
+      });
+      expect(getModelSelectionAvailableReasoningLevels({ provider, model })).not.toContain("off");
+    }
+    expect(resolveModelSelectionPattern(`${provider}/gpt-6-luna:ultra`, models)).toMatchObject({
+      selection: { provider, model: "gpt-6-luna", reasoning: "max", thinking: "max" },
+    });
+    expect(resolveModelSelectionPattern(`${provider}/gpt-6-luna:off`, models)).toMatchObject({
+      selection: { provider, model: "gpt-6-luna", reasoning: "off", thinking: "off" },
+    });
+  }
 });
 
 test("selection canonicalizes the gpt-5.6 alias for both Codex providers", () => {
@@ -156,7 +177,7 @@ test("selection canonicalizes the gpt-5.6 alias for both Codex providers", () =>
   expect(resolveModelSelectionPattern("openai-codex/gpt-5.6:ultra", models)).toMatchObject({
     selection: {
       provider: OPENAI_CODEX_PROVIDER_ID,
-      model: OPENAI_CODEX_DEFAULT_MODEL,
+      model: "gpt-5.6-sol",
       reasoning: "ultra",
       thinking: "ultra",
     },
@@ -164,7 +185,7 @@ test("selection canonicalizes the gpt-5.6 alias for both Codex providers", () =>
   expect(resolveModelSelectionPattern("codex-api/gpt-5.6:max", models)).toMatchObject({
     selection: {
       provider: CODEX_API_PROVIDER_ID,
-      model: OPENAI_CODEX_DEFAULT_MODEL,
+      model: "gpt-5.6-sol",
       reasoning: "max",
       thinking: "max",
     },
@@ -173,7 +194,7 @@ test("selection canonicalizes the gpt-5.6 alias for both Codex providers", () =>
   expect(resolveModelSelectionPattern("gpt-5.6", models, {
     defaultProvider: CODEX_API_PROVIDER_ID,
   })).toMatchObject({
-    selection: { provider: CODEX_API_PROVIDER_ID, model: OPENAI_CODEX_DEFAULT_MODEL },
+    selection: { provider: CODEX_API_PROVIDER_ID, model: "gpt-5.6-sol" },
   });
 });
 
@@ -230,7 +251,7 @@ test("catalog exposes configured xAI Grok with a sanitized endpoint", () => {
   expect(JSON.stringify(catalog[0])).not.toContain("hidden");
 });
 
-test("catalog exposes ChatGPT auth state and current GPT-5.6 metadata", () => {
+test("catalog exposes ChatGPT auth state and current GPT-6.1 metadata", () => {
   const status = getProviderCatalogStatus(OPENAI_CODEX_PROVIDER_ID, {
     authStatus: {
       configured: true,
@@ -252,17 +273,21 @@ test("catalog exposes ChatGPT auth state and current GPT-5.6 metadata", () => {
     authStatus: { configured: true, authPath: "/tmp/auth.json", type: "oauth" },
   });
   expect(catalog.map((model) => model.model)).toEqual([
+    "gpt-6.1-sol",
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
   ]);
   expect(catalog[0]).toMatchObject({
     providerDisplayName: "ChatGPT",
-    displayName: "GPT-5.6 Sol",
+    displayName: "GPT-6.1 Sol",
     available: true,
     authSource: "oauth",
     endpoint: "https://chatgpt.com",
-    cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
+    cost: { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
   });
 });
 
