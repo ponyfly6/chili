@@ -66,12 +66,16 @@ export class DesktopRemoteControlAdapter implements RemoteControlService {
   }
 
   /** Abort queued/not-yet-executed work when disabling or replacing the bridge. */
-  revoke(): void {
-    this.#controlService.revokeRemoteControlScope(this.#scope);
+  revoke(): Promise<void> {
+    return this.#controlService.revokeRemoteControlScope(this.#scope);
   }
 
-  close(): void {
-    this.revoke();
+  revokeDevice(deviceId: string): Promise<void> {
+    return this.#controlService.revokeRemoteControlDevice(this.#scope, deviceId);
+  }
+
+  close(): Promise<void> {
+    return this.revoke();
   }
 
   async invoke(
@@ -85,18 +89,18 @@ export class DesktopRemoteControlAdapter implements RemoteControlService {
     }
     switch (desktopRequest.type) {
       case "sessions.list":
-        return projectRemoteSessionList(await this.#controlService.invokeRemoteControl(desktopRequest, this.#scope, context.signal));
+        return projectRemoteSessionList(await this.#controlService.invokeRemoteControl(desktopRequest, this.#scope, context.signal, context.idempotencyKey, context.deviceId));
       case "session.snapshot":
-        return projectRemoteSnapshot(await this.#controlService.invokeRemoteControl(desktopRequest, this.#scope, context.signal));
+        return projectRemoteSnapshot(await this.#controlService.invokeRemoteControl(desktopRequest, this.#scope, context.signal, context.idempotencyKey, context.deviceId));
       case "session.send": {
-        const result = await this.#controlService.invokeRemoteControl(desktopRequest, this.#scope, context.signal);
+        const result = await this.#controlService.invokeRemoteControl(desktopRequest, this.#scope, context.signal, context.idempotencyKey, context.deviceId);
         return {
           status: result.status,
           ...(result.position !== undefined ? { position: result.position } : {}),
         };
       }
       case "session.stop": {
-        const result = await this.#controlService.invokeRemoteControl(desktopRequest, this.#scope, context.signal);
+        const result = await this.#controlService.invokeRemoteControl(desktopRequest, this.#scope, context.signal, context.idempotencyKey, context.deviceId);
         return { interrupted: result.interrupted };
       }
     }

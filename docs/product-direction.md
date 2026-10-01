@@ -4,7 +4,7 @@
 
 2026-10-01 更新：**当前以用户能将自己的真实日常工作从 Codex/ChatGPT 迁到本地 Chili 为产品标准。** 公开下载、签名、公证、更新渠道与商业分发后置。围绕持续增强的编码智能体打磨极简且完整的客户端，不限定为表格办公，不以一次演示作为完成。用户允许改变架构、语言和框架；取舍以产品收益及迭代效率为依据。共享 Host 的当前实现与迁移边界见 [`@chili/host`](../packages/host/README.md)。
 
-后续完成 Codex、DeepSeek Harness、Pi 的专项研究和独立设计复核，形成 Host 重设计建议：公共装配与执行状态统一，保留现有核心与存储，通过明确 owner 支持跨端连接；不引入各参考项目完整框架。现已开始实施，批次 A 的公共装配归位见 [`@chili/host`](../packages/host/README.md)：CLI 与 Desktop 使用同一 Host 工厂，TUI 沿用 HTTP/SSE，命令展开和工具限制共用逻辑。持久输入、执行 owner 发现/attach、Memory/Context 重构与独立后台生命周期仍未完成。
+后续完成 Codex、DeepSeek Harness、Pi、OpenCode 的专项研究和独立设计复核，形成 [Host 重设计建议](chili-host-design-2026-10-01.md)：公共装配与执行状态统一，保留现有核心与存储；不引入各参考项目完整框架。现已开始实施，批次 A 的公共装配归位见 [`@chili/host`](../packages/host/README.md)：CLI 与 Desktop 使用同一 Host 工厂，TUI 沿用 HTTP/SSE，命令展开和工具限制共用逻辑。下一优先是持久接纳、后端队列与明确的停止/恢复，同时推进桌面日用能力；完整跨端自动发现不作为客户端产品的前置条件。每个 store 一个逻辑 owner，不预先固定每项目一个后台进程。批次 B 已将持久接纳、提交去重、队列与 Goal 仲裁、停止/恢复接入公共 RuntimeService；桌面读取后端状态，重启恢复要求明确继续并核对未知操作结果。执行 owner 发现/attach、Memory/Context 重构与独立后台生命周期仍未完成。
 
 ## 核心承诺
 
@@ -41,7 +41,7 @@ flowchart LR
 | 当前接线 | 对自主工作的影响 | 演进方向 |
 | --- | --- | --- |
 | [顶层任务](../apps/desktop/src/main/control-service.ts:743) 一律以项目 cwd 创建，[创建参数](../apps/desktop/src/shared/contracts.ts:138) 没有任务工作区绑定 | 多项独立写任务仍共用代码现场，成果与执行目录的归属不完整 | 宿主为任务分配并记录明确的工作区；常规路径自动选择资源策略 |
-| [DesktopControlService](../apps/desktop/src/main/control-service.ts) 在 Electron main 管理内存队列与 Steer；[现有架构](desktop-architecture.md) 明确队列退出后不恢复 | 已交给 AI 的后续意图还依赖某个客户端进程，恢复容易要求用户重述 | 持久保存已接受的输入、执行状态和目标变化，恢复时由 AI 接续 |
+| [RuntimeService](../packages/core/src/runtime-service.ts) 已负责持久输入与 Queue / Steer / Stop；[Host 说明](../packages/host/README.md#durable-root-inputs) 记录恢复边界 | 输入可跨重启保留，但尚无跨进程控制转发及独立驻留 | 验证真实日用恢复，再接最小 owner attach 与成果入口 |
 | 当前桌面主要围绕 Timeline、Activity 与 Changes 展开，见 [App](../apps/desktop/src/renderer/App.tsx:1246) | 用户容易停留在阅读执行记录，难以直接进入当前成果 | 任务关联可用成果和运行入口，逐步将体验、自然语言反馈与继续执行接通 |
 | [Diff 查询](../apps/desktop/src/main/control-service.ts:711) 固定读取项目目录；权限配置也是项目级状态 | 执行位置、成果观察与配置作用范围尚未统一到任务 | 明确项目身份、任务工作区和有效执行配置，让所有操作跟随同一归属 |
 
@@ -81,7 +81,7 @@ AI 应能读项目、修改文件、安装项目所需依赖、启动程序、�
 - **模型**理解意图、阅读与观察、制定并调整计划、实施、排错和委派。
 - **桌面**组织项目与成果，接收自然语言反馈，展示进度和需要用户决定的事项。
 
-共享输入与控制契约经 server / SDK 提供，执行行为归 core，耐久状态归 store。Desktop main 继续负责本机和窗口适配，业务队列逐步移入共享宿主。共享 host 包在边界明确后顺势提取，不先做大规模结构重写。
+共享输入与控制契约经 server / SDK 提供，执行行为归 core，耐久状态归 store。Desktop main 继续负责本机和窗口适配，业务队列已移入共享 RuntimeService，公共装配已归入 host 包。下一步依据实际日用缺口继续接通能力。
 
 代码和输出的来源、版本、权限及范围仍由内部协议准确记录。这些机制支持 AI 自主获取上下文，不需要先做一套让用户管理引用的界面。
 

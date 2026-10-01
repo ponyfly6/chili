@@ -1,6 +1,6 @@
-import { normalizeSessionTitle, type ChiliEvent, type SessionId } from "@chili/protocol";
+import { normalizeSessionTitle, type ChiliEvent, type RuntimeInputQueue, type SessionId } from "@chili/protocol";
 import { resolve } from "node:path";
-import { reduceRuntimeEvents, ReplayableRuntimeEventWindowAccumulator } from "@chili/sdk";
+import { reduceRuntimeEvents, ReplayableRuntimeEventWindowAccumulator, RuntimeHttpError } from "@chili/sdk";
 import type {
   RuntimeAgentMailboxRecord,
   RuntimeAgentRunRecord,
@@ -25,13 +25,6 @@ import { DetachedProcessGroupRegistry } from "./detached-process-group-registry.
 import { desktopDiff } from "./git-diff.js";
 import type { SidecarManager } from "./sidecar-manager.js";
 
-interface QueuedPrompt {
-  text: string;
-  mode: SendMode;
-  bytes: number;
-  origin: "local" | "remote";
-}
-
 interface BusySessionState {
   controlEpoch: number;
   sidecarGeneration: number;
@@ -47,11 +40,6 @@ interface ClientLease {
   readTimeoutMs: number;
   /** Read-only budget shared by remote membership and send preflight; never aborts a write. */
   readDeadlineAt?: number;
-}
-
-interface GoalResumeMarker {
-  controlEpoch: number;
-  sidecarGeneration: number;
 }
 
 export interface DesktopControlServiceOptions {
@@ -94,30 +82,20 @@ const MAX_PENDING_SENDS_PER_SESSION = 8;
 const MAX_PENDING_SENDS_GLOBAL = 64;
 const MAX_PENDING_STOPS_PER_SESSION = 2;
 const MAX_PENDING_STOPS_GLOBAL = 16;
-const MAX_QUEUED_PROMPTS_PER_SESSION = 64;
-const MAX_QUEUED_PROMPTS_GLOBAL = 256;
-const MAX_QUEUED_PROMPT_BYTES_PER_SESSION = 2_000_000;
-const MAX_QUEUED_PROMPT_BYTES_GLOBAL = 8_000_000;
-
 type SessionActorAdmission = "internal" | "send" | "stop";
 
 export class DesktopControlService {
-  private readonly queues = new Map<string, QueuedPrompt[]>();
-  private readonly queuedBytesBySession = new Map<string, number>();
+  private readonly inputQueues = new Map<string, RuntimeInputQueue>();
   private readonly busySessions = new Map<string, BusySessionState>();
-  private readonly flushingSessions = new Map<string, ClientLease>();
   private readonly sessionActors = new Map<string, Promise<void>>();
   private workspaceActor: Promise<void> = Promise.resolve();
   private readonly observedEventIds = new Map<string, Set<string>>();
-  private readonly resumeGoalsAfterDrain = new Map<string, GoalResumeMarker>();
   private readonly remoteDeliveryUnknown = new Set<string>();
   private controlEpoch = 0;
   private controlEpochController = new AbortController();
   private switchingWorkspace = false;
   private workspaceSelectionsPending = 0;
   private closing = false;
-  private queuedPromptCount = 0;
-  private queuedPromptBytes = 0;
   private pendingSendOperations = 0;
   private pendingStopOperations = 0;
   private readonly pendingSendsBySession = new Map<string, number>();
@@ -125,9 +103,13 @@ export class DesktopControlService {
   private readonly mainProcessGroups: DetachedProcessGroupRegistry;
   private mainProcessContainment: Promise<void> | undefined;
   private readonly controlReadTimeoutMs: number;
+  private hydratedGeneration: number | undefined;
   private readonly remoteScopes = new WeakMap<DesktopRemoteControlScope, {
     lease: ClientLease;
     controller: AbortController;
+    source: string;
+    sessions: Map<string, Set<string>>;
+    revokedSources: Set<string>;
   }>();
 
   constructor(private readonly options: DesktopControlServiceOptions) {
@@ -163,7 +145,7 @@ export class DesktopControlService {
     const controller = new AbortController();
     const signal = AbortSignal.any([lease.signal, controller.signal]);
     const scope = Object.freeze({ workspace: this.requireWorkspace(), signal });
-    this.remoteScopes.set(scope, { lease: { ...lease, signal }, controller });
+    this.remoteScopes.set(scope, { lease: { ...lease, signal }, controller, source: `remote:${crypto.randomUUID()}`, sessions: new Map(), revokedSources: new Set() });
     return scope;
   }
 
@@ -175,27 +157,54 @@ export class DesktopControlService {
     this.assertClientLease(lease);
   }
 
-  revokeRemoteControlScope(scope: DesktopRemoteControlScope): void {
-    this.remoteScopes.get(scope)?.controller.abort(new Error("Remote control was disabled"));
-    this.remoteScopes.delete(scope);
+  revokeRemoteControlScope(scope: DesktopRemoteControlScope): Promise<void> {
+    const state = this.remoteScopes.get(scope);
+    state?.controller.abort(new Error("Remote control was disabled"));
+    if (!state) return Promise.resolve();
+    return this.revokeRemoteSources(state, [...state.sessions.keys()]).then(() => {
+      this.remoteScopes.delete(scope);
+    });
+  }
+
+  revokeRemoteControlDevice(scope: DesktopRemoteControlScope, deviceId: string): Promise<void> {
+    const state = this.remoteScopes.get(scope);
+    if (!state) return Promise.resolve();
+    return this.revokeRemoteSources(state, [`${state.source}:${deviceId}`]);
+  }
+
+  private async revokeRemoteSources(
+    state: { lease: ClientLease; sessions: Map<string, Set<string>>; revokedSources: Set<string> },
+    sources: string[],
+  ): Promise<void> {
+    for (const source of sources) state.revokedSources.add(source);
+    const results = await Promise.allSettled(sources.flatMap((source) =>
+      [...(state.sessions.get(source) ?? [])].map(async (sessionId) => {
+        const queue = await state.lease.client.cancelInputsFromSource({ sessionId: sessionId as SessionId, source });
+        if (this.isCurrentEpoch(state.lease.controlEpoch, state.lease.sidecarGeneration)) this.observeInputQueue(queue);
+      })));
+    const failure = results.find((result) => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
+    for (const source of sources) state.sessions.delete(source);
   }
 
   /**
    * Every remote operation resolves membership using the original workspace lease.
-   * Sends and stops still use the local window's service actors and prompt queue.
+   * Sends and stops use the local window's service actors and the runtime queue.
    * Snapshot reads never enter those actors or fetch subagent session contents.
    */
   async invokeRemoteControl<Request extends DesktopRemoteControlRequest>(
     request: Request,
     scope: DesktopRemoteControlScope,
     signal?: AbortSignal,
+    submissionId?: string,
+    deviceId?: string,
   ): Promise<DesktopRemoteControlResponse<Request>> {
     this.assertRemoteControlScope(scope);
     const scopedLease = this.remoteScopes.get(scope)!.lease;
     const lease = signal ? { ...scopedLease, signal: AbortSignal.any([scopedLease.signal, signal]) } : scopedLease;
     this.assertClientLease(lease);
     if (request.type === "session.send" || request.type === "session.stop") {
-      return await this.invokeRemoteMutation(request, scope, lease) as DesktopRemoteControlResponse<Request>;
+      return await this.invokeRemoteMutation(request, scope, lease, submissionId, deviceId) as DesktopRemoteControlResponse<Request>;
     }
     const sessions = await this.readRemoteSessions(scope, lease);
     if (request.type === "sessions.list") {
@@ -228,6 +237,8 @@ export class DesktopControlService {
     request: DesktopRemoteMutationRequest,
     scope: DesktopRemoteControlScope,
     lease: ClientLease,
+    submissionId?: string,
+    deviceId?: string,
   ): Promise<DesktopResponse<DesktopRemoteMutationRequest>> {
     // Reserve capacity and actor order before the first await. Membership reads
     // may finish out of order; local and remote writes must not do so.
@@ -245,10 +256,18 @@ export class DesktopControlService {
         const session = sessions.find((candidate) => String(candidate.id) === request.sessionId);
         if (!session) throw new Error("Task is not available for remote control in this workspace");
         if (session.status !== "active") throw new Error("Archived tasks cannot be controlled remotely");
+        const remote = this.remoteScopes.get(scope)!;
+        const source = deviceId ? `${remote.source}:${deviceId}` : remote.source;
+        if (remote.revokedSources.has(source)) throw new Error("Remote device authorization was revoked");
+        if (request.type === "session.send") {
+          const sessions = remote.sessions.get(source) ?? new Set<string>();
+          sessions.add(request.sessionId);
+          remote.sessions.set(source, sessions);
+        }
         // send's remaining preflight uses the same read budget. Neither this
         // budget nor waiting for an earlier write expires an authorized Stop.
         return request.type === "session.send"
-          ? this.send(request.sessionId, request.text, request.mode, readLease, "remote")
+          ? this.send(request.sessionId, request.text, request.mode, readLease, source, submissionId)
           : this.stop(request.sessionId, lease);
       });
       this.assertRemoteControlScope(scope);
@@ -264,7 +283,7 @@ export class DesktopControlService {
     lease: ClientLease,
   ): Promise<DesktopRemoteRootSnapshot> {
     const sessionId = session.id;
-    const [eventWindow, inputs] = await boundedControlRead(lease, (signal) => Promise.all([
+    const [eventWindow, inputs, queue] = await boundedControlRead(lease, (signal) => Promise.all([
       (async () => {
         if (lease.client.sessionEventWindow) {
           return lease.client.sessionEventWindow({ sessionId, limit: 5_000, signal });
@@ -277,12 +296,13 @@ export class DesktopControlService {
         return { events, pendingApprovals: approvals, truncated: false, approvalsTruncated: false };
       })(),
       lease.client.listUserInputs({ sessionId, signal }),
+      lease.client.inputQueue({ sessionId, signal }),
     ]));
     this.assertClientLease(lease);
     return {
       session,
       events: eventWindow.events,
-      queuedCount: this.queues.get(String(sessionId))?.length ?? 0,
+      queuedCount: queue.pendingCount,
       deliveryUnknown: this.remoteDeliveryUnknown.has(String(sessionId)),
       needsDesktop: {
         approval: eventWindow.pendingApprovals.length > 0
@@ -296,7 +316,6 @@ export class DesktopControlService {
   beginShutdown(): void {
     if (this.closing) return;
     this.closing = true;
-    this.resumeGoalsAfterDrain.clear();
     this.remoteDeliveryUnknown.clear();
     this.controlEpochController.abort(new Error("Desktop is closing"));
     this.mainProcessContainment = this.mainProcessGroups.close();
@@ -329,6 +348,10 @@ export class DesktopControlService {
     void this.withSessionActor(sessionId, async () => {
       if (!this.isCurrentEpoch(controlEpoch, sidecarGeneration)) return;
       this.recordObservedEvent(sessionId, event.id);
+      if (event.type === "session.input_queue_changed") {
+        this.observeInputQueue(event.payload);
+        return;
+      }
       const current = this.busySessions.get(sessionId);
       if (event.type === "turn.started") {
         if (!current || !current.baselineEventIds.has(event.id)) {
@@ -359,43 +382,45 @@ export class DesktopControlService {
       }
       if (current?.awaitingTurnStart && current.baselineEventIds.has(event.id)) return;
       this.busySessions.delete(sessionId);
-      const lease = this.tryCaptureClientLease(controlEpoch, sidecarGeneration);
-      if (lease) await this.flushInsideActor(sessionId, lease);
+
     });
   }
 
   observeState(state: DesktopState, sidecarGeneration: number): void {
-    if (this.closing || state.sidecar.phase !== "healthy") return;
-    const controlEpoch = this.controlEpoch;
-    for (const sessionId of this.queues.keys()) {
-      void this.withSessionActor(sessionId, async () => {
-        const lease = this.tryCaptureClientLease(controlEpoch, sidecarGeneration);
-        if (lease) await this.flushInsideActor(sessionId, lease);
-      });
-    }
+    if (this.closing) return;
+    if (state.sidecar.phase !== "healthy") { this.hydratedGeneration = undefined; return; }
+    if (this.hydratedGeneration === sidecarGeneration) return;
+    const lease = this.tryCaptureClientLease(this.controlEpoch, sidecarGeneration);
+    if (!lease) return;
+    this.hydratedGeneration = sidecarGeneration;
+    void boundedControlRead(lease, (signal) => lease.client.listSessions({ signal })).then(async (sessions) => {
+      for (const session of sessions) {
+        if (session.source === "subagent" || session.status !== "active") continue;
+        const queue = await boundedControlRead(lease, (signal) => lease.client.inputQueue({ sessionId: session.id, signal }));
+        this.assertClientLease(lease);
+        this.observeInputQueue(queue);
+      }
+    }).catch((error: unknown) => { if (this.isClientLeaseCurrent(lease)) this.options.onError(error instanceof Error ? error : new Error(String(error))); });
+  }
+
+  private observeInputQueue(queue: RuntimeInputQueue): void {
+    const previous = this.inputQueues.get(queue.sessionId);
+    if (previous && previous.revision >= queue.revision) return;
+    this.inputQueues.set(queue.sessionId, queue);
+    this.updateQueueCount(queue.sessionId, queue.pendingCount);
   }
 
   clearQueues(): void {
-    for (const sessionId of this.queues.keys()) this.updateQueueCount(sessionId, 0);
-    this.queues.clear();
-    this.queuedBytesBySession.clear();
-    this.queuedPromptCount = 0;
-    this.queuedPromptBytes = 0;
+    this.hydratedGeneration = undefined;
+    for (const sessionId of this.inputQueues.keys()) this.updateQueueCount(sessionId, 0);
+    this.inputQueues.clear();
     this.busySessions.clear();
-    this.flushingSessions.clear();
     this.observedEventIds.clear();
-    this.resumeGoalsAfterDrain.clear();
     this.remoteDeliveryUnknown.clear();
   }
 
   private clearSessionQueue(sessionId: string): void {
-    const queue = this.queues.get(sessionId);
-    if (queue) {
-      for (const prompt of queue) this.releaseQueuedPrompt(sessionId, prompt);
-    }
-    this.queues.delete(sessionId);
-    this.queuedBytesBySession.delete(sessionId);
-    this.resumeGoalsAfterDrain.delete(sessionId);
+    this.inputQueues.delete(sessionId);
     this.updateQueueCount(sessionId, 0);
   }
 
@@ -474,14 +499,9 @@ export class DesktopControlService {
         if (goal?.status === "budgetLimited") {
           throw new Error("Increase the Goal token budget before resuming this task");
         }
-        if (goal?.status === "active" || goal?.status === "paused") {
-          if (await this.isBusy(request.sessionId, lease)) {
-            throw new Error("Wait for the current run to stop before resuming this Goal");
-          }
-          await lease.client.updateGoal({ sessionId, status: "active", signal: lease.signal });
-          this.assertClientLease(lease);
-          this.markOptimisticBusy(request.sessionId, lease);
-        }
+        const queue = await lease.client.resumeInputs({ sessionId, signal: lease.signal });
+        this.assertClientLease(lease);
+        this.observeInputQueue(queue);
         return this.sessionSnapshot(sessionId, lease);
       });
     }
@@ -610,7 +630,6 @@ export class DesktopControlService {
     if (request.type === "session.goal.set") {
       const lease = this.captureClientLease();
       return this.withSessionActor(request.sessionId, async () => {
-        this.resumeGoalsAfterDrain.delete(request.sessionId);
         const goal = await lease.client.setGoal({
           sessionId: request.sessionId as SessionId,
           objective: request.objective,
@@ -628,9 +647,6 @@ export class DesktopControlService {
         if (request.status === "active" && await this.isBusy(request.sessionId, lease)) {
           throw new Error("Wait for the current run to stop before resuming this Goal");
         }
-        if (request.status !== undefined && request.status !== "active") {
-          this.resumeGoalsAfterDrain.delete(request.sessionId);
-        }
         const goal = await lease.client.updateGoal({
           sessionId: request.sessionId as SessionId,
           ...(request.status !== undefined ? { status: request.status } : {}),
@@ -645,7 +661,6 @@ export class DesktopControlService {
     if (request.type === "session.goal.clear") {
       const lease = this.captureClientLease();
       return this.withSessionActor(request.sessionId, async () => {
-        this.resumeGoalsAfterDrain.delete(request.sessionId);
         const result = await lease.client.clearGoal({
           sessionId: request.sessionId as SessionId,
           signal: lease.signal,
@@ -679,7 +694,7 @@ export class DesktopControlService {
       const lease = this.captureClientLease();
       return this.withSessionActor(
         request.sessionId,
-        () => this.send(request.sessionId, request.text, request.mode, lease),
+        () => this.send(request.sessionId, request.text, request.mode, lease, "local", request.submissionId),
         "send",
       );
     }
@@ -908,7 +923,11 @@ export class DesktopControlService {
     pendingInputs: SessionControlSnapshot["inputs"];
     truncated?: boolean;
     warning?: string;
+    inputQueue?: RuntimeInputQueue;
   }> {
+    let inputQueue = await boundedControlRead(lease, (signal) => lease.client.inputQueue({ sessionId, signal }));
+    this.assertClientLease(lease);
+    this.observeInputQueue(inputQueue);
     const pendingSessionIds: SessionId[] = [sessionId];
     const discoveredSessionIds = new Set<string>([sessionId]);
     const sessionOrder = new Map<string, number>([[sessionId, 0]]);
@@ -1033,10 +1052,15 @@ export class DesktopControlService {
 
     this.assertClientLease(lease);
     const retainedEvents = events.result();
+    for (const event of retainedEvents.events) {
+      if (event.type === "session.input_queue_changed" && event.sessionId === sessionId && event.payload.revision > inputQueue.revision) inputQueue = event.payload;
+    }
+    this.observeInputQueue(inputQueue);
     if (retainedEvents.truncated) warnings.add("timeline events exceeded their desktop snapshot budget");
     const result = {
       sessionId: String(sessionId),
       events: retainedEvents.events,
+      inputQueue,
       agentTree: mergeAgentTrees(retainedAgentTrees),
       tasks: tasks.values(),
       pendingApprovals: approvals.values()
@@ -1054,116 +1078,46 @@ export class DesktopControlService {
 
   private async stop(sessionId: string, lease: ClientLease): Promise<{ interrupted: boolean }> {
     this.assertClientLease(lease);
-    this.resumeGoalsAfterDrain.delete(sessionId);
-    const previous = this.busySessions.get(sessionId);
-    if (!previous) {
-      this.busySessions.set(sessionId, {
-        controlEpoch: lease.controlEpoch,
-        sidecarGeneration: lease.sidecarGeneration,
-        awaitingTurnStart: false,
-        baselineEventIds: new Set(this.observedEventIds.get(sessionId)),
-      });
-    }
-    try {
-      const result = await lease.client.interruptSession({
-        sessionId: sessionId as SessionId,
-        reason: "desktop_stop",
-        signal: lease.signal,
-      });
-      this.assertClientLease(lease);
-      if (!result.interrupted) {
-        this.busySessions.delete(sessionId);
-        this.scheduleFlush(sessionId);
-      }
-      return result;
-    } catch (error) {
-      if (!previous) this.deleteBusyIfOwned(sessionId, lease);
-      throw error;
-    }
+    const result = await lease.client.interruptSession({
+      sessionId: sessionId as SessionId, reason: "desktop_stop", signal: lease.signal,
+    });
+    this.assertClientLease(lease);
+    this.remoteDeliveryUnknown.delete(sessionId);
+    const queue = await boundedControlRead(lease, (signal) => lease.client.inputQueue({ sessionId: sessionId as SessionId, signal }));
+    this.assertClientLease(lease);
+    this.observeInputQueue(queue);
+    return result;
   }
 
   private async send(
-    sessionId: string,
-    text: string,
-    mode: SendMode,
-    lease: ClientLease,
-    origin: QueuedPrompt["origin"] = "local",
+    sessionId: string, text: string, mode: SendMode, lease: ClientLease,
+    origin: string = "local", submissionId: string = crypto.randomUUID(),
   ): Promise<{ status: "accepted" | "queued"; position?: number }> {
     this.assertClientLease(lease);
-    // One deadline covers all preflight reads, so two slow reads cannot each
-    // consume a full deadline ahead of Stop. Mutations use the original lease.
-    const { busy, resumeGoalAfterDrain } = await boundedControlRead(lease, async (signal) => {
-      const readLease = { ...lease, signal };
-      const busy = await this.isBusy(sessionId, readLease);
-      // Even the optimistic in-memory busy fast path yields at this await.
-      this.assertClientLease(readLease);
-      const goal = mode === "steer"
-        ? await lease.client.getGoal({ sessionId: sessionId as SessionId, signal })
-        : undefined;
-      this.assertClientLease(readLease);
-      return { busy, resumeGoalAfterDrain: goal?.status === "active" };
-    });
+    const input = { sessionId: sessionId as SessionId, text, mode, submissionId, inputSource: origin, signal: lease.signal };
+    let accepted;
+    try {
+      accepted = await lease.client.submitPromptAsync(input);
+    } catch (error) {
+      // The same ID can be safely queried after a lost response. Never invent a
+      // replacement ID or put the body in a second, client-owned queue.
+      if (error instanceof RuntimeHttpError && error.status < 500) throw error;
+      this.assertClientLease(lease);
+      const saved = await boundedControlRead(lease, (signal) => lease.client.getInput({ sessionId: input.sessionId, submissionId, signal })).catch(() => undefined);
+      this.assertClientLease(lease);
+      if (!saved) throw error;
+      accepted = { status: "accepted" as const, sessionId: input.sessionId, input: saved,
+        queue: await boundedControlRead(lease, (signal) => lease.client.inputQueue({ sessionId: input.sessionId, signal })) };
+    }
     this.assertClientLease(lease);
-    let queue = this.queues.get(sessionId) ?? [];
-    if (!busy && !resumeGoalAfterDrain && queue.length === 0) {
-      this.markOptimisticBusy(sessionId, lease);
-      try {
-        this.assertClientLease(lease);
-        await lease.client.submitPromptAsync({ sessionId: sessionId as SessionId, text, signal: lease.signal });
-        this.assertClientLease(lease);
-        return { status: "accepted" };
-      } catch (error) {
-        this.deleteBusyIfOwned(sessionId, lease);
-        throw error;
-      }
+    if (!accepted.input || !accepted.queue) throw new Error("Runtime does not support durable input receipts; restart Chili");
+    this.observeInputQueue(accepted.queue);
+    if (accepted.input.state === "pending") {
+      const position = accepted.queue.items.filter((item) => item.state === "pending").findIndex((item) => item.inputId === accepted.input!.inputId) + 1;
+      return { status: "queued", position };
     }
-
-    const prompt: QueuedPrompt = { text, mode, bytes: Buffer.byteLength(text, "utf8"), origin };
-    this.enqueuePrompt(sessionId, prompt, mode === "steer");
-    queue = this.queues.get(sessionId) ?? [];
-    this.updateQueueCount(sessionId, queue.length);
-    if (mode === "steer") {
-      if (resumeGoalAfterDrain) {
-        this.resumeGoalsAfterDrain.set(sessionId, {
-          controlEpoch: lease.controlEpoch,
-          sidecarGeneration: lease.sidecarGeneration,
-        });
-      }
-      try {
-        this.assertClientLease(lease);
-        const result = await lease.client.interruptSession({
-          sessionId: sessionId as SessionId,
-          reason: "desktop_steer",
-          signal: lease.signal,
-        });
-        this.assertClientLease(lease);
-        if (!result.interrupted) {
-          if (resumeGoalAfterDrain) {
-            await lease.client.updateGoal({
-              sessionId: sessionId as SessionId,
-              status: "paused",
-              signal: lease.signal,
-            });
-            this.assertClientLease(lease);
-          }
-          this.busySessions.delete(sessionId);
-          this.scheduleFlush(sessionId);
-        }
-      } catch (error) {
-        if (resumeGoalAfterDrain) this.resumeGoalsAfterDrain.delete(sessionId);
-        if (!this.isClientLeaseCurrent(lease)) throw error;
-        const queuedIndex = queue.indexOf(prompt);
-        if (queuedIndex >= 0) {
-          queue.splice(queuedIndex, 1);
-          this.releaseQueuedPrompt(sessionId, prompt);
-        }
-        if (queue.length === 0) this.queues.delete(sessionId);
-        this.updateQueueCount(sessionId, queue.length);
-        throw error;
-      }
-    }
-    if (!busy) this.scheduleFlush(sessionId);
-    return { status: "queued", position: mode === "steer" ? 1 : queue.length };
+    if (accepted.input.state === "claimed") this.markOptimisticBusy(sessionId, lease);
+    return { status: "accepted" };
   }
 
   private async isBusy(sessionId: string, lease: ClientLease): Promise<boolean> {
@@ -1191,113 +1145,6 @@ export class DesktopControlService {
       });
     }
     return busy;
-  }
-
-  private async flush(sessionId: string): Promise<void> {
-    if (this.closing || this.switchingWorkspace) return;
-    let lease: ClientLease;
-    try {
-      lease = this.captureClientLease();
-    } catch (error) {
-      if (this.closing || this.switchingWorkspace) return;
-      throw error;
-    }
-    try {
-      await this.withSessionActor(sessionId, () => this.flushInsideActor(sessionId, lease));
-    } catch (error) {
-      if (!this.isClientLeaseCurrent(lease)) return;
-      throw error;
-    }
-  }
-
-  private scheduleFlush(sessionId: string): void {
-    void this.flush(sessionId).catch((error) => {
-      this.options.onError(error instanceof Error ? error : new Error(String(error)));
-    });
-  }
-
-  private async flushInsideActor(sessionId: string, lease: ClientLease): Promise<void> {
-    this.assertClientLease(lease);
-    const busy = this.busySessions.get(sessionId);
-    if (busy && (
-      busy.controlEpoch !== lease.controlEpoch
-      || busy.sidecarGeneration !== lease.sidecarGeneration
-    )) this.busySessions.delete(sessionId);
-    if (this.flushingSessions.has(sessionId) || this.busySessions.has(sessionId)) return;
-    const queue = this.queues.get(sessionId);
-    const next = queue?.shift();
-    if (!queue || !next) {
-      this.queues.delete(sessionId);
-      this.updateQueueCount(sessionId, 0);
-      await this.resumeGoalAfterQueueDrain(sessionId, lease);
-      return;
-    }
-    this.releaseQueuedPrompt(sessionId, next);
-    this.flushingSessions.set(sessionId, lease);
-    this.updateQueueCount(sessionId, queue.length);
-    try {
-      this.markOptimisticBusy(sessionId, lease);
-      await lease.client.submitPromptAsync({
-        sessionId: sessionId as SessionId,
-        text: next.text,
-        signal: lease.signal,
-      });
-      this.assertClientLease(lease);
-    } catch (error) {
-      if (next.origin === "remote" && !this.closing && !this.switchingWorkspace && lease.controlEpoch === this.controlEpoch) {
-        this.remoteDeliveryUnknown.add(sessionId);
-      }
-      if (this.isClientLeaseCurrent(lease)) {
-        if (next.origin === "remote") {
-          // The runtime may have committed the prompt before its HTTP response
-          // was lost. Never convert that uncertainty into a second execution.
-          if (queue.length === 0) this.queues.delete(sessionId);
-          // Keep optimistic busy until a runtime event or explicit Stop settles
-          // the original run, so remaining queued prompts do not race it.
-        } else {
-          this.deleteBusyIfOwned(sessionId, lease);
-          queue.unshift(next);
-          this.accountQueuedPrompt(sessionId, next);
-        }
-        this.updateQueueCount(sessionId, queue.length);
-        this.options.onError(next.origin === "remote"
-          ? new Error("Remote queued message result is unknown; it may have started. Check the task before sending it again.")
-          : error instanceof Error ? error : new Error(String(error)));
-      }
-    } finally {
-      if (this.flushingSessions.get(sessionId) === lease) this.flushingSessions.delete(sessionId);
-    }
-  }
-
-  private async resumeGoalAfterQueueDrain(sessionId: string, lease: ClientLease): Promise<void> {
-    const marker = this.resumeGoalsAfterDrain.get(sessionId);
-    if (
-      !marker
-      || marker.controlEpoch !== lease.controlEpoch
-      || marker.sidecarGeneration !== lease.sidecarGeneration
-    ) return;
-    this.resumeGoalsAfterDrain.delete(sessionId);
-    try {
-      this.assertClientLease(lease);
-      const goal = await boundedControlRead(lease, (signal) => lease.client.getGoal({ sessionId: sessionId as SessionId, signal }));
-      this.assertClientLease(lease);
-      if (goal?.status !== "paused") return;
-      await lease.client.updateGoal({
-        sessionId: sessionId as SessionId,
-        status: "active",
-        signal: lease.signal,
-      });
-      this.assertClientLease(lease);
-      this.markOptimisticBusy(sessionId, lease);
-    } catch (error) {
-      if (this.isClientLeaseCurrent(lease)) {
-        this.resumeGoalsAfterDrain.set(sessionId, marker);
-        // Keep an empty queue key so a later healthy sidecar state retries the
-        // deferred Goal resume without resubmitting the steer prompt.
-        this.queues.set(sessionId, []);
-        this.options.onError(error instanceof Error ? error : new Error(String(error)));
-      }
-    }
   }
 
   private withSessionActor<T>(
@@ -1340,40 +1187,6 @@ export class DesktopControlService {
       if (admission === "send") this.pendingSendOperations -= 1;
       else this.pendingStopOperations -= 1;
     };
-  }
-
-  private enqueuePrompt(sessionId: string, prompt: QueuedPrompt, front: boolean): void {
-    const queue = this.queues.get(sessionId) ?? [];
-    const sessionBytes = this.queuedBytesBySession.get(sessionId) ?? 0;
-    if (
-      queue.length >= MAX_QUEUED_PROMPTS_PER_SESSION
-      || this.queuedPromptCount >= MAX_QUEUED_PROMPTS_GLOBAL
-      || sessionBytes + prompt.bytes > MAX_QUEUED_PROMPT_BYTES_PER_SESSION
-      || this.queuedPromptBytes + prompt.bytes > MAX_QUEUED_PROMPT_BYTES_GLOBAL
-    ) {
-      throw new Error("Desktop prompt queue capacity exceeded");
-    }
-    if (front) queue.unshift(prompt);
-    else queue.push(prompt);
-    this.queues.set(sessionId, queue);
-    this.accountQueuedPrompt(sessionId, prompt);
-  }
-
-  private accountQueuedPrompt(sessionId: string, prompt: QueuedPrompt): void {
-    this.queuedPromptCount += 1;
-    this.queuedPromptBytes += prompt.bytes;
-    this.queuedBytesBySession.set(
-      sessionId,
-      (this.queuedBytesBySession.get(sessionId) ?? 0) + prompt.bytes,
-    );
-  }
-
-  private releaseQueuedPrompt(sessionId: string, prompt: QueuedPrompt): void {
-    this.queuedPromptCount = Math.max(0, this.queuedPromptCount - 1);
-    this.queuedPromptBytes = Math.max(0, this.queuedPromptBytes - prompt.bytes);
-    const remaining = Math.max(0, (this.queuedBytesBySession.get(sessionId) ?? 0) - prompt.bytes);
-    if (remaining > 0) this.queuedBytesBySession.set(sessionId, remaining);
-    else this.queuedBytesBySession.delete(sessionId);
   }
 
   private withWorkspaceActor<T>(operation: () => Promise<T>): Promise<T> {

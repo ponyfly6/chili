@@ -319,7 +319,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   );
   const selectedModel = sessionConfig?.model.modelSelection;
   const selectedGoal = sessionConfig?.goal ?? undefined;
-  const canResumeSession = canResumeTask(presentation?.chat.status, selectedGoal?.status, Boolean(selectedArchived));
+  const canResumeSession = canResumeTask(presentation?.chat.status, selectedGoal?.status, Boolean(selectedArchived), snapshot?.inputQueue?.paused);
   const mcpReloadEnabled = canReloadSessionMcp(selectedId, Boolean(selectedArchived), runtimeActionsDisabled);
 
   useEffect(() => {
@@ -1357,7 +1357,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                   ? "Archived tasks are read-only"
                   : selectedId
                     ? canResumeSession
-                      ? "Resume with a follow-up…"
+                      ? "Queue a follow-up, then resume…"
                       : "Ask Chili to change, investigate, or ship something…"
                     : "Create or select a task first"}
                 disabled={!composerEditable}
@@ -1367,6 +1367,8 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                 <div className="composer-context">
                   <span className={`composer-local phase-${desktop.sidecar.phase}`}><span />Local</span>
                   {selectedGoal ? <span className={`composer-goal goal-${selectedGoal.status}`}>Goal · {goalStatusLabel(selectedGoal.status)}</span> : null}
+                  {snapshot?.inputQueue?.paused ? <span>Paused — resume to continue</span> : null}
+                  {snapshot?.inputQueue?.interruptedCount ? <span>Interrupted work saved</span> : null}
                   {(desktop.queuedBySession[selectedId ?? ""] ?? 0) > 0 ? <span>{desktop.queuedBySession[selectedId ?? ""]} queued</span> : null}
                   <span className="shortcut-hint">⌘ ↵ send</span>
                 </div>

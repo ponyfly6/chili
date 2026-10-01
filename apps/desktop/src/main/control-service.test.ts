@@ -1,268 +1,108 @@
 import { describe, expect, test } from "bun:test";
 import { SESSION_TITLE_MAX_CHARS } from "@chili/protocol";
 import { reduceRuntimeEvents, type RuntimeClient } from "@chili/sdk";
+import { acceptedInput, emptyInputQueue } from "./testing/input-receipts.js";
+import { RuntimeHttpError } from "@chili/sdk";
 import { DesktopControlService } from "./control-service.js";
 
 describe("desktop prompt controls", () => {
-  test("serializes concurrent idle sends so only one prompt is accepted", async () => {
-    const eventsGate = deferred<never[]>();
-    const submitted: string[] = [];
-    let eventReads = 0;
+  test("forwards every input and its mode to durable admission without reading busy state", async () => {
+    const submitted: unknown[] = [];
     const client = {
-      sessionEvents: async () => {
-        eventReads += 1;
-        return eventsGate.promise;
-      },
-      submitPromptAsync: async (input: { text: string }) => {
-        submitted.push(input.text);
-        return { status: "accepted", sessionId: "session_1" };
+      sessionEvents: async () => { throw new Error("send must not read busy state"); },
+      submitPromptAsync: async (input: { sessionId: string; text: string; mode: string; submissionId: string }) => {
+        submitted.push(input);
+        return acceptedInput(input.sessionId, input.text, submitted.length > 1, input.submissionId);
       },
     } as unknown as RuntimeClient;
     const service = serviceFor(client);
-
-    const first = service.invoke({ type: "session.send", sessionId: "session_1", text: "first", mode: "queue" });
-    await waitUntil(() => eventReads === 1);
-    const second = service.invoke({ type: "session.send", sessionId: "session_1", text: "second", mode: "queue" });
-    await Promise.resolve();
-    expect(eventReads).toBe(1);
-    expect(submitted).toEqual([]);
-
-    eventsGate.resolve([]);
-    expect(await first).toEqual({ status: "accepted" });
-    expect(await second).toEqual({ status: "queued", position: 1 });
-    expect(submitted).toEqual(["first"]);
-    expect(eventReads).toBe(1);
+    expect(await service.invoke({ type: "session.send", sessionId: "s", text: "one", mode: "queue", submissionId: "stable_one" })).toEqual({ status: "accepted" });
+    expect(await service.invoke({ type: "session.send", sessionId: "s", text: "two", mode: "steer", submissionId: "stable_two" })).toEqual({ status: "queued", position: 1 });
+    expect(submitted).toMatchObject([{ submissionId: "stable_one", mode: "queue" }, { submissionId: "stable_two", mode: "steer" }]);
   });
 
-  test("orders stop after a send that is still checking admission", async () => {
-    const eventsGate = deferred<never[]>();
+  test("serializes a held admission before Stop and gives Stop separate capacity", async () => {
+    const gate = deferred<void>();
     const order: string[] = [];
     const client = {
-      sessionEvents: async () => {
-        order.push("events:start");
-        const events = await eventsGate.promise;
-        order.push("events:end");
-        return events;
-      },
-      submitPromptAsync: async () => {
-        order.push("submit");
-        return { status: "accepted", sessionId: "session_1" };
-      },
-      interruptSession: async () => {
-        order.push("interrupt");
-        return { interrupted: true };
-      },
+      submitPromptAsync: async (input: { text: string }) => { order.push(input.text); await gate.promise; return acceptedInput("s", input.text); },
+      interruptSession: async () => { order.push("stop"); return { interrupted: true }; },
     } as unknown as RuntimeClient;
     const service = serviceFor(client);
-
-    const sending = service.invoke({ type: "session.send", sessionId: "session_1", text: "first", mode: "queue" });
-    await waitUntil(() => order.includes("events:start"));
-    const stopping = service.invoke({ type: "session.stop", sessionId: "session_1" });
-    await Promise.resolve();
-    expect(order).toEqual(["events:start"]);
-
-    eventsGate.resolve([]);
-    expect(await sending).toEqual({ status: "accepted" });
-    expect(await stopping).toEqual({ interrupted: true });
-    expect(order).toEqual(["events:start", "events:end", "submit", "interrupt"]);
+    const sends = Array.from({ length: 8 }, (_, i) => service.invoke({ type: "session.send", sessionId: "s", text: String(i), mode: "queue" }));
+    await waitUntil(() => order.length === 1);
+    await expect(service.invoke({ type: "session.send", sessionId: "s", text: "overflow", mode: "queue" })).rejects.toThrow("Too many pending");
+    const stop = service.invoke({ type: "session.stop", sessionId: "s" });
+    expect(order).toEqual(["0"]);
+    gate.resolve();
+    await Promise.all(sends);
+    await stop;
+    expect(order).toEqual(["0", "1", "2", "3", "4", "5", "6", "7", "stop"]);
   });
 
-  test("bounds pending sends while preserving a separate stop admission channel", async () => {
-    const eventsGate = deferred<never[]>();
-    let eventReads = 0;
-    let interrupts = 0;
+  test("a lost response queries the same input instead of resubmitting it", async () => {
+    let submits = 0;
+    const lookedUp: string[] = [];
+    const saved = acceptedInput("s", "one", false, "stable");
     const client = {
-      sessionEvents: async () => {
-        eventReads += 1;
-        return eventsGate.promise;
-      },
-      submitPromptAsync: async () => ({ status: "accepted", sessionId: "session_1" }),
-      interruptSession: async () => {
-        interrupts += 1;
-        return { interrupted: true };
-      },
+      submitPromptAsync: async () => { submits++; throw new Error("connection lost"); },
+      getInput: async ({ submissionId }: { submissionId: string }) => { lookedUp.push(submissionId); return saved.input; },
+      inputQueue: async () => saved.queue,
     } as unknown as RuntimeClient;
-    const service = serviceFor(client);
-
-    const admitted = Array.from({ length: 8 }, (_, index) => service.invoke({
-      type: "session.send" as const,
-      sessionId: "session_1",
-      text: `work ${index}`,
-      mode: "queue" as const,
-    }));
-    await waitUntil(() => eventReads === 1);
-    await expect(service.invoke({
-      type: "session.send",
-      sessionId: "session_1",
-      text: "over capacity",
-      mode: "queue",
-    })).rejects.toThrow("Too many pending desktop send operations");
-    const stopping = service.invoke({ type: "session.stop", sessionId: "session_1" });
-
-    eventsGate.resolve([]);
-    expect((await Promise.all(admitted)).map((result) => result.status)).toEqual([
-      "accepted",
-      "queued",
-      "queued",
-      "queued",
-      "queued",
-      "queued",
-      "queued",
-      "queued",
-    ]);
-    expect(await stopping).toEqual({ interrupted: true });
-    expect(interrupts).toBe(1);
+    expect(await serviceFor(client).invoke({ type: "session.send", sessionId: "s", text: "one", mode: "queue", submissionId: "stable" })).toEqual({ status: "accepted" });
+    expect(submits).toBe(1);
+    expect(lookedUp).toEqual(["stable"]);
   });
 
-  test("bounds queued prompt items and cumulative UTF-8 bytes", async () => {
+  test("a content conflict is not mistaken for a lost response", async () => {
+    let queries = 0;
     const client = {
-      sessionEvents: async () => [{
-        id: "event_queue_capacity_running",
-        type: "session.status_changed",
-        time: 1,
-        sessionId: "session_1",
-        payload: { sessionId: "session_1", status: "running" },
-      }],
+      submitPromptAsync: async () => { throw new RuntimeHttpError(409, "different content"); },
+      getInput: async () => { queries++; return acceptedInput("s").input; },
     } as unknown as RuntimeClient;
-    const service = serviceFor(client);
-
-    for (let index = 0; index < 64; index += 1) {
-      expect(await service.invoke({
-        type: "session.send",
-        sessionId: "session_1",
-        text: `item ${index}`,
-        mode: "queue",
-      })).toMatchObject({ status: "queued", position: index + 1 });
-    }
-    await expect(service.invoke({
-      type: "session.send",
-      sessionId: "session_1",
-      text: "item overflow",
-      mode: "queue",
-    })).rejects.toThrow("Desktop prompt queue capacity exceeded");
-
-    const byteService = serviceFor(client);
-    const utf8Prompt = "界".repeat(63_000);
-    for (let index = 0; index < 10; index += 1) {
-      expect((await byteService.invoke({
-        type: "session.send",
-        sessionId: "session_1",
-        text: utf8Prompt,
-        mode: "queue",
-      })).status).toBe("queued");
-    }
-    await expect(byteService.invoke({
-      type: "session.send",
-      sessionId: "session_1",
-      text: utf8Prompt,
-      mode: "queue",
-    })).rejects.toThrow("Desktop prompt queue capacity exceeded");
+    await expect(serviceFor(client).invoke({ type: "session.send", sessionId: "s", text: "changed", mode: "queue", submissionId: "stable" })).rejects.toThrow("different content");
+    expect(queries).toBe(0);
   });
 
-  test("invalidates an admitted send before switching to a new workspace client", async () => {
-    const eventsGate = deferred<never[]>();
-    const submissions: string[] = [];
-    let eventReads = 0;
-    const oldClient = {
-      sessionEvents: async () => {
-        eventReads += 1;
-        return eventsGate.promise;
-      },
-      submitPromptAsync: async () => {
-        submissions.push("old");
-        return { status: "accepted", sessionId: "session_1" };
-      },
+  test("idle events and Stop never dispatch client-owned work", async () => {
+    let submits = 0;
+    const queue = { ...emptyInputQueue("s", true, 4), pendingCount: 1 };
+    const client = {
+      submitPromptAsync: async () => { submits++; return acceptedInput("s", "queued", true); },
+      interruptSession: async () => ({ interrupted: false }),
+      inputQueue: async () => queue,
     } as unknown as RuntimeClient;
-    const newClient = {
-      submitPromptAsync: async () => {
-        submissions.push("new");
-        return { status: "accepted", sessionId: "session_1" };
-      },
-    } as unknown as RuntimeClient;
-    let client = oldClient;
-    let generation = 1;
-    let workspace = "/old";
-    const sidecar = {
-      state: () => ({ sidecar: { phase: "healthy" as const, attempt: 0 }, workspace, queuedBySession: {} }),
-      getClient: () => client,
-      getClientContext: () => ({ client, generation }),
-      currentGeneration: () => generation,
-      currentWorkspace: () => workspace,
-      setQueuedCount: () => undefined,
-      switchWorkspace: async (nextWorkspace: string, afterStop?: () => Promise<void>) => {
-        generation += 1;
-        await afterStop?.();
-        client = newClient;
-        workspace = nextWorkspace;
-      },
-    };
+    const service = serviceFor(client);
+    await service.invoke({ type: "session.send", sessionId: "s", text: "queued", mode: "queue" });
+    await service.invoke({ type: "session.stop", sessionId: "s" });
+    service.observeEvent({ id: "idle", type: "session.status_changed", sessionId: "s", time: 1, payload: { sessionId: "s", status: "idle" } } as never, 1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(submits).toBe(1);
+  });
+
+  test("healthy-state hydration cannot recursively trigger itself", async () => {
+    let reads = 0;
+    let emissions = 0;
+    const state = { sidecar: { phase: "healthy" as const, attempt: 0 }, queuedBySession: {} };
+    const client = { listSessions: async () => [sessionSummary("s")], inputQueue: async () => { reads++; return emptyInputQueue("s"); } } as unknown as RuntimeClient;
     const service = new DesktopControlService({
-      sidecar: sidecar as never,
-      selectWorkspace: async () => "/new",
-      persistWorkspace: async () => undefined,
-      emitQueue: () => undefined,
-      onError: () => undefined,
+      sidecar: { getClientContext: () => ({ client, generation: 1 }), currentGeneration: () => 1,
+        setQueuedCount: () => { emissions++; service.observeState(state, 1); } } as never,
+      selectWorkspace: async () => undefined, persistWorkspace: async () => undefined, emitQueue: () => undefined, onError: (error) => { throw error; },
     });
-
-    const sending = service.invoke({ type: "session.send", sessionId: "session_1", text: "old work", mode: "queue" });
-    await waitUntil(() => eventReads === 1);
-    const switching = service.invoke({ type: "workspace.select" });
-    await Promise.resolve();
-    eventsGate.resolve([]);
-
-    await expect(sending).rejects.toThrow("Workspace changed");
-    expect((await switching).workspace).toBe("/new");
-    expect(submissions).toEqual([]);
+    service.observeState(state, 1);
+    await waitUntil(() => emissions === 1);
+    for (let i = 0; i < 4; i++) service.observeState(state, 1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(reads).toBe(1);
   });
 
-  test("preserves queued work when the same workspace is selected again", async () => {
-    let runtimeBusy = true;
-    let submissions = 0;
-    const client = {
-      sessionEvents: async () => runtimeBusy ? [{
-        id: "event_running",
-        type: "session.status_changed",
-        time: 1,
-        sessionId: "session_1",
-        payload: { sessionId: "session_1", status: "running" },
-      }] : [],
-      submitPromptAsync: async () => {
-        submissions += 1;
-        return { status: "accepted", sessionId: "session_1" };
-      },
+  test("snapshot keeps a newer queue event that arrived after its initial queue read", async () => {
+    const queue = emptyInputQueue("s", true, 3);
+    const client = { ...snapshotClientMethods(), inputQueue: async () => emptyInputQueue("s", false, 1),
+      sessionEventWindow: async () => ({ events: [{ id: "pause", type: "session.input_queue_changed", sessionId: "s", time: 1, payload: queue }], pendingApprovals: [], truncated: false, bytes: 2, pinnedEventIds: [] }),
     } as unknown as RuntimeClient;
-    const sidecar = {
-      state: () => ({ sidecar: { phase: "healthy" as const, attempt: 0 }, workspace: "/same", queuedBySession: {} }),
-      getClient: () => client,
-      getClientContext: () => ({ client, generation: 1 }),
-      currentGeneration: () => 1,
-      currentWorkspace: () => "/same",
-      setQueuedCount: () => undefined,
-      switchWorkspace: async () => undefined,
-    };
-    const service = new DesktopControlService({
-      sidecar: sidecar as never,
-      selectWorkspace: async () => "/same",
-      persistWorkspace: async () => undefined,
-      emitQueue: () => undefined,
-      onError: () => undefined,
-    });
-
-    expect(await service.invoke({
-      type: "session.send",
-      sessionId: "session_1",
-      text: "queued old work",
-      mode: "queue",
-    })).toEqual({ status: "queued", position: 1 });
-    runtimeBusy = false;
-    await service.invoke({ type: "workspace.select" });
-    expect(await service.invoke({
-      type: "session.send",
-      sessionId: "session_1",
-      text: "fresh work",
-      mode: "queue",
-    })).toEqual({ status: "queued", position: 2 });
-    expect(submissions).toBe(0);
+    expect((await serviceFor(client).invoke({ type: "session.snapshot", sessionId: "s" })).inputQueue).toEqual(queue);
   });
 
   test("serializes concurrent workspace selections", async () => {
@@ -317,260 +157,6 @@ describe("desktop prompt controls", () => {
     expect(maxActiveSelections).toBe(1);
   });
 
-  test("ignores a stale idle event while an accepted prompt awaits its turn start", async () => {
-    const submitGate = deferred<{ status: "accepted"; sessionId: "session_1" }>();
-    const priorIdle = {
-      id: "event_prior_idle",
-      type: "session.status_changed",
-      time: 10,
-      sessionId: "session_1",
-      payload: { sessionId: "session_1", status: "idle" },
-    } as never;
-    let submissions = 0;
-    const client = {
-      sessionEvents: async () => [priorIdle],
-      submitPromptAsync: async () => {
-        submissions += 1;
-        if (submissions === 1) return submitGate.promise;
-        return { status: "accepted", sessionId: "session_1" };
-      },
-    } as unknown as RuntimeClient;
-    const service = serviceFor(client);
-
-    const first = service.invoke({ type: "session.send", sessionId: "session_1", text: "first", mode: "queue" });
-    await waitUntil(() => submissions === 1);
-    service.observeEvent(priorIdle, 1);
-    const second = service.invoke({ type: "session.send", sessionId: "session_1", text: "second", mode: "queue" });
-    submitGate.resolve({ status: "accepted", sessionId: "session_1" });
-
-    expect(await first).toEqual({ status: "accepted" });
-    expect(await second).toEqual({ status: "queued", position: 1 });
-    expect(submissions).toBe(1);
-
-    service.observeEvent({
-      id: "event_new_turn",
-      type: "turn.started",
-      time: 10,
-      sessionId: "session_1",
-      payload: { turnId: "turn_new" },
-    } as never, 1);
-    service.observeEvent({
-      id: "event_new_idle",
-      type: "session.status_changed",
-      time: 30,
-      sessionId: "session_1",
-      payload: { sessionId: "session_1", status: "idle" },
-    } as never, 1);
-    await waitUntil(() => submissions === 2);
-  });
-
-  test("releases optimistic busy when stop cancels before turn.started", async () => {
-    const baselineIdle = {
-      id: "event_baseline_idle",
-      type: "session.status_changed",
-      time: 10,
-      sessionId: "session_1",
-      payload: { sessionId: "session_1", status: "idle" },
-    } as never;
-    const submitted: string[] = [];
-    const client = {
-      sessionEvents: async () => [baselineIdle],
-      submitPromptAsync: async (input: { text: string }) => {
-        submitted.push(input.text);
-        return { status: "accepted", sessionId: "session_1" };
-      },
-      interruptSession: async () => ({ interrupted: true }),
-    } as unknown as RuntimeClient;
-    const service = serviceFor(client);
-
-    expect(await service.invoke({
-      type: "session.send",
-      sessionId: "session_1",
-      text: "first",
-      mode: "queue",
-    })).toEqual({ status: "accepted" });
-    service.observeEvent({
-      id: "event_running_without_turn",
-      type: "session.status_changed",
-      time: 10,
-      sessionId: "session_1",
-      payload: { sessionId: "session_1", status: "running" },
-    } as never, 1);
-    expect(await service.invoke({ type: "session.stop", sessionId: "session_1" })).toEqual({ interrupted: true });
-    expect(await service.invoke({
-      type: "session.send",
-      sessionId: "session_1",
-      text: "after stop",
-      mode: "queue",
-    })).toEqual({ status: "queued", position: 1 });
-
-    service.observeEvent({
-      id: "event_cancelled_without_turn",
-      type: "session.status_changed",
-      time: 10,
-      sessionId: "session_1",
-      payload: { sessionId: "session_1", status: "idle" },
-    } as never, 1);
-    await waitUntil(() => submitted.length === 2);
-    expect(submitted).toEqual(["first", "after stop"]);
-  });
-
-  test("queues while busy and steer interrupts ahead of the queue", async () => {
-    const submitted: string[] = [];
-    const interrupts: string[] = [];
-    const client = {
-      sessionEvents: async () => [{
-        id: "event_running",
-        type: "session.status_changed",
-        time: 1,
-        sessionId: "session_1",
-        payload: { sessionId: "session_1", status: "running" },
-      }],
-      submitPromptAsync: async (input: { text: string }) => {
-        submitted.push(input.text);
-        return { status: "accepted", sessionId: "session_1" };
-      },
-      interruptSession: async (input: { reason?: string }) => {
-        interrupts.push(input.reason ?? "");
-        return { interrupted: true };
-      },
-      getGoal: async () => undefined,
-    } as unknown as RuntimeClient;
-    const sidecar = {
-      state: () => ({ sidecar: { phase: "healthy" as const, attempt: 0 }, queuedBySession: {} }),
-      getClient: () => client,
-      getClientContext: () => ({ client, generation: 1 }),
-      currentGeneration: () => 1,
-      currentWorkspace: () => "/repo",
-      setQueuedCount: () => undefined,
-    };
-    const counts: number[] = [];
-    const service = new DesktopControlService({
-      sidecar: sidecar as never,
-      selectWorkspace: async () => undefined,
-      persistWorkspace: async () => undefined,
-      emitQueue: (_sessionId, count) => counts.push(count),
-      onError: () => undefined,
-    });
-
-    expect(await service.invoke({ type: "session.send", sessionId: "session_1", text: "later", mode: "queue" })).toMatchObject({ status: "queued", position: 1 });
-    expect(await service.invoke({ type: "session.send", sessionId: "session_1", text: "now", mode: "steer" })).toMatchObject({ status: "queued", position: 1 });
-    expect(interrupts).toEqual(["desktop_steer"]);
-    expect(submitted).toEqual([]);
-
-    service.observeEvent({
-      id: "event_idle",
-      type: "session.status_changed",
-      time: 2,
-      sessionId: "session_1",
-      payload: { sessionId: "session_1", status: "idle" },
-    } as never, 1);
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(submitted).toEqual(["now"]);
-    expect(counts).toContain(1);
-  });
-
-  test("clears the optimistic busy flag when initial submission fails", async () => {
-    let submissions = 0;
-    const client = {
-      sessionEvents: async () => [],
-      submitPromptAsync: async () => {
-        submissions += 1;
-        if (submissions === 1) throw new Error("submit failed before acceptance");
-        return { status: "accepted", sessionId: "session_1" };
-      },
-    } as unknown as RuntimeClient;
-    const service = serviceFor(client);
-
-    await expect(service.invoke({
-      type: "session.send",
-      sessionId: "session_1",
-      text: "first",
-      mode: "queue",
-    })).rejects.toThrow("submit failed");
-    expect(await service.invoke({
-      type: "session.send",
-      sessionId: "session_1",
-      text: "retry",
-      mode: "queue",
-    })).toEqual({ status: "accepted" });
-    expect(submissions).toBe(2);
-  });
-
-  test("clears the optimistic busy flag when stop is rejected or finds no active turn", async () => {
-    for (const behavior of ["not-interrupted", "rejected"] as const) {
-      let submissions = 0;
-      const client = {
-        sessionEvents: async () => [],
-        submitPromptAsync: async () => {
-          submissions += 1;
-          return { status: "accepted", sessionId: "session_1" };
-        },
-        interruptSession: async () => {
-          if (behavior === "rejected") throw new Error("interrupt failed");
-          return { interrupted: false };
-        },
-      } as unknown as RuntimeClient;
-      const service = serviceFor(client);
-
-      const stopping = service.invoke({ type: "session.stop", sessionId: "session_1" });
-      if (behavior === "rejected") await expect(stopping).rejects.toThrow("interrupt failed");
-      else expect(await stopping).toEqual({ interrupted: false });
-      expect(await service.invoke({
-        type: "session.send",
-        sessionId: "session_1",
-        text: "still sendable",
-        mode: "queue",
-      })).toEqual({ status: "accepted" });
-      expect(submissions).toBe(1);
-    }
-  });
-
-  test("does not leak a queued background flush rejection across shutdown", async () => {
-    const reported: Error[] = [];
-    const unhandled: unknown[] = [];
-    const onUnhandled = (reason: unknown): void => {
-      unhandled.push(reason);
-    };
-    process.on("unhandledRejection", onUnhandled);
-    try {
-      const client = {
-        sessionEvents: async () => [{
-          id: "running",
-          type: "session.status_changed",
-          time: 1,
-          sessionId: "session_1",
-          payload: { sessionId: "session_1", status: "running" },
-        }],
-      } as unknown as RuntimeClient;
-      const service = serviceFor(client, (error) => reported.push(error));
-      expect(await service.invoke({
-        type: "session.send",
-        sessionId: "session_1",
-        text: "queued",
-        mode: "queue",
-      })).toEqual({ status: "queued", position: 1 });
-
-      const actorGate = deferred<void>();
-      const internals = service as unknown as {
-        withSessionActor(sessionId: string, operation: () => Promise<void>): Promise<void>;
-        scheduleFlush(sessionId: string): void;
-      };
-      const blocker = internals.withSessionActor("session_1", () => actorGate.promise);
-      internals.scheduleFlush("session_1");
-      service.beginShutdown();
-      actorGate.resolve(undefined);
-      await blocker;
-      await new Promise((resolve) => setImmediate(resolve));
-      await new Promise((resolve) => setImmediate(resolve));
-
-      expect(unhandled).toEqual([]);
-      expect(reported).toEqual([]);
-    } finally {
-      process.off("unhandledRejection", onUnhandled);
-    }
-  });
 });
 
 describe("desktop task and Goal controls", () => {
@@ -999,88 +585,17 @@ describe("desktop task and Goal controls", () => {
     expect(updates).toBe(0);
   });
 
-  test("steers an active Goal and resumes it only after the queued prompt drains", async () => {
-    const order: string[] = [];
-    let goalStatus: "active" | "paused" = "active";
-    let submissions = 0;
-    let resumptions = 0;
+  test("Steer delegates Goal arbitration entirely to RuntimeService", async () => {
+    const seen: string[] = [];
     const client = {
-      sessionEvents: async () => [{
-        id: "event_running_goal",
-        type: "session.status_changed",
-        time: 1,
-        sessionId: "session_goal",
-        payload: { sessionId: "session_goal", status: "running" },
-      }],
-      getGoal: async () => {
-        order.push(`goal:${goalStatus}`);
-        return goalRecord("session_goal", goalStatus);
-      },
-      interruptSession: async () => {
-        order.push("interrupt");
-        goalStatus = "paused";
-        return { interrupted: true };
-      },
-      submitPromptAsync: async () => {
-        order.push("submit:steer");
-        submissions += 1;
-        return { status: "accepted", sessionId: "session_goal" };
-      },
-      updateGoal: async ({ status }: { status?: "active" | "paused" }) => {
-        order.push(`update:${status}`);
-        if (status === "active") {
-          goalStatus = "active";
-          resumptions += 1;
-        }
-        return goalRecord("session_goal", goalStatus);
-      },
+      getGoal: async () => { throw new Error("steer must not read Goal"); },
+      interruptSession: async () => { throw new Error("steer must not issue a separate interrupt"); },
+      submitPromptAsync: async (input: { mode: string }) => { seen.push(input.mode); return acceptedInput("s", "change", true); },
     } as unknown as RuntimeClient;
-    const service = serviceFor(client);
-
-    expect(await service.invoke({
-      type: "session.send",
-      sessionId: "session_goal",
-      text: "change direction",
-      mode: "steer",
-    })).toEqual({ status: "queued", position: 1 });
-    expect(order).toEqual(["goal:active", "interrupt"]);
-
-    service.observeEvent({
-      id: "event_original_stopped",
-      type: "session.status_changed",
-      time: 2,
-      sessionId: "session_goal",
-      payload: { sessionId: "session_goal", status: "cancelled" },
-    } as never, 1);
-    await waitUntil(() => submissions === 1);
-    expect(resumptions).toBe(0);
-
-    service.observeEvent({
-      id: "event_steer_finished",
-      type: "session.status_changed",
-      time: 3,
-      sessionId: "session_goal",
-      payload: { sessionId: "session_goal", status: "idle" },
-    } as never, 1);
-    await waitUntil(() => resumptions === 1);
-    expect(order).toEqual([
-      "goal:active",
-      "interrupt",
-      "submit:steer",
-      "goal:paused",
-      "update:active",
-    ]);
-
-    service.observeEvent({
-      id: "event_extra_idle",
-      type: "session.status_changed",
-      time: 4,
-      sessionId: "session_goal",
-      payload: { sessionId: "session_goal", status: "idle" },
-    } as never, 1);
-    await new Promise((resolve) => setImmediate(resolve));
-    expect(resumptions).toBe(1);
+    expect(await serviceFor(client).invoke({ type: "session.send", sessionId: "s", text: "change", mode: "steer" })).toEqual({ status: "queued", position: 1 });
+    expect(seen).toEqual(["steer"]);
   });
+
 });
 
 describe("desktop session projections", () => {
@@ -1686,6 +1201,10 @@ describe("desktop session projections", () => {
 });
 
 function serviceFor(client: RuntimeClient, onError: (error: Error) => void = () => undefined): DesktopControlService {
+  client.inputQueue ??= async ({ sessionId }) => emptyInputQueue(sessionId);
+  client.getInput ??= async () => undefined;
+  client.resumeInputs ??= async ({ sessionId }) => { await client.updateGoal?.({ sessionId, status: "active" }); return emptyInputQueue(sessionId); };
+
   const sidecar = {
     state: () => ({ sidecar: { phase: "healthy" as const, attempt: 0 }, queuedBySession: {} }),
     getClient: () => client,

@@ -326,6 +326,10 @@ export function appendRuntimeEvent(
   event: ChiliEvent,
   limits: RuntimeEventLimits = DEFAULT_RUNTIME_EVENT_LIMITS,
 ): RuntimeSnapshot {
+  if (event.type === "session.input_queue_changed" && event.sessionId === snapshot.sessionId
+      && event.payload.revision >= (snapshot.inputQueue?.revision ?? 0)) {
+    snapshot = { ...snapshot, inputQueue: event.payload };
+  }
   requireRuntimeEventLimits(limits);
   const state = liveWindowState(snapshot, limits);
   const existing = state.events.findIndex((candidate) => candidate.id === event.id);

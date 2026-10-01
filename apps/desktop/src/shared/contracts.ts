@@ -1,6 +1,8 @@
 import type { DesktopTheme } from "./appearance.js";
 import {
   normalizeSessionTitle,
+  parseRuntimeInputQueue,
+  type RuntimeInputQueue,
   parseRuntimeDelegationConfig as parseProtocolDelegationConfig,
   parseRuntimeMcpReloadResponse as parseProtocolMcpReloadResponse,
   parseRuntimeMcpStatusResponse as parseProtocolMcpStatusResponse,
@@ -86,6 +88,7 @@ export interface DesktopState {
 }
 
 export interface RuntimeSnapshot {
+  inputQueue?: RuntimeInputQueue;
   sessionId: string;
   events: ChiliEvent[];
   agentTree: RuntimeAgentTreeSnapshot;
@@ -213,7 +216,7 @@ type DesktopOperation =
   | { type: "session.goal.clear"; sessionId: string }
   | { type: "mcp.status"; sessionId?: string }
   | { type: "mcp.reload"; sessionId?: string }
-  | { type: "session.send"; sessionId: string; text: string; mode: SendMode }
+  | { type: "session.send"; sessionId: string; text: string; mode: SendMode; submissionId?: string }
   | { type: "session.stop"; sessionId: string }
   | {
       type: "approval.resolve";
@@ -416,6 +419,7 @@ function parseDesktopOperation(value: unknown): DesktopOperation {
       sessionId: requireIdentifier(record.sessionId, "sessionId"),
       text: requireString(record.text, "text", 200_000),
       mode,
+      ...(record.submissionId !== undefined ? { submissionId: requireIdentifier(record.submissionId, "submissionId") } : {}),
     };
   }
   if (type === "approval.resolve") {
@@ -840,6 +844,10 @@ function parseRuntimeSnapshot(value: unknown): RuntimeSnapshot {
     pendingApprovals: record.pendingApprovals.map((approval) => parsePendingApprovalRequest(approval)),
     pendingInputs: record.pendingInputs.map((input) => parseUserInputRequest(input)),
   };
+  if (record.inputQueue !== undefined) {
+    snapshot.inputQueue = parseRuntimeInputQueue(record.inputQueue);
+    requireMatchingSessionId(snapshot.sessionId, snapshot.inputQueue.sessionId, "snapshot.inputQueue.sessionId");
+  }
   if (record.truncated !== undefined) snapshot.truncated = requireBoolean(record.truncated, "snapshot.truncated");
   if (record.warning !== undefined) snapshot.warning = requireString(record.warning, "snapshot.warning", 2_000);
   return snapshot;
@@ -1169,7 +1177,7 @@ function requestKeys(type: string): readonly string[] {
   if (type === "session.goal.set") return ["type", "sessionId", "objective", "tokenBudget", "replace"];
   if (type === "session.goal.update") return ["type", "sessionId", "status", "objective", "tokenBudget"];
   if (type === "mcp.status" || type === "mcp.reload") return ["type", "sessionId"];
-  if (type === "session.send") return ["type", "sessionId", "text", "mode"];
+  if (type === "session.send") return ["type", "sessionId", "text", "mode", "submissionId"];
   if (type === "approval.resolve") return ["type", "approvalId", "decision", "feedback"];
   if (type === "user-input.resolve") return ["type", "inputId", "answers"];
   if (type === "events.resync.complete") return ["type", "barrierId"];
@@ -1229,6 +1237,10 @@ function requireSafeMapKey(value: unknown, field: string): string {
 }
 
 function assertRuntimePayloadSchema(type: string, payload: Record<string, unknown>): void {
+  if (type === "session.input_queue_changed") {
+    parseRuntimeInputQueue(payload);
+    return;
+  }
   if (type === "session.created") {
     requirePayloadString(payload.sessionId, "event.payload.sessionId");
     requirePayloadString(payload.cwd, "event.payload.cwd", true);
@@ -1953,6 +1965,7 @@ function requireOwnField(record: Record<string, unknown>, key: string, field: st
 
 const RUNTIME_EVENT_ID_FIELDS: Readonly<Record<string, readonly string[]>> = {
   "session.created": ["sessionId"],
+  "session.input_queue_changed": ["sessionId"],
   "session.renamed": ["sessionId"],
   "session.status_changed": ["sessionId", "turnId"],
   "session.model_changed": ["sessionId"],

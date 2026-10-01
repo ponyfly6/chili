@@ -1,3 +1,4 @@
+import { acceptedInput, emptyInputQueue } from "./testing/input-receipts.js";
 import { describe, expect, test } from "bun:test";
 import type { ChiliEvent, SessionId } from "@chili/protocol";
 import type { RuntimeClient, RuntimeSessionSummary } from "@chili/sdk";
@@ -55,9 +56,10 @@ describe("real desktop remote adapter boundary", () => {
   test("pending remote preflights share one admission deadline instead of multiplying Stop latency", async () => {
     const events = deferred<ChiliEvent[]>();
     const readSignals: AbortSignal[] = [];
-    const fixture = harness({ sessionEvents: async ({ signal }) => {
-      readSignals.push(signal!);
-      return events.promise;
+    const fixture = harness({ listSessions: async (input) => {
+      if (readSignals.length >= 8) return [summary("root")];
+      readSignals.push(input!.signal!);
+      return events.promise as unknown as Promise<RuntimeSessionSummary[]>;
     } }, 60);
     const startedAt = performance.now();
     const sends = Array.from({ length: 8 }, (_, index) => invoke(fixture.adapter, {
@@ -77,11 +79,11 @@ describe("real desktop remote adapter boundary", () => {
     events.resolve([]);
     await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
     expect(fixture.submitted).toEqual([]);
-    expect(fixture.queuedCounts).toEqual([]);
+    expect(fixture.queuedCounts.every((count) => count === 0)).toBe(true);
     fixture.adapter.revoke();
   });
 
-  test("a send read deadline neither aborts an earlier real write nor discards an authorized Stop", async () => {
+  test("completed membership stays valid while waiting for an earlier admitted write", async () => {
     const submission = deferred<{ status: "accepted"; sessionId: SessionId }>();
     const order: string[] = [];
     let writeSignal: AbortSignal | undefined;
@@ -98,7 +100,7 @@ describe("real desktop remote adapter boundary", () => {
     const first = fixture.service.invoke({ type: "session.send", sessionId: "root", text: "real write", mode: "queue" });
     await until(() => writeSignal !== undefined);
     const later = invoke(fixture.adapter, {
-      operation: "session.send", payload: { sessionId: "root", text: "expired preflight", mode: "queue" },
+      operation: "session.send", payload: { sessionId: "root", text: "authorized follow-up", mode: "queue" },
     }).then(() => null, (error: unknown) => error);
     const stopping = invoke(fixture.adapter, { operation: "session.stop", payload: { sessionId: "root" } });
     await until(() => membershipReads === 2);
@@ -108,11 +110,9 @@ describe("real desktop remote adapter boundary", () => {
     expect(order).toEqual(["submit:real write"]);
     submission.resolve({ status: "accepted", sessionId: "root" as SessionId });
     expect(await first).toEqual({ status: "accepted" });
-    const expired = await later;
-    expect(expired).toBeInstanceOf(Error);
-    expect((expired as Error).message).toContain("read timed out");
+    expect(await later).toBeNull();
     expect(await stopping).toEqual({ interrupted: true });
-    expect(order).toEqual(["submit:real write", "stop"]);
+    expect(order).toEqual(["submit:real write", "submit:authorized follow-up", "stop"]);
     expect(writeSignal?.aborted).toBe(false);
     fixture.adapter.revoke();
   });
@@ -133,11 +133,11 @@ describe("real desktop remote adapter boundary", () => {
     await until(() => membershipReads === 9);
     membership.resolve([summary("root")]);
     expect((await Promise.all(sending)).map((result) => (result as { status: string }).status))
-      .toEqual(["accepted", "queued", "queued", "queued", "queued", "queued", "queued", "queued"]);
+      .toEqual(Array(8).fill("accepted"));
     expect(await stopping).toEqual({ interrupted: true });
     expect(await invoke(fixture.adapter, {
       operation: "session.send", payload: { sessionId: "root", text: "capacity restored", mode: "queue" },
-    })).toMatchObject({ status: "queued" });
+    })).toMatchObject({ status: "accepted" });
     expect(membershipReads).toBe(10);
     fixture.adapter.revoke();
   });
@@ -226,82 +226,27 @@ describe("real desktop remote adapter boundary", () => {
     fixture.adapter.revoke();
   });
 
-  test("desktop and remote Queue/Steer/Stop use the same session actor and queue", async () => {
-    const fixture = harness();
-    expect(await fixture.service.invoke({ type: "session.send", sessionId: "root", text: "desktop", mode: "queue" }))
-      .toEqual({ status: "accepted" });
-    expect(await invoke(fixture.adapter, {
-      operation: "session.send", payload: { sessionId: "root", text: "mobile queue", mode: "queue" },
-    })).toEqual({ status: "queued", position: 1 });
-    expect(await invoke(fixture.adapter, {
-      operation: "session.send", payload: { sessionId: "root", text: "mobile steer", mode: "steer" },
-    })).toEqual({ status: "queued", position: 1 });
-    const snapshot = await invoke(fixture.adapter, { operation: "session.snapshot", payload: { sessionId: "root" } });
-    expect(snapshot).toMatchObject({ session: { queuedCount: 2 } });
-    expect(await invoke(fixture.adapter, { operation: "session.stop", payload: { sessionId: "root" } }))
-      .toEqual({ interrupted: true });
-    expect(fixture.submitted).toEqual(["desktop"]);
-    expect(fixture.interrupts).toEqual(["desktop_steer", "desktop_stop"]);
-    expect(fixture.queuedCounts).toEqual([1, 2]);
+  test("remote submissions preserve the authenticated stable ID and trusted source", async () => {
+    const received: Array<{ submissionId?: string; inputSource?: string; mode?: string }> = [];
+    const fixture = harness({ submitPromptAsync: async (input) => { received.push(input); return acceptedInput("root"); } });
+    await fixture.adapter.invoke({ operation: "session.send", payload: { sessionId: "root", text: "remote work", mode: "steer" } },
+      { ...context("session.send"), idempotencyKey: "authenticated_request_123" });
+    expect(received[0]).toMatchObject({ submissionId: "authenticated_request_123", mode: "steer" });
+    expect(received[0]?.inputSource?.startsWith("remote:")).toBe(true);
     fixture.adapter.revoke();
   });
 
-  test.each(["queue", "steer"] as const)("remote %s is never requeued after the runtime commits but its response fails", async (mode) => {
-    const delivered: string[] = [];
-    const fixture = harness({ submitPromptAsync: async ({ text }) => {
-      delivered.push(text);
-      if (text === "remote work") throw new Error("202 response lost after runtime commit");
-      return { status: "accepted", sessionId: "root" as SessionId };
-    } });
-    await fixture.service.invoke({ type: "session.send", sessionId: "root", text: "desktop", mode: "queue" });
-    expect(await invoke(fixture.adapter, {
-      operation: "session.send", payload: { sessionId: "root", text: "remote work", mode },
-    })).toEqual({ status: "queued", position: 1 });
-    fixture.service.observeEvent(event("session.status_changed", { sessionId: "root", status: "idle" }), 1);
-    await until(() => fixture.errors.length === 1);
-    expect(delivered).toEqual(["desktop", "remote work"]);
-    expect(fixture.errors[0]?.message).toContain("result is unknown");
-    expect(await invoke(fixture.adapter, { operation: "session.snapshot", payload: { sessionId: "root" } }))
-      .toMatchObject({ session: { queuedCount: 0, deliveryUnknown: true } });
-
-    // Further idle events, healthy-state flushes, Stop, and a new authorization
-    // must not turn the lost response into another runtime submission.
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      fixture.service.observeEvent(event("session.status_changed", { sessionId: "root", status: "idle" }), 1);
-      fixture.service.observeState({ sidecar: { phase: "healthy", attempt: 0 }, queuedBySession: {} }, 1);
-      await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
-    }
-    await invoke(fixture.adapter, { operation: "session.stop", payload: { sessionId: "root" } });
+  test("revoking a scope durably revokes each source that admitted work", async () => {
+    const sources: string[] = [];
+    let admittedSource: string | undefined;
+    const fixture = harness({
+      submitPromptAsync: async (input) => { admittedSource = input.inputSource; return acceptedInput("root", "pending", true); },
+      cancelInputsFromSource: async (input) => { sources.push(input.source); return emptyInputQueue(input.sessionId, true, 2); },
+    });
+    await invoke(fixture.adapter, { operation: "session.send", payload: { sessionId: "root", text: "pending", mode: "queue" } });
     fixture.adapter.revoke();
-    const reauthorized = new DesktopRemoteControlAdapter({ controlService: fixture.service });
-    expect(await invoke(reauthorized, { operation: "session.snapshot", payload: { sessionId: "root" } }))
-      .toMatchObject({ session: { deliveryUnknown: true } });
-    expect(delivered).toEqual(["desktop", "remote work"]);
-    reauthorized.revoke();
-    fixture.service.clearQueues();
-  });
-
-  test("local queued prompts retain the existing retry behavior", async () => {
-    const delivered: string[] = [];
-    let failOnce = true;
-    const fixture = harness({ submitPromptAsync: async ({ text }) => {
-      delivered.push(text);
-      if (text === "local queued" && failOnce) {
-        failOnce = false;
-        throw new Error("local transport failure");
-      }
-      return { status: "accepted", sessionId: "root" as SessionId };
-    } });
-    await fixture.service.invoke({ type: "session.send", sessionId: "root", text: "desktop", mode: "queue" });
-    await fixture.service.invoke({ type: "session.send", sessionId: "root", text: "local queued", mode: "queue" });
-    fixture.service.observeEvent(event("session.status_changed", { sessionId: "root", status: "idle" }), 1);
-    await until(() => fixture.errors.length === 1);
-    fixture.service.observeState({ sidecar: { phase: "healthy", attempt: 0 }, queuedBySession: {} }, 1);
-    await until(() => delivered.length === 3);
-    expect(delivered).toEqual(["desktop", "local queued", "local queued"]);
-    expect(await invoke(fixture.adapter, { operation: "session.snapshot", payload: { sessionId: "root" } }))
-      .toMatchObject({ session: { deliveryUnknown: false } });
-    fixture.adapter.revoke();
+    await until(() => sources.length === 1);
+    expect(sources).toEqual([admittedSource!]);
   });
 
   test("workspace and sidecar changes while checking membership cannot reach a new runtime", async () => {
@@ -333,9 +278,9 @@ describe("real desktop remote adapter boundary", () => {
   });
 
   test("revoke also prevents a remote send already waiting behind a local actor", async () => {
-    const gate = deferred<ChiliEvent[]>();
+    const gate = deferred<void>();
     let eventReads = 0;
-    const fixture = harness({ sessionEvents: () => { eventReads += 1; return gate.promise; } });
+    const fixture = harness({ submitPromptAsync: async (input) => { eventReads += 1; await gate.promise; return acceptedInput(input.sessionId, input.text); } });
     const desktopSending = fixture.service.invoke({ type: "session.send", sessionId: "root", text: "desktop", mode: "queue" });
     await until(() => eventReads === 1);
     const mobileSending = invoke(fixture.adapter, {
@@ -344,11 +289,11 @@ describe("real desktop remote adapter boundary", () => {
     await Promise.resolve();
     await Promise.resolve();
     fixture.adapter.revoke();
-    gate.resolve([]);
+    gate.resolve(undefined as never);
     await expect(mobileSending).rejects.toThrow();
     expect(await desktopSending).toEqual({ status: "accepted" });
-    expect(fixture.submitted).toEqual(["desktop"]);
-    expect(fixture.queuedCounts).toEqual([]);
+    expect(fixture.submitted).toEqual([]);
+    expect(fixture.queuedCounts.every((count) => count === 0)).toBe(true);
   });
 
   test("revoking one device releases its membership read without revoking other devices or the desktop", async () => {
@@ -375,9 +320,9 @@ describe("real desktop remote adapter boundary", () => {
   });
 
   test("a revoked device cannot execute a send waiting behind the desktop actor; another device still can", async () => {
-    const gate = deferred<ChiliEvent[]>();
+    const gate = deferred<void>();
     let eventReads = 0;
-    const fixture = harness({ sessionEvents: () => { eventReads += 1; return gate.promise; } });
+    const fixture = harness({ submitPromptAsync: async (input) => { eventReads += 1; await gate.promise; return acceptedInput(input.sessionId, input.text); } });
     const desktopSending = fixture.service.invoke({ type: "session.send", sessionId: "root", text: "desktop", mode: "queue" });
     await until(() => eventReads === 1);
     const device = new AbortController();
@@ -390,12 +335,12 @@ describe("real desktop remote adapter boundary", () => {
     const otherSending = invoke(fixture.adapter, {
       operation: "session.send", payload: { sessionId: "root", text: "other device", mode: "queue" },
     });
-    gate.resolve([]);
+    gate.resolve(undefined as never);
     expect(await desktopSending).toEqual({ status: "accepted" });
     await expect(revokedSending).rejects.toThrow();
-    expect(await otherSending).toEqual({ status: "queued", position: 1 });
-    expect(fixture.submitted).toEqual(["desktop"]);
-    expect(fixture.queuedCounts).toEqual([1]);
+    expect(await otherSending).toEqual({ status: "accepted" });
+    expect(fixture.submitted).toEqual([]);
+    expect(fixture.queuedCounts.every((count) => count === 0)).toBe(true);
     fixture.adapter.revoke();
   });
 
@@ -409,33 +354,6 @@ describe("real desktop remote adapter boundary", () => {
     })).rejects.toThrow();
     expect(reads).toBe(0);
     expect(fixture.interrupts).toEqual([]);
-    fixture.adapter.revoke();
-  });
-
-  test("revocation during the optimistic busy await cannot enqueue a late prompt", async () => {
-    const fixture = harness();
-    await fixture.service.invoke({ type: "session.send", sessionId: "root", text: "desktop", mode: "queue" });
-    const device = new AbortController();
-    // Inject cancellation precisely at the await, including the in-memory fast
-    // path that performs no SDK read and therefore cannot rely on SDK aborts.
-    const serviceBoundary = fixture.service as unknown as {
-      isBusy(sessionId: string, lease: unknown): Promise<boolean>;
-    };
-    const original = serviceBoundary.isBusy;
-    serviceBoundary.isBusy = function(sessionId, lease) {
-      const result = original.call(fixture.service, sessionId, lease);
-      queueMicrotask(() => device.abort());
-      return result;
-    };
-    await expect(fixture.adapter.invoke({
-      operation: "session.send", payload: { sessionId: "root", text: "revoked", mode: "queue" },
-    }, { ...context("session.send"), signal: device.signal })).rejects.toThrow();
-    serviceBoundary.isBusy = original;
-    expect(fixture.submitted).toEqual(["desktop"]);
-    expect(fixture.queuedCounts).toEqual([]);
-    expect(await invoke(fixture.adapter, {
-      operation: "session.send", payload: { sessionId: "root", text: "other device", mode: "queue" },
-    })).toEqual({ status: "queued", position: 1 });
     fixture.adapter.revoke();
   });
 
@@ -461,35 +379,11 @@ describe("real desktop remote adapter boundary", () => {
     fixture.adapter.revoke();
   });
 
-  test.each(["busy", "goal"] as const)("a slow local send %s read times out before Stop and never submits late", async (slowRead) => {
-    const gate = deferred<unknown>();
-    let readSignal: AbortSignal | undefined;
-    const fixture = harness({
-      sessionEvents: async ({ signal }) => {
-        if (slowRead !== "busy") return [];
-        readSignal = signal;
-        return await gate.promise as ChiliEvent[];
-      },
-      getGoal: async ({ signal }) => {
-        readSignal = signal;
-        return await gate.promise as undefined;
-      },
-    }, 25);
-    const started = Date.now();
-    const sending = fixture.service.invoke({
-      type: "session.send", sessionId: "root", text: "must not submit", mode: slowRead === "goal" ? "steer" : "queue",
-    });
-    await until(() => readSignal !== undefined);
-    const stopping = invoke(fixture.adapter, { operation: "session.stop", payload: { sessionId: "root" } });
-    await expect(sending).rejects.toThrow("read timed out");
-    expect(await stopping).toEqual({ interrupted: true });
-    expect(Date.now() - started).toBeLessThan(5_000);
-    expect(readSignal?.aborted).toBe(true);
-    gate.resolve(slowRead === "busy" ? [] : undefined);
-    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
-    expect(fixture.submitted).toEqual([]);
-    expect(fixture.queuedCounts).toEqual([]);
-    expect(fixture.interrupts).toEqual(["desktop_stop"]);
+  test("local send no longer waits for client-side busy or Goal preflight", async () => {
+    const fixture = harness({ sessionEvents: async () => { throw new Error("unused busy read"); }, getGoal: async () => { throw new Error("unused Goal read"); } });
+    expect(await fixture.service.invoke({ type: "session.send", sessionId: "root", text: "work", mode: "steer" })).toEqual({ status: "accepted" });
+    expect(await invoke(fixture.adapter, { operation: "session.stop", payload: { sessionId: "root" } })).toEqual({ interrupted: true });
+    expect(fixture.submitted).toEqual(["work"]);
     fixture.adapter.revoke();
   });
 
@@ -524,7 +418,7 @@ describe("real desktop remote adapter boundary", () => {
     await expect(invoke(fixture.adapter, { operation: "session.snapshot", payload: { sessionId: "root" } }))
       .rejects.toThrow("original snapshot failure");
     expect(siblingSignal?.aborted).toBe(true);
-    gate.resolve([]);
+    gate.resolve(undefined as never);
     fixture.adapter.revoke();
   });
 
@@ -687,6 +581,14 @@ function harness(overrides: Partial<RuntimeClient> = {}, controlReadTimeoutMs = 
     },
     ...overrides,
   } as unknown as RuntimeClient;
+  const originalSubmit = client.submitPromptAsync.bind(client);
+  client.submitPromptAsync = async (input) => {
+    const response = await originalSubmit(input);
+    return response.input ? response : acceptedInput(input.sessionId, input.text, false, input.submissionId);
+  };
+  client.inputQueue ??= async ({ sessionId }) => emptyInputQueue(sessionId);
+  client.getInput ??= async () => undefined;
+  client.cancelInputsFromSource ??= async ({ sessionId }) => emptyInputQueue(sessionId, true, 2);
   const service = new DesktopControlService({
     controlReadTimeoutMs,
     sidecar: {
@@ -743,3 +645,23 @@ async function until(predicate: () => boolean): Promise<void> {
   }
   throw new Error("Condition did not become true");
 }
+
+test("failed durable revocation remains retryable and cannot admit more device work", async () => {
+  let attempts = 0;
+  const sources: string[] = [];
+  const fixture = harness({
+    cancelInputsFromSource: async (input) => {
+      sources.push(input.source);
+      if (++attempts === 1) throw new Error("Runtime unavailable");
+      return emptyInputQueue(input.sessionId, true, 2);
+    },
+  });
+  await invoke(fixture.adapter, { operation: "session.send", payload: { sessionId: "root", text: "pending", mode: "queue" } });
+  await expect(fixture.adapter.revokeDevice("device-test")).rejects.toThrow("Runtime unavailable");
+  await expect(invoke(fixture.adapter, { operation: "session.send", payload: { sessionId: "root", text: "later", mode: "queue" } })).rejects.toThrow("revoked");
+  await fixture.adapter.revokeDevice("device-test");
+  expect(sources).toHaveLength(2);
+  expect(sources[0]).toBe(sources[1]);
+  await fixture.adapter.invoke({ operation: "session.send", payload: { sessionId: "root", text: "other device", mode: "queue" } }, { ...context("session.send"), deviceId: "other" });
+  await fixture.adapter.revoke();
+});

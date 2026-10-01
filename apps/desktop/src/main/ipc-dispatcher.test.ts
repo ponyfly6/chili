@@ -80,7 +80,9 @@ test("the registered dispatcher bounds a 100-snapshot burst before mock sidecar 
       const href = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       const url = new URL(href);
       const path = url.pathname;
-      const body = path === "/agents/tree"
+      const body = path.endsWith("/input_queue")
+        ? { sessionId: "session_1", paused: false, revision: 0, pendingCount: 0, interruptedCount: 0, items: [] }
+        : path === "/agents/tree"
         ? { nodes: [], agents: [], tasks: [], mailbox: [] }
         : url.searchParams.get("window") === "replayable"
           ? { events: [], pendingApprovals: [], truncated: false, bytes: 2, pinnedEventIds: [] }
@@ -122,9 +124,8 @@ test("the registered dispatcher bounds a 100-snapshot burst before mock sidecar 
       : `unexpected:${error instanceof Error ? error.message : String(error)}` as const,
   ));
 
-  await waitUntil(() => totalHttp === 32);
-  expect(activeHttp).toBe(32);
-  expect(peakHttp).toBe(32);
+  await waitUntil(() => totalHttp === 8);
+  expect(activeHttp).toBe(8);
   gate.resolve();
   const outcomes = await Promise.all(requests);
   expect(outcomes.filter((outcome) => outcome.startsWith("unexpected:"))).toEqual([]);

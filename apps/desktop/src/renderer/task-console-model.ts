@@ -213,7 +213,9 @@ export function canResumeTask(
   sessionStatus: RuntimeSessionStatus | "unknown" | undefined,
   goalStatus: SessionGoalStatus | undefined,
   archived: boolean,
+  dispatchPaused = false,
 ): boolean {
+  if (dispatchPaused) return !archived && goalStatus !== "budgetLimited" && sessionStatus !== "running" && sessionStatus !== "cancelling" && sessionStatus !== "waiting_for_approval";
   return !archived
     && (goalStatus === "active" || goalStatus === "paused")
     && (sessionStatus === "cancelled" || sessionStatus === "failed");

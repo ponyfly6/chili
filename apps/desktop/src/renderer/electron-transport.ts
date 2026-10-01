@@ -6,6 +6,10 @@ import type {
 } from "../shared/contracts.js";
 import type { ControlTransport } from "./transport.js";
 
+// An uncertain delivery retains its identity even if the user presses Send again.
+// Project-specific transport views share these pending receipts.
+const pendingSubmissions = new Map<string, { text: string; submissionId: string }>();
+
 export function createElectronTransport(api: ChiliDesktopApi, projectId?: string): ControlTransport {
   const invoke = <Request extends DesktopRequest>(request: Request) => api.invoke({
     ...request,
@@ -59,7 +63,17 @@ export function createElectronTransport(api: ChiliDesktopApi, projectId?: string
     updateGoal: (sessionId, input) => invoke({ type: "session.goal.update", sessionId, ...input }),
     clearGoal: (sessionId) => invoke({ type: "session.goal.clear", sessionId }),
     reloadMcp: (sessionId) => invoke({ type: "mcp.reload", ...(sessionId ? { sessionId } : {}) }),
-    send: (sessionId, text, mode) => invoke({ type: "session.send", sessionId, text, mode }),
+    send: async (sessionId, text, mode) => {
+      const key = JSON.stringify([projectId, sessionId, mode]);
+      let pending = pendingSubmissions.get(key);
+      if (!pending || pending.text !== text) {
+        pending = { text, submissionId: crypto.randomUUID() };
+        pendingSubmissions.set(key, pending);
+      }
+      const result = await invoke({ type: "session.send", sessionId, text, mode, submissionId: pending.submissionId });
+      if (pendingSubmissions.get(key) === pending) pendingSubmissions.delete(key);
+      return result;
+    },
     stop: (sessionId) => invoke({ type: "session.stop", sessionId }),
     resolveApproval: (approvalId, decision) => invoke({ type: "approval.resolve", approvalId, decision }),
     resolveUserInput: (inputId, answers) => invoke({ type: "user-input.resolve", inputId, answers }),

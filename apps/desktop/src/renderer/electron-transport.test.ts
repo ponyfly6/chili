@@ -174,3 +174,24 @@ function deferred<T>(): {
   });
   return { promise, resolve, reject };
 }
+
+test("uncertain delivery retains submission ID across transport views until acknowledged", async () => {
+  const calls: Extract<DesktopRequest, { type: "session.send" }>[] = [];
+  const api = {
+    invoke: async (request: DesktopRequest) => {
+      if (request.type !== "session.send") throw new Error("Unexpected request");
+      calls.push(request);
+      if (calls.length === 1) throw new Error("Connection lost after commit");
+      return { status: "accepted" };
+    },
+    subscribe: () => () => undefined,
+  } as ChiliDesktopApi;
+  const first = createElectronTransport(api, "stable-project");
+  await expect(first.send("stable-session", "same content", "queue")).rejects.toThrow("Connection lost");
+  const retry = createElectronTransport(api).forProject!("stable-project");
+  await retry.send("stable-session", "same content", "queue");
+  await retry.send("stable-session", "same content", "queue");
+  expect(calls[0]!.submissionId).toBeTruthy();
+  expect(calls[1]!.submissionId).toBe(calls[0]!.submissionId);
+  expect(calls[2]!.submissionId).not.toBe(calls[0]!.submissionId);
+});

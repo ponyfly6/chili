@@ -17,6 +17,7 @@ export interface DesktopRemoteSettingsAccess {
 export class DesktopRemoteControlManager implements ChiliRemoteDesktopApi {
   private host: PrivateControlHttpsHost | undefined;
   private adapter: DesktopRemoteControlAdapter | undefined;
+  private readonly revoking = new Set<DesktopRemoteControlAdapter>();
   private pairing: RemoteDesktopState["pairing"];
   private generation = 0;
   private transition = 0;
@@ -49,7 +50,10 @@ export class DesktopRemoteControlManager implements ChiliRemoteDesktopApi {
       if (request.type === "pairing.create") this.pairing = host.createPairing();
       else if (request.type === "pairing.approve") host.approvePairing(request.pairingId);
       else if (request.type === "pairing.reject") host.rejectPairing(request.pairingId);
-      else if (request.type === "device.revoke") host.revokeDevice(request.deviceId);
+      else if (request.type === "device.revoke") {
+        host.revokeDevice(request.deviceId);
+        await this.adapter?.revokeDevice(request.deviceId);
+      }
     }
     return this.snapshot();
   }
@@ -77,13 +81,17 @@ export class DesktopRemoteControlManager implements ChiliRemoteDesktopApi {
     this.transition += 1;
     this.starting = false;
     this.options.settings.invalidatePending();
-    this.adapter?.revoke();
+    if (this.adapter) this.revoking.add(this.adapter);
+    const revocations = [...this.revoking].map(async (adapter) => {
+      await adapter.revoke();
+      this.revoking.delete(adapter);
+    });
     this.adapter = undefined;
     const host = this.host;
     this.host = undefined;
     this.pairing = undefined;
     const previous = this.closing;
-    this.closing = Promise.all([previous, host?.disable() ?? Promise.resolve()]).then(() => undefined);
+    this.closing = Promise.all([previous.catch(() => undefined), host?.disable() ?? Promise.resolve(), ...revocations]).then(() => undefined);
     return this.closing;
   }
 
@@ -107,12 +115,10 @@ export class DesktopRemoteControlManager implements ChiliRemoteDesktopApi {
       this.host = host;
       await host.enable(configuration);
       if (epoch !== this.transition) {
-        adapter.revoke();
-        await host.disable();
+        await Promise.all([adapter.revoke(), host.disable()]);
       }
     } catch (error) {
-      adapter?.revoke();
-      await host?.disable();
+      await Promise.allSettled([adapter?.revoke(), host?.disable()]);
       if (host && this.host === host) this.host = undefined;
       if (adapter && this.adapter === adapter) this.adapter = undefined;
       if (epoch !== this.transition) return;
