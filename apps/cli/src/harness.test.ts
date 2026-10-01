@@ -445,6 +445,10 @@ test("CLI harness recovers an expired child task, agent run, and child turn thro
       return task?.status === "cancelled" && childStatus === "failed";
     });
 
+    // Background completion also wakes the parent. Let its events settle so
+    // recovery assertions cannot accidentally count another session's turn.
+    await harness.mailboxPump.waitForIdle();
+
     expect(await harness.events.agentTask(taskId)).toMatchObject({
       id: taskId,
       status: "cancelled",
@@ -456,8 +460,12 @@ test("CLI harness recovers an expired child task, agent run, and child turn thro
     });
     expect(observed.filter((event) => event.type === "agent.task_completed")).toHaveLength(1);
     expect(observed.filter((event) => event.type === "agent.completed")).toHaveLength(1);
-    expect(observed.filter((event) => event.type === "turn.completed")).toHaveLength(1);
-    expect(observed.filter((event) => event.type === "session.status_changed")).toHaveLength(1);
+    expect(observed.filter((event) => event.type === "turn.completed"
+      && event.sessionId === childSessionId)).toHaveLength(1);
+    expect(observed.filter((event) => event.type === "session.status_changed"
+      && event.sessionId === childSessionId)).toHaveLength(1);
+    expect(observed.some((event) => event.type === "turn.completed"
+      && event.sessionId === parentSessionId)).toBe(true);
 
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 30));
     const durable = await harness.events.events({ limit: 100 });
