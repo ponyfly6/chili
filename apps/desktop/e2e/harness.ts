@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { openAdvancedTaskDialog, openDesktopSettings, assertConversationDesign } from "./conversation-design.js";
 import type { ChiliDesktopApi } from "../src/shared/contracts.js";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -175,6 +176,7 @@ try {
   } else {
     logStep("launch 1/4: create an overnight Goal through the New Task dialog");
     currentLaunch = await launchDesktop("goal-create", "fake");
+    await assertConversationDesign(currentLaunch.page, artifacts);
     await createGoalThroughUi(currentLaunch.page);
     await assertGoalSurface(currentLaunch.page);
     await assertDesktopAppearance(currentLaunch.page, artifacts);
@@ -566,6 +568,8 @@ async function createGoalThroughUi(page: Page): Promise<void> {
 }
 
 async function assertGoalSurface(page: Page): Promise<void> {
+  const show = page.getByRole("button", { name: "Show workbench", exact: true });
+  if (await show.isVisible()) await show.click();
   const goal = page.locator(".inspector-section.goal-section");
   await expectVisible(goal.getByText("Goal", { exact: true }));
   await expectVisible(goal.getByText(GOAL_OBJECTIVE, { exact: true }));
@@ -574,6 +578,8 @@ async function assertGoalSurface(page: Page): Promise<void> {
 }
 
 async function assertRecoveredGoalAndControls(page: Page): Promise<void> {
+  const show = page.getByRole("button", { name: "Show workbench", exact: true });
+  if (await show.isVisible()) await show.click();
   await waitForTaskTitle(page, GOAL_TITLE);
   const goal = page.locator(".inspector-section.goal-section");
   await expectVisible(goal.getByText(GOAL_OBJECTIVE, { exact: true }));
@@ -627,11 +633,11 @@ async function renameSearchAndArchiveThroughUi(page: Page): Promise<void> {
   const initialActions = page.getByRole("button", { name: `Task actions for ${APPROVAL_TITLE}`, exact: true });
   await initialActions.click();
   const initialMenu = page.getByRole("menu", { name: `Task actions for ${APPROVAL_TITLE}`, exact: true });
-  await expectFocused(initialMenu.getByRole("menuitem", { name: "Rename task", exact: true }));
+  await expectFocused(initialMenu.getByRole("menuitem", { name: "重命名", exact: true }));
   await page.keyboard.press("Escape");
   await expectFocused(initialActions);
   await initialActions.click();
-  await initialMenu.getByRole("menuitem", { name: "Rename task", exact: true }).click();
+  await initialMenu.getByRole("menuitem", { name: "重命名", exact: true }).click();
   const renameDialog = page.getByRole("dialog", { name: "Rename task", exact: true });
   await expectVisible(renameDialog);
   const titleInput = renameDialog.getByLabel("New task title", { exact: true });
@@ -640,6 +646,7 @@ async function renameSearchAndArchiveThroughUi(page: Page): Promise<void> {
   await renameDialog.waitFor({ state: "hidden" });
   await waitForTaskTitle(page, RENAMED_APPROVAL_TITLE);
 
+  await page.getByRole("button", { name: "搜索会话", exact: true }).click();
   const search = page.getByLabel("Search tasks", { exact: true });
   await search.fill("renamed approval");
   const renamedTaskRow = page.getByRole("button", { name: /^Renamed approval E2E\b/iu });
@@ -649,14 +656,14 @@ async function renameSearchAndArchiveThroughUi(page: Page): Promise<void> {
     name: `Task actions for ${RENAMED_APPROVAL_TITLE}`,
     exact: true,
   });
-  await renamedMenu.getByRole("menuitem", { name: "Archive task", exact: true }).click();
+  await renamedMenu.getByRole("menuitem", { name: "归档会话", exact: true }).click();
   const archiveDialog = page.getByRole("dialog", { name: "Archive task?", exact: true });
   await expectVisible(archiveDialog);
   await expectFocused(archiveDialog.getByRole("button", { name: "Cancel", exact: true }));
-  await archiveDialog.getByRole("button", { name: "Archive task", exact: true }).click();
+  await archiveDialog.getByRole("button", { name: "归档会话", exact: true }).click();
   await archiveDialog.waitFor({ state: "hidden" });
   const statusTabs = page.getByRole("tablist", { name: "Task status", exact: true });
-  const archivedTab = statusTabs.getByRole("tab", { name: /^Archived tasks\b/iu });
+  const archivedTab = statusTabs.getByRole("tab", { name: /^已归档/u });
   await waitUntil("Archived tasks tab selection after archive", async () => (
     await archivedTab.getAttribute("aria-selected") === "true"
   ));
@@ -666,7 +673,7 @@ async function renameSearchAndArchiveThroughUi(page: Page): Promise<void> {
     0,
     "Archived tasks must not expose mutation actions",
   );
-  await statusTabs.getByRole("tab", { name: /^Active tasks\b/iu }).click();
+  await statusTabs.getByRole("tab", { name: /^会话/u }).click();
   await renamedTaskRow.waitFor({ state: "hidden" });
   await search.fill("");
 }
@@ -691,17 +698,19 @@ async function createSlowProviderTaskThroughUi(page: Page): Promise<void> {
 }
 
 async function recoverSlowGoalThroughUi(page: Page): Promise<void> {
+  const show = page.getByRole("button", { name: "Show workbench", exact: true });
+  if (await show.isVisible()) await show.click();
   await waitForTaskTitle(page, SLOW_TITLE);
   const goal = page.locator(".inspector-section.goal-section");
   const objective = goal.locator(".goal-card > p", { hasText: SLOW_STEER_PROMPT });
   await expectVisible(objective);
   assert.equal((await objective.innerText()).trim(), SLOW_STEER_PROMPT);
-  const configuration = page.getByLabel("Task runtime configuration", { exact: true });
+  const configuration = page.locator(".inspector-section.runtime-config-section");
   await expectVisible(configuration);
   await waitUntil("Default permission reset after sidecar restart", async () => (
-    /default permissions/iu.test(await configuration.innerText())
+    /Permission\s+default/iu.test(await configuration.innerText())
   ));
-  await expectVisible(configuration.getByText(/^provider default tier$/iu));
+  await expectVisible(configuration.getByText(/^Provider default$/iu));
   const requestsBeforeResume = provider.requests.filter((request) => request.text.includes(SLOW_STEER_PROMPT)).length;
   await sleep(750);
   assert.equal(
@@ -711,7 +720,7 @@ async function recoverSlowGoalThroughUi(page: Page): Promise<void> {
   );
 
   const resumeTask = page.locator(".conversation-heading-actions")
-    .getByRole("button", { name: "Resume task", exact: true });
+    .getByRole("button", { name: "继续处理", exact: true });
   const resumeGoal = goal.getByRole("button", { name: "Resume Goal", exact: true });
   if (await isVisible(resumeTask, 2_000)) {
     await resumeTask.click();
@@ -740,7 +749,7 @@ async function steerSlowTurnThroughUi(page: Page): Promise<void> {
   )).length;
   const composer = activeComposer(page);
   await composer.fill(STEER_REPLACEMENT);
-  await controls.getByRole("button", { name: "Steer", exact: true }).click();
+  await controls.getByRole("button", { name: "调整方向", exact: true }).click();
   await waitForProviderRequest(STEER_REPLACEMENT, 1);
   await expectVisible(page.locator(".timeline").getByText(`Fixture response: ${STEER_REPLACEMENT}`, { exact: true }));
   await waitForProviderAbort(SLOW_STEER_PROMPT, slowAbortsBefore + 1);
@@ -758,13 +767,13 @@ async function stopSlowTurnThroughUi(page: Page): Promise<void> {
   await stop.waitFor({ state: "hidden" });
   await waitForProviderAbort(SLOW_STEER_PROMPT, slowAbortsBefore + 1);
   await expectVisible(page.locator(".conversation-heading-actions")
-    .getByRole("button", { name: "Resume task", exact: true }));
+    .getByRole("button", { name: "继续处理", exact: true }));
 }
 
 async function resumeStoppedTaskThroughUi(page: Page): Promise<void> {
   const slowRequestsBefore = provider.requests.filter((request) => request.text.includes(SLOW_STEER_PROMPT)).length;
   const resume = page.locator(".conversation-heading-actions")
-    .getByRole("button", { name: "Resume task", exact: true });
+    .getByRole("button", { name: "继续处理", exact: true });
   await expectVisible(resume);
   await resume.click();
   await resume.waitFor({ state: "hidden" });
@@ -780,6 +789,8 @@ async function sendRecoveryFollowUpThroughUi(page: Page): Promise<void> {
   await expectVisible(composer);
   await composer.fill(RECOVERY_PROMPT);
   await page.locator(".composer-buttons").getByRole("button", { name: "Send message", exact: true }).click();
+  const resume = page.getByRole("button", { name: "继续处理", exact: true });
+  if (await resume.isVisible()) await resume.click();
   await waitForProviderRequest(RECOVERY_PROMPT, 1);
   await expectVisible(page.locator(".timeline").getByText(`Fixture response: ${RECOVERY_PROMPT}`, { exact: true }));
 }
@@ -819,14 +830,11 @@ async function assertNativeResponsiveWidths(launch: DesktopLaunch): Promise<void
       await launch.page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
       await launch.page.screenshot({ path: join(artifacts, `responsive-navigation-${width}.png`) });
     }
-    await launch.page.getByRole("button", { name: "Appearance settings", exact: true }).click();
-    const appearance = launch.page.getByRole("dialog", { name: "Appearance", exact: true });
-    await assertWithinViewport(appearance, width, `appearance dialog at ${width}px`);
-    for (const name of [/System/, /Dark/, /Light/]) {
-      await assertWithinViewport(appearance.getByRole("radio", { name }), width, `theme choice at ${width}px`);
-    }
+    const appearance = await openDesktopSettings(launch.page);
+    await assertWithinViewport(appearance, width, `settings dialog at ${width}px`);
+    await assertWithinViewport(appearance.getByLabel("颜色主题", { exact: true }), width, `theme choice at ${width}px`);
     await launch.page.screenshot({ path: join(artifacts, `appearance-${width}.png`) });
-    await appearance.getByRole("button", { name: "Done", exact: true }).click();
+    await appearance.getByRole("button", { name: "关闭设置", exact: true }).click();
     await assertWithinViewport(
       launch.page.locator(".titlebar-leading").getByRole("button", { name: /(?:Hide|Show) sidebar/iu }),
       width,
@@ -957,8 +965,7 @@ async function assertProviderDefaultServiceTier(dialog: Locator): Promise<void> 
 }
 
 async function openNewTaskDialog(page: Page): Promise<Locator> {
-  await page.getByRole("button", { name: /^New task\b/iu }).click();
-  const dialog = page.getByRole("dialog", { name: "Create a new task", exact: true });
+  const dialog = await openAdvancedTaskDialog(page);
   await expectVisible(dialog);
   await expectFocused(dialog.getByLabel("Task title", { exact: true }));
   return dialog;

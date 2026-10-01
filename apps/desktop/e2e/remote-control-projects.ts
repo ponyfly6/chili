@@ -1,3 +1,4 @@
+import { openPhoneSettings } from "./conversation-design.js";
 import assert from "node:assert/strict";
 import { mkdir } from "node:fs/promises";
 import { basename, join } from "node:path";
@@ -50,11 +51,11 @@ export async function proveRemoteProjectIsolation(options: ProjectScenarioOption
   };
   try {
     process.stdout.write("[remote-e2e] Two running projects keep independent phone authorization and queues\n");
-    await desktop.getByRole("button", { name: "Close phone control", exact: true }).click();
+    await desktop.getByRole("button", { name: "关闭设置", exact: true }).click();
     await options.createTask(desktop, titleA, promptA);
     await waitUntil("project A model stream starts", () => requests.some((request) => request.text === promptA));
     const ownerA = await taskOwner(desktop, titleA);
-    await desktop.getByTestId("remote-open").click();
+    await openPhoneSettings(desktop);
     await options.pair(desktop, phone, "Project A scope E2E");
     await phone.getByTestId("task-list").getByText(titleA, { exact: true }).click();
     await waitUntil("project A phone snapshot", async () => (await phone.getByTestId("transcript").innerText()).includes(promptA));
@@ -70,7 +71,7 @@ export async function proveRemoteProjectIsolation(options: ProjectScenarioOption
         return { canceled: false, filePaths: [selectedWorkspace] };
       };
     }, projectBPath);
-    await desktop.getByRole("button", { name: "Close phone control", exact: true }).click();
+    await desktop.getByRole("button", { name: "关闭设置", exact: true }).click();
     await desktop.getByRole("button", { name: "Add project", exact: true }).click();
     await waitForProject(desktop, basename(projectBPath));
     await assertPhoneLostScope(phone);
@@ -81,7 +82,7 @@ export async function proveRemoteProjectIsolation(options: ProjectScenarioOption
     assert.notEqual(ownerA.projectId, ownerB.projectId);
     assertBothRunning();
 
-    await desktop.getByTestId("remote-open").click();
+    await openPhoneSettings(desktop);
     await enableAfterProjectSwitch(desktop, phone, options);
     const staleAOnB = await rejectStaleGrant(phone, grantA, [ownerA.sessionId, ownerB.sessionId], "A grant while B is active");
     assertBothRunning();
@@ -103,12 +104,12 @@ export async function proveRemoteProjectIsolation(options: ProjectScenarioOption
     assert.equal(requests.filter((request) => request.text === queuedB).length, 0, "A Queue cannot preempt B's running turn");
     await phone.screenshot({ path: join(options.artifacts, "mobile-project-b-only.png"), fullPage: true });
 
-    await desktop.getByRole("button", { name: "Close phone control", exact: true }).click();
+    await desktop.getByRole("button", { name: "关闭设置", exact: true }).click();
     await desktop.getByRole("button", { name: `Open project ${basename(options.workspace)}`, exact: true }).click();
     await waitForProject(desktop, basename(options.workspace));
     await assertPhoneLostScope(phone);
     assertBothRunning();
-    await desktop.getByTestId("remote-open").click();
+    await openPhoneSettings(desktop);
     await enableAfterProjectSwitch(desktop, phone, options);
     const staleBOnA = await rejectStaleGrant(phone, grantB, [ownerA.sessionId, ownerB.sessionId], "B grant while A is active");
     const staleAOnA = await rejectStaleGrant(phone, grantA, [ownerA.sessionId, ownerB.sessionId], "original A grant after returning to A");
@@ -126,18 +127,19 @@ export async function proveRemoteProjectIsolation(options: ProjectScenarioOption
     assert.equal(stream(promptB).aborted, false, "A's valid Stop must not interrupt the background B project");
     await phone.screenshot({ path: join(options.artifacts, "mobile-project-a-repaired.png"), fullPage: true });
 
-    // Drain B's accepted queue through the real desktop Stop, also proving the
-    // earlier unauthorized sends were never waiting invisibly behind its turn.
-    await desktop.getByRole("button", { name: "Close phone control", exact: true }).click();
+    // Changing the phone's project revokes its scope and cancels that scope's
+    // pending inputs, while B's already running turn remains independent.
+    await desktop.getByRole("button", { name: "关闭设置", exact: true }).click();
     await desktop.getByRole("button", { name: `Open project ${basename(projectBPath)}`, exact: true }).click();
     await waitForProject(desktop, basename(projectBPath));
-    assert.equal((await desktopState(desktop)).queuedBySession[ownerB.sessionId], 1);
+    assert.equal((await desktopState(desktop)).queuedBySession[ownerB.sessionId] ?? 0, 0);
+    assert.equal(requests.filter((request) => request.text === queuedB).length, 0, "Revoked phone inputs must not run later in the background project");
     await desktop.getByRole("button", { name: "Stop current turn", exact: true }).click();
-    await waitUntil("B's own stop drains its own queue once", () => stream(promptB).aborted
-      && requests.filter((request) => request.text === queuedB).length === 1);
+    await waitUntil("B's own stop affects only its running turn", () => stream(promptB).aborted);
+    assert.equal(requests.filter((request) => request.text === queuedB).length, 0);
     await desktop.getByRole("button", { name: `Open project ${basename(options.workspace)}`, exact: true }).click();
     await waitForProject(desktop, basename(options.workspace));
-    await desktop.getByTestId("remote-open").click();
+    await openPhoneSettings(desktop);
     await desktop.getByTestId("remote-enable").waitFor();
     assert.equal(await options.readSavedSetup(), options.savedSetup, "Project selection preserves HTTPS settings bytes");
     assert.equal(requests.some((request) => request.text.startsWith("Rejected stale grant")), false);
@@ -151,7 +153,7 @@ export async function proveRemoteProjectIsolation(options: ProjectScenarioOption
       newPairingRequiredForEachProjectSwitch: true,
       originalAuthorizationNotRevivedOnReturn: true,
       freshPhoneStopOnlyAffectsItsOwnProject: true,
-      projectBQueueExecutesOnceAfterItsOwnStop: true,
+      projectBPendingPhoneInputCancelledOnScopeRevocation: true,
       staleGrantRequests: [...staleAOnB, ...staleBOnA, ...staleAOnA],
       staleGrantInstrumentation: "fresh valid encrypted Queue/Steer/Stop frames sent by browser fetch using previously observed real grants; normal TLS verification",
       physicalDeviceTested: false,

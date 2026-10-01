@@ -1,3 +1,4 @@
+import { openAdvancedTaskDialog } from "./conversation-design.js";
 import assert from "node:assert/strict";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
@@ -57,8 +58,7 @@ export class TimelineFollowFixture {
 export async function assertTimelineFollowStream(page: Page, fixture: TimelineFollowFixture, artifacts: string): Promise<void> {
   const showSidebar = page.getByRole("button", { name: "Show sidebar", exact: true });
   if (await showSidebar.isVisible()) await showSidebar.click();
-  await page.getByRole("button", { name: /^New task\b/iu }).click();
-  const dialog = page.getByRole("dialog", { name: "Create a new task", exact: true });
+  const dialog = await openAdvancedTaskDialog(page);
   await dialog.waitFor();
   await dialog.getByLabel("Task title", { exact: true }).fill(TITLE);
   await dialog.getByLabel("What should Chili accomplish?", { exact: true }).fill(TIMELINE_FOLLOW_PROMPT);
@@ -81,13 +81,18 @@ export async function assertTimelineFollowStream(page: Page, fixture: TimelineFo
   const contains = async (text: string): Promise<boolean> => (await timeline.innerText()).includes(text);
   const bottom = async (): Promise<boolean> => timeline.evaluate((element) =>
     element.scrollHeight - element.scrollTop - element.clientHeight <= 2);
+  const readHistory = async (): Promise<void> => {
+    await timeline.hover();
+    await page.mouse.wheel(0, -10000);
+    await jump.waitFor();
+    await until("history scroll settles", async () => await timeline.evaluate((element) => element.scrollTop) <= 2);
+  };
   await until("initial live provider chunk", () => contains("Short live response."));
   assert.equal(await jump.isVisible(), false, "A short live response needs no jump button");
 
   fixture.append(paragraphs("Initial flowing row", 60));
   await until("large stream rendered and followed", async () => await contains("Initial flowing row 60.") && await bottom());
-  await timeline.evaluate((element) => { element.scrollTop = 0; });
-  await jump.waitFor();
+  await readHistory();
   const readingTop = await timeline.evaluate((element) => element.scrollTop);
   fixture.append(paragraphs("Output while reading", 10));
   await until("new content while reading history", () => contains("Output while reading 10."));
@@ -100,8 +105,7 @@ export async function assertTimelineFollowStream(page: Page, fixture: TimelineFo
   await until("later output remains followed", async () => await contains("Resumed follow row 10.") && await bottom());
   assert.equal(await jump.isVisible(), false, "Restored following must hide the jump button");
 
-  await timeline.evaluate((element) => { element.scrollTop = 0; });
-  await jump.waitFor();
+  await readHistory();
   await switchProject(page, "project-b");
   await page.getByRole("heading", { name: "Independent project B task", exact: true }).waitFor();
   await until("project scope clears old timeline", async () => !(await contains("Initial flowing row")));
@@ -112,9 +116,8 @@ export async function assertTimelineFollowStream(page: Page, fixture: TimelineFo
   fixture.append(paragraphs("Restored project follow", 5));
   await until("restored project follows new live output", async () => await contains("Restored project follow 5.") && await bottom());
   fixture.finish();
-  await page.locator(".conversation-heading-actions .session-status.status-idle").waitFor();
-  await timeline.evaluate((element) => { element.scrollTop = 0; });
-  await jump.waitFor();
+  await page.getByRole("button", { name: "Send message", exact: true }).waitFor();
+  await readHistory();
   const jumpBounds = await jump.boundingBox();
   const composerBounds = await page.locator(".composer").boundingBox();
   const width = await page.evaluate(() => window.innerWidth);

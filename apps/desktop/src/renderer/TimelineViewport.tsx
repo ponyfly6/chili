@@ -55,6 +55,14 @@ function ScopedTimelineViewport({ children }: { children: ReactNode }) {
         ref={viewportRef}
         tabIndex={-1}
         aria-label="Task messages"
+        onWheel={(event) => {
+          // Record upward intent before a pending resize can pull the reader
+          // back to the bottom, even if the scroll event has not fired yet.
+          if (event.deltaY < 0) {
+            followingRef.current = false;
+            automaticTopRef.current = undefined;
+          }
+        }}
         onScroll={(event) => {
           const viewport = event.currentTarget;
           // A scroll event from our last jump can arrive after another content

@@ -1,3 +1,4 @@
+import { openAdvancedTaskDialog, openPhoneSettings } from "./conversation-design.js";
 import assert from "node:assert/strict";
 import { cp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { createHash, X509Certificate } from "node:crypto";
@@ -140,7 +141,7 @@ try {
   process.stdout.write("[remote-e2e] Creating existing task through real desktop UI\n");
   await createDesktopTask(desktopPage, "Phone Alpha real runtime", "[slow] initial desktop task");
   await waitUntil("initial streamed model request", () => fixture.requests.some((request) => request.text === "[slow] initial desktop task"));
-  await desktopPage.getByTestId("remote-open").click();
+  await openPhoneSettings(desktopPage);
   assert.equal(await desktopPage.getByTestId("remote-status").count(), 0, "Remote must start disabled");
   process.stdout.write("[remote-e2e] Saving private HTTPS through the native desktop setup and testing picker cancellation\n");
   const savedSetup = await configureThroughUi(desktop, desktopPage, userData);
@@ -178,10 +179,10 @@ try {
   process.stdout.write("[remote-e2e] Queue, local concurrent operation, Steer and Stop\n");
   await mobile.getByTestId("message-input").fill("phone queued once");
   await mobile.getByTestId("queue-send").click();
-  await waitUntil("desktop sees remotely queued prompt", async () => /1 queued/iu.test(await desktopPage!.locator(".composer").innerText()));
+  await waitUntil("desktop sees remotely queued prompt", async () => /1 条待处理/u.test(await desktopPage!.locator(".composer").innerText()));
   assert.equal(fixture.requests.filter((request) => request.text === "phone queued once").length, 0, "Queue must not preempt running task");
   // A real local window and a real phone share the service's queue simultaneously.
-  await desktopPage.getByRole("button", { name: "Close phone control", exact: true }).click();
+  await desktopPage.getByRole("button", { name: "关闭设置", exact: true }).click();
   await desktopPage.getByLabel("Message composer", { exact: true }).fill("desktop queued concurrently");
   await desktopPage.getByRole("button", { name: "Queue message", exact: true }).click();
   await mobile.getByTestId("message-input").fill("phone steer replacement");
@@ -198,6 +199,8 @@ try {
   await mobile.getByTestId("stop-task").click();
   await waitUntil("phone Stop aborts real runtime turn", () => fixture.requests.some((request) => request.text === "[slow] phone stop target" && request.aborted));
   evidence.stopElapsedMs = Date.now() - stopStarted;
+  // Stop now persists a paused input queue; explicit local resume admits follow-ups.
+  await desktopPage.getByRole("button", { name: "继续处理", exact: true }).click();
 
   process.stdout.write("[remote-e2e] Disconnect/reconnect, refresh requires fresh pairing, device revocation\n");
   await mobile.getByTestId("disconnect").click();
@@ -208,7 +211,7 @@ try {
   await waitUntil("reconnected request reaches runtime once", () => fixture.requests.filter((request) => request.text === "after transport reconnect").length === 1);
   evidence.reconnect = true;
   await mobile.getByTestId("disconnect").click();
-  await desktopPage.getByTestId("remote-open").click();
+  await openPhoneSettings(desktopPage);
   evidence.unknownOutcomeUi = await proveStickyUnknownOutcomeUi(browser, desktopPage, remoteOrigin);
   evidence.wireLoss = await proveWireLoss(browser, desktopPage, remoteOrigin, desktop);
   await mobile.reload();
@@ -252,7 +255,7 @@ try {
   desktopPage.on("pageerror", (error) => errors.push(error.message));
   await desktop.context().tracing.start({ screenshots: true, snapshots: true, sources: true });
   await waitUntil("restarted real sidecar healthy", async () => /healthy/iu.test(await desktopPage!.locator('[title="Local runtime status"]').innerText()));
-  await desktopPage.getByTestId("remote-open").click();
+  await openPhoneSettings(desktopPage);
   assert.equal(await desktopPage.getByTestId("remote-status").count(), 0, "Desktop restart must leave remote disabled");
   await desktopPage.getByTestId("remote-setup-replace-tls").waitFor();
   assert.equal(await desktopPage.getByTestId("remote-setup-address").inputValue(), remoteBindAddress);
@@ -442,8 +445,8 @@ async function assertNativeSetupModal(application: ElectronApplication, page: Pa
     return window.getContentSize();
   });
   const results: unknown[] = [];
-  const dialog = page.getByRole("dialog", { name: "Phone control", exact: true });
-  const close = page.getByRole("button", { name: "Close phone control", exact: true });
+  const dialog = page.getByRole("dialog", { name: "设置", exact: true });
+  const close = page.getByRole("button", { name: "关闭设置", exact: true });
   const focusableSelector = "button:not(:disabled), input:not(:disabled), select:not(:disabled), summary, a[href], [tabindex='0']";
   try {
     for (const width of [1440, 820, 390]) {
@@ -457,7 +460,7 @@ async function assertNativeSetupModal(application: ElectronApplication, page: Pa
       await page.waitForFunction((expected) => innerWidth === expected && innerHeight === 820, width);
       const metrics = await dialog.evaluate((element) => {
         const bounds = element.getBoundingClientRect();
-        const scroller = element.querySelector<HTMLElement>(".remote-panel-scroll");
+        const scroller = element.querySelector<HTMLElement>(".settings-content");
         if (!scroller) throw new Error("Phone dialog scroll container is unavailable");
         return {
           width: innerWidth, height: innerHeight,
@@ -473,7 +476,8 @@ async function assertNativeSetupModal(application: ElectronApplication, page: Pa
       assert.equal(metrics.backgroundInert, true);
       await page.screenshot({ path: join(artifacts, `desktop-phone-setup-${width}.png`) });
 
-      await close.focus();
+      const first = dialog.getByRole("button", { name: "通用", exact: true });
+      await first.focus();
       const focusableCount = await dialog.evaluate((element, selector) => Array.from(element.querySelectorAll<HTMLElement>(selector)).filter((node) => node.getClientRects().length > 0).length, focusableSelector);
       assert.ok(focusableCount > 2);
       await page.keyboard.press("Shift+Tab");
@@ -482,18 +486,18 @@ async function assertNativeSetupModal(application: ElectronApplication, page: Pa
         return document.activeElement === controls.at(-1);
       }, focusableSelector), true, "Shift+Tab wraps from the first control to the last");
       await page.keyboard.press("Tab");
-      assert.equal(await close.evaluate((element) => element === document.activeElement), true, "Tab wraps back to the first control");
+      assert.equal(await first.evaluate((element) => element === document.activeElement), true, "Tab wraps back to the first control");
       for (let index = 0; index < focusableCount + 1; index += 1) {
         await page.keyboard.press("Tab");
         assert.equal(await dialog.evaluate((element) => element.contains(document.activeElement)), true, "Tab focus stays inside Phone control");
       }
       await page.keyboard.press("Escape");
       await dialog.waitFor({ state: "hidden" });
-      assert.equal(await page.getByTestId("remote-open").evaluate((element) => element === document.activeElement), true, "Escape returns keyboard focus to the Phone trigger");
+      assert.equal(await page.evaluate(() => !document.activeElement?.closest("[inert]")), true, "Escape restores focus outside the closed settings");
       assert.equal(await page.locator(".app-shell").evaluate((element) => (element as HTMLElement).inert), false);
-      await page.getByTestId("remote-open").click();
+      await openPhoneSettings(page);
       await dialog.waitFor();
-      assert.equal(await close.evaluate((element) => element === document.activeElement), true, "Opening Phone control focuses its close button");
+      assert.equal(await dialog.evaluate((element) => element.contains(document.activeElement)), true, "Opening settings keeps focus in the dialog");
       results.push({ ...metrics, keyboardTrap: true, escapeCloses: true, triggerFocusRestored: true, screenshot: `desktop-phone-setup-${width}.png` });
     }
   } finally {
@@ -531,8 +535,7 @@ async function assertNoTlsMaterialInRenderer(page: Page, state: RemoteDesktopSta
 }
 
 async function createDesktopTask(page: Page, title: string, text: string): Promise<void> {
-  await page.getByRole("button", { name: /^New task\b/iu }).click();
-  const dialog = page.getByRole("dialog", { name: "Create a new task", exact: true });
+  const dialog = await openAdvancedTaskDialog(page);
   await dialog.getByLabel("Task title", { exact: true }).fill(title);
   await dialog.getByLabel("What should Chili accomplish?", { exact: true }).fill(text);
   const model = dialog.getByLabel("Model", { exact: true });
@@ -663,6 +666,11 @@ async function proveStickyUnknownOutcomeUi(context: BrowserContext, local: Page,
   const unknown = page.getByTestId("outcome-unknown");
   const unknownItems = unknown.locator('[data-testid^="unknown-outcome-"]');
   const confirmations = unknown.getByRole("button", { name: /已核对，清除此提醒/u });
+  const resumeLocalQueue = async (): Promise<void> => {
+    await local.getByRole("button", { name: "关闭设置", exact: true }).click();
+    await local.getByRole("button", { name: "继续处理", exact: true }).click();
+    await openPhoneSettings(local);
+  };
   const assertOneWarning = async (message: string): Promise<void> => {
     await unknown.waitFor({ state: "visible" });
     assert.equal(await unknownItems.count(), 1, message);
@@ -704,6 +712,7 @@ async function proveStickyUnknownOutcomeUi(context: BrowserContext, local: Page,
     await unknown.waitFor({ state: "detached" });
 
     process.stdout.write("[remote-e2e] Production UI retains concurrent Queue/Stop unknown outcomes independently\n");
+    await resumeLocalQueue();
     dropStopResults = true;
     await page.getByTestId("message-input").fill(concurrentSend);
     await page.getByTestId("queue-send").click();
@@ -726,6 +735,7 @@ async function proveStickyUnknownOutcomeUi(context: BrowserContext, local: Page,
     assert.equal(fixture.requests.filter((request) => request.text === lostSend).length, 1);
     assert.equal(fixture.requests.filter((request) => request.text === concurrentSend).length, 1);
     process.stdout.write("[remote-e2e] Production UI retains admitted command uncertainty after desktop revocation\n");
+    await resumeLocalQueue();
     const revocationStarted = Date.now();
     await page.getByTestId("message-input").fill(revokedSend);
     await page.getByTestId("queue-send").click();
@@ -831,7 +841,7 @@ async function proveWireLoss(context: BrowserContext, local: Page, origin: strin
     await local.getByTestId("remote-pending-confirm").first().click();
     await paired;
     const list = await page.evaluate(async () => (window as unknown as BrowserFaultWindow).remoteFaultClient.request("sessions.list", { status: "active" })) as { sessions: { id: string; title: string }[] };
-    const sessionId = list.sessions.find((session) => session.title === "Phone Alpha real runtime")?.id;
+    let sessionId = list.sessions.find((session) => session.title === "Phone Alpha real runtime")?.id;
     assert.ok(sessionId);
     const snapshot = await page.evaluate(async (id) => (window as unknown as BrowserFaultWindow).remoteFaultClient.request("session.snapshot", { sessionId: id }), sessionId);
     assert.ok(Buffer.byteLength(JSON.stringify(snapshot), "utf8") <= 48 * 1024);
@@ -839,8 +849,15 @@ async function proveWireLoss(context: BrowserContext, local: Page, origin: strin
       assert.ok(!Object.keys(snapshot as Record<string, unknown>).includes(forbidden));
     }
     results.push(...await proveMutationMembershipOrdering(application, local, page, sessionId, requests, acknowledged));
+    // The ordering case deliberately leaves a stopped durable queue. Isolate
+    // subsequent wire-loss probes from those retained pending messages.
+    const wireSession = await local.evaluate(async () => (window as unknown as DesktopOrderingWindow).chiliDesktop.invoke({
+      type: "sessions.create", title: "Wire loss isolated runtime",
+    }));
+    sessionId = wireSession.sessionId;
     const slowReadStopText = "[slow] unresolved snapshot Stop";
     await page.evaluate(async ({ id, text }) => (window as unknown as BrowserFaultWindow).remoteFaultClient.request("session.send", { sessionId: id, text, mode: "queue" }), { id: sessionId, text: slowReadStopText });
+    await resumePausedQueue(local, sessionId);
     await waitUntil("runtime started for unresolved snapshot Stop", () => fixture.requests.some((request) => request.text === slowReadStopText));
     mode = "result";
     targetSnapshot = true;
@@ -864,6 +881,7 @@ async function proveWireLoss(context: BrowserContext, local: Page, origin: strin
       process.stdout.write(`[remote-e2e] Real encrypted wire loss: ${loss}\n`);
       const holder = `[slow] ${loss} queue holder`;
       await page.evaluate(async ({ id, text }) => (window as unknown as BrowserFaultWindow).remoteFaultClient.request("session.send", { sessionId: id, text, mode: "queue" }), { id: sessionId, text: holder });
+      await resumePausedQueue(local, sessionId);
       await waitUntil(`${loss} holder runs`, () => fixture.requests.some((request) => request.text === holder));
       targetText = `queue once after lost ${loss}`;
       targetId = "";
@@ -1032,8 +1050,10 @@ async function proveMutationMembershipOrdering(
       const expected = direction === "send_then_stop" ? ["prompt_async", "interrupt"] : ["interrupt", "prompt_async"];
       assert.deepEqual((await probe()).operations, expected, "Membership latency must not reorder actual runtime HTTP mutations");
       if (direction === "stop_then_send") {
-        await waitUntil("new Send after old Stop remains running", () => fixture.requests.some((request) => request.text === text));
-        assert.equal(fixture.requests.find((request) => request.text === text)?.aborted, false, "Delayed old Stop killed a newer Send");
+        const queued = await phone.evaluate(async (id) => (window as unknown as BrowserFaultWindow).remoteFaultClient.request("session.snapshot", { sessionId: id }), sessionId) as { session: { queuedCount: number } };
+        assert.ok(queued.session.queuedCount >= 1, "A new Send after Stop waits in the paused durable queue");
+        assert.equal(fixture.requests.some((request) => request.text === text), false,
+          "Send admission must not silently resume a queue paused by the earlier Stop");
       }
       const snapshot = await phone.evaluate(async (id) => (window as unknown as BrowserFaultWindow).remoteFaultClient.request("session.snapshot", { sessionId: id }), sessionId);
       assert.ok(snapshot && typeof snapshot === "object");
@@ -1050,8 +1070,8 @@ async function proveMutationMembershipOrdering(
     await resumeRenderer();
     // The idle UI intentionally has no Stop button. Invoke its real preload API
     // instead: this still crosses trusted Electron IPC into the same service.
-    // Do not seed a busy holder here: Stop-current-turn intentionally drains
-    // already accepted queued messages, which is a separate existing behavior.
+    // Do not seed a busy holder here: stopping a durable queue pauses pending
+    // messages. This check concerns mutation ordering, not queue resumption.
     await local.evaluate((id) => {
       const target = window as unknown as DesktopOrderingWindow;
       target.remoteOrderingLocalStop = target.chiliDesktop.invoke({ type: "session.stop", sessionId: id })
@@ -1081,4 +1101,12 @@ async function proveMutationMembershipOrdering(
     await debuggerSession.detach();
   }
   return results;
+}
+
+async function resumePausedQueue(local: Page, sessionId: string): Promise<void> {
+  await local.evaluate(async (id) => {
+    const desktop = (window as unknown as DesktopOrderingWindow).chiliDesktop;
+    const snapshot = await desktop.invoke({ type: "session.snapshot", sessionId: id });
+    if (snapshot.inputQueue?.paused) await desktop.invoke({ type: "session.resume", sessionId: id });
+  }, sessionId);
 }

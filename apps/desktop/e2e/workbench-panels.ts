@@ -1,3 +1,4 @@
+import { openAdvancedTaskDialog } from "./conversation-design.js";
 import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -9,8 +10,7 @@ import type { ChiliDesktopApi } from "../src/shared/contracts.js";
 export async function assertWorkbenchPanels(page: Page, workspace: string, artifacts: string): Promise<void> {
   await writeFile(join(workspace, "package.json"), JSON.stringify({ name: "workbench-panel-fixture", private: true }));
   await writeFile(join(workspace, "panel-review.ts"), "export const workbenchPanelAnswer = 42;\n");
-  await page.getByRole("button", { name: /^New task\b/iu }).click();
-  const dialog = page.getByRole("dialog", { name: "Create a new task", exact: true });
+  const dialog = await openAdvancedTaskDialog(page);
   await dialog.waitFor({ state: "visible" });
   await dialog.getByLabel("Task title", { exact: true }).fill("Workbench panels E2E");
   await dialog.getByLabel("What should Chili accomplish?", { exact: true }).fill("delegate read");

@@ -1,3 +1,4 @@
+import { openAdvancedTaskDialog } from "./conversation-design.js";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -231,8 +232,7 @@ async function saveMeasurements(): Promise<void> {
 }
 
 async function createTask(page: Page, prompt: string): Promise<void> {
-  await page.getByRole("button", { name: /^New task\b/u }).click();
-  const dialog = page.getByRole("dialog", { name: "Create a new task", exact: true });
+  const dialog = await openAdvancedTaskDialog(page);
   await dialog.getByLabel("Task title", { exact: true }).fill(prompt);
   await dialog.getByLabel("What should Chili accomplish?", { exact: true }).fill(prompt);
   const permissions = dialog.getByLabel("Permission profile", { exact: true });

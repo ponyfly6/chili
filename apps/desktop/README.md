@@ -17,6 +17,12 @@ bun run desktop
 CHILI_DESKTOP_WORKSPACE="$PWD" CHILI_DESKTOP_MODEL=fake bun run desktop
 ```
 
+使用本机已有 MiniMax 配置试用新版界面：
+
+```bash
+CHILI_DESKTOP_WORKSPACE="$PWD" CHILI_DESKTOP_MODEL=minimax bun run desktop
+```
+
 常用验证命令：
 
 ```bash
@@ -58,10 +64,10 @@ Preview 使用本地 ad-hoc 签名，不是已公证的正式发布包。打包�
 
 ## 产品表面
 
-- 标题栏 **Appearance** 提供 System / Dark / Light 主题。默认跟随 macOS 外观并随系统切换即时更新；手动选择立即生效，由主进程保存到当前应用配置目录的 `appearance-settings.json`，跨任务、刷新和重启保留。启动时先恢复原生窗口外观，再渲染界面；主题独立于工作区与 TUI 配置。
-- **Add project** 添加本地目录，侧边栏按项目展示任务及后台运行/待处理数量；点击项目或其任务切换。已打开项目各自保留 runtime，切换不会中断任务、Goal 或消息队列。当前窗口内记住各项目选中的任务与未发送草稿。
+- **设置 → 通用** 提供跟随系统 / 浅色 / 深色主题。默认跟随 macOS 外观并随系统切换即时更新；手动选择立即生效，由主进程保存到当前应用配置目录的 `appearance-settings.json`，跨任务、刷新和重启保留。启动时先恢复原生窗口外观，再渲染界面；主题独立于工作区与 TUI 配置。
+- 左侧 **目录 +** 添加本地目录，侧边栏按项目展示任务及后台运行/待处理数量；点击项目或其任务切换。已打开项目各自保留 runtime，切换不会中断任务、Goal 或消息队列。当前窗口内记住各项目选中的任务与未发送草稿。
 - 搜索 active/archived task，创建、重新载入或继续未归档 task，并对 active task 执行 rename/archive；subagent session 不会作为独立 task 暴露，也不支持 unarchive。
-- 在 inspector 查看或修改 model、model 能力允许的 reasoning/service tier、permission profile、delegation policy 与 Goal，并查看 MCP server 状态或触发 reload；不支持显式 tier 的模型使用 provider default，Desktop 不会提交伪造 tier。
+- **设置** 按通用、模型与账号、权限与协作、工具与技能、偏好与记忆、手机连接分类；模型、思考深度与响应速度按模型能力展示，权限标明影响此目录的所有会话，协作方式属于当前会话。工作过程面板继续提供 Goal、agent/task 状态；工具设置读取 MCP 状态并支持重新加载；不支持显式 tier 的模型使用 provider default，Desktop 不会提交伪造 tier。
 - 实时查看消息、工具和审批，并在 inspector 中查看 agent/task 状态。
 - 发送消息；忙碌时 Queue，或 Steer（中断当前 turn 后优先发送）。
 - Stop 当前 session。
@@ -71,9 +77,17 @@ Preview 使用本地 ad-hoc 签名，不是已公证的正式发布包。打包�
 - **Changes** 按文件查看当前 turn 或 workspace diff，提供增删统计、双侧行号、文件折叠和 Patch / Raw 切换；长补丁与原始文本分页，截断提示保留。
 - 窗口失焦或后台项目发生审批、输入请求和 turn 完成时发原生通知，点击后切到对应项目并聚焦窗口。
 
-## New Task 与 Goal
+## 新会话与高级任务
 
-New Task 对话框一次配置标题、任务目标、model、模型能力允许的 reasoning/service tier、permission、delegation，以及可选 Goal/token budget。没有公开 service tiers 的模型显示 provider default，并省略显式 tier。普通 task 在配置完成后提交一次 prompt；Goal 模式把同一段任务目标作为 Goal objective，并以最后一步 `setGoal` 启动，不会再重复提交 prompt。
+打开目录后可直接在输入区描述需求；**新会话** 或 `⌘ N` 创建空会话并聚焦输入，不显示向导。首次发送自动以需求的第一行命名。`Enter` 发送、`Shift + Enter` 换行，中文输入法确认候选词不会触发发送。忙碌时保留排队、调整方向和停止。
+
+输入 `/` 或点击 **更多** 打开可搜索的命令菜单，支持方向键、Enter、Escape。`/settings`、`/model`、`/permissions`、`/mcp`、`/skills`、`/memory` 打开对应设置；`/review` 和 `/help` 填入待发送的需求。`⌘ ,` 随时打开设置。
+
+完成的实际回复可在 **成果 / 对话 / 并排查看** 之间切换，成果页可查看历史回复；**文件修改** 默认展示目录当前尚未提交的改动，并说明可能包含其他会话与手动编辑。运行中的正文、带工具调用的过程说明及失败/中断的部分回复不会作为完成成果。通用设置中的“完成后直接查看成果”和“默认展开工作过程”由主进程原子保存到客户端的 `reading-settings.json`。网页内嵌预览、点选页面元素修改及附件上传尚未接入，不显示模拟操作入口。
+
+模型账号继续使用已有本机配置；设置显示真实模型可用性，不在网页收集密钥。技能和目录说明通过明确标注的“在会话中查看”入口填入需求，不模拟连接或记忆管理。当前无独立的个人记忆库，目录偏好由已有 `AGENTS.md` 机制承载。
+
+`/advanced` 按需打开高级任务对话框，一次配置标题、任务目标、model、模型能力允许的 reasoning/service tier、permission、delegation，以及可选 Goal/token budget。没有公开 service tiers 的模型显示 provider default，并省略显式 tier。普通 task 在配置完成后提交一次 prompt；Goal 模式把同一段任务目标作为 Goal objective，并以最后一步 `setGoal` 启动，不会再重复提交 prompt。
 
 创建结果区分 `not_started`、`started` 和 `unknown`。启动前失败会保留可恢复的 session，并在安全时回滚 permission；最终启动请求若可能已经提交但确认丢失，则返回 `unknown`，不擅自 archive session 或改变一个可能正在运行的 task。
 
@@ -81,10 +95,10 @@ Permission profile 是当前项目 runtime/sidecar 的**全局内存状态**，�
 
 ## Stop、Steer、恢复与 archive
 
-- Stop 会中断当前 turn；有 active Goal 时，runtime 会把 Goal 持久化为 paused。terminal 状态后可 Resume；仍在 cancelling/running 时会拒绝抢跑。
+- Stop 会中断当前 turn 并暂停持久化输入队列；待处理消息仍会保留。有 active Goal 时，runtime 会把 Goal 持久化为 paused。终止完成后点击 **继续处理** 恢复；仍在 cancelling/running 时会拒绝抢跑。
 - Steer active Goal 时，Desktop 记住原状态，让 interrupt 暂停 Goal，先排空 steer/queued prompt，再在 terminal idle 后恢复 Goal，避免双启动。若 Desktop 在中途退出，持久化 Goal 保持 paused，重启后需显式 Resume。
 - `budgetLimited` Goal 必须先提高到大于已用 tokens 的新 budget，再以 active 状态恢复。
-- 普通已取消/失败 task 通过新的 follow-up prompt 继续；Goal task 的 Resume 会重新触发 paused/idle Goal continuation。session、事件和 Goal 由 runtime/store 持久化，Desktop 或 sidecar 重启后可重新载入。
+- 暂停后发送的新消息进入待处理队列，点击 **继续处理** 才会执行。没有待处理消息时，会先核对上次中断的工作再继续。Goal task 的 Resume 会重新触发 paused/idle Goal continuation。session、事件、输入队列和 Goal 由 runtime/store 持久化，Desktop 或 sidecar 重启后可重新载入。
 - Archive 在当前 Desktop 中是单向操作：没有 unarchive；归档非 busy task 前会把 active Goal 持久化为 paused，busy task 必须先 Stop。archived task 只读，不能 Resume、发送或改配置；其历史与 Goal 记录仍保留用于查看。
 
 MCP 面板读取当前 session scope 的 server 状态与汇总，并提供 reload。Desktop 当前不暴露 add/remove/auth 配置流程；这些仍由现有 CLI/TUI/runtime 配置完成。
@@ -113,13 +127,13 @@ MCP 面板读取当前 session scope 的 server 状态与汇总，并提供 relo
 - 锁屏可见的 approval 与 user-input 原生通知只显示固定泛化文案，不包含问题、路径、命令 pattern、token 或其他运行时详情。
 - Electron fuses 禁止 RunAsNode、Node options、CLI inspect 和 file-protocol extra privileges，只允许从带完整性校验的 ASAR 加载应用。
 
-`desktop-state.json` 以 0600 权限原子保存项目 ID、规范化目录路径及当前项目；旧版单工作区配置自动迁移。重启后恢复项目列表，仅启动当前项目，其他项目在首次点击时启动并加载历史任务。未发送草稿和 Desktop 消息队列只保存在当前进程内，退出后不恢复。`appearance-settings.json` 以 0600 权限保存主题 ID。单独的 `remote-control-settings.json` 以 0600 权限保存本机绑定地址、端口及用户通过原生对话框选择的 TLS 文件引用；不复制证书或私钥内容。provider key、OAuth token、sidecar token、手机授权及启用状态均不写入这些文件。
+`desktop-state.json` 以 0600 权限原子保存项目 ID、规范化目录路径及当前项目；旧版单工作区配置自动迁移。重启后恢复项目列表，仅启动当前项目，其他项目在首次点击时启动并加载历史任务。未发送草稿只保存在当前进程内，已接受的输入队列由 runtime/store 持久化。`appearance-settings.json` 和 `reading-settings.json` 分别以 0600 权限保存主题及阅读偏好。单独的 `remote-control-settings.json` 以 0600 权限保存本机绑定地址、端口及用户通过原生对话框选择的 TLS 文件引用；不复制证书或私钥内容。provider key、OAuth token、sidecar token、手机授权及启用状态均不写入这些文件。
 
 更完整的模块与 transport 设计见 [../../docs/desktop-architecture.md](../../docs/desktop-architecture.md)。
 
 ## 私网手机控制 Alpha
 
-通过标题栏 **Phone · Off** 开启配有可信 TLS 的私网端点，生成短期一次性配对码并在本地确认设备。手机只控制当前工作区的既有顶层任务（列表、有限消息、Queue / Steer / Stop），与桌面窗口共享同一个 `DesktopControlService`。远控默认关闭；关闭、切换工作区或重启会使旧授权失效。手机刷新需重新配对，审批与提问只能回桌面处理。
+通过 **设置 → 手机连接** 开启配有可信 TLS 的私网端点，生成短期一次性配对码并在本地确认设备。手机只控制当前工作区的既有顶层任务（列表、有限消息、Queue / Steer / Stop），与桌面窗口共享同一个 `DesktopControlService`。远控默认关闭；关闭、切换工作区或重启会使旧授权失效。手机刷新需重新配对，审批与提问只能回桌面处理。
 
 Phone 面板可选择本机私网地址与端口，依次在原生文件对话框选择证书和私钥并保存。保存不会开启监听；每次开启都重新检查地址仍可用、证书 SAN/有效期及密钥匹配。证书路径和 PEM 留在主进程，不跨越 renderer IPC。修改配置前须关闭远控；取消文件选择保留旧配置。完整的既有 `CHILI_REMOTE_*` 启动环境仍优先且在面板只读，部分环境配置会报错，不与保存值混用。
 

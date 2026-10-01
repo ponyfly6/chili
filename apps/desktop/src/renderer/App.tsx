@@ -1,12 +1,14 @@
+import { useReadingPreferences } from "./useReadingPreferences.js";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { RemoteControlPanel } from "./RemoteControlPanel.js";
+import { DesktopSettings, type SessionSettingsValues } from "./DesktopSettings.js";
+import { completedResults, conversationTitle, matchingDesktopCommands,
+  type ConversationView, type DesktopCommand, type SettingsPage } from "./conversation-design.js";
 import { ProjectSidebar } from "./ProjectSidebar.js";
 import { AgentDetailsPanel } from "./AgentDetailsPanel.js";
 import { DiffViewer } from "./DiffViewer.js";
 import { TimelineViewport } from "./TimelineViewport.js";
 import { eventMatchesProject, ProjectViewMemory } from "./project-view-state.js";
-import { desktopThemeOptions, type DesktopTheme } from "./theme.js";
 import { useDesktopTheme } from "./useDesktopTheme.js";
 import { getDesktopBuildInfo } from "../shared/build-info.js";
 import { SESSION_TITLE_MAX_CHARS } from "@chili/protocol";
@@ -58,7 +60,6 @@ import {
   draftScopeChanged,
   nextBoundedRetryAttempt,
   preferredSessionAfterRecovery,
-  RENDERER_CREDENTIAL_BOUNDARY_COPY,
   selectWorkspaceEscapingPausedResync,
   sidecarRecoveryGuidance,
   workspaceSelectionChangesScope,
@@ -80,9 +81,7 @@ import {
   canExposeTaskActions,
   canReloadSessionMcp,
   canResumeTask,
-  canSelectProviderDefault,
   createNewTaskDraft,
-  createSessionModelSettingsDraft,
   filterSessions,
   goalResumeBudgetMinimum,
   goalProgress,
@@ -91,14 +90,12 @@ import {
   modelKey,
   newTaskSubmission,
   reconcileNewTaskModel,
-  reconcileSessionModelSettingsModel,
   sessionModelSettingsMutations,
   validateNewTaskDraft,
   validateSessionModelSettingsDraft,
   type NewTaskDraft,
   type ReasoningSelection,
   type ServiceTierSelection,
-  type SessionModelSettingsDraft,
   type SessionListStatus,
 } from "./task-console-model.js";
 
@@ -106,15 +103,15 @@ type DesktopProjection = CoordinatedProjection<DesktopState, RuntimeSessionSumma
 const MAX_OUTER_RESYNC_RETRIES = 4;
 const OUTER_RESYNC_RETRY_DELAY_MS = 500;
 
-interface SessionSettingsValues extends SessionModelSettingsDraft {
-  permissionProfile: RuntimePermissionProfileId;
-  delegationPolicy: DelegationPolicy;
-}
-
 export function App({ transport: hostTransport }: { transport: ControlTransport }) {
   const buildInfo = getDesktopBuildInfo();
   const { theme, changeTheme, saveFailed: themeSaveFailed, saving: themeSaving } = useDesktopTheme();
-  const [appearanceOpen, setAppearanceOpen] = useState(false);
+  const [settingsPage, setSettingsPage] = useState<SettingsPage>("general");
+  const [view, setView] = useState<ConversationView>("chat");
+  const [commandsOpen, setCommandsOpen] = useState(false);
+  const [commandIndex, setCommandIndex] = useState(0);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const { preferences, ready: preferencesReady, saving: preferencesSaving, saveFailed: preferenceSaveFailed, savePreferences } = useReadingPreferences();
   const [projection, setProjection] = useState<DesktopProjection>({
     epoch: 0,
     diffRevision: 0,
@@ -140,7 +137,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const setDiffText = useCallback((text: string) => setDiffView({ text, truncated: false }), []);
   const [diffLoading, setDiffLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 640);
-  const [inspectorOpen, setInspectorOpen] = useState(() => window.innerWidth > 1080);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
   const [inspectorTab, setInspectorTab] = useState<"activity" | "changes">("activity");
   const [resyncRetryAvailable, setResyncRetryAvailable] = useState(false);
   const [sessionQuery, setSessionQuery] = useState("");
@@ -308,10 +305,10 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const actionsDisabled = working || resyncing || loadingSession;
   const runtimeActionsDisabled = actionsDisabled || !healthy;
   const composerEditable = !selectedArchived
-    && canEditComposer({ selectedId, healthy, resyncing, loadingSession, working });
+    && canEditComposer({ selectedId: selectedId ?? (healthy ? "new" : undefined), healthy, resyncing, loadingSession, working });
   const workspaceSwitchEnabled = canSwitchWorkspace({ working, loadingSession, resyncing, resyncRetryAvailable });
   const sidecarGuidance = sidecarRecoveryGuidance(desktop.sidecar);
-  const selectedTitle = selectedSession?.title || selectedSession?.preview || "Development session";
+  const selectedTitle = selectedSession?.title || selectedSession?.preview || "新会话";
   const projectLabel = workspaceLabel(desktop.workspace);
   const visibleSessions = useMemo(
     () => filterSessions(sessions, sessionQuery, sessionListStatus),
@@ -321,6 +318,30 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   const selectedGoal = sessionConfig?.goal ?? undefined;
   const canResumeSession = canResumeTask(presentation?.chat.status, selectedGoal?.status, Boolean(selectedArchived), snapshot?.inputQueue?.paused);
   const mcpReloadEnabled = canReloadSessionMcp(selectedId, Boolean(selectedArchived), runtimeActionsDisabled);
+  const results = useMemo(() => completedResults(timelineItems, presentation?.runtime), [timelineItems, presentation?.runtime]);
+  const latestResult = results.at(-1);
+  const emptyConversation = !loadingSession && timelineItems.length === 0;
+  const commands = commandsOpen ? matchingDesktopCommands(composer.startsWith("/") ? composer : "/") : [];
+  const resultScope = JSON.stringify([desktop.projectId, selectedId]);
+  const observedResult = useRef({ scope: resultScope, id: latestResult?.id, busy: Boolean(sessionBusy) });
+  useEffect(() => {
+    if (!preferencesReady) return;
+    const previous = observedResult.current;
+    if (previous.scope !== resultScope) {
+      setView(preferences.autoResult && latestResult && !sessionBusy ? "result" : "chat");
+      setCommandsOpen(false);
+    } else if (preferences.autoResult && latestResult && !sessionBusy
+      && (latestResult.id !== previous.id || previous.busy)) {
+      setView("result");
+    }
+    observedResult.current = { scope: resultScope, id: latestResult?.id, busy: Boolean(sessionBusy) };
+  }, [resultScope, latestResult?.id, sessionBusy, preferences.autoResult, preferencesReady]);
+
+  const openSettings = (page: SettingsPage = "general") => {
+    setSettingsPage(page);
+    setSettingsOpen(true);
+    setCommandsOpen(false);
+  };
 
   useEffect(() => {
     if (!composer && composerRef.current) composerRef.current.style.height = "";
@@ -370,6 +391,14 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
       document.removeEventListener("keydown", handleKeyDown);
     };
   }, [taskMenuId]);
+
+  useEffect(() => {
+    const dismiss = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && settingsOpen && !working && !themeSaving && !preferencesSaving) { event.preventDefault(); setSettingsOpen(false); }
+    };
+    window.addEventListener("keydown", dismiss);
+    return () => window.removeEventListener("keydown", dismiss);
+  }, [settingsOpen, working, themeSaving, preferencesSaving]);
 
   const reloadSessionConfig = useCallback(async (sessionId = selectedRef.current) => {
     if (!sessionId || sidecarPhaseRef.current !== "healthy") return;
@@ -803,7 +832,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     if (state.sidecar.phase === "healthy") await refreshSessions();
   });
 
-  const openNewTask = useCallback(() => {
+  const openAdvancedTask = useCallback(() => {
     setTaskMenuId(undefined);
     setNewTaskDraft(() => {
       const draft = createNewTaskDraft(models);
@@ -852,9 +881,27 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     });
   };
 
+  const openNewTask = useCallback(() => {
+    if (!healthy || actionsDisabled) return;
+    void runAction(async () => {
+      const created = await transport.createSession({ title: "新会话" });
+      setSessionListStatus("active");
+      setSessionQuery("");
+      setTaskMenuId(undefined);
+      await refreshSessions(created.sessionId);
+      setComposer("");
+      setView("chat");
+      if (window.innerWidth <= 640) closeSidebar();
+      requestAnimationFrame(() => composerRef.current?.focus());
+      if (created.failure) throw new Error(createFailureMessage(created));
+    });
+  }, [healthy, actionsDisabled, transport, refreshSessions, closeSidebar]);
+
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent): void => {
-      if (!event.metaKey || event.altKey || event.ctrlKey || event.shiftKey || event.key.toLowerCase() !== "n") return;
+      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return;
+      if (event.key === ",") { event.preventDefault(); if (!document.querySelector('[role="dialog"]')) { setSettingsPage("general"); setSettingsOpen(true); } return; }
+      if (event.key.toLowerCase() !== "n") return;
       event.preventDefault();
       if (document.querySelector('[role="dialog"][aria-modal="true"]')) return;
       if (healthy && !actionsDisabled) openNewTask();
@@ -895,30 +942,25 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     });
   };
 
-  const saveSessionSettings = async (values: SessionSettingsValues) => {
+  const saveSessionSettings = async (values: SessionSettingsValues, section: "models" | "permissions") => {
     if (!selectedId || !sessionConfig || selectedArchived) return;
     await runAction(async () => {
-      const catalog = models.length > 0 ? models : sessionConfig.model.models;
-      const validation = validateSessionModelSettingsDraft(values, catalog, sessionConfig.model);
-      if (!validation.valid) {
-        throw new TypeError(Object.values(validation.errors)[0] ?? "Invalid task runtime settings.");
-      }
-      const model = modelFromKey(catalog, values.modelKey)!;
-      if (modelKey(model) !== (sessionConfig.model.modelSelection ? modelKey(sessionConfig.model.modelSelection) : "")) {
-        await transport.setModel(selectedId, { provider: model.provider, model: model.model });
-      }
-      const mutations = sessionModelSettingsMutations(values, sessionConfig.model);
-      if (mutations.reasoningLevel) {
-        await transport.setReasoning(selectedId, mutations.reasoningLevel);
-      }
-      if (mutations.serviceTier) {
-        await transport.setServiceTier(selectedId, mutations.serviceTier);
-      }
-      if (values.permissionProfile !== sessionConfig.permission.profile) {
-        await transport.setPermission(values.permissionProfile);
-      }
-      if (values.delegationPolicy !== sessionConfig.delegation.policy) {
-        await transport.setDelegation(selectedId, values.delegationPolicy);
+      if (section === "models") {
+        const catalog = models.length > 0 ? models : sessionConfig.model.models;
+        const validation = validateSessionModelSettingsDraft(values, catalog, sessionConfig.model);
+        if (!validation.valid) {
+          throw new TypeError(Object.values(validation.errors)[0] ?? "Invalid task runtime settings.");
+        }
+        const model = modelFromKey(catalog, values.modelKey)!;
+        if (modelKey(model) !== (sessionConfig.model.modelSelection ? modelKey(sessionConfig.model.modelSelection) : "")) {
+          await transport.setModel(selectedId, { provider: model.provider, model: model.model });
+        }
+        const mutations = sessionModelSettingsMutations(values, sessionConfig.model);
+        if (mutations.reasoningLevel) await transport.setReasoning(selectedId, mutations.reasoningLevel);
+        if (mutations.serviceTier) await transport.setServiceTier(selectedId, mutations.serviceTier);
+      } else {
+        if (values.permissionProfile !== sessionConfig.permission.profile) await transport.setPermission(values.permissionProfile);
+        if (values.delegationPolicy !== sessionConfig.delegation.policy) await transport.setDelegation(selectedId, values.delegationPolicy);
       }
       setSettingsOpen(false);
       await reloadSessionConfig(selectedId);
@@ -967,13 +1009,44 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
     });
   };
 
+  const chooseCommand = (command: DesktopCommand) => {
+    setCommandsOpen(false);
+    setCommandIndex(0);
+    if (command.group === "prompt") {
+      setComposer(command.prompt);
+      composerRef.current?.focus();
+    } else {
+      if (/^\/[^\s]*$/.test(composer)) setComposer("");
+      if (command.group === "settings") openSettings(command.page);
+      else if (command.group === "advanced") openAdvancedTask();
+      else if (selectedId) setGoalSetupOpen(true);
+      else openAdvancedTask();
+    }
+  };
+
   const submit = async (mode: "queue" | "steer") => {
     const text = composer.trim();
-    if (!selectedId || !text || !composerEditable || actionInFlightRef.current) return;
+    if (!text || !composerEditable || actionInFlightRef.current) return;
+    const localCommand = matchingDesktopCommands(text).find((command) => `/${command.id}` === text.toLowerCase());
+    if (localCommand) { chooseCommand(localCommand); return; }
+    setCommandsOpen(false);
     await runAction(async () => {
-      await transport.send(selectedId, text, mode);
-      projectViews.current.remember(desktop.workspace, selectedId, "");
-      if (projectionRef.current.state.workspace === desktop.workspace && selectedRef.current === selectedId) setComposer("");
+      if (!selectedId) {
+        const created = await transport.createSession({ title: conversationTitle(text), prompt: text });
+        setSessionListStatus("active");
+        await refreshSessions(created.sessionId);
+        // Never offer a one-click retry when the runtime may already have accepted the prompt.
+        setComposer(created.startState === "not_started" ? text : "");
+        if (created.failure) throw new Error(createFailureMessage(created));
+      } else {
+        if (selectedSession?.title === "新会话" && !timelineItems.some((item) => item.kind === "message" && item.role === "user")) {
+          await transport.renameSession(selectedId, conversationTitle(text));
+        }
+        await transport.send(selectedId, text, mode);
+        projectViews.current.remember(desktop.workspace, selectedId, "");
+        if (projectionRef.current.state.workspace === desktop.workspace && selectedRef.current === selectedId) setComposer("");
+      }
+      requestAnimationFrame(() => composerRef.current?.focus());
     });
   };
 
@@ -1022,36 +1095,13 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
           >
             <Icon name="sidebar" />
           </button>
-          <div className="brand" aria-label="Chili">
-            <ChiliMark />
-            <span>Chili</span>
-            {buildInfo.channel === "preview" ? <small className="desktop-build-label" data-testid="desktop-build-label" title={buildInfo.label}>{buildInfo.label}</small> : null}
-          </div>
-          <span className="title-divider" aria-hidden="true" />
           <div className="title-context">
             <strong>{projectLabel}</strong>
             <span>/</span>
-            <span>{selectedId ? selectedTitle : "New task"}</span>
+            <span>{selectedId ? selectedTitle : "新会话"}</span>
           </div>
         </div>
         <div className="titlebar-actions">
-          <button
-            className="chrome-button"
-            type="button"
-            aria-label="Appearance settings"
-            title="Appearance"
-            aria-haspopup="dialog"
-            onClick={() => setAppearanceOpen(true)}
-          >
-            <Icon name="appearance" />
-          </button>
-          <RemoteControlPanel />
-          <div className={`runtime-pill phase-${desktop.sidecar.phase}`} title="Local runtime status">
-            <span className="status-dot" aria-hidden="true" />
-            <span>Local</span>
-            <strong>{desktop.sidecar.phase}</strong>
-            {desktop.sidecar.attempt > 0 ? <em>retry {desktop.sidecar.attempt}</em> : null}
-          </div>
           <button
             ref={inspectorToggleRef}
             className={`chrome-button workbench-toggle ${inspectorOpen ? "active" : ""}`}
@@ -1061,7 +1111,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
             onClick={() => setInspectorOpen((current) => !current)}
           >
             <Icon name="activity" />
-            <span>Work</span>
+            <span>工作过程</span>
           </button>
         </div>
       </header>
@@ -1096,12 +1146,17 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
 
       <main className={`workspace-grid ${sidebarOpen ? "" : "sidebar-collapsed"} ${inspectorOpen ? "" : "inspector-collapsed"}`}>
         <aside ref={sidebarRef} className="sidebar panel" aria-hidden={!sidebarOpen} inert={!sidebarOpen}>
+          <div className="brand" aria-label="Chili">
+            <ChiliMark />
+            <span>Chili</span>
+            {buildInfo.channel === "preview" ? <small className="desktop-build-label" data-testid="desktop-build-label" title={buildInfo.label}>{buildInfo.label}</small> : null}
+          </div>
           <div className="sidebar-actions">
             <button className="new-task-button" aria-label="New task" disabled={!healthy || actionsDisabled} onClick={openNewTask}>
-              <span><Icon name="plus" />New task</span>
+              <span><Icon name="plus" />新会话</span>
               <kbd aria-hidden="true">⌘ N</kbd>
             </button>
-            <label className="session-search">
+            {searchOpen ? <><label className="session-search">
               <span className="sr-only">Search tasks</span>
               <Icon name="search" />
               <input
@@ -1109,7 +1164,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                 aria-label="Search tasks"
                 value={sessionQuery}
                 onChange={(event) => { setTaskMenuId(undefined); setSessionQuery(event.target.value); }}
-                placeholder="Search tasks"
+                placeholder="搜索此目录的会话"
               />
             </label>
             <div className="session-filters" role="tablist" aria-label="Task status">
@@ -1120,7 +1175,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                 className={sessionListStatus === "active" ? "active" : ""}
                 onClick={() => { setTaskMenuId(undefined); setSessionListStatus("active"); }}
               >
-                Active tasks <span>{sessions.filter((session) => session.status === "active").length}</span>
+                会话 <span>{sessions.filter((session) => session.status === "active").length}</span>
               </button>
               <button
                 type="button"
@@ -1129,12 +1184,14 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                 className={sessionListStatus === "archived" ? "active" : ""}
                 onClick={() => { setTaskMenuId(undefined); setSessionListStatus("archived"); }}
               >
-                Archived tasks <span>{sessions.filter((session) => session.status === "archived").length}</span>
+                已归档 <span>{sessions.filter((session) => session.status === "archived").length}</span>
               </button>
-            </div>
+            </div></> : null}
           </div>
+          <div className="directory-heading"><span>目录</span><div><button className="icon-button" aria-label="搜索会话" aria-expanded={searchOpen} onClick={() => { setSearchOpen(!searchOpen); if (searchOpen) { setSessionQuery(""); setSessionListStatus("active"); } }}><Icon name="search" /></button><button className="icon-button" aria-label="Add project" title="打开目录" disabled={!workspaceSwitchEnabled} onClick={() => void chooseWorkspace()}><Icon name="plus" /></button></div></div>
           <ProjectSidebar projects={desktop.projects ?? []} activeId={desktop.projectId} disabled={!workspaceSwitchEnabled}
-            onActivate={(id, sessionId) => void chooseWorkspace(id, sessionId)}>
+            onActivate={(id, sessionId) => void chooseWorkspace(id, sessionId)}
+            onNewSession={openNewTask}>
           <section className="session-section">
             <div className="section-heading">
               <p className="eyebrow">{sessionListStatus === "active" ? "Recent tasks" : "Archived tasks"}</p>
@@ -1154,7 +1211,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                   >
                     <span className="session-glyph" aria-hidden="true"><Icon name={session.status === "archived" ? "archive" : "message"} /></span>
                     <span className="session-copy">
-                      <span className="session-title">{session.title || session.preview || "Untitled task"}</span>
+                      <span className="session-title">{session.title || session.preview || "新会话"}</span>
                       <span className="session-meta">
                         {formatRelativeTime(session.updatedAt)}
                         {(desktop.queuedBySession[session.id] ?? 0) > 0 ? ` · ${desktop.queuedBySession[session.id]} queued` : ""}
@@ -1172,7 +1229,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                         }}
                         className="session-menu-button"
                         type="button"
-                        aria-label={`Task actions for ${session.title || session.preview || "Untitled task"}`}
+                        aria-label={`Task actions for ${session.title || session.preview || "新会话"}`}
                         aria-haspopup="menu"
                         aria-expanded={taskMenuId === session.id}
                         disabled={actionsDisabled}
@@ -1185,7 +1242,7 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                           ref={taskMenuRef}
                           className="session-menu"
                           role="menu"
-                          aria-label={`Task actions for ${session.title || session.preview || "Untitled task"}`}
+                          aria-label={`Task actions for ${session.title || session.preview || "新会话"}`}
                           onKeyDown={(event) => {
                             if (!isMenuNavigationKey(event.key)) return;
                             const items = menuItems(event.currentTarget);
@@ -1200,120 +1257,72 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                             dialogReturnFocusRef.current = taskMenuButtonRefs.current.get(String(session.id)) ?? null;
                             setRenameTarget(session);
                             setTaskMenuId(undefined);
-                          }}>Rename task</button>
+                          }}>重命名</button>
                           <button className="danger-menu-item" role="menuitem" onClick={() => {
                             dialogReturnFocusRef.current = taskMenuButtonRefs.current.get(String(session.id)) ?? null;
                             setArchiveTarget(session);
                             setTaskMenuId(undefined);
-                          }}>Archive task</button>
+                          }}>归档会话</button>
                         </div>
                       ) : null}
                     </>
                   ) : null}
                 </div>
               ))}
-              {healthy && sessions.length === 0 ? <p className="empty-copy sidebar-empty">Your recent work will live here.</p> : null}
+              {healthy && sessions.length === 0 ? <p className="empty-copy sidebar-empty">这个目录的会话会出现在这里。</p> : null}
               {healthy && sessions.length > 0 && visibleSessions.length === 0 ? (
-                <p className="empty-copy sidebar-empty">No {sessionListStatus} tasks match this search.</p>
+                <p className="empty-copy sidebar-empty">没有找到匹配的会话。</p>
               ) : null}
-              {!healthy ? <p className="empty-copy sidebar-empty">Choose a project and let the local runtime warm up.</p> : null}
+              {!healthy ? <p className="empty-copy sidebar-empty">打开一个目录，开始你的第一个想法。</p> : null}
             </div>
           </section>
           </ProjectSidebar>
           <footer className="workspace-picker">
-            <button className="workspace-card" aria-label="Add project" disabled={!workspaceSwitchEnabled} onClick={() => void chooseWorkspace()}>
-              <span className="workspace-icon" aria-hidden="true"><Icon name="folder" /></span>
-              <span className="workspace-copy">
-                <strong>Add project</strong>
-                <span>Keep projects running side by side</span>
-              </span>
-              <Icon name="chevron" />
-            </button>
-            <p><span className={`mini-status phase-${desktop.sidecar.phase}`} /> Runs on this Mac</p>
+            <button className="sidebar-settings" aria-label="打开设置" onClick={() => openSettings()}><Icon name="settings" /><span>设置</span><kbd>⌘ ,</kbd></button>
+            <p title="Local runtime status"><span className={`mini-status phase-${desktop.sidecar.phase}`} /><span>{healthy ? "本机工作空间" : desktop.sidecar.phase === "starting" || desktop.sidecar.phase === "recovering" ? "正在连接…" : "等待打开目录"}</span><span className="sr-only">{desktop.sidecar.phase}</span></p>
           </footer>
         </aside>
 
-        <section className="conversation panel">
+        <section className={`conversation panel ${emptyConversation ? "is-empty" : ""} view-${view}`}>
           <div className="conversation-heading">
-            <div className="conversation-title">
-              <h1>{selectedId ? selectedTitle : "A calmer place to ship code"}</h1>
-              <p>{selectedId ? `${projectLabel} · ${shortId(selectedId)}${selectedArchived ? " · archived" : ""}` : "Local-first · permission-aware · yours"}</p>
-              {selectedId && sessionConfig ? (
-                <div className="session-config-strip" aria-label="Task runtime configuration">
-                  <span title={selectedModel ? `${selectedModel.provider}/${selectedModel.model}` : "Runtime default model"}>
-                    {selectedModel?.model ?? "Default model"}
-                  </span>
-                  <span>{sessionConfig.model.reasoningLevel ?? "default"} reasoning</span>
-                  <span>{sessionConfig.model.serviceTier ?? "provider default"} tier</span>
-                  <span>{sessionConfig.permission.profile} permissions</span>
-                  <span>{sessionConfig.delegation.policy} delegation</span>
-                  {selectedGoal ? <span className={`goal-chip goal-${selectedGoal.status}`}>Goal {goalStatusLabel(selectedGoal.status)}</span> : null}
-                </div>
-              ) : selectedId && configLoading ? <p className="config-loading">Loading runtime configuration…</p> : null}
-            </div>
+            <div className="conversation-title"><h1>{selectedId ? selectedTitle : "新会话"}</h1></div>
             <div className="conversation-heading-actions">
-              {canResumeSession ? (
-                <button className="secondary compact-action" disabled={runtimeActionsDisabled} onClick={() => void resumeSession()}>
-                  <Icon name="resume" />Resume task
-                </button>
-              ) : null}
-              {selectedId && !selectedArchived ? (
-                <button
-                  className="icon-button session-settings-button"
-                  type="button"
-                  aria-label="Task runtime settings"
-                  disabled={runtimeActionsDisabled || !sessionConfig}
-                  onClick={() => setSettingsOpen(true)}
-                >
-                  <Icon name="settings" />
-                </button>
-              ) : null}
-              {presentation ? (
-                <span className={`session-status status-${presentation.chat.status}`}>
-                  <span aria-hidden="true" />{presentation.chat.status.replaceAll("_", " ")}
-                </span>
-              ) : null}
+              {canResumeSession ? <button className="secondary compact-action" disabled={runtimeActionsDisabled} onClick={() => void resumeSession()}><Icon name="resume" />继续处理</button> : null}
+              {sessionBusy ? <span className="session-status status-running"><span />正在处理</span> : null}
+              {selectedId && !selectedArchived ? <button className="icon-button" aria-label="Task runtime settings" title="会话设置" disabled={runtimeActionsDisabled || !sessionConfig} onClick={() => openSettings("models")}><Icon name="more" /></button> : null}
             </div>
           </div>
-
+          {latestResult ? <div className="conversation-viewbar">
+            <div role="group" aria-label="查看方式">
+              <button aria-pressed={view === "result"} onClick={() => setView("result")}>成果</button>
+              <button aria-pressed={view === "chat"} onClick={() => setView("chat")}>对话</button>
+            </div>
+            <button className="split-view-button" aria-pressed={view === "split"} onClick={() => setView(view === "split" ? "result" : "split")}><Icon name="sidebar" />并排查看</button>
+          </div> : null}
           {selectedArchived ? (
             <div className="read-only-banner" role="status">
               <Icon name="archive" />
-              <span>This task is archived and read-only. Archived tasks cannot be restored in this milestone.</span>
+              <span>此会话已归档，可以查看历史记录。</span>
             </div>
           ) : null}
 
+          <div className="conversation-body">
+          <div className="chat-surface" hidden={Boolean(latestResult) && view === "result"}>
           <TimelineViewport scopeKey={JSON.stringify([desktop.projectId, desktop.workspace, selectedId])}>
-            {loadingSession ? <p className="empty-copy centered">Restoring timeline…</p> : null}
-            {!loadingSession && timelineItems.map((item) => <TimelineItem key={`${item.kind}:${item.id}`} item={item} />)}
-            {!loadingSession && selectedId && timelineItems.length === 0 ? (
-              <div className="task-empty-state">
-                <ChiliMark />
-                <h2>What should we build?</h2>
-                <p>Describe the outcome. Chili will inspect the repo, work through the task, and keep the evidence here.</p>
-              </div>
-            ) : null}
-            {!selectedId ? (
-              <div className="welcome-card">
-                <div className="welcome-mark"><ChiliMark /></div>
-                <p className="eyebrow">Chili desktop</p>
-                <h2>Turn a repository into finished work.</h2>
-                <p>Start with the result you want. Chili reads the project, edits with visible permissions, and keeps agents, tasks, and changes in one place.</p>
-                <div className="welcome-actions">
-                  {healthy ? (
-                    <button className="primary" disabled={actionsDisabled} onClick={openNewTask}>
-                      <Icon name="plus" />Start a task
-                    </button>
-                  ) : (
-                    <button className="primary" disabled={!workspaceSwitchEnabled} onClick={() => void chooseWorkspace()}>
-                      <Icon name="folder" />Choose a project
-                    </button>
-                  )}
-                  <span>{RENDERER_CREDENTIAL_BOUNDARY_COPY}</span>
-                </div>
-              </div>
-            ) : null}
+            {loadingSession ? <p className="empty-copy centered">正在恢复会话…</p> : null}
+            {!loadingSession && timelineItems.map((item) => <TimelineItem key={`${item.kind}:${item.id}`} item={item} expandWork={preferences.expandWork} />)}
+            {emptyConversation ? <div className="welcome-card">
+              <div className="welcome-mark"><ChiliMark /></div>
+              <h2>你想做点什么？</h2><p>从一个想法开始。</p>
+              {!desktop.workspace ? <button className="secondary" disabled={!workspaceSwitchEnabled} onClick={() => void chooseWorkspace()}><Icon name="folder" />打开一个目录</button> : null}
+            </div> : null}
           </TimelineViewport>
+          </div>
+          {latestResult && view !== "chat" ? <ResultSurface key={resultScope} results={results} busy={Boolean(sessionBusy)}
+            diffText={diffBelongsToScope ? diffView.text : ""} diffLoading={diffLoading || !diffBelongsToScope} diffTruncated={diffView.truncated}
+            diffScope={diffScope} onViewChanges={() => setDiffScope("workspace")}
+            onViewChat={() => setView("chat")} /> : null}
+          </div>
 
           {presentation && presentation.pendingApprovals.length > 0 ? (
             <div className="blocking-dock">
@@ -1341,36 +1350,45 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
 
           <div className="composer-wrap">
             <div className="composer">
+              {commandsOpen && commands.length > 0 ? <div id="composer-commands" className="composer-command-menu" role="listbox" aria-label="斜杠命令">
+                <p>按需使用</p>{commands.map((command, index) => <button id={`command-${command.id}`} key={command.id} type="button" role="option" aria-selected={index === commandIndex % commands.length}
+                  onMouseDown={(event) => event.preventDefault()} onClick={() => chooseCommand(command)}><span>/{command.id}</span><small>{command.label}</small></button>)}
+              </div> : null}
               <textarea
                 ref={composerRef}
                 aria-label="Message composer"
                 value={composer}
                 onChange={(event) => {
                   setComposer(event.target.value);
+                  setCommandsOpen(event.target.value.startsWith("/"));
+                  setCommandIndex(0);
                   event.target.style.height = "auto";
                   event.target.style.height = `${Math.min(event.target.scrollHeight, 190)}px`;
                 }}
                 onKeyDown={(event) => {
-                  if (composerEditable && (event.metaKey || event.ctrlKey) && event.key === "Enter") void submit("queue");
+                  if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+                  if (commands.length && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+                    event.preventDefault(); setCommandIndex((index) => (index + (event.key === "ArrowDown" ? 1 : -1) + commands.length) % commands.length); return;
+                  }
+                  if (event.key === "Escape") { setCommandsOpen(false); return; }
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    if (commands.length) chooseCommand(commands[commandIndex % commands.length]!);
+                    else if (composerEditable) void submit("queue");
+                  }
                 }}
-                placeholder={selectedArchived
-                  ? "Archived tasks are read-only"
-                  : selectedId
-                    ? canResumeSession
-                      ? "Queue a follow-up, then resume…"
-                      : "Ask Chili to change, investigate, or ship something…"
-                    : "Create or select a task first"}
+                placeholder={selectedArchived ? "已归档的会话仅供查看" : sessionBusy ? "补充想法，或告诉 Chili 调整方向…" : latestResult ? "说说你还想改哪里…" : "说说你想做什么…"}
+                aria-expanded={commandsOpen && commands.length > 0}
+                aria-controls={commandsOpen && commands.length > 0 ? "composer-commands" : undefined}
+                aria-activedescendant={commandsOpen && commands.length > 0 ? `command-${commands[commandIndex % commands.length]!.id}` : undefined}
                 disabled={!composerEditable}
                 rows={2}
               />
               <div className="composer-actions">
                 <div className="composer-context">
-                  <span className={`composer-local phase-${desktop.sidecar.phase}`}><span />Local</span>
-                  {selectedGoal ? <span className={`composer-goal goal-${selectedGoal.status}`}>Goal · {goalStatusLabel(selectedGoal.status)}</span> : null}
-                  {snapshot?.inputQueue?.paused ? <span>Paused — resume to continue</span> : null}
-                  {snapshot?.inputQueue?.interruptedCount ? <span>Interrupted work saved</span> : null}
-                  {(desktop.queuedBySession[selectedId ?? ""] ?? 0) > 0 ? <span>{desktop.queuedBySession[selectedId ?? ""]} queued</span> : null}
-                  <span className="shortcut-hint">⌘ ↵ send</span>
+                  <button className="slash-trigger" aria-label="更多命令" disabled={!composerEditable} onClick={() => { setCommandsOpen((open) => !open); setCommandIndex(0); composerRef.current?.focus(); }}>/ <span>更多</span></button>
+                  {snapshot?.inputQueue?.paused ? <span>已暂停 · 可继续处理</span> : null}
+                  {(desktop.queuedBySession[selectedId ?? ""] ?? 0) > 0 ? <span>{desktop.queuedBySession[selectedId ?? ""]} 条待处理</span> : null}
                 </div>
                 <div className="composer-buttons">
                   {sessionBusy ? (
@@ -1386,15 +1404,20 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
                   ) : null}
                   {sessionBusy ? (
                     <button className="steer-button" disabled={!composer.trim() || !selectedId || runtimeActionsDisabled} onClick={() => void submit("steer")}>
-                      <Icon name="steer" />Steer
+                      <Icon name="steer" />调整方向
                     </button>
                   ) : null}
-                  <button className="send-button" title={sessionBusy ? "Queue message" : "Send message"} aria-label={sessionBusy ? "Queue message" : "Send message"} disabled={!composer.trim() || !selectedId || runtimeActionsDisabled} onClick={() => void submit("queue")}>
+                  <button className="send-button" title={sessionBusy ? "Queue message" : "Send message"} aria-label={sessionBusy ? "Queue message" : "Send message"} disabled={!composer.trim() || runtimeActionsDisabled} onClick={() => void submit("queue")}>
                     <Icon name={sessionBusy ? "queue" : "send"} />
                   </button>
                 </div>
               </div>
             </div>
+            {emptyConversation ? <div className="conversation-examples">{[
+              ["做一个网站", "帮我做一个简洁自然的网站，先了解这个目录，再和我确认具体内容。"],
+              ["整理文件", "查看这个目录，给我一个整理文件的建议，先不要移动或删除文件。"],
+              ["修改已有作品", "看看这个目录里的作品，告诉我有哪些值得改进的地方。"],
+            ].map(([label, prompt]) => <button key={label} disabled={!composerEditable} onClick={() => { setComposer(prompt!); composerRef.current?.focus(); }}>{label}<span aria-hidden="true">↗</span></button>)}</div> : <p className="composer-key-hint">Enter 发送 · Shift + Enter 换行</p>}
           </div>
         </section>
 
@@ -1557,25 +1580,14 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
         />
       ) : null}
 
-      {appearanceOpen ? (
-        <AppearanceDialog
-          theme={theme}
-          onChange={changeTheme}
-          saveFailed={themeSaveFailed}
-          saving={themeSaving}
-          onClose={() => setAppearanceOpen(false)}
-        />
-      ) : null}
-
-      {settingsOpen && sessionConfig ? (
-        <SessionSettingsDialog
-          config={sessionConfig}
-          models={models}
-          disabled={working}
-          onClose={() => !working && setSettingsOpen(false)}
-          onSubmit={(values) => void saveSessionSettings(values)}
-        />
-      ) : null}
+      {settingsOpen ? <ModalFrame labelId="desktop-settings-title" className="desktop-settings-dialog" onClose={() => setSettingsOpen(false)} closeDisabled={working || themeSaving || preferencesSaving}>
+        <DesktopSettings page={settingsPage} onPage={setSettingsPage} project={projectLabel} session={selectedId} config={sessionConfig}
+          models={models} disabled={runtimeActionsDisabled || Boolean(selectedArchived)} busy={working} error={error} theme={theme} onTheme={changeTheme}
+          themeSaveFailed={themeSaveFailed} themeSaving={themeSaving || preferencesSaving} preferences={preferences} onPreferences={savePreferences} preferenceSaveFailed={preferenceSaveFailed}
+          onSave={(values, section) => void saveSessionSettings(values, section)} onReloadMcp={() => void reloadMcp()}
+          onPrompt={(text) => { setSettingsOpen(false); setComposer(text); setView("chat"); requestAnimationFrame(() => composerRef.current?.focus()); }}
+          onNewSession={() => { setSettingsOpen(false); openNewTask(); }} onClose={() => setSettingsOpen(false)} />
+      </ModalFrame> : null}
 
       {goalSetupOpen ? (
         <GoalSetupDialog
@@ -1598,44 +1610,25 @@ export function App({ transport: hostTransport }: { transport: ControlTransport 
   );
 }
 
-function AppearanceDialog({ theme, onChange, saveFailed, saving, onClose }: {
-  theme: DesktopTheme;
-  onChange: (theme: DesktopTheme) => void;
-  saveFailed: boolean;
-  saving: boolean;
-  onClose: () => void;
+function ResultSurface({ results, busy, diffText, diffLoading, diffTruncated, diffScope, onViewChanges, onViewChat }: {
+  results: readonly { id: string; text: string }[]; busy: boolean; diffText: string; diffLoading: boolean; diffTruncated: boolean; onViewChat: () => void;
+  diffScope: DiffScope; onViewChanges: () => void;
 }) {
-  useDialogEscape(onClose, saving);
-  return (
-    <ModalFrame labelId="appearance-title" className="appearance-dialog" onClose={onClose} closeDisabled={saving}>
-      <header className="modal-heading">
-        <div><p className="eyebrow">Personalize</p><h2 id="appearance-title">Appearance</h2><p>Make Chili feel at home.</p></div>
-        <button className="icon-button" type="button" aria-label="Close appearance settings" disabled={saving} onClick={onClose}><Icon name="close" /></button>
-      </header>
-      <div className="modal-scroll">
-        <fieldset className="theme-picker">
-          <legend>Theme</legend>
-          <div className="theme-options">
-            {desktopThemeOptions.map((option) => (
-              <label className="theme-option" key={option.id}>
-                <span className={`theme-preview theme-preview-${option.id}`} aria-hidden="true">
-                  <span className="theme-preview-sidebar"><i /><i /><i /></span>
-                  <span className="theme-preview-content"><i /><i /><i /><b /></span>
-                </span>
-                <span className="theme-option-label">
-                  <input type="radio" name="desktop-theme" value={option.id} checked={theme === option.id} onChange={() => onChange(option.id)} data-modal-initial-focus={theme === option.id ? "true" : undefined} />
-                  <strong>{option.label}</strong>
-                </span>
-                <small>{option.description}</small>
-              </label>
-            ))}
-          </div>
-        </fieldset>
-        {saveFailed ? <p className="field-error" role="alert">Theme applied, but it could not be saved. <button className="text-button" onClick={() => onChange(theme)}>Retry</button></p> : null}
-      </div>
-      <footer className="modal-actions"><span role="status">{saving ? "Saving theme…" : saveFailed ? "This change has not been saved." : "Applies to all tasks. Changes are saved automatically."}</span><button className="primary" type="button" disabled={saving} onClick={onClose}>Done</button></footer>
-    </ModalFrame>
-  );
+  const [selected, setSelected] = useState<string>();
+  const [changes, setChanges] = useState(false);
+  const current = results.find((result) => result.id === selected) ?? results.at(-1)!;
+  return <section className="result-surface" aria-label="成果">
+    <div className="result-summary"><ChiliMark /><span>{busy ? "Chili 正在继续处理，你可以先查看已有成果。" : "已整理好。看看成果，继续说说想改哪里。"}</span></div>
+    <div className={`result-paper ${changes ? "show-changes" : ""}`}>
+      <header className="result-toolbar"><div role="group" aria-label="成果内容"><button aria-pressed={!changes} onClick={() => setChanges(false)}>回复</button><button aria-pressed={changes} onClick={() => { onViewChanges(); setChanges(true); }}>文件修改</button></div>
+        <select aria-label="查看历史回复" value={current.id} onChange={(event) => setSelected(event.target.value)}>
+          {results.map((result, index) => <option key={result.id} value={result.id}>第 {index + 1} 次回复{index === results.length - 1 ? " · 最新" : ""}</option>)}
+        </select></header>
+      {changes ? <><p className="result-changes-note">{diffScope === "workspace" ? "当前目录尚未提交的改动，可能包含其他会话或手动修改。" : "工作过程面板已切换为当前步骤的改动。"} 与所选历史回复无关。</p><DiffViewer text={diffText} truncated={diffTruncated} loading={diffLoading} /></>
+        : <div className="result-document"><MarkdownText text={current.text} /></div>}
+    </div>
+    <footer className="result-caption"><span>{changes ? "查看具体文件，继续描述你希望调整的地方。" : "成果来自当前会话的实际回复。"}</span><button onClick={onViewChat}><Icon name="message" />查看对话</button></footer>
+  </section>;
 }
 
 function NewTaskDialog({
@@ -1853,60 +1846,10 @@ function ArchiveTaskDialog({
   return (
     <ModalFrame labelId="archive-task-title" className="compact-dialog" onClose={onClose} closeDisabled={disabled} returnFocus={returnFocus}>
       <div>
-        <header className="modal-heading"><div><p className="eyebrow">Archive</p><h2 id="archive-task-title">Archive task?</h2><p>{session.title || session.preview || "Untitled task"}</p></div></header>
+        <header className="modal-heading"><div><p className="eyebrow">Archive</p><h2 id="archive-task-title">Archive task?</h2><p>{session.title || session.preview || "新会话"}</p></div></header>
         <div className="compact-dialog-body archive-warning"><Icon name="archive" /><p>This removes the task from Active tasks. Archived tasks remain inspectable but are read-only and cannot be restored in this milestone.</p>{archiveDisabled ? <small>Stop the running task before archiving it.</small> : null}</div>
-        <footer className="modal-actions"><span /><div><button autoFocus data-modal-initial-focus="true" className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="danger" type="button" disabled={disabled || archiveDisabled} onClick={onArchive}>Archive task</button></div></footer>
+        <footer className="modal-actions"><span /><div><button autoFocus data-modal-initial-focus="true" className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="danger" type="button" disabled={disabled || archiveDisabled} onClick={onArchive}>归档会话</button></div></footer>
       </div>
-    </ModalFrame>
-  );
-}
-
-function SessionSettingsDialog({
-  config,
-  models,
-  disabled,
-  onClose,
-  onSubmit,
-}: {
-  config: DesktopSessionConfig;
-  models: readonly RuntimeModelDescriptor[];
-  disabled: boolean;
-  onClose: () => void;
-  onSubmit: (values: SessionSettingsValues) => void;
-}) {
-  const catalog = models.length > 0 ? models : config.model.models;
-  const initialModelSettings = createSessionModelSettingsDraft(catalog, config.model);
-  const [values, setValues] = useState<SessionSettingsValues>({
-    ...initialModelSettings,
-    permissionProfile: config.permission.profile,
-    delegationPolicy: config.delegation.policy,
-  });
-  useDialogEscape(onClose, disabled);
-  const reasoningLevels = availableReasoningLevels(catalog, values.modelKey);
-  const serviceTiers = availableServiceTiers(catalog, values.modelKey);
-  const reasoningProviderDefaultSelectable = canSelectProviderDefault(config.model.reasoningLevel);
-  const serviceTierProviderDefaultSelectable = canSelectProviderDefault(config.model.serviceTier);
-  const settingsValidation = validateSessionModelSettingsDraft(values, catalog, config.model);
-  const settingsValid = settingsValidation.valid;
-  return (
-    <ModalFrame labelId="session-settings-title" className="settings-dialog" onClose={onClose} closeDisabled={disabled}>
-      <form onSubmit={(event) => { event.preventDefault(); if (!disabled && settingsValid) onSubmit(values); }}>
-        <header className="modal-heading"><div><p className="eyebrow">Runtime</p><h2 id="session-settings-title">Task runtime settings</h2><p>Changes apply to the next turn. Permission profile is shared by the runtime.</p></div><button className="icon-button" type="button" aria-label="Close task runtime settings" disabled={disabled} onClick={onClose}><Icon name="close" /></button></header>
-        <div className="modal-scroll settings-grid">
-          <label className="field-label field-wide"><span>Model</span><select autoFocus data-modal-initial-focus="true" aria-label="Task model" value={values.modelKey} disabled={disabled} onChange={(event) => {
-            const nextKey = event.target.value;
-            setValues((current) => ({
-              ...current,
-              ...reconcileSessionModelSettingsModel(current, catalog, nextKey),
-            }));
-          }}>{catalog.map((model) => <option key={modelKey(model)} value={modelKey(model)} disabled={model.available === false}>{model.displayName ?? model.model} · {model.providerDisplayName ?? model.provider}</option>)}</select></label>
-          <label className="field-label"><span>Reasoning</span><select aria-label="Task reasoning" value={values.reasoningLevel} disabled={disabled || reasoningLevels.length === 0} onChange={(event) => setValues({ ...values, reasoningLevel: event.target.value as ReasoningSelection })}><option value="" disabled={!reasoningProviderDefaultSelectable}>Provider default</option>{reasoningLevels.map((level) => <option key={level} value={level}>{reasoningLabel(level)}</option>)}</select>{reasoningLevels.length === 0 ? <small>This provider does not expose configurable reasoning.</small> : null}{settingsValidation.errors.reasoningLevel ? <small className="field-error">{settingsValidation.errors.reasoningLevel}</small> : null}</label>
-          <label className="field-label"><span>Service tier</span><select aria-label="Task service tier" value={values.serviceTier} disabled={disabled || serviceTiers.length === 0} onChange={(event) => setValues({ ...values, serviceTier: event.target.value as ServiceTierSelection })}><option value="" disabled={!serviceTierProviderDefaultSelectable}>Provider default</option>{serviceTiers.map((tier) => <option key={tier} value={tier}>{humanizeStatus(tier)}</option>)}</select>{serviceTiers.length === 0 ? <small>This provider does not expose a configurable service tier.</small> : null}{settingsValidation.errors.serviceTier ? <small className="field-error">{settingsValidation.errors.serviceTier}</small> : null}</label>
-          <label className="field-label"><span>Runtime permission profile</span><select aria-label="Task permission profile" value={values.permissionProfile} disabled={disabled} onChange={(event) => setValues({ ...values, permissionProfile: event.target.value as RuntimePermissionProfileId })}>{config.permission.profiles.map((profile) => <option key={profile.id} value={profile.id} disabled={Boolean(profile.disabledReason)}>{profile.label}</option>)}</select><small className="scope-warning"><Icon name="shield" />Applies to every task until restart; restart returns to Default.</small></label>
-          <label className="field-label"><span>Delegation</span><select aria-label="Task delegation" value={values.delegationPolicy} disabled={disabled} onChange={(event) => setValues({ ...values, delegationPolicy: event.target.value as DelegationPolicy })}><option value="proactive">Proactive</option><option value="explicit">Explicit only</option><option value="off">Off</option></select></label>
-        </div>
-        <footer className="modal-actions"><span>{settingsValid ? "Settings are validated before crossing the renderer boundary." : "Choose an available model before saving."}</span><div><button className="secondary" type="button" disabled={disabled} onClick={onClose}>Cancel</button><button className="primary" type="submit" disabled={disabled || !settingsValid}>Save settings</button></div></footer>
-      </form>
     </ModalFrame>
   );
 }
@@ -2113,26 +2056,27 @@ function useDialogEscape(close: () => void, disabled: boolean): void {
   }, [close, disabled]);
 }
 
-function TimelineItem({ item }: { item: DesktopTimelineItem }) {
-  if (item.kind === "work") return <WorkSummary item={item} />;
+function TimelineItem({ item, expandWork }: { item: DesktopTimelineItem; expandWork: boolean }) {
+  if (item.kind === "work") return <WorkSummary item={item} expandWork={expandWork} />;
   return (
     <article className={`timeline-item message message-${item.role}`}>
       <div className="message-content">
+        {item.role === "assistant" ? <div className="message-author"><ChiliMark /><span>Chili</span></div> : null}
         <div className="message-body">{item.parts.map((part) => <MessagePart key={part.id} part={part} />)}</div>
       </div>
     </article>
   );
 }
 
-function WorkSummary({ item }: { item: DesktopWorkItem }) {
-  const [open, setOpen] = useState(item.active);
+function WorkSummary({ item, expandWork }: { item: DesktopWorkItem; expandWork: boolean }) {
+  const [open, setOpen] = useState(expandWork);
   const wasActive = useRef(item.active);
 
   useEffect(() => {
-    if (item.active) setOpen(true);
-    else if (wasActive.current) setOpen(false);
+    if (expandWork) setOpen(true);
+    else if (wasActive.current && !item.active) setOpen(false);
     wasActive.current = item.active;
-  }, [item.active]);
+  }, [item.active, expandWork]);
 
   const elapsed = Math.max(0, item.updatedAt - item.startedAt);
   const label = item.active

@@ -13,8 +13,8 @@ import {
 } from "./remote-setup-model.js";
 import "./remote-control-panel.css";
 
-export function RemoteControlPanel() {
-  const [open, setOpen] = useState(false);
+export function RemoteControlPanel({ embedded = false }: { embedded?: boolean } = {}) {
+  const [open, setOpen] = useState(embedded);
   const [state, setState] = useState<RemoteDesktopState>();
   const [draft, setDraft] = useState(() => receiveRemoteSetup(undefined, undefined));
   const [error, setError] = useState("");
@@ -24,7 +24,7 @@ export function RemoteControlPanel() {
   const dialog = useRef<HTMLElement>(null);
 
   useLayoutEffect(() => {
-    if (!open || !dialog.current) return;
+    if (embedded || !open || !dialog.current) return;
     const restoreTarget = trigger.current;
     dialog.current.querySelector<HTMLElement>("[data-remote-initial-focus]")?.focus();
     const appShell = document.querySelector<HTMLElement>(".app-shell");
@@ -42,7 +42,7 @@ export function RemoteControlPanel() {
       }
       if (restoreTarget?.isConnected && !restoreTarget.closest("[inert]")) restoreTarget.focus();
     };
-  }, [open]);
+  }, [embedded, open]);
 
   useEffect(() => {
     if (!open || !window.chiliRemote) return;
@@ -92,6 +92,13 @@ export function RemoteControlPanel() {
     }
   }
 
+  if (embedded) return <section className="remote-panel remote-panel-embedded">
+    <RemoteControlPanelContent state={state} draft={draft} error={error} action={action}
+      onEdit={(field, value) => setDraft((current) => editRemoteSetup(current, field, value))}
+      onDiscardChanges={() => setDraft(receiveRemoteSetup(undefined, state?.setup))}
+      onAction={(request) => void act(request)} />
+  </section>;
+
   return <div className="remote-panel-anchor">
     <button ref={trigger} className="chrome-button" type="button" data-testid="remote-open" aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen(!open)}>
       Phone {state?.enabled ? "· On" : "· Off"}
@@ -124,7 +131,7 @@ export function RemoteControlPanelContent({ state, draft, error, action, onEdit,
   onEdit: (field: "bindAddress" | "port", value: string) => void;
   onDiscardChanges: () => void;
   onAction: (request: RemoteDesktopRequest) => void;
-  onClose: () => void;
+  onClose?: () => void;
 }) {
   const setup = state?.setup;
   const working = action !== undefined || Boolean(setup?.busy);
@@ -140,7 +147,7 @@ export function RemoteControlPanelContent({ state, draft, error, action, onEdit,
   };
 
   return <>
-    <header className="remote-panel-heading"><div><p className="eyebrow">Private connection · Alpha</p><h2 id="remote-panel-title">Phone control</h2></div><button type="button" data-remote-initial-focus="true" aria-label="Close phone control" onClick={onClose}>×</button></header>
+    {onClose ? <header className="remote-panel-heading"><div><p className="eyebrow">Private connection · Alpha</p><h2 id="remote-panel-title">Phone control</h2></div><button type="button" data-remote-initial-focus="true" aria-label="Close phone control" onClick={onClose}>×</button></header> : null}
     <div className="remote-panel-scroll">
       <p className="remote-panel-intro">Continue this workspace’s existing tasks on your phone. Approvals and questions stay on this Mac.</p>
       {error ? <p role="alert" className="remote-panel-error">{error}</p> : null}

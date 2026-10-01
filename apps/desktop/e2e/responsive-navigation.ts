@@ -4,7 +4,7 @@ import type { Page } from "playwright-core";
 /** Run after the harness sets the native window width; leave both panels closed. */
 export async function assertResponsiveNavigation(page: Page): Promise<void> {
   const taskTitle = await page.locator(".conversation-heading h1").textContent();
-  const dialog = page.getByRole("dialog", { name: "Create a new task", exact: true });
+  const dialog = page.getByRole("dialog", { name: "设置", exact: true });
   const sidebar = page.locator(".sidebar");
   const workbench = page.locator(".inspector");
 
@@ -13,9 +13,9 @@ export async function assertResponsiveNavigation(page: Page): Promise<void> {
     await hidePanel(page, "sidebar");
     await page.getByRole("button", { name: "Show sidebar", exact: true }).click();
     await waitForPanelBounds(page, ".sidebar");
-    await sidebar.getByRole("button", { name: "New task", exact: true }).click();
+    await sidebar.getByRole("button", { name: "打开设置", exact: true }).click();
     await dialog.waitFor({ state: "visible" });
-    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await dialog.getByRole("button", { name: "关闭设置", exact: true }).click();
     await dialog.waitFor({ state: "hidden" });
 
     await page.getByRole("button", { name: "Hide sidebar", exact: true }).click();
@@ -48,10 +48,10 @@ export async function assertResponsiveNavigation(page: Page): Promise<void> {
     assert.equal(await sidebar.getAttribute("aria-hidden"), "true");
     assert.equal(await workbench.getAttribute("aria-hidden"), "true");
     assert.equal(await page.locator(".conversation-heading h1").textContent(), taskTitle,
-      "Navigation and a cancelled New task dialog must preserve the current task");
+      "Navigation and a closed settings dialog must preserve the current task");
   } finally {
     if (await dialog.isVisible()) {
-      await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+      await dialog.getByRole("button", { name: "关闭设置", exact: true }).click();
       await dialog.waitFor({ state: "hidden" });
     }
     if (await page.getByRole("button", { name: "Hide workbench", exact: true }).isVisible()) {

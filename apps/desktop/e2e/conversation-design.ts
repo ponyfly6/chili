@@ -1,0 +1,80 @@
+import assert from "node:assert/strict";
+import { join } from "node:path";
+import type { Page } from "playwright-core";
+
+export async function openDesktopSettings(page: Page) {
+  await page.keyboard.press("Meta+,");
+  const dialog = page.getByRole("dialog", { name: "设置", exact: true });
+  await dialog.waitFor();
+  return dialog;
+}
+
+export async function openAdvancedTaskDialog(page: Page) {
+  const composer = page.getByLabel("Message composer", { exact: true });
+  if (await composer.isDisabled()) {
+    const showSidebar = page.getByRole("button", { name: "Show sidebar", exact: true });
+    if (await showSidebar.isVisible()) await showSidebar.click();
+    await page.getByRole("button", { name: "New task", exact: true }).click();
+    await page.waitForFunction(() => !document.querySelector<HTMLTextAreaElement>('[aria-label="Message composer"]')?.disabled);
+  }
+  await composer.fill("/advanced");
+  await composer.press("Enter");
+  const dialog = page.getByRole("dialog", { name: "Create a new task", exact: true });
+  await dialog.waitFor();
+  return dialog;
+}
+
+export async function assertConversationDesign(page: Page, artifacts: string): Promise<void> {
+  await page.getByRole("heading", { name: "你想做点什么？", exact: true }).waitFor();
+  assert.equal(await page.getByRole("dialog").count(), 0, "A fresh workspace must offer the composer directly");
+  assert.equal(await page.locator(".inspector").getAttribute("aria-hidden"), "true");
+  await page.screenshot({ path: join(artifacts, "conversation-new.png") });
+  const composer = page.getByLabel("Message composer", { exact: true });
+  await composer.fill("hello conversation redesign");
+  await composer.press("Shift+Enter");
+  assert.equal(await composer.inputValue(), "hello conversation redesign\n", "Shift+Enter inserts a newline without sending");
+  await composer.press("Enter");
+  const result = page.getByRole("region", { name: "成果", exact: true });
+  await result.waitFor();
+  await page.getByRole("heading", { name: "hello conversation redesign", exact: true }).waitFor();
+  assert.equal(await page.locator(".timeline .message-user").count(), 1, "The first prompt is submitted once");
+  await page.screenshot({ path: join(artifacts, "conversation-result.png") });
+  await page.getByRole("button", { name: "并排查看", exact: true }).click();
+  await page.locator(".timeline .message-user").waitFor();
+  await result.waitFor();
+  await page.screenshot({ path: join(artifacts, "conversation-split.png") });
+  await page.getByRole("button", { name: "对话", exact: true }).click();
+  await composer.fill("保留这条未发送的想法");
+  await page.getByRole("button", { name: "更多命令", exact: true }).click();
+  await page.getByRole("option", { name: "/settings 打开设置", exact: true }).click();
+  const settings = page.getByRole("dialog", { name: "设置", exact: true });
+  await settings.waitFor();
+  for (const name of ["模型与账号", "权限与协作", "工具与技能", "偏好与记忆", "手机连接", "通用"]) {
+    await settings.getByRole("button", { name, exact: true }).click();
+    await settings.getByRole("heading", { name, exact: true }).waitFor();
+  }
+  await settings.getByRole("checkbox", { name: /完成后直接查看成果/ }).uncheck();
+  await settings.getByRole("checkbox", { name: /默认展开工作过程/ }).check();
+  await settings.getByRole("button", { name: "模型与账号", exact: true }).click();
+  await settings.getByLabel("Task model", { exact: true }).waitFor();
+  await page.screenshot({ path: join(artifacts, "conversation-settings.png") });
+  await page.keyboard.press("Escape");
+  await settings.waitFor({ state: "hidden" });
+  assert.equal(await composer.inputValue(), "保留这条未发送的想法", "Opening commands and settings must preserve an existing draft");
+  await composer.fill("/mod");
+  await composer.press("Enter");
+  await settings.getByRole("heading", { name: "模型与账号", exact: true }).waitFor();
+  await page.keyboard.press("Escape");
+  await settings.waitFor({ state: "hidden" });
+  await page.keyboard.press("Meta+n");
+  await page.getByRole("heading", { name: "你想做点什么？", exact: true }).waitFor();
+  assert.equal(await page.getByRole("dialog").count(), 0, "New conversation must never open the advanced configuration form");
+  assert.equal(await composer.inputValue(), "");
+}
+
+export async function openPhoneSettings(page: Page) {
+  const dialog = await openDesktopSettings(page);
+  await dialog.getByRole("button", { name: "手机连接", exact: true }).click();
+  await dialog.locator(".remote-panel-embedded").waitFor();
+  return dialog;
+}

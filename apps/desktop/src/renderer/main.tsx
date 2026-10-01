@@ -4,6 +4,7 @@ import { App } from "./App.js";
 import { createElectronTransport } from "./electron-transport.js";
 import { applyDesktopTheme } from "./theme.js";
 import "./styles.css";
+import "./conversation-design.css";
 
 const root = document.getElementById("root");
 if (!root) throw new Error("Missing Chili desktop root");
