@@ -19,6 +19,7 @@
       "dependencies": {
         "@chili/commands": "workspace:*",
         "@chili/core": "workspace:*",
+        "@chili/host": "workspace:*",
         "@chili/mcp": "workspace:*",
         "@chili/policy": "workspace:*",
         "@chili/protocol": "workspace:*",
@@ -48,6 +49,7 @@
       "name": "@chili/desktop",
       "version": "0.1.0",
       "devDependencies": {
+        "@chili/host": "workspace:*",
         "@chili/protocol": "workspace:*",
         "@chili/remote-control": "workspace:*",
         "@chili/sdk": "workspace:*",
@@ -133,6 +135,21 @@
       "dependencies": {
         "@chili/policy": "workspace:*",
         "@chili/protocol": "workspace:*",
+        "@chili/store": "workspace:*",
+        "@chili/tools": "workspace:*",
+      },
+    },
+    "packages/host": {
+      "name": "@chili/host",
+      "version": "0.0.0",
+      "dependencies": {
+        "@chili/commands": "workspace:*",
+        "@chili/core": "workspace:*",
+        "@chili/mcp": "workspace:*",
+        "@chili/policy": "workspace:*",
+        "@chili/protocol": "workspace:*",
+        "@chili/providers": "workspace:*",
+        "@chili/skills": "workspace:*",
         "@chili/store": "workspace:*",
         "@chili/tools": "workspace:*",
       },
@@ -270,6 +287,8 @@
     "@chili/core": ["@chili/core@workspace:packages/core"],
 
     "@chili/desktop": ["@chili/desktop@workspace:apps/desktop"],
+
+    "@chili/host": ["@chili/host@workspace:packages/host"],
 
     "@chili/mcp": ["@chili/mcp@workspace:packages/mcp"],
 

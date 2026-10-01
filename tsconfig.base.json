@@ -25,6 +25,12 @@
       "@chili/core": [
         "packages/core/src/index.ts"
       ],
+      "@chili/host": [
+        "packages/host/src/index.ts"
+      ],
+      "@chili/host/testing": [
+        "packages/host/src/testing.ts"
+      ],
       "@chili/mcp": [
         "packages/mcp/src/index.ts"
       ],

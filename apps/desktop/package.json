@@ -19,6 +19,7 @@
   "devDependencies": {
     "@electron/asar": "3.4.1",
     "@electron/fuses": "2.1.3",
+    "@chili/host": "workspace:*",
     "@chili/protocol": "workspace:*",
     "@chili/sdk": "workspace:*",
     "@chili/server": "workspace:*",

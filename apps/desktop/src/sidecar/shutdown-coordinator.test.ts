@@ -131,7 +131,7 @@ describe("sidecar shutdown coordinator", () => {
   });
 });
 
-test("resource close still attempts the harness after server rejection", async () => {
+test("resource close still attempts the Host after server rejection", async () => {
   const events: string[] = [];
   await expect(closeSidecarResources({
     denyPending() {
@@ -141,11 +141,11 @@ test("resource close still attempts the harness after server rejection", async (
       events.push("server");
       throw new Error("server close rejected");
     },
-    async closeHarness() {
-      events.push("harness");
+    async closeHost() {
+      events.push("host");
     },
   })).rejects.toThrow("server close rejected");
-  expect(events).toEqual(["deny", "server", "harness"]);
+  expect(events).toEqual(["deny", "server", "host"]);
 });
 
 function coordinatorFixture(options: { delayResolvedDecision?: boolean } = {}): {

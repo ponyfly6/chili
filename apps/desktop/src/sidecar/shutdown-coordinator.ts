@@ -23,7 +23,7 @@ export interface SidecarShutdownCoordinatorOptions {
 export interface SidecarCloseResourcesOptions {
   denyPending(): void;
   closeServer?(): Promise<void>;
-  closeHarness?(): Promise<void>;
+  closeHost?(): Promise<void>;
 }
 
 export async function closeSidecarResources(options: SidecarCloseResourcesOptions): Promise<void> {
@@ -40,9 +40,9 @@ export async function closeSidecarResources(options: SidecarCloseResourcesOption
       errors.push(error);
     }
   }
-  if (options.closeHarness) {
+  if (options.closeHost) {
     try {
-      await options.closeHarness();
+      await options.closeHost();
     } catch (error) {
       errors.push(error);
     }

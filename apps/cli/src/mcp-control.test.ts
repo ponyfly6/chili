@@ -1006,7 +1006,7 @@ test("MCP close is reentrant, observes disconnect rejection, and rejects every p
     ];
     for (const operation of closedOperations) {
       await expect(Promise.resolve().then(operation)).rejects.toMatchObject({
-        name: "CliMcpRuntimeClosedError",
+        name: "HostMcpRuntimeClosedError",
       });
     }
   } finally {
@@ -1051,7 +1051,7 @@ test("MCP close shares an admitted reload disconnect and prevents a replacement 
     const [reloadResult, closeResult] = await Promise.allSettled([reload, firstClose]);
     expect(reloadResult).toMatchObject({
       status: "rejected",
-      reason: { name: "CliMcpRuntimeClosedError" },
+      reason: { name: "HostMcpRuntimeClosedError" },
     });
     expect(closeResult).toEqual({ status: "fulfilled", value: undefined });
     expect(clientCount).toBe(1);
@@ -1095,7 +1095,7 @@ test("MCP close does not await a stuck background connect and contains its late 
     for (let index = 0; index < 12; index += 1) await Promise.resolve();
     expect(state.status).toBe("disconnected");
     expect(disconnectCalls).toBe(1);
-    await expect(runtime.control.list()).rejects.toMatchObject({ name: "CliMcpRuntimeClosedError" });
+    await expect(runtime.control.list()).rejects.toMatchObject({ name: "HostMcpRuntimeClosedError" });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1149,7 +1149,7 @@ test("MCP close does not await an admitted eager reconnect and rejects its late 
     const addResult = await Promise.allSettled([add]);
     expect(addResult).toMatchObject([{
       status: "rejected",
-      reason: { name: "CliMcpRuntimeClosedError" },
+      reason: { name: "HostMcpRuntimeClosedError" },
     }]);
     expect(state.status).toBe("disconnected");
     expect(disconnectCalls).toBe(1);

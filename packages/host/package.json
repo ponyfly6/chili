@@ -1,20 +1,25 @@
 {
-  "name": "@chili/cli",
+  "name": "@chili/host",
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "bin": {
-    "chili": "./dist/index.js"
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "default": "./dist/testing.js"
+    }
   },
   "dependencies": {
     "@chili/commands": "workspace:*",
     "@chili/core": "workspace:*",
-    "@chili/host": "workspace:*",
     "@chili/mcp": "workspace:*",
     "@chili/policy": "workspace:*",
     "@chili/protocol": "workspace:*",
     "@chili/providers": "workspace:*",
-    "@chili/server": "workspace:*",
     "@chili/skills": "workspace:*",
     "@chili/store": "workspace:*",
     "@chili/tools": "workspace:*"

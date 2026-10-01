@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { createReadStream, writeSync } from "node:fs";
 import { realpath, rename, writeFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
+import { createChiliHost, type ChiliHost } from "@chili/host";
 import { startRuntimeHttpServer } from "@chili/server";
 import {
   DeferredApprovalQueue,
@@ -10,7 +11,6 @@ import {
   observeRunProcessLifecycle,
   runProcess,
 } from "@chili/tools";
-import { createCliHarness } from "../../../cli/src/harness.js";
 import { safeDesktopErrorMessage as safeErrorMessage } from "../shared/safe-error.js";
 import {
   readSidecarCredentialStream,
@@ -45,7 +45,7 @@ for (const name of [
 const activeToolProcessGroups = new Set<number>();
 const approvalQueue = new DeferredApprovalQueue();
 const userInputQueue = new DeferredUserInputQueue();
-let harness: Awaited<ReturnType<typeof createCliHarness>> | undefined;
+let host: ChiliHost | undefined;
 let server: ReturnType<typeof startRuntimeHttpServer> | undefined;
 let fixtureToolStart: {
   resolve(pid: number): void;
@@ -144,7 +144,7 @@ const close = (reason: string): Promise<void> => {
       userInputQueue.denyAll(reason);
     },
     ...(server ? { closeServer: () => server?.close() ?? Promise.resolve() } : {}),
-    ...(harness ? { closeHarness: () => harness?.close() ?? Promise.resolve() } : {}),
+    ...(host ? { closeHost: () => host?.close() ?? Promise.resolve() } : {}),
   });
   return closing;
 };
@@ -171,9 +171,8 @@ try {
     autoClose: true,
   }));
   const workspace = await realpath(workspaceInput);
-  harness = await createCliHarness({
+  host = await createChiliHost({
     cwd: workspace,
-    quiet: true,
     approvalQueue,
     userInputQueue,
     mcpConnectMode: "manual",
@@ -188,19 +187,19 @@ try {
   });
 
   server = startRuntimeHttpServer({
-    service: harness.service,
-    store: harness.events,
-    tasks: harness.tasks,
-    agents: harness.agents,
-    teams: harness.teams,
-    teamDispatcher: harness.teamDispatcher,
-    teamMerger: harness.teamMerger,
-    teamRunner: harness.teamRunner,
+    service: host.service,
+    store: host.events,
+    tasks: host.tasks,
+    agents: host.agents,
+    teams: host.teams,
+    teamDispatcher: host.teamDispatcher,
+    teamMerger: host.teamMerger,
+    teamRunner: host.teamRunner,
     approvals: approvalQueue,
     userInputs: userInputQueue,
-    permissions: harness.permissions,
-    commands: harness.commands,
-    mcp: harness.mcp,
+    permissions: host.permissions,
+    commands: host.commands,
+    mcp: host.mcp,
     authToken: token,
     hostname: "127.0.0.1",
     port: 0,
